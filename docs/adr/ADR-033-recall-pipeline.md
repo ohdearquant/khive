@@ -229,11 +229,11 @@ The `recall` verb accepts three optional per-request knobs that override the pac
 `RecallConfig` for a single call. All knobs are optional; absent or `null` preserves the
 current default behavior.
 
-| Parameter         | Type             | Default             | Semantics                                                                                                                                                         |
-| ----------------- | ---------------- | ------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `top_k`           | `usize` \| null  | `limit` or `10`     | Maximum number of results to return. Overrides `limit` when set. Capped at `100`.                                                                                 |
+| Parameter         | Type             | Default                | Semantics                                                                                                                                                                                                                                                                   |
+| ----------------- | ---------------- | ---------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `top_k`           | `usize` \| null  | `limit` or `10`        | Maximum number of results to return. Overrides `limit` when set. Capped at `100`.                                                                                                                                                                                           |
 | `fusion_strategy` | `string` \| null | omitted = RRF `k = 10` | Fusion algorithm for candidate merging. Must be one of `"rrf"`, `"weighted"`, `"union"`, `"vector_only"`, `"keyword_only"`; any other value errors. Omitting the parameter selects the calibrated pack default, RRF `k = 10`; the explicit string `"rrf"` selects `k = 60`. |
-| `score_floor`     | `f32` \| null    | `0.0` (no floor)    | Minimum composite score threshold applied after `compute_score`. Results below this floor are excluded. `0.0` or `null` = no filtering.                           |
+| `score_floor`     | `f32` \| null    | `0.0` (no floor)       | Minimum composite score threshold applied after `compute_score`. Results below this floor are excluded. `0.0` or `null` = no filtering.                                                                                                                                     |
 
 **`fusion_strategy` details:**
 

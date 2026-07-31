@@ -528,7 +528,7 @@ own daemon component under the base ADR and Amendment 1's registration contract:
    component only (`email-channel` in the roster). It reads `KHIVE_EMAIL_*`
    configuration, polls IMAP under the per-cycle watchdog deadline, and ingests
    through `comm.ingest`. This satisfies Amendment 1's fences and verification
-   bar for the *poll* half of Decision point 4.
+   bar for the _poll_ half of Decision point 4.
 2. **Phase 2 (separate lane, not scheduled by this amendment)**: a supervised
    outbox delivery component that drains stored outbound `email:*` messages and
    calls `Channel::send`, with its own restart/backoff registration, health

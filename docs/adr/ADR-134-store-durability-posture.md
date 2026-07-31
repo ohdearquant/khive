@@ -1,4 +1,4 @@
-# ADR-134 — Store durability posture, and the obligation it carries for accounting records
+# ADR-134: Store durability posture, and the obligation it carries for accounting records
 
 - **Status:** Proposed
 - **Date:** 2026-07-29
@@ -18,7 +18,7 @@ Under WAL, `synchronous=NORMAL` means a commit returns **without** fsyncing the 
 failure classes differ and must not be collapsed:
 
 - A **process crash** loses nothing. The data is in the OS page cache and survives.
-- An **OS crash or power loss** can lose recent *committed* transactions.
+- An **OS crash or power loss** can lose recent _committed_ transactions.
 
 That is a legitimate and common trade. This record does not exist because the value is wrong. It
 exists because the value was never decided, and because of what now sits on top of it.
@@ -117,7 +117,7 @@ assume the worst case in both directions, or the best.
 **The favourable direction is conditional, and the condition is not this record's to keep.** "Errs
 toward under-accounting" holds only while the sole failure mode is loss. A write path that retries
 after an ambiguous commit outcome can persist the same accounting payload twice, which errs
-*against* the party the record concerns and, unlike an undercount, is not detectable from the
+_against_ the party the record concerns and, unlike an undercount, is not detectable from the
 accounting records afterwards — a duplicate is indistinguishable from a second genuine dispatch
 unless record identity was established when the row was produced.
 

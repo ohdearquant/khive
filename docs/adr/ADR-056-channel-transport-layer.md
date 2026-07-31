@@ -340,13 +340,13 @@ agent and never stored in any khive store.
 
 ### Configuration (env-only, mirroring §14)
 
-| Variable                            | Required | Default      | Description                                                                                               |
-| ----------------------------------- | -------- | ------------ | --------------------------------------------------------------------------------------------------------- |
-| `KHIVE_TELEGRAM_BOT_TOKEN`          | yes      | --           | Bot API token (BotFather). Never logged (masked `{first6}...[N chars]`), never stored in any khive store. |
-| `KHIVE_TELEGRAM_MAINTAINER_CHAT_ID` | yes      | --           | The authorized inbound conversation AND the outbound recipient for the maintainer slug. Numeric, signed (group ids are negative). |
-| `KHIVE_TELEGRAM_AUTHORIZED_SENDER_ID` | no     | chat id\*    | The numeric Telegram account (`message.from.id`) authorized to send inbound messages. Positive integer. \*Defaults to `KHIVE_TELEGRAM_MAINTAINER_CHAT_ID` only when that id is positive (a private chat); required explicitly otherwise. |
-| `KHIVE_TELEGRAM_MAINTAINER_SLUG`    | no       | `maintainer` | The slug in `telegram:<slug>` that maps to the maintainer chat id.                                        |
-| `KHIVE_TELEGRAM_INGEST_NAMESPACE`   | no       | `local`      | Target namespace for ingested inbound messages (passed as `namespace` to `comm.ingest`).                  |
+| Variable                              | Required | Default      | Description                                                                                                                                                                                                                              |
+| ------------------------------------- | -------- | ------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `KHIVE_TELEGRAM_BOT_TOKEN`            | yes      | --           | Bot API token (BotFather). Never logged (masked `{first6}...[N chars]`), never stored in any khive store.                                                                                                                                |
+| `KHIVE_TELEGRAM_MAINTAINER_CHAT_ID`   | yes      | --           | The authorized inbound conversation AND the outbound recipient for the maintainer slug. Numeric, signed (group ids are negative).                                                                                                        |
+| `KHIVE_TELEGRAM_AUTHORIZED_SENDER_ID` | no       | chat id\*    | The numeric Telegram account (`message.from.id`) authorized to send inbound messages. Positive integer. \*Defaults to `KHIVE_TELEGRAM_MAINTAINER_CHAT_ID` only when that id is positive (a private chat); required explicitly otherwise. |
+| `KHIVE_TELEGRAM_MAINTAINER_SLUG`      | no       | `maintainer` | The slug in `telegram:<slug>` that maps to the maintainer chat id.                                                                                                                                                                       |
+| `KHIVE_TELEGRAM_INGEST_NAMESPACE`     | no       | `local`      | Target namespace for ingested inbound messages (passed as `namespace` to `comm.ingest`).                                                                                                                                                 |
 
 When any required variable is absent, `TelegramChannelConfig::from_env()` returns
 `ChannelError::Config`; the server logs a warning and skips the Telegram adapter
@@ -355,12 +355,12 @@ without crashing (mirrors the email adapter, §14).
 **Sender id resolution (amended 2026-07-27).** `KHIVE_TELEGRAM_AUTHORIZED_SENDER_ID`
 resolves as follows, and any error names the variable:
 
-| Configuration                                                        | Result                                                                                                  |
-| -------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------- |
-| Set to a positive base-10 `i64`                                      | Used as-is. Works for private and group chats.                                                          |
-| Absent or blank, `KHIVE_TELEGRAM_MAINTAINER_CHAT_ID` positive        | Defaults to the chat id. In a private one-to-one chat the chat id *is* the maintainer's account id, so existing single-user deployments keep working with no new variable. |
-| Absent or blank, `KHIVE_TELEGRAM_MAINTAINER_CHAT_ID` non-positive    | `ChannelError::Config`. A group/channel id names a room, not a person, and is never inferred as a human sender. |
-| Set to a malformed, zero, or negative value                          | `ChannelError::Config`. Never falls back to the chat id.                                                 |
+| Configuration                                                     | Result                                                                                                                                                                     |
+| ----------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Set to a positive base-10 `i64`                                   | Used as-is. Works for private and group chats.                                                                                                                             |
+| Absent or blank, `KHIVE_TELEGRAM_MAINTAINER_CHAT_ID` positive     | Defaults to the chat id. In a private one-to-one chat the chat id _is_ the maintainer's account id, so existing single-user deployments keep working with no new variable. |
+| Absent or blank, `KHIVE_TELEGRAM_MAINTAINER_CHAT_ID` non-positive | `ChannelError::Config`. A group/channel id names a room, not a person, and is never inferred as a human sender.                                                            |
+| Set to a malformed, zero, or negative value                       | `ChannelError::Config`. Never falls back to the chat id.                                                                                                                   |
 
 The operator finds their own account id in the same first `getUpdates` response
 that surfaces the `chat.id` — it is `message.from.id`. It is env configuration
@@ -3157,7 +3157,7 @@ via env var. Username matching is a fallback only, as usernames can be reassigne
 maintainer identity is never stored in the KG.
 
 > **Telegram inbound authorization amended 2026-07-27 — two-factor.** The original text
-> named `chat.id` as the sole inbound identity. A `chat.id` identifies a *conversation*,
+> named `chat.id` as the sole inbound identity. A `chat.id` identifies a _conversation_,
 > not a person: in a group or supergroup every member shares it, so it cannot by itself
 > justify stamping the maintainer's `telegram:<slug>` address onto an inbound envelope.
 > The shipped check is now conjunctive — an update is authorized only when
@@ -3276,15 +3276,15 @@ The ingest loop enforces a configurable minimum inter-poll interval (default 5 s
 All configuration is read from environment variables at adapter construction. No filesystem
 config files are consulted. Credentials are never defaulted or logged.
 
-| Variable                         | Required | Default | Description                                                                            |
-| -------------------------------- | -------- | ------- | -------------------------------------------------------------------------------------- |
-| `KHIVE_EMAIL_SMTP_HOST`          | yes      | --      | SMTP relay hostname                                                                    |
-| `KHIVE_EMAIL_SMTP_PORT`          | no       | 587     | SMTP submission port                                                                   |
-| `KHIVE_EMAIL_IMAP_HOST`          | yes      | --      | IMAP server hostname                                                                   |
-| `KHIVE_EMAIL_IMAP_PORT`          | no       | 993     | IMAP over TLS port                                                                     |
-| `KHIVE_EMAIL_USERNAME`           | yes      | --      | IMAP/SMTP credential username                                                          |
-| `KHIVE_EMAIL_PASSWORD`           | yes      | --      | IMAP/SMTP credential password (never logged)                                           |
-| `KHIVE_EMAIL_MAINTAINER_ADDRESS` | yes      | --      | The sole authorized inbound sender (RFC 5322 addr-spec)                                |
+| Variable                         | Required | Default | Description                                             |
+| -------------------------------- | -------- | ------- | ------------------------------------------------------- |
+| `KHIVE_EMAIL_SMTP_HOST`          | yes      | --      | SMTP relay hostname                                     |
+| `KHIVE_EMAIL_SMTP_PORT`          | no       | 587     | SMTP submission port                                    |
+| `KHIVE_EMAIL_IMAP_HOST`          | yes      | --      | IMAP server hostname                                    |
+| `KHIVE_EMAIL_IMAP_PORT`          | no       | 993     | IMAP over TLS port                                      |
+| `KHIVE_EMAIL_USERNAME`           | yes      | --      | IMAP/SMTP credential username                           |
+| `KHIVE_EMAIL_PASSWORD`           | yes      | --      | IMAP/SMTP credential password (never logged)            |
+| `KHIVE_EMAIL_MAINTAINER_ADDRESS` | yes      | --      | The sole authorized inbound sender (RFC 5322 addr-spec) |
 
 When configuration is attempted but any required variable is absent,
 `EmailChannelConfig::from_env()` returns `ChannelError::Config`. The ADR-119 component boundary

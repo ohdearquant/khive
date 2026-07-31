@@ -47,7 +47,7 @@ layer: an LLM-in-the-loop reasoning layer is a different concern from bounded, d
 control flow over retrieval primitives.
 
 Two claims from an earlier synthesis do not hold and are rejected here before any
-implementation proceeds: that fixed-point score comparison makes a *run* reproducible (it only
+implementation proceeds: that fixed-point score comparison makes a _run_ reproducible (it only
 makes branch selection deterministic given the same vectors, corpus, and embedder), and that a
 `declared_verbs` manifest is a sufficient capability model for a stored, third-party-invocable
 program (it is not — it does not prevent a confused deputy or argument-level injection). This
@@ -159,7 +159,7 @@ and does not add a separate verb namespace; `flow` and `score(...)` ride the one
 
 ## Trace and reproducibility contract
 
-"Deterministic score" does not by itself make a *run* reproducible. Fixed-point
+"Deterministic score" does not by itself make a _run_ reproducible. Fixed-point
 comparison makes branch evaluation deterministic given the same vectors; a repeated
 execution can diverge if the corpus, canonical entity body, stored vector, embedding
 artifact, embedder configuration, or candidate population changes, or if a mutable model

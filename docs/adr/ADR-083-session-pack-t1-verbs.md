@@ -198,12 +198,12 @@ They are related but not interchangeable, and this ADR does not unify them.
 
 ### 4. Backend seam
 
-| Verb             | Call                                                                                                     |
-| ---------------- | -------------------------------------------------------------------------------------------------------- |
-| `session.store`  | `runtime.core().create_note(token, "session", title, &content, None, Some(properties), vec![])`          |
-| `session.list`   | `runtime.core().notes(token)?.query_notes_filtered(namespace, &filter, PageRequest { offset, limit })`   |
+| Verb             | Call                                                                                                                   |
+| ---------------- | ---------------------------------------------------------------------------------------------------------------------- |
+| `session.store`  | `runtime.core().create_note(token, "session", title, &content, None, Some(properties), vec![])`                        |
+| `session.list`   | `runtime.core().notes(token)?.query_notes_filtered(namespace, &filter, PageRequest { offset, limit })`                 |
 | `session.resume` | `runtime.core().resolve_prefix(token, raw)` (hex-prefix case only), then `runtime.core().resolve_primary(token, uuid)` |
-| `session.export` | Same resolution as `session.resume`, then serializes the resolved note to the requested format           |
+| `session.export` | Same resolution as `session.resume`, then serializes the resolved note to the requested format                         |
 
 All four handlers route through `runtime.core()`, the ADR-073 accessor.
 

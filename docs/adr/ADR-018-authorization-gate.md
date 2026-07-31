@@ -28,7 +28,7 @@ The system must satisfy:
 
 1. **Pluggable policy.** No hardcoded auth logic. Each deployment plugs in its policy
    engine — Rego, capability-based, OAuth-scope-based, or custom.
-2. **Fail-closed defaults** *(revised by ADR-129 Stage 2)*. `RuntimeConfig::default()`
+2. **Fail-closed defaults** _(revised by ADR-129 Stage 2)_. `RuntimeConfig::default()`
    carries an unprovisioned `CapabilityGate`, which denies every request until a
    composition root provisions that same gate instance through the boot mint.
    `AllowAllGate` remains available only as an explicit permissive opt-out.
@@ -37,8 +37,8 @@ The system must satisfy:
 4. **Structured audit trail.** Every gate consultation produces a queryable record:
    who attempted what verb, on which namespace, with what decision, what reason. Stored
    in the substrate (`EventStore`) and emitted via structured logging.
-5. **Fail-closed on infrastructure errors** *(revised by Amendment 3; the original
-   fail-open principle is preserved there as history)*. A gate that cannot answer
+5. **Fail-closed on infrastructure errors** _(revised by Amendment 3; the original
+   fail-open principle is preserved there as history)_. A gate that cannot answer
    refuses: gate-infrastructure failures are audited and dispatch returns a typed
    gate-unavailable error.
 6. **License clean.** The gate contract and explicit `AllowAllGate` opt-out live
@@ -94,7 +94,7 @@ The JSON projection of `GateRequest` is the **public contract**. Field names
 (`input.actor.kind`, `input.namespace`, `input.verb`, etc.) are what policies receive
 as input. Changing a field name is a breaking change requiring an ADR amendment.
 
-### `AllowAllGate`: explicit permissive opt-out *(default superseded by ADR-129)*
+### `AllowAllGate`: explicit permissive opt-out _(default superseded by ADR-129)_
 
 ```rust
 // crates/khive-gate/src/lib.rs
@@ -239,7 +239,7 @@ match &decision {
 `RuntimeError::PermissionDenied { verb, reason }` is a first-class error variant.
 Callers can match on it to distinguish authorization failures from operational errors.
 
-### Gate `Err`: fail-closed *(revised by Amendment 3 / ADR-129 Stage 1a)*
+### Gate `Err`: fail-closed _(revised by Amendment 3 / ADR-129 Stage 1a)_
 
 A gate that errors out before it can produce a decision (e.g. request serialization
 failure, a poisoned internal lock surfaced as `GateError::Internal`) returns
@@ -438,7 +438,7 @@ policies but NOT enforced by the runtime in v1. They're declarative signals:
 The shape is locked now so policy authors can write `allow { ... obligations: [...]
 }` today. Enforcement subsystems land independently.
 
-### Trust boundary alignment with ADR-003 *(revised by ADR-129)*
+### Trust boundary alignment with ADR-003 _(revised by ADR-129)_
 
 ADR-129 supersedes this ADR's original interpretation that operator mode implicitly
 ran under `AllowAllGate`. Authorization is enforced at the runtime dispatch and
@@ -778,7 +778,7 @@ guarantees by construction. It does **not** move enforcement into the Gate: the 
 pre-dispatch and row-blind. It names the class of verbs whose row-isolation is a
 construction-primary handler-seam predicate rather than a Gate decision.
 
-*Note (Amendment 3).* The base contract now refuses dispatch on gate `Err`, so the failure
+_Note (Amendment 3)._ The base contract now refuses dispatch on gate `Err`, so the failure
 mode that motivated this amendment is no longer reachable through the Gate. The handler-seam
 positive-scope requirement is unchanged: it guards against every path to the handler, not just
 the Gate's former fail-open one, and remains the construction-primary defense for its members.

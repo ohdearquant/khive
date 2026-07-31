@@ -49,7 +49,7 @@ record's **structure** — which logical object it belongs to, how it is grouped
 whether it is visible — while identifying no actor.
 
 Such a key is not protected by an identity-shaped set, and a forged value does not corrupt the
-record it sits on. It changes how a *different* set of records reconstructs. The record stays
+record it sits on. It changes how a _different_ set of records reconstructs. The record stays
 intact and readable; what degrades is the assembled view. Detection is therefore not a matter of
 finding a damaged row, because there is no damaged row.
 
@@ -103,7 +103,7 @@ Two modes, because creation and mutation are different operations:
   value.
 
 There is no single physical guard shared by create, update, proposal apply, and merge, and this
-record does not invent one. Sharing one *declaration* across four seams prevents policy drift
+record does not invent one. Sharing one _declaration_ across four seams prevents policy drift
 without pretending that derivation and preservation are the same operation.
 
 ### 2. The owning pack declares its protected keys, with a typed policy
@@ -196,8 +196,8 @@ avoid.
 
 ## Acceptance test, stated as falsification
 
-The claim under test is: *a set enumerated by trusted production and semantic read dependence
-catches keys that a meaning-based enumeration misses.*
+The claim under test is: _a set enumerated by trusted production and semantic read dependence
+catches keys that a meaning-based enumeration misses._
 
 A retrospective check cannot test this. Every key currently in the tree is already visible to this
 record's author, so any "held-out" set drawn from existing keys is contaminated by knowledge of the
@@ -286,9 +286,9 @@ confirm itself.
 4. The recorded reproduction, re-run, shows no degradation of the assembled view after every
    attempted caller mutation.
 5. A compile-fail or lint fixture introduces a new raw semantic property read and fails until the
-   key is classified, including through bulk deserialization and a helper wrapper. *Narrowed by
+   key is classified, including through bulk deserialization and a helper wrapper. _Narrowed by
    Amendment 1: the fixture covers the five type-reachable access forms; bulk deserialization and
-   two further forms discovered during execution are demonstrated bypasses, not covered forms.*
+   two further forms discovered during execution are demonstrated bypasses, not covered forms._
 6. Merge tests prove a missing protected key on `into` stays missing and an existing value is
    unchanged under every strategy.
 7. A rejected patch names every protected key it contained, and no unprotected sibling key was

@@ -1,4 +1,4 @@
-# ADR-128 — Custody party-pairs and slot authenticity
+# ADR-128: Custody party-pairs and slot authenticity
 
 Status: accepted 2026-07-25
 Date: 2026-07-25
@@ -88,7 +88,7 @@ was measured. **It works, and the custody home fails anyway**, for a reason the 
 does not cover.
 
 Two separately built binaries were used, one depositing the item and one not. The measurement
-makes no claim about *what* the store uses to tell them apart; the operative fact is that the
+makes no claim about _what_ the store uses to tell them apart; the operative fact is that the
 store treated them differently, which the results below establish directly. All operations ran
 with user interaction disabled, so any operation requiring confirmation returned an error rather
 than prompting. A success therefore shows that the operation **completed without interactive
@@ -97,17 +97,17 @@ applied" from "authorised automatically by policy or caller attribute" — the h
 returned status, not the store's internal decision. That distinction does not affect the finding
 below, which turns on the operation completing at all.
 
-| # | Step | Performed by | Result |
-| --- | --- | --- | --- |
-| 0 | Pre-state control: items under the service | — | none |
-| 1 | Create the item | depositor | success |
-| 2 | Read the secret | depositor | **success** |
-| 3 | Read the secret | non-depositor | **refused**, authorisation failure |
-| 4 | Delete the item | non-depositor | success |
-| 5 | Absence check after deletion | non-depositor | **item not found** |
-| 6 | Add an item at the same service and account | non-depositor | success |
-| 7 | Read the new item | non-depositor | success |
-| 8 | Read at the same service and account | **depositor** | **refused**, authorisation failure |
+| # | Step                                        | Performed by  | Result                             |
+| - | ------------------------------------------- | ------------- | ---------------------------------- |
+| 0 | Pre-state control: items under the service  | —             | none                               |
+| 1 | Create the item                             | depositor     | success                            |
+| 2 | Read the secret                             | depositor     | **success**                        |
+| 3 | Read the secret                             | non-depositor | **refused**, authorisation failure |
+| 4 | Delete the item                             | non-depositor | success                            |
+| 5 | Absence check after deletion                | non-depositor | **item not found**                 |
+| 6 | Add an item at the same service and account | non-depositor | success                            |
+| 7 | Read the new item                           | non-depositor | success                            |
+| 8 | Read at the same service and account        | **depositor** | **refused**, authorisation failure |
 
 Each step of the argument is carried by a specific row, and the rows were chosen to close the
 readings under which the store would have behaved correctly:
@@ -129,7 +129,7 @@ an independent tool finds it, and only then confirming absence, so the final neg
 absence rather than a dead instrument.
 
 **The protection is attached to reading a particular item, and an item is not an identity.**
-Deleting an item and adding another is not an operation *on* the deleted item, so no access
+Deleting an item and adding another is not an operation _on_ the deleted item, so no access
 control carried by that item is consulted. A consumer that fetches "the secret at service S,
 account A" during start-up receives the replacement and cannot distinguish it from what it
 deposited: the same location, the same retrieval call, the same success, no marker.
@@ -181,9 +181,9 @@ before someone deliberately chooses otherwise.
    evaluation question is "can an unauthorised local party replace what I stored and have me
    load it as mine," not only "can that party read what I stored." This decision is unconditional
    and rests on Finding 2 as measured.
-4. **Conditional.** For the human-versus-agent pair, *in the deployment where the agent holds the
-   same credential as the human*, and *unless the open question above resolves in favour of the
-   data-protection store*, an anchor must be one the local agent cannot replace. This record does
+4. **Conditional.** For the human-versus-agent pair, _in the deployment where the agent holds the
+   same credential as the human_, and _unless the open question above resolves in favour of the
+   data-protection store_, an anchor must be one the local agent cannot replace. This record does
    not design such an anchor and does not authorise building one. It records the requirement, its
    two conditions, and the fact that both are checkable.
 

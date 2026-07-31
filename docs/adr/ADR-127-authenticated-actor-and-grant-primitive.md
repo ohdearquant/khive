@@ -1,4 +1,4 @@
-# ADR-127 — Authenticated actor and grant primitive
+# ADR-127: Authenticated actor and grant primitive
 
 Status: accepted 2026-07-25
 Date: 2026-07-25
@@ -20,8 +20,8 @@ Two problems arrived from different directions and reduce to one root cause.
 **The provenance problem.** `comm.forward` emits a block citing the original message's
 author-side id, read from that record's `outbound_ref`. A generic caller can create a note
 of a pack-owned kind carrying an arbitrary `outbound_ref`, so the citation attests nothing.
-ADR-125 closed the *mutation* half — those keys are refused on writes to an existing record
-— and recorded the *creation* half as explicitly unresolved, naming it the `OwnerOnly`
+ADR-125 closed the _mutation_ half — those keys are refused on writes to an existing record
+— and recorded the _creation_ half as explicitly unresolved, naming it the `OwnerOnly`
 question: there is no way to say "only the owning pack may establish this key at creation,"
 because the owning pack's handlers and a generic caller reach the store as the same thing.
 
@@ -53,7 +53,7 @@ different moments.
 The dispatch boundary authenticates the caller from a presented credential, derives the
 principal, classifies the **assurance level** of that derivation, and mints an
 `AuthenticatedContext` whose constructor is private to dispatch. Config- or
-environment-derived actor labels MAY select *which* credential to present. They MAY NOT
+environment-derived actor labels MAY select _which_ credential to present. They MAY NOT
 establish a verified principal.
 
 Verification returns an assurance-bearing result, never a boolean:
@@ -83,14 +83,14 @@ The capability substrate this design builds on is the published
 layering khive semantics over it. A grant is an extension of `lion-core`'s `Capability`, not a
 parallel primitive. What it already provides is adopted rather than re-specified:
 
-| Property | Provided by | Mechanism |
-|---|---|---|
-| Unforgeable by holders | `lion-core` | HMAC-SHA256 seal over a deterministically serialized payload; all fields `pub(crate)`, no public constructor |
-| Delegation can only narrow | `lion-core` | `delegate_cap` intersects requested rights with the parent's, then seals the result |
-| Transitive revocation | `lion-core` | `revoke_cap` BFS over the children index |
-| Key rotation with a grace window | `lion-core` | `verify_seal` tries current key, then previous |
-| Absence of a grant is denial | `khive-capability` | `validate` rejects on `!plugin_holds` before inspecting anything else |
-| New verbs cannot inherit permission | `khive-capability` | verb-to-right match is exhaustive with no wildcard arm; a new `Operation` fails to compile until classified |
+| Property                            | Provided by        | Mechanism                                                                                                    |
+| ----------------------------------- | ------------------ | ------------------------------------------------------------------------------------------------------------ |
+| Unforgeable by holders              | `lion-core`        | HMAC-SHA256 seal over a deterministically serialized payload; all fields `pub(crate)`, no public constructor |
+| Delegation can only narrow          | `lion-core`        | `delegate_cap` intersects requested rights with the parent's, then seals the result                          |
+| Transitive revocation               | `lion-core`        | `revoke_cap` BFS over the children index                                                                     |
+| Key rotation with a grace window    | `lion-core`        | `verify_seal` tries current key, then previous                                                               |
+| Absence of a grant is denial        | `khive-capability` | `validate` rejects on `!plugin_holds` before inspecting anything else                                        |
+| New verbs cannot inherit permission | `khive-capability` | verb-to-right match is exhaustive with no wildcard arm; a new `Operation` fails to compile until classified  |
 
 **A grant is a `Capability` plus the five fields below.** Nothing above is redesigned.
 
@@ -117,7 +117,7 @@ to parse an envelope to learn this will eventually skip the parse.
 and the `open -> consumed` compare-and-set **in one transaction**. A separate `verify` is
 informational and cannot authorize an action: authority comes only from consumption, which
 closes the verify-then-act race. This is the single most important addition, because a
-lion-core capability is *reusable authority* by design and a consequential action needs
+lion-core capability is _reusable authority_ by design and a consequential action needs
 one-shot authority.
 
 Two further deltas are deployment properties rather than record fields. Kernel state is
@@ -133,7 +133,7 @@ call `verify_cap_seal`.** `bootstrap_root_capability` mints its root capability 
 `insert_cap_raw` — documented in the kernel as bypassing kernel minting, for internal and
 test use — with a zero tag.
 
-That is sound *today* for a specific and fragile reason: capability ids never leave the
+That is sound _today_ for a specific and fragile reason: capability ids never leave the
 process that minted them, so the kernel's in-memory holder table is the authority and the
 seal is redundant. The holder table is what actually decides, and it cannot be forged by a
 caller because a caller cannot reach it.
@@ -146,7 +146,7 @@ grant path:
 1. Every load of a capability the loading process did not mint **must** verify the seal
    before the capability is treated as authority.
 2. Grants **must** be minted through `delegate_cap`, never `insert_cap_raw`.
-3. A seal that fails to verify is a `REJECT`; a seal that *cannot* be verified — missing key
+3. A seal that fails to verify is a `REJECT`; a seal that _cannot_ be verified — missing key
    epoch, unreachable key history — is `UNAVAILABLE`, and specifically not a pass.
 
 Adopting the kernel without these three is the failure this record's rejected-alternative 2
@@ -156,9 +156,9 @@ authority while the verification step that makes it so is absent.
 #### Why the kernel cannot supply `ActorSignature`, and why that is the whole point
 
 `lion-core` seals with **HMAC-SHA256**, and it has no asymmetric dependency —
-`verify_seal(key, payload, tag)` takes the *same* key as `seal_payload(key, payload)`.
+`verify_seal(key, payload, tag)` takes the _same_ key as `seal_payload(key, payload)`.
 
-A symmetric MAC proves that *a holder of the key* produced the tag. Every party who can
+A symmetric MAC proves that _a holder of the key_ produced the tag. Every party who can
 verify can also mint. So the kernel can establish "the daemon minted this" and can never
 establish "actor X authorized this" to anyone who is not the daemon.
 
@@ -178,7 +178,7 @@ substrate "has capability tokens now" therefore says nothing about P1. The gap i
 cryptographic, not procedural, so it cannot be closed by policy, review, or convention.
 
 Grant ids are globally resolvable, consistent with ADR-007 Rule 2 — by-ID ops have no
-namespace check at any layer. Audience and tenant policy are authenticated grant *fields*
+namespace check at any layer. Audience and tenant policy are authenticated grant _fields_
 evaluated at the Gate, never post-fetch namespace checks. **This is not namespace isolation
 returning under a new name.**
 
@@ -251,7 +251,7 @@ it was **measured** rather than assumed.
 
 Result: the item is readable **non-interactively**, with no prompt, by a process running as
 the host user, and every actor runs as that same user. A keychain item therefore
-protects against a *different* OS user and against a stolen disk image. It does **not**
+protects against a _different_ OS user and against a stolen disk image. It does **not**
 separate one actor from another, because actor identity has no representation at the OS layer
 that the keychain can key an ACL against — keychain ACLs are per-application, and the actors
 are the same application.
@@ -270,7 +270,7 @@ because the config format supports indirect references (`${VAR}`, `${VAR:-defaul
 credential need not be written into the file at all.
 
 It is **not** a custody boundary, and the agent platform's own documented threat model says
-so: the working-directory constraint is a *write* boundary rather than an isolation
+so: the working-directory constraint is a _write_ boundary rather than an isolation
 boundary; per-directory configuration is organisational; and isolation between concurrent
 sessions of the same OS user is out of scope, belonging to the OS layer. The stated security
 model assumes all processes running as one OS user are equally trusted, because that is what
@@ -361,15 +361,15 @@ Profiles:
 - **Hosted** — tenant-separated key custody and policy administration; store not
   readable across tenants.
 
-| Property | Assurance required | Local | Hosted | Holds against / does not hold against |
-|---|---|---|---|---|
-| P1 sender authenticity | `ActorSignature` | **NOT-DELIVERED vs peer actor**; delivered vs an unauthenticated client | Shipped | Holds: a caller forging another actor without that actor's key; a store-only attacker. Does not hold: key theft, a malicious actor, any component that can read the key. **Local fails on custody, not on cryptography.** `DaemonBearer` never carries this label. |
-| P2 content integrity | `ActorSignature` | Shipped for signed bytes | Shipped | Holds: byte or property mutation after signing. Does not hold: mutation before signing; execution built from fields outside the signed descriptor; a compromised signer; unsigned projections. |
-| P3 non-replay | `ActorSignature` + atomic consume + epoch | Shipped | Shipped | Holds: message replay, concurrent double-use, a genuine grant from a closed epoch. Does not hold: store rollback/restore without a monotonic epoch authority outside the snapshot; an administrator able to rewrite both state and epoch. **A signature alone does not deliver P3.** |
-| P4 action binding | `ActorSignature` + registered action schema | Shipped | Shipped | Holds: substitution of target revision, action type, parameters, audience or policy class. Does not hold: a deliberately coarse schema that policy approved; semantics omitted from the descriptor; execution using different bytes than were signed. |
-| P5 durable cross-namespace attribution | Global grant id + `ActorSignature` | Shipped for khive-origin | Shipped for khive-origin | Holds: namespace change, transport loss, projection movement. Does not hold: an external-origin ruling with no signing bridge; unavailable key history. **Global lookup alone is attribution availability, not authenticity.** |
-| P6 revocation before action | Online authoritative consume, zero positive-validity cache | Shipped | Shipped | Holds: revocation committed before consume's serialization point. Does not hold: revocation racing after that point; a partition where authority is unreachable (which is `UNAVAILABLE`, never a pass); already-executed actions. "Instant" means a transaction ordering, not wall-clock. **Shipped-Local is scoped to grants that exist**: a peer able to mint fresh grants after a revocation is a P1-local failure, not a P6 one — see the P1 row rather than re-deriving the boundary. |
-| P7 authorization policy | Gate policy + registered action | Deferred | Deferred | Reason for deferral is separability, not difficulty: the policy vocabulary needs its own design round and is meaningless before P1. Authentication is not P7. |
+| Property                               | Assurance required                                         | Local                                                                   | Hosted                   | Holds against / does not hold against                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| -------------------------------------- | ---------------------------------------------------------- | ----------------------------------------------------------------------- | ------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| P1 sender authenticity                 | `ActorSignature`                                           | **NOT-DELIVERED vs peer actor**; delivered vs an unauthenticated client | Shipped                  | Holds: a caller forging another actor without that actor's key; a store-only attacker. Does not hold: key theft, a malicious actor, any component that can read the key. **Local fails on custody, not on cryptography.** `DaemonBearer` never carries this label.                                                                                                                                                                                                                         |
+| P2 content integrity                   | `ActorSignature`                                           | Shipped for signed bytes                                                | Shipped                  | Holds: byte or property mutation after signing. Does not hold: mutation before signing; execution built from fields outside the signed descriptor; a compromised signer; unsigned projections.                                                                                                                                                                                                                                                                                             |
+| P3 non-replay                          | `ActorSignature` + atomic consume + epoch                  | Shipped                                                                 | Shipped                  | Holds: message replay, concurrent double-use, a genuine grant from a closed epoch. Does not hold: store rollback/restore without a monotonic epoch authority outside the snapshot; an administrator able to rewrite both state and epoch. **A signature alone does not deliver P3.**                                                                                                                                                                                                       |
+| P4 action binding                      | `ActorSignature` + registered action schema                | Shipped                                                                 | Shipped                  | Holds: substitution of target revision, action type, parameters, audience or policy class. Does not hold: a deliberately coarse schema that policy approved; semantics omitted from the descriptor; execution using different bytes than were signed.                                                                                                                                                                                                                                      |
+| P5 durable cross-namespace attribution | Global grant id + `ActorSignature`                         | Shipped for khive-origin                                                | Shipped for khive-origin | Holds: namespace change, transport loss, projection movement. Does not hold: an external-origin ruling with no signing bridge; unavailable key history. **Global lookup alone is attribution availability, not authenticity.**                                                                                                                                                                                                                                                             |
+| P6 revocation before action            | Online authoritative consume, zero positive-validity cache | Shipped                                                                 | Shipped                  | Holds: revocation committed before consume's serialization point. Does not hold: revocation racing after that point; a partition where authority is unreachable (which is `UNAVAILABLE`, never a pass); already-executed actions. "Instant" means a transaction ordering, not wall-clock. **Shipped-Local is scoped to grants that exist**: a peer able to mint fresh grants after a revocation is a P1-local failure, not a P6 one — see the P1 row rather than re-deriving the boundary. |
+| P7 authorization policy                | Gate policy + registered action                            | Deferred                                                                | Deferred                 | Reason for deferral is separability, not difficulty: the policy vocabulary needs its own design round and is meaningless before P1. Authentication is not P7.                                                                                                                                                                                                                                                                                                                              |
 
 Two properties are worth stating plainly because a reader skimming for green cells will
 otherwise mis-read them. **P1 is the property the whole design exists for, and it is the one
@@ -383,12 +383,12 @@ will consume it and the exact triple it consumes against. **A consumer may retir
 protocol clause only against a triple this record marks Shipped for that consumer's actual
 deployment profile** — not against the feature existing.
 
-| Consumer | Artifact | Consumes against | Retires | Status under Local |
-|---|---|---|---|---|
-| Confirm-back retirement | The counterparty's confirm-back protocol clause, which today requires a human-readable acknowledgement because the substrate cannot establish who sent a mark | P1 + P3, `ActorSignature`, Hosted | The confirm-back round-trip on a coordinated substrate window | **Blocked.** P1-local is NOT-DELIVERED, so the clause is retained in full. Retiring it under Local would remove a working control and substitute a mechanism that does not hold against the peer actor it is protecting against. |
-| `comm.forward` | The forwarding path and its Critical finding: a forwarded message's origin cannot be distinguished from the forwarder's assertion of it | P1 + P2 + P5, `ActorSignature` | Origin-as-asserted-field, replaced by origin-as-verified-principal | **Blocked**, and this is why that work stays parked rather than shipping behind a flag. Under Local the forwarder and the origin share a key, so a forwarded origin claim is exactly as strong as an unforwarded one. |
-| ADR-125 creation-half enforcement | The reserved-property-key enforcement at record creation, which currently trusts the writer to not set owner-established properties | P4 + P1, `ActorSignature` | Writer-side discipline, replaced by a descriptor-bound check at the write seam | **Partial.** P4 is Shipped once schemas are registered, so the descriptor binding half is available under Local; the *identity* half is not, so enforcement can prevent a mis-set property but cannot attribute a violation. |
-| Substrate windows generally | Any go/mark handshake between two actors during a coordinated change | P1 + P3 + P6 | Manual out-of-band confirmation | **Blocked under Local**, for the same custody reason as row 1. |
+| Consumer                          | Artifact                                                                                                                                                      | Consumes against                  | Retires                                                                        | Status under Local                                                                                                                                                                                                               |
+| --------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------- | ------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Confirm-back retirement           | The counterparty's confirm-back protocol clause, which today requires a human-readable acknowledgement because the substrate cannot establish who sent a mark | P1 + P3, `ActorSignature`, Hosted | The confirm-back round-trip on a coordinated substrate window                  | **Blocked.** P1-local is NOT-DELIVERED, so the clause is retained in full. Retiring it under Local would remove a working control and substitute a mechanism that does not hold against the peer actor it is protecting against. |
+| `comm.forward`                    | The forwarding path and its Critical finding: a forwarded message's origin cannot be distinguished from the forwarder's assertion of it                       | P1 + P2 + P5, `ActorSignature`    | Origin-as-asserted-field, replaced by origin-as-verified-principal             | **Blocked**, and this is why that work stays parked rather than shipping behind a flag. Under Local the forwarder and the origin share a key, so a forwarded origin claim is exactly as strong as an unforwarded one.            |
+| ADR-125 creation-half enforcement | The reserved-property-key enforcement at record creation, which currently trusts the writer to not set owner-established properties                           | P4 + P1, `ActorSignature`         | Writer-side discipline, replaced by a descriptor-bound check at the write seam | **Partial.** P4 is Shipped once schemas are registered, so the descriptor binding half is available under Local; the _identity_ half is not, so enforcement can prevent a mis-set property but cannot attribute a violation.     |
+| Substrate windows generally       | Any go/mark handshake between two actors during a coordinated change                                                                                          | P1 + P3 + P6                      | Manual out-of-band confirmation                                                | **Blocked under Local**, for the same custody reason as row 1.                                                                                                                                                                   |
 
 Every consumer under the Local profile is blocked on the same cell: **P1-local**. That is
 not four independent problems; it is one custody problem with four names. If P1-local is
@@ -416,7 +416,7 @@ Quarantine carries four requirements:
 
 1. A separate surface, not reachable by the verb that reads ordinary traffic; retrieval is a
    deliberate act.
-2. **Visible** — a recipient can see *that* something was quarantined without reading it. A
+2. **Visible** — a recipient can see _that_ something was quarantined without reading it. A
    silent quarantine is indistinguishable from no-attack and, worse, from an authentication
    layer rejecting genuine traffic while the deployment appears to have gone quiet.
 3. The visible signal appears on a surface the recipient already reads, not one they must
@@ -564,11 +564,11 @@ the strength of it.
    staged design **launders weaker evidence through the stronger API**. Acceptable only as an
    explicitly lower-assurance mode that consumer policy can refuse — which is what the
    `assurance_class` field in §2 exists to be refused against. Note that the existing kernel
-   can *only* issue the lower-assurance class, so this alternative is not hypothetical: it is
+   can _only_ issue the lower-assurance class, so this alternative is not hypothetical: it is
    the shape the work naturally takes if `ActorSignature` is deferred and the API is not
    differentiated.
 3. **Sign every write in every pack.** Rejected as unnecessary scope. The properties require
-   the *authorization* to carry verifiable provenance, not every KG write.
+   the _authorization_ to carry verifiable provenance, not every KG write.
 4. **Grant as a note kind.** Rejected for the authority-bearing record. It depends on two
    controls that do not exist: ADR-125 records the owning-pack-versus-generic capability
    distinction as unestablished, and pack note-kind specs are collected for introspection and

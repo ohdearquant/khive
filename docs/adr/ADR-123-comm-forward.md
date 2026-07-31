@@ -207,7 +207,7 @@ subject line belongs — a claim the consumer cannot render and did not ask to p
 
 Identifier is the default. A field added to the block later inherits the non-blank requirement
 without anyone opting it in; the content list is the exemption. This is deliberate — the rule is
-stated over the *kind* of a value rather than over a list of field names, because a per-field rule
+stated over the _kind_ of a value rather than over a list of field names, because a per-field rule
 leaves the same defect available on the next field.
 
 On the construction path this yields the **second unforwardable class**, and it is case 4 of the
@@ -215,7 +215,7 @@ selection order restated on the actor axis: a message whose original author cann
 A message is forwardable only if its author can be named **both** as an actor (`from_actor`, or
 the raw `from` label an ingested message carries) and by a citation (the selection order above).
 Neither half may be defaulted. The handler must not fall back to an empty `from_actor`, because
-the block's entire guarantee is that the *server* wrote that field rather than the caller — and a
+the block's entire guarantee is that the _server_ wrote that field rather than the caller — and a
 server that writes `""` satisfies the letter of that guarantee while destroying its meaning,
 producing a record that asserts the message came from nobody with the same authority as a real
 attribution. As with case 4, the error names the fields that were looked for.

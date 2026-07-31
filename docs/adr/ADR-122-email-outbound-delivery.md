@@ -43,11 +43,11 @@ A message note is **pending email delivery** when all of:
 The delivery component records outcomes by patching note properties (by-ID
 update):
 
-| Outcome | Properties written |
-| --- | --- |
-| Delivered | `delivery = "delivered"`, `delivered_at` (RFC 3339), `transport_message_id` |
-| Permanent failure | `delivery = "failed"`, `failed_at`, `last_error` |
-| Transient failure | `delivery_attempts` (incremented), `last_error` — note stays pending |
+| Outcome           | Properties written                                                          |
+| ----------------- | --------------------------------------------------------------------------- |
+| Delivered         | `delivery = "delivered"`, `delivered_at` (RFC 3339), `transport_message_id` |
+| Permanent failure | `delivery = "failed"`, `failed_at`, `last_error`                            |
+| Transient failure | `delivery_attempts` (incremented), `last_error` — note stays pending        |
 
 `delivery` is written only on terminal outcomes, so the pending predicate is
 simply "no `delivery` key". Transient failures leave the note pending and

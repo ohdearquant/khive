@@ -44,7 +44,7 @@ Meanwhile the roadmap keeps producing consumers that want richer shapes:
 - **Documents with heterogeneous content.** A paper entity may hold a PDF, an HTML rendering,
   an extracted-text form — the same information in several formats — while another paper is
   only an external link with no bytes held at all.
-- **Multimodal records.** Voice messages and images are records whose *own content* is
+- **Multimodal records.** Voice messages and images are records whose _own content_ is
   non-textual. The text field holds the searchable rendition (a transcript, a caption); the raw
   modality data needs a home on the same record. Planned multimodal retrieval (image/audio
   embedding over stored media) assumes exactly this: original bytes retained in the CAS store,
@@ -102,9 +102,9 @@ Because each version is a record, a note that references a specific version simp
 that record — version-precise reference falls out of the model with no attachment-level
 addressing needed.
 
-**Utterance vs. thing (the note boundary).** A note attachment is the note's *own content* in a
+**Utterance vs. thing (the note boundary).** A note attachment is the note's _own content_ in a
 non-text modality: the raw audio of a voice message (text field: transcript), the pixels of a
-shared photo (text field: caption). A note attachment is never a *thing* — a report, a dataset,
+shared photo (text field: caption). A note attachment is never a _thing_ — a report, a dataset,
 a paper delivered through a conversation is content worth naming, which makes it an entity; the
 message note `annotates` it. The test: "is this byte payload another form of what this record
 itself says, or an independent thing?" Text that fits a text column stays in the text column;
@@ -176,7 +176,7 @@ Delete-cascade reclamation is a tested contract (see Rollout).
 
 Content addressing makes "casual payload becomes named thing" free: a photo that arrived as a
 message-note attachment and later proves worth keeping is promoted by creating the entity and
-attaching the *same* `ContentRef` — no byte copy, no re-upload. The message note remains
+attaching the _same_ `ContentRef` — no byte copy, no re-upload. The message note remains
 exactly what it was; the record of what happened is not rewritten to serve the new view.
 
 ---

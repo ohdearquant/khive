@@ -1,4 +1,4 @@
-# ADR-133 — Reduce writer acquisitions on the request path
+# ADR-133: Reduce writer acquisitions on the request path
 
 - **Status:** Proposed
 - **Date:** 2026-07-29
@@ -14,12 +14,12 @@ SQLite writer. The classification was fail-closed — absence of evidence for a 
 as `UNKNOWN`, never as read-only — and carried a known-positive control (`comm.read` must
 classify as a writer, since it ends in `update_note_properties`; a method that misses it is void).
 
-| Classification | Count |
-| --- | --- |
-| WRITER | 51 |
-| WRITER-COND | 45 |
-| UNKNOWN | 4 |
-| **NO-WRITER** | **0** |
+| Classification        | Count   |
+| --------------------- | ------- |
+| WRITER                | 51      |
+| WRITER-COND           | 45      |
+| UNKNOWN               | 4       |
+| **NO-WRITER**         | **0**   |
 | **Total inventoried** | **100** |
 
 No verb was established as read-only. The 45 conditional entries are conditional on one fact:
@@ -43,8 +43,8 @@ That census is a floor in three independent ways, and the three should not be co
    count is meaningful only against a stated pack set.
 
 Six rows carry a further caveat distinct from their classification: `blob.put`, the three external
-`git` write verbs, `code.ingest`, and `db_diagnostics` have no completed *SQLite writer
-acquisition* trace. Four of those are classified `UNKNOWN`; `blob.put` is classified `WRITER` on
+`git` write verbs, `code.ingest`, and `db_diagnostics` have no completed _SQLite writer
+acquisition_ trace. Four of those are classified `UNKNOWN`; `blob.put` is classified `WRITER` on
 its intrinsic object-store write and `db_diagnostics` `WRITER-COND` on its audit path, so
 "incomplete SQLite trace" and "classified UNKNOWN" are different sets and must not be quoted
 interchangeably.
@@ -54,7 +54,7 @@ set rather than a prose count.
 
 ### The incidental writes
 
-An *incidental* write is one the caller did not ask for: bookkeeping attached to an operation
+An _incidental_ write is one the caller did not ask for: bookkeeping attached to an operation
 whose own semantics are read-only.
 
 1. **Per-dispatch audit row.** Appended on the verb-dispatch path
@@ -70,7 +70,7 @@ whose own semantics are read-only.
    (`crates/khive-pack-brain/src/handlers.rs:1942-1970`,
    `crates/khive-pack-brain/src/serve_ledger.rs:85-124`).
 
-Item 4 scales with *result count*, not call count, and is therefore the largest of the four for a
+Item 4 scales with _result count_, not call count, and is therefore the largest of the four for a
 recall returning many targets. It is listed last because it was found last — by review, after the
 first draft of this record asserted the list was complete. The list is now believed complete for
 the read path and is not assumed to be.
@@ -84,16 +84,16 @@ An earlier draft of this record conflated two independent goals:
 - **Reducing durability.** Buffering appends in memory and accepting their loss on abrupt
   termination. Loses data.
 
-Only the first is needed. The contention problem is the number of times the writer is *acquired*,
+Only the first is needed. The contention problem is the number of times the writer is _acquired_,
 not the number of rows eventually written. Treating these as the same thing produced a decision
 that traded durability for a benefit that durable batching already provides.
 
 ### Why that mattered concretely
 
-ADR-103 establishes that **accounting rides the per-dispatch audit row**: *"Accounting rides the
-audit row ADR-094 already established as the daemon's default construction"*
-(`ADR-103:405-410`), and the usage object *"lands under the existing per-dispatch audit row's
-`resource` payload"* (`ADR-103:814-822`), read by four consumers including accounting and Gate
+ADR-103 establishes that **accounting rides the per-dispatch audit row**: _"Accounting rides the
+audit row ADR-094 already established as the daemon's default construction"_
+(`ADR-103:405-410`), and the usage object _"lands under the existing per-dispatch audit row's
+`resource` payload"_ (`ADR-103:814-822`), read by four consumers including accounting and Gate
 quota.
 
 So the per-dispatch audit row **is** the accounting record. Any decision that makes that row lossy
@@ -215,7 +215,7 @@ Therefore:
   reconciliation index is required. Building one would be over-engineering for a mode this design
   cannot reach.
 - **But the identity is persisted with the row and uniquely constrained in the store**, and that is
-  not the same claim. The idempotent insert has to detect a *prior commit*, and a prior commit lives
+  not the same claim. The idempotent insert has to detect a _prior commit_, and a prior commit lives
   in the store rather than in memory — an in-memory-only identity cannot tell "already committed"
   from "never written". The constraint is a unique index on the identity column of the rows this
   record already writes; it is not additional durable machinery.
@@ -223,7 +223,7 @@ Therefore:
   obligations, not repeats.
 
 **Why the conflict rule is not pedantry.** The obvious implementation of "idempotent insert" is
-`INSERT ... ON CONFLICT DO NOTHING`. That handles a retry of the same row and *also* silently turns a
+`INSERT ... ON CONFLICT DO NOTHING`. That handles a retry of the same row and _also_ silently turns a
 genuinely different later row that happens to share an identity into a no-op. Both dispatches then
 observe a successful commit while only one obligation was recorded. That is a **dropped** record —
 INV-1 clause 1 — reached with no retry and no ambiguous acknowledgement, produced by the very
@@ -235,15 +235,15 @@ breaks another is worse than guarding neither, because the record would claim co
 The two retries in this design are different operations and conflating them decides the duplication
 question in the wrong direction:
 
-- **Internal re-commit** — the same *already-produced* row is committed again after a transient or
+- **Internal re-commit** — the same _already-produced_ row is committed again after a transient or
   ambiguous failure. It reuses the identity. This is what D1c deduplicates.
 - **Caller-level retry** — the caller reissues a dispatch that did not return success. The verb
   executes again and **produces a new row with a new identity**.
 
 The second is correct rather than a leak. If a dispatch did not return success, no obligation was
 acknowledged to the caller; when they reissue, the work is genuinely performed a second time and
-accounting follows work performed. This covers the lifecycle *produce row, process dies before commit,
-caller retries*: the post-crash records are correctly distinct, not a duplicated obligation.
+accounting follows work performed. This covers the lifecycle _produce row, process dies before commit,
+caller retries_: the post-crash records are correctly distinct, not a duplicated obligation.
 
 The boundary is therefore: **identity is per produced row, and de-duplication covers only the
 re-commit of a row that was already produced.** Stated because it was previously implied, and an
@@ -297,11 +297,11 @@ a gap correlated with an incident.
 A falsely acknowledged one leaves nothing anomalous at all, and the reason is structural rather than
 a matter of difficulty. **Detection requires a disagreement between two records, and this failure
 produces agreement.** The caller wrote down success; the store has no row; and no reconciliation
-between them can fire, because reconciliation compares what the two sides *say*, and they say the
+between them can fire, because reconciliation compares what the two sides _say_, and they say the
 same thing. The missing row is visible only against an external truth the system does not have.
 
 So it is not that this mode is hard to detect. There is no observable to detect it with, and no
-amount of additional monitoring creates one. A mechanism that *could* create one does exist, and the
+amount of additional monitoring creates one. A mechanism that _could_ create one does exist, and the
 distinction matters enough to state: an independently committed receipt, reconciled by identity
 against the audit row, would supply the missing disagreement. But that is a second authoritative
 write path, not a monitor, and it carries the same acknowledgement problem one level further out. It
@@ -314,7 +314,7 @@ coverage**, and merely insufficient otherwise. The record should not overstate t
 counting observed flush failures is a useful non-authoritative supplement, and D8 specifies one.
 What makes the harmful reading the likely one rather than a hypothetical misuse is that this
 instrument's clean output is indistinguishable from a covered system. Nothing in a green panel says
-*this cannot see the class you are asking about*, so remembering it falls to every future reader, in
+_this cannot see the class you are asking about_, so remembering it falls to every future reader, in
 every later incident, indefinitely. That is not a place to put a safety property.
 
 `EventKind` alone is not a valid discriminator for this, because one `Audit` kind covers both
@@ -338,13 +338,13 @@ unconditionally — the observability carve-out does not reach an accounting-bea
 draft achieved the same property by
 excluding accounting rows from batching altogether, which would have removed the acquisition
 reduction in exactly the high-concurrency deployment that motivates this record, since under
-ADR-103 the usage object rides *every* per-dispatch audit row. Stating the obligation instead of
+ADR-103 the usage object rides _every_ per-dispatch audit row. Stating the obligation instead of
 the exemption keeps the guarantee and keeps the benefit.
 
 What remains specific to this class is failure handling, which is D2's subject, and the store's own
 durability posture, which is neither.
 
-ADR-103 already freezes the usage object *before* the enclosing audit row is written
+ADR-103 already freezes the usage object _before_ the enclosing audit row is written
 (`ADR-103:814-822`), so this is compatible with its stated ordering and requires no amendment to
 it. This record does not change what accounting means, where it lands, or who reads it.
 
@@ -415,7 +415,7 @@ instrumentation cannot see the population this record shrinks.
   success, and a retry able to write the same accounting payload twice. A property that
   four independent mechanisms can break is not local to any of them.
 
-  **Note on scope.** INV-1 governs how the *write path* handles a record — whether it can be
+  **Note on scope.** INV-1 governs how the _write path_ handles a record — whether it can be
   dropped, deferred past its operation's return, or reported as successful without committing. It
   does not by itself establish that the underlying store's durability settings are adequate for
   the records it holds. That is a separate property and the two must not be conflated: a record
@@ -428,8 +428,8 @@ instrumentation cannot see the population this record shrinks.
   the writer is idle.
 - **INV-4.** No write becomes weaker **than the current implementation's behaviour in the same
   situation**. That comparison basis is the whole content of the invariant and was previously left
-  implicit. Batching changes *when* the writer is acquired and *how many rows share one
-  acquisition*, never whether a row survives a case the current implementation would have survived.
+  implicit. Batching changes _when_ the writer is acquired and _how many rows share one
+  acquisition_, never whether a row survives a case the current implementation would have survived.
 
   Read against D1's scope: for an obligation-bearing row this is strictly stronger than today, since
   a dispatch returns only after its row commits and a persistent failure fails it, where today it
@@ -454,7 +454,7 @@ transactional appends with surfaced failures.
   rather than silently succeeding over a lost record. This is a visible behaviour change and is
   the intended one: the swallow is why the current failure counts are a lower bound.
 - **A store outage becomes a service outage rather than unaccounted service, and this follows
-  directly from the reversal above.** Under ADR-103 the usage object rides *every* per-dispatch audit
+  directly from the reversal above.** Under ADR-103 the usage object rides _every_ per-dispatch audit
   row, so a persistently failing writer fails every metered dispatch rather than serving them
   unaccounted. That is the correct trade — serving work whose accounting record cannot be written is
   the loss INV-1 exists to prevent — but it is a real availability consequence and it is named here
@@ -473,7 +473,7 @@ later than the operation that produced them." Under D1's waiting clause that is 
 of this record, and the read-your-own-audit caveat it carried is withdrawn.
 
 **Explicitly not claimed.** This record does **not** claim interactive traffic becomes read-only.
-It claims writer *acquisitions* fall. Whether any verb reaches zero writes is a question the
+It claims writer _acquisitions_ fall. Whether any verb reaches zero writes is a question the
 revised census answers, not something this record asserts.
 
 **Not addressed here.** Remaining genuine writes still serialize on one writer. Raising that
@@ -526,9 +526,9 @@ post-change profile.
 9. A test that a recall returning multiple targets performs one serve-ledger acquisition, not one
    per target (D7).
 10. Writer-acquisition counters show a reduction under a fixed replayed workload — a measured
-   delta under identical input, at a concurrency level high enough for batches to form. A
-   single-threaded replay cannot demonstrate this decision, because a batch of one is the
-   unchanged path.
+    delta under identical input, at a concurrency level high enough for batches to form. A
+    single-threaded replay cannot demonstrate this decision, because a batch of one is the
+    unchanged path.
 11. Crash injection loses no record **for which D1 requires durability at return** — every
     obligation-bearing row, and every observability row whose commit succeeded. Scoped this way
     because D1's carve-out permits a persistently-failed observability row to be absent after its

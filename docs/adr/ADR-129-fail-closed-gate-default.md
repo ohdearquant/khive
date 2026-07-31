@@ -112,11 +112,11 @@ At composition-root boot (the local binary, not library construction), the
 local process principal is registered and granted one capability per
 namespace under this authority rule:
 
-| Config source | Namespaces | Rights granted |
-|---|---|---|
-| `default_namespace` | that one namespace | full (read, create, write, delete, send) |
-| read-visibility set | each listed namespace | read only |
-| outbound-delivery set | each listed namespace | send only |
+| Config source         | Namespaces            | Rights granted                           |
+| --------------------- | --------------------- | ---------------------------------------- |
+| `default_namespace`   | that one namespace    | full (read, create, write, delete, send) |
+| read-visibility set   | each listed namespace | read only                                |
+| outbound-delivery set | each listed namespace | send only                                |
 
 The three sources overlap by design — config resolution folds the actor's
 own namespace into the read-visibility set, and nothing stops a namespace
@@ -333,8 +333,8 @@ provisions the anonymous fallback identity, preserving access for
 identity-less local callers; it is an explicit deployment-posture opt-in,
 never a default.
 
-Uniform grants are deliberate. This amendment provisions *who may call*, not
-*who may do what*: every enumerated caller receives the boot enumeration, and
+Uniform grants are deliberate. This amendment provisions _who may call_, not
+_who may do what_: every enumerated caller receives the boot enumeration, and
 per-caller differentiation (distinct namespace sets or rights per caller) is
 a later stage with its own design record. Callers absent from the enumeration
 remain denied — the fail-closed default is narrowed, not weakened.

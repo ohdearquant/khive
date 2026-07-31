@@ -21,14 +21,14 @@ The coordinator marks a fan-out partial when any backend leg reported an error:
 `partial = per_backend.iter().any(|r| r.error.is_some())`
 (`crates/kkernel/src/coordinator/service.rs:135`). The MCP layer recomputes the
 failed-backend list, sorts and dedupes it, and ORs it into the same flag
-(`crates/khive-mcp/src/server.rs:1401-1409`). It then builds a *successful*
+(`crates/khive-mcp/src/server.rs:1401-1409`). It then builds a _successful_
 envelope: `ok=true`, `tool`, `result`, and — only when partial — the two
 degradation fields (`ok_envelope`, `crates/khive-mcp/src/server.rs:1517-1535`).
 
 So a search whose only backend was unreachable returns
 
 ```json
-{"ok": true, "tool": "search", "result": [], "partial": true, "missing_backends": ["main"]}
+{ "ok": true, "tool": "search", "result": [], "partial": true, "missing_backends": ["main"] }
 ```
 
 while a genuine no-match returns `{"ok": true, "tool": "search", "result": []}`.
@@ -131,7 +131,7 @@ operation MUST return:
 - `error.message` stating that no-match was not established.
 
 This includes the case where pre-filter fusion found hits but `min_rank_score`
-removed all of them. Completeness is a property of the answer *after* the
+removed all of them. Completeness is a property of the answer _after_ the
 requested filter, because that is what the caller observes.
 
 ### 2. Ranking and evidence fields

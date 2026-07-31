@@ -108,7 +108,7 @@ the same path GTD takes for `"task"`. No schema migration is required for M1: th
 The runtime validates the kind against all registered `NOTE_KINDS` at write time and
 returns `RuntimeError::UnknownNoteKind` if the pack is not loaded.
 
-### 3. Verb surface *(historical; superseded by ADR-083)*
+### 3. Verb surface _(historical; superseded by ADR-083)_
 
 [ADR-083](ADR-083-session-pack-t1-verbs.md) supersedes this section in full
 and is the sole accepted authority for the current caller-facing surface. The

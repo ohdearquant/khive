@@ -12,9 +12,9 @@ accepted 2026-07-17; Amendment 4 accepted 2026-07-19)
   to add `entities.content_ref`)
 - [ADR-044](ADR-044-vector-store-extensions.md) — Vector Store Extensions (the `orphan_sweep`
   CLI-only precedent this ADR mirrors for `BlobStore`)
-**Related**: [ADR-086](ADR-086-doc-file-pack.md) — proposed Doc/File Pack that deferred
-`StorageCapability::Blob` to a real consumer; it motivates this accepted storage capability
-but is not its prerequisite.
+  **Related**: [ADR-086](ADR-086-doc-file-pack.md) — proposed Doc/File Pack that deferred
+  `StorageCapability::Blob` to a real consumer; it motivates this accepted storage capability
+  but is not its prerequisite.
 
 ---
 

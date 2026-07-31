@@ -381,7 +381,7 @@ The condition is unenforced in two of the three legs:
   open the socket dispatches under whatever `namespace` / `actor_id` / `visible_namespaces` it
   asserts on the frame.
 
-Multi-principal serving is therefore *undeclared* rather than *disabled*: the mechanism runs
+Multi-principal serving is therefore _undeclared_ rather than _disabled_: the mechanism runs
 unconditionally for every deployment shape, and the only thing keeping the shipped shape inside
 the accepted envelope is that nobody has deployed it outside one.
 
@@ -395,7 +395,7 @@ enforced with data the principal supplies.
 
 The isolation boundary of the accepted single-principal envelope **is the operating-system
 uid**. Same-uid callers form one trust domain; `actor_id` / `namespace` on the request frame
-are attribution *within* that domain (ADR-007), never a boundary. "Multi-principal serving"
+are attribution _within_ that domain (ADR-007), never a boundary. "Multi-principal serving"
 in condition 2 means **multi-uid serving**. Condition 2's blocking clause — hosted / multi-uid
 serving stays disabled until the separately gated connection-identity ADR — stands unchanged.
 
@@ -417,7 +417,7 @@ Three small items, no new dependencies:
 
 This amendment is **not** the connection-identity mechanism condition 2 defers to a future
 ADR. It binds no principal to allowed namespaces, does not resolve Open question 4, and does
-not unblock hosted serving. It makes the *current* accepted envelope self-enforcing — a
+not unblock hosted serving. It makes the _current_ accepted envelope self-enforcing — a
 different and much smaller job than enabling anything new.
 
 ---

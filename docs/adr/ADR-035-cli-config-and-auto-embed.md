@@ -30,11 +30,11 @@ with an overlapping purpose.
 
 The accepted loader discovers these filenames, in precedence order:
 
-| File                      | Scope                                  | Committed                         |
-| ------------------------- | -------------------------------------- | --------------------------------- |
-| `./khive.toml`            | Project-root compatibility location    | Operator choice                   |
-| `./.khive/config.toml`    | Canonical project-local location       | Yes — shared across collaborators |
-| `~/.khive/config.toml`    | User-global fallback                   | No — machine-specific             |
+| File                   | Scope                               | Committed                         |
+| ---------------------- | ----------------------------------- | --------------------------------- |
+| `./khive.toml`         | Project-root compatibility location | Operator choice                   |
+| `./.khive/config.toml` | Canonical project-local location    | Yes — shared across collaborators |
+| `~/.khive/config.toml` | User-global fallback                | No — machine-specific             |
 
 Only the first existing file is loaded. The files are not merged per key.
 `.khive/khive.toml` is not a discovery tier and must never be silently treated
@@ -129,10 +129,11 @@ selected project file.
 ### 2. Configuration resolution order
 
 Configuration-file discovery is **explicit `--config` / `KHIVE_CONFIG` path
+
 > project-root `./khive.toml` > DB-anchored or cwd project
-`./.khive/config.toml` > `~/.khive/config.toml` > no file**. The first file
-that exists is parsed and validated; a malformed higher-precedence file is an
-error, not a reason to continue to a lower tier.
+> `./.khive/config.toml` > `~/.khive/config.toml` > no file**. The first file
+> that exists is parsed and validated; a malformed higher-precedence file is an
+> error, not a reason to continue to a lower tier.
 
 When an explicit database path is supplied, the hidden project tier is
 anchored beside that resolved database so a thin client and its daemon select
@@ -467,17 +468,17 @@ as separating source files from build artifacts in a standard software project.
 
 ## Alternatives Considered
 
-| Alternative                                            | Pros                        | Cons                                                                  | Why rejected                                                       |
-| ------------------------------------------------------ | --------------------------- | --------------------------------------------------------------------- | ------------------------------------------------------------------ |
-| Separate active topology and embedding files in one project | Clear file roles       | Two files to manage; split mental context                             | One selected file is simpler and sufficient                        |
-| Per-key project/global TOML merge                      | Machine-local overlays      | Hidden composite config; client/daemon fingerprint drift risk         | First-file selection is deterministic and auditable                |
-| YAML config format                                     | Familiar                    | Ambiguous parsing; indentation errors in practice                     | TOML is unambiguous; already used in Cargo and this project        |
-| JSON config format                                     | Machine-writable            | No comments; annoying to hand-edit; trailing-comma errors             | TOML is better for human-edited files                              |
-| Vectors stored in NDJSON (committed)                   | Single source of truth      | 15 MB+ non-diffable content per 10K entities; breaks merge guarantees | Recomputable state should not be committed                         |
-| Dedicated committed vector file (separate from NDJSON) | Separates vectors from text | Same merge problem; grows with entity count                           | Still recomputable; still breaks git diff                          |
-| Manual embed only (`auto_embed = false` as default)    | Explicit control            | Silent quality degradation when users forget                          | Auto-embed prevents the failure mode at negligible cost            |
-| Embed on every verb write (real-time)                  | Vectors always current      | Embed latency per write blocks interactive use                        | Batch on commit/sync matches the git-workflow cadence              |
-| `embed.model` allowed as per-user override             | User flexibility            | Incompatible vectors across collaborators                             | Model is a project invariant; must be locked at project level      |
+| Alternative                                                 | Pros                        | Cons                                                                  | Why rejected                                                  |
+| ----------------------------------------------------------- | --------------------------- | --------------------------------------------------------------------- | ------------------------------------------------------------- |
+| Separate active topology and embedding files in one project | Clear file roles            | Two files to manage; split mental context                             | One selected file is simpler and sufficient                   |
+| Per-key project/global TOML merge                           | Machine-local overlays      | Hidden composite config; client/daemon fingerprint drift risk         | First-file selection is deterministic and auditable           |
+| YAML config format                                          | Familiar                    | Ambiguous parsing; indentation errors in practice                     | TOML is unambiguous; already used in Cargo and this project   |
+| JSON config format                                          | Machine-writable            | No comments; annoying to hand-edit; trailing-comma errors             | TOML is better for human-edited files                         |
+| Vectors stored in NDJSON (committed)                        | Single source of truth      | 15 MB+ non-diffable content per 10K entities; breaks merge guarantees | Recomputable state should not be committed                    |
+| Dedicated committed vector file (separate from NDJSON)      | Separates vectors from text | Same merge problem; grows with entity count                           | Still recomputable; still breaks git diff                     |
+| Manual embed only (`auto_embed = false` as default)         | Explicit control            | Silent quality degradation when users forget                          | Auto-embed prevents the failure mode at negligible cost       |
+| Embed on every verb write (real-time)                       | Vectors always current      | Embed latency per write blocks interactive use                        | Batch on commit/sync matches the git-workflow cadence         |
+| `embed.model` allowed as per-user override                  | User flexibility            | Incompatible vectors across collaborators                             | Model is a project invariant; must be locked at project level |
 
 ## Consequences
 

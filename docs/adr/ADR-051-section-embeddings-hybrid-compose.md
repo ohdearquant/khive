@@ -249,7 +249,7 @@ The failure is logged (`tracing::warn!`) and `entities` is simply omitted,
 identically to the "nothing blended" case.
 
 **Budget.** Blended entities consume the same `max_tokens` budget as the rest
-of the briefing, but are trimmed *after* the atom/section body is finalized,
+of the briefing, but are trimmed _after_ the atom/section body is finalized,
 against whatever budget is left over (`char_budget - body_used`). A tight
 budget never evicts an atom or section to make room for an entity — entities
 are purely additive, capped at 5 (`KG_BLEND_CAP`), and are the first (only)
