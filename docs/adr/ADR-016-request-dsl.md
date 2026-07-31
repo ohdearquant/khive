@@ -69,9 +69,27 @@ verb(arg=value, arg=value)
 verb1(...) | verb2(arg=$prev.id) | verb3(arg=$prev.field)
 ```
 
-Mixing `,` and `|` at the top level is rejected as a parse error. A future
-extension may define sub-chain bracketing if a real use case justifies the
-complexity.
+Mixing `,` and `|` in one request is rejected as a parse error. A parallel
+batch cannot contain a chain; sub-chain bracketing is not part of this DSL.
+For example, this combined shape is invalid:
+
+```text
+[create(kind="concept", name="Independent A"),
+ create(kind="concept", name="Independent B"),
+ create(kind="concept", name="Dependent") |
+   link(source_id=$prev.id, target_id="<existing-uuid>", relation="extends")]
+```
+
+Split it into exactly two `request` calls: one parallel call for the
+independent operations, and one sequential call for the dependency:
+
+```text
+request(ops='[create(kind="concept", name="Independent A"), create(kind="concept", name="Independent B")]')
+request(ops='create(kind="concept", name="Dependent") | link(source_id=$prev.id, target_id="<existing-uuid>", relation="extends")')
+```
+
+The two calls above are independent and may be issued in either order. `$prev`
+is scoped to the second call's chain; it never carries across request calls.
 
 **JSON form** is canonical for programmatic input that produces structured objects
 more easily than string templating:

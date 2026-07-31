@@ -146,6 +146,20 @@ uses case-insensitive string collation. An empty list compiles to match nothing 
 binding value parameters. `NULL` is not a valid list item and is rejected during parsing.
 Without `OR`/`IN`, multi-value filters require N separate queries or caller-side UNION.
 
+WHERE references distinguish dedicated substrate fields from JSON properties:
+
+```text
+field reference         = variable "." field
+JSON property reference = variable ".properties." identifier ("." identifier)*
+```
+
+Dedicated fields are checked against the bound substrate's allowlist. Unknown direct fields,
+including compiler result aliases such as `_depth`, are errors rather than implicit JSON
+lookups. The bare `properties` container is reserved and cannot be compared directly. JSON
+access must use the explicit `properties.<path>` form; every path segment is an identifier and
+the compiler lowers the complete path through `json_extract`. This makes typos fail closed
+while retaining arbitrary and nested JSON-property filters (issues #521 and #1089).
+
 ### Read-only constraint
 
 `khive-query` compiles read-only SQL. It does not generate `INSERT`, `UPDATE`, `DELETE`,

@@ -313,6 +313,17 @@ The two forms cannot be combined in one `request`, and the JSON op form does not
 Mixing `,` and `|` at the top level of one `request` is rejected, as is `$prev` inside the JSON op
 form. Use the function-call form shown above for chaining.
 
+When one workload contains independent ops alongside a dependent chain, split it into exactly two
+calls:
+
+```text
+request(ops="[create(kind=\"concept\", name=\"Independent A\"), create(kind=\"concept\", name=\"Independent B\")]")
+request(ops="create(kind=\"concept\", name=\"Dependent\") | link(source_id=$prev.id, target_id=\"<existing-uuid>\", relation=\"extends\")")
+```
+
+These calls are independent and may run in either order. `$prev` is scoped to the second call's
+chain and never crosses a `request` boundary.
+
 ### Output format
 
 The `request` envelope accepts a `format` parameter that controls how the response is serialized
@@ -588,7 +599,7 @@ Sparse graphs are useless. Every entity should have minimum edges:
 MATCH (a)-[:extends|variant_of*1..3]->(b {name: 'LoRA'}) RETURN a, b
 
 # Find all papers in the attention domain
-MATCH (a:concept) WHERE a.domain = 'attention' AND a.type = 'paper' RETURN a
+MATCH (a:concept) WHERE a.properties.domain = 'attention' AND a.properties.type = 'paper' RETURN a
 
 # What concepts does this implementation realize?
 MATCH ({name: 'lattice-inference'})-[:implements]->(c:concept) RETURN c

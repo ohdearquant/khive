@@ -430,13 +430,54 @@ fn find_prefix_token<'a>(text: &'a str, needle: &str, min_len: usize) -> Option<
         };
         if at_boundary {
             let token = extract_token(&text[abs..]);
-            if token.len() >= min_len {
+            if token.len() >= min_len && !is_filename_shaped_prefix_match(token, needle) {
                 return Some(token);
             }
         }
         start = abs + needle.len().max(1);
     }
     None
+}
+
+/// Known source-file extensions that can terminate an ordinary provider-
+/// prefixed filename. This is deliberately a closed set: an unknown suffix
+/// is not evidence strong enough to suppress a context-free prefix detector.
+const SOURCE_FILE_EXTENSIONS: &[&str] =
+    &[".py", ".rs", ".ts", ".js", ".sh", ".md", ".toml", ".json"];
+
+/// Returns `true` for a lowercase source filename after a known provider
+/// prefix, such as `vercel_deployment_monitor.py`.
+///
+/// A source extension alone is not enough. The payload before it must contain
+/// only lowercase ASCII letters and filename/path punctuation; any uppercase
+/// letter or digit is credential-value evidence and keeps the prefix match
+/// fail-closed. Outer Markdown/prose punctuation is ignored, but never any
+/// payload byte inside the filename itself.
+fn is_filename_shaped_prefix_match(token: &str, needle: &str) -> bool {
+    let token = token.trim_end_matches(|c: char| {
+        matches!(
+            c,
+            '`' | '"' | '\'' | ')' | ']' | '}' | '>' | ',' | ';' | ':' | '!' | '?'
+        )
+    });
+    let token = token.strip_suffix('.').unwrap_or(token);
+    let Some(payload) = token.strip_prefix(needle) else {
+        return false;
+    };
+    let Some(stem) = SOURCE_FILE_EXTENSIONS
+        .iter()
+        .find_map(|extension| payload.strip_suffix(extension))
+    else {
+        return false;
+    };
+
+    stem.bytes().any(|byte| byte.is_ascii_lowercase())
+        && stem
+            .bytes()
+            .any(|byte| matches!(byte, b'_' | b'-' | b'/' | b'.'))
+        && stem
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || matches!(byte, b'_' | b'-' | b'/' | b'.'))
 }
 
 /// Scan for a JWT pattern: at least two "eyJ" segments separated by a `.`
@@ -748,13 +789,23 @@ fn check_entropy_heuristic(text: &str, from: usize) -> Option<(&str, &'static st
         // revision. The hex value itself is a separate token and receives
         // the full check sequence on its own iteration.
         if is_vcs_marker_before_hex(text, raw_token)
-            && !has_clause_credential_label(text, token_offset, raw_token)
+            && !has_clause_credential_label(
+                text,
+                token_offset,
+                raw_token,
+                ClauseValueKind::VcsReference,
+            )
         {
             continue;
         }
 
         let vcs_reference_exempt = is_git_revision_reference(text, token_offset, raw_token)
-            && !has_clause_credential_label(text, token_offset, raw_token);
+            && !has_clause_credential_label(
+                text,
+                token_offset,
+                raw_token,
+                ClauseValueKind::VcsReference,
+            );
 
         // Hex API keys (AWS secret access key, Stripe test keys, random hex
         // tokens) are pure hex yet are real credentials.  The entropy heuristic
@@ -922,7 +973,12 @@ fn check_entropy_heuristic(text: &str, from: usize) -> Option<(&str, &'static st
             }
 
             if is_plausible_file_path(token)
-                && !has_clause_credential_label(text, token_offset, raw_token)
+                && !has_clause_credential_label(
+                    text,
+                    token_offset,
+                    raw_token,
+                    ClauseValueKind::FilePath,
+                )
             {
                 continue;
             }
@@ -1081,6 +1137,21 @@ const LABEL_CLAUSE_SKIP_WORDS: &[&str] = &[
 /// stays in range without exhaustion.
 const LABEL_CLAUSE_WALK_LIMIT: usize = 8;
 
+/// File-path candidates may walk across at most this many content identifiers
+/// without a `:`/`=` delimiter. Two reaches the direct-label shapes that need
+/// protection (`auth scanner found <path>`) while keeping the walk local.
+const FILE_PATH_NO_DELIMITER_CONTENT_LIMIT: usize = 2;
+
+/// The two narrow trigger-context exemptions need different no-delimiter
+/// behavior. VCS coordinates preserve the strict prose guard that keeps
+/// `the key changes are in commit <sha>` readable; file paths admit the
+/// bounded bridge above so a short label cannot disguise a credential value.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ClauseValueKind {
+    VcsReference,
+    FilePath,
+}
+
 /// Sentence/paragraph boundary inside a clause-walk gap. `;`, `!`, `?`, and
 /// blank lines always end the clause. `.` ends it only when it is not
 /// immediately followed by an alphanumeric character: a dot tight between
@@ -1105,7 +1176,10 @@ fn gap_has_sentence_boundary(gap: &str) -> bool {
 /// Treated as connector material so a versioned label ("api key v1.2 value
 /// is …") stays reachable.
 fn is_version_fragment(word: &str) -> bool {
-    let digits = word.strip_prefix('v').unwrap_or(word);
+    let digits = word
+        .strip_prefix('v')
+        .or_else(|| word.strip_prefix('V'))
+        .unwrap_or(word);
     !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit())
 }
 
@@ -1116,6 +1190,63 @@ fn is_version_fragment(word: &str) -> bool {
 /// ends the clause.
 fn is_hex_fragment_word(word: &str) -> bool {
     word.len() >= 12 && word.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// Allocation-free case-insensitive substring search for ASCII identifiers.
+fn contains_ascii_case_insensitive(haystack: &str, needle: &str) -> bool {
+    haystack
+        .as_bytes()
+        .windows(needle.len())
+        .any(|window| window.eq_ignore_ascii_case(needle.as_bytes()))
+}
+
+/// A trailing identifier can contain only ASCII alphanumerics and `_`, so
+/// splitting on `_` exactly preserves the bare-trigger boundary rule used by
+/// [`contains_bounded_word`] without allocating a lowercase copy.
+fn clause_label_has_credential_trigger(label: &str) -> bool {
+    label.eq_ignore_ascii_case("token")
+        || COMPOUND_TRIGGER_WORDS
+            .iter()
+            .any(|trigger| contains_ascii_case_insensitive(label, trigger))
+        || label.split('_').any(|part| {
+            TRIGGER_WORDS
+                .iter()
+                .any(|trigger| part.eq_ignore_ascii_case(trigger))
+        })
+}
+
+fn is_label_clause_skip_word(label: &str) -> bool {
+    LABEL_CLAUSE_SKIP_WORDS
+        .iter()
+        .any(|word| label.eq_ignore_ascii_case(word))
+}
+
+/// Words ending in the byte sequence `ed` are only a cheap proxy for a
+/// regular English participle. Keep known lexical false matches explicit so
+/// a noun such as `hundred` cannot become evidence that a credential label is
+/// merely narrative prose. Irregular forms such as `found` deliberately do
+/// not qualify: they must not shield `api key found <value>`.
+fn is_clause_narrative_participle(label: &str) -> bool {
+    const NON_PARTICIPLE_ED_WORDS: &[&str] = &["hundred"];
+
+    label.len() >= 5
+        && label
+            .get(label.len().saturating_sub(2)..)
+            .is_some_and(|suffix| suffix.eq_ignore_ascii_case("ed"))
+        && !NON_PARTICIPLE_ED_WORDS
+            .iter()
+            .any(|word| label.eq_ignore_ascii_case(word))
+}
+
+/// Cheap regular-gerund proxy used only after the no-delimiter file-path walk
+/// has crossed an explicit `in` on the value side (`api_key handling in
+/// <path>`). Adjacency alone is never narrative evidence: `api key handling
+/// <value>` must keep walking to the direct credential label.
+fn is_clause_narrative_gerund(label: &str) -> bool {
+    label.len() >= 6
+        && label
+            .get(label.len().saturating_sub(3)..)
+            .is_some_and(|suffix| suffix.eq_ignore_ascii_case("ing"))
 }
 
 /// `true` when the candidate token sits in credential-value syntax: an inline
@@ -1136,22 +1267,34 @@ fn is_hex_fragment_word(word: &str) -> bool {
 /// qualifier past the cap. For the same reason, exhausting the walk budget
 /// after crossing a delimiter fails CLOSED: the clause is assignment-shaped
 /// and its head was never scanned, so it is treated as credential-labeled.
-/// A past-participle content word ("flagged", "introduced") ends the walk —
+/// A regular past-participle content word ("flagged", "introduced") ends the walk —
 /// verb-phrase prose narrates an action on the value rather than labeling it
 /// ("the auth scanner flagged this file: <path>", "one extra token was
 /// introduced by sha: <hex>"). Coordinating conjunctions are transparent to
 /// that position test — "shared and encrypted deploy" keeps both participles
-/// in adjective position. Without a delimiter, only the closed sets are
-/// stepped over — skipping arbitrary words there would re-block ordinary
-/// prose like "the key changes are in commit <hex>", the false-positive
-/// class these exemptions exist to fix.
-fn has_clause_credential_label(text: &str, token_offset: usize, raw_token: &str) -> bool {
+/// in adjective position. Without a delimiter, VCS references step over only
+/// the closed connector sets, preserving ordinary prose such as "the key
+/// changes are in commit <hex>". File paths additionally step over at most
+/// [`FILE_PATH_NO_DELIMITER_CONTENT_LIMIT`] content words, closing direct
+/// label shapes such as "auth scanner found <path>" without broadening the
+/// VCS tier.
+fn has_clause_credential_label(
+    text: &str,
+    token_offset: usize,
+    raw_token: &str,
+    value_kind: ClauseValueKind,
+) -> bool {
     if has_inline_credential_trigger(raw_token) {
         return true;
     }
 
     let mut rest = &text[..token_offset];
     let mut crossed_value_delimiter = false;
+    let mut no_delimiter_content_words = 0usize;
+    // Whether the previously processed identifier (the one nearer the value)
+    // was the literal preposition `in`. This starts false deliberately:
+    // adjacency to the value must not make a gerund narrative evidence.
+    let mut arrived_through_in_preposition = false;
     // Whether the previously processed identifier (the one nearer the value)
     // was connector material. Starts true: step 0 is adjacent to the value or
     // its delimiter.
@@ -1165,37 +1308,43 @@ fn has_clause_credential_label(text: &str, token_offset: usize, raw_token: &str)
         if step > 0 && gap_has_sentence_boundary(gap) {
             return false;
         }
-        let lower = label.to_ascii_lowercase();
         if gap.contains([':', '=']) {
             crossed_value_delimiter = true;
         }
-        if lower == "token"
-            || COMPOUND_TRIGGER_WORDS
-                .iter()
-                .any(|trigger| lower.contains(trigger))
-            || TRIGGER_WORDS
-                .iter()
-                .any(|trigger| contains_bounded_word(&lower, trigger))
-        {
+        if clause_label_has_credential_trigger(label) {
             return true;
         }
-        let skippable = LABEL_CLAUSE_SKIP_WORDS.contains(&lower.as_str())
-            || is_version_fragment(&lower)
-            || is_hex_fragment_word(&lower);
+        let skippable = is_label_clause_skip_word(label)
+            || is_version_fragment(label)
+            || is_hex_fragment_word(label);
         if !skippable {
-            if !crossed_value_delimiter {
+            // This barrier applies to delimiter-bearing clauses and to the
+            // bounded file-path bridge. It intentionally recognizes regular
+            // `-ed` forms only: `found` is a bridge word, not a narrative
+            // shield for a direct credential label.
+            let no_delimiter_file_path_narrative = !crossed_value_delimiter
+                && value_kind == ClauseValueKind::FilePath
+                && arrived_through_in_preposition
+                && is_clause_narrative_gerund(label);
+            // Delimiter-bearing clauses and VCS coordinates preserve their
+            // existing direct-participle semantics. A no-delimiter file path
+            // must first process real value-side context: the synthetic
+            // initial connector state alone cannot let `api key leaked
+            // <value>` stop before reaching the trigger.
+            let regular_participle_narrative = is_clause_narrative_participle(label)
+                && (crossed_value_delimiter || value_kind != ClauseValueKind::FilePath || step > 0);
+            if arrived_through_connector
+                && (regular_participle_narrative || no_delimiter_file_path_narrative)
+            {
                 return false;
             }
-            // A past-participle word is verb-phrase evidence ONLY in verb
-            // position — followed by a glue word or the value itself
-            // ("flagged THIS file", "introduced BY sha", "updated: <v>").
-            // Followed by a content word it is a participial adjective
-            // inside a noun-compound label qualifier ("SHARED deploy",
-            // "ENCRYPTED backup") and walks like any other qualifier noun.
-            // The walk runs backwards, so "followed by" is the identifier
-            // processed on the previous iteration.
-            if arrived_through_connector && lower.len() >= 5 && lower.ends_with("ed") {
-                return false;
+            if !crossed_value_delimiter {
+                if value_kind != ClauseValueKind::FilePath
+                    || no_delimiter_content_words >= FILE_PATH_NO_DELIMITER_CONTENT_LIMIT
+                {
+                    return false;
+                }
+                no_delimiter_content_words += 1;
             }
         }
         // Coordinating conjunctions are transparent to participle-position
@@ -1203,9 +1352,10 @@ fn has_clause_credential_label(text: &str, token_offset: usize, raw_token: &str)
         // as a whole is followed by a content noun, so "shared" is still an
         // adjective — the conjunction preserves the arrived state instead of
         // marking connector position.
-        if !matches!(lower.as_str(), "and" | "or") {
+        if !label.eq_ignore_ascii_case("and") && !label.eq_ignore_ascii_case("or") {
             arrived_through_connector = skippable;
         }
+        arrived_through_in_preposition = label.eq_ignore_ascii_case("in");
         let start = label.as_ptr() as usize - rest.as_ptr() as usize;
         rest = &rest[..start];
     }
@@ -1982,6 +2132,67 @@ mod tests {
         let fake = "vercel_FAKETOKEN00000000000000000";
         assert!(scan(fake).is_some(), "vercel_ must be caught");
         assert_eq!(scan(fake).unwrap().detector, "vercel-token");
+    }
+
+    #[test]
+    fn prefix_detectors_allow_lowercase_source_filenames() {
+        let filename_body = "provider_integration_monitoring_adapter_configuration.py";
+
+        for &(_, needle, min_len) in PREFIX_DETECTORS {
+            let candidate = format!("{needle}{filename_body}");
+            assert!(
+                candidate.len() >= min_len,
+                "negative control must exercise {needle}'s length tier"
+            );
+            assert!(
+                find_prefix_token(&candidate, needle, min_len).is_none(),
+                "lowercase source filename must not match prefix {needle}: {candidate}"
+            );
+            assert!(
+                check(&candidate).is_ok(),
+                "lowercase source filename must pass the canonical scanner: {candidate}, got {:?}",
+                scan(&candidate)
+            );
+        }
+    }
+
+    #[test]
+    fn prefix_detectors_keep_value_shaped_payloads_with_source_suffixes() {
+        for &(_, needle, min_len) in PREFIX_DETECTORS {
+            let required_payload_len = min_len.saturating_sub(needle.len()).max(2);
+            let value_payload = "A1".repeat(required_payload_len.div_ceil(2));
+            let candidate = format!("{needle}{value_payload}.py");
+            assert!(
+                find_prefix_token(&candidate, needle, min_len).is_some(),
+                "uppercase/digit value evidence must preserve prefix {needle}: {candidate}"
+            );
+        }
+    }
+
+    #[test]
+    fn prefix_detectors_keep_lowercase_single_run_payloads_with_source_suffixes() {
+        for &(_, needle, min_len) in PREFIX_DETECTORS {
+            let required_payload_len = min_len.saturating_sub(needle.len()).max(24);
+            let value_payload = "a".repeat(required_payload_len);
+            let candidate = format!("{needle}{value_payload}.py");
+            assert!(
+                find_prefix_token(&candidate, needle, min_len).is_some(),
+                "an extension alone must not exempt prefix {needle}: {candidate}"
+            );
+        }
+    }
+
+    #[test]
+    fn allows_vercel_prefixed_source_filename_on_every_scanner_surface() {
+        let content = "review `vercel_deployment_monitoring_adapter.py` before release";
+
+        assert!(check(content).is_ok(), "write gate must allow filename");
+        assert!(scan(content).is_none(), "scanner must not report filename");
+        assert_eq!(
+            mask_secrets(content).as_ref(),
+            content,
+            "masking surface must preserve the filename byte-for-byte"
+        );
     }
 
     #[test]
@@ -3140,10 +3351,9 @@ mod tests {
 
     #[test]
     fn allows_unlabeled_unknown_connector_without_delimiter() {
-        // Documented residuals: without a value delimiter, an identifier
-        // outside the connector set still ends the walk. Skipping arbitrary
-        // words there would re-block ordinary prose — the false-positive
-        // class the exemptions exist to fix.
+        // VCS coordinates retain the strict no-delimiter tier: an identifier
+        // outside the connector set ends the walk. The bounded bridge used by
+        // file paths must not re-block this ordinary revision prose.
         let revision = "d362950a3c9b1a4cb47d97f1623e38f1a1e6bcdf";
         for content in [
             format!("the key changes are in commit {revision}"),
@@ -3152,6 +3362,109 @@ mod tests {
             assert!(
                 check(&content).is_ok(),
                 "prose without a value delimiter must keep the VCS exemption: \
+                 {content:?}, got {:?}",
+                scan(&content)
+            );
+        }
+    }
+
+    #[test]
+    fn blocks_direct_no_delimiter_labels_for_both_file_path_value_families() {
+        let values = [
+            "Xk9mZ2vQpLrT8nJwYuA/HfBsDcGiONvMabcdefgh",
+            "internal/workspaces/20260701/cloud-rebuild/R1-repo-audit.md",
+        ];
+
+        for value in values {
+            for label in ["api key found", "auth scanner found", "secret note"] {
+                let content = format!("{label} {value}");
+                assert!(
+                    check(&content).is_err(),
+                    "a direct no-delimiter label must refuse the file-path exemption: \
+                     {content:?}, got {:?}",
+                    scan(&content)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn blocks_direct_gerund_and_see_labels_for_both_file_path_value_families() {
+        let values = [
+            "Xk9mZ2vQpLrT8nJwYuA/HfBsDcGiONvMabcdefgh",
+            "internal/workspaces/20260701/cloud-rebuild/R1-repo-audit.md",
+        ];
+
+        for value in values {
+            for label in [
+                "api key handling",
+                "auth scanner handling",
+                "api key see",
+                "key: see",
+            ] {
+                let content = format!("{label} {value}");
+                assert!(
+                    check(&content).is_err(),
+                    "narrative-looking adjacency must not shield a direct credential label: \
+                     {content:?}, got {:?}",
+                    scan(&content)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn blocks_direct_participle_labels_for_both_file_path_value_families() {
+        let values = [
+            "Xk9mZ2vQpLrT8nJwYuA/HfBsDcGiONvMabcdefgh",
+            "internal/workspaces/20260701/cloud-rebuild/R1-repo-audit.md",
+        ];
+
+        for value in values {
+            for label in ["api key leaked", "auth scanner leaked"] {
+                let content = format!("{label} {value}");
+                assert!(
+                    check(&content).is_err(),
+                    "step-zero participle adjacency must not shield a direct credential label: \
+                     {content:?}, got {:?}",
+                    scan(&content)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn allows_no_delimiter_narrative_file_path_prose() {
+        // The value-side `file`/`this` identifiers provide real walk context
+        // before `flagged`; the step-zero direct-label tightening must not
+        // remove this required narrative exemption.
+        let content = "the auth scanner flagged this file \
+            internal/workspaces/20260701/cloud-rebuild/R1-repo-audit.md";
+
+        assert!(
+            check(content).is_ok(),
+            "a regular participle in narrative position must preserve the path: got {:?}",
+            scan(content)
+        );
+    }
+
+    #[test]
+    fn suffix_word_hundred_is_not_a_narrative_participle() {
+        assert!(is_clause_narrative_participle("flagged"));
+        assert!(is_clause_narrative_participle("INTRODUCED"));
+        assert!(!is_clause_narrative_participle("found"));
+        assert!(!is_clause_narrative_participle("hundred"));
+        assert!(is_clause_narrative_gerund("HANDLING"));
+        assert!(!is_clause_narrative_gerund("found"));
+
+        for value in [
+            "Xk9mZ2vQpLrT8nJwYuA/HfBsDcGiONvMabcdefgh",
+            "internal/workspaces/20260701/cloud-rebuild/R1-repo-audit.md",
+        ] {
+            let content = format!("api key hundred: {value}");
+            assert!(
+                check(&content).is_err(),
+                "a lexical -ed suffix must not shield a credential label: \
                  {content:?}, got {:?}",
                 scan(&content)
             );
@@ -3640,11 +3953,12 @@ mod tests {
     }
 
     #[test]
-    fn allows_high_entropy_workspace_path_near_key_word() {
-        let content = "key: see internal/workspaces/20260701/adr079-slices234/PACKET.md";
+    fn allows_high_entropy_workspace_path_before_later_key_word() {
+        let content =
+            "see internal/workspaces/20260701/adr079-slices234/PACKET.md for the key behavior";
         assert!(
             check(content).is_ok(),
-            "workspace path in technical prose must pass; got {:?}",
+            "a path before a later topical key word must pass; got {:?}",
             scan(content)
         );
     }

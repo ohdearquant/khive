@@ -513,7 +513,7 @@ async fn query_via_gql_where_equality_large_integer_matches_exact_json_number() 
     let rows = rt
         .query(
             &tok,
-            "MATCH (n:artifact) WHERE n.number = 9007199254740993 RETURN n",
+            "MATCH (n:artifact) WHERE n.properties.number = 9007199254740993 RETURN n",
         )
         .await
         .unwrap();
@@ -562,7 +562,7 @@ async fn query_via_gql_where_equality_i64_bounds_match_exact_json_number() {
         let rows = rt
             .query(
                 &tok,
-                &format!("MATCH (n:artifact) WHERE n.number = {bound} RETURN n"),
+                &format!("MATCH (n:artifact) WHERE n.properties.number = {bound} RETURN n"),
             )
             .await
             .unwrap();

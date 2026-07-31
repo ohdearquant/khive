@@ -18,7 +18,7 @@ The query AST is the shared contract between the GQL and SPARQL parsers, validat
 
 `WhereExpr` preserves the boolean tree instead of flattening it: `And`, `Or`, a leaf `Condition`, or `True` when the query has no `WHERE` clause. `conditions()` walks leaves depth-first from left to right; `for_each_condition_mut()` provides the same traversal for normalization; `is_true()` detects the identity expression.
 
-A `Condition` binds a variable and property to a `CompareOp` and `ConditionValue`. Operators cover scalar comparisons, `LIKE`, literal `CONTAINS` and `STARTS WITH`, list-valued `IN`, and operand-free `IS NOT NULL`. A `ReturnItem` is either a whole bound variable or one property projection; `variable()` returns the binding name in both cases.
+A `Condition` binds a variable and `PropertyRef` to a `CompareOp` and `ConditionValue`. `PropertyRef::Field` names a dedicated substrate field, while `PropertyRef::JsonPath` stores the non-empty identifier segments below the JSON `properties` object. The distinction prevents an unknown field from silently becoming a JSON lookup. Operators cover scalar comparisons, `LIKE`, literal `CONTAINS` and `STARTS WITH`, list-valued `IN`, and operand-free `IS NOT NULL`. A `ReturnItem` is either a whole bound variable or one property projection; `variable()` returns the binding name in both cases.
 
 ## Numeric and literal values
 

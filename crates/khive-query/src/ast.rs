@@ -155,11 +155,21 @@ pub enum EdgeDirection {
     Both,
 }
 
-/// A predicate in the WHERE clause: `variable.property op value`.
+/// A field or JSON-property path referenced by a WHERE condition.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PropertyRef {
+    /// A dedicated field on the bound substrate, such as `name` or `created_at`.
+    Field(String),
+    /// A path below the bound record's JSON `properties` object.
+    JsonPath(Vec<String>),
+}
+
+/// A predicate in the WHERE clause: `variable.field op value` or
+/// `variable.properties.path op value`.
 #[derive(Debug, Clone)]
 pub struct Condition {
     pub variable: String,
-    pub property: String,
+    pub property: PropertyRef,
     pub op: CompareOp,
     pub value: ConditionValue,
 }
