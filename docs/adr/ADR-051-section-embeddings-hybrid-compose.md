@@ -198,11 +198,10 @@ Status: proposed.
 measured, expert-curated content often lives as knowledge-graph `concept` and
 `document` entities (algorithms, papers, ADRs) rather than as a lore atom —
 those entities rank top under `kg.search(kind="entity")` for the same query but
-were invisible to compose callers. Dogfood evidence (2026-07-21): the query
-"int8 paged KV cache quantization x flash-attention decode on Metal GPU"
-returned only generic systems atoms (~0.35 scores) from compose, while KIVI,
-ZipCache, and fused-decode-kernel-design concept entities plus ADR document
-entities ranked top via `kg.search`.
+were invisible to compose callers. For example, a query naming a specific
+technical technique can return only generic, low-relevance atoms from compose,
+while the concept and document entities describing that technique — including
+matching ADRs — rank at the top via `kg.search`.
 
 ### Decision
 
@@ -273,7 +272,7 @@ blending outright; `blend_kg=false` reproduces pre-Amendment-1 behavior exactly.
 - One extra `hybrid_search` round-trip per blended kind (2 total) plus one
   `embed_batch` call per compose request when `blend_kg` is enabled and the
   query resolves at least one atom — bounded by the existing per-request
-  `ComposeTiming` slow-request WARN (#887).
+  `ComposeTiming` slow-request WARN.
 - Entity search is namespace-scoped identically to `kg.search` (primary
   namespace only for the vector leg per `hybrid_search`'s documented
   cross-namespace deferral) — no new namespace-visibility surface.

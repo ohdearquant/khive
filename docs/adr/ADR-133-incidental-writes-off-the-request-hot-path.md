@@ -145,9 +145,9 @@ The consequences of the waiting clause, all of which follow from it directly:
 - **Acquisitions stop scaling with request rate.** Under concurrency the acquisition rate is
   bounded by one per commit cycle instead of one per dispatch. This is the entire objective.
 - **Under contention this reduces latency rather than adding it.** Today each dispatch queues for
-  its own exclusive writer acquisition; the writer-acquisition timeout is already observed in
-  ordinary fleet traffic. Waiting for a shared commit that is already in flight is cheaper than
-  waiting for an exclusive turn.
+  its own exclusive writer acquisition, and the writer-acquisition timeout is a real risk under
+  ordinary concurrent traffic. Waiting for a shared commit that is already in flight is cheaper
+  than waiting for an exclusive turn.
 
   Stated exactly, because the loose version undercounts: a dispatch arriving while the writer is
   idle commits immediately and waits approximately nothing. A dispatch arriving mid-commit waits the

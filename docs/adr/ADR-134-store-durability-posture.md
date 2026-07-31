@@ -35,9 +35,8 @@ would not learn that accounting rides on it.
 
 ### How it became visible
 
-A peer store instance runs with `synchronous=FULL`, confirmed from the live pragma on the running
-database rather than from source or from a config default. The divergence between two store
-instances is what turns this setting from scenery into a choice. A value nobody compares is invisible.
+A peer store instance runs with `synchronous=FULL`. The divergence between two store instances is
+what turns this setting from scenery into a choice. A value nobody compares is invisible.
 
 ### The distinction this record must not blur
 
@@ -94,8 +93,9 @@ assumption so that it cannot later be cited as a finding.
 
 ### D4 — Accounting durability is gated on exposure, not on a date
 
-Before the system produces an accounting record any external party relies on, the accounting path
-is durably synced — by store-wide `FULL` or by D2's targeted sync, whichever the D3 numbers favour.
+Before the system produces an accounting record any consumer depends on for a resource-usage
+outcome, the accounting path is durably synced — by store-wide `FULL` or by D2's targeted sync,
+whichever the D3 numbers favour.
 
 The condition is tied to the arrival of accounted usage rather than to a release or a calendar date,
 because the exposure begins when a record starts determining a resource-usage outcome and not before.
@@ -104,10 +104,10 @@ because the exposure begins when a record starts determining a resource-usage ou
 
 The exposure is asymmetric, and the asymmetry is load-bearing for D1:
 
-- Audit-row loss produces a usage **undercount**, so the direction of error is under-accounting. That
-  favors the party the record concerns.
+- Audit-row loss produces a usage **undercount**, so the direction of error is under-accounting —
+  the safer direction for whoever the record concerns.
 - Quota reads over a partial history fail toward **over-serving**. That is abuse-relevant, not
-  safety-relevant, at an exposure level with no billed usage.
+  safety-relevant, while no consumer yet depends on the record.
 
 Neither observation makes loss acceptable once usage is accounted, and D4 is where that changes. They
 are recorded because a durability decision without a stated loss direction invites a later reader to
@@ -133,7 +133,8 @@ thing supporting it.
   default. A posture nobody chose is a defect regardless of which value it holds.
 - **INV-2.** Store durability and write-path handling are asserted separately. No record, test, or
   review may treat a guarantee about one as evidence about the other.
-- **INV-3.** Once external usage is billed, accounting records are durably synced at commit.
+- **INV-3.** Once any consumer depends on an accounting record for a resource-usage outcome, that
+  record is durably synced at commit.
 
 ## Consequences
 
@@ -185,4 +186,3 @@ would be as unexamined as the default it replaces.
 **Treat this as part of the write-path record.** Rejected. Merging them is exactly the conflation
 INV-2 forbids, and a single record would let a reader take a write-path guarantee as a durability
 guarantee.
-

@@ -86,43 +86,40 @@ surface:
    saturation metric exists at the queue boundary; the only contention signal
    a caller has today is the legacy mutex's timeout error.
 
-### Operational measurement
+### Illustrative failure mode
 
-An operational measurement on a production deployment exercised the batch
-surface's embed-bearing and hard-delete paths against these mechanisms. A
-single embed-creating operation completed in 0.31 seconds. Batches of 10
-embed-creating operations completed in 3.51 and 4.47 seconds on two separate
-runs, 10 of 10 operations successful both times. A batch of 15 embed-creating
-operations completed in 6.13 seconds, 15 of 15 successful, with zero writer
-timeouts recorded across any embed-bearing run. A separate batch of 36
-parallel hard-delete operations produced 7 failures out of 36, every failure
-carrying the exact signature `timed out after 5s waiting for sqlite writer
-connection`; all seven operations succeeded when retried as a 7-operation
-batch. A corroborating operational observation recorded two independently issued,
-concurrent write calls against the same database; two operations across
-those calls failed with the identical writer-timeout signature and retried
-cleanly.
+Consider a batch surface exercising the embed-bearing and hard-delete paths
+against these mechanisms. A single embed-creating operation completes
+quickly, and small batches — say, 10 embed-creating operations — complete
+cleanly with every operation succeeding. A batch of 15 embed-creating
+operations still completes cleanly, with zero writer timeouts. A larger
+batch, however — say, 36 parallel hard-delete operations — can exceed the
+legacy mutex's fixed checkout budget: a fraction of the operations fail with
+the signature `timed out after 5s waiting for sqlite writer connection`,
+while the rest succeed; the failed operations succeed cleanly when retried as
+a smaller batch. The same signature can also surface from two independently
+issued, ordinary concurrent write calls against the same database, each well
+within any reasonable per-call limit.
 
-The observed failure text matches only `ConnectionPool::writer()`'s error
-format, never `WriteQueueFull`, so the measurement establishes that the legacy
-mutex path, not the WriterTask queue, is the one exercised in this production
-deployment today. Contention is transient (retries succeed) and
-workload-dependent: embed-bearing batches survive further because embed
-inference dominates per-operation time and staggers arrival at the writer.
-The measurement does not establish a numeric failure boundary: 15 is the
-highest clean embed-bearing batch observed, not a proven threshold, and the
-36-operation batch is the first reproduction of the failure on this path, not
-a wedge (the retry succeeded).
+That failure text matches only `ConnectionPool::writer()`'s error format,
+never `WriteQueueFull`, so it is the legacy mutex path, not the WriterTask
+queue, that this failure mode exercises. The contention it illustrates is
+transient (retries succeed) and workload-dependent: embed-bearing batches
+tolerate more concurrency because embed inference dominates per-operation
+time and staggers arrival at the writer. This does not establish a numeric
+failure boundary — 15 is a conservative clean-batch size, not a proven
+threshold, and a 36-operation batch is an illustration of the failure on this
+path, not a wedge (the retry succeeds).
 
 ### Why per-batch admission alone cannot close this
 
 The fixed checkout budget in `ConnectionPool::writer()` is shared by every
 caller of that method, not allocated per batch. Two calls that are each
 individually below any per-batch operation cap can still arrive concurrently
-and jointly exceed that shared budget for whichever caller checks out last.
-The corroborating cross-call observation confirms this is not hypothetical:
-it reproduced with two ordinary, independently admitted concurrent calls. A
-control that only bounds the size of one call's batch has no visibility into
+and jointly exceed that shared budget for whichever caller checks out last,
+as the cross-call example above illustrates: two ordinary, independently
+admitted concurrent calls are enough. A control that only bounds the size of
+one call's batch has no visibility into
 what else is concurrently queued and cannot bound the aggregate.
 
 ## Decision
@@ -141,8 +138,8 @@ in Decision 3, which admits single-operation calls on the same terms.
 
 #### Exemption inventory (from ADR-067 Amendment 1, "Corrected inventory (final state at merge)")
 
-ADR-067 Amendment 1 (2026-07-06) records that Component A landed in full (PR
-#670) with all store write paths, `SqlBridge`'s writer methods, the
+ADR-067 Amendment 1 (2026-07-06) records that Component A landed in full,
+with all store write paths, `SqlBridge`'s writer methods, the
 `atomic_unit` multi-statement units, and the `execute_script_top_level`
 maintenance seam routed through the writer task, and that four paths do not
 traverse it. Those four are excluded from this ADR's governed population.
@@ -372,8 +369,8 @@ surface enforces:
 4. Callers must inspect every per-operation result; batch-level success does
    not imply every operation succeeded.
 
-The value 15 is the highest clean embed-bearing batch observed in the
-operational measurement in Context, not a proven failure boundary. The value
+The value 15 matches the conservative clean-batch size used in the
+illustrative example in Context, not a proven failure boundary. The value
 20 is the prior operational guidance carried forward, not a demonstrated
 universal safe limit. Both are deliberately conservative and temporary.
 
@@ -462,8 +459,9 @@ observing a single clean batch does not satisfy retirement.
   never accepted or may already have executed, which makes retries unsafe.
 - **Reject every operation immediately whenever queue depth is above zero,
   with no admission wait (Decision 2).** Rejected: it discards the transient,
-  self-clearing contention the operational measurement shows retries resolve
-  on their own, converting brief recoverable queuing into guaranteed failure.
+  self-clearing contention the illustrative example in Context shows retries
+  resolve on their own, converting brief recoverable queuing into guaranteed
+  failure.
 - **Wait for admission with no deadline (Decision 2).** Rejected: this is
   today's `send().await` behavior; it gives a caller no saturation signal to
   act on and no basis for a retry decision, only an indefinite suspension.
@@ -502,8 +500,8 @@ observing a single clean batch does not satisfy retirement.
   traffic routes through it by default, that fairness and saturation hold
   under concurrent load, or that production observability exists.
 - **Keep the 20 and 15 caps permanently instead of retiring them (Decision
-  5).** Rejected: the values are observations from one measurement run and
-  interim guidance, not durable capacity properties of the writer.
+  5).** Rejected: the values are a conservative illustration and interim
+  guidance, not durable capacity properties of the writer.
 
 ## Verification
 
@@ -565,4 +563,3 @@ observing a single clean batch does not satisfy retirement.
 - `crates/khive-db/src/backend.rs`: `apply_schema` acquiring the legacy writer
   path (`:147-158`); two-pool/same-file writer topology test
   (`:1377-1405`)
-

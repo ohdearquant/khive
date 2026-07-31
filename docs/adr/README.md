@@ -2,8 +2,6 @@
 
 Architecture Decision Records (ADRs) for khive v1. These are **desired-state specifications** — the contract that code must implement. ADRs use closed taxonomies and bear normative weight; changes require explicit ADR amendments.
 
-For historical context, see the untracked local `_archive/adr_v0` set. v0 ADRs are preserved for reference but are not authoritative for v1.
-
 ## ADR catalog
 
 <!-- BEGIN GENERATED ADR CATALOG -->

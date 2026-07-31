@@ -8,7 +8,7 @@
 - Depends on: ADR-127 (authenticated actor and grant primitive), the capability
   substrate this design builds on — the published `lion-core` crate (crates.io,
   Apache-2.0) plus `khive-capability`
-- Amended by: [ADR-136](ADR-136-hierarchical-subactor-identity.md), which
+- Amended by: a forthcoming amendment on hierarchical subactor identity, which
   supersedes Amendment 2's "no runtime registration API" invariant with an
   audited grant surface and delivers its per-caller differentiation in
   per-view form

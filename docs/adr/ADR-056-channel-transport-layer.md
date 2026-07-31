@@ -3177,7 +3177,7 @@ maintainer identity is never stored in the KG.
 > working without setting the new variable.
 >
 > **Disposition.** Shipped `TelegramChannel::poll` logs and drops an unauthorized update
-> rather than returning `ChannelError::UnauthorizedSender` as the paragraph below
+> rather than returning `ChannelError::UnauthorizedSender` as the paragraph above
 > describes, so that one denied update cannot abort the remaining updates in the same
 > `getUpdates` batch; the offset still advances past it once committed, so a denial is not
 > re-delivered forever. Because `poll` returns `Ok(vec![])` for both a denied batch and an

@@ -68,9 +68,7 @@ Three consequences follow that reshape how this design should be read:
    ADR-094's `ChannelPollStarted` / `CheckpointOutcomeRecorded` variants and should extend
    that taxonomy rather than invent a sibling one.
 
-### Is a subsystem warranted, or is this three small features plus metering a hosted
-
-### deployment already owns?
+### Is a subsystem warranted, or is this three small features plus metering a hosted deployment already owns?
 
 The steelman for "no subsystem": dev-machine contention is an OS problem solved with an
 advisory external lock convention for GPU work; hosted-deployment metering is an

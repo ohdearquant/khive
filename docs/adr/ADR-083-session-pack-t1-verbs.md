@@ -17,8 +17,8 @@ for numbering reasons only; it has no topical relationship to either.
 Epic `ohdearquant/khive#342` asks for the first working slice of the khive T1 session pack: an
 agent-facing surface to store, list, resume, and export session records through the local backend,
 so an agent can pick up a prior session instead of starting cold. The 2026-07-02 rescope narrows
-this to storage and retrieval only. The digester and summarization pipeline stay cloud-side, and
-tiering and billing are deferred (ADR-080 Context).
+this to storage and retrieval only. The digester and summarization pipeline, storage tiering,
+and other account-level concerns stay out of scope (ADR-080 Context).
 
 ADR-080 already decided that sessions belong in the OSS pack surface, modeled as `kind="session"`
 notes via `Pack::NOTE_KINDS` (ADR-080 §1 and §2), and that decision is shipped on `main`. ADR-080
@@ -229,10 +229,7 @@ M2 milestone (issue #350, PR #368), gained the Codex CLI source in PR #375, and 
 default.
 
 The T1 verb surface and the session mirror are additive, not a replacement. This is a deliberate
-design ruling, restated here because an earlier branch-local draft of this document stated the
-opposite in four places. Commit `28215e07` restored the mirror after a brief branch-local removal,
-specifically to correct that error; its commit message states that the two subsystems are additive,
-not a replacement. T1's four verbs read and write `kind=session` notes in the shared `notes` table.
+design ruling. T1's four verbs read and write `kind=session` notes in the shared `notes` table.
 The mirror reads transcript files on disk and writes its own three auxiliary tables. Neither
 subsystem's schema, code, or tests depend on the other, and both run in the same crate and the same
 pack instance at the same time.
@@ -245,11 +242,9 @@ adds verb handlers alongside them, not in place of them.
 
 ### 6. Deferred
 
-Out of scope for this ADR, consistent with ADR-080's Context:
-
-- The digester and summarization pipeline (cloud-side).
-- Hot, warm, and cold tiering.
-- Billing, metering, quotas, and customer or account ledgers.
+Out of scope for this ADR, consistent with ADR-080's Context: account-level concerns —
+including digestion and summarization pipelines, storage tiering, and billing, metering, or
+quota accounting — are out of scope for this pack.
 
 T1-specific deferrals:
 
@@ -320,8 +315,6 @@ repeated here. Alternatives specific to this ADR's verb-surface decision:
 - T1 cannot efficiently query by `provider_session_id` at very large scale without a later index or
   table decision.
 - Duplicate provider-session anchors are possible by design (§3); no uniqueness is enforced.
-- `session.resume` and `session.export` do not route through `runtime.core()` the way `session.store`
-  and `session.list` do, a latent inconsistency with no effect today, flagged in §4.
 
 ### Neutral
 

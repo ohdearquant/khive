@@ -257,7 +257,7 @@ that the keychain can key an ACL against — keychain ACLs are per-application, 
 are the same application.
 
 This does not disqualify the keychain; it disqualifies the keychain **as the whole answer**.
-Seat separation requires either distinct OS principals per actor, or custody in a component
+Actor separation requires either distinct OS principals per actor, or custody in a component
 that authenticates the actor by something other than its ability to open a file.
 
 ### Per-workspace agent configuration is a distribution mechanism, not a boundary
@@ -267,8 +267,7 @@ own config file carrying its own credential. This was evaluated as the second ca
 
 It is the correct **distribution** mechanism, and better than storing a literal secret,
 because the config format supports indirect references (`${VAR}`, `${VAR:-default}`) so the
-credential need not be written into the file at all. The live configuration was checked and
-carries no credential material — only pack selection and embedding model names.
+credential need not be written into the file at all.
 
 It is **not** a custody boundary, and the agent platform's own documented threat model says
 so: the working-directory constraint is a *write* boundary rather than an isolation
@@ -283,7 +282,7 @@ no actor separation available at the credential-store layer, the configuration l
 agent-platform layer.** The adversary is not exotic — an actor here can run arbitrary shell
 commands, so "can actor A read actor B's key" reduces to "can actor A run a file read."
 
-Seat separation is therefore an OS-layer problem, and the remedy is **topological rather
+Actor separation is therefore an OS-layer problem, and the remedy is **topological rather
 than architectural**. The co-located arrangement is transitional: actors are expected to move
 onto distinct hosts or remotes, at which point separation is a property of the deployment
 and needs no mechanism from this record. A distinct host is a distinct OS principal with a
@@ -307,27 +306,23 @@ can skip.
 ## Why the current arrangement is safe, and precisely what ends that
 
 The substrate does not prevent one actor from claiming another's identity. It has not needed
-to. Every actor is currently drawn from one model family, that family is unusually
-cooperative with itself, and none of them is inclined to fabricate an identity. The
-arrangement holds as a gentleman's agreement and it has held.
+to: today's actors share a single trust boundary, and none of them is inclined to fabricate
+an identity within it.
 
-**That safety is a property of the population, not of the protocol.** It is real, and it is
-not a guarantee, because nothing in the substrate produces it and nothing in the substrate
-would notice its absence.
+**That safety is a property of the current population, not of the protocol.** It is real,
+and it is not a guarantee, because nothing in the substrate produces it and nothing in the
+substrate would notice its absence.
 
-**The trigger is heterogeneity, not scale.** Ten more actors of the same family change
-nothing: they inherit the same disposition. The exposure begins at the first actor holding an
-actor identity whose model comes from a different provider, which is an expected consequence
-of optimising the model adapter. Model families differ in ways that matter here — propensity
-to overclaim, willingness to assert what was not verified, and how cooperatively they treat
-a peer from another family. The asymmetry runs both directions: our own actors' conduct
-toward a foreign peer is also not what it is toward a sibling. **A protocol must not depend
-on courtesy from either side.**
+**The trigger is a change in trust boundary, not scale.** More actors that share the same
+trust assumptions change nothing. The exposure begins the moment an actor identity is held by
+a party that cannot be presumed to share that trust — an expected consequence of a deployment
+becoming more heterogeneous over time. **A protocol must not depend on courtesy from either
+side.**
 
 So the activation condition for this record is stated as a population event rather than a
 date or an actor count:
 
-> **When the first actor identity is held by an actor outside the current model family, the
+> **When the first actor identity is held by a party outside the current trust boundary, the
 > properties in the table below stop being cushioned by disposition and must be carried by
 > mechanism.**
 
@@ -350,7 +345,8 @@ This record does not attempt to mechanise the others. It names them so the scope
 transition is not understated: **heterogeneity does not merely introduce an impostor risk,
 it withdraws the epistemic discipline the deployment currently uses to catch its own errors.**
 Deciding which of those norms must become mechanisms before the population changes is
-separate work, and it should not wait for the first foreign actor to be scheduled.
+separate work, and it should not wait for the first actor outside the trust boundary to be
+scheduled.
 
 ## Disposition table
 
@@ -522,21 +518,13 @@ case is always the forgery.
 
 ## Sequencing
 
-Nothing in this record is urgent while the deployment is single-family and co-located. Both
-conditions are load-bearing and both expire:
+Nothing in this record is urgent while every actor shares the same trust boundary. That
+condition expires by intent — broadening the population of actors is a goal, not an accident
+— so the date is chosen rather than suffered, not discovered after the fact.
 
-- **Co-location expires by topology.** Seats moving to their own hosts or remotes restores
-  the custody property with no mechanism from this record.
-- **Single-family composition expires by intent.** Optimising the model adapter toward other
-  providers is a goal, not an accident, so the date is chosen rather than suffered.
-
-These expire independently, and the second is the one that bites. A heterogeneous deployment that
-is also distributed still needs this record; a co-located single-family deployment needs almost
-none of it. **Build against the model-diversity date, not the distribution date.**
-
-The practical consequence is that the mechanism should exist before the first foreign actor
-is scheduled rather than after it appears, because the gap is discovered by the thing it was
-supposed to prevent.
+The practical consequence is that the mechanism should exist before an actor outside the
+trust boundary is scheduled rather than after it appears, because the gap is discovered by
+the thing it was supposed to prevent.
 
 Build order follows from §2. The capability kernel is already in the workspace, so the
 `DaemonBearer` class, attenuating delegation and transitive revocation are available now and

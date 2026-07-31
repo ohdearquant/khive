@@ -7,29 +7,28 @@
 
 ## Context
 
-Live incident, 2026-07-04 (#580): `~/.khive/khive.db` was 3.7GB; `khive.db-wal` had grown
-to 15.5GB (15,512,941,272 bytes); `-shm` was 30MB. The deployment was running roughly three
-concurrent implementer agents plus a warm daemon. Writes started failing with
-`sqlite: invalid data: timed out after 5s waiting for sqlite writer connection` on
-`comm.send` and other write ops. `PRAGMA wal_checkpoint(PASSIVE)` returned `0|3768965|44`:
-the writer was not busy, 3,768,965 frames sat in the WAL, and only 44 were checkpointable.
-Process census at the time: one `kkernel mcp --daemon` plus seven `kkernel mcp [--db ...]`
-stdio sessions, several live parents more than 24h old. Killing the idle stdio processes
-freed the WAL, which is the load-bearing datum this ADR's mechanism has to explain: some
-per-process, long-lived state was pinning the checkpoint boundary, and closing the
-process (not merely being idle) released it.
+A long-lived reader can pin SQLite's WAL checkpoint boundary and cause the WAL file to grow
+unbounded (#580). In one observed case, a database's WAL file grew to many times the size of
+the database itself while several long-running stdio sessions plus a warm daemon held open,
+otherwise-idle connections against it. Writes started failing with `sqlite: invalid data:
+timed out after 5s waiting for sqlite writer connection` on `comm.send` and other write ops.
+`PRAGMA wal_checkpoint(PASSIVE)` showed the writer was not busy, yet almost none of the
+accumulated WAL frames were checkpointable. Closing the long-running idle sessions — not
+merely leaving them idle — freed the WAL, which is the load-bearing datum this ADR's
+mechanism has to explain: some per-process, long-lived state was pinning the checkpoint
+boundary, and closing the process (not merely being idle) released it.
 
-`0|3768965|44` means SQLite's own checkpoint boundary, the oldest live reader's mark, had
-barely moved across 3.77M frames. `PRAGMA wal_checkpoint(PASSIVE)` never blocks and never
-reclaims past the oldest reader; it is by design incapable of doing more than this once a
-reader pins the tail. The write timeouts are a downstream symptom: as the WAL and `-shm`
-grow, `wal-index` operations degrade and both readers and the writer do more work per
-statement, but the presenting error (`timed out ... waiting for writer connection`) is a
-`khive-db` writer-mutex checkout timeout (`crates/khive-db/src/pool.rs:308-319`), not a
-SQLite-level lock. `PASSIVE` reported `busy=0`, so the writer mutex itself was not
-contended at diagnosis time; the writer was simply slow underneath a bloated WAL, or hit
-timeouts during separate bursts. Root cause is squarely "something pinned the checkpoint
-boundary," not writer contention.
+A near-zero checkpointable count means SQLite's own checkpoint boundary, the oldest live
+reader's mark, had barely moved despite the accumulated backlog. `PRAGMA
+wal_checkpoint(PASSIVE)` never blocks and never reclaims past the oldest reader; it is by
+design incapable of doing more than this once a reader pins the tail. The write timeouts are
+a downstream symptom: as the WAL and `-shm` grow, `wal-index` operations degrade and both
+readers and the writer do more work per statement, but the presenting error (`timed out ...
+waiting for writer connection`) is a `khive-db` writer-mutex checkout timeout
+(`crates/khive-db/src/pool.rs:308-319`), not a SQLite-level lock. `PASSIVE` reporting `busy=0`
+means the writer mutex itself was not contended at diagnosis time; the writer was simply slow
+underneath a bloated WAL, or hit timeouts during separate bursts. Root cause is squarely
+"something pinned the checkpoint boundary," not writer contention.
 
 ### Correction: revised Plank 1 basis (this section replaces the original draft's basis)
 
@@ -508,9 +507,9 @@ Existing, unchanged: `KHIVE_CHECKPOINT_INTERVAL_MS` (500), `KHIVE_WAL_WARN_PAGES
 3. **Kill long-lived reader sessions at the OS level** (SIGKILL `kkernel mcp` processes
    older than N hours). Rejected: violent, drops in-flight agent work, and does not fix
    the mechanism since a freshly started session can re-pin the tail immediately.
-   Long-lived stdio sessions are live Claude Code seats; killing them by policy is a
+   Long-lived stdio sessions are live Claude Code instances; killing them by policy is a
    worse user experience than bounding transaction/connection lifetime underneath them.
-   Also notable: the incident's own workaround (killing idle processes freed the WAL)
+   Also notable: the observed case's own workaround (killing idle processes freed the WAL)
    is exactly this alternative applied manually, which is precisely why it is not an
    acceptable long-term policy rather than evidence the mechanism is understood.
 4. **Route all reads through the daemon instead of per-process pools** (collapse "N
@@ -835,13 +834,11 @@ question (Inventory item 4) remains unverified precisely there.
   WAL-index directly was struck at the spec gate (2026-07-19) as
   implementation-detail-fragile; do not ship shm parsing.
 
-**Deployment-shape note.** The hosted khive-cloud topology is single-process:
-the in-process registry already sees every span there, and this amendment adds
-nothing to that path (the sidecar is a no-op with one process, and its
-enumeration output is trivially self-attributing). The multi-process shape this
-amendment instruments is local multi-seat operation — which is also the
-many-agents-one-substrate deployment khivedb ships as, so the gap is a product
-defect class, not a dev-environment quirk.
+**Deployment-shape note.** In a single-process deployment the in-process registry already
+sees every span, so this amendment adds nothing on that path (the sidecar is a no-op with one
+process, and its enumeration output is trivially self-attributing). The multi-process shape
+this amendment instruments is any deployment that runs several long-lived processes against
+one shared database, so the gap is a product defect class, not a dev-environment quirk.
 
 **Non-goals.** No enforcement changes: thresholds, TRUNCATE policy, and the
 visibility-not-reclamation posture are unchanged. No read-routing migration

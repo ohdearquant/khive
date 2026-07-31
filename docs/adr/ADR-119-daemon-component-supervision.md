@@ -450,10 +450,11 @@ ADR-027 already uses for pack self-registration:
 3. An empty inventory is the normal core state: the public binary builds, tests, and
    runs with zero external components, and the supervisor treats the empty set as a
    no-op. Core carries a test fixture component to prove the seam without shipping one.
-4. The distribution workspace imports the channel crates and implements the email poll
-   and outbox loops as daemon components under this contract. The per-cycle IMAP
-   operation deadline is the component's own obligation; stall detection and restart
-   are the supervisor's, driven by the component's heartbeat through `HealthReporter`.
+4. A downstream workspace may link additional component crates and implement components
+   — such as the email poll and outbox loops — as daemon components under this contract.
+   Each component's per-cycle operation deadline is its own obligation; stall detection
+   and restart are the supervisor's, driven by the component's heartbeat through
+   `HealthReporter`.
 
 ### Fences (additive to the base ADR)
 
@@ -611,8 +612,8 @@ and process-local health rows. Failure or terminal configuration state for
 The Phase 1 interim statement in Amendment 2 remains historical context and is
 no longer the current operator contract. A binary that does not link
 `khive-component-email`, a non-daemon invocation, or an entirely absent email
-configuration still performs no SMTP delivery; the full `khive-dist` daemon
-links both registrations.
+configuration still performs no SMTP delivery; a downstream workspace that
+links both registrations performs both.
 
 ### Verify by
 
