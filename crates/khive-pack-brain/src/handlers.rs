@@ -1905,11 +1905,9 @@ impl BrainPack {
 
     // ── brain.record_serve ────────────────────────────────────────────────
 
-    /// ADR-081 §4/§5 (#394): append one serve-ledger row per target id. Never
-    /// propagates a per-target write failure as a batch error — a serve-ledger
-    /// append is best-effort accounting, not the recall response itself, so a
-    /// single row's failure (or an exact-key duplicate, tolerated as `skipped`)
-    /// must not poison the rest of the batch.
+    /// ADR-081 §4/§5 (#394): append one serve-ledger row per target id. The
+    /// append remains best-effort accounting, but all rows from one recall
+    /// commit atomically so a failed target cannot leave a partial ledger.
     pub(crate) async fn handle_record_serve(
         &self,
         token: &NamespaceToken,
@@ -1941,39 +1939,39 @@ impl BrainPack {
         let served_at = p.served_at.unwrap_or_else(|| Utc::now().timestamp_micros());
         let sql = self.runtime.sql();
 
-        let mut written = 0usize;
-        let mut skipped = 0usize;
-        for target_id in &p.target_ids {
-            let row_id = uuid::Uuid::new_v4().to_string();
-            match crate::serve_ledger::record_serve(
-                sql.as_ref(),
-                &row_id,
-                &namespace,
-                &p.consumer_kind,
-                p.served_by_profile_id.as_deref(),
-                None,
-                None,
-                target_id,
-                &query_class,
-                &p.query_raw,
-                served_at,
-            )
-            .await
-            {
-                Ok(true) => written += 1,
-                Ok(false) => skipped += 1,
-                Err(e) => {
-                    eprintln!(
-                        "[brain] serve ledger write failed for target {target_id} (non-fatal): {e}"
-                    );
-                }
+        let rows = p
+            .target_ids
+            .iter()
+            .map(|target_id| crate::serve_ledger::ServeLedgerInsert {
+                id: uuid::Uuid::new_v4().to_string(),
+                target_id: target_id.clone(),
+            })
+            .collect::<Vec<_>>();
+        let summary = match crate::serve_ledger::record_serves(
+            sql.as_ref(),
+            &rows,
+            &namespace,
+            &p.consumer_kind,
+            p.served_by_profile_id.as_deref(),
+            None,
+            None,
+            &query_class,
+            &p.query_raw,
+            served_at,
+        )
+        .await
+        {
+            Ok(summary) => summary,
+            Err(e) => {
+                eprintln!("[brain] serve ledger batch write failed (non-fatal): {e}");
+                crate::serve_ledger::ServeLedgerBatchSummary::default()
             }
-        }
+        };
 
         Ok(json!({
             "ok": true,
-            "written": written,
-            "skipped": skipped,
+            "written": summary.written,
+            "skipped": summary.skipped,
             "query_class": query_class,
             "verb": "brain.record_serve",
         }))

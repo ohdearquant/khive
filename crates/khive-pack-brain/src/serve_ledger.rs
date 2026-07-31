@@ -77,6 +77,110 @@ fn row_int(row: &khive_storage::types::SqlRow, col: &str) -> Result<i64, Runtime
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ServeLedgerInsert {
+    pub id: String,
+    pub target_id: String,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ServeLedgerBatchSummary {
+    pub written: usize,
+    pub skipped: usize,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn serve_ledger_insert_statement(
+    row: &ServeLedgerInsert,
+    namespace: &str,
+    consumer_kind: &str,
+    served_by_profile_id: Option<&str>,
+    resolved_profile_id: Option<&str>,
+    resolved_at: Option<i64>,
+    query_class: &str,
+    query_raw: &str,
+    served_at: i64,
+) -> SqlStatement {
+    SqlStatement {
+        sql: "INSERT INTO brain_serve_ledger \
+              (id, namespace, consumer_kind, served_by_profile_id, resolved_profile_id, \
+               resolved_at, target_id, query_class, query_raw, served_at) \
+              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10) \
+              ON CONFLICT(namespace, target_id, query_class, served_at) DO NOTHING"
+            .into(),
+        params: vec![
+            SqlValue::Text(row.id.clone()),
+            SqlValue::Text(namespace.to_string()),
+            SqlValue::Text(consumer_kind.to_string()),
+            served_by_profile_id
+                .map(|s| SqlValue::Text(s.to_string()))
+                .unwrap_or(SqlValue::Null),
+            resolved_profile_id
+                .map(|s| SqlValue::Text(s.to_string()))
+                .unwrap_or(SqlValue::Null),
+            resolved_at.map(SqlValue::Integer).unwrap_or(SqlValue::Null),
+            SqlValue::Text(row.target_id.clone()),
+            SqlValue::Text(query_class.to_string()),
+            SqlValue::Text(query_raw.to_string()),
+            SqlValue::Integer(served_at),
+        ],
+        label: Some("brain_serve_ledger_insert".into()),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn record_serves(
+    sql: &dyn SqlAccess,
+    rows: &[ServeLedgerInsert],
+    namespace: &str,
+    consumer_kind: &str,
+    served_by_profile_id: Option<&str>,
+    resolved_profile_id: Option<&str>,
+    resolved_at: Option<i64>,
+    query_class: &str,
+    query_raw: &str,
+    served_at: i64,
+) -> Result<ServeLedgerBatchSummary, RuntimeError> {
+    if rows.is_empty() {
+        return Ok(ServeLedgerBatchSummary::default());
+    }
+
+    let statements = rows
+        .iter()
+        .map(|row| {
+            serve_ledger_insert_statement(
+                row,
+                namespace,
+                consumer_kind,
+                served_by_profile_id,
+                resolved_profile_id,
+                resolved_at,
+                query_class,
+                query_raw,
+                served_at,
+            )
+        })
+        .collect();
+    let mut writer = sql.writer().await.map_err(|e| sql_err("writer", e))?;
+    let affected = writer
+        .execute_batch(statements)
+        .await
+        .map_err(|e| sql_err("insert serve batch", e))?;
+    let written = usize::try_from(affected)
+        .map_err(|_| sql_err("insert serve batch", "affected row count exceeds usize"))?;
+    let skipped = rows.len().checked_sub(written).ok_or_else(|| {
+        sql_err(
+            "insert serve batch",
+            format!(
+                "affected row count {written} exceeds input count {}",
+                rows.len()
+            ),
+        )
+    })?;
+
+    Ok(ServeLedgerBatchSummary { written, skipped })
+}
+
 /// Record a new serve row (the ADR-081 §4 write side). Returns `Ok(true)` when
 /// the row was written, `Ok(false)` when an exact-key duplicate was tolerated
 /// (the natural key `(namespace, target_id, query_class, served_at)` already
@@ -95,77 +199,24 @@ pub async fn record_serve(
     query_raw: &str,
     served_at: i64,
 ) -> Result<bool, RuntimeError> {
-    let mut writer = sql.writer().await.map_err(|e| sql_err("writer", e))?;
-    let result = writer
-        .execute(SqlStatement {
-            sql: "INSERT INTO brain_serve_ledger \
-                  (id, namespace, consumer_kind, served_by_profile_id, resolved_profile_id, \
-                   resolved_at, target_id, query_class, query_raw, served_at) \
-                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)"
-                .into(),
-            params: vec![
-                SqlValue::Text(id.to_string()),
-                SqlValue::Text(namespace.to_string()),
-                SqlValue::Text(consumer_kind.to_string()),
-                served_by_profile_id
-                    .map(|s| SqlValue::Text(s.to_string()))
-                    .unwrap_or(SqlValue::Null),
-                resolved_profile_id
-                    .map(|s| SqlValue::Text(s.to_string()))
-                    .unwrap_or(SqlValue::Null),
-                resolved_at.map(SqlValue::Integer).unwrap_or(SqlValue::Null),
-                SqlValue::Text(target_id.to_string()),
-                SqlValue::Text(query_class.to_string()),
-                SqlValue::Text(query_raw.to_string()),
-                SqlValue::Integer(served_at),
-            ],
-            label: Some("brain_serve_ledger_insert".into()),
-        })
-        .await;
-    match result {
-        Ok(_) => Ok(true),
-        Err(e) if e.is_unique_constraint_violation() => {
-            // PR #583: `is_unique_constraint_violation` fires
-            // for ANY unique-index collision on this table — the intended
-            // natural key `(namespace, target_id, query_class, served_at)`,
-            // but also the `id TEXT PRIMARY KEY` column and any future unique
-            // index. Confirm the natural-key row actually exists before
-            // reporting a tolerated duplicate; otherwise this would mask a
-            // genuine `id` collision (or other future constraint) as a no-op.
-            if natural_key_row_exists(sql, namespace, target_id, query_class, served_at).await? {
-                Ok(false)
-            } else {
-                Err(sql_err("insert serve row", e))
-            }
-        }
-        Err(e) => Err(sql_err("insert serve row", e)),
-    }
-}
-
-async fn natural_key_row_exists(
-    sql: &dyn SqlAccess,
-    namespace: &str,
-    target_id: &str,
-    query_class: &str,
-    served_at: i64,
-) -> Result<bool, RuntimeError> {
-    let mut reader = sql.reader().await.map_err(|e| sql_err("reader", e))?;
-    let row = reader
-        .query_row(SqlStatement {
-            sql: "SELECT id FROM brain_serve_ledger \
-                  WHERE namespace = ?1 AND target_id = ?2 AND query_class = ?3 AND served_at = ?4"
-                .into(),
-            params: vec![
-                SqlValue::Text(namespace.to_string()),
-                SqlValue::Text(target_id.to_string()),
-                SqlValue::Text(query_class.to_string()),
-                SqlValue::Integer(served_at),
-            ],
-            label: Some("brain_serve_ledger_natural_key_check".into()),
-        })
-        .await
-        .map_err(|e| sql_err("check natural key", e))?;
-    Ok(row.is_some())
+    let rows = [ServeLedgerInsert {
+        id: id.to_string(),
+        target_id: target_id.to_string(),
+    }];
+    let summary = record_serves(
+        sql,
+        &rows,
+        namespace,
+        consumer_kind,
+        served_by_profile_id,
+        resolved_profile_id,
+        resolved_at,
+        query_class,
+        query_raw,
+        served_at,
+    )
+    .await?;
+    Ok(summary.written == 1)
 }
 
 /// Fetch a serve ledger row by id.
@@ -276,14 +327,290 @@ pub async fn resolve(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
 
-    /// Fork C slice 2: proves `record_serve`'s single-row INSERT — issued via
-    /// `sql.writer().execute(..)` — is actually enqueued on the pool's shared
-    /// `WriterTaskHandle` channel when the write queue is enabled. This is
-    /// the `SqliteWriter::execute` fix, which routes through the
-    /// writer task like `execute_batch` already did): `record_serve` itself
-    /// needed zero code changes, but this test proves the fix actually
-    /// reaches this call site rather than asserting it by inspection alone.
+    struct CapturingSqlAccess {
+        writer_acquisitions: Arc<AtomicUsize>,
+        execute_batch_calls: Arc<AtomicUsize>,
+        batches: Arc<Mutex<Vec<Vec<SqlStatement>>>>,
+        affected: u64,
+    }
+
+    impl CapturingSqlAccess {
+        fn new(affected: u64) -> Self {
+            Self {
+                writer_acquisitions: Arc::new(AtomicUsize::new(0)),
+                execute_batch_calls: Arc::new(AtomicUsize::new(0)),
+                batches: Arc::new(Mutex::new(Vec::new())),
+                affected,
+            }
+        }
+    }
+
+    struct CapturingWriter {
+        execute_batch_calls: Arc<AtomicUsize>,
+        batches: Arc<Mutex<Vec<Vec<SqlStatement>>>>,
+        affected: u64,
+    }
+
+    #[async_trait::async_trait]
+    impl khive_storage::SqlReader for CapturingWriter {
+        async fn query_row(
+            &mut self,
+            _statement: SqlStatement,
+        ) -> khive_storage::StorageResult<Option<khive_storage::SqlRow>> {
+            panic!("record_serves must not issue reads")
+        }
+
+        async fn query_all(
+            &mut self,
+            _statement: SqlStatement,
+        ) -> khive_storage::StorageResult<Vec<khive_storage::SqlRow>> {
+            panic!("record_serves must not issue reads")
+        }
+
+        async fn query_scalar(
+            &mut self,
+            _statement: SqlStatement,
+        ) -> khive_storage::StorageResult<Option<SqlValue>> {
+            panic!("record_serves must not issue reads")
+        }
+
+        async fn explain(
+            &mut self,
+            _statement: SqlStatement,
+        ) -> khive_storage::StorageResult<Vec<khive_storage::SqlRow>> {
+            panic!("record_serves must not issue reads")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl khive_storage::SqlWriter for CapturingWriter {
+        async fn execute(&mut self, _statement: SqlStatement) -> khive_storage::StorageResult<u64> {
+            panic!("record_serves must use one execute_batch call")
+        }
+
+        async fn execute_batch(
+            &mut self,
+            statements: Vec<SqlStatement>,
+        ) -> khive_storage::StorageResult<u64> {
+            self.execute_batch_calls.fetch_add(1, Ordering::SeqCst);
+            self.batches.lock().unwrap().push(statements);
+            Ok(self.affected)
+        }
+
+        async fn execute_script(&mut self, _script: String) -> khive_storage::StorageResult<()> {
+            panic!("record_serves must not execute raw scripts")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl SqlAccess for CapturingSqlAccess {
+        async fn reader(&self) -> khive_storage::StorageResult<Box<dyn khive_storage::SqlReader>> {
+            panic!("record_serves must not acquire a reader")
+        }
+
+        async fn writer(&self) -> khive_storage::StorageResult<Box<dyn khive_storage::SqlWriter>> {
+            self.writer_acquisitions.fetch_add(1, Ordering::SeqCst);
+            Ok(Box::new(CapturingWriter {
+                execute_batch_calls: Arc::clone(&self.execute_batch_calls),
+                batches: Arc::clone(&self.batches),
+                affected: self.affected,
+            }))
+        }
+
+        async fn atomic_unit(
+            &self,
+            _op: khive_storage::AtomicUnitOp,
+        ) -> khive_storage::StorageResult<Box<dyn std::any::Any + Send>> {
+            panic!("record_serves must use the SqlWriter batch seam")
+        }
+    }
+
+    fn text_param(statement: &SqlStatement, index: usize) -> &str {
+        match &statement.params[index] {
+            SqlValue::Text(value) => value,
+            other => panic!("parameter {index} must be text, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn record_serves_empty_input_does_not_acquire_writer() {
+        let sql = CapturingSqlAccess::new(0);
+        let summary = record_serves(
+            &sql,
+            &[],
+            "local",
+            "recall",
+            Some("profile-a"),
+            None,
+            None,
+            "class-a",
+            "raw query",
+            7,
+        )
+        .await
+        .expect("empty batch must succeed");
+
+        assert_eq!(summary, ServeLedgerBatchSummary::default());
+        assert_eq!(sql.writer_acquisitions.load(Ordering::SeqCst), 0);
+        assert_eq!(sql.execute_batch_calls.load(Ordering::SeqCst), 0);
+        assert!(sql.batches.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn record_serves_uses_one_ordered_batch_and_affected_count() {
+        let sql = CapturingSqlAccess::new(2);
+        let rows = [
+            ServeLedgerInsert {
+                id: "row-a".into(),
+                target_id: "target-a".into(),
+            },
+            ServeLedgerInsert {
+                id: "row-b".into(),
+                target_id: "target-b".into(),
+            },
+            ServeLedgerInsert {
+                id: "row-c".into(),
+                target_id: "target-c".into(),
+            },
+        ];
+
+        let summary = record_serves(
+            &sql,
+            &rows,
+            "namespace-a",
+            "recall",
+            Some("served-profile"),
+            Some("resolved-profile"),
+            Some(123),
+            "class-a",
+            "Literal Raw Query",
+            456,
+        )
+        .await
+        .expect("captured batch must succeed");
+
+        assert_eq!(
+            summary,
+            ServeLedgerBatchSummary {
+                written: 2,
+                skipped: 1,
+            }
+        );
+        assert_eq!(sql.writer_acquisitions.load(Ordering::SeqCst), 1);
+        assert_eq!(sql.execute_batch_calls.load(Ordering::SeqCst), 1);
+
+        let batches = sql.batches.lock().unwrap();
+        assert_eq!(batches.len(), 1);
+        let statements = &batches[0];
+        assert_eq!(statements.len(), rows.len());
+        for (statement, row) in statements.iter().zip(rows.iter()) {
+            assert!(statement
+                .sql
+                .ends_with("ON CONFLICT(namespace, target_id, query_class, served_at) DO NOTHING"));
+            assert_eq!(
+                statement.label.as_deref(),
+                Some("brain_serve_ledger_insert")
+            );
+            assert_eq!(text_param(statement, 0), row.id.as_str());
+            assert_eq!(text_param(statement, 1), "namespace-a");
+            assert_eq!(text_param(statement, 2), "recall");
+            assert_eq!(text_param(statement, 3), "served-profile");
+            assert_eq!(text_param(statement, 4), "resolved-profile");
+            assert!(matches!(
+                statement.params.get(5),
+                Some(SqlValue::Integer(123))
+            ));
+            assert_eq!(text_param(statement, 6), row.target_id.as_str());
+            assert_eq!(text_param(statement, 7), "class-a");
+            assert_eq!(text_param(statement, 8), "Literal Raw Query");
+            assert!(matches!(
+                statement.params.get(9),
+                Some(SqlValue::Integer(456))
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn record_serves_rolls_back_earlier_rows_on_late_id_collision() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("serve-ledger-batch-rollback.db");
+        let pool = Arc::new(
+            khive_db::ConnectionPool::new(khive_db::PoolConfig {
+                path: Some(db_path),
+                write_queue_enabled: false,
+                ..khive_db::PoolConfig::default()
+            })
+            .expect("pool"),
+        );
+        {
+            let mut writer = pool.writer().expect("writer");
+            khive_db::run_migrations(writer.conn_mut()).expect("migrations");
+        }
+        let sql: Arc<dyn SqlAccess> = Arc::new(khive_db::SqlBridge::new(Arc::clone(&pool), true));
+
+        record_serve(
+            sql.as_ref(),
+            "colliding-id",
+            "local",
+            "recall",
+            None,
+            None,
+            None,
+            "preexisting-target",
+            "preexisting-class",
+            "preexisting query",
+            1,
+        )
+        .await
+        .expect("precondition row must be inserted");
+
+        let rows = [
+            ServeLedgerInsert {
+                id: "must-roll-back".into(),
+                target_id: "fresh-target".into(),
+            },
+            ServeLedgerInsert {
+                id: "colliding-id".into(),
+                target_id: "different-target".into(),
+            },
+        ];
+        record_serves(
+            sql.as_ref(),
+            &rows,
+            "local",
+            "recall",
+            None,
+            None,
+            None,
+            "batch-class",
+            "batch query",
+            2,
+        )
+        .await
+        .expect_err("late primary-key collision must fail the whole batch");
+
+        assert!(
+            get_serve_row(sql.as_ref(), "must-roll-back")
+                .await
+                .expect("rollback probe")
+                .is_none(),
+            "the earlier statement must roll back when a later ID collides"
+        );
+        assert!(
+            get_serve_row(sql.as_ref(), "colliding-id")
+                .await
+                .expect("precondition probe")
+                .is_some(),
+            "the pre-existing colliding row must remain"
+        );
+    }
+
+    /// Fork C slice 2: proves `record_serve`'s single-row compatibility batch
+    /// is actually enqueued on the pool's shared `WriterTaskHandle` channel
+    /// when the write queue is enabled.
     ///
     /// Deliberately NOT a wall-clock/occupier-timing test — see the sibling
     /// `fold_gate::tests::fold_gate_apply_routes_through_writer_task_when_flag_enabled`
@@ -379,7 +706,7 @@ mod tests {
             saw_enqueued,
             "record_serve's write request never appeared in the writer task's \
              channel while the occupier held the single drain slot — \
-             SqliteWriter::execute is not routing this single-row write \
+             SqliteWriter::execute_batch is not routing this single-row write \
              through the shared writer task"
         );
 
