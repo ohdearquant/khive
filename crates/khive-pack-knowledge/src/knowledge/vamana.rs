@@ -568,7 +568,7 @@ impl AnnBridge {
         // Step 3: write the id-map sidecar atomically (tmp rename), bound to the
         // commit-record digest so any segment/sidecar pairing from different
         // saves is self-detecting at load time.
-        write_external_ids_sidecar(dir, &digest, &self.id_map)
+        write_external_ids_sidecar(dir, &digest, &self.id_map).map_err(|e| e.to_string())
     }
 
     /// Load a bridge from a segment directory previously written by

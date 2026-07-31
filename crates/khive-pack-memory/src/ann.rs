@@ -471,7 +471,7 @@ impl AnnBridge {
             .ok_or_else(|| {
                 "save_atomic succeeded but metadata.bin is absent (torn commit)".to_string()
             })?;
-        write_external_ids_sidecar(dir, &digest, &self.id_map)
+        write_external_ids_sidecar(dir, &digest, &self.id_map).map_err(|e| e.to_string())
     }
 
     /// Load a bridge from a segment directory written by `save_atomic`. Any
