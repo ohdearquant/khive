@@ -1,14 +1,11 @@
 //! ComposePipeline: score candidates then pack to budget.
 
-use crate::anchor::{Anchor, AnchorGraph};
 use crate::error::FoldError;
 use crate::objective::{Objective, ObjectiveContext};
 use crate::selector::{Selector, SelectorInput, SelectorOutput, SelectorWeights};
 
 /// Pipeline that scores candidates with an objective then packs to budget via a selector.
 pub struct ComposePipeline<T> {
-    /// Graph anchor used for causal provenance traversal before scoring.
-    pub anchor: Box<dyn Anchor>,
     /// Objective that assigns scores to each candidate.
     pub objective: Box<dyn Objective<T>>,
     /// Selector that packs the scored candidates under a budget.
@@ -16,17 +13,20 @@ pub struct ComposePipeline<T> {
 }
 
 impl<T: Clone + Send + Sync + 'static> ComposePipeline<T> {
-    /// Score candidates with the objective, then pack under budget with the selector.
+    /// Score at most `context.max_candidates` inputs in caller order, then pack under budget.
     pub fn execute(
         &self,
-        _graph: &AnchorGraph,
         candidates: Vec<SelectorInput<T>>,
         budget: usize,
         weights: &SelectorWeights,
         context: &ObjectiveContext,
     ) -> Result<SelectorOutput<T>, FoldError> {
-        let mut scored = Vec::with_capacity(candidates.len());
-        for mut candidate in candidates {
+        let considered = context
+            .max_candidates
+            .unwrap_or(candidates.len())
+            .min(candidates.len());
+        let mut scored = Vec::with_capacity(considered);
+        for mut candidate in candidates.into_iter().take(considered) {
             let score = self.objective.score(&candidate.content, context);
             if !self.objective.passes_score(score, context) {
                 continue;
@@ -103,7 +103,6 @@ mod tests {
 
     fn pipeline() -> ComposePipeline<(f64, f64)> {
         ComposePipeline {
-            anchor: Box::new(crate::anchor::BfsAnchor),
             objective: Box::new(TupleObjective),
             selector: Box::new(crate::selector::GreedySelector),
         }
@@ -115,7 +114,6 @@ mod tests {
         let candidates = vec![input("a", 10.0, 0.1), input("b", 2.0, 1.0)];
         let out = pipeline
             .execute(
-                &AnchorGraph::new(),
                 candidates,
                 1,
                 &SelectorWeights::default(),
@@ -132,15 +130,22 @@ mod tests {
         let candidates = vec![input("a", 1.0, 1.0)];
         let context = ObjectiveContext::new().with_min_score(2.0);
         let out = pipeline
-            .execute(
-                &AnchorGraph::new(),
-                candidates,
-                10,
-                &SelectorWeights::default(),
-                &context,
-            )
+            .execute(candidates, 10, &SelectorWeights::default(), &context)
             .unwrap();
         assert!(out.selected.is_empty());
+    }
+
+    #[test]
+    fn compose_pipeline_respects_max_candidates_before_scoring() {
+        let pipeline = pipeline();
+        let candidates = vec![input("first", 1.0, 1.0), input("outside-limit", 10.0, 1.0)];
+        let context = ObjectiveContext::new().with_max_candidates(1);
+        let out = pipeline
+            .execute(candidates, 10, &SelectorWeights::default(), &context)
+            .unwrap();
+
+        assert_eq!(out.selected.len(), 1);
+        assert_eq!(out.selected[0].id, "first");
     }
 
     #[test]
@@ -155,7 +160,6 @@ mod tests {
         let candidates = vec![input("a", 1.0, 1.0), input("b", 1.000_000_04, 1.0)];
         let out = pipeline
             .execute(
-                &AnchorGraph::new(),
                 candidates,
                 1,
                 &SelectorWeights::default(),
@@ -174,7 +178,6 @@ mod tests {
         let candidates = vec![input("z", 0.0, 1.0), input("a", 0.0, 1.0)];
         let out = pipeline
             .execute(
-                &AnchorGraph::new(),
                 candidates,
                 10,
                 &SelectorWeights::default(),
@@ -209,13 +212,7 @@ mod tests {
             ..Default::default()
         };
         let out = pipeline
-            .execute(
-                &AnchorGraph::new(),
-                candidates,
-                1,
-                &weights,
-                &ObjectiveContext::new(),
-            )
+            .execute(candidates, 1, &weights, &ObjectiveContext::new())
             .unwrap();
         assert_eq!(out.selected.len(), 1);
         assert_eq!(
@@ -230,7 +227,6 @@ mod tests {
         let candidates = vec![input("a", f64::MAX, 1.0)];
         let err = pipeline
             .execute(
-                &AnchorGraph::new(),
                 candidates,
                 10,
                 &SelectorWeights::default(),

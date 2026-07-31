@@ -432,13 +432,13 @@ replace `WeightedObjective` without rewriting scoring logic. `PriorityObjective`
 fallback) and `ConsensusObjective` (geometric mean) are both plausible alternatives for
 specific use cases. One formula cannot be swapped without rewriting.
 
-### Why `NoAnchor` rather than graph-proximate anchoring
+### Why recall does not perform graph-proximate anchoring
 
 Recall is unanchored in v1: it searches all memory notes in the namespace without bias toward
 graph-proximate notes. Graph-proximate anchoring (bias results toward memories connected to
-currently active entities) is a valid v2 extension — the `ComposePipeline`'s `anchor` slot
-exists precisely for this. The `NoAnchor` implementation is a deliberate placeholder, not an
-oversight.
+currently active entities) is a valid v2 extension. It must use ADR-024's independent `Anchor`
+primitive to materialize graph-derived candidate features before objective scoring; the
+`ComposePipeline` itself does not perform traversal.
 
 ### Why Brain integration is one-way
 
@@ -521,8 +521,8 @@ Rejected.
    get different recall tuning) or global to the pack? The current design is global; per-
    namespace config is a natural extension once the multi-namespace use case is established.
 3. **Anchored recall.** Should `recall` accept an anchor set (related entities) to bias
-   results toward graph-proximate memories? The `ComposePipeline.anchor` slot exists for
-   exactly this. Deferred to when a concrete use case emerges.
+   results toward graph-proximate memories? ADR-024's independent `Anchor` primitive can
+   materialize those features before scoring. Deferred to when a concrete use case emerges.
 4. **memory.recall_train.** When brain feedback has accumulated sufficient labeled examples,
    should the pack support a `memory.recall_train` handler that runs gradient-free
    optimization over the weight space? The infrastructure is in place; the training signal
