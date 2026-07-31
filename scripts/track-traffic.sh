@@ -32,8 +32,8 @@ echo "$views_json" | jq -e 'has("views")' >/dev/null || {
 
 mkdir -p "$(dirname "$LEDGER")"
 [ -f "$LEDGER" ] || echo '{"days":{}}' > "$LEDGER"
-jq -e 'has("days")' "$LEDGER" >/dev/null || {
-    echo "ERROR: existing ledger $LEDGER is malformed (no .days key); refusing to overwrite" >&2
+jq -e 'type == "object" and (.days | type == "object")' "$LEDGER" >/dev/null || {
+    echo "ERROR: existing ledger $LEDGER is malformed (.days must be an object); refusing to overwrite" >&2
     exit 1
 }
 
@@ -64,6 +64,14 @@ merged=$(jq -n \
             unique_views_14d: $views.uniques
         }
     }')
+
+# Byte-stable when nothing changed: if the merged day series equals the
+# existing one, leave the file untouched (last_snapshot keeps its old
+# taken_at) so downstream blob comparison sees no delta.
+if jq -e --argjson new "$(echo "$merged" | jq .days)" '.days == $new' "$LEDGER" >/dev/null; then
+    echo "ledger: $LEDGER — day series unchanged; snapshot not refreshed"
+    exit 0
+fi
 
 echo "$merged" | jq . > "$LEDGER"
 
