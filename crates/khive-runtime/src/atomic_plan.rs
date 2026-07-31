@@ -425,7 +425,11 @@ impl GtdTransitionPlan {
     /// Callers outside this crate (e.g. the atomic-apply layer wiring
     /// `gtd.transition` into a multi-op unit) cannot construct the struct
     /// literal directly since its fields are crate-private.
-    pub fn new(task_id: Uuid, statements: Vec<PlanStatement>, post_commit: PostCommitEffect) -> Self {
+    pub fn new(
+        task_id: Uuid,
+        statements: Vec<PlanStatement>,
+        post_commit: PostCommitEffect,
+    ) -> Self {
         Self {
             task_id,
             statements,
@@ -469,7 +473,11 @@ impl GtdCompletePlan {
     /// Callers outside this crate (e.g. the atomic-apply layer wiring
     /// `gtd.complete` into a multi-op unit) cannot construct the struct
     /// literal directly since its fields are crate-private.
-    pub fn new(task_id: Uuid, statements: Vec<PlanStatement>, post_commit: PostCommitEffect) -> Self {
+    pub fn new(
+        task_id: Uuid,
+        statements: Vec<PlanStatement>,
+        post_commit: PostCommitEffect,
+    ) -> Self {
         Self {
             task_id,
             statements,
