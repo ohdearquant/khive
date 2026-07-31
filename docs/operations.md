@@ -553,6 +553,33 @@ read-only: it inspects `_schema_migrations`' `MAX(version)` directly rather than
 binary knows, or corresponding to a pre-consolidated-baseline version) into a nonzero exit via
 `anyhow::bail!` (`main.rs:433-445`).
 
+### `exec --save-file` / `exec --ops-file`: daemon coexistence
+
+When they execute operations, both file-oriented `exec` modes deliberately build a local runtime
+instead of forwarding through the warm daemon (`--ops-file --dry-run` stops before runtime
+construction). `--save-file` needs a trusted local result sink; `--ops-file` needs bulk execution,
+including optional whole-file atomic behavior, that the daemon protocol does not expose. If a live
+daemon has the same database open, the command and daemon are independent SQLite clients.
+`KHIVE_WRITE_QUEUE=1` does not combine them into one writer because that queue is process-local.
+
+SQLite serializes their writes through the WAL write lock. Each process waits for
+`KHIVE_BUSY_TIMEOUT_SECS` (30 seconds by default) and then reports `database is locked` if the
+other writer still owns the lock. The CLI does not retry automatically. Configure the environment
+for the daemon and the CLI separately if changing the timeout; setting it for one process does not
+change the other.
+
+For non-atomic `--ops-file`, a busy op can fail after earlier ops committed. Inspect the printed
+failure list and use `--strict` when any failed op must produce a non-zero exit. For
+`--ops-file --atomic`, the whole commit pass holds one bounded write transaction; run large units
+against an idle daemon or in a maintenance window. A plan-level rollback prints
+`atomic.committed=false` but currently exits zero even with `--strict`; inspect that field rather
+than relying on process status. Admissibility, prepare, and atomic-unit seam errors instead exit
+non-zero before printing an atomic result envelope. For `--save-file`, stdout is a manifest whose
+`summary` carries failure counts; the saved JSONL rows carry the per-op error details. Retry only
+after checking the complete result, and only when the operations are known to be idempotent. The
+normative rationale and mode-by-mode exit contract are in
+[the kkernel design note](../crates/kkernel/docs/design.md#exec-daemon-bypass-second-writer-contract-548-adr-067-adr-099).
+
 ### `exec --pending-events`: cron drain for scheduled events
 
 ```bash
