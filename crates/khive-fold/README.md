@@ -64,7 +64,8 @@ N scored, sized candidates into a `SelectorOutput<T>` that fits `budget`.
 `category_weights` multipliers, then packs by effective score (score plus an
 optional `epistemic_weight * information_gain` term) with deterministic
 size-then-ID tie-breaking; `diversity_bias > 0` switches to a pick-best-remaining
-loop that penalizes repeated categories.
+loop that penalizes repeated categories. This priority-ordered greedy strategy fits the
+budget deterministically but does not promise a knapsack optimum or approximation ratio.
 
 ## Checkpoint — durable fold snapshots
 

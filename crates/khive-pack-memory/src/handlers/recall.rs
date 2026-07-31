@@ -4004,7 +4004,6 @@ mod tests {
     #[tokio::test]
     #[serial(background_tasks)]
     async fn ns733_recall_ann_overfetch_retry_loop_respects_effective_namespace() {
-        // Poll only through the bounded stale-serve window; never retry corpus setup.
         let rt = KhiveRuntime::memory().expect("in-memory runtime");
         rt.register_embedder(FixedVecProvider {
             model_name: NS733_ANN_MODEL.to_string(),
@@ -4013,7 +4012,9 @@ mod tests {
 
         let mut builder = VerbRegistryBuilder::new();
         builder.register(KgPack::new(rt.clone()));
-        builder.register(MemoryPack::new(rt.clone()));
+        let memory_pack = MemoryPack::new(rt.clone());
+        let ann = memory_pack.ann_for_test();
+        builder.register(memory_pack);
         let registry = builder.build().expect("registry");
 
         // Omitting the model fans out to the sole registered custom provider.
@@ -4046,6 +4047,30 @@ mod tests {
             .parse::<Uuid>()
             .expect("valid uuid");
 
+        // Establish readiness from this test's own ANN state rather than inferring it
+        // from a successful recall. The fresh-tail leg can surface the newest target
+        // while the installed bridge is still stale, which would make the following
+        // one-round assertion observe a different engine state under load. The
+        // single-flight ensure installs the complete seeded generation, and the idle
+        // barrier drains any fire-and-forget warm started by `memory.remember`.
+        let ann_key = crate::ann::AnnKey::from_token(NS733_ANN_MODEL);
+        let local_token = rt
+            .authorize(Namespace::local())
+            .expect("authorize local for deterministic ANN warm");
+        crate::ann::ensure_ann_for_model(&rt, &local_token, &ann, NS733_ANN_MODEL)
+            .await
+            .expect("synchronously warm the complete ns733 corpus");
+        crate::ann::wait_until_warm_idle(&ann, &ann_key).await;
+        assert!(
+            crate::ann::is_current(&ann, &ann_key).await,
+            "test-owned ANN must cover the final seeded generation"
+        );
+        assert_eq!(
+            crate::ann::index_namespace_set(&ann, &ann_key).await,
+            Some(HashSet::from(["local".to_string(), "bench-a".to_string()])),
+            "the installed graph must contain both namespaces before overfetch assertions"
+        );
+
         let base_params = serde_json::json!({
             "query": NS733_QUERY,
             "namespace": "bench-a",
@@ -4055,17 +4080,11 @@ mod tests {
             "limit": 1,
         });
 
-        // Case 1: default widening — the target must be found, and only the
-        // target. Poll (#791) until the background warm settles the target
-        // into the ANN cache.
-        let widened_result = recall_until(&registry, "memory.recall", base_params.clone(), |r| {
-            r.as_array().is_some_and(|hits| {
-                hits.len() == 1
-                    && hits[0]["id"].as_str().and_then(|s| s.parse::<Uuid>().ok())
-                        == Some(target_id)
-            })
-        })
-        .await;
+        // Case 1: default widening — the target must be found, and only the target.
+        let widened_result = registry
+            .dispatch("memory.recall", base_params.clone())
+            .await
+            .expect("memory.recall with default widening");
         let widened_hits = widened_result.as_array().expect("bare array result");
         assert_eq!(
             widened_hits.len(),

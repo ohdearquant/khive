@@ -15,6 +15,17 @@ configuration should use `try_new`. Defaults are `k1 = 1.2` and
 `Arc<dyn Tokenizer>`. Changing the tokenizer later affects only future indexing: existing postings
 are not re-tokenized.
 
+## Tokenizer changes and rebuilds
+
+When tokenizer semantics change, call `clear()` and repopulate the index from source text, or build
+a fresh index. Re-indexing the same IDs in place is not a complete rebuild: when replacement text
+has no indexable terms, `index_document` deliberately preserves the existing document.
+
+This applies to persisted indexes created before the `khive-text` tokenizer adoption with
+`SimpleTokenizer::new(_, 0)`. That older path could store an empty-string posting for a
+punctuation-only span; the current tokenizer always drops empty normalized terms. Indexes using the
+default minimum of one are unaffected by this specific change.
+
 ## `index_document`
 
 Indexing tokenizes and builds the replacement term-frequency map before mutating the index. Empty

@@ -52,6 +52,7 @@ sha2 = { workspace = true }
 lattice-embed = { workspace = true }
 
 [dev-dependencies]
+libc = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 serial_test = { workspace = true }
 rmcp = { workspace = true, features = ["client", "transport-child-process"] }

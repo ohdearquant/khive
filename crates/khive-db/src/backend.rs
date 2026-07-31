@@ -124,10 +124,10 @@ impl StorageBackend {
 
     /// Apply pack-auxiliary DDL statements.
     ///
-    /// Executes each DDL statement idempotently via `execute_batch`. Each
-    /// statement MUST be self-contained and use `CREATE TABLE IF NOT EXISTS`
-    /// (or equivalent idempotent DDL) so that calling this method more than
-    /// once does not fail.
+    /// Executes the full plan in one transaction, applying each DDL statement
+    /// idempotently via `execute_batch`. Each statement MUST be self-contained
+    /// and use `CREATE TABLE IF NOT EXISTS` (or equivalent idempotent DDL) so
+    /// that calling this method more than once does not fail.
     ///
     /// Pack auxiliary tables are NOT tracked in `_schema_versions` — they are
     /// non-versioned. Use `apply_schema` with a `ServiceSchemaPlan` when version
@@ -143,10 +143,12 @@ impl StorageBackend {
         statements: &[&'static str],
     ) -> Result<(), SqliteError> {
         let writer = self.pool.try_writer()?;
-        for &stmt in statements {
-            writer.conn().execute_batch(stmt)?;
-        }
-        Ok(())
+        writer.transaction(|conn| {
+            for &stmt in statements {
+                conn.execute_batch(stmt)?;
+            }
+            Ok(())
+        })
     }
 
     /// Get an EntityStore. Applies the entities DDL if not already present.
@@ -1165,6 +1167,59 @@ mod tests {
             )
             .unwrap();
         assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn pack_ddl_plan_rolls_back_all_statements_on_failure() {
+        let backend = StorageBackend::memory().unwrap();
+        let error = backend
+            .apply_pack_ddl_statements(&[
+                "CREATE TABLE IF NOT EXISTS pack_schema_first (id INTEGER PRIMARY KEY)",
+                "CREATE INDEX IF NOT EXISTS pack_schema_second ON pack_schema_missing(id)",
+            ])
+            .unwrap_err();
+
+        assert!(
+            error.to_string().contains("pack_schema_missing"),
+            "schema-plan error must retain the failing SQLite diagnostic: {error}"
+        );
+
+        let reader = backend.pool().reader().unwrap();
+        let visible_objects: i64 = reader
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master \
+                 WHERE name IN ('pack_schema_first', 'pack_schema_second')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(visible_objects, 0);
+    }
+
+    #[test]
+    fn pack_ddl_plan_applies_all_statements_idempotently() {
+        const PLAN: &[&str] = &[
+            "CREATE TABLE IF NOT EXISTS pack_schema_success (id INTEGER PRIMARY KEY, value TEXT)",
+            "CREATE INDEX IF NOT EXISTS pack_schema_success_value_idx \
+             ON pack_schema_success(value)",
+        ];
+
+        let backend = StorageBackend::memory().unwrap();
+        backend.apply_pack_ddl_statements(PLAN).unwrap();
+        backend.apply_pack_ddl_statements(PLAN).unwrap();
+
+        let reader = backend.pool().reader().unwrap();
+        let visible_objects: i64 = reader
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master \
+                 WHERE name IN ('pack_schema_success', 'pack_schema_success_value_idx')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(visible_objects, 2);
     }
 
     /// khive#1029 repro: a `create_entity`-shaped write sequence (entity

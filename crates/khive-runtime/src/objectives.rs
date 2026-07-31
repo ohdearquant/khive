@@ -145,8 +145,8 @@ impl Objective<NoteCandidate> for RrfFusionObjective {
 
 /// Pre-computed signals for a single memory note candidate.
 ///
-/// Used by the recall pipeline's `ComposePipeline` to score and rank candidates
-/// via `DecayAwareSalienceObjective`, `TemporalRecencyObjective`, and
+/// Used by the recall pipeline to score and rank candidates via
+/// `AmplifiedDecayAwareSalienceObjective`, `TemporalRecencyObjective`, and
 /// `RerankerObjective` without any IO. The runtime layer populates this struct
 /// from stored notes before handing the slice to the pipeline.
 #[derive(Debug, Clone)]
@@ -183,24 +183,28 @@ impl HasId for NoteCandidate {
 
 /// Scores a `NoteCandidate` by salience with configurable temporal decay.
 ///
-/// The decay formula is determined by the configured `DecayModel` (injected at
-/// construction time). The default `DecayModel::Exponential` uses the note's own
-/// `decay_factor`: `salience * exp(-decay_factor * age_days)`.
+/// Uses the fixed exponential rate supplied at construction:
+/// `salience * exp(-decay_rate * age_days)`. It does not read the candidate's
+/// per-note `decay_factor`. The memory recall pipeline applies its configured
+/// `DecayModel` before scoring and uses `AmplifiedDecayAwareSalienceObjective`
+/// over the resulting `effective_salience` instead.
 ///
-/// This objective participates in `WeightedObjective` composition alongside
-/// `RrfFusionObjective` and `TemporalRecencyObjective` to form the full recall
-/// scoring pipeline.
+/// This objective remains useful for callers that want one decay policy across
+/// every candidate in a `WeightedObjective` composition.
 pub struct DecayAwareSalienceObjective {
-    /// Exponential decay rate k (>= 0.0). Score = `salience * exp(-k * age_days)`.
-    /// Corresponds to the per-note `decay_factor` parameter stored on memory notes.
-    pub decay_rate: f64,
+    decay_rate: f64,
 }
 
 impl DecayAwareSalienceObjective {
-    /// Create a new objective with the given exponential decay rate.
+    /// Create a new objective with the given exponential decay rate. Panics if
+    /// `decay_rate` is negative or non-finite.
     ///
     /// `decay_rate = 0.01` gives a ~69-day half-life (default for memory notes).
     pub fn new(decay_rate: f64) -> Self {
+        assert!(
+            decay_rate.is_finite() && decay_rate >= 0.0,
+            "decay_rate must be finite and non-negative, got {decay_rate}"
+        );
         Self { decay_rate }
     }
 
@@ -213,7 +217,7 @@ impl DecayAwareSalienceObjective {
 impl Objective<NoteCandidate> for DecayAwareSalienceObjective {
     #[inline]
     fn score(&self, candidate: &NoteCandidate, _context: &ObjectiveContext) -> f64 {
-        candidate.salience * (-candidate.decay_factor * candidate.age_days).exp()
+        candidate.salience * (-self.decay_rate * candidate.age_days).exp()
     }
 
     fn name(&self) -> &str {
@@ -644,29 +648,49 @@ mod tests {
     }
 
     #[test]
-    fn decay_aware_uses_note_decay_factor_not_field() {
-        // Scoring uses the note's own decay_factor, not the objective's field.
-        let obj = DecayAwareSalienceObjective::new(0.99); // obj.decay_rate ignored
-        let c = note_candidate(None, 1.0, 0.01, 100.0);
-        let score = obj.score(&c, &ctx());
-        let expected = (-0.01_f64 * 100.0).exp();
+    fn decay_aware_configured_rates_produce_expected_distinct_scores() {
+        let slow = DecayAwareSalienceObjective::new(0.01);
+        let fast = DecayAwareSalienceObjective::new(0.1);
+        let c = note_candidate(None, 0.8, 0.99, 10.0);
+
+        let slow_score = slow.score(&c, &ctx());
+        let fast_score = fast.score(&c, &ctx());
+        let expected_slow = 0.8 * (-0.01_f64 * 10.0).exp();
+        let expected_fast = 0.8 * (-0.1_f64 * 10.0).exp();
+
         assert!(
-            (score - expected).abs() < 1e-12,
-            "got {score}, expected {expected}"
+            (slow_score - expected_slow).abs() < 1e-12,
+            "got {slow_score}, expected {expected_slow}"
+        );
+        assert!(
+            (fast_score - expected_fast).abs() < 1e-12,
+            "got {fast_score}, expected {expected_fast}"
+        );
+        assert!(
+            slow_score > fast_score,
+            "slower configured decay should score higher: {slow_score} vs {fast_score}"
         );
     }
 
     #[test]
-    fn decay_aware_high_decay_reduces_score_faster() {
-        let obj = DecayAwareSalienceObjective::new(0.0);
+    fn decay_aware_does_not_read_candidate_decay_factor() {
+        let obj = DecayAwareSalienceObjective::new(0.05);
         let slow = note_candidate(None, 1.0, 0.001, 100.0);
         let fast = note_candidate(None, 1.0, 0.1, 100.0);
         let score_slow = obj.score(&slow, &ctx());
         let score_fast = obj.score(&fast, &ctx());
         assert!(
-            score_slow > score_fast,
-            "slow decay should score higher: {score_slow} vs {score_fast}"
+            (score_slow - score_fast).abs() < 1e-12,
+            "candidate decay_factor changed fixed-rate score: {score_slow} vs {score_fast}"
         );
+    }
+
+    #[test]
+    fn decay_aware_rejects_invalid_configured_rates() {
+        for bad in [-0.1, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let result = std::panic::catch_unwind(|| DecayAwareSalienceObjective::new(bad));
+            assert!(result.is_err(), "accepted invalid decay_rate {bad}");
+        }
     }
 
     // ── TemporalRecencyObjective ─────────────────────────────────────────

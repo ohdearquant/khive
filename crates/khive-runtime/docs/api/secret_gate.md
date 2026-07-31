@@ -32,9 +32,18 @@ through to explicit detection instead of being silently allowed.
   whitespace. The literal-prefix checks (Layer 1) treat any non-ASCII-alphanumeric char (CJK,
   accented text, emoji) as a token boundary, so a known-prefix secret is caught whether the
   adjacent non-ASCII sits before the prefix (`数据AKIA…`) or after it (`AKIA…数据`).
+- Known provider prefixes (Layer 1) require the configured minimum token length and reject one
+  narrow filename shape: after the prefix, a payload ending in `.py`, `.rs`, `.ts`, `.js`, `.sh`,
+  `.md`, `.toml`, or `.json` is treated as a source filename only when its stem contains lowercase
+  ASCII letters, contains at least one filename separator, and otherwise consists solely of
+  lowercase letters plus `_`, `-`, `/`, and `.`. This admits ordinary names such as
+  `vercel_deployment_monitor.py`. An uppercase letter, digit, or separator-free payload is
+  independent value-shape evidence and preserves the prefix match even when the token ends in a
+  source extension. Markdown/prose punctuation around the filename is ignored. This check only
+  suppresses the matching prefix detector; every other detector layer still evaluates the token.
 - Structured identifiers: a token is only considered for this exemption when it contains at least
   one of `/`, `-`, `_`, or `.` (the gate); it is then decomposed into maximal alphanumeric runs by
-  splitting on *every* non-alphanumeric character (not just the four gating separators — any other
+  splitting on _every_ non-alphanumeric character (not just the four gating separators — any other
   ASCII punctuation glued into the same whitespace token, e.g. a stray `:` or `,`, also acts as a
   run boundary). A token exempts when it decomposes into two or more such runs and every run is
   letters-then-digits or pure digits, at most 24 chars long, with a low case-transition density.
@@ -72,7 +81,7 @@ through to explicit detection instead of being silently allowed.
 - VCS revisions (trigger-context, narrow): a 40-hex value attached to an explicit VCS coordinate
   marker (`commit`, `revision`, `rev`, `sha` — immediately preceding word, or `marker:value` in
   one token) is treated as a public VCS coordinate near a trigger word, again only outside
-  credential-value syntax. The exemption is a *flag over the hex-credential-shape checks only*,
+  credential-value syntax. The exemption is a _flag over the hex-credential-shape checks only_,
   never an early skip of the whole check sequence. For the bare-marker form (`commit <hex>`) the
   exempt hex value is a plain alphanumeric token, so it still participates in fragment
   reconstruction anchored at neighboring tokens: a split credential hiding one fragment behind
@@ -106,34 +115,54 @@ bypass one natural qualifier past the cap. For the same reason, EXHAUSTING the w
 crossing a delimiter fails CLOSED: the clause is assignment-shaped and its head was never
 scanned, so it is treated as credential-labeled — clause length cannot launder a labeled value
 into the exemptions (`api key for the new shared encrypted regional staging deploy: <value>`
-blocks even though the trigger sits past the walk budget). A past-participle content word ends
-the walk:
-verb-phrase prose narrates an action on the value rather than labeling it (`the auth scanner
-flagged this file: <path>`, `one extra token was introduced by sha: <hex>` stay exempt). The
-walk stops at a sentence/paragraph boundary (`;`, `!`, `?`, blank line; `.` only when not
-immediately followed by an alphanumeric character, so a dotted version qualifier does not read
-as a sentence end). The past-participle stop is position-sensitive: it applies only in verb
-position — the participle followed (in reading order) by a glue word or the value itself
-("flagged this file:", "introduced by sha:", "key updated: <v>"). Followed by a content noun it
-is a participial ADJECTIVE inside a label qualifier ("shared deploy:", "encrypted backup:") and
-walks like any other qualifier noun. Coordinating conjunctions (`and`, `or`) are transparent to
-this classification: in "shared and encrypted staging deploy: <value>" the coordination as a
-whole is followed by a content noun, so both participles read as adjectives and walk. A participle BEFORE the trigger word never matters — the
-walk reaches the trigger first ("generated api key: <v>" blocks). A single-identifier lookback
-is deliberately NOT the contract: `api key value is commit <hex>` is a labeled credential
-wearing a marker, and one connector word must not hide the label. A label on the far side of a
-sentence boundary is prose context (the `near_trigger` window models that), not this value's
-label. Known residuals, accepted under the threat model: a non-connector qualifier without any
-delimiter (`api key pour commit <hex>`) and a participle in verb position directly after the
-trigger (`api key updated: commit <hex>` reads as changelog prose; without the VCS marker the
-raw hex still blocks under the near-trigger rule — note the ordering: `updated api
-key: <hex>` blocks, since the walk meets the trigger first). The no-delimiter residual is not
-limited to the VCS family: without a `:`/`=`, the walk ends open at the first content word, so
-a slash-bearing or path-dressed high-entropy value also reaches the file-path exemption behind
-an intervening verb or noun (`api key found <slash-base64>`, `auth scanner found
-<slash-base64>`, `secret note <high-entropy path>` all pass; adding a delimiter to any of them
-blocks). This is the widest documented residual of the no-delimiter tier and the first
-candidate for a future tightening of that tier. Accepted false positives,
+blocks even though the trigger sits past the walk budget).
+
+A regular `-ed` past-participle content word ends the walk: verb-phrase prose narrates an action
+on the value rather than labeling it (`the auth scanner flagged this file: <path>`, `one extra
+token was introduced by sha: <hex>` stay exempt). The walk stops at a sentence/paragraph boundary
+(`;`, `!`, `?`, blank line; `.` only when not immediately followed by an alphanumeric character,
+so a dotted version qualifier does not read as a sentence end). The participle stop is
+position-sensitive: it applies only in verb position — the participle followed (in reading order)
+by a glue word or the value itself (`flagged this file:`, `introduced by sha:`, `key updated:
+<v>`). For a no-delimiter file-path candidate, however, adjacency to the value is not sufficient:
+the reverse walk must already have processed a real value-side identifier and remain in connector
+position. Thus `api key leaked <value>` blocks, while `the auth scanner flagged this file <path>`
+retains the stop after processing `file` and `this`. Delimiter-bearing clauses and VCS coordinates
+retain their existing direct-participle behavior. Followed by a content noun, a participle is an
+ADJECTIVE inside a label qualifier (`shared deploy:`, `encrypted backup:`) and walks like any other
+qualifier noun. Coordinating conjunctions (`and`, `or`) are transparent to this classification: in
+`shared and encrypted staging deploy: <value>` the coordination as a whole is followed by a content
+noun, so both participles read as adjectives and walk. A participle BEFORE the trigger word never
+matters — the walk reaches the trigger first (`generated api key: <v>` blocks). The regular-suffix
+proxy has an explicit lexical exception set: `hundred` is not treated as a participle merely because
+its bytes end in `ed`. Irregular `found` intentionally is not a narrative stop, so it cannot shield
+the direct label in `api key found <value>`.
+
+Without a `:`/`=`, the two exemptions deliberately use different tiers. VCS coordinates retain
+the strict connector-only walk; the first unknown content word ends it, preserving ordinary prose
+such as `the key changes are in commit <hex>`. This leaves the accepted VCS residual `api key pour
+commit <hex>`. File-path candidates may instead cross at most two content words, in addition to
+the closed connector sets, so direct labels remain reachable: `api key found <slash-base64>`,
+`auth scanner found <slash-base64>`, and `secret note <high-entropy path>` all block, as do the
+corresponding path/slash-base64 combinations. The position-sensitive regular-participle stop applies
+to this bounded bridge only after real value-side walk progress, so `the auth scanner flagged this
+file <path>` stays exempt but `api key leaked <value>` blocks. The file-path tier has one narrower
+regular-`-ing` narrative stop: it applies only when the reverse walk has just crossed the literal
+value-side preposition `in`, preserving technical citations such as `api_key handling in <path>`.
+Adjacency is not enough: `api key handling <value>` keeps walking to the direct trigger and blocks.
+`see` has no special stop; `key: see <path>` likewise blocks, while a citation whose path precedes a
+later topical trigger (`see <path> ... key`) stays exempt because the backward clause contains no
+credential label.
+
+A single-identifier lookback is deliberately NOT the contract: `api key value is commit <hex>` is
+a labeled credential wearing a marker, and one connector word must not hide the label. A label on
+the far side of a sentence boundary is prose context (the `near_trigger` window models that), not
+this value's label. The other accepted participle residual remains: `api key updated: commit
+<hex>` reads as changelog prose; without the VCS marker the raw hex still blocks under the
+near-trigger rule. Ordering remains significant: `updated api key: <hex>` blocks because the walk
+meets the trigger first.
+
+Accepted false positives,
 conservative direction: the walk has no grammar — ANY trigger word reachable inside the
 pre-delimiter clause (absent a sentence boundary or verb-position participle) is treated as a
 credential label, whether it is attributive (`see the docs for auth setup: <path>`, `secret
@@ -169,6 +198,19 @@ credential-config compounds keep firing: `SECRET_KEY=...` (Django/Flask-style co
 half. This is implemented by parameterizing the boundary rule (`contains_word`'s
 `underscore_is_word_char` argument) rather than sharing one rule between the two callers.
 
+## find_prefix_token
+
+Known provider-prefix matching remains context-free and requires both a token boundary and the
+detector's configured minimum total length. Before returning a match, `find_prefix_token` applies
+`is_filename_shaped_prefix_match` to the payload after the prefix. The helper recognizes only the
+closed source-extension set and a stem made entirely from lowercase ASCII letters plus filename
+punctuation (`_`, `-`, `/`, `.`), with at least one letter and at least one such separator. Outer
+backticks, quotes, brackets, and sentence punctuation do not become payload evidence. Any digit,
+uppercase byte, or separator-free payload rejects the filename shape, so a value-shaped provider
+token still matches even if `.py` or another known extension is appended. Suppressing this one
+prefix match is not an allow decision: the remaining known-shape and entropy detectors still scan
+the token.
+
 ## value_candidates
 
 Yields every candidate value that an assignment/wrapper-glued whitespace token could contain, so
@@ -188,7 +230,7 @@ so a last-separator split would land on the padding boundary instead. A label ca
 contain `:`/`=` (`{"api:key":"<uuid>"}`) or the assignment can be doubled
 (`key=label=<uuid>`), so neither "first" nor "last" is a sound single choice. Emitting every
 suffix and letting the caller test each one is the only choice that is sound in all these shapes:
-the true value always appears as *some* suffix, and a `=`/`:` that lands inside padding or a label
+the true value always appears as _some_ suffix, and a `=`/`:` that lands inside padding or a label
 simply yields a non-matching suffix that the caller's shape check harmlessly rejects.
 
 Byte-scan via `char_indices` over an already-short token (whitespace-delimited, so bounded by
@@ -198,6 +240,7 @@ realistic line length) — no allocation, since this runs in the hot scan path.
 
 `underscore_is_word_char` selects which of two, deliberately different, boundary rules the caller
 needs:
+
 - `true` (used by `has_standalone_token` / `has_token_assignment` for `token`): underscore is a
   continuation of the same identifier, so `next_token`, `tokenizer`, and `token_count` do NOT
   match — a prior, deliberate decision that must not change.
@@ -205,7 +248,7 @@ needs:
   boundary, so `secret_key=`/`auth_token=`/`signing_key=` still match on the
   `secret`/`auth`/`key` half of the compound — these underscore-joined credential-config
   compounds (Django/Flask `SECRET_KEY`, OAuth `auth_token`, JWT `signing_key`) are exactly the
-  shape a credential trigger must not lose. Only *letter*-joined collisions (`authorized`,
+  shape a credential trigger must not lose. Only _letter_-joined collisions (`authorized`,
   `authentication`, `monkey`, `keyword`) are meant to stop matching.
 
 CJK/accented prose always counts as a boundary in both modes (only ASCII alphanumerics — plus
@@ -241,6 +284,7 @@ used.
 ## is_base64_content_hash
 
 Criteria:
+
 - Token starts with `sha<digits>-` (e.g. `sha256-`, `sha384-`, `sha512-`).
 - The body after the prefix matches a SHA-family length (43, 64, or 86–88 unpadded chars).
 - Every byte in the body is a standard-base64 or URL-safe-base64 character.
