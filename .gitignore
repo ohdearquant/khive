@@ -122,5 +122,3 @@ scripts/perf/calibration/
 # main or a feature branch.
 bench-data/
 .perf-data-worktree/
-
-.DS_Store
