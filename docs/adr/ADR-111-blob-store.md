@@ -1,7 +1,8 @@
 # ADR-111: BlobStore — Content-Addressed Binary Object Storage
 
 **Status**: accepted
-**Date**: 2026-07-12 (amended 2026-07-13, PR #922; Amendment 2 proposed 2026-07-16; Amendment 3
+**Date**: 2026-07-12 (amended 2026-07-13, PR #922; Amendment 2 accepted and implemented
+2026-07-17, PR #1054; Amendment 3
 accepted 2026-07-17; Amendment 4 accepted 2026-07-19)
 **Authors**: khive maintainers
 **Depends on**:
@@ -241,11 +242,11 @@ deletes blob files directly, so a blob referenced from two places is never remov
 concurrent reader by a consumer-side heuristic. `BlobStore` owns the deletion policy; consumers only
 ever add references and let GC reconcile.
 
-**Concurrency guarantee: offline-maintenance-only (amended 2026-07-13).** The paragraph above, as
-originally written, claimed this design "is never removed out from under a concurrent reader".
-That claim was not true of the shipped implementation and has
-been corrected here rather than left standing. Both `delete` and `orphan_sweep` are
-**offline-maintenance-only** APIs, not safe to run against a live entity writer:
+**Concurrency guarantee: choose the API deliberately (amended 2026-07-23, PR #1313).** The
+paragraph above, as originally written, claimed this design "is never removed out from under a
+concurrent reader". That remains false for `delete` and the caller-snapshot
+`orphan_sweep(config)` API. Both are **offline-maintenance-only**, not safe to run against a live
+entity writer:
 
 - `orphan_sweep`'s `live_refs` set is a **snapshot** the caller assembles before the call. Nothing
   in `BlobStore` detects a `content_ref` that becomes newly live — an entity write lands
@@ -257,20 +258,33 @@ been corrected here rather than left standing. Both `delete` and `orphan_sweep` 
   delete a `content_ref` an entity write races into existence a moment later, with no coordination
   from this trait.
 
-The actual guarantee is narrower than the original text implied: **run `orphan_sweep` and `delete`
-only when writes that could create a new `content_ref` reference are quiesced** — a maintenance
-window, a single-writer admin CLI invocation with no live traffic, or equivalent. `BlobStore` has no
-visibility into the entity substrate (ADR-005 constraint 4) and therefore cannot enforce this
-itself; it is a caller obligation, now stated explicitly on `BlobStore::delete` and
-`BlobStore::orphan_sweep`'s doc comments.
+Run those two methods only when writes that could create a new `content_ref` reference are
+quiesced. `BlobStore::transactional_orphan_sweep(sql, dry_run)`, added by PR #1313, is the live-
+traffic alternative for backends that can coordinate both stores. The filesystem implementation:
 
-A transactional, DB-coordinated sweep — selecting and deleting live/orphaned blobs under the entity
-writer's own transactional boundary, so the sweep is safe to run concurrently with normal traffic —
-would close this hazard properly. That is a larger design (does it live in `khive-storage` as a new
-capability, or in `khive-runtime` orchestrating `BlobStore` + `SqlAccess`/`GraphStore` together?)
-left to a follow-up: [khive#924](https://github.com/ohdearquant/khive/issues/924). It is
-**deliberately not built as part of this fix**. The scoped correction makes the existing hazard
-explicit and tested without expanding into a larger coordination design.
+1. acquires the canonical-root in-process and advisory write locks and captures the complete blob
+   candidate set while publishers are excluded;
+2. enters `SqlAccess::atomic_unit` (`BEGIN IMMEDIATE` on SQLite), selects distinct references from
+   non-deleted entities, and retains the entity-writer boundary through physical deletion; and
+3. deletes only candidates absent from that transaction's live-reference set.
+
+This yields two concurrency guarantees pinned by tests. A blob published after candidate capture
+is not in the sweep set and survives. A committed entity reference cannot appear or disappear
+between the liveness query and physical deletion because both occur under the entity writer's
+transaction. Invalid stored `content_ref` values fail closed rather than making the sweep delete
+against an incomplete live set.
+
+The guarantee still has a bounded publish gap. `put(bytes)` and the later entity write that stores
+its returned reference are separate client steps, outside one shared transaction. A candidate with
+no committed reference is therefore protected by file age: `FsBlobStore` defaults to a one-hour
+grace period, treats an unknown age as protected, and refreshes the mtime on a deduplicated `put`.
+A client whose put-to-reference gap exceeds the configured grace remains exposed to deletion.
+Tests cover a fresh unreferenced publish, deduplicated republication, zero-grace behavior, and
+deletion after grace expiry; the warning is not weakened beyond that evidence.
+
+`S3BlobStore` does not override `transactional_orphan_sweep` and returns `Unsupported`; its
+caller-snapshot `orphan_sweep` has no publish-grace accounting and remains offline-maintenance-
+only. Unconditional `delete` remains offline-maintenance-only on both backends.
 
 ---
 
@@ -332,10 +346,9 @@ misses.
   serialized value is rejected at deserialization instead of later panicking in `shard_path`.
   `FsBlobStore::put`'s floor check now accounts for the pending write's own size. `delete` and
   `orphan_sweep` are now explicitly documented (trait doc comments, §8 above) as
-  offline-maintenance-only, requiring quiesced entity writes — a real, undefended concurrency hazard
-  the original §8 text incorrectly described as absent. A DB-coordinated transactional sweep that
-  would close that hazard is tracked as a follow-up, not built here:
-  [khive#924](https://github.com/ohdearquant/khive/issues/924).
+  offline-maintenance-only, requiring quiesced entity writes — a real concurrency hazard the
+  original §8 text incorrectly described as absent. PR #1313 later added the distinct filesystem
+  `transactional_orphan_sweep` path described in §8; it did not make these legacy methods safe.
 - **Further amendment (same date):** the first fix for serializing `put` scoped
   its `tokio::sync::Mutex` to one
   `FsBlobStore` instance and borrowed the guard across the async fn's own frame — insufficient,
@@ -350,8 +363,12 @@ misses.
 
 ## Amendment 2 (2026-07-16): S3-compatible backend
 
-**Status:** proposed amendment. The accepted filesystem decision and the existing `BlobStore`
-trait remain unchanged while this amendment passes the implementation specification gate.
+**Status:** accepted and implemented. PR
+[#1054](https://github.com/ohdearquant/khive/pull/1054) merged on 2026-07-17 as
+`439b7d30561710c5272e76bd5b3e7e836caacca2`, adding `S3BlobStore`, strict
+`[storage.blob]` selection, single- and multi-backend boot wiring, shared conformance tests,
+fake-client failure tests, and the MinIO compatibility job. The filesystem decision and provider-
+neutral `BlobStore` boundary remain in force.
 
 ### Context and decision
 
@@ -451,10 +468,12 @@ concurrent `put` calls.
 
 No object-store mutex replaces the §8 safety requirement because an in-process lock would not solve
 it. The hazardous race is between a database snapshot of live `content_ref`s and a later entity
-write, potentially across processes and storage systems. `delete` and `orphan_sweep` therefore
-remain offline-maintenance-only for S3 and require deployment-wide quiescence of every writer that
-can create a new entity reference for the full snapshot-plus-sweep interval. The transactional,
-DB-coordinated design remains khive#924.
+write, potentially across processes and storage systems. `delete` and the caller-snapshot
+`orphan_sweep` therefore remain offline-maintenance-only for S3 and require deployment-wide
+quiescence of every writer that can create a new entity reference for the full snapshot-plus-sweep
+interval. PR #1313 implemented `transactional_orphan_sweep` only for `FsBlobStore`;
+`S3BlobStore` retains the trait default (`Unsupported`) and does not inherit the filesystem grace-
+period guarantee.
 
 Out-of-band lifecycle policies have the same limitation and must not delete objects from the live
 BlobStore prefix.
@@ -550,9 +569,10 @@ tests.
 - Existing configurations continue to select `FsBlobStore` with the current root and floor
   behavior.
 - S3 deployments gain off-host blob storage but must provide environment credentials, an
-  unversioned bucket, and an offline maintenance window for deletion and sweep.
-- `BlobStore` still does not provide transactional reference GC; this amendment does not close or
-  weaken khive#924.
+  unversioned bucket, and an offline maintenance window for deletion and caller-snapshot sweep.
+- The later provider-neutral `transactional_orphan_sweep` trait method does not imply S3 support:
+  the S3 backend returns `Unsupported`, while the filesystem backend implements the coordinated
+  guarantee and grace-period boundary described in §8.
 
 ---
 
@@ -701,8 +721,12 @@ unauthenticated callers, or telemetry that leaves the deployment boundary.
   `write_lock_for_root`/`root_write_locks` (the canonical-root-keyed shared-lock registry),
   `crosses_floor` (the pure write-size-aware floor comparison).
 - `crates/khive-db/src/backend.rs` — `StorageBackend::blob_store`.
-- Amendment 2 proposes `S3BlobStore` beside `FsBlobStore` plus one config-aware boot-layer selector;
+- `crates/khive-db/src/stores/blob_s3.rs` — shipped `S3BlobStore` implementation from PR #1054.
+- `crates/khive-runtime/src/blob.rs`, `crates/khive-runtime/src/engine_config.rs`, and
+  `crates/khive-mcp/src/serve.rs` — config-aware blob-store selection and boot wiring from PR #1054;
   no provider type enters `khive-storage`.
+- `crates/khive-storage/src/blob.rs` and `crates/khive-db/src/stores/blob.rs` — provider-neutral
+  transactional sweep contract and filesystem implementation from PR #1313.
 - `crates/khive-db/sql/010-entities-content-ref.sql` — migration V10.
 - `crates/khive-db/sql/entities-ddl.sql` — mirrored `content_ref` column + index.
 - `crates/khive-db/src/stores/entity.rs` — `content_ref` threaded through
@@ -720,8 +744,10 @@ unauthenticated callers, or telemetry that leaves the deployment boundary.
 - PR #922 follow-up confirmed the deserialization fix and found the floor-guard fix
   incomplete (not actually per-root, not cancellation-safe) and this ADR's `ContentRef` example
   stale.
-- [khive#924](https://github.com/ohdearquant/khive/issues/924) — follow-up: transactional,
-  DB-coordinated `BlobStore` orphan sweep.
+- [khive#924](https://github.com/ohdearquant/khive/issues/924) — transactional,
+  DB-coordinated `BlobStore` orphan sweep, closed by PR
+  [#1313](https://github.com/ohdearquant/khive/pull/1313) on 2026-07-23
+  (`c716e9821ba60f444d0400b3004893c2f4c175e5`).
 - [khive#1145](https://github.com/ohdearquant/khive/issues/1145) — capability-by-hash
   authorization model and `blob.stat` oracle posture (Amendment 4).
 - [`object_store` 0.13.2 S3 builder](https://docs.rs/object_store/0.13.2/object_store/aws/struct.AmazonS3Builder.html)

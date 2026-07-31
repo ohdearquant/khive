@@ -99,7 +99,7 @@ backend = "main"
 [embed]
 model = "default"          # logical name — must match a [[engines]] entry
 dimensions = 384            # vector dimensions
-auto_embed = true           # embed on commit and sync (default: true)
+auto_embed = true           # design field; not wired by the current Rust CLI
 batch_size = 64             # entities per embed batch
 
 [embed.fields]
@@ -151,17 +151,18 @@ For each runtime option, precedence is:
 default**. Exact option-specific exceptions are listed in the canonical config
 reference (`docs/core/khive-config-example.toml`).
 
-| Option             | CLI flag          | Env var                  | Config key                | Default           |
-| ------------------ | ----------------- | ------------------------ | ------------------------- | ----------------- |
-| Namespace          | `--namespace`     | `KHIVE_NAMESPACE`        | `runtime.namespace`       | `default`         |
-| Loaded packs       | `--pack` (repeat) | `KHIVE_PACKS`            | `runtime.packs`           | `kg`              |
-| DB path            | `--db`            | `KHIVE_DB`               | `runtime.db_path`         | `~/.khive/kg.db`  |
-| Recall min_score   | (n/a, per-call)   | `KHIVE_RECALL_MIN_SCORE` | `memory.recall.min_score` | `None` (no floor) |
-| Auto-embed mode    | `--auto-embed`    | `KHIVE_AUTO_EMBED`       | `embed.auto_embed`        | `true`            |
-| Embedding model    | `--embed-model`   | `KHIVE_EMBED_MODEL`      | `embed.model`             | `mE5-small`       |
-| Log level          | `--log-level`     | `KHIVE_LOG`              | `runtime.log_level`       | `info`            |
-| Authorization gate | `--gate`          | `KHIVE_GATE`             | `runtime.gate`            | `allow-all`       |
-| Brain profile      | `--brain-profile` | `KHIVE_BRAIN_PROFILE`    | `runtime.brain_profile`   | `None`            |
+| Option             | CLI flag                         | Env var                             | Config key                | Default           |
+| ------------------ | -------------------------------- | ----------------------------------- | ------------------------- | ----------------- |
+| Namespace          | `--namespace`                    | `KHIVE_NAMESPACE`                   | `runtime.namespace`       | `default`         |
+| Loaded packs       | `--pack` (repeat)                | `KHIVE_PACKS`                       | `runtime.packs`           | `kg`              |
+| DB path            | `--db`                           | `KHIVE_DB`                          | `runtime.db_path`         | `~/.khive/kg.db`  |
+| Recall min_score   | (n/a, per-call)                  | `KHIVE_RECALL_MIN_SCORE`            | `memory.recall.min_score` | `None` (no floor) |
+| Disable embeddings | `kkernel mcp --no-embed`         | `KHIVE_NO_EMBED`                    | (none)                    | `false`           |
+| Reindex model      | `kkernel reindex --model <name>` | `KHIVE_EMBEDDING_MODEL`             | `[[engines]]`             | built-in engine   |
+| Additional models  | (none)                           | `KHIVE_ADDITIONAL_EMBEDDING_MODELS` | `[[engines]]`             | none              |
+| Log level          | `--log-level`                    | `KHIVE_LOG`                         | `runtime.log_level`       | `info`            |
+| Authorization gate | `--gate`                         | `KHIVE_GATE`                        | `runtime.gate`            | `allow-all`       |
+| Brain profile      | `--brain-profile`                | `KHIVE_BRAIN_PROFILE`               | `runtime.brain_profile`   | `None`            |
 
 Note: `recall(min_score)` has **no floor by default**. Operators serving larger corpora should
 set `KHIVE_RECALL_MIN_SCORE=0.5` (or similar) in production deployments.
@@ -200,8 +201,12 @@ working as before.
 
 ### 3. `[embed]` and `[schema]` sections
 
-The `[embed]` section controls the automatic embedding pipeline (§5). The `[schema]`
-section controls import validation.
+The original decision assigned automatic-pipeline settings to `[embed]` and import validation
+to `[schema]`. The current Rust runtime resolves embedding engines from `[[engines]]`; it does
+not read `embed.auto_embed`, and it exposes no `--auto-embed` or `KHIVE_AUTO_EMBED` control.
+The shipped operational controls are `kkernel mcp --no-embed` / `KHIVE_NO_EMBED` and the
+explicit `kkernel reindex` workflow in §5. The table below records the decision's intended
+defaults, not additional live CLI flags.
 
 **Built-in defaults** (when no selected config file supplies the setting):
 
@@ -264,66 +269,52 @@ Init automatically updates only the byte-exact `.gitignore` emitted by the
 old initializer (`!khive.toml` to `!config.toml`). It never rewrites a
 customized ignore file.
 
-### 5. Automatic embedding pipeline
+### 5. Shipped embedding and repair workflow
 
-Embeddings are generated during the two operations that transition working state: commit
-and sync. Both use the same `embed_missing` subroutine.
+The original decision specified an `embed_missing` pass in `kkernel kg commit` and
+`kkernel kg sync`, plus a `kkernel kg embed` command. That automatic-embedding behavior and
+dedicated command are not present in the current Rust CLI. `kkernel kg commit` validates and
+commits a staged change-set; the current `kkernel kg sync` spelling is a visible alias for remote
+fetch; and top-level `kkernel sync` rebuilds the SQLite database and FTS documents from NDJSON.
+None invokes an embedding pass, and `kkernel kg` has no `embed` subcommand.
 
-#### `embed_missing` subroutine
+The shipped behavior has two parts:
 
-Queries `working.db` for entities that have no vector in the per-(model, dim) virtual table
-for the currently configured model, or whose vector was computed with a different model than
-the current `embed.model`. Constructs the input text by joining the values of
-`embed.fields.include` with a single space separator. Calls lattice-embed (ADR-011) in
-batches of `embed.batch_size` via the EmbedderRegistry (ADR-031). Writes resulting vectors
-to the appropriate per-(model, dim) table in `working.db` via the VectorStore trait
-(ADR-005).
+1. Runtime create and update paths embed inline for every configured engine.
+   `kkernel mcp --no-embed` (or `KHIVE_NO_EMBED=1`) starts the MCP runtime without any
+   built-in embedding engine, so those writes remain text-only.
+2. `kkernel reindex` is the explicit maintenance and repair command. It rebuilds vectors and
+   FTS documents for entities, notes, and, by default, the knowledge corpus. It resolves the
+   same database, config, namespace, and `[[engines]]` set as `kkernel mcp`.
 
-For an entity with `name = "LoRA"` and `description = "Low-rank adaptation technique for
-fine-tuning"`, the concatenated input is:
-`"LoRA Low-rank adaptation technique for fine-tuning"`.
+Examples using only shipped flags:
 
-#### `kkernel kg commit` — embed before export
+```bash
+# Re-embed entities, notes, and knowledge with every configured engine.
+kkernel reindex --db ~/.khive/khive.db --namespace local
 
-The `commit` pipeline from ADR-020 §6 is extended:
+# Repair only the graph substrate and keep vectors that already exist.
+kkernel reindex --db ~/.khive/khive.db --namespace local \
+  --no-knowledge --keep-existing
 
-1. Run `embed_missing` on `working.db` if `embed.auto_embed = true`.
-2. Run `kkernel kg export` (DB → NDJSON). Unchanged from ADR-020.
-3. Run `kkernel kg validate`. Unchanged from ADR-020.
-4. `git add .khive/kg/` and `git commit`. Unchanged from ADR-020.
-
-Embedding runs before export because export reads `working.db`; per-entity validation
-rules (ADR-034) that check vector quality must see vectors already present. Embedding after
-export would make such checks impossible without a second pass.
-
-#### `kkernel kg sync` — embed after rebuild
-
-The `sync` pipeline from ADR-020 §6 is extended:
-
-1. Check for uncommitted DB changes. Unchanged from ADR-020.
-2. Atomic DB rebuild from NDJSON. Unchanged from ADR-020.
-3. Run `embed_missing` on the freshly rebuilt DB if `embed.auto_embed = true`. Embeds
-   entities that arrived from other collaborators and lack local vectors.
-4. Print summary: `Synced: 472 entities, 1,111 edges (38 entities embedded)`.
-
-Embedding runs after rebuild because the rebuild drops and recreates `working.db` from
-NDJSON. Embedding before rebuild would populate vectors into a DB that is immediately
-discarded.
-
-#### `kkernel kg embed` — explicit command
-
-An explicit command for full or selective re-embedding:
-
-```
-kkernel kg embed              # embed all entities missing vectors for current model
-kkernel kg embed --all        # re-embed all entities (force, regardless of existing vectors)
-kkernel kg embed --ids a1b2 c3d4  # embed specific entity IDs
-kkernel kg embed --dry-run    # print which entities would be embedded; no writes
+# Rebuild entity/note vectors with one named engine.
+kkernel reindex --db ~/.khive/khive.db --namespace local \
+  --no-knowledge --model all-minilm-l6-v2
 ```
 
-When `auto_embed = false`, `kkernel kg embed` is the only way embeddings are created.
-Projects that want explicit control (large KGs, separate embed jobs, slow hardware) set
-`auto_embed = false` and call `kkernel kg embed` on their own schedule.
+Without `--keep-existing`, every staged record is re-embedded and each prior vector is
+replaced atomically with its new value; a failed embed or insert leaves the prior vector in
+place rather than deleting it first. With `--keep-existing`, records already embedded for
+the selected model and namespace are skipped. FTS backfill still runs in either mode. The
+default is fail-closed on partial failures; `--best-effort` is the explicit opt-in to a zero
+exit after partial work.
+
+There is no current `--embeds-only`, `--ids`, or `--dry-run` reindex mode. In particular,
+`--keep-existing` means incremental vector top-up, not vector-only execution. When no
+embedding engine is configured, `kkernel reindex` still backfills FTS but warns and skips
+vector work. An operator who normally runs the server with `--no-embed` can therefore run a
+separate `kkernel reindex` invocation without that server flag, using a config that declares
+the desired `[[engines]]`, to populate vectors on an explicit schedule.
 
 ### 6. Embeddings are local-only derived state
 
@@ -336,43 +327,42 @@ Vectors are stored in `working.db` only. They are **not** written to NDJSON file
 - **Size**: 384 floats per entity is 1.5 KB. A 10,000-entity KG would add 15 MB of
   non-human-readable binary content to NDJSON, destroying the git diff and merge
   guarantees that are the entire value of ADR-020.
-- **Consistency**: `kkernel kg sync` re-embeds after every rebuild. Two collaborators
-  using the same model and entity text produce identical vectors. There is no durability
-  requirement.
+- **Consistency**: `kkernel reindex` recomputes vectors from the selected engine set and
+  current entity/note text. There is no durability requirement for the vectors themselves.
 
 `working.db` is gitignored by ADR-020's allowlist. The `.khive/state/` directory is
 ephemeral by design.
 
 ### 7. Model change workflow
 
-When the project's embedding model changes, all vectors in `working.db` are incompatible
-with the new model. The workflow is:
+When the project's embedding engine set changes, the existing vectors no longer describe the
+selected configuration. The shipped workflow is:
 
 ```bash
-# 1. Edit .khive/config.toml:
-#    embed.model = "BGE-large"
-#    embed.dimensions = 1024
+# 1. Edit the selected config's [[engines]] entries.
 
-# 2. Re-embed all entities with the new model
-kkernel kg embed --all
+# 2. Re-embed graph and knowledge state with that config.
+kkernel reindex --config .khive/config.toml --db ~/.khive/khive.db \
+  --namespace local
 
-# 3. Commit the config change (vectors are local-only — only config.toml changes in git)
-kkernel kg commit -m "switch embedding model to BGE-large"
+# 3. Commit only the config change; vectors remain local derived state.
+git add .khive/config.toml
+git commit -m "config: switch embedding engine"
 ```
 
 After the commit, other collaborators run:
 
 ```bash
 git pull
-kkernel kg sync     # rebuilds DB from NDJSON; auto-embeds with new model
+kkernel reindex --config .khive/config.toml --db ~/.khive/khive.db \
+  --namespace local
 ```
-
-`kkernel kg sync` reads the updated `.khive/config.toml` after the DB rebuild step, so the
-`embed_missing` pass uses the new model automatically.
 
 ### 8. Config validation
 
-The CLI validates the one selected config file at startup. Validation checks:
+The original `[embed]` decision called for the following validation. The current Rust config
+parser validates `[[engines]]` but does not deserialize these `[embed]` keys, so it does not
+currently enforce this list:
 
 - `embed.model` is a non-empty string. Model availability is validated by lattice-embed
   at runtime; the config loader does not check against a list.
@@ -400,18 +390,11 @@ ERROR: .khive/config.toml line 5: expected integer for embed.dimensions, got "38
 `[[engines]]` (ADR-028) declares the process-wide registry of loaded embedding models —
 the names and dimensions that `EmbedderRegistry::from_config` uses to instantiate models.
 
-`[embed]` (this ADR) specifies which model is used for the entity-text embedding pipeline
-and what fields it operates on. `embed.model` must reference a name in `[[engines]]`. The
-runtime validates this at startup:
-
-```
-ERROR: embed.model "BGE-large" not found in [[engines]]. Available: mE5-small
-```
-
-This separation keeps the registry declaration (ADR-028) orthogonal to embed pipeline
-configuration (this ADR). A deployment can load multiple engines (for query-time
-multi-engine retrieval, ADR-031) while designating exactly one as the entity embedding
-model for the commit/sync pipeline.
+The current Rust runtime does not consume `[embed]` or validate `embed.model` against that
+registry. `[[engines]]` is the shipped source of truth: `default = true` selects the default
+engine, inline create/update fans out across the registered set, and `kkernel reindex` does the
+same for entities and notes unless `--model` narrows the pass. The `[embed]` shape above is
+retained as the original decision record, not described as a second live selector.
 
 ## Rationale
 
@@ -429,34 +412,22 @@ just cohabitation in one well-sectioned file.
 
 ### Why project config wins over the global fallback
 
-The embedding model is a project invariant. If a global `~/.khive/config.toml` could
-override the project's `embed.model`, a collaborator with a different default would silently
+The embedding engine set is a project invariant. If a global `~/.khive/config.toml` could
+override the project's `[[engines]]`, a collaborator with a different default would silently
 produce incompatible vectors. The project config must win on embedding-related keys.
 
 Machine-local overrides such as device choice belong in an explicit CLI or
 environment tier when a project config is selected. The global file is a
 fallback for projects without a project config, not a merge source.
 
-### Why auto-embed defaults to true
+### Why inline writes plus an explicit repair command
 
-Without automatic embedding, the user-visible symptom of stale vectors is worse search
-results, not an error. There is no "search returned poor results because vectors are
-missing" warning — the user sees a lower-quality result set and does not know why.
-Auto-embedding prevents this failure mode by ensuring vectors are current after every
-commit and sync. The cost is a few seconds of embed time, negligible for typical KG sizes.
-`auto_embed = false` is the explicit opt-out for large KGs or slow hardware.
-
-### Why embed before export in `kkernel kg commit`
-
-Embedding before export allows validation rules (ADR-034) to check vector quality — for
-example, flagging entities whose stored embedding dimension does not match the configured
-model's output. Embedding after export would make such pre-commit checks impossible.
-
-### Why embed after rebuild in `kkernel kg sync`
-
-The rebuild drops and recreates `working.db`. Embedding before rebuild populates vectors
-into a database that is immediately discarded. Embedding after rebuild ensures vectors are
-computed against the final, committed entity set.
+Missing vectors degrade semantic search without producing a query error. The current runtime
+therefore embeds ordinary create/update writes inline when engines are configured, while
+`kkernel reindex` provides a deliberate full or incremental repair after bulk import, NDJSON
+sync, or an engine change. Keeping reindex separate from git commit/sync also gives operators a
+clear fail-closed maintenance command and avoids documenting lifecycle coupling the Rust CLI does
+not implement.
 
 ### Why NDJSON files never carry vectors
 
@@ -468,17 +439,17 @@ as separating source files from build artifacts in a standard software project.
 
 ## Alternatives Considered
 
-| Alternative                                                 | Pros                        | Cons                                                                  | Why rejected                                                  |
-| ----------------------------------------------------------- | --------------------------- | --------------------------------------------------------------------- | ------------------------------------------------------------- |
-| Separate active topology and embedding files in one project | Clear file roles            | Two files to manage; split mental context                             | One selected file is simpler and sufficient                   |
-| Per-key project/global TOML merge                           | Machine-local overlays      | Hidden composite config; client/daemon fingerprint drift risk         | First-file selection is deterministic and auditable           |
-| YAML config format                                          | Familiar                    | Ambiguous parsing; indentation errors in practice                     | TOML is unambiguous; already used in Cargo and this project   |
-| JSON config format                                          | Machine-writable            | No comments; annoying to hand-edit; trailing-comma errors             | TOML is better for human-edited files                         |
-| Vectors stored in NDJSON (committed)                        | Single source of truth      | 15 MB+ non-diffable content per 10K entities; breaks merge guarantees | Recomputable state should not be committed                    |
-| Dedicated committed vector file (separate from NDJSON)      | Separates vectors from text | Same merge problem; grows with entity count                           | Still recomputable; still breaks git diff                     |
-| Manual embed only (`auto_embed = false` as default)         | Explicit control            | Silent quality degradation when users forget                          | Auto-embed prevents the failure mode at negligible cost       |
-| Embed on every verb write (real-time)                       | Vectors always current      | Embed latency per write blocks interactive use                        | Batch on commit/sync matches the git-workflow cadence         |
-| `embed.model` allowed as per-user override                  | User flexibility            | Incompatible vectors across collaborators                             | Model is a project invariant; must be locked at project level |
+| Alternative                                                 | Pros                         | Cons                                                                  | Why rejected                                                  |
+| ----------------------------------------------------------- | ---------------------------- | --------------------------------------------------------------------- | ------------------------------------------------------------- |
+| Separate active topology and embedding files in one project | Clear file roles             | Two files to manage; split mental context                             | One selected file is simpler and sufficient                   |
+| Per-key project/global TOML merge                           | Machine-local overlays       | Hidden composite config; client/daemon fingerprint drift risk         | First-file selection is deterministic and auditable           |
+| YAML config format                                          | Familiar                     | Ambiguous parsing; indentation errors in practice                     | TOML is unambiguous; already used in Cargo and this project   |
+| JSON config format                                          | Machine-writable             | No comments; annoying to hand-edit; trailing-comma errors             | TOML is better for human-edited files                         |
+| Vectors stored in NDJSON (committed)                        | Single source of truth       | 15 MB+ non-diffable content per 10K entities; breaks merge guarantees | Recomputable state should not be committed                    |
+| Dedicated committed vector file (separate from NDJSON)      | Separates vectors from text  | Same merge problem; grows with entity count                           | Still recomputable; still breaks git diff                     |
+| Manual repair only                                          | Explicit control             | Silent quality degradation when users forget                          | Inline create/update plus explicit reindex covers both paths  |
+| Embed on every embedding-bearing write                      | Fresh vectors for new writes | Adds model latency to those writes                                    | Shipped default; `mcp --no-embed` is the explicit opt-out     |
+| `embed.model` allowed as per-user override                  | User flexibility             | Incompatible vectors across collaborators                             | Model is a project invariant; must be locked at project level |
 
 ## Consequences
 
@@ -493,33 +464,26 @@ as separating source files from build artifacts in a standard software project.
 
 ### Positive
 
-- Search quality is reliable: every collaborator who runs `kkernel kg sync` or `kkernel kg
-  commit` has current vectors without manual intervention.
+- `kkernel reindex` gives operators one verified command for full rebuilds and incremental
+  top-up across the configured engine set.
 - The embedding model is recorded in `.khive/config.toml`, committed alongside the KG data.
   Changing the model produces a one-line diff in git that reviewers can see and approve.
 - Device preferences stay local: `device = "metal"` never appears in committed files.
 - `kkernel kg init` writes a valid, well-commented `.khive/config.toml` that makes its defaults
   explicit and reviewable in the initial PR.
-- `kkernel kg embed --dry-run` gives visibility into which entities lack vectors before
-  committing.
+- `--keep-existing` avoids recomputing vectors already present for the selected model and
+  namespace.
 - One selected config file, not a hidden per-key merge, reduces operator friction.
 
 ### Negative
 
-- `kkernel kg commit` and `kkernel kg sync` have an optional embed step that adds latency.
-  For large KGs on slow hardware, this may be noticeable. Mitigation: `auto_embed = false`
-  moves embedding to an explicit `kkernel kg embed` call.
+- Inline create/update embedding adds model latency. On model-less or latency-sensitive servers,
+  `kkernel mcp --no-embed` disables that work and a separate `kkernel reindex` process can run on
+  an explicit schedule.
 - `~/.khive/config.toml` introduces a user-global fallback that must be documented and
-  supported. A misconfigured `embed.device` produces a runtime error from lattice-embed
-  rather than a config validation error. Mitigation: type validation catches `device`
-  value errors at startup; model availability errors from lattice-embed are propagated
-  with their full message.
-- Changing `embed.model` requires re-embedding all entities (potentially slow for large
-  KGs) and a follow-up commit. The workflow is documented in §7 but adds ceremony to
-  model upgrades.
-- `embed.model` must match a name in `[[engines]]`. Operators who add a new model must
-  update both sections consistently. Mitigation: startup validation reports the mismatch
-  with the list of available engine names.
+  supported. Model availability errors from lattice-embed are propagated at runtime.
+- Changing `[[engines]]` requires re-embedding the affected corpus (potentially slow for large
+  KGs). The explicit workflow is documented in §7.
 
 ### Neutral
 
@@ -527,9 +491,8 @@ as separating source files from build artifacts in a standard software project.
   artifacts beyond the selected config sections in `.khive/config.toml`.
 - `working.db` already carries a per-(model, dim) vector table layout (ADR-005, ADR-009).
   This ADR specifies when those tables are populated, not how they are structured.
-- Projects that do not use `kkernel search` can set `auto_embed = false` and ignore the
-  embed subsystem entirely. The pipeline steps are no-ops when `auto_embed = false` and
-  `kkernel kg embed` is never invoked.
+- Projects that do not use semantic retrieval can run `kkernel mcp --no-embed`; text search
+  remains available, and `kkernel reindex` without a configured engine still backfills FTS.
 
 ## Open Questions
 
@@ -553,20 +516,17 @@ as separating source files from build artifacts in a standard software project.
 
 - [ADR-001](ADR-001-entity-kind-taxonomy.md) — `embed.fields.include` cannot include
   `kind`; it is a closed-taxonomy discriminant, not an embeddable text field
-- [ADR-005](ADR-005-storage-capability-traits.md) — `VectorStore` trait; `embed_missing`
+- [ADR-005](ADR-005-storage-capability-traits.md) — `VectorStore` trait; `kkernel reindex`
   writes to per-(model, dim) tables via this trait
 - [ADR-009](ADR-009-backend-architecture.md) — `khive-db` backend works in-memory and
   on-disk; `working.db` is a project-scoped on-disk backend
-- [ADR-011](ADR-011-embedding-and-inference.md) — lattice-embed boundary; `embed_missing`
-  calls lattice-embed for batched inference
-- [ADR-020](ADR-020-git-native-kg-implementation.md) — git-native KG implementation;
-  this ADR extends the `commit` and `sync` pipelines defined in ADR-020 §6; the
-  `.khive/.gitignore` allowlist gains `config.toml`
+- [ADR-011](ADR-011-embedding-and-inference.md) — lattice-embed boundary used for batched
+  reindex inference
+- [ADR-020](ADR-020-git-native-kg-implementation.md) — git-native KG implementation and the
+  NDJSON sync boundary; the `.khive/.gitignore` allowlist gains `config.toml`
 - [ADR-028](ADR-028-pack-scoped-backends.md) — pack-scoped backends; `[[backends]]`,
   `[[engines]]`, and `[packs.*]` sections live in the same selected TOML file this ADR governs
-- [ADR-031](ADR-031-multi-engine-retrieval.md) — `EmbedderRegistry`; `embed_missing`
-  routes inference requests through the registry; `embed.model` must reference a registered
-  engine name
-- [ADR-034](ADR-034-kg-validation-pipelines.md) — validation pipelines; embedding before
-  export in `commit` allows validation rules to check vector presence and dimension
-  correctness
+- [ADR-031](ADR-031-multi-engine-retrieval.md) — `EmbedderRegistry`; `kkernel reindex`
+  fans entity/note work across registered engines unless `--model` narrows it
+- [ADR-034](ADR-034-kg-validation-pipelines.md) — validation pipelines remain separate from
+  the explicit reindex maintenance path

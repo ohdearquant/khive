@@ -84,7 +84,7 @@ kkernel exec 'knowledge.search(query="...", rerank=true)' --presentation verbose
 
 Flags: `--db`, `--namespace`, `--presentation <agent|verbose|human>`, `--strict`.
 A request in which every op failed or aborted always exits nonzero after printing the full
-response. Without `--strict`, a *partially* failed request (`status: "partial"` with at least
+response. Without `--strict`, a _partially_ failed request (`status: "partial"` with at least
 one success) retains its compatibility behavior and exits zero; `--strict` converts any failed
 or aborted op into a nonzero process exit.
 
@@ -111,10 +111,13 @@ kkernel reindex --db ~/.khive/khive.db --sections-only      # backfill only sect
 | `--no-sections`    | within the knowledge pass, embed atoms but skip section embeddings (ADR-051)    |
 | `--sections-only`  | embed only knowledge sections (skip entities/notes and atoms)                   |
 | `--model <name>`   | entities/notes use this single engine instead of fanning out                    |
-| `--keep-existing`  | skip records already embedded (incremental top-up) instead of drop-and-rebuild  |
-| `--batch-size <n>` | records per embedding batch (default 100, max 500)                              |
+| `--keep-existing`  | skip records already embedded (incremental top-up) instead of replacing them    |
+| `--batch-size <n>` | records per embedding batch (default 128, max 500)                              |
 | `--best-effort`    | downgrade partial failures to a warning and still exit 0 (default fails closed) |
 | `--human`          | readable report instead of JSON                                                 |
+
+There is no `--embeds-only`, `--ids`, or `--dry-run` mode. `--keep-existing` narrows
+vector work to missing records, but the selected graph pass still backfills FTS.
 
 **Config resolution.** Engines, db path, and config file are resolved with the
 **same precedence as `kkernel mcp`** — config-file `[[engines]]` (via `--config`
