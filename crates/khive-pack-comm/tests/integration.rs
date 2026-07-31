@@ -3787,7 +3787,7 @@ async fn t12_allowlist_is_one_directional() {
 // the cross-test injection race that "local" would introduce.
 #[tokio::test]
 async fn t13_inbound_fts_failure_leaves_no_stranded_row() {
-    use khive_runtime::arm_fts_fail;
+    use khive_runtime::arm_fts_fail_scoped;
 
     // Unique namespace keeps the process-global FTS_FAIL_NS one-shot isolated
     // from other concurrent tests (each test uses a different UUID).
@@ -3797,7 +3797,7 @@ async fn t13_inbound_fts_failure_leaves_no_stranded_row() {
 
     // Arm FTS injection on the unique namespace — fires on the next create_note
     // call in this namespace, then clears (one-shot).
-    arm_fts_fail(&unique_ns);
+    let _fts_arm = arm_fts_fail_scoped(&unique_ns);
 
     // Attempt to create a note; the FTS step must fail and roll back the row.
     let result = rt
@@ -3837,7 +3837,7 @@ async fn t13_inbound_fts_failure_leaves_no_stranded_row() {
 #[tokio::test]
 async fn t14_inbound_vector_failure_leaves_no_stranded_row() {
     use async_trait::async_trait;
-    use khive_runtime::{arm_vector_fail, EmbedderProvider};
+    use khive_runtime::{arm_vector_fail_scoped, EmbedderProvider};
     use lattice_embed::{EmbedError, EmbeddingModel, EmbeddingService};
 
     const T14_MODEL: &str = "t14-const-vec";
@@ -3884,7 +3884,7 @@ async fn t14_inbound_vector_failure_leaves_no_stranded_row() {
 
     // Arm vector injection on the unique namespace — fires on the next create_note
     // call in this namespace after row + FTS commit, then clears (one-shot).
-    arm_vector_fail(&unique_ns);
+    let _vector_arm = arm_vector_fail_scoped(&unique_ns);
 
     // Attempt to create a note; the vector step must fail and roll back row + FTS.
     let result = rt

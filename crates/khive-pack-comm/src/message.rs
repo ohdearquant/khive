@@ -362,7 +362,7 @@ mod tests {
     async fn dual_write_inbound_failure_rollback_delete_failure_removes_outbound_or_reports_composite(
     ) {
         use khive_runtime::{
-            arm_fts_fail, arm_rollback_cleanup_fail, AllowAllGate, BackendId, RuntimeConfig,
+            arm_fts_fail_scoped, arm_rollback_cleanup_fail, AllowAllGate, BackendId, RuntimeConfig,
         };
 
         let sender_ns = format!("t460-sender-{}", Uuid::new_v4().simple());
@@ -390,7 +390,7 @@ mod tests {
 
         // Outbound (1st create_note call) targets sender_ns and is unaffected.
         // Inbound (2nd create_note call) targets recipient_ns and fails.
-        arm_fts_fail(&recipient_ns);
+        let _fts_arm = arm_fts_fail_scoped(&recipient_ns);
         // The rollback compensation's post-row-removal cleanup also fails.
         arm_rollback_cleanup_fail(&sender_ns);
 
