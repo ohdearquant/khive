@@ -1346,7 +1346,10 @@ mod tests {
             default_namespace: Namespace::parse("local").unwrap(),
             embedding_model: None,
             additional_embedding_models: vec![],
-            packs: vec!["kg".to_string()],
+            // kg + schedule + comm: this module's tests drive schedule.remind /
+            // schedule.cancel through the drain path and assert delivery lands in
+            // the creator's comm inbox, on top of the kg-verb fixture actions.
+            packs: vec!["kg".to_string(), "schedule".to_string(), "comm".to_string()],
             actor_id: actor_id.map(str::to_string),
             ..Default::default()
         };

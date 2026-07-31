@@ -1198,10 +1198,10 @@ mod tests {
             embedding_model: None,
             additional_embedding_models: vec![],
             // Pin the pack list explicitly rather than inheriting `KHIVE_PACKS`
-            // from the ambient environment (#1276) — every caller of this
-            // helper only dispatches `kg` verbs, so the behavior under test
-            // shouldn't depend on a wider pack set a developer's shell exports.
-            packs: vec!["kg".to_string()],
+            // from the ambient environment (#1276) — callers of this helper
+            // dispatch `kg` and `gtd.assign` verbs, so pin both rather than
+            // letting a wider ambient pack set a developer's shell exports.
+            packs: vec!["kg".to_string(), "gtd".to_string()],
             ..Default::default()
         };
         let rt = KhiveRuntime::new(cfg).expect("runtime on temp db");
@@ -1218,7 +1218,13 @@ mod tests {
     // `PackRegError { unknown: "gtd", .. }`. A unit test's outcome must not
     // depend on ambient shell configuration.
     #[test]
-    #[serial(khive_packs_env)]
+    // Bare `#[serial]`, not a named group: this test mutates the process-wide
+    // `KHIVE_PACKS` env var, and so does `code_ingest.rs`'s own ambient-env
+    // coverage — a named group here would let the two race across crate test
+    // modules within the same test binary (both bare-`#[serial]`), letting
+    // this test's temporary "kg,gtd" override leak into a concurrently
+    // running `code_ingest` test's `resolve_runtime_config(packs: None)` call.
+    #[serial]
     fn isolated_server_ignores_ambient_khive_packs_naming_unavailable_pack() {
         let prev = std::env::var("KHIVE_PACKS").ok();
         std::env::set_var("KHIVE_PACKS", "kg,gtd");
@@ -2385,6 +2391,7 @@ default = true
             None,
             None,
             ExecDbContext::default(),
+            false,
         )
         .await;
 
@@ -2567,6 +2574,7 @@ default = true
             None, // output_format
             None,
             ExecDbContext::default(),
+            false,
             spy_forward_records_call,
         )
         .await;
@@ -2623,6 +2631,7 @@ default = true
             None, // output_format
             None,
             ExecDbContext::default(),
+            false,
             spy_forward_records_call,
         )
         .await;
