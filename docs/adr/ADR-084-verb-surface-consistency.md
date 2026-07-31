@@ -3,12 +3,18 @@
 **Status**: proposed
 **Date**: 2026-07-02
 **Authors**: khive maintainers
-**Amends**: [ADR-023](ADR-023-declarative-pack-format.md) §3 (kg verb table -- adds the
-`schema` verb, 16 → 17). The table edit itself rides with the PR that ships the verb, so
-ADR-023 keeps describing the live surface at every commit. `AGENTS.md` taxonomy sections
-become generated artifacts under §5 of this document once the verb ships.
+**Would amend if accepted**: [ADR-023](ADR-023-declarative-pack-format.md) §3 (kg verb
+table -- adds the `schema` verb). The table edit would ride with the implementation PR,
+so ADR-023 keeps describing the live surface at every commit. `AGENTS.md` taxonomy
+sections would become generated artifacts under §5 once the verb ships.
 **Does not amend**: [ADR-016](ADR-016-request-dsl.md). The DSL grammar requires no change
 (see Context §"Phantom gaps").
+
+> **Implementation status (2026-07-31): deferred / not shipped.** `schema` is absent
+> from the registered `KG_HANDLERS` table, and `schema()` currently follows the
+> unknown-verb path. Section 2 specifies a proposed wire contract, not an available
+> public surface. None of this ADR's proposed rules becomes normative unless the ADR is
+> accepted and the corresponding implementation and conformance tests land.
 
 ---
 
@@ -82,7 +88,7 @@ Each new pack that ships without a stated contract is a fresh opportunity for th
 divergence. Several instances above are already filed as issues; fixing them individually
 does not prevent instance N+1.
 
-## Decision
+## Proposed decision
 
 One contract, one introspection verb. The contract states the invariants every pack's
 verb surface must obey; the `schema` verb is the contract's runtime projection -- the
@@ -345,7 +351,7 @@ taxonomy cannot silently diverge from the compiled one.
 
 **Negative / accepted costs**
 
-- One more kg verb (16 → 17) to document and maintain; mitigated by it being a
+- One more kg verb to document and maintain; mitigated by it being a
   serialization of existing structures plus one pack-attributed rule accessor (§2.6).
 - Phase-1 conformance is name-level only; behavioral rules remain review-enforced until
   the `ParamKind` enrichment lands. This is stated, not hidden.
@@ -382,8 +388,8 @@ taxonomy cannot silently diverge from the compiled one.
   addressing (both verified shipped, unamended)
 - [ADR-017](ADR-017-pack-standard.md) -- Pack trait, `EDGE_RULES`, pack-extensible
   endpoints (the merge semantics `schema` serializes)
-- [ADR-023](ADR-023-declarative-pack-format.md) -- verb surface and naming rules
-  (amended: `schema` row in the kg verb table)
+- [ADR-023](ADR-023-declarative-pack-format.md) -- verb surface and naming rules (would
+  gain a `schema` row if this proposal is accepted and implemented)
 - [ADR-045](ADR-045-verb-response-presentation.md) -- presentation rules applied to `schema`
   output
 - [ADR-048](ADR-048-knowledge-section-profiles.md) -- `resource` kind (pack-declared;
