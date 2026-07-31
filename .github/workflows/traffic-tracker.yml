@@ -1,0 +1,91 @@
+name: Traffic Tracker (14-day rolling)
+
+# GitHub's traffic API retains clone/view data for only 14 days. This
+# workflow runs every 13 days (24h safety overlap), merges the current
+# window into a per-day ledger via scripts/track-traffic.sh, and records
+# the result on the dedicated `traffic-data` branch.
+#
+# No workflow_dispatch: manual dispatch resolves workflow YAML from the
+# selected ref, which would let the unprotected data branch supply the
+# code this write-capable workflow runs. To capture a spike manually,
+# push a whitespace edit to one of the two watched paths instead.
+#
+# Trust boundary: the data branch is NEVER checked out and nothing from it
+# is ever executed. The ledger file is read with `git show`, the script
+# runs from the trusted main checkout, and the snapshot commit is built
+# with git plumbing (hash-object/mktree/commit-tree), which also keeps
+# `traffic-data` an orphan branch whose tree contains only the ledger.
+#
+# The traffic API requires push access, so this runs in-repo with
+# GITHUB_TOKEN rather than granting any third-party tracker a token.
+
+on:
+  schedule:
+    # every 13 days, off the :00 mark to spread cron load
+    - cron: '23 5 */13 * *'
+  push:
+    branches: [main]
+    paths:
+      - 'scripts/track-traffic.sh'
+      - '.github/workflows/traffic-tracker.yml'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: traffic-tracker
+  cancel-in-progress: false
+
+jobs:
+  track:
+    name: Snapshot repository traffic
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: main
+          fetch-depth: 1
+
+      - name: Fetch existing ledger without checking out the data branch
+        run: |
+          set -euo pipefail
+          if git ls-remote --exit-code origin refs/heads/traffic-data >/dev/null 2>&1; then
+            git fetch --depth 1 origin '+refs/heads/traffic-data:refs/remotes/origin/traffic-data'
+            if git rev-parse -q --verify origin/traffic-data:data/traffic-ledger.json >/dev/null; then
+              git show origin/traffic-data:data/traffic-ledger.json > "$RUNNER_TEMP/traffic-ledger.json"
+            fi
+          fi
+
+      - name: Merge current traffic window into the ledger
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TRAFFIC_REPO: ${{ github.repository }}
+          TRAFFIC_LEDGER: ${{ runner.temp }}/traffic-ledger.json
+        run: bash scripts/track-traffic.sh
+
+      - name: Commit snapshot via plumbing (data-only tree, no checkout)
+        run: |
+          set -euo pipefail
+          new_blob=$(git hash-object -w "$RUNNER_TEMP/traffic-ledger.json")
+          old_blob=$(git rev-parse -q --verify origin/traffic-data:data/traffic-ledger.json || echo none)
+          if [ "$new_blob" = "$old_blob" ]; then
+            echo "Ledger unchanged; nothing to commit"
+            exit 0
+          fi
+          if [ "$old_blob" = "none" ] && [ "$(jq '.days | length' "$RUNNER_TEMP/traffic-ledger.json")" -eq 0 ]; then
+            echo "First run returned no traffic days; not creating an empty ledger branch"
+            exit 0
+          fi
+          subtree=$(printf '100644 blob %s\ttraffic-ledger.json\n' "$new_blob" | git mktree)
+          tree=$(printf '040000 tree %s\tdata\n' "$subtree" | git mktree)
+          parent=$(git rev-parse -q --verify origin/traffic-data || true)
+          clones=$(jq -r '.last_snapshot.clones_14d // "n/a"' "$RUNNER_TEMP/traffic-ledger.json")
+          views=$(jq -r '.last_snapshot.views_14d // "n/a"' "$RUNNER_TEMP/traffic-ledger.json")
+          export GIT_AUTHOR_NAME="github-actions[bot]"
+          export GIT_AUTHOR_EMAIL="41898282+github-actions[bot]@users.noreply.github.com"
+          export GIT_COMMITTER_NAME="$GIT_AUTHOR_NAME"
+          export GIT_COMMITTER_EMAIL="$GIT_AUTHOR_EMAIL"
+          commit=$(git commit-tree "$tree" ${parent:+-p "$parent"} \
+            -m "chore(data): traffic snapshot — ${clones} clones / ${views} views (14d)")
+          git push origin "$commit:refs/heads/traffic-data"
