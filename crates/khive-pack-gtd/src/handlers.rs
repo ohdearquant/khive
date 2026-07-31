@@ -1264,9 +1264,9 @@ impl GtdPack {
                 target,
             } => {
                 // Idempotent by status (current == target) — but a caller-supplied
-                // `note` was being silently discarded here (issue #15). `transitioned`
+                // `note` was being silently discarded here. `transitioned`
                 // stays an accurate statement about status; persisting the note is a
-                // separate effect (reporter's preferred fix: khive-dist #15).
+                // separate effect.
                 let mut note_recorded = None;
                 if let Some(n) = p.note.as_deref() {
                     let mut props = note.properties.clone().unwrap_or_else(|| json!({}));
