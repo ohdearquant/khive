@@ -17,6 +17,11 @@ over the notes substrate.
 All five verbs are declared in `GTD_HANDLERS` (`src/vocab.rs`) and dispatched
 by `GtdPack::dispatch` (`src/pack.rs`).
 
+`gtd.complete` and `gtd.transition` are by-ID operations: a full UUID or a
+unique 8+ character hexadecimal prefix resolves without a namespace filter,
+as required by ADR-007. The task keeps its original namespace attribution;
+authorization remains the Gate's responsibility.
+
 ## Task lifecycle
 
 The `task` note kind's lifecycle field is `kind_status` (not `status` — that

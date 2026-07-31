@@ -228,6 +228,109 @@ async fn complete_via_short_id_resolves_prefix() {
 }
 
 #[tokio::test]
+async fn lifecycle_by_id_cross_namespace_supports_legacy_tasks() {
+    let runtime = rt();
+    let pack = pack(runtime.clone());
+    let legacy_namespace = Namespace::parse("legacy-gtd").expect("valid legacy namespace");
+    let legacy_token = runtime
+        .authorize(legacy_namespace)
+        .expect("authorize legacy namespace");
+    let task = runtime
+        .create_note(
+            &legacy_token,
+            "task",
+            Some("legacy namespace task"),
+            "legacy namespace task",
+            Some(0.5),
+            Some(json!({"status": "inbox", "priority": "p2"})),
+            vec![],
+        )
+        .await
+        .expect("create task under legacy namespace");
+    let full_id = task.id.as_hyphenated().to_string();
+    let short_id = full_id[..8].to_string();
+
+    let fetched = pack
+        .dispatch("get", json!({"id": full_id}))
+        .await
+        .expect("generic by-ID get must see the legacy task");
+    assert_eq!(fetched["namespace"], "legacy-gtd");
+
+    let transitioned = pack
+        .dispatch("gtd.transition", json!({"id": full_id, "status": "next"}))
+        .await
+        .expect("full-UUID transition must not filter by namespace");
+    assert_eq!(transitioned["from"], "inbox");
+    assert_eq!(transitioned["to"], "next");
+
+    let completed = pack
+        .dispatch("gtd.complete", json!({"id": short_id}))
+        .await
+        .expect("short-prefix completion must not filter by namespace");
+    assert_eq!(completed["from"], "next");
+    assert_eq!(completed["to"], "done");
+
+    let persisted = pack
+        .dispatch("get", json!({"id": full_id}))
+        .await
+        .expect("legacy task must remain readable after lifecycle writes");
+    assert_eq!(persisted["namespace"], "legacy-gtd");
+    assert_eq!(persisted["status"], "done");
+    assert!(persisted["properties"]["completed_at"].is_string());
+}
+
+#[tokio::test]
+async fn assign_dependency_prefix_ignores_collisions_outside_primary_namespace() {
+    use khive_storage::note::Note;
+    use uuid::Uuid;
+
+    let runtime = rt();
+    let pack = pack(runtime.clone());
+    let local_token = runtime
+        .authorize(Namespace::local())
+        .expect("authorize local namespace");
+    let legacy_token = runtime
+        .authorize(Namespace::parse("legacy-gtd").expect("valid legacy namespace"))
+        .expect("authorize legacy namespace");
+    let local_id = Uuid::parse_str("aabbccdd-1111-4000-8000-000000000001").unwrap();
+    let legacy_id = Uuid::parse_str("aabbccdd-2222-4000-8000-000000000002").unwrap();
+
+    let mut local_task = Note::new("local", "task", "local blocker")
+        .with_name("local blocker")
+        .with_properties(json!({"status": "inbox", "priority": "p2"}));
+    local_task.id = local_id;
+    runtime
+        .notes(&local_token)
+        .expect("local note store")
+        .upsert_note(local_task)
+        .await
+        .expect("insert local blocker");
+
+    let mut legacy_task = Note::new("legacy-gtd", "task", "legacy blocker")
+        .with_name("legacy blocker")
+        .with_properties(json!({"status": "inbox", "priority": "p2"}));
+    legacy_task.id = legacy_id;
+    runtime
+        .notes(&legacy_token)
+        .expect("legacy note store")
+        .upsert_note(legacy_task)
+        .await
+        .expect("insert legacy blocker");
+
+    let created = pack
+        .dispatch(
+            "gtd.assign",
+            json!({"title": "local dependent", "depends_on": ["aabbccdd"]}),
+        )
+        .await
+        .expect("primary-scoped dependency prefix must resolve the local task");
+    assert_eq!(
+        created["properties"]["depends_on"][0],
+        local_id.as_hyphenated().to_string()
+    );
+}
+
+#[tokio::test]
 async fn complete_rejects_non_task_notes() {
     // Reach around the pack and create a kg-shaped "observation" note to prove
     // the task-kind guard fires.
