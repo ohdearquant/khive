@@ -17,8 +17,8 @@ visible as the "current" state.
    violation leaves the existing target DB completely untouched.
 3. Build the working database in `<db_path>.tmp`.
 4. Upsert entities and populate the FTS5 index. Vector embeddings are
-   skipped — they're local-only derived state computed lazily via
-   `kkernel kg embed` (ADR-035 §6).
+   skipped — they're local-only derived state repaired explicitly via
+   `kkernel reindex` (ADR-035 §5).
 5. Checkpoint the WAL (`PRAGMA wal_checkpoint(TRUNCATE)`).
 6. Atomic rename: `<db_path>.tmp` → `<db_path>`. A crash before this step
    leaves the previous DB intact (all-or-nothing guarantee).
@@ -114,20 +114,20 @@ silently no-ops the checkpoint and can lose WAL-resident writes at the
 subsequent rename. The regression test
 `wal_checkpoint_truncate_via_plain_execute_script_fails_with_write_queue_enabled`
 is a revert-and-confirm-fails companion: it asserts the OLD call shape
-*fails* under the write queue, which proves the paired "succeeds" test is
+_fails_ under the write queue, which proves the paired "succeeds" test is
 actually exercising the fix rather than passing vacuously (i.e. it isn't a
 test that would pass regardless of which call shape were in use).
 
 ## Failure modes
 
-| Scenario                        | Behaviour                                                |
-| -------------------------------- | ---------------------------------------------------------- |
-| Invalid edge relation in NDJSON | Error before any DB/cache write; previous DB intact       |
-| Hash mismatch on remote pin     | `VcsError::HashMismatch`; no cache files written           |
-| Git clone failure               | Error with remote name only (URL redacted from message)   |
-| Non-UTF-8 staging path          | `Path` passed directly to `Command::arg`; no panic         |
-| Non-finite edge weight          | `VcsError::Internal` from `edge_to_canonical_value`         |
-| WAL checkpoint failure          | Error before rename; previous DB intact                    |
+| Scenario                        | Behaviour                                               |
+| ------------------------------- | ------------------------------------------------------- |
+| Invalid edge relation in NDJSON | Error before any DB/cache write; previous DB intact     |
+| Hash mismatch on remote pin     | `VcsError::HashMismatch`; no cache files written        |
+| Git clone failure               | Error with remote name only (URL redacted from message) |
+| Non-UTF-8 staging path          | `Path` passed directly to `Command::arg`; no panic      |
+| Non-finite edge weight          | `VcsError::Internal` from `edge_to_canonical_value`     |
+| WAL checkpoint failure          | Error before rename; previous DB intact                 |
 
 ## Test coverage map
 

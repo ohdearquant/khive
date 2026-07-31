@@ -18,8 +18,9 @@ verb-dispatch machinery that lets packs (`kg`, `gtd`, `memory`, …) extend the 
   `EntityDedupMergePolicy`) — update/merge semantics per
   [ADR-014](https://github.com/ohdearquant/khive/blob/main/docs/adr/ADR-014-curation-operations.md)
 - **Retrieval objectives** (`RrfFusionObjective`, `VectorSimilarityObjective`,
-  `TextRelevanceObjective`, `TemporalRecencyObjective`, `DecayAwareSalienceObjective`, …)
-  composed into a `MemoryRecallPipeline`
+  `TextRelevanceObjective`, `TemporalRecencyObjective`,
+  `AmplifiedDecayAwareSalienceObjective`, …) composed into a `MemoryRecallPipeline`, plus
+  `DecayAwareSalienceObjective` for standalone fixed-rate scoring
 - **Graph traversal** (`PathNode`) and **validation** (`ValidationRule`,
   `ValidationReport`, `Violation`) for domain-specific graph-shape rules
 - **Daemon** (unix only) — `run_daemon`, socket/pid path helpers, and the

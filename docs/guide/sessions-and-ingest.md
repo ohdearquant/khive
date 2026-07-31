@@ -1,8 +1,9 @@
 # Agent Sessions and Data Ingest
 
-This guide covers the session pack (`crates/khive-pack-session/`), which has
-two independent parts that are easy to conflate but serve different
-purposes:
+This guide covers the shipped session pack, whose wire declarations live in
+[`src/vocab.rs`](../../crates/khive-pack-session/src/vocab.rs) and whose dispatch and lifecycle
+wiring live in [`src/pack.rs`](../../crates/khive-pack-session/src/pack.rs). It has two independent
+parts that are easy to conflate but serve different purposes:
 
 - **Session verbs** (`session.store`, `session.list`, `session.resume`,
   `session.export`): explicit, caller-driven persistence of a session record
@@ -87,16 +88,18 @@ verbatim.
 
 ## Provider mirror ingest
 
-The mirror service (`crates/khive-pack-session/src/mirror/`) is a background
-task, distinct from the four verbs above, that discovers and tails local
-transcript files and writes their events into three dedicated tables
-(`sessions`, `session_messages`, `session_mirror_cursor`) created by the
-pack's schema plan. It never calls `session.store` and does not create
-`session` notes.
+The [mirror service](../../crates/khive-pack-session/src/mirror/service.rs) is a background task,
+distinct from the four verbs above, that discovers and tails local transcript files through the
+[ingest module](../../crates/khive-pack-session/src/mirror/ingest.rs). It writes their events into
+three dedicated tables (`sessions`, `session_messages`, `session_mirror_cursor`) created by the
+pack's schema plan in
+[`src/vocab.rs`](../../crates/khive-pack-session/src/vocab.rs). It never calls `session.store` and
+does not create `session` notes.
 
 ### Supported providers
 
-Only three sources are implemented (`MirrorSource` in `mirror/ingest.rs`):
+Only three sources are implemented (`MirrorSource` in
+[`src/mirror/ingest.rs`](../../crates/khive-pack-session/src/mirror/ingest.rs)):
 
 - **Claude Code CLI transcripts** (`claude_code`): JSONL files under
   `KHIVE_MIRROR_PROJECTS_DIR`.
@@ -112,11 +115,13 @@ variant, not folded into the existing ChatGPT or Claude Code parsers.
 
 ### Enabling it
 
-The mirror service only starts if at least one enable flag is true. This is
-checked once, in the session pack's `warm()` lifecycle hook, and `warm()` is
-only invoked by the persistent daemon's startup path
-(`crates/khive-runtime/src/daemon.rs`), not by a plain stdio client. So, like
-the email channel loops described in
+The mirror service only starts if at least one enable flag is true. This is checked once in the
+session pack's `warm()` hook
+([`src/pack.rs`](../../crates/khive-pack-session/src/pack.rs)). The registry collects those hooks in
+[`khive-runtime/src/pack.rs`](../../crates/khive-runtime/src/pack.rs), and the persistent daemon is
+the process that invokes them during startup through
+[`khive-runtime/src/daemon.rs`](../../crates/khive-runtime/src/daemon.rs). A plain stdio client does
+not run that daemon warm path. So, like the email channel loops described in
 [Communication and Email](communication.md), running `kkernel mcp --daemon`
 is what actually starts background ingestion; a stdio session never spawns
 its own mirror poller.
@@ -172,6 +177,14 @@ To store a manual session summary through the note-based verbs instead
 request(ops="session.store(content=\"Reviewed PR #610, confirmed daemon-only gating\", title=\"PR 610 review\", provider=\"claude_code\")")
 request(ops="session.list(provider=\"claude_code\", limit=5)")
 ```
+
+## Auditing the surface
+
+The wire contract is discoverable without relying on implementation paths:
+`request(ops="verbs(pack=\"session\")")` lists the four public verbs, and the
+[API reference](api-reference.md) records their parameters and response shapes. The source links
+above are implementation anchors verified in this distribution, not a substitute for runtime
+discovery.
 
 ## See also
 

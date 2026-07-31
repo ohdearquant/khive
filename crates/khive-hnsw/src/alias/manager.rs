@@ -362,11 +362,13 @@ impl IndexAliasManager {
 
         // If we have a validator, run it and capture recall
         if let Some(ref v) = validator {
-            let collections = self.collections.read();
-            let index = Arc::clone(&collections.get(&new_collection_name).unwrap().index);
-            let validation_result = v.validate(&index);
-            drop(collections);
-            match validation_result {
+            // Validation may block on recalls, so retain an index snapshot
+            // without monopolizing collection registry updates.
+            let index = {
+                let collections = self.collections.read();
+                Arc::clone(&collections.get(&new_collection_name).unwrap().index)
+            };
+            match v.validate(&index) {
                 Ok(()) => {}
                 Err(AliasError::ValidationFailed {
                     recall, min_recall, ..
@@ -844,6 +846,99 @@ mod tests {
         assert_eq!(mgr.acquire_reader("active").unwrap().len(), 5);
         assert_eq!(mgr.acquire_reader("candidate").unwrap().len(), 8);
         assert_eq!(mgr.collection_count(), 2);
+    }
+
+    /// Regression for #1439: validation must retain only the selected index
+    /// snapshot, not a collection registry read lock.
+    #[test]
+    fn test_migrate_validation_releases_collection_lock() {
+        use std::sync::{mpsc, Mutex};
+
+        struct BlockingFailValidator {
+            entered: mpsc::SyncSender<()>,
+            release: Mutex<mpsc::Receiver<()>>,
+        }
+
+        impl IndexValidator for BlockingFailValidator {
+            fn validate(&self, _index: &HnswIndex) -> Result<(), AliasError> {
+                self.entered.send(()).unwrap();
+                self.release.lock().unwrap().recv().unwrap();
+                Err(AliasError::ValidationFailed {
+                    reason: "blocked validator failure".to_string(),
+                    recall: Some(0.42),
+                    min_recall: Some(0.95),
+                })
+            }
+        }
+
+        let manager = Arc::new(IndexAliasManager::new(Duration::from_secs(5)));
+        manager
+            .register_collection("v1", make_index(4, 10))
+            .unwrap();
+        manager.create_alias("production", "v1").unwrap();
+
+        let (entered_tx, entered_rx) = mpsc::sync_channel(0);
+        let (release_tx, release_rx) = mpsc::channel();
+        let migration_manager = Arc::clone(&manager);
+        let migration = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let vectors = (0..20u8)
+                .map(|i| (NodeId::new([i; 16]), vec![i as f32; 4]))
+                .collect();
+            runtime.block_on(migration_manager.migrate(
+                "production",
+                vectors,
+                HnswConfig::with_dimensions(4),
+                Some(Box::new(BlockingFailValidator {
+                    entered: entered_tx,
+                    release: Mutex::new(release_rx),
+                })),
+            ))
+        });
+
+        entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("validator did not start");
+
+        let registration_manager = Arc::clone(&manager);
+        let (registration_tx, registration_rx) = mpsc::channel();
+        let registration = std::thread::spawn(move || {
+            let result = registration_manager.register_collection("unrelated", make_index(4, 1));
+            registration_tx.send(result).unwrap();
+        });
+
+        let registration_result = registration_rx.recv_timeout(Duration::from_secs(5));
+        release_tx.send(()).unwrap();
+        let migration_result = migration.join().unwrap();
+        registration.join().unwrap();
+
+        registration_result
+            .expect("collection registration blocked while validation was paused")
+            .unwrap();
+        match migration_result {
+            Err(AliasError::ValidationFailed {
+                reason,
+                recall,
+                min_recall,
+            }) => {
+                assert_eq!(reason, "recall below threshold");
+                assert_eq!(recall, Some(0.42));
+                assert_eq!(min_recall, Some(0.95));
+            }
+            other => panic!("unexpected migration result: {other:?}"),
+        }
+        assert_eq!(manager.resolve_alias("production"), Some("v1".to_string()));
+
+        let collections = manager.collections.read();
+        assert_eq!(collections.len(), 2);
+        assert!(collections.contains_key("v1"));
+        assert!(collections.contains_key("unrelated"));
+        assert!(!collections
+            .keys()
+            .any(|name| name.starts_with("v1_migrated_")));
     }
 
     /// Regression for #417: acquiring a reader must not race a concurrent

@@ -39,7 +39,8 @@ and `api/snapshot-hash.md` (content-addressed `SnapshotId` hashing).
 ### Vector embeddings are local-only derived state (ADR-035)
 
 - `run_sync` intentionally skips vector embedding during import. Vectors are local-only
-  derived state computed lazily via `kkernel kg embed` when needed.
+  derived state repaired explicitly with `kkernel reindex` when needed; `--keep-existing`
+  provides incremental top-up and `--no-knowledge` narrows the pass to entities and notes.
 - FTS5 text index is populated during sync so that text search works immediately
   after sync without a separate embedding pass.
 

@@ -1,16 +1,14 @@
 # API Reference
 
-khive exposes exactly one MCP tool, `request`. Everything else, 85 verbs across 12
-production packs, is dispatched through that single tool via a small request DSL.
+khive exposes exactly one MCP tool, `request`. Every public verb from the production
+packs is dispatched through that single tool via a small request DSL.
 This page documents the DSL grammar, the response envelope, and every verb's full
 parameter contract, so an agent can call khive correctly without reading Rust source.
 
-This page is verified against the live registry (`request(ops="verbs()")`, run
-2026-07-17) and the pack source (`crates/khive-pack-*/src/*.rs` `HandlerDef`/`ParamDef`
-struct literals). Verb count: **85**, matching both the live registry `total` field and
-the sum of the 12 pack counts below. If your server reports a different total, your
-`KHIVE_PACKS` configuration loads a different pack set than the default — run
-`request(ops="verbs()")` against your own server to get the authoritative list.
+The live registry is authoritative: run `request(ops="verbs()")` against your server to
+discover its loaded pack set and total. The static sections below are audited against pack
+`HandlerDef`/`ParamDef` declarations; the kg catalog was refreshed against the 19-entry
+`KG_HANDLERS` table and its integration contract when `whoami` shipped.
 
 An always-machine-readable copy of this page is at
 [`/md/api-reference.md`](md/api-reference.md). The site also publishes
@@ -21,7 +19,7 @@ An always-machine-readable copy of this page is at
 
 | Pack        | Verbs | Load with                                  | Optional?           |
 | ----------- | ----- | ------------------------------------------ | ------------------- |
-| `kg`        | 18    | `KHIVE_PACKS=kg` (default)                 | No — base substrate |
+| `kg`        | 19    | `KHIVE_PACKS=kg` (default)                 | No — base substrate |
 | `gtd`       | 5     | `KHIVE_PACKS=kg,gtd`                       | Yes                 |
 | `memory`    | 5     | `KHIVE_PACKS=kg,memory`                    | Yes                 |
 | `brain`     | 15    | `KHIVE_PACKS=kg,brain`                     | Yes                 |
@@ -58,8 +56,8 @@ even with no `[storage.blob]` section and no `KHIVE_BLOB_ROOT` set; the verbs on
 unconfigured (erroring until a backend is installed) when the server boots against an
 in-memory backend, which has no directory to default a root beside.
 
-The default binary (no `KHIVE_PACKS`/`--pack` override) loads all 12 packs: 18 + 5 + 5 +
-15 + 7 + 4 + 19 + 4 + 4 + 1 + 0 + 3 = **85 verbs**.
+The default binary (no `KHIVE_PACKS`/`--pack` override) loads all 12 packs. Use `verbs()` for the
+current aggregate rather than carrying a second hand-maintained total here.
 
 Verb names in the `kg` pack are bare (`create`, `search`, `link`, …). Every other pack
 namespaces its verbs with a `pack.` prefix (`gtd.assign`, `memory.recall`,
@@ -157,7 +155,7 @@ parallel batches, since parallel failures do not cascade.
 
 ---
 
-## `kg` pack — 18 verbs
+## `kg` pack — 19 verbs
 
 Base substrate verbs, bare names (no `kg.` prefix). Category is the illocutionary act
 (Searle 1976): Assertive = retrieves state, Commissive = commits a persistent change,
@@ -633,6 +631,16 @@ silent pick among close candidates. Read-only: performs no mutation.
 request(ops="resolve(refs=[\"the old record\", \"<uuid>\"])")
 ```
 
+### `whoami` — Assertive
+
+Report the caller identity and namespace scope the runtime already resolved for this request.
+It takes no parameters and returns only identity labels, never tokens or credentials:
+`{actor_id, actor_kind, unattributed, namespace, visible_namespaces}`.
+
+```
+request(ops="whoami()")
+```
+
 ### `verbs` — Assertive
 
 List all MCP-callable verbs registered on this server. Internal subhandlers are
@@ -1085,6 +1093,11 @@ List inbound messages for the caller.
 ```
 request(ops="comm.inbox(limit=10)")
 ```
+
+Every returned message uses the hyphenated full UUID for `id`, so the value is
+always accepted unchanged by `comm.read`, `comm.reply`, or `comm.thread`, even
+when two messages share an eight-character prefix. `full_id` remains an alias
+for compatibility, while `short_id` is the compact display-only prefix.
 
 ### `comm.read` — Declaration
 

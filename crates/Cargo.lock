@@ -2591,6 +2591,7 @@ dependencies = [
  "khive-vcs",
  "khive-vcs-adapters",
  "lattice-embed",
+ "libc",
  "rmcp",
  "serde",
  "serde_json",

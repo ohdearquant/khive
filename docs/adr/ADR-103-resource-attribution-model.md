@@ -463,7 +463,17 @@ of the previous.
 
 ## Amendment 1 (2026-07-13): Batch-Scaled `cost_unit` and Daemon-Startup Warm-Hook Attribution
 
-**Status**: Proposed (amendment to ADR-103's Stage 1 design; not yet implemented)
+**Status**: Accepted and implemented in PR
+[#927](https://github.com/ohdearquant/khive/pull/927), merged on 2026-07-13 as
+`68e9325a039f0975f9caaa64ee5fb834ba874aa2`.
+
+The shipped boundary is precise: successful dispatch audit rows carry deterministic
+`resource.cost_unit`; all dispatch outcomes carry `resource.work_class`; and the kg and knowledge
+embedder warm hooks emit phase spans. `brain.event_counts` later gained `total_cost_unit` and
+`cost_unit_by_verb` aggregation in PR #958. The formula is implemented, but its current weight
+table is still the uncalibrated baseline (`base_weight = 1` for every verb and
+`per_item_weight = 1` for embedding-bearing verbs). Stage 2 scheduling and Stage 3 quota
+enforcement remain outside this amendment and are not implied by its accepted status.
 
 ### Context
 
@@ -614,8 +624,8 @@ skipped, not counted into a default bucket.
 runtime's embedder once at daemon construction (or lazily on first pack install) to warm
 it. Both run through `PackRuntime::warm(&self)` (`crates/khive-runtime/src/pack.rs:232`),
 which takes no `NamespaceToken` argument, so neither call executes inside `dispatch()` or
-under the Gate. There is no actor in scope, no audit row is written (there is no dispatch
-to attach one to), and both embedder-warmup passes are currently invisible on the event
+under the Gate. Before PR #927 there was no actor in scope, no audit row was written (there
+was no dispatch to attach one to), and both embedder-warmup passes were invisible on the event
 plane entirely, the one concrete gap in Decision (c) as written, which already commits
 background phase work of this shape to `PhaseStarted` plus a terminal event.
 
@@ -674,8 +684,8 @@ already-proven mechanism, not new design surface.
 
 ### Consequences
 
-- Positive: `cost_unit` becomes usable for Stage 3 quota accounting without a follow-up
-  correction once the formula ships, since it already accounts for both the batch-size
+- Positive: the shipped `cost_unit` formula is usable as the deterministic input to future
+  Stage 3 quota accounting, since it already accounts for both the batch-size
   and model-fan-out undercounts a naive per-verb weight would have missed at scale. The
   two daemon-startup warmup passes join the rest of the daemon's background work (ANN
   warm, checkpoint, channel poll) on the event plane instead of remaining the one silent
@@ -693,6 +703,27 @@ already-proven mechanism, not new design surface.
   stage boundaries.
 
 ## Amendment 2 (2026-07-21): Itemized Executed-Usage Counters — Response-Envelope `usage` and Audit-Row `resource.units`
+
+**Status**: Accepted; partially implemented in PR
+[#1231](https://github.com/ohdearquant/khive/pull/1231), merged on 2026-07-22 as
+`bb764bf58f06a8c651b93c3d223dd75dcf6f0a74` (ported in the current history as
+`b0d92a67aa2f69d070daca6911384057cc9bdca6`).
+
+The shipped implementation provides the seven-counter `UsageContext`, per-operation MCP envelope
+`usage`, and the identical frozen audit snapshot at `resource.units`. Production increments exist
+for embedding, FTS, vector probes, graph hops, graph-store round trips, and successfully appended
+event rows. Runtime entity/note multi-model create paths explicitly propagate the context into
+their joined child tasks.
+
+The remaining gaps are observable in current code and are not papered over by this status:
+
+- `ann_jobs_consumed` has no production increment site, so it is always absent/zero.
+- spawned per-model work in `memory.recall` and `knowledge.index` does not re-enter the usage
+  scope, so those child tasks can under-report `embed_calls`, `vector_passes`, and related work;
+- `db_round_trips` is instrumented at graph-read seams, not as a universal counter for every SQL
+  or storage call; and
+- Part 5's `[request] max_ops` deployment setting is not parsed or enforced. The shipped parser
+  ceiling remains the constant `khive_request::MAX_OPS = 100`.
 
 ### Context
 
@@ -824,27 +855,26 @@ the hand-set weight table Amendment 1 left open can now be **calibrated from obs
 `units` distributions** instead of guessed, under the same governance Decision (b)
 established. Nothing in quota enforcement (Decision d) changes.
 
-### Part 5: request-cap configurability
+### Part 5: request-cap configurability (not implemented)
 
-The batch cap is today a protocol constant (`MAX_OPS = 100`, defined in
-`khive-request` and re-exported through its crate root). The parser stays pure:
-ADR-016 makes `khive-request` a zero-runtime-dependency parser shared by every
-transport, and a config-dependent parse would let the same stored input (a scheduled
-action, a replayed request) parse under one deployment and fail under another.
-Instead, the deployment cap is enforced **at the runtime boundary before dispatch**:
-`MAX_OPS` remains the protocol ceiling the parser enforces unconditionally, and a
-`[request] max_ops` setting (default 100, valid range 1..=`MAX_OPS`) is checked after
-parse, rejecting the batch with the existing typed op-count error. The authority
-model is single: the process performing the dispatch applies its own configured
-limit. The 1 MiB input length bound stays a parser constant.
+The shipped batch cap is the protocol constant `MAX_OPS = 100`, defined in
+`khive-request` and re-exported through its crate root. The parser stays pure: ADR-016
+makes `khive-request` a zero-runtime-dependency parser shared by every transport, and a
+config-dependent parse would let the same stored input parse under one deployment and fail
+under another.
+
+This amendment also decides that a future `[request] max_ops` setting (default 100, valid
+range 1..=`MAX_OPS`) belongs at the runtime boundary after parse, while the 1 MiB input
+length bound remains a parser constant. Current code has no such config field or post-parse
+deployment check; only the fixed protocol ceiling is enforced. This paragraph records the
+accepted placement for future implementation, not a shipped operator knob.
 
 ### Consequences
 
-- Positive: usage accounting by executed actuals becomes possible for every consumer
-  (quota policy, operators, external usage readers) without estimating from request
-  shape; the F2 read-time maintenance work and graph-expansion costs become visible
-  per-dispatch for the first time; Amendment 1's open weight table gains an empirical
-  calibration source.
+- Positive: usage accounting by executed actuals is available on the instrumented MCP paths
+  without estimating solely from request shape; graph-expansion costs become visible
+  per-dispatch, and Amendment 1's open weight table gains a partial empirical calibration
+  source. The gaps listed in the lifecycle note above bound that claim.
 - Negative: seven increment sites to keep honest as retrieval paths evolve; a
   regression test per counter per representative verb is required at implementation
   time so a refactor cannot silently zero a counter, plus the two propagation-class
