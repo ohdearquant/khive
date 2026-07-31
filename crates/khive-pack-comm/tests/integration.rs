@@ -436,6 +436,34 @@ async fn test_short_id_collision_errors_clearly() {
     builder.register(khive_pack_comm::CommPack::new(rt.clone()));
     let registry = builder.build().expect("registry");
 
+    // The inbox must never emit the ambiguous prefix as its actionable `id`.
+    // Both colliding rows remain individually round-trippable through read.
+    let inbox = registry
+        .dispatch("comm.inbox", serde_json::json!({ "status": "all" }))
+        .await
+        .expect("inbox succeeds with colliding UUID prefixes");
+    let messages = inbox["messages"].as_array().expect("messages array");
+    assert_eq!(messages.len(), 2);
+    let returned_ids = messages
+        .iter()
+        .map(|message| {
+            assert_eq!(message["short_id"].as_str(), Some(base));
+            let id = message["id"].as_str().expect("round-trippable id");
+            assert_eq!(message["full_id"].as_str(), Some(id));
+            id.to_string()
+        })
+        .collect::<std::collections::HashSet<_>>();
+    assert_eq!(
+        returned_ids,
+        [uuid_a.to_string(), uuid_b.to_string()].into()
+    );
+    for id in &returned_ids {
+        registry
+            .dispatch("comm.read", serde_json::json!({ "id": id }))
+            .await
+            .expect("every inbox id is accepted by comm.read");
+    }
+
     let err = registry
         .dispatch("comm.read", serde_json::json!({ "id": base }))
         .await
@@ -445,6 +473,10 @@ async fn test_short_id_collision_errors_clearly() {
     assert!(
         msg.contains("ambiguous"),
         "ambiguous prefix error must mention 'ambiguous': got {msg:?}"
+    );
+    assert!(
+        msg.contains(&uuid_a.to_string()) && msg.contains(&uuid_b.to_string()),
+        "ambiguity error must name distinguishable full UUIDs: got {msg:?}"
     );
 }
 // ── UE6 Critical F-C3: dual-write delivery tests ─────────────────────────────
@@ -591,6 +623,30 @@ async fn test_inbox_returns_inbound_for_recipient() {
     assert_eq!(
         props.get("direction").and_then(|v| v.as_str()),
         Some("inbound")
+    );
+
+    let id = msgs[0]
+        .get("id")
+        .and_then(|value| value.as_str())
+        .expect("inbox message exposes a round-trippable id");
+    let short_id = msgs[0]
+        .get("short_id")
+        .and_then(|value| value.as_str())
+        .expect("inbox message exposes a compact display id");
+    let full_id = msgs[0]
+        .get("full_id")
+        .and_then(|value| value.as_str())
+        .expect("inbox message exposes a full id");
+    assert_eq!(short_id.len(), 8);
+    assert_eq!(id, full_id);
+
+    let read = registry
+        .dispatch("comm.read", serde_json::json!({ "id": id }))
+        .await
+        .expect("the id returned by inbox round-trips through comm.read");
+    assert_eq!(
+        read.get("full_id").and_then(|value| value.as_str()),
+        Some(full_id)
     );
 }
 

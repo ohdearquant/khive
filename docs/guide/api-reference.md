@@ -1086,6 +1086,11 @@ List inbound messages for the caller.
 request(ops="comm.inbox(limit=10)")
 ```
 
+Every returned message uses the hyphenated full UUID for `id`, so the value is
+always accepted unchanged by `comm.read`, `comm.reply`, or `comm.thread`, even
+when two messages share an eight-character prefix. `full_id` remains an alias
+for compatibility, while `short_id` is the compact display-only prefix.
+
 ### `comm.read` — Declaration
 
 Mark an inbound message as read. Outbound messages cannot be marked read.
