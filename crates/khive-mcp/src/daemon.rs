@@ -20,6 +20,7 @@ use khive_runtime::daemon::{
     DaemonRequestFrame, DaemonResponseFrame, PROTOCOL_VERSION,
 };
 use rmcp::ErrorData as McpError;
+use sha2::{Digest, Sha256};
 use tokio::net::UnixStream;
 
 use crate::tools::request::RequestParams;
@@ -271,6 +272,89 @@ pub(crate) fn reset_fallback_counters() {
     FALLBACK_STRICT_VIOLATIONS.store(0, SeqCst);
 }
 
+struct ConfigIdFields<'a> {
+    packs: &'a str,
+    db: &'a str,
+    embed: &'a str,
+    extra: &'a str,
+    backend: &'a str,
+    outbound: &'a str,
+    git_write: &'a str,
+    backends: Option<&'a str>,
+    pack_backends: Option<&'a str>,
+}
+
+fn parse_config_id(config_id: &str) -> Option<ConfigIdFields<'_>> {
+    let (base, backends, pack_backends) =
+        if let Some((before_routing, routing)) = config_id.rsplit_once("];pack_backends=[") {
+            let pack_backends = routing.strip_suffix(']')?;
+            let (base, backends) = before_routing.rsplit_once(";backends=[")?;
+            (base, Some(backends), Some(pack_backends))
+        } else {
+            (config_id, None, None)
+        };
+
+    let base = base.strip_prefix("packs=[")?;
+    let (packs, rest) = base.split_once("];db=")?;
+    let (rest, git_write) = rest.rsplit_once(";git_write=")?;
+    let (rest, outbound) = rest.rsplit_once(";outbound=[")?;
+    let outbound = outbound.strip_suffix(']')?;
+    let (rest, backend) = rest.rsplit_once(";backend=")?;
+    let (rest, extra) = rest.rsplit_once(";extra=[")?;
+    let extra = extra.strip_suffix(']')?;
+    let (db, embed) = rest.rsplit_once(";embed=")?;
+
+    Some(ConfigIdFields {
+        packs,
+        db,
+        embed,
+        extra,
+        backend,
+        outbound,
+        git_write,
+        backends,
+        pack_backends,
+    })
+}
+
+fn first_config_mismatch_field(client: &str, daemon: Option<&str>) -> &'static str {
+    let Some(daemon) = daemon else {
+        return "unknown";
+    };
+    let (Some(client), Some(daemon)) = (parse_config_id(client), parse_config_id(daemon)) else {
+        return "unknown";
+    };
+
+    if client.packs != daemon.packs {
+        "packs"
+    } else if client.db != daemon.db {
+        "db"
+    } else if client.embed != daemon.embed {
+        "embed"
+    } else if client.extra != daemon.extra {
+        "extra"
+    } else if client.backend != daemon.backend {
+        "backend"
+    } else if client.outbound != daemon.outbound {
+        "outbound"
+    } else if client.git_write != daemon.git_write {
+        "git_write"
+    } else if client.backends != daemon.backends {
+        "backends"
+    } else if client.pack_backends != daemon.pack_backends {
+        "pack_backends"
+    } else {
+        "unknown"
+    }
+}
+
+fn opaque_config_id(config_id: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"khive.daemon-config-diagnostic.v1\0");
+    hasher.update(config_id.as_bytes());
+    format!("sha256:{:x}", hasher.finalize())
+}
+
 /// Emit the standardized `daemon_fallback` event and increment the matching
 /// counters. Call exactly once per fallback event, at the point where the
 /// caller is about to dispatch locally instead of via the warm daemon.
@@ -291,13 +375,23 @@ fn record_fallback(
 
     let strict_violation =
         reason.severity() == FallbackSeverity::Illegitimate && is_daemon_strict_mode();
+    let diagnostic_config_id_client = opaque_config_id(config_id_client);
+    let diagnostic_config_id_daemon = config_id_daemon
+        .map(opaque_config_id)
+        .unwrap_or_else(|| "none".to_string());
+    let config_mismatch_field = if reason == FallbackReason::ConfigMismatch {
+        first_config_mismatch_field(config_id_client, config_id_daemon)
+    } else {
+        "not_applicable"
+    };
 
     if strict_violation {
         FALLBACK_STRICT_VIOLATIONS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         tracing::error!(
             reason = reason.as_str(),
-            config_id_client,
-            config_id_daemon = config_id_daemon.unwrap_or("none"),
+            config_id_client = %diagnostic_config_id_client,
+            config_id_daemon = %diagnostic_config_id_daemon,
+            config_mismatch_field,
             namespace_client,
             pid = std::process::id(),
             strict = true,
@@ -306,8 +400,9 @@ fn record_fallback(
     } else {
         tracing::warn!(
             reason = reason.as_str(),
-            config_id_client,
-            config_id_daemon = config_id_daemon.unwrap_or("none"),
+            config_id_client = %diagnostic_config_id_client,
+            config_id_daemon = %diagnostic_config_id_daemon,
+            config_mismatch_field,
             namespace_client,
             pid = std::process::id(),
             "daemon_fallback"
@@ -1869,8 +1964,9 @@ where
             // path below.
         }
         ForwardOutcome::ParseFailure => {
+            let config_id = opaque_config_id(&frame.config_id);
             tracing::warn!(
-                config_id = %frame.config_id,
+                config_id = %config_id,
                 namespace = %frame.namespace,
                 retry_suppressed = true,
                 "daemon connection lost after the request was fully written — \
@@ -1879,8 +1975,9 @@ where
             return Some(Err(ambiguous_forward_error()));
         }
         ForwardOutcome::ProtocolMismatch => {
+            let config_id = opaque_config_id(&frame.config_id);
             tracing::warn!(
-                config_id = %frame.config_id,
+                config_id = %config_id,
                 namespace = %frame.namespace,
                 retry_suppressed = true,
                 "daemon protocol mismatch discovered after the request was fully \
@@ -1993,8 +2090,9 @@ where
                 return map_response(*resp, &frame.config_id, &frame.namespace)
             }
             ForwardOutcome::ParseFailure => {
+                let config_id = opaque_config_id(&frame.config_id);
                 tracing::warn!(
-                    config_id = %frame.config_id,
+                    config_id = %config_id,
                     namespace = %frame.namespace,
                     retry_suppressed = true,
                     "freshly-established daemon connection lost after the request \
@@ -2003,8 +2101,9 @@ where
                 return Some(Err(ambiguous_forward_error()));
             }
             ForwardOutcome::ProtocolMismatch => {
+                let config_id = opaque_config_id(&frame.config_id);
                 tracing::warn!(
-                    config_id = %frame.config_id,
+                    config_id = %config_id,
                     namespace = %frame.namespace,
                     "daemon protocol mismatch discovered on the post-recovery retry \
                      — not retrying again or falling back locally"
@@ -2465,6 +2564,83 @@ mod tests {
     }
 
     #[test]
+    fn first_config_mismatch_field_follows_fingerprint_order() {
+        let client = "packs=[kg];db=/private/client.db;embed=none;extra=[];\
+                      backend=main;outbound=[];git_write=client-policy";
+        let daemon = "packs=[kg,gtd];db=/private/daemon.db;embed=none;extra=[];\
+                      backend=main;outbound=[];git_write=daemon-policy";
+
+        assert_eq!(first_config_mismatch_field(client, Some(daemon)), "packs");
+    }
+
+    #[test]
+    fn first_config_mismatch_field_names_backend_topology_without_values() {
+        let base = "packs=[kg];db=:memory:;embed=none;extra=[];backend=main;\
+                    outbound=[];git_write=policy";
+        let client =
+            format!("{base};backends=[main:Sqlite:/private/client.db];pack_backends=[kg=main]");
+        let daemon =
+            format!("{base};backends=[main:Sqlite:/private/daemon.db];pack_backends=[kg=main]");
+
+        assert_eq!(
+            first_config_mismatch_field(&client, Some(&daemon)),
+            "backends"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn map_response_config_mismatch_logs_opaque_ids_and_field_without_values() {
+        reset_fallback_counters();
+        let client = "packs=[kg];db=/private/client-topology/main.db;embed=none;extra=[];\
+                      backend=main;outbound=[];git_write=same-policy";
+        let daemon = "packs=[kg];db=/private/daemon-topology/main.db;embed=none;extra=[];\
+                      backend=main;outbound=[];git_write=same-policy";
+        let response = DaemonResponseFrame {
+            ok: false,
+            result: None,
+            error: None,
+            namespace_mismatch: false,
+            config_mismatch: true,
+            served_config_id: Some(daemon.to_string()),
+            version_mismatch: false,
+            daemon_protocol_version: PROTOCOL_VERSION,
+            metrics: None,
+            request_id: None,
+        };
+
+        let events = capture_sync_events(|| {
+            assert!(map_response(response, client, NS).is_none());
+        });
+
+        assert!(events.contains("daemon_fallback"), "{events}");
+        assert!(events.contains("config_mismatch_field=\"db\""), "{events}");
+        assert!(events.contains(&opaque_config_id(client)), "{events}");
+        assert!(events.contains(&opaque_config_id(daemon)), "{events}");
+        assert!(!events.contains(client), "{events}");
+        assert!(!events.contains(daemon), "{events}");
+        assert!(!events.contains("client-topology"), "{events}");
+        assert!(!events.contains("daemon-topology"), "{events}");
+        assert_eq!(fallback_count(FallbackReason::ConfigMismatch), 1);
+        assert_eq!(fallback_total(), 1);
+    }
+
+    #[test]
+    #[serial]
+    fn map_response_matching_config_emits_no_fallback_diagnostic() {
+        reset_fallback_counters();
+        let events = capture_sync_events(|| {
+            assert!(matches!(map_response(frame_ok("ok"), CFG, NS), Some(Ok(_))));
+        });
+
+        assert!(
+            events.is_empty(),
+            "matching config logged fallback: {events}"
+        );
+        assert_eq!(fallback_total(), 0);
+    }
+
+    #[test]
     #[serial]
     fn fallback_total_sums_all_reason_counters() {
         reset_fallback_counters();
@@ -2828,6 +3004,17 @@ mod tests {
             String::from_utf8(self.0.lock().expect("captured log mutex poisoned").clone())
                 .expect("tracing output is UTF-8")
         }
+    }
+
+    fn capture_sync_events(run: impl FnOnce()) -> String {
+        let captured = CapturedLog::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(captured.clone())
+            .with_ansi(false)
+            .without_time()
+            .finish();
+        tracing::subscriber::with_default(subscriber, run);
+        captured.contents()
     }
 
     #[test]

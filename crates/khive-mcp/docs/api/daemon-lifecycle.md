@@ -102,6 +102,13 @@ on read rather than tracking a separate atomic, so total == sum-of-reasons is
 a structural invariant instead of a timing-dependent one (two independent
 `fetch_add`s could otherwise be observed momentarily out of sync).
 
+The `daemon_fallback` event renders client and daemon configuration identifiers
+as stable, full SHA-256 identifiers rather than the path- and topology-bearing
+fingerprints used for the equality check. A configuration mismatch also carries
+`config_mismatch_field`, naming the first differing fingerprint field without
+emitting either field value. The wire equality check and fallback decision still
+use the original full fingerprints.
+
 The `khive_strict_daemon_fallback` marker on a strict-fallback rejection's
 `McpError` (#947) lets `request()` in `server.rs` distinguish "the daemon was
 never reached and strict mode rejected the fallback" from every other
