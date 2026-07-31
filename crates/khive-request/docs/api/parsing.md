@@ -30,7 +30,16 @@ Pure JSON arrays/objects become one `ArgValue::Value`; a container with any `$pr
 
 ## Function-call batches and chains
 
-`[op(...), op(...)]` is parallel and rejects `$prev`. `op(...) | op(...)` is a sequential chain and may contain `$prev` anywhere in an argument value. Empty batches, mixed top-level `,` and `|` separators, trailing input, and more than `MAX_OPS` operations are errors.
+`[op(...), op(...)]` is parallel and rejects `$prev`. `op(...) | op(...)` is a sequential chain and may contain `$prev` anywhere in an argument value. Empty batches, mixed `,` and `|` separators in one request, trailing input, and more than `MAX_OPS` operations are errors. A chain is not a valid element of a parallel batch.
+
+Split independent operations and a dependent chain into two `request` calls:
+
+```text
+request(ops='[create(kind="concept", name="Independent A"), create(kind="concept", name="Independent B")]')
+request(ops='create(kind="concept", name="Dependent") | link(source_id=$prev.id, target_id="<existing-uuid>", relation="extends")')
+```
+
+The calls are independent and may run in either order. `$prev` is scoped to the second call and never crosses a request boundary.
 
 Chain parsing does not resolve references; it only represents them. The dispatcher resolves each operation against the immediately preceding result and aborts after a failed step.
 

@@ -1170,6 +1170,12 @@ fn mixed_separator_before_any_chain_pipe_reaches_the_same_message() {
         msg.contains("cannot mix ',' (parallel) and '|' (chain) separators"),
         "message must name the mix mistake, got: {msg}"
     );
+    assert!(
+        msg.contains("two `request` calls")
+            && msg.contains("one `[...]` batch")
+            && msg.contains("a() | b(arg=$prev.id)"),
+        "message must prescribe the documented two-call split, got: {msg}"
+    );
 }
 
 #[test]
