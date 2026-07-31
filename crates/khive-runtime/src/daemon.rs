@@ -47,7 +47,6 @@ pub const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 /// See `docs/api/daemon.md#protocol_version` for the version-by-version history.
 pub const PROTOCOL_VERSION: u32 = 3;
 
-#[cfg(unix)]
 const DEFAULT_DRAIN_TIMEOUT_SECS: u64 = 10;
 
 // ── paths ─────────────────────────────────────────────────────────────────────
@@ -821,6 +820,24 @@ pub fn background_task_count() -> usize {
     background_tasks().load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Process-wide daemon shutdown signal (ADR-119).
+///
+/// Cancelled exactly once, when the daemon's unified shutdown future resolves
+/// — before `drain()` begins waiting on tracked tasks — so long-running
+/// daemon components supervised outside this module observe shutdown through
+/// the same path the daemon itself does, rather than inventing their own.
+/// Clones share the underlying token; child tokens derived from it are
+/// cancelled transitively.
+///
+/// In non-daemon processes the token simply never fires.
+pub fn daemon_shutdown_token() -> tokio_util::sync::CancellationToken {
+    static TOKEN: std::sync::OnceLock<tokio_util::sync::CancellationToken> =
+        std::sync::OnceLock::new();
+    TOKEN
+        .get_or_init(tokio_util::sync::CancellationToken::new)
+        .clone()
+}
+
 // ── active background phase names (ADR-103) ──────────────────────────────────
 //
 // A lightweight, best-effort process-wide gauge of which named background
@@ -1380,6 +1397,23 @@ pub async fn run_daemon_with_boot_guard<D: DaemonDispatch>(
     dispatcher: D,
     boot_guard: Option<std::fs::File>,
 ) -> anyhow::Result<()> {
+    // ADR-119: components may have been started by the serve path before this
+    // function established (or failed to establish) daemon ownership. Cancel
+    // the process-wide shutdown token on EVERY exit — setup failures below,
+    // early return when another daemon owns the socket, bind errors, and
+    // normal shutdown alike — so supervisors never outlive this process's
+    // claim to daemon role. Constructed before any fallible startup work so
+    // no error path can precede it. The token is process-lifetime
+    // single-shot; a process that stops being (or never becomes) the daemon
+    // has no path back except exec.
+    struct ComponentTeardown;
+    impl Drop for ComponentTeardown {
+        fn drop(&mut self) {
+            daemon_shutdown_token().cancel();
+        }
+    }
+    let _component_teardown = ComponentTeardown;
+
     let sock = socket_path();
     let pid_file = pid_path();
 
@@ -1577,6 +1611,11 @@ pub async fn run_daemon_with_boot_guard<D: DaemonDispatch>(
     // actually waits on it via `track_background_task` rather than the
     // task outliving the drain window (or the process) unsignalled.
     let _ = checkpoint_shutdown_tx.send(());
+
+    // Same ordering contract for ADR-119 daemon components: cancel before
+    // drain, so each component's supervisor (itself a tracked task) can run
+    // its bounded shutdown inside the drain wait.
+    daemon_shutdown_token().cancel();
 
     drain(&active).await;
 
@@ -1779,8 +1818,12 @@ async fn drain(active: &std::sync::atomic::AtomicUsize) {
     }
 }
 
-#[cfg(unix)]
-fn drain_timeout() -> std::time::Duration {
+/// The bound `drain()` waits for tracked background tasks at daemon shutdown
+/// (`KHIVE_DRAIN_TIMEOUT_SECS`, default 10s). Public so component supervision
+/// can clamp per-component shutdown timeouts against it — a component timeout
+/// longer than the drain bound could never complete its abort/state
+/// transition before the daemon returns.
+pub fn drain_timeout() -> std::time::Duration {
     let secs = std::env::var("KHIVE_DRAIN_TIMEOUT_SECS")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())

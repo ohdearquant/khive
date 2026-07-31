@@ -35,7 +35,8 @@ use clap::Parser;
 use khive_mcp::serve::resolve_runtime_config;
 use khive_mcp::serve::{
     apply_env_output_format, build_server_multi_backend_with_db_anchor, config_discovery_db_anchor,
-    enforce_strict_actor_mode, install_resolved_blob_store, RuntimeConfigInputs,
+    enforce_strict_actor_mode, install_resolved_blob_store, normalize_redundant_db_override,
+    RuntimeConfigInputs,
 };
 #[cfg(unix)]
 use khive_mcp::server::compute_config_id;
@@ -280,12 +281,12 @@ pub struct ExecArgs {
     pub atomic_max_ops: Option<usize>,
 
     /// Exit non-zero when any op in the batch fails (or, for `--ops-file`,
-    /// when any applied op fails). Without this flag the process exits 0
-    /// whenever the request itself was dispatched, even if every op inside
-    /// it failed — the per-op `results` entries and the `summary`/`status`
-    /// fields in the printed output are the only signal (#1220). Not
-    /// meaningful with `--atomic`, which already fails the whole file on
-    /// any rejected op.
+    /// when any applied op fails). Without this flag a *partially* failed
+    /// batch still exits 0 — the per-op `results` entries and the
+    /// `summary`/`status` fields in the printed output are the signal
+    /// (#1220). A batch in which *every* op failed always exits non-zero,
+    /// with or without this flag (#1339). Not meaningful with `--atomic`,
+    /// which already fails the whole file on any rejected op.
     #[arg(long)]
     pub strict: bool,
 }
@@ -470,6 +471,11 @@ async fn apply_ops_file(
         "{}",
         serde_json::to_string_pretty(&summary).expect("serialize summary")
     );
+    if total > 0 && total_succeeded == 0 {
+        anyhow::bail!(
+            "every op failed: {total_failed} op(s) failed out of {total}, 0 succeeded (see printed summary above)"
+        );
+    }
     if strict && total_failed > 0 {
         anyhow::bail!(
             "--strict: {total_failed} op(s) failed out of {total} (see printed summary above)"
@@ -602,23 +608,33 @@ pub async fn run_exec(args: ExecArgs) -> Result<()> {
     }
 }
 
-/// Returns `Err` describing the failed/aborted op counts when `strict` is set
-/// and the parsed response envelope's `summary` reports either as non-zero
-/// (#1220). `raw` must be the exact envelope string already printed to
-/// stdout — the caller prints first, unconditionally, then this decides the
-/// exit code; a caller piping the output still sees the full result either way.
+/// Decides the process exit code from the response envelope's `summary`.
+/// `raw` must be the exact envelope string already printed to stdout — the
+/// caller prints first, unconditionally, then this decides the exit code; a
+/// caller piping the output still sees the full result either way.
+///
+/// Two tiers (#1220, #1339):
+/// - Always: `Err` when the batch had ops and none succeeded. A fully-failed
+///   invocation has no success to report; scripted single-op callers (the
+///   dominant `exec` shape) check the process exit code, and exiting 0 there
+///   converts loud op-level rejections into silent drops.
+/// - `--strict` only: `Err` when any op failed or aborted (partial failure).
 fn enforce_strict_batch_result(raw: &str, strict: bool) -> Result<()> {
-    if !strict {
-        return Ok(());
-    }
     let Ok(parsed) = serde_json::from_str::<serde_json::Value>(raw) else {
         // Non-JSON output (e.g. --output-format table/auto): nothing to
-        // inspect here. `--strict` only applies to the default JSON shape.
+        // inspect here. Exit-code enforcement only applies to the default
+        // JSON shape.
         return Ok(());
     };
+    let succeeded = parsed["summary"]["succeeded"].as_u64().unwrap_or(0);
     let failed = parsed["summary"]["failed"].as_u64().unwrap_or(0);
     let aborted = parsed["summary"]["aborted"].as_u64().unwrap_or(0);
-    if failed > 0 || aborted > 0 {
+    if succeeded == 0 && (failed > 0 || aborted > 0) {
+        anyhow::bail!(
+            "every op failed: {failed} failed, {aborted} aborted, 0 succeeded (see printed output above)"
+        );
+    }
+    if strict && (failed > 0 || aborted > 0) {
         anyhow::bail!(
             "--strict: {failed} op(s) failed, {aborted} op(s) aborted (see printed output above)"
         );
@@ -687,11 +703,11 @@ async fn run_exec_inline(
 #[allow(clippy::too_many_arguments)]
 async fn run_exec_inline_with_forward(
     ops: String,
-    cfg: RuntimeConfig,
+    mut cfg: RuntimeConfig,
     presentation: Option<String>,
     output_format: Option<String>,
     save_file: Option<String>,
-    db_context: ExecDbContext,
+    mut db_context: ExecDbContext,
     strict: bool,
     #[cfg(unix)] forward_fn: ForwardFnPtr,
 ) -> Result<()> {
@@ -734,12 +750,14 @@ async fn run_exec_inline_with_forward(
     // fallback below applies, BEFORE the daemon fast-path — otherwise a warm
     // daemon answers this request without the override ever being checked at
     // all, while the identical override on `--ops-file` (always in-process)
-    // correctly rejects it. See `validate_db_override_against_backends`.
+    // correctly rejects it. A matching concrete override is redundant, so its
+    // fingerprint and captured construction anchor are normalized to the same
+    // values used when no override is supplied.
     if !khive_cfg.backends.is_empty() {
-        khive_mcp::serve::validate_db_override_against_backends(
-            db_context.raw.as_deref(),
-            khive_cfg.backends.len(),
-        )?;
+        normalize_redundant_db_override(&mut cfg, db_context.raw.as_deref(), &khive_cfg.backends)?;
+        if matches!(db_context.raw.as_deref(), Some(path) if path != ":memory:") {
+            db_context.anchor = cfg.db_path.clone();
+        }
     }
 
     // ── daemon fast-path (Unix only) ─────────────────────────────────────────
@@ -1293,6 +1311,15 @@ default = true
         // exec-shaped inputs: `config: None` (kkernel exec has no `--config`
         // flag today), `namespace_explicit: true` (the choice made in `run_exec`
         // above).
+        // Pin the pack list explicitly rather than inheriting `KHIVE_PACKS`
+        // from the ambient environment (same rationale as `isolated_server`
+        // above, #1276): `RuntimeConfig::default()` reads `KHIVE_PACKS` fresh
+        // on every call, so leaving this `None` makes the assertion below
+        // depend on two independent env reads observing the same ambient
+        // value — a real flake source when a concurrently-running test
+        // mutates process env between them (#1356).
+        let pinned_packs = Some(vec!["kg".to_string()]);
+
         let exec_cfg = resolve_runtime_config(RuntimeConfigInputs {
             db: Some(&db_str),
             config: None,
@@ -1300,7 +1327,7 @@ default = true
             namespace_explicit: true,
             actor_explicit: false,
             no_embed: false,
-            packs: None,
+            packs: pinned_packs.clone(),
             brain_profile: None,
         })
         .expect("resolve exec-shaped config");
@@ -1316,7 +1343,7 @@ default = true
             namespace_explicit: false,
             actor_explicit: false,
             no_embed: false,
-            packs: None,
+            packs: pinned_packs,
             brain_profile: None,
         })
         .expect("resolve serve-shaped config");
@@ -1369,6 +1396,9 @@ default = true
         let missing_config =
             std::path::PathBuf::from("/nonexistent/khive-exec-parity-test/config.toml");
         let ns = Namespace::parse("lambda:custom-ns").expect("ns");
+        // Pin packs so the `compute_config_id` comparison below never depends
+        // on two independent `KHIVE_PACKS` env reads agreeing (#1356).
+        let pinned_packs = Some(vec!["kg".to_string()]);
 
         let with_explicit_true = resolve_runtime_config(RuntimeConfigInputs {
             db: Some(":memory:"),
@@ -1377,7 +1407,7 @@ default = true
             namespace_explicit: true,
             actor_explicit: false,
             no_embed: false,
-            packs: None,
+            packs: pinned_packs.clone(),
             brain_profile: None,
         })
         .expect("resolve with namespace_explicit=true");
@@ -1389,7 +1419,7 @@ default = true
             namespace_explicit: false,
             actor_explicit: false,
             no_embed: false,
-            packs: None,
+            packs: pinned_packs,
             brain_profile: None,
         })
         .expect("resolve with namespace_explicit=false");
@@ -1476,6 +1506,10 @@ default = true
             ..KhiveConfig::default()
         };
 
+        // Pin packs so the config_id comparisons below never depend on two
+        // independent `KHIVE_PACKS` env reads agreeing (#1356).
+        let pinned_packs = Some(vec!["kg".to_string()]);
+
         // exec-shaped inputs (namespace_explicit: true — the choice `run_exec` makes).
         let exec_cfg = resolve_runtime_config(RuntimeConfigInputs {
             db: Some(":memory:"),
@@ -1484,7 +1518,7 @@ default = true
             namespace_explicit: true,
             actor_explicit: false,
             no_embed: false,
-            packs: None,
+            packs: pinned_packs.clone(),
             brain_profile: None,
         })
         .expect("resolve exec-shaped config");
@@ -1497,7 +1531,7 @@ default = true
             namespace_explicit: false,
             actor_explicit: false,
             no_embed: false,
-            packs: None,
+            packs: pinned_packs,
             brain_profile: None,
         })
         .expect("resolve serve-shaped config");
@@ -2103,13 +2137,47 @@ default = true
     // ── #1220: --strict exit-code signal for partially-failed batches ─────────
 
     #[test]
-    fn enforce_strict_batch_result_ok_when_strict_off_regardless_of_failures() {
+    fn enforce_strict_batch_result_ok_when_strict_off_and_partially_failed() {
+        let raw = serde_json::json!({
+            "results": [],
+            "summary": {"total": 2, "succeeded": 1, "failed": 1, "aborted": 0},
+        })
+        .to_string();
+        assert!(enforce_strict_batch_result(&raw, false).is_ok());
+    }
+
+    // ── #1339: fully-failed batches exit non-zero even without --strict ──────
+
+    #[test]
+    fn enforce_strict_batch_result_errs_when_strict_off_and_every_op_failed() {
         let raw = serde_json::json!({
             "results": [],
             "summary": {"total": 1, "succeeded": 0, "failed": 1, "aborted": 0},
         })
         .to_string();
+        let err = enforce_strict_batch_result(&raw, false).unwrap_err();
+        assert!(format!("{err}").contains("every op failed"));
+    }
+
+    #[test]
+    fn enforce_strict_batch_result_errs_when_strict_off_and_chain_fully_aborted() {
+        let raw = serde_json::json!({
+            "results": [],
+            "summary": {"total": 3, "succeeded": 0, "failed": 1, "aborted": 2},
+        })
+        .to_string();
+        assert!(enforce_strict_batch_result(&raw, false).is_err());
+    }
+
+    #[test]
+    fn enforce_strict_batch_result_ok_on_empty_batch_summary() {
+        let raw = serde_json::json!({
+            "results": [],
+            "summary": {"total": 0, "succeeded": 0, "failed": 0, "aborted": 0},
+        })
+        .to_string();
         assert!(enforce_strict_batch_result(&raw, false).is_ok());
+        assert!(enforce_strict_batch_result(&raw, true).is_ok());
     }
 
     #[test]
@@ -2186,6 +2254,26 @@ default = true
             .await
             .expect_err("strict mode must surface the per-op failure as a process error");
         assert!(format!("{err}").contains("1 op(s) failed"));
+    }
+
+    #[tokio::test]
+    async fn apply_ops_file_errs_without_strict_when_every_op_fails() {
+        let db_file = NamedTempFile::new().expect("temp db");
+        let db_path = db_file.path().to_str().expect("utf8").to_string();
+        let server = isolated_server(&db_path);
+
+        let mut f = NamedTempFile::new().unwrap();
+        use std::io::Write as _;
+        f.write_all(
+            b"{\"tool\":\"search\",\"args\":{\"kind\":\"not_a_real_kind\",\"query\":\"x\"}}\n",
+        )
+        .unwrap();
+
+        let ops = parse_ops_file(&f.path().to_path_buf()).unwrap();
+        let err = apply_ops_file(&server, ops, None, false)
+            .await
+            .expect_err("a fully-failed ops-file must exit non-zero even without --strict");
+        assert!(format!("{err}").contains("every op failed"));
     }
 
     // ── ADR-099 B1 inertness (golden shape) ────────────────────────────────────
@@ -2700,10 +2788,10 @@ default = true
 
         // No explicit `--db` anywhere below — this mirrors the real multi-tenant
         // deployment shape the bug affects: `~/.khive/config.toml` declares
-        // `[[backends]]` and `kkernel exec` relies on default discovery. An
-        // explicit `--db` would itself be rejected as ambiguous once backends
-        // are declared (ADR-028 §8, `build_registry_for_multi_backend`), so it
-        // is not a legitimate way to reach this scenario — default discovery is.
+        // `[[backends]]` and `kkernel exec` relies on default discovery.
+        // A divergent explicit `--db` would be rejected as ambiguous once
+        // backends are declared; repeating the main path would be accepted but
+        // would not model this default-discovery scenario.
         let khive_dir = home_dir.path().join(".khive");
         std::fs::create_dir_all(&khive_dir).expect("mkdir .khive");
         // Keep the configuration home-shaped while placing the stores in a
@@ -2815,7 +2903,7 @@ backend = "sessions"
     #[cfg(unix)]
     #[tokio::test]
     #[serial]
-    async fn inline_db_override_conflicting_with_backends_is_rejected_before_daemon_forward() {
+    async fn inline_db_override_guard_normalizes_main_config_id_and_rejects_conflict() {
         std::env::remove_var("KHIVE_EMBEDDING_MODEL");
         std::env::remove_var("KHIVE_ADDITIONAL_EMBEDDING_MODELS");
         std::env::remove_var("KHIVE_ACTOR");
@@ -2825,8 +2913,12 @@ backend = "sessions"
 
         let khive_dir = home_dir.path().join(".khive");
         std::fs::create_dir_all(&khive_dir).expect("mkdir .khive");
-        let main_backend_path = khive_dir.join("main-backend.db");
-        let sessions_backend_path = khive_dir.join("sessions-backend.db");
+        // Keep the configuration home-shaped while placing the stores in a
+        // separate tempdir. Test-harness builds reject every store under
+        // `$HOME/.khive`, including isolated fixtures, at the open boundary.
+        let backend_dir = tempfile::tempdir().expect("backend tempdir");
+        let main_backend_path = backend_dir.path().join("main-backend.db");
+        let sessions_backend_path = backend_dir.path().join("sessions-backend.db");
         std::fs::write(
             khive_dir.join("config.toml"),
             format!(
@@ -2850,19 +2942,80 @@ backend = "sessions"
         )
         .expect("write multi-backend config.toml");
 
-        let cfg = resolve_runtime_config(RuntimeConfigInputs {
+        let no_override_cfg = resolve_runtime_config(RuntimeConfigInputs {
             db: None,
             config: None,
             namespace: Namespace::parse("local").expect("ns"),
             namespace_explicit: true,
             actor_explicit: false,
             no_embed: true,
-            packs: None,
+            // Pin the pack list rather than inheriting `KHIVE_PACKS` from the
+            // ambient environment (#1276) — an ambient list naming packs not
+            // compiled into this build would fail resolution before the
+            // behavior under test.
+            packs: Some(vec!["kg".to_string()]),
+            brain_profile: None,
+        })
+        .expect("resolve exec-shaped config without override");
+        let no_override_result = run_exec_inline_with_forward(
+            "stats()".to_string(),
+            no_override_cfg,
+            None,
+            None,
+            None,
+            ExecDbContext::default(),
+            false,
+            spy_capture_config_id,
+        )
+        .await;
+        assert!(
+            no_override_result.is_ok(),
+            "no-override dispatch must succeed: {no_override_result:?}"
+        );
+        let no_override_config_id = SPY_CAPTURED_CONFIG_ID
+            .with(|captured| captured.borrow_mut().take())
+            .expect("no-override frame must be captured");
+
+        let matching_override = main_backend_path.display().to_string();
+        let cfg = resolve_runtime_config(RuntimeConfigInputs {
+            db: Some(&matching_override),
+            config: None,
+            namespace: Namespace::parse("local").expect("ns"),
+            namespace_explicit: true,
+            actor_explicit: false,
+            no_embed: true,
+            // Pin the pack list rather than inheriting `KHIVE_PACKS` from the
+            // ambient environment (#1276) — an ambient list naming packs not
+            // compiled into this build would fail resolution before the
+            // behavior under test.
+            packs: Some(vec!["kg".to_string()]),
             brain_profile: None,
         })
         .expect("resolve exec-shaped config");
 
-        let conflicting_override = khive_dir.join("override.db");
+        let matching_result = run_exec_inline_with_forward(
+            "stats()".to_string(),
+            cfg.clone(),
+            None,
+            None,
+            None,
+            ExecDbContext {
+                raw: Some(matching_override.clone()),
+                anchor: khive_runtime::resolve_db_anchor(Some(&matching_override)),
+            },
+            false,
+            spy_capture_config_id,
+        )
+        .await;
+        assert!(
+            matching_result.is_ok(),
+            "an override matching the declared main backend must reach daemon forwarding: {matching_result:?}"
+        );
+        let matching_config_id = SPY_CAPTURED_CONFIG_ID
+            .with(|captured| captured.borrow_mut().take())
+            .expect("matching-override frame must be captured");
+
+        let conflicting_override = backend_dir.path().join("override.db");
         let result = run_exec_inline_with_forward(
             "stats()".to_string(),
             cfg,
@@ -2888,6 +3041,10 @@ backend = "sessions"
             SPY_CAPTURED_CONFIG_ID.with(|c| c.borrow().is_none()),
             "the conflict must be caught BEFORE any daemon-forward attempt — the spy must \
              never have been called"
+        );
+        assert_eq!(
+            matching_config_id, no_override_config_id,
+            "a matching --db override must emit the same config_id as no override for the same multi-backend config"
         );
     }
 
@@ -3116,7 +3273,8 @@ backend = "sessions"
     /// conflict-absorbs into is created by an EARLIER op in the SAME
     /// atomic unit (so it does not exist at either op's prepare time). The
     /// commit must both write correctly (X deleted, the just-linked row
-    /// carries X's patch) and RENDER the correct surviving id — not X's
+    /// preserved unchanged per ADR-039 DO NOTHING — X's patch is discarded,
+    /// not applied) and RENDER the correct surviving id — not X's
     /// prepare-time-advisory id, which this fix removed reliance on
     /// entirely (`build_op_result` now derives it from a post-commit
     /// natural-key lookup).
@@ -3203,15 +3361,123 @@ backend = "sessions"
             "the update's rendered result must be the surviving (just-linked) row: {envelope}"
         );
         assert_eq!(
-            envelope["results"][1]["result"]["weight"], 0.9,
-            "the surviving row must carry the update's patch: {envelope}"
+            envelope["results"][1]["result"]["weight"], 0.6,
+            "ADR-039 DO NOTHING: the surviving row keeps its OWN pre-existing weight (0.6, \
+             set by the link above), not the discarded update's patched weight (0.9): {envelope}"
         );
 
         let server = isolated_server(&db_path);
         let surviving_resp = dispatch_json(&server, &format!(r#"get(id="{linked_id}")"#)).await;
         assert_eq!(
-            surviving_resp["results"][0]["result"]["weight"], 0.9,
-            "the committed row itself must carry the patch: {surviving_resp}"
+            surviving_resp["results"][0]["result"]["weight"], 0.6,
+            "the committed row itself must keep its pre-existing weight, not the discarded \
+             update's patch: {surviving_resp}"
+        );
+    }
+
+    /// The canonical survivor a
+    /// symmetric-update op absorbs into can ALREADY be soft-deleted before the
+    /// atomic unit even runs (not just tombstoned as a side effect of the same
+    /// unit's own writes, as the sibling test above covers). This exercises
+    /// `build_op_result`'s `get_edge_by_natural_key_including_deleted` call
+    /// through the real atomic path with a genuinely pre-existing tombstone: the
+    /// pre-fix renderer (`KhiveRuntime::list_edges`, which unconditionally
+    /// filters `deleted_at IS NULL`) would report the committed update as "not
+    /// found" for exactly this row, turning a successful DO NOTHING absorption
+    /// into a spurious post-commit error.
+    #[tokio::test]
+    async fn atomic_symmetric_update_absorbs_into_pre_existing_tombstoned_survivor_and_renders_it()
+    {
+        let db_file = NamedTempFile::new().expect("temp db");
+        let db_path = db_file.path().to_str().expect("utf8").to_string();
+
+        let (canonical_id, x_id) = {
+            let server = isolated_server(&db_path);
+            let resp = dispatch_json(
+                &server,
+                r#"[create(kind="concept", name="TombA"), create(kind="concept", name="TombB")]"#,
+            )
+            .await;
+            let a_id = resp["results"][0]["result"]["id"]
+                .as_str()
+                .expect("a id")
+                .to_string();
+            let b_id = resp["results"][1]["result"]["id"]
+                .as_str()
+                .expect("b id")
+                .to_string();
+
+            // The canonical survivor: created, then soft-deleted, BEFORE the atomic
+            // unit ever runs.
+            let link_resp = dispatch_json(
+                &server,
+                &format!(
+                    r#"link(source_id="{a_id}", target_id="{b_id}", relation="competes_with", weight=0.6)"#
+                ),
+            )
+            .await;
+            let canonical_id = link_resp["results"][0]["result"]["id"]
+                .as_str()
+                .expect("canonical id")
+                .to_string();
+            dispatch_json(&server, &format!(r#"delete(id="{canonical_id}")"#)).await;
+
+            // A distinct pre-existing edge under a different relation, later
+            // converted (by the atomic update below) into the same
+            // (a, b, competes_with) natural key — it must absorb into the
+            // already-tombstoned canonical row, not resurrect or overwrite it.
+            let x_resp = dispatch_json(
+                &server,
+                &format!(
+                    r#"link(source_id="{a_id}", target_id="{b_id}", relation="extends", weight=0.2)"#
+                ),
+            )
+            .await;
+            let x_id = x_resp["results"][0]["result"]["id"]
+                .as_str()
+                .expect("x id")
+                .to_string();
+            (canonical_id, x_id)
+        };
+
+        let ops = vec![atomic_op(
+            "update",
+            serde_json::json!({"id": x_id, "relation": "competes_with", "weight": 0.9}),
+        )];
+
+        let khive_cfg = KhiveConfig::default();
+        let envelope = crate::atomic_apply::execute_atomic_ops_file(
+            ops,
+            atomic_cfg(&db_path),
+            &khive_cfg,
+            khive_types::pack::ATOMIC_MAX_OPS_DEFAULT,
+        )
+        .await
+        .expect("atomic run must succeed by absorbing into the tombstoned survivor");
+
+        assert_eq!(
+            envelope["atomic"]["committed"], true,
+            "envelope: {envelope}"
+        );
+
+        let rendered_id = envelope["results"][0]["result"]["id"]
+            .as_str()
+            .expect("update result id")
+            .to_string();
+        assert_eq!(
+            rendered_id, canonical_id,
+            "must render the pre-existing tombstoned canonical survivor, not X's stale \
+             requested id: {envelope}"
+        );
+        assert!(
+            !envelope["results"][0]["result"]["deleted_at"].is_null(),
+            "the rendered survivor must show its OWN tombstoned state (non-null deleted_at) \
+             — absorbing a conflicting update must not resurrect it: {envelope}"
+        );
+        assert_eq!(
+            envelope["results"][0]["result"]["weight"], 0.6,
+            "ADR-039 DO NOTHING: the survivor keeps its own pre-existing weight, not X's \
+             discarded patched weight (0.9): {envelope}"
         );
     }
 

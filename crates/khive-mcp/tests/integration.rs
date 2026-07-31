@@ -2360,6 +2360,11 @@ async fn remind_help_returns_required_content_and_at() -> anyhow::Result<()> {
 /// the migration ran at construction time.
 #[tokio::test]
 async fn startup_migrations_applied_to_fresh_file_backed_db() -> anyhow::Result<()> {
+    // Required for correctness under process-per-test runners: without it this
+    // test only passed when a sibling test in the same process had already set
+    // KHIVE_NO_DAEMON, and a failed daemon spawn surfaces as `respawn_failed`
+    // with no local-dispatch fallback (ADR-049 Amendment 2).
+    disable_daemon();
     let db_file = tempfile::NamedTempFile::new()?;
     let config = RuntimeConfig {
         db_path: Some(db_file.path().to_path_buf()),
@@ -3922,6 +3927,7 @@ async fn agenda_returns_iso8601_timestamps() -> anyhow::Result<()> {
 
 async fn connect_brain_only(
 ) -> anyhow::Result<impl std::ops::Deref<Target = rmcp::service::Peer<rmcp::RoleClient>>> {
+    disable_daemon();
     let (server_transport, client_transport) = tokio::io::duplex(65536);
     let config = RuntimeConfig {
         db_path: None,

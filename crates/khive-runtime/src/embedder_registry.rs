@@ -377,32 +377,40 @@ impl EmbedderRegistry {
             .ok_or_else(|| RuntimeError::UnknownModel(name.to_string()))?
             .clone();
 
-        entry.resolve().await
+        Ok(entry.resolve().await?.0)
     }
 }
 
 impl EmbedderEntry {
     /// Lazily initialise and return the embedding service for this entry.
     ///
-    /// The `OnceCell` guarantees that `build` is called at most once even
-    /// under concurrent access. Callers hold no external lock while awaiting.
+    /// `OnceCell::get_or_try_init` single-flights concurrent cold callers: only
+    /// one of them runs [`EmbedderProvider::build`], and every other waiter
+    /// receives the same result once it completes. Only the caller whose task
+    /// actually ran `build()` gets back `Some(duration)`; every other caller
+    /// (cache hit or wait-for-in-flight-build) gets `None`.
     ///
-    /// Returns `RuntimeError` if `build()` fails, rather than panicking.
-    pub(crate) async fn resolve(self) -> RuntimeResult<Arc<dyn EmbeddingService>> {
-        // `OnceCell` has no fallible init, so failure is handled manually; a losing
-        // racer's build() result is simply discarded since both are equivalent.
-        if let Some(svc) = self.cell.get() {
-            return Ok(Arc::clone(svc));
-        }
-        let svc = self.provider.build().await.map_err(|e| {
-            crate::error::RuntimeError::Internal(format!(
-                "EmbedderProvider '{}' build() failed: {e}",
-                self.provider.name()
-            ))
-        })?;
-        // A losing `set` (raced by another task) is fine: the two results are equivalent.
-        let _ = self.cell.set(Arc::clone(&svc));
-        Ok(svc)
+    /// Returns `RuntimeError` if `build()` fails, rather than panicking. On
+    /// failure the cell stays unset, so a later call retries the build.
+    pub(crate) async fn resolve(self) -> RuntimeResult<(Arc<dyn EmbeddingService>, Option<i64>)> {
+        let mut own_init_duration_us: Option<i64> = None;
+        let provider = Arc::clone(&self.provider);
+        let init_duration_us = &mut own_init_duration_us;
+        let svc = self
+            .cell
+            .get_or_try_init(|| async move {
+                let init_start = std::time::Instant::now();
+                let svc = provider.build().await.map_err(|e| {
+                    crate::error::RuntimeError::Internal(format!(
+                        "EmbedderProvider '{}' build() failed: {e}",
+                        provider.name()
+                    ))
+                })?;
+                *init_duration_us = Some(init_start.elapsed().as_micros() as i64);
+                Ok::<_, RuntimeError>(svc)
+            })
+            .await?;
+        Ok((Arc::clone(svc), own_init_duration_us))
     }
 }
 
@@ -441,6 +449,7 @@ impl EmbedderProvider for LatticeEmbedderProvider {
 
     async fn build(&self) -> RuntimeResult<Arc<dyn EmbeddingService>> {
         let native = Arc::new(NativeEmbeddingService::with_model(self.model));
+        native.ensure_loaded().await?;
         let cached = Arc::new(CachedEmbeddingService::with_default_cache(native));
         Ok(Arc::new(BlockingEmbeddingService::new(cached)) as Arc<dyn EmbeddingService>)
     }
@@ -975,6 +984,64 @@ mod tests {
             counter.load(Ordering::SeqCst),
             1,
             "build must be called exactly once regardless of get_service call count"
+        );
+    }
+
+    struct SlowBuildProvider {
+        name: String,
+        dims: usize,
+        build_calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl EmbedderProvider for SlowBuildProvider {
+        fn name(&self) -> &str {
+            &self.name
+        }
+
+        fn dimensions(&self) -> usize {
+            self.dims
+        }
+
+        async fn build(&self) -> RuntimeResult<Arc<dyn EmbeddingService>> {
+            self.build_calls.fetch_add(1, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            Ok(Arc::new(ConstVecService { dims: self.dims }))
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn concurrent_cold_resolutions_single_flight_one_build() {
+        const CALLERS: usize = 16;
+        let counter = Arc::new(AtomicUsize::new(0));
+        let mut reg = EmbedderRegistry::new();
+        reg.register(SlowBuildProvider {
+            name: "cold-model".to_owned(),
+            dims: 8,
+            build_calls: Arc::clone(&counter),
+        });
+        let reg = Arc::new(reg);
+
+        let mut callers = Vec::with_capacity(CALLERS);
+        for _ in 0..CALLERS {
+            let reg = Arc::clone(&reg);
+            callers.push(tokio::spawn(
+                async move { reg.get_service("cold-model").await },
+            ));
+        }
+
+        for caller in callers {
+            let service = caller
+                .await
+                .expect("resolution task must not panic")
+                .expect("every concurrent cold resolution must receive a working service");
+            assert_eq!(service.name(), "const-vec-service");
+        }
+
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            1,
+            "concurrent cold resolutions must share a single in-flight build()"
         );
     }
 }

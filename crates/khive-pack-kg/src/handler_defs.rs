@@ -862,12 +862,15 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 19] = [
         description: "Resolve natural-language references to ids. Each ref in \
                        `refs` is resolved through, in order: (1) id-string \
                        passthrough (UUID / 8+ hex prefix) via the by-ID path; \
-                       (2) this actor's recently-referenced ring; (3) an exact, \
+                       Entity ids only: note, edge, and event ids return \
+                       NotFound here; use `get` for auto-detection. (2) this \
+                       actor's recently-referenced ring; (3) an exact, \
                        case-sensitive entity-name match, which resolves \
                        deterministically regardless of search rank (one match \
                        -> Resolved; several identically-named entities -> \
                        Ambiguous over exactly that set); (4) hybrid search over \
-                       the namespace. Returns one of Resolved{id,confidence} | \
+                       the namespace, discarding vector hits with raw cosine similarity \
+                       below 0.3 before RRF fusion. Returns one of Resolved{id,confidence} | \
                        Ambiguous{candidates} | NotFound per ref — never a silent \
                        pick among close candidates. For a non-exact ref that \
                        stays ambiguous, `candidates` is a bounded sample capped \

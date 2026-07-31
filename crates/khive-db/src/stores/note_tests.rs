@@ -111,6 +111,86 @@ async fn test_namespace_isolation() {
     assert_eq!(count_ns2, 1);
 }
 
+#[tokio::test]
+async fn batched_namespace_note_count_exceeds_sqlite_variable_limit() {
+    let pool = setup_pool();
+    let store = SqlNoteStore::new(Arc::clone(&pool), false);
+    let live_a = make_note("stats-a", "observation", "live-a");
+    let deleted_a = make_note("stats-a", "observation", "deleted-a");
+    let deleted_a_id = deleted_a.id;
+    let live_b = make_note("stats-b", "insight", "live-b");
+
+    store.upsert_note(live_a).await.unwrap();
+    store.upsert_note(deleted_a).await.unwrap();
+    store.upsert_note(live_b).await.unwrap();
+    assert!(store
+        .delete_note(deleted_a_id, DeleteMode::Soft)
+        .await
+        .unwrap());
+
+    let per_namespace_total = store.count_notes("stats-a", None).await.unwrap()
+        + store.count_notes("stats-b", None).await.unwrap();
+    pool.writer()
+        .unwrap()
+        .conn()
+        .set_limit(rusqlite::limits::Limit::SQLITE_LIMIT_VARIABLE_NUMBER, 999)
+        .unwrap();
+    let mut namespaces = vec!["stats-a".to_string(), "stats-b".to_string()];
+    namespaces.extend((0..999).map(|i| format!("empty-{i}")));
+    assert_eq!(namespaces.len(), 1_001);
+
+    assert_eq!(
+        store
+            .count_notes_in_namespaces(&namespaces, None)
+            .await
+            .unwrap(),
+        per_namespace_total
+    );
+    assert_eq!(
+        store
+            .count_notes_in_namespaces(&namespaces, Some("observation"))
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(per_namespace_total, 2);
+}
+
+#[tokio::test]
+async fn duplicate_namespace_across_chunk_boundary_is_not_double_counted() {
+    let pool = setup_pool();
+    let store = SqlNoteStore::new(Arc::clone(&pool), false);
+
+    store
+        .upsert_note(make_note("stats-a", "observation", "live-a-1"))
+        .await
+        .unwrap();
+    store
+        .upsert_note(make_note("stats-a", "observation", "live-a-2"))
+        .await
+        .unwrap();
+
+    let per_namespace_total = store.count_notes("stats-a", None).await.unwrap();
+    assert_eq!(per_namespace_total, 2);
+
+    // 501 unique namespaces ("stats-a" + 500 empties), then "stats-a" repeats
+    // once more past index 500 — the repeat lands in the second 500-entry
+    // chunk, so a dedup bug double-counts "stats-a"'s rows.
+    let mut namespaces = vec!["stats-a".to_string()];
+    namespaces.extend((0..500).map(|i| format!("empty-{i}")));
+    assert_eq!(namespaces.len(), 501);
+    namespaces.push("stats-a".to_string());
+    assert_eq!(namespaces.len(), 502);
+
+    assert_eq!(
+        store
+            .count_notes_in_namespaces(&namespaces, None)
+            .await
+            .unwrap(),
+        per_namespace_total
+    );
+}
+
 /// query_notes and count_notes use the namespace parameter as passed.
 #[tokio::test]
 async fn test_query_and_count_use_caller_namespace() {
