@@ -1655,6 +1655,18 @@ impl VerbRegistry {
         None
     }
 
+    /// Whether any registered pack declares a handler with this verb name.
+    ///
+    /// A non-dispatch capability check: callers that would otherwise pay a
+    /// guaranteed-failed `dispatch` (and its audit write) when an optional
+    /// pack is absent can probe first and skip the call entirely.
+    pub fn has_verb(&self, verb: &str) -> bool {
+        self.packs
+            .iter()
+            .flat_map(|p| p.handlers().iter())
+            .any(|h| h.name == verb)
+    }
+
     /// All MCP-exposed handlers across all registered packs (`Visibility::Verb` only).
     ///
     /// Subhandlers (`Visibility::Subhandler`) are excluded — they are internal
