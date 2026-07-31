@@ -96,7 +96,9 @@
 
 - Memory decay formula: `effective_salience = salience * exp(-decay_factor * age_days)`
 - Default decay rate: 0.01 (~69-day half-life)
-- Per-note `decay_factor` is used by `DecayAwareSalienceObjective` rather than the objective's own rate
+- The active memory pipeline applies each note's `decay_factor` before
+  `AmplifiedDecayAwareSalienceObjective`; the standalone `DecayAwareSalienceObjective` applies
+  its constructor-supplied fixed rate instead
 
 ### Declarative Pack Format (ADR-023)
 
