@@ -8,15 +8,15 @@
 ## Context
 
 A long-lived reader can pin SQLite's WAL checkpoint boundary and cause the WAL file to grow
-unbounded (#580). In one observed case, a database's WAL file grew to many times the size of
-the database itself while several long-running stdio sessions plus a warm daemon held open,
-otherwise-idle connections against it. Writes started failing with `sqlite: invalid data:
+unbounded (#580). When several long-running processes hold open, otherwise-idle
+connections against a database, the WAL file can grow to many times the size of the
+database itself. Writes then start failing with `sqlite: invalid data:
 timed out after 5s waiting for sqlite writer connection` on `comm.send` and other write ops.
-`PRAGMA wal_checkpoint(PASSIVE)` showed the writer was not busy, yet almost none of the
-accumulated WAL frames were checkpointable. Closing the long-running idle sessions — not
-merely leaving them idle — freed the WAL, which is the load-bearing datum this ADR's
-mechanism has to explain: some per-process, long-lived state was pinning the checkpoint
-boundary, and closing the process (not merely being idle) released it.
+The diagnostic signature is `PRAGMA wal_checkpoint(PASSIVE)` showing the writer not busy,
+yet almost none of the accumulated WAL frames checkpointable. Closing the long-running idle
+sessions — not merely leaving them idle — frees the WAL, which is the load-bearing datum
+this ADR's mechanism has to explain: some per-process, long-lived state pins the checkpoint
+boundary, and closing the process (not merely being idle) releases it.
 
 A near-zero checkpointable count means SQLite's own checkpoint boundary, the oldest live
 reader's mark, had barely moved despite the accumulated backlog. `PRAGMA
@@ -509,9 +509,9 @@ Existing, unchanged: `KHIVE_CHECKPOINT_INTERVAL_MS` (500), `KHIVE_WAL_WARN_PAGES
    the mechanism since a freshly started session can re-pin the tail immediately.
    Long-lived stdio sessions are live Claude Code instances; killing them by policy is a
    worse user experience than bounding transaction/connection lifetime underneath them.
-   Also notable: the observed case's own workaround (killing idle processes freed the WAL)
-   is exactly this alternative applied manually, which is precisely why it is not an
-   acceptable long-term policy rather than evidence the mechanism is understood.
+   Also notable: freeing the WAL by killing idle processes is exactly this alternative
+   applied manually, which is precisely why it is not an acceptable long-term policy
+   rather than evidence the mechanism is understood.
 4. **Route all reads through the daemon instead of per-process pools** (collapse "N
    independent `ConnectionPool`s against one file" into one daemon-mediated reader path).
    Would remove the multi-process topology entirely and is a natural extension of

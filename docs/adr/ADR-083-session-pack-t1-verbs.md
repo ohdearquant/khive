@@ -243,8 +243,8 @@ adds verb handlers alongside them, not in place of them.
 ### 6. Deferred
 
 Out of scope for this ADR, consistent with ADR-080's Context: account-level concerns —
-including digestion and summarization pipelines, storage tiering, and billing, metering, or
-quota accounting — are out of scope for this pack.
+including digestion and summarization pipelines and storage tiering — are out of scope for
+this pack.
 
 T1-specific deferrals:
 

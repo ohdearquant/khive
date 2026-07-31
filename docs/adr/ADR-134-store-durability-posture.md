@@ -35,8 +35,9 @@ would not learn that accounting rides on it.
 
 ### How it became visible
 
-A peer store instance runs with `synchronous=FULL`. The divergence between two store instances is
-what turns this setting from scenery into a choice. A value nobody compares is invisible.
+Store instances can legitimately run at different levels — one at `NORMAL`, a peer at `FULL`.
+The divergence between two postures is what turns this setting from scenery into a choice.
+A value nobody compares is invisible.
 
 ### The distinction this record must not blur
 

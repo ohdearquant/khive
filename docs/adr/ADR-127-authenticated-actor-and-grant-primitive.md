@@ -283,8 +283,8 @@ agent-platform layer.** The adversary is not exotic — an actor here can run ar
 commands, so "can actor A read actor B's key" reduces to "can actor A run a file read."
 
 Actor separation is therefore an OS-layer problem, and the remedy is **topological rather
-than architectural**. The co-located arrangement is transitional: actors are expected to move
-onto distinct hosts or remotes, at which point separation is a property of the deployment
+than architectural**. When a deployment places actors on distinct hosts or remotes,
+separation is a property of the deployment
 and needs no mechanism from this record. A distinct host is a distinct OS principal with a
 distinct filesystem, which is the same custody property the hosted profile obtains for a
 different reason.
@@ -303,13 +303,13 @@ Consequently: **in the local deployment profile, P1 against a malicious peer act
 NOT-DELIVERED**, and it is recorded as such in the table below rather than in prose a reader
 can skip.
 
-## Why the current arrangement is safe, and precisely what ends that
+## When disposition suffices, and precisely what ends that
 
-The substrate does not prevent one actor from claiming another's identity. It has not needed
-to: today's actors share a single trust boundary, and none of them is inclined to fabricate
-an identity within it.
+The substrate does not prevent one actor from claiming another's identity. A deployment
+whose actors all share a single trust boundary can operate without that enforcement, so
+long as no actor within the boundary is inclined to fabricate an identity.
 
-**That safety is a property of the current population, not of the protocol.** It is real,
+**That safety is a property of the population, not of the protocol.** It is real,
 and it is not a guarantee, because nothing in the substrate produces it and nothing in the
 substrate would notice its absence.
 
@@ -322,7 +322,7 @@ side.**
 So the activation condition for this record is stated as a population event rather than a
 date or an actor count:
 
-> **When the first actor identity is held by a party outside the current trust boundary, the
+> **When the first actor identity is held by a party outside the deployment's trust boundary, the
 > properties in the table below stop being cushioned by disposition and must be carried by
 > mechanism.**
 
@@ -337,13 +337,13 @@ nothing but inclination:
 - a check that cannot fail loudly is not a check;
 - unavailable is reported as unavailable, never as an absence of objection.
 
-Each is honoured today because the actors are disposed to honour it. All of them degrade at
+Each is honoured only because the actors are disposed to honour it. All of them degrade at
 the same moment identity does, and a population that follows the letter without the spirit
 is the harder case, because its output still looks conformant.
 
 This record does not attempt to mechanise the others. It names them so the scope of the
 transition is not understated: **heterogeneity does not merely introduce an impostor risk,
-it withdraws the epistemic discipline the deployment currently uses to catch its own errors.**
+it withdraws the epistemic discipline such a deployment uses to catch its own errors.**
 Deciding which of those norms must become mechanisms before the population changes is
 separate work, and it should not wait for the first actor outside the trust boundary to be
 scheduled.
@@ -518,9 +518,10 @@ case is always the forgery.
 
 ## Sequencing
 
-Nothing in this record is urgent while every actor shares the same trust boundary. That
-condition expires by intent — broadening the population of actors is a goal, not an accident
-— so the date is chosen rather than suffered, not discovered after the fact.
+Nothing in this record is urgent in a deployment where every actor shares the same trust
+boundary. That condition typically ends by intent rather than by accident — broadening the
+actor population is a choice — so the date can be chosen rather than discovered after the
+fact.
 
 The practical consequence is that the mechanism should exist before an actor outside the
 trust boundary is scheduled rather than after it appears, because the gap is discovered by
