@@ -170,14 +170,14 @@ record rather than inherited from this one.
    wrongly on purpose and must make the test fail. A durability test that passes against a
    misconfigured store is measuring nothing.
 5. A check that fails when a store holding INV-1 records has an unrecorded posture, so this class is
-   caught by construction rather than by someone noticing a divergence with a peer.
+   caught by construction rather than by an ad-hoc configuration comparison.
 
 ## Alternatives considered
 
 **Leave `NORMAL` unrecorded, since it is a common default.** Rejected. The defect was never the
-value; it was that no decision existed, which is why it took a peer store's differing configuration
-to surface it. An unrecorded default under an accounting record is a hole regardless of which value
-sits in it.
+value; it was that no decision existed, and an unrecorded posture stays invisible until something
+forces a comparison. An unrecorded default under an accounting record is a hole regardless of which
+value sits in it.
 
 **Move to store-wide `FULL` immediately.** Rejected for now, and deliberately not rejected on the
 grounds that it is too slow, since that is currently an assumption. It is deferred until D3 prices
