@@ -349,6 +349,36 @@ pub(crate) fn parse_ops_file(path: &PathBuf) -> Result<Vec<OpsFileEntry>> {
     Ok(ops)
 }
 
+/// Extract the failed entries of one dispatched chunk as `{op_index, tool,
+/// error}` objects, with `op_index` global across chunks. A failure summary
+/// without the per-op reason strings is unactionable: a gate rejection, a
+/// schema error, and a transient failure all look identical, and pipelines
+/// that trust the counts alone lose records silently.
+fn collect_op_failures(
+    parsed: &serde_json::Value,
+    applied_before: usize,
+) -> Vec<serde_json::Value> {
+    let Some(results) = parsed["results"].as_array() else {
+        return Vec::new();
+    };
+    results
+        .iter()
+        .enumerate()
+        .filter(|(_, entry)| entry["ok"].as_bool() == Some(false))
+        .map(|(i, entry)| {
+            let error = match &entry["error"] {
+                serde_json::Value::Null => serde_json::Value::from("unknown error"),
+                other => other.clone(),
+            };
+            serde_json::json!({
+                "op_index": applied_before + i,
+                "tool": entry["tool"].as_str().unwrap_or("?"),
+                "error": error,
+            })
+        })
+        .collect()
+}
+
 /// Apply a parsed ops-file against the given server, printing progress to
 /// stderr and the final summary to stdout.
 async fn apply_ops_file(
@@ -359,6 +389,7 @@ async fn apply_ops_file(
     let total = ops.len();
     let mut total_succeeded: usize = 0;
     let mut total_failed: usize = 0;
+    let mut failures: Vec<serde_json::Value> = Vec::new();
 
     for (chunk_idx, chunk) in ops.chunks(OPS_FILE_CHUNK_SIZE).enumerate() {
         let applied_before = (chunk_idx * OPS_FILE_CHUNK_SIZE).min(total);
@@ -399,15 +430,31 @@ async fn apply_ops_file(
         total_succeeded += chunk_succeeded;
         total_failed += chunk_failed;
 
+        for failure in collect_op_failures(&parsed, applied_before) {
+            let reason = match &failure["error"] {
+                serde_json::Value::String(s) => s.clone(),
+                other => other.to_string(),
+            };
+            eprintln!(
+                "op {} ({}) failed: {reason}",
+                failure["op_index"],
+                failure["tool"].as_str().unwrap_or("?"),
+            );
+            failures.push(failure);
+        }
+
         let applied_now = applied_before + chunk.len();
         eprintln!("applied {applied_now}/{total} (ok={total_succeeded}, failed={total_failed})");
     }
 
-    let summary = serde_json::json!({
+    let mut summary = serde_json::json!({
         "total": total,
         "succeeded": total_succeeded,
         "failed": total_failed,
     });
+    if !failures.is_empty() {
+        summary["failures"] = serde_json::Value::Array(failures);
+    }
     println!(
         "{}",
         serde_json::to_string_pretty(&summary).expect("serialize summary")
@@ -809,6 +856,60 @@ mod tests {
     use clap::Parser;
     use serial_test::serial;
     use tempfile::NamedTempFile;
+
+    // ── collect_op_failures: per-op error surfacing (#1228) ───────────────────
+
+    #[test]
+    fn collect_op_failures_extracts_reason_with_global_index() {
+        let parsed = serde_json::json!({
+            "results": [
+                {"ok": true, "tool": "create", "result": {}},
+                {"ok": false, "tool": "create", "error": "content rejected: suspected credential material"},
+                {"ok": false, "tool": "link"},
+            ],
+            "summary": {"total": 3, "succeeded": 1, "failed": 2}
+        });
+        let failures = collect_op_failures(&parsed, 500);
+        assert_eq!(failures.len(), 2);
+        assert_eq!(failures[0]["op_index"], 501);
+        assert_eq!(failures[0]["tool"], "create");
+        assert_eq!(
+            failures[0]["error"],
+            "content rejected: suspected credential material"
+        );
+        assert_eq!(failures[1]["op_index"], 502);
+        assert_eq!(
+            failures[1]["error"], "unknown error",
+            "a failed entry with no error value still surfaces a placeholder"
+        );
+    }
+
+    #[test]
+    fn collect_op_failures_preserves_structured_error_payloads() {
+        let parsed = serde_json::json!({
+            "results": [
+                {"ok": false, "tool": "create",
+                 "error": {"kind": "invalid_input", "message": "content rejected"}},
+            ],
+            "summary": {"total": 1, "succeeded": 0, "failed": 1}
+        });
+        let failures = collect_op_failures(&parsed, 0);
+        assert_eq!(
+            failures[0]["error"],
+            serde_json::json!({"kind": "invalid_input", "message": "content rejected"}),
+            "structured KhiveError payloads pass through as JSON, not a placeholder"
+        );
+    }
+
+    #[test]
+    fn collect_op_failures_empty_on_all_ok_or_missing_results() {
+        let all_ok = serde_json::json!({
+            "results": [{"ok": true, "tool": "stats", "result": {}}],
+            "summary": {"total": 1, "succeeded": 1, "failed": 0}
+        });
+        assert!(collect_op_failures(&all_ok, 0).is_empty());
+        assert!(collect_op_failures(&serde_json::json!({}), 0).is_empty());
+    }
 
     // ── HOME isolation for local-fallback tests ───────────────────────────────
     //
