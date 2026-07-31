@@ -15,9 +15,10 @@
 //! pool-mutex path) and the ADR-067 component breakdown.
 
 use rusqlite::Connection;
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use tokio::sync::{mpsc, oneshot};
 
-use khive_storage::error::StorageError;
+use khive_storage::error::{StorageError, WriterTaskRequestState};
 
 use crate::error::SqliteError;
 use crate::pool::ConnectionPool;
@@ -55,11 +56,21 @@ pub struct WriteRequest<R: Send + 'static> {
 
 mod sealed {
     /// Restricts [`super::AnyWriteRequest`] to implementations defined in
-    /// this module — only [`super::WriteRequest<R>`] implements it.
-    pub trait Sealed {}
-}
+    /// this module — only [`super::WriteRequest<R>`] implements it — and
+    /// carries the drain loop's internal terminal-state reporting methods
+    /// without changing the public execution-method signatures.
+    pub trait Sealed {
+        fn execute_and_reply_reporting_terminal(
+            self: Box<Self>,
+            conn: &rusqlite::Connection,
+        ) -> Option<khive_storage::error::WriterTaskRequestState>;
 
-impl<R: Send + 'static> sealed::Sealed for WriteRequest<R> {}
+        fn execute_and_reply_top_level_reporting_terminal(
+            self: Box<Self>,
+            conn: &rusqlite::Connection,
+        ) -> Option<khive_storage::error::WriterTaskRequestState>;
+    }
+}
 
 /// Type-erased write request the writer task's drain loop can hold in a
 /// homogeneous channel (`mpsc::Sender<Box<dyn AnyWriteRequest + Send>>`),
@@ -111,35 +122,90 @@ pub trait AnyWriteRequest: sealed::Sealed + Send {
     fn is_top_level(&self) -> bool;
 }
 
+impl<R: Send + 'static> sealed::Sealed for WriteRequest<R> {
+    fn execute_and_reply_reporting_terminal(
+        self: Box<Self>,
+        conn: &Connection,
+    ) -> Option<WriterTaskRequestState> {
+        // Keep the typed reply sender outside the unwind boundary. Calling
+        // `(self.op)(conn)` directly would drop `self.reply` while unwinding,
+        // leaving the active caller with only an untyped RecvError.
+        let WriteRequest { op, reply, .. } = *self;
+        match catch_unwind(AssertUnwindSafe(|| op(conn))) {
+            Ok(outcome) => {
+                let final_result = match outcome {
+                    Ok(value) => match conn.execute_batch("COMMIT") {
+                        Ok(()) => Ok(value),
+                        Err(e) => {
+                            let _ = conn.execute_batch("ROLLBACK");
+                            Err(StorageError::Pool {
+                                operation: "writer_task_commit".into(),
+                                message: e.to_string(),
+                            })
+                        }
+                    },
+                    Err(e) => {
+                        let _ = conn.execute_batch("ROLLBACK");
+                        Err(e)
+                    }
+                };
+                // The receiver may already be gone (caller dropped its
+                // future) — that is not this task's problem to report.
+                let _ = reply.send(final_result);
+                None
+            }
+            Err(_panic_payload) => {
+                // The transaction and connection are owned by this blocking
+                // thread, so rollback happens here rather than from the async
+                // task on a foreign connection.
+                let request_state = match conn.execute_batch("ROLLBACK") {
+                    Ok(()) => WriterTaskRequestState::TransactionRolledBack,
+                    Err(rollback_error) => {
+                        tracing::error!(
+                            error = %rollback_error,
+                            "writer task: rollback after request panic failed; \
+                             request side effects are unknown"
+                        );
+                        WriterTaskRequestState::SideEffectsUnknown
+                    }
+                };
+                let _ = reply.send(Err(writer_task_terminated(request_state)));
+                Some(request_state)
+            }
+        }
+    }
+
+    fn execute_and_reply_top_level_reporting_terminal(
+        self: Box<Self>,
+        conn: &Connection,
+    ) -> Option<WriterTaskRequestState> {
+        let WriteRequest { op, reply, .. } = *self;
+        match catch_unwind(AssertUnwindSafe(|| op(conn))) {
+            Ok(outcome) => {
+                // No COMMIT/ROLLBACK here: this request explicitly did not
+                // open a transaction, so there is nothing to close.
+                let _ = reply.send(outcome);
+                None
+            }
+            Err(_panic_payload) => {
+                // Statements completed before a top-level panic may already
+                // have autocommitted. Report the ambiguity; never invent a
+                // rollback for a request that opened no transaction.
+                let request_state = WriterTaskRequestState::SideEffectsUnknown;
+                let _ = reply.send(Err(writer_task_terminated(request_state)));
+                Some(request_state)
+            }
+        }
+    }
+}
+
 impl<R: Send + 'static> AnyWriteRequest for WriteRequest<R> {
     fn execute_and_reply(self: Box<Self>, conn: &Connection) {
-        let outcome = (self.op)(conn);
-        let final_result = match outcome {
-            Ok(value) => match conn.execute_batch("COMMIT") {
-                Ok(()) => Ok(value),
-                Err(e) => {
-                    let _ = conn.execute_batch("ROLLBACK");
-                    Err(StorageError::Pool {
-                        operation: "writer_task_commit".into(),
-                        message: e.to_string(),
-                    })
-                }
-            },
-            Err(e) => {
-                let _ = conn.execute_batch("ROLLBACK");
-                Err(e)
-            }
-        };
-        // The receiver may already be gone (caller dropped its future) —
-        // that is not this task's problem to report; it just moves on.
-        let _ = self.reply.send(final_result);
+        let _ = sealed::Sealed::execute_and_reply_reporting_terminal(self, conn);
     }
 
     fn execute_and_reply_top_level(self: Box<Self>, conn: &Connection) {
-        let outcome = (self.op)(conn);
-        // No COMMIT/ROLLBACK here: this request explicitly did not open a
-        // transaction, so there is nothing for this method to close.
-        let _ = self.reply.send(outcome);
+        let _ = sealed::Sealed::execute_and_reply_top_level_reporting_terminal(self, conn);
     }
 
     fn reply_error(self: Box<Self>, err: StorageError) {
@@ -151,6 +217,10 @@ impl<R: Send + 'static> AnyWriteRequest for WriteRequest<R> {
     fn is_top_level(&self) -> bool {
         self.top_level
     }
+}
+
+fn writer_task_terminated(request_state: WriterTaskRequestState) -> StorageError {
+    StorageError::WriterTaskTerminated { request_state }
 }
 
 /// Sender half of the write queue. Cheaply cloneable (wraps an
@@ -170,9 +240,11 @@ impl WriterTaskHandle {
     /// caller-supplied deadline (see `send_with_timeout`) can bound ONLY
     /// this enqueue step — never the reply-wait that follows it. Once this
     /// returns `Ok`, the request has been accepted by the writer task and
-    /// will run to completion; the returned receiver must be awaited without
-    /// a timeout; abandoning it here would silently drop the request's
-    /// eventual result, not cancel the request itself.
+    /// will either run to completion or receive a typed terminal error if an
+    /// earlier request kills the task before this operation begins. The
+    /// returned receiver must be awaited without a timeout; abandoning it
+    /// here would silently drop the request's eventual result, not cancel the
+    /// request itself.
     async fn enqueue<R, F>(
         &self,
         op: F,
@@ -206,7 +278,7 @@ impl WriterTaskHandle {
         self.tx
             .send(Box::new(request))
             .await
-            .map_err(|_| StorageError::Internal("writer task channel closed".to_string()))?;
+            .map_err(|_| writer_task_terminated(WriterTaskRequestState::NotStarted))?;
 
         Ok(reply_rx)
     }
@@ -223,9 +295,9 @@ impl WriterTaskHandle {
         F: FnOnce(&Connection) -> Result<R, StorageError> + Send + 'static,
     {
         let reply_rx = self.enqueue(op).await?;
-        reply_rx.await.map_err(|_| {
-            StorageError::Internal("writer task dropped before replying".to_string())
-        })?
+        reply_rx
+            .await
+            .map_err(|_| writer_task_terminated(WriterTaskRequestState::SideEffectsUnknown))?
     }
 
     /// Like [`Self::send`], but bounds the wait for the bounded channel to
@@ -261,9 +333,9 @@ impl WriterTaskHandle {
             }
         };
 
-        reply_rx.await.map_err(|_| {
-            StorageError::Internal("writer task dropped before replying".to_string())
-        })?
+        reply_rx
+            .await
+            .map_err(|_| writer_task_terminated(WriterTaskRequestState::SideEffectsUnknown))?
     }
 
     /// Send a write operation that MUST run outside any open transaction
@@ -283,9 +355,9 @@ impl WriterTaskHandle {
         F: FnOnce(&Connection) -> Result<R, StorageError> + Send + 'static,
     {
         let reply_rx = self.enqueue_inner(op, true).await?;
-        reply_rx.await.map_err(|_| {
-            StorageError::Internal("writer task dropped before replying".to_string())
-        })?
+        reply_rx
+            .await
+            .map_err(|_| writer_task_terminated(WriterTaskRequestState::SideEffectsUnknown))?
     }
 
     /// Current write-queue backlog depth: requests enqueued but not yet
@@ -313,8 +385,9 @@ impl WriterTaskHandle {
 /// Opens a dedicated standalone writer connection
 /// ([`ConnectionPool::open_standalone_writer`]), independent of the pool's
 /// Mutex-guarded `writer()` connection used by unmigrated paths. Returns the
-/// cloneable [`WriterTaskHandle`] sender half; the task runs until every
-/// handle clone is dropped and the channel closes.
+/// cloneable [`WriterTaskHandle`] sender half. The task normally runs until
+/// every handle clone is dropped and the channel closes; a request panic puts
+/// it into the permanent terminal state documented below.
 ///
 /// `capacity` bounds the channel (`PoolConfig::write_queue_capacity` /
 /// `KHIVE_WRITE_QUEUE_CAPACITY`, ADR-067 recommends 256).
@@ -333,15 +406,32 @@ pub fn spawn(pool: &ConnectionPool, capacity: usize) -> Result<WriterTaskHandle,
     Ok(WriterTaskHandle { tx })
 }
 
+/// Permanently close admission, then reply to every request that was already
+/// accepted into the bounded channel without invoking its operation closure.
+///
+/// Closing before draining is load-bearing: draining an open receiver would
+/// wait forever while [`WriterTaskHandle`] clones still exist, while dropping
+/// the receiver immediately would discard buffered requests and their typed
+/// reply senders.
+async fn close_and_fail_queued_requests(rx: &mut mpsc::Receiver<Box<dyn AnyWriteRequest + Send>>) {
+    rx.close();
+    while let Some(request) = rx.recv().await {
+        request.reply_error(writer_task_terminated(WriterTaskRequestState::NotStarted));
+    }
+}
+
 /// Drain loop: the sole caller of `BEGIN IMMEDIATE` for write traffic routed
 /// through the channel. A `BEGIN IMMEDIATE` failure replies the request's
 /// error via [`AnyWriteRequest::reply_error`] without invoking the
 /// request's closure; no retry — the connection tries fresh next request.
-/// Exits when every [`WriterTaskHandle`] clone drops and the channel closes,
-/// or the blocking closure panics — either way `rx` drops with it, which is
-/// what turns subsequent `send` calls into `StorageError::Internal`. See
-/// `crates/khive-db/docs/api/writer-task.md` for the ADR-067 failure-mode
-/// table this implements.
+///
+/// A request-operation panic is contained inside the concrete
+/// [`WriteRequest<R>`] so its typed reply survives. The task then closes
+/// admission, explicitly fails every already-queued request as
+/// [`WriterTaskRequestState::NotStarted`], and exits permanently. There is no
+/// supervisor or connection restart; later sends observe the closed channel
+/// as the same typed terminal state. See
+/// `crates/khive-db/docs/api/writer-task.md` for the full failure matrix.
 async fn run_writer_task(
     mut conn: Connection,
     mut rx: mpsc::Receiver<Box<dyn AnyWriteRequest + Send>>,
@@ -350,7 +440,7 @@ async fn run_writer_task(
     while let Some(request) = rx.recv().await {
         let origin = origin.clone();
         let outcome = tokio::task::spawn_blocking(move || {
-            if request.is_top_level() {
+            let terminal_state = if request.is_top_level() {
                 // ADR-067 Component A:
                 // no BEGIN IMMEDIATE for this request — some statements
                 // (e.g. VACUUM) are rejected by SQLite inside any open
@@ -358,42 +448,55 @@ async fn run_writer_task(
                 // connection and still serialized one-request-at-a-time by
                 // this same drain loop, so the single-writer guarantee
                 // holds; only the transaction wrap is skipped.
-                request.execute_and_reply_top_level(&conn);
-                return conn;
-            }
-            let _tx_handle = khive_storage::tx_registry::register_scoped(
-                Some("writer_task_tx".to_string()),
-                origin,
-            );
-            match conn.execute_batch("BEGIN IMMEDIATE") {
-                Ok(()) => request.execute_and_reply(&conn),
-                Err(e) => {
-                    // Do NOT run the request's operation: `conn` never
-                    // entered a transaction, so executing the op's DML here
-                    // would run in autocommit mode and land partial writes
-                    // for a request the caller is about to be told failed.
-                    tracing::warn!(
-                        error = %e,
-                        "writer task: BEGIN IMMEDIATE failed; replying an \
-                         error without running the request's operation"
-                    );
-                    request.reply_error(StorageError::Pool {
-                        operation: "writer_task_begin".into(),
-                        message: e.to_string(),
-                    });
+                sealed::Sealed::execute_and_reply_top_level_reporting_terminal(request, &conn)
+            } else {
+                let _tx_handle = khive_storage::tx_registry::register_scoped(
+                    Some("writer_task_tx".to_string()),
+                    origin,
+                );
+                match conn.execute_batch("BEGIN IMMEDIATE") {
+                    Ok(()) => sealed::Sealed::execute_and_reply_reporting_terminal(request, &conn),
+                    Err(e) => {
+                        // Do NOT run the request's operation: `conn` never
+                        // entered a transaction, so executing the op's DML
+                        // here would run in autocommit mode and land partial
+                        // writes for a request the caller is about to be told
+                        // failed.
+                        tracing::warn!(
+                            error = %e,
+                            "writer task: BEGIN IMMEDIATE failed; replying an \
+                             error without running the request's operation"
+                        );
+                        request.reply_error(StorageError::Pool {
+                            operation: "writer_task_begin".into(),
+                            message: e.to_string(),
+                        });
+                        None
+                    }
                 }
-            }
-            conn
+            };
+            (conn, terminal_state)
         })
         .await;
 
         match outcome {
-            Ok(returned_conn) => conn = returned_conn,
+            Ok((returned_conn, None)) => conn = returned_conn,
+            Ok((_returned_conn, Some(request_state))) => {
+                tracing::error!(
+                    request_state = %request_state,
+                    "writer task request panicked; closing and failing the \
+                     queue without restarting"
+                );
+                close_and_fail_queued_requests(&mut rx).await;
+                return;
+            }
             Err(join_err) => {
                 tracing::error!(
                     error = %join_err,
-                    "writer task blocking closure panicked; writer task is exiting"
+                    "writer task blocking closure failed outside the request \
+                     panic boundary; closing and failing the queue without restarting"
                 );
+                close_and_fail_queued_requests(&mut rx).await;
                 return;
             }
         }
@@ -406,6 +509,7 @@ mod tests {
     use crate::pool::PoolConfig;
     use serial_test::serial;
     use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::mpsc as std_mpsc;
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -415,6 +519,18 @@ mod tests {
             ..PoolConfig::default()
         };
         ConnectionPool::new(cfg).expect("pool open")
+    }
+
+    fn assert_writer_task_terminal_state<T: std::fmt::Debug>(
+        result: Result<T, StorageError>,
+        expected: WriterTaskRequestState,
+    ) {
+        match result {
+            Err(StorageError::WriterTaskTerminated { request_state }) => {
+                assert_eq!(request_state, expected)
+            }
+            other => panic!("expected WriterTaskTerminated({expected:?}), got {other:?}"),
+        }
     }
 
     // `#[serial(tx_registry)]`: `run_writer_task` registers a `writer_task_tx`
@@ -682,19 +798,331 @@ mod tests {
         assert_eq!(v, "slow");
     }
 
+    #[test]
+    fn wrapped_panic_with_failed_rollback_reports_side_effects_unknown() {
+        let conn = Connection::open_in_memory().expect("in-memory connection");
+        conn.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY); BEGIN IMMEDIATE")
+            .unwrap();
+        let (reply_tx, mut reply_rx) = oneshot::channel();
+        let request = WriteRequest {
+            op: Box::new(|conn| -> Result<(), StorageError> {
+                // Deliberately violate WriteOp's no-COMMIT contract to create
+                // the otherwise rare but reachable rollback-failure state.
+                // The row commits before the panic, so reporting a successful
+                // rollback here would be dangerously false.
+                conn.execute_batch("INSERT INTO t (id) VALUES (1); COMMIT")
+                    .map_err(|e| StorageError::Pool {
+                        operation: "test_force_rollback_failure".into(),
+                        message: e.to_string(),
+                    })?;
+                panic!("intentional panic after illicit commit");
+            }),
+            reply: reply_tx,
+            top_level: false,
+        };
+
+        let terminal_state =
+            sealed::Sealed::execute_and_reply_reporting_terminal(Box::new(request), &conn);
+        assert_eq!(
+            terminal_state,
+            Some(WriterTaskRequestState::SideEffectsUnknown)
+        );
+        let reply = reply_rx
+            .try_recv()
+            .expect("active request must receive a typed terminal reply");
+        assert_writer_task_terminal_state(reply, WriterTaskRequestState::SideEffectsUnknown);
+
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM t", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            count, 1,
+            "the fixture's committed side effect proves why the state must be unknown"
+        );
+    }
+
+    // `#[serial(tx_registry)]`: the active request holds a registered
+    // `writer_task_tx` until its panic is caught and rolled back. Share the
+    // process-wide registry key with the other writer-task transaction tests.
     #[tokio::test]
-    async fn dropped_receiver_maps_send_to_internal_error() {
-        // Simulates the writer task having stopped/panicked: its `rx` is
-        // gone, so `tx.send()` must fail rather than hang.
+    #[serial(tx_registry)]
+    async fn wrapped_panic_rolls_back_and_terminally_fails_queue() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("writer_task_wrapped_panic.db");
+        let cfg = PoolConfig {
+            path: Some(path),
+            write_queue_enabled: true,
+            write_queue_capacity: 8,
+            ..PoolConfig::default()
+        };
+        let pool = ConnectionPool::new(cfg).unwrap();
+        {
+            let writer = pool.try_writer().unwrap();
+            writer
+                .conn()
+                .execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
+                .unwrap();
+        }
+
+        // Use the pool-owned OnceLock path rather than `spawn` directly so
+        // the test also proves a terminal task is never silently replaced.
+        let handle = pool
+            .writer_task_handle()
+            .expect("writer task lookup")
+            .expect("file-backed queued pool must spawn its writer task");
+        assert_eq!(pool.writer_task_spawn_count(), 1);
+
+        let (started_tx, started_rx) = oneshot::channel::<()>();
+        let (release_tx, release_rx) = std_mpsc::channel::<()>();
+        let active = tokio::spawn({
+            let handle = handle.clone();
+            async move {
+                handle
+                    .send(move |conn| -> Result<usize, StorageError> {
+                        conn.execute("INSERT INTO t (id, v) VALUES (1, 'active')", [])
+                            .map_err(|e| StorageError::Pool {
+                                operation: "test_active_insert".into(),
+                                message: e.to_string(),
+                            })?;
+                        let _ = started_tx.send(());
+                        release_rx.recv().expect("test must release active op");
+                        panic!("intentional wrapped writer request panic");
+                    })
+                    .await
+            }
+        });
+
+        tokio::time::timeout(Duration::from_secs(5), started_rx)
+            .await
+            .expect("active request did not start")
+            .expect("active request dropped its start signal");
+
+        let queued_one_ran = Arc::new(AtomicBool::new(false));
+        let queued_one_ran_in_op = Arc::clone(&queued_one_ran);
+        let queued_one = handle
+            .enqueue(move |conn| {
+                queued_one_ran_in_op.store(true, Ordering::SeqCst);
+                conn.execute("INSERT INTO t (id, v) VALUES (2, 'queued-one')", [])
+                    .map_err(|e| StorageError::Pool {
+                        operation: "test_queued_one_insert".into(),
+                        message: e.to_string(),
+                    })
+            })
+            .await
+            .expect("first queued request must be accepted");
+
+        let queued_two_ran = Arc::new(AtomicBool::new(false));
+        let queued_two_ran_in_op = Arc::clone(&queued_two_ran);
+        let queued_two = handle
+            .enqueue(move |_conn| {
+                queued_two_ran_in_op.store(true, Ordering::SeqCst);
+                Ok::<String, StorageError>("queued-two-ran".to_string())
+            })
+            .await
+            .expect("second queued request must be accepted");
+
+        assert_eq!(
+            handle.queue_depth(),
+            2,
+            "both heterogeneous requests must be buffered behind the active op"
+        );
+        release_tx.send(()).expect("release active op");
+
+        let active_result = tokio::time::timeout(Duration::from_secs(5), active)
+            .await
+            .expect("active caller hung after panic")
+            .expect("active caller task join");
+        assert_writer_task_terminal_state(
+            active_result,
+            WriterTaskRequestState::TransactionRolledBack,
+        );
+
+        let queued_one_result = tokio::time::timeout(Duration::from_secs(5), queued_one)
+            .await
+            .expect("first queued caller hung after terminal failure")
+            .expect("terminal drain must preserve first typed reply");
+        assert_writer_task_terminal_state(queued_one_result, WriterTaskRequestState::NotStarted);
+
+        let queued_two_result = tokio::time::timeout(Duration::from_secs(5), queued_two)
+            .await
+            .expect("second queued caller hung after terminal failure")
+            .expect("terminal drain must preserve second typed reply");
+        assert_writer_task_terminal_state(queued_two_result, WriterTaskRequestState::NotStarted);
+        assert!(!queued_one_ran.load(Ordering::SeqCst));
+        assert!(!queued_two_ran.load(Ordering::SeqCst));
+
+        let future_ran = Arc::new(AtomicBool::new(false));
+        let future_ran_in_op = Arc::clone(&future_ran);
+        let future_result = handle
+            .send(move |_conn| {
+                future_ran_in_op.store(true, Ordering::SeqCst);
+                Ok::<(), StorageError>(())
+            })
+            .await;
+        assert_writer_task_terminal_state(future_result, WriterTaskRequestState::NotStarted);
+        assert!(!future_ran.load(Ordering::SeqCst));
+
+        let cached_after_failure = pool
+            .writer_task_handle()
+            .expect("cached writer task lookup")
+            .expect("pool retains its terminal handle");
+        assert_eq!(
+            pool.writer_task_spawn_count(),
+            1,
+            "a terminal writer task must not be restarted behind callers' backs"
+        );
+        let cached_result = cached_after_failure
+            .send(|_conn| Ok::<(), StorageError>(()))
+            .await;
+        assert_writer_task_terminal_state(cached_result, WriterTaskRequestState::NotStarted);
+
+        let reader = pool.reader().expect("reader");
+        let count: i64 = reader
+            .conn()
+            .query_row("SELECT COUNT(*) FROM t", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            count, 0,
+            "the active transaction must be rolled back and queued ops must never run"
+        );
+    }
+
+    #[tokio::test]
+    async fn top_level_panic_reports_unknown_and_fails_queue_without_running_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("writer_task_top_level_panic.db");
+        let pool = file_pool(&path);
+        {
+            let writer = pool.try_writer().unwrap();
+            writer
+                .conn()
+                .execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
+                .unwrap();
+        }
+        let handle = spawn(&pool, 8).expect("writer task spawn");
+
+        let (started_tx, started_rx) = oneshot::channel::<()>();
+        let (release_tx, release_rx) = std_mpsc::channel::<()>();
+        let active = tokio::spawn({
+            let handle = handle.clone();
+            async move {
+                handle
+                    .send_top_level(move |conn| -> Result<usize, StorageError> {
+                        conn.execute("INSERT INTO t (id, v) VALUES (10, 'autocommitted')", [])
+                            .map_err(|e| StorageError::Pool {
+                                operation: "test_top_level_insert".into(),
+                                message: e.to_string(),
+                            })?;
+                        let _ = started_tx.send(());
+                        release_rx.recv().expect("test must release top-level op");
+                        panic!("intentional top-level writer request panic");
+                    })
+                    .await
+            }
+        });
+
+        tokio::time::timeout(Duration::from_secs(5), started_rx)
+            .await
+            .expect("top-level request did not start")
+            .expect("top-level request dropped its start signal");
+
+        let queued_ran = Arc::new(AtomicBool::new(false));
+        let queued_ran_in_op = Arc::clone(&queued_ran);
+        let queued = handle
+            .enqueue(move |conn| {
+                queued_ran_in_op.store(true, Ordering::SeqCst);
+                conn.execute("INSERT INTO t (id, v) VALUES (11, 'queued')", [])
+                    .map_err(|e| StorageError::Pool {
+                        operation: "test_top_level_queued_insert".into(),
+                        message: e.to_string(),
+                    })
+            })
+            .await
+            .expect("queued request must be accepted");
+        assert_eq!(handle.queue_depth(), 1);
+        release_tx.send(()).expect("release top-level op");
+
+        let active_result = tokio::time::timeout(Duration::from_secs(5), active)
+            .await
+            .expect("top-level caller hung after panic")
+            .expect("top-level caller task join");
+        assert_writer_task_terminal_state(
+            active_result,
+            WriterTaskRequestState::SideEffectsUnknown,
+        );
+
+        let queued_result = tokio::time::timeout(Duration::from_secs(5), queued)
+            .await
+            .expect("queued caller hung after top-level panic")
+            .expect("terminal drain must preserve queued typed reply");
+        assert_writer_task_terminal_state(queued_result, WriterTaskRequestState::NotStarted);
+        assert!(!queued_ran.load(Ordering::SeqCst));
+
+        let reader = pool.reader().expect("reader");
+        let active_count: i64 = reader
+            .conn()
+            .query_row("SELECT COUNT(*) FROM t WHERE id = 10", [], |row| row.get(0))
+            .unwrap();
+        let queued_count: i64 = reader
+            .conn()
+            .query_row("SELECT COUNT(*) FROM t WHERE id = 11", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            active_count, 1,
+            "the completed top-level statement autocommits before the panic"
+        );
+        assert_eq!(queued_count, 0, "the queued request must never run");
+    }
+
+    #[tokio::test]
+    async fn closed_receiver_rejects_all_send_surfaces_as_not_started() {
+        // Simulates the writer task having terminated: its `rx` is gone, so
+        // every send surface must fail deterministically without running the
+        // supplied operation.
         let (tx, rx) = mpsc::channel::<Box<dyn AnyWriteRequest + Send>>(4);
         drop(rx);
 
         let handle = WriterTaskHandle { tx };
-        let result = handle.send(|_conn| Ok::<(), StorageError>(())).await;
+        let send_result = handle.send(|_conn| Ok::<(), StorageError>(())).await;
+        assert_writer_task_terminal_state(send_result, WriterTaskRequestState::NotStarted);
 
-        match result {
-            Err(StorageError::Internal(_)) => {}
-            other => panic!("expected Internal error on a closed channel, got {other:?}"),
-        }
+        let timed_result = handle
+            .send_with_timeout(|_conn| Ok::<(), StorageError>(()), Duration::from_secs(1))
+            .await;
+        assert_writer_task_terminal_state(timed_result, WriterTaskRequestState::NotStarted);
+
+        let top_level_result = handle
+            .send_top_level(|_conn| Ok::<(), StorageError>(()))
+            .await;
+        assert_writer_task_terminal_state(top_level_result, WriterTaskRequestState::NotStarted);
+    }
+
+    #[tokio::test]
+    async fn accepted_request_lost_reply_is_side_effects_unknown() {
+        // A request can be accepted before an unexpected receiver/task loss.
+        // The handle cannot prove whether its closure ran, so the oneshot
+        // fallback must conservatively report SideEffectsUnknown.
+        let (tx, mut rx) = mpsc::channel::<Box<dyn AnyWriteRequest + Send>>(1);
+        let handle = WriterTaskHandle { tx };
+        let request_ran = Arc::new(AtomicBool::new(false));
+        let request_ran_in_op = Arc::clone(&request_ran);
+
+        let dropper = tokio::spawn(async move {
+            let request = rx.recv().await.expect("request must be accepted");
+            drop(request);
+        });
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            handle.send(move |_conn| {
+                request_ran_in_op.store(true, Ordering::SeqCst);
+                Ok::<(), StorageError>(())
+            }),
+        )
+        .await
+        .expect("caller hung after accepted request was dropped");
+        dropper.await.expect("dropper task join");
+
+        assert_writer_task_terminal_state(result, WriterTaskRequestState::SideEffectsUnknown);
+        assert!(!request_ran.load(Ordering::SeqCst));
     }
 }
