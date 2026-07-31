@@ -31,7 +31,7 @@ The hardest race lands a write after a background task has chosen its generation
 
 The ANN graph spans all namespaces. Exact namespace overrides therefore require both post-filtering and enough over-fetch to find visible candidates when unrelated namespaces occupy the nearest positions.
 
-Coverage seeds many local filler vectors and a target in another namespace under deterministic fixed embeddings. With widening enabled the target appears; with `ann_overfetch_max_rounds = 1` it does not. A second case ensures widening is skipped when the graph's namespace set proves there are no hidden namespaces to filter. Tests retry only the warm-state precondition when asynchronous build completion is involved; they do not retry the whole assertion until it happens to pass.
+Coverage seeds many local filler vectors and a target in another namespace under deterministic fixed embeddings. With widening enabled the target appears; with `ann_overfetch_max_rounds = 1` it does not. The two arms run against the same test-owned graph: the test synchronously ensures the final seeded generation, drains the background warm guard, and verifies both namespaces are installed before dispatching either recall. It does not infer ANN readiness from a successful result, because the fresh-tail exact leg can surface a new target while the installed graph is still stale. A second case ensures widening is skipped when the graph's namespace set proves there are no hidden namespaces to filter.
 
 The absent-namespace case remains byte-identical to legacy behavior, an explicit namespace returns only that namespace, and invalid namespace text produces a per-operation error naming the bad value.
 
