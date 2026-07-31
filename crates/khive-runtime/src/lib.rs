@@ -7,6 +7,7 @@ pub mod atomic_plan;
 pub mod atomic_prepare;
 pub mod atomic_runner;
 pub mod blob;
+pub mod build_info;
 pub mod config;
 pub mod config_ledger;
 pub mod cost_unit;
@@ -44,6 +45,7 @@ pub use atomic_runner::{
     CommittedPostCommitEffects,
 };
 pub use blob::resolve_blob_store;
+pub use build_info::{BuildInfo, BUILD_INFO, BUILD_VERSION};
 pub use cost_unit::{base_resource_payload, cost_unit_for_dispatch, resource_payload};
 pub use curation::{
     entity_embedding_text, entity_fts_document, entity_merge_guard_error, note_embedding_text,

@@ -1490,7 +1490,13 @@ pub async fn run_daemon_with_boot_guard<D: DaemonDispatch>(
     // written.  Any concurrent client or daemon startup will observe a live
     // socket+pid and take the non-recovery path.
     drop(_startup_lock);
-    tracing::info!(socket = ?sock, pid = std::process::id(), "khived listening");
+    tracing::info!(
+        socket = ?sock,
+        pid = std::process::id(),
+        source_revision = crate::BUILD_INFO.source_revision,
+        build_time = crate::BUILD_INFO.build_time,
+        "khived listening"
+    );
 
     {
         let warm = dispatcher.clone();

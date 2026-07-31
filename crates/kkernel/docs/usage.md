@@ -9,6 +9,9 @@ All subcommands emit JSON on stdout by default; pass `--human` where supported f
 readable table. `--log <level>` (env `KHIVE_LOG`, default `warn`) is global and goes
 to stderr — stdout stays clean for JSON / MCP traffic.
 
+`kkernel -V` reports the package version; `kkernel --version` also reports the full source
+revision (including `-dirty` when applicable) and UTC build time.
+
 ```
 kkernel <command> [flags]
 

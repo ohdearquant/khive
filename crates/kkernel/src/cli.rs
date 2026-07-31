@@ -25,6 +25,7 @@ use khive_runtime::{BackendId, KhiveConfig, KhiveRuntime, RuntimeConfig};
 #[command(
     name = "kkernel",
     version,
+    long_version = khive_runtime::BUILD_VERSION,
     about = "khive kernel — admin/management Rust binary"
 )]
 struct Args {
@@ -760,8 +761,26 @@ fn cmd_backend(cmd: BackendCommand) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::CommandFactory;
     use serial_test::serial;
     use tempfile::TempDir;
+
+    #[test]
+    fn version_surfaces_share_the_compiled_provenance() {
+        let command = Args::command();
+
+        assert_eq!(command.get_version(), Some(env!("CARGO_PKG_VERSION")));
+        assert_eq!(
+            command.get_long_version(),
+            Some(khive_runtime::BUILD_VERSION)
+        );
+        assert!(command
+            .render_long_version()
+            .contains(khive_runtime::BUILD_INFO.source_revision));
+        assert!(command
+            .render_long_version()
+            .contains(khive_runtime::BUILD_INFO.build_time));
+    }
 
     // A schema check must be read-only: it must not create a missing database,
     // and it must not migrate (mutate) an existing one. Regression for the
