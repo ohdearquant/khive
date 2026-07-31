@@ -5,7 +5,7 @@ use std::str::FromStr;
 
 use khive_types::EdgeRelation;
 
-use crate::ast::{CompareOp, Condition, ConditionValue, GqlQuery, PatternElement};
+use crate::ast::{CompareOp, Condition, ConditionValue, GqlQuery, PatternElement, PropertyRef};
 use crate::error::QueryError;
 
 /// Closed synthetic relation set handled outside the canonical edge enum.
@@ -198,12 +198,12 @@ enum VarKind {
 }
 
 fn validate_condition(cond: &mut Condition, is_edge: bool) -> Result<(), QueryError> {
-    match cond.property.as_str() {
-        "namespace" => Err(QueryError::Validation(
+    match &cond.property {
+        PropertyRef::Field(property) if property == "namespace" => Err(QueryError::Validation(
             "namespace is set by CompileOptions, not query text".into(),
         )),
-        "kind" if !is_edge => Ok(()),
-        "relation" if is_edge => {
+        PropertyRef::Field(property) if property == "kind" && !is_edge => Ok(()),
+        PropertyRef::Field(property) if property == "relation" && is_edge => {
             let normalize = |s: &mut String| -> Result<(), QueryError> {
                 let parsed = EdgeRelation::from_str(s)
                     .map_err(|err| QueryError::Validation(err.to_string()))?;

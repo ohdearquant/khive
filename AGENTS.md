@@ -587,7 +587,7 @@ Sparse graphs are useless. Every entity should have minimum edges:
 MATCH (a)-[:extends|variant_of*1..3]->(b {name: 'LoRA'}) RETURN a, b
 
 # Find all papers in the attention domain
-MATCH (a:concept) WHERE a.domain = 'attention' AND a.type = 'paper' RETURN a
+MATCH (a:concept) WHERE a.properties.domain = 'attention' AND a.properties.type = 'paper' RETURN a
 
 # What concepts does this implementation realize?
 MATCH ({name: 'lattice-inference'})-[:implements]->(c:concept) RETURN c

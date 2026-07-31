@@ -84,6 +84,16 @@ fn rejects_namespace_in_where() {
 }
 
 #[test]
+fn allows_explicit_json_property_named_namespace() {
+    let mut q = gql::parse(
+        "MATCH (a:concept)-[:extends]->(b) \
+         WHERE a.properties.namespace = 'legacy' RETURN a",
+    )
+    .unwrap();
+    validate(&mut q).unwrap();
+}
+
+#[test]
 fn rejects_namespace_in_node_properties() {
     let mut q =
         gql::parse("MATCH (a:concept {namespace: 'other'})-[:extends]->(b) RETURN a").unwrap();
@@ -358,7 +368,8 @@ fn validate_pattern_shape_rejects_wrong_type_at_position() {
 #[test]
 fn node_property_named_relation_allowed() {
     let mut q =
-        gql::parse("MATCH (a)-[:extends]->(b) WHERE a.relation = 'external' RETURN a").unwrap();
+        gql::parse("MATCH (a)-[:extends]->(b) WHERE a.properties.relation = 'external' RETURN a")
+            .unwrap();
     validate(&mut q).unwrap();
     assert_eq!(first_condition_string_value(&q), "external");
 }
