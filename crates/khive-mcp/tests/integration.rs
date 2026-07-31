@@ -3927,6 +3927,7 @@ async fn agenda_returns_iso8601_timestamps() -> anyhow::Result<()> {
 
 async fn connect_brain_only(
 ) -> anyhow::Result<impl std::ops::Deref<Target = rmcp::service::Peer<rmcp::RoleClient>>> {
+    disable_daemon();
     let (server_transport, client_transport) = tokio::io::duplex(65536);
     let config = RuntimeConfig {
         db_path: None,
