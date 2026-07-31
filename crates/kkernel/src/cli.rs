@@ -763,14 +763,6 @@ mod tests {
     use serial_test::serial;
     use tempfile::TempDir;
 
-    // Force-link `khive-pack-template` (a dev-dependency only) so its
-    // `inventory::submit!` registration is visible to this bin target's own
-    // test binary — mirrors the same force-link in `kkernel::lib`'s
-    // `_test_pack_links` (this bin target compiles independently of the lib
-    // crate's `#[cfg(test)]` items).
-    #[allow(unused_imports)]
-    use khive_pack_template::TemplatePack as _TemplatePack;
-
     // A schema check must be read-only: it must not create a missing database,
     // and it must not migrate (mutate) an existing one. Regression for the
     // finding that `db check` ran migrations via the read-only runtime path.
