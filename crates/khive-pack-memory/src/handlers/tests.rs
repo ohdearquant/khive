@@ -769,17 +769,17 @@ fn compute_score_composite_bounded_to_unit_interval() {
 }
 
 #[test]
-fn default_fusion_strategy_is_weighted() {
+fn default_fusion_strategy_is_rrf_k10() {
     let cfg = RecallConfig::default();
     assert!(
-        matches!(cfg.fuse_strategy, FusionStrategy::Weighted { .. }),
-        "default fuse_strategy must be Weighted (CC-6), got {:?}",
+        matches!(cfg.fuse_strategy, FusionStrategy::Rrf { k: 10 }),
+        "default fuse_strategy must be Rrf {{ k: 10 }} (calibrated 2026-07-21), got {:?}",
         cfg.fuse_strategy
     );
 }
 
 #[test]
-fn salience_dominates_relevance_under_default_weighted_strategy() {
+fn salience_dominates_relevance_under_default_weights() {
     let cfg = RecallConfig::default();
     let age_days = 0.0;
     let decay = 0.01;
@@ -794,7 +794,7 @@ fn salience_dominates_relevance_under_default_weighted_strategy() {
     assert!(
         score_high > score_low,
         "high-salience (0.9, relevance=0.8, score={score_high}) should outrank \
-         low-salience (0.3, relevance=0.9, score={score_low}) under default Weighted strategy"
+         low-salience (0.3, relevance=0.9, score={score_low}) under default weights"
     );
 }
 

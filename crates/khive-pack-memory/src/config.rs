@@ -66,7 +66,7 @@ pub struct RecallConfig {
     /// Explicit max candidates per retrieval path before fusion. When None,
     /// candidate_multiplier keeps the legacy behavior.
     pub candidate_limit: Option<u32>,
-    /// Strategy used to fuse retrieval lists. Default weighted `[vector=0.7, text=0.3]`.
+    /// Strategy used to fuse retrieval lists. Default `Rrf { k: 10 }` (calibrated).
     pub fuse_strategy: FusionStrategy,
     /// Minimum composite score to include in results. Default 0.0.
     pub min_score: f64,
@@ -370,12 +370,12 @@ impl RecallFtsGatherConfig {
 // until a harder corpus (embed-enabled, synonym queries, partial matches) provides signal.
 // See tests/khive-contract/tune/REPORT.md for the analysis.
 //
-// CC-6: Default strategy changed from RRF to Weighted [0.7, 0.3].
-//
-// Under RRF with the default weights (relevance 70%, salience 20%, temporal 10%), a
-// salience=0.3 memory can rank above a salience=0.9 memory when its text/vector rank is
-// marginally better. The Weighted strategy gives full-resolution score values to both
-// retrieval paths, making the salience contribution a meaningful tiebreaker.
+// Default strategy: RRF k=10 (restored 2026-07-21). CC-6 flipped this to
+// Weighted [0.7, 0.3] to let salience act as a tiebreaker, but the live golden-suite
+// sweep showed the flip regressed adversarial-paraphrase recall (hit@5 0.471 -> 0.353,
+// MRR 0.321 -> 0.153) while RRF k=10 held the holdout suite at its best tier: min-max
+// weighted fusion lets a keyword-only text hit outrank paraphrase hits visible only to
+// the vector leg. Salience still contributes through the composite score weights.
 // The RRF strategy remains available via `fusion_strategy="rrf"`.
 impl Default for RecallConfig {
     fn default() -> Self {
@@ -388,14 +388,13 @@ impl Default for RecallConfig {
             decay_model: DecayModel::default(),
             candidate_multiplier: 20,
             candidate_limit: Some(150),
-            // CC-6: Weighted fusion respects score magnitude, allowing the salience
-            // amplifier to meaningfully differentiate high- vs low-salience memories.
-            // Weights [vector=0.7, text=0.3] match the prior RRF intent: vector
-            // results are weighted higher because embedding search captures semantic
-            // similarity; text results supplement with keyword precision.
-            fuse_strategy: FusionStrategy::Weighted {
-                weights: vec![0.7, 0.3],
-            },
+            // RRF k=10 is the calibrated default (2026-06 pen-default, reconfirmed by
+            // the 2026-07-21 live sweep). The CC-6 Weighted [0.7, 0.3] flip regressed
+            // the adversarial-paraphrase suite (hit@5 0.471 -> 0.353, MRR halved):
+            // min-max weighted fusion lets a strong text-leg score on a keyword-only
+            // match outrank paraphrase hits that only the vector leg sees. RRF's
+            // rank-based fusion is robust to that magnitude mismatch.
+            fuse_strategy: FusionStrategy::Rrf { k: 10 },
             min_score: 0.0,
             min_salience: 0.0,
             include_breakdown: false,
@@ -809,13 +808,10 @@ mod tests {
     fn new_fields_have_correct_defaults() {
         let cfg = RecallConfig::default();
         assert_eq!(cfg.candidate_limit, Some(150));
-        // CC-6: default changed to Weighted [0.7, 0.3] so salience can influence ranking
+        // Calibrated default: RRF k=10 (2026-06 pen-default, reconfirmed 2026-07-21).
         assert!(
-            matches!(
-                cfg.fuse_strategy,
-                FusionStrategy::Weighted { ref weights } if weights == &vec![0.7_f64, 0.3_f64]
-            ),
-            "default fuse_strategy should be Weighted [0.7, 0.3], got {:?}",
+            matches!(cfg.fuse_strategy, FusionStrategy::Rrf { k: 10 }),
+            "default fuse_strategy should be Rrf {{ k: 10 }}, got {:?}",
             cfg.fuse_strategy
         );
         assert!(!cfg.include_breakdown);
@@ -880,10 +876,9 @@ mod tests {
         let json = r#"{"temporal_weight": 0.15}"#;
         let cfg: RecallConfig = serde_json::from_str(json).expect("deserialize partial");
         assert_eq!(cfg.candidate_limit, Some(150));
-        // CC-6: default changed to Weighted [0.7, 0.3]
         assert!(
-            matches!(cfg.fuse_strategy, FusionStrategy::Weighted { .. }),
-            "partial config must deserialize fuse_strategy to Weighted default"
+            matches!(cfg.fuse_strategy, FusionStrategy::Rrf { k: 10 }),
+            "partial config must deserialize fuse_strategy to the Rrf {{ k: 10 }} default"
         );
         assert!(!cfg.include_breakdown);
     }

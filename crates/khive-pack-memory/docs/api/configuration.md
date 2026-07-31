@@ -6,9 +6,9 @@
 
 The three primary weights are relevance `0.70`, salience `0.20`, and temporal `0.10`. Validation requires finite, non-negative weights with a positive sum. Temporal half-life must be positive, per-reranker weights must be finite and non-negative, a provided candidate limit must be positive, and the score and salience floors must be finite. Nested gather/scoring configuration is not validated here.
 
-Retrieval defaults include a candidate multiplier of 20, optional explicit candidate limit, weighted vector/text fusion, score floor zero, salience floor zero, and breakdowns disabled. Weighted fusion defaults to vector `0.7` and text `0.3`, preserving the prior semantic-over-keyword preference while respecting score magnitude. RRF remains selectable.
+Retrieval defaults include a candidate multiplier of 20, optional explicit candidate limit, RRF fusion with `k = 10`, score floor zero, salience floor zero, and breakdowns disabled. Weighted fusion (vector `0.7`, text `0.3`) remains selectable per call via `fusion_strategy: "weighted"`; an explicit `fusion_strategy: "rrf"` request selects `k = 60`, distinct from the omitted-parameter default.
 
-A tuning sweep of 116 configurations on the synthetic contract corpus produced the same recall@10 (`0.9333`) for every configuration. That corpus therefore supplied no evidence for changing the prior defaults; an embedding-enabled corpus with synonym and partial-match queries is needed before retuning.
+A tuning sweep of 116 configurations on the synthetic contract corpus produced the same recall@10 (`0.9333`) for every configuration and supplied no evidence either way. A later live-corpus golden-suite sweep (2026-07-21, adversarial-paraphrase and holdout suites) did discriminate: the weighted default regressed paraphrase recall relative to RRF `k = 10`, which was restored as the calibrated default.
 
 `validate()` returns `RuntimeError::InvalidInput` for inconsistent values. `try_from_value()` deserializes JSON and validates in one operation.
 
