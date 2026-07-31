@@ -1,6 +1,58 @@
 use super::*;
 use crate::pool::PoolConfig;
 
+pub(super) mod page_snapshot_seam {
+    use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
+    use std::sync::Mutex;
+
+    struct Barrier {
+        operation: &'static str,
+        namespace: String,
+        reached_tx: SyncSender<()>,
+        proceed_rx: Receiver<()>,
+    }
+
+    static BARRIER: Mutex<Option<Barrier>> = Mutex::new(None);
+
+    pub(crate) fn install(
+        operation: &'static str,
+        namespace: String,
+    ) -> (Receiver<()>, SyncSender<()>) {
+        let (reached_tx, reached_rx) = sync_channel(0);
+        let (proceed_tx, proceed_rx) = sync_channel(0);
+        *BARRIER.lock().unwrap() = Some(Barrier {
+            operation,
+            namespace,
+            reached_tx,
+            proceed_rx,
+        });
+        (reached_rx, proceed_tx)
+    }
+
+    pub(crate) fn uninstall() {
+        *BARRIER.lock().unwrap() = None;
+    }
+
+    pub(crate) fn hook(operation: &'static str, namespace: &str) {
+        let barrier = {
+            let mut guard = BARRIER.lock().unwrap();
+            match guard.as_ref() {
+                Some(barrier)
+                    if barrier.operation == operation && barrier.namespace == namespace =>
+                {
+                    guard.take()
+                }
+                _ => None,
+            }
+        };
+        let Some(barrier) = barrier else {
+            return;
+        };
+        let _ = barrier.reached_tx.send(());
+        let _ = barrier.proceed_rx.recv();
+    }
+}
+
 fn setup_pool() -> Arc<ConnectionPool> {
     let config = PoolConfig {
         path: None,
@@ -226,6 +278,152 @@ async fn test_query_and_count_use_caller_namespace() {
     let count_b = store.count_notes("ns_b", None).await.unwrap();
     assert_eq!(count_a, 1);
     assert_eq!(count_b, 1);
+}
+
+#[derive(Clone, Copy, Debug)]
+enum SnapshotPageQuery {
+    Basic,
+    Filtered,
+}
+
+impl SnapshotPageQuery {
+    fn operation(self) -> &'static str {
+        match self {
+            Self::Basic => "query_notes",
+            Self::Filtered => "query_notes_filtered",
+        }
+    }
+}
+
+async fn run_snapshot_page_query(
+    store: &SqlNoteStore,
+    query: SnapshotPageQuery,
+    namespace: &str,
+    filter: &NoteFilter,
+) -> Result<Page<Note>, StorageError> {
+    let page = PageRequest {
+        offset: 0,
+        limit: 10,
+    };
+    match query {
+        SnapshotPageQuery::Basic => {
+            store
+                .query_notes(namespace, Some("observation"), page)
+                .await
+        }
+        SnapshotPageQuery::Filtered => store.query_notes_filtered(namespace, filter, page).await,
+    }
+}
+
+async fn assert_page_count_and_items_share_snapshot(query: SnapshotPageQuery) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join(format!("note-page-snapshot-{query:?}.db"));
+    let pool = Arc::new(
+        ConnectionPool::new(PoolConfig {
+            path: Some(path),
+            write_queue_enabled: false,
+            ..PoolConfig::default()
+        })
+        .unwrap(),
+    );
+    {
+        let writer = pool.writer().unwrap();
+        writer.conn().execute_batch(NOTES_DDL).unwrap();
+        let journal_mode: String = writer
+            .conn()
+            .pragma_query_value(None, "journal_mode", |row| row.get(0))
+            .unwrap();
+        assert_eq!(journal_mode.to_ascii_lowercase(), "wal");
+    }
+
+    let store = Arc::new(SqlNoteStore::new(Arc::clone(&pool), true));
+    let namespace = format!("snapshot-{}", Uuid::new_v4());
+    let properties = serde_json::json!({"snapshot_case": true});
+
+    let mut initial = make_note_with_props(
+        &namespace,
+        "observation",
+        "present when count starts",
+        properties.clone(),
+    );
+    initial.created_at = 1;
+    let initial_id = initial.id;
+    store.upsert_note(initial).await.unwrap();
+
+    let filter = NoteFilter {
+        kind: Some("observation".to_string()),
+        property_filters: vec![khive_storage::note::PropertyFilter {
+            json_path: "$.snapshot_case".to_string(),
+            op: FilterOp::Eq,
+            value: SqlValue::Bool(true),
+        }],
+        ..NoteFilter::default()
+    };
+
+    let (reached_rx, proceed_tx) =
+        page_snapshot_seam::install(query.operation(), namespace.clone());
+    let query_task = {
+        let store = Arc::clone(&store);
+        let namespace = namespace.clone();
+        let filter = filter.clone();
+        tokio::spawn(
+            async move { run_snapshot_page_query(&store, query, &namespace, &filter).await },
+        )
+    };
+
+    tokio::task::spawn_blocking(move || reached_rx.recv_timeout(std::time::Duration::from_secs(5)))
+        .await
+        .expect("waiting for the count-to-page seam must not panic")
+        .expect("query must reach the seam after reading its count");
+
+    let mut concurrent = make_note_with_props(
+        &namespace,
+        "observation",
+        "committed between count and page",
+        properties,
+    );
+    concurrent.created_at = 2;
+    let concurrent_id = concurrent.id;
+    store
+        .upsert_note(concurrent)
+        .await
+        .expect("WAL writer must commit while the page reader is parked");
+    assert!(
+        store.get_note(concurrent_id).await.unwrap().is_some(),
+        "a new reader must observe the committed row before the page reader resumes"
+    );
+    assert!(
+        !query_task.is_finished(),
+        "page query must remain parked until the test releases its production seam"
+    );
+
+    proceed_tx
+        .send(())
+        .expect("page query must still be waiting at the production seam");
+    let page = query_task
+        .await
+        .expect("page query task must not panic")
+        .expect("page query must succeed");
+    page_snapshot_seam::uninstall();
+
+    assert_eq!(page.total, Some(1));
+    assert_eq!(
+        page.items.iter().map(|note| note.id).collect::<Vec<_>>(),
+        vec![initial_id]
+    );
+
+    let after = run_snapshot_page_query(&store, query, &namespace, &filter)
+        .await
+        .unwrap();
+    assert_eq!(after.total, Some(2));
+    assert!(after.items.iter().any(|note| note.id == concurrent_id));
+}
+
+#[tokio::test]
+async fn note_page_count_and_items_share_one_snapshot_during_concurrent_insert() {
+    for query in [SnapshotPageQuery::Basic, SnapshotPageQuery::Filtered] {
+        assert_page_count_and_items_share_snapshot(query).await;
+    }
 }
 
 #[tokio::test]
