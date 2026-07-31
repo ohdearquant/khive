@@ -638,12 +638,10 @@ pub async fn prepare_update(
                 None => {}
                 Some(AtomicUpdateKind::Entity {
                     specific: Some(expected),
-                }) => {
-                    if &entity.kind != expected {
-                        return Err(RuntimeError::NotFound(format!("entity {id}")));
-                    }
+                }) if &entity.kind != expected => {
+                    return Err(RuntimeError::NotFound(format!("entity {id}")));
                 }
-                Some(AtomicUpdateKind::Entity { specific: None }) => {}
+                Some(AtomicUpdateKind::Entity { .. }) => {}
                 Some(AtomicUpdateKind::Note { .. }) => {
                     return Err(RuntimeError::NotFound(format!("note {id}")));
                 }
@@ -680,12 +678,10 @@ pub async fn prepare_update(
                 None => {}
                 Some(AtomicUpdateKind::Note {
                     specific: Some(expected),
-                }) => {
-                    if &note.kind != expected {
-                        return Err(RuntimeError::NotFound(format!("note {id}")));
-                    }
+                }) if &note.kind != expected => {
+                    return Err(RuntimeError::NotFound(format!("note {id}")));
                 }
-                Some(AtomicUpdateKind::Note { specific: None }) => {}
+                Some(AtomicUpdateKind::Note { .. }) => {}
                 Some(AtomicUpdateKind::Entity { .. }) => {
                     return Err(RuntimeError::NotFound(format!("entity {id}")));
                 }
@@ -1010,12 +1006,10 @@ pub async fn prepare_delete(
                 None => {}
                 Some(AtomicDeleteKind::Entity {
                     specific: Some(expected),
-                }) => {
-                    if &entity.kind != expected {
-                        return Err(RuntimeError::NotFound(format!("{expected} {id}")));
-                    }
+                }) if &entity.kind != expected => {
+                    return Err(RuntimeError::NotFound(format!("{expected} {id}")));
                 }
-                Some(AtomicDeleteKind::Entity { specific: None }) => {}
+                Some(AtomicDeleteKind::Entity { .. }) => {}
                 Some(AtomicDeleteKind::Note { .. }) => {
                     return Err(RuntimeError::NotFound(format!("note {id}")));
                 }
@@ -1085,12 +1079,10 @@ pub async fn prepare_delete(
                 None => {}
                 Some(AtomicDeleteKind::Note {
                     specific: Some(expected),
-                }) => {
-                    if &note.kind != expected {
-                        return Err(RuntimeError::NotFound(format!("{expected} {id}")));
-                    }
+                }) if &note.kind != expected => {
+                    return Err(RuntimeError::NotFound(format!("{expected} {id}")));
                 }
-                Some(AtomicDeleteKind::Note { specific: None }) => {}
+                Some(AtomicDeleteKind::Note { .. }) => {}
                 Some(AtomicDeleteKind::Entity { .. }) => {
                     return Err(RuntimeError::NotFound(format!("entity {id}")));
                 }

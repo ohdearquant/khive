@@ -320,14 +320,14 @@ mod prune_recall_visibility_tests {
         ann.reset_warm_route_count();
 
         // `fusion_strategy: None` omits the param entirely rather than passing
-        // "weighted" explicitly, so this leg exercises `RecallConfig::default()`
-        // (`config.rs` — `FusionStrategy::Weighted { weights: [0.7, 0.3] }`), the
-        // strategy an ordinary caller actually hits, not just the named strategy.
+        // a strategy explicitly, so this leg exercises `RecallConfig::default()`
+        // (`config.rs` — `FusionStrategy::Rrf { k: 10 }`), the strategy an
+        // ordinary caller actually hits, not just the named strategy.
         for (label, fusion_strategy) in [
             ("keyword_only (FTS lexical leg)", Some("keyword_only")),
             ("vector_only (sqlite-vec/ANN leg)", Some("vector_only")),
-            ("rrf (non-default fusion, explicit)", Some("rrf")),
-            ("weighted (default fusion, fusion_strategy omitted)", None),
+            ("weighted (non-default fusion, explicit)", Some("weighted")),
+            ("rrf k=10 (default fusion, fusion_strategy omitted)", None),
         ] {
             let mut params = serde_json::json!({
                 "query": NOTE_TEXT,
@@ -362,20 +362,20 @@ mod prune_recall_visibility_tests {
         );
     }
 
-    /// #533 follow-up: `RecallConfig::default()` fuses via `FusionStrategy::Weighted
-    /// { weights: [0.7, 0.3] }` (`config.rs`), not `rrf` — the shipped default is
-    /// reached by omitting `fusion_strategy` from the recall params entirely, not by
-    /// passing `"rrf"`. This test exercises that exact omitted-param path: seed a
+    /// #533 follow-up: `RecallConfig::default()` fuses via `FusionStrategy::Rrf
+    /// { k: 10 }` (`config.rs`) — the shipped default is reached by omitting
+    /// `fusion_strategy` from the recall params entirely (an explicit `"rrf"`
+    /// string selects k=60). This test exercises that exact omitted-param path: seed a
     /// low-salience note, confirm it is recallable pre-prune via the FTS, vector, and
     /// default (fusion_strategy omitted) legs — proving each leg actually sees the
     /// note, not just vacuously agreeing on absence — then prune and confirm all
     /// three legs exclude it post-prune.
     #[tokio::test]
     #[serial(background_tasks)]
-    async fn prune_excludes_pruned_memory_via_default_weighted_fusion_recall() {
-        const MODEL: &str = "prune-533-visibility-model-weighted-default";
+    async fn prune_excludes_pruned_memory_via_default_fusion_recall() {
+        const MODEL: &str = "prune-533-visibility-model-default-fusion";
         const DIMS: usize = 16;
-        const NOTE_TEXT: &str = "issue 533 prune stale weighted default fusion regression note";
+        const NOTE_TEXT: &str = "issue 533 prune stale default fusion regression note";
 
         let rt = KhiveRuntime::memory().expect("in-memory runtime");
         rt.register_embedder(HashVecProvider {
@@ -425,7 +425,7 @@ mod prune_recall_visibility_tests {
         for (label, fusion_strategy) in [
             ("keyword_only (FTS lexical leg)", Some("keyword_only")),
             ("vector_only (sqlite-vec/ANN leg)", Some("vector_only")),
-            ("weighted (default fusion, fusion_strategy omitted)", None),
+            ("rrf k=10 (default fusion, fusion_strategy omitted)", None),
         ] {
             let result = registry
                 .dispatch("memory.recall", recall_params(fusion_strategy))
@@ -452,7 +452,7 @@ mod prune_recall_visibility_tests {
         for (label, fusion_strategy) in [
             ("keyword_only (FTS lexical leg)", Some("keyword_only")),
             ("vector_only (sqlite-vec/ANN leg)", Some("vector_only")),
-            ("weighted (default fusion, fusion_strategy omitted)", None),
+            ("rrf k=10 (default fusion, fusion_strategy omitted)", None),
         ] {
             let result = registry
                 .dispatch("memory.recall", recall_params(fusion_strategy))

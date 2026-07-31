@@ -77,7 +77,7 @@ fn strategies() -> Vec<FtsGatherStrategy> {
 }
 
 const FUSION_STRATEGIES: &[(&str, &str)] = &[
-    ("weighted (default 0.7/0.3)", "weighted"),
+    ("weighted (0.7/0.3)", "weighted"),
     ("vector_only", "vector_only"),
     ("keyword_only", "keyword_only"),
     ("rrf", "rrf"),
