@@ -69,6 +69,7 @@ pub struct SelectorWeights {
     /// Minimum score threshold (inputs below this are excluded even if budget allows).
     pub min_score: f32,
     /// Preference for diversity vs. relevance (0.0 = pure relevance, 1.0 = pure diversity).
+    /// Values outside the inclusive `[0.0, 1.0]` range are rejected.
     pub diversity_bias: f32,
     /// Weight for epistemic (uncertainty-reducing) selection.
     ///
@@ -101,7 +102,8 @@ pub trait Selector<T>: Send + Sync {
 /// to adjust scores, then greedily packs until the budget is exhausted. When
 /// `diversity_bias > 0`, uses a pick-best-remaining loop instead of a single
 /// sort pass. Tie-breaking is deterministic: effective score descending, size
-/// ascending, then id ascending. See
+/// ascending, then id ascending. This is an ordering heuristic, not a knapsack
+/// optimizer, and provides no optimality or approximation-ratio guarantee. See
 /// crates/khive-fold/docs/design.md#adr-024-bayesian-extensions-selector-budget-packing-and-precision-weighted-scoring
 /// for the diversity-penalty formula.
 #[derive(Debug, Clone, Copy, Default)]
@@ -152,6 +154,11 @@ fn validate_selector_weights(weights: &SelectorWeights) -> Result<(), FoldError>
     if !weights.diversity_bias.is_finite() {
         return Err(FoldError::InvalidInput(
             "SelectorWeights.diversity_bias must be finite".to_string(),
+        ));
+    }
+    if !(0.0..=1.0).contains(&weights.diversity_bias) {
+        return Err(FoldError::InvalidInput(
+            "SelectorWeights.diversity_bias must be within [0.0, 1.0]".to_string(),
         ));
     }
     if !weights.epistemic_weight.is_finite() {
@@ -279,7 +286,7 @@ impl<T: Clone> Selector<T> for GreedySelector {
                         a_det
                             .cmp(&b_det)
                             .then_with(|| remaining[j].size.cmp(&remaining[i].size))
-                            .then_with(|| remaining[i].id.cmp(&remaining[j].id))
+                            .then_with(|| remaining[j].id.cmp(&remaining[i].id))
                     })
                     .map(|(i, _)| i);
 
@@ -549,6 +556,20 @@ mod tests {
     }
 
     #[test]
+    fn diversity_path_tie_breaks_id_ascending() {
+        let inputs = vec![input("z", 1, 0.5), input("a", 1, 0.5)];
+        let w = SelectorWeights {
+            diversity_bias: 0.5,
+            ..Default::default()
+        };
+
+        let out = GreedySelector.select(inputs, 1, &w).unwrap();
+
+        assert_eq!(out.selected.len(), 1);
+        assert_eq!(out.selected[0].id, "a");
+    }
+
+    #[test]
     fn no_overflow_near_usize_max() {
         // Items with near-usize::MAX sizes must not overflow when checking budget.
         let large = usize::MAX - 1;
@@ -751,6 +772,24 @@ mod tests {
             };
             let err = GreedySelector.select(inputs, 100, &w).unwrap_err();
             assert!(matches!(err, FoldError::InvalidInput(_)));
+        }
+    }
+
+    #[test]
+    fn greedy_selector_rejects_out_of_range_diversity_bias() {
+        for bad in [-0.1, 1.1] {
+            let inputs = vec![input("a", 100, 0.5)];
+            let w = SelectorWeights {
+                diversity_bias: bad,
+                ..Default::default()
+            };
+
+            let err = GreedySelector.select(inputs, 100, &w).unwrap_err();
+
+            assert_eq!(
+                err.to_string(),
+                "invalid input: SelectorWeights.diversity_bias must be within [0.0, 1.0]"
+            );
         }
     }
 
