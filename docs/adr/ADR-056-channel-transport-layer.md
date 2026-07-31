@@ -11,9 +11,13 @@ implementation and two-way chat; amended 2026-07-09 -- durable IMAP UID cursor; 
 [§Amendment 2026-07-17](#amendment-2026-07-17----imessage-channel-over-an-ssh-bridge))\
 **Date**: 2026-06-14 (amended 2026-07-02, 2026-07-03, 2026-07-05, 2026-07-09, 2026-07-17)\
 **Authors**: khive maintainers
+**Amended by**: [ADR-122](ADR-122-email-outbound-delivery.md) (email outbound
+delivery now runs as an externally linked supervised component)\
 **Depends on**: ADR-017 (Pack Standard), ADR-018 (Authorization Gate), ADR-040 (Communication
-and Schedule Packs), ADR-053 (ActorStore / SessionStore -- extends ADR-018's actor model),
+and Schedule Packs), ADR-127 (authenticated principal and grant authority),
 ADR-108 (Git Write Surface -- hardened shell-out argv pattern reused by this amendment)\
+**Related**: superseded ADR-053, retained only as the historical caller-threading problem
+statement; its SessionStore design was not carried forward\
 **Related issues**: #112 (khive-channel umbrella), #113 (Telegram adapter), #114 (email adapter),
 #448 (inbound header spoofing -- resolved by this amendment), #449 (IMAP UID progress -- resolved
 by the 2026-07-09 amendment)
@@ -246,19 +250,22 @@ must deliver a message to the maintainer's Telegram, and the maintainer's replie
 must arrive as inbound `comm` messages that wake the inbox monitor -- the same
 two-way shape email already has.
 
-### The outbound path is live, not deferred (un-stales §5c/§5d)
+### Historical outbound topology (superseded by ADR-119/122)
 
-ADR-056 §5c/§5d mark the outbound path and reply routing DEFERRED. That labeling
-is stale relative to the shipped code: the email adapter made outbound delivery
-live via a per-channel **outbox loop**. `spawn_email_channel_loops`
-(`khive-mcp/src/serve.rs`) spawns two tasks under the daemon role -- an inbound
-`channel_poll_loop` and a `channel_outbox_loop` that drains outbound `message`
-notes destined for the channel and calls the channel's `Channel::send`. Outbound
-therefore already works for a live adapter; §5c/§5d describe an earlier plan, not
-the current mechanism.
+This subsection records the topology that was live when the 2026-07-05
+amendment was accepted. It is historical, not the current implementation
+contract. At that time the email adapter made outbound delivery live via a
+per-channel **outbox loop**: `spawn_email_channel_loops`
+(`khive-mcp/src/serve.rs`) spawned an inbound `channel_poll_loop` and a
+`channel_outbox_loop` that drained outbound `message` notes and called the
+channel's `Channel::send`.
 
-This amendment records that current mechanism as the normative outbound design and
-applies it to Telegram: a `channel-telegram`-feature-gated
+ADR-119 subsequently removed transport-specific loops from the core daemon and
+defined externally linked supervised components. ADR-122 now owns the current
+email outbox contract and the separately supervised `email-outbound`
+implementation. The Telegram decisions in this amendment remain accepted, but
+the following spawn-function description is retained only as implementation
+history: a `channel-telegram`-feature-gated
 `spawn_telegram_channel_loops`, mirroring `spawn_email_channel_loops`, spawns a
 Telegram poll loop and a Telegram outbox loop holding an `Arc<TelegramChannel>`.
 No change to the comm pack, the `comm.ingest` verb, the dispatch gate, the dedup
@@ -333,16 +340,32 @@ agent and never stored in any khive store.
 
 ### Configuration (env-only, mirroring §14)
 
-| Variable                            | Required | Default      | Description                                                                                               |
-| ----------------------------------- | -------- | ------------ | --------------------------------------------------------------------------------------------------------- |
-| `KHIVE_TELEGRAM_BOT_TOKEN`          | yes      | --           | Bot API token (BotFather). Never logged (masked `{first6}...[N chars]`), never stored in any khive store. |
-| `KHIVE_TELEGRAM_MAINTAINER_CHAT_ID` | yes      | --           | The single authorized inbound sender AND the outbound recipient for the maintainer slug. Numeric.         |
-| `KHIVE_TELEGRAM_MAINTAINER_SLUG`    | no       | `maintainer` | The slug in `telegram:<slug>` that maps to the maintainer chat id.                                        |
-| `KHIVE_TELEGRAM_INGEST_NAMESPACE`   | no       | `local`      | Target namespace for ingested inbound messages (passed as `namespace` to `comm.ingest`).                  |
+| Variable                              | Required | Default      | Description                                                                                                                                                                                                                              |
+| ------------------------------------- | -------- | ------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `KHIVE_TELEGRAM_BOT_TOKEN`            | yes      | --           | Bot API token (BotFather). Never logged (masked `{first6}...[N chars]`), never stored in any khive store.                                                                                                                                |
+| `KHIVE_TELEGRAM_MAINTAINER_CHAT_ID`   | yes      | --           | The authorized inbound conversation AND the outbound recipient for the maintainer slug. Numeric, signed (group ids are negative).                                                                                                        |
+| `KHIVE_TELEGRAM_AUTHORIZED_SENDER_ID` | no       | chat id\*    | The numeric Telegram account (`message.from.id`) authorized to send inbound messages. Positive integer. \*Defaults to `KHIVE_TELEGRAM_MAINTAINER_CHAT_ID` only when that id is positive (a private chat); required explicitly otherwise. |
+| `KHIVE_TELEGRAM_MAINTAINER_SLUG`      | no       | `maintainer` | The slug in `telegram:<slug>` that maps to the maintainer chat id.                                                                                                                                                                       |
+| `KHIVE_TELEGRAM_INGEST_NAMESPACE`     | no       | `local`      | Target namespace for ingested inbound messages (passed as `namespace` to `comm.ingest`).                                                                                                                                                 |
 
 When any required variable is absent, `TelegramChannelConfig::from_env()` returns
 `ChannelError::Config`; the server logs a warning and skips the Telegram adapter
 without crashing (mirrors the email adapter, §14).
+
+**Sender id resolution (amended 2026-07-27).** `KHIVE_TELEGRAM_AUTHORIZED_SENDER_ID`
+resolves as follows, and any error names the variable:
+
+| Configuration                                                     | Result                                                                                                                                                                     |
+| ----------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Set to a positive base-10 `i64`                                   | Used as-is. Works for private and group chats.                                                                                                                             |
+| Absent or blank, `KHIVE_TELEGRAM_MAINTAINER_CHAT_ID` positive     | Defaults to the chat id. In a private one-to-one chat the chat id _is_ the maintainer's account id, so existing single-user deployments keep working with no new variable. |
+| Absent or blank, `KHIVE_TELEGRAM_MAINTAINER_CHAT_ID` non-positive | `ChannelError::Config`. A group/channel id names a room, not a person, and is never inferred as a human sender.                                                            |
+| Set to a malformed, zero, or negative value                       | `ChannelError::Config`. Never falls back to the chat id.                                                                                                                   |
+
+The operator finds their own account id in the same first `getUpdates` response
+that surfaces the `chat.id` — it is `message.from.id`. It is env configuration
+only and, like the chat id, is never written to the KG or any note property
+(§9).
 
 **Inbound target namespace (deploy-config, not a code decision).** For the
 two-way-chat deployment, `KHIVE_TELEGRAM_INGEST_NAMESPACE` is set to the target
@@ -380,8 +403,8 @@ compiled). `channel-email` and `channel-telegram` can be enabled together; the
 
 ### Motivation
 
-Issue #449 (`khive-channel-email: IMAP polling can repeatedly fetch the same UID subset and
-miss later messages`, P1/high): a mailbox with more messages in one `SINCE` day-window than the
+`khive-channel-email`'s IMAP polling could repeatedly fetch the same UID subset and miss later
+messages: a mailbox with more messages in one `SINCE` day-window than the
 50-item fetch limit could have its overflow permanently starved. `LiveImap::fetch_since` searched
 `SINCE <date>`, collected the result into a `Vec` straight from `async-imap`'s `HashSet<Uid>`, and
 truncated to the limit before any progress state existed. With 75 same-day UIDs and a 50-item
@@ -427,14 +450,17 @@ Telegram's offset remains in-memory as originally documented.
 2. **`EmailChannel::poll_page`** (a new override of the `Channel` trait's default) plus
    `comm.cursor_get`/`comm.cursor_commit`: a fully implemented and unit/integration-tested durable
    checkpoint path, keyed by a stable `imap+tls:{host}:{port}:{mailbox}:INBOX` source string so
-   one account's high-water can never suppress another's. **`khive-mcp/src/serve.rs`'s
-   `channel_poll_loop` now calls `cursor_get` -> `poll_page` -> every `comm.ingest` -> `cursor_commit`
-   for each configured channel, committing the cursor only after every envelope in the page has
-   durably ingested.** A partial-page `comm.ingest` failure leaves the checkpoint untouched, so the
-   next poll re-selects the whole page; `comm.ingest`'s `INSERT OR IGNORE` dedup then skips
-   re-storing the messages that already succeeded and only the failed one is effectively retried.
-   A `cursor_get` failure skips that channel's poll for the cycle rather than risk polling from an
-   empty checkpoint and silently discarding durable state.
+   one account's high-water can never suppress another's. **The externally linked ADR-119
+   `email-channel` component in `khive-component-email` owns this path:** its
+   `start_email_component`/`run_component`/`run_cycle` sequence uses the supervisor-provided
+   `HostContext` server and namespace to call `cursor_get` -> `poll_page` -> every
+   `comm.ingest` -> `cursor_commit`, committing the cursor only after every envelope in the page
+   has durably ingested. The earlier in-process `khive-mcp/src/serve.rs::channel_poll_loop`
+   topology is historical and superseded. A partial-page `comm.ingest` failure leaves the
+   checkpoint untouched, so the next poll re-selects the whole page; `comm.ingest`'s
+   `INSERT OR IGNORE` dedup then skips re-storing the messages that already succeeded and only
+   the failed one is effectively retried. A `cursor_get` failure returns a retryable component
+   error before polling from an empty checkpoint, preserving the durable state.
 3. **Poison-UID durability** (issue #449 High): a selected UID whose `UID FETCH` response carries
    no RFC822 body, or whose body fails to parse, no longer fails the whole page. It gets a durable
    terminal disposition -- a quarantine envelope carrying the stable `imap:{host}:{uidvalidity}:{uid}`
@@ -447,15 +473,15 @@ Telegram's offset remains in-memory as originally documented.
 - The issue's literal 75-message/50-limit backlog-drain scenario is fixed and covered by tests
   exercising the real `EmailChannel::poll` entrypoint, not only the pure helpers.
 - Full restart durability (a daemon crash or redeploy resuming exactly above the last durably
-  ingested UID) is delivered end-to-end: `channel_poll_loop` drives `cursor_get`/`poll_page`/
-  `cursor_commit` on every cycle, and the commit-only-after-full-page-ingest ordering is covered by
-  poll-loop regression tests for partial-ingest-failure non-advancement and cross-restart
-  round-tripping.
+  ingested UID) is delivered end-to-end: `khive-component-email::run_cycle` drives
+  `cursor_get`/`poll_page`/`cursor_commit` on every cycle, and the
+  commit-only-after-full-page-ingest ordering is covered by component regression tests for
+  partial-ingest-failure non-advancement and cross-restart round-tripping.
 - `comm_channel_cursor`'s subhandlers are pack-owned operational bookkeeping and not a new
-  MCP-callable verb, exercised in production only via the daemon poll loop's internal dispatch
-  calls. Its table schema was pack-declared through `CREATE TABLE IF NOT EXISTS` when this bullet
-  was written; the 2026-07-17 amendment below moves that schema to core migration `V11`, so the
-  table's schema is core-migrated while its subhandlers stay pack-internal.
+  MCP-callable verb, exercised in production only through the email component's internal
+  dispatch calls. Its table schema was pack-declared through `CREATE TABLE IF NOT EXISTS` when
+  this bullet was written; the 2026-07-17 amendment below moves that schema to core migration
+  `V11`, so the table's schema is core-migrated while its subhandlers stay pack-internal.
 - Telegram's in-memory offset watermark and its restart-durability rationale (Amendment
   2026-07-05) are unchanged by this amendment.
 
@@ -2741,7 +2767,9 @@ exists for a sibling crate to write a single inbound note via this function.
 **The auth gate fires at exactly one site**: `VerbRegistry::dispatch`
 (`khive-runtime/src/pack.rs:678`). Any write path that calls `KhiveRuntime::create_note`
 directly, without routing through `dispatch`, bypasses the gate. This reintroduces the gap
-ADR-053 was written to close.
+the ADR-018 single-dispatch-site invariant and ADR-127's authenticated-principal/grant seam
+exist to close. Superseded ADR-053 records the historical version of this problem but is not
+current authority.
 
 **`VerbRegistry::dispatch` takes no external token and mints its own.** The signature is
 `pub async fn dispatch(&self, verb: &str, params: Value) -> Result<Value, RuntimeError>`
@@ -2867,6 +2895,7 @@ pub enum ChannelError {
     Config(String),
     Transport(String),
     Auth(String),
+    Permanent(String),
     UnauthorizedSender(String),
     InvalidEnvelope(String),
 }
@@ -3123,12 +3152,43 @@ the single-maintainer case.
 > [§Amendment 2026-07-02](#amendment-2026-07-02----inbound-authentication-hardening). The
 > Telegram drop behavior is unchanged.
 
-For Telegram, authentication is by numeric `chat.id` (stable across username changes),
-configured via env var. Username matching is a fallback only, as usernames can be reassigned.
-The maintainer identity is never stored in the KG.
+For Telegram, authentication is by numeric id (stable across username changes), configured
+via env var. Username matching is a fallback only, as usernames can be reassigned. The
+maintainer identity is never stored in the KG.
 
-The exact identity model (which identity claim is authoritative and how it ties to the ADR-053
-actor model) was an open question at the original Proposed status; it is resolved by OQ-2 as
+> **Telegram inbound authorization amended 2026-07-27 — two-factor.** The original text
+> named `chat.id` as the sole inbound identity. A `chat.id` identifies a _conversation_,
+> not a person: in a group or supergroup every member shares it, so it cannot by itself
+> justify stamping the maintainer's `telegram:<slug>` address onto an inbound envelope.
+> The shipped check is now conjunctive — an update is authorized only when
+>
+> ```text
+> message.chat.id == KHIVE_TELEGRAM_MAINTAINER_CHAT_ID
+>   && message.from is present
+>   && message.from.id == KHIVE_TELEGRAM_AUTHORIZED_SENDER_ID
+> ```
+>
+> `message.from` is optional on the wire (the Bot API omits it for channel posts and some
+> service messages), so it is modeled as `Option` at the decode boundary and an absent
+> sender is a denial, not a pass — fail-closed. The chat id keeps its existing roles:
+> it gates the inbound conversation and is the outbound `sendMessage` destination. The
+> sender id is inbound-only. See the sender-id resolution table under
+> §"Configuration (env-only)" for how existing single-user/private-chat deployments keep
+> working without setting the new variable.
+>
+> **Disposition.** Shipped `TelegramChannel::poll` logs and drops an unauthorized update
+> rather than returning `ChannelError::UnauthorizedSender` as the paragraph above
+> describes, so that one denied update cannot abort the remaining updates in the same
+> `getUpdates` batch; the offset still advances past it once committed, so a denial is not
+> re-delivered forever. Because `poll` returns `Ok(vec![])` for both a denied batch and an
+> empty one, each denial emits a `tracing::warn!` carrying a stable `reason` field —
+> `chat_id_mismatch`, `missing_sender`, or `sender_id_mismatch` — alongside `update_id`,
+> `chat_id`, and (for a mismatch) `sender_id`. That field, not the English message text, is
+> the observable rejection contract. The warning carries identifiers only: never the bot
+> token, never the message body.
+
+The exact identity model (which identity claim is authoritative and how it ties to ADR-127's
+authenticated-principal/grant model) was an open question at the original Proposed status; it is resolved by OQ-2 as
 hardened by the 2026-07-02 amendment (domain authentication with alignment plus allowlist
 before attribution; quarantined mail carries no trusted actor identity).
 
@@ -3216,20 +3276,26 @@ The ingest loop enforces a configurable minimum inter-poll interval (default 5 s
 All configuration is read from environment variables at adapter construction. No filesystem
 config files are consulted. Credentials are never defaulted or logged.
 
-| Variable                         | Required | Default | Description                                                                            |
-| -------------------------------- | -------- | ------- | -------------------------------------------------------------------------------------- |
-| `KHIVE_EMAIL_SMTP_HOST`          | yes      | --      | SMTP relay hostname                                                                    |
-| `KHIVE_EMAIL_SMTP_PORT`          | no       | 587     | SMTP submission port                                                                   |
-| `KHIVE_EMAIL_IMAP_HOST`          | yes      | --      | IMAP server hostname                                                                   |
-| `KHIVE_EMAIL_IMAP_PORT`          | no       | 993     | IMAP over TLS port                                                                     |
-| `KHIVE_EMAIL_USERNAME`           | yes      | --      | IMAP/SMTP credential username                                                          |
-| `KHIVE_EMAIL_PASSWORD`           | yes      | --      | IMAP/SMTP credential password (never logged)                                           |
-| `KHIVE_EMAIL_MAINTAINER_ADDRESS` | yes      | --      | The sole authorized inbound sender (RFC 5322 addr-spec)                                |
-| `KHIVE_EMAIL_INGEST_NAMESPACE`   | no       | `local` | Target namespace for ingested inbound messages; passed as `namespace` to `comm.ingest` |
+| Variable                         | Required | Default | Description                                             |
+| -------------------------------- | -------- | ------- | ------------------------------------------------------- |
+| `KHIVE_EMAIL_SMTP_HOST`          | yes      | --      | SMTP relay hostname                                     |
+| `KHIVE_EMAIL_SMTP_PORT`          | no       | 587     | SMTP submission port                                    |
+| `KHIVE_EMAIL_IMAP_HOST`          | yes      | --      | IMAP server hostname                                    |
+| `KHIVE_EMAIL_IMAP_PORT`          | no       | 993     | IMAP over TLS port                                      |
+| `KHIVE_EMAIL_USERNAME`           | yes      | --      | IMAP/SMTP credential username                           |
+| `KHIVE_EMAIL_PASSWORD`           | yes      | --      | IMAP/SMTP credential password (never logged)            |
+| `KHIVE_EMAIL_MAINTAINER_ADDRESS` | yes      | --      | The sole authorized inbound sender (RFC 5322 addr-spec) |
 
-When any required variable is absent, `EmailChannelConfig::from_env()` returns
-`ChannelError::Config`. The MCP server logs a warning and skips the email adapter; it does not
-crash.
+When configuration is attempted but any required variable is absent,
+`EmailChannelConfig::from_env()` returns `ChannelError::Config`. The ADR-119 component boundary
+distinguishes that partial/invalid state from a completely absent `KHIVE_EMAIL_*` configuration:
+complete absence stops both email components cleanly, while partial or invalid configuration
+records terminal `Unhealthy` state independently for `email-channel` and `email-outbound`.
+
+The current externally supervised implementation takes the message namespace
+from ADR-119's `HostContext` and passes that namespace to `comm.ingest`
+explicitly. A single-tenant daemon defaults it to `local`; the email adapter
+does not read a separate ingest-namespace environment variable.
 
 #### Inbound authentication (OQ-2 resolved)
 
@@ -3296,10 +3362,13 @@ The email adapter uses `lettre 0.11` (SMTP, `tokio1-rustls-tls` transport), `asy
 (IMAP UID fetch), `async-native-tls 0.5` (TLS layer), and `mail-parser 0.9` (RFC 822 parsing).
 These are workspace dependencies; the adapter crate declares them as non-optional.
 
-The `channel-email` feature in `khive-mcp/Cargo.toml` gates the adapter and the polling loop.
-When the feature is disabled (default), the binary compiles without any email dependency. When
-the feature is enabled and the required env vars are present at runtime, the loop starts; when
-they are absent, the loop is skipped with a log warning.
+A binary that force-links `khive-component-email` gets its link-time inventory submissions,
+which register independent `email-channel` and `email-outbound` ADR-119 components.
+Generic `khive-mcp` owns only the component supervisor and has no channel-specific feature or
+polling loop; a custom/core binary can omit email by not depending on the component crate. When
+all `KHIVE_EMAIL_*` variables are absent, both registered components stop cleanly. A partial or
+invalid configuration instead reports terminal `Unhealthy` state under each component's
+independent health identity.
 
 ## Open Questions
 
@@ -3324,9 +3393,9 @@ attributed. See [§Amendment 2026-07-02](#amendment-2026-07-02----inbound-authen
   `idx_comm_message_external_id` PARTIAL UNIQUE index is NOT in the pack schema plan; it is
   created by schema migration V5 (`005-unique-comm-external-id.sql`), which is the sole durable
   authority. Dedup is atomic via `INSERT OR IGNORE` in `KhiveRuntime::try_create_note`.
-- The polling loop runs in `kkernel` as a `tokio::task`, holding `Arc<VerbRegistry>` and
-  `Arc<ChannelRegistry>` (no `NamespaceToken` -- `dispatch` mints its own per call). It is
-  cancelled on shutdown.
+- The original implementation ran a polling loop in `kkernel`; ADR-119 supersedes that lifecycle.
+  Current email polling runs in the externally linked `email-channel` component with a
+  supervisor-provided `HostContext`, and it is cooperatively cancelled on shutdown.
 - Every inbound write passes through `VerbRegistry::dispatch:678`, satisfying the ADR-018
   single-dispatch-site invariant. The registry mints the `NamespaceToken` internally from the
   `"namespace"` param on each call.
@@ -3342,12 +3411,14 @@ attributed. See [§Amendment 2026-07-02](#amendment-2026-07-02----inbound-authen
 - ADR-018: Authorization Gate (original) -- defines the single-dispatch-site invariant and the
   `Gate` trait. Every ingest write passes through `VerbRegistry::dispatch:678`.
 - ADR-040: Communication and Schedule Packs -- the `comm.*` verb surface and `message` note kind.
-- ADR-053: Authorization Gate (ActorStore / SessionStore extension) -- extends ADR-018's actor
-  model. `KhiveRuntime::authorize` (the public gate-checked door) and
-  `NamespaceToken::mint_authorized` (`pub(crate)`, unreachable externally) are introduced here.
-  The ruling on how the ingest loop's identity interacts with this model is delivered by the
-  2026-07-02 amendment: attribution requires the two-part authentication gate, and quarantined
-  mail is written without a trusted actor identity.
+- ADR-053: superseded historical ActorStore / SessionStore proposal. Its caller-threading
+  problem statement remains useful context, but its SessionStore design was not carried
+  forward and it is not implementation authority.
+- ADR-127: current authenticated-principal and grant authority.
+  `KhiveRuntime::authorize` (the public gate-checked door) and
+  `NamespaceToken::mint_authorized` (`pub(crate)`, unreachable externally) compose with the
+  2026-07-02 amendment's ruling: attribution requires the two-part authentication gate, and
+  quarantined mail is written without a trusted actor identity.
 - ADR-028: Pack-Scoped Backends -- offset/cursor persistence pattern for channel adapters.
 - ADR-108: Git Write Surface -- the hardened, allowlisted argv-construction pattern for shelling
   out to an external process, reused by the 2026-07-17 amendment's `ssh`/`osascript` outbound

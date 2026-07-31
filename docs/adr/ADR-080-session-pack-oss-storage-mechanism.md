@@ -3,6 +3,9 @@
 **Status**: accepted
 **Date**: 2026-06-28
 **Amended**: 2026-07-02 — shipped-surface record (§3), session mirror (§6), scope revision (Context)
+**Superseded by**: [ADR-083](ADR-083-session-pack-t1-verbs.md) for §3 only; ADR-083 is
+the current authority for the public session verb surface, while the rest of this record
+remains in force.
 **Authors**: khive maintainers
 
 ## Context
@@ -56,9 +59,9 @@ notes land in the shared store alongside KG, GTD, and memory notes.
 ADR-071 replaces `Arc<StorageBackend>` with a `BackendHandle` struct carrying individual
 trait objects for each storage capability. Phase 4 of ADR-071 is not yet implemented; the
 current runtime still holds a concrete `Arc<StorageBackend>`. The session pack's verb
-handlers call `runtime.create_note` / `runtime.get_note` / `runtime.list_notes` — the
-public `KhiveRuntime` API — and therefore require no modification when ADR-071 Phase 4
-lands. The `BackendHandle` seam is preserved by this ADR.
+handlers call only the public `KhiveRuntime` APIs specified by ADR-083 §4 and therefore
+require no modification when ADR-071 Phase 4 lands. The `BackendHandle` seam is
+preserved by this ADR.
 
 ### A `session` note kind fills a gap in the note taxonomy
 
@@ -105,86 +108,37 @@ the same path GTD takes for `"task"`. No schema migration is required for M1: th
 The runtime validates the kind against all registered `NOTE_KINDS` at write time and
 returns `RuntimeError::UnknownNoteKind` if the pack is not loaded.
 
-### 3. Verb surface: four verbs, all prefixed `session.*`
+### 3. Verb surface _(historical; superseded by ADR-083)_
 
-All four verbs have `visibility: Visibility::Verb`. Speech-act categories follow ADR-025.
+[ADR-083](ADR-083-session-pack-t1-verbs.md) supersedes this section in full
+and is the sole accepted authority for the current caller-facing surface. The
+live declaration has:
 
-> **Amended 2026-07-02** — shipped-surface record. The implementation that landed diverges
-> from this section in three ways, all deliberate:
->
-> 1. **Three handlers, not four.** `session.resume` was renamed `session.get` before ship
->    (consistency with the substrate-wide `get`). `session.export` was never registered as
->    a verb: serialization is an internal helper (`handle_export`) called in-process, with
->    no `HandlerDef` entry.
-> 2. **`Visibility::Subhandler`, not `Verb`.** All three handlers ship operator-only:
->    dispatchable through the runtime and `kkernel exec`, withheld from the agent-facing
->    MCP `request` surface until the session-continuity query UX is designed.
-> 3. **The pack's active feature is the background mirror** (§6), which runs from the
->    `warm()` hook independent of verb visibility.
+- four `Visibility::Verb` handlers: `session.store`, `session.list`,
+  `session.resume`, and `session.export`;
+- `session.store(content, title?, provider?, provider_session_id?, tags?)`;
+- `session.list(limit?, offset?, provider?)`;
+- `session.resume(id)` by full UUID or an 8+ hex prefix; and
+- `session.export(id, format?)`, where `format` is `json` or `markdown`.
 
-#### `session.store` (Directive)
+The original ADR-080 decision and its 2026-07-02 amendment are retained only
+as history: the original draft described four verbs with an earlier parameter
+vocabulary, while the amendment recorded the intervening shipped surface of
+three `Visibility::Subhandler` handlers (`session.store`, `session.list`, and
+`session.get`) with no dispatchable export. Neither historical surface is the
+current contract.
 
-Store a session blob: transcript, context snapshot, accumulated agent state, or arbitrary
-text content.
-
-| Parameter  | Type     | Required | Description                                            |
-| ---------- | -------- | -------- | ------------------------------------------------------ |
-| `content`  | string   | yes      | Arbitrary text content                                 |
-| `agent_id` | string   | no       | Stored in `properties.agent_id`; used as a list filter |
-| `tags`     | string[] | no       | Standard note tags                                     |
-| `metadata` | object   | no       | Arbitrary JSON merged into `properties`                |
-
-Implementation: `runtime.create_note(token, "session", None, content, None, props, vec![])`.
-Returns the standard Note envelope (`id`, `kind`, `created_at`, and properties).
-
-#### `session.list` (Assertive)
-
-List stored sessions, newest first.
-
-| Parameter  | Type         | Description                     |
-| ---------- | ------------ | ------------------------------- |
-| `agent_id` | string       | Filter by `properties.agent_id` |
-| `limit`    | integer      | Page size (default 20)          |
-| `offset`   | integer      | Pagination offset               |
-| `since`    | ISO datetime | Filter: `created_at >= since`   |
-
-Implementation: `runtime.list_notes(token, "session", filters, limit, offset)`.
-
-#### `session.resume` (Assertive)
-
-Fetch a single session record by UUID for replay or context injection.
-
-| Parameter | Type | Description |
-| --------- | ---- | ----------- |
-| `id`      | UUID | Required    |
-
-Implementation: `runtime.get_note(id)`. Returns the full Note record (`id`, `kind`,
-`content`, `properties`, `tags`, `created_at`).
-
-#### `session.export` (Assertive)
-
-Serialize a session record for downstream use.
-
-| Parameter | Type                 | Description      |
-| --------- | -------------------- | ---------------- |
-| `id`      | UUID                 | Required         |
-| `format`  | `"json"` \| `"text"` | Default `"json"` |
-
-Implementation: fetch via `runtime.get_note(id)`, then serialize to the requested format.
-`"json"` returns the full Note envelope as a JSON object; `"text"` returns `content` only.
-
-`session.import` is **not in scope** for this pack. Ingestion and processing of external
-session content belongs to layers outside this repository.
-
-> **Amended 2026-07-02**: still no `session.import` verb — ingestion is not caller-driven.
-> It ships instead as the read-only background mirror (§6), which tails known transcript
-> locations on a poll loop. The digestion half of the original exclusion (summarization,
-> derived aggregation) remains out of scope.
+ADR-083 does not change this ADR's storage-mechanism decisions (§1, §2, §4,
+§5), and it leaves the background mirror (§6) intact. There is still no
+caller-driven `session.import` verb: transcript ingestion ships through the
+read-only background mirror, while summarization and derived aggregation
+remain out of scope.
 
 ### 4. Storage phasing: M1 (substrate-native) and M2 (optional auxiliary index)
 
-The two phases share the same verb surface. The difference is where auxiliary index data
-lives; the caller sees no API change between M1 and M2.
+These phases describe storage only. The current public verb surface is owned
+by ADR-083 and remains unchanged if a future auxiliary index is added; the
+difference between M1 and M2 is where auxiliary index data lives.
 
 #### M1 — substrate-native note storage (shipped)
 
@@ -206,9 +160,10 @@ implementation for the first PR.
 
 When list-query performance over large session corpora becomes the constraint, the pack
 may introduce a dedicated `session_metadata` auxiliary table via `PackSchemaPlan` — the
-same ADR-028 mechanism GTD uses for `gtd_lifecycle_audit`. The table indexes `agent_id`,
-`started_at`, `ended_at`, and `session_id` as SQL columns, enabling fast range queries
-without a full `notes` table scan.
+same ADR-028 mechanism GTD uses for `gtd_lifecycle_audit`. The table indexes
+`provider`, `provider_session_id`, and note creation time as SQL columns, enabling
+indexed forms of ADR-083's current list and continuity lookups without a full
+`notes` table scan.
 
 The M2 schema plan would be declared as:
 
@@ -233,11 +188,12 @@ beyond routing the metadata write.
 
 ### 5. The ADR-071 `BackendHandle` seam is preserved
 
-Session verb handlers call only the public `KhiveRuntime` API methods (`create_note`,
-`get_note`, `list_notes`) and, for M2, `runtime.core()` (ADR-073) and `runtime.sql()`.
-They do not hold a direct reference to `Arc<StorageBackend>` or any `khive-db` type. When
-ADR-071 Phase 4 replaces `Arc<StorageBackend>` with `BackendHandle`, the session pack
-requires no modification. This is an explicit constraint on the implementation.
+Session verb handlers use only the public `KhiveRuntime` APIs specified by
+ADR-083 §4 and, for a future M2 index, `runtime.core()` (ADR-073) and
+`runtime.sql()`. They do not hold a direct reference to `Arc<StorageBackend>`
+or any `khive-db` type. When ADR-071 Phase 4 replaces `Arc<StorageBackend>`
+with `BackendHandle`, the session pack requires no modification. This is an
+explicit constraint on the implementation.
 
 ### 6. The session mirror (Amendment, 2026-07-02)
 
@@ -396,9 +352,10 @@ interprets them lives outside this repository.
 
 ### Positive
 
-- Agent sessions are storable, retrievable by UUID, listable by `agent_id` and time range,
-  and exportable — all through the established `session.*` verb surface — without requiring
-  any deployment outside this repository.
+- Agent sessions are storable, retrievable by full UUID or short prefix,
+  listable by `provider`, and exportable as JSON or Markdown — all through the
+  ADR-083 `session.*` verb surface — without requiring any deployment outside
+  this repository.
 - Session records participate in the shared graph: `memory.recall`, full-text and vector
   search, and `annotates` edges all work because session notes land in the main backend.
 - The pack adds no schema migration for M1: the existing `notes` table and `NOTE_KINDS`
@@ -443,3 +400,4 @@ interprets them lives outside this repository.
 - [ADR-028](ADR-028-pack-scoped-backends.md) — Pack-Scoped Backends and Per-Pack Schema Declaration; `PackSchemaPlan` for M2
 - [ADR-071](ADR-071-backend-pluggable-runtime.md) — Backend-Pluggable Runtime; `BackendHandle` seam preserved by §5
 - [ADR-073](ADR-073-pack-core-backend-accessor.md) — Pack Core-Backend Accessor; `core()` accessor used by M2 cross-backend write pattern
+- [ADR-083](ADR-083-session-pack-t1-verbs.md) — current public session verb surface; supersedes §3

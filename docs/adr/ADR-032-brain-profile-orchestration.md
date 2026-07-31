@@ -15,7 +15,8 @@
 - ADR-031 (Multi-Engine Retrieval)
 - ADR-033 (Recall Pipeline)
 
-**Supersedes**: old ADR-064 (Brain Architecture — scalar-weight-only event fold; replaced by
+**Historical predecessor**:
+the legacy v0 brain architecture design (scalar-weight-only event fold; replaced by
 the profile-orchestration direction defined here)
 
 ---
@@ -24,7 +25,7 @@ the profile-orchestration direction defined here)
 
 ### What existed before this ADR
 
-The predecessor design (legacy ADR-064) framed the brain as a `Fold<Event, BrainState>` whose
+The legacy v0 predecessor design framed the brain as a `Fold<Event, BrainState>` whose
 state was a flat map of `pack::parameter_name → BetaPosterior`. Three scalars drove memory
 recall: `recall::relevance_weight`, `recall::salience_weight`, `recall::temporal_weight`.
 Events updated these posteriors in-place via a single `EventFold::step` implementation. The
@@ -336,7 +337,7 @@ ready when local-inference call sites land.
 A LoRA-class profile's state is a set of rank-r adapter matrices `(A: rank×d_in,
 B: d_out×rank)` per `(layer_idx, module_name)` pair. The state is consumed by
 `lattice-inference` at forward-pass time via the
-[`LoraHook` trait](../../../../lattice/crates/inference/src/lora_hook.rs) —
+[`LoraHook` trait](https://github.com/ohdearquant/lattice/blob/main/crates/inference/src/lora_hook.rs) —
 khive does not implement inference. Lattice owns the surface; brain composes:
 
 | Surface                        | Lattice crate / feature                                                                              | What it provides                                                                                                                                                         |
@@ -1309,7 +1310,7 @@ As of #1016, newly emitted `FeedbackExplicit` events always persist the effectiv
 - ADR-027 — Dynamic Pack Loading (brain pack self-registers via the pack registry)
 - ADR-031 — Multi-Engine Retrieval (brain learns engine and strategy weights)
 - ADR-033 — Recall Pipeline (recall calibration is brain's first tunable target)
-- Legacy ADR-064 — Brain Architecture (event-driven scalar Beta posteriors; the historical
+- The legacy v0 brain architecture (event-driven scalar Beta posteriors; the historical
   predecessor to this ADR. The Bayesian mechanics survive as `BalancedRecallProfile`; the
   fixed-shape `BrainState` design is superseded by the profile-orchestration direction here)
 - kkernel crate — the runtime that composes packs, hosts the event log, and runs the live

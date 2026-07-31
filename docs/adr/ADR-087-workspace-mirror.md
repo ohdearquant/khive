@@ -3,12 +3,12 @@
 **Status**: Accepted\
 **Date**: 2026-07-03\
 **Authors**: khive maintainers
-**Depends on**: ADR-086 (Document/File Modeling — the `document`-entity shape this mirror
-populates), ADR-080 (Session Pack — OSS Storage Mechanism, §6 session mirror — the
+**Depends on**: ADR-080 (Session Pack — OSS Storage Mechanism, §6 session mirror — the
 operational pattern this ADR reuses), ADR-002 (Edge Ontology — `supersedes`), ADR-017
 (Pack Standard)\
-**Related**: ADR-010 (KG Versioning — NDJSON snapshot scope; explains why `.khive/kg/*`
-is excluded from this mirror's scope), ADR-021 (Memory Pack)
+**Related**: ADR-086 (Document/File Modeling — the original shape dependency, decoupled by
+accepted Amendment A1 below), ADR-010 (KG Versioning — NDJSON snapshot scope; explains why
+`.khive/kg/*` is excluded from this mirror's scope), ADR-021 (Memory Pack)
 
 ## Context
 

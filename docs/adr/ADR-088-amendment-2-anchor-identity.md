@@ -2,7 +2,8 @@
 
 **Status**: Proposed
 **Date**: 2026-07-20
-**Amends**: ADR-088 Amendment 1 (anchor-resolution clause of the `project`
+**Amends**: [ADR-088 Amendment 1](ADR-088-amendment-1-git-digest.md)
+(anchor-resolution clause of the `project`
 parameter)
 **Tracking**: issue #1173
 

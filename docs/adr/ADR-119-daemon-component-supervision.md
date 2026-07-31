@@ -1,8 +1,9 @@
 # ADR-119: Host-Supervised Daemon Components Beside the Verb Plane
 
-**Status**: proposed\
+**Status**: accepted (2026-07-19)\
 **Date**: 2026-07-19\
-**Scope**: daemon-resident work that is not a caller-invoked operation
+**Scope**: daemon-resident work that is not a caller-invoked operation\
+**Amended by**: [ADR-122](ADR-122-email-outbound-delivery.md) (email Phase 2)
 
 ## Context
 
@@ -404,3 +405,226 @@ Daemon-resident work gets a shared lifecycle without pretending it is a verb. Th
 public API remains unchanged. Pack-level service declaration stays possible but must be
 earned by a narrow dependency seam. Event topics, arbitrary subscriptions, and MCP
 resources do not ride along with the stronger supervision decision.
+
+---
+
+## Amendment 1: Externally-Linked Daemon Components (2026-07-23)
+
+**Status**: accepted (2026-07-23)\
+**Trigger**: a channel-crate reorganization can silently drop a daemon component's startup
+loop if the loop lives outside the crate boundary that moves. When transport-channel crates
+(`khive-channel`, `khive-channel-email`, `khive-channel-telegram`) live separately from the
+daemon binary that force-links them, but their daemon loops (`spawn_email_channel_loops`,
+`channel_poll_loop`, `channel_outbox_loop`) live inline in `khive-mcp/src/serve.rs`, a crate
+reorganization can move the crates without moving the loops, and a binary can build and run
+with the transport channel silently absent — no warning, because the code is absent rather
+than failing. A binary composed from separately-linked components needs a way to contribute
+daemon components the core crate cannot itself name.
+
+### Problem
+
+The base decision makes the component registry internal to `khive-mcp`, with the host
+constructing registrations from code it can see. A component whose crate lives outside
+`khive-mcp`'s own dependency tree cannot be constructed by the core registry, and a binary
+that links such a crate has no sanctioned way to hand its component to the supervisor. A
+capability can therefore go missing with no error surface, because absent code neither
+starts nor fails.
+
+### Decision
+
+Extend the base registry with **link-time component registration**, the same mechanism
+ADR-027 already uses for pack self-registration:
+
+1. `khive-mcp` exposes a public registration surface: an inventory-collected submission
+   whose payload is a `DaemonComponentRegistration` where `start` is a factory function
+   `fn(&HostContext) -> BoxFuture<Result<(), ComponentError>>` (names illustrative;
+   behavioral contract normative). `HostContext` supplies only what the base ADR already
+   lets internal factories capture: the resolved verb-dispatch handle, the daemon's
+   resolved actor/namespace configuration, and the `ComponentHost` lifecycle services.
+   It is not a service locator; anything else a component needs, it owns.
+2. In daemon role, after server configuration, actor identity, backend routing, and
+   pack selection are fully resolved, the host iterates the inventory and registers
+   each submission with the supervisor. Every base-ADR lifecycle contract — restart
+   classes, budgets, backoff, shutdown timeout, health reporting, panic isolation —
+   applies to externally-linked components unchanged and without exception.
+3. An empty inventory is the normal core state: the public binary builds, tests, and
+   runs with zero external components, and the supervisor treats the empty set as a
+   no-op. Core carries a test fixture component to prove the seam without shipping one.
+4. A downstream workspace may link additional component crates and implement components
+   — such as the email poll and outbox loops — as daemon components under this contract.
+   Each component's per-cycle operation deadline is its own obligation; stall detection
+   and restart are the supervisor's, driven by the component's heartbeat through
+   `HealthReporter`.
+
+### Fences (additive to the base ADR)
+
+- Registration is collected at daemon startup only; non-daemon roles MUST NOT start
+  external components.
+- The registration seam itself MUST remain generic; it must not be special-cased to any
+  one component.
+- A component that fails to construct MUST report as terminally unhealthy by name; it
+  MUST NOT abort daemon startup for unrelated components.
+- The install verification for any binary composing external components MUST include a
+  positive artifact for each expected component (startup health row or equivalent),
+  because verb counts cannot witness non-verb capability — a capability check keyed only
+  on verb counts can pass with a component silently missing.
+
+### Verify by
+
+- Core: fixture-component test proving registration, supervision, cancellation, and the
+  empty-inventory no-op.
+- Core: HostContext's dispatch handle demonstrably carries daemon-internal capability —
+  a fixture component performs a write that is not reachable on the MCP wire surface
+  (the ingest class), and the write lands. A component limited to wire-callable verbs
+  is dead on arrival for channel ingest.
+- Core: at startup the daemon logs the enumerated external-component roster (names and
+  count), so zero-components-where-N-expected is one visible runtime line complementing
+  fence 4's install-time check. Both daemon entrypoints emit it.
+- Distribution: channel component behavioral test — a REAL ingest write lands a message
+  row (not heartbeat alone); heartbeat advances under a test config; a deliberately
+  hung poll cycle is deadline-classified as a failure, consumes restart budget, and
+  surfaces in health rather than freezing silently.
+- Install: capability check extended per fence 4.
+
+### Consequences
+
+The email and telegram channels register as supervised components instead of
+hand-spawned loops, closing the silent-drop class this amendment addresses. The core
+public API grows one generic registration seam with no component-specific knowledge.
+Pack-level service declaration remains deferred exactly as the base ADR left it; this
+amendment registers binaries' components, not packs'.
+
+---
+
+## Amendment 2: Phased Email Distribution Delivery — Poll First (2026-07-23)
+
+**Status**: accepted (2026-07-23)\
+**Trigger**: Amendment 1's Decision point 4 commits to implementing "the email poll and
+outbox loops" as a single deliverable, but inbound poll/ingest and outbound send are
+separable units of work that need not ship atomically. Shipping the supervised inbound
+poll/ingest component alone, before the outbox/send loop exists, would leave the accepted
+contract and the shipped behavior in direct conflict unless the ADR itself records the
+split.
+
+**Current disposition**: the Phase 1 interval and all “Phase 2 future” language
+below are historical. Amendment 3 records Phase 2 as delivered on 2026-07-29.
+
+### Problem
+
+Amendment 1 does not distinguish inbound and outbound delivery as separable
+deliverables — it names both loops in one decision point. The distribution
+workspace's `khive-channel-email` crate exposes `Channel::send`, and
+`comm.send(to="email:...")` is accepted and durably stored by `khive-pack-comm`
+today, but no supervised component drains stored outbound email and calls `send`.
+An operator reading Amendment 1 alone would reasonably expect outbound delivery to
+already work.
+
+### Decision
+
+Split the single "email poll and outbox loops" deliverable into two phases, each its
+own daemon component under the base ADR and Amendment 1's registration contract:
+
+1. **Phase 1 (this amendment)**: the inbound poll/ingest
+   component only (`email-channel` in the roster). It reads `KHIVE_EMAIL_*`
+   configuration, polls IMAP under the per-cycle watchdog deadline, and ingests
+   through `comm.ingest`. This satisfies Amendment 1's fences and verification
+   bar for the _poll_ half of Decision point 4.
+2. **Phase 2 (separate lane, not scheduled by this amendment)**: a supervised
+   outbox delivery component that drains stored outbound `email:*` messages and
+   calls `Channel::send`, with its own restart/backoff registration, health
+   reporting, and behavioral test proving a real send lands (mirroring the Phase 1
+   ingest-lands-a-row test). Until Phase 2 lands, Decision point 4 remains only
+   partially satisfied.
+
+**Interim behavior, stated plainly**: `comm.send(to="email:...")` is accepted and
+durably stored by `khive-pack-comm` in both phases. In Phase 1, that stored message
+is **not delivered** — no supervised loop reads it, and no daemon component sends
+SMTP traffic. Operators MUST NOT rely on daemon email delivery until Phase 2 ships;
+a `comm.send` to an `email:*` target is durable storage only, not a delivery
+guarantee, for the duration of Phase 1.
+
+### Fences (additive to Amendment 1)
+
+- The Phase 1 roster and health rows MUST NOT claim or imply outbound delivery
+  capability — the `email-channel` component name and its documentation describe
+  inbound poll/ingest only.
+- Phase 2 MUST register as its own named component (not folded silently into
+  `email-channel`'s health identity), so an operator can distinguish "inbound is
+  healthy" from "outbound is healthy" once both exist.
+- INSTALL.md and any other operator-facing distribution documentation MUST state
+  the interim behavior from this amendment's Decision section, not a bare
+  "not shipped" deferral, so an operator reading it understands stored-but-
+  undelivered rather than assuming the feature is simply missing.
+
+### Verify by
+
+- Phase 1: Amendment 1's existing distribution behavioral test bar (real ingest
+  write lands a row, heartbeat advances, hung-poll deadline classification),
+  scoped explicitly to poll/ingest. Config-construction failure is also verified: an entirely absent
+  `KHIVE_EMAIL_*` configuration resolves to a clean stop, while an invalid or
+  partial configuration reports terminal `Unhealthy` by component name (fence 3),
+  covered by component-level tests asserting both outcomes without opening a
+  real network connection.
+- Phase 2 (future): its own component behavioral test proving a real outbound
+  send lands, plus a fence-3-equivalent construction-failure test, before
+  Decision point 4 is considered fully satisfied.
+
+### Consequences
+
+Amendment 1's Decision point 4 is satisfied incrementally rather than atomically:
+Phase 1 closes the inbound half now; the outbound half remains open, tracked, and
+explicitly not claimed as delivered. This keeps the accepted ADR and the shipped
+binary's actual behavior in agreement at every merge, rather than allowing a merged
+contract to run silently ahead of shipped capability.
+
+---
+
+## Amendment 3: Email Phase 2 Delivered and Separately Supervised (2026-07-29)
+
+**Status**: accepted (2026-07-29)\
+**Trigger**: a binary force-linked `email-outbound` while this accepted ADR and
+INSTALL still described Phase 2 as unshipped — the documentation lagged the shipped
+capability. [ADR-122](ADR-122-email-outbound-delivery.md) now carries the accepted
+outbox and delivery contract.
+
+### Decision
+
+Amendment 2's Phase 2 is delivered. A configured distribution daemon starts
+two independently registered components:
+
+- `email-channel` owns inbound IMAP poll/ingest; and
+- `email-outbound` drains pending `email:*` outbound message notes and invokes
+  the channel SMTP transport.
+
+On configured startup, `email-outbound` includes stored messages from the
+pre-delivery backlog: there is no age cutoff. It permanently records an
+allowlist rejection without calling the transport, records transport failures
+as pending per-message retries with bounded exponential backoff, and stamps
+`delivery = "delivered"` only after transport acceptance. A crash or durable
+stamp failure in that interval therefore redelivers at least once; both
+attempts carry the UUIDv5 Message-ID deterministically derived from the note
+UUID.
+
+The two components have separate ADR-119 registration names, restart budgets,
+and process-local health rows. Failure or terminal configuration state for
+`email-outbound` cannot overwrite the `email-channel` health identity.
+
+The Phase 1 interim statement in Amendment 2 remains historical context and is
+no longer the current operator contract. A binary that does not link
+`khive-component-email`, a non-daemon invocation, or an entirely absent email
+configuration still performs no SMTP delivery; a downstream workspace that
+links both registrations performs both.
+
+### Verify by
+
+Run the `khive-component-email` library tests serially:
+
+```bash
+cargo test -p khive-component-email --lib -- --test-threads=1
+```
+
+Ratification requires behavioral coverage for successful drain and stamp,
+allowlist failure, transient retry/backoff, a fault between transport
+acceptance and durable stamp with same-Message-ID redelivery, and distinct
+supervisor health rows for `email-channel` and `email-outbound`. Static binary
+inspection or a roster-string match alone is not delivery evidence.

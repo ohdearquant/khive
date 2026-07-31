@@ -365,6 +365,63 @@ with a broader outbound allowlist.
 
 ---
 
+## Amendment 2: Condition 2 self-enforcement — the boundary is the uid, and the daemon must assert it (2026-07-23)
+
+### Defect being corrected
+
+Acceptance condition 2 rests single-principal safety on three legs: the `0600` owner-only
+socket, all connections being the same uid, and the database being already same-uid-accessible.
+The condition is unenforced in two of the three legs:
+
+- The socket-permission chmods exist (`0700` parent dir, `0600` socket, applied immediately
+  after bind) but **fail open**: each is a warn-and-continue. A daemon whose chmod fails keeps
+  serving on whatever mode the umask produced.
+- The same-uid leg has **no code representation at all**. Nothing reads peer identity at
+  `accept`, so nothing can notice when the assumption stops being true. Any process that can
+  open the socket dispatches under whatever `namespace` / `actor_id` / `visible_namespaces` it
+  asserts on the frame.
+
+Multi-principal serving is therefore _undeclared_ rather than _disabled_: the mechanism runs
+unconditionally for every deployment shape, and the only thing keeping the shipped shape inside
+the accepted envelope is that nobody has deployed it outside one.
+
+The condition's wording also invites a wrong fix. "Principal" is not attribution: many
+`actor_id`s over one socket from one uid is exactly the accepted design, so a check that
+refused a second distinct `actor_id` would break it — and any check keyed on frame fields is
+not a check, because the frame is self-asserted. A condition about principals cannot be
+enforced with data the principal supplies.
+
+### Correction to the condition's terms
+
+The isolation boundary of the accepted single-principal envelope **is the operating-system
+uid**. Same-uid callers form one trust domain; `actor_id` / `namespace` on the request frame
+are attribution _within_ that domain (ADR-007), never a boundary. "Multi-principal serving"
+in condition 2 means **multi-uid serving**. Condition 2's blocking clause — hosted / multi-uid
+serving stays disabled until the separately gated connection-identity ADR — stands unchanged.
+
+### Binding enforcement (makes the accepted envelope self-asserting)
+
+Three small items, no new dependencies:
+
+1. **Capture the peer uid at `accept`** — `getpeereid(2)` on macOS/BSD, `SO_PEERCRED` on
+   Linux (`libc` is already a direct dependency of `khive-runtime`).
+2. **Refuse any connection whose peer uid differs from the daemon's own euid**, with an
+   explicit error naming the reason. This converts "all connections are the same uid" from an
+   ambient assumption into a code assertion, without touching multi-attribution: same-uid
+   callers with distinct `actor_id`s are unaffected.
+3. **The socket-permission chmods become fail-closed.** A daemon that cannot assert `0700` on
+   the socket directory and `0600` on the socket refuses to serve rather than warning and
+   continuing.
+
+### Scope guard
+
+This amendment is **not** the connection-identity mechanism condition 2 defers to a future
+ADR. It binds no principal to allowed namespaces, does not resolve Open question 4, and does
+not unblock hosted serving. It makes the _current_ accepted envelope self-enforcing — a
+different and much smaller job than enabling anything new.
+
+---
+
 ## Scope / Non-goals
 
 - **Does not implement.** This is a design contract; the code change is a separate, gated task.

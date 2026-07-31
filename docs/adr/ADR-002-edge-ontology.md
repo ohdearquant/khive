@@ -5,13 +5,18 @@
 **Authors**: khive maintainers
 **Amended by**: [ADR-076](ADR-076-relation-calculability-and-system-role.md) — `part_of` is a
 distinct relation, not the "inverse of `contains`"; the two coincide in some domains and diverge
-in others, and neither is derived from the other.
+in others, and neither is derived from the other; [ADR-055](ADR-055-epistemic-edge-relations.md)
+adds the `supports` and `refutes` epistemic relations.
 **Amended 2026-07-08**: base endpoint contract gains four pairs — three provenance
 (`Document introduced_by Person`, `Document introduced_by Org`, `Concept introduced_by Org`)
 and one dependency (`Document depends_on Document`) — closing a gap where a document's own
 authorship and a document's normative dependency on another document had no representable
 edge. See "Base endpoint contract" below and "Why the 2026-07-08 endpoint amendment?" in
 Rationale.
+**Amended 2026-07-27**: base endpoint contract gains one provenance pair —
+`Document derived_from Document` — for publication provenance: a curated or filtered
+publication copy of a document points at the canonical source it was produced from. See
+"Base endpoint contract" below and "Why the 2026-07-27 provenance amendment?" in Rationale.
 
 ## Context
 
@@ -135,10 +140,26 @@ checkpoint -[derived_from]-> training_set
 embedding_index -[derived_from]-> corpus
 brain_profile_v2 -[derived_from]-> brain_profile_v1
 snapshot -[derived_from]-> project
+published_copy -[derived_from]-> canonical_document
 ```
 
 `derived_from` is for material/generative provenance. It is NOT for intellectual inspiration
 (use `extends` or `introduced_by`) or dependency (use `depends_on`).
+
+For documents, `derived_from` records publication provenance: a copy produced from a
+canonical source by a content transformation (filtering, subsetting, redaction, format
+conversion) is a distinct document entity pointing at its source. The boundary is content
+identity. A document that moves keeps one entity — relocation is location history recorded
+in properties, not a new document. A document whose content is transformed for a different
+audience or authority is a new entity with a `derived_from` edge; it does not share an
+entity with its canonical source.
+
+`derived_from` and `supersedes` are orthogonal assertions and may coexist on the same
+document pair: production is not replacement. A publication copy points at its canonical
+with `derived_from` and carries no `supersedes` — the canonical remains authoritative. A
+published version produced from a preprint legitimately carries both: `derived_from`
+records the production, `supersedes` records the transfer of authority. Collapsing the two
+into one edge loses one of two distinct facts.
 
 ### Rules
 
@@ -244,6 +265,12 @@ allowlist but cannot remove base rules.
 | `Artifact` | `derived_from` | `Document` |
 | `Artifact` | `derived_from` | `Project`  |
 | `Artifact` | `derived_from` | `Artifact` |
+| `Document` | `derived_from` | `Document` |
+
+> **Amended 2026-07-27**: added `Document derived_from Document` for publication provenance —
+> a curated or filtered publication copy pointing at the canonical document it was produced
+> from. Direction is unchanged: output → input, copy → canonical. See "Why the 2026-07-27
+> provenance amendment?" in Rationale for the move-vs-copy boundary this pair depends on.
 
 #### Temporal relation
 
@@ -504,6 +531,42 @@ It also adds one pair to `depends_on`:
 None of these four pairs remove or narrow an existing rule; they are strictly additive to the
 base contract, consistent with the "packs extend, never tighten" principle this ADR already
 applies to pack-level `EDGE_RULES` ([ADR-017](ADR-017-pack-standard.md)).
+
+### Why the 2026-07-27 provenance amendment?
+
+`derived_from` covered artifact provenance (checkpoints, indexes, exports) but had no pair
+for document-to-document production. Real corpora surface this as soon as a document exists
+in more than one authoritative form: a public reference copy produced from an internal
+canonical by a filtering sync, a redacted release of a full report, an abridged or translated
+edition. These copies are not the same document at a second address — their content differs
+by construction and they serve a different audience and authority — and no existing relation
+fits:
+
+- `supersedes` is wrong: the canonical remains authoritative; nothing is replaced.
+- `precedes` is wrong: the relationship is production, not chronology.
+- `variant_of` is wrong twice over: its endpoints are concept/artifact, and it records a
+  modified version relative to an original, not material production from a source.
+- `annotates` is substrate-wrong: the copy is a document entity, not a note.
+
+The amendment adds one pair — `Document derived_from Document` — with the standard
+`derived_from` direction (output → input: the copy points at the canonical).
+
+Two modelling rules keep the pair from being misused:
+
+1. **Move vs copy.** Relocation of a document (a repository migration, a path change) is
+   location history on ONE entity, recorded in properties. A `derived_from` edge between two
+   document entities asserts that two documents exist with a production relationship between
+   them. If only one content-bearing thing exists, there is nothing to link.
+2. **Mint at publication.** The copy's entity is created when the copy is produced (or first
+   modelled), pointing at the already-existing canonical entity. Canonical records are never
+   split retroactively to manufacture a second endpoint.
+
+Weight and annotation follow existing rules: a definitional production relationship carries
+weight 1.0, and an annotating note on the edge records what transformation produced the copy
+(what was filtered, when, for which audience) — two `derived_from` edges are otherwise
+indistinguishable.
+
+This pair is strictly additive; no existing rule is removed or narrowed.
 
 ### Why 9 categories?
 

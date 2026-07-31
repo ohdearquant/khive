@@ -328,18 +328,25 @@ required or added.
 
 ### 6. Interval: configurable, default 60 seconds
 
-The tick interval is read from a single environment variable,
-`KHIVE_SCHEDULE_TICK_INTERVAL_MS`, mirroring `KHIVE_CHECKPOINT_INTERVAL_MS`
-(`crates/khive-db/src/checkpoint.rs`) in shape: milliseconds, env-only for v1 (no
-`khive.toml` key), default 60000 (60 seconds) when unset. An unparseable or zero value
-falls back to the default, with a warn-level log naming the rejected value: a stricter
-failure mode than the checkpoint precedent, which falls back silently. This ADR chooses
-to log because a misconfigured schedule interval is user-facing latency,
-not an internal tuning knob. The 60-second default matches the cadence the drain's own
-module documentation already recommends for cron-based invocation
+The accepted and shipped interval contract is the environment-only
+`KHIVE_SCHEDULE_TICK_SECS`, expressed in seconds, with no `khive.toml` key. A positive
+`u64` value is used directly; an unset, empty, unparseable, negative, overflowing, or
+zero value falls back **silently** to `60` seconds. The resolver does not emit a warning
+for a rejected value. The 60-second default matches the cadence the drain's own module
+documentation already recommends for cron-based invocation
 (`* * * * * kkernel exec --pending-events`), keeping scheduled-event latency in the
 same ballpark operators would get from a standard cron minute-tick, without requiring
 cron to be configured at all in a daemon-fronted deployment.
+
+**Implementation evidence.** The constant and exact parse/filter/fallback chain are in
+`crates/khive-mcp/src/pending_events.rs:1237-1252`; daemon-role and loaded-pack gating
+resolve that duration and spawn the loop in `crates/khive-mcp/src/serve.rs:240-265`.
+
+**Residual work.** No direct unit regression currently pins the environment resolver's
+valid, zero, and invalid cases. The larger `DaemonDispatch` seam and tracked
+watch-channel shutdown design remain unimplemented residuals documented under Amendment
+B (Acceptance Criteria 5-7); this interval-contract correction does not imply that they
+shipped.
 
 ### 7. Repeat-advance semantics are unchanged
 
@@ -574,11 +581,11 @@ same PR:
   daemon start (or a redundant external cron invocation) picks up any row left
   mid-claim via the existing `reclaim_stale_firing_events` sweep, the same recovery
   path Acceptance Criterion 5 relies on for the target design's bounded-drain case.
-- The interval env var is `KHIVE_SCHEDULE_TICK_SECS` (seconds, default `60`), not
-  `KHIVE_SCHEDULE_TICK_INTERVAL_MS` (milliseconds, default `60000`) as specified in
-  Decision point 6. The resolved default cadence is identical (60 seconds); only the
-  variable name and unit differ from the original decision — Acceptance Criterion 4
-  above is amended to name this shipped contract directly.
+- The interval env var is `KHIVE_SCHEDULE_TICK_SECS` (seconds, default `60`), not the
+  originally proposed `KHIVE_SCHEDULE_TICK_INTERVAL_MS` (milliseconds, default `60000`).
+  Invalid and zero values fall back silently. Decision point 6 and Acceptance Criterion
+  4 now name this shipped contract directly; this bullet remains as the historical
+  implementation-amendment record.
 
 ### Amendment B, update 1 (2026-07-09)
 

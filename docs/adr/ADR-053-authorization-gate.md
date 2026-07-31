@@ -1,7 +1,36 @@
 # ADR-053: Authorization Gate -- ActorStore, SessionStore, and Caller Propagation
 
-**Status**: Proposed
+**Status**: Superseded (2026-07-25)
 **Date**: 2026-06-13
+**Related**: ADR-127 (authenticated actor and grant primitive) and ADR-129 including its
+Amendment 1 (fail-closed authorization gate default, pseudo-verb authority classification).
+Together they replace the relevant portions of this record; neither alone formally
+supersedes the whole split design.
+
+## Supersession note (2026-07-25)
+
+This record is superseded and retained for history. The body below is unchanged from the
+2026-06-13 proposal and is not re-specified here; read it as the historical statement of the
+problem, not as the current contract. Its components now live in four places:
+
+- **Caller identity threading into dispatch** (§3, §3a — `DispatchRequest` / `dispatch_request`)
+  shipped under different names: `RequestIdentity` and `VerbRegistry::dispatch_with_identity`.
+  The gate check and the namespace token derive from the same resolved actor, which is the
+  invariant this record set out to establish.
+- **Authentication** (§1 — `ActorStore`, token-to-caller resolution) → **ADR-127**. ADR-127 also
+  rejects this record's `NoopActorStore` ambient-identity fallback as an authentication
+  mechanism: a config- or environment-derived actor label may select which credential is
+  presented, and may not establish a verified principal.
+- **Multi-actor authorization** (§4 — `TenantGate`) → **ADR-129** and its **Amendment 1**.
+  `CapabilityGate` is where per-verb, multi-actor authority policy now lives. §4's composition
+  text is carried verbatim into ADR-127's Related-decisions section, which is where the ADR-127
+  implementation lane reads it.
+- **Session lifecycle** (§2 — `SessionStore`, `EphemeralSessionStore`) is **not** carried
+  forward. The trait shape is trivial; the load-bearing decisions — durable store, sharing
+  across replicas, revocation semantics — are unanswerable until a connection-oriented
+  transport exists. A short ADR is written when the HTTP gateway lane opens.
+- **Accounting stage** (§3 pipeline) → the resource-management lane, against the dispatch
+  chokepoint that already carries the resolved actor.
 
 ## Context
 

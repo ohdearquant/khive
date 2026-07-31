@@ -2,11 +2,12 @@
 
 **Status**: accepted\
 **Date**: 2026-05-23\
-**Authors**: khive maintainers
-
-> **Amended ([ADR-055](ADR-055-epistemic-edge-relations.md))**: ADR-055 added 2
-> epistemic relations (`supports`, `refutes`), expanding the closed set from 15 to 17.
-> Occurrences of "15 edge relations" in this document reflect the original base set.
+**Authors**: khive maintainers\
+**Amended by**: [ADR-061](ADR-061-pack-extensible-by-id-resolution.md), which adds the
+`PackByIdResolver` sub-trait.\
+**Related**: [ADR-055](ADR-055-epistemic-edge-relations.md), which amends ADR-002 by
+adding the `supports` and `refutes` relations. Occurrences of "15 edge relations" in
+this historical pack-standard text reflect the original base set.
 
 ## Context
 
@@ -363,25 +364,36 @@ The registry rejects:
    `[a-z][a-z0-9_]*` and are at most 32 characters.
 3. **A pack-registered kind that violates kind-name rules.** Kind names follow the same
    `[a-z][a-z0-9_]*` pattern.
-4. **A pack rule whose `source` or `target` references a kind not registered by any
+4. **Two declarations of the same note kind.** A note kind has exactly one owning pack
+   in the live registry; duplicates across packs (or repeated within one pack) make
+   `VerbRegistryBuilder::build()` return `RuntimeError::InvalidInput` with the kind and
+   both owning pack names.
+5. **A pack rule whose `source` or `target` references a kind not registered by any
    loaded pack.** `BootError::UnknownKindInRule { rule, kind }`. This prevents dead
    rules.
-5. **A pack whose `REQUIRES` names a pack not in the loaded set.**
+6. **A pack whose `REQUIRES` names a pack not in the loaded set.**
    `BootError::MissingDependency { pack, requires }`. All missing dependencies across
    the loaded set are reported in a single error before aborting.
-6. **A `REQUIRES` graph containing a cycle.** `BootError::DependencyCycle { cycle:
+7. **A `REQUIRES` graph containing a cycle.** `BootError::DependencyCycle { cycle:
    Vec<&'static str> }`. Cycles are a pack-authoring error; the runtime cannot recover.
 
-Kind name collisions across packs are NOT errors — two packs declaring the same kind
-string (e.g., `task`) are idempotent in the merged vocabulary set. The runtime
-de-duplicates for schema display purposes. However, when multiple **pack instances**
-declare ownership of the same granular kind (e.g., two `memory` pack instances), the
-registry preserves per-instance routing internally. See "Pack instance kind collision"
-below.
-Semantic collisions are documented through the pack-registry conventions, not enforced
-in code.
+This note-kind ownership rule aligns with ADR-013's composed-registry contract; it is
+not a schema-display de-duplication rule. **Implementation evidence:**
+`VerbRegistryBuilder::build()` invokes `validate_unique_note_kinds` before constructing
+the registry, and that validator records one owner per declared note kind
+(`crates/khive-runtime/src/pack.rs:587-647`). The build-time regression is
+`note_kind_duplicate_rejected_at_build_time`
+(`crates/khive-runtime/src/pack.rs:3184-3235`).
 
-### Pack instance kind collision (multiple instances declaring same granular kind)
+**Residual work.** The multi-instance `KindRoute` fan-out design below is not implemented
+and is incompatible with the live single-owner check. Supporting two instances that both
+claim `memory`, for example, requires a future ADR amendment plus explicit read-fusion,
+primary-write, and instance-override configuration. Until then, duplicate note-kind
+ownership is rejected at boot.
+
+### Deferred design: multiple instances declaring the same granular kind
+
+The following type is a design sketch, not a live registry contract:
 
 ```rust
 pub struct KindRoute {
@@ -399,19 +411,21 @@ pub struct KindRoute {
 }
 ```
 
-When two or more pack instances declare the same granular kind (e.g., `memory-hot` and
-`memory-cold` both declare `kind=memory`), the registry preserves all owners:
+If a future amendment permits two or more pack instances to declare the same granular
+kind (e.g., `memory-hot` and `memory-cold` both declare `kind=memory`), the registry
+would need to preserve all owners:
 
-- **Reads fan out** across all `readable_instances`; results fuse using `read_fusion`
+- **Reads would fan out** across all `readable_instances`; results would fuse using `read_fusion`
   (default: backend-level RRF).
-- **Writes route deterministically** to `primary_write_instance`. The operator MUST
+- **Writes would route deterministically** to `primary_write_instance`. The operator MUST
   declare this when multiple writable instances own a kind — registration order is NOT
   a valid tiebreaker.
-- **Explicit override** is supported via `instance="memory-cold"` arg on writes
+- **Explicit override would be supported** via `instance="memory-cold"` on writes
   (subject to auth).
 
-Public kind de-duplication is fine for schema display, but the registry MUST retain
-per-instance routing internally.
+That future contract would require public kind de-duplication for schema display while
+retaining per-instance routing internally. None of those routing fields or behaviors
+exists in the current `VerbRegistry`.
 
 ### Inter-pack dependencies
 

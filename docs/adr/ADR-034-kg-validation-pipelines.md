@@ -51,7 +51,7 @@ This ADR documents the shipped `kkernel kg validate` validation surface:
   `VerbRegistry::all_validation_rules`). What remains deferred is CLI runner integration —
   `kkernel kg validate` does not yet call these methods against live corpus data.
 - ADR-020 `khive kg init`: currently initializes `.khive/kg/{entities,edges}.ndjson`,
-  `.khive/khive.toml`, and hooks; it does not generate `rules.toml`.
+  `.khive/config.toml`, and hooks; it does not generate `rules.toml`.
 - All other ADR-020 contracts: unchanged.
 
 ## Decision

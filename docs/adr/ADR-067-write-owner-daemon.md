@@ -5,6 +5,8 @@
 **Issue**: #195 (cross-op atomicity for `--ops-file` bulk apply); 2026-06-22 write-wedge incident
 **Amends**: ADR-049 (khived daemon — adds write-queue layer inside the daemon process)
 **Depends on**: ADR-049 (socket framing, forward_or_spawn protocol — unchanged by this ADR)
+**Amended by**: [ADR-131](ADR-131-batch-write-admission-control.md), which adds one
+admission authority and caller-visible saturation for parallel write batches.
 
 ---
 
@@ -474,7 +476,7 @@ Key properties:
 - The blocking closure detects `SqliteFailure { code: ErrorCode::OperationInterrupted }` and
   issues `conn.execute_batch("ROLLBACK")` locally before returning.
 - `InterruptHandle` is `Send + Sync` and safe to hold in the async task concurrent with the
-  blocking closure. Obtained via `Connection::get_interrupt_handle()` (rusqlite 0.33 stable API).
+  blocking closure. Obtained via `Connection::get_interrupt_handle()` (rusqlite 0.40.1 stable API).
 - The `&mut handle` borrow in `timeout(..., &mut handle)` does not consume the `JoinHandle`, so
   the elapsed branch can still `.await` it to observe the post-interrupt result.
 

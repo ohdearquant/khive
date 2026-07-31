@@ -187,3 +187,94 @@ feature flag.
 - PR #18 — hybrid section scoring in compose
 - PR #19 — progress bars, domain backfill, auto-compose, token budget, review fixes
 - [ADR-021](ADR-021-memory-pack.md), [ADR-048](ADR-048-knowledge-section-profiles.md)
+
+## Amendment 1: Blend KG entities into the compose candidate pool
+
+Status: proposed.
+
+### Problem
+
+`knowledge.compose` reaches lore atoms only. On sharply technical queries, the
+measured, expert-curated content often lives as knowledge-graph `concept` and
+`document` entities (algorithms, papers, ADRs) rather than as a lore atom —
+those entities rank top under `kg.search(kind="entity")` for the same query but
+were invisible to compose callers. For example, a query naming a specific
+technical technique can return only generic, low-relevance atoms from compose,
+while the concept and document entities describing that technique — including
+matching ADRs — rank at the top via `kg.search`.
+
+### Decision
+
+`knowledge.compose` blends `concept` and `document` KG entities into the
+candidate pool for AUTO and explicit-`domain_ids` calls. `atom_ids`-only calls
+never blend — the caller pinned exact atoms and gets exactly those back.
+
+**Candidate discovery** reuses `KhiveRuntime::hybrid_search` — the identical
+FTS+ANN RRF-fused retrieval path `kg.search(kind="entity")` dispatches to
+(`khive-pack-kg`'s `handle_search` calls the same method) — run once per
+blended kind (`concept`, `document`) and deduplicated by entity id. This does
+not stand up a parallel retrieval stack; only the final relevance score used
+to rank and cap the blended set is recomputed (see Scoring below).
+
+**Scoring / fusion rule.** `hybrid_search`'s RRF-fused score (`k=10`, roughly
+0.01–0.09 in practice) is not on a comparable scale to compose's atom/section
+scores (embedding-cosine-based, weighted-additive, roughly 0–1). Rather than
+rank-fusing two incomparable scales, blended entity candidates are **reranked**
+with the exact same signal `rerank_text_items` already applies to atom bodies:
+cosine similarity between the query embedding and an embedding of
+`name + description`, computed via one shared `embed_batch` call. Because both
+pools are scored with the identical metric against the identical query
+embedding, the resulting scores land on the same 0–1 scale as atom/section
+scores by construction — no separate rank-fusion step is needed to make them
+comparable. (`hybrid_search`'s own RRF score is used only for candidate
+discovery/ranking within the entity pool before rerank, never surfaced.)
+
+**Inclusion floor.** A blended entity is included only if its reranked score
+is `>=` the minimum reranked score among the atoms that made the final compose
+body. The floor is self-calibrating (derived from the current request's own
+atom scores) rather than a fixed constant, so it tracks whatever relevance bar
+the query's atom pool actually cleared instead of an arbitrary threshold that
+would need separate tuning per corpus. Applied after rerank, before the
+5-entity cap. **Zero-atom edge case (Decision):** if the final compose body
+contains zero atoms (e.g. every atom/section was trimmed by `max_tokens`),
+the floor is undefined, so the compose blends **no** entities at all — an
+entity is never blended into a briefing that has no atoms to calibrate
+against, even when `blend_kg` is true and matching entities exist.
+
+**Failure handling (Decision).** KG entity discovery/hydration failures
+(`hybrid_search` or entity hydration erroring) degrade to the atom-only
+response instead of aborting the whole `knowledge.compose` call — the
+already-finalized atom/section body is a valid, useful briefing on its own.
+The failure is logged (`tracing::warn!`) and `entities` is simply omitted,
+identically to the "nothing blended" case.
+
+**Budget.** Blended entities consume the same `max_tokens` budget as the rest
+of the briefing, but are trimmed _after_ the atom/section body is finalized,
+against whatever budget is left over (`char_budget - body_used`). A tight
+budget never evicts an atom or section to make room for an entity — entities
+are purely additive, capped at 5 (`KG_BLEND_CAP`), and are the first (only)
+thing dropped when the budget is tight.
+
+**Rendering.** Blended entities render as a distinct `## Knowledge graph`
+markdown section (not interleaved into the atom section list), and are listed
+in a new `entities` array in the JSON response (`{id, kind, name, score}`) —
+additive; `atoms`/`domains`/`sections` are unchanged. `entities` is omitted
+entirely when nothing blends (no field, not an empty array), preserving
+byte-identical output for callers unaffected by this change.
+
+**Opt-out.** A `blend_kg` boolean param (default `true`) lets callers disable
+blending outright; `blend_kg=false` reproduces pre-Amendment-1 behavior exactly.
+
+### Consequences
+
+- Compose briefings on technical queries surface KG-curated concepts/ADRs
+  alongside lore atoms without a second manual `kg.search` call.
+- One extra `hybrid_search` round-trip per blended kind (2 total) plus one
+  `embed_batch` call per compose request when `blend_kg` is enabled and the
+  query resolves at least one atom — bounded by the existing per-request
+  `ComposeTiming` slow-request WARN.
+- Entity search is namespace-scoped identically to `kg.search` (primary
+  namespace only for the vector leg per `hybrid_search`'s documented
+  cross-namespace deferral) — no new namespace-visibility surface.
+- `atom_ids`-only compose is unaffected — an explicit, minimal-surface escape
+  hatch for callers who already know exactly which atoms they want.

@@ -3,6 +3,8 @@
 **Status**: accepted\
 **Date**: 2026-05-23\
 **Authors**: khive maintainers
+**Superseded by**: [ADR-031](ADR-031-multi-engine-retrieval.md) for the
+single-embedder direction only.
 
 ## Context
 

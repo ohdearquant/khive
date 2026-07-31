@@ -4,6 +4,8 @@
 **Date**: 2026-07-09\
 **Authors**: khive maintainers\
 **Amends**: [ADR-088](ADR-088-git-lifecycle-pack.md) (Git-Lifecycle Pack)\
+**Amended by**: proposed [ADR-088 Amendment 2](ADR-088-amendment-2-anchor-identity.md),
+which narrows canonical repo-anchor identity\
 **Related**: ADR-016 (Request DSL), ADR-017 (Pack Standard), ADR-023 (Pack Verb Surface)
 
 ## Context

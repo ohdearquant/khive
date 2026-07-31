@@ -19,16 +19,14 @@ emit no start/end markers under the default deployment shape; see ADR-094 Contex
 after the fact the question "what was the daemon doing, and on whose behalf" is
 unanswerable from any artifact that should answer it.
 
-This is not solely an internal-operations problem. The same gap exists on the commercial
-side: the khive-cloud deployment (a separate product codebase, not part of this source
-tree) meters billable requests at its router with a two-phase reserve/finalize meter that
-fails closed on the reservation write. That external constraint is taken as given here,
-not verifiable from this repository. A request counter answers "how many billable
+This is not solely a single-deployment problem. The same gap exists for any hosted
+deployment: a router that meters accounted requests with a two-phase reserve/finalize meter
+failing closed on the reservation write still only answers "how many accounted
 requests did this tenant make," which
 is a different question from "how much compute did this tenant's work cost," and it is
-structurally blind to any cost that is not itself a billable request — background warm,
+structurally blind to any cost that is not itself an accounted request — background warm,
 shared-embedder serving on behalf of a caller, and any other work that runs off the
-request path. Observability, scheduling, quota enforcement, and billing all need to answer
+request path. Observability, scheduling, quota enforcement, and accounting all need to answer
 some version of "which actor's work cost how much," but nothing today defines a shared
 unit that all four could read.
 
@@ -70,19 +68,17 @@ Three consequences follow that reshape how this design should be read:
    ADR-094's `ChannelPollStarted` / `CheckpointOutcomeRecorded` variants and should extend
    that taxonomy rather than invent a sibling one.
 
-### Is a subsystem warranted, or is this three small features plus billing khive-cloud
+### Is a subsystem warranted, or is this three small features plus metering a hosted deployment already owns?
 
-### already owns?
-
-The steelman for "no subsystem": dev-machine contention is an OS problem the fleet already
-solves with an advisory external lock convention for GPU work; cloud metering is a
-billing-layer concern that is already delivered. What remains, on this reading, is phase
+The steelman for "no subsystem": dev-machine contention is an OS problem solved with an
+advisory external lock convention for GPU work; hosted-deployment metering is an
+accounting-layer concern handled elsewhere. What remains, on this reading, is phase
 logging, a health field, a thread-priority call, and a read surface over existing events —
 none of which needs a unifying model.
 
 This does not hold, for three reasons:
 
-- **The delivered request counter cannot attribute non-request work.** It counts billable
+- **A request counter cannot attribute non-request work.** It counts accounted
   requests at the router chokepoint. Background CPU work — warm, shared-embedder serving
   triggered by other callers' requests, maintenance passes — does not cross that counter at
   all. A request counter cannot become a cost meter by definition; it meters a different
@@ -94,7 +90,7 @@ This does not hold, for three reasons:
 - **The one thing piecemeal delivery cannot produce is a shared attribution unit.** If
   `work_class` and `cost_unit` are defined once, the same unit is read by an observability
   surface, classed by a scheduling posture, budgeted by a quota check at the Gate, and
-  priced by billing. Built piecemeal, the result is four things that do not share a key: a
+  priced by accounting. Built piecemeal, the result is four things that do not share a key: a
   request counter, a wall-clock duration, a phase log, and an external lock — none of which
   can be joined to answer "which actor's ops cost how much, and was it warm or serving."
 
@@ -102,8 +98,8 @@ The subsystem survives this refutation, but resized: it is not a new component, 
 substrate, or event stream. It is a closed `work_class` enum, a `cost` sub-schema riding
 the existing audit-row payload, reuse of the Gate's already-locked `Obligation` composition
 model for quota, and phase-span `EventKind` variants extending ADR-094. The remainder of
-this ADR specifies that model. A per-op resource stream, a subsystem that duplicates the
-delivered billing meter, or an OS-level enforcement layer the daemon has no privilege to
+this ADR specifies that model. A per-op resource stream, a subsystem that duplicates an
+external accounting meter, or an OS-level enforcement layer the daemon has no privilege to
 run are each considered and rejected below.
 
 ## Decision
@@ -152,7 +148,7 @@ object to that row's existing JSON `payload`, with no new row and no migration:
 thread-time API) is always-on: one clock read before and after the handler runs, at
 negligible marginal cost since the row is already written. `cost_unit` is a deterministic
 `i64` computed from an op-class weight table (embedding-bearing verbs weigh more than a
-verb like `stats`); this is the number quota and billing count, because it is replayable
+verb like `stats`); this is the number quota and accounting count, because it is replayable
 independent of measurement noise. `cpu_us` is the measured, non-deterministic number
 diagnostics read. The `dims` split (embedder time vs. SQL time vs. inference time) sits
 behind a sampling flag: most ops do not need the split, and it is cheap to sample but
@@ -251,11 +247,11 @@ One mechanism, two policies, over the same `cost_unit`:
   shape before enforcing it (`RateLimit` today) and how other staged-authority surfaces in
   this system have shipped an authoritative floor with advisory behavior above it.
 
-Two separate mechanisms — one local, one cloud — would mean building and reconciling a
+Two separate mechanisms — one local, one hosted — would mean building and reconciling a
 meter twice and risking drift on what a "unit" even is. One mechanism with two policies
-keeps a single attribution unit across internal stability and revenue, at the cost of
+keeps a single attribution unit across internal stability and accounting, at the cost of
 designing the counter's durability and shared-state model once, correctly, for the
-multi-seat topology.
+multi-tenant topology.
 
 ### (e) Contention signal: pull, not push — the daemon does not join the external lock
 
@@ -357,10 +353,10 @@ of the previous.
    the actual mechanism of the incident that motivates this design. If attribution fails,
    the per-actor `cpu_us` under-counts exactly the cost that matters most, though
    `cost_unit` (a deterministic op-class weight, not a measurement) is unaffected by this
-   risk and remains the billing-safe fallback. This is the riskiest assumption in this
+   risk and remains the accounting-safe fallback. This is the riskiest assumption in this
    design and is not resolved here: a measurement spike to confirm or refute per-actor
    embedder-CPU capture is needed before `cost_unit` weights are finalized, ahead of Stage 1
-   shipping any billing-facing use of the number.
+   shipping any accounting-facing use of the number.
 
    **Resolved 2026-07-08 — NOT-CAPTURED.** The measurement spike returned a verdict against
    per-actor embedder-CPU attribution, for reasons sharper than the mechanism feared above:
@@ -403,7 +399,7 @@ of the previous.
 ### Positive
 
 - One attribution unit — actor × `work_class` × `cost_unit` — is defined once and read by
-  four consumers (observability, scheduling posture, Gate quota, and billing) instead of
+  four consumers (observability, scheduling posture, Gate quota, and accounting) instead of
   four independently-defined, non-joinable measures.
 - No new storage substrate. Accounting rides the audit row ADR-094 already established as
   the daemon's default construction; phase spans extend the same closed `EventKind`
@@ -422,7 +418,7 @@ of the previous.
   open question is resolved; shipping Stage 1 before that spike means the diagnostic
   `cpu_us` field may be known-incomplete for embedding-bearing ops from day one.
   Mitigated: `cost_unit` (deterministic, weight-based) is distinct from `cpu_us` (measured)
-  precisely so a measurement gap in one does not compromise the other's use for billing.
+  precisely so a measurement gap in one does not compromise the other's use for accounting.
 - Two Gate-quota policies (hard, soft) over one mechanism means the shared `QuotaCounter`
   durability model must be correct across a multi-seat topology from the start; getting
   this wrong affects both deployments at once, since they share the mechanism.
@@ -443,9 +439,9 @@ of the previous.
 
 ## Not covered (deliberate scope exclusions)
 
-- Fleet-wide or cross-machine scheduling and orchestration outside this daemon.
+- System-wide or cross-machine scheduling and orchestration outside this daemon.
 - Replacing or taking ownership of the external GPU-contention lock convention.
-- The delivered cloud billing meter and its reserve/finalize/payment integration — the
+- An external accounting meter and its reserve/finalize/payment integration — the
   internal Gate quota is its analog and is designed to share its `cost_unit`, not to rebuild
   it.
 - Events-table prune/retention policy — an inherited open question (see Open Questions).
@@ -517,7 +513,7 @@ for absence, below, is never given a third case.
   class, fixed at implementation time and not measured, consistent with Decision (b)'s
   existing requirement that `cost_unit` stay deterministic and replayable, and with Open
   Question 1's resolution that per-actor CPU is not attributable, so `cost_unit` was
-  already the billing-safe fallback. For every verb that is not embedding-bearing,
+  already the accounting-safe fallback. For every verb that is not embedding-bearing,
   `per_item_weight(verb) = 0`, so `item_count` and `model_count` play no role and
   `cost_unit` reduces to `base_weight(verb)` alone, matching Decision (b)'s original
   `stats`-verb illustration.
@@ -695,3 +691,164 @@ already-proven mechanism, not new design surface.
   embedding-bearing verbs is computed and closes two Stage 1 emission gaps identified by
   measurement, without opening new design surface or altering the Staged Landing Plan's
   stage boundaries.
+
+## Amendment 2 (2026-07-21): Itemized Executed-Usage Counters — Response-Envelope `usage` and Audit-Row `resource.units`
+
+### Context
+
+Decision (b)'s `cost_unit` is deliberately deterministic and request-shaped: it is
+computed from the verb, its params, and its result summary, so it is replayable and
+noise-free. Amendment 1 fixed its batch and model-fan-out scaling. What it cannot do,
+by construction, is report **executed** work: for a growing verb class the executed
+work is not derivable from the request at all:
+
+- Graph verbs (`traverse`, `context`, `neighbors`) cost **edges actually expanded**,
+  which depends on the graph at the anchor, not on `max_depth`/`hops` (the BFS in
+  `khive-runtime/src/graph_traversal.rs` runs one `batch_neighbors` round-trip per
+  frontier level; `max_depth` is only a bound).
+- Read verbs perform backlog-dependent ANN index maintenance (the warm-path consumer
+  drains `ann_write_log` during `memory.recall` / `knowledge.search`), work whose size
+  is a function of the backlog at call time, invisible to the caller.
+- Optional parameters change the executed shape: `knowledge.compose` without
+  `domain_ids` runs a full internal `suggest` (one extra query embed, FTS pass, and ANN
+  pass); `knowledge.search(decompose=true)` splits one FTS pass into per-concept
+  passes; `context(entity_ids=..., query omitted)` skips the hybrid-search anchor
+  entirely.
+- Per-engine fan-out differs per verb: `memory.recall` embeds the query once per
+  configured engine, while kg `search` embeds only with the default engine.
+
+A consumer that wants to account for usage by actuals — a quota policy under Decision
+(d), an external usage reader, or a diagnosing operator — currently has nothing
+per-dispatch except the estimate. This amendment adds the measured, itemized
+counterpart without disturbing `cost_unit`'s role.
+
+### Part 1: a closed unit-counter vocabulary
+
+Seven counters, all non-negative integers, all "executed during this dispatch, inline":
+
+| Counter             | Unit meaning                                                                                                                                                                                                              |
+| ------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `embed_calls`       | one text run through one embedding engine — a batch of k texts through one engine counts k, per engine                                                                                                                    |
+| `fts_passes`        | one FTS5 query execution                                                                                                                                                                                                  |
+| `vector_passes`     | one vector/ANN probe (sqlite-vec KNN or Vamana), per engine per query                                                                                                                                                     |
+| `graph_hops`        | one adjacency entry returned by storage during BFS/traversal, counted **before** visited-set de-duplication (the measurable unit at the `batch_neighbors` choke point); multi-edges and self-loops each count as returned |
+| `db_round_trips`    | one batched storage round-trip issued by the handler path                                                                                                                                                                 |
+| `ann_jobs_consumed` | one `ann_write_log` job drained by the inline warm-path consumer                                                                                                                                                          |
+| `event_rows`        | one event-plane row **successfully appended** by this dispatch **before the audit snapshot is taken** — the enclosing per-dispatch audit row itself is explicitly excluded (it cannot count itself; see Part 3)           |
+
+The set is closed and amendment-governed, matching every other closed taxonomy in this
+repository. Within a complete `usage` object, a counter that a given verb path does
+not touch is simply zero, and omitting a key is equivalent to zero. This equivalence
+holds **only for a complete object** — see the failure rule below.
+
+Governance note on extensibility: the object is designed to grow by amendment without
+wire breakage — consumers must treat unknown keys as additional counters, so future
+additions (`rows_scanned` for GQL execution, byte-scaled blob I/O) are additive.
+
+**Usage reporting is best-effort and can never fail a verb.** If the accumulator is
+unavailable, poisoned, or any counter cannot be computed, the op result ships with
+**no `usage` key at all** — never a partial object. All-or-nothing keeps the unit
+semantics unambiguous: a present object is complete (absent key = zero); an absent
+object means "not measured", never "zero work". The op's `ok`/`error` status is
+decided solely by the verb's own execution; a reporting failure is logged, never
+surfaced as an op error.
+
+### Part 2: collection — a dispatch-scoped inline accumulator
+
+A **dispatch-accounting context** in `khive-runtime`, armed by the registry around
+each verb dispatch and incremented at the existing runtime choke points: the embedder
+call seam (`embed_query` / per-model embed), the FTS query functions, the
+vector-search functions, `batch_neighbors` (adjacency entries returned), the inline
+ANN consumer drain, and the event append path. Handlers do not thread a context
+parameter; the choke points are few and already centralized.
+
+Plain task-local storage is **not sufficient** as the propagation mechanism: several
+request-owned paths run their per-model work on spawned tasks that are then joined
+(`memory.recall`'s per-model embed and ANN fan-out,
+`crates/khive-pack-memory/src/handlers/common.rs`; `knowledge.index`'s per-model
+embed-and-insert, `crates/khive-pack-knowledge/src/knowledge/index_handler.rs`), and
+Tokio task-locals do not cross `tokio::spawn`. The context is therefore an explicitly
+propagated handle (an `Arc`-shared accumulator or equivalent) with the following
+scope contract:
+
+- **In scope**: the dispatch task itself; futures it awaits or `join!`s directly; and
+  every **request-owned spawned child** — a task spawned by the dispatch whose
+  `JoinHandle` is awaited before the response is produced. Request-owned children
+  receive the context at spawn and their counts are merged only after the join.
+- **Out of scope**: detached background tasks (ANN warm, maintenance passes) and any
+  work that can outlive the response. These receive no context and remain attributed
+  via Decision (c)'s phase-span events under their own `work_class`. This closes the
+  snapshot race by construction: nothing holding the context can still be running
+  when the response's `usage` object is read.
+
+Implementation must carry a regression test for each class: a joined-child path
+(recall's per-model fan-out counts its embeds), and a detached path (a background
+warm contributes nothing to the dispatch's counters).
+
+### Part 3: surfacing — two read paths, no new rows
+
+1. **Response envelope.** Each per-op result entry gains a sibling `usage` object next
+   to `ok`/`tool`/`result`:
+
+   ```jsonc
+   { "ok": true, "tool": "memory.recall", "result": { ... },
+     "usage": { "embed_calls": 2, "fts_passes": 1, "vector_passes": 2,
+                "ann_jobs_consumed": 6, "event_rows": 3 } }
+   ```
+
+   Always-on (the increments are integer adds on hot paths already doing the work),
+   additive to the wire shape, zero-valued counters omitted. Batch requests report
+   per-op usage per entry; the aggregate response adds no roll-up (callers sum).
+
+   Compatibility: the new key is wire-additive **for tolerant JSON consumers** —
+   decoders that reject unknown fields would break, and no shipped envelope contract
+   yet obligates unknown-key tolerance. The claim is therefore scoped: known consumers
+   (the MCP client surface, the CLI, the audit tooling) are tolerant; a strict
+   third-party decoder is a documented compatibility risk, not covered by a guarantee.
+
+2. **Audit row.** The same object lands under the existing per-dispatch audit row's
+   `resource` payload as `resource.units`, alongside Decision (b)'s `cost_unit` and
+   `cpu_us`. Payload enrichment only — no new row, no migration, same write-load
+   argument as Decision (b). Snapshot ordering: the `usage` object is frozen once —
+   after all request-owned children are joined and all non-audit event appends have
+   resolved, and **before** the enclosing audit row is written — and that single
+   snapshot is serialized into both read paths, which is why `event_rows` excludes
+   the enclosing audit row (Part 1): the same exact object appears in the response
+   and in the audit payload.
+
+### Part 4: relation to `cost_unit`
+
+`cost_unit` remains the deterministic, replayable number quota logic keys on; `units`
+is the measured record of what actually ran. They are complementary, not competing:
+the hand-set weight table Amendment 1 left open can now be **calibrated from observed
+`units` distributions** instead of guessed, under the same governance Decision (b)
+established. Nothing in quota enforcement (Decision d) changes.
+
+### Part 5: request-cap configurability
+
+The batch cap is today a protocol constant (`MAX_OPS = 100`, defined in
+`khive-request` and re-exported through its crate root). The parser stays pure:
+ADR-016 makes `khive-request` a zero-runtime-dependency parser shared by every
+transport, and a config-dependent parse would let the same stored input (a scheduled
+action, a replayed request) parse under one deployment and fail under another.
+Instead, the deployment cap is enforced **at the runtime boundary before dispatch**:
+`MAX_OPS` remains the protocol ceiling the parser enforces unconditionally, and a
+`[request] max_ops` setting (default 100, valid range 1..=`MAX_OPS`) is checked after
+parse, rejecting the batch with the existing typed op-count error. The authority
+model is single: the process performing the dispatch applies its own configured
+limit. The 1 MiB input length bound stays a parser constant.
+
+### Consequences
+
+- Positive: usage accounting by executed actuals becomes possible for every consumer
+  (quota policy, operators, external usage readers) without estimating from request
+  shape; the F2 read-time maintenance work and graph-expansion costs become visible
+  per-dispatch for the first time; Amendment 1's open weight table gains an empirical
+  calibration source.
+- Negative: seven increment sites to keep honest as retrieval paths evolve; a
+  regression test per counter per representative verb is required at implementation
+  time so a refactor cannot silently zero a counter, plus the two propagation-class
+  tests Part 2 mandates (joined-child counted, detached excluded).
+- Neutral: `work_class`, quota mechanism, phase-span events, and the staged landing
+  plan are all unchanged; the response-envelope addition is additive for tolerant
+  JSON consumers (Part 3's scoped compatibility statement).

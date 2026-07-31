@@ -4,7 +4,11 @@
 **Date**: 2026-06-19
 **Authors**: khive maintainers
 **Amends**: ADR-007-namespace.md (adds Rule 8 on top of Rev 6; all prior rules Rev 0–7 retained, Rule 8 is additive)
+**Amended by**: proposed [ADR-068](ADR-068-process-isolation-topology.md), which
+replaces Rule 4's TenantGate clause if accepted.
 **Supersedes (partial)**: None — additive amendment only
+**Superseded by**: [ADR-050](ADR-050-kg-token-namespace-contract.md) for the historical
+KG-pack namespace-rebinding clause only; the remainder of this record stays authoritative.
 **ADR chain**: ADR-018 (Gate trait, single dispatch site) | ADR-014 (curation, merge semantics)
 | ADR-002 (edge cascade, no dangling refs) | ADR-057 (comm actor-addressed delivery) |
 ADR-063 (comm pack principal model and remote backend isolation)
@@ -629,7 +633,7 @@ collision.
 | Per-pack actor namespace routing (Namespace-by-Layer Rule 3) | Preserves operational separation for gtd/comm                  | Contradicts Rule 0; breaks cross-lambda memory.recall; live audit shows memory is already "local"                    | Rejected in full. Blanket form rejected in Rev 2; narrow comm-only carry and memory carry both closed as NO-CARRY by the 2026-06-17 Rev 3 decision. No per-pack carry exists or is planned. |
 | ADR-059 three-tier visibility model                          | Supports cooperative multi-lambda with fine-grained boundaries | Extra complexity; per-edge namespace-join query; "local" becomes ambiguous; conflicts with "one shared brain" ruling | Withdrawn before acceptance (ADR-007 Rev 2). Withdrawn status reaffirmed by Rev 3.                                                                                                          |
 | ADR-059 three-column edge visibility filter                  | Prevents edge-induced namespace leaks                          | Complexity; joins across three namespace columns on every edge query; incompatible with "edges are shared structure" | Rejected (Rule 3a). Edge namespace is attribution-only, stamped "local" by default. No per-edge namespace-join at any tier.                                                                 |
-| New ADR number (ADR-060) instead of amending ADR-007         | Clean slate                                                    | Leaves conflicting ADR-007 as active on main                                                                         | Rejected; amend in place                                                                                                                                                                    |
+| New ADR instead of amending ADR-007                          | Clean slate                                                    | Leaves conflicting ADR-007 as active on main                                                                         | Rejected; amend in place                                                                                                                                                                    |
 | Namespace as pure write-stamp, no SQL filter anywhere        | Simplest storage                                               | Removes legitimate tag-based view filtering for gtd assignee, comm addressing                                        | Rejected; view-layer filtering is correct, namespace-routing is not                                                                                                                         |
 
 ---

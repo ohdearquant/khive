@@ -4,9 +4,10 @@
 **Date**: 2026-07-02
 **Authors**: khive maintainers
 **GitHub**: #342
-**Amends**: [ADR-080](ADR-080-session-pack-oss-storage-mechanism.md) §3 (verb visibility, verb count,
-and parameter vocabulary) for the T1 continuity epic. Does not touch ADR-080 §6 (session mirror),
-which is unaffected and continues to run unchanged.
+**Supersedes**: [ADR-080](ADR-080-session-pack-oss-storage-mechanism.md) §3
+(verb visibility, verb count, names, export behaviour, and parameter
+vocabulary) for the T1 continuity epic. ADR-080 §1, §2, §4, §5, and §6 remain
+in force; in particular, the session mirror is unaffected and continues to run.
 **Note**: ADR-081 is assigned to the recall-retune driver (PR #400, branch `adr-081-retune-driver`).
 ADR-082 is the retrieval quality measurement loop. This document takes the next free number, 083,
 for numbering reasons only; it has no topical relationship to either.
@@ -16,8 +17,8 @@ for numbering reasons only; it has no topical relationship to either.
 Epic `ohdearquant/khive#342` asks for the first working slice of the khive T1 session pack: an
 agent-facing surface to store, list, resume, and export session records through the local backend,
 so an agent can pick up a prior session instead of starting cold. The 2026-07-02 rescope narrows
-this to storage and retrieval only. The digester and summarization pipeline stay cloud-side, and
-tiering and billing are deferred (ADR-080 Context).
+this to storage and retrieval only. The digester and summarization pipeline, storage tiering,
+and other account-level concerns stay out of scope (ADR-080 Context).
 
 ADR-080 already decided that sessions belong in the OSS pack surface, modeled as `kind="session"`
 notes via `Pack::NOTE_KINDS` (ADR-080 §1 and §2), and that decision is shipped on `main`. ADR-080
@@ -25,13 +26,12 @@ notes via `Pack::NOTE_KINDS` (ADR-080 §1 and §2), and that decision is shipped
 handlers (`session.store`, `session.list`, `session.get`), all `Visibility::Subhandler`, with
 parameters `agent_id`, `metadata`, and `since`, and no dispatchable `session.export` handler.
 
-The `session-pack-t1` branch (commit `49cda88e`, work for issue #342; mirror-subsystem restoration
-in `28215e07`) implements a different verb surface: four handlers, all `Visibility::Verb`, with
-`session.get` renamed to `session.resume`, `session.export` promoted to a dispatchable handler, and
-the parameter vocabulary changed to `provider` and `provider_session_id`. This is a deliberate,
-in-scope redesign for the T1 continuity epic, not drift and not a stale draft. It is also, precisely,
-a proposal to reopen an accepted decision, ADR-080 §3. That is why it is submitted as its own ADR
-rather than folded into ADR-080 or described as a routine correction.
+The T1 implementation exposes a different verb surface: four handlers,
+all `Visibility::Verb`, with `session.get` renamed to `session.resume`,
+`session.export` promoted to a dispatchable handler, and the parameter
+vocabulary changed to `provider` and `provider_session_id`. This accepted ADR
+records that deliberate, in-scope redesign and supersedes ADR-080 §3 rather
+than treating the change as routine drift.
 
 An earlier version of this document was drafted directly on the `session-pack-t1` branch, under a
 different number, against a copy of ADR-080 that predated the 2026-07-02 amendment. That draft
@@ -41,13 +41,12 @@ fixes a code citation (§4).
 
 ## Decision
 
-### 1. This ADR proposes to reopen ADR-080 §3's shipped-surface record for T1
+### 1. ADR-080 §3's shipped-surface record is superseded for T1
 
-ADR-080 §3 is accepted. Until this ADR is itself accepted, ADR-080 §3's shipped-surface record
-(three `Visibility::Subhandler` verbs, `agent_id`/`metadata`/`since` parameters, no dispatchable
-export) remains the authoritative description of what the `session` pack exposes. This ADR is the
-decision vehicle for changing that. If accepted, it supersedes ADR-080 §3 with the surface described
-in §2 below, and leaves every other part of ADR-080 (§1, §2, §4, §5, §6) unchanged.
+This accepted ADR supersedes ADR-080 §3's intervening shipped-surface record
+(three `Visibility::Subhandler` handlers, `agent_id`/`metadata`/`since`
+parameters, and no dispatchable export) with the surface in §2 below. ADR-080
+§1, §2, §4, §5, and §6 remain authoritative and unchanged.
 
 No new schema is required for T1's own storage. The four verbs read and write the existing `notes`
 table through `runtime.core().create_note` and `runtime.core().notes(token)?.query_notes_filtered(...)`
@@ -199,26 +198,23 @@ They are related but not interchangeable, and this ADR does not unify them.
 
 ### 4. Backend seam
 
-| Verb             | Call                                                                                                     |
-| ---------------- | -------------------------------------------------------------------------------------------------------- |
-| `session.store`  | `runtime.core().create_note(token, "session", title, &content, None, Some(properties), vec![])`          |
-| `session.list`   | `runtime.core().notes(token)?.query_notes_filtered(namespace, &filter, PageRequest { offset, limit })`   |
-| `session.resume` | `runtime.resolve_prefix(token, raw)` (hex-prefix case only), then `runtime.resolve_primary(token, uuid)` |
-| `session.export` | Same resolution as `session.resume`, then serializes the resolved note to the requested format           |
+| Verb             | Call                                                                                                                   |
+| ---------------- | ---------------------------------------------------------------------------------------------------------------------- |
+| `session.store`  | `runtime.core().create_note(token, "session", title, &content, None, Some(properties), vec![])`                        |
+| `session.list`   | `runtime.core().notes(token)?.query_notes_filtered(namespace, &filter, PageRequest { offset, limit })`                 |
+| `session.resume` | `runtime.core().resolve_prefix(token, raw)` (hex-prefix case only), then `runtime.core().resolve_primary(token, uuid)` |
+| `session.export` | Same resolution as `session.resume`, then serializes the resolved note to the requested format                         |
 
-`session.store` and `session.list` route through `runtime.core()`, the ADR-073 accessor.
-`session.resume` and `session.export` instead call `resolve_prefix` and `resolve_primary` directly
-on `runtime`, inside the shared `resolve_session_uuid` and `fetch_session_note` helpers
-(`crates/khive-pack-session/src/handlers/mod.rs`), not through `core()`.
+All four handlers route through `runtime.core()`, the ADR-073 accessor.
 
-This has no observable effect today. `core()` returns `self.clone()` whenever `core_backend` is
-`None`, which is the only configuration this pack runs in (single-backend M1). It is worth naming as
-a latent inconsistency for when ADR-071 Phase 4 (`BackendHandle`, not yet implemented) lets a pack be
-assigned a dedicated backend: store and list would then follow the pack's own backend, while resume
-and export would keep reading through the shared runtime handle, and the two paths could diverge.
-This ADR does not require routing all four handlers through the same seam; it changes no observable
-behavior at M1. It is flagged here as a follow-up worth doing before or alongside any future
-backend-assignment change for this pack.
+History: as originally shipped, `session.resume` and `session.export` called `resolve_prefix` and
+`resolve_primary` directly on `runtime` — harmless in single-backend M1 (where `core()` is a
+`self.clone()` no-op), and flagged in an earlier revision of this section as a latent inconsistency
+for any future per-pack backend assignment. That divergence became observable the first time the
+pack ran with a `[packs.session]` backend assignment: `store`/`list` wrote and read session notes in
+the main shared graph while `resume`/`export` resolved against the pack backend and reported every
+stored session as not found. Both handlers now resolve through `core()`, with a two-backend regression test in
+`crates/khive-pack-session/src/handlers/resume.rs`.
 
 No handler holds a direct reference to `Arc<StorageBackend>` or any `khive-db` type, preserving the
 ADR-071 `BackendHandle` seam per ADR-080 §5.
@@ -233,26 +229,22 @@ M2 milestone (issue #350, PR #368), gained the Codex CLI source in PR #375, and 
 default.
 
 The T1 verb surface and the session mirror are additive, not a replacement. This is a deliberate
-design ruling, restated here because an earlier branch-local draft of this document stated the
-opposite in four places. Commit `28215e07` restored the mirror after a brief branch-local removal,
-specifically to correct that error; its commit message states that the two subsystems are additive,
-not a replacement. T1's four verbs read and write `kind=session` notes in the shared `notes` table.
+design ruling. T1's four verbs read and write `kind=session` notes in the shared `notes` table.
 The mirror reads transcript files on disk and writes its own three auxiliary tables. Neither
 subsystem's schema, code, or tests depend on the other, and both run in the same crate and the same
 pack instance at the same time.
 
-Accepting this ADR does not remove, disable, deprecate, or defer any part of the mirror, its
-transcript parsers, or its session-message tables. All of that is shipped today, per ADR-080 §6,
-independent of this ADR's verb-visibility change. `src/mirror/` and `SESSION_SCHEMA_PLAN_STMTS` are
-unchanged by this ADR. T1 adds new verb handlers alongside them, not in place of them.
+This ADR does not remove, disable, deprecate, or defer any part of the mirror,
+its transcript parsers, or its session-message tables. All of that is shipped
+today, per ADR-080 §6, independent of this ADR's verb-visibility change.
+`src/mirror/` and `SESSION_SCHEMA_PLAN_STMTS` are unchanged by this ADR. T1
+adds verb handlers alongside them, not in place of them.
 
 ### 6. Deferred
 
-Out of scope for this ADR, consistent with ADR-080's Context:
-
-- The digester and summarization pipeline (cloud-side).
-- Hot, warm, and cold tiering.
-- Billing, metering, quotas, and customer or account ledgers.
+Out of scope for this ADR, consistent with ADR-080's Context: account-level concerns —
+including digestion and summarization pipelines and storage tiering — are out of scope for
+this pack.
 
 T1-specific deferrals:
 
@@ -271,7 +263,7 @@ service, and the `session_messages` table. These are shipped today (§5).
   MCP `request` surface, not only through operator tooling such as `kkernel exec`.
   `Visibility::Subhandler` was the right choice while the session-continuity query UX was undecided
   (ADR-080 §3 amendment). This ADR treats that question as settled for T1's scope by fixing the
-  four-verb, four-parameter contract in §2.
+  four-verb, fixed-parameter contract in §2.
 - **Why rename `session.get` to `session.resume`.** `resume` names the continuity use case directly:
   fetching a session in order to continue it. `get` is a generic accessor name shared with unrelated
   substrate operations.
@@ -323,30 +315,28 @@ repeated here. Alternatives specific to this ADR's verb-surface decision:
 - T1 cannot efficiently query by `provider_session_id` at very large scale without a later index or
   table decision.
 - Duplicate provider-session anchors are possible by design (§3); no uniqueness is enforced.
-- `session.resume` and `session.export` do not route through `runtime.core()` the way `session.store`
-  and `session.list` do, a latent inconsistency with no effect today, flagged in §4.
 
 ### Neutral
 
 - T1 and the session mirror (ADR-080 §6) are independent subsystems that read and write different
-  tables and coexist in the same crate and pack instance by design (§5). Accepting this ADR does not
-  change, disable, or deprecate the mirror.
+  tables and coexist in the same crate and pack instance by design (§5). This
+  ADR does not change, disable, or deprecate the mirror.
 - No change to `khive-vamana`, `khive-db`, `khive-storage`, or `khive-runtime`. The session pack
   remains a pure consumer of the existing runtime API.
-- If accepted, this ADR supersedes only ADR-080 §3. ADR-080 §1, §2, §4, §5, and §6 are unaffected.
+- This ADR supersedes only ADR-080 §3. ADR-080 §1, §2, §4, §5, and §6 are unaffected.
 
 ## Validation
 
-The branch's test suite (`crates/khive-pack-session/tests/integration.rs`) covers, by scenario:
+The implementation's integration suite (`crates/khive-pack-session/tests/integration.rs`) covers, by scenario:
 store-to-resume content equality, list visibility (summaries omit `content`), export as JSON, export
 as markdown, UUID short-prefix resolution, provider filtering, invalid-`format` errors listing valid
 values, invalid-`limit` range errors, and rejection of a non-session UUID. All nine scenarios are
-present and passing on the `session-pack-t1` branch as of commit `28215e07`.
+present and passing as of the recorded implementation commit `28215e07`.
 
 ## References
 
 - [ADR-080](ADR-080-session-pack-oss-storage-mechanism.md): Session Pack, OSS Storage Mechanism.
-  This ADR revises ADR-080 §3 only. ADR-080 §1, §2, §4, §5, and §6 remain authoritative and
+  This ADR supersedes ADR-080 §3 only. ADR-080 §1, §2, §4, §5, and §6 remain authoritative and
   unchanged.
 - [ADR-013](ADR-013-note-kind-taxonomy.md): Note Kind Taxonomy. `session` is a pack-registered kind
   under the mechanism this ADR describes.

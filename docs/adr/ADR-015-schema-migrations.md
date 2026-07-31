@@ -3,6 +3,7 @@
 **Status**: accepted\
 **Date**: 2026-05-23\
 **Authors**: khive maintainers
+**Amended by**: [ADR-062](ADR-062-fts-ann-consolidation.md), which adds schema version 4.
 
 ## Context
 
