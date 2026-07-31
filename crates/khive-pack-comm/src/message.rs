@@ -55,6 +55,7 @@ async fn rollback_outbound(
 
 pub(crate) fn note_to_message_json(note: &Note) -> Value {
     let props = note.properties.as_ref();
+    let full_id = note.id.as_hyphenated().to_string();
 
     let from = props
         .and_then(|p| p.get("from_actor"))
@@ -85,8 +86,12 @@ pub(crate) fn note_to_message_json(note: &Note) -> Value {
     let preview = build_preview(&note.content);
 
     json!({
-        "id": short_id(note.id),
-        "full_id": note.id.as_hyphenated().to_string(),
+        // `id` is the round-trippable identifier. Keep `full_id` as a
+        // compatibility alias and expose the ambiguous prefix only as an
+        // explicitly display-oriented field (#1421).
+        "id": full_id.clone(),
+        "short_id": short_id(note.id),
+        "full_id": full_id,
         "kind": "message",
         "from": from,
         "to": to,
@@ -462,6 +467,17 @@ mod tests {
         assert_eq!(v["read"], json!(false));
         assert!(v["content"].is_string());
         assert!(v["properties"].is_object());
+    }
+
+    #[test]
+    fn message_ids_are_round_trippable_with_separate_compact_display_id() {
+        let note = make_note("local", "hello", None);
+        let full_id = note.id.as_hyphenated().to_string();
+        let v = note_to_message_json(&note);
+
+        assert_eq!(v["id"], json!(full_id));
+        assert_eq!(v["full_id"], v["id"]);
+        assert_eq!(v["short_id"], json!(short_id(note.id)));
     }
 
     #[test]

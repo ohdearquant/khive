@@ -317,11 +317,11 @@ pub fn fts_text_leg_or_err<T>(
 }
 
 fn format_uuid_list(uuids: &[uuid::Uuid]) -> String {
-    let shorts: Vec<String> = uuids
+    uuids
         .iter()
-        .map(|u| u.to_string()[..8].to_string())
-        .collect();
-    shorts.join(", ")
+        .map(uuid::Uuid::to_string)
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Maps the dependency-light `khive-types` entity-type resolution error onto
