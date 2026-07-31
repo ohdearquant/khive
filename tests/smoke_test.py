@@ -201,7 +201,7 @@ def main():
         # Surface-contract tripwire: the default config (no --pack, KHIVE_PACKS
         # unset) loads 12 production packs (kg, gtd, memory, brain, comm, schedule,
         # knowledge, session, git, code, workspace, blob), so verbs() returns exactly
-        # 86 user-facing MCP-callable verbs (count what verbs() returns, not internal
+        # 88 user-facing MCP-callable verbs (count what verbs() returns, not internal
         # dispatch arms). The session pack contributes 4 agent-facing T1 verbs
         # (store/list/resume/export), promoted from internal subhandlers to
         # Visibility::Verb per ADR-083; brain.register_adapter (#354), context
@@ -225,8 +225,8 @@ def main():
         # until a backend is installed via [storage.blob] or KHIVE_BLOB_ROOT.
         # Update this number when the pack set or verb surface changes; a
         # silent drift here is the bug this assertion exists to catch.
-        assert verbs_result["total"] == 86, (
-            f"expected 86 user-facing verbs from the 12 default packs "
+        assert verbs_result["total"] == 88, (
+            f"expected 88 user-facing verbs from the 12 default packs "
             f"(session contributes 4 T1 verbs promoted to Visibility::Verb per "
             f"ADR-083; context is the 17th kg-substrate bare verb per ADR-089; "
             f"resolve is the 18th kg-substrate bare verb per the unified-verb "
@@ -236,7 +236,9 @@ def main():
             f"git.commit/git.branch/git.push (ADR-108); "
             f"code contributes code.ingest per ADR-085 Amendment 2 (PR #1039); "
             f"workspace (#873) contributes zero verbs; "
-            f"blob contributes blob.put/blob.get/blob.stat per ADR-111), "
+            f"blob contributes blob.put/blob.get/blob.stat per ADR-111; "
+            f"brain.mark_turn is the per-actor work-unit marker; "
+            f"comm.unread lists unread inbound messages), "
             f"got {verbs_result['total']}: {verbs_result}"
         )
         verb_names = [v["verb"] for v in verbs_result["verbs"]]
