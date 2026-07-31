@@ -417,15 +417,15 @@ dependency and an anchor line in `crates/khive-mcp/src/pack.rs`.
 
 ## Amendment 3 (2026-07-21): configuration-file pack selection
 
-**Status**: proposed
+**Status**: accepted
 
 ### Context
 
-Pack selection is specified by this ADR as `--pack` CLI > `KHIVE_PACKS` env > built-in
-default. [ADR-035](ADR-035-cli-config-and-auto-embed.md) additionally lists a
-`runtime.packs` configuration key in its option table, but that key was never
-implemented: the configuration loader parses only `[packs.<name>]` backend assignments
-(ADR-028), and the runtime resolves the loaded set from the environment alone.
+Before this amendment, pack selection was implemented as `--pack` CLI > `KHIVE_PACKS`
+env > built-in default. [ADR-035](ADR-035-cli-config-and-auto-embed.md) additionally
+listed a `runtime.packs` configuration key in its option table, but the runtime did not
+consume it: configuration parsing covered only `[packs.<name>]` backend assignments
+(ADR-028), while startup resolved the loaded set from the environment alone.
 
 Environment-only selection makes the loaded pack set a property of each spawning
 process's environment. Every spawn path — interactive shells, service managers,
@@ -483,7 +483,7 @@ this amendment to reflect the deviation.
 - Service-manager and supervised deployments declare packs once in configuration; the
   environment variable becomes an override, not a load-bearing requirement.
 - One more selection layer to document and test; the resolution order is centralized
-  in the runtime configuration loader and reported by introspection.
+  in the MCP startup configuration resolver and reported by introspection.
 
 ## References
 

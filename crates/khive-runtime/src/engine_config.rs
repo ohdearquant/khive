@@ -341,7 +341,7 @@ pub struct GitWriteSectionConfig {
 /// Sections consumed today:
 /// - `[[engines]]`: embedding engine declarations
 /// - `[actor]`: default namespace / identity (OSS actor model)
-/// - `[runtime]`: runtime knobs (namespace, brain_profile)
+/// - `[runtime]`: runtime knobs (pack selection, brain profile, output format)
 /// - `[[backends]]`: storage backend declarations (ADR-028)
 /// - `[packs.<name>]`: per-pack backend assignments (ADR-028)
 ///
@@ -408,6 +408,11 @@ pub struct KhiveConfig {
 /// defaults.
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct RuntimeSectionConfig {
+    /// Packs to load when neither `--pack` nor `KHIVE_PACKS` selects them.
+    /// An absent or empty list preserves the built-in production default.
+    #[serde(default)]
+    pub packs: Option<Vec<String>>,
+
     /// Brain profile ID to use for `memory.feedback` / `knowledge.feedback`
     /// and recall-time score boosting (ADR-035 §Brain profile configuration).
     ///

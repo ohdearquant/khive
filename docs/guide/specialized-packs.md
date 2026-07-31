@@ -1,7 +1,7 @@
 # Specialized Packs
 
-khive's default install loads eleven production packs
-(`kg, gtd, memory, brain, comm, schedule, knowledge, session, git, code, workspace`, per
+khive's default install loads twelve production packs
+(`kg, gtd, memory, brain, comm, schedule, knowledge, session, git, code, workspace, blob`, per
 `RuntimeConfig::default()` in `crates/khive-runtime/src/config.rs`). The `code` pack contributes one verb, `code.ingest` (L1 manifest + L1.5
 import-scan source ingestion into a dedicated map database, see
 [ADR-085](../adr/ADR-085-code-pack.md)), alongside its `finding` note kind and
@@ -26,13 +26,18 @@ base contract already allows.
 
 ### Loading a pack
 
-Packs are selected via the `--pack` CLI flag (repeatable) or the
-`KHIVE_PACKS` environment variable (comma- or whitespace-separated):
+Packs are selected, in descending precedence, by the repeatable `--pack` CLI flag,
+the comma- or whitespace-separated `KHIVE_PACKS` environment variable, or
+`[runtime].packs` in the discovered configuration file. Each non-empty layer replaces
+the complete set; with no selection, khive loads the built-in production set.
 
 ```bash
 kkernel mcp --pack kg --pack gtd --pack formal
 # or
 KHIVE_PACKS="kg,gtd,formal" kkernel mcp
+# or in khive.toml
+# [runtime]
+# packs = ["kg", "gtd", "formal"]
 ```
 
 `formal` declares `REQUIRES = &["kg"]`, so `kg` must also be in the load set.

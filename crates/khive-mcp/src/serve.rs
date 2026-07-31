@@ -8,9 +8,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use khive_runtime::{
-    config_from_env, run_migrations, runtime_config_from_khive_config, BackendConfig, BackendId,
-    BackendKind, ConnectionPool, KhiveConfig, KhiveRuntime, OutputFormat, RuntimeConfig,
-    StorageBackend,
+    config_from_env, parse_pack_list, run_migrations, runtime_config_from_khive_config,
+    BackendConfig, BackendId, BackendKind, ConnectionPool, KhiveConfig, KhiveRuntime, OutputFormat,
+    RuntimeConfig, StorageBackend,
 };
 
 use crate::args::{resolve_cli_namespace, Args};
@@ -2558,7 +2558,8 @@ pub struct RuntimeConfigInputs<'a> {
     pub actor_explicit: bool,
     /// Disable embedding entirely (still resolves actor namespace from config).
     pub no_embed: bool,
-    /// Packs to register. `None` falls back to `RuntimeConfig::default().packs`.
+    /// Explicit CLI packs to register. `None` falls through to `KHIVE_PACKS`,
+    /// `[runtime].packs`, then the built-in production set.
     pub packs: Option<Vec<String>>,
     /// Explicit brain profile ID (highest-priority tier).
     ///
@@ -2588,9 +2589,15 @@ pub fn resolve_runtime_config_with_db_anchor(
     let db_anchor = khive_runtime::resolve_db_anchor(inputs.db);
     let db_path = db_anchor.clone();
 
-    let packs = inputs
-        .packs
-        .unwrap_or_else(|| RuntimeConfig::default().packs);
+    let cli_packs = inputs.packs.filter(|packs| !packs.is_empty());
+    let env_packs = std::env::var("KHIVE_PACKS")
+        .ok()
+        .map(|value| parse_pack_list(&value))
+        .filter(|packs| !packs.is_empty());
+    let packs_overridden = cli_packs.is_some() || env_packs.is_some();
+    let packs = cli_packs
+        .or(env_packs)
+        .unwrap_or_else(RuntimeConfig::built_in_packs);
 
     // Tier-1: explicit CLI --brain-profile only (not env — env is tier-3, after TOML).
     // We must NOT read KHIVE_BRAIN_PROFILE here; RuntimeConfig::default() reads it, so
@@ -2622,7 +2629,12 @@ pub fn resolve_runtime_config_with_db_anchor(
             brain_profile: cli_brain_profile,
             ..RuntimeConfig::no_embeddings()
         };
-        resolve_actor_from_config(inputs.config, no_embed_base, db_path_for_config.as_deref())?
+        resolve_actor_from_config(
+            inputs.config,
+            no_embed_base,
+            db_path_for_config.as_deref(),
+            packs_overridden,
+        )?
     } else {
         let base_config = RuntimeConfig {
             db_path,
@@ -2633,7 +2645,12 @@ pub fn resolve_runtime_config_with_db_anchor(
             brain_profile: cli_brain_profile,
             ..RuntimeConfig::default()
         };
-        resolve_config(inputs.config, base_config, db_path_for_config.as_deref())?
+        resolve_config(
+            inputs.config,
+            base_config,
+            db_path_for_config.as_deref(),
+            packs_overridden,
+        )?
     };
 
     // ADR-096 Fork 2 — per-connection `actor_id` precedence chain (highest to
@@ -2770,11 +2787,13 @@ fn resolve_config(
     config_path: Option<&std::path::Path>,
     base: RuntimeConfig,
     db_path: Option<&std::path::Path>,
+    packs_overridden: bool,
 ) -> anyhow::Result<RuntimeConfig> {
     match KhiveConfig::load_with_home_fallback(config_path, db_path)
         .map_err(|e| anyhow::anyhow!("config error: {e}"))?
     {
         Some(khive_cfg) => {
+            let base = apply_config_pack_selection(&khive_cfg, base, packs_overridden);
             let env_primary = std::env::var("KHIVE_EMBEDDING_MODEL").ok();
             let env_additional = std::env::var("KHIVE_ADDITIONAL_EMBEDDING_MODELS").ok();
             if !khive_cfg.engines.is_empty() && (env_primary.is_some() || env_additional.is_some())
@@ -2808,11 +2827,13 @@ fn resolve_actor_from_config(
     config_path: Option<&std::path::Path>,
     base: RuntimeConfig,
     db_path: Option<&std::path::Path>,
+    packs_overridden: bool,
 ) -> anyhow::Result<RuntimeConfig> {
     match KhiveConfig::load_with_home_fallback(config_path, db_path)
         .map_err(|e| anyhow::anyhow!("config error: {e}"))?
     {
         Some(khive_cfg) => {
+            let base = apply_config_pack_selection(&khive_cfg, base, packs_overridden);
             let resolved = runtime_config_from_khive_config(&khive_cfg, base);
             Ok(RuntimeConfig {
                 embedding_model: None,
@@ -2822,6 +2843,24 @@ fn resolve_actor_from_config(
         }
         None => Ok(base),
     }
+}
+
+fn apply_config_pack_selection(
+    khive_cfg: &KhiveConfig,
+    mut base: RuntimeConfig,
+    packs_overridden: bool,
+) -> RuntimeConfig {
+    if !packs_overridden {
+        if let Some(packs) = khive_cfg
+            .runtime
+            .packs
+            .as_ref()
+            .filter(|packs| !packs.is_empty())
+        {
+            base.packs.clone_from(packs);
+        }
+    }
+    base
 }
 
 #[cfg(test)]
@@ -2866,6 +2905,101 @@ mod tests {
 
     fn kg_test_packs() -> Vec<String> {
         vec!["kg".to_string()]
+    }
+
+    fn resolve_packs(
+        config: &std::path::Path,
+        cli_packs: Option<Vec<String>>,
+        no_embed: bool,
+    ) -> Vec<String> {
+        resolve_runtime_config(RuntimeConfigInputs {
+            db: Some(":memory:"),
+            config: Some(config),
+            namespace: Namespace::parse("local").expect("ns"),
+            namespace_explicit: false,
+            actor_explicit: false,
+            no_embed,
+            packs: cli_packs,
+            brain_profile: None,
+        })
+        .expect("resolve config")
+        .packs
+    }
+
+    #[test]
+    #[serial]
+    fn config_pack_selection_applies_to_both_embedding_paths() {
+        let _env = ClearedKhiveEnvGuard::clear();
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = write_config(dir.path(), "[runtime]\npacks = [\"kg\", \"gtd\"]\n");
+
+        assert_eq!(resolve_packs(&path, None, false), vec!["kg", "gtd"]);
+        assert_eq!(resolve_packs(&path, None, true), vec!["kg", "gtd"]);
+    }
+
+    #[test]
+    #[serial]
+    fn env_pack_selection_overrides_config_file() {
+        let _env = ClearedKhiveEnvGuard::clear();
+        std::env::set_var("KHIVE_PACKS", "kg, gtd");
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = write_config(dir.path(), "[runtime]\npacks = [\"kg\", \"memory\"]\n");
+
+        assert_eq!(resolve_packs(&path, None, true), vec!["kg", "gtd"]);
+    }
+
+    #[test]
+    #[serial]
+    fn cli_pack_selection_overrides_env_and_config_file() {
+        let _env = ClearedKhiveEnvGuard::clear();
+        std::env::set_var("KHIVE_PACKS", "kg,gtd");
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = write_config(dir.path(), "[runtime]\npacks = [\"kg\", \"memory\"]\n");
+
+        assert_eq!(
+            resolve_packs(&path, Some(vec!["kg".to_string()]), true),
+            vec!["kg"]
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn empty_cli_and_env_pack_layers_fall_through_to_config() {
+        let _env = ClearedKhiveEnvGuard::clear();
+        std::env::set_var("KHIVE_PACKS", " ,  ");
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = write_config(dir.path(), "[runtime]\npacks = [\"kg\", \"memory\"]\n");
+
+        assert_eq!(
+            resolve_packs(&path, Some(Vec::new()), true),
+            vec!["kg", "memory"]
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn empty_config_pack_selection_preserves_built_in_default() {
+        let _env = ClearedKhiveEnvGuard::clear();
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = write_config(dir.path(), "[runtime]\npacks = []\n");
+
+        assert_eq!(
+            resolve_packs(&path, None, true),
+            RuntimeConfig::built_in_packs()
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn backend_assignment_table_does_not_select_packs() {
+        let _env = ClearedKhiveEnvGuard::clear();
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = write_config(
+            dir.path(),
+            "[runtime]\npacks = [\"kg\"]\n\n[packs.gtd]\nbackend = \"main\"\n",
+        );
+
+        assert_eq!(resolve_packs(&path, None, true), vec!["kg"]);
     }
 
     // The resolver MUST honor config-file `[[engines]]` over RuntimeConfig

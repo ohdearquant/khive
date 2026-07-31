@@ -19,7 +19,7 @@ An always-machine-readable copy of this page is at
 
 | Pack        | Verbs | Load with                                  | Optional?           |
 | ----------- | ----- | ------------------------------------------ | ------------------- |
-| `kg`        | 19    | `KHIVE_PACKS=kg` (default)                 | No — base substrate |
+| `kg`        | 19    | `KHIVE_PACKS=kg`                           | No — base substrate |
 | `gtd`       | 5     | `KHIVE_PACKS=kg,gtd`                       | Yes                 |
 | `memory`    | 5     | `KHIVE_PACKS=kg,memory`                    | Yes                 |
 | `brain`     | 15    | `KHIVE_PACKS=kg,brain`                     | Yes                 |
@@ -56,8 +56,10 @@ even with no `[storage.blob]` section and no `KHIVE_BLOB_ROOT` set; the verbs on
 unconfigured (erroring until a backend is installed) when the server boots against an
 in-memory backend, which has no directory to default a root beside.
 
-The default binary (no `KHIVE_PACKS`/`--pack` override) loads all 12 packs. Use `verbs()` for the
-current aggregate rather than carrying a second hand-maintained total here.
+Pack selection resolves as `--pack` > `KHIVE_PACKS` > discovered `[runtime].packs` > the
+built-in production set. With no non-empty selection at any of the first three layers, the
+default binary loads all 12 packs. Use `verbs()` for the current aggregate rather than carrying
+a second hand-maintained total here.
 
 Verb names in the `kg` pack are bare (`create`, `search`, `link`, …). Every other pack
 namespaces its verbs with a `pack.` prefix (`gtd.assign`, `memory.recall`,
