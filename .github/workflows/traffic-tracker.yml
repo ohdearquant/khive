@@ -5,6 +5,11 @@ name: Traffic Tracker (14-day rolling)
 # window into a per-day ledger via scripts/track-traffic.sh, and records
 # the result on the dedicated `traffic-data` branch.
 #
+# No workflow_dispatch: manual dispatch resolves workflow YAML from the
+# selected ref, which would let the unprotected data branch supply the
+# code this write-capable workflow runs. To capture a spike manually,
+# push a whitespace edit to one of the two watched paths instead.
+#
 # Trust boundary: the data branch is NEVER checked out and nothing from it
 # is ever executed. The ledger file is read with `git show`, the script
 # runs from the trusted main checkout, and the snapshot commit is built
@@ -18,8 +23,6 @@ on:
   schedule:
     # every 13 days, off the :00 mark to spread cron load
     - cron: '23 5 */13 * *'
-  workflow_dispatch:
-    # manual runs, e.g. after a release announcement to capture the spike
   push:
     branches: [main]
     paths:
@@ -48,7 +51,7 @@ jobs:
         run: |
           set -euo pipefail
           if git ls-remote --exit-code origin traffic-data >/dev/null 2>&1; then
-            git fetch --depth 1 origin traffic-data
+            git fetch --depth 1 origin '+refs/heads/traffic-data:refs/remotes/origin/traffic-data'
             if git rev-parse -q --verify origin/traffic-data:data/traffic-ledger.json >/dev/null; then
               git show origin/traffic-data:data/traffic-ledger.json > "$RUNNER_TEMP/traffic-ledger.json"
             fi
@@ -68,6 +71,10 @@ jobs:
           old_blob=$(git rev-parse -q --verify origin/traffic-data:data/traffic-ledger.json || echo none)
           if [ "$new_blob" = "$old_blob" ]; then
             echo "Ledger unchanged; nothing to commit"
+            exit 0
+          fi
+          if [ "$old_blob" = "none" ] && [ "$(jq '.days | length' "$RUNNER_TEMP/traffic-ledger.json")" -eq 0 ]; then
+            echo "First run returned no traffic days; not creating an empty ledger branch"
             exit 0
           fi
           subtree=$(printf '100644 blob %s\ttraffic-ledger.json\n' "$new_blob" | git mktree)
