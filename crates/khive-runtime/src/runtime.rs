@@ -1141,12 +1141,13 @@ mod tests {
     }
 
     #[test]
-    fn default_config_packs_loads_all_production_packs() {
+    fn default_config_packs_loads_kg_only() {
         let prior = std::env::var("KHIVE_PACKS").ok();
         // SAFETY: test function runs single-threaded; no other threads read or write KHIVE_PACKS.
         unsafe {
             std::env::remove_var("KHIVE_PACKS");
         }
+        // The default distribution loads all production packs.
         let cfg = RuntimeConfig::default();
         assert!(cfg.packs.contains(&"kg".to_string()));
         assert!(cfg.packs.contains(&"gtd".to_string()));
