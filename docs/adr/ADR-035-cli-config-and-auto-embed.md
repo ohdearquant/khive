@@ -149,12 +149,16 @@ CLI or environment override.
 For each runtime option, precedence is:
 **CLI flag > selected config file > applicable `KHIVE_*` env var > built-in
 default**. Exact option-specific exceptions are listed in the canonical config
-reference (`docs/core/khive-config-example.toml`).
+reference (`docs/khive-config-example.toml`).
+
+Pack selection is the exception specified by ADR-027 Amendment 3: `--pack` >
+`KHIVE_PACKS` > `runtime.packs` > the built-in production set. Each layer replaces
+the complete set; an empty layer falls through rather than selecting zero packs.
 
 | Option             | CLI flag                         | Env var                             | Config key                | Default           |
 | ------------------ | -------------------------------- | ----------------------------------- | ------------------------- | ----------------- |
 | Namespace          | `--namespace`                    | `KHIVE_NAMESPACE`                   | `runtime.namespace`       | `default`         |
-| Loaded packs       | `--pack` (repeat)                | `KHIVE_PACKS`                       | `runtime.packs`           | `kg`              |
+| Loaded packs       | `--pack` (repeat)                | `KHIVE_PACKS`                       | `runtime.packs`           | production set    |
 | DB path            | `--db`                           | `KHIVE_DB`                          | `runtime.db_path`         | `~/.khive/kg.db`  |
 | Recall min_score   | (n/a, per-call)                  | `KHIVE_RECALL_MIN_SCORE`            | `memory.recall.min_score` | `None` (no floor) |
 | Disable embeddings | `kkernel mcp --no-embed`         | `KHIVE_NO_EMBED`                    | (none)                    | `false`           |

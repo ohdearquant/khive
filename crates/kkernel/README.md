@@ -86,7 +86,7 @@ take precedence).
 | `KHIVE_DB`                        | Database path (also `kkernel mcp --db`)                       |
 | `KHIVE_ACTOR` / `KHIVE_NAMESPACE` | Default namespace (also `--actor` / `--namespace`)            |
 | `KHIVE_NO_EMBED`                  | Disable local embedding model                                 |
-| `KHIVE_PACKS`                     | Comma/whitespace-separated pack list (also repeated `--pack`) |
+| `KHIVE_PACKS`                     | Pack-list override (after `--pack`, before `[runtime].packs`) |
 | `KHIVE_CONFIG`                    | Path to the TOML config file (also `--config`)                |
 | `KHIVE_LOG`                       | Log level for stderr (JSON results on stdout are unaffected)  |
 | `KHIVE_BRAIN_PROFILE`             | Brain profile for feedback routing and recall boosting        |

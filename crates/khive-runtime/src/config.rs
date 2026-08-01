@@ -218,7 +218,8 @@ pub struct RuntimeConfig {
     /// The transport layer (e.g. `khive-mcp`) reads this list and instantiates
     /// the matching concrete pack types. Unknown names are reported as errors
     /// by the transport, not silently ignored.
-    /// Default: `["kg"]`.
+    /// Defaults to the shipped production set returned by
+    /// [`RuntimeConfig::built_in_packs`].
     pub packs: Vec<String>,
     /// Identifies this runtime's backend in a multi-backend deployment.
     ///
@@ -300,25 +301,7 @@ impl Default for RuntimeConfig {
             .ok()
             .map(|s| parse_pack_list(&s))
             .filter(|v| !v.is_empty())
-            .unwrap_or_else(|| {
-                vec![
-                    "kg",
-                    "gtd",
-                    "memory",
-                    "brain",
-                    "comm",
-                    "schedule",
-                    "knowledge",
-                    "session",
-                    "git",
-                    "code",
-                    "workspace",
-                    "blob",
-                ]
-                .into_iter()
-                .map(String::from)
-                .collect()
-            });
+            .unwrap_or_else(Self::built_in_packs);
         let brain_profile = std::env::var("KHIVE_BRAIN_PROFILE")
             .ok()
             .filter(|s| !s.trim().is_empty());
@@ -343,6 +326,28 @@ impl Default for RuntimeConfig {
 }
 
 impl RuntimeConfig {
+    /// Return the shipped pack set used when no CLI, environment, or
+    /// configuration-file selection is present.
+    pub fn built_in_packs() -> Vec<String> {
+        [
+            "kg",
+            "gtd",
+            "memory",
+            "brain",
+            "comm",
+            "schedule",
+            "knowledge",
+            "session",
+            "git",
+            "code",
+            "workspace",
+            "blob",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect()
+    }
+
     /// Build a `RuntimeConfig` with embedding disabled entirely.
     ///
     /// `embedding_model` and `additional_embedding_models` are computed

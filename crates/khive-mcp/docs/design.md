@@ -40,6 +40,8 @@ decisions and rationale.
 
 - `builtin_pack_names()` is sourced from `PackRegistry::discovered_names()` so
   the list always reflects whichever pack crates are linked into the binary.
+- Loaded-pack selection resolves once at startup with precedence `--pack` →
+  `KHIVE_PACKS` → `[runtime].packs` → the built-in production set.
 - Pack registration fails fast on unknown names or unsatisfied dependencies —
   a misconfigured `KHIVE_PACKS` is a boot error, not a silent degradation.
 - `pack.rs` force-references one public symbol per pack crate so the linker
