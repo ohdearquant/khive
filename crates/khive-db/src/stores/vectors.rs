@@ -1813,33 +1813,41 @@ mod batch_exists_tests {
     }
 
     /// Derivation (checked against sqlite-vec's `distance_cosine_float` in
-    /// sqlite-vec.c, which accumulates `dot`/`aMag`/`bMag` in f32 before
-    /// computing `1 - dot/(sqrt(aMag)*sqrt(bMag))`, still in f32):
+    /// sqlite-vec.c, which accumulates `dot`/`aMag`/`bMag` in f32 but calls
+    /// the C `sqrt` — not `sqrtf` — on those f32 accumulators, so the
+    /// square-root, product, and division all run in `double` before the
+    /// final implicit narrowing back to `f32` on return).
     ///
-    /// For the self-comparison vector `[3.0, 3.0, 3.0]`, each product
-    /// `3.0*3.0 = 9.0` is exact in f32, and `9.0+9.0+9.0 = 27.0` is also
-    /// exact (no rounding at any accumulation step), so
-    /// `dot = aMag = bMag = 27.0f32` bit-for-bit.
+    /// Because the widening to `double` happens before the square root, a
+    /// self- or exactly-proportional comparison (`dot == aMag == bMag`
+    /// bit-for-bit in f32) round-trips through `sqrt` at `double` precision
+    /// and lands within `f64::EPSILON` of the exact endpoint — nowhere near
+    /// the `f32::EPSILON` scale. The f32-scale roundoff this driver actually
+    /// exposes instead comes from the *accumulation* step: `dot` and the two
+    /// magnitudes are summed independently, so an exactly anti-parallel pair
+    /// (`query = -1.5 * stored`, mathematical cosine `-1`, ideal distance
+    /// `2`) can still see `dot` round to a f32 value fractionally larger in
+    /// magnitude than `sqrt(aMag) * sqrt(bMag)` would predict.
     ///
-    /// `sqrt(27.0)` is not exactly representable, so it is correctly
-    /// rounded to the nearest f32 (`5.1961524f32`); squaring that back in
-    /// f32 lands one f32 ULP *below* 27.0, at `26.999998092651367f32` —
-    /// the round-trip through `sqrt` does not invert exactly. So:
-    ///
-    /// `distance = 1 - 27.0/26.999998092651367 = -1.1920928955078125e-07`
-    ///
-    /// which is exactly `-f32::EPSILON`. That is negative — outside the
-    /// mathematical `[0, 2]` cosine-distance range — yet its magnitude is
-    /// only 1 f32 ULP, far inside the widened `8*f32::EPSILON` boundary
+    /// For `stored = [-4.8, -0.4, -0.4]` and `query = [7.2, 0.6, 0.6]`, that
+    /// yields a raw distance of `2.0000002384185791` — exactly
+    /// `2 + 2*f32::EPSILON`. Verified against the vendored
+    /// `distance_cosine_float` body compiled standalone under every
+    /// combination of `-O0`/`-O2`/`-O3` and `-ffp-contract=off`/`fast` plus
+    /// explicit `-mavx2 -mfma`, since whether the target architecture fuses
+    /// the per-term multiply-add changes the *path* to this result but not
+    /// the final f32 value — the fixture is architecture-independent. That
+    /// distance is outside the mathematical `[0, 2]` cosine-distance range,
+    /// yet its magnitude is within the widened `8*f32::EPSILON` boundary
     /// (~9.537e-7) and enormously outside the old `4*f64::EPSILON`
     /// tolerance (~8.88e-16) that round one shipped. A driver that still
     /// used the old f64-scale window would reject this distance outright.
     #[tokio::test]
-    async fn sqlite_vector_paths_tolerate_real_f32_endpoint_roundoff_below_zero() {
+    async fn sqlite_vector_paths_tolerate_real_f32_endpoint_roundoff_above_two() {
         let pool = make_vec_pool();
         let raw_pool = Arc::clone(&pool);
-        let model_key = "f32_endpoint_roundoff_below_zero";
-        let namespace = "ns:f32-roundoff-below-zero";
+        let model_key = "f32_endpoint_roundoff_above_two";
+        let namespace = "ns:f32-roundoff-above-two";
         create_vec_table(&pool, model_key, 3);
         let store = SqliteVecStore::new(
             pool,
@@ -1851,15 +1859,16 @@ mod batch_exists_tests {
         )
         .unwrap();
 
-        let self_id = Uuid::from_u128(1);
-        let vector = vec![3.0_f32, 3.0, 3.0];
+        let stored_id = Uuid::from_u128(1);
+        let stored_vector = vec![-4.8_f32, -0.4, -0.4];
+        let query_vector = vec![7.2_f32, 0.6, 0.6];
         store
             .insert(
-                self_id,
+                stored_id,
                 SubstrateKind::Entity,
                 namespace,
                 "body",
-                vec![vector.clone()],
+                vec![stored_vector],
             )
             .await
             .unwrap();
@@ -1871,41 +1880,42 @@ mod batch_exists_tests {
                 model_key
             );
             let mut stmt = writer.conn().prepare(&sql).unwrap();
-            stmt.raw_bind_parameter(1, f32_slice_as_bytes(&vector))
+            stmt.raw_bind_parameter(1, f32_slice_as_bytes(&query_vector))
                 .unwrap();
-            stmt.raw_bind_parameter(2, self_id.to_string().as_str())
+            stmt.raw_bind_parameter(2, stored_id.to_string().as_str())
                 .unwrap();
             let mut rows = stmt.raw_query();
             let row = rows.next().unwrap().expect("one row");
             row.get(0).unwrap()
         };
 
-        assert_eq!(raw_distance, -(f32::EPSILON as f64));
+        assert_eq!(raw_distance, 2.0 + 2.0 * f32::EPSILON as f64);
         assert!(
             !(0.0..=2.0).contains(&raw_distance),
             "fixture must land outside the mathematical [0, 2] cosine range, got {raw_distance}"
         );
+        let deviation_above_two = raw_distance - 2.0;
         let boundary_epsilon = 8.0 * f32::EPSILON as f64;
         assert!(
-            raw_distance.abs() <= boundary_epsilon,
+            deviation_above_two <= boundary_epsilon,
             "fixture must stay within the widened f32-scale tolerance, got {raw_distance}"
         );
         let old_tolerance = 4.0 * f64::EPSILON;
         assert!(
-            raw_distance.abs() > old_tolerance,
+            deviation_above_two > old_tolerance,
             "fixture must exceed the old f64-scale tolerance so it would have failed under it, got {raw_distance}"
         );
 
         let candidate_hits = store
-            .score_candidates(&vector, &[self_id])
+            .score_candidates(&query_vector, &[stored_id])
             .await
             .unwrap();
         assert_eq!(candidate_hits.len(), 1);
-        assert_eq!(candidate_hits[0].score, DeterministicScore::from_f64(1.0));
+        assert_eq!(candidate_hits[0].score, DeterministicScore::from_f64(-1.0));
 
         let search_hits = store
             .search(VectorSearchRequest {
-                query_vectors: vec![vector],
+                query_vectors: vec![query_vector],
                 top_k: 1,
                 namespace: Some(namespace.to_string()),
                 kind: Some(SubstrateKind::Entity),
@@ -1916,7 +1926,7 @@ mod batch_exists_tests {
             .await
             .unwrap();
         assert_eq!(search_hits.len(), 1);
-        assert_eq!(search_hits[0].score, DeterministicScore::from_f64(1.0));
+        assert_eq!(search_hits[0].score, DeterministicScore::from_f64(-1.0));
         assert_eq!(search_hits[0].rank, 1);
     }
 
