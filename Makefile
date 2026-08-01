@@ -1,3 +1,9 @@
+# The full pack set the installed daemon must serve. `make local` verifies the
+# INSTALLED binary registers the whole set by positive artifact (a verbs()
+# count from the binary itself) — a build that silently drops a pack's
+# inventory registration fails here instead of shipping.
+FULL_PACKS := kg,gtd,memory,comm,schedule,session,workspace,blob,git,knowledge,brain,code,formal
+
 .PHONY: check clippy test contract-test fmt fmt-check build clean ci docs-check publish publish-dry local check-fwd bench-1m bench-1m-ci
 
 check:
@@ -85,6 +91,13 @@ local:
 	  echo "==> ERROR: post-mv hash drift! staged=$$STAGED_HASH dest=$$DEST_HASH"; \
 	  exit 1; \
 	fi; \
-	echo "==> Installed: $$DEST ($$DEST_HASH, $$DEST_SIZE bytes, $$DEST_MTIME)"; \
+	echo "==> Verifying installed binary loads the full pack set..."; \
+	VERBS=$$(KHIVE_PACKS="$(FULL_PACKS)" "$$DEST" exec 'verbs()' 2>/dev/null \
+	  | python3 -c 'import json,sys; print(len(json.load(sys.stdin)["results"][0]["result"]["verbs"]))' 2>/dev/null || echo 0); \
+	if [ "$$VERBS" -lt 80 ]; then \
+	  echo "==> ERROR: installed binary registered $$VERBS verbs (expected >= 80) — full pack set did not load"; \
+	  exit 1; \
+	fi; \
+	echo "==> Installed: $$DEST ($$DEST_HASH, $$DEST_SIZE bytes, $$DEST_MTIME, $$VERBS verbs)"; \
 	"$$DEST" --version
 	@echo "==> Done. Run /mcp in Claude Code to reconnect."
