@@ -1639,11 +1639,13 @@ request(ops="session.store(content=\"...\", provider=\"claude_code\", title=\"pa
 
 List stored sessions newest first.
 
-| Param      | Type    | Required | Notes                                  |
-| ---------- | ------- | -------- | -------------------------------------- |
-| `limit`    | integer | no       | 1–200, default 20.                     |
-| `offset`   | integer | no       | Default 0.                             |
-| `provider` | string  | no       | Exact filter on `properties.provider`. |
+| Param      | Type    | Required | Notes                                               |
+| ---------- | ------- | -------- | --------------------------------------------------- |
+| `limit`    | integer | no       | 1–200, default 20.                                  |
+| `offset`   | integer | no       | Default 0.                                          |
+| `provider` | string  | no       | Exact filter on `properties.provider`.              |
+| `agent_id` | string  | no       | Exact filter on legacy `properties.agent_id`.       |
+| `since`    | string  | no       | Inclusive RFC 3339 lower bound on session creation. |
 
 ```
 request(ops="session.list(provider=\"claude_code\", limit=10)")
