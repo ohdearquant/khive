@@ -10,7 +10,7 @@ use std::sync::Arc;
 use khive_pack_kg::KgPack;
 use khive_pack_session::SessionPack;
 use khive_runtime::{
-    AllowAllGate, BackendId, KhiveRuntime, Namespace, RuntimeConfig, VerbRegistry,
+    AllowAllGate, BackendId, KhiveRuntime, Namespace, RuntimeConfig, RuntimeError, VerbRegistry,
     VerbRegistryBuilder,
 };
 use serde_json::{json, Value};
@@ -266,6 +266,58 @@ async fn list_filter_by_unknown_provider_returns_empty() {
 }
 
 #[tokio::test]
+async fn list_filters_by_agent_id_in_storage() {
+    let dir = TempDir::new().expect("tempdir");
+    let rt = file_rt(dir.path().join("list_agent_id.db"));
+    let registry = build_registry(rt);
+
+    for (content, agent_id) in [("alpha", "lambda:alpha"), ("beta", "lambda:beta")] {
+        registry
+            .dispatch(
+                "create",
+                json!({
+                    "kind": "session",
+                    "content": content,
+                    "properties": {"agent_id": agent_id}
+                }),
+            )
+            .await
+            .expect("create attributed session note");
+    }
+
+    let result = registry
+        .dispatch("session.list", json!({"agent_id": "lambda:alpha"}))
+        .await
+        .expect("list by agent_id");
+    let sessions = result["sessions"].as_array().expect("sessions array");
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(result["total"], 1);
+    assert_eq!(sessions[0]["id"].as_str().map(str::len), Some(36));
+}
+
+#[tokio::test]
+async fn list_filters_by_inclusive_since_bound_in_storage() {
+    let dir = TempDir::new().expect("tempdir");
+    let rt = file_rt(dir.path().join("list_since.db"));
+    let registry = build_registry(rt);
+
+    store_session(&registry, "before").await;
+    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    let after = store_session(&registry, "after").await;
+    let after_id = after["session"]["id"].as_str().expect("after id");
+    let since = after["session"]["created_at"].as_str().expect("created_at");
+
+    let result = registry
+        .dispatch("session.list", json!({"since": since}))
+        .await
+        .expect("list since");
+    let sessions = result["sessions"].as_array().expect("sessions array");
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(result["total"], 1);
+    assert_eq!(sessions[0]["id"], after_id);
+}
+
+#[tokio::test]
 async fn list_limit_respected() {
     let dir = TempDir::new().expect("tempdir");
     let rt = file_rt(dir.path().join("list_limit.db"));
@@ -438,6 +490,26 @@ async fn resume_rejects_non_session_note() {
     assert!(err.is_err(), "non-session note must be rejected");
 }
 
+#[tokio::test]
+async fn resume_excludes_soft_deleted_session() {
+    let dir = TempDir::new().expect("tempdir");
+    let rt = file_rt(dir.path().join("resume_deleted.db"));
+    let registry = build_registry(rt);
+
+    let stored = store_session(&registry, "deleted resume session").await;
+    let id = stored["session"]["id"].as_str().expect("id").to_string();
+    registry
+        .dispatch("delete", json!({"id": id}))
+        .await
+        .expect("soft delete session");
+
+    let result = registry.dispatch("session.resume", json!({"id": id})).await;
+    assert!(
+        matches!(&result, Err(RuntimeError::NotFound(_))),
+        "resume must report a soft-deleted session as not found: {result:?}"
+    );
+}
+
 // ── session.export tests ──────────────────────────────────────────────────────
 
 #[tokio::test]
@@ -522,6 +594,26 @@ async fn export_rejects_missing_id() {
         .dispatch("session.export", json!({"format": "json"}))
         .await;
     assert!(err.is_err(), "missing required id field must error");
+}
+
+#[tokio::test]
+async fn export_excludes_soft_deleted_session() {
+    let dir = TempDir::new().expect("tempdir");
+    let rt = file_rt(dir.path().join("export_deleted.db"));
+    let registry = build_registry(rt);
+
+    let stored = store_session(&registry, "deleted export session").await;
+    let id = stored["session"]["id"].as_str().expect("id").to_string();
+    registry
+        .dispatch("delete", json!({"id": id}))
+        .await
+        .expect("soft delete session");
+
+    let result = registry.dispatch("session.export", json!({"id": id})).await;
+    assert!(
+        matches!(&result, Err(RuntimeError::NotFound(_))),
+        "export must report a soft-deleted session as not found: {result:?}"
+    );
 }
 
 // ── round-trip regression ────────────────────────────────────────────────────

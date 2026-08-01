@@ -1,5 +1,6 @@
 //! `session.list` - list stored sessions, newest first.
 
+use chrono::DateTime;
 use serde_json::Value;
 
 use khive_runtime::{KhiveRuntime, NamespaceToken, RuntimeError};
@@ -18,6 +19,7 @@ pub(crate) async fn handle_list(
 ) -> Result<Value, RuntimeError> {
     let p: ListParams = deser(params)?;
     require_non_empty_if_present(&p.provider, "provider", VERB)?;
+    require_non_empty_if_present(&p.agent_id, "agent_id", VERB)?;
 
     let limit = match p.limit {
         None => DEFAULT_LIMIT,
@@ -38,11 +40,31 @@ pub(crate) async fn handle_list(
             value: SqlValue::Text(provider.clone()),
         });
     }
+    if let Some(agent_id) = &p.agent_id {
+        property_filters.push(PropertyFilter {
+            json_path: "$.agent_id".to_string(),
+            op: FilterOp::Eq,
+            value: SqlValue::Text(agent_id.clone()),
+        });
+    }
+
+    let min_created_at = p
+        .since
+        .as_deref()
+        .map(|raw| DateTime::parse_from_rfc3339(raw).map(|value| value.timestamp_micros()))
+        .transpose()
+        .map_err(|_| {
+            RuntimeError::InvalidInput(format!(
+                "{VERB}: since must be an RFC 3339 timestamp; valid example: \
+                 2026-01-01T00:00:00Z; got {:?}",
+                p.since.as_deref().unwrap_or_default()
+            ))
+        })?;
 
     let filter = NoteFilter {
         kind: Some(SESSION_KIND.to_string()),
         property_filters,
-        min_created_at: None,
+        min_created_at,
         ..Default::default()
     };
 
@@ -153,5 +175,39 @@ mod tests {
             msg.contains("provider must be a non-empty string when provided"),
             "error must name the blank-provider violation; got: {msg}",
         );
+    }
+
+    #[tokio::test]
+    async fn blank_agent_id_rejected() {
+        let rt = KhiveRuntime::memory().expect("in-memory runtime");
+        let token = rt.authorize(Namespace::local()).expect("authorize local");
+
+        let err = handle_list(&rt, &token, json!({ "agent_id": "  " }))
+            .await
+            .unwrap_err();
+
+        let khive_runtime::RuntimeError::InvalidInput(msg) = err else {
+            panic!("expected InvalidInput, got {err:?}");
+        };
+        assert!(
+            msg.contains("agent_id must be a non-empty string when provided"),
+            "error must name the blank-agent-id violation; got: {msg}",
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_since_rejected() {
+        let rt = KhiveRuntime::memory().expect("in-memory runtime");
+        let token = rt.authorize(Namespace::local()).expect("authorize local");
+
+        let err = handle_list(&rt, &token, json!({ "since": "yesterday" }))
+            .await
+            .unwrap_err();
+
+        let khive_runtime::RuntimeError::InvalidInput(msg) = err else {
+            panic!("expected InvalidInput, got {err:?}");
+        };
+        assert!(msg.contains("since must be an RFC 3339 timestamp"));
+        assert!(msg.contains("yesterday"));
     }
 }
