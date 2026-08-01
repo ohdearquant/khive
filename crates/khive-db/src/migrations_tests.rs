@@ -125,6 +125,7 @@ fn v15_fresh_start_installs_narrow_gtd_dependency_cycle_guards() {
     for trigger in [
         "gtd_task_dependency_cycle_notes_bi",
         "gtd_task_dependency_cycle_notes_bu",
+        "gtd_task_dependency_cycle_note_activation_bu",
         "gtd_task_dependency_cycle_edges_bi",
         "gtd_task_dependency_cycle_edges_bu",
     ] {
@@ -403,6 +404,156 @@ fn v13_edge_guard_ignores_paths_through_soft_deleted_tasks() {
         None,
     )
     .expect("tombstoned task edges must not form a live dependency path");
+}
+
+#[test]
+fn v13_note_activation_rejects_dormant_edge_cycles() {
+    let mut conn = open_memory();
+    run_migrations(&mut conn).expect("migrations should succeed");
+
+    insert_dependency_test_note(&conn, "live-a", "task", "{}", None);
+    insert_dependency_test_note(&conn, "deleted-b", "task", "{}", Some(2));
+    insert_dependency_test_edge(
+        &conn,
+        "live-a-deleted-b",
+        "live-a",
+        "deleted-b",
+        "depends_on",
+        None,
+    )
+    .expect("edge to tombstoned task is dormant");
+    insert_dependency_test_edge(
+        &conn,
+        "deleted-b-live-a",
+        "deleted-b",
+        "live-a",
+        "depends_on",
+        None,
+    )
+    .expect("edge from tombstoned task is dormant");
+
+    let reactivation_error = conn
+        .execute(
+            "UPDATE notes SET deleted_at = NULL WHERE id = 'deleted-b'",
+            [],
+        )
+        .expect_err("reactivating a task endpoint must not expose an edge cycle");
+    assert!(
+        reactivation_error.to_string().contains("dependency cycle"),
+        "unexpected task-reactivation error: {reactivation_error}"
+    );
+    let remains_deleted: bool = conn
+        .query_row(
+            "SELECT deleted_at IS NOT NULL FROM notes WHERE id = 'deleted-b'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("load rejected task reactivation");
+    assert!(remains_deleted, "the rejected reactivation must roll back");
+
+    insert_dependency_test_note(&conn, "live-c", "task", "{}", None);
+    insert_dependency_test_note(&conn, "observation-d", "observation", "{}", None);
+    insert_dependency_test_edge(
+        &conn,
+        "live-c-observation-d",
+        "live-c",
+        "observation-d",
+        "depends_on",
+        None,
+    )
+    .expect("edge to non-task note is dormant");
+    insert_dependency_test_edge(
+        &conn,
+        "observation-d-live-c",
+        "observation-d",
+        "live-c",
+        "depends_on",
+        None,
+    )
+    .expect("edge from non-task note is dormant");
+
+    let conversion_error = conn
+        .execute(
+            "UPDATE notes SET kind = 'task' WHERE id = 'observation-d'",
+            [],
+        )
+        .expect_err("converting a note to a task must not expose an edge cycle");
+    assert!(
+        conversion_error.to_string().contains("dependency cycle"),
+        "unexpected task-conversion error: {conversion_error}"
+    );
+    let persisted_kind: String = conn
+        .query_row(
+            "SELECT kind FROM notes WHERE id = 'observation-d'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("load rejected task conversion");
+    assert_eq!(persisted_kind, "observation");
+}
+
+#[test]
+fn v13_note_activation_preserves_acyclic_and_unrelated_edges() {
+    let mut conn = open_memory();
+    run_migrations(&mut conn).expect("migrations should succeed");
+
+    insert_dependency_test_note(&conn, "live-a", "task", "{}", None);
+    insert_dependency_test_note(&conn, "deleted-b", "task", "{}", Some(2));
+    insert_dependency_test_edge(
+        &conn,
+        "deleted-b-live-a",
+        "deleted-b",
+        "live-a",
+        "depends_on",
+        None,
+    )
+    .expect("acyclic edge from tombstoned task is dormant");
+    conn.execute(
+        "UPDATE notes SET deleted_at = NULL WHERE id = 'deleted-b'",
+        [],
+    )
+    .expect("acyclic task reactivation must remain allowed");
+
+    insert_dependency_test_note(&conn, "observation-c", "observation", "{}", None);
+    insert_dependency_test_edge(
+        &conn,
+        "live-a-observation-c",
+        "live-a",
+        "observation-c",
+        "depends_on",
+        None,
+    )
+    .expect("acyclic edge to non-task note is dormant");
+    conn.execute(
+        "UPDATE notes SET kind = 'task' WHERE id = 'observation-c'",
+        [],
+    )
+    .expect("acyclic task conversion must remain allowed");
+
+    insert_dependency_test_note(&conn, "deleted-d", "task", "{}", Some(2));
+    insert_dependency_test_edge(
+        &conn,
+        "live-a-deleted-d-related",
+        "live-a",
+        "deleted-d",
+        "related_to",
+        None,
+    )
+    .expect("first unrelated edge");
+    insert_dependency_test_edge(
+        &conn,
+        "deleted-d-live-a-related",
+        "deleted-d",
+        "live-a",
+        "related_to",
+        None,
+    )
+    .expect("second unrelated edge");
+    conn.execute(
+        "UPDATE notes SET deleted_at = NULL WHERE id = 'deleted-d'",
+        [],
+    )
+    .expect("unrelated edge cycles must not block task reactivation");
 }
 
 #[test]

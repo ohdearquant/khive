@@ -202,8 +202,10 @@ cannot bypass that durable check. It traverses only array-valued `depends_on` pr
 legacy scalar/object values remain diagnostically broken data, not phantom edges. It
 considers only live task property paths and live task-to-task `depends_on` edges;
 soft-deleted rows and unrelated writes are excluded. Existing cyclic data is not
-rewritten at migration time, but a later governed mutation cannot preserve or close a
-cycle.
+rewritten at migration time. Reactivating a tombstoned task or converting another note
+kind into a live task is also rejected when its pre-existing `depends_on` edge endpoints
+would thereby expose a live cycle; acyclic and unrelated edge activations remain valid.
+A later governed mutation therefore cannot preserve, expose, or close a cycle.
 
 Reads keep dependency failure distinct from lifecycle status. Task envelopes returned
 by `gtd.tasks` and `gtd.next` carry:
