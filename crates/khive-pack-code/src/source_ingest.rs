@@ -715,7 +715,7 @@ pub async fn run_code_ingest(
 
     let mut project_ids: HashMap<String, Uuid> = HashMap::new();
     for m in &manifests {
-        let file_label = m.root.display().to_string();
+        let file_label = m.manifest_path.display().to_string();
         let Some(id) = upsert_project(
             rt,
             token,
@@ -830,7 +830,10 @@ async fn run_import_scan(
         let proj_id = match project_ids.get(&proj_name) {
             Some(id) => *id,
             None => {
-                let proj_label = proj_root.display().to_string();
+                // Label a refused fallback-project write by the source file
+                // whose scan triggered it — a real on-disk location, never
+                // the content-derived project name (#1594).
+                let proj_label = file_label.clone();
                 let Some(id) = upsert_project(
                     rt,
                     token,

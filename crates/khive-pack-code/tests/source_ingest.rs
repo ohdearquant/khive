@@ -501,10 +501,11 @@ fn write_gate_blocked_project_name_fixture(root: &Path) {
 }
 
 /// issue #1594 / gate-report label leak: when the *project name itself* is
-/// secret-shaped, the quarantine report's `blocked[].file` must carry the
-/// trusted manifest path, never the refused name — reusing content-derived
-/// identity as a diagnostic label would re-exfiltrate exactly what the gate
-/// just refused. Mirrors `khive-pack-git`'s full-report masking assertion
+/// secret-shaped, the quarantine report's `blocked[].file` must carry a
+/// trusted on-disk file location (the governing manifest for the manifest
+/// tier, the triggering source file for the import-scan fallback), never the
+/// refused name — reusing content-derived identity as a diagnostic label
+/// would re-exfiltrate exactly what the gate just refused. Mirrors `khive-pack-git`'s full-report masking assertion
 /// (`crates/khive-pack-git/tests/acceptance.rs`, `writes_refused` case).
 #[tokio::test]
 async fn gate_blocked_project_name_reports_safe_manifest_path() {
@@ -528,25 +529,40 @@ async fn gate_blocked_project_name_reports_safe_manifest_path() {
 
     // The manifest-tier upsert and the import-scan-tier upsert each attempt
     // (and independently refuse) the same secret-shaped project name, so
-    // both are quarantined — every entry must still carry the same safe,
-    // trusted manifest path, never the refused name.
-    assert!(
-        !report.blocked.is_empty(),
-        "expected at least one quarantined write, got: {:?}",
-        report.blocked
-    );
+    // both routes are quarantined, each labeled by its own trusted on-disk
+    // location: the governing manifest file for the manifest tier, the
+    // triggering source file for the import-scan fallback. Asserting the
+    // exact pair proves BOTH routes carry a real file path, never the
+    // refused name and never a bare directory.
     assert_eq!(
         report.blocked_count as usize,
         report.blocked.len(),
         "blocked_count must match the number of entries in blocked"
     );
-
-    let expected_path = root.path().join("pkg_secret").display().to_string();
+    let expected_manifest = root
+        .path()
+        .join("pkg_secret")
+        .join("Cargo.toml")
+        .display()
+        .to_string();
+    let expected_source = root
+        .path()
+        .join("pkg_secret")
+        .join("src")
+        .join("lib.rs")
+        .display()
+        .to_string();
+    let mut blocked_files: Vec<&str> = report.blocked.iter().map(|b| b.file.as_str()).collect();
+    blocked_files.sort_unstable();
+    let mut expected_files = vec![expected_manifest.as_str(), expected_source.as_str()];
+    expected_files.sort_unstable();
+    assert_eq!(
+        blocked_files, expected_files,
+        "blocked[].file must be exactly the manifest file (manifest tier) and the \
+         triggering source file (import-scan fallback): {:?}",
+        report.blocked
+    );
     for entry in &report.blocked {
-        assert_eq!(
-            entry.file, expected_path,
-            "blocked[].file must be the trusted manifest path, not the refused project name"
-        );
         assert_eq!(entry.detector, "url-userinfo");
         assert!(
             !entry.masked_excerpt.is_empty(),
