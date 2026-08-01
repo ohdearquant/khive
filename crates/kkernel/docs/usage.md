@@ -85,11 +85,24 @@ kkernel exec 'knowledge.index(help=true)'                         # param schema
 kkernel exec 'knowledge.search(query="...", rerank=true)' --presentation verbose
 ```
 
-Flags: `--db`, `--namespace`, `--presentation <agent|verbose|human>`, `--strict`.
+Flags: `--db`, `--namespace`, `--actor`, `--expect-actor`,
+`--presentation <agent|verbose|human>`, `--strict`.
 A request in which every op failed or aborted always exits nonzero after printing the full
 response. Without `--strict`, a _partially_ failed request (`status: "partial"` with at least
 one success) retains its compatibility behavior and exits zero; `--strict` converts any failed
 or aborted op into a nonzero process exit.
+
+`--actor` is a highest-precedence identity pin: it overrides project config and
+`KHIVE_ACTOR` for this invocation without changing the storage namespace, and
+the configured authorization gate still checks the selected identity.
+`--expect-actor` makes scripts fail before dispatch when identity resolution
+produces anything else. The two flags compose:
+
+```bash
+kkernel exec 'create(kind="concept", name="X")' \
+  --actor lambda:worker --expect-actor lambda:worker
+kkernel exec 'stats()' --expect-actor lambda:worker  # validate config/env resolution
+```
 
 ---
 

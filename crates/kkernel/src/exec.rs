@@ -203,6 +203,23 @@ pub struct ExecArgs {
     #[arg(long, default_value = "local")]
     pub namespace: String,
 
+    /// Pin the acting identity for this invocation.
+    ///
+    /// This is an attribution and authorization identity, not a storage
+    /// namespace. It has higher precedence than project config and
+    /// `KHIVE_ACTOR`, and is checked by the same dispatch gate as every other
+    /// resolved actor. A refused actor is never retried as a fallback identity.
+    #[arg(long, value_name = "ACTOR", conflicts_with = "pending_events")]
+    pub actor: Option<String>,
+
+    /// Require the resolved acting identity to equal this value.
+    ///
+    /// Composes with `--actor`; without it, validates the normal project,
+    /// config, and environment resolution chain. Use `local` to require the
+    /// anonymous/local identity. A mismatch fails before dispatch.
+    #[arg(long, value_name = "ACTOR", conflicts_with = "pending_events")]
+    pub expect_actor: Option<String>,
+
     /// Presentation mode: `verbose` (default), `agent`, or `human`.
     ///
     /// ADR-045 §2 selection rules: the `kkernel exec` CLI surface (a trusted
@@ -539,7 +556,7 @@ pub async fn run_exec(args: ExecArgs) -> Result<()> {
     // forwarded frame as a `ConfigMismatch` and `exec` silently fell back to an
     // in-process, TOML-blind, effectively-anonymous dispatch (issue #581).
     let namespace = Namespace::parse(&args.namespace).map_err(|e| anyhow::anyhow!("{e}"))?;
-    let (cfg, db_anchor) =
+    let (mut cfg, db_anchor) =
         khive_mcp::serve::resolve_runtime_config_with_db_anchor(RuntimeConfigInputs {
             db: args.db.as_deref(),
             config: None, // `kkernel exec` has no `--config` flag today
@@ -566,6 +583,18 @@ pub async fn run_exec(args: ExecArgs) -> Result<()> {
             packs: None,
             brain_profile: None,
         })?;
+
+    // Apply the explicit actor only AFTER the shared resolver has loaded the
+    // project/config/environment fallbacks. This makes the CLI value the true
+    // highest-precedence tier without coupling identity to storage namespace.
+    // Keeping the selected identity in `cfg` also sends every execution mode
+    // through its existing gate seam: daemon request identity, local registry
+    // dispatch, ops-file dispatch, or atomic apply's pre-write authorization.
+    apply_actor_pin_and_expectation(
+        &mut cfg,
+        args.actor.as_deref(),
+        args.expect_actor.as_deref(),
+    )?;
 
     // Regression fence: `cfg.db_path` must agree with the canonical anchor for
     // this same `--db`/`KHIVE_DB` input, or `compute_config_id` would silently
@@ -606,6 +635,39 @@ pub async fn run_exec(args: ExecArgs) -> Result<()> {
             .await
         }
     }
+}
+
+/// Apply the explicit exec actor tier and validate an optional identity
+/// expectation before any daemon forwarding or local dispatch occurs.
+fn apply_actor_pin_and_expectation(
+    cfg: &mut RuntimeConfig,
+    actor: Option<&str>,
+    expect_actor: Option<&str>,
+) -> Result<()> {
+    if let Some(raw) = actor {
+        let parsed =
+            Namespace::parse(raw).map_err(|e| anyhow::anyhow!("invalid --actor {raw:?}: {e}"))?;
+        cfg.actor_id = if parsed == Namespace::local() {
+            None
+        } else {
+            Some(parsed.as_str().to_owned())
+        };
+    }
+
+    if let Some(raw_expected) = expect_actor {
+        let expected = Namespace::parse(raw_expected)
+            .map_err(|e| anyhow::anyhow!("invalid --expect-actor {raw_expected:?}: {e}"))?;
+        let actual = khive_runtime::resolve_actor(cfg.actor_id.as_deref());
+        if actual.id != expected.as_str() {
+            anyhow::bail!(
+                "--expect-actor mismatch: expected {:?}, resolved {:?}",
+                expected.as_str(),
+                actual.id
+            );
+        }
+    }
+
+    Ok(())
 }
 
 /// Decides the process exit code from the response envelope's `summary`.
@@ -1126,6 +1188,127 @@ mod tests {
         let args = ExecArgs::parse_from(["exec", "stats()"]);
         std::env::remove_var("KHIVE_DB");
         assert_eq!(args.db.as_deref(), Some("/tmp/kkernel-exec-env.db"));
+    }
+
+    #[test]
+    fn actor_and_expect_actor_flags_parse_together() {
+        let args = ExecArgs::parse_from([
+            "exec",
+            "stats()",
+            "--actor",
+            "lambda:worker",
+            "--expect-actor",
+            "lambda:worker",
+        ]);
+        assert_eq!(args.actor.as_deref(), Some("lambda:worker"));
+        assert_eq!(args.expect_actor.as_deref(), Some("lambda:worker"));
+    }
+
+    #[test]
+    #[serial]
+    fn khive_actor_env_does_not_bind_to_explicit_actor_arg() {
+        let previous = std::env::var("KHIVE_ACTOR").ok();
+        std::env::set_var("KHIVE_ACTOR", "lambda:env");
+        let args = ExecArgs::parse_from(["exec", "stats()"]);
+        match previous {
+            Some(value) => std::env::set_var("KHIVE_ACTOR", value),
+            None => std::env::remove_var("KHIVE_ACTOR"),
+        }
+        assert_eq!(args.actor, None, "the env fallback must not become tier 1");
+    }
+
+    #[test]
+    fn actor_flags_conflict_with_pending_events_mode() {
+        assert!(ExecArgs::try_parse_from(
+            ["exec", "--pending-events", "--actor", "lambda:worker",]
+        )
+        .is_err());
+        assert!(ExecArgs::try_parse_from([
+            "exec",
+            "--pending-events",
+            "--expect-actor",
+            "lambda:worker",
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn explicit_actor_overrides_fallback_without_changing_namespace() {
+        let mut cfg = RuntimeConfig {
+            default_namespace: Namespace::parse("project:data").unwrap(),
+            actor_id: Some("lambda:fallback".to_string()),
+            ..RuntimeConfig::default()
+        };
+        apply_actor_pin_and_expectation(&mut cfg, Some("lambda:cli"), Some("lambda:cli")).unwrap();
+        assert_eq!(cfg.actor_id.as_deref(), Some("lambda:cli"));
+        assert_eq!(cfg.default_namespace.as_str(), "project:data");
+    }
+
+    #[test]
+    fn explicit_local_actor_authoritatively_clears_fallback() {
+        let mut cfg = RuntimeConfig {
+            actor_id: Some("lambda:fallback".to_string()),
+            ..RuntimeConfig::default()
+        };
+        apply_actor_pin_and_expectation(&mut cfg, Some("local"), Some("local")).unwrap();
+        assert_eq!(cfg.actor_id, None);
+    }
+
+    #[test]
+    fn expect_actor_alone_validates_resolved_identity() {
+        let mut cfg = RuntimeConfig {
+            actor_id: Some("lambda:project".to_string()),
+            ..RuntimeConfig::default()
+        };
+        apply_actor_pin_and_expectation(&mut cfg, None, Some("lambda:project")).unwrap();
+        let err = apply_actor_pin_and_expectation(&mut cfg, None, Some("lambda:other"))
+            .expect_err("a mismatched expectation must fail before dispatch");
+        assert!(err.to_string().contains("--expect-actor mismatch"));
+        assert!(err.to_string().contains("lambda:project"));
+    }
+
+    #[test]
+    fn actor_inputs_are_namespace_validated() {
+        let mut cfg = RuntimeConfig::default();
+        assert!(apply_actor_pin_and_expectation(&mut cfg, Some("bad actor"), None).is_err());
+        assert!(apply_actor_pin_and_expectation(&mut cfg, None, Some("bad actor")).is_err());
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn authorized_explicit_actor_is_used_for_write_attribution() {
+        let (previous_home, _home_dir) = isolate_home_for_test();
+        let mut cfg = RuntimeConfig {
+            db_path: None,
+            actor_id: Some("lambda:fallback".to_string()),
+            gate: std::sync::Arc::new(khive_runtime::AllowAllGate),
+            embedding_model: None,
+            additional_embedding_models: vec![],
+            packs: vec!["kg".to_string(), "comm".to_string()],
+            ..RuntimeConfig::default()
+        };
+        apply_actor_pin_and_expectation(&mut cfg, Some("lambda:pinned"), None).unwrap();
+        let server = build_local_fallback_server(cfg, &KhiveConfig::default(), None, None).unwrap();
+        let raw = server
+            .dispatch_request_local(RequestParams {
+                ops: r#"comm.send(to="local", content="actor pin attribution")"#.to_string(),
+                presentation: None,
+                presentation_per_op: None,
+                save_to: None,
+                format: None,
+                format_per_op: None,
+                request_id: None,
+            })
+            .await
+            .unwrap();
+        restore_home(previous_home);
+
+        let response: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(
+            response["results"][0]["ok"], true,
+            "comm.send dispatch failed: {raw}"
+        );
+        assert_eq!(response["results"][0]["result"]["from"], "lambda:pinned");
     }
 
     #[test]
@@ -2450,6 +2633,76 @@ default = true
             .map(|a| a.len())
             .unwrap_or(0);
         assert_eq!(count, 0, "dry-run must not write any entities");
+    }
+
+    #[derive(Debug)]
+    struct DenyPinnedActorGate {
+        observed: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl khive_runtime::Gate for DenyPinnedActorGate {
+        fn check(
+            &self,
+            req: &khive_runtime::GateRequest,
+        ) -> std::result::Result<khive_runtime::GateDecision, khive_runtime::GateError> {
+            self.observed.lock().unwrap().push(req.actor.id.clone());
+            if req.actor.id == "lambda:pinned" {
+                Ok(khive_runtime::GateDecision::deny(
+                    "test actor is not granted",
+                ))
+            } else {
+                Ok(khive_runtime::GateDecision::allow())
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn unauthorized_explicit_actor_is_not_retried_as_fallback() {
+        let previous_no_daemon = std::env::var("KHIVE_NO_DAEMON").ok();
+        std::env::set_var("KHIVE_NO_DAEMON", "1");
+        let (previous_home, _home_dir) = isolate_home_for_test();
+        let db_file = NamedTempFile::new().expect("temp db");
+        let observed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut cfg = RuntimeConfig {
+            db_path: Some(db_file.path().to_path_buf()),
+            actor_id: Some("lambda:fallback".to_string()),
+            gate: std::sync::Arc::new(DenyPinnedActorGate {
+                observed: observed.clone(),
+            }),
+            packs: vec!["kg".to_string()],
+            ..RuntimeConfig::default()
+        };
+        apply_actor_pin_and_expectation(&mut cfg, Some("lambda:pinned"), Some("lambda:pinned"))
+            .unwrap();
+
+        let result = run_exec_inline(
+            r#"create(kind="concept", name="MustNotExist")"#.to_string(),
+            cfg,
+            None,
+            None,
+            None,
+            ExecDbContext::default(),
+            false,
+        )
+        .await;
+
+        match previous_no_daemon {
+            Some(value) => std::env::set_var("KHIVE_NO_DAEMON", value),
+            None => std::env::remove_var("KHIVE_NO_DAEMON"),
+        }
+        restore_home(previous_home);
+
+        assert!(result.is_err(), "the gate refusal must be terminal");
+        let observed = observed.lock().unwrap();
+        assert!(
+            !observed.is_empty(),
+            "the configured gate must be consulted"
+        );
+        assert!(
+            observed.iter().all(|actor| actor == "lambda:pinned"),
+            "no gate check may retry as the displaced fallback actor: {observed:?}"
+        );
     }
 
     // ── strict-actor mode: daemon bypass regression ───────────────────────────
