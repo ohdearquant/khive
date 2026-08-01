@@ -247,7 +247,11 @@ impl Details {
     where
         I: IntoIterator<Item = (&'static str, String)>,
     {
-        Self::from_owned(pairs.into_iter().map(|(k, v)| (Cow::Borrowed(k), Cow::Owned(v))))
+        Self::from_owned(
+            pairs
+                .into_iter()
+                .map(|(k, v)| (Cow::Borrowed(k), Cow::Owned(v))),
+        )
     }
 
     /// Shared bounding/truncation logic for the constructor: partition the

@@ -165,7 +165,7 @@ it does not train the default/live namespace's posterior state.
 ### Comm pack — 9 verbs (`comm.` prefix)
 
 | Verb             | What it does                                                                                                                 | When to use                                   |
-| ---------------- | ---------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------- |
+| ---------------- | ---------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------- |
 | `comm.send`      | Send a message (optionally threaded)                                                                                         | Inter-agent or inter-namespace messaging      |
 | `comm.delivered` | Confirm the internal inbound sibling for an outbound UUID                                                                    | Resolve an ambiguous atomic-write outcome     |
 | `comm.inbox`     | List inbound messages                                                                                                        | Check what's waiting                          |
