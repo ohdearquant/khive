@@ -3554,11 +3554,27 @@ mod tests {
             .await
             .unwrap();
         let annotator = rt
-            .create_entity(&tok, "concept", None, "Annotator", None, None, vec![])
+            .create_note(
+                &tok,
+                "observation",
+                None,
+                "edge judgment",
+                None,
+                None,
+                vec![],
+            )
             .await
             .unwrap();
         let nested_annotator = rt
-            .create_entity(&tok, "concept", None, "NestedAnnotator", None, None, vec![])
+            .create_note(
+                &tok,
+                "observation",
+                None,
+                "judgment review",
+                None,
+                None,
+                vec![],
+            )
             .await
             .unwrap();
 
