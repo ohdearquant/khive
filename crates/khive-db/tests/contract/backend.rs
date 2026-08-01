@@ -242,6 +242,29 @@ async fn test_note_store(backend: &StorageBackend) {
     assert_eq!(fetched.content, "Test note content");
     assert!(fetched.deleted_at.is_none());
 
+    assert!(store
+        .set_note_property(id, "first", serde_json::json!(1), fetched.updated_at + 1)
+        .await
+        .expect("set first note property"));
+    assert!(store
+        .set_note_property(
+            id,
+            "second",
+            serde_json::json!(true),
+            fetched.updated_at + 2
+        )
+        .await
+        .expect("set second note property"));
+    let patched = store
+        .get_note(id)
+        .await
+        .expect("get patched note")
+        .expect("patched note must exist");
+    assert_eq!(
+        patched.properties,
+        Some(serde_json::json!({ "first": 1, "second": true }))
+    );
+
     // Soft-delete
     let deleted = store
         .delete_note(id, DeleteMode::Soft)

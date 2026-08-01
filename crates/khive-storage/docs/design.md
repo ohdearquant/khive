@@ -24,6 +24,9 @@ verb, substrate, actor, session, aggregate, and observed/selected referents.
 The `StorageCapability` enum in `capability.rs` identifies which surface produced
 an error (`Sql`, `Notes`, `Entities`, `Graph`, `Events`, `Vectors`, `Sparse`,
 `Text`). Each trait file defines one capability surface as a separate module.
+`NoteStore::set_note_property` is the atomic, top-level JSON-key mutation
+contract: backend implementations must preserve unrelated keys without a
+caller-side read/replace cycle.
 
 ### [ADR-009: Backend Architecture](../../../docs/adr/ADR-009-backend-architecture.md)
 

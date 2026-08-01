@@ -313,16 +313,33 @@ pub trait NoteStore: Send + Sync + 'static {
     /// `UPDATE`, leaving every other column (including the row's `rowid`)
     /// untouched.
     ///
-    /// Unlike `upsert_note` (an `INSERT OR REPLACE`, which on a primary-key
-    /// conflict is a SQLite DELETE+INSERT that silently reassigns the row's
-    /// implicit `rowid`), this never churns `rowid`, which is required by any
-    /// caller relying on `rowid` as a stable, monotonically-increasing cursor (#780).
+    /// Unlike `upsert_note`, which writes the complete note shape, this leaves
+    /// every non-property column untouched. It also never churns the row's
+    /// implicit `rowid`, which is required by callers relying on stable row
+    /// identity (#780).
     /// Returns `true` when a live (non-soft-deleted) row with this `id` was
     /// found and updated, `false` otherwise.
     async fn update_note_properties(
         &self,
         id: Uuid,
         properties: Option<Value>,
+        updated_at: i64,
+    ) -> StorageResult<bool>;
+    /// Atomically set one top-level key in a note's JSON `properties` object.
+    ///
+    /// The backend must perform the read/modify/write as one storage operation
+    /// so concurrent writes to different keys cannot overwrite each other.
+    /// `value` keeps its JSON type, including explicit JSON `null`. A SQL-NULL
+    /// property document is initialized as an empty object. A live row whose
+    /// stored document is a non-object is not modified and returns `false`, as
+    /// do missing and soft-deleted rows. Keys containing U+0000 must be
+    /// rejected: SQLite JSON-path labels cannot address them without risking
+    /// mutation of a shorter sibling key.
+    async fn set_note_property(
+        &self,
+        id: Uuid,
+        key: &str,
+        value: Value,
         updated_at: i64,
     ) -> StorageResult<bool>;
     /// Query notes by namespace and optional kind with pagination.
