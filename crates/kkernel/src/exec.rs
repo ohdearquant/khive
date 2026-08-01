@@ -3293,6 +3293,135 @@ backend = "sessions"
         );
     }
 
+    // ── round-2 follow-up: daemon-forward frame must reflect the corrected
+    // actor-pin visibility, not the displaced project-config fallback ────────
+
+    #[cfg(unix)]
+    std::thread_local! {
+        static SPY_CAPTURED_IDENTITY: std::cell::RefCell<Option<(Option<String>, Vec<String>)>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    #[cfg(unix)]
+    fn spy_capture_identity(frame: &DaemonRequestFrame) -> super::ForwardFuture<'_> {
+        SPY_CAPTURED_IDENTITY.with(|c| {
+            *c.borrow_mut() = Some((frame.actor_id.clone(), frame.visible_namespaces.clone()))
+        });
+        Box::pin(async { None })
+    }
+
+    /// Complements `actor_pin_default_read_exposes_only_local_and_pinned_records`
+    /// (`crates/kkernel/tests/actor_pin_default_read_scope.rs`, which reads
+    /// real seeded records back through `run_exec`'s in-process fallback):
+    /// this drives the SAME `--actor` pin through the daemon-forward framing
+    /// seam and asserts on the actual `DaemonRequestFrame` a live daemon
+    /// would receive — the wire-level proof that a warm daemon would filter
+    /// reads by the corrected identity too, not just the in-process path.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial]
+    async fn daemon_forward_frame_reflects_actor_pin_not_displaced_fallback() {
+        std::env::remove_var("KHIVE_EMBEDDING_MODEL");
+        std::env::remove_var("KHIVE_ADDITIONAL_EMBEDDING_MODELS");
+        std::env::remove_var("KHIVE_ACTOR");
+        std::env::remove_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR");
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let khive_dir = dir.path().join(".khive");
+        std::fs::create_dir_all(&khive_dir).expect("mkdir .khive");
+        std::fs::write(
+            khive_dir.join("config.toml"),
+            r#"
+[actor]
+id = "lambda:fallback"
+"#,
+        )
+        .expect("write config.toml");
+        let db_path = khive_dir.join("frame-identity-test.db");
+        let db_str = db_path.to_str().expect("utf8 path").to_string();
+        let pinned_packs = Some(vec!["kg".to_string()]);
+
+        let resolve = || {
+            resolve_runtime_config(RuntimeConfigInputs {
+                db: Some(&db_str),
+                config: None,
+                namespace: Namespace::parse("local").expect("ns"),
+                namespace_explicit: true,
+                actor_explicit: false,
+                no_embed: true,
+                packs: pinned_packs.clone(),
+                brain_profile: None,
+            })
+            .expect("resolve exec-shaped config")
+        };
+
+        // Non-local pin: the frame must carry the pinned actor and its
+        // namespace, never the displaced project-config fallback actor.
+        let mut pinned_cfg = resolve();
+        apply_actor_pin_and_expectation(&mut pinned_cfg, Some("lambda:pinned"), None).unwrap();
+        SPY_CAPTURED_IDENTITY.with(|c| *c.borrow_mut() = None);
+        let result = run_exec_inline_with_forward(
+            "stats()".to_string(),
+            pinned_cfg,
+            None,
+            None,
+            None,
+            ExecDbContext::default(),
+            false,
+            spy_capture_identity,
+        )
+        .await;
+        assert!(result.is_ok(), "pinned dispatch must succeed: {result:?}");
+        let (frame_actor, frame_visible) = SPY_CAPTURED_IDENTITY
+            .with(|c| c.borrow_mut().take())
+            .expect("spy must have captured a forwarded frame");
+        assert_eq!(
+            frame_actor.as_deref(),
+            Some("lambda:pinned"),
+            "the forwarded frame's actor_id must be the pin, not the project-config fallback"
+        );
+        assert!(
+            frame_visible.iter().any(|ns| ns == "lambda:pinned"),
+            "the forwarded frame's visible_namespaces must include the pinned actor: \
+             {frame_visible:?}"
+        );
+        assert!(
+            !frame_visible.iter().any(|ns| ns == "lambda:fallback"),
+            "the forwarded frame's visible_namespaces must NOT retain the displaced \
+             fallback actor: {frame_visible:?}"
+        );
+
+        // `local` pin: the frame must carry no actor and no extra visibility —
+        // the fallback must not survive under the anonymous identity either.
+        let mut local_cfg = resolve();
+        apply_actor_pin_and_expectation(&mut local_cfg, Some("local"), None).unwrap();
+        SPY_CAPTURED_IDENTITY.with(|c| *c.borrow_mut() = None);
+        let result = run_exec_inline_with_forward(
+            "stats()".to_string(),
+            local_cfg,
+            None,
+            None,
+            None,
+            ExecDbContext::default(),
+            false,
+            spy_capture_identity,
+        )
+        .await;
+        assert!(result.is_ok(), "local-pin dispatch must succeed: {result:?}");
+        let (frame_actor, frame_visible) = SPY_CAPTURED_IDENTITY
+            .with(|c| c.borrow_mut().take())
+            .expect("spy must have captured a forwarded frame");
+        assert_eq!(
+            frame_actor, None,
+            "the forwarded frame's actor_id must be cleared under a local pin"
+        );
+        assert!(
+            frame_visible.is_empty(),
+            "the forwarded frame's visible_namespaces must be empty under a local pin, \
+             retaining neither the fallback actor nor the previous pin: {frame_visible:?}"
+        );
+    }
+
     // ── #1226: inline --db/[[backends]] guard must fire before daemon-forward ──
 
     #[cfg(unix)]
