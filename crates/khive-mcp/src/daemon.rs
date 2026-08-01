@@ -739,16 +739,24 @@ fn spawn_daemon() -> std::io::Result<std::process::Child> {
 }
 
 fn spawn_daemon_with_exe(exe: &std::path::Path) -> std::io::Result<std::process::Child> {
+    spawn_daemon_with_exe_and_config(exe, None)
+}
+
+fn spawn_daemon_with_exe_and_config(
+    exe: &std::path::Path,
+    config: Option<&std::path::Path>,
+) -> std::io::Result<std::process::Child> {
     #[cfg(test)]
     SPAWN_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
     // The binary is `kkernel`; the MCP server (and its daemon mode) live under
     // the `mcp` subcommand.
     let mut cmd = std::process::Command::new(exe);
-    cmd.arg("mcp")
-        .arg("--daemon")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null());
+    cmd.arg("mcp").arg("--daemon");
+    if let Some(path) = config {
+        cmd.arg("--config").arg(path);
+    }
+    cmd.stdin(Stdio::null()).stdout(Stdio::null());
     // The daemon's tracing (including WAL/checkpoint telemetry) goes to
     // stderr honoring KHIVE_LOG (init_tracing in kkernel's main.rs) — wiring
     // it to /dev/null silently discards all of it. Route it to a log file
@@ -1934,6 +1942,25 @@ async fn wait_for_boot_quiescence_then_reprobe(frame: &DaemonRequestFrame) -> Bo
 /// locally (#644). See `crates/khive-mcp/docs/api/daemon-lifecycle.md`.
 pub async fn forward_or_spawn(frame: &DaemonRequestFrame) -> Option<Result<String, McpError>> {
     forward_or_spawn_with(frame, &spawn_daemon).await
+}
+
+/// Forward a request while preserving an explicit config selection on a
+/// daemon this call may need to spawn.
+///
+/// An already-running daemon is still matched exclusively by `config_id`.
+/// `config` only supplies the construction input for a missing daemon; without
+/// it, `kkernel exec --config <path>` would spawn `kkernel mcp --daemon`
+/// against automatic discovery and immediately disagree with the request it
+/// was spawned to serve.
+pub async fn forward_or_spawn_with_config(
+    frame: &DaemonRequestFrame,
+    config: Option<&std::path::Path>,
+) -> Option<Result<String, McpError>> {
+    let spawn = || {
+        let exe = std::env::current_exe()?;
+        spawn_daemon_with_exe_and_config(&exe, config)
+    };
+    forward_or_spawn_with(frame, &spawn).await
 }
 
 #[cfg(test)]
