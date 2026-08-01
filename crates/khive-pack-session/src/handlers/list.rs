@@ -267,7 +267,10 @@ mod tests {
         .await
         .expect("list since");
 
-        assert_eq!(result["sessions"].as_array().expect("sessions array").len(), 0);
+        assert_eq!(
+            result["sessions"].as_array().expect("sessions array").len(),
+            0
+        );
         assert_eq!(result["total"], 0);
     }
 }
