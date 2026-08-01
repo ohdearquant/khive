@@ -269,6 +269,23 @@ pub fn arm_rollback_cleanup_fail(ns: &str) {
     *ROLLBACK_CLEANUP_FAIL_NS.lock().unwrap() = Some(ns.to_string());
 }
 
+/// `atomic_message::create_notes_atomic` equivalents of the `FTS_FAIL_NS`/
+/// `VECTOR_FAIL_NS` checks above, reusing the SAME arm sets (and thus the
+/// SAME `arm_fts_fail_scoped`/`arm_vector_fail_scoped` test API) so a test
+/// can arm one call and exercise either write path. `create_notes_atomic`
+/// builds raw `PlanStatement`s instead of calling `text_for_notes()`/
+/// `vectors_for_model().insert()`, so it cannot reuse `consume_fault`
+/// in-line the way `create_note_inner` does above; these wrappers are the
+/// seam that lets it check the same arms.
+#[cfg(any(test, feature = "fault-injection"))]
+pub(crate) fn consume_fts_fail_fault(ns: &str) -> bool {
+    consume_fault(&FTS_FAIL_NS, ns)
+}
+#[cfg(any(test, feature = "fault-injection"))]
+pub(crate) fn consume_vector_fail_fault(ns: &str) -> bool {
+    consume_fault(&VECTOR_FAIL_NS, ns)
+}
+
 /// A note search result with UUID, salience-weighted RRF score, and display text.
 #[derive(Clone, Debug)]
 pub struct NoteSearchHit {
