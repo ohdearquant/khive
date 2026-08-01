@@ -6,14 +6,14 @@ dual-write, actor-addressed delivery.
 
 ## Verbs
 
-| Verb          | What it does                                                       |
-| ------------- | ------------------------------------------------------------------ |
-| `comm.send`   | Send a message, optionally threaded                                |
-| `comm.inbox`  | List inbound messages for the caller (filter: unread / read / all) |
-| `comm.read`   | Mark an inbound message as read (best-effort: inspect `read`; `false` plus `mark_error` means re-issue later) |
-| `comm.unread` | Count the caller's unread inbound messages without message payloads |
-| `comm.reply`  | Reply to a message, preserving thread linkage                      |
-| `comm.thread` | Retrieve all messages in a conversation thread, chronologically    |
+| Verb          | What it does                                                                                                                                                  |
+| ------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `comm.send`   | Send a message, optionally threaded                                                                                                                           |
+| `comm.inbox`  | List inbound messages for the caller (filter: unread / read / all)                                                                                            |
+| `comm.read`   | Mark an inbound message as read (best-effort: inspect `read`; `false` plus `mark_error` means re-issue later)                                                 |
+| `comm.unread` | Count the caller's unread inbound messages without message payloads                                                                                           |
+| `comm.reply`  | Reply to a message, preserving thread linkage                                                                                                                 |
+| `comm.thread` | Retrieve all messages in a conversation thread, chronologically                                                                                               |
 | `comm.probe`  | Read-only poll for new inbound message metadata and a stale unread count (takes an explicit `actor`; unlike `comm.inbox`, it is not inferred from the caller) |
 
 A sixth handler, `comm.ingest`, is `Visibility::Subhandler` — it lets an

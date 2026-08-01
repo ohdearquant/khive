@@ -157,15 +157,15 @@ Composite scores are always in [0,1]. Typical production floor: 0.3-0.7.
 
 ### Comm pack — 7 verbs (`comm.` prefix)
 
-| Verb          | What it does                                                           | When to use                                   |
-| ------------- | ---------------------------------------------------------------------- | --------------------------------------------- |
-| `comm.send`   | Send a message (optionally threaded)                                   | Inter-agent or inter-namespace messaging      |
-| `comm.inbox`  | List inbound messages                                                  | Check what's waiting                          |
+| Verb          | What it does                                                                                                                 | When to use                                   |
+| ------------- | ---------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------- |
+| `comm.send`   | Send a message (optionally threaded)                                                                                         | Inter-agent or inter-namespace messaging      |
+| `comm.inbox`  | List inbound messages                                                                                                        | Check what's waiting                          |
 | `comm.read`   | Mark an **inbound** message as read (best-effort: check `read` in the response; `false` + `mark_error` means re-issue later) | Acknowledge receipt (recipient action)        |
-| `comm.reply`  | Reply to a message (threading linkage)                                 | Respond in-thread                             |
-| `comm.thread` | Retrieve full conversation thread                                      | Read the whole conversation                   |
-| `comm.health` | Per-channel health snapshot (no args)                                  | Check daemon channel-poll state               |
-| `comm.probe`  | Read-only poll for new inbound message metadata and stale unread count | Cheap wake-up check without a full inbox scan |
+| `comm.reply`  | Reply to a message (threading linkage)                                                                                       | Respond in-thread                             |
+| `comm.thread` | Retrieve full conversation thread                                                                                            | Read the whole conversation                   |
+| `comm.health` | Per-channel health snapshot (no args)                                                                                        | Check daemon channel-poll state               |
+| `comm.probe`  | Read-only poll for new inbound message metadata and stale unread count                                                       | Cheap wake-up check without a full inbox scan |
 
 **Inbox shape (ADR-057).** `comm.inbox` is scannable: each entry carries top-level `from`, `to`,
 `subject`, `read`, `direction`, and a derived `preview` (whitespace-collapsed, truncated to 80
