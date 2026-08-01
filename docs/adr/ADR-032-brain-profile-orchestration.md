@@ -189,7 +189,9 @@ field — they were never "served" by a profile.
 // Minimum payload shape for profile-served events.
 #[derive(Serialize, Deserialize)]
 pub struct ServedEventPayload {
-    pub served_by_profile_id: Option<String>,  // None ⇒ legacy event (see Amendment 1)
+    pub served_by_profile_id: Option<String>,
+    #[serde(default)]
+    pub serve_attribution: ServeAttribution, // see Amendment 2
     #[serde(flatten)]
     pub kind_specific: serde_json::Value,
 }
@@ -205,7 +207,12 @@ interleaved counterfactual or skip the event.
 
 ```rust
 pub enum BrainSignal {
-    RecallHit     { target_id: Uuid, latency_us: i64 },
+    RecallHit     {
+        target_id: Uuid,
+        latency_us: i64,
+        served_by_profile_id: Option<String>,
+        serve_attribution: ServeAttribution,
+    },
     RecallMiss,
     SearchCompleted { latency_us: i64 },
     Feedback      { target_id: Uuid, signal: FeedbackSignal },
@@ -1033,27 +1040,27 @@ out of scope — runaway feedback risk requires its own ADR.
 
 > **Amendment (current shipped v1)**: verbs `brain.create_profile` and `brain.bindings`
 > are public. `brain.profile` accepts canonical `profile_id` and legacy alias `id`.
-> `brain.feedback` takes `(target_id, signal, served_by_profile_id?)`. `brain.reset`
+> `brain.feedback` takes `(target_id, signal, served_by_profile_id?, serve_attribution?)`. `brain.reset`
 > accepts optional `profile_id` and defaults to `balanced-recall-v1`.
 
-| Verb                                                                     | Speech act (ADR-025) | Visibility | Purpose                                                                                                                                                                |
-| ------------------------------------------------------------------------ | -------------------- | ---------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `brain.profiles`                                                         | assertive            | Verb       | List profiles, optionally filtered by lifecycle.                                                                                                                       |
-| `brain.profile(profile_id)`                                              | assertive            | Verb       | Metadata, latest snapshot, current state summary. `profile_id` is canonical; `id` is accepted as a legacy alias.                                                       |
-| `brain.resolve(actor?, namespace?, consumer_kind)`                       | assertive            | Verb       | Show which non-archived profile would serve this caller context, falling back to `balanced-recall-v1` when no binding matches.                                         |
-| `brain.bindings(profile_id?, actor?, namespace?, consumer_kind?)`        | assertive            | Verb       | List `BrainState.bindings` rows, optionally filtered.                                                                                                                  |
-| `brain.activate(profile_id)`                                             | commissive           | Verb       | Move an inactive profile to Active. Archived profiles reject because archive is terminal.                                                                              |
-| `brain.deactivate(profile_id)`                                           | commissive           | Verb       | Move to Inactive.                                                                                                                                                      |
-| `brain.archive(profile_id)`                                              | commissive           | Verb       | Move to Archived after deactivation; archived is terminal/read-only.                                                                                                   |
-| `brain.reset(profile_id?)`                                               | declaration          | Verb       | Reset posteriors to priors, increment `exploration_epoch`, and sync `ProfileRecord.state_snapshot`. Defaults to `balanced-recall-v1`.                                  |
-| `brain.create_profile(name, description?, consumer_kind?, seed_priors?)` | declaration          | Verb       | Create an inactive Bayesian `ProfileRecord` plus live `BalancedRecallState`. `seed_priors` seeds section posteriors, not the three recall Beta priors.                 |
-| `brain.bind(profile_id, actor?, namespace?, consumer_kind?, priority?)`  | declaration          | Verb       | Write a binding row into `BrainState.bindings`. Archived profiles are rejected.                                                                                        |
-| `brain.unbind(profile_id?, actor?, namespace?, consumer_kind?)`          | declaration          | Verb       | Remove binding rows. At least one filter is required.                                                                                                                  |
-| `brain.feedback(target_id, signal, served_by_profile_id?)`               | commissive           | Verb       | Emit a `FeedbackExplicit` event and fold it into the selected profile's `BalancedRecallState`; defaults to `balanced-recall-v1` when `served_by_profile_id` is absent. |
-| `brain.events`                                                           | assertive            | Subhandler | Debug event listing.                                                                                                                                                   |
-| `brain.emit`                                                             | assertive            | Subhandler | Manual event emit/debug path; prefer `brain.feedback`.                                                                                                                 |
-| `brain.config`                                                           | assertive            | Subhandler | Projected pack config for inspection.                                                                                                                                  |
-| `brain.state`                                                            | assertive            | Subhandler | Return current `BrainState` snapshot for inspection.                                                                                                                   |
+| Verb                                                                           | Speech act (ADR-025) | Visibility | Purpose                                                                                                                                                                       |
+| ------------------------------------------------------------------------------ | -------------------- | ---------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `brain.profiles`                                                               | assertive            | Verb       | List profiles, optionally filtered by lifecycle.                                                                                                                              |
+| `brain.profile(profile_id)`                                                    | assertive            | Verb       | Metadata, latest snapshot, current state summary. `profile_id` is canonical; `id` is accepted as a legacy alias.                                                              |
+| `brain.resolve(actor?, namespace?, consumer_kind)`                             | assertive            | Verb       | Show which non-archived profile would serve this caller context, falling back to `balanced-recall-v1` when no binding matches.                                                |
+| `brain.bindings(profile_id?, actor?, namespace?, consumer_kind?)`              | assertive            | Verb       | List `BrainState.bindings` rows, optionally filtered.                                                                                                                         |
+| `brain.activate(profile_id)`                                                   | commissive           | Verb       | Move an inactive profile to Active. Archived profiles reject because archive is terminal.                                                                                     |
+| `brain.deactivate(profile_id)`                                                 | commissive           | Verb       | Move to Inactive.                                                                                                                                                             |
+| `brain.archive(profile_id)`                                                    | commissive           | Verb       | Move to Archived after deactivation; archived is terminal/read-only.                                                                                                          |
+| `brain.reset(profile_id?)`                                                     | declaration          | Verb       | Reset posteriors to priors, increment `exploration_epoch`, and sync `ProfileRecord.state_snapshot`. Defaults to `balanced-recall-v1`.                                         |
+| `brain.create_profile(name, description?, consumer_kind?, seed_priors?)`       | declaration          | Verb       | Create an inactive Bayesian `ProfileRecord` plus live `BalancedRecallState`. `seed_priors` seeds section posteriors, not the three recall Beta priors.                        |
+| `brain.bind(profile_id, actor?, namespace?, consumer_kind?, priority?)`        | declaration          | Verb       | Write a binding row into `BrainState.bindings`. Archived profiles are rejected.                                                                                               |
+| `brain.unbind(profile_id?, actor?, namespace?, consumer_kind?)`                | declaration          | Verb       | Remove binding rows. At least one filter is required.                                                                                                                         |
+| `brain.feedback(target_id, signal, served_by_profile_id?, serve_attribution?)` | commissive           | Verb       | Emit a `FeedbackExplicit` event and fold it into the selected profile's `BalancedRecallState`; only omitted/`unspecified` serve attribution permits binding/default fallback. |
+| `brain.events`                                                                 | assertive            | Subhandler | Debug event listing.                                                                                                                                                          |
+| `brain.emit`                                                                   | assertive            | Subhandler | Manual event emit/debug path; prefer `brain.feedback`.                                                                                                                        |
+| `brain.config`                                                                 | assertive            | Subhandler | Projected pack config for inspection.                                                                                                                                         |
+| `brain.state`                                                                  | assertive            | Subhandler | Return current `BrainState` snapshot for inspection.                                                                                                                          |
 
 `brain.backtest`, `brain.compare`, `brain.snapshot`, `brain.merge_profiles`, LoRA adapter
 import/export, and generic `Profile` composition are deferred target architecture, not
@@ -1311,6 +1318,42 @@ As of #1016, newly emitted `FeedbackExplicit` events always persist the effectiv
   predates this amendment (legacy semantics). Historical events are not retro-stamped —
   the resolution table may have changed since they were written — and decoders remain
   tolerant of both missing fields.
+
+---
+
+## Amendment 2 — Serve-attribution tri-state and automatic-signal routing (2026-08-01, #1475, #1486)
+
+Amendment 1 treated a missing serve-time profile id as legacy omission and therefore
+allowed `brain.feedback` to resolve a current binding/default. That is unsafe when the id
+is missing because recall selected a profile but could not read its record: configured
+defaults served, so resolving that profile again at feedback time credits a profile that
+did not serve.
+
+New recall results, `RecallExecuted` events, automatic dispatch-hook events, and feedback
+events carry `serve_attribution: "profile" | "unattributed" | "unspecified"`:
+
+- On recall results and feedback input, `profile` requires `served_by_profile_id` and means
+  the named profile state served; `unattributed` forbids it and records a failed
+  profile-record read; `unspecified` forbids it and means no serve-time attribution was
+  available. Omission of the new field remains the legacy form: an accompanying profile id
+  implies `profile`, while no id implies `unspecified`.
+- A feedback event produced from `unspecified` input may carry the effective
+  `served_by_profile_id` selected by the legacy binding/default fallback together with
+  `profile_resolution`. The marker still records the original serve-time knowledge; the id
+  records the profile that the feedback fold actually credited, as required by Amendment 1.
+
+Automatic `RecallHit` signals route to the named profile-local posterior when the state is
+available. `unspecified` retains the historical built-in-profile route. `unattributed`, a
+contradictory payload, or a named profile absent from the namespace state fails closed and
+updates no profile; it must never fall back to `balanced-recall-v1`.
+
+For implicit feedback, `unattributed` is appended as an auditable forced-zero event with a
+null `served_by_profile_id`, then skips profile and section-posterior mutation entirely.
+Ledger feedback whose `accounting_profile_id` is null follows the same path. Explicit or
+correction feedback carrying `unattributed` is rejected because no profile can receive
+that credit. This is the sole exception to Amendment 1's always-stamped rule. Ordinary
+legacy/`unspecified` feedback still resolves explicit id → matching binding → system
+default exactly as before.
 
 ---
 

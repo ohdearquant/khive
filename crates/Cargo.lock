@@ -2114,6 +2114,7 @@ dependencies = [
  "serial_test",
  "tempfile",
  "tokio",
+ "tracing",
  "uuid",
 ]
 

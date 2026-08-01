@@ -9,7 +9,7 @@ use crate::recall_feedback::{on_recall_hit, on_recall_miss};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
-use khive_brain_core::{compute_query_class, PackTunable};
+use khive_brain_core::{compute_query_class, PackTunable, ServeAttribution};
 use khive_fusion::FusionStrategy;
 use khive_runtime::{
     micros_to_iso, KhiveRuntime, Namespace, NamespaceToken, RequestIdentity, RuntimeError,
@@ -169,41 +169,45 @@ impl MemoryPack {
         // Resolve once BEFORE scoring so projection, response stamp, and ledger cannot drift.
         // Explicit unknown IDs error; unreadable bound state degrades to configured defaults.
         let mut profile_state: Option<khive_brain_core::BalancedRecallState> = None;
-        let served_by_profile_id: Option<String> = if let Some(ref pid) = p.profile_id {
-            let resp = load_brain_profile(registry, token, pid)
-                .await
-                .map_err(|e| {
-                    RuntimeError::InvalidInput(format!(
-                        "profile_id {pid:?} is not a known profile: {e}"
-                    ))
-                })?;
-            profile_state = super::common::balanced_recall_state_from_profile_response(&resp);
-            Some(pid.clone())
-        } else {
-            let mut resolved =
-                super::common::resolve_serving_profile(&self.brain_profile, token, registry).await;
-            if let Some(ref profile_id) = resolved {
-                match load_brain_profile(registry, token, profile_id).await {
-                    Ok(resp) => {
-                        profile_state =
-                            super::common::balanced_recall_state_from_profile_response(&resp);
+        let (served_by_profile_id, serve_attribution): (Option<String>, ServeAttribution) =
+            if let Some(ref pid) = p.profile_id {
+                let resp = load_brain_profile(registry, token, pid)
+                    .await
+                    .map_err(|e| {
+                        RuntimeError::InvalidInput(format!(
+                            "profile_id {pid:?} is not a known profile: {e}"
+                        ))
+                    })?;
+                profile_state = super::common::balanced_recall_state_from_profile_response(&resp);
+                (Some(pid.clone()), ServeAttribution::Profile)
+            } else {
+                let resolved =
+                    super::common::resolve_serving_profile(&self.brain_profile, token, registry)
+                        .await;
+                if let Some(profile_id) = resolved {
+                    match load_brain_profile(registry, token, &profile_id).await {
+                        Ok(resp) => {
+                            profile_state =
+                                super::common::balanced_recall_state_from_profile_response(&resp);
+                            (Some(profile_id), ServeAttribution::Profile)
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                profile_id = %profile_id,
+                                error = %e,
+                                "ADR-104 §1: profile record unreadable; recall scores with configured defaults and is not attributed to the profile"
+                            );
+                            // A profile whose record cannot be read never served this recall;
+                            // stamping it would credit downstream feedback to a profile that
+                            // had no effect on ranking. A readable record with a null snapshot
+                            // (new profile) still stamps — that is the posterior bootstrap path.
+                            (None, ServeAttribution::Unattributed)
+                        }
                     }
-                    Err(e) => {
-                        tracing::warn!(
-                            profile_id = %profile_id,
-                            error = %e,
-                            "ADR-104 §1: profile record unreadable; recall scores with configured defaults and is not attributed to the profile"
-                        );
-                        // A profile whose record cannot be read never served this recall;
-                        // stamping it would credit downstream feedback to a profile that
-                        // had no effect on ranking. A readable record with a null snapshot
-                        // (new profile) still stamps — that is the posterior bootstrap path.
-                        resolved = None;
-                    }
+                } else {
+                    (None, ServeAttribution::Unspecified)
                 }
-            }
-            resolved
-        };
+            };
 
         // Project request-local weights without mutating pack config; retain defaults for ratios.
         let default_weights = scoring_cfg.weights.clone();
@@ -360,10 +364,13 @@ impl MemoryPack {
             self.track_recall_serve(
                 token,
                 registry,
-                query_trimmed,
-                served_by_profile_id.as_deref(),
-                Vec::new(),
-                recall_start.elapsed().as_micros() as i64,
+                RecallServeFields {
+                    query_raw: query_trimmed,
+                    served_by_profile_id: served_by_profile_id.as_deref(),
+                    serve_attribution,
+                    target_ids: Vec::new(),
+                    latency_us: recall_start.elapsed().as_micros() as i64,
+                },
             );
             if let Ok(mut state) = self.recall_state.lock() {
                 on_recall_miss(&mut state);
@@ -753,6 +760,9 @@ impl MemoryPack {
                 r["served_by_profile_id"] = json!(profile_id);
             }
         }
+        for r in results.iter_mut() {
+            r["serve_attribution"] = json!(serve_attribution);
+        }
 
         let target_ids = results
             .iter()
@@ -761,10 +771,13 @@ impl MemoryPack {
         self.track_recall_serve(
             token,
             registry,
-            query_trimmed,
-            served_by_profile_id.as_deref(),
-            target_ids,
-            recall_start.elapsed().as_micros() as i64,
+            RecallServeFields {
+                query_raw: query_trimmed,
+                served_by_profile_id: served_by_profile_id.as_deref(),
+                serve_attribution,
+                target_ids,
+                latency_us: recall_start.elapsed().as_micros() as i64,
+            },
         );
 
         // Update recall-domain posteriors before returning.
@@ -868,11 +881,15 @@ impl MemoryPack {
         &self,
         token: &NamespaceToken,
         registry: &VerbRegistry,
-        query_raw: &str,
-        served_by_profile_id: Option<&str>,
-        target_ids: Vec<String>,
-        latency_us: i64,
+        fields: RecallServeFields<'_>,
     ) {
+        let RecallServeFields {
+            query_raw,
+            served_by_profile_id,
+            serve_attribution,
+            target_ids,
+            latency_us,
+        } = fields;
         let registry = registry.clone();
         let namespace = token.namespace().as_str().to_string();
         let query_raw = query_raw.to_string();
@@ -919,6 +936,7 @@ impl MemoryPack {
                 RecallExecutedFields {
                     actor,
                     served_by_profile_id,
+                    serve_attribution,
                     query_raw,
                     query_class,
                     target_ids,
@@ -930,12 +948,23 @@ impl MemoryPack {
     }
 }
 
+/// Values captured at the recall response boundary for background serve
+/// accounting and telemetry.
+struct RecallServeFields<'a> {
+    query_raw: &'a str,
+    served_by_profile_id: Option<&'a str>,
+    serve_attribution: ServeAttribution,
+    target_ids: Vec<String>,
+    latency_us: i64,
+}
+
 /// Fields for the best-effort `RecallExecuted` telemetry event. Grouped into a
 /// struct rather than passed positionally to stay under clippy's
 /// too-many-arguments threshold.
 struct RecallExecutedFields {
     actor: String,
     served_by_profile_id: Option<String>,
+    serve_attribution: ServeAttribution,
     query_raw: String,
     query_class: String,
     target_ids: Vec<String>,
@@ -949,7 +978,8 @@ struct RecallExecutedFields {
 /// candidate pool at this emission boundary, so every served id is reported
 /// as both), the typed result kind (`memory.recall` always serves `note`
 /// substrate records), the full query text, `served_by_profile_id`, the
-/// calling actor, and a timestamp (`Event::new` stamps `created_at`).
+/// tri-state `serve_attribution`, the calling actor, and a timestamp
+/// (`Event::new` stamps `created_at`).
 async fn emit_recall_executed_event(
     rt: &KhiveRuntime,
     token: &NamespaceToken,
@@ -958,6 +988,7 @@ async fn emit_recall_executed_event(
     let RecallExecutedFields {
         actor,
         served_by_profile_id,
+        serve_attribution,
         query_raw,
         query_class,
         target_ids,
@@ -979,6 +1010,7 @@ async fn emit_recall_executed_event(
     let payload = json!({
         "actor": actor,
         "served_by_profile_id": served_by_profile_id,
+        "serve_attribution": serve_attribution,
         "query": query_raw,
         "query_class": query_class,
         "result_kind": "note",
@@ -1016,7 +1048,7 @@ mod tests {
     };
     use khive_storage::Entity;
     use lattice_embed::{EmbedError, EmbeddingModel, EmbeddingService};
-    use serde_json::Value;
+    use serde_json::{json, Value};
     use serial_test::serial;
     use tokio::sync::Notify;
     use tracing::field::{Field, Visit};
@@ -1549,6 +1581,7 @@ mod tests {
             serde_json::json!("adr081-recall-v1"),
             "recall response must stamp the resolved serving profile"
         );
+        assert_eq!(hits[0]["serve_attribution"], json!("profile"));
 
         // The ledger append is fired via track_background_task off the response
         // path, so poll briefly rather than assume it has landed by the time recall returns.
@@ -1673,6 +1706,11 @@ mod tests {
             event.payload["served_by_profile_id"],
             serde_json::Value::Null,
             "no profile was bound/resolved for this call"
+        );
+        assert_eq!(
+            event.payload["serve_attribution"],
+            json!("unspecified"),
+            "telemetry must preserve ordinary omission as a distinct state"
         );
         assert!(
             event.payload["query_class"]
@@ -2352,6 +2390,11 @@ mod tests {
             hits[0].get("served_by_profile_id").is_none(),
             "no brain pack registered => no profile resolvable => no stamp"
         );
+        assert_eq!(
+            hits[0]["serve_attribution"],
+            json!("unspecified"),
+            "ordinary omission must remain distinct from a failed profile read"
+        );
     }
 
     // ── Auto entity-name extraction (dead `entity_names` parameter fix) ────────
@@ -2933,6 +2976,7 @@ mod tests {
             serde_json::json!("adr104-override-v1"),
             "profile_id override must stamp the named profile with no binding required"
         );
+        assert_eq!(hits[0]["serve_attribution"], json!("profile"));
 
         let target_id = note.id.to_string();
         let mut found = false;

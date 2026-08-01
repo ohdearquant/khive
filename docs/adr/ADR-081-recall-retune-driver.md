@@ -175,11 +175,14 @@ equivalent maintained expression). When both source columns are set,
 `resolved_profile_id` / `resolved_at` are retained as the drift audit trail. Before a
 scorer emits for a row, it must resolve attribution and write `resolved_profile_id` +
 `resolved_at` (unless the stamp already populated `served_by_profile_id`), so
-`accounting_profile_id` is non-null for every row that produces a feedback event. Scorer emission passes the row's
-`accounting_profile_id` as `served_by_profile_id` on the feedback call, so the profile
-the fold's accounting key reads is exactly the profile the ledger attributes. An
-implicit event whose serve row has no resolvable profile is recorded at zero weight —
-the same fail-safe path as a clamp excess — never folded under a guessed profile.
+`accounting_profile_id` is non-null for every ordinarily attributable row. Scorer
+emission passes the row's `accounting_profile_id` as `served_by_profile_id` on the
+feedback call, so the profile the fold's accounting key reads is exactly the profile the
+ledger attributes. An implicit event whose serve row has no resolvable profile is
+recorded at zero weight — the same fail-safe path as a clamp excess — never folded under
+a guessed profile. Such a row is a valid auditable exception: feedback carries
+`serve_attribution="unattributed"`, persists a null `served_by_profile_id`, and performs
+no profile-posterior mutation.
 
 **Query class** is a deterministic normalization of the query string: lowercase, strip
 punctuation, collapse whitespace, sort unique tokens, join, take the first 16 hex chars
@@ -202,6 +205,12 @@ surface, not new shape: ADR-032 already specifies `served_by_profile_id:
 Option<String>` on profile-served event payloads and requires stage-scoped feedback to
 credit exactly the profile that served (ADR-032, "Profile-served events carry
 `served_by_profile_id`").
+
+The additive `serve_attribution` marker from ADR-032 Amendment 2 makes a null id
+unambiguous. `unattributed` means a selected profile record was unreadable and prevents
+feedback-time binding/default re-resolution; `unspecified` means no profile resolved and
+retains legacy fallback behavior. The recall response, serve ledger, `RecallExecuted`
+telemetry, and automatic feedback must derive from the same state.
 
 The stamp is specified here but ships as a **separate implementation PR gated on a
 latency measurement**: resolution adds a cross-pack dispatch on the hot recall path

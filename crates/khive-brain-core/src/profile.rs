@@ -386,6 +386,8 @@ mod tests {
             state.apply_signal(&crate::brain_signal::BrainSignal::RecallHit {
                 target_id: id,
                 latency_us: 10_000,
+                served_by_profile_id: None,
+                serve_attribution: crate::brain_signal::ServeAttribution::Unspecified,
             });
         }
         let snap = state.to_snapshot();

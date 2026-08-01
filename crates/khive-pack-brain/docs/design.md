@@ -104,6 +104,11 @@ $$\text{Beta}(\alpha_1 + \alpha_2 - \alpha_{\text{prior}},\; \beta_1 + \beta_2 -
 - `brain.feedback` validates `target_id` existence against the KG before folding, and validates
   `served_by_profile_id` lifecycle before updating (must be non-archived). Lifecycle check
   precedes the event-log append so rejected calls leave no trace in the log (issue C4, R3-1).
+- `serve_attribution="unattributed"` is explicit negative serve-time knowledge. Implicit
+  feedback is recorded through the forced-zero gate and skips every profile mutation; it
+  never re-resolves a binding/default. Omission remains the legacy fallback path (#1486).
+- Automatic recall signals carry the same tri-state and update the named profile-local
+  posterior. Only `unspecified`/legacy signals update the built-in default (#1475).
 - `brain.unbind` requires at least one filter (`profile_id`, `actor`, `namespace`, or
   `consumer_kind`) to prevent accidental wipe of all bindings (issue C2).
 - `brain.bind` rejects archived profiles to prevent creating unresolvable bindings (issue C3).

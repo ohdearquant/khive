@@ -241,7 +241,11 @@ mean:     (1 + alpha') / (2 + alpha' + beta')        # Beta(1,1) prior enters he
   near `1 / (1 - 2^(-1/30)) = 43.8`, a decayed mean near 0.978, and a persistent
   multiplier near 1.143, enough to durably order candidates on exposure alone.
   `RecallHit` retains its shipped global-posterior updates (relevance and temporal);
-  `NoteAccessed` has no global-posterior effect in the shipped reducer and loses only
+  those global updates are applied to the profile stamped by the serve-time
+  `serve_attribution="profile"` contract (ADR-032 Amendment 2), not unconditionally to
+  `balanced-recall-v1`. An `unattributed` hit updates no profile, while an
+  `unspecified`/legacy hit retains the built-in fallback. `NoteAccessed` has no
+  global-posterior effect in the shipped reducer and loses only
   its per-entity effect here, so after Stage D a `NoteAccessed` leaves every posterior
   unchanged. Only the per-entity accrual rule changes. This amends the accepted ADR's
   Stage B accrual behavior as part of Stage D.
