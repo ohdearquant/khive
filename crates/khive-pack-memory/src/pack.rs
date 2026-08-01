@@ -949,6 +949,7 @@ mod note_mutation_hook_tests {
             "sanity: warm-up recall must leave the ANN cache current before \
              the merge under test"
         );
+        let generation_before = ann::generation_for_test(&ann, &mutation_hook_ann_key()).await;
 
         registry
             .dispatch(
@@ -963,9 +964,15 @@ mod note_mutation_hook_tests {
             .expect("kg merge on memory-kind notes");
 
         assert!(
-            !ann::is_current(&ann, &mutation_hook_ann_key()).await,
+            ann::generation_for_test(&ann, &mutation_hook_ann_key()).await > generation_before,
             "a KG `merge` of two memory-kind notes must invalidate the warm \
              ANN generation (#750)"
+        );
+        ann::wait_until_warm_idle(&ann, &mutation_hook_ann_key()).await;
+        assert!(
+            ann::is_current(&ann, &mutation_hook_ann_key()).await,
+            "the mutation-triggered background rebuild must converge on the \
+             post-merge generation without another recall"
         );
     }
 

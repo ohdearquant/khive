@@ -405,6 +405,78 @@ pub fn event_insert_statements(event: &Event) -> Result<Vec<SqlStatement>, rusql
     Ok(statements)
 }
 
+/// Build commit-time warning inserts for lineage-sensitive incident edges
+/// removed by a hard-delete cascade (ADR-002).
+///
+/// Each statement handles one protected relation and reads `graph_edges`
+/// when it executes, inside the caller's delete transaction. This is
+/// intentionally not a prepare-time edge query: a guarded edge write that
+/// commits immediately before the delete must be represented in the warning
+/// payload before the subsequent cascade statement removes it. Relations
+/// with no matching incident edge insert no event.
+pub fn hard_delete_lineage_warning_statements(
+    namespace: &str,
+    actor: &str,
+    target_id: Uuid,
+    substrate: SubstrateKind,
+) -> Vec<SqlStatement> {
+    const WARNINGS: [(&str, &str); 5] = [
+        ("derived_from", "provenance_loss"),
+        ("supersedes", "replacement_lineage_loss"),
+        ("precedes", "temporal_sequence_loss"),
+        ("supports", "evidential_link_loss"),
+        ("refutes", "evidential_link_loss"),
+    ];
+
+    let target_id = target_id.to_string();
+    let created_at = chrono::Utc::now().timestamp_micros();
+    WARNINGS
+        .into_iter()
+        .map(|(relation, warning)| SqlStatement {
+            sql: "INSERT INTO events \
+                  (id, namespace, verb, substrate, actor, kind, outcome, payload, \
+                   payload_schema_version, profile_state_version, duration_us, target_id, \
+                   session_id, aggregate_kind, aggregate_id, created_at) \
+                  SELECT ?1, ?2, 'delete', ?3, ?4, ?5, ?6, \
+                         json_object( \
+                           'severity', 'warning', \
+                           'warning', ?7, \
+                           'deleted_id', ?8, \
+                           'relation', ?9, \
+                           'edge_count', count(*), \
+                           'edges', json_group_array(json_object( \
+                             'id', incident.id, \
+                             'namespace', incident.namespace, \
+                             'source_id', incident.source_id, \
+                             'target_id', incident.target_id, \
+                             'deleted_at', incident.deleted_at)) \
+                         ), \
+                         1, NULL, 0, ?8, NULL, NULL, NULL, ?10 \
+                  FROM ( \
+                    SELECT id, namespace, source_id, target_id, deleted_at \
+                    FROM graph_edges \
+                    WHERE (source_id = ?8 OR target_id = ?8) AND relation = ?9 \
+                    ORDER BY namespace, id \
+                  ) AS incident \
+                  HAVING count(*) > 0"
+                .into(),
+            params: vec![
+                SqlValue::Text(Uuid::new_v4().to_string()),
+                SqlValue::Text(namespace.to_string()),
+                SqlValue::Text(substrate.name().to_string()),
+                SqlValue::Text(actor.to_string()),
+                SqlValue::Text(EventKind::Audit.name().to_string()),
+                SqlValue::Text(EventOutcome::Success.name().to_string()),
+                SqlValue::Text(warning.to_string()),
+                SqlValue::Text(target_id.clone()),
+                SqlValue::Text(relation.to_string()),
+                SqlValue::Integer(created_at),
+            ],
+            label: Some(format!("hard-delete-{relation}-warning")),
+        })
+        .collect()
+}
+
 /// Insert `event` (and any derived `event_observations` rows) through the
 /// `khive-storage` `SqlWriter` seam, on a transaction the CALLER already
 /// opened and controls the commit/rollback boundary for. Issues no
