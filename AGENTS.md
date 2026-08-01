@@ -164,16 +164,16 @@ it does not train the default/live namespace's posterior state.
 
 ### Comm pack — 8 verbs (`comm.` prefix)
 
-| Verb          | What it does                                                                                            | When to use                                   |
-| ------------- | -------------------------------------------------------------------------------------------------------- | --------------------------------------------- |
-| `comm.send`   | Send a message (optionally threaded)                                                                     | Inter-agent or inter-namespace messaging      |
-| `comm.inbox`  | Page and filter inbound messages                                                                          | Check or triage what's waiting                |
-| `comm.unread` | Count-only view of unread inbound messages (no args, no payloads)                                        | Cheap unread check without listing            |
-| `comm.read`   | Mark one or more **inbound** messages as read (best-effort: inspect each result's `read`/`mark_error`)  | Acknowledge receipt (recipient action)        |
-| `comm.reply`  | Reply to a message (threading linkage)                                                                    | Respond in-thread                             |
-| `comm.thread` | Retrieve full conversation thread                                                                         | Read the whole conversation                   |
-| `comm.health` | Per-channel health snapshot with nominal cadence and advisory staleness (no args)                         | Check daemon channel-poll state               |
-| `comm.probe`  | Read-only poll for new inbound message metadata and stale unread count                                    | Cheap wake-up check without a full inbox scan |
+| Verb          | What it does                                                                                           | When to use                                   |
+| ------------- | ------------------------------------------------------------------------------------------------------ | --------------------------------------------- |
+| `comm.send`   | Send a message (optionally threaded)                                                                   | Inter-agent or inter-namespace messaging      |
+| `comm.inbox`  | Page and filter inbound messages                                                                       | Check or triage what's waiting                |
+| `comm.unread` | Count-only view of unread inbound messages (no args, no payloads)                                      | Cheap unread check without listing            |
+| `comm.read`   | Mark one or more **inbound** messages as read (best-effort: inspect each result's `read`/`mark_error`) | Acknowledge receipt (recipient action)        |
+| `comm.reply`  | Reply to a message (threading linkage)                                                                 | Respond in-thread                             |
+| `comm.thread` | Retrieve full conversation thread                                                                      | Read the whole conversation                   |
+| `comm.health` | Per-channel health snapshot with nominal cadence and advisory staleness (no args)                      | Check daemon channel-poll state               |
+| `comm.probe`  | Read-only poll for new inbound message metadata and stale unread count                                 | Cheap wake-up check without a full inbox scan |
 
 **Inbox shape (ADR-057).** `comm.inbox` is scannable: each entry carries top-level `from`, `to`,
 `subject`, `read`, `direction`, and a derived `preview` (whitespace-collapsed, truncated to 80
