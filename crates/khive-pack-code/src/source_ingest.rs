@@ -2,7 +2,7 @@
 //! (ADR-085 Amendment 2 B3-B6). L2 Scanner/Extractor is out of scope (PR-2).
 //!
 //! Every entity write in this pipeline runs through the runtime secret gate
-//! (ADR-085 D6 #4) via [`upsert_entity`]. A gate refusal quarantines that one
+//! (ADR-085 D6 #4) via `upsert_entity`. A gate refusal quarantines that one
 //! item — it is recorded in [`CodeSourceIngestReport::blocked`] and skipped —
 //! rather than aborting the rest of the sweep (issue #1594), the same
 //! per-record posture `git.digest` already uses for its own write refusals.
