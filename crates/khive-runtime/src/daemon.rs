@@ -1142,6 +1142,45 @@ async fn handle_conn<D: DaemonDispatch>(mut stream: UnixStream, dispatcher: D) {
     }
 }
 
+/// An accepted connection owns a drain slot from the accept loop until its
+/// handler future is dropped. The claim happens before spawning so shutdown
+/// cannot observe zero in the gap between `accept()` and the task's first poll.
+#[cfg(unix)]
+struct ActiveConnectionGuard {
+    active: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[cfg(unix)]
+impl ActiveConnectionGuard {
+    fn claim(active: Arc<std::sync::atomic::AtomicUsize>) -> Self {
+        active.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Self { active }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for ActiveConnectionGuard {
+    fn drop(&mut self) {
+        self.active
+            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+#[cfg(unix)]
+fn spawn_connection_task<F>(
+    active: Arc<std::sync::atomic::AtomicUsize>,
+    future: F,
+) -> tokio::task::JoinHandle<()>
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    let guard = ActiveConnectionGuard::claim(active);
+    tokio::spawn(async move {
+        let _guard = guard;
+        future.await;
+    })
+}
+
 /// Run the daemon: bind the socket, warm in the background, serve request
 /// frames until SIGTERM/SIGINT.
 ///
@@ -1599,11 +1638,8 @@ pub async fn run_daemon_with_boot_guard<D: DaemonDispatch>(
                             }
                         }
                         let d = dispatcher.clone();
-                        let active = Arc::clone(&active);
-                        tokio::spawn(async move {
-                            active.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        spawn_connection_task(Arc::clone(&active), async move {
                             handle_conn(stream, d).await;
-                            active.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                         });
                     }
                     Err(e) => tracing::error!(error = %e, "accept failed"),
@@ -2068,6 +2104,107 @@ mod tests {
         std::env::set_var(key, "0");
         assert!(!env_truthy(key));
         std::env::remove_var(key);
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    #[serial(background_tasks)]
+    async fn accepted_connection_is_counted_before_first_poll_and_drain_waits() {
+        use std::sync::atomic::Ordering;
+
+        let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let started_in_task = Arc::clone(&started);
+
+        let handle = spawn_connection_task(Arc::clone(&active), async move {
+            started_in_task.store(true, Ordering::Relaxed);
+            let _ = release_rx.await;
+        });
+
+        assert_eq!(active.load(Ordering::Relaxed), 1);
+        assert!(
+            !started.load(Ordering::Relaxed),
+            "the current-thread runtime must leave the spawned handler unpolled"
+        );
+
+        let drain_fut = drain(active.as_ref());
+        tokio::pin!(drain_fut);
+        let too_early =
+            tokio::time::timeout(std::time::Duration::from_millis(150), &mut drain_fut).await;
+        assert!(
+            too_early.is_err(),
+            "drain must wait for a connection claimed before its task's first poll"
+        );
+        assert!(started.load(Ordering::Relaxed));
+
+        release_tx.send(()).expect("handler still waiting");
+        tokio::time::timeout(std::time::Duration::from_secs(1), handle)
+            .await
+            .expect("handler should finish promptly")
+            .expect("handler should not panic");
+        assert_eq!(active.load(Ordering::Relaxed), 0);
+        tokio::time::timeout(std::time::Duration::from_secs(1), drain_fut)
+            .await
+            .expect("drain should finish once the handler releases its claim");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancelled_connection_releases_count_before_first_poll() {
+        use std::sync::atomic::Ordering;
+
+        let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let started_in_task = Arc::clone(&started);
+        let handle = spawn_connection_task(Arc::clone(&active), async move {
+            started_in_task.store(true, Ordering::Relaxed);
+            std::future::pending::<()>().await;
+        });
+
+        assert_eq!(active.load(Ordering::Relaxed), 1);
+        handle.abort();
+        let error = handle.await.expect_err("aborted handler must be cancelled");
+        assert!(error.is_cancelled());
+        assert!(!started.load(Ordering::Relaxed));
+        assert_eq!(active.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn panicked_connection_releases_count() {
+        use std::sync::atomic::Ordering;
+
+        let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let handle = spawn_connection_task(Arc::clone(&active), async move {
+            panic!("intentional connection-handler panic");
+        });
+
+        assert_eq!(active.load(Ordering::Relaxed), 1);
+        let error = handle
+            .await
+            .expect_err("panicked handler must fail its join");
+        assert!(error.is_panic());
+        assert_eq!(active.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn connection_claim_releases_if_spawn_panics() {
+        use std::sync::atomic::Ordering;
+
+        let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            drop(spawn_connection_task(Arc::clone(&active), async {}));
+        }));
+
+        assert!(result.is_err(), "tokio::spawn outside a runtime must panic");
+        assert_eq!(active.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    #[serial(background_tasks)]
+    async fn drain_returns_promptly_with_no_accepted_connection() {
+        let active = std::sync::atomic::AtomicUsize::new(0);
+        tokio::time::timeout(std::time::Duration::from_secs(1), drain(&active))
+            .await
+            .expect("empty drain should return immediately");
     }
 
     // `drain()` must wait for tracked background tasks (e.g. memory.recall's
