@@ -25,7 +25,7 @@ stdio, and `cargo test` finishes in 4 seconds.
 
 | Capability                  | How                                                                                                                                                      |
 | --------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **85 verbs, 12 packs**      | KG, GTD, memory, brain, comm, schedule, knowledge, session, git, code, workspace, blob: all load by default                                              |
+| **89 verbs, 12 packs**      | KG, GTD, memory, brain, comm, schedule, knowledge, session, git, code, workspace, blob: all load by default                                              |
 | **Typed entities**          | 9 closed kinds: concept, document, dataset, project, person, org, artifact, service, resource                                                            |
 | **Typed edges**             | 17 closed relations in 9 categories (structure, derivation, provenance, temporal, dependency, impl, lateral, annotation, epistemic)                      |
 | **Typed notes**             | 5 closed kinds: observation, insight, question, decision, reference                                                                                      |
@@ -140,8 +140,8 @@ records what's connected, in which direction, and why.
 │  khive-pack-kg:        KG vocabulary + 20 verb handlers       │
 │  khive-pack-gtd:       task lifecycle (5 verbs)               │
 │  khive-pack-memory:    salience + decay recall (5 verbs)      │
-│  khive-pack-brain:     Bayesian profiles (15 verbs)           │
-│  khive-pack-comm:      threaded messaging (7 verbs)           │
+│  khive-pack-brain:     Bayesian profiles (16 verbs)           │
+│  khive-pack-comm:      threaded messaging (8 verbs)           │
 │  khive-pack-schedule:  reminders + scheduled ops (4 verbs)    │
 │  khive-pack-knowledge: atom KB + embedding rerank (19 verbs)  │
 │  khive-pack-session:   session record persistence (4 verbs)   │
@@ -380,7 +380,7 @@ Docs: [ohdearquant.github.io/khive](https://ohdearquant.github.io/khive/) (agent
 
 ## Status
 
-**v0.5.0 (publication pending; crates.io currently serves 0.4.0).** 85 verbs across 12
+**v0.5.0 (publication pending; crates.io currently serves 0.4.0).** 89 verbs across 12
 packs, 9 entity kinds, 17 edge relations, daemon warm startup (ADR-049), knowledge search with
 embedding rerank, Bayesian brain profiles, threaded messaging, scheduled verb execution.
 Ready for use with Claude Code and any MCP-compatible agent.

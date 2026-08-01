@@ -849,7 +849,7 @@ request(ops="memory.vacuum()")
 
 ---
 
-## `brain` pack — 15 verbs
+## `brain` pack — 16 verbs
 
 Recall-tuning profiles: Beta-posterior scoring, profile lifecycle, and the actor/
 namespace/consumer-kind resolution table that picks which profile serves a given
@@ -1002,6 +1002,24 @@ to call right after `memory.recall` instead of hand-building `brain.feedback`.
 request(ops="memory.recall(query=\"x\", limit=5) | brain.auto_feedback(query=\"x\", results=[{\"id\": \"$prev.items[0].id\"}])")
 ```
 
+### `brain.mark_turn` — Commissive
+
+Emit a `PhaseStarted` event with `work_class="actor_turn"` carrying the calling actor and
+a timestamp. Callers invoke it once per bounded unit of work (a wake, a turn) so
+`brain.event_counts`'s `counts_by_work_class["actor_turn"]`, grouped by actor, gives a
+per-actor denominator (e.g. `feedback_explicit / actor_turn`) that is not biased toward
+whichever actor issues the most raw verb calls. Reuses the existing ADR-103 Stage 1
+`PhaseStarted`/`work_class` vocabulary rather than a new event kind. Best-effort — never
+fails the caller's turn.
+
+| Param   | Type   | Required | Notes                                                                                                                                             |
+| ------- | ------ | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `label` | string | no       | Free-form label for this unit of work (e.g. `"wake"`, `"turn"`), recorded in the event payload's `phase` field. Does not affect the `work_class`. |
+
+```
+request(ops="brain.mark_turn(label=\"wake\")")
+```
+
 ### `brain.bind` — Declaration
 
 Write a row in the profile resolution table.
@@ -1081,7 +1099,7 @@ request(ops="brain.register_adapter(adapter_id=\"lora-v3\", content_hash=\"<sha2
 
 ---
 
-## `comm` pack — 7 verbs
+## `comm` pack — 8 verbs
 
 Actor-to-actor messaging with threading. Optional; load with `KHIVE_PACKS=kg,comm`.
 
@@ -1118,6 +1136,15 @@ Every returned message uses the hyphenated full UUID for `id`, so the value is
 always accepted unchanged by `comm.read`, `comm.reply`, or `comm.thread`, even
 when two messages share an eight-character prefix. `full_id` remains an alias
 for compatibility, while `short_id` is the compact display-only prefix.
+
+### `comm.unread` — Assertive
+
+Count-only view of the caller's unread inbound messages — the same filter as
+`comm.inbox(status="unread")`, without message payloads. Takes no parameters.
+
+```
+request(ops="comm.unread()")
+```
 
 ### `comm.read` — Declaration
 
