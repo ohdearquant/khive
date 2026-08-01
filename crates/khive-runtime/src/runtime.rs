@@ -325,6 +325,33 @@ impl KhiveRuntime {
         self.backend.ann_root()
     }
 
+    /// WAL/checkpoint diagnostics (ADR-091 operator surface): build identity,
+    /// checkpoint counters, a PASSIVE checkpoint probe, WAL file size, and
+    /// WAL-pin census. Not write-free: the PASSIVE probe may backfill WAL
+    /// frames into the database (normal checkpoint I/O). It never changes
+    /// logical state, escalates to TRUNCATE, creates a missing database file,
+    /// or deletes sidecar evidence — see `khive_db::diagnostics` for the
+    /// narrowings that make those claims hold.
+    ///
+    /// Always targets the *main* backend via [`Self::core`], regardless of
+    /// which backend this runtime handle is bound to, so a report never
+    /// describes a database this handle is not the canonical owner of.
+    pub async fn db_diagnostics(&self) -> RuntimeResult<khive_db::diagnostics::DbDiagnostics> {
+        let pool = self.core().backend.pool_arc();
+        let interval = khive_db::CheckpointConfig::from_env().interval;
+        let build_hash = crate::build_info::BUILD_INFO
+            .is_stamped()
+            .then_some(crate::build_info::BUILD_INFO.source_revision);
+        let build =
+            khive_db::diagnostics::BuildIdentity::from_env(env!("CARGO_PKG_VERSION"), build_hash);
+
+        tokio::task::spawn_blocking(move || khive_db::diagnostics::collect(&pool, build, interval))
+            .await
+            .map_err(|e| {
+                RuntimeError::Internal(format!("db_diagnostics: spawn_blocking join: {e}"))
+            })
+    }
+
     // ---- Store accessors (token-scoped) ----
 
     /// Get an EntityStore scoped to the token's namespace.

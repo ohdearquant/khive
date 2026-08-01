@@ -17,6 +17,8 @@ Rationale.
 `Document derived_from Document` — for publication provenance: a curated or filtered
 publication copy of a document points at the canonical source it was produced from. See
 "Base endpoint contract" below and "Why the 2026-07-27 provenance amendment?" in Rationale.
+**Amended 2026-07-31**: hard-delete cascade warnings use the existing `audit` event kind and
+carry a relation-specific payload atomically with the delete, as specified in "Cascade Behavior."
 
 ## Context
 
@@ -469,6 +471,14 @@ For provenance/lineage-sensitive relations, hard-delete cascade emits a warning 
 | `supports` / `refutes` | cascade edge; emit evidential-link-loss warning     |
 | `annotates`            | cascade as documented                               |
 | others                 | cascade normally                                    |
+
+Warnings use the existing `audit` event kind and target the hard-deleted record. The runtime
+emits one warning per affected protected relation, in the same transaction as the delete and
+edge cascade, with payload fields `severity="warning"`, `warning`, `deleted_id`, `relation`,
+`edge_count`, and `edges`. `warning` is `provenance_loss`, `replacement_lineage_loss`,
+`temporal_sequence_loss`, or `evidential_link_loss` as named by the table above; each `edges`
+entry preserves the removed edge's id, namespace, endpoints, and prior `deleted_at` value.
+Relations absent from the incident-edge set emit no warning.
 
 No hard blocks on delete. If stronger provenance guarantees are needed later, add tombstones
 or immutable lineage records in a separate ADR.

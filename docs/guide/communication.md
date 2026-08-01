@@ -55,7 +55,9 @@ request(ops="comm.inbox(status=\"all\")")
 
 ### Read
 
-Marks an inbound message read. Outbound messages cannot be marked read.
+Marks an inbound message read. Outbound messages cannot be marked read. The mark write is
+best-effort: a successful response can carry `read: false` plus `mark_error` when the mark
+did not land — check `read` and re-issue later if needed.
 
 ```
 request(ops="comm.read(id=\"<message_id_or_prefix>\")")

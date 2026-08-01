@@ -438,20 +438,90 @@ pub(crate) async fn handle_read(
         );
     }
 
-    // Patch via a real `UPDATE`, not `upsert_note`'s `INSERT OR REPLACE` (#780
-    // silently re-inserts the row on conflict). See docs/api/message-lifecycle.md#handlersrshandle_read
-    let mut props = note.properties.clone().unwrap_or_else(|| json!({}));
-    props["read"] = json!(true);
+    // Patch via one atomic JSON-property `UPDATE`, not a get/replace cycle or
+    // `upsert_note` (#1483, #780). See docs/api/message-lifecycle.md#handlersrshandle_read
+    //
+    // `orig_props` is kept as the stored `Option<Value>` (a SQL-NULL
+    // properties column is a real, distinct state from `{}`) so a degraded
+    // response can report exactly what is stored; `props` is a
+    // separately-normalized object used only for the attempted patch.
+    let orig_props = note.properties.clone();
+    let mut props = orig_props.clone().unwrap_or_else(|| json!({}));
+    match props.as_object_mut() {
+        Some(object) => {
+            object.insert("read".to_string(), json!(true));
+        }
+        None => props = json!({ "read": true }),
+    }
     let updated_at = Utc::now().timestamp_micros();
 
-    store
-        .update_note_properties(id, Some(props.clone()), updated_at)
-        .await
-        .map_err(|e| RuntimeError::Internal(format!("read: update_note_properties: {e}")))?;
+    // Best-effort: under multi-client writer contention the pool checkout can
+    // time out. The read itself already succeeded above — failing the whole
+    // call over a delivery-state patch would throw away a successful read for
+    // a caller who cannot retry the fetch half. Mirrors handle_reply's
+    // fold-in mark-read: `Ok(false)` (no live row
+    // updated, e.g. soft-deleted mid-flight) and `Err` both degrade to
+    // `read: false` + `mark_error` instead of failing the response. A caller
+    // polling unread counts simply sees the message still unread and can
+    // re-issue `read` — self-healing, no retry loop needed here.
+    let patch_result = store
+        .set_note_property(id, "read", json!(true), updated_at)
+        .await;
 
-    Ok(
-        json!({ "id": short_id(id), "full_id": id.as_hyphenated().to_string(), "read": true, "properties": props }),
-    )
+    Ok(read_response(
+        short_id(id),
+        id.as_hyphenated().to_string(),
+        patch_result,
+        orig_props,
+        props,
+    ))
+}
+
+/// Assemble `comm.read`'s response from the mark-read patch outcome.
+///
+/// Factored out so the three degrade arms (`Ok(true)`, `Ok(false)`, `Err`)
+/// are unit-testable directly: the `Ok(false)`/soft-delete-mid-flight race
+/// cannot be arranged honestly through the public dispatch path (`handle_read`
+/// fetches and patches within a single sequential call, with no seam to
+/// inject a concurrent delete between the two), so the response shape is
+/// verified against this pure function instead of a racing integration test.
+fn read_response(
+    short: String,
+    full: String,
+    patch_result: Result<bool, khive_storage::StorageError>,
+    original_properties: Option<Value>,
+    patched_properties: Value,
+) -> Value {
+    match patch_result {
+        Ok(true) => json!({
+            "id": short,
+            "full_id": full,
+            "read": true,
+            "properties": patched_properties,
+        }),
+        Ok(false) => json!({
+            "id": short,
+            "full_id": full,
+            "read": false,
+            "mark_error": "no live row updated",
+            "properties": original_properties,
+        }),
+        Err(e) => {
+            tracing::warn!(
+                id = %full,
+                error = %e,
+                "comm.read: mark-read update failed under writer contention; \
+                 degrading to read:false (best-effort)"
+            );
+            json!({
+                "id": short,
+                "full_id": full,
+                "read": false,
+                "mark_error": e.to_string(),
+                "properties": original_properties,
+            })
+        }
+    }
 }
 
 /// `reply` — reply to a message, threading linkage. See
@@ -646,24 +716,14 @@ pub(crate) async fn handle_reply(
     let marked_read = if original_direction == "outbound" || !caller_is_addressee {
         None
     } else {
-        // Re-fetch: `orig_props` predates the dual write above, so writing it
-        // back wholesale would erase any property another writer set in that
-        // window (the store replaces `properties`, it does not merge).
-        let current = store
-            .get_note(id)
-            .await
-            .ok()
-            .flatten()
-            .and_then(|n| n.properties)
-            .unwrap_or_else(|| orig_props.clone());
-        let mut props = current;
-        props["read"] = json!(true);
         let updated_at = Utc::now().timestamp_micros();
         // `Ok(false)` means no live row was updated (e.g. the original was
-        // soft-deleted mid-flight) — that is not a successful mark.
+        // soft-deleted mid-flight, or its properties ceased to be an object)
+        // — that is not a successful mark. The one-statement property set
+        // preserves every unrelated key without a race window (#1483).
         Some(
             store
-                .update_note_properties(id, Some(props), updated_at)
+                .set_note_property(id, "read", json!(true), updated_at)
                 .await
                 .unwrap_or(false),
         )
@@ -2045,9 +2105,11 @@ fn build_references_header(parent_chain: Option<&str>, parent_message_id: &str) 
 mod tests {
     use super::{
         build_references_header, heartbeat_note_id, message_id_match_candidates,
-        parent_references_chain, parent_wire_message_id, sanitize_reference_token, wrap_message_id,
+        parent_references_chain, parent_wire_message_id, read_response, sanitize_reference_token,
+        wrap_message_id,
     };
-    use serde_json::json;
+    use khive_storage::StorageError;
+    use serde_json::{json, Value};
 
     // #606: a delimiter-joined
     // `format!("...:{a}:{b}:{c}")` id encoding is not injective once
@@ -2330,6 +2392,129 @@ mod tests {
         assert_eq!(
             build_references_header(chain, "parent123@example.com"),
             "<parent123@example.com>"
+        );
+    }
+
+    // read_response's three arms are unit-tested directly because the
+    // `Ok(false)` case (a live row vanishing between handle_read's `get_note`
+    // and its `set_note_property` call) cannot be arranged honestly
+    // through the public dispatch path: the two calls are sequential within
+    // one handler invocation with no seam to inject a concurrent delete.
+
+    #[test]
+    fn read_response_ok_true_reports_read_and_patched_properties() {
+        let original = json!({ "direction": "inbound", "read": false });
+        let patched = json!({ "direction": "inbound", "read": true });
+        let resp = read_response(
+            "abc123".to_string(),
+            "full-uuid".to_string(),
+            Ok(true),
+            Some(original),
+            patched.clone(),
+        );
+        assert_eq!(resp["id"], json!("abc123"));
+        assert_eq!(resp["full_id"], json!("full-uuid"));
+        assert_eq!(resp["read"], json!(true));
+        assert_eq!(resp["properties"], patched);
+        assert!(
+            resp.get("mark_error").is_none(),
+            "a successful mark must not carry mark_error; got {resp}"
+        );
+    }
+
+    #[test]
+    fn read_response_ok_false_degrades_without_claiming_the_patch_landed() {
+        let original = json!({ "direction": "inbound", "read": false });
+        let patched = json!({ "direction": "inbound", "read": true });
+        let resp = read_response(
+            "abc123".to_string(),
+            "full-uuid".to_string(),
+            Ok(false),
+            Some(original.clone()),
+            patched,
+        );
+        assert_eq!(resp["id"], json!("abc123"));
+        assert_eq!(resp["full_id"], json!("full-uuid"));
+        assert_eq!(resp["read"], json!(false));
+        assert_eq!(
+            resp["mark_error"],
+            json!("no live row updated"),
+            "got {resp}"
+        );
+        assert_eq!(
+            resp["properties"], original,
+            "must report the ORIGINAL stored properties, never the attempted \
+             patch, when the write did not land; got {resp}"
+        );
+    }
+
+    #[test]
+    fn read_response_ok_false_preserves_stored_null_properties() {
+        let patched = json!({ "read": true });
+        let resp = read_response(
+            "abc123".to_string(),
+            "full-uuid".to_string(),
+            Ok(false),
+            None,
+            patched,
+        );
+        assert_eq!(resp["id"], json!("abc123"));
+        assert_eq!(resp["full_id"], json!("full-uuid"));
+        assert_eq!(resp["read"], json!(false));
+        assert_eq!(
+            resp["properties"],
+            Value::Null,
+            "a stored SQL-NULL properties column must round-trip as JSON \
+             null, never as {{}}; got {resp}"
+        );
+    }
+
+    #[test]
+    fn read_response_err_degrades_and_reports_the_error_string() {
+        let original = json!({ "direction": "inbound", "read": false });
+        let patched = json!({ "direction": "inbound", "read": true });
+        let err = StorageError::Timeout {
+            operation: "set_note_property".into(),
+        };
+        let err_text = err.to_string();
+        let resp = read_response(
+            "abc123".to_string(),
+            "full-uuid".to_string(),
+            Err(err),
+            Some(original.clone()),
+            patched,
+        );
+        assert_eq!(resp["id"], json!("abc123"));
+        assert_eq!(resp["full_id"], json!("full-uuid"));
+        assert_eq!(resp["read"], json!(false));
+        assert_eq!(resp["mark_error"], json!(err_text));
+        assert_eq!(
+            resp["properties"], original,
+            "must report the ORIGINAL stored properties on a write error; got {resp}"
+        );
+    }
+
+    #[test]
+    fn read_response_err_preserves_stored_null_properties() {
+        let patched = json!({ "read": true });
+        let err = StorageError::Timeout {
+            operation: "set_note_property".into(),
+        };
+        let resp = read_response(
+            "abc123".to_string(),
+            "full-uuid".to_string(),
+            Err(err),
+            None,
+            patched,
+        );
+        assert_eq!(resp["id"], json!("abc123"));
+        assert_eq!(resp["full_id"], json!("full-uuid"));
+        assert_eq!(resp["read"], json!(false));
+        assert_eq!(
+            resp["properties"],
+            Value::Null,
+            "a stored SQL-NULL properties column must round-trip as JSON \
+             null, never as {{}}; got {resp}"
         );
     }
 }

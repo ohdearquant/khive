@@ -1,10 +1,10 @@
 // FILE SIZE JUSTIFICATION: This module exceeds the 700-line soft target because it owns
 // the complete Vamana ANN lifecycle for knowledge search: SharedAnn type, AnnKey, snapshot
 // persistence (warm_known_snapshots / ensure_ann_background), index build (build_ann),
-// search (search_loaded), and all associated SQL queries and serialization logic. These
-// responsibilities are tightly coupled through the shared AnnState and cannot be split
-// without breaking the atomic lock protocol. Refactoring is deferred until
-// a stable snapshot format and the warm-start contract are defined.
+// search (search_loaded_with_seq plus the fresh-tail exact leg), and all associated SQL
+// queries and serialization logic. These responsibilities are tightly coupled through the
+// shared AnnState and its generation-fenced warm/install protocol; splitting them would obscure
+// the lock ordering and ownership contract.
 
 //! Vamana ANN bridge — parallel semantic signal for `knowledge.search`.
 //!
@@ -17,6 +17,7 @@
 //! fallback chain and the file-size/module-coupling rationale.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use khive_runtime::{KhiveRuntime, Namespace, NamespaceToken, RuntimeError};
@@ -54,13 +55,66 @@ impl AnnKey {
     }
 }
 
-/// Shared ANN state: per-{namespace, model} indexes plus a single-flight guard
-/// so at most one background warm runs per key at a time.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AnnWarmFailure {
+    EmptyCorpus,
+    Operational,
+    Interrupted,
+}
+
+/// Result of one load/rebuild worker. Kept separate from `AnnWarmState` so a
+/// failed replacement can remain retryable even when ADR-079 rule 8 left a
+/// stale-but-servable bridge installed during the attempt.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum AnnWarmOutcome {
+    Ready,
+    Empty,
+    Failed,
+}
+
+/// Lifecycle for one per-{namespace, model} warm slot.
+///
+/// `Failed` is deliberately retryable: an empty corpus may become populated,
+/// and an operational load failure says nothing about the next attempt. A
+/// namespace invalidation removes every matching state, returning those keys
+/// to the implicit `Absent` state.
+#[derive(Debug)]
+enum AnnWarmState {
+    Warming {
+        attempt_id: u64,
+        generation: u64,
+        started_at: std::time::Instant,
+    },
+    Ready {
+        generation: u64,
+    },
+    Failed {
+        generation: u64,
+        error: AnnWarmFailure,
+    },
+}
+
+/// Ownership token for one warm attempt. Only the matching attempt may
+/// transition its slot out of `Warming`, so a late completion cannot erase or
+/// complete a newer post-invalidation warm.
+struct AnnWarmPermit {
+    ann: SharedAnn,
+    key: AnnKey,
+    attempt_id: u64,
+    generation: u64,
+    finished: bool,
+}
+
+/// Shared ANN state: per-{namespace, model} indexes plus a warm lifecycle that
+/// permits at most one load/rebuild attempt per key at a time.
 pub(crate) struct AnnState {
     indexes: RwLock<HashMap<AnnKey, AnnBridge>>,
-    /// Keys currently being warmed (or already warmed). `std::sync::Mutex`
-    /// so the fire-and-check guard in `ensure_ann_background` stays sync.
-    warming: std::sync::Mutex<HashSet<AnnKey>>,
+    /// Per-key warm lifecycle. `std::sync::Mutex` keeps `begin_warm` usable by
+    /// the fire-and-return query path before it spawns an async task.
+    warm_states: std::sync::Mutex<HashMap<AnnKey, AnnWarmState>>,
+    /// Monotonic ownership token for warm attempts. Generation alone cannot
+    /// distinguish a failed retry from its predecessor at the same generation.
+    next_warm_attempt_id: AtomicU64,
     /// Per-namespace write-generation counter (issue #770), keyed by
     /// namespace (not the full `AnnKey`). Bumped by `clear_namespace`;
     /// `install_if_fresher` uses it to reject stale builds. See
@@ -72,7 +126,7 @@ pub(crate) struct AnnState {
     /// a rebuild error is operational (store open, SQL reader, corpus
     /// query) and says nothing about the corpus, so error paths keep the
     /// bounded-wait retry behavior instead of a marker. A marker is
-    /// terminal — `wait_for_ann` returns immediately rather than polling out
+    /// terminal — `wait_ready` returns immediately rather than polling out
     /// `ANN_WARM_WAIT_TIMEOUT_MS` — exactly when its stored generation is
     /// still >= the namespace's CURRENT generation: nothing can have changed
     /// the outcome since the scan that produced it. A marker whose stored
@@ -81,6 +135,17 @@ pub(crate) struct AnnState {
     /// `install_if_fresher` clears a key's marker whenever it actually
     /// installs a fresh index for that key.
     unavailable: std::sync::Mutex<HashMap<AnnKey, u64>>,
+    /// Keys whose durable consumer registration disappeared while an index
+    /// was serving.  Such a bridge is untrusted because another consumer may
+    /// already have compacted part of its tail (ADR-118 registration
+    /// precondition).  The marker is installed before re-registration and is
+    /// cleared only after an authoritative full-corpus scan publishes at the
+    /// current namespace generation.
+    force_rebuild: std::sync::Mutex<HashSet<AnnKey>>,
+    /// Process-local half of checkpoint publication serialization. File-backed
+    /// runtimes additionally take the directory lock for cross-process safety;
+    /// pathless runtimes need this lock to linearize raise-then-install.
+    checkpoint_locks: std::sync::Mutex<HashMap<AnnKey, std::sync::Weak<tokio::sync::Mutex<()>>>>,
 }
 
 pub(crate) type SharedAnn = Arc<AnnState>;
@@ -88,10 +153,51 @@ pub(crate) type SharedAnn = Arc<AnnState>;
 pub(crate) fn new_shared() -> SharedAnn {
     Arc::new(AnnState {
         indexes: RwLock::new(HashMap::new()),
-        warming: std::sync::Mutex::new(HashSet::new()),
+        warm_states: std::sync::Mutex::new(HashMap::new()),
+        next_warm_attempt_id: AtomicU64::new(1),
         generations: std::sync::Mutex::new(HashMap::new()),
         unavailable: std::sync::Mutex::new(HashMap::new()),
+        force_rebuild: std::sync::Mutex::new(HashSet::new()),
+        checkpoint_locks: std::sync::Mutex::new(HashMap::new()),
     })
+}
+
+fn force_rebuild_guard(
+    m: &std::sync::Mutex<HashSet<AnnKey>>,
+) -> std::sync::MutexGuard<'_, HashSet<AnnKey>> {
+    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn mark_force_rebuild(ann: &SharedAnn, key: &AnnKey) {
+    force_rebuild_guard(&ann.force_rebuild).insert(key.clone());
+}
+
+fn force_rebuild_required(ann: &SharedAnn, key: &AnnKey) -> bool {
+    force_rebuild_guard(&ann.force_rebuild).contains(key)
+}
+
+fn clear_force_rebuild_if_current(ann: &SharedAnn, key: &AnnKey, generation: u64) {
+    if current_generation(ann, &key.namespace) == generation {
+        clear_force_rebuild(ann, key);
+    }
+}
+
+fn clear_force_rebuild(ann: &SharedAnn, key: &AnnKey) {
+    force_rebuild_guard(&ann.force_rebuild).remove(key);
+}
+
+fn checkpoint_lock(ann: &SharedAnn, key: &AnnKey) -> Arc<tokio::sync::Mutex<()>> {
+    let mut locks = ann
+        .checkpoint_locks
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    locks.retain(|_, lock| lock.strong_count() > 0);
+    if let Some(lock) = locks.get(key).and_then(std::sync::Weak::upgrade) {
+        return lock;
+    }
+    let lock = Arc::new(tokio::sync::Mutex::new(()));
+    locks.insert(key.clone(), Arc::downgrade(&lock));
+    lock
 }
 
 // Recover a poisoned generations Mutex rather than aborting: the guarded
@@ -170,7 +276,7 @@ pub(crate) async fn install_if_fresher(ann: &SharedAnn, key: &AnnKey, candidate:
 /// segment with its completed rebuild (rule 8 → rebuild completion). The
 /// A/B-race protection that motivates tie-keeps-incumbent in
 /// `install_if_fresher` does not apply inside a single single-flight task.
-pub(crate) async fn install_replacing(ann: &SharedAnn, key: &AnnKey, candidate: AnnBridge) {
+pub(crate) async fn install_replacing(ann: &SharedAnn, key: &AnnKey, candidate: AnnBridge) -> bool {
     let mut idxs = ann.indexes.write().await;
     let ns_generation = current_generation(ann, &key.namespace);
     if candidate.generation < ns_generation {
@@ -180,18 +286,166 @@ pub(crate) async fn install_replacing(ann: &SharedAnn, key: &AnnKey, candidate: 
             namespace_generation = ns_generation,
             "knowledge ANN replace skipped: candidate predates namespace's current generation"
         );
-        return;
+        return false;
     }
     idxs.insert(key.clone(), candidate);
     unavailable_guard(&ann.unavailable).remove(key);
+    true
 }
 
-// Recover a poisoned warming Mutex rather than aborting: the guarded HashSet<AnnKey>
-// stays logically valid through a poison (spurious presence/absence is tolerable).
-fn warming_guard(
-    m: &std::sync::Mutex<HashSet<AnnKey>>,
-) -> std::sync::MutexGuard<'_, HashSet<AnnKey>> {
+async fn has_current_index(ann: &SharedAnn, key: &AnnKey) -> bool {
+    let idxs = ann.indexes.read().await;
+    let current = current_generation(ann, &key.namespace);
+    idxs.get(key)
+        .is_some_and(|bridge| bridge.generation >= current)
+}
+
+async fn has_current_index_at_watermark(ann: &SharedAnn, key: &AnnKey, watermark: u64) -> bool {
+    let idxs = ann.indexes.read().await;
+    let current = current_generation(ann, &key.namespace);
+    idxs.get(key).is_some_and(|bridge| {
+        bridge.generation >= current && bridge.index.last_applied_seq().unwrap_or(0) >= watermark
+    })
+}
+
+// Recover a poisoned warm-state Mutex rather than aborting: each transition is
+// one HashMap replacement, so the previous or next complete state remains safe
+// to inspect after a poison.
+fn warm_states_guard(
+    m: &std::sync::Mutex<HashMap<AnnKey, AnnWarmState>>,
+) -> std::sync::MutexGuard<'_, HashMap<AnnKey, AnnWarmState>> {
     m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Claim the single warm slot for `key`.
+///
+/// `Warming` and `Ready` at the current namespace generation suppress a
+/// duplicate attempt. `Failed`, `Absent`, and stale-generation states all
+/// transition to a newly owned `Warming` attempt so empty/operational failures
+/// remain retryable after the current request degrades.
+fn begin_warm(ann: &SharedAnn, key: AnnKey) -> Option<AnnWarmPermit> {
+    let mut states = warm_states_guard(&ann.warm_states);
+    let generation = current_generation(ann, &key.namespace);
+
+    match states.get(&key) {
+        Some(
+            AnnWarmState::Warming {
+                generation: state_generation,
+                ..
+            }
+            | AnnWarmState::Ready {
+                generation: state_generation,
+            },
+        ) if *state_generation >= generation => return None,
+        Some(AnnWarmState::Failed {
+            generation: failed_generation,
+            error,
+        }) => {
+            tracing::debug!(
+                key = ?key,
+                failed_generation,
+                error = ?error,
+                "retrying failed knowledge ANN warm"
+            );
+        }
+        _ => {}
+    }
+
+    let attempt_id = ann.next_warm_attempt_id.fetch_add(1, Ordering::Relaxed);
+    states.insert(
+        key.clone(),
+        AnnWarmState::Warming {
+            attempt_id,
+            generation,
+            started_at: std::time::Instant::now(),
+        },
+    );
+    Some(AnnWarmPermit {
+        ann: ann.clone(),
+        key,
+        attempt_id,
+        generation,
+        finished: false,
+    })
+}
+
+/// Apply the terminal transition only when `permit` still owns the slot.
+/// Namespace invalidation or a newer retry makes an older completion a no-op.
+fn finish_warm_state(permit: &mut AnnWarmPermit, next: AnnWarmState) {
+    let mut states = warm_states_guard(&permit.ann.warm_states);
+    let started_at = match states.get(&permit.key) {
+        Some(AnnWarmState::Warming {
+            attempt_id,
+            generation,
+            started_at,
+        }) if *attempt_id == permit.attempt_id && *generation == permit.generation => *started_at,
+        _ => {
+            permit.finished = true;
+            return;
+        }
+    };
+
+    tracing::debug!(
+        key = ?permit.key,
+        attempt_id = permit.attempt_id,
+        elapsed_ms = started_at.elapsed().as_millis(),
+        state = ?next,
+        "knowledge ANN warm finished"
+    );
+    states.insert(permit.key.clone(), next);
+    permit.finished = true;
+}
+
+/// Finish a normally-returning warm from the worker's explicit outcome. A
+/// `Ready` outcome is still verified against the attempt's generation before
+/// publication into the lifecycle state.
+async fn finish_warm(mut permit: AnnWarmPermit, outcome: AnnWarmOutcome) {
+    let next = match outcome {
+        AnnWarmOutcome::Ready => match permit
+            .ann
+            .indexes
+            .read()
+            .await
+            .get(&permit.key)
+            .map(|bridge| bridge.generation)
+            .filter(|generation| *generation >= permit.generation)
+        {
+            Some(generation) => AnnWarmState::Ready { generation },
+            None => AnnWarmState::Failed {
+                generation: permit.generation,
+                error: AnnWarmFailure::Operational,
+            },
+        },
+        AnnWarmOutcome::Empty => AnnWarmState::Failed {
+            generation: permit.generation,
+            error: AnnWarmFailure::EmptyCorpus,
+        },
+        AnnWarmOutcome::Failed => AnnWarmState::Failed {
+            generation: permit.generation,
+            error: AnnWarmFailure::Operational,
+        },
+    };
+    finish_warm_state(&mut permit, next);
+}
+
+impl Drop for AnnWarmPermit {
+    fn drop(&mut self) {
+        if !self.finished {
+            let next = AnnWarmState::Failed {
+                generation: self.generation,
+                error: AnnWarmFailure::Interrupted,
+            };
+            finish_warm_state(self, next);
+        }
+    }
+}
+
+#[cfg(test)]
+impl AnnWarmPermit {
+    /// Leave the state in `Warming` for deterministic cold-start tests.
+    fn leave_in_flight_for_test(mut self) {
+        self.finished = true;
+    }
 }
 
 // Recover a poisoned unavailable Mutex rather than aborting: the guarded
@@ -207,7 +461,7 @@ fn unavailable_guard(
 /// Record that `key`'s corpus scan at `generation` completed and found an
 /// empty corpus. Callers must not pass error outcomes here — see the
 /// `unavailable` field doc on `AnnState` for the generation-fencing
-/// invariant `wait_for_ann` relies on and why errors never mark.
+/// invariant `wait_ready` relies on and why errors never mark.
 fn mark_unavailable(ann: &SharedAnn, key: &AnnKey, generation: u64) {
     unavailable_guard(&ann.unavailable).insert(key.clone(), generation);
 }
@@ -249,25 +503,24 @@ pub(crate) async fn insert_ann_if_absent(ann: &SharedAnn, key: AnnKey, bridge: A
     }
 }
 
-/// Remove all in-memory ANN slots and warming-guard entries for `namespace`.
+/// Remove all in-memory ANN slots and warm states for `namespace`.
 ///
 /// Called after any corpus mutation so the next search triggers a fresh load.
 pub(crate) async fn clear_namespace(ann: &SharedAnn, namespace: &str) {
-    {
-        // Evict and bump the generation counter inside the SAME write-lock
-        // scope (PR #815). `install_if_fresher` takes this same
-        // lock before reading the namespace's current generation, so there
-        // is no window between "slot emptied" and "generation bumped" where
-        // a concurrent install could read a stale (pre-bump) generation and
-        // self-approve into the just-emptied slot.
-        let mut idxs = ann.indexes.write().await;
-        idxs.retain(|k, _| k.namespace != namespace);
-        bump_generation(ann, namespace);
-    }
-    warming_guard(&ann.warming).retain(|k| k.namespace != namespace);
+    // Evict, retire warm ownership, and bump the generation counter while
+    // holding both state locks. `begin_warm` serializes on `warm_states`, and
+    // `install_if_fresher` serializes on `indexes`, so a post-invalidation
+    // attempt cannot be accidentally removed and a pre-invalidation build
+    // cannot self-approve into the emptied slot.
+    let mut idxs = ann.indexes.write().await;
+    let mut states = warm_states_guard(&ann.warm_states);
+    idxs.retain(|k, _| k.namespace != namespace);
+    states.retain(|k, _| k.namespace != namespace);
+    bump_generation(ann, namespace);
 }
 
 /// Search the already-loaded index for `key`. Returns `None` on cache miss.
+#[cfg(test)]
 pub(crate) async fn search_loaded(
     ann: &SharedAnn,
     key: &AnnKey,
@@ -278,13 +531,41 @@ pub(crate) async fn search_loaded(
     guard.get(key).map(|bridge| bridge.search(query, k))
 }
 
-/// Returns `true` when `key` is registered in the warming set but its index has
-/// not yet been inserted — i.e. a background load is in flight right now.
+/// Search the loaded bridge and capture the write-log watermark represented by
+/// those candidates under the same read-lock guard. A concurrent checkpoint
+/// therefore cannot pair one bridge's hits with another bridge's watermark.
+pub(crate) async fn search_loaded_with_seq(
+    ann: &SharedAnn,
+    key: &AnnKey,
+    query: &[f32],
+    k: usize,
+) -> Option<(Vec<(Uuid, f32)>, u64)> {
+    let guard = ann.indexes.read().await;
+    guard.get(key).map(|bridge| {
+        (
+            bridge.search(query, k),
+            bridge.index.last_applied_seq().unwrap_or(0),
+        )
+    })
+}
+
+/// Returns `true` when `key` has a current-generation `Warming` owner but its
+/// index has not yet been inserted — i.e. a load is in flight right now.
 ///
 /// `false` means either (a) the index is already loaded, or (b) no warm has
 /// been triggered for this key at all (e.g. the corpus is empty).
 pub(crate) fn is_warming_not_loaded(ann: &SharedAnn, key: &AnnKey) -> bool {
-    let in_warming = warming_guard(&ann.warming).contains(key);
+    let in_warming = {
+        let states = warm_states_guard(&ann.warm_states);
+        let generation = current_generation(ann, &key.namespace);
+        matches!(
+            states.get(key),
+            Some(AnnWarmState::Warming {
+                generation: state_generation,
+                ..
+            }) if *state_generation >= generation
+        )
+    };
     if !in_warming {
         return false;
     }
@@ -304,7 +585,7 @@ pub(crate) fn is_warming_not_loaded(ann: &SharedAnn, key: &AnnKey) -> bool {
 /// out the full timeout on every query wastes `timeout_ms` for nothing).
 ///
 /// Returns `true` if the index became available within the timeout.
-pub(crate) async fn wait_for_ann(
+pub(crate) async fn wait_ready(
     ann: &SharedAnn,
     key: &AnnKey,
     timeout_ms: u64,
@@ -545,6 +826,15 @@ impl AnnBridge {
     /// is. See crates/khive-pack-knowledge/docs/api/vamana.md#save_atomic.
     #[allow(dead_code)]
     pub fn save_atomic(&self, dir: &std::path::Path) -> Result<(), String> {
+        let _publication_lock = acquire_bridge_checkpoint_lock(dir)?;
+        self.save_atomic_locked(dir)
+    }
+
+    /// Save while the caller holds this directory's bridge-level publication
+    /// lock.  Keeping the lock above both the Vamana commit and UUID sidecar
+    /// prevents two writers from pairing one commit digest with another
+    /// writer's id map.
+    fn save_atomic_locked(&self, dir: &std::path::Path) -> Result<(), String> {
         let count = self.id_map.len();
         if count != self.index.num_vectors() {
             return Err(format!(
@@ -626,6 +916,34 @@ impl AnnBridge {
     }
 }
 
+fn acquire_bridge_checkpoint_lock(dir: &std::path::Path) -> Result<std::fs::File, String> {
+    std::fs::create_dir_all(dir).map_err(|error| {
+        format!(
+            "create ANN bridge checkpoint directory {}: {error}",
+            dir.display()
+        )
+    })?;
+    let lock_path = dir.join(".bridge-checkpoint.lock");
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .map_err(|error| format!("open ANN bridge lock {}: {error}", lock_path.display()))?;
+    lock.lock()
+        .map_err(|error| format!("acquire ANN bridge lock {}: {error}", lock_path.display()))?;
+    Ok(lock)
+}
+
+async fn acquire_bridge_checkpoint_lock_async(
+    dir: std::path::PathBuf,
+) -> Result<std::fs::File, String> {
+    tokio::task::spawn_blocking(move || acquire_bridge_checkpoint_lock(&dir))
+        .await
+        .map_err(|error| format!("ANN bridge lock task failed: {error}"))?
+}
+
 fn l2_normalize(v: &mut [f32]) {
     let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
     if norm > 1e-8 {
@@ -693,6 +1011,7 @@ pub(crate) fn sanitize_model_key(s: &str) -> String {
 /// backend is in-memory (no database file) — skipping persistence is not an error.
 /// `save_atomic` binds the id-map sidecar to the commit-record digest internally;
 /// callers do not need to supply a `CorpusFingerprint`.
+#[cfg(test)]
 pub(crate) fn persist_ann_v2(
     rt: &KhiveRuntime,
     ns: &str,
@@ -702,6 +1021,18 @@ pub(crate) fn persist_ann_v2(
     match ann_segment_dir(rt, ns, model) {
         Some(dir) => bridge.save_atomic(&dir),
         None => Ok(()), // in-memory backend — no filesystem, skip silently
+    }
+}
+
+fn persist_ann_v2_locked(
+    rt: &KhiveRuntime,
+    ns: &str,
+    model: &str,
+    bridge: &AnnBridge,
+) -> Result<(), String> {
+    match ann_segment_dir(rt, ns, model) {
+        Some(dir) => bridge.save_atomic_locked(&dir),
+        None => Ok(()),
     }
 }
 
@@ -730,6 +1061,7 @@ fn ann_rebuild_threshold() -> f64 {
 /// segment for the scope: a row at 0 blocks pair-wide compaction instead of
 /// hiding this consumer from the registry `MIN` (ADR-079 Amendment 1 §A
 /// step 1).
+#[cfg(test)]
 async fn register_consumer(rt: &KhiveRuntime, ns: &str, model: &str) -> Result<(), String> {
     let sql = rt.sql();
     let mut w = sql.writer().await.map_err(|e| e.to_string())?;
@@ -749,8 +1081,72 @@ async fn register_consumer(rt: &KhiveRuntime, ns: &str, model: &str) -> Result<(
     Ok(())
 }
 
-/// Read this consumer's own registry watermark. `None` = no row (decision
-/// rule 4: Cold after re-registering at 0).
+/// Durable sentinel for registry-loss recovery.  `-1` is below every legal
+/// sequence watermark, so it both blocks pair-wide compaction (`MIN = -1`)
+/// and tells every process to reject its loaded/persisted bridge until one
+/// authoritative full-corpus checkpoint raises the row to a normal `S >= 0`.
+async fn write_force_rebuild_sentinel_row(rt: &KhiveRuntime, key: &AnnKey) -> Result<(), String> {
+    let sql = rt.sql();
+    let mut writer = sql.writer().await.map_err(|error| error.to_string())?;
+    writer
+        .execute(SqlStatement {
+            sql: "INSERT INTO ann_consumer_watermark \
+                  (consumer, namespace, embedding_model, watermark) \
+                  VALUES (?1, ?2, ?3, -1) \
+                  ON CONFLICT(consumer, namespace, embedding_model) \
+                  DO UPDATE SET watermark = -1"
+                .into(),
+            params: vec![
+                SqlValue::Text(ANN_CONSUMER.into()),
+                SqlValue::Text(key.namespace.clone()),
+                SqlValue::Text(key.model.clone()),
+            ],
+            label: Some("ann_force_authoritative_rebuild".into()),
+        })
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+async fn write_force_rebuild_sentinel(rt: &KhiveRuntime, key: &AnnKey) -> Result<(), String> {
+    // Serialize the sentinel with the complete bridge+sidecar publication and
+    // watermark transition.  A checkpoint that began before registry loss
+    // therefore either finishes before `-1` is published or observes `-1`
+    // under this same lock and aborts without publishing.
+    let _publication_lock = match ann_segment_dir(rt, &key.namespace, &key.model) {
+        Some(dir) => Some(acquire_bridge_checkpoint_lock_async(dir).await?),
+        None => None,
+    };
+    // The detector may have waited behind a successful authoritative
+    // checkpoint. Revalidate under the publication locks so that a delayed
+    // request cannot demote the winner's normal row back to -1.
+    if matches!(
+        read_own_watermark(rt, &key.namespace, &key.model).await?,
+        Some(watermark) if watermark >= 0
+    ) {
+        return Ok(());
+    }
+    write_force_rebuild_sentinel_row(rt, key).await
+}
+
+/// Establish the cross-process precondition for one authoritative rebuild
+/// after consumer-registry loss.  The local marker is deliberately set
+/// before the first await; the transactional SQL upsert then publishes the
+/// same state to every process before this consumer can be treated as
+/// registered again.
+async fn prepare_authoritative_rebuild(
+    rt: &KhiveRuntime,
+    ann: &SharedAnn,
+    key: &AnnKey,
+) -> Result<(), String> {
+    mark_force_rebuild(ann, key);
+    let local_publication_lock = checkpoint_lock(ann, key);
+    let _local_publication_guard = local_publication_lock.lock().await;
+    write_force_rebuild_sentinel(rt, key).await
+}
+
+/// Read this consumer's own registry watermark. `None` means decision-rule-4
+/// registry loss; knowledge publishes `-1` before its authoritative rebuild.
 async fn read_own_watermark(
     rt: &KhiveRuntime,
     ns: &str,
@@ -784,23 +1180,72 @@ async fn read_own_watermark(
 /// Raise this consumer's registered watermark monotonically after a durable
 /// segment commit at `s` (ADR-079 Amendment 1 §A step 2). A crash before this
 /// leaves the smaller watermark — under-compacts, never over-compacts.
-async fn raise_watermark(rt: &KhiveRuntime, ns: &str, model: &str, s: u64) -> Result<(), String> {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CheckpointAuthority {
+    Incremental,
+    FullRegistered,
+    FullSentinel,
+}
+
+/// Capture the durable registry state immediately before a full corpus scan.
+/// An absent row is published as the cross-process sentinel rather than a
+/// plain registration: the scan is authoritative and can safely clear it,
+/// while peers must remain Cold for the entire scan window.
+pub(crate) async fn prepare_full_corpus_scan(
+    rt: &KhiveRuntime,
+    ann: &SharedAnn,
+    key: &AnnKey,
+) -> Result<CheckpointAuthority, String> {
+    match read_own_watermark(rt, &key.namespace, &key.model).await? {
+        Some(watermark) if watermark >= 0 => Ok(CheckpointAuthority::FullRegistered),
+        Some(_) => {
+            mark_force_rebuild(ann, key);
+            Ok(CheckpointAuthority::FullSentinel)
+        }
+        None => {
+            prepare_authoritative_rebuild(rt, ann, key).await?;
+            Ok(CheckpointAuthority::FullSentinel)
+        }
+    }
+}
+
+async fn raise_watermark(
+    rt: &KhiveRuntime,
+    ns: &str,
+    model: &str,
+    s: u64,
+    authority: CheckpointAuthority,
+) -> Result<(), String> {
+    let predicate = match authority {
+        CheckpointAuthority::FullSentinel => "watermark = -1",
+        CheckpointAuthority::Incremental | CheckpointAuthority::FullRegistered => {
+            "watermark >= 0 AND watermark <= ?4"
+        }
+    };
     let sql = rt.sql();
     let mut w = sql.writer().await.map_err(|e| e.to_string())?;
-    w.execute(SqlStatement {
-        sql: "UPDATE ann_consumer_watermark SET watermark = MAX(watermark, ?4) \
-              WHERE consumer = ?1 AND namespace = ?2 AND embedding_model = ?3"
-            .into(),
-        params: vec![
-            SqlValue::Text(ANN_CONSUMER.into()),
-            SqlValue::Text(ns.to_owned()),
-            SqlValue::Text(model.to_owned()),
-            SqlValue::Integer(s as i64),
-        ],
-        label: Some("ann_raise_watermark".into()),
-    })
-    .await
-    .map_err(|e| e.to_string())?;
+    let affected = w
+        .execute(SqlStatement {
+            sql: format!(
+                "UPDATE ann_consumer_watermark SET watermark = MAX(watermark, ?4) \
+                 WHERE consumer = ?1 AND namespace = ?2 AND embedding_model = ?3 \
+                   AND {predicate}"
+            ),
+            params: vec![
+                SqlValue::Text(ANN_CONSUMER.into()),
+                SqlValue::Text(ns.to_owned()),
+                SqlValue::Text(model.to_owned()),
+                SqlValue::Integer(s as i64),
+            ],
+            label: Some("ann_raise_watermark".into()),
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+    if affected != 1 {
+        return Err(format!(
+            "ANN watermark publication fence rejected {authority:?}: affected {affected} rows"
+        ));
+    }
     Ok(())
 }
 
@@ -1036,52 +1481,742 @@ async fn replay_final_states(
     Ok(())
 }
 
-/// Persist `bridge` at its applied watermark, raise this consumer's registry
-/// row, compact the pair's log through the registry MIN, then reopen the
-/// just-written segment via the mmap load path and swap it in for the Owned
-/// build product (ADR-079 Amendment 1 §B). Registration precedes the persist
-/// (§A step 1). On any persist/reopen failure the Owned bridge is installed
-/// instead — correctness first, memory second.
+// ── ADR-118: fresh-tail exact leg ─────────────────────────────────────────
+
+fn fresh_tail_enabled() -> bool {
+    std::env::var("KHIVE_ANN_FRESH_TAIL")
+        .map(|value| value != "0")
+        .unwrap_or(true)
+}
+
+struct FreshTailSnapshot {
+    own_watermark: Option<i64>,
+    registry_min: Option<i64>,
+    live_count: Option<u64>,
+    ops: Vec<(Uuid, Option<Vec<f32>>)>,
+}
+
+/// Read the registry guard, optional live-count cap, selected log suffix, and
+/// every final upsert embedding in one SQLite statement.  A single statement
+/// is the snapshot primitive on every backend, including the in-memory
+/// pool-backed reader whose separate calls may use separate connections.
+async fn fetch_fresh_tail_snapshot(
+    rt: &KhiveRuntime,
+    ns: &str,
+    model: &str,
+    watermark: u64,
+    live_threshold: Option<f64>,
+) -> Result<FreshTailSnapshot, String> {
+    let watermark = i64::try_from(watermark)
+        .map_err(|_| "fresh-tail watermark exceeds SQLite INTEGER range".to_string())?;
+    let table_name = format!("vec_{}", sanitize_model_key(model));
+    let (live_cte, selected_order, live_join, live_column) = match live_threshold {
+        Some(_) => (
+            format!(
+                "live AS (\
+                   SELECT COUNT(*) AS live_count FROM {table_name} \
+                   WHERE namespace = ?1 AND embedding_model = ?2 \
+                     AND field = 'knowledge.atom'\
+                 ),"
+            ),
+            "ORDER BY seq DESC \
+             LIMIT (SELECT CAST(live_count * ?5 AS INTEGER) + \
+                       CASE WHEN CAST(live_count * ?5 AS INTEGER) < live_count * ?5 \
+                            THEN 1 ELSE 0 END FROM live)",
+            "CROSS JOIN live",
+            "live.live_count",
+        ),
+        None => (String::new(), "ORDER BY seq", "", "NULL"),
+    };
+    let mut params = vec![
+        SqlValue::Text(ns.to_owned()),
+        SqlValue::Text(model.to_owned()),
+        SqlValue::Integer(watermark),
+        SqlValue::Text(ANN_CONSUMER.into()),
+    ];
+    if let Some(threshold) = live_threshold {
+        params.push(SqlValue::Float(threshold));
+    }
+
+    let sql = rt.sql();
+    let mut reader = sql.reader().await.map_err(|error| error.to_string())?;
+    let rows = reader
+        .query_all(SqlStatement {
+            sql: format!(
+                "WITH \
+                 registry AS (\
+                   SELECT MIN(watermark) AS registry_min \
+                   FROM ann_consumer_watermark \
+                   WHERE (namespace = ?1 OR namespace = '*') \
+                     AND embedding_model = ?2\
+                 ), \
+                 own AS (\
+                   SELECT (SELECT watermark FROM ann_consumer_watermark \
+                           WHERE consumer = ?4 AND namespace = ?1 \
+                             AND embedding_model = ?2) AS own_watermark\
+                 ), \
+                 {live_cte} \
+                 selected AS (\
+                   SELECT seq, subject_id, op FROM ann_write_log \
+                   WHERE namespace = ?1 AND embedding_model = ?2 \
+                     AND field = 'knowledge.atom' \
+                     AND seq > MAX(\
+                       ?3, COALESCE((SELECT registry_min FROM registry), ?3)\
+                     ) \
+                   {selected_order}\
+                 ) \
+                 SELECT selected.seq, selected.subject_id, selected.op, \
+                        vectors.namespace AS vector_namespace, \
+                        vectors.embedding_model AS vector_model, \
+                        vectors.field AS vector_field, \
+                        vectors.embedding, registry.registry_min, \
+                        own.own_watermark, {live_column} AS live_count \
+                 FROM registry CROSS JOIN own {live_join} \
+                 LEFT JOIN selected ON 1 = 1 \
+                 LEFT JOIN {table_name} AS vectors \
+                   ON vectors.subject_id = selected.subject_id \
+                 ORDER BY selected.seq"
+            ),
+            params,
+            label: Some("knowledge_ann_fresh_tail_snapshot".into()),
+        })
+        .await
+        .map_err(|error| error.to_string())?;
+
+    let first = rows
+        .first()
+        .ok_or_else(|| "fresh-tail snapshot returned no registry row".to_string())?;
+    let read_optional_i64 = |column: &str| -> Result<Option<i64>, String> {
+        match first.get(column) {
+            Some(SqlValue::Integer(value)) => Ok(Some(*value)),
+            Some(SqlValue::Null) | None => Ok(None),
+            other => Err(format!("fresh-tail {column}: unexpected value {other:?}")),
+        }
+    };
+    let own_watermark = read_optional_i64("own_watermark")?;
+    let registry_min = read_optional_i64("registry_min")?;
+    let live_count = match read_optional_i64("live_count")? {
+        Some(value) => {
+            Some(u64::try_from(value).map_err(|_| "negative fresh-tail live_count".to_string())?)
+        }
+        None => None,
+    };
+
+    type RawVector = (
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<Vec<u8>>,
+    );
+    let mut finals: Vec<(Uuid, bool, RawVector)> = Vec::new();
+    let mut index_by_id: HashMap<Uuid, usize> = HashMap::new();
+    for row in &rows {
+        let Some(SqlValue::Integer(_)) = row.get("seq") else {
+            continue;
+        };
+        let subject = match row.get("subject_id") {
+            Some(SqlValue::Text(value)) => Uuid::parse_str(value)
+                .map_err(|error| format!("fresh-tail subject_id {value}: {error}"))?,
+            other => return Err(format!("fresh-tail subject_id: unexpected value {other:?}")),
+        };
+        let is_delete = match row.get("op") {
+            Some(SqlValue::Text(value)) if value == "delete" => true,
+            Some(SqlValue::Text(value)) if value == "upsert" => false,
+            other => return Err(format!("fresh-tail op: unexpected value {other:?}")),
+        };
+        let raw_vector = (
+            match row.get("vector_namespace") {
+                Some(SqlValue::Text(value)) => Some(value.clone()),
+                _ => None,
+            },
+            match row.get("vector_model") {
+                Some(SqlValue::Text(value)) => Some(value.clone()),
+                _ => None,
+            },
+            match row.get("vector_field") {
+                Some(SqlValue::Text(value)) => Some(value.clone()),
+                _ => None,
+            },
+            match row.get("embedding") {
+                Some(SqlValue::Blob(value)) => Some(value.clone()),
+                _ => None,
+            },
+        );
+        match index_by_id.get(&subject) {
+            Some(&index) => finals[index] = (subject, is_delete, raw_vector),
+            None => {
+                index_by_id.insert(subject, finals.len());
+                finals.push((subject, is_delete, raw_vector));
+            }
+        }
+    }
+
+    let mut ops = Vec::with_capacity(finals.len());
+    for (subject, is_delete, (vector_ns, vector_model, vector_field, embedding)) in finals {
+        if is_delete {
+            ops.push((subject, None));
+            continue;
+        }
+        let in_scope = vector_ns.as_deref() == Some(ns)
+            && vector_model.as_deref() == Some(model)
+            && vector_field.as_deref() == Some("knowledge.atom");
+        if !in_scope {
+            return Err(format!(
+                "fresh-tail upsert {subject}: vector row outside consumer scope"
+            ));
+        }
+        let Some(bytes) = embedding else {
+            return Err(format!(
+                "fresh-tail upsert {subject}: embedding is not a blob"
+            ));
+        };
+        if bytes.len() % std::mem::size_of::<f32>() != 0 {
+            return Err(format!(
+                "fresh-tail upsert {subject}: malformed embedding byte length {}",
+                bytes.len()
+            ));
+        }
+        let embedding = bytes
+            .chunks_exact(4)
+            .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+            .collect();
+        ops.push((subject, Some(embedding)));
+    }
+    Ok(FreshTailSnapshot {
+        own_watermark,
+        registry_min,
+        live_count,
+        ops,
+    })
+}
+
+fn exact_cosine(query: &[f32], embedding: &[f32]) -> f32 {
+    if query.len() != embedding.len() || query.is_empty() {
+        return 0.0;
+    }
+    let mut query = query.to_vec();
+    let mut embedding = embedding.to_vec();
+    l2_normalize(&mut query);
+    l2_normalize(&mut embedding);
+    query
+        .iter()
+        .zip(embedding.iter())
+        .map(|(left, right)| left * right)
+        .sum::<f32>()
+        .max(0.0)
+}
+
+pub(crate) fn merge_fresh_tail(
+    candidates: Vec<(Uuid, f32)>,
+    query: &[f32],
+    ops: Vec<(Uuid, Option<Vec<f32>>)>,
+) -> Vec<(Uuid, f32)> {
+    if ops.is_empty() {
+        return candidates;
+    }
+    let mut deletes = HashSet::new();
+    let mut upserts = HashMap::new();
+    for (subject, op) in ops {
+        match op {
+            Some(embedding) => {
+                upserts.insert(subject, exact_cosine(query, &embedding));
+            }
+            None => {
+                deletes.insert(subject);
+            }
+        }
+    }
+    let mut merged: Vec<(Uuid, f32)> = candidates
+        .into_iter()
+        .filter(|(subject, _)| !deletes.contains(subject) && !upserts.contains_key(subject))
+        .collect();
+    merged.extend(upserts);
+    merged.sort_by(|left, right| {
+        right
+            .1
+            .partial_cmp(&left.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| left.0.cmp(&right.0))
+    });
+    merged
+}
+
+pub(crate) enum FreshTailOutcome {
+    /// Coalesced final tail operations that are valid against the candidate
+    /// list the caller already captured from its serving bridge.
+    Ops(Vec<(Uuid, Option<Vec<f32>>)>),
+    /// A compaction mismatch forced current-query segment re-resolution. These
+    /// candidates already come from one coherent replacement segment plus its
+    /// own tail and must replace, never merge with, the caller's stale list.
+    Replace(Vec<(Uuid, f32)>),
+    /// The exact leg could not run; retain the caller's existing candidates.
+    Skipped,
+}
+
+pub(crate) async fn fresh_tail_leg(
+    rt: &KhiveRuntime,
+    ann: &SharedAnn,
+    key: &AnnKey,
+    query: &[f32],
+    k: usize,
+    watermark: Option<u64>,
+) -> FreshTailOutcome {
+    let ns = key.namespace.as_str();
+    let model = key.model.as_str();
+    if force_rebuild_required(ann, key) {
+        // The first detector already evicted the untrusted bridge and retired
+        // its Ready ownership.  Do not invalidate the authoritative warm now
+        // in flight on every concurrent query; dropping this query's captured
+        // candidates is sufficient until that warm replaces the cache.
+        return FreshTailOutcome::Replace(Vec::new());
+    }
+    if !fresh_tail_enabled() {
+        return match read_own_watermark(rt, ns, model).await {
+            Ok(Some(watermark)) if watermark >= 0 => FreshTailOutcome::Skipped,
+            Ok(_) => force_cold_after_registry_loss(rt, ann, key).await,
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    namespace = ns,
+                    model,
+                    "knowledge ANN registry read failed while fresh-tail was disabled"
+                );
+                FreshTailOutcome::Replace(Vec::new())
+            }
+        };
+    }
+
+    match watermark {
+        Some(watermark) => fresh_tail_serving(rt, ann, key, query, k, watermark).await,
+        None => fresh_tail_capped(rt, ann, key).await,
+    }
+}
+
+async fn force_cold_after_registry_loss(
+    rt: &KhiveRuntime,
+    ann: &SharedAnn,
+    key: &AnnKey,
+) -> FreshTailOutcome {
+    // Publish the cross-process fence before yielding or evicting local state.
+    // A peer checkpoint therefore cannot compact/publish through the gap while
+    // this process is transitioning its loaded bridge to Cold.
+    if let Err(error) = prepare_authoritative_rebuild(rt, ann, key).await {
+        tracing::warn!(
+            error = %error,
+            namespace = key.namespace,
+            model = key.model,
+            "knowledge ANN failed to publish registry-loss rebuild sentinel"
+        );
+    }
+    clear_namespace(ann, &key.namespace).await;
+    FreshTailOutcome::Replace(Vec::new())
+}
+
+fn ready_snapshot_watermark(snapshot: &FreshTailSnapshot) -> Option<u64> {
+    snapshot
+        .own_watermark
+        .filter(|watermark| *watermark >= 0)
+        .and_then(|watermark| u64::try_from(watermark).ok())
+}
+
+fn nonnegative_registry_min(snapshot: &FreshTailSnapshot) -> u64 {
+    snapshot
+        .registry_min
+        .filter(|watermark| *watermark >= 0)
+        .and_then(|watermark| u64::try_from(watermark).ok())
+        .unwrap_or(0)
+}
+
+async fn fresh_tail_serving(
+    rt: &KhiveRuntime,
+    ann: &SharedAnn,
+    key: &AnnKey,
+    query: &[f32],
+    k: usize,
+    watermark: u64,
+) -> FreshTailOutcome {
+    let ns = key.namespace.as_str();
+    let model = key.model.as_str();
+    let snapshot = match fetch_fresh_tail_snapshot(rt, ns, model, watermark, None).await {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            tracing::warn!(
+                error = %error,
+                namespace = ns,
+                model,
+                "knowledge fresh-tail snapshot failed; dropping stale vector leg"
+            );
+            return FreshTailOutcome::Replace(Vec::new());
+        }
+    };
+    let Some(_own_watermark) = ready_snapshot_watermark(&snapshot) else {
+        return force_cold_after_registry_loss(rt, ann, key).await;
+    };
+
+    let registry_min = nonnegative_registry_min(&snapshot);
+    if registry_min > watermark {
+        // The log may already have been compacted through `registry_min`, so
+        // candidates from the bridge at `watermark` cannot be paired with a
+        // scan floored at that newer value. Prefer the currently published
+        // segment, whose commit watermark must cover the registry minimum.
+        let published_watermark = ann_segment_dir(rt, ns, model)
+            .and_then(|dir| read_commit_info(&dir).ok().flatten())
+            .and_then(|info| info.last_applied_seq)
+            .filter(|published| *published >= registry_min);
+
+        match published_watermark {
+            Some(published_watermark) => {
+                // Retire the stale cache entry now. The query below owns a
+                // local replacement candidate set, while the next request's
+                // normal warm path re-adopts the published segment.
+                clear_namespace(ann, ns).await;
+                return fresh_tail_reresolve(rt, ann, key, query, k, published_watermark).await;
+            }
+            None => {
+                // Re-resolution is not possible in this query. Preserve the
+                // same-snapshot coverage proof above the registry minimum, but
+                // do not mix those operations with candidates from the older
+                // bridge: return an exact-only replacement vector source.
+                clear_namespace(ann, ns).await;
+                return FreshTailOutcome::Replace(merge_fresh_tail(
+                    Vec::new(),
+                    query,
+                    snapshot.ops,
+                ));
+            }
+        }
+    }
+    FreshTailOutcome::Ops(snapshot.ops)
+}
+
+/// Bound re-resolution when peers publish checkpoints faster than one query can
+/// load and validate them. The terminal branch keeps only the exact suffix above
+/// the last same-snapshot registry floor, avoiding an unprovable mixture with
+/// candidates from a segment behind that floor.
+const FRESH_TAIL_RERESOLVE_MAX_ROUNDS: u32 = 3;
+
+/// Load the currently published segment, search it, then validate its watermark
+/// against the registry minimum and fetch its own tail in one SQLite snapshot.
+/// A peer may advance the minimum between the filesystem load and validation;
+/// retry from the newly published segment in that case.
+async fn fresh_tail_reresolve(
+    rt: &KhiveRuntime,
+    ann: &SharedAnn,
+    key: &AnnKey,
+    query: &[f32],
+    k: usize,
+    published_watermark: u64,
+) -> FreshTailOutcome {
+    let ns = key.namespace.as_str();
+    let model = key.model.as_str();
+    let mut expected_watermark = published_watermark;
+    for round in 1..=FRESH_TAIL_RERESOLVE_MAX_ROUNDS {
+        let Some(dir) = ann_segment_dir(rt, ns, model) else {
+            tracing::warn!(
+                key = ?key,
+                namespace = ns,
+                model,
+                "knowledge fresh-tail published segment disappeared during re-resolution"
+            );
+            return FreshTailOutcome::Replace(Vec::new());
+        };
+        let bridge = match AnnBridge::load(&dir) {
+            Ok(bridge) => bridge,
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    key = ?key,
+                    namespace = ns,
+                    model,
+                    "knowledge fresh-tail published segment load failed"
+                );
+                return FreshTailOutcome::Replace(Vec::new());
+            }
+        };
+        let loaded_watermark = bridge
+            .index
+            .last_applied_seq()
+            .unwrap_or(expected_watermark);
+        let candidates = bridge.search(query, k);
+
+        let snapshot = match fetch_fresh_tail_snapshot(rt, ns, model, loaded_watermark, None).await
+        {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    key = ?key,
+                    namespace = ns,
+                    model,
+                    "knowledge fresh-tail re-resolution snapshot failed"
+                );
+                return FreshTailOutcome::Replace(Vec::new());
+            }
+        };
+        let Some(_own_watermark) = ready_snapshot_watermark(&snapshot) else {
+            return force_cold_after_registry_loss(rt, ann, key).await;
+        };
+        let registry_min = nonnegative_registry_min(&snapshot);
+
+        if registry_min <= loaded_watermark {
+            return FreshTailOutcome::Replace(merge_fresh_tail(candidates, query, snapshot.ops));
+        }
+
+        if round == FRESH_TAIL_RERESOLVE_MAX_ROUNDS {
+            tracing::warn!(
+                key = ?key,
+                namespace = ns,
+                model,
+                rounds = round,
+                floor = registry_min,
+                "knowledge fresh-tail re-resolution did not converge; using exact-only floored suffix"
+            );
+            return FreshTailOutcome::Replace(merge_fresh_tail(Vec::new(), query, snapshot.ops));
+        }
+
+        expected_watermark = registry_min;
+    }
+    unreachable!("fresh-tail re-resolution loop returns within its bounded rounds")
+}
+
+async fn fresh_tail_capped(rt: &KhiveRuntime, ann: &SharedAnn, key: &AnnKey) -> FreshTailOutcome {
+    let snapshot = match fetch_fresh_tail_snapshot(
+        rt,
+        &key.namespace,
+        &key.model,
+        0,
+        Some(ann_rebuild_threshold()),
+    )
+    .await
+    {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            tracing::warn!(
+                error = %error,
+                namespace = key.namespace,
+                model = key.model,
+                "knowledge capped fresh-tail fetch failed"
+            );
+            return FreshTailOutcome::Skipped;
+        }
+    };
+    if ready_snapshot_watermark(&snapshot).is_none() {
+        return force_cold_after_registry_loss(rt, ann, key).await;
+    }
+    debug_assert!(snapshot.live_count.is_some());
+    FreshTailOutcome::Ops(snapshot.ops)
+}
+
+/// Reconcile a checkpoint after another publisher already advanced the durable
+/// row. The loser must adopt the winner (when persisted) rather than overwrite
+/// a newer segment or demote a recovered row back to `-1`.
+/// `observed_watermark` is the winner's durable lower bound while the caller
+/// still holds the bridge publication lock.
+async fn adopt_checkpoint_winner(
+    rt: &KhiveRuntime,
+    ann: &SharedAnn,
+    key: &AnnKey,
+    generation: u64,
+    observed_watermark: u64,
+) -> bool {
+    let installed = match ann_segment_dir(rt, &key.namespace, &key.model) {
+        Some(dir) => match AnnBridge::load(&dir) {
+            Ok(bridge) if bridge.index.last_applied_seq().unwrap_or(0) >= observed_watermark => {
+                // Any incumbent predates registry-loss recovery. Remove it
+                // before installing the winner; the normal generation fence
+                // still rejects the winner if a local write raced its scan.
+                ann.indexes.write().await.remove(key);
+                install_replacing(ann, key, bridge.with_generation(generation)).await
+            }
+            Ok(bridge) => {
+                tracing::warn!(
+                    key = ?key,
+                    bridge_watermark = bridge.index.last_applied_seq().unwrap_or(0),
+                    observed_watermark,
+                    "checkpoint winner segment trails its durable watermark"
+                );
+                ann.indexes.write().await.remove(key);
+                false
+            }
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    key = ?key,
+                    "failed to adopt checkpoint race winner"
+                );
+                ann.indexes.write().await.remove(key);
+                false
+            }
+        },
+        // An in-memory runtime has no cross-process segment. A same-process
+        // winner may already be installed in the shared AnnState; otherwise
+        // the next warm retries as ordinary registered Cold.
+        None => {
+            let current = has_current_index_at_watermark(ann, key, observed_watermark).await;
+            if !current {
+                ann.indexes.write().await.remove(key);
+            }
+            current
+        }
+    };
+    clear_force_rebuild(ann, key);
+    installed
+}
+
+/// Persist `bridge` at its applied watermark, reopen and publish the mmap
+/// segment, then raise this consumer's registry row and compact through the
+/// pair MIN. Publishing before the durable raise makes the ADR-118 mismatch
+/// window empty for this process; a crash before the raise merely
+/// under-compacts. Registration still precedes persistence (ADR-079 Amendment
+/// 1 §A step 1). On persist/reopen failure the Owned bridge is installed.
 pub(crate) async fn checkpoint_raise_compact_readopt(
     rt: &KhiveRuntime,
     ann: &SharedAnn,
     key: &AnnKey,
-    ns: &str,
-    model: &str,
     bridge: AnnBridge,
     generation: u64,
-) {
-    let applied = bridge.index.last_applied_seq().unwrap_or(0);
-    if let Err(e) = register_consumer(rt, ns, model).await {
-        tracing::warn!(error = %e, "ann consumer registration failed; serving Owned, no persist");
-        install_replacing(ann, key, bridge.with_generation(generation)).await;
-        return;
-    }
-    if let Err(e) = persist_ann_v2(rt, ns, model, &bridge) {
-        tracing::error!(error = %e, "failed to persist v2 Vamana segment");
-        install_replacing(ann, key, bridge.with_generation(generation)).await;
-        return;
-    }
-    if let Err(e) = raise_watermark(rt, ns, model, applied).await {
-        tracing::warn!(error = %e, "ann watermark raise failed (under-compacts; safe)");
-    } else if let Err(e) = compact_log(rt, ns, model).await {
-        tracing::warn!(error = %e, "ann log compaction failed (retries next checkpoint)");
-    }
-    match ann_segment_dir(rt, ns, model) {
-        Some(dir) => match AnnBridge::load(&dir) {
-            Ok(mmap_bridge) => {
-                install_replacing(ann, key, mmap_bridge.with_generation(generation)).await;
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "mmap re-adoption failed; serving Owned build");
-                install_replacing(ann, key, bridge.with_generation(generation)).await;
+    authority: CheckpointAuthority,
+) -> bool {
+    let ns = key.namespace.as_str();
+    let model = key.model.as_str();
+    let local_publication_lock = checkpoint_lock(ann, key);
+    let _local_publication_guard = local_publication_lock.lock().await;
+
+    // This lock spans the complete knowledge-level publication: Vamana
+    // segments, UUID sidecar, mmap verification, and the durable registry
+    // transition.  The sentinel writer takes the same lock, so an ordinary
+    // replay checkpoint that predates registry loss cannot publish after -1.
+    let publication_lock = match ann_segment_dir(rt, ns, model) {
+        Some(dir) => match acquire_bridge_checkpoint_lock_async(dir).await {
+            Ok(lock) => Some(lock),
+            Err(error) => {
+                tracing::warn!(error = %error, "failed to acquire ANN checkpoint lock");
+                return false;
             }
         },
-        None => {
-            // In-memory backend: nothing was persisted; serve the Owned build.
-            install_replacing(ann, key, bridge.with_generation(generation)).await;
+        None => None,
+    };
+
+    let applied = bridge.index.last_applied_seq().unwrap_or(0);
+    let own_watermark = match read_own_watermark(rt, ns, model).await {
+        Ok(value) => value,
+        Err(error) => {
+            tracing::warn!(error = %error, "ann checkpoint registry read failed");
+            return false;
+        }
+    };
+    if authority == CheckpointAuthority::FullSentinel {
+        if let Some(observed) = own_watermark.filter(|watermark| *watermark >= 0) {
+            tracing::info!(
+                key = ?key,
+                observed_watermark = observed,
+                "authoritative ANN rebuild lost publication race; adopting winner"
+            );
+            let observed = u64::try_from(observed).unwrap_or(0);
+            return adopt_checkpoint_winner(rt, ann, key, generation, observed).await;
+        }
+    } else if let Some(observed) = own_watermark.filter(|watermark| *watermark >= 0) {
+        let observed = u64::try_from(observed).unwrap_or(0);
+        if observed > applied {
+            tracing::info!(
+                key = ?key,
+                candidate_watermark = applied,
+                observed_watermark = observed,
+                "stale ANN checkpoint lost publication race; adopting winner"
+            );
+            return adopt_checkpoint_winner(rt, ann, key, generation, observed).await;
         }
     }
+    let authorized = match authority {
+        CheckpointAuthority::FullSentinel => own_watermark == Some(-1),
+        CheckpointAuthority::Incremental | CheckpointAuthority::FullRegistered => {
+            own_watermark.is_some_and(|watermark| watermark >= 0)
+        }
+    };
+    if !authorized {
+        mark_force_rebuild(ann, key);
+        if let Err(error) = write_force_rebuild_sentinel_row(rt, key).await {
+            tracing::warn!(error = %error, "failed to fence unauthorized ANN checkpoint");
+        }
+        return false;
+    }
+
+    if let Err(e) = persist_ann_v2_locked(rt, ns, model, &bridge) {
+        tracing::error!(error = %e, "failed to persist v2 Vamana segment");
+        install_replacing(ann, key, bridge.with_generation(generation)).await;
+        return false;
+    }
+    let published = match ann_segment_dir(rt, ns, model) {
+        Some(dir) => match AnnBridge::load(&dir) {
+            Ok(mmap_bridge) => mmap_bridge,
+            Err(e) => {
+                tracing::warn!(error = %e, "mmap re-adoption failed; serving Owned build");
+                bridge
+            }
+        },
+        None => bridge,
+    };
+    // File-backed publication must replace the in-process bridge before the
+    // durable raise, closing the same-process mismatch window. An in-memory
+    // runtime has no cross-process segment or compaction peer, so defer its
+    // install until the conditional raise succeeds; a losing concurrent full
+    // scan then cannot overwrite the winner before discovering the lost race.
+    let file_backed = publication_lock.is_some();
+    let mut pending_in_memory = Some(published.with_generation(generation));
+    let mut installed = false;
+    if file_backed {
+        installed = install_replacing(
+            ann,
+            key,
+            pending_in_memory.take().expect("published bridge"),
+        )
+        .await;
+    }
+
+    // The durable segment already covers `applied`, and this process now
+    // serves that same state. A failed raise only retains extra log rows.
+    if let Err(e) = raise_watermark(rt, ns, model, applied, authority).await {
+        tracing::warn!(error = %e, "ann watermark raise failed (under-compacts; safe)");
+        match read_own_watermark(rt, ns, model).await {
+            Ok(Some(observed)) if observed >= 0 => {
+                let observed = u64::try_from(observed).unwrap_or(0);
+                if observed > applied {
+                    return adopt_checkpoint_winner(rt, ann, key, generation, observed).await;
+                }
+                // Either our conditional transition committed despite an
+                // uncertain client result, or the durable row remains behind
+                // this candidate. Both are safe under-compaction states.
+                if let Some(published) = pending_in_memory.take() {
+                    installed = install_replacing(ann, key, published).await;
+                }
+                clear_force_rebuild(ann, key);
+                return installed || has_current_index_at_watermark(ann, key, observed).await;
+            }
+            Ok(_) => {}
+            Err(read_error) => {
+                tracing::warn!(
+                    error = %read_error,
+                    "failed to reconcile ANN checkpoint race"
+                );
+            }
+        }
+        mark_force_rebuild(ann, key);
+        if let Err(error) = write_force_rebuild_sentinel_row(rt, key).await {
+            tracing::warn!(error = %error, "failed to restore ANN checkpoint fence");
+        }
+        return false;
+    }
+    if let Some(published) = pending_in_memory {
+        installed = install_replacing(ann, key, published).await;
+    }
+    if authority != CheckpointAuthority::Incremental {
+        clear_force_rebuild_if_current(ann, key, generation);
+    }
+    drop(publication_lock);
+    if let Err(e) = compact_log(rt, ns, model).await {
+        tracing::warn!(error = %e, "ann log compaction failed (retries next checkpoint)");
+    }
+    installed
 }
 
 /// Try to load a Vamana snapshot for `namespace`+`model` from `retrieval_snapshots`.
@@ -1170,17 +2305,19 @@ async fn scan_corpus_raw(
         .await
         .map_err(|e| RuntimeError::Internal(e.to_string()))?;
 
-    // The uncorrelated scalar subquery evaluates inside the SAME statement —
-    // and therefore the same SQLite read snapshot — as the corpus rows, so
-    // the captured watermark S describes exactly this scan's state (ADR-079
-    // Amendment 1: watermark capture and corpus read are linearized).
+    // The global AUTOINCREMENT high-water evaluates inside the SAME statement
+    // — and therefore the same SQLite read snapshot — as the corpus rows.
+    // Unlike MAX over retained rows it survives compaction, so an
+    // authoritative recovery checkpoint never regresses below the untrusted
+    // segment it replaces. Future writes have a strictly larger global seq;
+    // rows from sibling scopes below S are irrelevant to this corpus.
     let rows = reader
         .query_all(SqlStatement {
             sql: format!(
                 "SELECT subject_id, embedding, \
-                        (SELECT COALESCE(MAX(seq), 0) FROM ann_write_log \
-                          WHERE namespace = ?1 AND embedding_model = ?2 \
-                            AND field = 'knowledge.atom') AS log_s \
+                        (SELECT COALESCE(\
+                           (SELECT seq FROM sqlite_sequence \
+                            WHERE name = 'ann_write_log'), 0)) AS log_s \
                  FROM {table_name} \
                  WHERE namespace = ?1 AND embedding_model = ?2 \
                    AND field = 'knowledge.atom' \
@@ -1303,6 +2440,37 @@ pub(crate) async fn invalidate_snapshot(rt: &KhiveRuntime, namespace: &str) {
     }
 }
 
+/// Run one already-owned warm attempt to completion.
+async fn run_warm_attempt(
+    rt: &KhiveRuntime,
+    token: &NamespaceToken,
+    ann: &SharedAnn,
+    model: &str,
+    permit: AnnWarmPermit,
+) {
+    let outcome = ensure_ann_for_model(rt, token, ann, model).await;
+    finish_warm(permit, outcome).await;
+}
+
+/// Await one single-flight warm for the explicit model. Used by both v1 and
+/// v2 startup discovery so they share the same lifecycle while retaining the
+/// preload path's existing await-before-next-key timing.
+async fn warm_ann_for_model_once(
+    rt: &KhiveRuntime,
+    token: &NamespaceToken,
+    ann: &SharedAnn,
+    model: &str,
+) {
+    if model.is_empty() {
+        return;
+    }
+    let key = AnnKey::new(token.namespace().as_str(), model);
+    let Some(permit) = begin_warm(ann, key) else {
+        return;
+    };
+    run_warm_attempt(rt, token, ann, model, permit).await;
+}
+
 /// Pre-load Vamana snapshots for all `{ns}::vamana::{model}` keys found in
 /// `retrieval_snapshots`.  Called from `KnowledgePack::warm()` before the first
 /// search request so in-memory indexes are ready without a first-query spike.
@@ -1349,19 +2517,7 @@ pub(crate) async fn warm_known_snapshots(rt: &KhiveRuntime, ann: &SharedAnn) {
             Ok(t) => t,
             Err(_) => continue,
         };
-        let key = AnnKey::new(ns_str, model);
-        {
-            let mut warming = warming_guard(&ann.warming);
-            if warming.contains(&key) {
-                continue; // another path is already warming this key
-            }
-            warming.insert(key.clone());
-        }
-        ensure_ann_for_model(rt, &token, ann, model).await;
-        let loaded = ann.indexes.read().await.contains_key(&key);
-        if !loaded {
-            warming_guard(&ann.warming).remove(&key);
-        }
+        warm_ann_for_model_once(rt, &token, ann, model).await;
     }
 
     // Enumerate v2 segment directories under this database's own ANN root and
@@ -1388,19 +2544,13 @@ pub(crate) async fn warm_known_snapshots(rt: &KhiveRuntime, ann: &SharedAnn) {
             Ok(t) => t,
             Err(_) => continue,
         };
-        // Guard: skip if already loaded by the v1 pass.
-        let key = AnnKey::new(&ns_str, &model);
-        if ann.indexes.read().await.contains_key(&key) {
-            continue;
-        }
-        ensure_ann_for_model(rt, &token, ann, &model).await;
+        warm_ann_for_model_once(rt, &token, ann, &model).await;
     }
 }
 
-/// Fire-once per-key background warm. Returns immediately. If the key is already
-/// loaded or warming is in flight for it, does nothing. On a completed attempt
-/// that produced no index (e.g. no corpus yet), removes the key from the warming
-/// guard so a later search can retry.
+/// Spawn one per-key background warm and return immediately. Current-generation
+/// `Warming`/`Ready` states suppress duplicates; `Failed` remains retryable by
+/// the next search.
 pub(crate) fn ensure_ann_background(rt: &KhiveRuntime, token: &NamespaceToken, ann: &SharedAnn) {
     let model = rt.default_embedder_name().to_string();
     if model.is_empty() {
@@ -1408,27 +2558,17 @@ pub(crate) fn ensure_ann_background(rt: &KhiveRuntime, token: &NamespaceToken, a
     }
     let ns = token.namespace().as_str().to_owned();
     let key = AnnKey::new(&ns, &model);
-
-    {
-        let mut warming = warming_guard(&ann.warming);
-        if warming.contains(&key) {
-            return; // already warming or warmed
-        }
-        warming.insert(key.clone());
-    }
+    let Some(permit) = begin_warm(ann, key) else {
+        return;
+    };
 
     let rt = rt.clone();
     let ann = ann.clone();
-    let token_ns = token.namespace().clone();
+    // Preserve the request-minted actor/visibility context (ADR-096). Reauthorizing
+    // from the namespace here would silently replace it with runtime defaults.
+    let token = token.clone();
     tokio::spawn(async move {
-        if let Ok(token) = rt.authorize(token_ns) {
-            ensure_ann_for_model(&rt, &token, &ann, &model).await;
-        }
-        // If loading failed, remove from warming so a later search can retry.
-        let loaded = ann.indexes.read().await.contains_key(&key);
-        if !loaded {
-            warming_guard(&ann.warming).remove(&key);
-        }
+        run_warm_attempt(&rt, &token, &ann, &model, permit).await;
     });
 }
 
@@ -1443,6 +2583,9 @@ enum SegmentOutcome {
     Empty,
     /// No trustworthy segment: fall through to the v1 / rebuild paths.
     Cold,
+    /// Registry loss or its durable marker requires a full corpus scan.  The
+    /// caller must bypass both v2 adoption and the legacy-v1 fallback.
+    ForceRebuild,
 }
 
 /// ADR-079 Amendment 1 restart classifier (the 8-rule first-match decision
@@ -1458,6 +2601,10 @@ async fn classify_and_adopt_segment(
     seg_dir: &std::path::Path,
     target_generation: u64,
 ) -> SegmentOutcome {
+    if force_rebuild_required(ann, key) {
+        return SegmentOutcome::ForceRebuild;
+    }
+
     // Rule 1: commit record absent, corrupt, or invalid length → Cold.
     let info = match read_commit_info(seg_dir) {
         Ok(Some(info)) => info,
@@ -1493,19 +2640,22 @@ async fn classify_and_adopt_segment(
         None => return SegmentOutcome::Cold,
     }
 
-    // Rule 4: own registry row absent for an extended-format state → Cold
-    // after re-registering at 0. Registration precedes every persist, so an
-    // absent row means administrative removal or registry loss — compaction
-    // may already have deleted this consumer's tail.
+    // Rule 4: an absent row or the durable -1 sentinel requires an
+    // authoritative full-corpus rebuild.  The sentinel is cross-process and
+    // keeps pair compaction blocked until that rebuild publishes.
     match read_own_watermark(rt, ns, model).await {
-        Ok(Some(_)) => {}
+        Ok(Some(watermark)) if watermark >= 0 => {}
+        Ok(Some(_)) => {
+            mark_force_rebuild(ann, key);
+            return SegmentOutcome::ForceRebuild;
+        }
         Ok(None) => {
             tracing::info!(namespace = %ns, model = %model,
-                "ann consumer registry row absent; re-registering at 0, Cold rebuild");
-            if let Err(e) = register_consumer(rt, ns, model).await {
-                tracing::warn!(error = %e, "ann consumer re-registration failed");
+                "ann consumer registry row absent; fencing for authoritative rebuild");
+            if let Err(error) = prepare_authoritative_rebuild(rt, ann, key).await {
+                tracing::warn!(error = %error, "ann consumer re-registration failed");
             }
-            return SegmentOutcome::Cold;
+            return SegmentOutcome::ForceRebuild;
         }
         Err(e) => {
             tracing::warn!(error = %e, "ann registry read failed; Cold");
@@ -1582,7 +2732,18 @@ async fn classify_and_adopt_segment(
             return SegmentOutcome::Cold;
         }
         bridge.set_applied_seq(new_s);
-        checkpoint_raise_compact_readopt(rt, ann, key, ns, model, bridge, target_generation).await;
+        let checkpointed = checkpoint_raise_compact_readopt(
+            rt,
+            ann,
+            key,
+            bridge,
+            target_generation,
+            CheckpointAuthority::Incremental,
+        )
+        .await;
+        if !checkpointed && force_rebuild_required(ann, key) {
+            return SegmentOutcome::ForceRebuild;
+        }
         return SegmentOutcome::Installed;
     }
 
@@ -1609,18 +2770,50 @@ async fn classify_and_adopt_segment(
 /// legacy v1 JSON snapshot, (4) full corpus rebuild, atomically persisted
 /// as v2 for next restart. See
 /// crates/khive-pack-knowledge/docs/api/vamana.md#ensure_ann_for_model-load-order
-/// for the per-step detail.
+/// for the per-step detail. The explicit outcome lets the lifecycle retain a
+/// served stale fallback while keeping a failed replacement retryable.
 pub(crate) async fn ensure_ann_for_model(
     rt: &KhiveRuntime,
     token: &NamespaceToken,
     ann: &SharedAnn,
     model: &str,
-) {
+) -> AnnWarmOutcome {
     if model.is_empty() {
-        return;
+        return AnnWarmOutcome::Empty;
     }
     let ns = token.namespace().as_str().to_owned();
     let key = AnnKey::new(&ns, model);
+
+    // Registration precedes every scan or legacy serve. Local absence of a
+    // bridge cannot prove global first use: a peer may still hold stale v1 or
+    // Owned state after this row was administratively removed. Every absent
+    // knowledge row therefore publishes the durable force-rebuild sentinel
+    // before any further serving, even in a fresh process.
+    let mut force_rebuild = force_rebuild_required(ann, &key);
+    match read_own_watermark(rt, &ns, model).await {
+        Ok(Some(watermark)) if watermark < 0 => {
+            mark_force_rebuild(ann, &key);
+            force_rebuild = true;
+        }
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            if let Err(error) = prepare_authoritative_rebuild(rt, ann, &key).await {
+                tracing::warn!(error = %error, "failed to fence ANN registry loss");
+                return AnnWarmOutcome::Failed;
+            }
+            force_rebuild = true;
+        }
+        Err(error) => {
+            tracing::warn!(error = %error, "failed to read ANN registration before scan");
+            return AnnWarmOutcome::Failed;
+        }
+    }
+    if force_rebuild && !matches!(read_own_watermark(rt, &ns, model).await, Ok(Some(-1))) {
+        if let Err(error) = prepare_authoritative_rebuild(rt, ann, &key).await {
+            tracing::warn!(error = %error, "failed to establish ANN rebuild sentinel");
+            return AnnWarmOutcome::Failed;
+        }
+    }
 
     // Capture the namespace's write-generation BEFORE anything else (issue
     // #770) — including before the fast path below and before the corpus
@@ -1634,97 +2827,141 @@ pub(crate) async fn ensure_ann_for_model(
     // build served from an emptied-then-refilled slot serve indefinitely.
     // Falling through here re-enters the same rebuild path a genuine cache
     // miss would take.
-    if let Some(loaded_generation) = ann
-        .indexes
-        .read()
-        .await
-        .get(&key)
-        .map(|bridge| bridge.generation)
-    {
-        if loaded_generation >= target_generation {
-            return;
+    if !force_rebuild {
+        if let Some(loaded_generation) = ann
+            .indexes
+            .read()
+            .await
+            .get(&key)
+            .map(|bridge| bridge.generation)
+        {
+            if loaded_generation >= target_generation {
+                return AnnWarmOutcome::Ready;
+            }
+            tracing::debug!(
+                namespace = %ns,
+                model = %model,
+                loaded_generation,
+                target_generation,
+                "knowledge ANN fast path skipped: cached entry generation stale; rebuilding"
+            );
         }
-        tracing::debug!(
-            namespace = %ns,
-            model = %model,
-            loaded_generation,
-            target_generation,
-            "knowledge ANN fast path skipped: cached entry generation stale; rebuilding"
-        );
     }
 
     // 2. v2 segment path — ADR-079 Amendment 1 watermark classifier. Total,
     // first-match decision table over the persisted commit record, this
     // consumer's registry row, and one same-snapshot (live, tail) read.
-    if let Some(seg_dir) = ann_segment_dir(rt, &ns, model) {
-        match classify_and_adopt_segment(rt, ann, &key, &ns, model, &seg_dir, target_generation)
-            .await
-        {
-            SegmentOutcome::Installed => return,
-            SegmentOutcome::Empty => {
-                mark_unavailable(ann, &key, target_generation);
-                return;
+    if !force_rebuild {
+        if let Some(seg_dir) = ann_segment_dir(rt, &ns, model) {
+            match classify_and_adopt_segment(rt, ann, &key, &ns, model, &seg_dir, target_generation)
+                .await
+            {
+                SegmentOutcome::Installed => return AnnWarmOutcome::Ready,
+                SegmentOutcome::Empty => {
+                    mark_unavailable(ann, &key, target_generation);
+                    return AnnWarmOutcome::Empty;
+                }
+                SegmentOutcome::Cold => {} // fall through to v1 / rebuild
+                SegmentOutcome::ForceRebuild => force_rebuild = true,
             }
-            SegmentOutcome::Cold => {} // fall through to v1 / rebuild
         }
     }
 
     // 3. v1 JSON snapshot path (backwards-compat transition).
-    if let Some(snapshot) = try_load_snapshot(rt, &ns, model).await {
-        let current_fp = compute_fingerprint(rt, token, model).await;
-        if let Some(fp) = current_fp {
-            if snapshot.fingerprint == fp {
-                match AnnBridge::from_vamana_snapshot(snapshot) {
-                    Ok(bridge) => {
-                        install_if_fresher(ann, &key, bridge.with_generation(target_generation))
+    if !force_rebuild {
+        if let Some(snapshot) = try_load_snapshot(rt, &ns, model).await {
+            let current_fp = compute_fingerprint(rt, token, model).await;
+            if let Some(fp) = current_fp {
+                if snapshot.fingerprint == fp {
+                    match AnnBridge::from_vamana_snapshot(snapshot) {
+                        Ok(bridge) => {
+                            install_if_fresher(
+                                ann,
+                                &key,
+                                bridge.with_generation(target_generation),
+                            )
                             .await;
-                        return;
+                            return AnnWarmOutcome::Ready;
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, "corrupt Vamana v1 snapshot; rebuilding");
+                        }
                     }
-                    Err(e) => {
-                        tracing::warn!(error = %e, "corrupt Vamana v1 snapshot; rebuilding");
-                    }
+                } else {
+                    tracing::info!(
+                        namespace = %ns,
+                        model = %model,
+                        "stale Vamana v1 snapshot (fingerprint mismatch); rebuilding"
+                    );
                 }
-            } else {
-                tracing::info!(
-                    namespace = %ns,
-                    model = %model,
-                    "stale Vamana v1 snapshot (fingerprint mismatch); rebuilding"
-                );
             }
         }
     }
 
-    // 4. Rebuild fallthrough — build from vector store, persist v2 segments,
-    // raise the registry watermark, compact the log, and re-adopt as mmap.
+    // 4. Rebuild fallthrough — build from vector store, persist and re-adopt
+    // the v2 segment, then raise the registry watermark and compact the log.
+    let scan_authority = match prepare_full_corpus_scan(rt, ann, &key).await {
+        Ok(authority) => authority,
+        Err(error) => {
+            tracing::warn!(error = %error, "failed to establish ANN full-scan authority");
+            return AnnWarmOutcome::Failed;
+        }
+    };
     match load_and_build_from_vector_store(rt, token, model).await {
         Ok(Some(bridge)) => {
-            checkpoint_raise_compact_readopt(rt, ann, &key, &ns, model, bridge, target_generation)
-                .await;
+            let checkpointed = checkpoint_raise_compact_readopt(
+                rt,
+                ann,
+                &key,
+                bridge,
+                target_generation,
+                scan_authority,
+            )
+            .await;
+            if checkpointed {
+                AnnWarmOutcome::Ready
+            } else if force_rebuild_required(ann, &key) {
+                AnnWarmOutcome::Failed
+            } else if has_current_index(ann, &key).await {
+                // A normal cold build may still install an Owned bridge when
+                // persistence fails, and a lost FullSentinel race may adopt
+                // the winner while reporting a fenced local publication.
+                AnnWarmOutcome::Ready
+            } else {
+                AnnWarmOutcome::Failed
+            }
         }
         Ok(None) => {
             // Empty corpus: this scan (at target_generation) proves nothing is
-            // buildable right now. Mark it so wait_for_ann can short-circuit
+            // buildable right now. Mark it so wait_ready can short-circuit
             // instead of polling out the full warm-wait timeout (issue #1026).
             mark_unavailable(ann, &key, target_generation);
+            // An authoritative Empty scan keeps the durable -1 sentinel: no
+            // segment exists whose publication could advance the row safely.
+            // The first subsequent vector write invalidates this terminal
+            // marker and the next full scan checkpoints normally.
+            AnnWarmOutcome::Empty
         }
         Err(e) => {
             // Operational failure (store open, SQL reader, corpus query) —
             // not proof the corpus is unbuildable. Do NOT mark unavailable:
-            // the warming key is removed by the caller so the next request
-            // retries at the same generation, and a marker here would make
-            // wait_for_ann short-circuit false while that retry is in
-            // flight.
+            // the caller transitions the warm state to retryable `Failed`, and
+            // a marker here would make wait_ready short-circuit false while
+            // that retry is in flight.
             tracing::warn!(error = %e, "failed to rebuild Vamana ANN index");
+            AnnWarmOutcome::Failed
         }
     }
 }
 
-/// Simulate an in-flight warm by inserting `key` into the warming set without
-/// populating the index.  Call this in tests to construct the "warming but not
-/// yet loaded" state that triggers the cold-start guard in `suggest`/`search`.
+/// Simulate an in-flight warm without populating the index. Call this in tests
+/// to construct the state that triggers the cold-start guard in
+/// `suggest`/`search`.
 #[cfg(test)]
 pub(crate) fn simulate_warming_in_flight(ann: &SharedAnn, key: AnnKey) {
-    warming_guard(&ann.warming).insert(key);
+    begin_warm(ann, key)
+        .expect("fresh test ANN state must accept a warm")
+        .leave_in_flight_for_test();
 }
 
 #[cfg(test)]
@@ -1732,6 +2969,94 @@ mod tests {
     use super::*;
     use khive_runtime::KhiveRuntime;
     use khive_storage::types::{SqlStatement, SqlValue};
+    use serde_json::json;
+
+    #[test]
+    fn fresh_tail_merge_deduplicates_and_applies_deletes() {
+        let deleted = Uuid::new_v4();
+        let updated = Uuid::new_v4();
+        let stable = Uuid::new_v4();
+        let candidates = vec![(deleted, 0.99), (updated, 0.1), (stable, 0.5)];
+        let ops = vec![(deleted, None), (updated, Some(vec![1.0, 0.0]))];
+
+        let merged = merge_fresh_tail(candidates, &[1.0, 0.0], ops);
+
+        assert!(
+            !merged.iter().any(|(subject, _)| *subject == deleted),
+            "a final tail delete must remove a stale ANN candidate"
+        );
+        assert_eq!(
+            merged
+                .iter()
+                .filter(|(subject, _)| *subject == updated)
+                .count(),
+            1,
+            "a tail upsert must replace, not duplicate, an ANN candidate"
+        );
+        assert_eq!(merged[0].0, updated, "the exact tail score must win");
+        assert!(merged.iter().any(|(subject, _)| *subject == stable));
+    }
+
+    #[test]
+    fn fresh_tail_merge_breaks_equal_scores_by_uuid() {
+        let low = Uuid::from_u128(1);
+        let middle = Uuid::from_u128(2);
+        let high = Uuid::from_u128(3);
+        let ops = vec![
+            (high, Some(vec![1.0, 0.0])),
+            (low, Some(vec![1.0, 0.0])),
+            (middle, Some(vec![1.0, 0.0])),
+        ];
+
+        let merged = merge_fresh_tail(Vec::new(), &[1.0, 0.0], ops);
+
+        assert_eq!(
+            merged
+                .into_iter()
+                .map(|(subject, _)| subject)
+                .collect::<Vec<_>>(),
+            vec![low, middle, high],
+            "equal-cosine fresh hits must not inherit HashMap iteration order"
+        );
+    }
+
+    #[tokio::test]
+    async fn fresh_tail_missing_registration_publishes_force_rebuild_sentinel() {
+        let rt = KhiveRuntime::memory().expect("in-memory runtime");
+        let ann = new_shared();
+        let namespace = "local";
+        let model = "fresh-tail-registration-test";
+        let key = AnnKey::new(namespace, model);
+
+        let outcome = force_cold_after_registry_loss(&rt, &ann, &key).await;
+
+        assert!(matches!(outcome, FreshTailOutcome::Replace(ref hits) if hits.is_empty()));
+        assert_eq!(
+            read_own_watermark(&rt, namespace, model)
+                .await
+                .expect("registry read"),
+            Some(-1),
+            "registry loss must publish the cross-process rebuild sentinel"
+        );
+        assert!(force_rebuild_required(&ann, &key));
+    }
+
+    #[tokio::test]
+    async fn force_rebuild_queries_do_not_retire_authoritative_warm() {
+        let rt = KhiveRuntime::memory().expect("in-memory runtime");
+        let ann = new_shared();
+        let key = AnnKey::new("local", "force-warm-test");
+        force_cold_after_registry_loss(&rt, &ann, &key).await;
+        simulate_warming_in_flight(&ann, key.clone());
+
+        let outcome = fresh_tail_leg(&rt, &ann, &key, &[1.0], 1, None).await;
+
+        assert!(matches!(outcome, FreshTailOutcome::Replace(ref hits) if hits.is_empty()));
+        assert!(
+            is_warming_not_loaded(&ann, &key),
+            "a concurrent degraded query must not invalidate the authoritative warm"
+        );
+    }
 
     /// #1150 regression: a tombstoned ordinal's stale id-map entry must not
     /// let a later replay op for the old (already-deleted) subject tombstone
@@ -2247,26 +3572,26 @@ mod tests {
         );
     }
 
-    // ── wait_for_ann ──────────────────────────────────────────────────────────
+    // ── wait_ready ────────────────────────────────────────────────────────────
 
     #[tokio::test]
-    async fn wait_for_ann_returns_true_immediately_when_already_loaded() {
+    async fn wait_ready_returns_true_immediately_when_already_loaded() {
         let ann = new_shared();
         let key = AnnKey::new("local", "test-model");
         let bridge =
             AnnBridge::build(vec![1.0f32, 0.0, 0.0, 0.0], 4, vec![Uuid::new_v4()]).expect("build");
         insert_ann_if_absent(&ann, key.clone(), bridge).await;
         // Already loaded — should return true without sleeping.
-        let ready = wait_for_ann(&ann, &key, 100, 10).await;
+        let ready = wait_ready(&ann, &key, 100, 10).await;
         assert!(ready, "must return true when index is already in the map");
     }
 
     #[tokio::test]
-    async fn wait_for_ann_returns_false_on_timeout_when_never_loaded() {
+    async fn wait_ready_returns_false_on_timeout_when_never_loaded() {
         let ann = new_shared();
         let key = AnnKey::new("local", "test-model");
         // Nothing inserted — should time out and return false.
-        let ready = wait_for_ann(&ann, &key, 60, 10).await;
+        let ready = wait_ready(&ann, &key, 60, 10).await;
         assert!(
             !ready,
             "must return false when index never appears within timeout"
@@ -2274,7 +3599,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn wait_for_ann_returns_true_when_index_appears_mid_poll() {
+    async fn wait_ready_returns_true_when_index_appears_mid_poll() {
         let ann = new_shared();
         let key = AnnKey::new("local", "test-model");
         let ann2 = ann.clone();
@@ -2287,14 +3612,14 @@ mod tests {
             insert_ann_if_absent(&ann2, key2, bridge).await;
         });
         // Poll with a 500ms timeout; the insert happens at ~40ms so it should succeed.
-        let ready = wait_for_ann(&ann, &key, 500, 10).await;
+        let ready = wait_ready(&ann, &key, 500, 10).await;
         assert!(ready, "must return true when index appears before timeout");
     }
 
     // ── unavailable marker: terminal warm outcome (issue #1026) ──────────────
 
     #[tokio::test]
-    async fn wait_for_ann_returns_false_immediately_when_marked_unavailable() {
+    async fn wait_ready_returns_false_immediately_when_marked_unavailable() {
         let ann = new_shared();
         let key = AnnKey::new("local", "test-model");
         mark_unavailable(&ann, &key, current_generation(&ann, "local"));
@@ -2302,7 +3627,7 @@ mod tests {
         let start = std::time::Instant::now();
         // Timeout is generous (5s, matching production ANN_WARM_WAIT_TIMEOUT_MS)
         // to prove the short-circuit fires rather than the deadline.
-        let ready = wait_for_ann(&ann, &key, 5_000, 50).await;
+        let ready = wait_ready(&ann, &key, 5_000, 50).await;
         let elapsed = start.elapsed();
 
         assert!(
@@ -2316,7 +3641,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn wait_for_ann_resumes_polling_when_unavailable_marker_is_stale() {
+    async fn wait_ready_resumes_polling_when_unavailable_marker_is_stale() {
         let ann = new_shared();
         let key = AnnKey::new("local", "test-model");
 
@@ -2336,7 +3661,7 @@ mod tests {
             install_if_fresher(&ann2, &key2, bridge).await;
         });
 
-        let ready = wait_for_ann(&ann, &key, 500, 10).await;
+        let ready = wait_ready(&ann, &key, 500, 10).await;
         assert!(
             ready,
             "a stale unavailable marker must not block polling; the index installed \
@@ -2388,14 +3713,15 @@ mod tests {
 
     // ── poison recovery ───────────────────────────────────────────────────────
 
-    /// Poison the warming Mutex by panicking while holding the guard, then verify
-    /// that `warming_guard` and callers built on it survive and return sane results.
+    /// Poison the warm-state Mutex by panicking while holding the guard, then
+    /// verify that `warm_states_guard` and callers built on it survive and
+    /// return sane results.
     ///
-    /// This test WOULD panic if `warming_guard` were reverted to `.expect("warming
-    /// lock")`, because a poisoned Mutex causes `lock()` to return `Err`, and
-    /// `.expect()` converts that to a panic.
+    /// This test WOULD panic if `warm_states_guard` were reverted to
+    /// `.expect("warm-state lock")`, because a poisoned Mutex causes `lock()`
+    /// to return `Err`, and `.expect()` converts that to a panic.
     #[test]
-    fn warming_guard_recovers_from_poison() {
+    fn warm_states_guard_recovers_from_poison() {
         let ann = new_shared();
         let key = AnnKey::new("poison-ns", "poison-model");
 
@@ -2403,100 +3729,185 @@ mod tests {
         // while holding the guard.
         let ann2 = ann.clone();
         let join_result = std::thread::spawn(move || {
-            let _guard = ann2.warming.lock().expect("pre-poison lock");
+            let _guard = ann2.warm_states.lock().expect("pre-poison lock");
             panic!("deliberate poison");
         })
         .join();
         assert!(join_result.is_err(), "poison thread must have panicked");
         assert!(
-            ann.warming.is_poisoned(),
+            ann.warm_states.is_poisoned(),
             "mutex must be poisoned before recovery"
         );
 
-        // `warming_guard` must recover the guard without panicking.
-        let guard = warming_guard(&ann.warming);
+        // `warm_states_guard` must recover the guard without panicking.
+        let guard = warm_states_guard(&ann.warm_states);
         assert!(
-            !guard.contains(&key),
-            "recovered guard must report key absent (HashSet is empty after poison)"
+            !guard.contains_key(&key),
+            "recovered guard must report key absent"
         );
         drop(guard);
 
-        // Higher-level callers built on `warming_guard` must also succeed.
+        // Higher-level callers built on `warm_states_guard` must also succeed.
         assert!(
             !is_warming_not_loaded(&ann, &key),
             "is_warming_not_loaded must not panic on poisoned Mutex"
         );
     }
 
-    // ── warm-path-unification (Change D) invariants ───────────────────────────
+    // ── shared warm-state machine (issue #566) ────────────────────────────────
 
     #[tokio::test]
-    async fn warm_path_key_in_warming_set_before_and_after_successful_load() {
-        // Verifies the warm-path-unification protocol introduced for warm_known_snapshots:
-        // (1) key is registered in warming BEFORE the load attempt,
-        // (2) after a successful load, key is in both warming AND indexes,
-        //     so is_warming_not_loaded returns false (warm complete, not in flight).
-        // (3) during (1)→(2), is_warming_not_loaded returns true — a concurrent query
-        //     that arrives mid-warm correctly identifies the in-flight state.
+    async fn warm_state_success_becomes_ready_and_suppresses_duplicates() {
         let ann = new_shared();
         let key = AnnKey::new("local", "warm-unify-model");
 
-        // Step 1: register key in warming (mirrors new warm_known_snapshots pre-warm step).
-        {
-            let mut warming = warming_guard(&ann.warming);
-            warming.insert(key.clone());
-        }
+        let permit = begin_warm(&ann, key.clone()).expect("Absent -> Warming");
         assert!(
             is_warming_not_loaded(&ann, &key),
-            "key in warming but not indexes must report warming in flight"
+            "owned Warming state without an index must report in flight"
+        );
+        assert!(
+            begin_warm(&ann, key.clone()).is_none(),
+            "a current Warming owner must singleflight duplicate callers"
         );
 
-        // Step 2: simulate successful ensure_ann_for_model (bridge inserted into indexes).
         let bridge = AnnBridge::build(vec![1.0f32, 0.0, 0.0, 0.0], 4, vec![Uuid::new_v4()])
             .expect("build bridge for warm-path test");
         insert_ann_if_absent(&ann, key.clone(), bridge).await;
+        finish_warm(permit, AnnWarmOutcome::Ready).await;
 
-        // Step 3: key now in both warming and indexes → warm is complete, not in-flight.
         assert!(
             !is_warming_not_loaded(&ann, &key),
-            "key in both warming and indexes must not report warming in flight"
+            "Ready state must not report warming in flight"
         );
         assert!(
-            ann.indexes.read().await.contains_key(&key),
-            "index must be present after successful build"
+            matches!(
+                warm_states_guard(&ann.warm_states).get(&key),
+                Some(AnnWarmState::Ready { generation: 0 })
+            ),
+            "a published index must finish in Ready"
+        );
+        assert!(
+            begin_warm(&ann, key).is_none(),
+            "Ready at the current generation must suppress redundant loads"
         );
     }
 
     #[tokio::test]
-    async fn warm_path_failed_load_removes_key_from_warming_set() {
-        // Verifies that when warm_known_snapshots fails to load an index (e.g. no corpus
-        // vectors), the key is removed from the warming set, allowing a later search
-        // to trigger a fresh load attempt.
+    async fn warm_state_failed_and_empty_outcomes_remain_retryable() {
         let ann = new_shared();
         let key = AnnKey::new("local", "warm-unify-fail-model");
 
-        // Pre-warm step: insert key into warming (mirrors new warm_known_snapshots code).
-        warming_guard(&ann.warming).insert(key.clone());
+        let failed = begin_warm(&ann, key.clone()).expect("first warm");
+        finish_warm(failed, AnnWarmOutcome::Failed).await;
         assert!(
-            is_warming_not_loaded(&ann, &key),
-            "pre-condition: key must show as warming in flight"
+            matches!(
+                warm_states_guard(&ann.warm_states).get(&key),
+                Some(AnnWarmState::Failed {
+                    error: AnnWarmFailure::Operational,
+                    ..
+                })
+            ),
+            "no index and no empty marker is an operational failure"
         );
 
-        // Load failed — no bridge inserted. Cleanup step removes key from warming.
-        let loaded = ann.indexes.read().await.contains_key(&key);
-        if !loaded {
-            warming_guard(&ann.warming).remove(&key);
-        }
+        let empty_retry = begin_warm(&ann, key.clone()).expect("Failed -> Warming retry");
+        mark_unavailable(&ann, &key, current_generation(&ann, "local"));
+        finish_warm(empty_retry, AnnWarmOutcome::Empty).await;
+        assert!(
+            matches!(
+                warm_states_guard(&ann.warm_states).get(&key),
+                Some(AnnWarmState::Failed {
+                    error: AnnWarmFailure::EmptyCorpus,
+                    ..
+                })
+            ),
+            "current-generation empty scan must retain its distinct failure reason"
+        );
 
-        // After cleanup, key is in neither set → is_warming_not_loaded = false.
-        // A subsequent search can now trigger a fresh load attempt.
         assert!(
             !is_warming_not_loaded(&ann, &key),
-            "after failed-load cleanup, warming must not show in-flight"
+            "Failed must not masquerade as an in-flight warm"
+        );
+        let retry = begin_warm(&ann, key).expect("empty failures must remain retryable");
+        drop(retry);
+    }
+
+    #[tokio::test]
+    async fn failed_replacement_stays_retryable_with_servable_stale_index() {
+        let ann = new_shared();
+        let key = AnnKey::new("local", "warm-stale-retry-model");
+        let permit = begin_warm(&ann, key.clone()).expect("replacement warm");
+
+        // ADR-079 rule 8 serves a stale bridge while its replacement rebuilds.
+        let stale = AnnBridge::build(vec![1.0f32, 0.0, 0.0, 0.0], 4, vec![Uuid::new_v4()])
+            .expect("build stale bridge");
+        insert_ann_if_absent(&ann, key.clone(), stale).await;
+        finish_warm(permit, AnnWarmOutcome::Failed).await;
+
+        assert!(
+            search_loaded(&ann, &key, &[1.0, 0.0, 0.0, 0.0], 1)
+                .await
+                .is_some(),
+            "the stale fallback must remain available to search"
         );
         assert!(
-            !ann.indexes.read().await.contains_key(&key),
-            "index must remain absent after failed load"
+            begin_warm(&ann, key).is_some(),
+            "a failed replacement must retry despite the servable stale fallback"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_finish_cannot_steal_new_post_invalidation_owner() {
+        let ann = new_shared();
+        let key = AnnKey::new("local", "warm-owner-model");
+
+        let stale = begin_warm(&ann, key.clone()).expect("warm A");
+        clear_namespace(&ann, "local").await;
+        let current = begin_warm(&ann, key.clone()).expect("warm B after invalidation");
+        let current_id = current.attempt_id;
+
+        finish_warm(stale, AnnWarmOutcome::Failed).await;
+        assert!(
+            matches!(
+                warm_states_guard(&ann.warm_states).get(&key),
+                Some(AnnWarmState::Warming { attempt_id, .. }) if *attempt_id == current_id
+            ),
+            "warm A's late cleanup must not erase or complete warm B's ownership"
+        );
+        assert!(
+            begin_warm(&ann, key.clone()).is_none(),
+            "warm B must remain the only current singleflight owner"
+        );
+
+        finish_warm(current, AnnWarmOutcome::Failed).await;
+        assert!(
+            begin_warm(&ann, key).is_some(),
+            "warm B's failed completion must make the slot retryable"
+        );
+    }
+
+    #[test]
+    fn dropped_warm_permit_cannot_leave_stale_warming_ownership() {
+        let ann = new_shared();
+        let key = AnnKey::new("local", "warm-cancel-model");
+
+        let permit = begin_warm(&ann, key.clone()).expect("warm attempt");
+        drop(permit);
+
+        assert!(
+            matches!(
+                warm_states_guard(&ann.warm_states).get(&key),
+                Some(AnnWarmState::Failed {
+                    error: AnnWarmFailure::Interrupted,
+                    ..
+                })
+            ),
+            "cancellation must transition the owned slot out of Warming"
+        );
+        assert!(
+            begin_warm(&ann, key).is_some(),
+            "an interrupted warm must be retryable"
         );
     }
 
@@ -2637,8 +4048,8 @@ mod tests {
     use lattice_embed::{EmbedError, EmbeddingModel, EmbeddingService};
     use tempfile::TempDir;
 
-    const WARM_TEST_MODEL: &str = "ann-test-model";
-    const WARM_DIMS: usize = 4;
+    const WARM_TEST_MODEL: &str = "all-minilm-l6-v2";
+    const WARM_DIMS: usize = 384;
 
     struct ConstVecService;
 
@@ -2678,12 +4089,12 @@ mod tests {
         }
     }
 
-    fn file_rt_with_embedder(db_path: std::path::PathBuf) -> KhiveRuntime {
+    fn rt_with_embedder(db_path: Option<std::path::PathBuf>) -> KhiveRuntime {
         let rt = KhiveRuntime::new(RuntimeConfig {
             git_write: Default::default(),
-            db_path: Some(db_path),
+            db_path,
             default_namespace: Namespace::local(),
-            embedding_model: None,
+            embedding_model: Some(EmbeddingModel::AllMiniLmL6V2),
             additional_embedding_models: vec![],
             gate: Arc::new(AllowAllGate),
             packs: vec!["kg".to_string(), "knowledge".to_string()],
@@ -2693,9 +4104,17 @@ mod tests {
             allowed_outbound_namespaces: vec![],
             actor_id: None,
         })
-        .expect("file-backed runtime");
+        .expect("test runtime");
         rt.register_embedder(TestEmbedderProvider);
         rt
+    }
+
+    fn file_rt_with_embedder(db_path: std::path::PathBuf) -> KhiveRuntime {
+        rt_with_embedder(Some(db_path))
+    }
+
+    fn memory_rt_with_embedder() -> KhiveRuntime {
+        rt_with_embedder(None)
     }
 
     /// Seed `n` distinct rows into the vec0 table for `WARM_TEST_MODEL`.
@@ -2763,6 +4182,156 @@ mod tests {
             .await
             .expect("append write-log row");
         }
+    }
+
+    async fn append_warm_vector(
+        rt: &KhiveRuntime,
+        token: &NamespaceToken,
+        embedding: [f32; WARM_DIMS],
+    ) -> Uuid {
+        let _store = rt
+            .vectors_for_model(token, WARM_TEST_MODEL)
+            .expect("vec store");
+        let table = format!("vec_{}", sanitize_model_key(WARM_TEST_MODEL));
+        let namespace = token.namespace().as_str().to_owned();
+        let subject = Uuid::new_v4();
+        let bytes: Vec<u8> = embedding
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect();
+        let sql = rt.sql();
+        let mut writer = sql.writer().await.expect("writer");
+        writer
+            .execute(SqlStatement {
+                sql: format!(
+                    "INSERT INTO {table} \
+                     (subject_id, namespace, kind, field, embedding_model, embedding) \
+                     VALUES (?1, ?2, 'concept', 'knowledge.atom', ?3, ?4)"
+                ),
+                params: vec![
+                    SqlValue::Text(subject.to_string()),
+                    SqlValue::Text(namespace.clone()),
+                    SqlValue::Text(WARM_TEST_MODEL.to_string()),
+                    SqlValue::Blob(bytes),
+                ],
+                label: None,
+            })
+            .await
+            .expect("insert fresh vector");
+        writer
+            .execute(SqlStatement {
+                sql: "INSERT INTO ann_write_log \
+                      (namespace, embedding_model, kind, field, subject_id, op) \
+                      VALUES (?1, ?2, 'concept', 'knowledge.atom', ?3, 'upsert')"
+                    .into(),
+                params: vec![
+                    SqlValue::Text(namespace),
+                    SqlValue::Text(WARM_TEST_MODEL.to_string()),
+                    SqlValue::Text(subject.to_string()),
+                ],
+                label: None,
+            })
+            .await
+            .expect("append fresh-tail log row");
+        subject
+    }
+
+    #[test]
+    fn threshold_sized_tail_cap_scales_with_live_corpus() {
+        let cap = |live: u64, threshold: f64| (live as f64 * threshold).ceil() as u64;
+        assert_eq!(cap(3, 0.20), 1, "small corpora retain one newest row");
+        assert_eq!(cap(5, 0.21), 2, "fractional limits round upward");
+        assert_eq!(
+            cap(1_000_000, 0.20),
+            200_000,
+            "large corpora must not collapse to the retired fixed 20k ceiling"
+        );
+    }
+
+    #[tokio::test]
+    async fn capped_snapshot_selects_newest_threshold_sized_suffix() {
+        let dir = TempDir::new().expect("tempdir");
+        let rt = file_rt_with_embedder(dir.path().join("test.db"));
+        let token = rt.authorize(Namespace::local()).expect("authorize");
+        seed_warm_corpus(&rt, &token, 5).await;
+        register_consumer(&rt, "local", WARM_TEST_MODEL)
+            .await
+            .expect("register");
+
+        let mut reader = rt.sql().reader().await.expect("reader");
+        let newest_rows = reader
+            .query_all(SqlStatement {
+                sql: "SELECT subject_id FROM ann_write_log \
+                      WHERE namespace = 'local' AND embedding_model = ?1 \
+                        AND field = 'knowledge.atom' \
+                      ORDER BY seq DESC LIMIT 2"
+                    .into(),
+                params: vec![SqlValue::Text(WARM_TEST_MODEL.into())],
+                label: None,
+            })
+            .await
+            .expect("latest log rows");
+        let newest: Vec<Uuid> = newest_rows
+            .iter()
+            .map(|row| match row.get("subject_id") {
+                Some(SqlValue::Text(subject)) => Uuid::parse_str(subject).expect("UUID"),
+                other => panic!("unexpected subject: {other:?}"),
+            })
+            .collect();
+
+        let one = fetch_fresh_tail_snapshot(&rt, "local", WARM_TEST_MODEL, 0, Some(0.20))
+            .await
+            .expect("20% snapshot");
+        assert_eq!(one.live_count, Some(5));
+        assert_eq!(one.ops.len(), 1, "ceil(5 × .20) = 1");
+        assert_eq!(
+            one.ops[0].0, newest[0],
+            "the suffix must start newest-first"
+        );
+
+        let two = fetch_fresh_tail_snapshot(&rt, "local", WARM_TEST_MODEL, 0, Some(0.21))
+            .await
+            .expect("21% snapshot");
+        assert_eq!(two.live_count, Some(5));
+        assert_eq!(two.ops.len(), 2, "ceil(5 × .21) = 2");
+        assert_eq!(
+            two.ops
+                .iter()
+                .map(|(subject, _)| *subject)
+                .collect::<Vec<_>>(),
+            vec![newest[1], newest[0]],
+            "selected newest rows are replayed in chronological order"
+        );
+
+        // A repeat op for the newest subject makes the two-row suffix contain
+        // one distinct subject.  The final result must therefore coalesce to
+        // one op, proving LIMIT is applied to raw newest writes before final-
+        // state coalescing (the ADR-118 later-write boundary).
+        let mut writer = rt.sql().writer().await.expect("writer");
+        writer
+            .execute(SqlStatement {
+                sql: "INSERT INTO ann_write_log \
+                      (namespace, embedding_model, kind, field, subject_id, op) \
+                      VALUES ('local', ?1, 'concept', 'knowledge.atom', ?2, 'upsert')"
+                    .into(),
+                params: vec![
+                    SqlValue::Text(WARM_TEST_MODEL.into()),
+                    SqlValue::Text(newest[0].to_string()),
+                ],
+                label: None,
+            })
+            .await
+            .expect("repeat newest write");
+        drop(writer);
+        let repeated = fetch_fresh_tail_snapshot(&rt, "local", WARM_TEST_MODEL, 0, Some(0.40))
+            .await
+            .expect("40% repeated snapshot");
+        assert_eq!(
+            repeated.ops.len(),
+            1,
+            "two newest writes coalesce to one subject"
+        );
+        assert_eq!(repeated.ops[0].0, newest[0]);
     }
 
     /// `ann_segment_dir` encodes a round-trippable hex key that `decode_ann_dir_name` reverses.
@@ -2876,6 +4445,273 @@ mod tests {
             ino_before, ino_after,
             "second call must NOT rewrite metadata.bin — proves the v2 Hot load path, not a rebuild"
         );
+    }
+
+    #[tokio::test]
+    async fn knowledge_search_and_suggest_merge_write_above_loaded_bridge_watermark() {
+        let dir = TempDir::new().expect("tempdir");
+        let rt = file_rt_with_embedder(dir.path().join("test.db"));
+        let token = rt.authorize(Namespace::local()).expect("authorize");
+        seed_warm_corpus(&rt, &token, 4).await;
+
+        let ann = new_shared();
+        ensure_ann_for_model(&rt, &token, &ann, WARM_TEST_MODEL).await;
+        let key = AnnKey::new("local", WARM_TEST_MODEL);
+        let query = vec![1.0; WARM_DIMS];
+        let (_, bridge_watermark) = search_loaded_with_seq(&ann, &key, &query, 20)
+            .await
+            .expect("serving bridge");
+
+        let fresh_id = append_warm_vector(&rt, &token, [1.0; WARM_DIMS]).await;
+        let now = chrono::Utc::now().timestamp_micros();
+        let mut writer = rt.sql().writer().await.expect("writer");
+        writer
+            .execute(SqlStatement {
+                sql: "INSERT INTO knowledge_atoms \
+                      (id, namespace, slug, name, content, tags, properties, status, \
+                       finalized, created_at, updated_at) \
+                      VALUES (?1, 'local', 'opaque-fresh-tail', 'Opaque Fresh Tail', \
+                              'content with no lexical overlap', '[\"type:domain\"]', '{}', 'reviewed', \
+                              1, ?2, ?2)"
+                    .into(),
+                params: vec![SqlValue::Text(fresh_id.to_string()), SqlValue::Integer(now)],
+                label: None,
+            })
+            .await
+            .expect("insert hydratable knowledge atom");
+        drop(writer);
+
+        let (_, still_loaded_watermark) = search_loaded_with_seq(&ann, &key, &query, 20)
+            .await
+            .expect("stale serving bridge remains loaded");
+        assert_eq!(
+            still_loaded_watermark, bridge_watermark,
+            "the simulated external write must not mutate the in-process bridge"
+        );
+
+        let result = super::super::KnowledgeHandlers::search(
+            &rt,
+            &token,
+            json!({
+                "query": "quasar zephyr",
+                "min_score": 0.1,
+                "limit": 10,
+                "rerank": false
+            }),
+            &ann,
+        )
+        .await
+        .expect("knowledge.search");
+        let ids: Vec<&str> = result["results"]
+            .as_array()
+            .expect("results")
+            .iter()
+            .filter_map(|hit| hit["id"].as_str())
+            .collect();
+        let fresh_id = fresh_id.to_string();
+        assert!(
+            ids.contains(&fresh_id.as_str()),
+            "fresh-tail atom must be visible without rebuilding the loaded bridge: {result}"
+        );
+
+        let suggest = super::super::KnowledgeHandlers::suggest(
+            &rt,
+            &token,
+            json!({
+                "query": "quasar zephyr nebula pulsar aurora",
+                "limit": 10
+            }),
+            &ann,
+        )
+        .await
+        .expect("knowledge.suggest");
+        let suggest_ids: Vec<&str> = suggest["results"]
+            .as_array()
+            .expect("suggest results")
+            .iter()
+            .filter_map(|hit| hit["id"].as_str())
+            .collect();
+        assert!(
+            suggest_ids.contains(&fresh_id.as_str()),
+            "fresh-tail domain atom must be visible to knowledge.suggest: {suggest}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fresh_tail_mismatch_replaces_stale_candidates_from_published_segment() {
+        let dir = TempDir::new().expect("tempdir");
+        let rt = file_rt_with_embedder(dir.path().join("test.db"));
+        let token = rt.authorize(Namespace::local()).expect("authorize");
+        seed_warm_corpus(&rt, &token, 4).await;
+
+        let ann = new_shared();
+        ensure_ann_for_model(&rt, &token, &ann, WARM_TEST_MODEL).await;
+        let key = AnnKey::new("local", WARM_TEST_MODEL);
+        let query = vec![1.0; WARM_DIMS];
+        let (old_candidates, old_watermark) = search_loaded_with_seq(&ann, &key, &query, 20)
+            .await
+            .expect("old serving bridge");
+
+        let fresh_id = append_warm_vector(&rt, &token, [1.0; WARM_DIMS]).await;
+        assert!(
+            !old_candidates
+                .iter()
+                .any(|(subject, _)| *subject == fresh_id),
+            "the old bridge must not already contain the peer's fresh write"
+        );
+
+        // Simulate a peer checkpoint: publish a segment covering the fresh
+        // write, raise the shared registry floor, and compact through it while
+        // this process deliberately keeps its old bridge installed.
+        let replacement = load_and_build_from_vector_store(&rt, &token, WARM_TEST_MODEL)
+            .await
+            .expect("scan replacement corpus")
+            .expect("replacement corpus is non-empty");
+        let replacement_watermark = replacement
+            .index
+            .last_applied_seq()
+            .expect("replacement carries a watermark");
+        assert!(replacement_watermark > old_watermark);
+        persist_ann_v2(&rt, "local", WARM_TEST_MODEL, &replacement)
+            .expect("publish replacement segment");
+        raise_watermark(
+            &rt,
+            "local",
+            WARM_TEST_MODEL,
+            replacement_watermark,
+            CheckpointAuthority::Incremental,
+        )
+        .await
+        .expect("raise peer watermark");
+        compact_log(&rt, "local", WARM_TEST_MODEL)
+            .await
+            .expect("compact through peer watermark");
+        assert!(
+            !tail_exists(&rt, "local", WARM_TEST_MODEL, old_watermark)
+                .await
+                .expect("probe compacted old tail"),
+            "the old bridge's tail must be gone so only segment re-resolution can recover it"
+        );
+
+        let generation_before = current_generation(&ann, "local");
+        let outcome = fresh_tail_leg(&rt, &ann, &key, &query, 20, Some(old_watermark)).await;
+        let replacement_candidates = match outcome {
+            FreshTailOutcome::Replace(candidates) => candidates,
+            FreshTailOutcome::Ops(_) => {
+                panic!("a compaction mismatch must replace, not extend, stale candidates")
+            }
+            FreshTailOutcome::Skipped => panic!("mismatch re-resolution must not disappear"),
+        };
+
+        assert!(
+            replacement_candidates
+                .iter()
+                .any(|(subject, _)| *subject == fresh_id),
+            "current-query re-resolution must surface the write covered by the published segment"
+        );
+        assert!(
+            current_generation(&ann, "local") > generation_before,
+            "mismatch handling must retire the stale cache generation"
+        );
+        assert!(
+            search_loaded_with_seq(&ann, &key, &query, 20)
+                .await
+                .is_none(),
+            "the stale in-process bridge must be evicted so normal warming re-adopts the segment"
+        );
+    }
+
+    #[tokio::test]
+    async fn registry_loss_evicts_stale_bridge_and_forces_authoritative_rebuild() {
+        let dir = TempDir::new().expect("tempdir");
+        let rt = file_rt_with_embedder(dir.path().join("test.db"));
+        let token = rt.authorize(Namespace::local()).expect("authorize");
+        seed_warm_corpus(&rt, &token, 4).await;
+
+        let ann = new_shared();
+        ensure_ann_for_model(&rt, &token, &ann, WARM_TEST_MODEL).await;
+        let key = AnnKey::new("local", WARM_TEST_MODEL);
+        let query = vec![1.0; WARM_DIMS];
+        let (_, stale_watermark) = search_loaded_with_seq(&ann, &key, &query, 20)
+            .await
+            .expect("serving bridge");
+        let fresh_id = append_warm_vector(&rt, &token, [1.0; WARM_DIMS]).await;
+
+        // Simulate administrative loss followed by a peer consumer compacting
+        // the interval this process never checkpointed.  The stale bridge can
+        // no longer be repaired from its `> S` tail.
+        let mut writer = rt.sql().writer().await.expect("writer");
+        writer
+            .execute(SqlStatement {
+                sql: "DELETE FROM ann_consumer_watermark \
+                      WHERE consumer = ?1 AND namespace = 'local' \
+                        AND embedding_model = ?2"
+                    .into(),
+                params: vec![
+                    SqlValue::Text(ANN_CONSUMER.into()),
+                    SqlValue::Text(WARM_TEST_MODEL.into()),
+                ],
+                label: None,
+            })
+            .await
+            .expect("delete own registry row");
+        writer
+            .execute(SqlStatement {
+                sql: "INSERT INTO ann_consumer_watermark \
+                      (consumer, namespace, embedding_model, watermark) \
+                      VALUES ('peer:test', 'local', ?1, 999)"
+                    .into(),
+                params: vec![SqlValue::Text(WARM_TEST_MODEL.into())],
+                label: None,
+            })
+            .await
+            .expect("insert peer watermark");
+        drop(writer);
+        compact_log(&rt, "local", WARM_TEST_MODEL)
+            .await
+            .expect("compact missing interval");
+        assert!(
+            !tail_exists(&rt, "local", WARM_TEST_MODEL, stale_watermark)
+                .await
+                .expect("tail probe"),
+            "setup must remove the stale bridge's recovery tail"
+        );
+
+        let outcome = fresh_tail_leg(&rt, &ann, &key, &query, 20, Some(stale_watermark)).await;
+        assert!(
+            matches!(outcome, FreshTailOutcome::Replace(ref hits) if hits.is_empty()),
+            "the query that detects registry loss must discard stale candidates"
+        );
+        assert!(search_loaded_with_seq(&ann, &key, &query, 20)
+            .await
+            .is_none());
+        assert_eq!(
+            read_own_watermark(&rt, "local", WARM_TEST_MODEL)
+                .await
+                .expect("registry read"),
+            Some(-1),
+            "the cross-process sentinel must stay durable through the Cold transition"
+        );
+
+        assert_eq!(
+            ensure_ann_for_model(&rt, &token, &ann, WARM_TEST_MODEL).await,
+            AnnWarmOutcome::Ready
+        );
+        let rebuilt = search_loaded(&ann, &key, &query, 20)
+            .await
+            .expect("authoritative rebuilt bridge");
+        assert!(
+            rebuilt.iter().any(|(subject, _)| *subject == fresh_id),
+            "the next warm must rebuild from the full corpus, not re-adopt the stale segment"
+        );
+        assert!(
+            read_own_watermark(&rt, "local", WARM_TEST_MODEL)
+                .await
+                .expect("registry read")
+                .is_some_and(|watermark| watermark >= 0),
+            "successful authoritative publication must clear the sentinel"
+        );
+        assert!(!force_rebuild_required(&ann, &key));
     }
 
     /// After a corpus mutation the persisted segment has a non-empty tail and the
@@ -3046,7 +4882,7 @@ mod tests {
         );
         assert!(
             is_terminally_unavailable(&ann2, &key),
-            "Empty must set the terminal unavailable marker for wait_for_ann"
+            "Empty must set the terminal unavailable marker for wait_ready"
         );
     }
 
@@ -3096,9 +4932,15 @@ mod tests {
         );
 
         // A raises to 2 → MIN(2, 99) = 2 → rows 1-2 compact, 3-4 remain.
-        raise_watermark(&rt, "local", WARM_TEST_MODEL, 2)
-            .await
-            .expect("raise");
+        raise_watermark(
+            &rt,
+            "local",
+            WARM_TEST_MODEL,
+            2,
+            CheckpointAuthority::Incremental,
+        )
+        .await
+        .expect("raise");
         compact_log(&rt, "local", WARM_TEST_MODEL)
             .await
             .expect("compact");
@@ -3108,6 +4950,352 @@ mod tests {
         assert_eq!(
             tail_after, 2,
             "compaction must advance exactly to the pair MIN"
+        );
+    }
+
+    #[tokio::test]
+    async fn ordinary_checkpoint_cannot_clear_force_rebuild_sentinel() {
+        let dir = TempDir::new().expect("tempdir");
+        let rt = file_rt_with_embedder(dir.path().join("test.db"));
+        let ann = new_shared();
+        let key = AnnKey::new("local", WARM_TEST_MODEL);
+        prepare_authoritative_rebuild(&rt, &ann, &key)
+            .await
+            .expect("publish sentinel");
+
+        assert!(
+            raise_watermark(
+                &rt,
+                "local",
+                WARM_TEST_MODEL,
+                7,
+                CheckpointAuthority::Incremental,
+            )
+            .await
+            .is_err(),
+            "an ordinary checkpoint must lose the conditional publication fence"
+        );
+        assert_eq!(
+            read_own_watermark(&rt, "local", WARM_TEST_MODEL)
+                .await
+                .expect("read sentinel"),
+            Some(-1)
+        );
+
+        raise_watermark(
+            &rt,
+            "local",
+            WARM_TEST_MODEL,
+            7,
+            CheckpointAuthority::FullSentinel,
+        )
+        .await
+        .expect("authoritative checkpoint clears sentinel");
+        assert_eq!(
+            read_own_watermark(&rt, "local", WARM_TEST_MODEL)
+                .await
+                .expect("read raised watermark"),
+            Some(7)
+        );
+    }
+
+    #[tokio::test]
+    async fn full_scan_checkpoint_clears_local_force_rebuild_marker() {
+        let dir = TempDir::new().expect("tempdir");
+        let rt = file_rt_with_embedder(dir.path().join("test.db"));
+        let token = rt.authorize(Namespace::local()).expect("authorize");
+        seed_warm_corpus(&rt, &token, 4).await;
+
+        let ann = new_shared();
+        let key = AnnKey::new("local", WARM_TEST_MODEL);
+        let authority = prepare_full_corpus_scan(&rt, &ann, &key)
+            .await
+            .expect("establish full-scan authority");
+        assert_eq!(authority, CheckpointAuthority::FullSentinel);
+        assert!(force_rebuild_required(&ann, &key));
+
+        let bridge = load_and_build_from_vector_store(&rt, &token, WARM_TEST_MODEL)
+            .await
+            .expect("scan corpus")
+            .expect("non-empty corpus");
+        assert!(
+            checkpoint_raise_compact_readopt(
+                &rt,
+                &ann,
+                &key,
+                bridge,
+                current_generation(&ann, "local"),
+                authority,
+            )
+            .await,
+            "authoritative full scan must publish"
+        );
+        assert!(
+            !force_rebuild_required(&ann, &key),
+            "the shared checkpoint seam must finish local recovery for direct rebuild callers"
+        );
+
+        let query = vec![1.0; WARM_DIMS];
+        let (_, watermark) = search_loaded_with_seq(&ann, &key, &query, 20)
+            .await
+            .expect("published bridge");
+        assert!(
+            matches!(
+                fresh_tail_leg(&rt, &ann, &key, &query, 20, Some(watermark)).await,
+                FreshTailOutcome::Ops(_)
+            ),
+            "the next query must retain the freshly published bridge"
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_full_sentinel_loser_does_not_restore_sentinel() {
+        let rt = memory_rt_with_embedder();
+        let token = rt.authorize(Namespace::local()).expect("authorize");
+        seed_warm_corpus(&rt, &token, 4).await;
+
+        let ann = new_shared();
+        let key = AnnKey::new("local", WARM_TEST_MODEL);
+        let authority_a = prepare_full_corpus_scan(&rt, &ann, &key)
+            .await
+            .expect("first full-scan authority");
+        let authority_b = prepare_full_corpus_scan(&rt, &ann, &key)
+            .await
+            .expect("second full-scan authority");
+        assert_eq!(authority_a, CheckpointAuthority::FullSentinel);
+        assert_eq!(authority_b, CheckpointAuthority::FullSentinel);
+
+        let bridge_a = load_and_build_from_vector_store(&rt, &token, WARM_TEST_MODEL)
+            .await
+            .expect("scan A")
+            .expect("non-empty A");
+        let bridge_b = load_and_build_from_vector_store(&rt, &token, WARM_TEST_MODEL)
+            .await
+            .expect("scan B")
+            .expect("non-empty B");
+        let generation = current_generation(&ann, "local");
+        let (published_a, published_b) = tokio::join!(
+            checkpoint_raise_compact_readopt(&rt, &ann, &key, bridge_a, generation, authority_a,),
+            checkpoint_raise_compact_readopt(&rt, &ann, &key, bridge_b, generation, authority_b,)
+        );
+
+        assert!(published_a || published_b, "one full scan must win");
+        assert!(
+            read_own_watermark(&rt, "local", WARM_TEST_MODEL)
+                .await
+                .expect("read winner watermark")
+                .is_some_and(|watermark| watermark >= 0),
+            "the losing checkpoint must not demote the winner back to -1"
+        );
+        assert!(!force_rebuild_required(&ann, &key));
+        assert!(
+            has_current_index(&ann, &key).await,
+            "the winner must remain available after the losing fence"
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_pathless_normal_checkpoints_publish_monotonically() {
+        let rt = memory_rt_with_embedder();
+        let token = rt.authorize(Namespace::local()).expect("authorize");
+        seed_warm_corpus(&rt, &token, 4).await;
+        let ann = new_shared();
+        assert_eq!(
+            ensure_ann_for_model(&rt, &token, &ann, WARM_TEST_MODEL).await,
+            AnnWarmOutcome::Ready
+        );
+
+        let key = AnnKey::new("local", WARM_TEST_MODEL);
+        let old_authority = prepare_full_corpus_scan(&rt, &ann, &key)
+            .await
+            .expect("old authority");
+        let old_bridge = load_and_build_from_vector_store(&rt, &token, WARM_TEST_MODEL)
+            .await
+            .expect("old scan")
+            .expect("old corpus");
+        let old_watermark = old_bridge.index.last_applied_seq().unwrap_or(0);
+
+        let fresh_id = append_warm_vector(&rt, &token, [1.0; WARM_DIMS]).await;
+        let new_authority = prepare_full_corpus_scan(&rt, &ann, &key)
+            .await
+            .expect("new authority");
+        let new_bridge = load_and_build_from_vector_store(&rt, &token, WARM_TEST_MODEL)
+            .await
+            .expect("new scan")
+            .expect("new corpus");
+        let new_watermark = new_bridge.index.last_applied_seq().unwrap_or(0);
+        assert!(new_watermark > old_watermark);
+
+        let generation = current_generation(&ann, "local");
+        let (old_result, new_result) = tokio::join!(
+            checkpoint_raise_compact_readopt(
+                &rt,
+                &ann,
+                &key,
+                old_bridge,
+                generation,
+                old_authority,
+            ),
+            checkpoint_raise_compact_readopt(
+                &rt,
+                &ann,
+                &key,
+                new_bridge,
+                generation,
+                new_authority,
+            )
+        );
+
+        assert!(old_result && new_result);
+        assert_eq!(
+            read_own_watermark(&rt, "local", WARM_TEST_MODEL)
+                .await
+                .expect("registry read"),
+            Some(i64::try_from(new_watermark).expect("watermark range"))
+        );
+        let query = vec![1.0; WARM_DIMS];
+        let (hits, loaded_watermark) = search_loaded_with_seq(&ann, &key, &query, 20)
+            .await
+            .expect("monotone winner");
+        assert_eq!(loaded_watermark, new_watermark);
+        assert!(hits.iter().any(|(subject, _)| *subject == fresh_id));
+    }
+
+    #[tokio::test]
+    async fn stale_normal_checkpoint_adopts_newer_publisher_without_overwrite() {
+        let dir = TempDir::new().expect("tempdir");
+        let rt = file_rt_with_embedder(dir.path().join("test.db"));
+        let token = rt.authorize(Namespace::local()).expect("authorize");
+        seed_warm_corpus(&rt, &token, 4).await;
+
+        let initial_ann = new_shared();
+        assert_eq!(
+            ensure_ann_for_model(&rt, &token, &initial_ann, WARM_TEST_MODEL).await,
+            AnnWarmOutcome::Ready
+        );
+        let key = AnnKey::new("local", WARM_TEST_MODEL);
+        let stale_authority = prepare_full_corpus_scan(&rt, &initial_ann, &key)
+            .await
+            .expect("stale authority");
+        let stale_bridge = load_and_build_from_vector_store(&rt, &token, WARM_TEST_MODEL)
+            .await
+            .expect("stale scan")
+            .expect("stale corpus");
+        let stale_watermark = stale_bridge.index.last_applied_seq().unwrap_or(0);
+
+        let fresh_id = append_warm_vector(&rt, &token, [1.0; WARM_DIMS]).await;
+        let winner_ann = new_shared();
+        let winner_authority = prepare_full_corpus_scan(&rt, &winner_ann, &key)
+            .await
+            .expect("winner authority");
+        let winner_bridge = load_and_build_from_vector_store(&rt, &token, WARM_TEST_MODEL)
+            .await
+            .expect("winner scan")
+            .expect("winner corpus");
+        let winner_watermark = winner_bridge.index.last_applied_seq().unwrap_or(0);
+        assert!(winner_watermark > stale_watermark);
+        assert!(
+            checkpoint_raise_compact_readopt(
+                &rt,
+                &winner_ann,
+                &key,
+                winner_bridge,
+                current_generation(&winner_ann, "local"),
+                winner_authority,
+            )
+            .await,
+            "newer publisher must commit"
+        );
+
+        let stale_ann = new_shared();
+        assert!(
+            checkpoint_raise_compact_readopt(
+                &rt,
+                &stale_ann,
+                &key,
+                stale_bridge,
+                current_generation(&stale_ann, "local"),
+                stale_authority,
+            )
+            .await,
+            "stale publisher must adopt the winner instead of overwriting it"
+        );
+        assert_eq!(
+            read_own_watermark(&rt, "local", WARM_TEST_MODEL)
+                .await
+                .expect("registry read"),
+            Some(i64::try_from(winner_watermark).expect("watermark range"))
+        );
+        let info = read_commit_info(
+            &ann_segment_dir(&rt, "local", WARM_TEST_MODEL).expect("segment directory"),
+        )
+        .expect("commit read")
+        .expect("commit info");
+        assert_eq!(info.last_applied_seq, Some(winner_watermark));
+        assert_eq!(info.vector_count, 5);
+        let query = vec![1.0; WARM_DIMS];
+        assert!(
+            search_loaded(&stale_ann, &key, &query, 20)
+                .await
+                .expect("adopted winner")
+                .iter()
+                .any(|(subject, _)| *subject == fresh_id),
+            "the stale publisher must serve the winner's fresh row"
+        );
+    }
+
+    #[tokio::test]
+    async fn first_use_empty_corpus_retains_cross_process_sentinel() {
+        let dir = TempDir::new().expect("tempdir");
+        let rt = file_rt_with_embedder(dir.path().join("test.db"));
+        let token = rt.authorize(Namespace::local()).expect("authorize");
+        let ann = new_shared();
+        let key = AnnKey::new("local", WARM_TEST_MODEL);
+
+        assert_eq!(
+            ensure_ann_for_model(&rt, &token, &ann, WARM_TEST_MODEL).await,
+            AnnWarmOutcome::Empty
+        );
+        assert_eq!(
+            read_own_watermark(&rt, "local", WARM_TEST_MODEL)
+                .await
+                .expect("registry read"),
+            Some(-1),
+            "even a fresh process must preserve the only cross-process loss signal"
+        );
+        assert!(force_rebuild_required(&ann, &key));
+    }
+
+    #[tokio::test]
+    async fn delayed_sentinel_request_cannot_demote_completed_recovery() {
+        let rt = memory_rt_with_embedder();
+        let token = rt.authorize(Namespace::local()).expect("authorize");
+        seed_warm_corpus(&rt, &token, 4).await;
+        let ann = new_shared();
+        let key = AnnKey::new("local", WARM_TEST_MODEL);
+        assert_eq!(
+            ensure_ann_for_model(&rt, &token, &ann, WARM_TEST_MODEL).await,
+            AnnWarmOutcome::Ready
+        );
+        let winner = read_own_watermark(&rt, "local", WARM_TEST_MODEL)
+            .await
+            .expect("winner watermark")
+            .expect("registered winner");
+        assert!(winner >= 0);
+
+        prepare_authoritative_rebuild(&rt, &ann, &key)
+            .await
+            .expect("delayed sentinel request");
+        assert_eq!(
+            read_own_watermark(&rt, "local", WARM_TEST_MODEL)
+                .await
+                .expect("registry read"),
+            Some(winner),
+            "revalidation under the publication lock must preserve the winner"
+        );
+        assert!(
+            force_rebuild_required(&ann, &key),
+            "the delayed detector must remain Cold until it scans or adopts authoritatively"
         );
     }
 
@@ -3255,7 +5443,7 @@ mod tests {
     }
 
     /// End-to-end reproduction of issue #1026: an empty corpus must leave the
-    /// key marked unavailable so `wait_for_ann` short-circuits instead of
+    /// key marked unavailable so `wait_ready` short-circuits instead of
     /// polling out the full warm-wait timeout on every query.
     #[tokio::test]
     async fn ensure_ann_for_model_empty_corpus_marks_unavailable_and_wait_short_circuits() {
@@ -3273,7 +5461,7 @@ mod tests {
         );
 
         let start = std::time::Instant::now();
-        let ready = wait_for_ann(&ann, &key, 5_000, 50).await;
+        let ready = wait_ready(&ann, &key, 5_000, 50).await;
         let elapsed = start.elapsed();
 
         assert!(!ready, "empty corpus must never become ready");
@@ -3327,7 +5515,7 @@ mod tests {
         assert!(
             !unavailable_guard(&ann.unavailable).contains_key(&key),
             "a rebuild ERROR must not mark the key unavailable — only a completed \
-             empty-corpus scan may; a marker here would short-circuit wait_for_ann \
+             empty-corpus scan may; a marker here would short-circuit wait_ready \
              while the same-generation retry is in flight"
         );
 
@@ -3342,7 +5530,7 @@ mod tests {
                 .with_generation(0);
             install_if_fresher(&ann2, &key2, bridge).await;
         });
-        let ready = wait_for_ann(&ann, &key, 500, 10).await;
+        let ready = wait_ready(&ann, &key, 500, 10).await;
         assert!(
             ready,
             "after a rebuild error the wait must keep polling and observe the \
@@ -3385,7 +5573,7 @@ mod tests {
                 .with_generation(0);
             install_if_fresher(&ann2, &key2, bridge).await;
         });
-        let ready = wait_for_ann(&ann, &key, 500, 10).await;
+        let ready = wait_ready(&ann, &key, 500, 10).await;
         assert!(
             ready,
             "after a store-opening failure the wait must keep polling and observe \

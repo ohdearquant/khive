@@ -1,8 +1,21 @@
 # ADR-047: Knowledge Pack
 
-**Status**: accepted (amended 2026-06-07, 2026-06-10, 2026-06-10b)
+**Status**: accepted (amended 2026-06-07, 2026-06-10, 2026-06-10b, 2026-08-01)
 **Date**: 2026-05-25
 **Authors**: khive maintainers
+
+## Amendment (2026-08-01): exact namespace support for `knowledge.compose`
+
+Issue #1505 adds an optional `namespace` parameter to `knowledge.compose`. An absent parameter
+preserves the existing caller-token scope. An explicit value is parsed with `Namespace::parse`
+and scopes the operation to exactly one namespace under ADR-007's precise escape: automatic
+domain suggestion, domain and atom resolution, section loading, KG blending, and brain-profile
+type-weight reads all use the same derived token. Invalid values fail closed. The handler repeats
+the namespace parse for direct-call defense in depth, requires it to match the already-authorized
+token, and then narrows any broader visible set to that exact namespace; it never elevates a token.
+Nested brain dispatches preserve the token's request actor and scope through their own Gate checks.
+The pack-local Tier-3 section-posterior fallback is keyed by namespace so live feedback cannot
+change an untouched measurement arm. Registry dispatch remains the authorization seam.
 
 ## Amendment (2026-06-10b): exclude_status precedence fix; auto-compose member filter; atom status taxonomy clarification
 
@@ -261,6 +274,17 @@ draft state should not drive agent composition.
 
 **Score bands** (observed in production): `score >= 0.46` reliably on-target,
 `0.42 <= score < 0.46` mixed quality, `score < 0.42` mostly off-target.
+
+#### `knowledge.compose` — namespace-consistent briefing composition
+
+```
+compose(query, namespace?, domain_ids?, atom_ids?, blend_kg?, auto_limit?, max_tokens?, explain?) → {status, data}
+```
+
+When `namespace` is present, every data-dependent leg is scoped to that exact namespace,
+including the bound brain-profile read that supplies section-type weights. Identical atom or
+domain slugs in another namespace cannot enter the briefing. When absent, existing behavior is
+unchanged.
 
 ### 3. `learn` — concept registration with domain promotion
 

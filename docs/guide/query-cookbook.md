@@ -50,6 +50,7 @@ live read-only checks against a production knowledge graph.
 | Bounded lineage           | What is reachable by one to three `extends` hops?                   | YES via query                | `MATCH (a)-[:extends*1..3]->(b) RETURN a.name, b.name LIMIT 100`                                                                                                 |
 | General expansion         | Expand this known entity two hops with context.                     | YES via `traverse`/`context` | `traverse(roots=["<uuid>"], max_depth=2)`, or `context(entity_ids=["<uuid>"], hops=2, budget=N)`.                                                                |
 | Cross-substrate join      | Which notes annotate concepts, documents, or other notes?           | YES via query                | `MATCH (note:note)-[e:annotates]->(target) RETURN note.name, target.kind, target.name LIMIT 100`                                                                 |
+| Pack-note inventory       | Which caller-visible comm messages exist?                           | YES via query                | `MATCH (m:message) RETURN m.id, m.kind LIMIT 100`; equivalently, use `MATCH (m:note) WHERE m.kind = "message" RETURN m.id, m.kind LIMIT 100`.                    |
 | Kind/type filtering       | Which records use a given entity type?                              | YES via query                | `MATCH (n) WHERE n.entity_type IS NOT NULL RETURN n.entity_type, n.name LIMIT 100`                                                                               |
 | Property filtering        | Which names contain a token, or belong to a set of kinds?           | YES via query                | `WHERE n.name CONTAINS "<text>"`, `STARTS WITH`, or `n.kind IN ["concept", "project"]`.                                                                          |
 | Edge-weight filter        | Which `extends` edges have weight at least 0.8?                     | YES via query                | `MATCH (a)-[e:extends]->(b) WHERE e.weight >= 0.8 RETURN a.name, e.weight, b.name LIMIT 100`                                                                     |
@@ -93,6 +94,11 @@ MATCH (a)-[e:extends|implements]->(b) RETURN a.name, e.relation, b.name LIMIT 10
   its supported substrate columns. Variable-length paths add `_depth` and
   `_total_weight` (a running sum of edge weights along the path, not an
   average).
+- Pack-registered note kinds use the same GQL `kind` field as base kinds. A granular label
+  such as `:message` is shorthand for the stored kind; `:note` selects the note substrate and
+  can be combined with `WHERE m.kind = "message"`. `note_kind` belongs to the verb parameter
+  surface and is not a GQL field. Both forms remain restricted to the caller's authorized
+  namespace scopes.
 - SPARQL variables project as whole nodes (full column expansion), unlike
   GQL's dotted per-field projection.
 
