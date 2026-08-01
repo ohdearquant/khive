@@ -218,8 +218,13 @@ independently settable, matching the note-merge design in ADR-039.
 6. For each edge:
    a. Rewire endpoints: source_id == from_id → into_id; target_id == from_id → into_id.
    b. If rewire produces a self-loop: drop the edge.
-   c. Otherwise: upsert with DO UPDATE semantics (ADR-009) on the unique triple
-      (namespace, source, target, relation).
+   c. Otherwise, probe the unique triple `(namespace, source, target, relation)`.
+      With no collision, update the edge in place. With a collision, retain the
+      existing row unchanged and hard-delete the incoming duplicate.
+   d. Before a collision delete, capture the complete incoming edge row and every
+      incident edge the hard-delete cascade will remove. Cascade recursively so an
+      annotation of an annotation cannot be left dangling. Preserve those preimages
+      in the synchronous summary and merge audit event.
 7. Merge entity fields:
    - name:        per `policy`
    - description: per `content_strategy` (independent of `policy` — see above)
@@ -248,12 +253,34 @@ pub struct MergeSummary {
     pub kept_id: Uuid,
     pub removed_id: Uuid,
     pub edges_rewired: usize,
+    pub edges_contract_skipped: usize,
+    pub edge_conflict_preimages: Vec<MergeEdgeConflictPreimage>,
     pub properties_merged: usize,
     pub tags_unioned: usize,
     pub content_appended: bool,
     pub dry_run: bool,
 }
 ```
+
+#### Reversible edge-conflict resolution (amendment, #1463)
+
+A natural-key collision does not merge weights or metadata: doing so would invent
+a value neither edge asserted. The existing row survives unchanged, while the
+incoming row is removed. Before that destructive step, the runtime captures its
+full stored state: id, namespace, endpoints, relation, weight, metadata, storage
+timestamps, deletion state, and target-backend stamp. The preimage also names the
+surviving edge id. This applies ADR-101's accepted full-preimage rule for destructive
+merge steps to the direct curation path; the runtime shape additionally retains the
+storage-only target-backend stamp needed for exact restoration.
+
+An edge is a legal `annotates` target under ADR-002. Therefore a raw conflict-row
+delete can leave an annotation pointing at a missing edge. The conflict path uses
+the accepted hard-edge-delete cascade instead: it recursively captures and removes
+every row incident to the dropped edge, including already-soft-deleted annotations.
+Those rows are stored as `incident_edge_preimages` under the conflict entry, in
+root-to-leaf order, so restoring the dropped edge followed by that list reconstructs
+the destroyed subgraph. `dry_run=true` computes the same preimages without deleting
+anything.
 
 Merge operations keep their separate transaction boundary: SQL/FTS changes happen
 inside the backend transaction, while vector re-insert for the retained record is
@@ -387,8 +414,8 @@ Every curation operation emits an event to `EventStore`:
 update_entity → entity_updated  { id, namespace, changed_fields }
 update_edge   → edge_updated    { id, namespace, changed_fields }
 update_note   → note_updated    { id, namespace, changed_fields }
-merge_entity  → entity_merged   { into_id, from_id, policy, edges_rewired }
-merge_note    → note_merged     { into_id, from_id, policy, edges_rewired }
+merge_entity  → entity_merged   { into_id, from_id, policy, edges_rewired, edges_contract_skipped, edge_conflict_preimages }
+merge_note    → note_merged     { into_id, from_id, policy, edges_rewired, edges_contract_skipped, edge_conflict_preimages }
 delete_entity → entity_deleted  { id, namespace, hard }
 delete_edge   → edge_deleted    { id, namespace }
 delete_note   → note_deleted    { id, namespace, hard }
@@ -571,4 +598,5 @@ never specify `substrate` directly.
 - ADR-010: KG Versioning — `SnapshotMergeStrategy` (the other "merge" in khive).
 - ADR-013: Note Kind Taxonomy — supersession via edge for cross-kind transitions.
 - ADR-016: Request DSL — verb surface that exposes curation to agents.
+- ADR-101: KG Change-Set Model — full preimages for destructive merge operations.
 - ADR-038: Events — event substrate for audit trail.

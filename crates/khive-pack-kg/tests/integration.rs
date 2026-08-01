@@ -3415,6 +3415,14 @@ async fn curation_merge_entity_event_payload_has_adr014_fields() {
         payload.get("edges_rewired").is_some(),
         "entity_merged payload must contain 'edges_rewired'; got {payload}"
     );
+    assert_eq!(
+        payload
+            .get("edge_conflict_preimages")
+            .and_then(Value::as_array)
+            .map(Vec::len),
+        Some(0),
+        "a conflict-free merge must audit an empty 'edge_conflict_preimages' array; got {payload}"
+    );
     assert!(
         payload.get("content_strategy").is_some(),
         "entity_merged payload must contain 'content_strategy' (PR #814); got {payload}"

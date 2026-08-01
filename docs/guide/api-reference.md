@@ -361,9 +361,13 @@ request(ops="delete(id=\"<uuid>\")")
 
 ### `merge` — Declaration
 
-Deduplicate two entities. Returns `{kept_id, removed_id, edges_rewired,
-properties_merged, tags_unioned, content_appended, dry_run}` — chain with
-`$prev.kept_id`, **not** `$prev.id` (merge has no top-level `id` field).
+Deduplicate two entities or notes. Returns `{kept_id, removed_id, edges_rewired,
+edges_contract_skipped, edge_conflict_preimages, properties_merged,
+tags_unioned, content_appended, dry_run}` — chain with `$prev.kept_id`, **not**
+`$prev.id` (merge has no top-level `id` field). When rewiring collides with an
+existing edge natural key, `edge_conflict_preimages` records the surviving edge
+id, the complete dropped edge, and any incident annotation edges removed by the
+hard-delete cascade. The same preimages are stored in the merge audit event.
 When the surviving entity or note is reindexed and an embedder bounds its input, the successful
 response also includes the standard embedding-truncation `warnings` advisory.
 

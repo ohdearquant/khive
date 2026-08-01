@@ -136,11 +136,15 @@ Edge rewiring follows the same logic as `merge_entity_sql` in `khive-runtime`:
 2. Each edge is rewired: `source_id == from_id` becomes `into_id`; `target_id == from_id`
    becomes `into_id`.
 3. If rewiring produces a self-loop (`source == target`), the edge is deleted.
-4. Otherwise the rewired edge is upserted via the existing
-   `ON CONFLICT(namespace, source_id, target_id, relation) DO NOTHING` clause, which drops
-   duplicate natural edges automatically.
-5. FTS5 and vector index entries for `from_id` are deleted inside the transaction.
-6. After the transaction commits, `into_id` is reindexed (FTS5 + async vector re-insert),
+4. Otherwise the rewired edge's natural key is probed. If the key is free, the edge is
+   updated in place. If another live or soft-deleted row already owns it, that row survives
+   unchanged and the incoming duplicate is hard-deleted.
+5. Before a conflict delete, the complete duplicate edge and every recursively incident
+   annotation edge are captured in `edge_conflict_preimages`. The cascade removes those
+   annotation rows so none points at a missing edge; the same preimages are written to the
+   `NoteMerged` audit event.
+6. FTS5 and vector index entries for `from_id` are deleted inside the transaction.
+7. After the transaction commits, `into_id` is reindexed (FTS5 + async vector re-insert),
    identical to the entity merge post-commit pattern.
 
 ### Tombstoning, not hard-delete
@@ -174,13 +178,16 @@ preview, and returns without opening a write transaction.
 
 ### Extended MergeSummary
 
-Reuses `MergeSummary` from `khive-runtime/src/curation.rs` with two new fields:
+Reuses `MergeSummary` from `khive-runtime/src/curation.rs`; note merge added the
+content fields below, and later curation amendments added conflict preimages:
 
 ```rust
 pub struct MergeSummary {
     pub kept_id:            Uuid,
     pub removed_id:         Uuid,
     pub edges_rewired:      usize,
+    pub edges_contract_skipped: usize,
+    pub edge_conflict_preimages: Vec<MergeEdgeConflictPreimage>,
     pub properties_merged:  usize,
     pub tags_unioned:       usize,
     // new in ADR-039
@@ -191,6 +198,10 @@ pub struct MergeSummary {
 
 `content_appended` is `false` for `prefer_into` and `prefer_from` strategies even if `from`
 had content. It signals whether the append path actually ran.
+
+`edge_conflict_preimages` is empty when no natural-key collision occurs. Each entry names the
+surviving edge, contains the complete dropped row, and nests any incident annotation rows removed
+by the hard-delete cascade. The field is also populated predictively by `dry_run=true`.
 
 ## Rationale
 
@@ -293,8 +304,11 @@ patch it after the merge.
 - Edge rewire — self-loop dropped: an edge `(from_id, relation, from_id)` is deleted, not
   rewired to `(into_id, relation, into_id)`.
 - Edge rewire — duplicate natural edge dropped: if `(into_id, relation, X)` already exists
-  and `(from_id, relation, X)` is rewired, the `ON CONFLICT DO NOTHING` clause fires and the
-  count remains 1.
+  and `(from_id, relation, X)` is rewired, the existing row survives unchanged and the result
+  plus `NoteMerged` event contain a complete preimage of the dropped row.
+- Edge-conflict annotation cascade: a note annotating the dropped edge is removed rather than
+  left dangling, and its full row appears under the conflict's `incident_edge_preimages` so the
+  dropped edge and annotation can both be restored.
 - Tombstone: after merge, `from_id.status == deleted` and `from_id.deleted_at` is set.
 - FTS index: `from_id` is absent from FTS search results after merge; `into_id` returns
   content from both notes when `append` was used.
@@ -324,6 +338,7 @@ patch it after the merge.
   is resolved to substrate before handler selection.
 - ADR-021: Memory Pack — memory notes carry `salience`, `decay_factor`, `expires_at`, and
   `memory_type`; all are subject to the field-level merge rules in this ADR.
+- ADR-101: KG Change-Set Model — destructive merge steps carry full preimages for inversion.
 - `khive-runtime/src/curation.rs`: `merge_entity`, `merge_entity_sql`, `merge_properties`,
   `union_tags` helpers — `merge_note_sql` mirrors this structure.
 - `khive-types/src/note.rs`: `Note` struct and `NoteStatus` enum.
