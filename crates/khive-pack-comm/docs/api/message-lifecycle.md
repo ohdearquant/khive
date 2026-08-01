@@ -138,6 +138,32 @@ is keyed on `notes_seq.seq`, which is fixed at first insert and survives such
 churn, so this is defensive rather than load-bearing; a metadata patch should
 never rewrite the row regardless.
 
+The mark-read patch is best-effort: under multi-client burst traffic the
+sqlite writer pool can time out (`checkout_timeout`, 5s default), and the
+read itself has already succeeded by the time the patch runs, so a failed or
+no-op write no longer fails the whole call. This follows the same
+high-level best-effort principle as `handle_reply`'s fold-in mark, which has
+been best-effort since its introduction. Three outcomes:
+
+- `Ok(true)` — the row was live and updated: `read: true`, `properties` is
+  the patched value (including the new `read: true`).
+- `Ok(false)` — no live row was found to update (e.g. soft-deleted
+  mid-flight, between this handler's `get_note` and its
+  `update_note_properties` call): `read: false`, `mark_error: "no live row
+  updated"`, `properties` is the note's ORIGINAL stored value (a stored
+  SQL-NULL properties column round-trips as JSON `null`, never `{}`) — the
+  response never claims a write that did not land.
+- `Err(e)` — the patch failed (writer timeout, pool exhaustion, etc.):
+  logged via `tracing::warn!` with the full error detail, then `read:
+  false`, `mark_error` is the error's `Display` string, `properties` is the
+  original stored value (again `null` if that is what was stored).
+
+`id`/`full_id` are returned in all three arms — only the mark degrades, not
+the read. There is no retry loop; a caller polling unread counts simply
+sees the message still unread and can re-issue `comm.read` (self-healing).
+Every validation error that runs before the patch (not found, wrong kind,
+outbound, wrong addressee) is unaffected and stays a hard error.
+
 ## `handlers.rs::handle_reply`
 
 Replies to a message, threading linkage.
