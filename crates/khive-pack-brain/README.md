@@ -20,10 +20,12 @@ call time and feed back into via explicit or implicit signals.
   `FeedbackExplicit` event to the shared event log; `brain.auto_feedback` is
   convenience sugar so an agent can credit the top `memory.recall` hit without
   constructing a full feedback call
-- **Deterministic Fold-based state** — `BalancedRecallFold` and
-  `SectionPosteriorFold` each implement `khive_fold::Fold<Event, S>`
-  (`init`/`reduce`/`finalize`) over the append-only event log, so profile state is
-  always a pure replay, never a mutation in place
+- **Deterministic fold reducers** — `BalancedRecallFold` and
+  `SectionPosteriorFold` implement pure `khive_fold::Fold<Event, S>` reducers.
+  Current handlers invoke them synchronously; durable handler mutations append to
+  the private `brain_event_log` and write JSON snapshots. The best-effort
+  `DispatchHook` updates in-memory state without durable replay, while automatic
+  shared-log catch-up remains deferred by ADR-017.
 - **Adapter integrity gating** (`brain.register_adapter`) — records a
   content-hash + base-model-revision pair so an FFN/LoRA router only composes
   adapters that match the currently active base model revision

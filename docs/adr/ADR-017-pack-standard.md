@@ -258,11 +258,42 @@ impl VerbRegistry {
 }
 ```
 
-### `PackEventConsumer`: event delivery contract
+### Deferred design: `PackEventConsumer` event delivery
 
-Packs that derive state from the event log (brain, audit summary, future analytics)
-register as event consumers via the `PackEventConsumer` trait. The runtime delivers
-matching events one at a time; the pack owns reduction, persistence, and replay.
+**Status: deferred; this is not an accepted runtime, pack, or CLI contract.** The
+repository does not ship `PackEventConsumer`, `RuntimeEventContext`, or `EventCursor`;
+consumer registration; a catch-up/live-delivery driver; or `kkernel events replay`.
+The current `EventStore::query_events` API exposes newest-first, offset-based pages and
+cannot express the compound ascending cursor below.
+
+The shipped `DispatchHook` is not this seam. It is an optional best-effort callback
+after a successful in-process verb dispatch; it has no durable consumer identity,
+cursor, catch-up, replay, or failure-recovery contract and therefore cannot be used as
+an implementation shortcut for event-log consumption.
+
+The remainder of this section preserves the proposed shape and its safety constraints
+as design input only. A follow-up ADR must accept all of these prerequisites together
+before any pack or dependent design may rely on event delivery:
+
+1. A cursor-aware event-store query and `EventView` loading API with an explicit
+   ascending replay order and bounded pages.
+2. Host ownership, supervision, registration, and stable consumer identity (including
+   how a pack with multiple profiles identifies the cursor being advanced).
+3. A pack-backend transaction seam that can enforce and test atomic derived-state plus
+   cursor persistence.
+4. Gap-free catch-up-to-live handoff plus pinned retry, duplicate-delivery,
+   idempotence, cancellation, and terminal-failure semantics.
+5. An authenticated, bounded replay CLI with explicit start/end cursors and tests for
+   crash recovery, equal-timestamp ordering, restart, and repeated replay.
+
+Until that contract is accepted and implemented, packs must not register a
+`PackEventConsumer` or assume push delivery, automatic catch-up, or operator replay.
+They may use the shipped event query surface directly or keep work synchronous with
+the handler that owns it, as the proposal worker does in ADR-046.
+
+The deferred design would let packs that derive state from the event log (brain, audit
+summary, future analytics) register as event consumers. The runtime would deliver
+matching events one at a time; the pack would own reduction, persistence, and replay.
 
 ```rust
 pub trait PackEventConsumer: Send + Sync {
@@ -274,9 +305,10 @@ pub trait PackEventConsumer: Send + Sync {
     /// Invoked once per matching event, in canonical replay order
     /// (created_at ASC, event_id ASC — ADR-022 §3b). The consumer receives an
     /// `EventView` (ADR-041 §5) — the raw event plus its pre-joined provenance
-    /// observations. The consumer is responsible for loading state, applying its
-    /// Fold::reduce against the right field of the view (see ADR-041 §5 for the
-    /// two call shapes), and persisting state + cursor atomically.
+    /// observations. The consumer is responsible for loading state, applying the
+    /// canonical Fold<Event, S> to view.event, and persisting state + cursor atomically.
+    /// A replay that makes observations part of its deterministic input must define a
+    /// separate typed fold input rather than using EventView itself (ADR-024, ADR-041 §5).
     async fn on_event(
         &self,
         view: &EventView,
@@ -291,20 +323,19 @@ pub struct RuntimeEventContext {
 }
 ```
 
-#### State + cursor atomicity (MANDATORY)
+#### State + cursor atomicity (future requirement)
 
-A pack consumer MUST persist its derived state and the `EventCursor` of the event it
-just processed in the **same logical transaction**. A crash between state-update and
-cursor-update causes duplicate reduction on restart, breaking replay determinism for
-non-idempotent Folds.
+A future pack consumer MUST persist its derived state and the `EventCursor` of the
+event it just processed in the **same logical transaction**. A crash between
+state-update and cursor-update causes duplicate reduction on restart, breaking replay
+determinism for non-idempotent Folds.
 
 ```rust
 // Inside on_event(view: &EventView, ctx):
 let mut tx = pack.storage.begin().await?;
 let mut state = tx.load_state(profile_id).await?;
-// For Fold<Event, S> impls, pass the raw event:
+// EventView is the consumer envelope; Event is the canonical fold input:
 state = fold.reduce(state, &view.event, &fold_ctx);
-// (For Fold<EventView, S> impls — see ADR-041 §5 — pass `view` instead.)
 tx.save_state(profile_id, &state).await?;
 tx.save_cursor(profile_id, &EventCursor::from(&view.event)).await?;
 tx.commit().await?;
@@ -323,7 +354,7 @@ State and cursor MUST live in the same backend. Packs that use pack-scoped backe
 cross-backend state/cursor split is out of scope (the WAL pattern in ADR-029 is for
 hard-delete cascade, a different invariant — do not reuse for replay continuity).
 
-#### Catch-up on registration / restart
+#### Proposed catch-up on registration / restart
 
 When a consumer registers or restarts:
 
@@ -339,19 +370,20 @@ When a consumer registers or restarts:
 The runtime does NOT persist Fold state. The runtime does NOT execute Folds. It
 delivers events and invokes `on_event` — everything downstream is pack territory.
 
-#### Failure isolation
+#### Proposed failure isolation
 
 If a pack consumer's `on_event` returns an error, the runtime:
 
 1. Logs the error with `(pack_id, profile_id, event_cursor)`.
-2. Does NOT re-deliver the same event automatically (avoids tight retry loops).
+2. Does NOT retry the same event immediately in a tight loop.
 3. Does NOT abort event append for other consumers — the event log is the source of
    truth and survives individual consumer failures.
 4. Leaves the consumer's cursor at its last successful position; the next live event
-   that matches the filter triggers a catch-up that re-attempts the failed event.
+   that matches the filter triggers catch-up and a delayed automatic re-attempt of the
+   failed event.
 
-Operators may force re-processing via `kkernel events replay --pack <id> --from
-<cursor>` (CLI, not MCP — see ADR-032 §11 / concern-6 Q6.5).
+A future operator replay surface may use `kkernel events replay --pack <id> --from
+<cursor>` (CLI, not MCP), but that command is not reserved or shipped by this ADR.
 
 ### Boot-time collision checks
 

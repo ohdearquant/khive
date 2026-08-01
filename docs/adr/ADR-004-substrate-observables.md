@@ -223,8 +223,9 @@ The canonical total order on events is:
 ```
 
 `event_id` is compared by canonical UUID byte order. It does not encode true insertion
-order; it provides a deterministic tiebreaker when `created_at` ties. Replay consumers
-that need lossless catch-up persist a compound cursor:
+order; it provides a deterministic tiebreaker when `created_at` ties. Any future replay
+consumer that needs lossless catch-up must persist a compound cursor. The following is
+the reserved design shape, not a shipped public type:
 
 ```rust
 pub struct EventCursor {
@@ -236,9 +237,10 @@ pub struct EventCursor {
 This invariant is consumed by:
 
 - ADR-022 §3b — list/replay query shape and the composite index `idx_events_ns_created_id`.
-- ADR-017 — `PackEventConsumer` cursor persistence (state + cursor must be atomic).
-- ADR-024 / ADR-032 — `Fold<Event, State>` deterministic replay: same canonical-order
-  events + same `FoldContext` ⇒ same final state.
+- ADR-017 — the deferred `PackEventConsumer` design would require atomic state + cursor
+  persistence; no consumer or cursor API ships today.
+- ADR-024 / ADR-032 — any future `Fold<Event, State>` replay must preserve the same
+  canonical-order events + `FoldContext` ⇒ same final state invariant.
 
 A monotonic append-sequence counter (`event_seq`) is NOT in v1. The timestamp+id pair
 gives deterministic replay order; a true commit-order counter is a different invariant

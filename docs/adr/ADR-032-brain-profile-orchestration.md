@@ -73,16 +73,19 @@ profile. It is now one profile among many, not the shape of the brain itself.
 
 ## Decision
 
-### 1. Brain is a meta-Fold
+### 1. Brain's target architecture is a meta-Fold
 
-Brain is a `Fold<Event, BrainState>` whose derived state is a set of pipeline parameters.
-In shipped v1, `BrainState` stores both the profile registry and the live Bayesian recall
-state. The built-in `balanced-recall-v1` profile keeps its live posteriors in
-`BrainState.balanced_recall`; user-created Bayesian profiles keep live posteriors in
-`BrainState.profile_states`.
+The target shared-log architecture models Brain as a `Fold<Event, BrainState>` whose derived
+state is a set of pipeline parameters. Shipped v1 does not run that Fold from the shared event
+log. It updates state synchronously through the best-effort `DispatchHook` and explicit
+feedback handlers, then replays its private `brain_event_log` after a snapshot on cold load.
+`BrainState` stores both the profile registry and the live Bayesian recall state. The built-in
+`balanced-recall-v1` profile keeps its live posteriors in `BrainState.balanced_recall`;
+user-created Bayesian profiles keep live posteriors in `BrainState.profile_states`.
 
-Brain observes pack events only. It never processes its own state-transition events. This
-boundary prevents recursive self-tuning loops.
+The shipped interpreter observes successful dispatch-hook callbacks and explicit feedback,
+and ignores brain state-transition verbs. This boundary prevents recursive self-tuning loops;
+it is not durable shared-log delivery.
 
 ### 2. Shipped v1 profile record
 
@@ -122,19 +125,21 @@ persistence writes the full `BrainStateSnapshot` JSON blob into `brain_profile_s
 The generic `Profile` struct, `ProfileMetadata`, `ProfileStateClass`, `SnapshotAdapter`,
 and inference-hook fields remain target architecture and are not shipped v1 API.
 
-`event_filter` makes the ADR-022 §3a unification concrete: every profile declares its
-input substrate slice via `EventFilter`. The brain pack's `PackEventConsumer::event_filter`
-(ADR-017) returns the union of its active profiles' filters, so the runtime's storage
-query pushes the predicate down at the SQL layer — a deployment carrying thousands of
-cold profiles pays index lookup, not per-profile Rust evaluation. Profiles that need
-the `Objective<Event>` typed-shape (e.g., for `FilterFold` composition) use
-`filter.as_objective()`.
+`event_filter` remains target profile metadata, not a shipped consumer registration.
+If ADR-017's deferred `PackEventConsumer` design is accepted later, brain could return
+the union of active-profile filters and push that predicate down at the SQL layer. The
+current brain pack has no durable event-log consumer or live-delivery loop; posterior
+updates use the best-effort `DispatchHook` and explicit feedback paths, and profile
+state is projected at serve time per ADR-104. Future explicit replay or backtest code
+could use `filter.as_objective()`.
 
 ### 3. System-wide event log
 
-All packs emit structured events to a shared, append-only, time-ordered, schema-versioned
-log. Default-on for every pack. Brain reads this log. Today's `brain.events` table generalizes
-into this store.
+All packs emit audit events to a shared, append-only, time-ordered, schema-versioned log.
+Default-on for every pack. Brain's query handlers can read that log, but shipped profile
+evolution does not replay it. Profile mutation and cold-load replay use the synchronous hook /
+feedback paths and the private `brain_event_log` described above. Replacing that private path
+with the shared-log Fold remains deferred with ADR-017.
 
 ```rust
 pub struct Event {
@@ -169,15 +174,16 @@ pub enum EventKind {
 }
 ```
 
-Replay must handle every historical payload schema. A per-kind migration registry upgrades
-old payloads to the current shape before profile evolvers see them. The event log is the
-system of record; profile states are derivable from it.
+A future shared-log replay must handle every historical payload schema. Its follow-up ADR must
+specify a per-kind migration registry that upgrades old payloads before profile evolvers see
+them. Shipped profile state is not claimed to be derivable from the shared event log: cold-load
+replay reads the private `brain_event_log` after the latest brain snapshot.
 
 **Profile-served events carry `served_by_profile_id` in their payload.** Events whose
 production was shaped by a brain-resolved profile — `RecallExecuted`, `RerankExecuted`
 (ADR-042), `FeedbackExplicit` — record the resolved profile id in their
 payload. Other event kinds (`LinkCreated`, `TaskTransitioned`, …) do not carry this
-field — they were never "served" by a profile, just observed by brain.
+field — they were never "served" by a profile.
 
 ```rust
 // Minimum payload shape for profile-served events.
@@ -219,9 +225,11 @@ pub fn interpret(event: &Event) -> BrainSignal {
 }
 ```
 
-There is no `BrainEvent` enum parallel to `Event`. The `interpret()` function is the single
-mapping layer. Any pack that emits events through the standard dispatch path automatically
-feeds brain. To add a new signal source, add one match arm to `interpret()`.
+There is no `BrainEvent` enum parallel to `Event`. The shipped `interpret()` function maps the
+synthetic audit-shaped event passed by `DispatchHook` and explicit feedback records into brain
+signals. A successful standard dispatch invokes that best-effort hook when configured, but it
+does not provide durable shared-log delivery, catch-up, or replay. A future shared-log consumer
+could reuse the mapping only after ADR-017's prerequisites are accepted and implemented.
 
 ### 5. Profile state typology — Bayesian is one class among many
 
@@ -531,15 +539,17 @@ Trajectory → backtest pipeline).
 
 ### 6. Data flow
 
-Brain registers as a `PackEventConsumer` (ADR-017). The runtime delivers events; brain
-fans each delivered event to the matching profiles, applies their `Fold::reduce`, and
-persists `(state, cursor)` atomically per profile. The runtime does NOT execute Folds
-or persist profile state — those are pack territory.
+Brain does not register as a `PackEventConsumer`: ADR-017 defers that runtime seam, and
+ADR-104 explicitly pins activation to a lifecycle transition rather than a live update
+loop. Shipped posterior updates run through the best-effort `DispatchHook` and explicit
+feedback handlers, while serving projects state per request. The live-delivery and
+catch-up branches below are retained only as deferred target design; they are not
+current runtime behavior.
 
 ```
 EVENT LOG (substrate, ADR-022 §3b ordering: created_at ASC, event_id ASC for replay)
    |
-   |-- live delivery:
+   |-- [DEFERRED] live delivery:
    |     runtime queries events matching brain.event_filter()
    |       (union of active-profile filters, pushed down as SQL WHERE)
    |     for each event in canonical order:
@@ -573,7 +583,7 @@ EVENT LOG (substrate, ADR-022 §3b ordering: created_at ASC, event_id ASC for re
    |     emit RecallExecuted event with payload.served_by_profile_id = Some(P.id)
    |       (closes the feedback loop via §4 interpret())
    |
-   |-- catch-up (on registration / restart, ADR-017 PackEventConsumer):
+   |-- [DEFERRED] catch-up (on registration / restart):
    |     for each active profile P:
    |       cursor = tx.load_cursor(P.id) or EventCursor::zero()
    |       events = event_store.query(filter=P.event_filter, after=cursor,
@@ -599,28 +609,29 @@ EVENT LOG (substrate, ADR-022 §3b ordering: created_at ASC, event_id ASC for re
            ruvector-snapshot + ruvector-delta-core blob (generic / Bayesian)
 ```
 
-**Key invariants** (all derived from ADR-017 + ADR-022 §3b):
+**Deferred consumer invariants** (required if ADR-017 is accepted later):
 
-1. The runtime queries events using the §3b cursor-aware ascending replay query —
+1. The runtime would query events using the §3b cursor-aware ascending replay query —
    `(created_at, event_id)` tiebreak guarantees no skipped events at clock-tie boundaries.
-2. State and cursor are persisted in the same transaction in the **same backend** —
+2. State and cursor would be persisted in the same transaction in the **same backend** —
    the pack's primary SQLite store. See §6.1 below for how this works for LoRA-class
    profiles whose A/B matrices look like they want to live as files.
-3. Cold profiles never run Rust-side filtering — their `EventFilter` rolls into the
-   storage query's WHERE clause via the §3a closed-struct lowering (ADR-022).
+3. Cold profiles would not run Rust-side filtering — their `EventFilter` would roll
+   into the storage query's WHERE clause via the §3a closed-struct lowering (ADR-022).
 4. `Fold::reduce` is pure (no async, no IO, no clock — ADR-024 v1 invariants). The
    LoRA evolver's online SGD step (`khive_pack_brain::lora::sgd_step`) is deterministic
    given the same starting weights and signal. Lattice's online `adapt_step` is a
    future primitive (filed as a lattice issue) — until it lands the gradient math
    lives in khive-pack-brain.
 
-#### 6.1 LoRA two-resource atomicity — single-backend primary, SafeTensors as export
+#### 6.1 Future LoRA state/cursor atomicity — single-backend primary
 
-ADR-017 mandates state + cursor in the same transaction in the same backend. LoRA-class
-profile state looks like it wants to span two resources (SQLite for cursor + scalars,
-SafeTensors files for the A/B matrices) — that would be a two-phase commit problem.
-Resolution: **SafeTensors is not the primary persistence layer**, it is an import/export
-format. The primary store is the pack's SQLite, full stop.
+ADR-017's deferred design requires any future consumer to write state + cursor in the
+same transaction and backend. LoRA-class profile state looks like it wants to span two
+resources (SQLite for cursor + scalars, SafeTensors files for the A/B matrices), which
+would be a two-phase commit problem. The prerequisite design decision is:
+**SafeTensors is not the primary persistence layer**; it is an import/export format.
+The pack's SQLite store would be primary if the consumer seam is accepted.
 
 Shipped v1 persistence is JSON snapshot based (V20 migration, `V20_BRAIN_PROFILE_PERSISTENCE`):
 
@@ -649,9 +660,12 @@ used for reload. The LoRA tables (`profile_state_lora_layer`, `profile_state_sca
 `profile_cursor`) and SafeTensors import/export verbs are deferred until a native
 lattice/LoRA rerank call site ships.
 
-This is the right separation: the live state stays in one transactional backend; the
-portable format is for sharing/training-import/audit, where the latency of "flush to
-file" is acceptable and atomicity with the cursor is not required.
+This remains the right separation for a future consumer: durable state would stay in
+one transactional backend, while the portable format serves sharing, training import,
+and audit. Durable handler-owned mutations use the private `brain_event_log` and JSON
+snapshot path above. The best-effort `DispatchHook` mutates in-memory state only; it
+performs no event append or snapshot write and has no durability, cursor, or
+replay-atomicity guarantee.
 
 #### 6.1 Versioned `ModuleName` enum
 
@@ -949,8 +963,8 @@ active fallback profile: `balanced-recall-v1`.
 active  <->  inactive  ->  archived
 ```
 
-- **Active**: the profile can be resolved and updated by feedback.
-- **Inactive**: state is retained and the profile can be inspected, but live updates are stopped.
+- **Active**: lifecycle value eligible for unbound active-profile fallback resolution.
+- **Inactive**: state is retained; the transition itself starts or stops no background work.
 - **Archived**: terminal/read-only/audit-retained. No transition out of `Archived` is legal;
   `brain.activate(profile_id)` rejects archived profiles.
 
@@ -994,7 +1008,7 @@ A typical "train and serve per subagent per project" sequence:
      → derives state by replaying events through the Fold
      → persists snapshot
 3. brain.activate(profile_id=candidate)
-     → live update loop begins
+     → lifecycle changes to active; no live update loop is started (ADR-104)
 4. brain.bind(profile_id=candidate,
               actor="implementer-α",
               namespace="agent:docs",
@@ -1067,11 +1081,12 @@ from the moment it is created. The built-in `balanced-recall-v1` profile uses th
 
 ### 12. Brain registers as a pack
 
-Brain registers as `khive-pack-brain` via the pack registry (ADR-027). It observes pack
-events emitted by the runtime; it never processes events emitted by its own state
-transitions. This self-tuning prevention boundary is enforced by filtering on `EventKind`
-before passing events to profile evolvers — brain-internal kinds (`ProfileResolutionRecommended`,
-etc.) are excluded from the live update loop.
+Brain registers as `khive-pack-brain` via the pack registry (ADR-027), but it does not
+register a durable event-log consumer. The current best-effort `DispatchHook` and
+feedback handlers own state mutation synchronously. If the deferred ADR-017 seam is
+accepted later, its filter must exclude brain-internal events
+(`ProfileResolutionRecommended`, etc.) before passing events to profile evolvers so
+state transitions cannot tune themselves.
 
 ---
 
@@ -1209,8 +1224,9 @@ deployment.
      temporal decay
    - `Selector` that picks top-k under budget
    - `SnapshotAdapter` for the three Beta pairs plus entity LRU cache
-5. Live update loop: brain's `PackEventConsumer::on_event` (ADR-017) dispatches each
-   matching event to active profiles' `evolver.reduce` with atomic state+cursor commit.
+5. **Deferred**: a live update loop based on ADR-017's `PackEventConsumer` design. This
+   is not part of Phase 1 until a follow-up ADR accepts the consumer lifecycle and the
+   runtime ships atomic state+cursor delivery.
 
 ### Phase 2 — Backtest execution
 
@@ -1303,7 +1319,8 @@ As of #1016, newly emitted `FeedbackExplicit` events always persist the effectiv
 - ADR-006 — Deterministic Scoring (`DeterministicScore`, i64 fixed-point, canonical ordering)
 - ADR-017 — Pack Standard (brain registers as `khive-pack-brain`)
 - ADR-021 — Memory Pack (provides the `recall` verb that brain tunes)
-- ADR-022 — Events Query Surface (the substrate event log brain reads and all packs emit to)
+- ADR-022 — Events Query Surface (the shared substrate event log; profile-delivery integration
+  remains deferred)
 - ADR-024 — Fold Cognitive Primitives (`Fold`, `Anchor`, `Objective`, `Selector`,
   composition combinators — the building blocks brain composes into profiles)
 - ADR-025 — Verb Speech Acts (brain verbs classified as assertive, commissive, declaration)
@@ -1313,8 +1330,8 @@ As of #1016, newly emitted `FeedbackExplicit` events always persist the effectiv
 - The legacy v0 brain architecture (event-driven scalar Beta posteriors; the historical
   predecessor to this ADR. The Bayesian mechanics survive as `BalancedRecallProfile`; the
   fixed-shape `BrainState` design is superseded by the profile-orchestration direction here)
-- kkernel crate — the runtime that composes packs, hosts the event log, and runs the live
-  update loop
+- kkernel crate — the runtime that composes packs and hosts the event log; the live
+  update loop remains deferred
 - `ruvector-snapshot` — profile state persistence
 - `ruvector-delta-core` — delta-encoded snapshots
 - `ruvector-temporal-tensor` — time-evolving tiered state for rich-state profiles

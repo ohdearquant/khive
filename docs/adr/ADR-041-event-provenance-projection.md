@@ -6,10 +6,10 @@
 **Depends on**:
 
 - ADR-004 (Substrate Observables — Event substrate)
-- ADR-017 (Pack Standard — PackEventConsumer atomicity)
+- ADR-017 (Pack Standard — deferred PackEventConsumer atomicity constraint)
 - ADR-022 (Events Query Surface — EventFilter, ordering, cursor)
 - ADR-024 (Fold Cognitive Primitives)
-- ADR-032 (Brain Profile Orchestration — Fold consumer of events)
+- ADR-032 (Brain Profile Orchestration — target Fold/event-consumer design)
 
 ---
 
@@ -17,8 +17,9 @@
 
 [ADR-022](ADR-022-events-query-surface.md) establishes the event log as an append-only,
 ordered, queryable substrate. Brain (ADR-032), validation pipelines (ADR-034), and
-audit consumers fold over this log via `Fold<Event, State>`. The Event struct carries a
-JSON `payload` field that holds operation-specific structured data:
+audit tooling can query or explicitly fold over this log. Runtime-driven Fold delivery
+is deferred with ADR-017's `PackEventConsumer` design. The Event struct carries a JSON
+`payload` field that holds operation-specific structured data:
 
 ```rust
 pub struct Event {
@@ -45,7 +46,8 @@ The same data, modeled as edges, would make provenance queries graph-native:
 But ADR-002's edge ontology is closed (15 edge relations — closed taxonomy; entity↔entity by default) and
 ADR-022 §3b's append-only ordering invariant rests on events being a separate substrate
 from entities. Promoting events into the entity table to "make them queryable" would
-break replay determinism, cursor semantics, and PackEventConsumer atomicity (ADR-017).
+break replay determinism, cursor semantics, and the atomicity required by any future
+PackEventConsumer contract (ADR-017).
 
 > **Amended ([ADR-055](ADR-055-epistemic-edge-relations.md))**: ADR-055 added 2
 > epistemic relations (`supports`, `refutes`); the current total is 17 edge relations.
@@ -56,9 +58,10 @@ This ADR resolves the tension via a **hybrid** model: the event log stays canoni
 edges expose the projection to GQL/SPARQL without touching the canonical edges table.
 
 The Fold/Objective story (ADR-024 §"Pack-internal aggregators") gets materially cleaner
-as a side effect — Fold consumers receive pre-decoded `EventView`s with typed
-provenance instead of raw payload JSON. EventFilter (ADR-022 §3a) gains
-`Observed(EntityId)` / `Selected(EntityId)` predicates that lower to SQL JOINs.
+as a side effect — explicit callers and any future event consumer can inspect pre-decoded
+`EventView`s with typed provenance instead of raw payload JSON. Canonical event-log Folds still
+receive `Event`, not `EventView`. EventFilter (ADR-022 §3a) gains `Observed(EntityId)` /
+`Selected(EntityId)` predicates that lower to SQL JOINs.
 
 ### Scope
 
@@ -68,7 +71,8 @@ This ADR specifies:
 - The four canonical observation roles (`Candidate`, `Selected`, `Target`, `Signal`).
 - The write-time projection contract: which events project, what they project, in
   what transaction.
-- The `EventView` type passed to `Fold` consumers.
+- The `EventView` storage type available to explicit callers and reserved as a future
+  event-consumer envelope.
 - `EventFilter::Observed(EntityId)` / `Selected(EntityId)` field additions and their
   SQL lowering.
 - Synthetic GQL/SPARQL edge exposure.
@@ -92,7 +96,7 @@ It does NOT:
 │ events                          (ADR-022 — canonical log)   │
 │   id, created_at, namespace, actor, verb, kind, payload     │
 │   append-only, ordered by (created_at, event_id)            │
-│   primary store for Fold consumers (ADR-017 cursor anchor)  │
+│   query source; future Fold cursor anchor (ADR-017 deferred) │
 └─────────────────────────────────────────────────────────────┘
             │
             │  (same transaction, write-time projection)
@@ -222,9 +226,14 @@ defining its role mapping. Existing event kinds with no decoder produce no proje
 rows — backward-compatible. Renaming or restructuring decoded fields requires an event
 payload-schema migration (ADR-032 §3 mentions the migration registry).
 
-### 5. EventView — the Fold consumer surface
+### 5. EventView — storage shape and future consumer envelope
 
-PackEventConsumer (ADR-017) hands Folds enriched event views, not raw events:
+`EventView` is a shipped storage type used by explicit callers and the best-effort
+post-dispatch `DispatchHook`. The current hook receives a synthetic view whose
+`observations` vector is empty; it does not hydrate persisted projection rows. No runtime
+currently rehydrates logged events and invokes a `PackEventConsumer`; that delivery seam
+is deferred by ADR-017. A future consumer dispatcher would use `EventView` as its delivery
+envelope:
 
 ```rust
 pub struct EventView {
@@ -240,43 +249,40 @@ pub struct EventObservation {
 }
 ```
 
-The runtime fetches the `events` row + matching `event_observations` rows in one
-JOIN before invoking `on_event`. The Fold body matches on `view.observations` for
-typed provenance access:
+A future consumer dispatcher must fetch the `events` row plus matching
+`event_observations` rows before invoking `on_event`. Consumer orchestration may inspect
+`view.observations` for typed provenance access before invoking a Fold:
 
 ```rust
-fn reduce(&self, state: S, view: &EventView, _ctx: &FoldContext) -> S {
-    let candidates: Vec<_> = view.observations.iter()
-        .filter(|o| o.role == ObservationRole::Candidate)
-        .collect();
-    let selected = view.observations.iter()
-        .find(|o| o.role == ObservationRole::Selected);
-    // typed access, no JSON-LIKE
-}
+let candidates: Vec<_> = view.observations.iter()
+    .filter(|o| o.role == ObservationRole::Candidate)
+    .collect();
+let selected = view.observations.iter()
+    .find(|o| o.role == ObservationRole::Selected);
+
+// EventView is the consumer envelope; Event is the canonical Fold input.
+state = fold.reduce(state, &view.event, &fold_ctx);
 ```
 
-Fold purity (ADR-024 v1 invariants) holds: the dispatcher does the JOIN; the Fold
-consumes pre-enriched values without IO. Atomicity (ADR-017): cursor + state +
-observations all live in their respective tables, written/read in the dispatcher's
-transaction.
+Under ADR-017's deferred atomicity constraint, event plus observation rows are already
+committed upstream; only derived state plus cursor belong in the pack consumer's transaction.
+The dispatcher performs IO, while the canonical `Fold<Event, S>` remains pure and receives
+`&view.event`.
 
-The `Fold<L, S>` trait stays generic (ADR-024 §1) — `L` is whatever the impl
-declares. PackEventConsumer dispatches by handing the consumer the `EventView`;
-the consumer is responsible for picking the right call shape based on its Fold's
-type parameter:
+The `Fold<L, S>` trait stays generic (ADR-024 §1), but ADR-024 makes `Event` the canonical
+event-log replay input and explicitly reserves `EventView` for query/read surfaces. A future
+`PackEventConsumer` therefore receives `EventView` as an envelope and passes its event field to
+the canonical Fold:
 
 ```rust
-// For Fold<Event, S> impls — explicit unwrap, no Deref magic:
+// EventView is the consumer envelope; Event is the canonical Fold input:
 fold.reduce(state, &view.event, &fold_ctx);
-
-// For Fold<EventView, S> impls (wishing typed observation access):
-fold.reduce(state, view, &fold_ctx);
 ```
 
-Existing `Fold<Event, State>` impls (e.g., `LoraEvolver` in ADR-032 §5b) continue
-to compile unchanged — only their call site at the consumer changes from passing
-an `&Event` directly to passing `&view.event`. New impls that need observation
-access declare `Fold<EventView, State>` and consume `view.observations` directly.
+Existing `Fold<Event, State>` impls (e.g., `LoraEvolver` in ADR-032 §5b) remain
+source-compatible with that future seam. If observations must become part of deterministic
+replay input, the design must define a separate typed input such as `ObservedEvent` and pin its
+ordering/versioning rules; it must not use `EventView` as the Fold input.
 
 EventView does NOT implement `Deref<Target=Event>`. Callers access the underlying
 event explicitly via `view.event`. This prevents replay determinism from leaking
@@ -304,10 +310,10 @@ which only exists after the migration runs. The storage layer MUST reject filter
 that set these fields when `event_observations` is absent (return a clean error,
 not a SQL "no such table"). Same rule for `session_id` on the events column.
 
-Brain profiles whose `event_filter` includes `observed: [memory_id]` wake only for
-events that touched that memory. The earlier "every profile fires on every event"
-fanout becomes "wake on graph-proximity" — meaningful for high-cardinality profile
-deployments (ADR-032 §10).
+A future brain consumer whose `event_filter` includes `observed: [memory_id]` could
+select only events that touched that memory. That would turn the deferred "every
+profile fires on every event" fanout into graph-proximity selection for
+high-cardinality profile deployments (ADR-032 §10).
 
 ### `served_by_profile_id` projection (forward-ref ADR-032)
 
@@ -392,7 +398,7 @@ queryable as a graph at the GQL/SPARQL layer.
 - **No `followed_by` edges.** Session chaining is `(session_id, created_at, event_id)`
   ordering, not stored edges.
 - **No new verbs.** `link`/`create` over events stays prohibited (ADR-022 §1). The
-  projection is read-only via query and Fold consumers.
+  projection is read-only via query and any future event-consumer orchestration.
 - **No payload changes.** Existing event payloads continue to carry the same JSON;
   the projection is a denormalized supplement, not a replacement.
 
@@ -421,8 +427,8 @@ needs to JOIN observations to feedback events — without the projection, that's
 app-side scan.
 
 **Graph-only** (events promoted into entities): wins on graph-query expressiveness,
-loses cursor-based replay (entities don't have monotonic ordering), loses
-PackEventConsumer atomicity (the projection now spans the entity-substrate edge
+loses cursor-based replay (entities don't have monotonic ordering), and would prevent
+future PackEventConsumer atomicity (the projection now spans the entity-substrate edge
 table). And ADR-002's closed relation set forbids adding `observed`/`selected`
 relations without an amendment — a substrate-level change for a denormalization
 concern is the wrong layer.
@@ -435,9 +441,8 @@ touching ADR-002. Each layer carries the semantics it's best at.
 
 Read-time projection (compute observations on the fly when queried) keeps storage small
 but pays the JSON-decode cost on every query. Write-time pays it once per event and
-indexes the result. The Fold consumer rate is much lower than the event emit rate
-(many consumers query the same event repeatedly across replay/backtest/analytics) —
-amortize the decode cost at the write.
+indexes the result. Query, replay, backtest, and analytics callers can read the same
+event repeatedly, so write-time projection amortizes the decode cost.
 
 The cost: emitters must register a payload decoder per event kind. The decoder is
 ~10 lines of `serde_json` extraction per kind; total registry is bounded by the event
@@ -456,8 +461,8 @@ real pattern doesn't fit.
 
 The alternatives were (a) two columns (`entity_id`, `note_id`) with one always NULL, or
 (b) two tables (`event_entity_obs`, `event_note_obs`). (a) splits the index by which
-column is non-NULL; (b) doubles the JOIN code path in Fold consumers. The polymorphic
-column with a discriminator keeps the index dense and the consumer code single-path.
+column is non-NULL; (b) doubles the JOIN code path for callers. The polymorphic column
+with a discriminator keeps the index dense and caller code single-path.
 
 ### Why session_id on events, not a Session entity
 
@@ -475,18 +480,18 @@ follow-up ADR. Today they're context, not content.
 
 ## Alternatives Considered
 
-| Alternative                                                            | Why rejected                                                                                                                   |
-| ---------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------ |
-| JSON-LIKE scans on payload references (status quo)                     | O(N) per query; no index; doesn't scale beyond hobby corpus.                                                                   |
-| Promote events into the entity substrate; use ADR-002 edges            | Breaks cursor ordering, PackEventConsumer atomicity, append-only contract. Substrate-layer change for denormalization concern. |
-| Add new ADR-002 relations (`observed`, `selected`, `target`, `signal`) | Polymorphic source (entity vs event) breaks `edges.source_id REFERENCES entities(id)`. Closed-relation invariant compromised.  |
-| Read-time projection (compute on query)                                | Amortizes wrong — many consumers query same event repeatedly; pay decode cost N times instead of once.                         |
-| Two-table polymorphism (`event_entity_obs`, `event_note_obs`)          | Doubles JOIN paths in Fold consumers and EventFilter; index split by substrate.                                                |
-| `followed_by` event-to-event edges for session chaining                | Millions of rows for session reconstruction that's an indexed range scan. Wrong substrate for transient ordering.              |
-| `Session` as an entity kind                                            | Requires ADR-001 + ADR-002 amendments; sessions are dispatch context, not researchable subjects.                               |
-| Open role string (pack-extensible roles)                               | Query fragmentation — packs invent synonyms that don't aggregate.                                                              |
-| Open referent_kind (any substrate including future)                    | Polymorphism cost grows with substrates; v1's two (entity, note) cover every emit pattern.                                     |
-| Async projection (event row first, observations later)                 | Breaks PackEventConsumer atomicity — a Fold replay between event write and projection write sees incomplete data.              |
+| Alternative                                                            | Why rejected                                                                                                                  |
+| ---------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------- |
+| JSON-LIKE scans on payload references (status quo)                     | O(N) per query; no index; doesn't scale beyond hobby corpus.                                                                  |
+| Promote events into the entity substrate; use ADR-002 edges            | Breaks cursor ordering, future consumer atomicity, append-only contract. Substrate-layer change for denormalization concern.  |
+| Add new ADR-002 relations (`observed`, `selected`, `target`, `signal`) | Polymorphic source (entity vs event) breaks `edges.source_id REFERENCES entities(id)`. Closed-relation invariant compromised. |
+| Read-time projection (compute on query)                                | Amortizes wrong — many callers query the same event repeatedly; pay decode cost N times instead of once.                      |
+| Two-table polymorphism (`event_entity_obs`, `event_note_obs`)          | Doubles JOIN paths for callers and EventFilter; index split by substrate.                                                     |
+| `followed_by` event-to-event edges for session chaining                | Millions of rows for session reconstruction that's an indexed range scan. Wrong substrate for transient ordering.             |
+| `Session` as an entity kind                                            | Requires ADR-001 + ADR-002 amendments; sessions are dispatch context, not researchable subjects.                              |
+| Open role string (pack-extensible roles)                               | Query fragmentation — packs invent synonyms that don't aggregate.                                                             |
+| Open referent_kind (any substrate including future)                    | Polymorphism cost grows with substrates; v1's two (entity, note) cover every emit pattern.                                    |
+| Async projection (event row first, observations later)                 | A future Fold replay could observe incomplete data between the event write and projection write.                              |
 
 ---
 
@@ -496,15 +501,16 @@ follow-up ADR. Today they're context, not content.
 
 - Provenance becomes indexable: O(log N) seek on `(entity_id, role)` instead of O(N)
   JSON-LIKE scans.
-- Fold consumers receive typed `EventView` with pre-decoded observations — payload
-  schema-on-read coupling eliminated.
+- Explicit callers that load projection rows can use typed `EventView` with pre-decoded
+  observations, and any future event consumer can receive the same envelope while retaining
+  `Event` as its canonical Fold input — payload schema-on-read coupling is eliminated.
 - `EventFilter::observed` / `selected` push provenance predicates into the WHERE
-  clause; cold profiles with graph-proximity filters wake only for relevant events.
+  clause; any future cold profile can select only relevant events.
 - GQL/SPARQL pattern matchers can traverse event→entity provenance natively via
   synthetic edges, without touching ADR-002's closed relation set.
 - Session reconstruction is an indexed range scan, not a graph traversal.
-- ADR-022, ADR-017, ADR-024, ADR-002 semantics are preserved verbatim — this ADR is
-  additive.
+- ADR-022, ADR-024, and ADR-002 semantics remain additive; ADR-017's consumer
+  integration remains explicitly deferred.
 
 ### Negative
 
@@ -512,10 +518,9 @@ follow-up ADR. Today they're context, not content.
   registering a decoder and declaring its role mapping.
 - Storage doubles for high-fanout event kinds (1 event row + ~10 observation rows for
   recall). Bounded; SQLite handles 100M-row scale.
-- Cursor + state atomicity guarantee (ADR-017) now spans three tables — `events`,
-  `event_observations`, and the pack's state — all in one transaction. Manageable
-  with SQLite's single-writer model; concurrent writers across multiple connections
-  serialize naturally.
+- Any future consumer has two ordered transaction boundaries: event plus observation
+  projection commits upstream, then pack state plus cursor commits atomically. No
+  cross-boundary three-table transaction is accepted or shipped (ADR-017).
 - `EventView.event` is a plain public field (explicit access). Future maintainers must
   remember observations are NOT in `Event` itself, only in `EventView.observations`.
 
@@ -576,24 +581,26 @@ The generated V13 SQL adds `events.session_id TEXT`, creates `event_observations
 - `FeedbackExplicit`: `event.target_id` → entity **or note** `Signal` row, per
   `event.substrate` (Amendment A1, A2).
 
-### PackEventConsumer dispatch update
+### Deferred PackEventConsumer dispatch integration
 
 No shipped `crates/khive-runtime/src/events.rs`, `observations.rs`, or `event_view.rs`
-files own this behavior. Consumers that need event observations read the shipped
-`EventView` shape from `khive-storage`.
+files own this behavior. No dispatch update is accepted by this ADR. Callers that need
+event observations must explicitly load projection rows into the shipped `EventView`
+shape from `khive-storage`; the best-effort `DispatchHook` supplies an empty observation
+vector. Future automatic delivery must first satisfy ADR-017's prerequisites.
 
 ### Tests
 
-| Scenario                                           | Assert                                                                                                                             |
-| -------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------- |
-| `recall` emits event                               | `event_observations` rows exist for candidates + selected with correct positions                                                   |
-| `link` emits event                                 | Two `Target` rows at positions 0 and 1                                                                                             |
-| EventFilter `observed=[mem_id]`                    | Returns only events that observed `mem_id`; one JOIN in the EXPLAIN plan                                                           |
-| EventView in Fold                                  | `view.observations` is non-empty for projecting kinds; payload accessible via `view.event.payload` (NOT `view.payload` — no Deref) |
-| Synthetic edge in GQL                              | `MATCH (e:event)-[:observed_as_selected]->(m:memory) RETURN m` returns the selected memories                                       |
-| `link(event_id, entity_id, observed_as_candidate)` | Returns `InvalidRelation` — synthetic edges are read-only                                                                          |
-| Session reconstruction                             | `session_id = :sid ORDER BY (created_at, id)` returns events in causal order                                                       |
-| Cross-session reuse JOIN                           | The session-A→session-B JOIN returns correct memory ids                                                                            |
+| Scenario                                           | Assert                                                                                       |
+| -------------------------------------------------- | -------------------------------------------------------------------------------------------- |
+| `recall` emits event                               | `event_observations` rows exist for candidates + selected with correct positions             |
+| `link` emits event                                 | Two `Target` rows at positions 0 and 1                                                       |
+| EventFilter `observed=[mem_id]`                    | Returns only events that observed `mem_id`; one JOIN in the EXPLAIN plan                     |
+| EventView storage shape                            | Payload is accessed via `view.event.payload` (NOT `view.payload` — no Deref)                 |
+| Synthetic edge in GQL                              | `MATCH (e:event)-[:observed_as_selected]->(m:memory) RETURN m` returns the selected memories |
+| `link(event_id, entity_id, observed_as_candidate)` | Returns `InvalidRelation` — synthetic edges are read-only                                    |
+| Session reconstruction                             | `session_id = :sid ORDER BY (created_at, id)` returns events in causal order                 |
+| Cross-session reuse JOIN                           | The session-A→session-B JOIN returns correct memory ids                                      |
 
 ---
 
@@ -697,15 +704,14 @@ referents. `RecallExecuted` and `RerankExecuted` are unchanged by this amendment
   ADR.
 - [ADR-008](ADR-008-query-layer-separation.md): Query layer — host for synthetic-edge
   pattern compilation.
-- [ADR-017](ADR-017-pack-standard.md): PackEventConsumer — `on_event` signature gains
-  `EventView`.
+- [ADR-017](ADR-017-pack-standard.md): deferred PackEventConsumer design — any future
+  `on_event` signature uses `EventView` as its delivery envelope.
 - [ADR-022](ADR-022-events-query-surface.md): Events Query Surface — `EventFilter`
   gains `observed` / `selected` fields with explicit SQL lowering.
-- [ADR-024](ADR-024-fold-cognitive-primitives.md): Fold — consumers receive
-  `EventView`, not raw `Event`.
-- [ADR-032](ADR-032-brain-profile-orchestration.md): Brain — LoRA-class profiles use
-  `EventFilter::observed` to wake on graph-proximity.
-- [ADR-034](ADR-034-kg-validation-pipelines.md): KG validation — streaming rules
-  over `ValidationItem::Event` receive `EventView`s.
-- `crates/khive-runtime/src/events.rs`: emit path + per-kind decoders.
+- [ADR-024](ADR-024-fold-cognitive-primitives.md): Fold — canonical event-log Folds receive
+  `Event`; `EventView` remains a query/read envelope, not replay input.
+- [ADR-032](ADR-032-brain-profile-orchestration.md): Brain — future LoRA-class profiles
+  may use `EventFilter::observed` for graph-proximity selection.
+- [ADR-034](ADR-034-kg-validation-pipelines.md): KG validation — any future streaming event
+  orchestration may inspect `EventView`s while its Fold input follows ADR-024.
 - `crates/khive-storage/src/event.rs`: `EventFilter` extension.
