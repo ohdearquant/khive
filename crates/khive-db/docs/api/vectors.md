@@ -30,12 +30,26 @@ whenever those calls are reached), so there is no double-routing.
 `with_writer_unmanaged` bypasses the WriterTask channel unconditionally
 regardless of `KHIVE_WRITE_QUEUE`. Reserved for closures that manage their
 own transaction — those cannot be sent through the WriterTask channel, which
-already wraps every request in its own transaction. `orphan_sweep`'s
-flag-off path (`Transaction::new_unchecked`, its own manual `BEGIN
-IMMEDIATE`) is the only caller — on the flag-on path `orphan_sweep` routes a
-DML-only closure directly through the WriterTask instead, since routing a
-`Transaction::new_unchecked` through the channel would nest a transaction
-inside the WriterTask's own transaction.
+already wraps every request in its own transaction. The flag-off paths for
+`delete_subjects` and `orphan_sweep` use it with
+`Transaction::new_unchecked` (their own `BEGIN IMMEDIATE`); their flag-on
+paths route DML-only closures directly through the WriterTask instead, since
+routing `Transaction::new_unchecked` through the channel would nest a
+transaction inside the WriterTask's own transaction.
+
+## `delete_subjects` — atomic multi-chunk deletion (#1432)
+
+`delete_subjects` splits inputs into statements of at most 400 IDs to stay
+below SQLite's variable limit, but submits the complete DML loop as one
+WriterTask request when the queue is enabled. The task's own transaction wraps
+the entire input. On the legacy unmanaged path, one RAII
+`Transaction::new_unchecked` wraps the same complete DML loop; its Drop
+rollback also cleans up an open transaction when `COMMIT` itself fails.
+
+The operation is therefore all-or-nothing across the full input. If vector or
+ANN-log DML fails in any later chunk, or the unmanaged commit fails, the store
+rolls back every earlier chunk, including its matching `ann_write_log` rows,
+before returning the error.
 
 ## `replace_vector_row_dml` — shared DELETE-then-INSERT replacement (#546)
 
@@ -81,6 +95,7 @@ second record is the final readable value.
 The sentinel tests (`insert_batch_rollback_restores_deleted_stale_after_post_delete_insert_failure`
 and its `update` counterpart) use a `cfg(test)` failpoint that fires AFTER a
 successful same-namespace DELETE and BEFORE the INSERT. This means:
+
 - The stale row is genuinely gone from the DB when the error fires.
 - Only a correct ROLLBACK TO SAVEPOINT (or `tx.rollback`) restores it.
 - Removing those rollback lines WILL make these tests fail.
@@ -102,8 +117,9 @@ removes the stale row, then the failpoint fires before INSERT.
 
 Expected: `ROLLBACK TO SAVEPOINT vec_batch_record` restores the stale row —
 `batch_exists` finds id_X in ns:a, search with vec1 returns similarity
+
 > 0.999 (not vec2), and `BatchWriteSummary` reports attempted=1, affected=0,
-failed=1.
+> failed=1.
 
 FAILURE MODE: deleting the `ROLLBACK TO SAVEPOINT vec_batch_record` line
 from `insert_batch` makes this test fail — the stale row is gone.
@@ -120,8 +136,9 @@ failpoint fires before INSERT.
 
 Expected: `unchecked_transaction` rolls back, restoring the stale row —
 `batch_exists` finds id_X in ns:a, search with vec1 returns similarity
+
 > 0.999 (not vec2), and `update` returns `Err` (the injected error
-propagates out).
+> propagates out).
 
 FAILURE MODE: removing the transaction's rollback from `update` makes this
 test fail — the stale row is gone.

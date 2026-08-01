@@ -170,7 +170,9 @@ pub trait VectorStore: Send + Sync + 'static {
     /// Required when the vec table's PRIMARY KEY is `subject_id` alone (not
     /// `(subject_id, namespace)`): a row from a prior namespace would collide on
     /// re-insert after a relabel, so the pre-insert drop must target by subject
-    /// only. Returns the number of rows deleted across all chunks.
+    /// only. Returns the number of rows deleted across all chunks. The operation
+    /// is atomic across the full input: an error must not leave a prefix of the
+    /// requested subject IDs deleted.
     ///
     /// Default returns [`StorageError::Unsupported`]; backends that store vectors
     /// in a per-subject keyed table should override this method.
