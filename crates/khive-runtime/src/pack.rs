@@ -815,11 +815,12 @@ impl RequestIdentity {
     /// the registry's construction-baked identity would silently replace a
     /// warm daemon request's actor and visibility (ADR-096). This projection
     /// preserves the token's exact primary namespace, actor, and read-visible
-    /// namespaces. A `NamespaceToken` does not carry the ingress correlation
-    /// id or the origin's process provenance, so nested calls intentionally
-    /// use `request_id: None` and `process_ref: None` — substituting the
-    /// dispatching process's own environment here would violate the
-    /// attribution-only contract on `process_ref`.
+    /// namespaces, and the origin's process provenance rider. A
+    /// `NamespaceToken` does not carry the ingress correlation id, so nested
+    /// calls intentionally use `request_id: None`; `process_ref` IS carried by
+    /// the token (ADR-096: an absent value stays absent, a present origin
+    /// rider survives nested dispatch without reading the daemon
+    /// environment).
     pub fn from_token(token: &NamespaceToken) -> Self {
         Self {
             namespace: token.namespace().as_str().to_string(),
@@ -829,7 +830,7 @@ impl RequestIdentity {
                 .iter()
                 .map(|namespace| namespace.as_str().to_string())
                 .collect(),
-            process_ref: None,
+            process_ref: token.process_ref().map(str::to_owned),
             request_id: None,
         }
     }
@@ -2605,6 +2606,24 @@ mod tests {
     use super::*;
     use crate::ActorRef;
     use khive_types::Pack;
+
+    #[test]
+    fn from_token_preserves_process_ref() {
+        let with_ref = NamespaceToken::mint_authorized(
+            Namespace::local(),
+            ActorRef::new("agent", "provenance-carrier"),
+        )
+        .with_process_ref(Some("proc:origin-abc123".to_string()));
+        let identity = RequestIdentity::from_token(&with_ref);
+        assert_eq!(identity.process_ref.as_deref(), Some("proc:origin-abc123"));
+
+        let without_ref = NamespaceToken::mint_authorized(
+            Namespace::local(),
+            ActorRef::new("agent", "provenance-absent"),
+        );
+        let identity = RequestIdentity::from_token(&without_ref);
+        assert_eq!(identity.process_ref, None);
+    }
 
     struct AlphaPack;
 
