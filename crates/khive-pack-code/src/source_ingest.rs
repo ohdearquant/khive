@@ -850,6 +850,7 @@ async fn stamp_import_scan_coverage(
     rt: &KhiveRuntime,
     token: &NamespaceToken,
     module_scans: HashMap<Uuid, ModuleScan>,
+    report: &mut CodeSourceIngestReport,
 ) -> Result<(), CodeSourceIngestError> {
     for (module_id, scan) in module_scans {
         let mut unresolved_count = 0_u64;
@@ -869,6 +870,13 @@ async fn stamp_import_scan_coverage(
         let Some(mut module) = get_entity_opt(rt, token, module_id).await? else {
             continue;
         };
+        let source_label = module
+            .properties
+            .as_ref()
+            .and_then(|properties| properties.get("source_path"))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_else(|| module_id.to_string());
         let mut props = module
             .properties
             .clone()
@@ -885,7 +893,7 @@ async fn stamp_import_scan_coverage(
         props.insert("import_specifier_count".into(), json!(scan.imports.len()));
         props.insert("unresolved_import_count".into(), json!(unresolved_count));
         module.properties = Some(Value::Object(props));
-        upsert_entity(rt, token, module).await?;
+        upsert_entity(rt, token, module, &source_label, report).await?;
     }
     Ok(())
 }
@@ -1032,7 +1040,7 @@ pub async fn run_code_ingest(
     }
 
     reresolve_pass(rt, token, &manifest_scopes, opts.sweep_time, &mut report).await?;
-    stamp_import_scan_coverage(rt, token, module_scans).await?;
+    stamp_import_scan_coverage(rt, token, module_scans, &mut report).await?;
 
     Ok(report)
 }

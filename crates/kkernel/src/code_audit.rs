@@ -2,8 +2,9 @@
 //! dedicated code-map database (docs/adr/ADR-114-code-audit-derived-report.md).
 //!
 //! Phase 1 scope: structural signals computed with deterministic SQL over the
-//! `code.ingest` L1/L1.5 facts already present in the map (no file/history
-//! facts exist yet). This command opens the map database read-only, never
+//! `code.ingest` L1/L1.5 facts already present in the map (modules now carry
+//! path/current-revision provenance, but no per-file history timeline). This
+//! command opens the map database read-only, never
 //! writes to any graph, never creates `finding` notes, and never calls
 //! `memory.remember`. Interpreting a signal as a defect is a separate,
 //! human-approved step outside this pipeline.
@@ -761,10 +762,10 @@ async fn ingest_coverage_signals(
             }),
             evidence_ids,
             limitations: vec![
-                "total observed import count is not reconstructable in the phase-1 map \
-                 schema: resolved specifiers are folded into depends_on edge metadata rather \
-                 than counted individually, so only unresolved-specifier and module counts \
-                 are available"
+                "this schema_version=1 coverage ratio remains the legacy module-count / \
+                 unresolved-reference proxy; ADR-085 Amendment 5's per-module \
+                 import_specifier_count and unresolved_import_count remain available on the \
+                 source module entities for consumers that need exact scan coverage"
                     .to_string(),
             ],
         });
@@ -1311,9 +1312,9 @@ fn unavailable_history_signals(signals: &mut Vec<Signal>) {
         ),
         (
             "dead_file",
-            "requires durable file identity (FileIdentity/PathBinding) to distinguish a \
-             file from a module-path projection; not available until an ADR-085/088 \
-             history-join amendment lands",
+            "requires durable file identity and path bindings across revisions; the current \
+             module source_path/source_revision observation does not encode file lifecycle \
+             history",
         ),
         (
             "orphan_test_file",
