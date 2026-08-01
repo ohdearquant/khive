@@ -3310,6 +3310,45 @@ backend = "sessions"
         Box::pin(async { None })
     }
 
+    /// Drop-restored guard for both `HOME` and the process CWD, panic-safe
+    /// unlike the bare `isolate_home_for_test`/`restore_home` pair above: if
+    /// an assertion panics mid-test, `Drop` still runs and restores both, so
+    /// a panicking test can't leak a redirected `HOME`/cwd into the next
+    /// test sharing this `#[serial]` queue. Needed specifically here because
+    /// `KhiveConfig::load_with_home_fallback`'s tier 2
+    /// (`<cwd>/khive.toml`) and the independent project-actor lookup's tier
+    /// 3 (`<cwd>/.khive/config.toml`) both read the process CWD ahead of the
+    /// DB-anchored fixture; redirecting only `HOME` leaves an ambient CWD
+    /// config free to satisfy this test without the fixture ever being
+    /// exercised.
+    struct HomeCwdGuard {
+        prev_home: Option<std::ffi::OsString>,
+        prev_cwd: std::path::PathBuf,
+    }
+
+    impl HomeCwdGuard {
+        fn enter(home_dir: &std::path::Path, cwd_dir: &std::path::Path) -> Self {
+            let prev_home = std::env::var_os("HOME");
+            let prev_cwd = std::env::current_dir().expect("read current cwd");
+            std::env::set_var("HOME", home_dir);
+            std::env::set_current_dir(cwd_dir).expect("chdir into isolated fixture dir");
+            Self {
+                prev_home,
+                prev_cwd,
+            }
+        }
+    }
+
+    impl Drop for HomeCwdGuard {
+        fn drop(&mut self) {
+            match &self.prev_home {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+            let _ = std::env::set_current_dir(&self.prev_cwd);
+        }
+    }
+
     /// Complements `actor_pin_default_read_exposes_only_local_and_pinned_records`
     /// (`crates/kkernel/tests/actor_pin_default_read_scope.rs`, which reads
     /// real seeded records back through `run_exec`'s in-process fallback):
@@ -3325,13 +3364,6 @@ backend = "sessions"
         std::env::remove_var("KHIVE_ADDITIONAL_EMBEDDING_MODELS");
         std::env::remove_var("KHIVE_ACTOR");
         std::env::remove_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR");
-
-        // Hermeticity: isolate HOME so the in-process fallback's config
-        // reload (`run_exec_inline_with_forward`'s `khive_cfg` load, which
-        // both calls below must fall through to since `spy_capture_identity`
-        // always returns `None`) can never reach a real `~/.khive/config.toml`
-        // — see `isolate_home_for_test`'s doc comment above.
-        let (prev_home, _home_dir) = isolate_home_for_test();
 
         let dir = tempfile::tempdir().expect("tempdir");
         let khive_dir = dir.path().join(".khive");
@@ -3358,6 +3390,14 @@ id = "lambda:fallback"
             anchor: khive_runtime::resolve_db_anchor(Some(&db_str)),
         };
 
+        // Hermeticity: redirect HOME to an empty tempdir (tier 4 must never
+        // reach a real `~/.khive/config.toml`) and chdir into `dir` (tier 2's
+        // `<cwd>/khive.toml` stays absent, and the independent project-actor
+        // lookup's tier 3 `<cwd>/.khive/config.toml` resolves to the SAME
+        // fixture `config.toml` written above) — both restored on drop.
+        let home_dir = tempfile::tempdir().expect("tempdir for isolated HOME");
+        let _env_guard = HomeCwdGuard::enter(home_dir.path(), dir.path());
+
         let resolve = || {
             resolve_runtime_config(RuntimeConfigInputs {
                 db: Some(&db_str),
@@ -3375,6 +3415,26 @@ id = "lambda:fallback"
         // Non-local pin: the frame must carry the pinned actor and its
         // namespace, never the displaced project-config fallback actor.
         let mut pinned_cfg = resolve();
+        // Prove the fixture (not an ambient CWD/HOME config) actually fed
+        // this resolution before the pin displaces it — otherwise the
+        // assertions below could pass even if `resolve()` silently picked up
+        // a config from outside `dir`/`home_dir`.
+        assert_eq!(
+            pinned_cfg.actor_id.as_deref(),
+            Some("lambda:fallback"),
+            "the pre-pin resolved actor must come from the DB-anchored fixture \
+             config.toml, not an ambient CWD/HOME config: {:?}",
+            pinned_cfg.actor_id
+        );
+        assert!(
+            pinned_cfg
+                .visible_namespaces
+                .iter()
+                .any(|ns| ns.as_str() == "lambda:fallback"),
+            "the pre-pin resolved config must fold the fixture actor into \
+             visible_namespaces: {:?}",
+            pinned_cfg.visible_namespaces
+        );
         apply_actor_pin_and_expectation(&mut pinned_cfg, Some("lambda:pinned"), None).unwrap();
         SPY_CAPTURED_IDENTITY.with(|c| *c.borrow_mut() = None);
         let result = run_exec_inline_with_forward(
@@ -3424,7 +3484,10 @@ id = "lambda:fallback"
             spy_capture_identity,
         )
         .await;
-        assert!(result.is_ok(), "local-pin dispatch must succeed: {result:?}");
+        assert!(
+            result.is_ok(),
+            "local-pin dispatch must succeed: {result:?}"
+        );
         let (frame_actor, frame_visible) = SPY_CAPTURED_IDENTITY
             .with(|c| c.borrow_mut().take())
             .expect("spy must have captured a forwarded frame");
@@ -3437,8 +3500,6 @@ id = "lambda:fallback"
             "the forwarded frame's visible_namespaces must be empty under a local pin, \
              retaining neither the fallback actor nor the previous pin: {frame_visible:?}"
         );
-
-        restore_home(prev_home);
     }
 
     // ── #1226: inline --db/[[backends]] guard must fire before daemon-forward ──
