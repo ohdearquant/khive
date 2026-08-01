@@ -83,13 +83,19 @@
       "unique_clones": 59,
       "views": 27,
       "unique_views": 3
+    },
+    "2026-07-31": {
+      "clones": 2033,
+      "unique_clones": 168,
+      "views": 451,
+      "unique_views": 3
     }
   },
   "last_snapshot": {
-    "taken_at": "2026-07-31T20:11:46Z",
-    "clones_14d": 22355,
-    "unique_clones_14d": 1311,
-    "views_14d": 1118,
-    "unique_views_14d": 27
+    "taken_at": "2026-08-01T06:16:18Z",
+    "clones_14d": 20056,
+    "unique_clones_14d": 1318,
+    "views_14d": 1556,
+    "unique_views_14d": 28
   }
 }
