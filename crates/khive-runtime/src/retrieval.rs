@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use lattice_embed::EmbeddingModel;
+use lattice_embed::{EmbeddingModel, MAX_TEXT_CHARS};
 use uuid::Uuid;
 
 use crate::config::{parse_embedding_model_alias, sanitize_key};
@@ -84,6 +84,72 @@ const RRF_K: usize = 10;
 /// Candidates pulled per path before fusion. Higher = better recall, more work.
 const CANDIDATE_MULTIPLIER: u32 = 4;
 
+/// Advisory emitted by write verbs when only the embedding input was bounded.
+pub const EMBEDDING_INPUT_TRUNCATED_WARNING: &str =
+    "embedding input was truncated to the embedder maximum; full content was stored unchanged";
+
+/// What the embedding service actually received for one document.
+#[derive(Clone, Debug)]
+pub struct DocumentEmbeddingOutcome {
+    pub model_name: String,
+    pub vector: Vec<f32>,
+    pub source_bytes: usize,
+    pub embedded_bytes: usize,
+    pub truncated: bool,
+}
+
+/// Aggregate truncation accounting for one logical write or reindex batch.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+pub struct EmbeddingTruncationReport {
+    pub truncated: u64,
+    pub discarded_bytes: u64,
+}
+
+impl EmbeddingTruncationReport {
+    pub fn observe(&mut self, outcome: &DocumentEmbeddingOutcome) {
+        if outcome.truncated {
+            self.truncated += 1;
+            self.discarded_bytes +=
+                outcome.source_bytes.saturating_sub(outcome.embedded_bytes) as u64;
+        }
+    }
+
+    #[must_use]
+    pub const fn any_truncated(&self) -> bool {
+        self.truncated > 0
+    }
+
+    /// Add another batch's counters without wrapping on overflow.
+    pub fn merge(&mut self, other: Self) {
+        self.truncated = self.truncated.saturating_add(other.truncated);
+        self.discarded_bytes = self.discarded_bytes.saturating_add(other.discarded_bytes);
+    }
+}
+
+/// Maximum document bytes accepted before the embedding service adds its model prefix.
+pub fn document_embedding_budget(model_name: &str) -> usize {
+    parse_embedding_model_alias(model_name)
+        .and_then(|model| model.document_instruction())
+        .map_or(MAX_TEXT_CHARS, |prefix| {
+            MAX_TEXT_CHARS.saturating_sub(prefix.len())
+        })
+}
+
+/// Return the longest UTF-8-safe prefix of `text` within `max_bytes` and whether it was shortened.
+pub fn bounded_embedding_input(text: &str, max_bytes: usize) -> (&str, bool) {
+    if text.len() <= max_bytes {
+        return (text, false);
+    }
+
+    let end = text
+        .char_indices()
+        .map(|(index, _)| index)
+        .take_while(|index| *index <= max_bytes)
+        .last()
+        .unwrap_or(0);
+    (&text[..end], true)
+}
+
 impl KhiveRuntime {
     /// Generate an embedding vector for `text` using the configured default model.
     ///
@@ -147,32 +213,47 @@ impl KhiveRuntime {
         model_name: &str,
         text: &str,
     ) -> RuntimeResult<Vec<f32>> {
-        self.embed_document_with_model_inner(None, model_name, text)
+        Ok(self
+            .embed_document_with_model_outcome_inner(None, model_name, text)
+            .await?
+            .vector)
+    }
+
+    pub async fn embed_document_with_model_outcome(
+        &self,
+        model_name: &str,
+        text: &str,
+    ) -> RuntimeResult<DocumentEmbeddingOutcome> {
+        self.embed_document_with_model_outcome_inner(None, model_name, text)
             .await
     }
 
-    pub(crate) async fn embed_document_with_model_for_token(
+    pub(crate) async fn embed_document_with_model_outcome_for_token(
         &self,
         token: &NamespaceToken,
         model_name: &str,
         text: &str,
-    ) -> RuntimeResult<Vec<f32>> {
-        self.embed_document_with_model_inner(Some(token), model_name, text)
+    ) -> RuntimeResult<DocumentEmbeddingOutcome> {
+        self.embed_document_with_model_outcome_inner(Some(token), model_name, text)
             .await
     }
 
-    async fn embed_document_with_model_inner(
+    async fn embed_document_with_model_outcome_inner(
         &self,
         token: Option<&NamespaceToken>,
         model_name: &str,
         text: &str,
-    ) -> RuntimeResult<Vec<f32>> {
+    ) -> RuntimeResult<DocumentEmbeddingOutcome> {
         let model = parse_embedding_model_alias(model_name);
         let service = match token {
             Some(token) => self.embedder_with_token(token, model_name).await?,
             None => self.embedder(model_name).await?,
         };
         let emb_model = model.unwrap_or_default();
+        let source_bytes = text.len();
+        let (text, truncated) =
+            bounded_embedding_input(text, document_embedding_budget(model_name));
+        let embedded_bytes = text.len();
         // Issued-at-dispatch: counted before the await — see embed_with_model.
         crate::usage::count(crate::usage::UsageUnit::EmbedCalls, 1);
         let embeddings = service.embed_passage(&[text.to_string()], emb_model).await;
@@ -180,7 +261,13 @@ impl KhiveRuntime {
             .into_iter()
             .next()
             .ok_or_else(|| RuntimeError::Internal("embed_passage returned empty vec".into()))?;
-        Ok(out)
+        Ok(DocumentEmbeddingOutcome {
+            model_name: model_name.to_owned(),
+            vector: out,
+            source_bytes,
+            embedded_bytes,
+            truncated,
+        })
     }
 
     /// Embed a query string for retrieval using the named model.
@@ -324,6 +411,8 @@ impl KhiveRuntime {
     ///
     /// Applies `EmbeddingService::embed_passage`. Use for all bulk
     /// index/backfill/reindex operations to apply the passage-side prefix.
+    /// A mixed batch is bounded into one ordered owned batch so truncation never
+    /// fragments one provider batch into sequential singleton inference calls.
     ///
     /// **Reindex caveat**: see [`Self::embed_document_with_model`] — the same
     /// incomparability applies to batch-indexed vectors when switching models.
@@ -337,12 +426,58 @@ impl KhiveRuntime {
         if texts.is_empty() {
             return Ok(vec![]);
         }
+        Ok(self
+            .embed_document_batch_with_model_outcomes(model_name, texts)
+            .await?
+            .into_iter()
+            .map(|outcome| outcome.vector)
+            .collect())
+    }
+
+    pub async fn embed_document_batch_with_model_outcomes(
+        &self,
+        model_name: &str,
+        texts: &[String],
+    ) -> RuntimeResult<Vec<DocumentEmbeddingOutcome>> {
+        if texts.is_empty() {
+            return Ok(vec![]);
+        }
         let model = parse_embedding_model_alias(model_name);
         let service = self.embedder(model_name).await?;
         let emb_model = model.unwrap_or_default();
-        let out = service.embed_passage(texts, emb_model).await;
+        let budget = document_embedding_budget(model_name);
+        let out = if texts.iter().all(|text| text.len() <= budget) {
+            service.embed_passage(texts, emb_model).await
+        } else {
+            let bounded_texts: Vec<String> = texts
+                .iter()
+                .map(|text| bounded_embedding_input(text, budget).0.to_owned())
+                .collect();
+            service.embed_passage(&bounded_texts, emb_model).await
+        };
         crate::usage::count(crate::usage::UsageUnit::EmbedCalls, texts.len() as u64);
-        Ok(out?)
+        let vectors = out?;
+        if vectors.len() != texts.len() {
+            return Err(RuntimeError::Internal(format!(
+                "embed_passage returned {} vectors for {} inputs",
+                vectors.len(),
+                texts.len()
+            )));
+        }
+        Ok(texts
+            .iter()
+            .zip(vectors)
+            .map(|(text, vector)| {
+                let (bounded, truncated) = bounded_embedding_input(text, budget);
+                DocumentEmbeddingOutcome {
+                    model_name: model_name.to_owned(),
+                    vector,
+                    source_bytes: text.len(),
+                    embedded_bytes: bounded.len(),
+                    truncated,
+                }
+            })
+            .collect())
     }
 
     /// Embed a batch of documents for indexing using the configured default model.
@@ -360,6 +495,22 @@ impl KhiveRuntime {
             return Err(RuntimeError::Unconfigured("embedding_model".into()));
         }
         self.embed_document_batch_with_model(model_name, texts)
+            .await
+    }
+
+    /// Embed documents with the default model and retain actual input-bounding metadata.
+    pub async fn embed_document_batch_outcomes(
+        &self,
+        texts: &[String],
+    ) -> RuntimeResult<Vec<DocumentEmbeddingOutcome>> {
+        if texts.is_empty() {
+            return Ok(vec![]);
+        }
+        let model_name = self.default_embedder_name();
+        if model_name.is_empty() {
+            return Err(RuntimeError::Unconfigured("embedding_model".into()));
+        }
+        self.embed_document_batch_with_model_outcomes(model_name, texts)
             .await
     }
 
@@ -753,6 +904,7 @@ impl KhiveRuntime {
         let mut total_backfilled = 0u64;
 
         for model_name in &model_names {
+            let mut model_truncation = EmbeddingTruncationReport::default();
             // Must match vec_model_key's naming logic.
             let vec_table = format!("vec_{}", sanitize_key(model_name));
 
@@ -830,10 +982,11 @@ impl KhiveRuntime {
                     }
 
                     match self
-                        .embed_document_with_model_for_token(token, model_name, &desc)
+                        .embed_document_with_model_outcome_for_token(token, model_name, &desc)
                         .await
                     {
-                        Ok(vector) => {
+                        Ok(outcome) => {
+                            model_truncation.observe(&outcome);
                             if let Ok(vs) = self.vectors_for_model(token, model_name) {
                                 match vs
                                     .insert(
@@ -841,7 +994,7 @@ impl KhiveRuntime {
                                         SubstrateKind::Entity,
                                         &ns,
                                         "entity.description",
-                                        vec![vector],
+                                        vec![outcome.vector],
                                     )
                                     .await
                                 {
@@ -960,10 +1113,11 @@ impl KhiveRuntime {
 
                     let content = note.content.clone();
                     match self
-                        .embed_document_with_model_for_token(token, model_name, &content)
+                        .embed_document_with_model_outcome_for_token(token, model_name, &content)
                         .await
                     {
-                        Ok(vector) => {
+                        Ok(outcome) => {
+                            model_truncation.observe(&outcome);
                             if let Ok(vs) = self.vectors_for_model(token, model_name) {
                                 match vs
                                     .insert(
@@ -971,7 +1125,7 @@ impl KhiveRuntime {
                                         SubstrateKind::Note,
                                         &ns,
                                         "note.content",
-                                        vec![vector],
+                                        vec![outcome.vector],
                                     )
                                     .await
                                 {
@@ -1008,6 +1162,8 @@ impl KhiveRuntime {
                 namespace = %ns,
                 entities = entity_total,
                 notes = note_total,
+                truncated = model_truncation.truncated,
+                discarded_bytes = model_truncation.discarded_bytes,
                 "backfill_missing_embeddings: model pass complete"
             );
         }
@@ -1236,6 +1392,30 @@ mod tests {
     use khive_storage::types::{TextSearchHit, VectorSearchHit};
     use khive_types::namespace::Namespace;
     use lattice_embed::EmbeddingModel;
+
+    #[test]
+    fn bounded_embedding_input_reserves_prefix_and_preserves_utf8() {
+        assert_eq!(
+            document_embedding_budget("multilingual-e5-base"),
+            MAX_TEXT_CHARS - "passage: ".len()
+        );
+
+        let input = format!("{}\u{1f980}tail", "a".repeat(MAX_TEXT_CHARS - 1));
+        let (bounded, truncated) = bounded_embedding_input(&input, MAX_TEXT_CHARS);
+        assert!(truncated);
+        assert_eq!(bounded.len(), MAX_TEXT_CHARS - 1);
+        assert!(bounded.is_char_boundary(bounded.len()));
+        assert!(!bounded.contains('\u{1f980}'));
+    }
+
+    #[test]
+    fn bounded_embedding_input_leaves_normal_text_unchanged() {
+        let input = "normal byte-identical embedding input";
+        let (bounded, truncated) = bounded_embedding_input(input, MAX_TEXT_CHARS);
+        assert!(!truncated);
+        assert_eq!(bounded, input);
+        assert_eq!(bounded.as_ptr(), input.as_ptr());
+    }
 
     fn text_hit(id: Uuid, rank: u32, title: &str) -> TextSearchHit {
         TextSearchHit {
@@ -1821,6 +2001,48 @@ mod tests {
         captured: std::sync::Arc<std::sync::Mutex<Vec<Vec<String>>>>,
     }
 
+    struct WrongCardinalityEmbeddingService;
+
+    #[async_trait::async_trait]
+    impl EmbeddingService for WrongCardinalityEmbeddingService {
+        async fn embed(
+            &self,
+            texts: &[String],
+            _model: EmbeddingModel,
+        ) -> std::result::Result<Vec<Vec<f32>>, lattice_embed::EmbedError> {
+            Ok(texts
+                .iter()
+                .take(texts.len().saturating_sub(1))
+                .map(|_| vec![1.0])
+                .collect())
+        }
+
+        fn supports_model(&self, _model: EmbeddingModel) -> bool {
+            true
+        }
+
+        fn name(&self) -> &'static str {
+            "wrong-cardinality-embedding-service"
+        }
+    }
+
+    struct WrongCardinalityEmbedderProvider;
+
+    #[async_trait::async_trait]
+    impl EmbedderProvider for WrongCardinalityEmbedderProvider {
+        fn name(&self) -> &str {
+            "wrong-cardinality-embedding-service"
+        }
+
+        fn dimensions(&self) -> usize {
+            1
+        }
+
+        async fn build(&self) -> crate::error::RuntimeResult<std::sync::Arc<dyn EmbeddingService>> {
+            Ok(std::sync::Arc::new(WrongCardinalityEmbeddingService))
+        }
+    }
+
     #[async_trait::async_trait]
     impl EmbedderProvider for CapturingEmbedderProvider {
         fn name(&self) -> &str {
@@ -1923,6 +2145,57 @@ mod tests {
                 ],
             ],
             "E5 must receive its query prefix through single and batch paths"
+        );
+    }
+
+    #[tokio::test]
+    async fn mixed_document_batch_stays_one_ordered_provider_call() {
+        let model = EmbeddingModel::AllMiniLmL6V2;
+        let (runtime, captured) = runtime_with_capturing_embedder(model);
+        let texts = vec![
+            "first normal document".to_string(),
+            "x".repeat(MAX_TEXT_CHARS + 1),
+            "second normal document".to_string(),
+        ];
+
+        let outcomes = runtime
+            .embed_document_batch_with_model_outcomes(&model.to_string(), &texts)
+            .await
+            .expect("mixed batch must embed");
+        assert_eq!(outcomes.len(), texts.len());
+        assert!(!outcomes[0].truncated);
+        assert_eq!(outcomes[0].source_bytes, outcomes[0].embedded_bytes);
+        assert!(outcomes[1].truncated);
+        assert_eq!(outcomes[1].source_bytes, MAX_TEXT_CHARS + 1);
+        assert_eq!(outcomes[1].embedded_bytes, MAX_TEXT_CHARS);
+        assert!(!outcomes[2].truncated);
+        assert_eq!(
+            captured.lock().unwrap().as_slice(),
+            [vec![
+                texts[0].clone(),
+                "x".repeat(MAX_TEXT_CHARS),
+                texts[2].clone(),
+            ]]
+        );
+    }
+
+    #[tokio::test]
+    async fn truncated_document_batch_rejects_provider_cardinality_mismatch() {
+        let runtime = KhiveRuntime::memory().unwrap();
+        runtime.register_embedder(WrongCardinalityEmbedderProvider);
+        let model_name = "wrong-cardinality-embedding-service";
+        let texts = vec!["x".repeat(MAX_TEXT_CHARS + 1), "normal".to_string()];
+
+        let error = runtime
+            .embed_document_batch_with_model_outcomes(model_name, &texts)
+            .await
+            .expect_err("provider cardinality mismatch must fail the whole batch");
+
+        assert!(
+            error
+                .to_string()
+                .contains("embed_passage returned 1 vectors for 2 inputs"),
+            "unexpected error: {error}"
         );
     }
 

@@ -167,6 +167,10 @@ Declaration = changes institutional status by fiat.
 
 Create an entity or note (singleton) or a batch of entities (bulk via `items`).
 
+Singleton writes preserve the complete source in storage and FTS. If a configured embedder
+receives a UTF-8-safe bounded prefix, the successful response includes a `warnings` array; the
+warning is derived from the embedding outcome, not from a separate registry prediction.
+
 | Param               | Type            | Required    | Notes                                                                                                                                                                                                                                                                                      |
 | ------------------- | --------------- | ----------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `kind`              | string          | conditional | Substrate (`entity`\|`note`) or granular kind (`concept`, `document`, `observation`, …). Required for the singleton path; not required when `items` is present.                                                                                                                            |
@@ -302,6 +306,9 @@ Patch entity, note, or edge fields. Field set depends on substrate: entities acc
 `name`/`description`/`properties`/`tags`; notes accept
 `name`/`content`/`salience`/`decay_factor`/`properties`; edges accept
 `relation`/`weight`/`properties`.
+
+Entity/note text updates use the same full-source storage and bounded embedding contract as
+singleton `create`; a successful response includes `warnings` when embedding actually truncated.
 
 | Param          | Type            | Required | Notes                                                                     |
 | -------------- | --------------- | -------- | ------------------------------------------------------------------------- |
@@ -590,6 +597,9 @@ request(ops="[{\"tool\":\"propose\",\"args\":{\"title\":\"Add GQE\",\"descriptio
 ### `review` — Declaration
 
 Approve, reject, comment, or request changes on a proposal.
+
+When approval immediately applies an embedding-bearing changeset, the response includes the
+standard `warnings` advisory if that committed apply bounded any embedding input.
 
 | Param      | Type   | Required | Notes                                              |
 | ---------- | ------ | -------- | -------------------------------------------------- |
@@ -1072,6 +1082,9 @@ Actor-to-actor messaging with threading. Optional; load with `KHIVE_PACKS=kg,com
 
 Send a message, optionally threaded.
 
+The atomic outbound/inbound write preserves the full body on both notes. If either copy's
+embedding input is bounded, the successful response includes the standard `warnings` advisory.
+
 | Param       | Type   | Required | Notes                                                                                                                                                                                           |
 | ----------- | ------ | -------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `to`        | string | yes      | Actor label, e.g. `"lambda:leo"`. Both copies land in the caller's namespace; no cross-namespace write occurs.                                                                                  |
@@ -1121,6 +1134,9 @@ request(ops="comm.read(id=\"<message-id>\")")
 ### `comm.reply` — Commissive
 
 Reply to a message, threading linkage.
+
+Replies use the same full-source storage and embedding-truncation `warnings` contract as
+`comm.send`.
 
 | Param     | Type   | Required | Notes                                                       |
 | --------- | ------ | -------- | ----------------------------------------------------------- |

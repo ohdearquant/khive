@@ -1443,6 +1443,224 @@ async fn update_entity_with_note_field_salience_returns_error() {
 
 // ── #764: create's embedding_content wiring ─────────────────────────────────
 
+struct WarningEmbeddingService;
+
+#[async_trait::async_trait]
+impl lattice_embed::EmbeddingService for WarningEmbeddingService {
+    async fn embed(
+        &self,
+        texts: &[String],
+        _model: lattice_embed::EmbeddingModel,
+    ) -> Result<Vec<Vec<f32>>, lattice_embed::EmbedError> {
+        Ok(vec![vec![1.0]; texts.len()])
+    }
+
+    fn supports_model(&self, _model: lattice_embed::EmbeddingModel) -> bool {
+        true
+    }
+
+    fn name(&self) -> &'static str {
+        "warning-test"
+    }
+}
+
+struct WarningEmbedderProvider;
+
+#[async_trait::async_trait]
+impl khive_runtime::EmbedderProvider for WarningEmbedderProvider {
+    fn name(&self) -> &str {
+        "warning-test"
+    }
+
+    fn dimensions(&self) -> usize {
+        1
+    }
+
+    async fn build(
+        &self,
+    ) -> Result<std::sync::Arc<dyn lattice_embed::EmbeddingService>, khive_runtime::RuntimeError>
+    {
+        Ok(std::sync::Arc::new(WarningEmbeddingService))
+    }
+}
+
+struct BarrierEmbeddingService {
+    started: std::sync::Arc<tokio::sync::Notify>,
+    release: std::sync::Arc<tokio::sync::Notify>,
+}
+
+#[async_trait::async_trait]
+impl lattice_embed::EmbeddingService for BarrierEmbeddingService {
+    async fn embed(
+        &self,
+        texts: &[String],
+        _model: lattice_embed::EmbeddingModel,
+    ) -> Result<Vec<Vec<f32>>, lattice_embed::EmbedError> {
+        self.started.notify_one();
+        self.release.notified().await;
+        Ok(vec![vec![1.0]; texts.len()])
+    }
+
+    fn supports_model(&self, _model: lattice_embed::EmbeddingModel) -> bool {
+        true
+    }
+
+    fn name(&self) -> &'static str {
+        "registry-snapshot-barrier"
+    }
+}
+
+struct BarrierEmbedderProvider {
+    started: std::sync::Arc<tokio::sync::Notify>,
+    release: std::sync::Arc<tokio::sync::Notify>,
+}
+
+#[async_trait::async_trait]
+impl khive_runtime::EmbedderProvider for BarrierEmbedderProvider {
+    fn name(&self) -> &str {
+        "registry-snapshot-barrier"
+    }
+
+    fn dimensions(&self) -> usize {
+        1
+    }
+
+    async fn build(
+        &self,
+    ) -> Result<std::sync::Arc<dyn lattice_embed::EmbeddingService>, khive_runtime::RuntimeError>
+    {
+        Ok(std::sync::Arc::new(BarrierEmbeddingService {
+            started: std::sync::Arc::clone(&self.started),
+            release: std::sync::Arc::clone(&self.release),
+        }))
+    }
+}
+
+struct LateShortBudgetProvider;
+
+#[async_trait::async_trait]
+impl khive_runtime::EmbedderProvider for LateShortBudgetProvider {
+    fn name(&self) -> &str {
+        "multilingual-e5-base"
+    }
+
+    fn dimensions(&self) -> usize {
+        1
+    }
+
+    async fn build(
+        &self,
+    ) -> Result<std::sync::Arc<dyn lattice_embed::EmbeddingService>, khive_runtime::RuntimeError>
+    {
+        Ok(std::sync::Arc::new(WarningEmbeddingService))
+    }
+}
+
+#[tokio::test]
+async fn create_dispatch_emits_embedding_truncation_advisory() {
+    use crate::KgPack;
+    use khive_runtime::{KhiveRuntime, VerbRegistryBuilder};
+
+    let rt = KhiveRuntime::memory().expect("in-memory runtime");
+    rt.register_embedder(WarningEmbedderProvider);
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(KgPack::new(rt));
+    let registry = builder.build().expect("registry build");
+
+    let truncated = registry
+        .dispatch(
+            "create",
+            json!({
+                "kind": "concept",
+                "name": "warning target",
+                "description": "x".repeat(lattice_embed::MAX_TEXT_CHARS),
+                "skip_dedup_check": true,
+            }),
+        )
+        .await
+        .expect("over-limit create");
+    let warnings = truncated["warnings"].as_array().expect("warnings array");
+    assert_eq!(warnings.len(), 1);
+    assert!(warnings[0].as_str().unwrap().contains("truncated"));
+
+    let updated = registry
+        .dispatch(
+            "update",
+            json!({
+                "kind": "entity",
+                "id": truncated["id"],
+                "description": "y".repeat(lattice_embed::MAX_TEXT_CHARS + 1),
+            }),
+        )
+        .await
+        .expect("over-limit update");
+    assert_eq!(
+        updated["description"].as_str().map(str::len),
+        Some(lattice_embed::MAX_TEXT_CHARS + 1),
+        "the stored and FTS-indexed source remains complete"
+    );
+    assert!(
+        updated["warnings"]
+            .as_array()
+            .is_some_and(|warnings| warnings.len() == 1),
+        "a successful over-limit update must report actual truncation: {updated:?}"
+    );
+
+    let normal = registry
+        .dispatch(
+            "create",
+            json!({
+                "kind": "concept",
+                "name": "normal target",
+                "skip_dedup_check": true,
+            }),
+        )
+        .await
+        .expect("normal create");
+    assert!(
+        normal.get("warnings").is_none(),
+        "normal input must not emit an advisory"
+    );
+}
+
+#[tokio::test]
+async fn create_dispatch_uses_registry_snapshot_taken_before_embedding() {
+    use crate::KgPack;
+    use khive_runtime::{KhiveRuntime, VerbRegistryBuilder};
+
+    let rt = KhiveRuntime::memory().expect("in-memory runtime");
+    let started = std::sync::Arc::new(tokio::sync::Notify::new());
+    let release = std::sync::Arc::new(tokio::sync::Notify::new());
+    rt.register_embedder(BarrierEmbedderProvider {
+        started: std::sync::Arc::clone(&started),
+        release: std::sync::Arc::clone(&release),
+    });
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(KgPack::new(rt.clone()));
+    let registry = builder.build().expect("registry build");
+
+    let create = registry.dispatch(
+        "create",
+        json!({
+            "kind": "concept",
+            "name": "x".repeat(lattice_embed::MAX_TEXT_CHARS),
+            "skip_dedup_check": true,
+        }),
+    );
+    let mutate_registry = async {
+        started.notified().await;
+        rt.register_embedder(LateShortBudgetProvider);
+        release.notify_one();
+    };
+    let (response, ()) = tokio::join!(create, mutate_registry);
+    let response = response.expect("create using the captured registry model set");
+
+    assert!(
+        response.get("warnings").is_none(),
+        "the late E5 provider was outside this write's dispatch snapshot, so it must not affect the warning: {response:?}"
+    );
+}
+
 /// A note create with a proper-prefix `embedding_content` must succeed and
 /// store the full `content`; the override is a runtime-layer concern
 /// (covered by `khive-runtime`'s own unit tests) — this proves the handler

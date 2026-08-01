@@ -115,7 +115,11 @@ It runs, in order:
    in `kkernel` (not `khive-pack-gtd`) because `AtomicOpPlan`/`PlanStatement` are
    `khive-runtime` atomic-plan vocabulary this CLI orchestrator owns.
 3. The synchronous commit pass (`khive_runtime::atomic_runner::run_atomic_unit`, B2).
-4. The async post-commit reindex pass (`khive_runtime::atomic_prepare::apply_post_commit_effects`).
+4. The async post-commit reindex pass
+   (`khive_runtime::atomic_prepare::apply_post_commit_effects_with_report`).
+   Its typed embedding outcomes are matched back to the originating update plan, so an atomic
+   update whose embedding input was bounded carries the same per-result `warnings` advisory as
+   the canonical non-atomic handler.
 
 **Verbs without a prepare implementation.** `propose`/`review`/`withdraw` are listed in
 `khive_types::pack::ATOMIC_ADMISSIBLE_VERBS` (ADR-099 D3 intends them to eventually gain a
