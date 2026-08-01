@@ -74,9 +74,11 @@ serving bridge at build/adoption time; `S = 0` when no index is serving):
   nothing for them. If the same subject is also returned by the ANN index, it is dropped
   from the merged candidate list — the tail is authoritative for every subject it names.
 
-The read runs in a single snapshot (log scan + row point-reads in one read transaction), so
-a write committing mid-query is either entirely visible or entirely invisible — never a torn
-log/row pair.
+The read runs in a single snapshot, so a write committing mid-query is either entirely visible
+or entirely invisible — never a torn log/row pair. The knowledge implementation uses one SQL
+statement for the own-row guard, pair minimum, optional live count, selected log suffix, and
+joined current embeddings. This is load-bearing on pool-backed readers, where separate method
+calls are not guaranteed to share one connection even when bracketed by textual `BEGIN`/`COMMIT`.
 
 _Compaction linearization (review follow-up, 2026-07-19)._ A tail scan above `S` proves
 completeness only if the log still retains every row above `S` — and ADR-079 permits
@@ -109,6 +111,20 @@ before any **tail-dependent read path**, not merely before the first segment per
 consumer that finds its registration row absent must register at 0 and treat the log as
 untrusted until rows accumulate under the new registration (the existing Cold classification
 already produces the correct serving behavior for that window).
+
+_Knowledge cross-process refinement (#1515)._ A newly recreated zero row does not itself tell a
+second process that the consumer had been absent, so the knowledge consumer uses `-1` as a durable
+closed recovery state instead. Every absent knowledge row is changed to `-1` under the same
+cross-process lock used to publish the bridge, even when the detecting process has no local or
+persisted bridge; local evidence cannot exclude a stale peer. The detector then rejects or evicts
+local serving state.
+After acquiring the publication locks, the sentinel writer revalidates that the row is still
+absent/negative so a delayed detector cannot demote a completed recovery. Every knowledge process
+treats an absent row or `-1` as Cold and bypasses cached,
+v2, and legacy-v1 state. Only a full-corpus checkpoint tagged with the durable state observed
+before its scan may conditionally transition the row back to `S >= 0`; incremental replay cannot
+clear it. Failed or Empty recovery retains `-1`. This refinement is scoped to the knowledge
+consumer in issue #1515; the memory consumer retains ADR-079's baseline registration behavior.
 
 ### 2. Merge semantics — one source, not a fourth
 
@@ -150,7 +166,8 @@ The exact leg is O(|tail| × dims) per model per query. The tail is small by con
 When no ANN index is serving at all (Cold rebuild in flight, or Empty classification), the
 watermark is 0 and the tail is the entire scope. The exact leg does **not** absorb that case:
 it caps its scan at the threshold-sized tail, taking the highest-seq suffix of the log (the
-newest writes) so the freshest writes stay visible while FTS covers the rest, and otherwise
+newest raw writes, before final-state coalescing) so the freshest writes stay visible while FTS
+covers the rest, and otherwise
 defers to the existing Cold-path behavior (FTS-only serving while the rebuild runs). The leg
 restores freshness on a serving index; it is not a general exact-search fallback. This is
 the second tier of the §"Decision" guarantee stated precisely: with no serving index, a
@@ -192,6 +209,16 @@ external writer that appends log rows (the Amendment 1 write-path rule binds eve
 path) becomes visible to a warm daemon's recall on the daemon's next query. This closes the
 visibility half of issue #752; the invalidation half (getting the index itself rebuilt) is
 unchanged and remains that issue's subject.
+
+For knowledge, bridge publication is serialized across processes over the Vamana commit,
+`external_ids.bin`, mmap re-adoption, registry transition, and `-1` sentinel publication. This
+prevents a query from treating a re-created registry row as continuity with an older bridge and
+prevents concurrent writers from pairing one segment commit with another writer's UUID sidecar.
+Normal checkpoints also fence candidate `S` against the current durable watermark both before
+persistence and in the conditional raise; a stale publisher adopts the newer winner rather than
+overwriting its segment under a registry value whose intervening tail may already be compacted.
+Pathless checkpoints take a per-key process lock so their durable raise and cache install remain
+one monotone publication sequence.
 
 ## Relationship to ADR-107 (partial supersession)
 
