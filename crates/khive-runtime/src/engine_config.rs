@@ -490,15 +490,29 @@ impl KhiveConfig {
         path: Option<&Path>,
         db_path: Option<&Path>,
     ) -> Result<Option<Self>, ConfigError> {
+        Ok(Self::load_with_home_fallback_and_source(path, db_path)?.map(|(config, _)| config))
+    }
+
+    /// Load config with the full resolution order and retain the exact file
+    /// that supplied it.
+    ///
+    /// This is the diagnostic-preserving form of
+    /// [`KhiveConfig::load_with_home_fallback`]. Runtime callers that need to
+    /// tell an operator which selected file must be edited should use this
+    /// method instead of reconstructing the discovery order independently.
+    pub fn load_with_home_fallback_and_source(
+        path: Option<&Path>,
+        db_path: Option<&Path>,
+    ) -> Result<Option<(Self, PathBuf)>, ConfigError> {
         // Tier 1: explicit path (highest priority).
         if let Some(p) = path {
-            return Self::load(Some(p));
+            return Ok(Self::load(Some(p))?.map(|config| (config, Self::diagnostic_config_path(p))));
         }
 
         // Tiers 2-4: search project root, db-anchored hidden dir, user-global.
         let project_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         let home_root = std::env::var_os("HOME").map(PathBuf::from);
-        Self::load_with_roots(&project_root, home_root.as_deref(), db_path)
+        Self::load_with_roots_and_source(&project_root, home_root.as_deref(), db_path)
     }
 
     /// Testable inner search: tiers 2-4, given explicit roots instead of
@@ -514,28 +528,46 @@ impl KhiveConfig {
         home_root: Option<&Path>,
         db_path: Option<&Path>,
     ) -> Result<Option<Self>, ConfigError> {
+        Ok(
+            Self::load_with_roots_and_source(project_root, home_root, db_path)?
+                .map(|(config, _)| config),
+        )
+    }
+
+    fn load_with_roots_and_source(
+        project_root: &Path,
+        home_root: Option<&Path>,
+        db_path: Option<&Path>,
+    ) -> Result<Option<(Self, PathBuf)>, ConfigError> {
         // Tier 2: project root khive.toml.
         let tier2 = project_root.join("khive.toml");
         if tier2.exists() {
-            return Self::load(Some(&tier2));
+            return Ok(Self::load(Some(&tier2))?
+                .map(|config| (config, Self::diagnostic_config_path(&tier2))));
         }
 
         // Tier 3: project-local hidden dir, anchored to the resolved database's
         // own directory instead of the process cwd.
         let tier3 = Self::project_config_anchor_dir(db_path, project_root).join("config.toml");
         if tier3.exists() {
-            return Self::load(Some(&tier3));
+            return Ok(Self::load(Some(&tier3))?
+                .map(|config| (config, Self::diagnostic_config_path(&tier3))));
         }
 
         // Tier 4: user-global ~/.khive/config.toml.
         if let Some(home) = home_root {
             let tier4 = home.join(".khive/config.toml");
             if tier4.exists() {
-                return Self::load(Some(&tier4));
+                return Ok(Self::load(Some(&tier4))?
+                    .map(|config| (config, Self::diagnostic_config_path(&tier4))));
             }
         }
 
         Ok(None)
+    }
+
+    fn diagnostic_config_path(path: &Path) -> PathBuf {
+        std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
     }
 
     /// Resolve the directory searched for the tier-3 project-local config file.
@@ -1210,6 +1242,26 @@ id = "lambda:explicit"
             .expect("no error expected")
             .expect("file found");
         assert_eq!(cfg.actor.id.as_deref(), Some("lambda:explicit"));
+    }
+
+    #[test]
+    fn load_with_home_fallback_and_source_names_selected_file() {
+        let project_dir = tempfile::tempdir().unwrap();
+        let home_dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home_dir.path().join(".khive")).unwrap();
+        let selected = home_dir.path().join(".khive/config.toml");
+        std::fs::write(&selected, "[actor]\nid = \"lambda:home\"\n").unwrap();
+
+        let (config, source) = KhiveConfig::load_with_roots_and_source(
+            project_dir.path(),
+            Some(home_dir.path()),
+            None,
+        )
+        .expect("load should succeed")
+        .expect("home fallback should be selected");
+
+        assert_eq!(config.actor.id.as_deref(), Some("lambda:home"));
+        assert_eq!(source, selected);
     }
 
     #[test]

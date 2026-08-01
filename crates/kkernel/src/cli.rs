@@ -256,7 +256,19 @@ pub async fn cli_main() -> Result<()> {
         Command::Engine(e) => engine::run_engine(e).await,
         Command::Vector(v) => vector::run_vector(v),
         Command::Reindex(r) => reindex::run_reindex(r).await,
-        Command::Exec(e) => exec::run_exec(e).await,
+        Command::Exec(e) => {
+            let result = exec::run_exec(e).await;
+            if let Err(error) = &result {
+                if let Some(envelope) = khive_mcp::serve::db_override_refusal_envelope(error) {
+                    println!(
+                        "{}",
+                        serde_json::to_string(&envelope)
+                            .expect("database override refusal envelope must serialize")
+                    );
+                }
+            }
+            result
+        }
         Command::Mcp(a) => {
             let transport_registry = khive_mcp::transport::TransportRegistry::with_builtins();
 
@@ -273,10 +285,24 @@ pub async fn cli_main() -> Result<()> {
             // instead of the project, silently skipping a project-local
             // `.khive/config.toml`).
             let db_path_hint = khive_mcp::serve::config_discovery_db_anchor(a.db.as_deref());
-            let khive_cfg =
-                KhiveConfig::load_with_home_fallback(a.config.as_deref(), db_path_hint.as_deref())
-                    .unwrap_or_default()
-                    .unwrap_or_default();
+            let loaded_config = KhiveConfig::load_with_home_fallback_and_source(
+                a.config.as_deref(),
+                db_path_hint.as_deref(),
+            )
+            .unwrap_or_default();
+            let config_source = loaded_config.as_ref().map(|(_, source)| source.as_path());
+            let khive_cfg = loaded_config
+                .as_ref()
+                .map(|(config, _)| config.clone())
+                .unwrap_or_default();
+
+            if !khive_cfg.backends.is_empty() {
+                khive_mcp::serve::reject_conflicting_db_override_with_source(
+                    a.db.as_deref(),
+                    &khive_cfg.backends,
+                    config_source,
+                )?;
+            }
 
             if khive_cfg.backends.len() <= 1 {
                 // Single-backend: zero-change path — no coordinator.

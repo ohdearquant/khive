@@ -148,6 +148,16 @@ pub async fn run_pending_events(
     namespace: &str,
     verbose: bool,
 ) -> Result<DrainSummary> {
+    run_pending_events_with_config(db, None, namespace, verbose).await
+}
+
+/// Config-selecting form of [`run_pending_events`] used by `kkernel exec`.
+pub async fn run_pending_events_with_config(
+    db: Option<&str>,
+    config: Option<&std::path::Path>,
+    namespace: &str,
+    verbose: bool,
+) -> Result<DrainSummary> {
     // Resolve through the SAME multi-backend-aware construction the daemon
     // boot path uses (`khive-mcp::serve::build_server_with_explicit_namespace`),
     // rather than a throwaway `RuntimeConfig::default()` (PR #782):
@@ -162,11 +172,9 @@ pub async fn run_pending_events(
     // (single- or multi-backend), so replayed actions route through the
     // correct per-pack backend exactly like the daemon tick now does — not a
     // single runtime standing in for every pack (the same issue this fix
-    // closes for the daemon-resident tick). `kkernel exec` has no
-    // `--config` flag today (see `kkernel::exec::run_exec`'s own
-    // `resolve_runtime_config` call), so this mirrors that: `config: None`
-    // still triggers `khive.toml`'s standard cwd/home search order inside
-    // `resolve_runtime_config`.
+    // closes for the daemon-resident tick). An explicit config selection is
+    // threaded through from `kkernel exec`; `None` retains the standard
+    // cwd/database-anchor/home discovery order.
     //
     // This does NOT call `crate::serve::build_server` directly (PR #782):
     // `build_server` derives BOTH
@@ -201,7 +209,7 @@ pub async fn run_pending_events(
         namespace: None,
         no_embed: false,
         pack: Vec::new(),
-        config: None,
+        config: config.map(std::path::Path::to_path_buf),
         daemon: false,
         transport: None,
         bind: None,
@@ -210,7 +218,7 @@ pub async fn run_pending_events(
     };
     let (server, schedule_rt) =
         crate::serve::build_server_with_explicit_namespace(&args, ns, true, false)
-            .map_err(|e| anyhow::anyhow!("pending-events: build server: {e}"))?;
+            .context("pending-events: build server")?;
     let rt = schedule_rt.ok_or_else(|| {
         anyhow::anyhow!(
             "pending-events: resolved pack set does not include \"schedule\"; nothing to drain"

@@ -417,6 +417,7 @@ pack owns it, exactly like the MCP `request` tool:
 
 ```bash
 kkernel exec 'knowledge.import(path="/path/to/corpus.jsonl", format="ndjson")' --db ~/.khive/khive.db
+kkernel exec 'stats()' --config /absolute/path/to/config.toml
 ```
 
 See §3 below for `exec`'s general resolution rules, and the `knowledge` pack's own docs for

@@ -35,8 +35,8 @@ use clap::Parser;
 use khive_mcp::serve::resolve_runtime_config;
 use khive_mcp::serve::{
     apply_env_output_format, build_server_multi_backend_with_db_anchor, config_discovery_db_anchor,
-    enforce_strict_actor_mode, install_resolved_blob_store, normalize_redundant_db_override,
-    RuntimeConfigInputs,
+    enforce_strict_actor_mode, install_resolved_blob_store,
+    normalize_redundant_db_override_with_source, RuntimeConfigInputs,
 };
 #[cfg(unix)]
 use khive_mcp::server::compute_config_id;
@@ -198,6 +198,10 @@ pub struct ExecArgs {
     /// ephemeral in-memory database, matching `kkernel mcp`.
     #[arg(long, env = "KHIVE_DB")]
     pub db: Option<String>,
+
+    /// Path to the khive TOML config file. Overrides automatic discovery.
+    #[arg(long, env = "KHIVE_CONFIG")]
+    pub config: Option<PathBuf>,
 
     /// Namespace to operate in.
     #[arg(long, default_value = "local")]
@@ -521,9 +525,13 @@ async fn apply_ops_file(
 pub async fn run_exec(args: ExecArgs) -> Result<()> {
     // ── pending-events drain ─────────────────────────────────────────────────
     if args.pending_events {
-        let summary =
-            pending_events::run_pending_events(args.db.as_deref(), &args.namespace, args.verbose)
-                .await?;
+        let summary = pending_events::run_pending_events_with_config(
+            args.db.as_deref(),
+            args.config.as_deref(),
+            &args.namespace,
+            args.verbose,
+        )
+        .await?;
         pending_events::print_summary(&summary);
         return Ok(());
     }
@@ -559,7 +567,7 @@ pub async fn run_exec(args: ExecArgs) -> Result<()> {
     let (mut cfg, db_anchor) =
         khive_mcp::serve::resolve_runtime_config_with_db_anchor(RuntimeConfigInputs {
             db: args.db.as_deref(),
-            config: None, // `kkernel exec` has no `--config` flag today
+            config: args.config.as_deref(),
             namespace,
             // `--namespace` has a clap `default_value = "local"`, so it is always
             // present — there is no way to distinguish "operator typed --namespace
@@ -606,6 +614,7 @@ pub async fn run_exec(args: ExecArgs) -> Result<()> {
     let db_context = ExecDbContext {
         raw: args.db,
         anchor: db_anchor,
+        config: args.config,
     };
 
     match mode {
@@ -729,6 +738,7 @@ enum ExecMode {
 struct ExecDbContext {
     raw: Option<String>,
     anchor: Option<PathBuf>,
+    config: Option<PathBuf>,
 }
 
 async fn run_exec_inline(
@@ -804,8 +814,8 @@ async fn run_exec_inline_with_forward(
     // daemon's own boot path loads (`serve.rs`'s `build_server`:
     // `KhiveConfig::load_with_home_fallback(args.config.as_deref(),
     // config_discovery_db_anchor(args.db.as_deref()).as_deref())` —
-    // `kkernel exec` has no `--config` flag, so the first argument here is
-    // always `None`, exactly like there. The second argument is the raw
+    // `kkernel exec` threads its `--config` / `KHIVE_CONFIG` selection through
+    // this reload exactly like there. The second argument is the raw
     // `--db`/`KHIVE_DB` discovery anchor (`None` unless `--db` was set) rather
     // than `cfg.db_path` — `cfg.db_path` materializes the `$HOME/.khive`
     // default when `--db` is unset (#689), which would incorrectly re-anchor
@@ -820,8 +830,15 @@ async fn run_exec_inline_with_forward(
     // `ConfigMismatch` and silently fell back to the cold in-process path on
     // every call.
     let db_path_for_config = config_discovery_db_anchor(db_context.raw.as_deref());
-    let khive_cfg = KhiveConfig::load_with_home_fallback(None, db_path_for_config.as_deref())
-        .map_err(|e| anyhow::anyhow!("config error: {e}"))?
+    let loaded_config = KhiveConfig::load_with_home_fallback_and_source(
+        db_context.config.as_deref(),
+        db_path_for_config.as_deref(),
+    )
+    .map_err(|e| anyhow::anyhow!("config error: {e}"))?;
+    let config_source = loaded_config.as_ref().map(|(_, source)| source.as_path());
+    let khive_cfg = loaded_config
+        .as_ref()
+        .map(|(config, _)| config.clone())
         .unwrap_or_default();
 
     // #1226: apply the same --db/[[backends]] conflict guard the in-process
@@ -832,7 +849,12 @@ async fn run_exec_inline_with_forward(
     // fingerprint and captured construction anchor are normalized to the same
     // values used when no override is supplied.
     if !khive_cfg.backends.is_empty() {
-        normalize_redundant_db_override(&mut cfg, db_context.raw.as_deref(), &khive_cfg.backends)?;
+        normalize_redundant_db_override_with_source(
+            &mut cfg,
+            db_context.raw.as_deref(),
+            &khive_cfg.backends,
+            config_source,
+        )?;
         if matches!(db_context.raw.as_deref(), Some(path) if path != ":memory:") {
             db_context.anchor = cfg.db_path.clone();
         }
@@ -950,10 +972,10 @@ fn build_local_fallback_server(
 #[allow(clippy::too_many_arguments)]
 async fn run_exec_ops_file(
     path: PathBuf,
-    cfg: RuntimeConfig,
+    mut cfg: RuntimeConfig,
     presentation: Option<String>,
     dry_run: bool,
-    db_context: ExecDbContext,
+    mut db_context: ExecDbContext,
     atomic: bool,
     atomic_max_ops: Option<usize>,
     strict: bool,
@@ -990,9 +1012,28 @@ async fn run_exec_ops_file(
     // path — see `build_local_fallback_server`.
     enforce_strict_actor_mode(cfg.actor_id.as_deref(), &cfg.packs)?;
     let db_path_for_config = config_discovery_db_anchor(db_context.raw.as_deref());
-    let khive_cfg = KhiveConfig::load_with_home_fallback(None, db_path_for_config.as_deref())
-        .map_err(|e| anyhow::anyhow!("config error: {e}"))?
+    let loaded_config = KhiveConfig::load_with_home_fallback_and_source(
+        db_context.config.as_deref(),
+        db_path_for_config.as_deref(),
+    )
+    .map_err(|e| anyhow::anyhow!("config error: {e}"))?;
+    let config_source = loaded_config.as_ref().map(|(_, source)| source.as_path());
+    let khive_cfg = loaded_config
+        .as_ref()
+        .map(|(config, _)| config.clone())
         .unwrap_or_default();
+
+    if !khive_cfg.backends.is_empty() {
+        normalize_redundant_db_override_with_source(
+            &mut cfg,
+            db_context.raw.as_deref(),
+            &khive_cfg.backends,
+            config_source,
+        )?;
+        if matches!(db_context.raw.as_deref(), Some(path) if path != ":memory:") {
+            db_context.anchor = cfg.db_path.clone();
+        }
+    }
 
     if atomic {
         let max_ops = atomic_max_ops.unwrap_or(khive_types::pack::ATOMIC_MAX_OPS_DEFAULT);
@@ -1205,6 +1246,36 @@ mod tests {
         let args = ExecArgs::parse_from(["exec", "stats()"]);
         std::env::remove_var("KHIVE_DB");
         assert_eq!(args.db.as_deref(), Some("/tmp/kkernel-exec-env.db"));
+    }
+
+    #[test]
+    fn config_flag_selects_explicit_config() {
+        let args = ExecArgs::parse_from([
+            "exec",
+            "stats()",
+            "--config",
+            "/tmp/kkernel-exec-config.toml",
+        ]);
+        assert_eq!(
+            args.config.as_deref(),
+            Some(std::path::Path::new("/tmp/kkernel-exec-config.toml"))
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn khive_config_env_binds_to_config_arg() {
+        let previous = std::env::var_os("KHIVE_CONFIG");
+        std::env::set_var("KHIVE_CONFIG", "/tmp/kkernel-exec-env-config.toml");
+        let args = ExecArgs::parse_from(["exec", "stats()"]);
+        match previous {
+            Some(value) => std::env::set_var("KHIVE_CONFIG", value),
+            None => std::env::remove_var("KHIVE_CONFIG"),
+        }
+        assert_eq!(
+            args.config.as_deref(),
+            Some(std::path::Path::new("/tmp/kkernel-exec-env-config.toml"))
+        );
     }
 
     #[test]
@@ -3398,6 +3469,7 @@ backend = "sessions"
             ExecDbContext {
                 raw: Some(matching_override.clone()),
                 anchor: khive_runtime::resolve_db_anchor(Some(&matching_override)),
+                config: None,
             },
             false,
             spy_capture_config_id,
@@ -3421,6 +3493,7 @@ backend = "sessions"
             ExecDbContext {
                 raw: Some(conflicting_override.display().to_string()),
                 anchor: None,
+                config: None,
             },
             false,
             spy_capture_config_id,

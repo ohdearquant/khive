@@ -33,6 +33,94 @@ pub struct MultiBackendRegistry {
     pub main_backend: Arc<StorageBackend>,
 }
 
+/// Stable machine code for a concrete database override that conflicts with
+/// an already-declared multi-backend topology.
+pub const DB_OVERRIDE_CONFLICT_CODE: &str = "database_override_conflict";
+
+/// Invocation-level refusal raised before any verb is dispatched when a
+/// concrete `--db`/`KHIVE_DB` value would collapse declared backends.
+#[derive(Debug)]
+pub struct DatabaseOverrideConflict {
+    db_override: String,
+    backend_count: usize,
+    config_source: Option<PathBuf>,
+}
+
+impl DatabaseOverrideConflict {
+    fn new(
+        db_override: &str,
+        backend_count: usize,
+        config_source: Option<&std::path::Path>,
+    ) -> Self {
+        Self {
+            db_override: db_override.to_owned(),
+            backend_count,
+            config_source: config_source.map(std::path::Path::to_path_buf),
+        }
+    }
+
+    /// Stable JSON shape emitted by `kkernel exec` when dispatch never began.
+    pub fn envelope(&self) -> serde_json::Value {
+        let config_path = self
+            .config_source
+            .as_deref()
+            .map(|path| path.display().to_string());
+        serde_json::json!({
+            "ok": false,
+            "invocation": {
+                "started": false,
+            },
+            "error": {
+                "code": DB_OVERRIDE_CONFLICT_CODE,
+                "message": self.to_string(),
+                "db_override": self.db_override.as_str(),
+                "declared_backends": self.backend_count,
+                "config_path": config_path,
+            },
+        })
+    }
+}
+
+impl std::fmt::Display for DatabaseOverrideConflict {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "--db {:?} (or KHIVE_DB) cannot be combined with [[backends]]: {} \
+             backend(s) are already declared in the selected config, so applying this \
+             override here is ambiguous (it could silently collapse distinct declared \
+             backends onto a single file). ",
+            self.db_override, self.backend_count
+        )?;
+        if let Some(path) = self.config_source.as_deref() {
+            write!(
+                formatter,
+                "Edit the selected config file at {} to change persistent backend paths. ",
+                path.display()
+            )?;
+        } else {
+            write!(
+                formatter,
+                "Edit the selected config file to change persistent backend paths. "
+            )?;
+        }
+        write!(
+            formatter,
+            "Use --config <path> or KHIVE_CONFIG=<path> to select a different config, \
+             or pass --db :memory: to force all backends in-memory for this invocation."
+        )
+    }
+}
+
+impl std::error::Error for DatabaseOverrideConflict {}
+
+/// Return the stable invocation-refusal envelope when `error` carries a
+/// [`DatabaseOverrideConflict`].
+pub fn db_override_refusal_envelope(error: &anyhow::Error) -> Option<serde_json::Value> {
+    error
+        .downcast_ref::<DatabaseOverrideConflict>()
+        .map(DatabaseOverrideConflict::envelope)
+}
+
 /// Build a server from `args`, then serve it over `--daemon` or the named transport.
 ///
 /// #667: `build_server` runs migrations and applies pack schema plans (FTS DDL
@@ -1573,36 +1661,54 @@ pub fn validate_db_override_against_backends(
     cli_db_override: Option<&str>,
     backends: &[BackendConfig],
 ) -> anyhow::Result<bool> {
+    validate_db_override_against_backends_with_source(cli_db_override, backends, None)
+}
+
+/// Source-preserving form of [`validate_db_override_against_backends`].
+/// `config_source` is diagnostic only; it never participates in routing.
+pub fn validate_db_override_against_backends_with_source(
+    cli_db_override: Option<&str>,
+    backends: &[BackendConfig],
+    config_source: Option<&std::path::Path>,
+) -> anyhow::Result<bool> {
     let backend_count = backends.len();
+    reject_conflicting_db_override_with_source(cli_db_override, backends, config_source)?;
     match cli_db_override {
         Some(":memory:") => {
             tracing::warn!(
                 "--db :memory: (or KHIVE_DB=:memory:) is overriding {backend_count} \
                  configured [[backends]] entries to in-memory storage for this invocation; \
-                 khive.toml's declared backend paths will not be used this run"
+                 the selected config's declared backend paths will not be used this run"
             );
             Ok(true)
         }
         Some(other) => {
-            if override_matches_declared_main_backend(other, backends)? {
-                tracing::info!(
-                    "--db {other:?} (or KHIVE_DB) matches the path declared for the \
-                     \"main\" backend in khive.toml; proceeding because the override is a no-op"
-                );
-                Ok(false)
-            } else {
-                anyhow::bail!(
-                    "--db {other:?} (or KHIVE_DB) cannot be combined with [[backends]]: \
-                 {backend_count} backend(s) are already declared in khive.toml, so applying \
-                 this override here is ambiguous (it could silently collapse distinct \
-                 declared backends onto a single file). Edit khive.toml directly to change \
-                 backend paths, or pass --db :memory: to force all backends in-memory for \
-                 this invocation."
-                );
-            }
+            tracing::info!(
+                "--db {other:?} (or KHIVE_DB) matches the path declared for the \
+                 \"main\" backend in the selected config; proceeding because the override is a no-op"
+            );
+            Ok(false)
         }
         None => Ok(false),
     }
+}
+
+/// Fail only for a conflicting concrete override, without logging accepted
+/// `:memory:` or redundant-main cases. Boot paths use this before their shared
+/// builder so a refusal retains its config source without duplicating the
+/// builder's acceptance logs.
+pub fn reject_conflicting_db_override_with_source(
+    cli_db_override: Option<&str>,
+    backends: &[BackendConfig],
+    config_source: Option<&std::path::Path>,
+) -> anyhow::Result<()> {
+    let Some(other) = cli_db_override.filter(|path| *path != ":memory:") else {
+        return Ok(());
+    };
+    if override_matches_declared_main_backend(other, backends)? {
+        return Ok(());
+    }
+    Err(DatabaseOverrideConflict::new(other, backends.len(), config_source).into())
 }
 
 /// Validate a database override and normalize a redundant concrete override
@@ -1617,7 +1723,21 @@ pub fn normalize_redundant_db_override(
     cli_db_override: Option<&str>,
     backends: &[BackendConfig],
 ) -> anyhow::Result<bool> {
-    let force_memory = validate_db_override_against_backends(cli_db_override, backends)?;
+    normalize_redundant_db_override_with_source(config, cli_db_override, backends, None)
+}
+
+/// Source-preserving form of [`normalize_redundant_db_override`].
+pub fn normalize_redundant_db_override_with_source(
+    config: &mut RuntimeConfig,
+    cli_db_override: Option<&str>,
+    backends: &[BackendConfig],
+    config_source: Option<&std::path::Path>,
+) -> anyhow::Result<bool> {
+    let force_memory = validate_db_override_against_backends_with_source(
+        cli_db_override,
+        backends,
+        config_source,
+    )?;
     if matches!(cli_db_override, Some(path) if path != ":memory:") {
         config.db_path = khive_runtime::resolve_db_anchor(None);
     }
@@ -1987,10 +2107,24 @@ pub fn build_server_with_explicit_namespace(
     // agreement with the discovery anchor `resolve_runtime_config` already used
     // to produce `config` above.
     let db_path_for_config = config_discovery_db_anchor(args.db.as_deref());
-    let khive_cfg =
-        KhiveConfig::load_with_home_fallback(args.config.as_deref(), db_path_for_config.as_deref())
-            .map_err(|e| anyhow::anyhow!("config error: {e}"))?
-            .unwrap_or_default();
+    let loaded_config = KhiveConfig::load_with_home_fallback_and_source(
+        args.config.as_deref(),
+        db_path_for_config.as_deref(),
+    )
+    .map_err(|e| anyhow::anyhow!("config error: {e}"))?;
+    let config_source = loaded_config.as_ref().map(|(_, source)| source.as_path());
+    let khive_cfg = loaded_config
+        .as_ref()
+        .map(|(config, _)| config.clone())
+        .unwrap_or_default();
+
+    if !khive_cfg.backends.is_empty() {
+        reject_conflicting_db_override_with_source(
+            args.db.as_deref(),
+            &khive_cfg.backends,
+            config_source,
+        )?;
+    }
 
     if khive_cfg.backends.is_empty() {
         // Single-backend path — identical to pre-ADR-028 behavior.
@@ -4829,18 +4963,29 @@ region = "us-east-1"
         let override_path = dir.path().join("override.db");
         let khive_cfg = sqlite_multi_backend_config(main_path, secondary_path);
         let override_value = override_path.to_str().unwrap();
-        let base_cfg = RuntimeConfig {
-            db_path: khive_runtime::resolve_db_anchor(Some(override_value)),
-            ..base_runtime_config_for_multi_backend()
-        };
+        let config_path = dir.path().join("config.toml");
 
-        let error =
-            match build_registry_for_multi_backend(base_cfg, &khive_cfg, Some(override_value)) {
-                Ok(_) => panic!("a divergent concrete database override must remain ambiguous"),
-                Err(error) => error,
-            };
+        let error = validate_db_override_against_backends_with_source(
+            Some(override_value),
+            &khive_cfg.backends,
+            Some(&config_path),
+        )
+        .expect_err("a divergent concrete database override must remain ambiguous");
 
-        assert!(error.to_string().contains("khive.toml"));
+        assert!(error
+            .to_string()
+            .contains(&config_path.display().to_string()));
+        let envelope = db_override_refusal_envelope(&error)
+            .expect("database override conflict must carry a stable refusal envelope");
+        assert_eq!(envelope["ok"], false);
+        assert_eq!(envelope["invocation"]["started"], false);
+        assert_eq!(envelope["error"]["code"], DB_OVERRIDE_CONFLICT_CODE);
+        assert_eq!(envelope["error"]["db_override"], override_value);
+        assert_eq!(envelope["error"]["declared_backends"], 2);
+        assert_eq!(
+            envelope["error"]["config_path"],
+            config_path.display().to_string()
+        );
         assert!(
             !override_path.exists(),
             "rejecting an override must not create its database path"
@@ -5017,8 +5162,8 @@ region = "us-east-1"
 
     /// Issue #553: a concrete `--db` path override combined with declared
     /// `[[backends]]` is ambiguous (which of N declared backends should it apply
-    /// to?) and must fail loud, pointing at khive.toml as the place to make the
-    /// change, rather than silently collapsing distinct backends onto one path.
+    /// to?) and must fail loud with a selectable-config remedy rather than
+    /// silently collapsing distinct backends onto one path.
     #[test]
     #[serial]
     fn concrete_db_override_with_backends_declared_is_rejected() {
@@ -5077,11 +5222,9 @@ region = "us-east-1"
         );
         if let Err(err) = result {
             let msg = err.to_string();
-            assert!(
-                msg.contains("khive.toml"),
-                "error message must point at khive.toml as where to make the change \
-                 instead; got: {msg}"
-            );
+            assert!(msg.contains("selected config file"), "got: {msg}");
+            assert!(msg.contains("--config <path>"), "got: {msg}");
+            assert!(msg.contains("KHIVE_CONFIG=<path>"), "got: {msg}");
         }
     }
 
@@ -5649,8 +5792,8 @@ region = "us-east-1"
     /// Issue #553 sibling gap: a concrete `--db` path override combined with
     /// declared `[[backends]]` is ambiguous (which of N declared backends
     /// should it apply to?) and must fail loud on the `build_server_multi_backend`
-    /// path too, pointing at khive.toml as the place to make the change, rather
-    /// than silently collapsing distinct backends onto one path.
+    /// path too, with a selectable-config remedy rather than silently
+    /// collapsing distinct backends onto one path.
     #[test]
     #[serial]
     fn concrete_db_override_with_backends_declared_is_rejected_via_build_server_multi_backend() {
@@ -5709,11 +5852,9 @@ region = "us-east-1"
         );
         if let Err(err) = result {
             let msg = err.to_string();
-            assert!(
-                msg.contains("khive.toml"),
-                "error message must point at khive.toml as where to make the change \
-                 instead; got: {msg}"
-            );
+            assert!(msg.contains("selected config file"), "got: {msg}");
+            assert!(msg.contains("--config <path>"), "got: {msg}");
+            assert!(msg.contains("KHIVE_CONFIG=<path>"), "got: {msg}");
         }
     }
 
