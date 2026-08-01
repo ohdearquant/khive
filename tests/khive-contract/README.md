@@ -52,6 +52,15 @@ The session invokes it as `kkernel mcp …`. If the binary is missing, build it 
 cd crates && cargo build --release -p kkernel
 ```
 
+For a config-defined topology, pass `config=<path>` and `db=None`. Omitting `db`
+keeps the config's `[[backends]]` paths authoritative instead of adding a conflicting
+`--db` override:
+
+```python
+with KhiveMcpSession(config="/tmp/khive.toml", db=None, packs=("kg", "gtd")) as session:
+    session.verb("search", {"kind": "note", "query": "probe"})
+```
+
 ## Organization
 
 Tests are in `tests/` and organized by ADR. The `khive_contract/` package provides:

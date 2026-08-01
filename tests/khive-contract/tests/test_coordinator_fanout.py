@@ -8,20 +8,19 @@ Source of truth:
   crates/kkernel/src/coordinator/tests.rs — T1-T7 Rust regression suite
 
 These tests exercise the observable MCP verb surface properties that the
-coordinator routing contract specifies.  They drive the standard single-backend
-kkernel session; single-backend mode is the zero-change invariant baseline: the
-coordinator contract requires that behaviour is IDENTICAL to pre-coordinator
-operation (T6c, T1 in the Rust suite).  Any regression caught here signals a
-contract violation in both paths.
+coordinator routing contract specifies.  The original tests drive the standard
+single-backend kkernel session as the zero-change invariant baseline.  The T2/T3
+regressions added for #563 drive two physical SQLite backends through the public
+MCP process and verify both the wire result and the on-disk routing.
 
-Rust suite coverage (covered by kkernel coordinator tests, NOT re-tested here):
+Rust suite coverage (covered by kkernel coordinator tests, not repeated here):
   T1  single-backend zero-change invariant (Rust unit test, internal)
-  T2  cross-backend link stamps target_backend (requires two real backends)
-  T3  fan-out merges from two backends (requires two real backends)
   T5  record_created prewarns locator (internal prewarm)
-  D2/D4 LocatorCache, multi-backend note fan-out (Rust unit tests)
+  D2  LocatorCache internals
 
 Python contract coverage added here:
+  T2         — cross-backend link stamps target_backend on the source backend
+  T3         — note search merges hits from two physical backends
   T6c analog  — single-backend search and link produce correct results (zero-change)
   T6d analog  — malformed tags are rejected with per-op ok=false, not silently dropped
   T7a analog  — entity_kind field is non-null in entity search results
@@ -33,11 +32,167 @@ Python contract coverage added here:
 
 from __future__ import annotations
 
+import json
+import sqlite3
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Iterator
+
 import pytest
 
 from khive_contract.client import KhiveMcpSession
 
 VERBS_UNDER_TEST = {"create", "search", "link"}
+
+
+@dataclass(frozen=True)
+class TwoBackendHarness:
+    session: KhiveMcpSession
+    main_db: Path
+    tasks_db: Path
+
+
+@pytest.fixture(scope="module")
+def khive_two_backend_session(
+    tmp_path_factory: pytest.TempPathFactory,
+) -> Iterator[TwoBackendHarness]:
+    """KG on ``main`` plus GTD on a second physical SQLite backend."""
+    root = tmp_path_factory.mktemp("coordinator-fanout")
+    main_db = root / "main.db"
+    tasks_db = root / "tasks.db"
+    config = root / "khive.toml"
+    config.write_text(
+        "\n".join(
+            [
+                "[[backends]]",
+                'name = "main"',
+                'kind = "sqlite"',
+                f"path = {json.dumps(str(main_db))}",
+                "",
+                "[[backends]]",
+                'name = "tasks"',
+                'kind = "sqlite"',
+                f"path = {json.dumps(str(tasks_db))}",
+                "",
+                "[packs.gtd]",
+                'backend = "tasks"',
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    with KhiveMcpSession(
+        db=None,
+        config=config,
+        packs=("kg", "gtd"),
+        no_embed=True,
+        log="error",
+    ) as session:
+        yield TwoBackendHarness(session=session, main_db=main_db, tasks_db=tasks_db)
+
+
+def _note_kind(db: Path, note_id: str) -> str | None:
+    with sqlite3.connect(f"file:{db}?mode=ro", uri=True) as connection:
+        row = connection.execute("SELECT kind FROM notes WHERE id = ?", (note_id,)).fetchone()
+    return None if row is None else str(row[0])
+
+
+def _edge_target_backend(db: Path, edge_id: str) -> tuple[bool, str | None]:
+    with sqlite3.connect(f"file:{db}?mode=ro", uri=True) as connection:
+        row = connection.execute(
+            "SELECT target_backend FROM graph_edges WHERE id = ?", (edge_id,)
+        ).fetchone()
+    if row is None:
+        return False, None
+    return True, None if row[0] is None else str(row[0])
+
+
+# ---------------------------------------------------------------------------
+# T2/T3: true two-physical-backend contract coverage (#563)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.coordinator_fanout
+@pytest.mark.slow
+def test_cross_backend_link_stamps_and_persists_target_backend(
+    khive_two_backend_session: TwoBackendHarness,
+    temp_namespace: str,
+) -> None:
+    """A task→entity link is written on the task backend and points at ``main``."""
+    harness = khive_two_backend_session
+    session = harness.session
+
+    concept = session.verb(
+        "create",
+        {
+            "kind": "concept",
+            "name": f"cross_backend_target_{temp_namespace[-6:]}",
+        },
+    )
+    task = session.verb(
+        "gtd.assign",
+        {
+            "title": f"cross backend source {temp_namespace[-6:]}",
+        },
+    )
+    task_id = task["full_id"]
+
+    edge = session.verb(
+        "link",
+        {
+            "source_id": task_id,
+            "target_id": concept["id"],
+            "relation": "annotates",
+        },
+    )
+
+    assert edge["target_backend"] == "main"
+    assert edge["source_id"] == task_id
+    assert edge["target_id"] == concept["id"]
+    assert _edge_target_backend(harness.tasks_db, edge["id"]) == (True, "main")
+    assert _edge_target_backend(harness.main_db, edge["id"]) == (False, None)
+
+
+@pytest.mark.coordinator_fanout
+@pytest.mark.slow
+def test_note_search_merges_hits_from_two_physical_backends(
+    khive_two_backend_session: TwoBackendHarness,
+    temp_namespace: str,
+) -> None:
+    """A note fan-out returns the KG note from ``main`` and GTD task from ``tasks``."""
+    harness = khive_two_backend_session
+    session = harness.session
+    probe = f"physicalfanout{temp_namespace[-6:]}"
+
+    observation = session.verb(
+        "create",
+        {
+            "kind": "observation",
+            "content": f"{probe} observation on the main backend",
+        },
+    )
+    task = session.verb(
+        "gtd.assign",
+        {
+            "title": f"{probe} task on the tasks backend",
+        },
+    )
+    task_id = task["full_id"]
+
+    assert _note_kind(harness.main_db, observation["id"]) == "observation"
+    assert _note_kind(harness.main_db, task_id) is None
+    assert _note_kind(harness.tasks_db, task_id) == "task"
+    assert _note_kind(harness.tasks_db, observation["id"]) is None
+
+    hits = session.verb(
+        "search",
+        {"kind": "note", "query": probe},
+    )
+    hits_by_id = {hit["id"]: hit for hit in hits}
+
+    assert hits_by_id[observation["id"]]["note_kind"] == "observation"
+    assert hits_by_id[task_id]["note_kind"] == "task"
 
 
 # ---------------------------------------------------------------------------
@@ -451,7 +606,7 @@ def test_batch_search_and_link_dispatch_independently(
         f"search result must be a list; got {type(search_hits)}"
     )
     assert len(search_hits) >= 1, (
-        f"batch search must find the seeded concepts; got no hits"
+        "batch search must find the seeded concepts; got no hits"
     )
 
     assert link_entry.get("ok") is True, (

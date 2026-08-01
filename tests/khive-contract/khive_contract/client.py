@@ -114,7 +114,8 @@ class KhiveMcpSession:
         self,
         binary: str | Path | None = None,
         *,
-        db: str | Path = ":memory:",
+        db: str | Path | None = ":memory:",
+        config: str | Path | None = None,
         packs: Sequence[str] = ("kg",),
         namespace: str | None = None,
         no_embed: bool = True,
@@ -125,6 +126,7 @@ class KhiveMcpSession:
     ) -> None:
         self._binary = _resolve_binary(binary)
         self._db = db
+        self._config = config
         self._packs = list(packs)
         self._namespace = namespace
         self._no_embed = no_embed
@@ -147,7 +149,11 @@ class KhiveMcpSession:
                 "Build with: cd crates && cargo build --release -p kkernel"
             )
         # The MCP server is the `mcp` subcommand of the unified kkernel binary.
-        cmd = [str(binary), "mcp", "--db", str(self._db)]
+        cmd = [str(binary), "mcp"]
+        if self._db is not None:
+            cmd += ["--db", str(self._db)]
+        if self._config is not None:
+            cmd += ["--config", str(self._config)]
         if self._no_embed:
             cmd.append("--no-embed")
         cmd += ["--log", self._log]
@@ -156,6 +162,11 @@ class KhiveMcpSession:
         if self._namespace is not None:
             cmd += ["--namespace", self._namespace]
 
+        child_env = dict(os.environ)
+        if self._db is None:
+            child_env.pop("KHIVE_DB", None)
+        child_env.update(self._env or {})
+
         self.proc = subprocess.Popen(
             cmd,
             stdin=subprocess.PIPE,
@@ -163,7 +174,7 @@ class KhiveMcpSession:
             stderr=subprocess.PIPE,
             text=True,
             bufsize=1,
-            env={**os.environ, **(self._env or {})},
+            env=child_env,
         )
         self._do_initialize()
         return self
