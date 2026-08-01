@@ -117,7 +117,7 @@ pub(crate) static COMM_HANDLERS: [HandlerDef; 12] = [
     },
     HandlerDef {
         name: "comm.read",
-        description: "Mark an inbound message as read.",
+        description: "Mark an inbound message as read. Best-effort: on a mark-write failure the response still succeeds with read=false and a mark_error field; re-issue later.",
         visibility: Visibility::Verb,
         category: khive_types::VerbCategory::Declaration,
         params: &[ParamDef {

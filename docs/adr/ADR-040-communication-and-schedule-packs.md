@@ -593,3 +593,35 @@ standard `delete(id)` path.
   `inbox`, `agenda` are assertive; `read`, `cancel` are declarative.
 - ADR-027: Dynamic Pack Loading — self-registration via `inventory::submit!`.
 - ADR-028: Pack-Scoped Backends — `default_backend = "main"` for both packs.
+
+## Amendment (2026-08-01): `comm.read` degraded mark-read contract
+
+The `comm.read` row in the verb table above (line 102) states unconditionally that the
+verb "Set[s] `properties.read = true`" and "Returns the updated message envelope." That
+wording is only accurate when the post-read mark-read patch actually lands. Under
+multi-client writer contention the mark-read patch can
+time out or find no live row to update, and `handle_read` now degrades instead of failing
+the whole call: the fetch already succeeded, so a delivery-state patch failure should not
+throw away a successful read for a caller who cannot retry the fetch half.
+
+**Corrected contract**: validation errors that run before the patch (not found, wrong
+kind, outbound direction, wrong addressee) remain fatal and unchanged. The post-read
+mark-read patch itself is best-effort:
+
+- On success, the response is as originally specified: `read: true`, `properties` is the
+  updated envelope.
+- On a no-op (no live row updated, e.g. soft-deleted mid-flight) or a storage error, the
+  response degrades to `read: false` with a `mark_error` field (a fixed string for the
+  no-op case, the error's `Display` string otherwise) and `properties` set to the
+  pre-patch stored value — never a value implying the patch landed.
+
+This is eventual consistency on the read flag, not a correctness gap: a caller polling
+unread counts sees the message still unread and can simply re-issue `comm.read`
+(self-healing, no retry loop needed in the handler). See
+`crates/khive-pack-comm/docs/api/message-lifecycle.md#handlersrshandle_read` for the full
+three-arm contract and `crates/khive-pack-comm/src/handlers.rs::read_response` for the
+implementation. The `comm.read` discovery description in
+`crates/khive-pack-comm/src/vocab.rs` and the public guides (`AGENTS.md`,
+`docs/guide/api-reference.md`, `docs/guide/communication.md`, the comm skill) carry the
+best-effort wording; the verbatim `HandlerDef` snippet earlier in this ADR reflects the
+original pre-amendment description.

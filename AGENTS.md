@@ -161,7 +161,7 @@ Composite scores are always in [0,1]. Typical production floor: 0.3-0.7.
 | ------------- | ---------------------------------------------------------------------- | --------------------------------------------- |
 | `comm.send`   | Send a message (optionally threaded)                                   | Inter-agent or inter-namespace messaging      |
 | `comm.inbox`  | List inbound messages                                                  | Check what's waiting                          |
-| `comm.read`   | Mark an **inbound** message as read                                    | Acknowledge receipt (recipient action)        |
+| `comm.read`   | Mark an **inbound** message as read (best-effort: check `read` in the response; `false` + `mark_error` means re-issue later) | Acknowledge receipt (recipient action)        |
 | `comm.reply`  | Reply to a message (threading linkage)                                 | Respond in-thread                             |
 | `comm.thread` | Retrieve full conversation thread                                      | Read the whole conversation                   |
 | `comm.health` | Per-channel health snapshot (no args)                                  | Check daemon channel-poll state               |

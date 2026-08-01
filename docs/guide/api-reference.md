@@ -1104,7 +1104,11 @@ for compatibility, while `short_id` is the compact display-only prefix.
 
 ### `comm.read` — Declaration
 
-Mark an inbound message as read. Outbound messages cannot be marked read.
+Mark an inbound message as read. Outbound messages cannot be marked read. The mark-read
+write is best-effort: validation errors (not found, wrong kind, outbound direction, wrong
+addressee) remain fatal, but when the post-read mark write fails or finds no live row the
+call still succeeds with `read: false` and a `mark_error` field — inspect `read` and
+re-issue later if it is `false`.
 
 | Param | Type   | Required | Notes                                              |
 | ----- | ------ | -------- | -------------------------------------------------- |
