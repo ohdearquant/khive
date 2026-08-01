@@ -2,7 +2,7 @@
 
 **Scope:** Cognitive primitives — Fold, Anchor, Objective, Selector.
 
-**Last reviewed:** 2026-06-06
+**Last reviewed:** 2026-07-31
 
 ---
 
@@ -26,6 +26,7 @@
   knowing the wall-clock time.
 - Non-finite scores are rejected at every selection boundary (`passes_score`).
 - Non-finite precision falls back to 1.0 (full trust) rather than propagating NaN into ranking.
+- `ObjectiveContext.max_candidates` bounds the input-order prefix scored by `ComposePipeline`.
 - Deterministic tie-breaking: UUID ascending after score descending everywhere.
 
 ## Dependency Boundary

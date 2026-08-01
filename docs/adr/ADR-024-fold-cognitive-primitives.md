@@ -238,20 +238,26 @@ path (styx/) can later promote these to machine-checked properties.
 
 ### ComposePipeline — the canonical fold pass
 
+Amendment 2026-07-31: `ComposePipeline` composes objective scoring with budget selection only.
+`Anchor` remains an independent causal-traversal primitive. A consumer that needs anchoring must
+materialize graph-derived features before scoring and place them in its candidates or
+`ObjectiveContext`; the pipeline cannot perform a meaningful traversal without a start/outcome
+reference and depth. The unused `anchor` field and `graph` argument were therefore removed rather
+than advertising traversal that never occurred. `ObjectiveContext.max_candidates` bounds the
+input-order prefix scored by the pipeline, matching the `Objective` helpers.
+
 ```rust
 pub struct ComposePipeline<T> {
-    pub anchor:    Box<dyn Anchor>,
     pub objective: Box<dyn Objective<T>>,
     pub selector:  Box<dyn Selector<T>>,
 }
 
 impl<T> ComposePipeline<T> {
     /// Execute the full fold pass.
-    /// Precondition: anchor graph is materialized.
+    /// Precondition: any graph-derived features are already materialized.
     /// Postcondition: output is deterministically ranked within budget.
     pub fn execute(
         &self,
-        graph: &AnchorGraph,
         candidates: Vec<SelectorInput<T>>,
         budget: usize,
         weights: &SelectorWeights,
@@ -260,9 +266,9 @@ impl<T> ComposePipeline<T> {
 }
 ```
 
-Memory recall (ADR-033), retrieval pipelines (ADR-031), and brain profiles (ADR-032) all
-instantiate `ComposePipeline` with their own `Anchor`, `Objective`, and `Selector`
-implementations. The pipeline is the bridge between the foundation layer and consumers.
+Consumers instantiate `ComposePipeline` with their own `Objective` and `Selector`
+implementations. When a consumer also uses `Anchor`, it does so as a separate preprocessing step.
+The pipeline is the bridge between the foundation layer and consumers.
 
 ### Excluded from `khive-fold` (lives in consumers)
 
