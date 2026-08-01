@@ -4,7 +4,7 @@
 # inventory registration fails here instead of shipping.
 FULL_PACKS := kg,gtd,memory,comm,schedule,session,workspace,blob,git,knowledge,brain,code,formal
 
-.PHONY: check clippy test contract-test fmt fmt-check build clean ci docs-check publish publish-dry local check-fwd bench-1m bench-1m-ci
+.PHONY: check clippy test contract-test fmt fmt-check build clean ci docs-check publish publish-dry local check-fwd bench-1m bench-1m-ci hold-time-gate
 
 check:
 	cd crates && cargo check --workspace
@@ -58,6 +58,10 @@ bench-1m-ci:
 	@echo "==> Running Vamana CI smoke bench (2-point: 10K/50K, <60 s)..."
 	@echo "    Set SIFT_DIR to the sift_base.fvecs / sift_query.fvecs directory."
 	bash scripts/bench_1m.sh --ci
+
+hold-time-gate:
+	@echo "==> ADR-135 F4 release gate: per-shape writer hold-time regression coverage..."
+	cd crates && cargo test -p khive-pack-comm --test hold_time_regression -- --nocapture
 
 local:
 	@echo "==> Building kkernel (release, channel-email, channel-telegram)..."
