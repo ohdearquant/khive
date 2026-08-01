@@ -397,7 +397,8 @@ fn parse_claude_ai_conversation(
                 .get("summary")
                 .and_then(Value::as_str)
                 .filter(|summary| !summary.is_empty())
-        });
+        })
+        .map(|title| secret_gate::mask_secrets(title).into_owned());
     let conversation_created_at_micros = conversation
         .get("created_at")
         .and_then(parse_rfc3339_micros)
@@ -455,7 +456,7 @@ fn parse_claude_ai_conversation(
         if let Some(event) = build_claude_ai_event(
             message,
             session_id,
-            slug,
+            slug.as_deref(),
             conversation_created_at_micros,
             &current_path,
         ) {
@@ -482,7 +483,7 @@ fn parse_claude_ai_conversation(
         created_at_micros: conversation_created_at_micros,
         cwd: None,
         git_branch: None,
-        slug: slug.map(str::to_string),
+        slug,
     })
 }
 
@@ -1378,6 +1379,41 @@ mod tests {
         assert!(events[0].text.as_deref().unwrap().contains("***MASKED***"));
         assert!(!events[0].raw.contains(&secret));
         assert_eq!(events[1].text.as_deref(), Some("Legacy assistant text"));
+    }
+
+    #[test]
+    fn test_claude_ai_export_masks_secret_bearing_title_and_summary() {
+        let secret = format!("{}{}", "AKIA", "FAKEKEY1234567890");
+        let export = serde_json::json!([
+            {
+                "uuid": "claude-conv-secret-name",
+                "name": format!("prod creds {secret}"),
+                "chat_messages": [{
+                    "uuid": "claude-secret-name-user",
+                    "sender": "human",
+                    "text": "hello",
+                    "created_at": "2026-07-31T10:00:00Z"
+                }]
+            },
+            {
+                "uuid": "claude-conv-secret-summary",
+                "summary": format!("key={secret}"),
+                "chat_messages": []
+            }
+        ]);
+
+        let parsed =
+            parse_claude_ai_export_with_sessions(&export.to_string()).expect("secret-title export");
+        assert_eq!(parsed.sessions.len(), 2);
+        for session in &parsed.sessions {
+            let slug = session.slug.as_deref().expect("session slug");
+            assert!(!slug.contains(&secret));
+            assert!(slug.contains("***MASKED***"));
+        }
+        assert_eq!(parsed.events.len(), 1);
+        let event_slug = parsed.events[0].slug.as_deref().expect("event slug");
+        assert!(!event_slug.contains(&secret));
+        assert!(event_slug.contains("***MASKED***"));
     }
 
     #[test]

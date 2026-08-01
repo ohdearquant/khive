@@ -2724,6 +2724,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_claude_ai_export_secret_bearing_title_is_masked_in_stored_slug() {
+        let (rt, _dir) = setup().await;
+        let secret = format!("{}{}", "AKIA", "FAKEKEY1234567890");
+        let export = serde_json::to_string(&json!([{
+            "uuid": "claude-conv-secret-title",
+            "name": format!("prod creds {secret}"),
+            "created_at": "2026-07-31T10:00:00Z",
+            "chat_messages": []
+        }]))
+        .unwrap();
+        let (_file, path) = write_export_file(&export);
+
+        mirror_claude_ai_export_file(&rt, &path, 0)
+            .await
+            .expect("secret-title claude.ai conversation ingest");
+        assert_eq!(count_rows(&rt, "sessions").await, 1);
+
+        let sql = rt.sql();
+        let mut reader = sql.reader().await.expect("reader");
+        let session = reader
+            .query_row(SqlStatement {
+                sql: "SELECT slug FROM sessions WHERE id='claude-conv-secret-title'".into(),
+                params: vec![],
+                label: None,
+            })
+            .await
+            .expect("query secret-title session")
+            .expect("secret-title session row");
+        let Some(SqlValue::Text(slug)) = session.get("slug") else {
+            panic!("stored slug must be text");
+        };
+        assert!(!slug.contains(&secret));
+        assert!(slug.contains("***MASKED***"));
+    }
+
+    #[tokio::test]
     async fn test_claude_ai_export_over_max_bytes_leaves_cursor_untouched() {
         let (rt, _dir) = setup().await;
         let (_file, path) = write_export_file("[]");
