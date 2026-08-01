@@ -11,8 +11,8 @@ This crate implements the schedule half of ADR-040.
 `trigger_at` against the current time, and dispatching the stored payload — is
 not performed by this pack in process. Two supported execution modes exist:
 
-1. `kkernel scheduler` daemon mode (future): polls pending events and dispatches
-   them via the internal verb registry.
+1. The daemon's ADR-119-supervised `schedule-tick` component polls pending events
+   and dispatches them through the live multi-backend verb registry.
 2. External scheduler integration: an operator configures OS cron or a cloud
    scheduler to call `kkernel exec --pending-events` at an appropriate polling
    interval (minimum 1 minute).
@@ -42,31 +42,42 @@ following `properties` shape:
 ```
 
 `event_type` distinguishes `remind` (no action payload; delivers its content to
-the `created_by_actor` inbox) from `schedule` (stores a serialized verb+args
-payload for replay). `payload` is null for reminders and a JSON-encoded verb
-call string for scheduled dispatch. Reminder delivery uses the same dual-write
-path as `comm.send`. Use `schedule.schedule(action="comm.send(...)")` for
-delivery to an actor other than the creator.
+the creating actor's inbox) from `schedule` (stores a serialized verb+args
+payload for replay). Both event types mirror the creator in `created_by_actor`
+for display, but authority comes only from a target-bound, append-only
+`schedule.creator_provenance` event written from the dispatch token. Generic KG
+create can forge an unprovenanced row, but existing `scheduled_event` notes reject
+generic update and merge. The note is staged as `provisioning` and becomes `pending`
+only after provenance is durable.
+Replay reconstructs the exact verified actor kind from the event (including
+preserving `anonymous:local`), preserves public verb visibility, and therefore
+cannot inherit daemon authority, authorize rewritten executable intent, or invoke an
+internal subhandler; legacy generic rows without provenance fail closed.
+`payload` is null for reminders and a JSON-encoded verb call string for scheduled
+dispatch. Reminder delivery uses the same dual-write path as `comm.send`. Use
+`schedule.schedule(action="comm.send(...)")` for delivery to an actor other than
+the creator.
 
 **Four verbs:**
 
-| Verb | Speech act | Args | What it does |
-|------|-----------|------|-------------|
-| `schedule.remind` | commissive | `content`, `at`, `repeat?` | Create a `scheduled_event` that delivers `content` to the creating actor's inbox at fire time |
-| `schedule.schedule` | commissive | `action`, `at`, `repeat?` | Create a `scheduled_event` with `event_type="schedule"`; `action` is a DSL verb string |
-| `schedule.agenda` | assertive | `from?`, `to?`, `limit?` | List pending `scheduled_event` notes ordered by `trigger_at` ascending |
-| `schedule.cancel` | declaration | `id` | Set `properties.status = "cancelled"`, record `cancelled_at` |
+| Verb                | Speech act  | Args                       | What it does                                                                                  |
+| ------------------- | ----------- | -------------------------- | --------------------------------------------------------------------------------------------- |
+| `schedule.remind`   | commissive  | `content`, `at`, `repeat?` | Create a `scheduled_event` that delivers `content` to the creating actor's inbox at fire time |
+| `schedule.schedule` | commissive  | `action`, `at`, `repeat?`  | Create a `scheduled_event` with `event_type="schedule"`; `action` is a DSL verb string        |
+| `schedule.agenda`   | assertive   | `from?`, `to?`, `limit?`   | List pending `scheduled_event` notes ordered by `trigger_at` ascending                        |
+| `schedule.cancel`   | declaration | `id`                       | Set `properties.status = "cancelled"`, record `cancelled_at`                                  |
 
 **Recurrence specification.** `repeat` accepts:
 
-| Value | Semantics |
-|-------|-----------|
-| `"daily"` | Repeat every 24 hours from `trigger_at` |
-| `"weekly"` | Repeat every 7 days |
-| `"monthly"` | Repeat on the same day-of-month each month |
+| Value                | Semantics                                                               |
+| -------------------- | ----------------------------------------------------------------------- |
+| `"daily"`            | Repeat every 24 hours from `trigger_at`                                 |
+| `"weekly"`           | Repeat every 7 days                                                     |
+| `"monthly"`          | Repeat on the same day-of-month each month                              |
 | limited 5-field form | Each field is `*` or one in-range integer: `"0 9 * * 1"` (Monday 09:00) |
 
 Field ranges:
+
 - $\text{MIN} \in [0, 59]$
 - $\text{HOUR} \in [0, 23]$
 - $\text{DOM} \in [1, 31]$
@@ -86,7 +97,7 @@ before it enters storage, and (2) `validate_replayable_single_action` further
 requires a single call (no chains, no `$prev` references) against an
 exactly-registered, pack-prefixed verb name, with only literal argument
 values, every metadata-`required:true` argument present, and — for the small
-set of verbs with a *conditional* requirement not expressible in metadata
+set of verbs with a _conditional_ requirement not expressible in metadata
 (currently: `create`, which needs `kind` or `items`) — that alternative
 present too. This second stage exists because `kkernel`'s pending-events
 runner re-parses and re-dispatches the exact stored string at trigger time;
@@ -97,10 +108,11 @@ tracked as a known limitation — see `COMPLETION.md`). Stored actions may also
 not declare a business `namespace` argument for a verb that accepts one (e.g.
 `brain.bind`); replay always injects the firing event's own namespace, so a
 stored `namespace` value would be silently overwritten. At dispatch time, the
-payload runs with the permissions of the namespace that created the event —
-no privilege escalation is possible via stored payloads.
+payload runs under the immutable creator identity and inside the namespace
+bound to the scheduled event. Both authority dimensions are preserved, so
+delaying a payload cannot grant daemon authority or cross a namespace boundary.
 
-**Pack-auxiliary index.** The `idx_schedule_trigger` index is declared via
+**Pack-auxiliary indexes.** The `idx_schedule_trigger` index is declared via
 `SchemaPlan` as idempotent DDL (`CREATE INDEX IF NOT EXISTS`) outside the core
 versioned migration chain. It uses `WHERE deleted_at IS NULL` rather than
 `WHERE kind = 'scheduled_event'` so that the parameterized `kind = ?N` predicate
@@ -114,7 +126,11 @@ The two concepts are deliberately named to avoid confusion.
 
 ### ADR-015: Schema Migrations
 
-Pack-auxiliary DDL (the `idx_schedule_trigger` index) uses idempotent
+Creator replay additionally uses `idx_schedule_creator_provenance` on
+`events(namespace, verb, target_id, outcome)` so the immutable binding lookup is
+bounded by the scheduled note rather than scanning the event history per fire.
+
+Pack-auxiliary DDL (the schedule indexes) uses idempotent
 `CREATE INDEX IF NOT EXISTS` and is NOT part of the core versioned migration
 chain. It is declared via `schema_plan()` on `PackRuntime`.
 
@@ -155,3 +171,7 @@ persisting a reminder; the other three schedule verbs do not require `comm`.
   is consistent with the pattern in other packs.
 - Pagination in `agenda` uses `u64` offsets (not `u32`) to prevent overflow on
   very large stores. This is a defensive coding choice beyond ADR-040's spec.
+- The direct pack handler returns schedule intent only (`events` and `count`).
+  `khive-mcp`, which owns the daemon tick loop, decorates successful
+  `schedule.agenda` results with process-local `ticker.last_tick_at` per ADR-106
+  Amendment D. The heartbeat is not pack data and is never persisted.

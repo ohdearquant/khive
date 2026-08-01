@@ -29,6 +29,11 @@ Field applicability guard — authoritative field sets per substrate. Source of 
 | Note      | `name`, `content`, `salience`, `decay_factor`, `properties` (notes have NO top-level tags column; tags live in `properties["tags"]`) |
 | Edge      | `relation`, `weight`, `properties` |
 
+`scheduled_event` is the security-sensitive exception: ADR-119 Amendment 4 makes those
+notes schedule-managed, so generic note update and merge reject them before applying any
+otherwise-patchable field. Schedule cancellation and executor lifecycle transitions use
+the schedule pack's conditional state-machine writes instead.
+
 Any present-but-inapplicable field is rejected with a fail-loud error naming the offending
 field and listing the substrate's valid set. This function MUST be updated whenever
 `UpdateParams` or a patch struct changes.

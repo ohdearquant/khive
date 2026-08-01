@@ -94,7 +94,7 @@ consistency guard, the ADR-078 output-format resolution, and the ADR-091 checkpo
 pool are each implemented exactly once and apply identically to both boot paths. It
 also returns the resolved `"schedule"`-pack runtime (ADR-106) read out of the same
 `multi.per_pack_runtimes` map used to build the `BackendRegistry`, so the daemon's
-`spawn_schedule_tick_loop_if_daemon` drains the exact backend this boot resolved
+dynamic ADR-119 `schedule-tick` component drains the exact backend this boot resolved
 rather than a re-derived config (PR #782).
 
 Regression coverage for this path, in `main.rs`'s `#[cfg(test)]` module:

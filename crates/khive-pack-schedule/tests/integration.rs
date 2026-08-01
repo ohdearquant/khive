@@ -926,6 +926,10 @@ async fn schedule_pack_exposes_non_empty_schema_plan() {
         "schema plan must declare idx_schedule_trigger index; got: {combined}"
     );
     assert!(
+        combined.contains("idx_schedule_creator_provenance"),
+        "schema plan must index target-bound creator lookup; got: {combined}"
+    );
+    assert!(
         combined.contains("CREATE INDEX IF NOT EXISTS"),
         "schema plan DDL must be idempotent (CREATE INDEX IF NOT EXISTS); got: {combined}"
     );
