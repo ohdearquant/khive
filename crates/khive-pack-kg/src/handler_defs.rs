@@ -417,7 +417,7 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 19] = [
     // Declaration: declares two records identical
     HandlerDef {
         name: "merge",
-        description: "Deduplicate two entities or notes. Entity merges that fail the cheap entity_kind, name_similarity, or project_compatibility guard return a structured conflict error naming the guard in details.guard. force=true bypasses those guards and means the caller accepts responsibility. Successful non-dry-run merges emit an entity_merged or note_merged audit event. Returns {kept_id, removed_id, edges_rewired, properties_merged, tags_unioned, content_appended, dry_run}; \
+        description: "Deduplicate two entities or notes. Entity merges that fail the cheap entity_kind, name_similarity, or project_compatibility guard return a structured conflict error naming the guard in details.guard. force=true bypasses those guards and means the caller accepts responsibility. Successful non-dry-run merges emit an entity_merged or note_merged audit event. Natural-key edge collisions return and audit complete edge_conflict_preimages, including annotations cascaded with the dropped edge. Returns {kept_id, removed_id, edges_rewired, edges_contract_skipped, edge_conflict_preimages, properties_merged, tags_unioned, content_appended, dry_run}; \
                        chain with $prev.kept_id (not $prev.id — merge does not return a top-level id field).",
         visibility: Visibility::Verb,
         category: VerbCategory::Declaration,
