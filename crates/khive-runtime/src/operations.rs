@@ -532,9 +532,9 @@ pub fn accepted_pack_relations_for_entities(
 /// [`accepted_entity_kind_pairs_for_relation`]. It is shared by validation
 /// errors and pack-layer hints so every write path can tell a caller which
 /// relations would be legal without maintaining a second endpoint table.
-/// Pack declarations for special relations are excluded because the live
-/// validator resolves those relations through the base same-substrate branch
-/// before pack rules are consulted.
+/// Pack declarations for relations with dedicated substrate branches are
+/// excluded because the live validator resolves `annotates` and the three
+/// same-substrate special relations before pack rules are consulted.
 pub fn accepted_entity_relations_for_entities(
     rules: &[EdgeEndpointRule],
     src_kind: &str,
@@ -556,7 +556,9 @@ pub fn accepted_entity_relations_for_entities(
             tgt_entity_type,
         )
         .into_iter()
-        .filter(|relation| !crate::pack::is_special_relation(*relation)),
+        .filter(|relation| {
+            *relation != EdgeRelation::Annotates && !crate::pack::is_special_relation(*relation)
+        }),
     );
     relations.sort_by_key(|relation| relation.as_str());
     relations.dedup();
@@ -11415,12 +11417,28 @@ mod tests {
     }
 
     #[test]
-    fn cross_backend_illegal_entity_pair_names_when_no_relation_is_legal() {
+    fn cross_backend_legal_set_ignores_unenforced_annotates_pack_rule() {
         let rt = rt();
+        rt.install_edge_rules(vec![EdgeEndpointRule {
+            relation: EdgeRelation::Annotates,
+            source: EndpointKind::EntityOfKind("concept"),
+            target: EndpointKind::EntityOfKind("project"),
+        }]);
         let source_id = Uuid::new_v4();
         let target_id = Uuid::new_v4();
         let source = Resolved::Entity(Entity::new("local", "concept", "Concept"));
         let target = Resolved::Entity(Entity::new("local", "project", "Project"));
+
+        rt.validate_link_endpoints_by_resolved(
+            source_id,
+            target_id,
+            EdgeRelation::Annotates,
+            Some(&source),
+            Some(&target),
+        )
+        .expect_err(
+            "an annotates pack rule cannot override the dedicated note-source validator branch",
+        );
 
         let error = rt
             .validate_link_endpoints_by_resolved(
@@ -11436,7 +11454,11 @@ mod tests {
             message.contains(
                 "currently legal relations for concept -> project under the loaded endpoint rules: none"
             ),
-            "cross-backend rejection must say when the ordered pair has no legal relation; got: {message}"
+            "an unenforced entity-source annotates pack rule must not be advertised; got: {message}"
+        );
+        assert!(
+            !message.contains("endpoint rules: annotates"),
+            "the rejection must not call annotates legal when the live validator rejects it; got: {message}"
         );
     }
 

@@ -37,12 +37,16 @@ impl KgPack {
                     let target =
                         resolve_uuid_unfiltered(&entry.target_id, &self.runtime, token).await?;
                     let relation = parse_relation(&entry.relation)?;
-                    let (source, target) = if relation.is_symmetric() && target < source {
+                    // Canonicalize only the duplicate-detection key. Runtime validation
+                    // must see caller order so a rejected symmetric relation reports the
+                    // legal set for the requested ordered pair; `build_edge` canonicalizes
+                    // the accepted edge before persistence.
+                    let (key_source, key_target) = if relation.is_symmetric() && target < source {
                         (target, source)
                     } else {
                         (source, target)
                     };
-                    let key = format!("{source}::{target}::{}", relation.as_str());
+                    let key = format!("{key_source}::{key_target}::{}", relation.as_str());
                     if !seen.insert(key) {
                         skipped += 1;
                         continue;
@@ -101,12 +105,14 @@ impl KgPack {
                             continue;
                         }
                     };
-                    let (source, target) = if relation.is_symmetric() && target < source {
+                    // Keep caller order for validation/diagnostics; only the dedup key
+                    // needs UUID-canonical endpoints. `link` canonicalizes on success.
+                    let (key_source, key_target) = if relation.is_symmetric() && target < source {
                         (target, source)
                     } else {
                         (source, target)
                     };
-                    let key = format!("{source}::{target}::{}", relation.as_str());
+                    let key = format!("{key_source}::{key_target}::{}", relation.as_str());
                     if !seen.insert(key) {
                         skipped += 1;
                         continue;
