@@ -51,8 +51,9 @@ the serving index's watermark. Tail hits are merged into that model's existing c
 list **before** fusion. The guarantee is two-tier. While a serving index exists, recall is
 read-your-writes for every write covered by the serving index **or newer than the pair's
 registry minimum** — a set that includes every committed write except, transiently, writes
-inside the cross-process mismatch window of §1, which is empty for same-process checkpoints
-and closed by re-adoption. While no index is serving (Cold rebuild in flight, or Empty), a
+inside §1's checkpoint mismatch window, which re-resolution closes for both cross-process
+checkpoints and same-process queries that captured candidates before the bridge swap. While no
+index is serving (Cold rebuild in flight, or Empty), a
 committed write is visible to the vector legs iff its log row is still retained and fewer
 than threshold-many retained writes committed after it in scope (§3 states the precise
 condition); ADR-107 governs everything else until the rebuild lands. The
@@ -95,11 +96,15 @@ provable in the same snapshot (compaction never passes the minimum), and the unc
 one — has durably checkpointed past, i.e. writes already reflected in the newer published
 segment the stale bridge lacks; they become visible on the re-adoption the mismatch
 triggers. Either way, the exact leg never silently disappears on a serving-index path — the
-mismatch narrows what it covers, never whether it runs. Implementations
-SHOULD additionally order same-process checkpoint publication so the in-process bridge is
-replaced before the durable watermark is raised, making the mismatch window empty for the
-process's own checkpoints; the snapshot check remains mandatory because another process can
-raise and compact independently.
+mismatch narrows what it covers, never whether it runs. Implementations SHOULD additionally
+order same-process checkpoint publication so the in-process bridge is replaced before the
+durable watermark is raised. That prevents **new** searches from capturing the old bridge, but a
+query which captured `(candidates, S)` before the swap can still enter its exact leg after the
+raise and compaction. A pathless implementation MUST then re-search the installed bridge at or
+above the observed minimum and return replacement candidates (or drop the stale ANN candidates
+if no such bridge remains); a filesystem-backed implementation may re-resolve the durable
+segment. The snapshot check remains mandatory because another process can raise and compact
+independently.
 
 _Registration precondition (review follow-up, 2026-07-19)._ `S = 0` establishes an
 entire-scope tail only if no compaction has ever run for the pair — which ADR-079 guarantees
@@ -108,9 +113,15 @@ same `(namespace, model)` pair legitimately compacts rows the unregistered consu
 saw. The exact leg is therefore permitted only after the consumer's durable registration row
 exists. ADR-079's "register before persist" rule is extended for tail consumers: register
 before any **tail-dependent read path**, not merely before the first segment persist. A
-consumer that finds its registration row absent must register at 0 and treat the log as
-untrusted until rows accumulate under the new registration (the existing Cold classification
-already produces the correct serving behavior for that window).
+consumer that finds its registration row absent must register at the closed pending watermark
+`-2`, evict already-captured ANN candidates, and treat the log as untrusted until a full
+checkpoint atomically activates the row at `S >= 0`. A pending registration that never activates
+may be retired after ADR-079's one-day grace; the same reject-and-rebuild rule makes its later
+return safe. A pathless tail read which already captured a bridge during the initial
+install-before-activation window waits for the per-key publication lock and then revalidates the
+row: completed activation may proceed, while a row that remains closed, disappears, or errors
+still evicts. The no-index tier does not wait on this path, preserving its bounded readiness
+timeout.
 
 _Knowledge cross-process refinement (#1515)._ A newly recreated zero row does not itself tell a
 second process that the consumer had been absent, so the knowledge consumer uses `-1` as a durable
@@ -124,7 +135,8 @@ treats an absent row or `-1` as Cold and bypasses cached,
 v2, and legacy-v1 state. Only a full-corpus checkpoint tagged with the durable state observed
 before its scan may conditionally transition the row back to `S >= 0`; incremental replay cannot
 clear it. Failed or Empty recovery retains `-1`. This refinement is scoped to the knowledge
-consumer in issue #1515; the memory consumer retains ADR-079's baseline registration behavior.
+consumer in issue #1515; the memory consumer uses ADR-079's `-2` pending state and likewise
+rejects cached candidates on absence or closed state.
 
 ### 2. Merge semantics — one source, not a fourth
 
@@ -228,8 +240,9 @@ govern the ANN **candidate generator**: graph adjacency, quantized codes, and th
 pool for older corpus remain eventually consistent exactly as specified. What the bound no
 longer governs is **result visibility while a serving index exists**: there, a committed
 write is eligible for recall results on the next query, independent of rebuild progress,
-subject only to the §1 cross-process mismatch window (empty for same-process checkpoints,
-closed by re-adoption). In the no-index states (Cold, Empty) the §3 second tier applies —
+subject only to §1's checkpoint mismatch window (closed by durable-segment or installed-bridge
+re-resolution, including for already-started same-process queries). In the no-index states
+(Cold, Empty) the §3 second tier applies —
 visibility under the retained-row iff of §3, ADR-107 behavior for everything else — so
 ADR-107 §1 continues to describe the verb's observable freshness in exactly and only those
 states and that window.

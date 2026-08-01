@@ -64,6 +64,17 @@ full scan may transition it to a normal watermark. Failed or Empty scans keep th
 re-created row cannot be mistaken for uninterrupted registry history.
 `KHIVE_ANN_FRESH_TAIL=0` disables the exact leg but does not bypass this registry guard.
 
+Migration V17 also distinguishes a never-activated registration (`-2` plus a timestamp) from a
+real active checkpoint at `S = 0`. Knowledge treats `-2` exactly like registry loss and promotes it
+to the non-expiring `-1` recovery fence before its authoritative scan. Compaction may retire only
+`-2` after a 24-hour grace, warns with the exact consumer scope, and performs retirement plus log
+deletion in one writer transaction; active knowledge rows and `-1` are never age-retired.
+Those durable lifecycle transactions apply to file-backed runtimes. A pathless in-memory runtime
+has neither cross-process consumers nor durable pending metadata to retire, and its pooled writer
+cannot pin a manual transaction across separate asynchronous writer calls. Its pending fence,
+recovery sentinel, conditional raise, and scoped compaction therefore each use one SQL statement,
+still serialized by the per-key process publication lock.
+
 ## `AnnState::warm_states` (shared warm lifecycle, issue #566)
 
 The v1 snapshot preload, v2 segment preload, and request background warm all claim the same

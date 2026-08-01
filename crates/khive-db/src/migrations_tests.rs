@@ -745,6 +745,7 @@ fn core_tables_exist() {
         "knowledge_atoms",
         "knowledge_domains",
         "knowledge_sections",
+        "ann_consumer_pending",
     ] {
         assert!(table_exists(&conn, t), "missing table: {t}");
     }
@@ -1681,6 +1682,63 @@ fn v14_index_rejects_new_cross_namespace_duplicate_edge_id() {
         err.to_string().to_lowercase().contains("unique"),
         "expected a UNIQUE constraint failure, got: {err}"
     );
+}
+
+// ── V17: distinguish never-activated ANN consumers from active S=0 ──────────
+
+#[test]
+fn v17_moves_legacy_zero_watermark_into_timestamped_pending_state() {
+    let mut conn = open_memory();
+    conn.execute_batch(MIGRATION_TRACKING_TABLE).unwrap();
+    for migration in MIGRATIONS
+        .iter()
+        .filter(|migration| migration.version <= 16)
+    {
+        let tx = conn.transaction().unwrap();
+        tx.execute_batch(migration.up).unwrap();
+        tx.execute(
+            "INSERT INTO _schema_migrations (version, name, applied_at) VALUES (?1, ?2, 0)",
+            rusqlite::params![migration.version, migration.name],
+        )
+        .unwrap();
+        tx.commit().unwrap();
+    }
+    conn.execute(
+        "INSERT INTO ann_consumer_watermark \
+         (consumer, namespace, embedding_model, watermark) \
+         VALUES ('legacy-zero', 'local', 'model', 0), \
+                ('active', 'local', 'model', 17), \
+                ('recovering', 'local', 'model', -1)",
+        [],
+    )
+    .unwrap();
+
+    assert_eq!(run_migrations(&mut conn).unwrap(), 17);
+    assert!(table_exists(&conn, "ann_consumer_pending"));
+    let legacy: (i64, i64) = conn
+        .query_row(
+            "SELECT watermark, pending.registered_at_us \
+             FROM ann_consumer_watermark watermark \
+             JOIN ann_consumer_pending pending USING \
+               (consumer, namespace, embedding_model) \
+             WHERE watermark.consumer = 'legacy-zero'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(legacy.0, -2);
+    assert!(legacy.1 > 0);
+    let protected: Vec<i64> = conn
+        .prepare(
+            "SELECT watermark FROM ann_consumer_watermark \
+             WHERE consumer IN ('active', 'recovering') ORDER BY watermark",
+        )
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(protected, vec![-1, 17]);
 }
 
 #[test]

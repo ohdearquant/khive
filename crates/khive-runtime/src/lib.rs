@@ -3,6 +3,7 @@
 //! Wraps `StorageBackend` and query compilation into a single Rust API surface.
 
 pub mod actor_identity;
+pub mod ann_registry;
 pub mod atomic_message;
 pub mod atomic_plan;
 pub mod atomic_prepare;
