@@ -258,12 +258,16 @@ fn ts(dt: DateTime<Utc>) -> i64 {
 /// for a different language recorded on the same entity.
 ///
 /// Returns `Ok(None)` when the runtime secret gate refuses the write (the
-/// refusal is recorded in `report.blocked`, keyed by `name`) — callers must
-/// treat that project as absent from this sweep rather than indexing it.
+/// refusal is recorded in `report.blocked`, keyed by `source_label` — never
+/// by `name`, since `name` is content-derived from the manifest and may
+/// itself be what the gate refused) — callers must treat that project as
+/// absent from this sweep rather than indexing it.
+#[allow(clippy::too_many_arguments)]
 async fn upsert_project(
     rt: &KhiveRuntime,
     token: &NamespaceToken,
     name: &str,
+    source_label: &str,
     language: &str,
     sweep_time: DateTime<Utc>,
     report: &mut CodeSourceIngestReport,
@@ -303,7 +307,7 @@ async fn upsert_project(
     let now = ts(sweep_time);
     entity.created_at = existing.as_ref().map(|e| e.created_at).unwrap_or(now);
     entity.updated_at = now;
-    if !upsert_entity(rt, token, entity, name, report).await? {
+    if !upsert_entity(rt, token, entity, source_label, report).await? {
         return Ok(None);
     }
 
@@ -642,7 +646,8 @@ async fn reresolve_pass(
                 );
             }
             entity.properties = Some(Value::Object(props));
-            upsert_entity(rt, token, entity, &source_project, report).await?;
+            let entity_label = entity.id.to_string();
+            upsert_entity(rt, token, entity, &entity_label, report).await?;
         }
     }
     Ok(())
@@ -710,8 +715,17 @@ pub async fn run_code_ingest(
 
     let mut project_ids: HashMap<String, Uuid> = HashMap::new();
     for m in &manifests {
-        let Some(id) =
-            upsert_project(rt, token, &m.name, m.language, opts.sweep_time, &mut report).await?
+        let file_label = m.root.display().to_string();
+        let Some(id) = upsert_project(
+            rt,
+            token,
+            &m.name,
+            &file_label,
+            m.language,
+            opts.sweep_time,
+            &mut report,
+        )
+        .await?
         else {
             // Gate-refused write, already recorded in report.blocked — this
             // project is absent from the sweep, skip it and keep going
@@ -816,8 +830,17 @@ async fn run_import_scan(
         let proj_id = match project_ids.get(&proj_name) {
             Some(id) => *id,
             None => {
-                let Some(id) =
-                    upsert_project(rt, token, &proj_name, language, sweep_time, report).await?
+                let proj_label = proj_root.display().to_string();
+                let Some(id) = upsert_project(
+                    rt,
+                    token,
+                    &proj_name,
+                    &proj_label,
+                    language,
+                    sweep_time,
+                    report,
+                )
+                .await?
                 else {
                     // Gate-refused write, already recorded in report.blocked
                     // — move on to the next file (issue #1594).

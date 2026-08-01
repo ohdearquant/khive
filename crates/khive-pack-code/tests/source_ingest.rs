@@ -479,6 +479,109 @@ async fn gate_blocked_write_is_quarantined_and_siblings_ingest() {
     );
 }
 
+/// `pkg_secret`'s own manifest-declared project name is itself a
+/// secret-shaped string (`scheme://user:pass@host`) — the value the runtime
+/// secret gate refuses is the entity's `name`, not one of its dependencies.
+/// `pkg_ok` is an ordinary sibling project.
+fn write_gate_blocked_project_name_fixture(root: &Path) {
+    let pkg_secret = root.join("pkg_secret");
+    let pkg_ok = root.join("pkg_ok");
+    std::fs::create_dir_all(pkg_secret.join("src")).unwrap();
+    std::fs::create_dir_all(pkg_ok.join("src")).unwrap();
+
+    std::fs::write(
+        pkg_secret.join("Cargo.toml"),
+        "[package]\nname = \"scheme://user:pass@host\"\n",
+    )
+    .unwrap();
+    std::fs::write(pkg_secret.join("src/lib.rs"), "pub fn call_it() {}\n").unwrap();
+
+    std::fs::write(pkg_ok.join("Cargo.toml"), "[package]\nname = \"pkg_ok\"\n").unwrap();
+    std::fs::write(pkg_ok.join("src/lib.rs"), "pub fn helper() {}\n").unwrap();
+}
+
+/// issue #1594 / gate-report label leak: when the *project name itself* is
+/// secret-shaped, the quarantine report's `blocked[].file` must carry the
+/// trusted manifest path, never the refused name — reusing content-derived
+/// identity as a diagnostic label would re-exfiltrate exactly what the gate
+/// just refused. Mirrors `khive-pack-git`'s full-report masking assertion
+/// (`crates/khive-pack-git/tests/acceptance.rs`, `writes_refused` case).
+#[tokio::test]
+async fn gate_blocked_project_name_reports_safe_manifest_path() {
+    let root = TempDir::new().expect("tempdir");
+    write_gate_blocked_project_name_fixture(root.path());
+    let db = root.path().join("gate_blocked_name.db");
+    let rt = rt_at(&db);
+    let token = rt.authorize(Namespace::local()).expect("token");
+
+    let report = run_code_ingest(
+        &rt,
+        &token,
+        CodeSourceIngestOptions {
+            path: root.path(),
+            languages: all_languages(),
+            sweep_time: Utc::now(),
+        },
+    )
+    .await
+    .unwrap_or_else(|e| panic!("ingest must complete despite one gate-blocked write: {e}"));
+
+    // The manifest-tier upsert and the import-scan-tier upsert each attempt
+    // (and independently refuse) the same secret-shaped project name, so
+    // both are quarantined — every entry must still carry the same safe,
+    // trusted manifest path, never the refused name.
+    assert!(
+        !report.blocked.is_empty(),
+        "expected at least one quarantined write, got: {:?}",
+        report.blocked
+    );
+    assert_eq!(
+        report.blocked_count as usize,
+        report.blocked.len(),
+        "blocked_count must match the number of entries in blocked"
+    );
+
+    let expected_path = root.path().join("pkg_secret").display().to_string();
+    for entry in &report.blocked {
+        assert_eq!(
+            entry.file, expected_path,
+            "blocked[].file must be the trusted manifest path, not the refused project name"
+        );
+        assert_eq!(entry.detector, "url-userinfo");
+        assert!(
+            !entry.masked_excerpt.is_empty(),
+            "masked_excerpt must be present"
+        );
+        assert!(
+            !entry.masked_excerpt.contains("user:pass"),
+            "masked excerpt must not echo the credential-shaped span: {}",
+            entry.masked_excerpt
+        );
+    }
+
+    let serialized = serde_json::to_string(&report).expect("CodeSourceIngestReport serializes");
+    assert!(
+        !serialized.contains("user:pass"),
+        "the complete serialized report must never contain the refused credential-shaped \
+         project name: {serialized}"
+    );
+
+    assert!(
+        report.projects_created >= 1,
+        "the unrelated sibling pkg_ok must still be created, got {} (report: {report:?})",
+        report.projects_created
+    );
+    let names = entity_names(&rt).await;
+    assert!(
+        names.iter().any(|n| n == "pkg_ok"),
+        "unrelated sibling pkg_ok must be ingested: {names:?}"
+    );
+    assert!(
+        !names.iter().any(|n| n.contains("user:pass")),
+        "the gate-blocked project name must never be written as an entity: {names:?}"
+    );
+}
+
 #[tokio::test]
 async fn rejects_nonexistent_path() {
     let root = TempDir::new().expect("tempdir");
