@@ -629,6 +629,29 @@ mod tests {
         assert!(live.contains(&hits[0].entity_id));
     }
 
+    #[tokio::test]
+    async fn hybrid_default_rrf_alive_filter_refills_below_complete_four_x_prefix() {
+        let (rt, tok, query_text, query_vector, _text_hits, _vector_hits, live) =
+            stale_full_prefix_fixture().await;
+
+        let hits = rt
+            .hybrid_search(
+                &tok,
+                query_text,
+                Some(query_vector),
+                1,
+                None,
+                None,
+                &[],
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(hits.len(), 1);
+        assert!(live.contains(&hits[0].entity_id));
+    }
+
     // 9. Roundtrip serde preserves variant
     #[test]
     fn serde_roundtrip() {
