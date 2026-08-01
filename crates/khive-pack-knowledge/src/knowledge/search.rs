@@ -42,6 +42,49 @@ struct ScoredHit {
     score: f32,
 }
 
+enum AnnSearchState {
+    Loaded(Vec<(Uuid, f32)>),
+    WarmingTimedOut { corpus_non_empty: bool },
+    Absent,
+}
+
+/// Search the loaded ANN slot, waiting a bounded time when its warm is in flight.
+async fn search_ann_with_warm_wait(
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+    ann: &vamana::SharedAnn,
+    key: &vamana::AnnKey,
+    query_embedding: &[f32],
+    k: usize,
+) -> AnnSearchState {
+    if let Some(hits) = vamana::search_loaded(ann, key, query_embedding, k).await {
+        return AnnSearchState::Loaded(hits);
+    }
+    if !vamana::is_warming_not_loaded(ann, key) {
+        return AnnSearchState::Absent;
+    }
+    if vamana::wait_ready(
+        ann,
+        key,
+        vamana::warm_wait_timeout_ms(),
+        vamana::ANN_WARM_WAIT_POLL_MS,
+    )
+    .await
+    {
+        return match vamana::search_loaded(ann, key, query_embedding, k).await {
+            Some(hits) => AnnSearchState::Loaded(hits),
+            None => AnnSearchState::Absent,
+        };
+    }
+
+    let corpus_non_empty =
+        vamana::compute_fingerprint(runtime, token, runtime.default_embedder_name())
+            .await
+            .map(|fingerprint| fingerprint.vector_count > 0)
+            .unwrap_or(false);
+    AnnSearchState::WarmingTimedOut { corpus_non_empty }
+}
+
 // ─── ANN fusion (symmetric RRF) ─────────────────────────────────────────────
 
 const RRF_K: usize = 60;
@@ -1261,54 +1304,24 @@ impl KnowledgeHandlers {
             let ann_k = fetch_limit.max(20);
             let key = vamana::AnnKey::new(&ns, runtime.default_embedder_name());
 
-            // If the ANN slot is absent but a background warm is in flight, wait a
-            // bounded time before continuing with FTS-only results.  This avoids a
-            // cold-start race where the ANN is loading and the first query silently
-            // returns ok:true,total:0 when FTS also finds nothing.
-            //
-            // Test coverage note: the warming-Err branch here is exercised by
-            // both the mechanism-unit tests in vamana::tests and the handler-level
-            // degrade regression tests in knowledge::ann_degrade_tests.  The handler
-            // tests call this function directly with a pre-warmed SharedAnn, using
-            // the pub(crate) seams simulate_warming_in_flight and
-            // set_warm_wait_timeout_override_ms (50 ms override avoids a 5 s stall
-            // in CI while still exercising every line in the degrade branch).
-            let mut ann_hits_opt = vamana::search_loaded(ann, &key, &query_emb, ann_k).await;
-            if ann_hits_opt.is_none() && vamana::is_warming_not_loaded(ann, &key) {
-                if vamana::wait_for_ann(
-                    ann,
-                    &key,
-                    vamana::warm_wait_timeout_ms(),
-                    vamana::ANN_WARM_WAIT_POLL_MS,
-                )
-                .await
-                {
-                    ann_hits_opt = vamana::search_loaded(ann, &key, &query_emb, ann_k).await;
-                } else {
-                    // Still not ready: if FTS already found results, those are
-                    // valid partial hits — return them.  Only set ann_unavailable
-                    // when FTS is also empty and the corpus is non-empty (issue #322).
-                    if hits.is_empty() {
-                        let model = runtime.default_embedder_name();
-                        let corpus_non_empty = vamana::compute_fingerprint(runtime, token, model)
-                            .await
-                            .map(|fp| fp.vector_count > 0)
-                            .unwrap_or(false);
-                        if corpus_non_empty {
-                            ann_unavailable = true;
-                        }
-                    }
-                }
-            }
-
-            if let Some(ann_hits) = ann_hits_opt {
-                if !ann_hits.is_empty() {
+            match search_ann_with_warm_wait(runtime, token, ann, &key, &query_emb, ann_k).await {
+                AnnSearchState::Loaded(ann_hits) if !ann_hits.is_empty() => {
                     fuse_ann_hits(&mut hits, &ann_hits, min_score);
                     hydrate_empty_hits(runtime, &ns, &mut hits).await;
                     // ANN-sourced hits bypass the SQL status predicate; apply the
                     // same exclusion policy here so all result sources are consistent.
                     filter_by_excluded_statuses(&mut hits, &exclude_statuses_buf);
                 }
+                // FTS hits remain valid partial results. Preserve the existing
+                // advisory only for a non-empty corpus with no lexical fallback.
+                AnnSearchState::WarmingTimedOut { corpus_non_empty }
+                    if corpus_non_empty && hits.is_empty() =>
+                {
+                    ann_unavailable = true;
+                }
+                AnnSearchState::Loaded(_)
+                | AnnSearchState::WarmingTimedOut { .. }
+                | AnnSearchState::Absent => {}
             }
         }
         // Apply the kind gate unconditionally — both FTS-sourced and ANN-sourced
@@ -1399,51 +1412,8 @@ impl KnowledgeHandlers {
             let ann_k = (limit * 50).max(200);
             let key = vamana::AnnKey::new(&ns, runtime.default_embedder_name());
 
-            // If the ANN index is not yet loaded but is actively warming (background
-            // task in flight), wait a bounded time before falling through.  This
-            // prevents a race between the daemon warm-start and the first incoming
-            // query from producing a silent ok:true,total:0 result.
-            //
-            // Test coverage note: same degrade regression coverage as the `search`
-            // handler above — see knowledge::ann_degrade_tests for the handler-level
-            // tests that exercise this branch directly with a pre-warmed SharedAnn.
-            let mut ann_hits_opt = vamana::search_loaded(ann, &key, &query_emb, ann_k).await;
-            if ann_hits_opt.is_none() && vamana::is_warming_not_loaded(ann, &key) {
-                if vamana::wait_for_ann(
-                    ann,
-                    &key,
-                    vamana::warm_wait_timeout_ms(),
-                    vamana::ANN_WARM_WAIT_POLL_MS,
-                )
-                .await
-                {
-                    ann_hits_opt = vamana::search_loaded(ann, &key, &query_emb, ann_k).await;
-                } else {
-                    // Still not ready after the wait.  FTS/full-scan lexical hits
-                    // (if any) already sit in `hits` and are returned regardless —
-                    // ANN unavailability degrades candidate recall breadth, not
-                    // necessarily final ranking: the fresh embedding rerank below
-                    // can still apply a dense score to the lexical candidates.
-                    // A caller must not read non-empty `hits` here as evidence of
-                    // healthy candidate retrieval either.
-                    // Flag degraded whenever the corpus is genuinely non-empty,
-                    // in BOTH the empty-hits case (issue #322: total:0 could
-                    // mean "nothing exists" or "couldn't check") and the
-                    // non-empty case (issue #91: partial candidate retrieval looks
-                    // identical to a healthy response unless flagged).
-                    let model = runtime.default_embedder_name();
-                    let corpus_non_empty = vamana::compute_fingerprint(runtime, token, model)
-                        .await
-                        .map(|fp| fp.vector_count > 0)
-                        .unwrap_or(false);
-                    if corpus_non_empty {
-                        ann_unavailable = true;
-                    }
-                }
-            }
-
-            if let Some(ann_hits) = ann_hits_opt {
-                if !ann_hits.is_empty() {
+            match search_ann_with_warm_wait(runtime, token, ann, &key, &query_emb, ann_k).await {
+                AnnSearchState::Loaded(ann_hits) if !ann_hits.is_empty() => {
                     fuse_ann_hits(&mut hits, &ann_hits, 0.0);
                     hydrate_empty_hits(runtime, &ns, &mut hits).await;
                     // Apply the same status exclusion to ANN-sourced domain hits.
@@ -1452,6 +1422,12 @@ impl KnowledgeHandlers {
                     // not crowd out domain hits in the final ranking.
                     filter_hits_by_type(&mut hits, Some("domain"));
                 }
+                // Suggest always reports degraded candidate recall for a
+                // non-empty corpus, even when lexical candidates survived.
+                AnnSearchState::WarmingTimedOut { corpus_non_empty } => {
+                    ann_unavailable = corpus_non_empty;
+                }
+                AnnSearchState::Loaded(_) | AnnSearchState::Absent => {}
             }
         }
 

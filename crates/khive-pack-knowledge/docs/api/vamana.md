@@ -24,8 +24,23 @@ lifecycle for knowledge search: `SharedAnn` type, `AnnKey`, snapshot persistence
 (`warm_known_snapshots` / `ensure_ann_background`), index build (`build_ann`), search
 (`search_loaded`), and all associated SQL queries and serialization logic. These
 responsibilities are tightly coupled through the shared `AnnState` and cannot be split
-without breaking the atomic lock protocol. Refactoring is deferred until a stable snapshot
-format and the warm-start contract are defined.
+without obscuring the generation-fenced install and warm-ownership lock protocol.
+
+## `AnnState::warm_states` (shared warm lifecycle, issue #566)
+
+The v1 snapshot preload, v2 segment preload, and request background warm all claim the same
+per-`{namespace, model}` lifecycle through `begin_warm` and publish through `finish_warm`:
+implicit **Absent** → **Warming** → **Ready** or retryable **Failed**. Each `Warming` entry carries
+the namespace generation, start time, and a unique attempt id. The returned ownership permit is
+the only attempt allowed to finish that entry; namespace invalidation retires it, so a late old
+completion cannot erase or mark ready a newer warm. Dropping a permit transitions its still-owned
+entry to `Failed`, making cancellation and panic retryable rather than leaving stale ownership.
+
+The startup callers continue to await each claimed warm before advancing, while
+`ensure_ann_background` still spawns and returns immediately. `Ready` suppresses duplicate work;
+both empty and operational `Failed` outcomes may be retried by a later request. An explicit worker
+outcome keeps a failed Stale-rebuild replacement retryable even though ADR-079 rule 8 leaves its
+older bridge available to search. Search's bounded wait and FTS degradation timing are unchanged.
 
 ## `AnnState::generations` (per-namespace write-generation counter, issue #770)
 

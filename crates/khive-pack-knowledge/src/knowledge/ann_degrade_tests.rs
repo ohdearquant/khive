@@ -4,12 +4,13 @@
 //! and [`vamana::set_warm_wait_timeout_override_ms`] are `pub(crate)` — inaccessible
 //! from the external `tests/` directory.
 //!
-//! ## P1 — `suggest` and `compose` degrade path
+//! ## P1 — `search`, `suggest`, and `compose` degrade path
 //!
 //! When the ANN is warming but not yet loaded and the bounded wait times out,
-//! `suggest` must set `ann_unavailable: true` rather than silently returning zero
-//! results.  `compose` in auto-mode calls `suggest` internally and must propagate
-//! the flag in `data["ann_unavailable"]`.
+//! `search` and `suggest` must set `ann_unavailable: true` rather than silently
+//! returning zero results. `search` preserves its existing partial-result policy:
+//! a lexical hit remains usable without the advisory. `compose` in auto-mode calls
+//! `suggest` internally and must propagate the flag in `data["ann_unavailable"]`.
 //!
 //! The prerequisite for `ann_unavailable` is a non-empty corpus (vectors in the
 //! store); we satisfy this by upsert + `knowledge.index` through the registry
@@ -248,16 +249,84 @@ impl Drop for TimeoutOverrideReset {
     }
 }
 
-/// Serializes the two timeout-override tests. Both mutate the process-global
+/// Serializes the timeout-override tests. They mutate the process-global
 /// `ANN_WARM_WAIT_TIMEOUT_OVERRIDE_MS`, and `TimeoutOverrideReset` clears it on
 /// drop. Under Cargo's parallel test runner, one test's reset could otherwise
-/// fire while the other is mid-flight, dropping it back to the 5s production
+/// fire while another is mid-flight, dropping it back to the 5s production
 /// timeout (a latency-order-dependent slow run). `tokio::sync::Mutex` is
 /// await-safe (no `clippy::await_holding_lock`) and does not poison on panic,
 /// so a failing test still releases the lock. Each test declares the guard
 /// before `TimeoutOverrideReset`, so on exit the reset (override -> 0) runs
 /// first and the lock releases only after, handing a clean state to the next.
 static TIMEOUT_OVERRIDE_SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+// ── P1: search preserves its timeout fallback policy
+
+/// `search` reports ANN unavailability only when warming times out, the corpus
+/// is non-empty, and lexical search also found no result. A lexical hit remains
+/// a valid partial result without the advisory.
+#[tokio::test]
+async fn search_preserves_timeout_fallback_policy() {
+    let _serial = TIMEOUT_OVERRIDE_SERIAL.lock().await;
+    vamana::set_warm_wait_timeout_override_ms(50);
+    let _reset = TimeoutOverrideReset;
+
+    let rt = rt_with_fake_embedder();
+    let registry = build_registry(&rt);
+    registry
+        .dispatch(
+            "knowledge.upsert_atoms",
+            json!({
+                "atoms": [{
+                    "slug": "degrade-search-atom",
+                    "name": "Degrade Search Atom",
+                    "finalized": true,
+                    "content": "lexicalsentinel transformer retrieval corpus benchmark search latency vector index nearest neighbor ranking fusion embedding cosine similarity attention encoder decoder positional normalization residual connection"
+                }]
+            }),
+        )
+        .await
+        .expect("upsert atom");
+    registry
+        .dispatch("knowledge.index", json!({ "rebuild_ann": false }))
+        .await
+        .expect("index");
+
+    let ann = vamana::new_shared();
+    let key = vamana::AnnKey::new("local", rt.default_embedder_name());
+    vamana::simulate_warming_in_flight(&ann, key);
+    let token = rt.authorize(Namespace::local()).expect("authorize");
+
+    // The domain gate drops the seeded non-domain atom, including from the
+    // small-corpus full-scan fallback, so lexical search is genuinely empty.
+    let empty = KnowledgeHandlers::search(
+        &rt,
+        &token,
+        json!({ "query": "unfindablegossamer", "kind": "domain", "rerank": false }),
+        &ann,
+    )
+    .await
+    .expect("empty search must not Err");
+    assert_eq!(empty["total"], 0, "result: {empty}");
+    assert_eq!(empty["ann_unavailable"], true, "result: {empty}");
+
+    let lexical = KnowledgeHandlers::search(
+        &rt,
+        &token,
+        json!({ "query": "lexicalsentinel", "rerank": false }),
+        &ann,
+    )
+    .await
+    .expect("lexical fallback search must not Err");
+    assert!(
+        lexical["total"].as_u64().unwrap_or_default() > 0,
+        "lexical fallback must retain its hit; result: {lexical}"
+    );
+    assert!(
+        lexical.get("ann_unavailable").is_none(),
+        "search preserves its existing no-advisory policy when FTS found hits; result: {lexical}"
+    );
+}
 
 // ── P1a: suggest sets ann_unavailable when warming times out ─────────────────
 
