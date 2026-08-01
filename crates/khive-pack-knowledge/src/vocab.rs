@@ -322,6 +322,12 @@ pub(crate) static KNOWLEDGE_HANDLERS: [HandlerDef; 19] = [
         category: VerbCategory::Assertive,
         params: &[
             ParamDef {
+                name: "namespace",
+                param_type: "string",
+                required: false,
+                description: "Exact-match read namespace override (ADR-007 Rev 6 escape hatch). When absent, compose uses the caller token's namespace. When present, atom, domain, section, KG-blend, and profile-weight reads use exactly this namespace; invalid values are rejected.",
+            },
+            ParamDef {
                 name: "domain_ids",
                 param_type: "array<string>",
                 required: false,
@@ -690,6 +696,7 @@ mod tests {
             (
                 "knowledge.compose",
                 &[
+                    "namespace",
                     "domain_ids",
                     "atom_ids",
                     "query",

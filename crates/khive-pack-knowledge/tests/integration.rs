@@ -10,8 +10,12 @@
 
 use khive_pack_kg::KgPack;
 use khive_pack_knowledge::KnowledgePack;
-use khive_runtime::{KhiveRuntime, PackRegistry, RuntimeError, VerbRegistry, VerbRegistryBuilder};
+use khive_runtime::{
+    Gate, GateDecision, GateError, GateRequest, KhiveRuntime, PackRegistry, RequestIdentity,
+    RuntimeError, VerbRegistry, VerbRegistryBuilder,
+};
 use serde_json::{json, Value};
+use std::sync::{Arc, Mutex};
 
 // ── test fixture ──────────────────────────────────────────────────────────────
 
@@ -21,6 +25,29 @@ fn rt() -> KhiveRuntime {
 
 struct Fixture {
     registry: VerbRegistry,
+}
+
+#[derive(Debug, Default)]
+struct NestedProfileIdentityGate {
+    requests: Mutex<Vec<(String, String, String)>>,
+}
+
+impl Gate for NestedProfileIdentityGate {
+    fn check(&self, req: &GateRequest) -> Result<GateDecision, GateError> {
+        self.requests.lock().expect("gate request lock").push((
+            req.verb.clone(),
+            req.actor.id.clone(),
+            req.namespace.as_str().to_string(),
+        ));
+        if matches!(req.verb.as_str(), "brain.resolve" | "brain.profile")
+            && req.actor.id != "requester"
+        {
+            return Ok(GateDecision::deny(
+                "nested profile reads require the per-request principal",
+            ));
+        }
+        Ok(GateDecision::allow())
+    }
 }
 
 impl Fixture {
@@ -1865,6 +1892,184 @@ async fn compose_returns_markdown_for_atoms() {
     assert_eq!(count, 2);
 }
 
+/// #1505: the public namespace parameter is an exact compose scope, not a
+/// widened visible set. Identical slugs in local and a measurement arm must
+/// resolve to the arm's atom only, while an absent parameter preserves the
+/// unchanged local default.
+#[tokio::test]
+async fn compose_namespace_selects_exact_atom_corpus() {
+    let f = pack(rt());
+    let shared_slug = "namespace-compose-target";
+
+    f.dispatch(
+        "knowledge.upsert_atoms",
+        json!({
+            "atoms": [{
+                "slug": shared_slug,
+                "name": "Local Compose Marker",
+                "content": "Local corpus marker for namespace composition regression coverage with enough distinct retrieval words to satisfy the atom content validation contract and remain readable in generated markdown output."
+            }]
+        }),
+    )
+    .await
+    .expect("upsert local atom");
+    f.dispatch(
+        "knowledge.upsert_atoms",
+        json!({
+            "namespace": "bench-arm-a",
+            "atoms": [{
+                "slug": shared_slug,
+                "name": "Bench Arm Compose Marker",
+                "content": "Bench arm corpus marker for exact namespace composition regression coverage with enough distinct retrieval words to satisfy the atom content validation contract and remain readable in generated markdown output."
+            }]
+        }),
+    )
+    .await
+    .expect("upsert bench-arm atom");
+
+    let arm = f
+        .dispatch(
+            "knowledge.compose",
+            json!({
+                "namespace": "bench-arm-a",
+                "atom_ids": [shared_slug],
+                "query": "namespace composition marker",
+            }),
+        )
+        .await
+        .expect("compose exact bench-arm namespace");
+    let arm_atom = &arm["data"]["atoms"][0];
+    assert_eq!(arm_atom["name"], json!("Bench Arm Compose Marker"));
+    assert!(arm["data"]["markdown"]
+        .as_str()
+        .expect("arm markdown")
+        .contains("Bench arm corpus marker"));
+    assert!(
+        !arm["data"]["markdown"]
+            .as_str()
+            .expect("arm markdown")
+            .contains("Local corpus marker"),
+        "exact arm compose must not blend the same slug from local"
+    );
+
+    let local = f
+        .dispatch(
+            "knowledge.compose",
+            json!({
+                "atom_ids": [shared_slug],
+                "query": "namespace composition marker",
+            }),
+        )
+        .await
+        .expect("compose unchanged local default");
+    assert_eq!(
+        local["data"]["atoms"][0]["name"],
+        json!("Local Compose Marker")
+    );
+}
+
+/// ADR-096/#1505: nested brain.resolve/profile calls must carry the outer
+/// request's principal and exact namespace, not the registry's baked daemon
+/// identity. The gate denies either nested read under any other actor.
+#[tokio::test]
+async fn compose_nested_profile_reads_preserve_request_identity() {
+    use khive_pack_brain::BrainPack;
+
+    let rt = rt();
+    let gate = Arc::new(NestedProfileIdentityGate::default());
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(KgPack::new(rt.clone()));
+    builder.register(BrainPack::new(rt.clone()));
+    builder.register(KnowledgePack::new(rt.clone()));
+    builder.with_gate(gate.clone());
+    builder.with_actor_id(Some("daemon".to_string()));
+    let registry = builder.build().expect("registry");
+    let arm_ns = "bench-arm-a";
+
+    registry
+        .dispatch(
+            "brain.create_profile",
+            json!({
+                "namespace": arm_ns,
+                "name": "requester-compose-v1",
+                "consumer_kind": "knowledge_compose",
+            }),
+        )
+        .await
+        .expect("create arm profile");
+    registry
+        .dispatch(
+            "brain.activate",
+            json!({
+                "namespace": arm_ns,
+                "profile_id": "requester-compose-v1",
+            }),
+        )
+        .await
+        .expect("activate arm profile");
+    registry
+        .dispatch(
+            "brain.bind",
+            json!({
+                "namespace": arm_ns,
+                "profile_id": "requester-compose-v1",
+                "consumer_kind": "knowledge_compose",
+            }),
+        )
+        .await
+        .expect("bind arm profile");
+    registry
+        .dispatch(
+            "knowledge.upsert_atoms",
+            json!({
+                "namespace": arm_ns,
+                "atoms": [{
+                    "slug": "requester-compose-atom",
+                    "name": "Requester Compose Atom",
+                    "content": "Per-request identity propagation for nested profile reads with enough retrieval corpus words to satisfy validation and produce a deterministic briefing.",
+                }]
+            }),
+        )
+        .await
+        .expect("upsert arm atom");
+    gate.requests.lock().expect("gate request lock").clear();
+
+    registry
+        .dispatch_with_identity(
+            "knowledge.compose",
+            json!({
+                "namespace": arm_ns,
+                "atom_ids": ["requester-compose-atom"],
+                "query": "per request identity propagation",
+            }),
+            Some(RequestIdentity {
+                namespace: "local".to_string(),
+                actor_id: Some("requester".to_string()),
+                visible_namespaces: vec!["local".to_string()],
+                request_id: Some(1505),
+            }),
+        )
+        .await
+        .expect("compose with request-scoped nested profile reads");
+
+    let requests = gate.requests.lock().expect("gate request lock");
+    let nested: Vec<_> = requests
+        .iter()
+        .filter(|(verb, _, _)| matches!(verb.as_str(), "brain.resolve" | "brain.profile"))
+        .collect();
+    assert_eq!(
+        nested.len(),
+        2,
+        "bound compose must perform both nested profile reads: {requests:?}"
+    );
+    assert!(
+        nested
+            .iter()
+            .all(|(_, actor, namespace)| actor == "requester" && namespace == arm_ns),
+        "nested Gate checks must preserve requester + exact arm identity: {nested:?}"
+    );
+}
+
 #[tokio::test]
 async fn compose_returns_markdown_for_domain() {
     let f = pack(rt());
@@ -3183,6 +3388,117 @@ mod kg_blend {
         assert!(
             md.contains("ZipCache"),
             "markdown must render the blended concept's name, got: {md}"
+        );
+    }
+
+    /// #1505 direct-call exactness: even when the authorized token's primary
+    /// namespace matches the explicit arm, a broader visible set must be
+    /// narrowed before KG blending. Otherwise a local-only entity leaks into
+    /// an arm briefing while corpus rows remain correctly arm-scoped.
+    #[tokio::test]
+    async fn direct_compose_narrows_matching_broad_token_before_kg_blend() {
+        use khive_runtime::PackRuntime;
+
+        let rt = rt_with_marker_embedder();
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(KgPack::new(rt.clone()));
+        let registry = builder.build().expect("kg registry");
+        let local_entity = registry
+            .dispatch(
+                "create",
+                json!({
+                    "kind": "concept",
+                    "name": "LocalOnlyZipCache",
+                    "description": format!(
+                        "{MARKER} local-only paged KV cache quantization technique"
+                    ),
+                }),
+            )
+            .await
+            .expect("create local-only KG entity")["id"]
+            .as_str()
+            .expect("entity id")
+            .to_string();
+
+        let arm_ns = Namespace::parse("bench-arm-a").expect("arm namespace");
+        let arm_entity = registry
+            .dispatch(
+                "create",
+                json!({
+                    "namespace": arm_ns.as_str(),
+                    "kind": "concept",
+                    "name": "ArmOnlyZipCache",
+                    "description": format!(
+                        "{MARKER} arm-only paged KV cache quantization technique"
+                    ),
+                }),
+            )
+            .await
+            .expect("create arm-only KG entity")["id"]
+            .as_str()
+            .expect("arm entity id")
+            .to_string();
+        let broad_arm_token = rt
+            .authorize_with_visibility(arm_ns.clone(), vec![Namespace::local()])
+            .expect("arm token with local visibility");
+        let knowledge = KnowledgePack::new(rt.clone());
+        knowledge
+            .dispatch(
+                "knowledge.upsert_atoms",
+                json!({
+                    "atoms": [{
+                        "slug": "arm-kg-blend-atom",
+                        "name": "Arm KG Blend Atom",
+                        "content": format!("{MARKER} {OVERLAP_CONTENT}"),
+                        "finalized": true,
+                    }]
+                }),
+                &registry,
+                &broad_arm_token,
+            )
+            .await
+            .expect("upsert arm atom");
+        knowledge
+            .dispatch(
+                "knowledge.upsert_domains",
+                json!({
+                    "domains": [{
+                        "slug": "arm-kg-blend-domain",
+                        "name": "Arm KG Blend Domain",
+                        "description": OVERLAP_CONTENT,
+                        "members": ["arm-kg-blend-atom"],
+                    }]
+                }),
+                &registry,
+                &broad_arm_token,
+            )
+            .await
+            .expect("upsert arm domain");
+
+        let resp = knowledge
+            .dispatch(
+                "knowledge.compose",
+                json!({
+                    "namespace": arm_ns.as_str(),
+                    "domain_ids": ["arm-kg-blend-domain"],
+                    "query": QUERY,
+                }),
+                &registry,
+                &broad_arm_token,
+            )
+            .await
+            .expect("direct exact-arm compose");
+        let entities = resp["data"]["entities"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            entities.iter().any(|entity| entity["id"] == arm_entity),
+            "the arm KG candidate must prove the blend leg ran: {entities:?}"
+        );
+        assert!(
+            entities.iter().all(|entity| entity["id"] != local_entity),
+            "local-only KG entity leaked through a matching but broad direct-call token: {entities:?}"
         );
     }
 

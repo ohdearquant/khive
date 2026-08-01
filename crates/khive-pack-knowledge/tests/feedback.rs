@@ -3,7 +3,7 @@
 //! Tier order (exclusive flow per ADR-035):
 //! 1. Explicit brain profile in pack config → route via `brain.feedback`, return early
 //! 2. Namespace-bound profile via `brain.resolve(consumer_kind="knowledge_compose")`, matched_binding=true → return early
-//! 3. Global section_posteriors → update pack-local prior (only when tiers 1 and 2 do not resolve)
+//! 3. Namespace-keyed section_posteriors → update pack-local prior (only when tiers 1 and 2 do not resolve)
 
 use khive_pack_brain::BrainPack;
 use khive_pack_kg::KgPack;
@@ -366,7 +366,7 @@ async fn feedback_tier2_actor_bound_profile_credited() {
 /// unconditionally (before tiers 1/2 were checked), and tier-2 used consumer_kind
 /// "knowledge.search" which never matched recall bindings.
 #[tokio::test]
-async fn feedback_tier3_global_fallback_no_explicit_binding() {
+async fn feedback_tier3_namespace_fallback_no_explicit_binding() {
     // No explicit brain_profile, brain pack loaded but NO explicit binding.
     let rt = make_rt(None, true);
     let ns = Namespace::parse("local").expect("ns");
@@ -425,7 +425,7 @@ async fn feedback_tier3_global_fallback_no_explicit_binding() {
     );
 }
 
-/// Tier-3 without brain pack: feedback always falls through to global prior.
+/// Tier-3 without brain pack: feedback falls through to its namespace-local prior.
 #[tokio::test]
 async fn feedback_tier3_no_brain_pack() {
     let rt = make_rt(None, false);
