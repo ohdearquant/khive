@@ -1458,6 +1458,36 @@ async fn w4_c4_feedback_accepts_valid_target_and_profile() {
     assert_eq!(result["signal"], json!("useful"));
 }
 
+#[tokio::test]
+async fn feedback_success_counts_one_event_row_for_each_append_path() {
+    for signal in ["explicit_positive", "correction", "implicit_positive"] {
+        let (pack, rt) = make_pack();
+        let registry = empty_registry();
+        let token = rt.authorize(Namespace::local()).unwrap();
+        let target = create_test_entity(&rt, &token).await;
+        let usage = khive_storage::usage::UsageContext::new();
+
+        let result = khive_storage::usage::scope(
+            usage.clone(),
+            pack.dispatch(
+                "brain.feedback",
+                json!({"target_id": target, "signal": signal}),
+                &registry,
+                &token,
+            ),
+        )
+        .await
+        .expect("feedback append must commit");
+
+        assert_eq!(result["emitted"], json!(true));
+        assert_eq!(
+            usage.snapshot()["event_rows"],
+            json!(1u64),
+            "signal {signal:?} must count its one committed public event row"
+        );
+    }
+}
+
 /// Regression (#831): a note-target `brain.feedback` signal must resolve via
 /// `observed_as_signal` (previously unreachable — the decoder hard-coded
 /// `ReferentKind::Entity`). See crates/khive-pack-brain/docs/dispatch-namespace-isolation.md#feedback_note_target_resolves_through_observed_as_signal.
@@ -4219,20 +4249,25 @@ async fn feedback_revalidates_lifecycle_inside_cross_process_transaction() {
     let feedback_token_task = Arc::clone(&feedback_token);
     let registry_task = Arc::clone(&registry);
     let target_for_task = target.clone();
-    let feedback_task = tokio::spawn(async move {
-        feedback_pack_task
-            .dispatch(
-                "brain.feedback",
-                json!({
-                    "target_id": target_for_task,
-                    "signal": "implicit_positive",
-                    "served_by_profile_id": profile_id,
-                }),
-                &registry_task,
-                &feedback_token_task,
-            )
-            .await
-    });
+    let feedback_usage = khive_storage::usage::UsageContext::new();
+    let feedback_usage_task = feedback_usage.clone();
+    let feedback_task = tokio::spawn(khive_storage::usage::scope(
+        feedback_usage_task,
+        async move {
+            feedback_pack_task
+                .dispatch(
+                    "brain.feedback",
+                    json!({
+                        "target_id": target_for_task,
+                        "signal": "implicit_positive",
+                        "served_by_profile_id": profile_id,
+                    }),
+                    &registry_task,
+                    &feedback_token_task,
+                )
+                .await
+        },
+    ));
 
     reached_rx
         .await
@@ -4255,6 +4290,10 @@ async fn feedback_revalidates_lifecycle_inside_cross_process_transaction() {
     assert!(
         matches!(error, RuntimeError::InvalidInput(ref message) if message.contains("archived")),
         "rebased feedback rejection must report the archived lifecycle: {error:?}"
+    );
+    assert!(
+        feedback_usage.snapshot().get("event_rows").is_none(),
+        "a lifecycle rejection inside the atomic unit must not count an event row"
     );
 
     let profile = observer_pack
@@ -5668,8 +5707,10 @@ mod adr081_retune_driver_tests {
         .await
         .expect("record_serve");
 
-        let first = pack
-            .dispatch(
+        let first_usage = khive_storage::usage::UsageContext::new();
+        let first = khive_storage::usage::scope(
+            first_usage.clone(),
+            pack.dispatch(
                 "brain.feedback",
                 json!({
                     "target_id": target,
@@ -5679,15 +5720,19 @@ mod adr081_retune_driver_tests {
                 }),
                 &registry,
                 &token,
-            )
-            .await
-            .expect("first emit must succeed");
+            ),
+        )
+        .await
+        .expect("first emit must succeed");
         assert_eq!(first["emitted"], json!(true));
+        assert_eq!(first_usage.snapshot()["event_rows"], json!(1u64));
 
         let sal_beta_after_first = pack.snapshot().balanced_recall.salience.beta();
 
-        let second = pack
-            .dispatch(
+        let second_usage = khive_storage::usage::UsageContext::new();
+        let second = khive_storage::usage::scope(
+            second_usage.clone(),
+            pack.dispatch(
                 "brain.feedback",
                 json!({
                     "target_id": target,
@@ -5697,15 +5742,20 @@ mod adr081_retune_driver_tests {
                 }),
                 &registry,
                 &token,
-            )
-            .await
-            .expect("duplicate emit must be a no-op, not an error");
+            ),
+        )
+        .await
+        .expect("duplicate emit must be a no-op, not an error");
         assert_eq!(
             second["deduped"],
             json!(true),
             "second emit with the same (scorer_run_id, serve_ledger_id) must be deduped"
         );
         assert_eq!(second["emitted"], json!(false));
+        assert!(
+            second_usage.snapshot().get("event_rows").is_none(),
+            "deduped feedback must not count an event row"
+        );
 
         let sal_beta_after_second = pack.snapshot().balanced_recall.salience.beta();
         assert_eq!(
@@ -6354,16 +6404,23 @@ mod durable_write_tests {
                 .expect("drop brain_profile_snapshots to simulate schema drift");
         }
 
-        let err = pack
-            .dispatch(
+        let usage = khive_storage::usage::UsageContext::new();
+        let err = khive_storage::usage::scope(
+            usage.clone(),
+            pack.dispatch(
                 "brain.feedback",
                 json!({"target_id": target, "signal": "useful"}),
                 &registry,
                 &token,
-            )
-            .await
-            .expect_err("brain.feedback must fail when brain-specific persistence fails");
+            ),
+        )
+        .await
+        .expect_err("brain.feedback must fail when brain-specific persistence fails");
         let _ = err;
+        assert!(
+            usage.snapshot().get("event_rows").is_none(),
+            "a rolled-back feedback append must not count an event row"
+        );
 
         let total_after = pack.snapshot().balanced_recall.total_events;
         assert_eq!(

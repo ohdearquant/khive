@@ -1671,6 +1671,7 @@ impl BrainPack {
                 "scorer_run_id": p.scorer_run_id,
             }));
         };
+        khive_storage::usage::count(khive_storage::usage::UsageUnit::EventRows, 1);
 
         // lattice-router: build the context vector from the now-published live
         // state and forward through the fann network. This is a best-effort
