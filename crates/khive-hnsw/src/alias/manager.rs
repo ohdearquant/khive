@@ -43,6 +43,8 @@ pub struct MigrationReport {
 }
 
 /// Manages named collections and aliases for zero-downtime HNSW index switching.
+///
+/// Methods that need both maps always acquire `aliases` before `collections`.
 pub struct IndexAliasManager {
     /// Collection name -> Collection data.
     /// Protected by RwLock: reads (search) take shared lock, writes (register/remove)
@@ -97,15 +99,15 @@ impl IndexAliasManager {
     /// Create an alias pointing to an existing collection.
     /// Fails if the alias already exists or the collection does not exist.
     pub fn create_alias(&self, alias: &str, collection: &str) -> Result<(), AliasError> {
-        // Verify collection exists
-        {
-            let collections = self.collections.read();
-            if !collections.contains_key(collection) {
-                return Err(AliasError::CollectionNotFound(collection.to_string()));
-            }
+        // Keep the canonical aliases -> collections order and hold both
+        // through insertion so retirement cannot remove the target between
+        // its existence check and publishing the alias.
+        let mut aliases = self.aliases.write();
+        let collections = self.collections.read();
+        if !collections.contains_key(collection) {
+            return Err(AliasError::CollectionNotFound(collection.to_string()));
         }
 
-        let mut aliases = self.aliases.write();
         if aliases.contains_key(alias) {
             return Err(AliasError::AliasAlreadyExists(alias.to_string()));
         }
@@ -179,21 +181,49 @@ impl IndexAliasManager {
         new_collection: &str,
         validator: Option<&dyn IndexValidator>,
     ) -> Result<String, AliasError> {
-        // Verify new collection exists and optionally validate
-        {
+        self.switch_alias_inner(alias, new_collection, validator, || {})
+    }
+
+    fn switch_alias_inner(
+        &self,
+        alias: &str,
+        new_collection: &str,
+        validator: Option<&dyn IndexValidator>,
+        before_publish: impl FnOnce(),
+    ) -> Result<String, AliasError> {
+        // Validate before taking the aliases write lock so readers and
+        // unrelated alias operations can continue during validation.
+        let validated_index = if let Some(v) = validator {
             let collections = self.collections.read();
             let collection = collections
                 .get(new_collection)
                 .ok_or_else(|| AliasError::CollectionNotFound(new_collection.to_string()))?;
+            let index = Arc::clone(&collection.index);
+            v.validate(&index)?;
+            drop(collections);
+            Some(index)
+        } else {
+            None
+        };
 
-            if let Some(v) = validator {
-                v.validate(&collection.index)?;
-            }
+        before_publish();
+
+        // Keep the canonical aliases -> collections order and hold both
+        // through the swap so retirement cannot remove the target between
+        // its existence check and publishing the alias.
+        let mut aliases = self.aliases.write();
+        let collections = self.collections.read();
+        let collection = collections
+            .get(new_collection)
+            .ok_or_else(|| AliasError::CollectionNotFound(new_collection.to_string()))?;
+        if validated_index
+            .as_ref()
+            .is_some_and(|validated| !Arc::ptr_eq(validated, &collection.index))
+        {
+            // The validated target disappeared even though its name was reused.
+            return Err(AliasError::CollectionNotFound(new_collection.to_string()));
         }
 
-        // Swap the alias (exclusive lock, but the critical section is just
-        // a HashMap insert -- nanoseconds)
-        let mut aliases = self.aliases.write();
         let old_collection = aliases
             .get(alias)
             .ok_or_else(|| AliasError::AliasNotFound(alias.to_string()))?
@@ -203,7 +233,53 @@ impl IndexAliasManager {
         Ok(old_collection)
     }
 
+    /// Test-only variant that pauses after validation and before publishing
+    /// the alias, used to exercise replacement of the validated collection.
+    #[cfg(test)]
+    fn switch_alias_with_test_hook(
+        &self,
+        alias: &str,
+        new_collection: &str,
+        validator: Option<&dyn IndexValidator>,
+        hook: impl FnOnce(),
+    ) -> Result<String, AliasError> {
+        self.switch_alias_inner(alias, new_collection, validator, hook)
+    }
+
+    fn retire_collection(
+        &self,
+        collection: &str,
+        expected_index: Option<&Arc<HnswIndex>>,
+    ) -> Result<Arc<ReaderCounter>, AliasError> {
+        // Keep the canonical aliases -> collections order and hold both
+        // through removal so no alias can begin referencing the target
+        // after the check succeeds.
+        let aliases = self.aliases.read();
+        let mut collections = self.collections.write();
+        let registered = collections
+            .get(collection)
+            .ok_or_else(|| AliasError::CollectionNotFound(collection.to_string()))?;
+        if expected_index.is_some_and(|expected| !Arc::ptr_eq(expected, &registered.index)) {
+            // Do not retire a replacement that merely reused the expected name.
+            return Err(AliasError::CollectionNotFound(collection.to_string()));
+        }
+        if aliases.values().any(|target| target == collection) {
+            return Err(AliasError::CollectionInUse(collection.to_string()));
+        }
+
+        let coll = collections
+            .remove(collection)
+            .expect("collection existence checked while holding the write lock");
+        let counter = Arc::clone(&coll.readers);
+        drop(collections);
+        drop(aliases);
+        Ok(counter)
+    }
+
     /// Retire a collection from manager ownership and wait for its readers to drain.
+    ///
+    /// Returns [`AliasError::CollectionInUse`] without changing either map
+    /// when any alias still references the collection.
     ///
     /// The collection is removed from `self.collections` *before* waiting,
     /// not after: outstanding `ReaderGuard`s hold their own `Arc<HnswIndex>`
@@ -212,13 +288,7 @@ impl IndexAliasManager {
     /// owns the retired collection forever -- its memory is reclaimed
     /// normally once the last guard drops (#418).
     pub async fn drain_and_remove(&self, collection: &str) -> Result<(), AliasError> {
-        let counter = {
-            let mut collections = self.collections.write();
-            let coll = collections
-                .remove(collection)
-                .ok_or_else(|| AliasError::CollectionNotFound(collection.to_string()))?;
-            Arc::clone(&coll.readers)
-        };
+        let counter = self.retire_collection(collection, None)?;
 
         // Wait for readers to drain (async, no locks held). A timeout here
         // no longer leaves the collection manager-owned -- it was already
@@ -303,9 +373,9 @@ impl IndexAliasManager {
                 Err(AliasError::ValidationFailed {
                     recall, min_recall, ..
                 }) => {
-                    // Remove the new collection since validation failed
-                    let mut colls = self.collections.write();
-                    colls.remove(&new_collection_name);
+                    // Preserve the validation error even if another alias now
+                    // owns the candidate or its name refers to a replacement.
+                    let _ = self.retire_collection(&new_collection_name, Some(&index));
                     return Err(AliasError::ValidationFailed {
                         reason: "recall below threshold".to_string(),
                         recall,
@@ -313,9 +383,7 @@ impl IndexAliasManager {
                     });
                 }
                 Err(e) => {
-                    // Remove the new collection since validation failed
-                    let mut colls = self.collections.write();
-                    colls.remove(&new_collection_name);
+                    let _ = self.retire_collection(&new_collection_name, Some(&index));
                     return Err(e);
                 }
             }
@@ -334,13 +402,17 @@ impl IndexAliasManager {
         let swap_drain_duration = swap_drain_start.elapsed();
         let total_duration = total_start.elapsed();
 
-        // Log drain timeout but don't fail the migration -- the alias is
-        // already switched, so new queries go to the new index.
-        if let Err(AliasError::DrainTimeout { .. }) = &drain_result {
-            // The old collection is already retired from manager ownership;
-            // we report this in the migration report but don't fail.
-        } else {
-            drain_result?;
+        match drain_result {
+            Ok(()) => {}
+            Err(AliasError::DrainTimeout { .. }) => {
+                // The old collection is already retired from manager ownership;
+                // report the completed migration without waiting longer.
+            }
+            Err(AliasError::CollectionInUse(_)) => {
+                // Another alias still needs the old collection, so leaving it
+                // registered is the successful migration outcome for this alias.
+            }
+            Err(error) => return Err(error),
         }
 
         Ok(MigrationReport {
@@ -514,6 +586,49 @@ mod tests {
         assert_eq!(mgr.resolve_alias("active"), Some("v1".to_string()));
     }
 
+    /// Regression for #1438: a validated index cannot be retired and replaced
+    /// under the same name before the alias is published.
+    #[tokio::test]
+    async fn test_switch_alias_rejects_replacement_after_validation() {
+        struct PassValidator;
+
+        impl IndexValidator for PassValidator {
+            fn validate(&self, _index: &HnswIndex) -> Result<(), AliasError> {
+                Ok(())
+            }
+        }
+
+        let mgr = Arc::new(IndexAliasManager::new(Duration::from_secs(1)));
+        mgr.register_collection("v1", make_index(4, 5)).unwrap();
+        mgr.register_collection("v2", make_index(4, 10)).unwrap();
+        mgr.create_alias("active", "v1").unwrap();
+
+        let (validated_tx, validated_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let switch_manager = Arc::clone(&mgr);
+        let switch = std::thread::spawn(move || {
+            switch_manager.switch_alias_with_test_hook("active", "v2", Some(&PassValidator), || {
+                validated_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            })
+        });
+
+        validated_rx.recv().unwrap();
+        mgr.drain_and_remove("v2").await.unwrap();
+        mgr.register_collection("v2", make_index(4, 12)).unwrap();
+        release_tx.send(()).unwrap();
+
+        assert!(matches!(
+            switch.join().unwrap(),
+            Err(AliasError::CollectionNotFound(name)) if name == "v2"
+        ));
+        assert_eq!(mgr.resolve_alias("active"), Some("v1".to_string()));
+        assert_eq!(mgr.acquire_reader("active").unwrap().len(), 5);
+
+        mgr.create_alias("replacement", "v2").unwrap();
+        assert_eq!(mgr.acquire_reader("replacement").unwrap().len(), 12);
+    }
+
     #[tokio::test]
     async fn test_drain_and_remove() {
         let mgr = IndexAliasManager::new(Duration::from_secs(1));
@@ -522,6 +637,52 @@ mod tests {
         // No readers -- drain should succeed immediately
         mgr.drain_and_remove("v1").await.unwrap();
         assert_eq!(mgr.collection_count(), 0);
+    }
+
+    /// Regression for #1438: cleanup of a known candidate must not remove a
+    /// different index that later reuses the same collection name.
+    #[tokio::test]
+    async fn test_retire_collection_preserves_same_name_replacement() {
+        let mgr = IndexAliasManager::new(Duration::from_secs(1));
+        mgr.register_collection("v1", make_index(4, 5)).unwrap();
+        let original = Arc::clone(&mgr.collections.read().get("v1").unwrap().index);
+
+        mgr.drain_and_remove("v1").await.unwrap();
+        mgr.register_collection("v1", make_index(4, 10)).unwrap();
+
+        assert!(matches!(
+            mgr.retire_collection("v1", Some(&original)),
+            Err(AliasError::CollectionNotFound(name)) if name == "v1"
+        ));
+        mgr.create_alias("active", "v1").unwrap();
+        assert_eq!(mgr.acquire_reader("active").unwrap().len(), 10);
+    }
+
+    /// Regression for #1438: rejecting retirement must leave every alias and
+    /// collection usable, including aliases unrelated to the rejected target.
+    #[tokio::test]
+    async fn test_drain_and_remove_rejects_aliased_collection_without_state_change() {
+        let mgr = IndexAliasManager::new(Duration::from_secs(1));
+        mgr.register_collection("v1", make_index(4, 5)).unwrap();
+        mgr.register_collection("v2", make_index(4, 10)).unwrap();
+        mgr.create_alias("active", "v1").unwrap();
+        mgr.create_alias("mirror", "v1").unwrap();
+        mgr.create_alias("fallback", "v2").unwrap();
+
+        let result = mgr.drain_and_remove("v1").await;
+        assert!(matches!(
+            result,
+            Err(AliasError::CollectionInUse(name)) if name == "v1"
+        ));
+
+        assert_eq!(mgr.collection_count(), 2);
+        assert_eq!(mgr.alias_count(), 3);
+        assert_eq!(mgr.resolve_alias("active"), Some("v1".to_string()));
+        assert_eq!(mgr.resolve_alias("mirror"), Some("v1".to_string()));
+        assert_eq!(mgr.resolve_alias("fallback"), Some("v2".to_string()));
+        assert_eq!(mgr.acquire_reader("active").unwrap().len(), 5);
+        assert_eq!(mgr.acquire_reader("mirror").unwrap().len(), 5);
+        assert_eq!(mgr.acquire_reader("fallback").unwrap().len(), 10);
     }
 
     #[tokio::test]
@@ -577,6 +738,114 @@ mod tests {
         // The alias should now point to the new collection
         let guard = mgr.acquire_reader("active").unwrap();
         assert_eq!(guard.len(), 8);
+        assert_eq!(mgr.reader_count("v1"), None);
+        assert_eq!(mgr.collection_count(), 1);
+    }
+
+    /// Regression for #1438: migrating one alias must keep an old collection
+    /// registered when another alias still targets it.
+    #[tokio::test]
+    async fn test_migrate_preserves_old_collection_used_by_another_alias() {
+        let mgr = Arc::new(IndexAliasManager::new(Duration::from_secs(5)));
+        mgr.register_collection("v1", make_index(4, 5)).unwrap();
+        mgr.create_alias("active", "v1").unwrap();
+        mgr.create_alias("fallback", "v1").unwrap();
+
+        let vectors: Vec<(NodeId, Vec<f32>)> = (0..8u8)
+            .map(|i| (NodeId::new([i; 16]), vec![i as f32; 4]))
+            .collect();
+        let report = mgr
+            .migrate("active", vectors, HnswConfig::with_dimensions(4), None)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            mgr.resolve_alias("active"),
+            Some(report.new_collection.clone())
+        );
+        assert_eq!(mgr.resolve_alias("fallback"), Some("v1".to_string()));
+        assert_eq!(mgr.acquire_reader("active").unwrap().len(), 8);
+        assert_eq!(mgr.acquire_reader("fallback").unwrap().len(), 5);
+        assert_eq!(mgr.collection_count(), 2);
+    }
+
+    /// Regression for #1438: validation cleanup must retain a failed candidate
+    /// once an alias begins referencing it.
+    #[test]
+    fn test_migrate_validation_failure_preserves_aliased_candidate() {
+        use std::sync::{mpsc, Mutex};
+
+        struct BlockingFailValidator {
+            entered: mpsc::SyncSender<()>,
+            release: Mutex<mpsc::Receiver<()>>,
+        }
+
+        impl IndexValidator for BlockingFailValidator {
+            fn validate(&self, _index: &HnswIndex) -> Result<(), AliasError> {
+                self.entered.send(()).unwrap();
+                self.release.lock().unwrap().recv().unwrap();
+                Err(AliasError::ValidationFailed {
+                    reason: "candidate rejected".to_string(),
+                    recall: Some(0.4),
+                    min_recall: Some(0.9),
+                })
+            }
+        }
+
+        let mgr = Arc::new(IndexAliasManager::new(Duration::from_secs(5)));
+        mgr.register_collection("v1", make_index(4, 5)).unwrap();
+        mgr.create_alias("active", "v1").unwrap();
+
+        let (entered_tx, entered_rx) = mpsc::sync_channel(0);
+        let (release_tx, release_rx) = mpsc::channel();
+        let migration_manager = Arc::clone(&mgr);
+        let migration = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let vectors = (0..8u8)
+                .map(|i| (NodeId::new([i; 16]), vec![i as f32; 4]))
+                .collect();
+            runtime.block_on(migration_manager.migrate(
+                "active",
+                vectors,
+                HnswConfig::with_dimensions(4),
+                Some(Box::new(BlockingFailValidator {
+                    entered: entered_tx,
+                    release: Mutex::new(release_rx),
+                })),
+            ))
+        });
+
+        entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("validator did not start");
+        let candidate = mgr
+            .collections
+            .read()
+            .keys()
+            .find(|name| name.starts_with("v1_migrated_"))
+            .cloned()
+            .expect("registered migration candidate");
+        let alias_result = mgr.create_alias("candidate", &candidate);
+        release_tx.send(()).unwrap();
+        let migration_result = migration.join().unwrap();
+
+        alias_result.unwrap();
+        assert!(matches!(
+            migration_result,
+            Err(AliasError::ValidationFailed {
+                reason,
+                recall: Some(0.4),
+                min_recall: Some(0.9),
+            }) if reason == "recall below threshold"
+        ));
+        assert_eq!(mgr.resolve_alias("active"), Some("v1".to_string()));
+        assert_eq!(mgr.resolve_alias("candidate"), Some(candidate));
+        assert_eq!(mgr.acquire_reader("active").unwrap().len(), 5);
+        assert_eq!(mgr.acquire_reader("candidate").unwrap().len(), 8);
+        assert_eq!(mgr.collection_count(), 2);
     }
 
     /// Regression for #1439: validation must retain only the selected index
