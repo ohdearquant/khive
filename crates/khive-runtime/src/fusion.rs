@@ -232,7 +232,7 @@ mod tests {
     use super::*;
     use chrono::Utc;
     use khive_storage::types::{TextDocument, TextSearchHit, VectorSearchHit, VectorSearchRequest};
-    use khive_types::Entity;
+    use khive_storage::Entity;
     use lattice_embed::EmbeddingModel;
 
     use crate::RuntimeConfig;
