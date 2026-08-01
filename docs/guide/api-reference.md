@@ -788,8 +788,8 @@ request(ops="gtd.complete(id=\"<task-id>\", result=\"shipped in PR #600\")")
 List tasks filtered by status, assignee, priority.
 
 Each task reports `dependency_state` (`ready`, `blocked`, or `broken`), `actionable`,
-and a `blocked_by` array whose entries distinguish pending, cancelled, soft-deleted,
-hard-missing, malformed, cross-namespace, and wrong-kind dependencies.
+and a `blocked_by` array whose entries carry a `state` of `pending`, `cancelled`,
+`soft_deleted`, `missing`, `invalid`, `different_namespace`, or `wrong_kind`.
 
 | Param      | Type    | Required | Notes                                                                                              |
 | ---------- | ------- | -------- | -------------------------------------------------------------------------------------------------- |

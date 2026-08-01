@@ -850,6 +850,105 @@ async fn dependency_diagnostics_surface_cancelled_soft_deleted_and_missing_block
 }
 
 #[tokio::test]
+async fn dependency_diagnostics_surface_invalid_different_namespace_and_wrong_kind_blockers() {
+    let rt = rt();
+    let fixture = pack(rt.clone());
+    let token = rt.authorize(khive_runtime::Namespace::local()).unwrap();
+    let store = rt.notes(&token).expect("note store");
+
+    let wrong_kind_blocker = assign(
+        &fixture,
+        json!({"title": "wrong-kind blocker", "status": "inbox"}),
+    )
+    .await;
+    let namespace_blocker = assign(
+        &fixture,
+        json!({"title": "namespace blocker", "status": "inbox"}),
+    )
+    .await;
+
+    for (title, blocker) in [
+        ("blocked by wrong kind", &wrong_kind_blocker),
+        ("blocked by different namespace", &namespace_blocker),
+    ] {
+        assign(
+            &fixture,
+            json!({
+                "title": title,
+                "status": "next",
+                "depends_on": [blocker["full_id"].as_str().unwrap()]
+            }),
+        )
+        .await;
+    }
+
+    let invalid_dependent = assign(
+        &fixture,
+        json!({"title": "blocked by invalid entry", "status": "next"}),
+    )
+    .await;
+
+    // Corrupt each blocker's stored row directly through the note store,
+    // bypassing the pack-level write-time validation that would otherwise
+    // reject these shapes — read-time diagnostics must still catch them.
+    let wrong_kind_id =
+        uuid::Uuid::parse_str(wrong_kind_blocker["full_id"].as_str().unwrap()).unwrap();
+    let mut corrupted_kind = store
+        .get_note(wrong_kind_id)
+        .await
+        .expect("fetch blocker")
+        .expect("blocker exists");
+    corrupted_kind.kind = "observation".to_string();
+    store
+        .upsert_note(corrupted_kind)
+        .await
+        .expect("corrupt blocker kind");
+
+    let namespace_id =
+        uuid::Uuid::parse_str(namespace_blocker["full_id"].as_str().unwrap()).unwrap();
+    let mut corrupted_namespace = store
+        .get_note(namespace_id)
+        .await
+        .expect("fetch blocker")
+        .expect("blocker exists");
+    corrupted_namespace.namespace = "other".to_string();
+    store
+        .upsert_note(corrupted_namespace)
+        .await
+        .expect("corrupt blocker namespace");
+
+    let invalid_id = uuid::Uuid::parse_str(invalid_dependent["full_id"].as_str().unwrap()).unwrap();
+    store
+        .set_note_property(
+            invalid_id,
+            "depends_on",
+            json!(["not-a-uuid"]),
+            chrono::Utc::now().timestamp_micros(),
+        )
+        .await
+        .expect("corrupt dependent depends_on");
+
+    let tasks = fixture
+        .dispatch("gtd.tasks", json!({"status": "next"}))
+        .await
+        .expect("diagnostic task listing");
+    let tasks = tasks.as_array().expect("tasks array");
+    for (title, blocker_state) in [
+        ("blocked by wrong kind", "wrong_kind"),
+        ("blocked by different namespace", "different_namespace"),
+        ("blocked by invalid entry", "invalid"),
+    ] {
+        let task = tasks
+            .iter()
+            .find(|task| task["title"].as_str() == Some(title))
+            .unwrap_or_else(|| panic!("missing diagnostic task {title:?}: {tasks:?}"));
+        assert_eq!(task["dependency_state"], "broken");
+        assert_eq!(task["actionable"], false);
+        assert_eq!(task["blocked_by"][0]["state"], blocker_state);
+    }
+}
+
+#[tokio::test]
 async fn generic_update_rejects_direct_and_multihop_property_cycles() {
     let fixture = pack(rt());
     let a = assign(&fixture, json!({"title": "cycle A"})).await;

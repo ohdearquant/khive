@@ -87,9 +87,10 @@ only `transitioned`, `id`, `full_id`, `from`, `to`, and `note` are present.
 Pass task identifiers in `depends_on` when creating a task to express blockers.
 The GTD pack adds a `depends_on` endpoint rule for task-to-task edges; other
 note or entity types are not valid dependency targets. `gtd.next` omits a task
-until every listed dependency is `done`. A cancelled, soft-deleted, hard-missing,
-malformed, cross-namespace, or wrong-kind dependency makes the task `broken` and
-is identified in `blocked_by`; an unfinished live task makes it `blocked`.
+until every listed dependency is `done`. A dependency with `blocked_by[].state`
+of `cancelled`, `soft_deleted`, `missing`, `invalid`, `different_namespace`, or
+`wrong_kind` makes the task `broken`; an unfinished live task makes it `blocked`
+with a state of `pending`.
 Dependency writes reject direct and transitive cycles on both generic task-property
 updates and graph links.
 
