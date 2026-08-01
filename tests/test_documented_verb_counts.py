@@ -14,15 +14,16 @@ from documented_verb_counts import (
 
 
 PACK_COUNTS = {"kg": 20, "comm": 8, "workspace": 0}
+EXTENDED_PACK_COUNTS = {**PACK_COUNTS, "git": 4, "blob": 3}
 
 
-def verbs_result() -> dict:
+def verbs_result(pack_counts: dict[str, int] = PACK_COUNTS) -> dict:
     verbs = [
         {"verb": f"{pack}.{index}", "pack": pack}
-        for pack, count in PACK_COUNTS.items()
+        for pack, count in pack_counts.items()
         for index in range(count)
     ]
-    return {"verbs": verbs, "total": len(verbs), "pack_counts": PACK_COUNTS}
+    return {"verbs": verbs, "total": len(verbs), "pack_counts": pack_counts}
 
 
 class DocumentedVerbCountsTest(unittest.TestCase):
@@ -260,6 +261,66 @@ The server config loads all three (`kg`, `comm`, `workspace`).
 
         self.assertEqual(len(errors), 1)
         self.assertIn("claims comm verbs=7, registry says 8", errors[0])
+
+    def test_clause_pack_marker_beats_pack_path_before_and_after_count(self) -> None:
+        published = """35 verbs across 5 built-in packs.
+| Pack | Verbs |
+| --- | --- |
+| kg | 20 |
+| comm | 8 |
+| workspace | 0 |
+| git | 4 |
+| blob | 3 |
+"""
+        cases = (
+            (
+                "pre-count",
+                "`git` contributes four verbs; `blob` contributes three verbs.\n",
+                "`git` contributes four verbs; `blob` contributes two verbs.\n",
+                [("git", 4), ("blob", 3)],
+                "claims blob verbs=2, registry says 3",
+            ),
+            (
+                "post-count",
+                "Twenty public verbs ship in the kg pack; "
+                "eight public verbs ship in the comm pack.\n",
+                "Twenty public verbs ship in the kg pack; "
+                "seven public verbs ship in the comm pack.\n",
+                [("kg", 20), ("comm", 8)],
+                "claims comm verbs=7, registry says 8",
+            ),
+        )
+        pack_path = "crates/khive-pack-workspace/README.md"
+        for label, correct, stale, expected, stale_error in cases:
+            with self.subTest(label=label):
+                claims = scan_document(pack_path, correct, EXTENDED_PACK_COUNTS)
+                self.assertEqual(
+                    [(claim.pack, claim.value) for claim in claims],
+                    expected,
+                )
+
+                with tempfile.TemporaryDirectory() as tmp:
+                    root = Path(tmp)
+                    (root / "README.md").write_text(published, encoding="utf-8")
+                    pack_readme = root / pack_path
+                    pack_readme.parent.mkdir(parents=True)
+                    pack_readme.write_text(correct, encoding="utf-8")
+                    self.assertEqual(
+                        validate_documented_counts(
+                            root,
+                            verbs_result(EXTENDED_PACK_COUNTS),
+                        ),
+                        [],
+                    )
+
+                    pack_readme.write_text(stale, encoding="utf-8")
+                    errors = validate_documented_counts(
+                        root,
+                        verbs_result(EXTENDED_PACK_COUNTS),
+                    )
+
+                self.assertEqual(len(errors), 1)
+                self.assertIn(stale_error, errors[0])
 
     def test_shipped_cli_help_detects_built_in_pack_count_mutations(self) -> None:
         published = """28 verbs across 3 built-in packs.

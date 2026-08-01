@@ -55,6 +55,7 @@ PACK_COUNT_RE = re.compile(
     rf"\b(?P<count>{COUNT_TOKEN})\s*(?:-\s*|\s+){PACK_COUNT_MODIFIERS}packs?\b",
     re.IGNORECASE,
 )
+CLAUSE_BOUNDARY_RE = re.compile(r"(?:;|[.!?](?=\s|$))")
 INVERTED_PACK_COUNT_RE = re.compile(
     rf"\bpacks\s*:\s*(?P<count>{COUNT_TOKEN})\b",
     re.IGNORECASE,
@@ -163,9 +164,19 @@ def _context_pack(
     context: str,
     pack_names: set[str],
     count_span: tuple[int, int],
+    *,
+    local_clause_only: bool = False,
 ) -> str | None:
     plain = _plain(context)
     count_start, count_end = count_span
+    scope_start, scope_end = 0, len(plain)
+    if local_clause_only:
+        for boundary in CLAUSE_BOUNDARY_RE.finditer(plain):
+            if boundary.end() <= count_start:
+                scope_start = boundary.end()
+            elif boundary.start() >= count_end:
+                scope_end = boundary.start()
+                break
     candidates: list[tuple[int, bool, int, str]] = []
     for pack in pack_names:
         marker = re.compile(
@@ -179,6 +190,8 @@ def _context_pack(
             re.IGNORECASE,
         )
         for match in marker.finditer(plain):
+            if match.start() < scope_start or match.end() > scope_end:
+                continue
             if match.end() <= count_start:
                 distance = count_start - match.end()
                 follows_count = False
@@ -370,16 +383,23 @@ def scan_document(path: str, text: str, pack_names: Iterable[str]) -> list[Count
                 continue
             matched_spans.add(match.span())
             value = _number(match.group("count"))
-            pack = path_pack or _context_pack(
+            count_span = (
+                context_offset + match.start(),
+                context_offset + match.end(),
+            )
+            clause_pack = _context_pack(
                 context,
                 names,
-                (
-                    context_offset + match.start(),
-                    context_offset + match.end(),
-                ),
+                count_span,
+                local_clause_only=True,
             )
+            pack = clause_pack or path_pack or _context_pack(context, names, count_span)
             claim_plain = _plain(claim_text(match))
-            pack_context = claim_plain if path_pack is not None else _plain(context)
+            pack_context = (
+                claim_plain
+                if path_pack is not None and clause_pack is None
+                else _plain(context)
+            )
             unqualified_path_inverted = (
                 path_pack is not None
                 and match.re is INVERTED_VERB_COUNT_RE
