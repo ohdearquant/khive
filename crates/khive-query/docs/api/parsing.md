@@ -10,7 +10,47 @@ The unified guard recognizes GQL/Cypher mutations and SPARQL Update forms, inclu
 
 ## GQL parser
 
-`parsers::gql::parse` accepts a `MATCH` pattern, optional `WHERE`, `RETURN`, and optional `LIMIT`. Patterns support directed or undirected edges, relation alternatives, inline node properties, and bounded hop ranges.
+`parsers::gql::parse` implements the following read-only dialect. Keywords are case-insensitive; the grammar accepts exactly one connected, alternating path after `MATCH`.
+
+```text
+query       = "MATCH" path ["WHERE" where_expr]
+              "RETURN" return_item ("," return_item)* ["LIMIT" integer]
+path        = node (edge node)*
+node        = "(" [identifier] [":" identifier] [property_map] ")"
+property_map = "{" [property ("," property)*] "}"
+property    = identifier ":" value
+edge        = "-[" edge_body "]->" | "<-[" edge_body "]-"
+            | "-[" edge_body "]-"  | "<-[" edge_body "]->"
+edge_body   = [identifier] [":" identifier ("|" identifier)*] [hop_range]
+hop_range   = "*" | "*" integer | "*" integer ".." integer
+return_item = identifier ["." identifier]
+```
+
+The four edge spellings represent outgoing, incoming, and the two accepted undirected forms. An omitted relation matches any supported edge relation. A bare `*` means one through five hops; explicit ranges are inclusive and validation caps the maximum at ten. `LIMIT` is terminal and takes a non-negative integer.
+
+Only unaliased variables and `variable.property` projections are supported. `AS`, expressions, aggregates, `DISTINCT`, ordering, and `OFFSET` are outside this dialect. Result column names are derived from their variables, such as `a_id` and `e_relation`.
+
+### One-path boundary and parallel-edge alternative
+
+Comma-separated `MATCH` patterns are not supported. This form returns an unsupported-feature error that names the construct:
+
+```text
+MATCH (a)-[e1]->(b), (a)-[e2]->(b) RETURN a, b
+```
+
+To audit parallel edges, list edge records with one unlabeled-edge path instead:
+
+```text
+MATCH (a)-[e]->(b) RETURN a.id, e.id, e.relation, b.id
+```
+
+Group rows by `a_id` and `b_id` client-side, while retaining `e_id` and `e_relation` so endpoint grouping does not erase edge identity. This enumerates edge records; it does not add a self-join or grouping operation to the query language.
+
+Return aliases are likewise recognized and rejected with an unsupported-feature error that names `AS`:
+
+```text
+MATCH (a)-[e]->(b) RETURN a.name AS src, b.name AS dst LIMIT 5
+```
 
 The `WHERE` grammar gives `AND` tighter precedence than `OR`:
 
@@ -50,4 +90,4 @@ SPARQL `*` is rejected: it means zero-or-more, while the recursive SQL seed begi
 
 ## Parse errors and unsupported forms
 
-Malformed tokens, unterminated strings, trailing input, invalid numeric forms, and grammar mismatches return `QueryError::Parse`. Recognized writes or semantics such as SPARQL zero-hop paths return `QueryError::Unsupported`. Neither parser executes SQL or mutates an input AST.
+Malformed tokens, unterminated strings, trailing input, invalid numeric forms, and grammar mismatches return `QueryError::Parse`. Recognized unsupported semantics—including comma-separated GQL `MATCH` patterns, GQL `AS` aliases, writes, and SPARQL zero-hop paths—return `QueryError::Unsupported`. Neither parser executes SQL or mutates an input AST.

@@ -527,12 +527,19 @@ impl Parser {
 
     fn parse_return_items(&mut self) -> Result<Vec<ReturnItem>, QueryError> {
         let mut items = Vec::new();
-        items.push(self.parse_return_item()?);
         loop {
+            items.push(self.parse_return_item()?);
+            if self.try_keyword("AS") {
+                return Err(QueryError::Unsupported(
+                    "RETURN aliases (`AS`) are not supported; use unaliased variable or \
+                     variable.property projections"
+                        .into(),
+                ));
+            }
+
             self.skip_whitespace();
             if self.peek() == Some(',') {
                 self.advance();
-                items.push(self.parse_return_item()?);
             } else {
                 break;
             }
@@ -554,6 +561,15 @@ impl Parser {
     fn parse_query(&mut self) -> Result<GqlQuery, QueryError> {
         self.expect_keyword("MATCH")?;
         let pattern = self.parse_pattern()?;
+        self.skip_whitespace();
+        if self.peek() == Some(',') {
+            return Err(QueryError::Unsupported(
+                "comma-separated MATCH patterns are not supported; use one alternating path per \
+                 query; for parallel-edge audits, return a.id, e.id, e.relation, b.id and group \
+                 by endpoint IDs client-side"
+                    .into(),
+            ));
+        }
 
         let where_clause = if self.try_keyword("WHERE") {
             self.parse_where_expr()?
@@ -803,6 +819,88 @@ mod tests {
         assert_eq!(q.pattern.elements.len(), 5);
         let nodes: Vec<_> = q.pattern.nodes().collect();
         assert_eq!(nodes.len(), 3);
+    }
+
+    #[test]
+    fn comma_separated_match_patterns_name_unsupported_construct() {
+        let err = parse("MATCH (a)-[e1]->(b), (a)-[e2]->(b) RETURN a, b").unwrap_err();
+        assert!(
+            matches!(&err, QueryError::Unsupported(_)),
+            "multiple MATCH patterns must return Unsupported; got {err:?}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("comma-separated MATCH patterns"),
+            "error must name the unsupported construct; got: {msg}"
+        );
+        assert!(
+            msg.contains("e.id") && msg.contains("e.relation"),
+            "error must preserve edge identity in its alternative; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn return_aliases_name_unsupported_construct() {
+        for query in [
+            "MATCH (a)-[e]->(b) RETURN a.name AS src, b.name AS dst LIMIT 5",
+            "MATCH (a) RETURN a as node",
+            "MATCH (a)-[e]->(b) RETURN a.name, b.name aS dst",
+        ] {
+            let err = parse(query).unwrap_err();
+            assert!(
+                matches!(&err, QueryError::Unsupported(_)),
+                "RETURN alias must return Unsupported for {query:?}; got {err:?}"
+            );
+            assert!(
+                err.to_string().contains("aliases (`AS`)"),
+                "error must name AS for {query:?}; got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn documented_single_path_parallel_edge_audit_parses() {
+        let q = parse("MATCH (a)-[e]->(b) RETURN a.id, e.id, e.relation, b.id").unwrap();
+        assert_eq!(
+            q.return_items,
+            vec![
+                ReturnItem::Property("a".into(), "id".into()),
+                ReturnItem::Property("e".into(), "id".into()),
+                ReturnItem::Property("e".into(), "relation".into()),
+                ReturnItem::Property("b".into(), "id".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn gql_dialect_reference_matches_parser_contract() {
+        const DOCS: &str = include_str!("../../docs/api/parsing.md");
+        const SUPPORTED: &str = "MATCH (a)-[e]->(b) RETURN a.id, e.id, e.relation, b.id";
+        const MULTI_PATTERN: &str = "MATCH (a)-[e1]->(b), (a)-[e2]->(b) RETURN a, b";
+        const ALIAS: &str = "MATCH (a)-[e]->(b) RETURN a.name AS src, b.name AS dst LIMIT 5";
+
+        for query in [SUPPORTED, MULTI_PATTERN, ALIAS] {
+            assert!(
+                DOCS.contains(query),
+                "dialect reference must include contract example: {query}"
+            );
+        }
+
+        parse(SUPPORTED).expect("documented single-path alternative must parse");
+        for (query, feature) in [
+            (MULTI_PATTERN, "comma-separated MATCH patterns"),
+            (ALIAS, "aliases (`AS`)"),
+        ] {
+            let err = parse(query).unwrap_err();
+            assert!(
+                matches!(&err, QueryError::Unsupported(_)),
+                "documented unsupported form must return Unsupported; got {err:?}"
+            );
+            assert!(
+                err.to_string().contains(feature),
+                "documented error must name {feature:?}; got: {err}"
+            );
+        }
     }
 
     #[test]

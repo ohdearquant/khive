@@ -71,6 +71,12 @@ MATCH (a)-[e:extends|implements]->(b) RETURN a.name, e.relation, b.name LIMIT 10
 
 ## Operational limits
 
+- GQL accepts one connected, alternating path after `MATCH`. It does not
+  accept comma-separated patterns or branching self-joins. For a parallel-edge
+  audit, return `a.id, e.id, e.relation, b.id` from one unlabeled-edge path and
+  group endpoint IDs client-side without discarding the edge ID.
+- `RETURN` accepts comma-separated variables or `variable.property` items,
+  but not `AS` aliases. Output names remain variable-prefixed, such as `a_id`.
 - GQL supports either a chain of fixed-relation hops or exactly one
   variable-length edge per query — never both mixed in the same pattern.
   Minimum hop count is 1; maximum is 10. A bare `*` (no bounds) means 1
@@ -114,6 +120,16 @@ counts only — no graph content is reproduced here.
 | 14 | `WHERE ... OR ...`                    | `MATCH (n) WHERE n.kind = "concept" OR n.kind = "project" RETURN n.name, n.kind LIMIT 2` | 2 rows; `n_kind, n_name`. `AND` binds tighter than `OR`; parentheses are not available to force grouping.                                                              |
 | 15 | Outer cap vs. language `LIMIT`        | `query(query="MATCH (n) RETURN n.name LIMIT 5", limit=2)`                                | 2 rows; warning: result set capped at 2 rows; requested limit 5 exceeds the cap. The outer `limit` argument is a hard server cap independent of the language `LIMIT`.  |
 
+## Parser-diagnosed dialect boundaries
+
+These unsupported constructs receive specific parser errors rather than
+generic grammar or trailing-input failures:
+
+| Form                       | Query string                                                     | Contract and alternative                                                                                                                                                                                             |
+| -------------------------- | ---------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Comma-separated patterns   | `MATCH (a)-[e1]->(b), (a)-[e2]->(b) RETURN a, b`                 | `QueryError::Unsupported` names comma-separated `MATCH` patterns. For parallel-edge audits, use one path returning `a.id, e.id, e.relation, b.id`, then group endpoint IDs client-side while retaining each edge ID. |
+| `RETURN` aliases with `AS` | `MATCH (a)-[e]->(b) RETURN a.name AS src, b.name AS dst LIMIT 5` | `QueryError::Unsupported` names `AS`. Use unaliased `variable` or `variable.property` projections; result names remain variable-prefixed.                                                                            |
+
 ## Rejected forms (live-checked)
 
 Each is a verified read-only check against the running server. Errors are
@@ -145,6 +161,9 @@ returns rows on the live MCP tool.
 
 ## Gaps
 
+- Comma-separated GQL `MATCH` patterns and `RETURN ... AS ...` aliases are
+  rejected with named unsupported-feature errors. Use one alternating path and
+  unaliased projections; group returned rows client-side where needed.
 - Mixed fixed-plus-variable-length paths are rejected; split the query into
   separate calls instead.
 - No anti-join, optional match, aggregate, `GROUP BY`, `DISTINCT`, ordering,
@@ -158,6 +177,7 @@ returns rows on the live MCP tool.
 
 ## See also
 
+- [GQL and SPARQL parsing](../../crates/khive-query/docs/api/parsing.md) — the concise grammar and unsupported-form contract.
 - [ADR-008: Query Layer Separation](../adr/ADR-008-query-layer-separation.md) — why GQL and SPARQL share one SQL compilation target and no mutation path.
 - [Search and Retrieval](search.md) — fuzzy, full-text, and hybrid retrieval when `query` isn't the right tool.
 - [Prompt Cookbook](prompt-cookbook.md) — verb patterns beyond `query`.
