@@ -326,6 +326,8 @@ pub trait NoteStore: Send + Sync + 'static {
         updated_at: i64,
     ) -> StorageResult<bool>;
     /// Query notes by namespace and optional kind with pagination.
+    /// The returned total and page items must come from one consistent
+    /// backend snapshot.
     async fn query_notes(
         &self,
         namespace: &str,
@@ -333,6 +335,8 @@ pub trait NoteStore: Send + Sync + 'static {
         page: PageRequest,
     ) -> StorageResult<Page<Note>>;
     /// Query notes with property-based filtering and custom sort.
+    /// The returned total and page items must come from one consistent
+    /// backend snapshot.
     async fn query_notes_filtered(
         &self,
         namespace: &str,

@@ -375,6 +375,44 @@ fn parse_uuid(s: &str) -> Result<Uuid, rusqlite::Error> {
     })
 }
 
+fn query_note_page_snapshot(
+    conn: &rusqlite::Connection,
+    operation: &'static str,
+    namespace: &str,
+    count_sql: &str,
+    count_params: &[Box<dyn rusqlite::types::ToSql>],
+    data_sql: &str,
+    data_params: &[Box<dyn rusqlite::types::ToSql>],
+) -> Result<Page<Note>, rusqlite::Error> {
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Deferred)?;
+
+    let total: i64 = {
+        let mut stmt = tx.prepare(count_sql)?;
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+            count_params.iter().map(|param| param.as_ref()).collect();
+        stmt.query_row(param_refs.as_slice(), |row| row.get(0))?
+    };
+
+    #[cfg(test)]
+    tests::page_snapshot_seam::hook(operation, namespace);
+    #[cfg(not(test))]
+    let _ = (operation, namespace);
+
+    let items = {
+        let mut stmt = tx.prepare(data_sql)?;
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+            data_params.iter().map(|param| param.as_ref()).collect();
+        let rows = stmt.query_map(param_refs.as_slice(), read_note)?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
+
+    tx.commit()?;
+    Ok(Page {
+        items,
+        total: Some(total as u64),
+    })
+}
+
 /// DML-only batch upsert loop shared by both the legacy (flag-off) and
 /// WriterTask-routed (flag-on) `upsert_notes` paths (ADR-067 Component A).
 ///
@@ -922,13 +960,7 @@ impl NoteStore for SqlNoteStore {
 
         self.with_reader("query_notes", move |conn| {
             let (count_sql, count_params) = build_note_where(&namespace, kind.as_deref());
-            let total: i64 = {
-                let sql = format!("SELECT COUNT(*) FROM notes{}", count_sql);
-                let mut stmt = conn.prepare(&sql)?;
-                let param_refs: Vec<&dyn rusqlite::types::ToSql> =
-                    count_params.iter().map(|p| p.as_ref()).collect();
-                stmt.query_row(param_refs.as_slice(), |row| row.get(0))?
-            };
+            let count_sql = format!("SELECT COUNT(*) FROM notes{count_sql}");
 
             let (where_sql, mut data_params) = build_note_where(&namespace, kind.as_deref());
             data_params.push(Box::new(limit_i64));
@@ -944,20 +976,15 @@ impl NoteStore for SqlNoteStore {
                 where_sql, limit_idx, offset_idx,
             );
 
-            let mut stmt = conn.prepare(&data_sql)?;
-            let param_refs: Vec<&dyn rusqlite::types::ToSql> =
-                data_params.iter().map(|p| p.as_ref()).collect();
-            let rows = stmt.query_map(param_refs.as_slice(), read_note)?;
-
-            let mut items = Vec::new();
-            for row in rows {
-                items.push(row?);
-            }
-
-            Ok(Page {
-                items,
-                total: Some(total as u64),
-            })
+            query_note_page_snapshot(
+                conn,
+                "query_notes",
+                &namespace,
+                &count_sql,
+                &count_params,
+                &data_sql,
+                &data_params,
+            )
         })
         .await
     }
@@ -990,13 +1017,7 @@ impl NoteStore for SqlNoteStore {
 
         self.with_reader("query_notes_filtered", move |conn| {
             let (count_sql, count_params) = build_note_filter_where(&namespace, &filter)?;
-            let total: i64 = {
-                let sql = format!("SELECT COUNT(*) FROM notes{}", count_sql);
-                let mut stmt = conn.prepare(&sql)?;
-                let param_refs: Vec<&dyn rusqlite::types::ToSql> =
-                    count_params.iter().map(|p| p.as_ref()).collect();
-                stmt.query_row(param_refs.as_slice(), |row| row.get(0))?
-            };
+            let count_sql = format!("SELECT COUNT(*) FROM notes{count_sql}");
 
             let (where_sql, mut data_params) = build_note_filter_where(&namespace, &filter)?;
             data_params.push(Box::new(limit_i64));
@@ -1022,20 +1043,15 @@ impl NoteStore for SqlNoteStore {
                 where_sql, limit_idx, offset_idx,
             );
 
-            let mut stmt = conn.prepare(&data_sql)?;
-            let param_refs: Vec<&dyn rusqlite::types::ToSql> =
-                data_params.iter().map(|p| p.as_ref()).collect();
-            let rows = stmt.query_map(param_refs.as_slice(), read_note)?;
-
-            let mut items = Vec::new();
-            for row in rows {
-                items.push(row?);
-            }
-
-            Ok(Page {
-                items,
-                total: Some(total as u64),
-            })
+            query_note_page_snapshot(
+                conn,
+                "query_notes_filtered",
+                &namespace,
+                &count_sql,
+                &count_params,
+                &data_sql,
+                &data_params,
+            )
         })
         .await
     }
