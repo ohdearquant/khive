@@ -149,38 +149,6 @@ jobs:
           - [`/llms-full.txt`](llms-full.txt): every doc page, concatenated, in one fetch
           - [`/md/*.md`](md/getting-started.md): raw, unconverted markdown for each page (also
             linked from the bottom of every page)
-
-          ## Documentation
-
-          - [Getting Started](getting-started.html): install, connect, first session
-          - [Knowledge Graph Modeling](knowledge-graph.html): entity kinds, edge relations, modeling patterns
-          - [Memory and Recall](memory.html): episodic vs semantic, salience, decay
-          - [Search and Retrieval](search.html): FTS, vector, hybrid fusion, reranking
-          - [GTD Task Management](tasks.html): task lifecycle, priorities, dependencies
-          - [Prompt Cookbook](prompt-cookbook.html): ready-to-use verb patterns
-          - [API Reference](api-reference.html): full verb catalog, params, DSL examples
-
-          ## Demos
-
-          Runnable transcripts, captured against a scratch database, in the repo's
-          [`demos/`](https://github.com/ohdearquant/khive/tree/main/demos) directory:
-
-          - [research-ingest](https://github.com/ohdearquant/khive/blob/main/demos/research-ingest.md): create entities, link them, search, and traverse the graph
-          - [gtd-memory](https://github.com/ohdearquant/khive/blob/main/demos/gtd-memory.md): task lifecycle and salience-weighted memory recall
-
-          ## Install
-
-          ```bash
-          cargo install kkernel
-          ```
-
-          `kkernel` is the single shipped binary; `kkernel mcp` serves the MCP `request` surface.
-          Full install and MCP client setup: [Getting Started](getting-started.html).
-
-          ## Reference
-
-          - [AGENTS.md](https://github.com/ohdearquant/khive/blob/main/AGENTS.md): full verb reference for agents using khive
-          - [Architecture Decision Records](https://github.com/ohdearquant/khive/tree/main/docs/adr): the design contract
           EOF
 
           # Per-guide-page assembly: inject nav_order/title/description front matter,
@@ -248,6 +216,43 @@ jobs:
           # (nav_order, then basename, ascending) — not a separately maintained
           # list.
           mapfile -t ORDERED_BASENAMES < <(printf '%s\n' "${PAGE_ORDER_LIST[@]}" | sort -t'|' -k1,1n -k2,2 | cut -d'|' -f2)
+
+          # Homepage "## Documentation" index — derived from the same
+          # NAV_ORDER-driven loop as the sidebar and agent surfaces, so a new
+          # guide page can never be present in the nav but missing from the
+          # homepage (the drift PR #1552 fixed by construction).
+          {
+            echo "## Documentation"
+            echo
+            for base in "${ORDERED_BASENAMES[@]}"; do
+              echo "- [${PAGE_TITLE[$base]}](${base}.html): ${PAGE_DESC[$base]}"
+            done
+            echo
+          } >> "$SRC/index.md"
+
+          cat >> "$SRC/index.md" <<'EOF'
+          ## Demos
+
+          Runnable transcripts, captured against a scratch database, in the repo's
+          [`demos/`](https://github.com/ohdearquant/khive/tree/main/demos) directory:
+
+          - [research-ingest](https://github.com/ohdearquant/khive/blob/main/demos/research-ingest.md): create entities, link them, search, and traverse the graph
+          - [gtd-memory](https://github.com/ohdearquant/khive/blob/main/demos/gtd-memory.md): task lifecycle and salience-weighted memory recall
+
+          ## Install
+
+          ```bash
+          cargo install kkernel
+          ```
+
+          `kkernel` is the single shipped binary; `kkernel mcp` serves the MCP `request` surface.
+          Full install and MCP client setup: [Getting Started](getting-started.html).
+
+          ## Reference
+
+          - [AGENTS.md](https://github.com/ohdearquant/khive/blob/main/AGENTS.md): full verb reference for agents using khive
+          - [Architecture Decision Records](https://github.com/ohdearquant/khive/tree/main/docs/adr): the design contract
+          EOF
 
           # llms.txt — the llms.txt convention: short summary + linked index,
           # HTML and raw-markdown URLs for every page.
