@@ -1922,6 +1922,7 @@ impl KhiveMcpServer {
         let identity = khive_runtime::RequestIdentity {
             namespace: self.default_namespace.clone(),
             actor_id: actor.map(|actor| actor.as_str().to_string()),
+            process_ref: khive_runtime::process_ref_from_env(),
             visible_namespaces: self
                 .visible_namespaces()
                 .iter()
