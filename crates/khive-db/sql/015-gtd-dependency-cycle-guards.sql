@@ -98,6 +98,11 @@ BEGIN
                 AND task.namespace = NEW.namespace
                 AND task.kind = 'task'
                 AND task.deleted_at IS NULL
+                -- OLD remains visible in a BEFORE UPDATE but its old key does not.
+                AND (
+                    OLD.id = NEW.id
+                    OR task.id <> OLD.id
+                )
             JOIN json_each(task.properties, '$.depends_on') AS dependency
                 ON json_type(task.properties, '$.depends_on') = 'array'
                 AND dependency.type = 'text'
@@ -111,6 +116,53 @@ BEGIN
             END,
             '-', ''), '{', ''), '}', ''))
     ) THEN RAISE(ABORT, 'task properties.depends_on dependency cycle') END;
+END;
+
+CREATE TRIGGER IF NOT EXISTS gtd_task_dependency_cycle_note_activation_bi
+BEFORE INSERT ON notes
+WHEN NEW.kind = 'task'
+    AND NEW.deleted_at IS NULL
+BEGIN
+    -- NEW is not visible through notes during a BEFORE INSERT trigger, so
+    -- carry its id explicitly as the endpoint this statement would activate.
+    SELECT CASE WHEN EXISTS (
+        WITH RECURSIVE dependency_walk(namespace, id) AS (
+            SELECT edge.namespace, edge.target_id
+            FROM graph_edges AS edge
+            WHERE edge.source_id = NEW.id
+                AND edge.relation = 'depends_on'
+                AND edge.deleted_at IS NULL
+                AND (
+                    edge.target_id = NEW.id
+                    OR EXISTS (
+                        SELECT 1
+                        FROM notes AS target_task
+                        WHERE target_task.id = edge.target_id
+                            AND target_task.kind = 'task'
+                            AND target_task.deleted_at IS NULL
+                    )
+                )
+            UNION
+            SELECT edge.namespace, edge.target_id
+            FROM dependency_walk AS walk
+            JOIN graph_edges AS edge
+                ON edge.namespace = walk.namespace
+                AND edge.source_id = walk.id
+                AND edge.relation = 'depends_on'
+                AND edge.deleted_at IS NULL
+            WHERE edge.target_id = NEW.id
+                OR EXISTS (
+                    SELECT 1
+                    FROM notes AS target_task
+                    WHERE target_task.id = edge.target_id
+                        AND target_task.kind = 'task'
+                        AND target_task.deleted_at IS NULL
+                )
+        )
+        SELECT 1
+        FROM dependency_walk
+        WHERE id = NEW.id
+    ) THEN RAISE(ABORT, 'task depends_on edge dependency cycle') END;
 END;
 
 CREATE TRIGGER IF NOT EXISTS gtd_task_dependency_cycle_note_activation_bu

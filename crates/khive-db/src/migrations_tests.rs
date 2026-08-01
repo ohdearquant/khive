@@ -125,6 +125,7 @@ fn v15_fresh_start_installs_narrow_gtd_dependency_cycle_guards() {
     for trigger in [
         "gtd_task_dependency_cycle_notes_bi",
         "gtd_task_dependency_cycle_notes_bu",
+        "gtd_task_dependency_cycle_note_activation_bi",
         "gtd_task_dependency_cycle_note_activation_bu",
         "gtd_task_dependency_cycle_edges_bi",
         "gtd_task_dependency_cycle_edges_bu",
@@ -490,6 +491,142 @@ fn v13_note_activation_rejects_dormant_edge_cycles() {
         )
         .expect("load rejected task conversion");
     assert_eq!(persisted_kind, "observation");
+}
+
+#[test]
+fn v13_note_insert_rejects_dormant_edge_cycles() {
+    let mut conn = open_memory();
+    run_migrations(&mut conn).expect("migrations should succeed");
+
+    insert_dependency_test_note(&conn, "live-a", "task", "{}", None);
+    insert_dependency_test_edge(
+        &conn,
+        "live-a-missing-b",
+        "live-a",
+        "missing-b",
+        "depends_on",
+        None,
+    )
+    .expect("edge to a missing task is dormant");
+    insert_dependency_test_edge(
+        &conn,
+        "missing-b-live-a",
+        "missing-b",
+        "live-a",
+        "depends_on",
+        None,
+    )
+    .expect("edge from a missing task is dormant");
+
+    let insert_error = conn
+        .execute(
+            "INSERT INTO notes \
+             (id, namespace, kind, status, name, content, properties, created_at, updated_at) \
+             VALUES ('missing-b', 'local', 'task', 'active', 'missing-b', '', '{}', 1, 1)",
+            [],
+        )
+        .expect_err("inserting a task endpoint must not expose an edge cycle");
+    assert!(
+        insert_error.to_string().contains("dependency cycle"),
+        "unexpected task-insert error: {insert_error}"
+    );
+    let rejected_rows: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM notes WHERE id = 'missing-b'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("count rejected task insert");
+    assert_eq!(rejected_rows, 0, "the rejected insert must roll back");
+
+    insert_dependency_test_edge(
+        &conn,
+        "missing-c-live-a",
+        "missing-c",
+        "live-a",
+        "depends_on",
+        None,
+    )
+    .expect("acyclic edge from a missing task is dormant");
+    insert_dependency_test_note(&conn, "missing-c", "task", "{}", None);
+}
+
+#[test]
+fn v13_property_id_replacement_uses_the_post_update_graph() {
+    let mut conn = open_memory();
+    run_migrations(&mut conn).expect("migrations should succeed");
+
+    let old_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    let middle_id = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+    let new_id = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+    let old_properties = format!(r#"{{"depends_on":["{new_id}"]}}"#);
+    let middle_properties = format!(r#"{{"depends_on":["{old_id}"]}}"#);
+    insert_dependency_test_note(&conn, old_id, "task", &old_properties, None);
+    insert_dependency_test_note(&conn, middle_id, "task", &middle_properties, None);
+
+    let replacement_properties = format!(r#"{{"depends_on":["{middle_id}"]}}"#);
+    conn.execute(
+        "UPDATE notes SET id = ?1, properties = ?2 WHERE id = ?3",
+        rusqlite::params![new_id, replacement_properties, old_id],
+    )
+    .expect("the disappearing old endpoint must not create a phantom property cycle");
+    let replacement_rows: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM notes WHERE id = ?1",
+            rusqlite::params![new_id],
+            |row| row.get(0),
+        )
+        .expect("count replacement task");
+    assert_eq!(replacement_rows, 1);
+    let old_rows: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM notes WHERE id = ?1",
+            rusqlite::params![old_id],
+            |row| row.get(0),
+        )
+        .expect("count disappearing old task");
+    assert_eq!(old_rows, 0);
+
+    let cycle_old_id = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
+    let cycle_middle_id = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee";
+    let cycle_new_id = "ffffffff-ffff-4fff-8fff-ffffffffffff";
+    insert_dependency_test_note(&conn, cycle_old_id, "task", "{}", None);
+    let cycle_middle_properties = format!(r#"{{"depends_on":["{cycle_new_id}"]}}"#);
+    insert_dependency_test_note(
+        &conn,
+        cycle_middle_id,
+        "task",
+        &cycle_middle_properties,
+        None,
+    );
+
+    let cycle_replacement_properties = format!(r#"{{"depends_on":["{cycle_middle_id}"]}}"#);
+    let cycle_error = conn
+        .execute(
+            "UPDATE notes SET id = ?1, properties = ?2 WHERE id = ?3",
+            rusqlite::params![cycle_new_id, cycle_replacement_properties, cycle_old_id],
+        )
+        .expect_err("a real property cycle through the replacement id must still fail");
+    assert!(
+        cycle_error.to_string().contains("dependency cycle"),
+        "unexpected replacement-cycle error: {cycle_error}"
+    );
+    let preserved_rows: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM notes WHERE id = ?1",
+            rusqlite::params![cycle_old_id],
+            |row| row.get(0),
+        )
+        .expect("count preserved old task");
+    assert_eq!(preserved_rows, 1, "the rejected replacement must roll back");
+    let rejected_new_rows: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM notes WHERE id = ?1",
+            rusqlite::params![cycle_new_id],
+            |row| row.get(0),
+        )
+        .expect("count rejected replacement id");
+    assert_eq!(rejected_new_rows, 0);
 }
 
 #[test]
