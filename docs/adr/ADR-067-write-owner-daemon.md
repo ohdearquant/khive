@@ -741,3 +741,43 @@ stable owner of write connections." Precisely: the bulk-apply path runs against 
 in-process runtime (it does not traverse the daemon), so the dependency is on the
 **`atomic_unit` seam** — whose queue-on and queue-off arms are both shipped — rather than
 on the daemon-resident task being in the loop for that path.
+
+## Amendment 2 (2026-07-31): Terminal writer-task failure semantics
+
+This amendment supersedes the original failure-mode table's generic `Internal` errors for a
+writer-task panic, a stopped receiver, and a dropped reply. A writer-task panic is a permanent
+terminal event for that task instance. It is reported with the public
+`StorageError::WriterTaskTerminated { request_state }` variant, whose
+`WriterTaskRequestState` communicates what can be proven about each request:
+
+| Request position / condition                                      | State                   | Contract                                                                            |
+| ----------------------------------------------------------------- | ----------------------- | ----------------------------------------------------------------------------------- |
+| Active transaction-wrapped request panics; `ROLLBACK` succeeds    | `TransactionRolledBack` | Its enclosing SQLite transaction was rolled back; no wrapped database write commits |
+| Active transaction-wrapped request panics; `ROLLBACK` fails       | `SideEffectsUnknown`    | The request ran, but the transaction's final state cannot be proved                 |
+| Active top-level request panics                                   | `SideEffectsUnknown`    | The request ran without an enclosing transaction                                    |
+| Request buffered behind the panicking request                     | `NotStarted`            | Its operation closure is not invoked                                                |
+| Send attempted after the receiver closes                          | `NotStarted`            | The request is not accepted and its operation closure is not invoked                |
+| Accepted request loses its reply outside the contained panic path | `SideEffectsUnknown`    | The caller cannot prove whether the operation began or which side effects occurred  |
+
+The panic boundary lives inside the concrete `WriteRequest<R>`, after destructuring its
+operation and typed reply sender. Catching only around `spawn_blocking` would detect task loss
+but would also lose the active request's reply sender, preventing the state-specific typed
+response required above. A transaction-wrapped panic triggers `ROLLBACK` before the active
+reply is sent. Top-level requests deliberately skip the transaction wrapper, so their panic
+state cannot be stronger than `SideEffectsUnknown`.
+
+After replying to the active request where possible, the drain loop closes the receiver first
+and then drains every already-buffered request with `NotStarted`. The close-before-drain order
+is load-bearing: it prevents concurrent senders from adding work while termination cleanup is
+in progress and makes the finite drain deterministic. Drained operation closures are never
+invoked.
+
+There is no supervisor or automatic restart. The pool retains its original handle, which now
+points at a closed receiver; all future sends fail as `NotStarted`. This avoids silently
+resuming writes after an invariant-breaking panic and gives all callers one stable terminal
+view of the writer task. `WriterTaskTerminated` has no capability attribution and is not
+retryable: retrying `SideEffectsUnknown` could duplicate a committed side effect. Runtime and
+MCP envelopes remain structurally unchanged because storage errors are flattened through
+`Display`, not serialized as `StorageError` variants. Because `StorageError` is public and is
+not marked `#[non_exhaustive]`, the new variant is a Rust source-compatibility change for
+downstream exhaustive matches; consumers must add a `WriterTaskTerminated` arm.

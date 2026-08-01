@@ -2,10 +2,40 @@
 
 use std::borrow::Cow;
 use std::error::Error as StdError;
+use std::fmt;
 
 use thiserror::Error;
 
 use crate::capability::StorageCapability;
+
+/// What is known about one request when its single writer task terminates.
+///
+/// The state is deliberately about the request, not about why the task
+/// stopped. Callers need this distinction to decide whether a write is known
+/// not to have started, known to have had its SQLite transaction rolled back,
+/// or may already have produced side effects.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriterTaskRequestState {
+    /// The request's operation closure was never invoked.
+    NotStarted,
+    /// The request panicked inside `BEGIN IMMEDIATE`, and that transaction was
+    /// successfully rolled back on the connection that owned it.
+    TransactionRolledBack,
+    /// The request was accepted, but its exact outcome cannot be established;
+    /// it may already have produced side effects and must not be blindly
+    /// retried.
+    SideEffectsUnknown,
+}
+
+impl fmt::Display for WriterTaskRequestState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::NotStarted => "not_started",
+            Self::TransactionRolledBack => "transaction_rolled_back",
+            Self::SideEffectsUnknown => "side_effects_unknown",
+        })
+    }
+}
 
 /// Unified error type for all storage operations.
 #[derive(Debug, Error)]
@@ -87,10 +117,16 @@ pub enum StorageError {
     #[error("write queue full: timed out after {timeout_ms}ms waiting for writer task capacity")]
     WriteQueueFull { timeout_ms: u64 },
 
-    /// An internal write-queue plumbing failure not attributable to a
-    /// specific storage capability: the writer task's channel closed (the
-    /// task panicked or was dropped) or its oneshot reply was dropped before
-    /// sending a result.
+    /// The pool's single writer task has terminated permanently. The state
+    /// identifies what is known about this request at that boundary. Retrying
+    /// on the same pool cannot recover the closed writer task.
+    #[error("writer task terminated (request_state={request_state})")]
+    WriterTaskTerminated {
+        request_state: WriterTaskRequestState,
+    },
+
+    /// An internal storage failure not attributable to a specific storage
+    /// capability.
     #[error("internal storage error: {0}")]
     Internal(String),
 
@@ -148,6 +184,7 @@ impl StorageError {
             | Self::Timeout { .. }
             | Self::Transaction { .. }
             | Self::WriteQueueFull { .. }
+            | Self::WriterTaskTerminated { .. }
             | Self::Internal(..)
             | Self::WriterTaskNoRuntime => None,
         }
@@ -255,6 +292,39 @@ mod tests {
             operation,
             FakeSource(message.into()),
         )
+    }
+
+    #[test]
+    fn writer_task_request_state_display_is_stable() {
+        assert_eq!(
+            WriterTaskRequestState::NotStarted.to_string(),
+            "not_started"
+        );
+        assert_eq!(
+            WriterTaskRequestState::TransactionRolledBack.to_string(),
+            "transaction_rolled_back"
+        );
+        assert_eq!(
+            WriterTaskRequestState::SideEffectsUnknown.to_string(),
+            "side_effects_unknown"
+        );
+    }
+
+    #[test]
+    fn writer_task_terminated_is_uncapability_scoped_and_not_retryable() {
+        for request_state in [
+            WriterTaskRequestState::NotStarted,
+            WriterTaskRequestState::TransactionRolledBack,
+            WriterTaskRequestState::SideEffectsUnknown,
+        ] {
+            let error = StorageError::WriterTaskTerminated { request_state };
+            assert_eq!(error.capability(), None);
+            assert!(!error.is_retryable());
+            assert_eq!(
+                error.to_string(),
+                format!("writer task terminated (request_state={request_state})")
+            );
+        }
     }
 
     #[test]

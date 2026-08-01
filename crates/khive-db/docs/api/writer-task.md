@@ -39,9 +39,35 @@ without ever invoking the request's operation closure via
 for a failed `BEGIN` (Component D is a later slice); the connection simply
 tries `BEGIN IMMEDIATE` fresh on the next request.
 
-Exits when every `WriterTaskHandle` clone is dropped and the channel closes
-(`rx.recv()` returns `None`), or if the blocking closure panics. Either way,
-this task's `rx` is dropped when the function returns, which is what turns
-subsequent `WriterTaskHandle::send` calls into `StorageError::Internal`
-(ADR-067 failure-mode table: "Receiver drop (writer task stopped)" /
-"Writer task panic").
+Exits normally when every `WriterTaskHandle` clone is dropped and the channel
+closes (`rx.recv()` returns `None`). A panic while executing a request instead
+puts that writer-task instance into a permanent terminal state. The task does
+not restart: the pool retains the same handle, so subsequent sends observe the
+closed receiver rather than creating a replacement task.
+
+### Terminal failure contract
+
+Panic containment happens inside the concrete `WriteRequest<R>`, after its
+typed reply sender has been separated from the operation closure. This allows
+the active caller to receive `StorageError::WriterTaskTerminated` with the
+strongest state the writer task can prove. Once a panic makes the task
+terminal, the receiver is closed **before** buffered requests are drained.
+Closing first prevents concurrent producers from extending the drain forever;
+drained requests receive a typed error without invoking their closures.
+
+| Request position / condition                                         | `WriterTaskRequestState` | Guarantee                                                                                      |
+| -------------------------------------------------------------------- | ------------------------ | ---------------------------------------------------------------------------------------------- |
+| Active transaction-wrapped request panics; `ROLLBACK` succeeds       | `TransactionRolledBack`  | The request ran, but its SQLite transaction was rolled back; no wrapped database write commits |
+| Active transaction-wrapped request panics; `ROLLBACK` fails          | `SideEffectsUnknown`     | The request ran and the task cannot prove the transaction's final state                        |
+| Active top-level request panics                                      | `SideEffectsUnknown`     | Top-level requests have no enclosing transaction to roll back                                  |
+| Request was buffered behind the panicking request                    | `NotStarted`             | Its operation closure is never invoked                                                         |
+| Send begins after the receiver has closed                            | `NotStarted`             | The request was not accepted and its operation closure is never invoked                        |
+| An accepted request loses its reply outside the contained panic path | `SideEffectsUnknown`     | The caller cannot prove whether the operation began or which side effects occurred             |
+
+All three handle surfaces (`send`, `send_with_timeout`, and
+`send_top_level`) use this contract. Queue backpressure and
+`WriteQueueFull` remain unchanged: a timeout while waiting for capacity is
+not a writer-task termination. `WriterTaskTerminated` is deliberately not
+retryable because retrying an outcome marked `SideEffectsUnknown` could
+duplicate a committed side effect; callers must make a new, explicit decision
+using operation-level idempotency.

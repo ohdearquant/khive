@@ -19,7 +19,7 @@ pub mod vectors;
 pub use blob::{BlobOrphanSweepConfig, BlobOrphanSweepResult, BlobStore, ContentRef};
 pub use capability::StorageCapability;
 pub use entity::{Entity, EntityFilter, EntityStore};
-pub use error::StorageError;
+pub use error::{StorageError, WriterTaskRequestState};
 
 pub use event::{
     Event, EventFilter, EventObservation, EventStore, EventView, ObservationRole, ReferentKind,
