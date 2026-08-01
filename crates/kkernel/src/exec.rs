@@ -3717,11 +3717,10 @@ backend = "sessions"
         )
         .await
         .expect_err("atomic preparation must reject an alternate dependency UUID spelling");
+        let alternate_spelling_message = format!("{alternate_spelling_error:#}");
         assert!(
-            alternate_spelling_error
-                .to_string()
-                .contains("canonical lowercase hyphenated UUID"),
-            "unexpected alternate-spelling error: {alternate_spelling_error}"
+            alternate_spelling_message.contains("canonical lowercase hyphenated UUID"),
+            "unexpected alternate-spelling error: {alternate_spelling_message}"
         );
 
         {
