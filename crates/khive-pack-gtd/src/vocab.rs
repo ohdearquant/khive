@@ -182,7 +182,7 @@ pub(crate) static GTD_HANDLERS: [HandlerDef; 5] = [
                 name: "id",
                 param_type: "uuid",
                 required: true,
-                description: "UUID of the task to complete.",
+                description: "Full UUID or unique 8+ hex prefix of the task to complete. By-ID resolution is namespace-agnostic (ADR-007).",
             },
             ParamDef {
                 name: "result",
@@ -257,7 +257,7 @@ pub(crate) static GTD_HANDLERS: [HandlerDef; 5] = [
                 name: "id",
                 param_type: "uuid",
                 required: true,
-                description: "UUID of the task to transition.",
+                description: "Full UUID or unique 8+ hex prefix of the task to transition. By-ID resolution is namespace-agnostic (ADR-007).",
             },
             ParamDef {
                 name: "status",

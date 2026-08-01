@@ -146,12 +146,20 @@ No collision with kg pack's shared CRUD. ADR-017's `VerbRegistry` registers all 
 verbs as `gtd`-owned. The kg pack's `create(kind="note", note_kind="task", ...)`
 path also produces tasks — see "Two equivalent paths" below.
 
+`gtd.complete` and `gtd.transition` follow ADR-007's by-ID contract. Their `id`
+argument accepts a full UUID or a unique 8+ character hexadecimal prefix and
+resolves without a namespace filter. A task created under a legacy namespace is
+therefore directly transitionable and completable by ID; its stored namespace
+remains unchanged attribution, while authorization stays at the Gate.
+
 ### `depends_on` as both property and edge
 
 When `assign` (or shared `create`) creates a task with `depends_on: ["abc12345",
 "def67890"]`:
 
-1. The IDs are resolved within the caller's namespace (full UUID or 8-char prefix).
+1. Each ID accepts a full UUID or unique 8+ character hexadecimal prefix. Prefix
+   resolution is scoped to the caller's primary namespace, and the resolved target
+   must be a task in that namespace before the dependency write proceeds.
 2. The full UUIDs are stored in `properties.depends_on` for self-describing record
    shape.
 3. **Plus**: one `depends_on` edge is created per dependency, with the new task as

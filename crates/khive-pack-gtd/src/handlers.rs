@@ -246,12 +246,12 @@ fn short_id(uuid: Uuid) -> String {
     uuid.as_hyphenated().to_string().chars().take(8).collect()
 }
 
-/// `pub` (widened from `pub(crate)`, ADR-099 B3): the
-/// `--atomic` seam in `kkernel` reuses this exact resolver (full UUID or 8+
-/// hex prefix, namespace-scoped via `resolve_prefix`) to resolve `gtd.transition`
-/// / `gtd.complete` `id` args before atomic prepare, matching what
-/// `handle_transition`/`handle_complete` use — reproducing canonical short-id
-/// acceptance without a duplicated resolution helper.
+/// Resolve a task-create reference as a full UUID or 8+ hex prefix.
+/// Prefix lookup stays scoped to the caller's primary namespace per ADR-016;
+/// task creation applies its primary-namespace mutation checks after this
+/// resolution. Lifecycle by-ID operations use the private
+/// `resolve_lifecycle_uuid` helper
+/// instead.
 pub async fn resolve_uuid(
     s: &str,
     runtime: &KhiveRuntime,
@@ -262,6 +262,26 @@ pub async fn resolve_uuid(
     }
     if s.len() >= 8 && s.chars().all(|c| c.is_ascii_hexdigit()) {
         return match runtime.resolve_prefix(token, s).await? {
+            Some(uuid) => Ok(uuid),
+            None => Err(RuntimeError::InvalidInput(format!(
+                "no record matches prefix: {s:?}"
+            ))),
+        };
+    }
+    Err(RuntimeError::InvalidInput(format!(
+        "invalid UUID (expected full UUID or 8+ hex prefix): {s:?}"
+    )))
+}
+
+/// Resolve a lifecycle verb's by-ID reference without a namespace filter.
+/// `gtd.transition` and `gtd.complete` follow ADR-007's global by-ID contract
+/// for both full UUIDs and short prefixes.
+async fn resolve_lifecycle_uuid(s: &str, runtime: &KhiveRuntime) -> Result<Uuid, RuntimeError> {
+    if let Ok(uuid) = Uuid::from_str(s) {
+        return Ok(uuid);
+    }
+    if s.len() >= 8 && s.chars().all(|c| c.is_ascii_hexdigit()) {
+        return match runtime.resolve_prefix_unfiltered(s).await? {
             Some(uuid) => Ok(uuid),
             None => Err(RuntimeError::InvalidInput(format!(
                 "no record matches prefix: {s:?}"
@@ -480,15 +500,15 @@ async fn fetch_all_matching_tasks(
     Ok(notes)
 }
 
-/// Load a task note and verify (a) it exists, (b) namespace matches, (c) it is
-/// actually `kind = "task"`. Used by `complete` and `transition`.
+/// Load a task note by global ID and verify it is actually `kind = "task"`.
+/// Used by `complete` and `transition`; the task's stored namespace is
+/// attribution and therefore does not gate these by-ID lifecycle operations.
 async fn load_task(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
     raw_id: &str,
 ) -> Result<(khive_storage::note::Note, String), RuntimeError> {
-    let uuid = resolve_uuid(raw_id, runtime, token).await?;
-    let ns = token.namespace().as_str();
+    let uuid = resolve_lifecycle_uuid(raw_id, runtime).await?;
     let store = runtime.notes(token)?;
     let note = store
         .get_note(uuid)
@@ -496,9 +516,6 @@ async fn load_task(
         .map_err(|e| RuntimeError::Internal(format!("get_note: {e}")))?
         .ok_or_else(|| RuntimeError::NotFound(format!("not found: {raw_id}")))?;
 
-    if note.namespace != ns {
-        return Err(RuntimeError::NotFound(format!("not found: {raw_id}")));
-    }
     if note.kind != "task" {
         return Err(RuntimeError::InvalidInput(format!(
             "expected kind=\"task\", got {:?}",
