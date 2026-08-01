@@ -38,7 +38,7 @@ operations layer:
 | Concern                              | Decision                                                                                                                            |
 | ------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------- |
 | Cross-backend edge representation    | D1: `target_backend` column on `graph_edges`                                                                                        |
-| Node-to-backend resolution           | D2: in-memory lazy locator cache                                                                                                    |
+| Node-to-backend resolution           | D2: in-memory bounded TTL/LRU locator cache                                                                                         |
 | Cross-backend `link()` mechanics     | D3: coordinator-driven, with edge stored on source's backend                                                                        |
 | Substrate-kind search fan-out        | D4: unweighted RRF across backends                                                                                                  |
 | Cross-backend traversal and curation | D5: DEFERRED in shipped code; target design retained below for transparent BFS, cross-backend merge errors, and hard-delete cascade |
@@ -66,7 +66,7 @@ crates do not depend on it.
 kkernel
 ├── coordinator/      ← this ADR
 │   ├── edges.rs      (D1 — target_backend column, link mechanics)
-│   ├── locator.rs    (D2 — DashMap<Uuid, BackendName>)
+│   ├── locator.rs    (D2 — bounded TTL/LRU cache)
 │   ├── search.rs     (D4 — substrate-kind fan-out + RRF)
 │   ├── traversal.rs  (D5 — deferred target: cross-backend BFS)
 │   ├── curation.rs   (D5 — deferred target: update / merge / delete cascade)
@@ -121,12 +121,15 @@ pub struct Edge {
 }
 ```
 
-### D2 — Node locator is an in-memory lazy cache
+### D2 — Node locator is an in-memory bounded TTL/LRU cache
 
 The coordinator owns:
 
 ```text
-Arc<DashMap<Uuid, BackendName>>
+Arc<LocatorCache>
+└── Mutex<LocatorState>
+    ├── LruCache<Uuid, LocatorEntry>
+    └── BTreeSet<(Instant, Uuid)>  // expiration index
 ```
 
 Semantics:
@@ -136,12 +139,17 @@ Semantics:
 - **Lazy on read**: a `locate(uuid)` call hits the cache first; on miss, the coordinator
   issues parallel reads to all backends and caches the first hit (or returns `None` if no
   backend contains the UUID).
+- **TTL pruning**: every insertion removes elapsed five-minute entries through a separate
+  expiration index, so one-time IDs disappear without being queried again. Cache hits
+  update LRU recency without extending the TTL.
+- **Bounded LRU**: the default capacity is 65,536 entries. Inserting beyond the cap
+  evicts the least-recently-used live mapping.
 - **Not persisted**: in-memory only. Across process restarts the cache is empty and warms
   lazily as queries arrive.
 
-Memory budget: 16 bytes (UUID) + ~16 bytes (backend name) ≈ 32 bytes per entry. 1M cached
-entries ≈ 32 MB. Bounded by working set. Currently unbounded; a bounded LRU with operator-
-configurable cap is a follow-up if a deployment hits memory pressure.
+The 65,536-entry default bounds both the LRU and expiration index. Exact resident memory
+depends on backend-name allocations and the map/tree bookkeeping; making the cap
+operator-configurable remains a follow-up if deployments need a different tradeoff.
 
 Cache invalidation:
 
@@ -659,7 +667,8 @@ write queue. `link()` and ordinary writes still hard-fail on partition (see D6).
   the cascade plan. Bounded; only on `hard_delete_entity(hard=true)`.
 - **Incoming neighbors are O(N backends)** per node. Bounded by backend count and
   visited-set pruning.
-- **Locator memory budget grows with working set** — bounded but unmonitored in v1.
+- **Locator memory budget is fixed and unmonitored in v1** — the 65,536-entry default is
+  not yet operator-configurable.
 - **More test surface** — substrate-kind tests, cross-backend link tests, partition tests.
 
 ### Neutral
@@ -684,8 +693,8 @@ empty (one entry per substrate kind, all pointing at `main`).
 
 ## Open Questions
 
-1. **Locator eviction policy.** Default unbounded for v1; bounded LRU with operator-
-   configurable cap if a deployment exceeds ~10M cached UUIDs.
+1. **Locator capacity configuration.** The bounded LRU defaults to 65,536 entries. Add an
+   operator-configurable override if deployments need a different memory/hit-rate tradeoff.
 2. **Stable backend IDs vs. names.** `target_backend` references operator-defined
    strings. Renaming a backend orphans existing values. Mitigation v1: document that
    backend renames require a migration script. Future: a stable `backend_id` UUID
