@@ -80,9 +80,11 @@ inbound copy addressed to the actor label supplied in `to` (ADR-057).
 
 Both copies land in the caller's namespace; no cross-namespace write occurs.
 `from_actor` is set to `token.actor().id`; the caller namespace is carried separately as the routing `from`/`to` values passed to `dual_write_message`. `to_actor` is set to the
-`to` argument. When the caller's actor label is `"local"` (single-actor
-fallback), `comm.inbox` does not apply an actor filter, preserving backward
-compatibility.
+`to` argument. `comm.inbox` scopes every caller, including the anonymous
+`"local"` fallback, with `to_actor = caller OR to_actor IS NULL`. Anonymous
+callers therefore share messages addressed to `"local"` and can still read
+legacy rows without `to_actor`, but cannot read messages explicitly addressed
+to another actor.
 
 The routing `from` and `to` passed to `dual_write_message` are both set to the
 caller's namespace string so that `from == recipient_ns_str` is always true:
@@ -153,11 +155,11 @@ the default inbox, so a misplaced filter cannot silently return the wrong box.
 The existing envelope remains stable; `unread_count` is zero for the sent box
 because outbound rows have no recipient read state.
 
-When the caller's actor label is `"local"` (single-actor fallback), no
-`to_actor` filter is applied and the inbox behaves as before (party-line).
-When the caller has a non-`"local"` actor label, only messages addressed to
-that actor are returned. Legacy messages without a `to_actor` field are
-visible regardless (Q3: OR IS NULL).
+Every caller is filtered by `to_actor = caller OR to_actor IS NULL`. A
+configured actor therefore sees messages addressed to that actor plus legacy
+rows without `to_actor`. The anonymous `"local"` fallback sees messages
+addressed to `"local"` plus the same legacy rows; it does not bypass the filter
+or expose messages explicitly addressed to another actor.
 
 `from_actor`/`from_prefix` (#493) sender filters are mutually exclusive.
 Direction + read-status + `to_actor` filters are pushed into SQL so
@@ -186,9 +188,9 @@ Omitting it preserves the full message object. The accepted top-level names are
 `updated_at`. Stable property aliases `comm_schema_version`, `from_actor`,
 `to_actor`, `thread_id`, `sent_at`, `outbound_ref`, and `sent_by_process` are
 also available without returning the full `properties` map; an absent optional
-property projects as null, except `from_actor`/`to_actor`, which retain the
-full view's documented legacy `from`/`to` fallbacks. Unknown names and an empty
-list are hard errors.
+property projects as null, except `from_actor`/`to_actor`, which fall back to
+the full view's `from`/`to` values. Unknown names and an empty list are hard
+errors.
 Authorization, filtering, unread counting, pagination lookahead, and thread
 deduplication all operate on the complete internal view before projection.
 

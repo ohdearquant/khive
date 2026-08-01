@@ -8,7 +8,7 @@ Schedule Packs)\
 **Related issues**: #57 (actor-addressed delivery -- primary), #13 (cross-namespace policy
 gate), #75 (actor identity on every request), #1447 (sender-side dual-write confirmation),
 #1428 (process provenance), #1490 (versioned message properties), #1468 (list-read field
-projection), #1471 (sender-visible sent history)
+projection), #1471 (sender-visible sent history), #199 (anonymous inbox isolation)
 
 ## Context
 
@@ -84,17 +84,16 @@ recipient share a namespace.
 
 ### Scope of this implementation
 
-This PR delivers **Failure 1 (delivery denied)** for the shared-`"local"` deployment:
-`comm.send` and `comm.reply` no longer return `PermissionDenied` for actor-addressed sends.
-Both copies of a message stay in the caller's namespace; delivery works via the single-actor
-fallback in `comm.inbox` (no `to_actor` filter when `caller_actor == "local"`).
+The original implementation delivered **Failure 1 (delivery denied)** for the shared-`"local"`
+deployment: `comm.send` and `comm.reply` no longer return `PermissionDenied` for
+actor-addressed sends, and both copies stay in the caller's namespace.
 
-**Failure 2 (per-actor inbox filtering)** requires distinguishing actors within a shared
-namespace, which in turn requires actor identity to be carried separately from the namespace
-string. That work is tracked in issue #75. The `to_actor` field, the
-`idx_comm_message_to_actor` index, and the `EqOrMissing` filter in `handle_inbox` are
-forward-deployed and dormant: they activate automatically once tokens carry distinct actor
-labels within the same namespace.
+Subsequent actor propagation and issue #199 completed **Failure 2 (per-actor inbox
+filtering)**. `handle_inbox` now applies `to_actor = caller OR to_actor IS NULL` for every
+caller, including `"local"`. Anonymous sessions share the `"local"` mailbox and retain access
+to legacy rows without `to_actor`, but do not see messages explicitly addressed to another
+actor. The `to_actor` field, `idx_comm_message_to_actor` index, and `EqOrMissing` filter are
+therefore active compatibility and isolation machinery, not a dormant future path.
 
 `comm.reply` is fail-closed: it always writes both copies into the caller's namespace and
 always sets `from_actor`/`to_actor`. No code path through `handle_reply` can cause
@@ -208,8 +207,8 @@ and sender filters remain inbox-only and fail when combined with the sent box.
 projection is applied after actor visibility, filtering, pagination, and thread
 deduplication. It can select ordinary top-level view fields or stable message
 property aliases such as `from_actor`, `to_actor`, and `sent_at`; absent optional
-properties render as null, while `from_actor`/`to_actor` retain the full view's
-legacy `from`/`to` fallback semantics. Omitting `fields` preserves the complete
+properties render as null, while `from_actor`/`to_actor` fall back to the full
+view's `from`/`to` values. Omitting `fields` preserves the complete
 historical response, while an empty list or an unknown field is rejected rather
 than silently changing shape.
 
@@ -296,21 +295,21 @@ the properties JSON for both copies.
 
 ### `comm.inbox` behavior change
 
-`comm.inbox` adds a `to_actor` filter:
+`comm.inbox` applies one actor predicate for every caller:
 
-- If the caller's actor label equals `"local"` (the single-actor fallback), no `to_actor`
-  filter is applied. The inbox behaves exactly as today: all inbound messages in the namespace
-  are returned. This preserves backward compatibility for existing single-actor deployments.
-- If the caller's actor label is anything other than `"local"`, an additional property filter
-  is applied: `properties.to_actor == caller_actor_label`. Only messages addressed to this
-  actor are returned. Messages without a `to_actor` field (legacy messages) are not visible
-  to actor-scoped callers; see Open Question Q3.
+`properties.to_actor == caller_actor_label OR properties.to_actor IS NULL`.
+
+- A configured actor sees messages addressed to that actor plus legacy messages without a
+  `to_actor` field.
+- The anonymous `"local"` fallback sees messages addressed to `"local"` plus the same legacy
+  rows. It does not bypass actor filtering, so messages explicitly addressed to another actor
+  remain hidden.
 
 The `status` filter (`unread`, `read`, `all`) is unchanged.
 
 The optional `box="sent"` path reverses the actor predicate: it requires
 `direction=outbound` and `from_actor=caller`, then optionally filters
-`to_actor`. The default remains this section's inbound behavior.
+`to_actor`. The default remains the actor-scoped inbound behavior above.
 
 The `idx_comm_message_direction` index (vocab.rs:17) covers `(namespace, kind, direction,
 read, created_at)`. When actor filtering is active, a separate index covering
@@ -356,11 +355,10 @@ cross-namespace path (Option B) is not disturbed.
 
 ### Back-compat: existing party-line messages
 
-Messages written before this ADR lack `from_actor` and `to_actor` fields. Because the
-single-actor fallback skips the `to_actor` filter when the actor label is `"local"`,
-existing deployments that have not configured `--actor` or `[actor] id` see no change in
-inbox behavior. Deployments that set an actor label will not see legacy party-line messages
-in their actor-scoped inbox; see Open Question Q3.
+Messages written before this ADR lack `from_actor` and `to_actor` fields. `FilterOp::EqOrMissing`
+keeps those rows visible to every caller as a compatibility concession. New attributed rows
+remain actor-scoped, and an anonymous `"local"` caller sees new rows only when they are addressed
+to `"local"`.
 
 ## Implementation Sketch
 
@@ -406,16 +404,13 @@ JSON properties; index creation is idempotent via `CREATE INDEX IF NOT EXISTS` a
 
 Tests assert the following:
 
-**(a) Per-actor inbox filtering -- deferred to issue #75**
+**(a) Per-actor inbox filtering**
 
-Steps 6-8 of the original plan (inbox as `lambda:leo` sees the message; inbox as `lambda:khive`
-does not) require carrying actor identity separately from the namespace string. With the current
-mechanism, `token.namespace().as_str()` IS the actor label, so two actors in the same namespace
-`"local"` would both have actor label `"local"` and both see all messages via the single-actor
-fallback. Per-actor filtering within a shared namespace is therefore not achievable with this
-implementation and is deferred to issue #75. The `to_actor` field, the
-`idx_comm_message_to_actor` index, and the `EqOrMissing` inbox filter are forward-deployed
-machinery that activate once tokens carry distinct non-`"local"` actor labels.
+1. Send one message addressed to `lambda:leo` and one addressed to `lambda:khive` in the same
+   namespace.
+2. Assert each configured actor sees only its own attributed message.
+3. Assert an anonymous `"local"` caller sees neither attributed message.
+4. Assert every caller can still see a legacy row with no `to_actor`.
 
 **(b) Namespace isolation is preserved**
 
@@ -431,12 +426,12 @@ machinery that activate once tokens carry distinct non-`"local"` actor labels.
 **(c) Single-actor fallback delivers messages (Failure 1 fix)**
 
 7. Call `comm.send(to="lambda:leo")` with actor label `"local"` (no `--actor` configured).
-8. Assert send succeeds, no `PermissionDenied`.
-9. Assert the inbound note is in namespace `"local"` with `to_actor="lambda:leo"`.
-10. `comm.inbox` with actor label `"local"`: the inbound message appears (the `caller_actor ==
-    "local"` branch skips the `to_actor` filter, returning all inbound messages).
-11. Assert `comm.reply` from `"local"` on the inbound note succeeds and all four notes
-    (outbound1, inbound1, outbound2, inbound2) remain in namespace `"local"`.
+8. Assert send succeeds, no `PermissionDenied`, and the inbound note remains in namespace
+   `"local"` with `to_actor="lambda:leo"`.
+9. Assert `lambda:leo` can read the message while the anonymous `"local"` inbox cannot.
+10. Call `comm.send(to="local")` anonymously and assert the `"local"` inbox sees that message.
+11. Assert participant reply and dual-write behavior keep all resulting notes in namespace
+    `"local"`.
 
 ## Alternatives Considered
 
@@ -480,9 +475,7 @@ added via `COMM_SCHEMA_PLAN_STMTS` (run idempotently at pack startup via `CREATE
 EXISTS`). Maintainers should confirm this approach is acceptable, or specify that the index belongs
 in a numbered `VersionedMigration` (ADR-015) to keep startup behavior predictable.
 
-**Q3. Legacy message visibility.** Messages written before this ADR have no `to_actor` field.
-Under the proposed fallback, these messages are visible only to callers whose actor label is
-`"local"`. Callers with a configured actor label (e.g., `lambda:leo`) will not see them.
-Whether existing party-line messages should be backfilled with `to_actor = "local"` (to
-remain visible in single-actor inboxes) or declared out-of-scope for actor-scoped inboxes is
-a product decision maintainers must settle before the migration story is finalized.
+**Q3. Legacy message visibility (resolved).** Messages written before this ADR have no
+`to_actor` field. The implemented `EqOrMissing` predicate leaves those rows visible to every
+caller rather than assigning them to `"local"` or hiding them from configured actors. This is
+the explicit backward-compatibility boundary; newly attributed rows remain actor-scoped.
