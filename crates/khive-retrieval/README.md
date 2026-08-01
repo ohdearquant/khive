@@ -38,8 +38,12 @@ for (id, score) in &fused {
 
 `HybridConfig::new(top_k)` defaults to RRF fusion (k=60); chain
 `.with_fusion_strategy(..)`, `.with_pool_size(..)`, `.with_min_score(..)`, or
-`.with_weights(vector, keyword)` to customize. `fuse_search_results` falls back
-to RRF if a `Weighted` strategy's weight count doesn't match the source count;
+`.with_weights(vector, keyword)` to customize. Fusion sources and positional
+weights always use `[vector, keyword]`; retain an empty arm as an empty vector
+instead of removing it, so the remaining source keeps its assigned position.
+Even a single supplied source is transformed by the configured strategy before
+`min_score` is applied. `fuse_search_results` falls back
+to RRF if a `Weighted` strategy is not given exactly those two source slots;
 `fuse_search_results_checked` returns `Err` in that case instead.
 
 ## Configuration (Cargo features)

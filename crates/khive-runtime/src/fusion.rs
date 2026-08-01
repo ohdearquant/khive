@@ -20,6 +20,7 @@ pub use khive_fusion::FusionStrategy;
 const CANDIDATE_MULTIPLIER: u32 = 4;
 
 /// Fuse text and vector hits using the given strategy, returning at most `limit` results.
+/// Positional weighted strategies use `[vector, keyword]` order.
 pub fn fuse_with_strategy(
     text_hits: Vec<TextSearchHit>,
     vector_hits: Vec<VectorSearchHit>,
@@ -91,10 +92,9 @@ fn fuse_sources(
         })
         .collect();
 
-    let sources: Vec<Vec<(Uuid, DeterministicScore)>> = vec![text_source, vector_source]
-        .into_iter()
-        .filter(|s| !s.is_empty())
-        .collect();
+    // Canonical positional order is [vector, keyword]. Empty arms remain in
+    // place: removing one would shift the surviving arm onto the wrong weight.
+    let sources: Vec<Vec<(Uuid, DeterministicScore)>> = vec![vector_source, text_source];
 
     Ok(khive_fusion::fuse(sources, strategy, limit)?
         .into_iter()
@@ -136,6 +136,38 @@ fn merge_sources(left: SearchSource, right: SearchSource) -> SearchSource {
 }
 
 impl KhiveRuntime {
+    async fn retain_alive_search_hits(
+        &self,
+        token: &NamespaceToken,
+        mut fused: Vec<SearchHit>,
+        limit: usize,
+    ) -> RuntimeResult<Vec<SearchHit>> {
+        // Filter out soft-deleted entities. A single query fetches all alive IDs from the
+        // fused candidate pool; any ID absent from the result has been soft-deleted.
+        if !fused.is_empty() {
+            let candidate_ids: Vec<Uuid> = fused.iter().map(|h| h.entity_id).collect();
+            let alive_page = self
+                .entities(token)?
+                .query_entities(
+                    token.namespace().as_str(),
+                    EntityFilter {
+                        ids: candidate_ids,
+                        ..EntityFilter::default()
+                    },
+                    PageRequest {
+                        offset: 0,
+                        limit: fused.len() as u32,
+                    },
+                )
+                .await?;
+            let alive: HashSet<Uuid> = alive_page.items.into_iter().map(|e| e.id).collect();
+            fused.retain(|h| alive.contains(&h.entity_id));
+        }
+
+        fused.truncate(limit);
+        Ok(fused)
+    }
+
     /// Hybrid search with a caller-supplied fusion strategy.
     pub async fn hybrid_search_with_strategy(
         &self,
@@ -184,31 +216,11 @@ impl KhiveRuntime {
             Vec::new()
         };
 
-        let mut fused = fuse_with_strategy(text_hits, vector_hits, &strategy, limit as usize)?;
-
-        // Filter out soft-deleted entities. A single query fetches all alive IDs from the
-        // fused set; any ID absent from the result has been soft-deleted (deleted_at IS NOT NULL).
-        if !fused.is_empty() {
-            let candidate_ids: Vec<Uuid> = fused.iter().map(|h| h.entity_id).collect();
-            let alive_page = self
-                .entities(token)?
-                .query_entities(
-                    token.namespace().as_str(),
-                    EntityFilter {
-                        ids: candidate_ids,
-                        ..EntityFilter::default()
-                    },
-                    PageRequest {
-                        offset: 0,
-                        limit: fused.len() as u32,
-                    },
-                )
-                .await?;
-            let alive: HashSet<Uuid> = alive_page.items.into_iter().map(|e| e.id).collect();
-            fused.retain(|h| alive.contains(&h.entity_id));
-        }
-
-        Ok(fused)
+        // Keep the full over-fetched pool through ranking and the alive check;
+        // truncating first lets a stale hit consume a final top-k slot.
+        let fused = fuse_with_strategy(text_hits, vector_hits, &strategy, candidates as usize)?;
+        self.retain_alive_search_hits(token, fused, limit as usize)
+            .await
     }
 }
 
@@ -255,7 +267,7 @@ mod tests {
         assert!(hits_k1[0].score > hits_k60[0].score);
     }
 
-    // 2. Weighted [0.7, 0.3] gives different ordering than [0.3, 0.7]
+    // 2. Canonical [vector, keyword] weights change ordering as documented.
     #[test]
     fn weighted_ordering_depends_on_weights() {
         let a = Uuid::new_v4();
@@ -264,7 +276,7 @@ mod tests {
         let text = vec![text_hit(a, 0.9, "a"), text_hit(b, 0.1, "b")];
         let vec_hits = vec![vector_hit(b, 0.9), vector_hit(a, 0.1)];
 
-        let heavy_text = fuse_with_strategy(
+        let heavy_vector = fuse_with_strategy(
             text.clone(),
             vec_hits.clone(),
             &FusionStrategy::Weighted {
@@ -273,7 +285,7 @@ mod tests {
             10,
         )
         .unwrap();
-        let heavy_vec = fuse_with_strategy(
+        let heavy_keyword = fuse_with_strategy(
             text,
             vec_hits,
             &FusionStrategy::Weighted {
@@ -283,8 +295,8 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(heavy_text[0].entity_id, a);
-        assert_eq!(heavy_vec[0].entity_id, b);
+        assert_eq!(heavy_vector[0].entity_id, b);
+        assert_eq!(heavy_keyword[0].entity_id, a);
     }
 
     // 3. Weighted [7.0, 3.0] = Weighted [0.7, 0.3] (normalization)
@@ -346,18 +358,37 @@ mod tests {
     fn weighted_negative_weight_clamped() {
         let a = Uuid::new_v4();
         let text = vec![text_hit(a, 0.9, "a")];
-        // Negative vector weight → only text contributes
+        // Negative vector weight → only keyword/text contributes.
         let hits = fuse_with_strategy(
             text,
             vec![],
             &FusionStrategy::Weighted {
-                weights: vec![1.0, -0.5],
+                weights: vec![-0.5, 1.0],
             },
             10,
         )
         .unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].entity_id, a);
+    }
+
+    #[test]
+    fn weighted_empty_arm_keeps_canonical_position() {
+        let text_only = Uuid::new_v4();
+        let hits = fuse_with_strategy(
+            vec![text_hit(text_only, 0.9, "text")],
+            vec![],
+            &FusionStrategy::Weighted {
+                // Canonical [vector, keyword]: the only non-empty arm has zero weight.
+                weights: vec![1.0, 0.0],
+            },
+            10,
+        )
+        .unwrap();
+        assert!(
+            hits.is_empty(),
+            "dropping the empty vector arm would incorrectly rebind text to its weight"
+        );
     }
 
     // 6. Union returns max score per entity when same id appears in both lists
@@ -388,10 +419,65 @@ mod tests {
         assert!(hits[0].title.is_none());
     }
 
+    #[test]
+    fn keyword_only_drops_vector() {
+        let text_id = Uuid::new_v4();
+        let vector_id = Uuid::new_v4();
+        let hits = fuse_with_strategy(
+            vec![text_hit(text_id, 0.8, "text")],
+            vec![vector_hit(vector_id, 0.9)],
+            &FusionStrategy::KeywordOnly,
+            10,
+        )
+        .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].entity_id, text_id);
+        assert_eq!(hits[0].source, SearchSource::Text);
+    }
+
     // 8. Default strategy is Rrf{k:60}
     #[test]
     fn default_strategy_is_rrf_k60() {
         assert_eq!(FusionStrategy::default(), FusionStrategy::Rrf { k: 60 });
+    }
+
+    #[tokio::test]
+    async fn alive_filter_refills_top_k_from_the_ranked_candidate_pool() {
+        let rt = KhiveRuntime::memory().unwrap();
+        let tok = NamespaceToken::local();
+        let live = rt
+            .create_entity(
+                &tok,
+                "concept",
+                None,
+                "live refill candidate",
+                None,
+                None,
+                vec![],
+            )
+            .await
+            .unwrap();
+        let stale = Uuid::new_v4();
+        let fused = vec![
+            SearchHit {
+                entity_id: stale,
+                score: DeterministicScore::from_f64(0.9),
+                source: SearchSource::Text,
+                title: Some("stale".into()),
+                snippet: None,
+            },
+            SearchHit {
+                entity_id: live.id,
+                score: DeterministicScore::from_f64(0.8),
+                source: SearchSource::Text,
+                title: Some("live".into()),
+                snippet: None,
+            },
+        ];
+
+        let hits = rt.retain_alive_search_hits(&tok, fused, 1).await.unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].entity_id, live.id);
     }
 
     // 9. Roundtrip serde preserves variant
@@ -405,6 +491,7 @@ mod tests {
             },
             FusionStrategy::Union,
             FusionStrategy::VectorOnly,
+            FusionStrategy::KeywordOnly,
         ];
         for strategy in cases {
             let json = serde_json::to_string(&strategy).expect("serialize");
