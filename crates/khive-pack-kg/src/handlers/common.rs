@@ -20,6 +20,7 @@ use khive_types::{EntityKind, EventKind};
 use crate::entity_type_registry::EntityTypeRegistry;
 use crate::vocab::NoteKind;
 
+pub(crate) use super::params::DbDiagnosticsParams;
 pub(crate) use super::params::{
     ContextParams, CreateParams, DeleteParams, GetParams, LinkParams, ListParams,
     ListProposalsParams, MergeParams, NeighborsParams, ProposeParams, QueryParams, ReviewParams,

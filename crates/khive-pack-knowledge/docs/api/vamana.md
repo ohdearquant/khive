@@ -22,9 +22,47 @@ sqlite-vec corpus on cache-miss. `kkernel reindex` re-persists v2 segments and c
 This module exceeds the 700-line soft target because it owns the complete Vamana ANN
 lifecycle for knowledge search: `SharedAnn` type, `AnnKey`, snapshot persistence
 (`warm_known_snapshots` / `ensure_ann_background`), index build (`build_ann`), search
-(`search_loaded`), and all associated SQL queries and serialization logic. These
+(`search_loaded_with_seq` plus the ADR-118 exact tail), and all associated SQL queries and
+serialization logic. These
 responsibilities are tightly coupled through the shared `AnnState` and cannot be split
 without obscuring the generation-fenced install and warm-ownership lock protocol.
+
+## Fresh-tail serving (ADR-118)
+
+`knowledge.search` and `knowledge.suggest` capture ANN candidates and the loaded bridge's
+write-log watermark under one cache read lock, then exact-score the final state of every
+`knowledge.atom` write above that watermark. One SQLite statement reads the consumer row,
+wildcard-inclusive pair minimum, optional live count, selected log suffix, and joined current
+embeddings; separate calls on a pool-backed reader would not guarantee one snapshot. Tail
+upserts replace stale ANN candidates, final deletes remove them, and the merged ordering remains
+one vector source for RRF rather than adding a new fusion leg. Equal scores break by UUID, making
+the result independent of hash-map iteration order. This makes an externally committed vector
+visible on the next query even when the daemon still holds an older segment.
+
+The same snapshot reads the wildcard-inclusive consumer-registry minimum before scanning the
+log. If compaction has advanced beyond the loaded bridge, the current query reloads and searches
+the newly published segment, then revalidates its watermark and reads that segment's own tail in
+one snapshot. Peer checkpoints that advance during revalidation cause a bounded reload retry; the
+terminal fallback serves only the exact suffix above the last same-snapshot registry floor, never
+the original stale candidates under a newer floor. The stale cache generation is retired so the
+normal warm path adopts the published segment for following queries. File-backed checkpoints
+publish their replacement bridge before raising the durable registry watermark, making that
+process's mismatch window empty while preserving crash-safe under-compaction. Pathless checkpoints
+serialize the inverse raise-then-install sequence with the per-key process lock.
+
+When no bridge is serving, the exact leg scans only the newest
+`ceil(KHIVE_ANN_REBUILD_THRESHOLD × live_count)` raw retained log rows, applying the cap before
+final-state coalescing. This is ADR-118's bounded Cold/Empty guarantee, not a corpus-scale exact
+fallback. If the consumer row is absent, the first detector publishes the durable `-1`
+force-rebuild sentinel under the bridge publication lock and rejects or evicts local serving
+state. This applies
+even when that process has no local or persisted bridge: local evidence cannot rule out a stale
+peer. The sentinel writer re-reads the row after acquiring both publication locks; if a rebuild
+already completed while it waited, it preserves the winner instead of demoting the row again.
+Every process rejects cached, v2, and legacy-v1 state while `-1` remains; only a fenced successful
+full scan may transition it to a normal watermark. Failed or Empty scans keep the sentinel so a
+re-created row cannot be mistaken for uninterrupted registry history.
+`KHIVE_ANN_FRESH_TAIL=0` disables the exact leg but does not bypass this registry guard.
 
 ## `AnnState::warm_states` (shared warm lifecycle, issue #566)
 
@@ -57,16 +95,23 @@ flight for it.
 
 ## `save_atomic`
 
-Writes Vamana index segments via `VamanaIndex::save_atomic` (which commits a v2
-`KHVVAMG2` record in `metadata.bin` carrying a `content_hash`), then writes the id-map
-sidecar (`external_ids.bin`) atomically via a tmp-then-rename sequence, stamped with the
-corpus `content_hash` taken from the v2 commit record.
+Acquires `<segment-dir>/.bridge-checkpoint.lock`, writes Vamana index segments via
+`VamanaIndex::save_atomic` (which commits a v2 `KHVVAMG2` record in `metadata.bin` carrying a
+`content_hash`), then writes the id-map sidecar (`external_ids.bin`) atomically via a
+tmp-then-rename sequence stamped with the commit digest. Checkpoint callers retain that same lock
+through mmap re-adoption and the conditional consumer-watermark transition. Sentinel publication
+takes it too, preventing both mixed commit/sidecar pairs and a checkpoint racing registry-loss
+recovery. A per-key process lock wraps the same checkpoint on every runtime, including pathless
+in-memory runtimes, so a later durable raise cannot be followed by an older cache install.
 
 ## `ensure_ann_for_model` load order
 
 First hit wins:
 
-1. **Fast path** — already in the in-memory cache; return immediately.
+1. **Registration guard and fast path** — read the durable consumer row before trusting the
+   cache. A normal row permits an already-current in-memory bridge to return immediately. Every
+   absent row is changed to `-1`, even when this process has no bridge; an existing `-1` marks
+   local force-rebuild state. Both bypass every persisted-state path.
 2. **v2 segment path** — if a `<db-file>.ann/<hex>/` directory exists with a valid
    `metadata.bin`, run the ADR-079 Amendment 1 restart classifier
    (`classify_and_adopt_segment`): a per-write delta log (`ann_write_log`) plus each
@@ -78,9 +123,16 @@ First hit wins:
 3. **v1 JSON snapshot path** — try `retrieval_snapshots`; on hit, validate the
    `CorpusFingerprint` (count + dims) and restore from JSON. On miss / stale / corrupt,
    fall through.
-4. **Rebuild fallthrough** — scan the full sqlite-vec corpus, build the index from
-   scratch, and atomically write a v2 segment directory so the next daemon restart can
-   use path 2. Write failures are logged and do not block search.
+4. **Rebuild fallthrough** — capture full-scan authority, then scan the full sqlite-vec corpus,
+   build the index from scratch, and atomically write a v2 segment directory so the next daemon
+   restart can use path 2. The scan reads the global `ann_write_log` AUTOINCREMENT high-water from
+   `sqlite_sequence` in the same statement as the corpus; unlike retained scoped `MAX(seq)`, that
+   watermark cannot regress after compaction. The checkpoint may clear local force-rebuild state
+   only after its conditional durable transition succeeds at the captured namespace generation.
+   Before writing, every ordinary checkpoint also requires its candidate watermark to be at least
+   the current durable watermark. The conditional raise repeats that monotonic fence, so a stale
+   publisher adopts the winner instead of overwriting it while leaving a newer registry value.
+   Empty and failed authoritative scans leave `-1` in place.
 
 ## `install_if_fresher` (PR #815, covering issue #770's empty-slot scenario)
 

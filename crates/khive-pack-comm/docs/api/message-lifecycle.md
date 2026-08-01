@@ -152,19 +152,24 @@ transaction: a validation failure rejects the call before any update, while an
 item-level storage failure returns `read=false` plus `mark_error` without rolling
 back an earlier successful item.
 
-Patches only the `read` key via a storage-side `json_set`, not a caller-side
-merge-then-overwrite of the whole `properties` column: the write re-evaluates
-namespace, message kind, direction, and addressee against the row's *current*
-state in the same `UPDATE`, so a property written by another caller between
-validation and this call (the bulk form's window can span up to 500 targets)
-survives untouched, and an eligibility change in that window degrades the
-mark instead of silently landing on stale data. This also patches in place
-via a real `UPDATE`, never `upsert_note`'s `INSERT OR REPLACE` (the latter
-silently deletes and re-inserts the row on a primary-key conflict — #780).
-The `comm.probe` cursor is keyed on `notes_seq.seq`, which is fixed at first
-insert and survives such churn, so avoiding `upsert_note` here is defensive
-rather than load-bearing; a metadata patch should never rewrite the row
-regardless.
+Patches only the `read` key via `NoteStore::try_patch_note_property`, a
+storage-side `json_set`, not a caller-side merge-then-overwrite of the whole
+`properties` column: the write re-evaluates namespace, message kind, direction,
+and addressee against the row's *current* state in the same `UPDATE`, so a
+property written by another caller between validation and this call (the bulk
+form's window can span up to 500 targets) survives untouched, and an
+eligibility change in that window degrades the mark instead of silently
+landing on stale data. This also patches in place via a real `UPDATE`, never
+`upsert_note`'s `INSERT OR REPLACE` (the latter silently deletes and
+re-inserts the row on a primary-key conflict — #780). The `comm.probe` cursor
+is keyed on `notes_seq.seq`, which is fixed at first insert and survives such
+churn, so avoiding `upsert_note` here is defensive rather than load-bearing; a
+metadata patch should never rewrite the row regardless.
+
+`handle_reply`'s fold-in mark (see below) covers the single-original case and
+uses the simpler `NoteStore::set_note_property` — an unconditional atomic
+patch with no eligibility recheck — since a reply has only one target and no
+validate-then-mark window to race.
 
 The mark-read patch is best-effort: under multi-client burst traffic the
 sqlite writer pool can time out (`checkout_timeout`, 5s default), and the
@@ -219,6 +224,11 @@ Replies to a message, threading linkage.
   regardless of whether the original message carried actor labels. No legacy
   code path can cause `dual_write_message` to mint a token in a foreign
   namespace.
+- Replying folds in the addressee's read mark with the same atomic
+  `set_note_property("read", true)` operation as `comm.read`; it does not
+  re-fetch and replace the properties document. The delivery of the reply is
+  already committed, so this mark remains best-effort and reports
+  `marked_read: false` on a failed/no-op property set.
 
 ## `handlers.rs::handle_thread`
 
