@@ -33,26 +33,6 @@ pub(crate) async fn resolve_id(
     )))
 }
 
-/// Rolls back a partially-written outbound note after a dual-write failure.
-/// See crates/khive-pack-comm/docs/api/message-lifecycle.md#messagersrollback_outbound
-async fn rollback_outbound(
-    runtime: &KhiveRuntime,
-    token: &NamespaceToken,
-    outbound_id: Uuid,
-    context: &str,
-    original: RuntimeError,
-) -> RuntimeError {
-    match runtime
-        .delete_note_row_first_for_compensation(token, outbound_id)
-        .await
-    {
-        Ok(()) => original,
-        Err(rollback_err) => RuntimeError::Internal(format!(
-            "{context}: original error: {original}; outbound rollback failed after row removal attempt for {outbound_id}: {rollback_err}"
-        )),
-    }
-}
-
 pub(crate) fn note_to_message_json(note: &Note) -> Value {
     let props = note.properties.as_ref();
     let full_id = note.id.as_hyphenated().to_string();
@@ -119,25 +99,24 @@ fn build_preview(content: &str) -> String {
 }
 
 /// Writes an outbound copy (caller namespace) and an inbound copy (recipient
-/// namespace), rolling back the outbound note if the inbound write fails
-/// (atomicity guarantee). Returns the outbound `Note` on success.
+/// namespace) as ONE atomic unit (`khive_runtime::create_notes_atomic`): one
+/// writer transaction covers both notes' rows, FTS documents, and vector
+/// rows. Returns the outbound `Note` on success.
 ///
-/// Known gap (external desk review, 2026-07-21): the two `create_note` calls
-/// below are not wrapped in one DB transaction, so a process crash between
-/// them (as opposed to an in-process error, which the rollback above already
-/// handles) can still leave a durable orphan outbound note with no inbound
-/// copy. `khive-runtime` exposes a lower-level atomic primitive
-/// (`run_atomic_unit`/`AtomicOpPlan::AddNote`) that spans one transaction, but
-/// it bypasses `create_note_inner`'s FTS/embedding/decay handling, so using it
-/// here would require re-deriving that logic at the pack layer rather than
-/// wrapping the existing calls. Blocked on `khive-runtime` exposing a
-/// transaction-scoped `create_note` equivalent; not safe to hack around from
-/// this crate.
+/// Resolved gap (external desk review, 2026-07-21; closed by construction
+/// here): the two note writes used to be separate `create_note` calls with
+/// only an in-process rollback compensating an inbound-write failure, so a
+/// process crash between them could leave a durable orphan outbound note
+/// with no inbound copy. `create_notes_atomic` commits both copies under one
+/// `SqlAccess::atomic_unit` — a crash or failure anywhere in the unit rolls
+/// back everything, so no partial pair can ever be observed durably.
 ///
-/// Invariant: when `thread_id` is `None` (root send), both copies are patched
-/// to share the sender's outbound UUID as their canonical `thread_id`, so
-/// `comm.thread` finds replies regardless of which copy they replied to. When
-/// `thread_id` is already supplied (reply path), it is forwarded unchanged.
+/// Invariant: the outbound id is generated BEFORE either write (rather than
+/// patched in after, as the old two-call version did) so both copies can
+/// carry the canonical `thread_id` from their first write: for a root send
+/// (`thread_id: None`), that id IS the canonical thread_id; for a reply, the
+/// caller-supplied `thread_id` is forwarded unchanged. Either way there is no
+/// longer a separate thread_id-patch write.
 ///
 /// See crates/khive-pack-comm/docs/api/message-lifecycle.md#messagersdual_write_message for
 /// the `in_reply_to_message_id`/`references_chain` header-threading contract.
@@ -199,12 +178,22 @@ pub(crate) async fn dual_write_message(
         }
     }
 
+    // Pre-generate the outbound id so the canonical thread_id is known before
+    // any write is attempted — both copies carry it from their first write,
+    // eliminating the separate thread_id-patch transaction the two-call
+    // version needed for root sends.
+    let outbound_id = Uuid::new_v4();
+    let canonical_thread_id: String = match thread_id {
+        Some(tid) => tid.to_string(),
+        None => outbound_id.as_hyphenated().to_string(),
+    };
+
     let mut outbound_props = json!({
         "from": from,
         "to": to,
         "direction": "outbound",
         "subject": subject,
-        "thread_id": thread_id,
+        "thread_id": canonical_thread_id,
         "read": false,
         "sent_at": sent_at,
     });
@@ -226,126 +215,78 @@ pub(crate) async fn dual_write_message(
         }
     }
 
-    let outbound_note = runtime
-        .create_note(
-            caller_token,
-            "message",
-            subject,
-            content,
-            None,
-            Some(outbound_props),
-            Vec::new(),
-        )
-        .await?;
-
-    // Canonical thread_id for both copies:
-    // - If the caller supplied a thread_id (reply path), propagate it as-is.
-    // - If this is a new root message (thread_id is None), use the outbound note's
-    //   UUID so that both copies share the same canonical root across namespaces.
-    let canonical_thread_id: String = match thread_id {
-        Some(tid) => tid.to_string(),
-        None => outbound_note.id.as_hyphenated().to_string(),
+    // When actor labels are provided (ADR-057 actor-addressed path), both copies
+    // land in the caller's namespace — no cross-namespace write occurs.
+    // When sender and recipient are in different namespaces (allowed cross-ns path),
+    // mint a recipient-scoped read+write token used for the inbound write after the
+    // allowlist check so the inbound note lands in the correct inbox. For
+    // same-namespace sends (from == to), use caller_token unchanged (preserves
+    // existing behavior).
+    let cross_ns_token;
+    let inbound_tok: &NamespaceToken = if from_actor.is_some() || from == recipient_ns_str {
+        // Actor-addressed path or same-namespace send: inbound copy stays in caller ns.
+        caller_token
+    } else {
+        cross_ns_token = caller_token.with_namespace(
+            Namespace::parse(recipient_ns_str).expect("recipient_ns_str already validated above"),
+        );
+        &cross_ns_token
     };
 
-    // Patch the outbound note's thread_id to the canonical value (only needed when
-    // this is a root send; reply path already has the correct thread_id stored).
-    if thread_id.is_none() {
-        let store = runtime
-            .notes(caller_token)
-            .map_err(|e| RuntimeError::Internal(format!("dual_write: get outbound store: {e}")))?;
-        let mut patched = outbound_note.clone();
-        let mut props = patched.properties.clone().unwrap_or_else(|| json!({}));
-        props["thread_id"] = json!(canonical_thread_id);
-        patched.properties = Some(props);
-        patched.updated_at = chrono::Utc::now().timestamp_micros();
-        if let Err(patch_err) = store.upsert_note(patched).await {
-            let original = RuntimeError::Internal(format!(
-                "dual_write: patch outbound thread_id: {patch_err}"
-            ));
-            return Err(rollback_outbound(
-                runtime,
-                caller_token,
-                outbound_note.id,
-                "dual_write: patch outbound thread_id rollback",
-                original,
-            )
-            .await);
+    let mut inbound_props = json!({
+        "from": from,
+        "to": to,
+        "direction": "inbound",
+        "subject": subject,
+        "thread_id": canonical_thread_id,
+        "read": false,
+        "sent_at": sent_at,
+        "outbound_ref": outbound_id,
+    });
+    if let Some(fa) = from_actor {
+        inbound_props["from_actor"] = json!(fa);
+    }
+    if let Some(ta) = to_actor {
+        inbound_props["to_actor"] = json!(ta);
+    }
+    if let Some(irt) = in_reply_to_message_id {
+        inbound_props["in_reply_to_message_id"] = json!(irt);
+    }
+    if let Some(refs) = references_chain {
+        inbound_props["references_chain"] = json!(refs);
+    }
+    if let Some(t) = tags {
+        if !t.is_empty() {
+            inbound_props["tags"] = json!(t);
         }
     }
 
-    {
-        // When actor labels are provided (ADR-057 actor-addressed path), both copies
-        // land in the caller's namespace — no cross-namespace write occurs.
-        // When sender and recipient are in different namespaces (allowed cross-ns path),
-        // mint a recipient-scoped read+write token used for exactly one inbound
-        // `create_note` call after the allowlist check so the inbound note lands in the
-        // correct inbox. For same-namespace sends (from == to), use caller_token
-        // unchanged (preserves existing behavior).
-        let cross_ns_token;
-        let inbound_tok: &NamespaceToken = if from_actor.is_some() || from == recipient_ns_str {
-            // Actor-addressed path or same-namespace send: inbound copy stays in caller ns.
-            caller_token
-        } else {
-            cross_ns_token = caller_token.with_namespace(
-                Namespace::parse(recipient_ns_str)
-                    .expect("recipient_ns_str already validated above"),
-            );
-            &cross_ns_token
-        };
-
-        let mut inbound_props = json!({
-            "from": from,
-            "to": to,
-            "direction": "inbound",
-            "subject": subject,
-            "thread_id": canonical_thread_id,
-            "read": false,
-            "sent_at": sent_at,
-            "outbound_ref": outbound_note.id,
-        });
-        if let Some(fa) = from_actor {
-            inbound_props["from_actor"] = json!(fa);
-        }
-        if let Some(ta) = to_actor {
-            inbound_props["to_actor"] = json!(ta);
-        }
-        if let Some(irt) = in_reply_to_message_id {
-            inbound_props["in_reply_to_message_id"] = json!(irt);
-        }
-        if let Some(refs) = references_chain {
-            inbound_props["references_chain"] = json!(refs);
-        }
-        if let Some(t) = tags {
-            if !t.is_empty() {
-                inbound_props["tags"] = json!(t);
-            }
-        }
-
-        let inbound_result = runtime
-            .create_note(
-                inbound_tok,
-                "message",
-                subject,
+    let mut notes = khive_runtime::create_notes_atomic(
+        runtime,
+        vec![
+            khive_runtime::AtomicNoteSpec {
+                token: caller_token,
+                id: Some(outbound_id),
+                kind: "message",
+                name: subject,
                 content,
-                None,
-                Some(inbound_props),
-                Vec::new(),
-            )
-            .await;
+                properties: Some(outbound_props),
+            },
+            khive_runtime::AtomicNoteSpec {
+                token: inbound_tok,
+                id: None,
+                kind: "message",
+                name: subject,
+                content,
+                properties: Some(inbound_props),
+            },
+        ],
+    )
+    .await?;
 
-        if let Err(inbound_err) = inbound_result {
-            return Err(rollback_outbound(
-                runtime,
-                caller_token,
-                outbound_note.id,
-                "dual_write: inbound write rollback",
-                inbound_err,
-            )
-            .await);
-        }
-    }
-
-    Ok(outbound_note)
+    // create_notes_atomic returns notes in the same order as the specs above:
+    // [outbound, inbound].
+    Ok(notes.remove(0))
 }
 
 #[cfg(test)]
@@ -354,21 +295,18 @@ mod tests {
     use khive_storage::note::Note;
     use serde_json::json;
 
-    // Issue #460: dual_write_message must not leave a live outbound note behind
-    // when the inbound write fails AND the rollback's compensation cleanup also
-    // fails. Forces outbound creation to succeed (sender_ns), the inbound create
-    // to fail (recipient_ns, via `arm_fts_fail`), and the rollback's post-row-
-    // removal cleanup to fail (sender_ns, via `arm_rollback_cleanup_fail`). Row-
-    // first ordering in `delete_note_row_first_for_compensation` means the
-    // outbound row is gone before cleanup runs, so it must stay gone even though
-    // cleanup errors; the caller must see that cleanup failure surfaced in the
-    // returned error rather than silently discarded.
+    // Issue #460 / atomic follow-up: dual_write_message must not leave a live
+    // outbound note behind when the inbound copy's write fails. Since the
+    // send-single-txn change, both copies commit under ONE atomic unit, so a
+    // failure on the inbound copy's FTS statement (armed via
+    // `arm_fts_fail_scoped(&recipient_ns)`, now consumed by
+    // `create_notes_atomic` through `consume_fts_fail_fault`) rolls back the
+    // WHOLE unit — including the outbound copy's already-applied statements
+    // in sender_ns. Assert absence positively in BOTH namespaces rather than
+    // inspecting the error string.
     #[tokio::test]
-    async fn dual_write_inbound_failure_rollback_delete_failure_removes_outbound_or_reports_composite(
-    ) {
-        use khive_runtime::{
-            arm_fts_fail_scoped, arm_rollback_cleanup_fail, AllowAllGate, BackendId, RuntimeConfig,
-        };
+    async fn dual_write_inbound_failure_rolls_back_whole_unit_including_outbound() {
+        use khive_runtime::{arm_fts_fail_scoped, AllowAllGate, BackendId, RuntimeConfig};
 
         let sender_ns = format!("t460-sender-{}", Uuid::new_v4().simple());
         let recipient_ns = format!("t460-recipient-{}", Uuid::new_v4().simple());
@@ -392,12 +330,13 @@ mod tests {
         let caller_token = runtime
             .authorize(Namespace::parse(&sender_ns).unwrap())
             .expect("authorize sender");
+        let recipient_token = runtime
+            .authorize(Namespace::parse(&recipient_ns).unwrap())
+            .expect("authorize recipient");
 
-        // Outbound (1st create_note call) targets sender_ns and is unaffected.
-        // Inbound (2nd create_note call) targets recipient_ns and fails.
+        // Outbound copy targets sender_ns; inbound copy targets recipient_ns
+        // and its FTS statement is armed to fail inside the atomic unit.
         let _fts_arm = arm_fts_fail_scoped(&recipient_ns);
-        // The rollback compensation's post-row-removal cleanup also fails.
-        arm_rollback_cleanup_fail(&sender_ns);
 
         let result = dual_write_message(
             &runtime,
@@ -418,16 +357,194 @@ mod tests {
 
         assert!(
             result.is_err(),
-            "dual_write_message must fail when the inbound create fails; got {result:?}"
+            "dual_write_message must fail when the inbound copy's write fails; got {result:?}"
         );
         let err_msg = result.unwrap_err().to_string();
         assert!(
-            err_msg.contains("rollback") || err_msg.contains("cleanup"),
-            "error must explicitly surface the rollback/cleanup failure, not discard it; got: {err_msg}"
+            err_msg.contains("rolled back"),
+            "error must report the atomic unit rolled back; got: {err_msg}"
+        );
+
+        for (token, ns) in [(&caller_token, "sender"), (&recipient_token, "recipient")] {
+            let alive = runtime
+                .list_notes(token, Some("message"), 100, 0)
+                .await
+                .expect("list_notes")
+                .into_iter()
+                .filter(|n| n.deleted_at.is_none())
+                .count();
+            assert_eq!(
+                alive, 0,
+                "no live note may remain in {ns}_ns after the whole unit rolled back; got {alive}"
+            );
+        }
+    }
+
+    /// Build a minimal same-namespace runtime + authorized token for the two
+    /// tests below. The namespace is still generated fresh per call so
+    /// `arm_vector_fail_scoped`/`arm_fts_fail_scoped` — process-wide,
+    /// namespace-keyed statics — never race a concurrently-running test.
+    fn scratch_runtime_and_token(ns: &str) -> (KhiveRuntime, NamespaceToken) {
+        use khive_runtime::{AllowAllGate, BackendId, RuntimeConfig};
+
+        let runtime = KhiveRuntime::new(RuntimeConfig {
+            git_write: Default::default(),
+            db_path: None,
+            default_namespace: Namespace::parse(ns).unwrap(),
+            embedding_model: None,
+            additional_embedding_models: vec![],
+            gate: std::sync::Arc::new(AllowAllGate),
+            packs: vec!["kg".to_string(), "comm".to_string()],
+            backend_id: BackendId::main(),
+            brain_profile: None,
+            visible_namespaces: vec![],
+            allowed_outbound_namespaces: vec![],
+            actor_id: None,
+        })
+        .expect("in-memory runtime");
+        let token = runtime
+            .authorize(Namespace::parse(ns).unwrap())
+            .expect("authorize");
+        (runtime, token)
+    }
+
+    /// A root send (no `thread_id`) must store the SAME canonical thread_id —
+    /// the outbound note's own id — on BOTH copies from their first write,
+    /// not patched in afterward. `created_at == updated_at` on both is the
+    /// positive signal that no later UPDATE ever touched either row
+    /// post-creation.
+    #[tokio::test]
+    async fn send_root_thread_id_is_canonical_without_patch_write() {
+        let ns = format!("thread-id-canonical-{}", Uuid::new_v4().simple());
+        let (runtime, token) = scratch_runtime_and_token(&ns);
+
+        let outbound_note = dual_write_message(
+            &runtime,
+            &token,
+            &ns,
+            &ns,
+            None,
+            "root send thread id",
+            None,
+            "2026-08-01T00:00:00Z",
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("dual_write_message succeeds");
+        let outbound_full_id = outbound_note.id.as_hyphenated().to_string();
+
+        let alive: Vec<_> = runtime
+            .list_notes(&token, Some("message"), 100, 0)
+            .await
+            .expect("list_notes")
+            .into_iter()
+            .filter(|n| n.deleted_at.is_none())
+            .collect();
+        assert_eq!(alive.len(), 2, "expected outbound + inbound; got {alive:?}");
+
+        for note in &alive {
+            let thread_id = note
+                .properties
+                .as_ref()
+                .and_then(|p| p.get("thread_id"))
+                .and_then(|v| v.as_str())
+                .expect("thread_id property present");
+            assert_eq!(
+                thread_id, outbound_full_id,
+                "both copies must carry the outbound id as canonical thread_id from \
+                 their first write; note {} had {thread_id}",
+                note.id
+            );
+            assert_eq!(
+                note.created_at, note.updated_at,
+                "no post-creation patch write may have touched note {} \
+                 (created_at must equal updated_at)",
+                note.id
+            );
+        }
+    }
+
+    /// Failure injection mid-unit: when the vector-insert statement for one
+    /// note's plan fails, the WHOLE atomic unit — both notes' rows, FTS
+    /// documents, and vector rows — must roll back, not just the failing
+    /// note. Absence is asserted positively via `list_notes`/
+    /// `VectorStore::count`, not by inspecting the error.
+    #[tokio::test]
+    async fn send_vector_failure_mid_unit_rolls_back_both_notes_and_their_vectors() {
+        use async_trait::async_trait;
+        use khive_runtime::{arm_vector_fail_scoped, EmbedderProvider};
+        use lattice_embed::{EmbedError, EmbeddingModel, EmbeddingService};
+
+        const MODEL: &str = "message-vecfail-model";
+        const DIMS: usize = 4;
+
+        struct StubService;
+        #[async_trait]
+        impl EmbeddingService for StubService {
+            async fn embed(
+                &self,
+                texts: &[String],
+                _model: EmbeddingModel,
+            ) -> std::result::Result<Vec<Vec<f32>>, EmbedError> {
+                Ok(texts.iter().map(|_| vec![0.5_f32; DIMS]).collect())
+            }
+            fn supports_model(&self, _model: EmbeddingModel) -> bool {
+                true
+            }
+            fn name(&self) -> &'static str {
+                MODEL
+            }
+        }
+        struct StubProvider;
+        #[async_trait]
+        impl EmbedderProvider for StubProvider {
+            fn name(&self) -> &str {
+                MODEL
+            }
+            fn dimensions(&self) -> usize {
+                DIMS
+            }
+            async fn build(
+                &self,
+            ) -> khive_runtime::RuntimeResult<std::sync::Arc<dyn EmbeddingService>> {
+                Ok(std::sync::Arc::new(StubService))
+            }
+        }
+
+        let ns = format!("vecfail-mid-unit-{}", Uuid::new_v4().simple());
+        let (runtime, token) = scratch_runtime_and_token(&ns);
+        runtime.register_embedder(StubProvider);
+
+        let _vec_arm = arm_vector_fail_scoped(&ns);
+
+        let result = dual_write_message(
+            &runtime,
+            &token,
+            &ns,
+            &ns,
+            None,
+            "vector fail mid-unit",
+            None,
+            "2026-08-01T00:00:00Z",
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "dual_write_message must fail when the vector-insert statement is injected \
+             to fail; got {result:?}"
         );
 
         let alive = runtime
-            .list_notes(&caller_token, Some("message"), 100, 0)
+            .list_notes(&token, Some("message"), 100, 0)
             .await
             .expect("list_notes")
             .into_iter()
@@ -435,8 +552,14 @@ mod tests {
             .count();
         assert_eq!(
             alive, 0,
-            "no live outbound note may remain after rollback, even though the \
-             compensation cleanup itself failed; got {alive}"
+            "no note may survive a mid-unit vector failure; got {alive}"
+        );
+
+        let vs = runtime.vectors_for_model(&token, MODEL).expect("vec store");
+        assert_eq!(
+            vs.count().await.expect("count"),
+            0,
+            "no vector row may survive a mid-unit vector failure"
         );
     }
 

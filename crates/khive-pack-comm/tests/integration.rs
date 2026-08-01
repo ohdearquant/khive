@@ -8115,3 +8115,112 @@ async fn i66_inbox_limit_zero_carries_real_unread_count() {
         "limit=0 must return the caller's real unread count"
     );
 }
+
+// ── send-single-txn: atomic dual-write coverage ────────────────────────────
+//
+// `dual_write_message` now commits both message copies (row + FTS + one
+// vector row per registered embedding model) through
+// `khive_runtime::create_notes_atomic` — ONE writer transaction for the
+// pair instead of one writer acquisition per row/FTS/vector write. This
+// test covers the multi-model vector fan-out count landing inside the
+// single atomic unit.
+
+/// A send must land the outbound + inbound note, an FTS document for each,
+/// and one vector row PER registered embedding model for EACH note, all
+/// inside the single atomic unit. Two stub models are registered: the
+/// vector-row count for each model must be exactly 2 (outbound + inbound).
+#[tokio::test]
+async fn send_lands_outbound_inbound_fts_and_vectors_with_multi_model_counts() {
+    use async_trait::async_trait;
+    use khive_runtime::EmbedderProvider;
+    use lattice_embed::{EmbedError, EmbeddingModel, EmbeddingService};
+
+    macro_rules! stub_model {
+        ($provider:ident, $service:ident, $name:literal, $dims:literal) => {
+            struct $service;
+            #[async_trait]
+            impl EmbeddingService for $service {
+                async fn embed(
+                    &self,
+                    texts: &[String],
+                    _model: EmbeddingModel,
+                ) -> std::result::Result<Vec<Vec<f32>>, EmbedError> {
+                    Ok(texts.iter().map(|_| vec![0.25_f32; $dims]).collect())
+                }
+                fn supports_model(&self, _model: EmbeddingModel) -> bool {
+                    true
+                }
+                fn name(&self) -> &'static str {
+                    $name
+                }
+            }
+            struct $provider;
+            #[async_trait]
+            impl EmbedderProvider for $provider {
+                fn name(&self) -> &str {
+                    $name
+                }
+                fn dimensions(&self) -> usize {
+                    $dims
+                }
+                async fn build(&self) -> khive_runtime::RuntimeResult<Arc<dyn EmbeddingService>> {
+                    Ok(Arc::new($service))
+                }
+            }
+        };
+    }
+    stub_model!(
+        SendCountsModelA,
+        SendCountsServiceA,
+        "send-counts-model-a",
+        4
+    );
+    stub_model!(
+        SendCountsModelB,
+        SendCountsServiceB,
+        "send-counts-model-b",
+        6
+    );
+
+    let (registry, rt) = build_registry_for_ns("lambda:khive");
+    rt.register_embedder(SendCountsModelA);
+    rt.register_embedder(SendCountsModelB);
+
+    registry
+        .dispatch(
+            "comm.send",
+            serde_json::json!({ "to": "lambda:khive", "content": "multi-model counts" }),
+        )
+        .await
+        .expect("send succeeds");
+
+    // Actor-addressed sends land both copies in "local".
+    let local_tok = rt.authorize(Namespace::parse("local").unwrap()).unwrap();
+    let notes = rt
+        .list_notes(&local_tok, Some("message"), 100, 0)
+        .await
+        .expect("list_notes");
+    let alive: Vec<_> = notes.iter().filter(|n| n.deleted_at.is_none()).collect();
+    assert_eq!(alive.len(), 2, "expected outbound + inbound; got {alive:?}");
+
+    let fts = rt.text_for_notes(&local_tok).expect("text store");
+    for note in &alive {
+        assert!(
+            fts.get_document("local", note.id)
+                .await
+                .expect("get_document")
+                .is_some(),
+            "FTS document must exist for note {}",
+            note.id
+        );
+    }
+
+    for model in ["send-counts-model-a", "send-counts-model-b"] {
+        let vs = rt.vectors_for_model(&local_tok, model).expect("vec store");
+        assert_eq!(
+            vs.count().await.expect("count"),
+            2,
+            "expected one vector row per note ({model}): outbound + inbound"
+        );
+    }
+}
