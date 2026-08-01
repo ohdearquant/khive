@@ -462,6 +462,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .await
         .expect("dual_write_message succeeds");
@@ -596,6 +597,7 @@ mod tests {
             "vector fail mid-unit",
             None,
             "2026-08-01T00:00:00Z",
+            None,
             None,
             None,
             None,
