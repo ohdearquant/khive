@@ -253,7 +253,7 @@ kkernel --version   # confirms the binary and version you just installed
 ```
 
 All 12 packs load by default, a background daemon auto-spawns to keep the runtime warm, and any
-MCP client discovers the `request` tool with the full 85-verb catalog.
+MCP client discovers the `request` tool with the full 89-verb catalog.
 
 ### Alternative: npm
 
