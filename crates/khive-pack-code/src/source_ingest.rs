@@ -1,5 +1,6 @@
 //! `code.ingest` L1 (manifest edges) + L1.5 (import-scan edges) core pipeline
-//! (ADR-085 Amendment 2 B3-B6). L2 Scanner/Extractor is out of scope (PR-2).
+//! (ADR-085 Amendment 2 B3-B6 and Amendment 5 F1-F3). L2
+//! Scanner/Extractor is out of scope (PR-2).
 //!
 //! Every entity write in this pipeline runs through the runtime secret gate
 //! (ADR-085 D6 #4) via `upsert_entity`. A gate refusal quarantines that one
@@ -16,9 +17,10 @@
 //! information needed to recompute its target's id later, and the
 //! synchronous re-resolve pass (`reresolve_pass`) does exactly that.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use chrono::{DateTime, Utc};
 use khive_runtime::{secret_gate, KhiveRuntime, NamespaceToken, RuntimeError};
@@ -70,6 +72,8 @@ pub struct CodeSourceIngestReport {
     /// never aborts the rest of the ingest.
     pub blocked: Vec<BlockedWrite>,
     pub db_path: String,
+    /// Git `HEAD` observed for the source tree, or `unversioned`.
+    pub source_revision: String,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -86,6 +90,70 @@ pub struct CodeSourceIngestOptions<'a> {
     pub path: &'a Path,
     pub languages: BTreeSet<&'static str>,
     pub sweep_time: DateTime<Utc>,
+}
+
+const IMPORT_DEPENDENCY_KIND: &str = "import";
+const IMPORT_DEPENDENCY_SCOPE: &str = "build";
+const UNVERSIONED_REVISION: &str = "unversioned";
+
+#[derive(Debug)]
+struct SourceSnapshot {
+    root: PathBuf,
+    revision: String,
+}
+
+#[derive(Debug)]
+struct ModuleScan {
+    source_project: String,
+    imports: Vec<UnresolvedSpec>,
+}
+
+type ManifestScopeIndex = BTreeMap<(String, String, String), BTreeSet<String>>;
+
+fn source_snapshot(ingest_root: &Path) -> SourceSnapshot {
+    let fallback_root = ingest_root
+        .canonicalize()
+        .unwrap_or_else(|_| ingest_root.to_path_buf());
+    let git_output = |args: &[&str]| {
+        Command::new("git")
+            .arg("-C")
+            .arg(ingest_root)
+            .args(args)
+            .env("GIT_OPTIONAL_LOCKS", "0")
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_COMMON_DIR")
+            .env_remove("GIT_INDEX_FILE")
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+            .and_then(|output| String::from_utf8(output.stdout).ok())
+            .map(|stdout| stdout.trim().to_string())
+    };
+    let root = git_output(&["rev-parse", "--show-toplevel"])
+        .filter(|root| !root.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or(fallback_root);
+    let revision = git_output(&["rev-parse", "--verify", "HEAD"])
+        .filter(|revision| !revision.is_empty())
+        .unwrap_or_else(|| UNVERSIONED_REVISION.to_string());
+    SourceSnapshot { root, revision }
+}
+
+fn source_path(file: &Path, source_root: &Path) -> Option<String> {
+    let canonical_file = file.canonicalize().ok()?;
+    let canonical_root = source_root
+        .canonicalize()
+        .unwrap_or_else(|_| source_root.to_path_buf());
+    let relative = canonical_file.strip_prefix(canonical_root).ok()?;
+    let components: Vec<String> = relative
+        .components()
+        .filter_map(|component| match component {
+            std::path::Component::Normal(value) => Some(value.to_string_lossy().to_string()),
+            _ => None,
+        })
+        .collect();
+    (!components.is_empty()).then(|| components.join("/"))
 }
 
 fn uuid5_json(value: &Value) -> Uuid {
@@ -119,8 +187,8 @@ fn module_uuid(source_project: &str, language: &str, module_path: &str) -> Uuid 
 /// creating a second row. Edge identity here matches that invariant exactly:
 /// no disambiguator. Distinct provenance for the same `depends_on` pair
 /// (e.g. a manifest-declared dependency and an import-scan-detected one)
-/// is folded into that single edge's `dependency_kinds` metadata (see
-/// `merge_dependency_kinds`), not encoded into a second id.
+/// is folded into that single edge's dependency metadata (see
+/// `merge_dependency_metadata`), not encoded into a second id.
 fn edge_uuid(relation: EdgeRelation, source_id: Uuid, target_id: Uuid) -> Uuid {
     uuid5_json(&json!({
         "kind": "code-source-edge",
@@ -138,14 +206,104 @@ struct UnresolvedSpec {
     specifier: String,
     target_kind: String,
     dependency_kind: String,
+    #[serde(default)]
+    dependency_scope: String,
     language: String,
 }
 
 fn read_unresolved(properties: &Value) -> Vec<UnresolvedSpec> {
-    properties
+    let mut specs: Vec<UnresolvedSpec> = properties
         .get("unresolved_specifiers")
         .and_then(|v| serde_json::from_value(v.clone()).ok())
-        .unwrap_or_default()
+        .unwrap_or_default();
+    for spec in &mut specs {
+        if !is_dependency_scope(&spec.dependency_scope) {
+            spec.dependency_scope = dependency_scope_for_kind(&spec.dependency_kind).to_string();
+        }
+    }
+    specs
+}
+
+fn dependency_scope_for_kind(kind: &str) -> &'static str {
+    match kind {
+        "dev-dependencies" | "devDependencies" => "dev",
+        "build-dependencies" | "import" => "build",
+        _ => "normal",
+    }
+}
+
+fn is_dependency_scope(scope: &str) -> bool {
+    matches!(scope, "normal" | "dev" | "build")
+}
+
+fn scopes_for_dependency_kinds(kinds: &BTreeSet<String>, import_scope: &str) -> BTreeSet<String> {
+    let declared: BTreeSet<String> = kinds
+        .iter()
+        .filter(|kind| kind.as_str() != IMPORT_DEPENDENCY_KIND)
+        .map(|kind| dependency_scope_for_kind(kind).to_string())
+        .collect();
+    if !declared.is_empty() {
+        declared
+    } else {
+        [import_scope.to_string()].into_iter().collect()
+    }
+}
+
+fn preferred_import_scope(scopes: &BTreeSet<String>) -> &'static str {
+    if scopes.contains("normal") {
+        "normal"
+    } else if scopes.contains("build") {
+        "build"
+    } else if scopes.contains("dev") {
+        "dev"
+    } else {
+        IMPORT_DEPENDENCY_SCOPE
+    }
+}
+
+fn declared_project_import_target_and_scope(
+    manifest_scopes: &ManifestScopeIndex,
+    source_project: &str,
+    language: &str,
+    target_project: &str,
+) -> Option<(String, &'static str)> {
+    let exact_key = (
+        source_project.to_string(),
+        language.to_string(),
+        target_project.to_string(),
+    );
+    if let Some(scopes) = manifest_scopes.get(&exact_key) {
+        return Some((target_project.to_string(), preferred_import_scope(scopes)));
+    }
+    if language != "rust" {
+        return None;
+    }
+    let normalized_target = target_project.replace('-', "_");
+    manifest_scopes
+        .iter()
+        .find(|((source, declared_language, declared_target), _)| {
+            source == source_project
+                && declared_language == language
+                && declared_target.replace('-', "_") == normalized_target
+        })
+        .map(|((_, _, declared_target), scopes)| {
+            (declared_target.clone(), preferred_import_scope(scopes))
+        })
+}
+
+fn project_import_target_and_scope(
+    manifest_scopes: &ManifestScopeIndex,
+    source_project: &str,
+    language: &str,
+    target_project: &str,
+) -> (String, &'static str) {
+    declared_project_import_target_and_scope(
+        manifest_scopes,
+        source_project,
+        language,
+        target_project,
+    )
+    .unwrap_or_else(|| (target_project.to_string(), IMPORT_DEPENDENCY_SCOPE))
 }
 
 async fn get_entity_opt(
@@ -329,6 +487,8 @@ async fn upsert_module(
     source_project: &str,
     language: &str,
     module_path: &str,
+    source_path: &str,
+    source_revision: &str,
     content_hash: &str,
     sweep_time: DateTime<Utc>,
     file: &str,
@@ -348,8 +508,11 @@ async fn upsert_module(
     props.insert("source_project".into(), json!(source_project));
     props.insert("language".into(), json!(language));
     props.insert("module_path".into(), json!(module_path));
+    props.insert("source_path".into(), json!(source_path));
+    props.insert("source_revision".into(), json!(source_revision));
     props.insert("content_hash".into(), json!(content_hash));
     props.insert("last_seen_at".into(), json!(sweep_time.to_rfc3339()));
+    props.insert("import_scan_status".into(), json!("unscanned"));
     if !unresolved.is_empty() {
         props.insert(
             "unresolved_specifiers".into(),
@@ -466,12 +629,14 @@ fn target_ids_for(source_project: &str, spec: &UnresolvedSpec) -> Vec<Uuid> {
     }
 }
 
-/// Merges `new_kind` into the `dependency_kinds` array already recorded on
-/// `existing_metadata` (if any), sorted and deduped so repeated ingests of
-/// the same provenance stay a no-op change.
-fn merge_dependency_kinds(
+/// Merges producer evidence and derives the normalized scope array from the
+/// complete evidence set. Manifest evidence is authoritative over `import`,
+/// so re-ingest can repair an older import-default scope without retaining a
+/// false production scope.
+fn merge_dependency_metadata(
     existing_metadata: Option<&Value>,
     new_kind: &str,
+    new_scope: &str,
     language: &str,
 ) -> Value {
     let mut kinds: BTreeSet<String> = existing_metadata
@@ -484,14 +649,16 @@ fn merge_dependency_kinds(
         })
         .unwrap_or_default();
     kinds.insert(new_kind.to_string());
+    let scopes = scopes_for_dependency_kinds(&kinds, new_scope);
     json!({
         "dependency_kinds": kinds.into_iter().collect::<Vec<_>>(),
+        "dependency_scopes": scopes.into_iter().collect::<Vec<_>>(),
         "language": language,
     })
 }
 
-/// Upserts a `depends_on` edge, merging `dependency_kind` into the edge's
-/// `dependency_kinds` list rather than overwriting it — `graph_edges`'s
+/// Upserts a `depends_on` edge, merging its evidence kind and normalized
+/// scope rather than overwriting either — `graph_edges`'s
 /// `(namespace, source_id, target_id, relation)` natural key means only one
 /// `depends_on` edge can ever exist between a given ordered pair, so a
 /// manifest-declared dependency and an import-scan-detected one between the
@@ -504,6 +671,7 @@ async fn upsert_dependency_edge(
     source_id: Uuid,
     target_id: Uuid,
     dependency_kind: &str,
+    dependency_scope: &str,
     language: &str,
     now: DateTime<Utc>,
     report: &mut CodeSourceIngestReport,
@@ -516,9 +684,10 @@ async fn upsert_dependency_edge(
         .await
         .map_err(|e| CodeSourceIngestError::Storage(e.to_string()))?;
     let existed = existing.is_some();
-    let metadata = merge_dependency_kinds(
+    let metadata = merge_dependency_metadata(
         existing.as_ref().and_then(|e| e.metadata.as_ref()),
         dependency_kind,
+        dependency_scope,
         language,
     );
     let edge = Edge {
@@ -553,6 +722,7 @@ async fn upsert_dependency_edge(
 async fn reresolve_pass(
     rt: &KhiveRuntime,
     token: &NamespaceToken,
+    manifest_scopes: &ManifestScopeIndex,
     now: DateTime<Utc>,
     report: &mut CodeSourceIngestReport,
 ) -> Result<(), CodeSourceIngestError> {
@@ -604,7 +774,19 @@ async fn reresolve_pass(
         }
         let mut still_unresolved = Vec::new();
         let mut changed = false;
-        for spec in list.drain(..) {
+        for mut spec in list.drain(..) {
+            if spec.target_kind == "project" && spec.dependency_kind == IMPORT_DEPENDENCY_KIND {
+                if let Some((target, scope)) = declared_project_import_target_and_scope(
+                    manifest_scopes,
+                    &source_project,
+                    &spec.language,
+                    &spec.specifier,
+                ) {
+                    changed |= spec.specifier != target || spec.dependency_scope != scope;
+                    spec.specifier = target;
+                    spec.dependency_scope = scope.to_string();
+                }
+            }
             let mut resolved_target = None;
             for target_id in target_ids_for(&source_project, &spec) {
                 if get_entity_opt(rt, token, target_id).await?.is_some() {
@@ -620,6 +802,7 @@ async fn reresolve_pass(
                         entity.id,
                         target_id,
                         &spec.dependency_kind,
+                        &spec.dependency_scope,
                         &spec.language,
                         now,
                         report,
@@ -628,7 +811,17 @@ async fn reresolve_pass(
                     report.unresolved_resolved += 1;
                     changed = true;
                 }
-                None => still_unresolved.push(spec),
+                None => {
+                    // A legacy import without `dependency_scope` can
+                    // normalize to the same specifier as the freshly
+                    // scanned form above. Keep the durable queue deduped
+                    // after that repair as well as before it.
+                    if still_unresolved.contains(&spec) {
+                        changed = true;
+                    } else {
+                        still_unresolved.push(spec);
+                    }
+                }
             }
         }
         if changed {
@@ -649,6 +842,50 @@ async fn reresolve_pass(
             let entity_label = entity.id.to_string();
             upsert_entity(rt, token, entity, &entity_label, report).await?;
         }
+    }
+    Ok(())
+}
+
+async fn stamp_import_scan_coverage(
+    rt: &KhiveRuntime,
+    token: &NamespaceToken,
+    module_scans: HashMap<Uuid, ModuleScan>,
+) -> Result<(), CodeSourceIngestError> {
+    for (module_id, scan) in module_scans {
+        let mut unresolved_count = 0_u64;
+        for spec in &scan.imports {
+            let mut resolved = false;
+            for target_id in target_ids_for(&scan.source_project, spec) {
+                if get_entity_opt(rt, token, target_id).await?.is_some() {
+                    resolved = true;
+                    break;
+                }
+            }
+            if !resolved {
+                unresolved_count += 1;
+            }
+        }
+
+        let Some(mut module) = get_entity_opt(rt, token, module_id).await? else {
+            continue;
+        };
+        let mut props = module
+            .properties
+            .clone()
+            .and_then(|value| value.as_object().cloned())
+            .unwrap_or_default();
+        props.insert(
+            "import_scan_status".into(),
+            json!(if unresolved_count == 0 {
+                "scanned"
+            } else {
+                "partially_resolved"
+            }),
+        );
+        props.insert("import_specifier_count".into(), json!(scan.imports.len()));
+        props.insert("unresolved_import_count".into(), json!(unresolved_count));
+        module.properties = Some(Value::Object(props));
+        upsert_entity(rt, token, module).await?;
     }
     Ok(())
 }
@@ -705,13 +942,29 @@ pub async fn run_code_ingest(
         return Err(CodeSourceIngestError::InvalidPath(opts.path.to_path_buf()));
     }
 
+    let snapshot = source_snapshot(opts.path);
     let mut report = CodeSourceIngestReport {
         languages: opts.languages.iter().map(|s| s.to_string()).collect(),
+        source_revision: snapshot.revision.clone(),
         ..Default::default()
     };
 
     let manifests = manifest::discover_manifests(opts.path, &opts.languages)
         .map_err(|e| CodeSourceIngestError::InvalidPath(opts.path.join(e.to_string())))?;
+
+    let mut manifest_scopes = ManifestScopeIndex::new();
+    for manifest in &manifests {
+        for (dependency, _kind, scope) in &manifest.dependencies {
+            manifest_scopes
+                .entry((
+                    manifest.name.clone(),
+                    manifest.language.to_string(),
+                    dependency.clone(),
+                ))
+                .or_default()
+                .insert(scope.clone());
+        }
+    }
 
     let mut project_ids: HashMap<String, Uuid> = HashMap::new();
     for m in &manifests {
@@ -743,11 +996,12 @@ pub async fn run_code_ingest(
             continue;
         };
         let file_label = m.root.display().to_string();
-        for (dep_name, dep_kind) in &m.dependencies {
+        for (dep_name, dep_kind, dep_scope) in &m.dependencies {
             let spec = UnresolvedSpec {
                 specifier: dep_name.clone(),
                 target_kind: "project".to_string(),
                 dependency_kind: dep_kind.clone(),
+                dependency_scope: dep_scope.clone(),
                 language: m.language.to_string(),
             };
             record_unresolved(rt, token, source_id, spec, &file_label, &mut report).await?;
@@ -760,20 +1014,25 @@ pub async fn run_code_ingest(
     // module/project entities and import edges under the basename-fallback
     // identity rule (ADR-085 Amendment 2 B4), rather than being silently
     // skipped for lack of a governing manifest.
+    let mut module_scans = HashMap::new();
     for language in opts.languages.iter().copied() {
         run_import_scan(
             rt,
             token,
             language,
             opts.path,
+            &snapshot,
+            &manifest_scopes,
             opts.sweep_time,
             &mut project_ids,
+            &mut module_scans,
             &mut report,
         )
         .await?;
     }
 
-    reresolve_pass(rt, token, opts.sweep_time, &mut report).await?;
+    reresolve_pass(rt, token, &manifest_scopes, opts.sweep_time, &mut report).await?;
+    stamp_import_scan_coverage(rt, token, module_scans).await?;
 
     Ok(report)
 }
@@ -793,8 +1052,11 @@ async fn run_import_scan(
     token: &NamespaceToken,
     language: &'static str,
     ingest_root: &Path,
+    snapshot: &SourceSnapshot,
+    manifest_scopes: &ManifestScopeIndex,
     sweep_time: DateTime<Utc>,
     project_ids: &mut HashMap<String, Uuid>,
+    module_scans: &mut HashMap<Uuid, ModuleScan>,
     report: &mut CodeSourceIngestReport,
 ) -> Result<(), CodeSourceIngestError> {
     let Some(ext) = imports::extension_for_language(language) else {
@@ -807,6 +1069,7 @@ async fn run_import_scan(
             .push(format!("walking {}: {e}", ingest_root.display()));
         return Ok(());
     }
+    files.sort();
 
     for file in files {
         let Some(file_dir) = file.parent() else {
@@ -822,6 +1085,13 @@ async fn run_import_scan(
                 },
             );
         let Some(module_path) = imports::module_path_for_file(&file, &proj_root, language) else {
+            continue;
+        };
+        let Some(source_path) = source_path(&file, &snapshot.root) else {
+            report.warnings.push(format!(
+                "deriving repository-relative path for {}",
+                file.display()
+            ));
             continue;
         };
 
@@ -870,6 +1140,8 @@ async fn run_import_scan(
             &proj_name,
             language,
             &module_path,
+            &source_path,
+            &snapshot.revision,
             &hash,
             sweep_time,
             &file_label,
@@ -900,6 +1172,7 @@ async fn run_import_scan(
             report.edges_updated += 1;
         }
 
+        let mut scan_imports = Vec::new();
         for raw in imports::extract_raw_imports(language, &content) {
             let resolved = if language == "typescript" && raw.starts_with('.') {
                 let rel_dir = file_dir.strip_prefix(&proj_root).unwrap_or(Path::new(""));
@@ -913,22 +1186,37 @@ async fn run_import_scan(
                     let spec = UnresolvedSpec {
                         specifier: target_module_path,
                         target_kind: "module".to_string(),
-                        dependency_kind: "import".to_string(),
+                        dependency_kind: IMPORT_DEPENDENCY_KIND.to_string(),
+                        dependency_scope: IMPORT_DEPENDENCY_SCOPE.to_string(),
                         language: language.to_string(),
                     };
+                    scan_imports.push(spec.clone());
                     record_unresolved(rt, token, module_id, spec, &file_label, report).await?;
                 }
                 Resolved::ExternalProject(target_name) => {
+                    let (target_name, dependency_scope) = project_import_target_and_scope(
+                        manifest_scopes,
+                        &proj_name,
+                        language,
+                        &target_name,
+                    );
                     let spec = UnresolvedSpec {
                         specifier: target_name,
                         target_kind: "project".to_string(),
-                        dependency_kind: "import".to_string(),
+                        dependency_kind: IMPORT_DEPENDENCY_KIND.to_string(),
+                        dependency_scope: dependency_scope.to_string(),
                         language: language.to_string(),
                     };
+                    scan_imports.push(spec.clone());
                     record_unresolved(rt, token, proj_id, spec, &file_label, report).await?;
                 }
             }
         }
+        let scan = module_scans.entry(module_id).or_insert_with(|| ModuleScan {
+            source_project: proj_name.clone(),
+            imports: Vec::new(),
+        });
+        scan.imports.extend(scan_imports);
     }
     Ok(())
 }

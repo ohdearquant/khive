@@ -1422,3 +1422,109 @@ existing one (`code.ingest`), against the count current as of Amendment 2's
 acceptance (79 verbs on the default pack set) — the implementation PR
 should cite the then-current count at merge time, since intervening PRs may
 have changed it.
+
+## Amendment 5 (2026-08-01): dependency, coverage, and source provenance
+
+The shipped L1/L1.5 map made positive edges queryable but left three negative
+results ambiguous: ecosystem-specific manifest section names were not a
+portable production/development filter, a module with no dependency edge did
+not say whether its imports were scanned successfully, and a module could not
+be joined to path-addressed git, CI, or editor data. This amendment makes those
+provenance dimensions explicit without adding a relation, entity kind, verb,
+or storage column. The fields live in the existing entity `properties` and
+edge `metadata` JSON objects.
+
+### F1: `depends_on` edges carry normalized scopes
+
+Every L1/L1.5 `depends_on` edge carries `metadata.dependency_scopes`, a sorted,
+deduplicated array whose closed values are `normal`, `dev`, and `build`.
+`metadata.dependency_kinds` remains the evidence vocabulary emitted by the
+source ecosystem (`dependencies`, `dev-dependencies`, `devDependencies`,
+`import`, and so on); consumers use `dependency_scopes`, not those producer
+tokens, for production-graph policy.
+
+The normalization is:
+
+| Source declaration                                             | Scope          |
+| -------------------------------------------------------------- | -------------- |
+| Cargo `[dependencies]`                                         | `normal`       |
+| Cargo `[dev-dependencies]`                                     | `dev`          |
+| Cargo `[build-dependencies]`                                   | `build`        |
+| Python `[project].dependencies` and optional dependency groups | `normal`       |
+| npm `dependencies`, `peerDependencies`, `optionalDependencies` | `normal`       |
+| npm `devDependencies`                                          | `dev`          |
+| L1.5 module-to-module import                                   | `build`        |
+| L1.5 project import with a matching manifest declaration       | declared scope |
+| L1.5 undeclared project import                                 | `build`        |
+
+The L1.5 module default makes D3's existing compile-time guidance concrete.
+For project imports, the governing manifest is authoritative when it declares
+the imported project: an import of a dev-only dependency remains dev-scoped
+instead of fabricating a production back-edge. An undeclared project import
+falls back to `build`. Rust's identifier spelling (`some_crate`) resolves to
+the declared Cargo dependency spelling (`some-crate`) before target identity
+and scope are recorded. Because the edge table has one row per `(namespace,
+source, target, relation)`, an edge may carry more than one scope. An edge is
+development-only exactly when its scope set is `{dev}`; `normal` or `build` in
+the set makes it part of the production dependency graph. Re-ingest upgrades
+unresolved references and edge metadata to this normalized contract while
+preserving the raw evidence tokens.
+
+### F2: module scan coverage and containment ownership are explicit
+
+Every module produced by a completed L1.5 pass carries:
+
+- `import_scan_status`: `scanned` when every observed non-skipped import
+  resolved, `partially_resolved` when at least one did not, and `unscanned`
+  while no completed import scan result exists;
+- `import_specifier_count`: the number of non-skipped import specifiers the
+  scanner observed; and
+- `unresolved_import_count`: how many remained unresolved after the
+  synchronous B6 re-resolve pass.
+
+Thus `scanned` plus a zero specifier count is a trustworthy negative result,
+distinct from `unscanned`; a module may have zero incident `depends_on` edges
+without becoming indistinguishable from missing coverage. A successful ingest
+does not leave a module from that pass at `unscanned`. Re-ingest recomputes the
+status, so a previously partial module becomes `scanned` when its target lands.
+
+`properties.source_project` is the canonical ownership field on every module.
+The containing project carries the same field, so either endpoint of a live
+`project contains module` edge is sufficient to aggregate modules by project.
+Future L2 containment nodes and symbols inherit the same ownership rule.
+
+### F3: modules carry path and revision identity
+
+Every module produced by L1.5 carries:
+
+- `properties.source_path`: a `/`-separated source-file path relative to the
+  enclosing git repository root, or relative to the ingested folder when no
+  git repository can be resolved; and
+- `properties.source_revision`: the repository's `HEAD` object id observed at
+  ingest, or the explicit sentinel `unversioned` when no committed revision is
+  available.
+
+The scanner reads the working-tree bytes, so `content_hash` remains the
+authority for those bytes when the tree is dirty; `source_revision` identifies
+the checked-out revision around that observation rather than claiming the file
+matches its committed blob. Rust package roots that contain both `src/lib.rs`
+and `src/main.rs` use module paths `crate` and `crate::main`, respectively, so
+the two physical modules do not collapse onto B4's same module UUID. These
+fields are properties, not additions to B4's UUID tuple: re-ingest updates
+path/revision/content provenance on the stable semantic module entity instead
+of accumulating one entity per commit. Future L2 symbol entities copy the
+declaring module's `source_path` and `source_revision`.
+
+### F4: Acceptance
+
+1. A two-project fixture with a normal dependency in one direction and a
+   dev-only reciprocal dependency has both edges in the history-preserving
+   map, but its production-scope projection has no cycle.
+2. A module with no imports reports `scanned` and zero counts; a module with a
+   missing target reports `partially_resolved`, then reports `scanned` after
+   the target is added and the map is re-ingested.
+3. Querying by `(source_project, source_path)` identifies exactly one module in
+   the fixture, and its `source_revision` advances when repository `HEAD`
+   advances.
+4. Both endpoints of every fixture `project contains module` edge expose the
+   same non-empty `source_project` value.

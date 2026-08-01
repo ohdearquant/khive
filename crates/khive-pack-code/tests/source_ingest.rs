@@ -1,4 +1,4 @@
-//! `code.ingest` L1 + L1.5 pipeline tests (ADR-085 Amendment 2 B3-B8).
+//! `code.ingest` L1 + L1.5 pipeline tests (ADR-085 Amendments 2 and 5).
 //!
 //! Exercises `khive_pack_code::source_ingest::run_code_ingest` directly
 //! against on-disk fixtures — no MCP/VerbRegistry wiring needed since the
@@ -52,16 +52,17 @@ fn write_two_package_fixture(root: &Path) {
     std::fs::write(pkg_b.join("src/lib.rs"), "pub fn helper() {}\n").unwrap();
 }
 
-/// Normalized `(source project/module name, relation, dependency_kinds)`
+/// Normalized `(relation, source name, target name, dependency kinds,
+/// dependency scopes)`
 /// triples for every non-deleted edge in the target db — comparable across
 /// two independently-ingested databases regardless of internal UUID values
 /// (which differ only if content differs, but we compare by name to make the
-/// assertion legible independent of that). `dependency_kinds` is the sorted,
-/// comma-joined `metadata.dependency_kinds` array — `graph_edges`'s
+/// assertion legible independent of that). The final two fields are sorted,
+/// comma-joined metadata arrays — `graph_edges`'s
 /// `(namespace, source_id, target_id, relation)` natural key means only one
 /// `depends_on` edge can exist per pair, so multiple provenances (manifest +
 /// import scan) fold onto one row's kind list rather than separate rows.
-async fn edge_fingerprints(rt: &KhiveRuntime) -> Vec<(String, String, String, String)> {
+async fn edge_fingerprints(rt: &KhiveRuntime) -> Vec<(String, String, String, String, String)> {
     let sql = rt.sql();
     let mut reader = sql.reader().await.expect("reader");
     let rows = reader
@@ -108,7 +109,18 @@ async fn edge_fingerprints(rt: &KhiveRuntime) -> Vec<(String, String, String, St
                 })
                 .unwrap_or_default();
             kinds.sort();
-            (relation, src, tgt, kinds.join(","))
+            let mut scopes: Vec<String> = serde_json::from_str::<serde_json::Value>(&metadata)
+                .ok()
+                .and_then(|v| v.get("dependency_scopes").cloned())
+                .and_then(|v| v.as_array().cloned())
+                .map(|arr| {
+                    arr.into_iter()
+                        .filter_map(|v| v.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default();
+            scopes.sort();
+            (relation, src, tgt, kinds.join(","), scopes.join(","))
         })
         .collect()
 }
@@ -148,6 +160,61 @@ async fn entity_count(rt: &KhiveRuntime) -> i64 {
         Some(SqlValue::Integer(n)) => *n,
         _ => -1,
     }
+}
+
+async fn module_properties_for_path(
+    rt: &KhiveRuntime,
+    source_project: &str,
+    source_path: &str,
+) -> Vec<serde_json::Value> {
+    let sql = rt.sql();
+    let mut reader = sql.reader().await.expect("reader");
+    let rows = reader
+        .query_all(SqlStatement {
+            sql: "SELECT properties FROM entities \
+                  WHERE deleted_at IS NULL AND entity_type='module' \
+                  AND json_extract(properties,'$.source_project')=?1 \
+                  AND json_extract(properties,'$.source_path')=?2"
+                .into(),
+            params: vec![
+                SqlValue::Text(source_project.to_string()),
+                SqlValue::Text(source_path.to_string()),
+            ],
+            label: Some("test_module_properties_for_path".into()),
+        })
+        .await
+        .expect("query modules by source path");
+    rows.into_iter()
+        .filter_map(|row| match row.get("properties") {
+            Some(SqlValue::Text(properties)) => serde_json::from_str(properties).ok(),
+            _ => None,
+        })
+        .collect()
+}
+
+fn git(root: &Path, args: &[&str]) -> String {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        // Keep the fixture independent of machine-wide hooks (for example,
+        // a global leak guard) when it creates its two local commits.
+        .args(["-c", "core.hooksPath=/dev/null"])
+        .args(args)
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_COMMON_DIR")
+        .env_remove("GIT_INDEX_FILE")
+        .output()
+        .expect("git must be available for source-revision test");
+    assert!(
+        output.status.success(),
+        "git {args:?} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout)
+        .expect("git output is utf-8")
+        .trim()
+        .to_string()
 }
 
 #[tokio::test]
@@ -202,18 +269,21 @@ async fn two_package_fixture_converges_regardless_of_ingest_order() {
 
     // Sanity: the manifest depends_on and the import depends_on fold onto
     // ONE edge (graph_edges' natural key allows only one `depends_on` row
-    // per ordered pair) whose `dependency_kinds` records both provenances,
-    // plus both contains edges.
-    assert!(fp1.iter().any(|(rel, src, tgt, kinds)| rel == "depends_on"
-        && src == "pkg_a"
-        && tgt == "pkg_b"
-        && kinds == "dependencies,import"));
+    // per ordered pair) whose evidence and scope arrays record both
+    // provenances, plus both contains edges.
     assert!(fp1
         .iter()
-        .any(|(rel, src, _tgt, _kind)| rel == "contains" && src == "pkg_a"));
+        .any(|(rel, src, tgt, kinds, scopes)| rel == "depends_on"
+            && src == "pkg_a"
+            && tgt == "pkg_b"
+            && kinds == "dependencies,import"
+            && scopes == "normal"));
     assert!(fp1
         .iter()
-        .any(|(rel, src, _tgt, _kind)| rel == "contains" && src == "pkg_b"));
+        .any(|(rel, src, _tgt, _kinds, _scopes)| rel == "contains" && src == "pkg_a"));
+    assert!(fp1
+        .iter()
+        .any(|(rel, src, _tgt, _kinds, _scopes)| rel == "contains" && src == "pkg_b"));
 }
 
 #[tokio::test]
@@ -265,9 +335,232 @@ async fn reingesting_same_fixture_is_idempotent() {
     );
 }
 
+#[tokio::test]
+async fn manifest_scopes_keep_dev_back_edges_out_of_the_production_graph() {
+    let root = TempDir::new().expect("tempdir");
+    for package in ["pkg_a", "pkg_b"] {
+        std::fs::create_dir_all(root.path().join(package).join("src")).unwrap();
+        std::fs::write(
+            root.path().join(package).join("src/lib.rs"),
+            format!("pub fn {package}() {{}}\n"),
+        )
+        .unwrap();
+    }
+    std::fs::write(
+        root.path().join("pkg_a/Cargo.toml"),
+        "[package]\nname = \"pkg-a\"\n\n[dependencies]\npkg-b = \"0.1\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.path().join("pkg_b/Cargo.toml"),
+        "[package]\nname = \"pkg-b\"\n\n[dev-dependencies]\npkg-a = \"0.1\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.path().join("pkg_b/src/lib.rs"),
+        "use pkg_a::test_helper;\n\npub fn pkg_b() { test_helper(); }\n",
+    )
+    .unwrap();
+
+    let rt = rt_at(&root.path().join("scopes.db"));
+    let token = rt.authorize(Namespace::local()).expect("token");
+    run_code_ingest(
+        &rt,
+        &token,
+        CodeSourceIngestOptions {
+            path: root.path(),
+            languages: all_languages(),
+            sweep_time: Utc::now(),
+        },
+    )
+    .await
+    .expect("scope fixture ingests");
+
+    let edges = edge_fingerprints(&rt).await;
+    assert!(edges
+        .iter()
+        .any(|(relation, source, target, kinds, scopes)| {
+            relation == "depends_on"
+                && source == "pkg-a"
+                && target == "pkg-b"
+                && kinds == "dependencies"
+                && scopes == "normal"
+        }));
+    assert!(edges
+        .iter()
+        .any(|(relation, source, target, kinds, scopes)| {
+            relation == "depends_on"
+                && source == "pkg-b"
+                && target == "pkg-a"
+                && kinds == "dev-dependencies,import"
+                && scopes == "dev"
+        }));
+
+    let production_edges: BTreeSet<(&str, &str)> = edges
+        .iter()
+        .filter(|(relation, _, _, _, scopes)| relation == "depends_on" && scopes != "dev")
+        .map(|(_, source, target, _, _)| (source.as_str(), target.as_str()))
+        .collect();
+    assert!(production_edges.contains(&("pkg-a", "pkg-b")));
+    assert!(
+        !production_edges.contains(&("pkg-b", "pkg-a")),
+        "the reciprocal manifest entry is dev-only and must not create a production cycle"
+    );
+    let pkg_b_module = module_properties_for_path(&rt, "pkg-b", "pkg_b/src/lib.rs").await;
+    assert_eq!(pkg_b_module.len(), 1);
+    assert_eq!(pkg_b_module[0]["import_scan_status"], "scanned");
+    assert_eq!(pkg_b_module[0]["unresolved_import_count"], 0);
+}
+
+#[tokio::test]
+async fn module_paths_revisions_coverage_and_contains_ownership_are_queryable() {
+    let root = TempDir::new().expect("tempdir");
+    std::fs::create_dir_all(root.path().join("src")).unwrap();
+    std::fs::write(
+        root.path().join("Cargo.toml"),
+        "[package]\nname = \"coverage_fixture\"\n",
+    )
+    .unwrap();
+    std::fs::write(root.path().join("src/lib.rs"), "pub fn independent() {}\n").unwrap();
+    std::fs::write(root.path().join("src/main.rs"), "fn main() {}\n").unwrap();
+    std::fs::write(
+        root.path().join("src/partial.rs"),
+        "use crate::missing::Thing;\n\npub fn needs_missing(_: Thing) {}\n",
+    )
+    .unwrap();
+
+    git(root.path(), &["init", "-q"]);
+    git(root.path(), &["add", "Cargo.toml", "src"]);
+    git(
+        root.path(),
+        &[
+            "-c",
+            "user.name=khive-test",
+            "-c",
+            "user.email=khive-test@example.invalid",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-qm",
+            "initial",
+        ],
+    );
+    let first_revision = git(root.path(), &["rev-parse", "HEAD"]);
+
+    let rt = rt_at(&root.path().join("coverage.db"));
+    let token = rt.authorize(Namespace::local()).expect("token");
+    let first = run_code_ingest(
+        &rt,
+        &token,
+        CodeSourceIngestOptions {
+            path: root.path(),
+            languages: all_languages(),
+            sweep_time: Utc::now(),
+        },
+    )
+    .await
+    .expect("coverage fixture ingests");
+    assert_eq!(first.source_revision, first_revision);
+
+    let lib = module_properties_for_path(&rt, "coverage_fixture", "src/lib.rs").await;
+    assert_eq!(lib.len(), 1, "path lookup must resolve to one module");
+    assert_eq!(
+        lib[0]["source_revision"].as_str(),
+        Some(first_revision.as_str())
+    );
+    assert_eq!(lib[0]["import_scan_status"], "scanned");
+    assert_eq!(lib[0]["import_specifier_count"], 0);
+    assert_eq!(lib[0]["unresolved_import_count"], 0);
+
+    let main = module_properties_for_path(&rt, "coverage_fixture", "src/main.rs").await;
+    assert_eq!(main.len(), 1, "binary-root path must resolve independently");
+    assert_eq!(main[0]["module_path"], "crate::main");
+    assert_eq!(main[0]["import_scan_status"], "scanned");
+
+    let partial = module_properties_for_path(&rt, "coverage_fixture", "src/partial.rs").await;
+    assert_eq!(partial.len(), 1, "path lookup must resolve to one module");
+    assert_eq!(
+        partial[0]["source_revision"].as_str(),
+        Some(first_revision.as_str())
+    );
+    assert_eq!(partial[0]["import_scan_status"], "partially_resolved");
+    assert_eq!(partial[0]["import_specifier_count"], 1);
+    assert_eq!(partial[0]["unresolved_import_count"], 1);
+
+    let sql = rt.sql();
+    let mut reader = sql.reader().await.expect("reader");
+    let ownership_rows = reader
+        .query_all(SqlStatement {
+            sql: "SELECT json_extract(parent.properties,'$.source_project') AS parent_project, \
+                         json_extract(child.properties,'$.source_project') AS child_project \
+                  FROM graph_edges edge \
+                  JOIN entities parent ON parent.id=edge.source_id \
+                  JOIN entities child ON child.id=edge.target_id \
+                  WHERE edge.relation='contains' AND edge.deleted_at IS NULL"
+                .into(),
+            params: vec![],
+            label: Some("test_contains_ownership".into()),
+        })
+        .await
+        .expect("query contains ownership");
+    assert!(!ownership_rows.is_empty());
+    for row in ownership_rows {
+        let parent_project = match row.get("parent_project") {
+            Some(SqlValue::Text(project)) => project,
+            value => panic!("expected text parent source_project, got {value:?}"),
+        };
+        let child_project = match row.get("child_project") {
+            Some(SqlValue::Text(project)) => project,
+            value => panic!("expected text child source_project, got {value:?}"),
+        };
+        assert_eq!(parent_project, "coverage_fixture");
+        assert_eq!(child_project, "coverage_fixture");
+    }
+    drop(reader);
+
+    std::fs::write(root.path().join("src/missing.rs"), "pub struct Thing;\n").unwrap();
+    git(root.path(), &["add", "src/missing.rs"]);
+    git(
+        root.path(),
+        &[
+            "-c",
+            "user.name=khive-test",
+            "-c",
+            "user.email=khive-test@example.invalid",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-qm",
+            "add missing module",
+        ],
+    );
+    let second_revision = git(root.path(), &["rev-parse", "HEAD"]);
+    assert_ne!(first_revision, second_revision);
+
+    run_code_ingest(
+        &rt,
+        &token,
+        CodeSourceIngestOptions {
+            path: root.path(),
+            languages: all_languages(),
+            sweep_time: Utc::now(),
+        },
+    )
+    .await
+    .expect("coverage fixture re-ingests");
+    let resolved = module_properties_for_path(&rt, "coverage_fixture", "src/partial.rs").await;
+    assert_eq!(resolved.len(), 1);
+    assert_eq!(
+        resolved[0]["source_revision"].as_str(),
+        Some(second_revision.as_str())
+    );
+    assert_eq!(resolved[0]["import_scan_status"], "scanned");
+    assert_eq!(resolved[0]["unresolved_import_count"], 0);
+}
+
 /// `src/lib.rs` importing `crate::foo::Thing`, an item declared in
 /// `src/foo.rs`, must resolve to a `crate -> foo` `depends_on` edge with
-/// `dependency_kinds=["import"]` — not stay unresolved because the raw
+/// build-scope `dependency_kinds=["import"]` — not stay unresolved because the raw
 /// import target (`foo::Thing`) names an item inside `foo`, not a nested
 /// module `foo::Thing` (see #1039).
 fn write_item_import_fixture(root: &Path) {
@@ -317,11 +610,14 @@ async fn rust_item_import_resolves_to_containing_module_after_reingest() {
 
     let edges = edge_fingerprints(&rt).await;
     assert!(
-        edges.iter().any(|(rel, src, tgt, kinds)| rel == "depends_on"
-            && src == "crate"
-            && tgt == "foo"
-            && kinds == "import"),
-        "expected one crate -> foo depends_on edge with dependency_kinds=[\"import\"], got: {edges:?}"
+        edges
+            .iter()
+            .any(|(rel, src, tgt, kinds, scopes)| rel == "depends_on"
+                && src == "crate"
+                && tgt == "foo"
+                && kinds == "import"
+                && scopes == "build"),
+        "expected one crate -> foo build-scope import edge, got: {edges:?}"
     );
 }
 
@@ -380,15 +676,18 @@ async fn manifestless_rust_folder_uses_basename_fallback() {
     assert!(
         edges
             .iter()
-            .any(|(rel, src, _tgt, _kinds)| rel == "contains" && src == "bare_rust_project"),
+            .any(|(rel, src, _tgt, _kinds, _scopes)| rel == "contains" && src == "bare_rust_project"),
         "expected the basename-fallback project 'bare_rust_project' to contain its module, got: {edges:?}"
     );
     assert!(
-        edges.iter().any(|(rel, src, tgt, kinds)| rel == "depends_on"
-            && src == "crate"
-            && tgt == "util"
-            && kinds == "import"),
-        "expected one crate -> util depends_on edge with dependency_kinds=[\"import\"], got: {edges:?}"
+        edges
+            .iter()
+            .any(|(rel, src, tgt, kinds, scopes)| rel == "depends_on"
+                && src == "crate"
+                && tgt == "util"
+                && kinds == "import"
+                && scopes == "build"),
+        "expected one crate -> util build-scope import edge, got: {edges:?}"
     );
 }
 
