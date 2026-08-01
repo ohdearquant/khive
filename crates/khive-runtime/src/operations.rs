@@ -11959,6 +11959,80 @@ mod tests {
         assert_eq!(note_node.kind.as_deref(), Some("observation"));
     }
 
+    // ── A nameless annotation note reached via traversal must fall back to
+    //    the same `[kind]` placeholder that `neighbors` produces ──
+    #[tokio::test]
+    async fn traverse_nameless_note_falls_back_to_bracketed_kind() {
+        use khive_storage::types::TraversalOptions;
+
+        let rt = rt();
+        let owner = NamespaceToken::for_namespace(Namespace::parse("owner-ns4").unwrap());
+        let a = rt
+            .create_entity(&owner, "concept", None, "A", None, None, vec![])
+            .await
+            .unwrap();
+        let note = rt
+            .create_note(
+                &owner,
+                "observation",
+                None,
+                "note body",
+                None,
+                None,
+                vec![a.id],
+            )
+            .await
+            .unwrap();
+
+        let caller = NamespaceToken::mint_with_visibility(
+            Namespace::parse("caller-ns4").unwrap(),
+            vec![Namespace::parse("owner-ns4").unwrap()],
+            ActorRef::anonymous(),
+        );
+        let neighbors = rt
+            .neighbors(
+                &caller,
+                a.id,
+                Direction::In,
+                None,
+                Some(vec![EdgeRelation::Annotates]),
+            )
+            .await
+            .unwrap();
+        let note_hit = neighbors
+            .iter()
+            .find(|hit| hit.node_id == note.id)
+            .unwrap_or_else(|| panic!("note must be present in neighbors, got {neighbors:#?}"));
+
+        let result = rt
+            .traverse(
+                &caller,
+                TraversalRequest {
+                    roots: vec![a.id],
+                    options: TraversalOptions {
+                        max_depth: 1,
+                        direction: Direction::In,
+                        relations: Some(vec![EdgeRelation::Annotates]),
+                        ..Default::default()
+                    },
+                    include_roots: false,
+                    include_properties: false,
+                },
+            )
+            .await
+            .unwrap();
+
+        let note_node = result[0]
+            .nodes
+            .iter()
+            .find(|n| n.node_id == note.id)
+            .unwrap_or_else(|| panic!("note must be present in traversal nodes, got {result:#?}"));
+        assert_eq!(note_node.name.as_deref(), note_hit.name.as_deref());
+        assert_eq!(note_node.kind.as_deref(), note_hit.kind.as_deref());
+        assert_eq!(note_node.name.as_deref(), Some("[observation]"));
+        assert_eq!(note_node.kind.as_deref(), Some("observation"));
+    }
+
     // ---- purge cascade must include already-soft-deleted edges ----
     //
     // Hard delete must cascade ALL incident edges synchronously. A cascade driven
