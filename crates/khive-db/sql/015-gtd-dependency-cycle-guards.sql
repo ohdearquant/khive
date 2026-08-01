@@ -6,6 +6,12 @@
 -- They are deliberately narrow: only live `task` note properties and live
 -- task-to-task `depends_on` edges are governed. Other note kinds, relations,
 -- and entity dependency graphs retain their existing behavior.
+--
+-- Typed update paths require lowercase hyphenated UUIDs. The note triggers
+-- still normalize case, hyphens, braces, and the `urn:uuid:` prefix while
+-- comparing keys so a direct-storage writer cannot evade the durable guard
+-- with another spelling accepted by `Uuid::parse_str`. Recursive expansion
+-- is array-only; malformed legacy scalar/object values are not edges.
 
 CREATE TRIGGER IF NOT EXISTS gtd_task_dependency_cycle_notes_bi
 BEFORE INSERT ON notes
@@ -15,23 +21,45 @@ WHEN NEW.kind = 'task'
 BEGIN
     SELECT CASE WHEN EXISTS (
         WITH RECURSIVE dependency_walk(id) AS (
-            SELECT value
+            SELECT lower(replace(replace(replace(
+                CASE
+                    WHEN lower(value) LIKE 'urn:uuid:%' THEN substr(value, 10)
+                    ELSE value
+                END,
+                '-', ''), '{', ''), '}', ''))
             FROM json_each(NEW.properties, '$.depends_on')
             WHERE type = 'text'
             UNION
-            SELECT dependency.value
+            SELECT lower(replace(replace(replace(
+                CASE
+                    WHEN lower(dependency.value) LIKE 'urn:uuid:%'
+                        THEN substr(dependency.value, 10)
+                    ELSE dependency.value
+                END,
+                '-', ''), '{', ''), '}', ''))
             FROM dependency_walk AS walk
             JOIN notes AS task
-                ON task.id = walk.id
+                ON lower(replace(replace(replace(
+                    CASE
+                        WHEN lower(task.id) LIKE 'urn:uuid:%' THEN substr(task.id, 10)
+                        ELSE task.id
+                    END,
+                    '-', ''), '{', ''), '}', '')) = walk.id
                 AND task.namespace = NEW.namespace
                 AND task.kind = 'task'
                 AND task.deleted_at IS NULL
             JOIN json_each(task.properties, '$.depends_on') AS dependency
-                ON dependency.type = 'text'
+                ON json_type(task.properties, '$.depends_on') = 'array'
+                AND dependency.type = 'text'
         )
         SELECT 1
         FROM dependency_walk
-        WHERE id = NEW.id
+        WHERE id = lower(replace(replace(replace(
+            CASE
+                WHEN lower(NEW.id) LIKE 'urn:uuid:%' THEN substr(NEW.id, 10)
+                ELSE NEW.id
+            END,
+            '-', ''), '{', ''), '}', ''))
     ) THEN RAISE(ABORT, 'task properties.depends_on dependency cycle') END;
 END;
 
@@ -43,23 +71,45 @@ WHEN NEW.kind = 'task'
 BEGIN
     SELECT CASE WHEN EXISTS (
         WITH RECURSIVE dependency_walk(id) AS (
-            SELECT value
+            SELECT lower(replace(replace(replace(
+                CASE
+                    WHEN lower(value) LIKE 'urn:uuid:%' THEN substr(value, 10)
+                    ELSE value
+                END,
+                '-', ''), '{', ''), '}', ''))
             FROM json_each(NEW.properties, '$.depends_on')
             WHERE type = 'text'
             UNION
-            SELECT dependency.value
+            SELECT lower(replace(replace(replace(
+                CASE
+                    WHEN lower(dependency.value) LIKE 'urn:uuid:%'
+                        THEN substr(dependency.value, 10)
+                    ELSE dependency.value
+                END,
+                '-', ''), '{', ''), '}', ''))
             FROM dependency_walk AS walk
             JOIN notes AS task
-                ON task.id = walk.id
+                ON lower(replace(replace(replace(
+                    CASE
+                        WHEN lower(task.id) LIKE 'urn:uuid:%' THEN substr(task.id, 10)
+                        ELSE task.id
+                    END,
+                    '-', ''), '{', ''), '}', '')) = walk.id
                 AND task.namespace = NEW.namespace
                 AND task.kind = 'task'
                 AND task.deleted_at IS NULL
             JOIN json_each(task.properties, '$.depends_on') AS dependency
-                ON dependency.type = 'text'
+                ON json_type(task.properties, '$.depends_on') = 'array'
+                AND dependency.type = 'text'
         )
         SELECT 1
         FROM dependency_walk
-        WHERE id = NEW.id
+        WHERE id = lower(replace(replace(replace(
+            CASE
+                WHEN lower(NEW.id) LIKE 'urn:uuid:%' THEN substr(NEW.id, 10)
+                ELSE NEW.id
+            END,
+            '-', ''), '{', ''), '}', ''))
     ) THEN RAISE(ABORT, 'task properties.depends_on dependency cycle') END;
 END;
 

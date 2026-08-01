@@ -266,20 +266,50 @@ fn v15_fresh_start_installs_narrow_gtd_dependency_cycle_guards() {
 }
 
 #[test]
-fn v13_serializes_opposite_property_updates_without_committing_a_cycle() {
+fn v13_property_guard_ignores_non_array_legacy_dependencies() {
+    let mut conn = open_memory();
+    run_migrations(&mut conn).expect("migrations should succeed");
+    let task_a = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    let task_b = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+    insert_dependency_test_note(&conn, task_a, "task", r#"{"status":"next"}"#, None);
+    let scalar_properties = format!(r#"{{"depends_on":"{task_a}"}}"#);
+    insert_dependency_test_note(&conn, task_b, "task", &scalar_properties, None);
+
+    let array_properties = format!(r#"{{"depends_on":["{task_b}"]}}"#);
+    conn.execute(
+        "UPDATE notes SET properties = ?1 WHERE id = ?2",
+        rusqlite::params![array_properties, task_a],
+    )
+    .expect("a legacy scalar depends_on value is not a traversable dependency edge");
+
+    let persisted: String = conn
+        .query_row(
+            "SELECT properties FROM notes WHERE id = ?1",
+            rusqlite::params![task_a],
+            |row| row.get(0),
+        )
+        .expect("load accepted dependency properties");
+    assert!(persisted.contains(task_b));
+}
+
+#[test]
+fn v13_serializes_alternate_uuid_spelling_updates_without_committing_a_cycle() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("gtd-cycle-race.db");
     let mut setup = Connection::open(&path).expect("open setup connection");
     run_migrations(&mut setup).expect("migrations should succeed");
-    insert_dependency_test_note(&setup, "race-a", "task", r#"{"status":"next"}"#, None);
-    insert_dependency_test_note(&setup, "race-b", "task", r#"{"status":"next"}"#, None);
+    let task_a = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    let task_b = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+    insert_dependency_test_note(&setup, task_a, "task", r#"{"status":"next"}"#, None);
+    insert_dependency_test_note(&setup, task_b, "task", r#"{"status":"next"}"#, None);
     drop(setup);
 
     let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
     let mut handles = Vec::new();
-    for (source, target) in [("race-a", "race-b"), ("race-b", "race-a")] {
+    for (source, target) in [(task_a, task_b), (task_b, task_a)] {
         let path = path.clone();
         let barrier = barrier.clone();
+        let target = target.to_ascii_uppercase();
         handles.push(std::thread::spawn(move || {
             let mut conn = Connection::open(path).expect("open racing connection");
             conn.busy_timeout(std::time::Duration::from_secs(5))
@@ -324,9 +354,9 @@ fn v13_serializes_opposite_property_updates_without_committing_a_cycle() {
     let verify = Connection::open(path).expect("open verification connection");
     let dependency_rows: i64 = verify
         .query_row(
-            "SELECT COUNT(*) FROM notes WHERE id IN ('race-a', 'race-b') \
+            "SELECT COUNT(*) FROM notes WHERE id IN (?1, ?2) \
              AND json_array_length(properties, '$.depends_on') = 1",
-            [],
+            rusqlite::params![task_a, task_b],
             |row| row.get(0),
         )
         .expect("count committed dependency directions");

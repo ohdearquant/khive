@@ -181,12 +181,14 @@ missing edge is a degraded result, not a failure.
 
 Task dependency graphs are acyclic at both public write surfaces. Before a generic
 `update` writes `properties.depends_on` on a task, the task kind hook validates full
-UUIDs, live task targets in the same namespace, direct self-dependencies, and
-property reachability. Before the generic `link` verb writes a task-to-task
-`depends_on` edge, the same hook checks edge reachability. Atomic bulk-link input is
+UUIDs in canonical lowercase-hyphenated form, live task targets in the same namespace,
+direct self-dependencies, and property reachability. Before the generic `link` verb writes a
+task-to-task `depends_on` edge, the same hook checks edge reachability. Atomic bulk-link input is
 validated as one proposed graph, so a cycle formed entirely inside one batch is
 rejected before any edge is stored. Both walks fail closed at a 20,000-node/edge
-safety bound instead of accepting an unverified dependency.
+safety bound instead of accepting an unverified dependency. The property walk charges
+every traversed array entry, including duplicate targets, before adding it to the queue;
+high duplicate fanout therefore cannot evade the edge budget through node deduplication.
 
 Typed hooks are necessary for precise request errors but insufficient as the durable
 invariant: two processes can both validate against the same pre-write snapshot, and
@@ -195,6 +197,9 @@ pass. Core migration V15 (`015-gtd-dependency-cycle-guards.sql`) therefore insta
 narrow `BEFORE INSERT`/`BEFORE UPDATE` triggers on `notes` and `graph_edges`. The trigger
 walk runs inside SQLite's serialized writer transaction, sees earlier writes in the
 same atomic unit, and rejects the later direction of an opposite-request race. It
+normalizes accepted UUID text spellings to one comparison key so an alternate spelling
+cannot bypass that durable check. It traverses only array-valued `depends_on` properties;
+legacy scalar/object values remain diagnostically broken data, not phantom edges. It
 considers only live task property paths and live task-to-task `depends_on` edges;
 soft-deleted rows and unrelated writes are excluded. Existing cyclic data is not
 rewritten at migration time, but a later governed mutation cannot preserve or close a

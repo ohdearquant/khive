@@ -899,6 +899,79 @@ async fn generic_update_rejects_direct_and_multihop_property_cycles() {
 }
 
 #[tokio::test]
+async fn generic_update_rejects_noncanonical_dependency_uuid_without_persisting() {
+    let fixture = pack(rt());
+    let task = assign(&fixture, json!({"title": "canonical dependency source"})).await;
+    let blocker = assign(&fixture, json!({"title": "canonical dependency target"})).await;
+    let task_id = task["full_id"].as_str().unwrap();
+    let blocker_id = blocker["full_id"].as_str().unwrap();
+    let compact_blocker_id = blocker_id.replace('-', "");
+
+    let error = fixture
+        .dispatch(
+            "update",
+            json!({
+                "id": task_id,
+                "properties": {"depends_on": [compact_blocker_id]}
+            }),
+        )
+        .await
+        .expect_err("ordinary update must reject an alternate UUID spelling");
+    assert!(
+        error
+            .to_string()
+            .contains("canonical lowercase hyphenated UUID"),
+        "unexpected canonical UUID validation error: {error}"
+    );
+
+    let persisted = fixture
+        .dispatch("get", json!({"id": task_id}))
+        .await
+        .expect("load task after rejected alternate UUID spelling");
+    assert!(persisted["properties"].get("depends_on").is_none());
+}
+
+#[tokio::test]
+async fn generic_update_rejects_duplicate_dependency_walk_over_edge_budget() {
+    let runtime = rt();
+    let fixture = pack(runtime.clone());
+    let token = runtime
+        .authorize(khive_runtime::Namespace::local())
+        .expect("authorize local namespace");
+    let leaf = assign(&fixture, json!({"title": "fanout leaf"})).await;
+    let leaf_id = leaf["full_id"].as_str().unwrap();
+    let repeated_edges = vec![leaf_id.to_string(); 20_001];
+    let fanout = runtime
+        .create_note(
+            &token,
+            "task",
+            Some("duplicate dependency fanout"),
+            "duplicate dependency fanout",
+            Some(0.5),
+            Some(json!({"status": "next", "depends_on": repeated_edges})),
+            vec![],
+        )
+        .await
+        .expect("create legacy task above the typed traversal edge budget");
+    let source = assign(&fixture, json!({"title": "bounded traversal source"})).await;
+
+    let error = fixture
+        .dispatch(
+            "update",
+            json!({
+                "id": source["full_id"],
+                "properties": {"depends_on": [fanout.id.as_hyphenated().to_string()]}
+            }),
+        )
+        .await
+        .expect_err("duplicate dependency entries must consume the edge budget");
+    assert!(
+        error.to_string().contains("20000-edge safety bound"),
+        "unexpected bounded-walk error: {error}"
+    );
+}
+
+#[tokio::test]
 async fn link_rejects_multihop_and_same_batch_dependency_cycles() {
     let fixture = pack(rt());
     let a = assign(&fixture, json!({"title": "edge cycle A"})).await;

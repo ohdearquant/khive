@@ -188,6 +188,11 @@ pub(crate) async fn validate_property_update(
     let dependencies = depends_on.as_array().ok_or_else(|| {
         RuntimeError::InvalidInput("task properties.depends_on must be an array of UUIDs".into())
     })?;
+    if dependencies.len() > DEPENDENCY_WALK_MAX_NODES {
+        return Err(RuntimeError::InvalidInput(format!(
+            "depends_on cycle validation exceeded the {DEPENDENCY_WALK_MAX_NODES}-edge safety bound"
+        )));
+    }
     let store = runtime.notes(token)?;
     for dependency in dependencies {
         let raw = dependency.as_str().ok_or_else(|| {
@@ -200,6 +205,12 @@ pub(crate) async fn validate_property_update(
                 "task properties.depends_on entry {raw:?} must be a full UUID"
             ))
         })?;
+        let canonical = dependency_id.as_hyphenated().to_string();
+        if raw != canonical {
+            return Err(RuntimeError::InvalidInput(format!(
+                "task properties.depends_on entry {raw:?} must use the canonical lowercase hyphenated UUID {canonical:?}"
+            )));
+        }
         if dependency_id == task.id {
             return Err(RuntimeError::InvalidInput(format!(
                 "depends_on update would create a dependency cycle: task {} cannot depend on itself",
@@ -251,6 +262,7 @@ async fn property_path_reaches(
     let store = runtime.notes(token)?;
     let mut queue = VecDeque::from([start]);
     let mut visited = HashSet::new();
+    let mut traversed_edges = 0usize;
     while let Some(current) = queue.pop_front() {
         if current == goal {
             return Ok(true);
@@ -277,6 +289,18 @@ async fn property_path_reaches(
         else {
             continue;
         };
+        traversed_edges = traversed_edges
+            .checked_add(dependencies.len())
+            .ok_or_else(|| {
+                RuntimeError::InvalidInput(format!(
+                    "depends_on cycle validation exceeded the {DEPENDENCY_WALK_MAX_NODES}-edge safety bound"
+                ))
+            })?;
+        if traversed_edges > DEPENDENCY_WALK_MAX_NODES {
+            return Err(RuntimeError::InvalidInput(format!(
+                "depends_on cycle validation exceeded the {DEPENDENCY_WALK_MAX_NODES}-edge safety bound"
+            )));
+        }
         queue.extend(dependencies.iter().filter_map(|dependency| {
             dependency
                 .as_str()

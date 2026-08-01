@@ -3692,6 +3692,49 @@ backend = "sessions"
             )
         };
 
+        let compact_a_id = a_id.replace('-', "");
+        let compact_b_id = b_id.replace('-', "");
+        let alternate_spelling_error = crate::atomic_apply::execute_atomic_ops_file(
+            vec![
+                atomic_op(
+                    "update",
+                    serde_json::json!({
+                        "id": a_id.clone(),
+                        "properties": {"depends_on": [compact_b_id]}
+                    }),
+                ),
+                atomic_op(
+                    "update",
+                    serde_json::json!({
+                        "id": b_id.clone(),
+                        "properties": {"depends_on": [compact_a_id]}
+                    }),
+                ),
+            ],
+            atomic_cfg(&db_path),
+            &KhiveConfig::default(),
+            khive_types::pack::ATOMIC_MAX_OPS_DEFAULT,
+        )
+        .await
+        .expect_err("atomic preparation must reject an alternate dependency UUID spelling");
+        assert!(
+            alternate_spelling_error
+                .to_string()
+                .contains("canonical lowercase hyphenated UUID"),
+            "unexpected alternate-spelling error: {alternate_spelling_error}"
+        );
+
+        {
+            let server = isolated_server(&db_path);
+            let response = dispatch_json(&server, &format!(r#"get(id="{a_id}")"#)).await;
+            assert!(
+                response["results"][0]["result"]["properties"]
+                    .get("depends_on")
+                    .is_none(),
+                "alternate dependency spelling must not persist: {response}"
+            );
+        }
+
         let property_envelope = crate::atomic_apply::execute_atomic_ops_file(
             vec![
                 atomic_op(
