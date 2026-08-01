@@ -1,6 +1,12 @@
 //! `code.ingest` L1 (manifest edges) + L1.5 (import-scan edges) core pipeline
 //! (ADR-085 Amendment 2 B3-B6). L2 Scanner/Extractor is out of scope (PR-2).
 //!
+//! Every entity write in this pipeline runs through the runtime secret gate
+//! (ADR-085 D6 #4) via `upsert_entity`. A gate refusal quarantines that one
+//! item — it is recorded in [`CodeSourceIngestReport::blocked`] and skipped —
+//! rather than aborting the rest of the sweep (issue #1594), the same
+//! per-record posture `git.digest` already uses for its own write refusals.
+//!
 //! Identity (B4): every entity this pipeline creates has a `uuid5`-derived
 //! id, so re-ingesting the same path is a pure upsert — no dedup lookups are
 //! needed to avoid duplicate rows. Edge ids are likewise `uuid5`-derived from
@@ -15,7 +21,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
-use khive_runtime::{KhiveRuntime, NamespaceToken, RuntimeError};
+use khive_runtime::{secret_gate, KhiveRuntime, NamespaceToken, RuntimeError};
 use khive_storage::{Edge, Entity, LinkId};
 use khive_types::EdgeRelation;
 use serde_json::{json, Value};
@@ -24,6 +30,20 @@ use uuid::Uuid;
 use crate::imports::{self, Resolved};
 use crate::ingest::CODE_INGEST_NAMESPACE;
 use crate::manifest;
+
+/// One content write the runtime secret gate refused during this pass.
+///
+/// The record's own identity (the manifest/source file it came from) is
+/// kept; the secret itself is represented only by the detector name and a
+/// masked excerpt (`SecretMatch`'s `first6...N` shape) — the rejected
+/// content is never copied into the report. Mirrors `git.digest`'s
+/// `IngestWriteRefusal` (ADR-088 Amendment 1 precedent).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct BlockedWrite {
+    pub file: String,
+    pub detector: String,
+    pub masked_excerpt: String,
+}
 
 /// Outcome counters for one `code.ingest` call, mirroring `git.digest`'s
 /// `IngestReport` shape (ADR-088 Amendment 1 precedent).
@@ -41,6 +61,14 @@ pub struct CodeSourceIngestReport {
     /// Per-manifest / per-file failures that did not abort the pass (fail
     /// loud without silently dropping the rest of the run).
     pub warnings: Vec<String>,
+    /// Count of per-item content writes refused by the runtime secret gate
+    /// during this pass, independent of unrelated `warnings` (mirrors
+    /// `git.digest`'s `writes_refused`).
+    pub blocked_count: u64,
+    /// Safe structured detail for every entry counted by `blocked_count`
+    /// (issue #1594): a gate-refused write is quarantined and skipped, it
+    /// never aborts the rest of the ingest.
+    pub blocked: Vec<BlockedWrite>,
     pub db_path: String,
 }
 
@@ -131,15 +159,53 @@ async fn get_entity_opt(
         .map_err(|e| CodeSourceIngestError::Storage(e.to_string()))
 }
 
+/// Runs the runtime secret gate over `entity`'s name and properties, the
+/// same content the gate checks for every other write (ADR-085 D6 #4). The
+/// direct storage-layer call `upsert_entity` wraps does not run this check
+/// on its own path, so callers of this pipeline get no gate coverage unless
+/// it happens here.
+fn gate_check(entity: &Entity) -> Result<(), RuntimeError> {
+    secret_gate::check(&entity.name)?;
+    if let Some(properties) = &entity.properties {
+        secret_gate::check_json(properties)?;
+    }
+    Ok(())
+}
+
+/// Upserts `entity` after running it through [`gate_check`]. Returns
+/// `Ok(false)` without writing anything when the gate refuses the entity:
+/// the refusal is recorded in `report.blocked` keyed by `file`, and the
+/// caller moves on to the next item rather than aborting the whole ingest
+/// (issue #1594 — quarantine, don't abort, mirroring `git.digest`'s
+/// per-record refusal handling). Any other `RuntimeError` — not a gate
+/// refusal — still propagates as an error, since only a gate refusal is
+/// safe to treat as "skip this one item and continue".
 async fn upsert_entity(
     rt: &KhiveRuntime,
     token: &NamespaceToken,
     entity: Entity,
-) -> Result<(), CodeSourceIngestError> {
+    file: &str,
+    report: &mut CodeSourceIngestReport,
+) -> Result<bool, CodeSourceIngestError> {
+    if let Err(err) = gate_check(&entity) {
+        return match err {
+            RuntimeError::SecretDetected(secret) => {
+                report.blocked_count += 1;
+                report.blocked.push(BlockedWrite {
+                    file: file.to_string(),
+                    detector: secret.detector.to_string(),
+                    masked_excerpt: secret.masked,
+                });
+                Ok(false)
+            }
+            other => Err(other.into()),
+        };
+    }
     rt.entities(token)?
         .upsert_entity(entity)
         .await
-        .map_err(|e| CodeSourceIngestError::Storage(e.to_string()))
+        .map_err(|e| CodeSourceIngestError::Storage(e.to_string()))?;
+    Ok(true)
 }
 
 /// Upserts the edge and returns `true` when it did not previously exist
@@ -190,14 +256,22 @@ fn ts(dt: DateTime<Utc>) -> i64 {
 /// Upsert (create or refresh) the `project` entity for `name`, merging the
 /// per-`(source_project, language)` sweep clock (B5) with any prior sweeps
 /// for a different language recorded on the same entity.
+///
+/// Returns `Ok(None)` when the runtime secret gate refuses the write (the
+/// refusal is recorded in `report.blocked`, keyed by `source_label` — never
+/// by `name`, since `name` is content-derived from the manifest and may
+/// itself be what the gate refused) — callers must treat that project as
+/// absent from this sweep rather than indexing it.
+#[allow(clippy::too_many_arguments)]
 async fn upsert_project(
     rt: &KhiveRuntime,
     token: &NamespaceToken,
     name: &str,
+    source_label: &str,
     language: &str,
     sweep_time: DateTime<Utc>,
     report: &mut CodeSourceIngestReport,
-) -> Result<Uuid, CodeSourceIngestError> {
+) -> Result<Option<Uuid>, CodeSourceIngestError> {
     let id = project_uuid(name);
     let existing = get_entity_opt(rt, token, id).await?;
     let is_new = existing.is_none();
@@ -233,16 +307,21 @@ async fn upsert_project(
     let now = ts(sweep_time);
     entity.created_at = existing.as_ref().map(|e| e.created_at).unwrap_or(now);
     entity.updated_at = now;
-    upsert_entity(rt, token, entity).await?;
+    if !upsert_entity(rt, token, entity, source_label, report).await? {
+        return Ok(None);
+    }
 
     if is_new {
         report.projects_created += 1;
     } else {
         report.projects_updated += 1;
     }
-    Ok(id)
+    Ok(Some(id))
 }
 
+/// Returns `Ok(None)` when the runtime secret gate refuses the write (the
+/// refusal is recorded in `report.blocked`, keyed by `file`) — callers must
+/// treat that module as absent from this sweep rather than indexing it.
 #[allow(clippy::too_many_arguments)]
 async fn upsert_module(
     rt: &KhiveRuntime,
@@ -252,8 +331,9 @@ async fn upsert_module(
     module_path: &str,
     content_hash: &str,
     sweep_time: DateTime<Utc>,
+    file: &str,
     report: &mut CodeSourceIngestReport,
-) -> Result<Uuid, CodeSourceIngestError> {
+) -> Result<Option<Uuid>, CodeSourceIngestError> {
     let id = module_uuid(source_project, language, module_path);
     let existing = get_entity_opt(rt, token, id).await?;
     let is_new = existing.is_none();
@@ -284,25 +364,33 @@ async fn upsert_module(
     let now = ts(sweep_time);
     entity.created_at = existing.as_ref().map(|e| e.created_at).unwrap_or(now);
     entity.updated_at = now;
-    upsert_entity(rt, token, entity).await?;
+    if !upsert_entity(rt, token, entity, file, report).await? {
+        return Ok(None);
+    }
 
     if is_new {
         report.modules_created += 1;
     } else {
         report.modules_updated += 1;
     }
-    Ok(id)
+    Ok(Some(id))
 }
 
 /// Append `spec` to `entity_id`'s `unresolved_specifiers` (deduped), without
 /// disturbing any other property already stamped this sweep (project/module
 /// upsert already ran first, so this always reads back the row this pass
 /// just wrote).
+///
+/// When the gate refuses the updated properties (e.g. `spec.specifier` is
+/// itself secret-shaped), the refusal is recorded in `report.blocked` keyed
+/// by `file` and the specifier is simply not recorded this sweep — the
+/// entity itself is untouched, since `upsert_entity` blocks before writing.
 async fn record_unresolved(
     rt: &KhiveRuntime,
     token: &NamespaceToken,
     entity_id: Uuid,
     spec: UnresolvedSpec,
+    file: &str,
     report: &mut CodeSourceIngestReport,
 ) -> Result<(), CodeSourceIngestError> {
     let Some(mut entity) = get_entity_opt(rt, token, entity_id).await? else {
@@ -317,7 +405,6 @@ async fn record_unresolved(
         return Ok(());
     }
     list.push(spec);
-    report.unresolved_recorded += 1;
     let mut props = entity
         .properties
         .clone()
@@ -328,7 +415,10 @@ async fn record_unresolved(
         serde_json::to_value(&list).expect("serializes"),
     );
     entity.properties = Some(Value::Object(props));
-    upsert_entity(rt, token, entity).await
+    if upsert_entity(rt, token, entity, file, report).await? {
+        report.unresolved_recorded += 1;
+    }
+    Ok(())
 }
 
 /// The path separator a module path uses in each language's native form
@@ -556,7 +646,8 @@ async fn reresolve_pass(
                 );
             }
             entity.properties = Some(Value::Object(props));
-            upsert_entity(rt, token, entity).await?;
+            let entity_label = entity.id.to_string();
+            upsert_entity(rt, token, entity, &entity_label, report).await?;
         }
     }
     Ok(())
@@ -624,14 +715,34 @@ pub async fn run_code_ingest(
 
     let mut project_ids: HashMap<String, Uuid> = HashMap::new();
     for m in &manifests {
-        let id =
-            upsert_project(rt, token, &m.name, m.language, opts.sweep_time, &mut report).await?;
+        let file_label = m.manifest_path.display().to_string();
+        let Some(id) = upsert_project(
+            rt,
+            token,
+            &m.name,
+            &file_label,
+            m.language,
+            opts.sweep_time,
+            &mut report,
+        )
+        .await?
+        else {
+            // Gate-refused write, already recorded in report.blocked — this
+            // project is absent from the sweep, skip it and keep going
+            // (issue #1594).
+            continue;
+        };
         project_ids.insert(m.name.clone(), id);
     }
 
     // L1: manifest dependency edges (project depends_on project).
     for m in &manifests {
-        let source_id = project_ids[&m.name];
+        let Some(&source_id) = project_ids.get(&m.name) else {
+            // This manifest's own project write was gate-refused above;
+            // nothing to hang dependency edges off of this sweep.
+            continue;
+        };
+        let file_label = m.root.display().to_string();
         for (dep_name, dep_kind) in &m.dependencies {
             let spec = UnresolvedSpec {
                 specifier: dep_name.clone(),
@@ -639,7 +750,7 @@ pub async fn run_code_ingest(
                 dependency_kind: dep_kind.clone(),
                 language: m.language.to_string(),
             };
-            record_unresolved(rt, token, source_id, spec, &mut report).await?;
+            record_unresolved(rt, token, source_id, spec, &file_label, &mut report).await?;
         }
     }
 
@@ -714,11 +825,30 @@ async fn run_import_scan(
             continue;
         };
 
+        let file_label = file.display().to_string();
+
         let proj_id = match project_ids.get(&proj_name) {
             Some(id) => *id,
             None => {
-                let id =
-                    upsert_project(rt, token, &proj_name, language, sweep_time, report).await?;
+                // Label a refused fallback-project write by the source file
+                // whose scan triggered it — a real on-disk location, never
+                // the content-derived project name (#1594).
+                let proj_label = file_label.clone();
+                let Some(id) = upsert_project(
+                    rt,
+                    token,
+                    &proj_name,
+                    &proj_label,
+                    language,
+                    sweep_time,
+                    report,
+                )
+                .await?
+                else {
+                    // Gate-refused write, already recorded in report.blocked
+                    // — move on to the next file (issue #1594).
+                    continue;
+                };
                 project_ids.insert(proj_name.clone(), id);
                 id
             }
@@ -734,7 +864,7 @@ async fn run_import_scan(
             }
         };
         let hash = content_hash(&content);
-        let module_id = upsert_module(
+        let Some(module_id) = upsert_module(
             rt,
             token,
             &proj_name,
@@ -742,9 +872,15 @@ async fn run_import_scan(
             &module_path,
             &hash,
             sweep_time,
+            &file_label,
             report,
         )
-        .await?;
+        .await?
+        else {
+            // Gate-refused write, already recorded in report.blocked — move
+            // on to the next file (issue #1594).
+            continue;
+        };
 
         let contains_edge_id = edge_uuid(EdgeRelation::Contains, proj_id, module_id);
         let contains_created = upsert_edge(
@@ -780,7 +916,7 @@ async fn run_import_scan(
                         dependency_kind: "import".to_string(),
                         language: language.to_string(),
                     };
-                    record_unresolved(rt, token, module_id, spec, report).await?;
+                    record_unresolved(rt, token, module_id, spec, &file_label, report).await?;
                 }
                 Resolved::ExternalProject(target_name) => {
                     let spec = UnresolvedSpec {
@@ -789,7 +925,7 @@ async fn run_import_scan(
                         dependency_kind: "import".to_string(),
                         language: language.to_string(),
                     };
-                    record_unresolved(rt, token, proj_id, spec, report).await?;
+                    record_unresolved(rt, token, proj_id, spec, &file_label, report).await?;
                 }
             }
         }

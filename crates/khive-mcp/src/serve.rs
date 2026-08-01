@@ -6896,6 +6896,10 @@ backend = "kg-backend"
             "payload": action_dsl,
             "fired_at": fired_at,
             "cancelled_at": cancelled_at,
+            // The schedule pack stamps the creating token's actor; this
+            // fixture writes through the runtime directly, so it must carry
+            // the provenance itself — the drain fail-closes without it.
+            "created_by_actor": "local",
         });
         let ns = Namespace::parse("local").expect("ns");
         let token = rt.authorize(ns).expect("authorize schedule runtime");

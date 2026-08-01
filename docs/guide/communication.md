@@ -79,15 +79,30 @@ the structured error and therefore does not know the server-generated UUID.
 
 ### Inbox
 
-| Param    | Type    | Required | Notes                                        |
-| -------- | ------- | -------- | -------------------------------------------- |
-| `limit`  | integer | no       | Default 20, max 200.                         |
-| `status` | string  | no       | `"unread"` (default) \| `"read"` \| `"all"`. |
+| Param                | Type    | Required | Notes                                                                        |
+| -------------------- | ------- | -------- | ---------------------------------------------------------------------------- |
+| `limit`              | integer | no       | Default 20, max 200.                                                         |
+| `offset`             | integer | no       | Default 0; offset in the fully-filtered newest-first result set.             |
+| `status`             | string  | no       | `"unread"` (default) \| `"read"` \| `"all"`.                                 |
+| `from_actor`         | string  | no       | Exact sender; mutually exclusive with `from_prefix`.                         |
+| `from_prefix`        | string  | no       | Sender prefix; mutually exclusive with `from_actor`.                         |
+| `exclude_from_actor` | string  | no       | Exclude an exact sender actor label.                                         |
+| `since`              | string  | no       | Inclusive RFC 3339 lower bound on response `created_at`.                     |
+| `before`             | string  | no       | Exclusive RFC 3339 upper bound on response `created_at`.                     |
+| `subject_contains`   | string  | no       | Case-insensitive non-empty subject substring; missing subjects do not match. |
+| `content_contains`   | string  | no       | Case-insensitive non-empty body substring.                                   |
 
 ```
 request(ops="comm.inbox(limit=10)")
 request(ops="comm.inbox(status=\"all\")")
+request(ops="comm.inbox(status=\"all\", content_contains=\"timeout\", since=\"2026-07-31T00:00:00Z\")")
 ```
+
+Responses include `offset`, `has_more`, and `next_offset`. Repeat the same call
+with `offset=<next_offset>` until `next_offset` is null to enumerate every
+matching message without changing its read state. Filters are ANDed and offsets
+apply after all filters. Time bounds use the always-present top-level
+`created_at`, not optional transport `sent_at` metadata.
 
 ### Read
 
@@ -97,9 +112,16 @@ did not land — check `read` and re-issue later if needed.
 
 ```
 request(ops="comm.read(id=\"<message_id_or_prefix>\")")
+request(ops="comm.read(ids=[\"<message_id_1>\", \"<message_id_2>\"])")
 ```
 
-`id` accepts either a full UUID or a short 8-character hex prefix.
+Exactly one of `id` or `ids` is required. IDs accept either a full UUID or a
+short 8-character hex prefix; `ids` accepts 1-500 entries. The bulk form
+validates every target before mutating any and returns per-item results plus
+`requested_count`, `unique_count`, `marked_count`, and `failed_count`. Bulk
+updates are not transactional across messages: target-validation errors reject
+the call before any write, while later storage errors are reported in each
+result's `read` and optional `mark_error` fields.
 
 ### Reply
 

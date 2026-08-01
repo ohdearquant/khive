@@ -72,10 +72,13 @@ The fields you triage on are surfaced at the **top level** — no digging into `
 ```
 
 Scan `from` + `subject` + `preview`, open `content` for the ones that matter, then
-`comm.read(id="<full_id>")` to clear them. Always pass a `limit` — active inboxes are large.
-The mark-read write is best-effort: a successful response can carry `read: false` plus a
-`mark_error` when the mark did not land (e.g. under writer contention). Check `read` in the
-response; if it is `false`, the message stays unread — re-issue `comm.read` later.
+`comm.read(id="<full_id>")` to clear one or `comm.read(ids=[...])` to clear up to 500 in one
+operation. Always pass a `limit` — active inboxes are large. If `next_offset` is non-null, repeat
+the same inbox filters with `offset=<next_offset>` until it is null; pagination itself never marks
+messages read. Use `content_contains` when automated notifications omit `subject`; sender
+exact/prefix/exclusion, RFC3339 `since`/`before`, and subject/content substring filters can be
+combined. Mark writes are best-effort and cross-message updates are not atomic: inspect every
+result's `read`/`mark_error`, and re-issue failures later.
 
 ### 4. Reply to thread, don't start a new one
 

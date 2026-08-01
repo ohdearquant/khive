@@ -566,6 +566,67 @@ async fn set_note_property_refuses_non_object_document() {
 }
 
 #[tokio::test]
+async fn try_patch_note_property_refuses_scalar_document() {
+    use khive_storage::note::NoteFilter;
+
+    let store = setup_memory_store();
+    let note =
+        make_note("default", "message", "scalar properties").with_properties(serde_json::json!(1));
+    let id = note.id;
+    let original_updated_at = note.updated_at;
+    store.upsert_note(note).await.unwrap();
+
+    let matched = store
+        .try_patch_note_property(
+            id,
+            "default",
+            &NoteFilter::default(),
+            "$.read",
+            serde_json::json!(true),
+            original_updated_at + 1,
+        )
+        .await
+        .unwrap();
+    assert!(!matched, "a scalar properties document must not be patched");
+
+    let fetched = store.get_note(id).await.unwrap().unwrap();
+    assert_eq!(fetched.properties, Some(serde_json::json!(1)));
+    assert_eq!(fetched.updated_at, original_updated_at);
+}
+
+#[tokio::test]
+async fn try_patch_note_property_refuses_array_document() {
+    use khive_storage::note::NoteFilter;
+
+    let store = setup_memory_store();
+    let note = make_note("default", "message", "array properties")
+        .with_properties(serde_json::json!(["not", "an", "object"]));
+    let id = note.id;
+    let original_updated_at = note.updated_at;
+    store.upsert_note(note).await.unwrap();
+
+    let matched = store
+        .try_patch_note_property(
+            id,
+            "default",
+            &NoteFilter::default(),
+            "$.read",
+            serde_json::json!(true),
+            original_updated_at + 1,
+        )
+        .await
+        .unwrap();
+    assert!(!matched, "an array properties document must not be patched");
+
+    let fetched = store.get_note(id).await.unwrap().unwrap();
+    assert_eq!(
+        fetched.properties,
+        Some(serde_json::json!(["not", "an", "object"]))
+    );
+    assert_eq!(fetched.updated_at, original_updated_at);
+}
+
+#[tokio::test]
 async fn set_note_property_rejects_nul_key_without_mutation() {
     let store = setup_memory_store();
     let note = make_note("default", "observation", "nul property key").with_properties(
