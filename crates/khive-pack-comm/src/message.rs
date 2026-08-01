@@ -22,6 +22,9 @@ pub(crate) const COMM_STABLE_PROPERTY_KEYS: &[&str] = &[
     "sent_by_process",
 ];
 
+#[cfg(test)]
+const ROOT_PREPUBLICATION_CRASH_CONTENT: &str = "__khive_test_root_prepublication_crash__";
+
 pub(crate) fn short_id(uuid: Uuid) -> String {
     uuid.as_hyphenated().to_string().chars().take(8).collect()
 }
@@ -218,7 +221,6 @@ pub(crate) async fn dual_write_message(
     }
 
     let mut outbound_props = json!({
-        "comm_schema_version": COMM_SCHEMA_VERSION,
         "from": from,
         "to": to,
         "direction": "outbound",
@@ -227,6 +229,14 @@ pub(crate) async fn dual_write_message(
         "read": false,
         "sent_at": sent_at,
     });
+    // A root's canonical thread id is its generated outbound-note UUID, which
+    // is unavailable until `create_note` returns. Do not advertise v1 on that
+    // first committed row: the root patch below publishes the version marker
+    // and canonical thread_id together. Replies already carry a canonical root
+    // and can be certified on their initial insert.
+    if thread_id.is_some() {
+        outbound_props["comm_schema_version"] = json!(COMM_SCHEMA_VERSION);
+    }
     if let Some(fa) = from_actor {
         outbound_props["from_actor"] = json!(fa);
     }
@@ -248,7 +258,7 @@ pub(crate) async fn dual_write_message(
         }
     }
 
-    let outbound_note = runtime
+    let mut outbound_note = runtime
         .create_note(
             caller_token,
             "message",
@@ -260,6 +270,17 @@ pub(crate) async fn dual_write_message(
         )
         .await?;
 
+    // Explicit crash seam: unlike an ordinary in-process error, a process
+    // disappearance cannot run compensation. This lets the regression test
+    // inspect the first durable root state exactly where a real crash would
+    // leave it, without exposing the seam in production builds.
+    #[cfg(test)]
+    if thread_id.is_none() && content == ROOT_PREPUBLICATION_CRASH_CONTENT {
+        return Err(RuntimeError::Internal(
+            "dual_write: simulated process crash before root publication".to_string(),
+        ));
+    }
+
     // Canonical thread_id for both copies:
     // - If the caller supplied a prevalidated canonical thread_id, propagate it.
     // - If this is a new root message (thread_id is None), use the outbound note's
@@ -269,8 +290,9 @@ pub(crate) async fn dual_write_message(
         None => outbound_note.id.as_hyphenated().to_string(),
     };
 
-    // Patch the outbound note's thread_id to the canonical value (only needed when
-    // this is a root send; reply path already has the correct thread_id stored).
+    // Publish the root's canonical thread_id and v1 marker in the same row
+    // update. A concurrent/crash-visible first insert is deliberately
+    // pre-versioned rather than falsely claiming the complete v1 contract.
     if thread_id.is_none() {
         let store = runtime
             .notes(caller_token)
@@ -278,9 +300,10 @@ pub(crate) async fn dual_write_message(
         let mut patched = outbound_note.clone();
         let mut props = patched.properties.clone().unwrap_or_else(|| json!({}));
         props["thread_id"] = json!(canonical_thread_id);
+        props["comm_schema_version"] = json!(COMM_SCHEMA_VERSION);
         patched.properties = Some(props);
         patched.updated_at = chrono::Utc::now().timestamp_micros();
-        if let Err(patch_err) = store.upsert_note(patched).await {
+        if let Err(patch_err) = store.upsert_note(patched.clone()).await {
             let original = RuntimeError::Internal(format!(
                 "dual_write: patch outbound thread_id: {patch_err}"
             ));
@@ -293,6 +316,7 @@ pub(crate) async fn dual_write_message(
             )
             .await);
         }
+        outbound_note = patched;
     }
 
     {
@@ -562,6 +586,78 @@ mod tests {
             directions.sort_unstable();
             assert_eq!(directions, ["inbound", "outbound"]);
         }
+    }
+
+    /// A root's UUID is allocated by the first durable note insert. If the
+    /// process disappears before the follow-up root patch, that orphan must be
+    /// recognizable as pre-versioned rather than claim v1 with `thread_id=null`.
+    #[tokio::test]
+    async fn root_prepublication_crash_does_not_advertise_incomplete_v1_properties() {
+        let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+        let caller_token = runtime
+            .authorize(Namespace::local())
+            .expect("authorize local");
+
+        let error = dual_write_message(
+            &runtime,
+            &caller_token,
+            "local",
+            "local",
+            None,
+            ROOT_PREPUBLICATION_CRASH_CONTENT,
+            None,
+            "2026-07-31T00:00:02Z",
+            Some("worker/crash-seam"),
+            Some("local"),
+            Some("local"),
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect_err("test seam stops after the first committed root row");
+        assert!(
+            error.to_string().contains("simulated process crash"),
+            "unexpected crash-seam error: {error}"
+        );
+
+        let notes = runtime
+            .list_notes(&caller_token, Some("message"), 100, 0)
+            .await
+            .expect("list crash-visible messages");
+        assert_eq!(
+            notes.len(),
+            1,
+            "the seam must expose exactly the first committed outbound row"
+        );
+        let props = notes[0].properties.as_ref().expect("outbound properties");
+        assert_eq!(props.get("thread_id"), Some(&Value::Null));
+        assert!(
+            props.get("comm_schema_version").is_none(),
+            "an incomplete root must not advertise message-properties v1: {props}"
+        );
+
+        let advertises_invalid_v1 = notes.iter().any(|note| {
+            let Some(properties) = note.properties.as_ref() else {
+                return false;
+            };
+            if properties
+                .get("comm_schema_version")
+                .and_then(Value::as_u64)
+                != Some(COMM_SCHEMA_VERSION)
+            {
+                return false;
+            }
+            properties
+                .get("thread_id")
+                .and_then(Value::as_str)
+                .and_then(|raw| raw.parse::<Uuid>().ok().map(|id| (raw, id)))
+                .is_none_or(|(raw, id)| raw != id.as_hyphenated().to_string())
+        });
+        assert!(
+            !advertises_invalid_v1,
+            "no crash-visible row may claim v1 without a canonical string thread_id"
+        );
     }
 
     fn make_note(namespace: &str, content: &str, props: Option<Value>) -> Note {

@@ -41,6 +41,15 @@ same canonical `thread_id` — the sender's outbound UUID. This ensures that
 because all replies carry the same canonical thread_id regardless of which
 copy they were replying to.
 
+The runtime allocates that outbound UUID during the first note insert. For a
+root only, the first committed row therefore omits `comm_schema_version`; the
+immediate row update publishes the canonical string `thread_id` and
+`comm_schema_version = 1` together. A concurrent reader or process crash can
+observe a pre-versioned orphan, but can never observe a row that claims v1
+while still carrying the temporary `thread_id = null`. Successful root sends
+patch the outbound note before creating the inbound copy and return that
+patched v1 value after both writes succeed.
+
 When `thread_id` is already supplied, the handler first parses it and serializes
 the UUID in full-hyphenated form, then forwards that canonical value unchanged
 to both copies.

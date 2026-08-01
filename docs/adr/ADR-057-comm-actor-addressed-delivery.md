@@ -153,11 +153,16 @@ are JSON properties, not columns.
 
 #### Amendment: versioned properties and process provenance (2026-07-31)
 
-The message-note `properties` object is a stable, versioned reader contract. Every message
-written by `comm.send`, `comm.reply`, or `comm.ingest` carries integer
+The message-note `properties` object is a stable, versioned reader contract. Every successfully
+completed message write by `comm.send`, `comm.reply`, or `comm.ingest` carries integer
 `comm_schema_version = 1`. A missing marker identifies the pre-versioning layout; it does not
 implicitly mean v1. Any later change to the presence, type, or meaning of a stable field, or an
 addition to the stable-field table, requires a version bump. Existing rows are not rewritten.
+
+A root send learns its canonical thread UUID only after the outbound insert allocates the note ID.
+That first insert omits the version marker; the immediate patch publishes the canonical
+`thread_id` and v1 marker in one row update. A crash can therefore leave an unversioned orphan but
+never a row that advertises v1 with an incomplete root.
 
 The normative field table and reader rules live in
 [`message-properties.md`](../../crates/khive-pack-comm/docs/api/message-properties.md).
