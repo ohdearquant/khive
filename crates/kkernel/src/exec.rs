@@ -775,6 +775,7 @@ async fn run_exec_inline_with_forward(
             presentation_per_op: None,
             namespace: cfg.default_namespace.as_str().to_string(),
             actor_id: cfg.actor_id.clone(),
+            process_ref: khive_runtime::process_ref_from_env(),
             visible_namespaces: cfg
                 .visible_namespaces
                 .iter()

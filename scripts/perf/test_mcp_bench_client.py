@@ -276,6 +276,9 @@ def _base_response(frame, **overrides):
 
 
 class RawDaemonFrameTests(unittest.TestCase):
+    def test_protocol_version_tracks_process_ref_rollout(self):
+        self.assertEqual(mbc.PROTOCOL_VERSION, 4)
+
     def test_base_daemon_frame_shape(self):
         frame = mbc.base_daemon_frame("stats()", "cfg1", probe_only=True, metrics_only=False)
         self.assertEqual(frame["ops"], "stats()")
