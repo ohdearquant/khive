@@ -781,3 +781,22 @@ MCP envelopes remain structurally unchanged because storage errors are flattened
 `Display`, not serialized as `StorageError` variants. Because `StorageError` is public and is
 not marked `#[non_exhaustive]`, the new variant is a Rust source-compatibility change for
 downstream exhaustive matches; consumers must add a `WriterTaskTerminated` arm.
+
+## Amendment 3 (2026-08-01): Rollback failure poisons the writer
+
+The Amendment 2 terminal-state contract applies to every failed rollback, not
+only rollback after a panic. If a successful request operation is followed by
+a failed `COMMIT`, or if the operation itself returns an error, the writer must
+inspect the ensuing `ROLLBACK`. A rollback failure is terminal and the active
+request receives `SideEffectsUnknown`; returning the retryable commit/pool
+error or the original operation error would overstate what the task knows.
+When rollback succeeds and restores autocommit mode, the existing non-terminal
+contract remains unchanged: return the original operation error or the
+retryable `writer_task_commit` pool error, then continue serving requests.
+
+The writer also verifies `Connection::is_autocommit()` after transaction
+terminators and before dispatching each request. A connection that remains in
+a transaction is retired, queued requests are failed as `NotStarted`, and no
+top-level request is allowed to run. This pre-dispatch check is load-bearing:
+top-level requests skip `BEGIN IMMEDIATE` and would otherwise execute inside a
+stale transaction left by the prior failure.
