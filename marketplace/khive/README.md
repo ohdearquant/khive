@@ -50,15 +50,16 @@ Once installed, invoke them as `khive:digester`, `khive:polisher`, and so on.
 ## Requirements
 
 The `kg` pack is the base (entities, edges, notes); every other pack builds on it. The default
-server config loads all eleven (`kg`, `gtd`, `memory`, `brain`, `comm`, `schedule`, `knowledge`,
-`session`, `git`, `code`, `workspace` — `git` contributes note kinds, a batch ingester, the
+server config loads all twelve (`kg`, `gtd`, `memory`, `brain`, `comm`, `schedule`, `knowledge`,
+`session`, `git`, `code`, `workspace`, `blob` — `git` contributes note kinds, a batch ingester, the
 `git.digest` verb, and three write verbs — `git.commit`/`git.branch`/`git.push` — that shell to
 system git with hardened, allowlisted argv construction and unconditional force-push denial
 (ADR-108); `code` contributes the `code.ingest` L1/L1.5 source-ingest verb plus a `finding`
 note kind whose `findings.json` batch ingestion is reached only through the
-`kkernel code-ingest` admin CLI; `workspace` contributes entity/endpoint vocabulary, no verbs) —
-this plugin currently ships pattern skills for the first seven; `session`, `git`, `code`, and
-`workspace` have no skill yet (see the Pattern skills table above).
+`kkernel code-ingest` admin CLI; `workspace` contributes entity/endpoint vocabulary, no verbs;
+`blob` contributes `blob.put`/`blob.get`/`blob.stat` over content-addressed storage) —
+this plugin currently ships pattern skills for the first seven; `session`, `git`, `code`,
+`workspace`, and `blob` have no skill yet (see the Pattern skills table above).
 See [INSTALL.md](../INSTALL.md) for setup, the actor config, and per-pack smoke tests.
 
 ## Links
