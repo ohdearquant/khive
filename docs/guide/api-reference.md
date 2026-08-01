@@ -23,7 +23,7 @@ An always-machine-readable copy of this page is at
 | `gtd`       | 5     | `KHIVE_PACKS=kg,gtd`                       | Yes                 |
 | `memory`    | 5     | `KHIVE_PACKS=kg,memory`                    | Yes                 |
 | `brain`     | 16    | `KHIVE_PACKS=kg,brain`                     | Yes                 |
-| `comm`      | 8     | `KHIVE_PACKS=kg,comm`                      | Yes                 |
+| `comm`      | 9     | `KHIVE_PACKS=kg,comm`                      | Yes                 |
 | `schedule`  | 4     | `KHIVE_PACKS=kg,schedule`                  | Yes                 |
 | `knowledge` | 19    | `KHIVE_PACKS=kg,knowledge`                 | Yes                 |
 | `session`   | 4     | `KHIVE_PACKS=kg,session`                   | Yes                 |
@@ -1155,7 +1155,7 @@ request(ops="brain.register_adapter(adapter_id=\"lora-v3\", content_hash=\"<sha2
 
 ---
 
-## `comm` pack — 8 verbs
+## `comm` pack — 9 verbs
 
 Actor-to-actor messaging with threading. Optional; load with `KHIVE_PACKS=kg,comm`.
 
@@ -1176,6 +1176,29 @@ embedding input is bounded, the successful response includes the standard `warni
 
 ```
 request(ops="comm.send(to=\"lambda:leo\", subject=\"PR ready\", content=\"#600 is open for review\")")
+```
+
+### `comm.delivered` — Assertive
+
+Confirm the internal inbound sibling for a `comm.send` or `comm.reply`
+outbound UUID. This is a read-only exact correlation lookup; it does not infer
+delivery from content and does not report later SMTP or other external
+transport status. The matching inbound note must belong to the caller's
+namespace and carry the caller as `from_actor`.
+
+| Param | Type | Required | Notes                                                                                                                                                              |
+| ----- | ---- | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `id`  | uuid | yes      | Full `full_id` from a successful send/reply, or `outbound_id` surfaced by an ambiguous atomic-write error. Prefixes are rejected; the UUID is the correlation key. |
+
+Returns `{id, status, delivered, inbound_count}`. A successful lookup is
+conclusive: `status` is `delivered` when `inbound_count > 0`, otherwise
+`undelivered`. A lookup error leaves the delivery outcome uncertain.
+Ordinary atomic-write failures leave neither copy and do not require this
+lookup. Loss of the entire MCP response also loses the generated UUID and is
+outside this operation's contract.
+
+```
+request(ops="comm.delivered(id=\"<full-outbound-uuid>\")")
 ```
 
 ### `comm.inbox` — Assertive

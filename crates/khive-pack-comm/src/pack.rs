@@ -10,7 +10,7 @@ use khive_types::{HandlerDef, Pack};
 use crate::handlers;
 use crate::vocab::{COMM_HANDLERS, COMM_SCHEMA_PLAN_STMTS};
 
-/// Communication pack providing the five `comm.*` verbs.
+/// Communication pack providing the public `comm.*` verbs and channel subhandlers.
 ///
 /// Stores and queries `message` notes in the standard notes table; message
 /// metadata lives in the `properties` JSON column.
@@ -86,6 +86,7 @@ impl PackRuntime for CommPack {
     ) -> Result<Value, RuntimeError> {
         match verb {
             "comm.send" => handlers::handle_send(self.runtime(), token, params).await,
+            "comm.delivered" => handlers::handle_delivered(self.runtime(), token, params).await,
             "comm.inbox" => handlers::handle_inbox(self.runtime(), token, params).await,
             "comm.read" => handlers::handle_read(self.runtime(), token, params).await,
             "comm.unread" => handlers::handle_unread(self.runtime(), token, params).await,
@@ -217,6 +218,24 @@ mod help_tests {
         );
     }
 
+    #[test]
+    fn delivered_has_full_uuid_contract() {
+        let h = find_handler("comm.delivered");
+        assert_eq!(h.visibility, Visibility::Verb);
+        assert_eq!(h.category, VerbCategory::Assertive);
+        let id = h
+            .params
+            .iter()
+            .find(|p| p.name == "id")
+            .expect("delivered must have 'id'");
+        assert!(id.required, "delivered.id must be required");
+        assert_eq!(id.param_type, "uuid");
+        assert!(
+            h.description.contains("not external transport"),
+            "delivered help must distinguish internal confirmation from SMTP delivery"
+        );
+    }
+
     /// #93 instance 3: the top-level description must not contradict `actor`
     /// being a required, non-inferred param — a caller reading only the
     /// one-line description (not the full param list) must not be misled
@@ -295,6 +314,11 @@ mod help_tests {
             h("comm.inbox").category,
             VerbCategory::Assertive,
             "comm.inbox must be Assertive"
+        );
+        assert_eq!(
+            h("comm.delivered").category,
+            VerbCategory::Assertive,
+            "comm.delivered must be Assertive"
         );
         assert_eq!(
             h("comm.read").category,

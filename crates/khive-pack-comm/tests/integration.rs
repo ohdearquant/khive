@@ -1,6 +1,6 @@
 //! Smoke tests for the comm pack.
 //!
-//! INLINE TEST JUSTIFICATION: all five comm verbs (send, inbox, read, reply, thread) share a
+//! INLINE TEST JUSTIFICATION: the public comm verbs share a
 //! single in-memory runtime fixture. Splitting into per-verb files would require duplicating
 //! the fixture and lose cross-verb invariant tests (e.g. send→inbox→read→reply→thread
 //! roundtrip and thread-isolation assertions) that exercise interactions between verbs.
@@ -97,15 +97,20 @@ async fn pack_registered_message_notes_are_queryable_through_gql() {
 }
 
 #[test]
-fn comm_pack_declares_nine_handlers() {
+fn comm_pack_declares_thirteen_handlers() {
     assert_eq!(
         CommPack::HANDLERS.len(),
-        12,
-        "comm pack must declare 12 handlers: send, inbox, read, unread, reply, thread, \
-         ingest, heartbeat, health, probe, cursor_get, cursor_commit (khive #449, #66)"
+        13,
+        "comm pack must declare 13 handlers: send, delivered, inbox, read, unread, reply, \
+         thread, ingest, heartbeat, health, probe, cursor_get, cursor_commit \
+         (khive #1447, #449, #66)"
     );
     let names: Vec<&str> = CommPack::HANDLERS.iter().map(|h| h.name).collect();
     assert!(names.contains(&"comm.send"));
+    assert!(
+        names.contains(&"comm.delivered"),
+        "comm.delivered verb must be registered (khive #1447)"
+    );
     assert!(names.contains(&"comm.inbox"));
     assert!(names.contains(&"comm.read"));
     assert!(
@@ -182,6 +187,210 @@ async fn send_and_inbox_roundtrip() {
     // status=all also includes outbound, but direction filter still applies.
     // The test verifies inbox runs without error; count may be 0 for outbound.
     assert!(inbox.get("count").is_some(), "inbox returns count: {inbox}");
+}
+
+/// #1447: a successful dual-write is confirmed by the inbound sibling's
+/// correlation property, independent of message content.
+#[tokio::test]
+async fn delivered_confirms_successful_actor_send() {
+    let (registry, _rt) = build_registry();
+    let sent = registry
+        .dispatch(
+            "comm.send",
+            serde_json::json!({ "to": "local", "content": "templated body" }),
+        )
+        .await
+        .expect("send succeeds");
+    let outbound_id = sent
+        .get("full_id")
+        .and_then(|value| value.as_str())
+        .expect("send returns full outbound UUID");
+
+    let result = registry
+        .dispatch("comm.delivered", serde_json::json!({ "id": outbound_id }))
+        .await
+        .expect("delivery confirmation succeeds");
+
+    assert_eq!(result["id"], outbound_id);
+    assert_eq!(result["status"], "delivered");
+    assert_eq!(result["delivered"], true);
+    assert_eq!(result["inbound_count"], 1);
+}
+
+/// Confirmation is a sender operation: another actor in the same namespace
+/// cannot use a known outbound correlation UUID to inspect the sender's result.
+#[tokio::test]
+async fn delivered_is_scoped_to_the_sending_actor() {
+    let backend = shared_backend();
+    let (sender, _sender_runtime) = build_actor_registry(backend.clone(), "lambda:sender");
+    let (recipient, _recipient_runtime) = build_actor_registry(backend, "lambda:recipient");
+
+    let sent = sender
+        .dispatch(
+            "comm.send",
+            serde_json::json!({
+                "to": "lambda:recipient",
+                "content": "sender-only confirmation",
+            }),
+        )
+        .await
+        .expect("actor-addressed send succeeds");
+    let outbound_id = sent["full_id"].as_str().expect("full outbound UUID");
+
+    let sender_result = sender
+        .dispatch("comm.delivered", serde_json::json!({ "id": outbound_id }))
+        .await
+        .expect("sender confirmation succeeds");
+    assert_eq!(sender_result["delivered"], true);
+
+    let recipient_result = recipient
+        .dispatch("comm.delivered", serde_json::json!({ "id": outbound_id }))
+        .await
+        .expect("non-sender confirmation remains a non-disclosing lookup");
+    assert_eq!(recipient_result["status"], "undelivered");
+    assert_eq!(recipient_result["delivered"], false);
+    assert_eq!(recipient_result["inbound_count"], 0);
+}
+
+/// #1447: an outbound-only row is explicitly undelivered even when its body
+/// is identical to another message that did arrive. Content is never used as
+/// a delivery heuristic.
+#[tokio::test]
+async fn delivered_rejects_outbound_only_identical_body() {
+    let (registry, rt) = build_registry();
+    registry
+        .dispatch(
+            "comm.send",
+            serde_json::json!({ "to": "local", "content": "identical template" }),
+        )
+        .await
+        .expect("control send succeeds");
+
+    let token = rt
+        .authorize(Namespace::parse("local").unwrap())
+        .expect("authorize local");
+    let orphan = rt
+        .create_note(
+            &token,
+            "message",
+            None,
+            "identical template",
+            None,
+            Some(serde_json::json!({
+                "direction": "outbound",
+                "from_actor": "local",
+                "to_actor": "local",
+            })),
+            vec![],
+        )
+        .await
+        .expect("create outbound-only fixture");
+
+    let result = registry
+        .dispatch(
+            "comm.delivered",
+            serde_json::json!({ "id": orphan.id.to_string() }),
+        )
+        .await
+        .expect("delivery confirmation succeeds");
+
+    assert_eq!(result["status"], "undelivered");
+    assert_eq!(result["delivered"], false);
+    assert_eq!(result["inbound_count"], 0);
+}
+
+/// #1447: confirmation must report delivered from the inbound correlation
+/// alone. It must not require an outbound row to resolve first, which keeps
+/// the read useful for legacy/imported states and direct ambiguity fixtures.
+#[tokio::test]
+async fn delivered_confirms_inbound_after_outbound_disappears() {
+    let (registry, rt) = build_registry();
+    let token = rt
+        .authorize(Namespace::parse("local").unwrap())
+        .expect("authorize local");
+    let missing_outbound_id = uuid::Uuid::new_v4();
+    rt.create_note(
+        &token,
+        "message",
+        None,
+        "ambiguous outcome fixture",
+        None,
+        Some(serde_json::json!({
+            "direction": "inbound",
+            "from_actor": "local",
+            "to_actor": "local",
+            "outbound_ref": missing_outbound_id,
+        })),
+        vec![],
+    )
+    .await
+    .expect("create committed inbound fixture");
+
+    let result = registry
+        .dispatch(
+            "comm.delivered",
+            serde_json::json!({ "id": missing_outbound_id.to_string() }),
+        )
+        .await
+        .expect("confirmation does not require outbound row");
+
+    assert_eq!(result["status"], "delivered");
+    assert_eq!(result["delivered"], true);
+    assert_eq!(result["inbound_count"], 1);
+}
+
+/// Confirmation is sender-namespace scoped. An unrelated namespace cannot
+/// manufacture a positive result for the caller by reusing its UUID.
+#[tokio::test]
+async fn delivered_ignores_matching_inbound_in_another_namespace() {
+    let (registry, rt) = build_registry();
+    let outbound_id = uuid::Uuid::new_v4();
+    let foreign_token = rt
+        .authorize(Namespace::parse("foreign").unwrap())
+        .expect("authorize foreign fixture namespace");
+    rt.create_note(
+        &foreign_token,
+        "message",
+        None,
+        "foreign inbound fixture",
+        None,
+        Some(serde_json::json!({
+            "direction": "inbound",
+            "outbound_ref": outbound_id,
+        })),
+        vec![],
+    )
+    .await
+    .expect("create foreign inbound fixture");
+
+    let result = registry
+        .dispatch(
+            "comm.delivered",
+            serde_json::json!({ "id": outbound_id.to_string() }),
+        )
+        .await
+        .expect("local confirmation succeeds");
+
+    assert_eq!(result["status"], "undelivered");
+    assert_eq!(result["delivered"], false);
+    assert_eq!(result["inbound_count"], 0);
+}
+
+/// A display prefix is not a stable correlation key and may have no outbound
+/// row to resolve, so the public contract requires the surfaced full UUID.
+#[tokio::test]
+async fn delivered_rejects_short_or_malformed_ids() {
+    let (registry, _rt) = build_registry();
+    for id in ["deadbeef", "not-a-uuid"] {
+        let error = registry
+            .dispatch("comm.delivered", serde_json::json!({ "id": id }))
+            .await
+            .expect_err("non-full id must be rejected");
+        assert!(
+            error.to_string().contains("full outbound UUID"),
+            "error must explain the stable correlation requirement: {error}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -2618,6 +2827,10 @@ async fn comm_pack_exposes_non_empty_schema_plan() {
     assert!(
         combined.contains("idx_comm_message_thread"),
         "schema plan must declare idx_comm_message_thread; got: {combined}"
+    );
+    assert!(
+        combined.contains("idx_comm_message_outbound_ref"),
+        "schema plan must declare idx_comm_message_outbound_ref; got: {combined}"
     );
     assert!(
         combined.contains("CREATE INDEX IF NOT EXISTS"),

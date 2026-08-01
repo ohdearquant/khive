@@ -1,7 +1,8 @@
 # Message lifecycle
 
 Technical reference for the `comm` pack's message write, threading, and read path —
-`comm.send` / `comm.inbox` / `comm.read` / `comm.reply` / `comm.thread` / `comm.ingest` —
+`comm.send` / `comm.delivered` / `comm.inbox` / `comm.read` / `comm.reply` /
+`comm.thread` / `comm.ingest` —
 spanning `message.rs`, `handlers.rs`, `params.rs`, and the inbox/thread indexes in
 `vocab.rs`.
 
@@ -10,13 +11,27 @@ spanning `message.rs`, `handlers.rs`, `params.rs`, and the inbox/thread indexes 
 Accepts a 36-char hyphenated UUID or an 8+ hex-char short prefix. The prefix
 is resolved via `runtime.resolve_prefix` (namespace-scoped).
 
+## `message.rs::attach_outbound_id_to_ambiguous_write`
+
+Preserves ordinary `create_notes_atomic` failures unchanged. A
+`WriterTaskTerminated { request_state: SideEffectsUnknown }` error is different:
+the request was accepted, but the caller cannot establish whether the complete
+pair committed. The helper turns that case into a structured
+`RuntimeError::Khive(KhiveError)` (`kind=Conflict`) carrying the pre-generated
+full `outbound_id` as `details.outbound_id`, so an automated caller can read
+the correlation id back out of the MCP error object instead of parsing prose,
+and use it for an exact `comm.delivered` lookup before retry.
+
 ## `message.rs::dual_write_message`
 
 Writes an outbound copy (caller namespace) and an inbound copy (recipient
-namespace), rolling back the outbound note if the inbound write fails
-(atomicity guarantee). The recipient-namespace behavior applies to this
-generic cross-namespace path; the public actor-addressed `comm.send` keeps
-both copies in the caller namespace (see below).
+namespace) through `create_notes_atomic`. Both notes, their FTS documents, and
+all registered-model vector rows commit in one writer transaction. Ordinary
+prepare/plan failures leave neither copy; an ambiguous writer-reply failure can
+mean either the complete pair committed or neither did, never a durable
+half-pair. The recipient-namespace behavior applies to this generic
+cross-namespace path; the public actor-addressed `comm.send` keeps both copies
+in the caller namespace (see below).
 
 `subject`, `thread_id` are optional. `sent_at` is the RFC3339 timestamp for
 both copies. `from_actor` and `to_actor` are optional actor labels (ADR-057)
@@ -109,6 +124,21 @@ proceeds rather than hard-erroring, to preserve backward compatibility with
 sessions that set `default_namespace` but not `actor_id`. Uses the shared
 actor-identity policy (#567) so this warning fires under exactly the same
 "unattributed" definition the gate and token minter use.
+
+## `handlers.rs::handle_delivered`
+
+Requires the full outbound UUID. It performs one indexed count of live inbound
+`message` notes in the caller's namespace whose `properties.from_actor` is the
+caller and whose `properties.outbound_ref` exactly matches that UUID. It
+deliberately does not fetch or resolve the outbound row first, because an
+undelivered or legacy/injected half-pair may have no outbound row available to
+resolve. The response carries
+`status` (`delivered` or `undelivered`), a matching boolean, and
+`inbound_count`; message content is irrelevant. This is internal paired-copy
+confirmation only, not external channel delivery status. If the caller loses
+the complete MCP response rather than receiving the structured ambiguous
+error, it also loses the server-generated outbound UUID; that case requires a
+future caller-supplied idempotency/correlation contract and is out of scope.
 
 ## `handlers.rs::handle_inbox`
 
@@ -420,6 +450,9 @@ planner sees different predicates and falls back to a table scan.
 condition is always satisfied and the index is eligible. `kind` is included
 as an indexed column so the `kind = ?N` predicate is covered. Statements are
 idempotent (`CREATE INDEX IF NOT EXISTS`).
+
+`idx_comm_message_outbound_ref` covers the exact `comm.delivered` lookup by
+namespace, note kind, direction, sender actor, and `properties.outbound_ref`.
 
 The `idx_comm_message_external_id` UNIQUE index is NOT listed here; it is
 created by the V5 schema migration (`005-unique-comm-external-id.sql`), which

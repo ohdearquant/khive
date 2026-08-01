@@ -47,6 +47,36 @@ A configured actor that addresses itself must opt in with `self_send=true`. If t
 target was meant to be a distinct parent or sub-agent, configure distinct actor identities
 instead of opting in; the rejection is intended to expose that identity collapse.
 
+### Confirm an uncertain internal delivery
+
+Rows, FTS documents, and vectors for a send/reply pair commit atomically.
+Ordinary failures leave neither copy. If the writer cannot establish whether
+an accepted request committed, the operation instead returns an `ambiguous`
+error containing `outbound_id=<full-uuid>`. Confirm the paired inbound write
+before retrying:
+
+```
+request(ops="comm.delivered(id=\"<full-outbound-uuid>\")")
+```
+
+A successful lookup returns `status="delivered"` and `delivered=true` when at
+least one live inbound note has `properties.outbound_ref` equal to that UUID.
+It returns `status="undelivered"`, `delivered=false`, and `inbound_count=0`
+when none does. The lookup does not require the outbound row to remain present
+and never compares message bodies. It is scoped to the caller's namespace and
+sender actor, so another actor cannot inspect a sender's outcome even if it
+learns the correlation UUID. If the lookup itself errors, the outcome is still
+uncertain.
+
+This operation confirms khive's internal inbound sibling only. It does not
+confirm asynchronous SMTP or another external transport; see
+[How outbound delivery works](#how-outbound-delivery-works) for that separate
+state machine.
+
+If the entire MCP response is lost, the caller receives neither the result nor
+the structured error and therefore does not know the server-generated UUID.
+`comm.delivered` cannot resolve that wider response-loss case.
+
 ### Inbox
 
 | Param                | Type    | Required | Notes                                                                        |

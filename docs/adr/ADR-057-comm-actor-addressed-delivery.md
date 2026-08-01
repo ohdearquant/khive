@@ -6,8 +6,8 @@
 **Depends on**: ADR-007 (Namespace), ADR-017 (Pack Standard), ADR-040 (Communication and
 Schedule Packs)\
 **Related issues**: #57 (actor-addressed delivery -- primary), #13 (cross-namespace policy
-gate), #75 (actor identity on every request), #1428 (process provenance), #1490 (versioned
-message properties)
+gate), #75 (actor identity on every request), #1447 (sender-side dual-write confirmation),
+#1428 (process provenance), #1490 (versioned message properties)
 
 ## Context
 
@@ -226,11 +226,54 @@ actor identities. Under ADR-096 Fork 2, project-scoped actor discovery can other
 sessions resolve the same actor label; failing loudly prevents that identity collapse from being
 mistaken for successful inter-agent delivery.
 
-The `dual_write_message` function does not need to be rewritten: the case where both copies
-land in the caller's namespace already works today (same-namespace send path). The only
-changes are that `from` and `to` in properties no longer need to be valid namespace strings,
-and two new fields (`from_actor`, `to_actor`) are added to the properties JSON for both
-copies.
+#### Amendment: sender-side dual-write confirmation (2026-08-01)
+
+`comm.send` and `comm.reply` write an outbound note and an inbound sibling with
+`properties.outbound_ref=<outbound UUID>`. Since #1565, both rows, their FTS
+documents, and their vector rows commit through `create_notes_atomic` in one
+writer transaction. Ordinary prepare and plan failures leave neither copy;
+the old durable half-pair and compensating-delete states are no longer part of
+the write path.
+
+Atomicity does not by itself prove the outcome to a caller when an accepted
+writer request loses its typed reply. The writer-task contract reports that
+case as `request_state=side_effects_unknown`: either the complete pair may have
+committed or neither copy did. `dual_write_message` pre-generates the outbound
+UUID and surfaces this case as a structured `RuntimeError::Khive(KhiveError)`
+(`kind=conflict`) whose `details.outbound_id` field carries the full
+`outbound_id` as a machine-readable wire value — not embedded in the
+free-text `message` field — so an automated caller can read it directly off
+the MCP error object.
+
+The comm pack exposes `comm.delivered(id=<full-outbound-uuid>)`, a read-only
+Assertive verb. It queries for a live inbound `message` in the caller's
+namespace whose `from_actor` matches the caller and whose `outbound_ref`
+exactly matches the supplied UUID. The outbound row need not exist. A
+successful response explicitly reports `delivered` when one or more siblings
+exist and `undelivered` when none exists; an operation error leaves the outcome
+uncertain. Content, subject, and timestamps are not correlation keys.
+
+Only an error whose outcome is genuinely unknown is relabeled `ambiguous` and
+given the full `outbound_id`; known pre-write and rolled-back errors preserve
+their existing classification. Prefixes are not accepted because confirmation
+uses the UUID as a correlation key and must not depend on resolving another
+record first.
+
+This contract confirms only khive's internal inbound sibling. It does not
+claim asynchronous external-transport delivery (for example SMTP), whose
+accepted/queued/failed state is a separate concern.
+
+Loss of the complete MCP response is also outside this contract. In that case
+the caller receives neither the success result nor the structured ambiguous
+error, and therefore does not know the server-generated outbound UUID. Closing
+that wider exactly-once gap requires a future caller-supplied correlation or
+idempotency key on `comm.send`/`comm.reply`.
+
+The actor-addressed routing rule remains unchanged by #1565: both copies land
+in the caller's namespace, now through the atomic write path. For this ADR's
+addressing change, `from` and `to` in properties no longer need to be valid
+namespace strings, and two fields (`from_actor`, `to_actor`) are present in
+the properties JSON for both copies.
 
 ### `comm.inbox` behavior change
 

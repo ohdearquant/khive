@@ -148,6 +148,17 @@ fn details_roundtrip() {
     assert_eq!(got.get("constraint"), Some("required"));
 }
 
+/// `Details::new_owned` accepts dynamically computed (non-`'static`) values —
+/// e.g. a UUID formatted at runtime — which `Details::new` cannot express.
+#[test]
+fn details_new_owned_roundtrip() {
+    let dynamic_id = format!("{:x}", 0xdead_beef_u32);
+    let details = Details::new_owned([("outbound_id", dynamic_id.clone())]);
+    let e = KhiveError::conflict("delivery outcome is uncertain").with_details(details);
+    let got = e.details().unwrap();
+    assert_eq!(got.get("outbound_id"), Some(dynamic_id.as_str()));
+}
+
 // ---- Serde wire shape stability ----
 
 #[cfg(feature = "serde")]

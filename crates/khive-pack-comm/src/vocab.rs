@@ -6,7 +6,7 @@ use khive_types::{HandlerDef, ParamDef, Visibility};
 /// crates/khive-pack-comm/docs/api/message-lifecycle.md#vocabrscomm_schema_plan_stmts for
 /// why they filter on `deleted_at IS NULL` rather than a literal `kind` value,
 /// and why `idx_comm_message_external_id` is deliberately absent from this list.
-pub(crate) static COMM_SCHEMA_PLAN_STMTS: [&str; 4] = [
+pub(crate) static COMM_SCHEMA_PLAN_STMTS: [&str; 5] = [
     "CREATE INDEX IF NOT EXISTS idx_comm_message_direction \
         ON notes(namespace, kind, json_extract(properties, '$.direction'), \
         json_extract(properties, '$.read'), created_at DESC) \
@@ -20,6 +20,11 @@ pub(crate) static COMM_SCHEMA_PLAN_STMTS: [&str; 4] = [
         json_extract(properties, '$.direction'), \
         json_extract(properties, '$.read'), \
         created_at DESC) \
+        WHERE deleted_at IS NULL",
+    "CREATE INDEX IF NOT EXISTS idx_comm_message_outbound_ref \
+        ON notes(namespace, kind, json_extract(properties, '$.direction'), \
+        json_extract(properties, '$.from_actor'), \
+        json_extract(properties, '$.outbound_ref')) \
         WHERE deleted_at IS NULL",
     COMM_CHANNEL_CURSOR_SCHEMA_STMT,
 ];
@@ -38,7 +43,7 @@ pub(crate) const COMM_CHANNEL_CURSOR_SCHEMA_STMT: &str =
     PRIMARY KEY (channel_kind, channel_slug)\
 )";
 
-pub(crate) static COMM_HANDLERS: [HandlerDef; 12] = [
+pub(crate) static COMM_HANDLERS: [HandlerDef; 13] = [
     HandlerDef {
         name: "comm.send",
         description: "Send a message, optionally threaded.",
@@ -82,6 +87,23 @@ pub(crate) static COMM_HANDLERS: [HandlerDef; 12] = [
                 description: "Explicitly allow delivery when `to` matches the configured sender actor. Defaults to false: such self-addressed sends are rejected unless this is true. The anonymous `local` fallback is exempt.",
             },
         ],
+    },
+    HandlerDef {
+        name: "comm.delivered",
+        description: "Confirm whether the caller's internal inbound sibling exists for an \
+                      outbound comm.send/comm.reply UUID. This is a read-only sender-scoped \
+                      dual-write confirmation, not external transport (for example SMTP) \
+                      delivery status.",
+        visibility: Visibility::Verb,
+        category: khive_types::VerbCategory::Assertive,
+        params: &[ParamDef {
+            name: "id",
+            param_type: "uuid",
+            required: true,
+            description: "Full UUID returned as full_id by comm.send or comm.reply, or surfaced \
+                          as outbound_id in an ambiguous atomic-write error. A full UUID is \
+                          required because it is the exact correlation key.",
+        }],
     },
     HandlerDef {
         name: "comm.inbox",
