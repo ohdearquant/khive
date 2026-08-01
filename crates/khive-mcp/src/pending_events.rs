@@ -680,6 +680,7 @@ pub async fn run_pending_events_on(
 
                 // ── Dispatch the action ──────────────────────────────────
                 let mut reminder_delivery_error = None;
+                let mut policy_error = None;
                 if let Some(dsl) = &action_dsl {
                     let dispatch_result =
                         dispatch_action(dsl, ns_str, server, scheduled_actor.as_deref(), verbose)
@@ -698,12 +699,13 @@ pub async fn run_pending_events_on(
                         summary.failed += 1;
                         if event_type == "remind" {
                             let error = e.to_string();
-                            append_reminder_delivery_failure_event(
+                            append_scheduled_action_failure_event(
                                 server,
                                 ns_str,
                                 id,
                                 scheduled_actor.as_deref().unwrap_or("local"),
                                 &error,
+                                event_type,
                             )
                             .await;
                             reminder_delivery_error = Some(error);
@@ -726,11 +728,11 @@ pub async fn run_pending_events_on(
                         error = %error,
                         "pending-events: scheduled event fail-closed: no verifiable creator provenance"
                     );
-                    if event_type == "remind" {
-                        append_reminder_delivery_failure_event(server, ns_str, id, "local", &error)
-                            .await;
-                        reminder_delivery_error = Some(error);
-                    }
+                    append_scheduled_action_failure_event(
+                        server, ns_str, id, "local", &error, event_type,
+                    )
+                    .await;
+                    policy_error = Some(error);
                 }
 
                 let fired_at_rfc = Utc::now().to_rfc3339();
@@ -743,6 +745,20 @@ pub async fn run_pending_events_on(
                         obj.remove("delivery_error");
                         obj.remove("delivery_failed_at");
                     }
+                }
+                // Fail-closed policy outcome (ADR-119): distinct from
+                // `delivery_error` above, which covers an attempted dispatch
+                // that failed. This covers a dispatch that was never
+                // attempted because the row's creator provenance could not
+                // be verified — a legacy-row case, not an execution error —
+                // and must remain visible on the row rather than reading as
+                // a clean `fired`/`pending` outcome.
+                if let Some(error) = policy_error {
+                    props["policy_error"] = json!(error);
+                    props["policy_error_at"] = json!(fired_at_rfc);
+                } else if let Some(obj) = props.as_object_mut() {
+                    obj.remove("policy_error");
+                    obj.remove("policy_error_at");
                 }
                 let updated_at;
 
@@ -1040,19 +1056,31 @@ fn reminder_subject(content: &str) -> String {
     }
 }
 
-async fn append_reminder_delivery_failure_event(
+/// Append a durable audit event for a scheduled action that failed to fire —
+/// either an attempted dispatch that errored, or (ADR-119) a dispatch that
+/// was never attempted because the row's creator provenance could not be
+/// verified. The verb mirrors the fired-action's own verb family
+/// (`schedule.remind` / `schedule.schedule`) so it is queryable per event
+/// type, not just as an undifferentiated failure.
+async fn append_scheduled_action_failure_event(
     server: &KhiveMcpServer,
     namespace: &str,
     scheduled_event_id: uuid::Uuid,
     recipient_actor: &str,
     error: &str,
+    event_type: &str,
 ) {
     let Some(store) = server.event_store() else {
         return;
     };
+    let verb = if event_type == "remind" {
+        "schedule.remind.fire"
+    } else {
+        "schedule.schedule.fire"
+    };
     let event = khive_storage::Event::new(
         namespace,
-        "schedule.remind.fire",
+        verb,
         EventKind::Audit,
         SubstrateKind::Note,
         recipient_actor,
@@ -1068,7 +1096,7 @@ async fn append_reminder_delivery_failure_event(
         tracing::error!(
             scheduled_event_id = %scheduled_event_id,
             error = %trace_error,
-            "pending-events: reminder delivery failure event append failed"
+            "pending-events: scheduled action failure event append failed"
         );
     }
 }
@@ -1344,6 +1372,27 @@ mod tests {
             if request.verb == "comm.send" {
                 Ok(GateDecision::deny(
                     "comm.send denied by delivery-failure test",
+                ))
+            } else {
+                Ok(GateDecision::allow())
+            }
+        }
+    }
+
+    /// Denies by actor identity alone, regardless of verb — used to prove a
+    /// scheduled action replays under its creator's authenticated identity
+    /// (ADR-119), not the daemon's: the daemon actor stays allowed while the
+    /// creator actor is denied.
+    #[derive(Debug)]
+    struct DenyActorGate {
+        denied_actor: String,
+    }
+
+    impl Gate for DenyActorGate {
+        fn check(&self, request: &GateRequest) -> Result<GateDecision, GateError> {
+            if request.actor.id == self.denied_actor {
+                Ok(GateDecision::deny(
+                    "actor denied by actor-aware policy-gate test",
                 ))
             } else {
                 Ok(GateDecision::allow())
@@ -1802,6 +1851,110 @@ mod tests {
         assert!(
             daemon_messages.is_empty(),
             "a fail-closed row must never dispatch under the daemon identity: {daemon_messages:?}"
+        );
+
+        // ADR-119: the row must carry a durable policy error, not read as a
+        // clean fire — an ephemeral drain counter alone hides action loss
+        // from anything reading the note row after the fact.
+        let props = get_note_props(&rt, id).await;
+        assert!(
+            props["policy_error"]
+                .as_str()
+                .is_some_and(|error| error.contains("fail-closed")
+                    && error.contains("created_by_actor")),
+            "fail-closed row must persist a policy error distinguishing it from a clean fire: \
+             {props:?}"
+        );
+        assert!(
+            props["policy_error_at"].as_str().is_some(),
+            "fail-closed row must record when the policy error was recorded: {props:?}"
+        );
+
+        let token = rt.authorize(Namespace::local()).expect("authorize");
+        let events = rt
+            .events(&token)
+            .expect("event store")
+            .query_events(
+                EventFilter {
+                    verbs: vec!["schedule.schedule.fire".to_string()],
+                    ..Default::default()
+                },
+                PageRequest {
+                    limit: 10,
+                    offset: 0,
+                },
+            )
+            .await
+            .expect("query fail-closed policy events");
+        assert!(
+            events
+                .items
+                .iter()
+                .any(|event| event.outcome == EventOutcome::Error && event.target_id == Some(id)),
+            "fail-closed row must append an auditable policy-error event: {events:?}"
+        );
+    }
+
+    /// ADR-119 acceptance criterion 6: a caller must not be able to schedule
+    /// an action that is denied to them but allowed to the daemon. This gate
+    /// denies purely by actor identity (not verb), so the drain only passes
+    /// if it replays under the creator's persisted identity rather than the
+    /// daemon's — proving the `VerifiedActor` dispatch seam is actually
+    /// evaluated by the Gate, not just threaded through unused.
+    #[tokio::test]
+    async fn scheduled_action_denied_to_creator_is_not_permitted_via_daemon() {
+        let (_tmp, db_path) = tmp_db();
+        let creator = "lambda:gated-creator";
+        let daemon_actor = "lambda:gated-daemon";
+
+        let creator_rt = make_rt_with_actor(&db_path, Some(creator)).await;
+        let action = format!(
+            "comm.send(to={creator:?}, subject=\"scheduled\", content=\"scheduled action \
+             fired\", self_send=true)"
+        );
+        let id = create_scheduled_event(
+            &creator_rt,
+            "local",
+            &due_rfc3339(),
+            Some(&action),
+            None,
+            "schedule",
+        )
+        .await;
+        let props = get_note_props(&creator_rt, id).await;
+        assert_eq!(props["created_by_actor"], creator, "{props}");
+
+        let cfg = RuntimeConfig {
+            db_path: Some(std::path::PathBuf::from(&db_path)),
+            default_namespace: Namespace::parse("local").unwrap(),
+            embedding_model: None,
+            additional_embedding_models: vec![],
+            gate: std::sync::Arc::new(DenyActorGate {
+                denied_actor: creator.to_string(),
+            }),
+            actor_id: Some(daemon_actor.to_string()),
+            ..Default::default()
+        };
+        let rt = KhiveRuntime::new(cfg).expect("runtime");
+        let packs = vec!["kg".to_string(), "comm".to_string(), "schedule".to_string()];
+        let server = KhiveMcpServer::with_packs(rt.clone(), &packs)
+            .expect("server with required scheduled action delivery pack");
+
+        let summary = run_pending_events_on(&rt, &server, false)
+            .await
+            .expect("drain continues after gate denial");
+        assert_eq!(
+            summary.failed, 1,
+            "an action denied to its creator must be recorded as a failure, not run under the \
+             daemon's allowed identity: {summary:?}"
+        );
+
+        let creator_messages = inbound_reminder_messages(&rt, creator).await;
+        let daemon_messages = inbound_reminder_messages(&rt, daemon_actor).await;
+        assert!(
+            creator_messages.is_empty() && daemon_messages.is_empty(),
+            "a gate-denied action must have no side effect: creator={creator_messages:?}, \
+             daemon={daemon_messages:?}"
         );
     }
 
