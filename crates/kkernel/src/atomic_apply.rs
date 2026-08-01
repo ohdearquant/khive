@@ -32,11 +32,15 @@ fn add_post_commit_embedding_warning(
     effect: Option<&PostCommitEffect>,
     outcomes: &[khive_runtime::atomic_prepare::PostCommitEmbeddingOutcome],
 ) {
+    // More than one atomic update may schedule the same target effect. Treat
+    // those outcomes as one aggregate advisory: a late model registration can
+    // make a later duplicate reindex truncate even when the first did not, and
+    // first-match lookup would silently lose that real outcome.
     let truncated = effect.is_some_and(|effect| {
         outcomes
             .iter()
-            .find(|outcome| &outcome.effect == effect)
-            .is_some_and(|outcome| outcome.truncation.any_truncated())
+            .filter(|outcome| &outcome.effect == effect)
+            .any(|outcome| outcome.truncation.any_truncated())
     });
     if !truncated {
         return;
@@ -972,6 +976,34 @@ mod validate_atomic_args_tests {
         };
         add_post_commit_embedding_warning(&mut unrelated, Some(&other_effect), &outcomes);
         assert!(unrelated.get("warnings").is_none());
+    }
+
+    #[test]
+    fn atomic_duplicate_update_effect_aggregates_later_truncation_outcome() {
+        let note_id = Uuid::new_v4();
+        let effect = PostCommitEffect::ReindexNote { note_id };
+        let outcomes = vec![
+            khive_runtime::atomic_prepare::PostCommitEmbeddingOutcome {
+                effect: effect.clone(),
+                truncation: khive_runtime::retrieval::EmbeddingTruncationReport::default(),
+            },
+            khive_runtime::atomic_prepare::PostCommitEmbeddingOutcome {
+                effect: effect.clone(),
+                truncation: khive_runtime::retrieval::EmbeddingTruncationReport {
+                    truncated: 1,
+                    discarded_bytes: 23,
+                },
+            },
+        ];
+        let mut first_result = json!({"id": note_id});
+        let mut second_result = json!({"id": note_id});
+
+        add_post_commit_embedding_warning(&mut first_result, Some(&effect), &outcomes);
+        add_post_commit_embedding_warning(&mut second_result, Some(&effect), &outcomes);
+
+        let expected = json!([khive_runtime::retrieval::EMBEDDING_INPUT_TRUNCATED_WARNING]);
+        assert_eq!(first_result["warnings"], expected);
+        assert_eq!(second_result["warnings"], expected);
     }
 
     #[test]

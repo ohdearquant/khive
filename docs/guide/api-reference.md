@@ -347,6 +347,8 @@ request(ops="delete(id=\"<uuid>\")")
 Deduplicate two entities. Returns `{kept_id, removed_id, edges_rewired,
 properties_merged, tags_unioned, content_appended, dry_run}` — chain with
 `$prev.kept_id`, **not** `$prev.id` (merge has no top-level `id` field).
+When the surviving entity or note is reindexed and an embedder bounds its input, the successful
+response also includes the standard embedding-truncation `warnings` advisory.
 
 | Param     | Type | Required | Notes                                       |
 | --------- | ---- | -------- | ------------------------------------------- |
@@ -1345,6 +1347,10 @@ request(ops="knowledge.stats()")
 
 Backfill embeddings + FTS for atoms/domains.
 
+The response includes `truncation_by_model`, keyed by every model that completed embedding work.
+Each value contains `truncated` and `discarded_bytes` counters derived from the actual embedding
+outcomes; atom source content remains complete in SQL and FTS.
+
 | Param         | Type            | Required | Notes                                                   |
 | ------------- | --------------- | -------- | ------------------------------------------------------- |
 | `ids`         | array\<string\> | no       | Atom slugs/IDs to index; omit to index all.             |
@@ -1431,6 +1437,10 @@ request(ops="knowledge.compose(query=\"FastAPI JWT middleware validation pattern
 ### `knowledge.edit` — Commissive
 
 Upsert sections for an atom without wiping other sections.
+
+The response combines the inline section and atom refresh outcomes in `truncation_by_model` and
+includes the standard `warnings` advisory when any model bounded an embedding input. Stored section
+and atom content remains complete.
 
 | Param      | Type            | Required | Notes                                                                                                                                                                                                                                                                             |
 | ---------- | --------------- | -------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |

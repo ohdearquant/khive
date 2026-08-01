@@ -490,7 +490,10 @@ mod tests {
             texts: &[String],
             _model: EmbeddingModel,
         ) -> Result<Vec<Vec<f32>>, EmbedError> {
-            Ok(texts.iter().map(|_| vec![0.5]).collect())
+            Ok(texts
+                .iter()
+                .map(|_| vec![0.5; EmbeddingModel::MultilingualE5Base.dimensions()])
+                .collect())
         }
         fn supports_model(&self, _model: EmbeddingModel) -> bool {
             true
@@ -507,7 +510,7 @@ mod tests {
             "multilingual-e5-base"
         }
         fn dimensions(&self) -> usize {
-            1
+            EmbeddingModel::MultilingualE5Base.dimensions()
         }
         async fn build(&self) -> RuntimeResult<std::sync::Arc<dyn EmbeddingService>> {
             Ok(std::sync::Arc::new(TruncationService))
