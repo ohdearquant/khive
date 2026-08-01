@@ -593,8 +593,9 @@ impl TraversalRequest {
 
 /// One node along a traversal path.
 ///
-/// Field naming (#148): JSON wire serialization is `id`. Enrichment (#162):
-/// `name`/`kind` are filled by the runtime layer after the storage call.
+/// Field naming (#148): JSON wire serialization is `id`. Enrichment (#162,
+/// #1484): `name`/`kind` are filled from entity or note records by the runtime
+/// layer after the storage call.
 ///
 /// Optional enrichment: `properties` is populated by the runtime when the
 /// caller passes `include_properties=true` to the `traverse` verb. It is

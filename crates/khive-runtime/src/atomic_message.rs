@@ -249,6 +249,16 @@ pub async fn create_notes_atomic(
     runtime: &KhiveRuntime,
     specs: Vec<AtomicNoteSpec<'_>>,
 ) -> RuntimeResult<Vec<Note>> {
+    Ok(create_notes_atomic_with_report(runtime, specs).await?.0)
+}
+
+/// The truncation-reporting form of [`create_notes_atomic`]. The report covers
+/// every note/model embedding actually produced before the atomic commit and is
+/// returned only when the whole note set commits successfully.
+pub async fn create_notes_atomic_with_report(
+    runtime: &KhiveRuntime,
+    specs: Vec<AtomicNoteSpec<'_>>,
+) -> RuntimeResult<(Vec<Note>, crate::retrieval::EmbeddingTruncationReport)> {
     // ---- 1. Validate + build Note objects (all pre-write checks, same as
     // create_note_inner, before any embedding or DML is attempted). ----
     let mut notes: Vec<Note> = Vec::with_capacity(specs.len());
@@ -284,6 +294,7 @@ pub async fn create_notes_atomic(
         .iter()
         .map(|_| vec![None; embed_model_names.len()])
         .collect();
+    let mut embedding_truncation = crate::retrieval::EmbeddingTruncationReport::default();
 
     if !embed_model_names.is_empty() {
         // Ensure every model's vector table exists before the commit pass —
@@ -304,7 +315,7 @@ pub async fn create_notes_atomic(
                 let text = text.clone();
                 let ctx = usage_ctx.clone();
                 join_set.spawn(async move {
-                    let fut = rt.embed_document_with_model_for_token(&token, &name, &text);
+                    let fut = rt.embed_document_with_model_outcome_for_token(&token, &name, &text);
                     let result = match ctx {
                         Some(ctx) => crate::usage::scope(ctx, fut).await,
                         None => fut.await,
@@ -316,8 +327,17 @@ pub async fn create_notes_atomic(
 
         while let Some(joined) = join_set.join_next().await {
             match joined {
-                Ok((note_idx, model_idx, Ok(vector))) => {
-                    embeddings[note_idx][model_idx] = Some(vector);
+                Ok((note_idx, model_idx, Ok(outcome))) => {
+                    embedding_truncation.observe(&outcome);
+                    if outcome.truncated {
+                        tracing::warn!(
+                            model = %outcome.model_name,
+                            source_bytes = outcome.source_bytes,
+                            embedded_bytes = outcome.embedded_bytes,
+                            "atomic note embedding input truncated; full content will be stored unchanged"
+                        );
+                    }
+                    embeddings[note_idx][model_idx] = Some(outcome.vector);
                 }
                 Ok((_, _, Err(e))) => {
                     join_set.abort_all();
@@ -407,7 +427,7 @@ pub async fn create_notes_atomic(
 
     // ---- 4. One writer acquisition for the whole set. ----
     match run_atomic_unit(runtime.sql().as_ref(), plans).await {
-        Ok(AtomicRunOutcome::Committed { .. }) => Ok(notes),
+        Ok(AtomicRunOutcome::Committed { .. }) => Ok((notes, embedding_truncation)),
         Ok(AtomicRunOutcome::RolledBack {
             failed_op_index,
             failure,
@@ -422,7 +442,7 @@ pub async fn create_notes_atomic(
 mod tests {
     use super::*;
     use async_trait::async_trait;
-    use lattice_embed::{EmbedError, EmbeddingModel, EmbeddingService};
+    use lattice_embed::{EmbedError, EmbeddingModel, EmbeddingService, MAX_TEXT_CHARS};
 
     use khive_types::Namespace;
 
@@ -459,6 +479,41 @@ mod tests {
         }
         async fn build(&self) -> RuntimeResult<std::sync::Arc<dyn EmbeddingService>> {
             Ok(std::sync::Arc::new(NanService))
+        }
+    }
+
+    struct TruncationService;
+    #[async_trait]
+    impl EmbeddingService for TruncationService {
+        async fn embed(
+            &self,
+            texts: &[String],
+            _model: EmbeddingModel,
+        ) -> Result<Vec<Vec<f32>>, EmbedError> {
+            Ok(texts
+                .iter()
+                .map(|_| vec![0.5; EmbeddingModel::MultilingualE5Base.dimensions()])
+                .collect())
+        }
+        fn supports_model(&self, _model: EmbeddingModel) -> bool {
+            true
+        }
+        fn name(&self) -> &'static str {
+            "multilingual-e5-base"
+        }
+    }
+
+    struct TruncationProvider;
+    #[async_trait]
+    impl EmbedderProvider for TruncationProvider {
+        fn name(&self) -> &str {
+            "multilingual-e5-base"
+        }
+        fn dimensions(&self) -> usize {
+            EmbeddingModel::MultilingualE5Base.dimensions()
+        }
+        async fn build(&self) -> RuntimeResult<std::sync::Arc<dyn EmbeddingService>> {
+            Ok(std::sync::Arc::new(TruncationService))
         }
     }
 
@@ -561,6 +616,38 @@ mod tests {
             ann_write_log_count(&runtime, ns, NAN_MODEL).await,
             0,
             "no ann_write_log row may be committed when an embedding is non-finite"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_notes_atomic_with_report_preserves_truncation_outcome() {
+        let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+        runtime.register_embedder(TruncationProvider);
+        let token = runtime
+            .authorize(Namespace::parse("atomic-message-truncation-test").unwrap())
+            .expect("authorize");
+        let content = "x".repeat(MAX_TEXT_CHARS);
+
+        let (notes, report) = create_notes_atomic_with_report(
+            &runtime,
+            vec![AtomicNoteSpec {
+                token: &token,
+                id: None,
+                kind: "observation",
+                name: None,
+                content: &content,
+                properties: None,
+            }],
+        )
+        .await
+        .expect("atomic note write");
+
+        assert_eq!(notes.len(), 1);
+        assert_eq!(report.truncated, 1);
+        assert_eq!(
+            report.discarded_bytes,
+            "passage: ".len() as u64,
+            "E5 document-prefix reservation must be reflected in the returned report"
         );
     }
 

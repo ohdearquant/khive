@@ -39,7 +39,6 @@ pub(super) const MIN_TERM_LEN: usize = 3;
 /// per batch) — NOT a separate DB-pagination unit. The reindex `--batch-size`
 /// flag overrides it; pagination uses the same value.
 pub(crate) const DEFAULT_EMBED_BATCH: usize = 128;
-pub(super) const MAX_EMBED_BYTES: usize = 32_768;
 
 pub(super) static STOP_WORDS: &[&str] = &[
     "and", "are", "also", "but", "can", "did", "does", "for", "from", "had", "has", "have", "its",

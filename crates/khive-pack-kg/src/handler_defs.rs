@@ -629,11 +629,12 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 20] = [
     // Assertive: retrieves multi-hop traversal results
     HandlerDef {
         name: "traverse",
-        description: "Bounded multi-hop BFS traversal. At most 100 roots, depth 10, \
-                      1,000 non-root results per root, 100,000 adjacency rows, and five \
-                      seconds of storage expansion per request; over-budget calls fail without partial paths. \
-                      Can reach note nodes (e.g. via an `annotates` edge) but only enriches \
-                      entity nodes with name/kind; note nodes come back with those fields absent.",
+        description: "Bounded multi-hop BFS traversal returning one path per distinct root. \
+                      At most 100 roots, depth 10, 1,000 non-root results per root, 100,000 \
+                      adjacency rows, and five seconds of storage expansion per request; \
+                      over-budget calls fail without partial paths. Entity and note nodes \
+                      both include name/kind; note names use the same fallback as \
+                      `neighbors` when no explicit name is stored.",
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,
         params: &[

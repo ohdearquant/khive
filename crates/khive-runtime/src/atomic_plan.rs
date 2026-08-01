@@ -249,6 +249,11 @@ impl UpdatePlan {
     pub fn edge_natural_key(&self) -> Option<&EdgeNaturalKey> {
         self.edge_natural_key.as_ref()
     }
+
+    /// The deferred post-commit effect assigned by the prepare pass.
+    pub fn post_commit(&self) -> &PostCommitEffect {
+        &self.post_commit
+    }
 }
 
 /// Write plan for an `AddEntity` proposal change: a fresh entity row plus its
