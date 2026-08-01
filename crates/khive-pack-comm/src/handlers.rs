@@ -1183,18 +1183,11 @@ pub(crate) async fn handle_ingest(
                 // outbound note to recover from_actor. The selected root stays canonical
                 // even when the transport supplied a compact or braced UUID.
                 let canonical_correlation_root = correlation_root.as_hyphenated().to_string();
-                // No backfill rewrites pre-v1 rows, so probe the spellings older
-                // handlers could have stored as well as the canonical v1 form.
-                // Whatever spelling matched, the selected root returned below is
-                // always canonical.
-                let mut candidates = vec![
-                    canonical_correlation_root.clone(),
-                    correlation_root.simple().to_string(),
-                    format!("{{{canonical_correlation_root}}}"),
-                    corr.trim().to_string(),
-                ];
-                let mut seen = HashSet::new();
-                candidates.retain(|candidate| seen.insert(candidate.clone()));
+                // No backfill rewrites pre-v1 rows, so probe every spelling older
+                // handlers could have stored (canonical, compact, braced, URN, and
+                // upper-hex) as well as the canonical v1 form. Whatever spelling
+                // matched, the selected root returned below is always canonical.
+                let candidates = thread_id_query_spellings(correlation_root, Some(corr.trim()));
 
                 let mut thread_match = None;
                 for candidate in candidates {

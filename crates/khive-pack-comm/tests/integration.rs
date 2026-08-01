@@ -4899,6 +4899,130 @@ async fn ingest_routing_reply_via_thread_uuid_routes_to_original_sender() {
     );
 }
 
+/// Pass-2 correlation must also probe the URN and upper-hex spellings a
+/// pre-v1 handler could have stored, not just canonical/compact/braced. A
+/// canonical incoming correlation must still find a legacy outbound row
+/// whose `thread_id` was persisted in one of those forms.
+#[tokio::test]
+async fn ingest_routing_reply_matches_legacy_urn_and_upper_hex_thread_id() {
+    let (registry, rt) = build_registry_for_ns("local");
+
+    async fn plant_outbound_with_thread_id(
+        rt: &KhiveRuntime,
+        content: &str,
+        external_id: &str,
+        thread_id: &str,
+    ) {
+        let token = rt
+            .authorize(khive_runtime::Namespace::local())
+            .expect("authorize");
+        let store = rt.notes(&token).expect("notes store");
+        let now = chrono::Utc::now().timestamp_micros();
+        let note = khive_storage::note::Note {
+            id: uuid::Uuid::new_v4(),
+            namespace: "local".into(),
+            kind: "message".into(),
+            status: "active".into(),
+            name: None,
+            content: content.into(),
+            salience: None,
+            decay_factor: None,
+            expires_at: None,
+            properties: Some(serde_json::json!({
+                "direction": "outbound",
+                "from": "email:mailbox@example.com",
+                "to": "email:user@example.com",
+                "from_actor": "lambda:khive",
+                "to_actor": "email:user@example.com",
+                "external_id": external_id,
+                "thread_id": thread_id,
+                "sent_at": chrono::Utc::now().to_rfc3339(),
+            })),
+            created_at: now,
+            updated_at: now,
+            deleted_at: None,
+        };
+        store.upsert_note(note).await.expect("upsert outbound note");
+    }
+
+    // Legacy row #1: thread_id stored in lower URN form.
+    let urn_thread_uuid = uuid::Uuid::new_v4();
+    plant_outbound_with_thread_id(
+        &rt,
+        "original outbound stored as URN",
+        "<original-urn@khive.ai>",
+        &urn_thread_uuid.urn().to_string(),
+    )
+    .await;
+
+    // Legacy row #2: thread_id stored in upper-hex hyphenated form.
+    let upper_thread_uuid = uuid::Uuid::new_v4();
+    plant_outbound_with_thread_id(
+        &rt,
+        "original outbound stored as upper-hex",
+        "<original-upper@khive.ai>",
+        &format!("{:X}", upper_thread_uuid.as_hyphenated()),
+    )
+    .await;
+
+    // Reply correlates with the canonical spelling — pass 2 must still find
+    // the legacy URN-stored row and recover its from_actor/root.
+    let urn_props = ingest_and_get_props(
+        &registry,
+        &rt,
+        serde_json::json!({
+            "from": "email:user@example.com",
+            "to": "email:mailbox@example.com",
+            "content": "reply correlating against a URN-stored thread_id",
+            "correlation_external_id": urn_thread_uuid.as_hyphenated().to_string(),
+            "external_id": "imap:mail:legacy-urn-reply:1",
+            "namespace": "local",
+        }),
+    )
+    .await;
+
+    assert_eq!(
+        urn_props["to_actor"].as_str(),
+        Some("lambda:khive"),
+        "reply correlating via canonical UUID against a legacy URN-stored \
+         thread_id must route to lambda:khive; got props={urn_props}"
+    );
+    assert_eq!(
+        urn_props["thread_id"].as_str(),
+        Some(urn_thread_uuid.as_hyphenated().to_string().as_str()),
+        "root selected from a URN-stored legacy row must be the canonical \
+         hyphenated spelling; got props={urn_props}"
+    );
+
+    // Same check against the upper-hex-stored row.
+    let upper_props = ingest_and_get_props(
+        &registry,
+        &rt,
+        serde_json::json!({
+            "from": "email:user@example.com",
+            "to": "email:mailbox@example.com",
+            "content": "reply correlating against an upper-hex-stored thread_id",
+            "correlation_external_id": upper_thread_uuid.as_hyphenated().to_string(),
+            "external_id": "imap:mail:legacy-upper-reply:1",
+            "namespace": "local",
+        }),
+    )
+    .await;
+
+    assert_eq!(
+        upper_props["to_actor"].as_str(),
+        Some("lambda:khive"),
+        "reply correlating via canonical UUID against a legacy upper-hex-stored \
+         thread_id must route to lambda:khive; got props={upper_props}"
+    );
+    assert_eq!(
+        upper_props["thread_id"].as_str(),
+        Some(upper_thread_uuid.as_hyphenated().to_string().as_str()),
+        "root selected from an upper-hex-stored legacy row must be the canonical \
+         hyphenated spelling; got props={upper_props}"
+    );
+}
+
 // --- issue #403: In-Reply-To/References on outbound replies (native MUA threading) ---
 //
 // khive's own thread continuity uses X-Khive-Thread-ID / external_id correlation
