@@ -585,7 +585,10 @@ non-goals, not actioned.
   `ConfigLocked` drain inside `VerbRegistry::dispatch`.** Best-effort: `tracing::warn!` and
   continue (Decision 2), matching #606's precedent. The poll/checkpoint loop's primary job
   (polling channels, checking WAL pages) is never blocked by a telemetry write failure, and
-  a failed drain append never fails or delays the dispatch that hosted it.
+  a failed drain append never fails or delays the dispatch that hosted it. For
+  `run_checkpoint_task`, the 2026-08-01 amendment also moves the append behind a bounded,
+  zero-wait handoff: sink latency cannot block the loop, and a full handoff queue drops the
+  event with an edge-triggered warning.
 - **`registry.event_store()` / `dispatcher.event_store_for_checkpoint()` returns `None`**
   (no `EventStore` configured, e.g. a test harness that builds a bare `VerbRegistry` or a
   `DaemonDispatch` implementor that never overrides the default). Every new call site treats
@@ -627,9 +630,11 @@ non-goals, not actioned.
   success emits; (2) the `khive-runtime::config_ledger` pending-emission `Vec` plus its
   companion `AtomicBool` flag, bounded by the number of `OnceLock` config sites (3 today)
   and drained to empty on the next `VerbRegistry::dispatch` call, not on a checkpoint tick.
-  `run_checkpoint_task`'s existing `was_above_warn` bool (Decision 4) is reused as-is, no new
-  state there. Beyond these two additions, `channel_poll_loop`, `VerbRegistry::dispatch`, and
-  `run_checkpoint_task` gain a handful of best-effort `append_event` calls at existing
+  At this ADR's original adoption, `run_checkpoint_task` reused its existing
+  `was_above_warn` bool (Decision 4) and added no state there. The 2026-08-01 amendment below
+  supersedes that checkpoint-specific statement with one bounded emitter and its accepted-row
+  elevation state. Beyond those explicitly documented additions, `channel_poll_loop`,
+  `VerbRegistry::dispatch`, and `run_checkpoint_task` gain only best-effort calls at existing
   decision points computed from data `channel_error_class`, `is_backoff_eligible`,
   `ImapBackoff`, and `crossing_warn` already produce today.
 - `events` table growth increases by roughly 17,280 rows/day/channel steady state (the one
@@ -643,6 +648,38 @@ non-goals, not actioned.
   does not delete them (implementation-time work, out of scope for this docs-only ADR).
 - #599 (daemon stderr loss) and #617 (its own N=3 counter implementation) both remain open,
   tracked separately; this ADR is the shared substrate both build on.
+
+## 2026-08-01 amendment: checkpoint emission cannot delay checkpoint cycles (#1434)
+
+Decision 2's original checkpoint shape awaited `EventStore::append_event` inline. That was
+best-effort with respect to errors, but not with respect to latency: writer checkout can wait
+for the pool's normal `checkout_timeout` (five seconds by default), and SQLite busy handling can
+wait longer than the checkpoint task's 500 ms cadence. An elevated tick could therefore delay
+several later PASSIVE observations or a TRUNCATE opportunity while persisting telemetry about
+the earlier tick.
+
+`run_checkpoint_task` now hands lifecycle rows to one task-owned append worker through a bounded
+Tokio MPSC channel. The scheduler uses `try_send` exclusively and never awaits sink I/O. The
+worker serializes accepted appends, and the channel permits one queued row behind the append in
+progress; when both slots are occupied, the new outcome is dropped. The first drop in each
+uninterrupted full-queue episode emits a `tracing::warn!` with the event kind and queue capacity;
+a later successful enqueue re-arms that warning without creating per-tick log spam. Append errors
+are likewise warned and swallowed, and the worker continues to receive later rows. On
+checkpoint-task shutdown, the scheduler-owned async worker is aborted so `run_checkpoint_task`
+does not await its current append future. This is deliberately not a daemon-, runtime-, or
+process-shutdown guarantee: if the event store already admitted the append to `spawn_blocking` or
+a `WriterTask`, aborting the worker does not cancel that downstream operation, and at most one
+such sink operation may outlive the checkpoint task. The task advances its lifecycle elevation
+state only after `try_send` accepts a row. In particular, a recovery/drain row rejected by a full
+queue is retried on the next healthy tick, so enqueue backpressure cannot permanently omit the
+closing row for a previously accepted elevated sequence.
+
+This amendment supersedes only Decision 2's inline-await shape for `run_checkpoint_task` and the
+checkpoint clause in Failure modes. Channel-poll lifecycle emission and the `ConfigLocked` drain
+remain unchanged. Delivered `CheckpointOutcomeRecorded` rows retain their original order, but
+sustained sink contention can create explicit gaps in the lifecycle sequence; that is preferable
+to telemetry delaying the scheduler it observes. The queue bound also prevents a detached task
+or future from being created for every elevated tick while the writer remains contended.
 
 ## Alternatives considered
 

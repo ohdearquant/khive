@@ -1199,6 +1199,150 @@ impl CheckpointLifecycleOwner {
     }
 }
 
+/// Maximum number of checkpoint lifecycle events waiting behind the append
+/// currently owned by the worker. One queued row preserves a recent outcome
+/// without allowing sustained writer contention to grow memory without bound.
+const CHECKPOINT_LIFECYCLE_QUEUE_CAPACITY: usize = 1;
+
+/// Zero-wait handoff from the checkpoint scheduler to its lifecycle sink.
+///
+/// The worker serializes appends, preserving the order of every event that is
+/// accepted. The scheduler only calls [`tokio::sync::mpsc::Sender::try_send`]:
+/// if the worker and its single queue slot are both occupied, telemetry is
+/// dropped rather than delaying the next checkpoint cycle. The first drop in
+/// each uninterrupted full-queue episode warns; a successful enqueue re-arms
+/// that warning without producing per-tick log spam.
+struct CheckpointLifecycleEmitter {
+    namespace: Option<String>,
+    sender: Option<tokio::sync::mpsc::Sender<khive_storage::Event>>,
+    worker: Option<tokio::task::JoinHandle<()>>,
+    busy_warning_emitted: bool,
+}
+
+impl CheckpointLifecycleEmitter {
+    fn new(owner: Option<CheckpointLifecycleOwner>) -> Self {
+        let Some(owner) = owner else {
+            return Self {
+                namespace: None,
+                sender: None,
+                worker: None,
+                busy_warning_emitted: false,
+            };
+        };
+
+        let namespace = owner.namespace.clone();
+        let (sender, mut receiver) =
+            tokio::sync::mpsc::channel::<khive_storage::Event>(CHECKPOINT_LIFECYCLE_QUEUE_CAPACITY);
+        let worker = tokio::spawn(async move {
+            while let Some(event) = receiver.recv().await {
+                let kind = event.kind;
+                if let Err(err) = owner.event_store.append_event(event).await {
+                    tracing::warn!(
+                        error = %err,
+                        event_kind = %kind.name(),
+                        "checkpoint lifecycle event append failed"
+                    );
+                }
+            }
+        });
+
+        Self {
+            namespace: Some(namespace),
+            sender: Some(sender),
+            worker: Some(worker),
+            busy_warning_emitted: false,
+        }
+    }
+
+    /// Serialize and enqueue one lifecycle event without awaiting sink I/O.
+    /// Returns whether the row was accepted for delivery (or no sink exists).
+    fn try_emit<P: serde::Serialize>(&mut self, kind: khive_types::EventKind, payload: P) -> bool {
+        let (Some(namespace), Some(sender)) = (&self.namespace, &self.sender) else {
+            return true;
+        };
+        let payload_value = match serde_json::to_value(&payload) {
+            Ok(value) => value,
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    event_kind = %kind.name(),
+                    "failed to serialize checkpoint lifecycle event payload"
+                );
+                return false;
+            }
+        };
+        let event = khive_storage::Event::new(
+            namespace,
+            "checkpoint.lifecycle",
+            kind,
+            khive_types::SubstrateKind::Event,
+            "daemon:checkpoint_task",
+        )
+        .with_payload(payload_value);
+
+        match sender.try_send(event) {
+            Ok(()) => {
+                self.busy_warning_emitted = false;
+                true
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Full(event)) => {
+                if !self.busy_warning_emitted {
+                    tracing::warn!(
+                        event_kind = %event.kind.name(),
+                        queue_capacity = CHECKPOINT_LIFECYCLE_QUEUE_CAPACITY,
+                        "checkpoint lifecycle event dropped because the append worker is busy"
+                    );
+                    self.busy_warning_emitted = true;
+                }
+                false
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(event)) => {
+                tracing::warn!(
+                    event_kind = %event.kind.name(),
+                    "checkpoint lifecycle event dropped because the append worker stopped"
+                );
+                false
+            }
+        }
+    }
+
+    /// Stop the scheduler-owned async worker without making
+    /// [`run_checkpoint_task`] wait for its current append future.
+    ///
+    /// This bounds checkpoint-task shutdown only. If the event store already
+    /// admitted the append to `spawn_blocking` or a `WriterTask`, aborting this
+    /// worker cannot cancel that downstream operation; at most one such sink
+    /// operation may outlive the checkpoint task.
+    async fn shutdown(mut self) {
+        drop(self.sender.take());
+        let Some(worker) = self.worker.take() else {
+            return;
+        };
+        worker.abort();
+        match worker.await {
+            Ok(()) => {}
+            Err(err) if err.is_cancelled() => {}
+            Err(err) => tracing::warn!(
+                error = %err,
+                "checkpoint lifecycle event append worker terminated unexpectedly"
+            ),
+        }
+    }
+}
+
+impl Drop for CheckpointLifecycleEmitter {
+    fn drop(&mut self) {
+        // The normal watch-signal path calls `shutdown` and takes the handle
+        // first. This fallback covers an externally-aborted or panicking
+        // checkpoint task so the scheduler-owned async worker itself is never
+        // detached. One already-admitted downstream sink operation may outlive
+        // it; see `shutdown`'s contract above.
+        if let Some(worker) = &self.worker {
+            worker.abort();
+        }
+    }
+}
+
 /// Run the WAL checkpoint background task.
 ///
 /// Long-running async task — spawn with `tokio::spawn`. Loops until
@@ -1239,11 +1383,13 @@ pub async fn run_checkpoint_task(
     let mut tx_age_state = TxAgeSweepState::default();
     let mut was_above_high_water = false;
     let mut truncate_state = TruncateState::default();
+    let mut lifecycle_emitter = CheckpointLifecycleEmitter::new(lifecycle_owner);
     // Independent of `severity_state` (which owns the WARN-episode ladder
-    // internally): this tracks only the "was the previous observed tick
-    // elevated" edge the ADR-094 event emission needs, so the event path
-    // never has to reach into the severity state machine's private fields.
-    let mut event_was_elevated = false;
+    // internally): this tracks whether an accepted elevated lifecycle row
+    // still needs its matching drain row. A full queue leaves it unchanged,
+    // so a dropped drain is retried on the next healthy tick rather than
+    // leaving consumers with a permanently open elevation episode.
+    let mut event_elevation_open = false;
     // ADR-091 Amendment 3: this task's own backend-scoped view of the
     // registry. `is_main` selects which `TxOriginFilter` variant applies —
     // the caller passes `true` for exactly the one checkpoint task covering
@@ -1385,7 +1531,7 @@ pub async fn run_checkpoint_task(
         // ADR-094: emit every elevated tick, plus exactly one drain row on
         // the tick that observes the episode end — never on every ordinary
         // below-warn tick.
-        if checkpoint_outcome_should_emit(above_warn, event_was_elevated) {
+        if checkpoint_outcome_should_emit(above_warn, event_elevation_open) {
             let payload = khive_storage::CheckpointOutcomeRecordedPayload {
                 wal_pages,
                 warn_pages: config.warn_pages,
@@ -1395,15 +1541,15 @@ pub async fn run_checkpoint_task(
                 above_high_water,
                 above_truncate_high_water,
             };
-            append_checkpoint_lifecycle_event(
-                lifecycle_owner.as_ref(),
-                khive_types::EventKind::CheckpointOutcomeRecorded,
-                payload,
-            )
-            .await;
+            if lifecycle_emitter
+                .try_emit(khive_types::EventKind::CheckpointOutcomeRecorded, payload)
+            {
+                event_elevation_open = above_warn;
+            }
         }
-        event_was_elevated = above_warn;
     }
+
+    lifecycle_emitter.shutdown().await;
 
     #[cfg(unix)]
     if let Some(sidecar) = walpin_state.as_mut() {
@@ -1418,48 +1564,6 @@ pub async fn run_checkpoint_task(
 /// below-warn tick emits nothing.
 fn checkpoint_outcome_should_emit(above_warn: bool, was_elevated: bool) -> bool {
     above_warn || was_elevated
-}
-
-/// Append one ADR-094 lifecycle event on behalf of the checkpoint task.
-///
-/// Best-effort: `lifecycle_owner == None` is a no-op, and an append failure is
-/// logged and swallowed. No lifecycle-append error may ever interrupt or
-/// slow down checkpoint/TRUNCATE work — the checkpoint task's correctness
-/// does not depend on this succeeding.
-async fn append_checkpoint_lifecycle_event<P: serde::Serialize>(
-    lifecycle_owner: Option<&CheckpointLifecycleOwner>,
-    kind: khive_types::EventKind,
-    payload: P,
-) {
-    let Some(owner) = lifecycle_owner else {
-        return;
-    };
-    let payload_value = match serde_json::to_value(&payload) {
-        Ok(v) => v,
-        Err(e) => {
-            tracing::warn!(
-                error = %e,
-                event_kind = %kind.name(),
-                "failed to serialize checkpoint lifecycle event payload"
-            );
-            return;
-        }
-    };
-    let event = khive_storage::Event::new(
-        &owner.namespace,
-        "checkpoint.lifecycle",
-        kind,
-        khive_types::SubstrateKind::Event,
-        "daemon:checkpoint_task",
-    )
-    .with_payload(payload_value);
-    if let Err(err) = owner.event_store.append_event(event).await {
-        tracing::warn!(
-            error = %err,
-            event_kind = %kind.name(),
-            "checkpoint lifecycle event append failed"
-        );
-    }
 }
 
 /// ADR-091 Plank 0 (Amendment 3: takes the tick's already-computed,
@@ -3872,9 +3976,35 @@ mod tests {
 
     // ADR-094: `CheckpointOutcomeRecorded` lifecycle event tests.
 
-    #[derive(Default)]
+    #[derive(Clone, Copy)]
+    enum FakeAppendBehavior {
+        Record,
+        Fail,
+    }
+
     struct FakeEventStore {
         events: std::sync::Mutex<Vec<khive_storage::Event>>,
+        append_attempts: std::sync::atomic::AtomicUsize,
+        append_behavior: FakeAppendBehavior,
+    }
+
+    impl Default for FakeEventStore {
+        fn default() -> Self {
+            Self {
+                events: std::sync::Mutex::new(Vec::new()),
+                append_attempts: std::sync::atomic::AtomicUsize::new(0),
+                append_behavior: FakeAppendBehavior::Record,
+            }
+        }
+    }
+
+    impl FakeEventStore {
+        fn failing() -> Self {
+            Self {
+                append_behavior: FakeAppendBehavior::Fail,
+                ..Self::default()
+            }
+        }
     }
 
     #[async_trait::async_trait]
@@ -3883,8 +4013,17 @@ mod tests {
             &self,
             event: khive_storage::Event,
         ) -> khive_storage::StorageResult<()> {
-            self.events.lock().unwrap().push(event);
-            Ok(())
+            self.append_attempts
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            match self.append_behavior {
+                FakeAppendBehavior::Record => {
+                    self.events.lock().unwrap().push(event);
+                    Ok(())
+                }
+                FakeAppendBehavior::Fail => Err(khive_storage::StorageError::Internal(
+                    "synthetic checkpoint lifecycle append failure".to_string(),
+                )),
+            }
         }
 
         async fn append_events(
@@ -4007,6 +4146,150 @@ mod tests {
         assert!(
             events.iter().all(|e| e.namespace == "local"),
             "events must be stamped with the namespace passed to run_checkpoint_task"
+        );
+    }
+
+    /// Regression #1434: the event sink's ordinary writer checkout can wait
+    /// five seconds, but a full lifecycle queue must drop telemetry while the
+    /// checkpoint scheduler continues through later elevated ticks. The
+    /// separate in-memory event backend makes that writer contention
+    /// deterministic without also preventing `checkpoint_once` from
+    /// observing the file-backed checkpoint pool.
+    #[tokio::test]
+    #[serial(checkpoint_skip_metrics)]
+    async fn checkpoint_cycles_and_task_shutdown_do_not_wait_for_a_contended_lifecycle_writer() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("outcome_contended_sink.db");
+        let checkpoint_pool = file_pool(&path);
+
+        let event_pool = Arc::new(
+            ConnectionPool::new(PoolConfig {
+                path: None,
+                checkout_timeout: Duration::from_secs(5),
+                write_queue_enabled: false,
+                ..PoolConfig::default()
+            })
+            .expect("event pool"),
+        );
+        {
+            let writer = event_pool.try_writer().expect("initialize event schema");
+            crate::stores::event::ensure_events_schema(writer.conn())
+                .expect("initialize event schema");
+        }
+        let event_store: Arc<dyn khive_storage::EventStore> =
+            Arc::new(crate::stores::event::SqlEventStore::new_scoped(
+                Arc::clone(&event_pool),
+                false,
+                "local",
+            ));
+        let held_event_writer = event_pool
+            .try_writer()
+            .expect("hold the event-store writer");
+
+        let buffer = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = CaptureSubscriber {
+            events: std::sync::Arc::clone(&buffer),
+        };
+        let _tracing_guard = tracing::subscriber::set_default(subscriber);
+
+        let cfg = CheckpointConfig {
+            interval: Duration::from_millis(10),
+            warn_pages: 0,
+            ..CheckpointConfig::default()
+        };
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
+        let handle = tokio::spawn(run_checkpoint_task(
+            checkpoint_pool,
+            cfg,
+            Some(CheckpointLifecycleOwner::new(event_store, "local")),
+            shutdown_rx,
+            true,
+        ));
+
+        let dropped = wait_for(Duration::from_secs(2), || {
+            buffer.lock().unwrap().iter().any(|event| {
+                event.message.as_deref()
+                    == Some("checkpoint lifecycle event dropped because the append worker is busy")
+            })
+        })
+        .await;
+        assert!(
+            dropped,
+            "later elevated ticks must reach the non-blocking enqueue while the first append is \
+             still waiting for the held event writer; got: {:?}",
+            buffer.lock().unwrap()
+        );
+
+        shutdown_tx.send(()).expect("send shutdown signal");
+        tokio::time::timeout(Duration::from_secs(1), handle)
+            .await
+            .expect(
+                "the run_checkpoint_task handle must not wait for the event store's \
+                 five-second writer checkout",
+            )
+            .expect("checkpoint task panicked");
+
+        // The bound above is deliberately checkpoint-task-local. Aborting the
+        // lifecycle worker cannot cancel the `spawn_blocking` checkout already
+        // admitted by `SqlEventStore`; release its fixture contention only
+        // after the `run_checkpoint_task` handle has returned.
+        drop(held_event_writer);
+    }
+
+    /// A sink error is observable, and the worker remains alive to accept a
+    /// later checkpoint outcome instead of terminating the scheduler.
+    #[tokio::test]
+    #[serial(checkpoint_skip_metrics)]
+    async fn checkpoint_task_continues_after_lifecycle_append_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("outcome_failing_sink.db");
+        let pool = file_pool(&path);
+        let store = Arc::new(FakeEventStore::failing());
+        let store_dyn: Arc<dyn khive_storage::EventStore> = store.clone();
+
+        let buffer = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = CaptureSubscriber {
+            events: std::sync::Arc::clone(&buffer),
+        };
+        let _tracing_guard = tracing::subscriber::set_default(subscriber);
+
+        let cfg = CheckpointConfig {
+            interval: Duration::from_millis(10),
+            warn_pages: 0,
+            ..CheckpointConfig::default()
+        };
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
+        let handle = tokio::spawn(run_checkpoint_task(
+            pool,
+            cfg,
+            Some(CheckpointLifecycleOwner::new(store_dyn, "local")),
+            shutdown_rx,
+            true,
+        ));
+
+        let retried = wait_for(Duration::from_secs(2), || {
+            store
+                .append_attempts
+                .load(std::sync::atomic::Ordering::Relaxed)
+                >= 2
+        })
+        .await;
+        shutdown_tx.send(()).expect("send shutdown signal");
+        tokio::time::timeout(Duration::from_secs(1), handle)
+            .await
+            .expect("checkpoint task should remain responsive after sink failure")
+            .expect("checkpoint task panicked");
+
+        assert!(
+            retried,
+            "a failed append must not terminate the worker or checkpoint task"
+        );
+        let captured = buffer.lock().unwrap().clone();
+        assert!(
+            captured.iter().any(|event| event.message.as_deref()
+                == Some("checkpoint lifecycle event append failed")),
+            "lifecycle append failures must remain observable; got: {:?}",
+            captured
         );
     }
 
