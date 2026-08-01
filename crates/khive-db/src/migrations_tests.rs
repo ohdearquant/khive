@@ -989,15 +989,15 @@ fn v13_sequence_trigger_failure_rolls_back_each_substrate_insert() {
     }
 }
 
-// ── V14: graph_edges.id must be globally unique (#1424, #1462 follow-up) ────
+// ── V13/V14: graph_edges.id must be globally unique (#1424, #1462 follow-up) ─
 
 #[test]
-fn v14_rejects_legacy_duplicate_edge_id_across_namespaces() {
+fn v13_rejects_legacy_duplicate_edge_id_on_upgrade_from_v12() {
     let mut conn = open_memory();
     conn.execute_batch(MIGRATION_TRACKING_TABLE).unwrap();
     for migration in MIGRATIONS
         .iter()
-        .filter(|migration| migration.version <= 13)
+        .filter(|migration| migration.version <= 12)
     {
         let tx = conn.transaction().unwrap();
         tx.execute_batch(migration.up).unwrap();
@@ -1009,9 +1009,10 @@ fn v14_rejects_legacy_duplicate_edge_id_across_namespaces() {
         tx.commit().unwrap();
     }
 
-    // Pre-V14 schema permits the same edge id in two namespaces because the
-    // base PRIMARY KEY is (namespace, id) -- exactly the legacy state the
-    // list-cursor ledger silently mishandled.
+    // A V12 (pre-list-cursor) database permits the same edge id in two
+    // namespaces because the base PRIMARY KEY is (namespace, id) -- exactly
+    // the legacy state the list-cursor ledger's UUID-only backfill would
+    // otherwise silently collapse onto one shared sequence row.
     for ns in ["ns-a", "ns-b"] {
         conn.execute(
             "INSERT INTO graph_edges \
@@ -1022,16 +1023,24 @@ fn v14_rejects_legacy_duplicate_edge_id_across_namespaces() {
         .unwrap();
     }
 
+    // This drives the real upgrade path (unlike a fixture that force-applies
+    // V13 before inserting the duplicate): run_migrations must hit V13's own
+    // uniqueness guard on this legacy pair, not silently backfill a ledger
+    // for V14 to fail on one version later.
     let result = run_migrations(&mut conn);
     assert!(
         result.is_err(),
-        "V14 must fail loudly on a legacy cross-namespace duplicate edge id instead of \
-         silently letting the two namespaces share one ledger row"
+        "V13 must fail loudly on a legacy cross-namespace duplicate edge id instead of \
+         backfilling a ledger that collapses the two rows onto one sequence entry"
     );
     assert_eq!(
         read_schema_version(&conn).unwrap(),
-        13,
-        "a failed V14 migration must leave the database at its last good version"
+        12,
+        "a failed V13 migration must leave the database at its last good version"
+    );
+    assert!(
+        !table_exists(&conn, "graph_edges_seq"),
+        "V13 must roll back in full on a legacy duplicate -- no ledger table, ambiguous or not"
     );
 }
 

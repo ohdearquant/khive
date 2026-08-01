@@ -17,6 +17,19 @@ CREATE TABLE IF NOT EXISTS graph_edges_seq (
     edge_id TEXT NOT NULL UNIQUE
 );
 
+-- Pre-V13 `graph_edges` only enforced `PRIMARY KEY (namespace, id)`, so a
+-- legacy database can hold two edges sharing an id across namespaces. The
+-- backfill below keys the ledger by edge id alone (`INSERT OR IGNORE`), so
+-- such a pair would silently collapse onto one shared sequence row instead
+-- of failing. Enforcing global id uniqueness here, before that backfill
+-- runs, means a legacy duplicate fails this migration's own transaction --
+-- so V13 rolls back in full (no ledger tables, no triggers) rather than
+-- committing an ambiguous ledger for a later migration to discover. See
+-- 014-graph-edges-id-unique.sql, which re-asserts the same index
+-- (IF NOT EXISTS, so idempotent here) for any database that already
+-- committed this V13 migration before this guard existed.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_graph_edges_id_unique ON graph_edges(id);
+
 -- Entity/note upgrade backfills use deterministic `(created_at, id)` order.
 -- Edge backfill preserves the UUID ordering of the public pre-V13 edge cursor,
 -- so an outstanding cursor can resume across the migration without silently

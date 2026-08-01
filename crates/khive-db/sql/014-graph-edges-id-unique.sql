@@ -13,11 +13,13 @@
 -- instead of its own, and a multi-namespace cursor walk can drop one of the
 -- pair during id-based deduplication.
 --
--- This index makes the invariant durable going forward. If a legacy
--- database already holds a duplicate id across namespaces, this
--- `CREATE UNIQUE INDEX` fails and the migration aborts rather than silently
--- leaving the ledger ambiguous -- the same fail-loudly posture
--- `run_migrations` already takes for a schema version it does not
--- understand. There is no automatic reconciliation: picking a winner would
--- mean silently dropping a live edge from whichever namespace loses.
+-- 013-list-cursor-sequences.sql now creates this same index (IF NOT EXISTS)
+-- before it backfills `graph_edges_seq`, so a legacy cross-namespace
+-- duplicate now fails at V13, before the ambiguous ledger row is ever
+-- created, and V13 itself rolls back in full. This V14 statement is kept as
+-- a compatibility no-op for any database that already committed V13 before
+-- that guard existed -- it re-asserts the invariant one version later
+-- rather than leaving such a database permanently unguarded. There is no
+-- automatic reconciliation: picking a winner would mean silently dropping a
+-- live edge from whichever namespace loses.
 CREATE UNIQUE INDEX IF NOT EXISTS idx_graph_edges_id_unique ON graph_edges(id);
