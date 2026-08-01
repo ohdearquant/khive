@@ -29,6 +29,9 @@ pub(crate) struct SendParams {
 pub(crate) struct InboxParams {
     #[serde(default)]
     pub limit: Option<u32>,
+    /// Offset in the fully-filtered, newest-first result set.
+    #[serde(default)]
+    pub offset: Option<u64>,
     #[serde(default)]
     pub status: Option<String>,
     /// Exact match on `properties.from_actor`. Mutually exclusive with `from_prefix`.
@@ -38,12 +41,30 @@ pub(crate) struct InboxParams {
     /// agents under one namespace). Mutually exclusive with `from_actor`.
     #[serde(default)]
     pub from_prefix: Option<String>,
+    /// Exclude messages whose `properties.from_actor` exactly matches this label.
+    #[serde(default)]
+    pub exclude_from_actor: Option<String>,
+    /// Inclusive lower `created_at` bound, expressed as RFC 3339.
+    #[serde(default)]
+    pub since: Option<String>,
+    /// Exclusive upper `created_at` bound, expressed as RFC 3339.
+    #[serde(default)]
+    pub before: Option<String>,
+    /// Case-insensitive substring match on `properties.subject`.
+    #[serde(default)]
+    pub subject_contains: Option<String>,
+    /// Case-insensitive substring match on the message body.
+    #[serde(default)]
+    pub content_contains: Option<String>,
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ReadParams {
-    pub id: String,
+    #[serde(default)]
+    pub id: Option<String>,
+    #[serde(default)]
+    pub ids: Option<Vec<String>>,
 }
 
 #[derive(Deserialize)]

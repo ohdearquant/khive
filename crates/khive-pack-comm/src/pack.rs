@@ -194,7 +194,7 @@ mod help_tests {
     }
 
     #[test]
-    fn read_has_required_id() {
+    fn read_has_optional_id_and_ids_for_exactly_one_validation() {
         let h = find_handler("comm.read");
         assert!(!h.params.is_empty(), "read must have non-empty params");
         let id = h
@@ -202,7 +202,19 @@ mod help_tests {
             .iter()
             .find(|p| p.name == "id")
             .expect("read must have 'id'");
-        assert!(id.required, "read.id must be required");
+        assert!(
+            !id.required,
+            "read.id is conditionally required with read.ids"
+        );
+        let ids = h
+            .params
+            .iter()
+            .find(|p| p.name == "ids")
+            .expect("read must have 'ids'");
+        assert!(
+            !ids.required,
+            "read.ids is conditionally required with read.id"
+        );
     }
 
     /// #93 instance 3: the top-level description must not contradict `actor`

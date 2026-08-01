@@ -118,18 +118,39 @@ visible regardless (Q3: OR IS NULL).
 `from_actor`/`from_prefix` (#493) sender filters are mutually exclusive.
 Direction + read-status + `to_actor` filters are pushed into SQL so
 `idx_comm_message_direction`/`idx_comm_message_to_actor` are usable; the read
-filter uses `json_type` to match the old `as_bool().unwrap_or(false)`
-semantics — only JSON boolean `true` counts as read, missing/false/string/
-integer all count as unread. `from_prefix` has no SQL `FilterOp`, so when a
-sender filter is supplied, pages are scanned in Rust (same unbounded-page-loop
-shape `handle_thread` uses) until `limit` matches are collected or the store is
-exhausted.
+filter uses `json_type` to match the old `as_bool().unwrap_or(false)` semantics —
+only JSON boolean `true` counts as read, missing/false/string/integer all count as
+unread. Exact `from_actor` and inclusive `since` (`created_at >=`) also stay in
+SQL. `from_prefix`, `exclude_from_actor`, exclusive `before`, and case-insensitive
+`subject_contains`/`content_contains` have no corresponding `FilterOp`, so they
+are applied over an unbounded paged scan in Rust.
+
+`offset` is logical rather than a raw database offset: it skips rows only after
+every SQL and Rust filter has matched. The handler collects one extra logical
+match to return `has_more` and `next_offset`; following `next_offset` with the
+same filters enumerates a backlog larger than the 200-message page cap without
+marking anything read. The total order is `(created_at DESC, id ASC)`. `since`
+is inclusive and `before` is exclusive, both RFC 3339 and both evaluated against
+the top-level note `created_at` exposed in the response, not optional transport
+metadata in `properties.sent_at`. Empty substring filters are rejected, and a
+missing/non-string subject does not match `subject_contains`.
 
 ## `handlers.rs::handle_read`
 
 Marks a message as read. Rejects `read()` on outbound messages — "read" is a
 recipient action; marking an outbound (sent) message as read corrupts the
 read/unread invariant and has no semantic meaning to the sender.
+
+Exactly one of `id` or `ids` is required. The single-ID form preserves its
+existing response. The bulk form accepts 1-500 IDs, resolves duplicates to one
+update, validates every target before the first mutation, and returns ordered
+per-target `results` with `requested_count`, `unique_count`, `marked_count`, and
+`failed_count`.
+Validation includes the same namespace, message-kind, direction, addressee, and
+legacy-message rules as the single-ID form. Updates are not a cross-message
+transaction: a validation failure rejects the call before any update, while an
+item-level storage failure returns `read=false` plus `mark_error` without rolling
+back an earlier successful item.
 
 Merges `read: true` into properties and patches in place via a real `UPDATE`
 (not `upsert_note`'s `INSERT OR REPLACE`): the latter silently deletes and
@@ -318,7 +339,7 @@ from the struct.
   all.
 - `parent_references_chain`: direction-aware — an inbound parent's chain (as
   received over the wire) lives in `wire_references`; an outbound parent's
-  chain is whatever was persisted on it as `references_chain` when *it* was
+  chain is whatever was persisted on it as `references_chain` when _it_ was
   sent (an outbound note that was a fresh send, not a reply, carries no
   `references_chain`). Returns `None` when the parent has no chain to extend;
   the caller then falls back to the parent's Message-ID alone, matching RFC

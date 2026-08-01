@@ -1086,37 +1086,57 @@ request(ops="comm.send(to=\"lambda:leo\", subject=\"PR ready\", content=\"#600 i
 
 ### `comm.inbox` — Assertive
 
-List inbound messages for the caller.
+List and page through filtered inbound messages for the caller.
 
-| Param    | Type    | Required | Notes                              |
-| -------- | ------- | -------- | ---------------------------------- |
-| `limit`  | integer | no       | Default 20, max 200.               |
-| `status` | string  | no       | `unread` (default)\|`read`\|`all`. |
+| Param                | Type    | Required | Notes                                                                     |
+| -------------------- | ------- | -------- | ------------------------------------------------------------------------- |
+| `limit`              | integer | no       | Default 20, max 200.                                                      |
+| `offset`             | integer | no       | Default 0; offset after every supplied filter.                            |
+| `status`             | string  | no       | `unread` (default)\|`read`\|`all`.                                        |
+| `from_actor`         | string  | no       | Exact sender; mutually exclusive with `from_prefix`.                      |
+| `from_prefix`        | string  | no       | Sender prefix; mutually exclusive with `from_actor`.                      |
+| `exclude_from_actor` | string  | no       | Exclude an exact sender actor label.                                      |
+| `since`              | string  | no       | Inclusive RFC 3339 lower bound on top-level `created_at`.                 |
+| `before`             | string  | no       | Exclusive RFC 3339 upper bound on top-level `created_at`.                 |
+| `subject_contains`   | string  | no       | Case-insensitive non-empty subject substring; null subjects do not match. |
+| `content_contains`   | string  | no       | Case-insensitive non-empty content substring.                             |
 
 ```
 request(ops="comm.inbox(limit=10)")
+request(ops="comm.inbox(status=\"all\", content_contains=\"timeout\", offset=200)")
 ```
 
 Every returned message uses the hyphenated full UUID for `id`, so the value is
 always accepted unchanged by `comm.read`, `comm.reply`, or `comm.thread`, even
 when two messages share an eight-character prefix. `full_id` remains an alias
 for compatibility, while `short_id` is the compact display-only prefix.
+Responses also carry `offset`, `has_more`, and `next_offset`; repeat the same
+filtered call with each non-null `next_offset` to enumerate every match without
+marking it read. All filters are ANDed. Time bounds use response `created_at`,
+not optional transport `sent_at` metadata.
 
 ### `comm.read` — Declaration
 
-Mark an inbound message as read. Outbound messages cannot be marked read. The mark-read
-write is best-effort: validation errors (not found, wrong kind, outbound direction, wrong
-addressee) remain fatal, but when the post-read mark write fails or finds no live row the
-call still succeeds with `read: false` and a `mark_error` field — inspect `read` and
-re-issue later if it is `false`.
+Mark one or more inbound messages as read. Outbound messages cannot be marked read. Mark writes
+are best-effort: validation errors (not found, wrong kind, outbound direction, wrong addressee)
+remain fatal, but a post-read mark failure returns `read: false` with `mark_error`. Inspect each
+single or bulk result and re-issue failures later.
 
-| Param | Type   | Required | Notes                                              |
-| ----- | ------ | -------- | -------------------------------------------------- |
-| `id`  | string | yes      | 8-char prefix or full UUID of the inbound message. |
+| Param | Type            | Required    | Notes                                                                   |
+| ----- | --------------- | ----------- | ----------------------------------------------------------------------- |
+| `id`  | string          | conditional | One 8-char prefix or full UUID; mutually exclusive with `ids`.          |
+| `ids` | array of string | conditional | 1-500 IDs; mutually exclusive with `id`. All targets validate up front. |
 
 ```
 request(ops="comm.read(id=\"<message-id>\")")
+request(ops="comm.read(ids=[\"<message-id-1>\", \"<message-id-2>\"])")
 ```
+
+Exactly one of `id` or `ids` is required. The bulk response contains ordered
+`results` plus `requested_count`, `unique_count`, `marked_count`, and
+`failed_count`. Bulk updates are not atomic across messages: validation errors
+reject the call before any write, while later storage errors appear in each
+item's `read` and optional `mark_error`.
 
 ### `comm.reply` — Commissive
 

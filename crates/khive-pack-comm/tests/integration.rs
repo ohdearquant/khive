@@ -8224,3 +8224,421 @@ async fn send_lands_outbound_inbound_fts_and_vectors_with_multi_model_counts() {
         );
     }
 }
+
+// ── #1422: inbox pagination, richer filters, and bulk read ────────────────────
+
+async fn insert_i1422_message(
+    runtime: &KhiveRuntime,
+    sequence: u32,
+    created_at: i64,
+    from_actor: &str,
+    to_actor: &str,
+    subject: Option<&str>,
+    content: &str,
+) -> uuid::Uuid {
+    use khive_storage::note::Note;
+
+    let token = runtime.authorize(Namespace::local()).expect("local token");
+    let store = runtime.notes(&token).expect("notes store");
+    let id = uuid::Uuid::from_u128((u128::from(sequence) << 96) | u128::from(sequence));
+    let mut properties = serde_json::json!({
+        "direction": "inbound",
+        "from_actor": from_actor,
+        "to_actor": to_actor,
+        "read": false,
+    });
+    if let Some(subject) = subject {
+        properties["subject"] = serde_json::json!(subject);
+    }
+    store
+        .upsert_note(Note {
+            id,
+            namespace: "local".to_string(),
+            kind: "message".to_string(),
+            status: "active".to_string(),
+            name: None,
+            content: content.to_string(),
+            salience: None,
+            decay_factor: None,
+            expires_at: None,
+            properties: Some(properties),
+            created_at,
+            updated_at: created_at,
+            deleted_at: None,
+        })
+        .await
+        .expect("insert #1422 message");
+    id
+}
+
+#[tokio::test]
+async fn i1422_inbox_offset_enumerates_more_than_the_page_cap_without_mutation() {
+    let backend = shared_backend();
+    let (registry, runtime) = build_actor_registry(backend, "lambda:reader");
+    let created_at = chrono::DateTime::parse_from_rfc3339("2026-07-31T12:00:00Z")
+        .unwrap()
+        .timestamp_micros();
+
+    for sequence in 1..=205 {
+        insert_i1422_message(
+            &runtime,
+            sequence,
+            created_at,
+            "lambda:sender",
+            "lambda:reader",
+            None,
+            &format!("message {sequence}"),
+        )
+        .await;
+    }
+
+    let first = registry
+        .dispatch(
+            "comm.inbox",
+            serde_json::json!({ "status": "all", "limit": 200 }),
+        )
+        .await
+        .expect("first page");
+    assert_eq!(first["count"], 200);
+    assert_eq!(first["offset"], 0);
+    assert_eq!(first["has_more"], true);
+    assert_eq!(first["next_offset"], 200);
+
+    let second = registry
+        .dispatch(
+            "comm.inbox",
+            serde_json::json!({ "status": "all", "limit": 200, "offset": 200 }),
+        )
+        .await
+        .expect("second page");
+    assert_eq!(second["count"], 5);
+    assert_eq!(second["offset"], 200);
+    assert_eq!(second["has_more"], false);
+    assert!(second["next_offset"].is_null());
+
+    let expected_id = |sequence: u32| {
+        uuid::Uuid::from_u128((u128::from(sequence) << 96) | u128::from(sequence)).to_string()
+    };
+    assert_eq!(first["messages"][0]["full_id"], expected_id(1));
+    assert_eq!(first["messages"][199]["full_id"], expected_id(200));
+    assert_eq!(second["messages"][0]["full_id"], expected_id(201));
+    assert_eq!(second["messages"][4]["full_id"], expected_id(205));
+
+    let ids: std::collections::HashSet<_> = first["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .chain(second["messages"].as_array().unwrap())
+        .map(|message| message["full_id"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(ids.len(), 205, "pages must be complete and disjoint");
+
+    let unread = registry
+        .dispatch("comm.unread", serde_json::json!({}))
+        .await
+        .expect("unread count");
+    assert_eq!(unread["count"], 205, "pagination must be read-only");
+}
+
+#[tokio::test]
+async fn i1422_offset_applies_after_time_sender_and_text_filters() {
+    let backend = shared_backend();
+    let (registry, runtime) = build_actor_registry(backend, "lambda:reader");
+    let micros = |timestamp: &str| {
+        chrono::DateTime::parse_from_rfc3339(timestamp)
+            .unwrap()
+            .timestamp_micros()
+    };
+
+    let older = insert_i1422_message(
+        &runtime,
+        301,
+        micros("2026-07-31T12:01:00Z"),
+        "team:alpha",
+        "lambda:reader",
+        Some("Deployment ALERT"),
+        "Database timeout in worker A",
+    )
+    .await;
+    insert_i1422_message(
+        &runtime,
+        302,
+        micros("2026-07-31T12:02:00Z"),
+        "team:noise",
+        "lambda:reader",
+        Some("Deployment alert"),
+        "database timeout from excluded sender",
+    )
+    .await;
+    insert_i1422_message(
+        &runtime,
+        303,
+        micros("2026-07-31T12:03:00Z"),
+        "team:no-subject",
+        "lambda:reader",
+        None,
+        "database timeout without a subject",
+    )
+    .await;
+    let newer = insert_i1422_message(
+        &runtime,
+        304,
+        micros("2026-07-31T12:04:00Z"),
+        "team:beta",
+        "lambda:reader",
+        Some("DEPLOYMENT ALERT: beta"),
+        "DATABASE timeout in worker B",
+    )
+    .await;
+    insert_i1422_message(
+        &runtime,
+        305,
+        micros("2026-07-31T12:06:00Z"),
+        "team:late",
+        "lambda:reader",
+        Some("Deployment alert"),
+        "database timeout outside the window",
+    )
+    .await;
+
+    let filters = serde_json::json!({
+        "status": "all",
+        "limit": 1,
+        "from_prefix": "team:",
+        "exclude_from_actor": "team:noise",
+        "since": "2026-07-31T12:00:00Z",
+        "before": "2026-07-31T12:05:00Z",
+        "subject_contains": "deployment alert",
+        "content_contains": "DATABASE TIMEOUT",
+    });
+    let first = registry
+        .dispatch("comm.inbox", filters.clone())
+        .await
+        .expect("filtered first page");
+    assert_eq!(first["count"], 1);
+    assert_eq!(first["messages"][0]["full_id"], newer.to_string());
+    assert_eq!(first["has_more"], true);
+    assert_eq!(first["next_offset"], 1);
+
+    let mut second_filters = filters;
+    second_filters["offset"] = serde_json::json!(1);
+    let second = registry
+        .dispatch("comm.inbox", second_filters)
+        .await
+        .expect("filtered second page");
+    assert_eq!(second["count"], 1);
+    assert_eq!(second["messages"][0]["full_id"], older.to_string());
+    assert_eq!(second["has_more"], false);
+    assert!(second["next_offset"].is_null());
+
+    let content_only = registry
+        .dispatch(
+            "comm.inbox",
+            serde_json::json!({
+                "status": "all",
+                "content_contains": "WITHOUT A SUBJECT",
+            }),
+        )
+        .await
+        .expect("content filter works independently of subject");
+    assert_eq!(content_only["count"], 1);
+    assert!(content_only["messages"][0]["subject"].is_null());
+}
+
+#[tokio::test]
+async fn i1422_time_bounds_are_since_inclusive_and_before_exclusive() {
+    let backend = shared_backend();
+    let (registry, runtime) = build_actor_registry(backend, "lambda:reader");
+    let micros = |timestamp: &str| {
+        chrono::DateTime::parse_from_rfc3339(timestamp)
+            .unwrap()
+            .timestamp_micros()
+    };
+    let at_since = insert_i1422_message(
+        &runtime,
+        311,
+        micros("2026-07-31T12:00:00Z"),
+        "lambda:sender",
+        "lambda:reader",
+        None,
+        "at since",
+    )
+    .await;
+    let inside = insert_i1422_message(
+        &runtime,
+        312,
+        micros("2026-07-31T12:01:00Z"),
+        "lambda:sender",
+        "lambda:reader",
+        None,
+        "inside",
+    )
+    .await;
+    insert_i1422_message(
+        &runtime,
+        313,
+        micros("2026-07-31T12:02:00Z"),
+        "lambda:sender",
+        "lambda:reader",
+        None,
+        "at before",
+    )
+    .await;
+
+    let inbox = registry
+        .dispatch(
+            "comm.inbox",
+            serde_json::json!({
+                "status": "all",
+                "since": "2026-07-31T12:00:00Z",
+                "before": "2026-07-31T12:02:00Z",
+            }),
+        )
+        .await
+        .expect("bounded inbox");
+    let ids: std::collections::HashSet<_> = inbox["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|message| message["full_id"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(ids, [at_since.to_string(), inside.to_string()].into());
+}
+
+#[tokio::test]
+async fn i1422_read_ids_marks_a_supplied_set_in_one_operation() {
+    let backend = shared_backend();
+    let (registry, runtime) = build_actor_registry(backend, "lambda:reader");
+    let created_at = chrono::Utc::now().timestamp_micros();
+    let ids = [401, 402, 403];
+    for sequence in ids {
+        insert_i1422_message(
+            &runtime,
+            sequence,
+            created_at + i64::from(sequence),
+            "lambda:sender",
+            "lambda:reader",
+            None,
+            &format!("bulk {sequence}"),
+        )
+        .await;
+    }
+
+    let mut raw_ids: Vec<String> = ids
+        .into_iter()
+        .map(|sequence| {
+            uuid::Uuid::from_u128((u128::from(sequence) << 96) | u128::from(sequence)).to_string()
+        })
+        .collect();
+    raw_ids.push(raw_ids[0].clone());
+    let result = registry
+        .dispatch("comm.read", serde_json::json!({ "ids": raw_ids }))
+        .await
+        .expect("bulk read succeeds");
+    assert_eq!(result["requested_count"], 4);
+    assert_eq!(result["unique_count"], 3);
+    assert_eq!(result["marked_count"], 3);
+    assert_eq!(result["failed_count"], 0);
+    assert_eq!(result["results"].as_array().unwrap().len(), 3);
+    assert!(result["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|item| item["read"] == true));
+
+    let unread = registry
+        .dispatch("comm.unread", serde_json::json!({}))
+        .await
+        .expect("unread after bulk read");
+    assert_eq!(unread["count"], 0);
+}
+
+#[tokio::test]
+async fn i1422_bulk_read_validates_every_target_before_mutating() {
+    let (registry, runtime) = build_registry_for_ns("local");
+    let sent = registry
+        .dispatch(
+            "comm.send",
+            serde_json::json!({ "to": "local", "content": "leave unread on validation error" }),
+        )
+        .await
+        .expect("self-send");
+    let outbound_id = sent["full_id"].as_str().unwrap().to_string();
+    let inbox = registry
+        .dispatch(
+            "comm.inbox",
+            serde_json::json!({ "status": "unread", "limit": 10 }),
+        )
+        .await
+        .expect("inbox");
+    let inbound_id = inbox["messages"][0]["full_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let error = registry
+        .dispatch(
+            "comm.read",
+            serde_json::json!({ "ids": [inbound_id.clone(), outbound_id] }),
+        )
+        .await
+        .expect_err("outbound target must reject the whole prevalidation phase");
+    assert!(error.to_string().contains("outbound"));
+
+    let token = runtime.authorize(Namespace::local()).expect("local token");
+    let stored = runtime
+        .notes(&token)
+        .unwrap()
+        .get_note(inbound_id.parse().unwrap())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        stored.properties.unwrap()["read"],
+        false,
+        "a later invalid target must not leave an earlier target marked read"
+    );
+}
+
+#[tokio::test]
+async fn i1422_rejects_invalid_filter_and_bulk_shapes() {
+    let (registry, _runtime) = build_registry_for_ns("local");
+
+    for params in [
+        serde_json::json!({ "since": "not-a-timestamp" }),
+        serde_json::json!({
+            "since": "2026-07-31T12:00:00Z",
+            "before": "2026-07-31T12:00:00Z",
+        }),
+        serde_json::json!({ "subject_contains": "   " }),
+        serde_json::json!({ "content_contains": "" }),
+    ] {
+        assert!(
+            registry.dispatch("comm.inbox", params).await.is_err(),
+            "invalid inbox filter must be rejected"
+        );
+    }
+
+    assert!(registry
+        .dispatch("comm.read", serde_json::json!({}))
+        .await
+        .is_err());
+    assert!(registry
+        .dispatch(
+            "comm.read",
+            serde_json::json!({ "id": "00000000", "ids": ["00000000"] }),
+        )
+        .await
+        .is_err());
+    assert!(registry
+        .dispatch("comm.read", serde_json::json!({ "ids": [] }))
+        .await
+        .is_err());
+    assert!(registry
+        .dispatch(
+            "comm.read",
+            serde_json::json!({ "ids": vec!["00000000"; 501] }),
+        )
+        .await
+        .is_err());
+}

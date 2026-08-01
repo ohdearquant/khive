@@ -9,8 +9,8 @@ dual-write, actor-addressed delivery.
 | Verb          | What it does                                                                                                                                                  |
 | ------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `comm.send`   | Send a message, optionally threaded                                                                                                                           |
-| `comm.inbox`  | List inbound messages for the caller (filter: unread / read / all)                                                                                            |
-| `comm.read`   | Mark an inbound message as read (best-effort: inspect `read`; `false` plus `mark_error` means re-issue later)                                                 |
+| `comm.inbox`  | Page and filter inbound messages for the caller                                                                                                               |
+| `comm.read`   | Mark one or up to 500 inbound messages as read (best-effort: inspect each result's `read`/`mark_error`)                                                       |
 | `comm.unread` | Count the caller's unread inbound messages without message payloads                                                                                           |
 | `comm.reply`  | Reply to a message, preserving thread linkage                                                                                                                 |
 | `comm.thread` | Retrieve all messages in a conversation thread, chronologically                                                                                               |
@@ -104,6 +104,17 @@ registry
 
 let inbox = registry.dispatch("comm.inbox", json!({"limit": 20})).await?;
 ```
+
+`comm.inbox` returns `has_more`/`next_offset`; pass the latter back as `offset`
+with otherwise-identical filters to enumerate the complete read-only result.
+Filters include sender exact/prefix/exclusion, inclusive `since`, exclusive
+`before`, and case-insensitive subject/content substring matching. Time bounds
+apply to top-level `created_at`.
+
+`comm.read(id=...)` keeps the single-message response. The additive
+`comm.read(ids=[...])` form validates 1-500 supplied IDs and returns per-item
+outcomes with marked/failed counts; inspect `read`/`mark_error` because bulk
+updates are not one cross-message transaction.
 
 Over MCP: `request(ops="comm.send(to=\"lambda:leo\", content=\"PR #372 is ready for review\")")`.
 

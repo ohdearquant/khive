@@ -40,6 +40,69 @@ fn validate_actor_label(verb: &str, label: &str, field: &str) -> Result<(), Runt
     Ok(())
 }
 
+fn parse_inbox_timestamp(field: &str, raw: &str) -> Result<i64, RuntimeError> {
+    DateTime::parse_from_rfc3339(raw.trim())
+        .map(|dt| dt.with_timezone(&Utc).timestamp_micros())
+        .map_err(|e| {
+            RuntimeError::InvalidInput(format!(
+                "inbox: `{field}` must be a valid RFC 3339 timestamp, got {raw:?}: {e}"
+            ))
+        })
+}
+
+fn validate_inbox_substring(field: &str, value: Option<&str>) -> Result<(), RuntimeError> {
+    if value.is_some_and(|raw| raw.trim().is_empty()) {
+        return Err(RuntimeError::InvalidInput(format!(
+            "inbox: `{field}` must not be empty"
+        )));
+    }
+    Ok(())
+}
+
+fn inbox_note_matches(
+    note: &Note,
+    params: &InboxParams,
+    before_micros: Option<i64>,
+    subject_needle: Option<&str>,
+    content_needle: Option<&str>,
+) -> bool {
+    let props = note.properties.as_ref();
+    let sender = props
+        .and_then(|properties| properties.get("from_actor"))
+        .and_then(Value::as_str);
+
+    if params
+        .from_prefix
+        .as_deref()
+        .is_some_and(|prefix| !sender.is_some_and(|value| value.starts_with(prefix)))
+    {
+        return false;
+    }
+    if params
+        .exclude_from_actor
+        .as_deref()
+        .is_some_and(|excluded| sender == Some(excluded))
+    {
+        return false;
+    }
+    if before_micros.is_some_and(|before| note.created_at >= before) {
+        return false;
+    }
+    if subject_needle.is_some_and(|needle| {
+        !props
+            .and_then(|properties| properties.get("subject"))
+            .and_then(Value::as_str)
+            .is_some_and(|subject| subject.to_lowercase().contains(needle))
+    }) {
+        return false;
+    }
+    if content_needle.is_some_and(|needle| !note.content.to_lowercase().contains(needle)) {
+        return false;
+    }
+
+    true
+}
+
 /// `send` — create a message note in the caller's namespace (outbound) AND
 /// deliver an inbound copy addressed to the actor label in `to` (ADR-057).
 /// Both copies land in the caller's namespace; no cross-namespace write occurs.
@@ -149,11 +212,13 @@ pub(crate) async fn handle_inbox(
 ) -> Result<Value, RuntimeError> {
     let p: InboxParams = deser(params)?;
     let raw_limit = p.limit.unwrap_or(20);
-    if raw_limit == 0 {
-        let unread_count = count_unread_messages(runtime, token, &token.actor().id).await?;
-        return Ok(json!({ "messages": [], "count": 0, "unread_count": unread_count }));
+    let offset = p.offset.unwrap_or(0);
+    if offset > i64::MAX as u64 {
+        return Err(RuntimeError::InvalidInput(format!(
+            "inbox: `offset` must be <= {}, got {offset}",
+            i64::MAX
+        )));
     }
-    let limit = raw_limit.clamp(1, 200) as usize;
 
     // #493: from_actor / from_prefix sender filter — mutually exclusive.
     if p.from_actor.is_some() && p.from_prefix.is_some() {
@@ -170,6 +235,38 @@ pub(crate) async fn handle_inbox(
             )));
         }
     };
+
+    validate_inbox_substring("subject_contains", p.subject_contains.as_deref())?;
+    validate_inbox_substring("content_contains", p.content_contains.as_deref())?;
+
+    let since_micros = p
+        .since
+        .as_deref()
+        .map(|raw| parse_inbox_timestamp("since", raw))
+        .transpose()?;
+    let before_micros = p
+        .before
+        .as_deref()
+        .map(|raw| parse_inbox_timestamp("before", raw))
+        .transpose()?;
+    if matches!((since_micros, before_micros), (Some(since), Some(before)) if since >= before) {
+        return Err(RuntimeError::InvalidInput(
+            "inbox: `since` must be earlier than `before`".into(),
+        ));
+    }
+
+    if raw_limit == 0 {
+        let unread_count = count_unread_messages(runtime, token, &token.actor().id).await?;
+        return Ok(json!({
+            "messages": [],
+            "count": 0,
+            "unread_count": unread_count,
+            "offset": offset,
+            "next_offset": Value::Null,
+            "has_more": false,
+        }));
+    }
+    let limit = raw_limit.clamp(1, 200) as usize;
 
     let caller_actor = token.actor().id.clone();
 
@@ -201,21 +298,45 @@ pub(crate) async fn handle_inbox(
         op: FilterOp::EqOrMissing,
         value: SqlValue::Text(caller_actor.clone()),
     });
+    if let Some(from_actor) = p.from_actor.as_ref() {
+        property_filters.push(PropertyFilter {
+            json_path: "$.from_actor".to_string(),
+            op: FilterOp::Eq,
+            value: SqlValue::Text(from_actor.clone()),
+        });
+    }
 
     let filter = NoteFilter {
         kind: Some("message".to_string()),
         property_filters,
         order_by: None, // preserves existing created_at DESC ordering
+        min_created_at: since_micros,
         ..Default::default()
     };
     let store = runtime.notes(token)?;
 
-    // #493: `FilterOp` has no prefix-match op, so a sender filter is applied in Rust
-    // over paged results (see docs/api/message-lifecycle.md#handlersrshandle_inbox) instead of SQL.
-    let messages: Vec<Value> = if p.from_actor.is_some() || p.from_prefix.is_some() {
+    let subject_needle = p
+        .subject_contains
+        .as_ref()
+        .map(|value| value.to_lowercase());
+    let content_needle = p
+        .content_contains
+        .as_ref()
+        .map(|value| value.to_lowercase());
+    let has_post_filter = p.from_prefix.is_some()
+        || p.exclude_from_actor.is_some()
+        || before_micros.is_some()
+        || subject_needle.is_some()
+        || content_needle.is_some();
+
+    // Offset is defined over the fully-filtered sequence. When a filter cannot
+    // be represented by `NoteFilter`, scan the indexed base query and count only
+    // matching rows before collecting one lookahead item for `has_more`.
+    let mut messages: Vec<Value> = if has_post_filter {
         const PAGE_SIZE: u32 = 200;
         let mut collected: Vec<Value> = Vec::new();
-        let mut db_offset: u32 = 0;
+        let mut matched: u64 = 0;
+        let mut db_offset: u64 = 0;
         loop {
             let page = store
                 .query_notes_filtered(
@@ -223,33 +344,36 @@ pub(crate) async fn handle_inbox(
                     &filter,
                     PageRequest {
                         limit: PAGE_SIZE,
-                        offset: db_offset.into(),
+                        offset: db_offset,
                     },
                 )
                 .await?;
             let fetched = page.items.len() as u32;
             for n in &page.items {
-                let sender = n
-                    .properties
-                    .as_ref()
-                    .and_then(|props| props.get("from_actor"))
-                    .and_then(Value::as_str);
-                let matches = match (p.from_actor.as_deref(), p.from_prefix.as_deref()) {
-                    (Some(exact), None) => sender == Some(exact),
-                    (None, Some(prefix)) => sender.map(|s| s.starts_with(prefix)).unwrap_or(false),
-                    _ => unreachable!("mutual exclusion already validated above"),
-                };
-                if matches {
-                    collected.push(note_to_message_json(n));
-                    if collected.len() >= limit {
-                        break;
-                    }
+                if !inbox_note_matches(
+                    n,
+                    &p,
+                    before_micros,
+                    subject_needle.as_deref(),
+                    content_needle.as_deref(),
+                ) {
+                    continue;
+                }
+                if matched < offset {
+                    matched += 1;
+                    continue;
+                }
+                collected.push(note_to_message_json(n));
+                if collected.len() > limit {
+                    break;
                 }
             }
-            if collected.len() >= limit || fetched < PAGE_SIZE {
+            if collected.len() > limit || fetched < PAGE_SIZE {
                 break;
             }
-            db_offset += PAGE_SIZE;
+            db_offset = db_offset.checked_add(u64::from(PAGE_SIZE)).ok_or_else(|| {
+                RuntimeError::InvalidInput("inbox: pagination offset overflowed".into())
+            })?;
         }
         collected
     } else {
@@ -258,13 +382,18 @@ pub(crate) async fn handle_inbox(
                 token.namespace().as_str(),
                 &filter,
                 PageRequest {
-                    limit: limit as u32,
-                    offset: 0,
+                    limit: (limit + 1) as u32,
+                    offset,
                 },
             )
             .await?;
         page.items.iter().map(note_to_message_json).collect()
     };
+
+    let has_more = messages.len() > limit;
+    if has_more {
+        messages.truncate(limit);
+    }
     let count = messages.len();
     // #66: cheap derived stat over the page already fetched above — no extra
     // DB round-trip. For `status="unread"` every returned message is unread
@@ -275,7 +404,21 @@ pub(crate) async fn handle_inbox(
         .iter()
         .filter(|m| !m["read"].as_bool().unwrap_or(false))
         .count();
-    Ok(json!({ "messages": messages, "count": count, "unread_count": unread_count }))
+    let next_offset = if has_more {
+        Some(offset.checked_add(count as u64).ok_or_else(|| {
+            RuntimeError::InvalidInput("inbox: pagination offset overflowed".into())
+        })?)
+    } else {
+        None
+    };
+    Ok(json!({
+        "messages": messages,
+        "count": count,
+        "unread_count": unread_count,
+        "offset": offset,
+        "next_offset": next_offset,
+        "has_more": has_more,
+    }))
 }
 
 /// `unread` — count-only view of the caller's unread inbound messages (#66):
@@ -365,7 +508,80 @@ pub(crate) async fn handle_read(
     params: Value,
 ) -> Result<Value, RuntimeError> {
     let p: ReadParams = deser(params)?;
-    let id = resolve_id(runtime, token, &p.id, "read").await?;
+    match (p.id, p.ids) {
+        (Some(_), Some(_)) => Err(RuntimeError::InvalidInput(
+            "read: `id` and `ids` are mutually exclusive".into(),
+        )),
+        (None, None) => Err(RuntimeError::InvalidInput(
+            "read: exactly one of `id` or `ids` is required".into(),
+        )),
+        (Some(raw), None) => {
+            let (id, note) = validate_read_target(runtime, token, &raw).await?;
+            mark_read_target(runtime, token, id, note).await
+        }
+        (None, Some(raw_ids)) => {
+            const MAX_BULK_READ_IDS: usize = 500;
+            if raw_ids.is_empty() {
+                return Err(RuntimeError::InvalidInput(
+                    "read: `ids` must contain at least one message id".into(),
+                ));
+            }
+            if raw_ids.len() > MAX_BULK_READ_IDS {
+                return Err(RuntimeError::InvalidInput(format!(
+                    "read: `ids` accepts at most {MAX_BULK_READ_IDS} message ids, got {}",
+                    raw_ids.len()
+                )));
+            }
+
+            // Validate every target before the first mutation so malformed,
+            // outbound, or wrong-addressee input cannot produce a partial bulk read.
+            let requested_count = raw_ids.len();
+            let mut seen = HashSet::new();
+            let mut targets = Vec::with_capacity(requested_count);
+            for raw in raw_ids {
+                let (id, note) = validate_read_target(runtime, token, &raw).await?;
+                if seen.insert(id) {
+                    targets.push((id, note));
+                }
+            }
+
+            let mut results = Vec::with_capacity(targets.len());
+            for (id, note) in targets {
+                let original_properties = note.properties.clone();
+                match mark_read_target(runtime, token, id, note).await {
+                    Ok(result) => results.push(result),
+                    Err(error) => results.push(json!({
+                        "id": short_id(id),
+                        "full_id": id.as_hyphenated().to_string(),
+                        "read": false,
+                        "mark_error": error.to_string(),
+                        "properties": original_properties,
+                    })),
+                }
+            }
+            let marked_count = results
+                .iter()
+                .filter(|result| result["read"].as_bool() == Some(true))
+                .count();
+            let unique_count = results.len();
+            let failed_count = unique_count - marked_count;
+            Ok(json!({
+                "results": results,
+                "requested_count": requested_count,
+                "unique_count": unique_count,
+                "marked_count": marked_count,
+                "failed_count": failed_count,
+            }))
+        }
+    }
+}
+
+async fn validate_read_target(
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+    raw: &str,
+) -> Result<(Uuid, Note), RuntimeError> {
+    let id = resolve_id(runtime, token, raw, "read").await?;
 
     let store = runtime.notes(token)?;
     let note = store
@@ -438,8 +654,19 @@ pub(crate) async fn handle_read(
         );
     }
 
+    Ok((id, note))
+}
+
+async fn mark_read_target(
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+    id: Uuid,
+    note: Note,
+) -> Result<Value, RuntimeError> {
     // Patch via a real `UPDATE`, not `upsert_note`'s `INSERT OR REPLACE` (#780
     // silently re-inserts the row on conflict). See docs/api/message-lifecycle.md#handlersrshandle_read
+    let store = runtime.notes(token)?;
+
     //
     // `orig_props` is kept as the stored `Option<Value>` (a SQL-NULL
     // properties column is a real, distinct state from `{}`) so a degraded
