@@ -24,6 +24,22 @@ pass (ADR-088 Amendment 1 `max_items`). Only creation attempts (success or
 failure) consume budget — cheap natural-key "already exists" skips do not,
 since they are not the work the bound exists to limit.
 
+## Secret-gate refusal accounting
+
+`run_ingest` keeps its established per-record fail-closed/continue behavior: a refused
+`create` does not land and freezes that section's cursor, while clean sibling records are
+still attempted. The result makes that partial outcome mechanically visible through
+`IngestReport::writes_refused` and `IngestReport::write_refusals`, in addition to the
+human-readable warning. Only `RuntimeError::SecretDetected` increments this counter;
+ordinary validation, storage, and embedding failures remain warnings but are not
+misclassified as secret-gate refusals.
+
+Each structured detail names `verb=create`, the provenance record kind, and a trusted
+natural key (commit SHA or GitHub number), plus `SecretMatch`'s detector and masked
+excerpt. It never includes the rejected content. Accounting is per ingest call rather
+than process-global daemon telemetry, so a caller can reliably assert
+`writes_refused == 0` even when other digests run concurrently.
+
 ## `NewRecordForRef`
 
 A newly created note this pass, retained so the post-ingestion

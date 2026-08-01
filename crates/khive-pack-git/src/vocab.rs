@@ -79,7 +79,8 @@ pub(crate) static GIT_HANDLERS: [HandlerDef; 4] = [
         name: "git.digest",
         description: "Ingest commit/issue/pull_request provenance from a local git repo path or \
                        an https:// URL into the graph. Bounded and cursor-resumable: call \
-                       repeatedly until the response's `done` field is true.",
+                       repeatedly until the response's `done` field is true. Check \
+                       `writes_refused` is zero before treating a completed pass as clean.",
         visibility: Visibility::Verb,
         category: VerbCategory::Commissive,
         params: &[

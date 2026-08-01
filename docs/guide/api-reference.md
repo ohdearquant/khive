@@ -1613,6 +1613,13 @@ response's `done` field is `false`.
 request(ops="git.digest(source=\"https://github.com/org/repo\", max_items=500)")
 ```
 
+The result includes `writes_refused`, a per-call count of record writes blocked by the
+secret gate, and `write_refusals`, one safe structured diagnostic per refusal. Each
+diagnostic names the attempted `verb`, the provenance `record_kind` and natural
+`record_key`, plus the detector and a masked excerpt; rejected content is never returned.
+Because a digest continues after a per-record refusal, callers that require a clean run
+should assert `writes_refused == 0` in addition to waiting for `done == true`.
+
 ### `git.commit` / `git.branch` / `git.push` — Commissive (ADR-108)
 
 Thin write verbs that shell to system git (`std::process::Command::args`, no shell
