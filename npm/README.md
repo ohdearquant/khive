@@ -1,6 +1,6 @@
 # khive
 
-A research knowledge graph runtime — 89 verbs, 12 packs, one MCP tool.
+A research knowledge graph runtime — 90 verbs, 12 packs, one MCP tool.
 
 [![GitHub](https://img.shields.io/github/stars/ohdearquant/khive?style=flat)](https://github.com/ohdearquant/khive)
 [![crates.io](https://img.shields.io/crates/v/khive-mcp.svg)](https://crates.io/crates/khive-mcp)
@@ -30,7 +30,7 @@ runtime warm.
 | **gtd**       | 5     | Task lifecycle (inbox → next → active → done)                                                                                                    |
 | **memory**    | 5     | Salience-weighted remember / decay-ranked recall                                                                                                 |
 | **brain**     | 16    | Bayesian user profiles + feedback loop                                                                                                           |
-| **comm**      | 8     | Threaded messaging                                                                                                                               |
+| **comm**      | 9     | Threaded messaging with sender-side internal delivery confirmation                                                                               |
 | **schedule**  | 4     | Reminders and scheduled verb execution                                                                                                           |
 | **knowledge** | 19    | Atom-based KB with embedding rerank search                                                                                                       |
 | **session**   | 4     | Session record persistence (store/list/resume/export)                                                                                            |

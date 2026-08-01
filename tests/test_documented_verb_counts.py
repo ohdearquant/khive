@@ -322,6 +322,53 @@ The server config loads all three (`kg`, `comm`, `workspace`).
                 self.assertEqual(len(errors), 1)
                 self.assertIn(stale_error, errors[0])
 
+    def test_named_pack_windows_cover_headings_delimiters_and_bare_names(self) -> None:
+        cases = (
+            ("### KG pack verbs (20 — ADR-017)\n", [("kg", 20)]),
+            ("kg: 20 verbs; comm — 8 verbs.\n", [("kg", 20), ("comm", 8)]),
+            ("20 kg-substrate bare verbs.\n", [("kg", 20)]),
+            ("The kg substrate pack owns 20 bare verb names.\n", [("kg", 20)]),
+        )
+        for text, expected in cases:
+            with self.subTest(text=text):
+                claims = scan_document("docs/guide/api.md", text, PACK_COUNTS)
+                self.assertEqual(
+                    [(claim.pack, claim.value) for claim in claims],
+                    expected,
+                )
+
+    def test_line_wrapped_post_count_pack_marker_beats_pack_path(self) -> None:
+        text = "Twenty public verbs ship in the\nkg pack.\n"
+        claims = scan_document(
+            "crates/khive-pack-workspace/README.md",
+            text,
+            PACK_COUNTS,
+        )
+        self.assertEqual(
+            [(claim.pack, claim.value) for claim in claims],
+            [("kg", 20)],
+        )
+
+        stale = text.replace("Twenty", "Nineteen")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "README.md").write_text(
+                "28 verbs across 3 packs.\n"
+                "| Pack | Verbs |\n"
+                "| --- | --- |\n"
+                "| kg | 20 |\n"
+                "| comm | 8 |\n"
+                "| workspace | 0 |\n",
+                encoding="utf-8",
+            )
+            pack_readme = root / "crates/khive-pack-workspace/README.md"
+            pack_readme.parent.mkdir(parents=True)
+            pack_readme.write_text(stale, encoding="utf-8")
+            errors = validate_documented_counts(root, verbs_result())
+
+        self.assertEqual(len(errors), 1)
+        self.assertIn("claims kg verbs=19, registry says 20", errors[0])
+
     def test_shipped_cli_help_detects_built_in_pack_count_mutations(self) -> None:
         published = """28 verbs across 3 built-in packs.
 | Pack | Verbs |
@@ -358,6 +405,8 @@ The server config loads all three (`kg`, `comm`, `workspace`).
         text = """`propose` is the one verb that requires JSON form.
 [ADR-017](docs/adr/ADR-017-pack-standard.md) defines the Pack trait.
 The harness has a 7-pack `--packs` default.
+Three schedule verbs remain available without `comm`.
+After persisting a reminder, the other three schedule verbs do not require `comm`.
 """
         self.assertEqual(
             scan_document("marketplace/khive/skills/kg/SKILL.md", text, PACK_COUNTS),

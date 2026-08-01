@@ -40,11 +40,11 @@ NUMBER_WORDS = {
     "twenty": 20,
 }
 COUNT_TOKEN = rf"(?:\d+|{'|'.join(NUMBER_WORDS)})"
-VERB_COUNT_MODIFIERS = r"(?:(?:public|agent-facing|production|mcp-callable)\s+)*"
+VERB_COUNT_MODIFIERS = r"(?:(?:public|agent-facing|production|mcp-callable|bare)\s+)*"
 PACK_COUNT_MODIFIERS = r"(?:(?:built-in|default(?:-loaded)?|loaded|production)\s+)*"
 VERB_COUNT_RE = re.compile(
     rf"\b(?P<count>{COUNT_TOKEN})\s*(?:-\s*|\s+)"
-    rf"{VERB_COUNT_MODIFIERS}verbs?(?:\s+handlers?)?\b",
+    rf"{VERB_COUNT_MODIFIERS}verbs?(?:\s+(?:handlers?|names?))?\b",
     re.IGNORECASE,
 )
 INVERTED_VERB_COUNT_RE = re.compile(
@@ -182,6 +182,7 @@ def _context_pack(
         marker = re.compile(
             rf"(?:khive-pack-{re.escape(pack)}\b|"
             rf"(?<![\w.-]){re.escape(pack)}(?![\w.-])"
+            rf"(?:[- ]substrate)?"
             rf"(?:\s*\([^)]*\))?\s+pack\b|"
             rf"(?<![\w.-]){re.escape(pack)}(?![\w.-])"
             rf"(?:\s*\([^)]*\))?\s+"
@@ -209,6 +210,8 @@ def _context_pack(
 
 def _is_reference_count(plain: str, match: re.Match[str]) -> bool:
     prefix = plain[max(0, match.start() - 12) : match.start()]
+    if re.fullmatch(r"\s*#{1,6}\s*", prefix):
+        return False
     return re.search(r"(?:ADR|PR|issue|#)[ -]?$", prefix, re.IGNORECASE) is not None
 
 
@@ -216,7 +219,10 @@ def _is_pack_total_context(plain: str, match: re.Match[str]) -> bool:
     lowered = plain.lower()
     if "amendment" in lowered and re.search(r"\badds?(?:\s+exactly)?\b", lowered):
         return False
-    if re.search(r"\b(?:surface|pack|handlers?|catalog|descriptors?|all)\b", lowered):
+    if re.search(
+        r"\b(?:surface|pack|handlers?|catalog|descriptors?|all)\b|\bbare\s+verbs?\b",
+        lowered,
+    ):
         return True
     if re.search(
         r"\b(?:add|contribut|provid|implement|dispatch|register|ship|expos)\w*\b",
@@ -310,7 +316,37 @@ def scan_document(path: str, text: str, pack_names: Iterable[str]) -> list[Count
         preceding_context = "\n".join(
             lines[max(0, line_number - 3) : line_number - 1]
         )
-        context = f"{preceding_context}\n{raw}" if preceding_context else raw
+        plain_raw = _plain(raw).rstrip()
+        next_starts_block = next_raw.lstrip().startswith(("#", "|", "- ", "* ", "```"))
+        next_content = re.sub(
+            r"^(?://[/!]\s*)",
+            "",
+            _plain(next_raw).lstrip(),
+        )
+        continuation_tail = re.search(
+            r"\b(?:a|an|the|of|in|for|by|from|to|with|and|or|its|this|that)\s*$",
+            plain_raw,
+            re.IGNORECASE,
+        )
+        continuation_head = re.match(
+            r"(?:verbs?|packs?|ships?|belongs?|provided|exposed|registered|"
+            r"implemented|contributed|in|by|for|from|within|across)\b",
+            next_content,
+            re.IGNORECASE,
+        )
+        include_next_context = (
+            bool(next_raw.strip())
+            and not stripped.startswith(("#", "|", "```"))
+            and not plain_raw.endswith((".", "!", "?", ";", ":"))
+            and not next_starts_block
+            and (continuation_tail is not None or continuation_head is not None)
+        )
+        current_context = raw_window if include_next_context else raw
+        context = (
+            f"{preceding_context}\n{current_context}"
+            if preceding_context
+            else current_context
+        )
         context_offset = len(_plain(preceding_context)) + (1 if preceding_context else 0)
 
         def starts_on_current_line(match: re.Match[str]) -> bool:
@@ -363,17 +399,34 @@ def scan_document(path: str, text: str, pack_names: Iterable[str]) -> list[Count
             pack_table_columns = None
 
         matched_spans: set[tuple[int, int]] = set()
+        explicit_total_patterns: tuple[re.Pattern[str], ...] = ()
         verb_matches = list(VERB_COUNT_RE.finditer(plain)) + list(
             INVERTED_VERB_COUNT_RE.finditer(plain)
         )
         if names:
+            pack_alternation = "|".join(map(re.escape, sorted(names)))
             named_count_re = re.compile(
                 rf"\b(?P<count>{COUNT_TOKEN})\s+{VERB_COUNT_MODIFIERS}"
-                rf"(?:{'|'.join(map(re.escape, sorted(names)))})(?:\.)?\s+"
-                rf"{VERB_COUNT_MODIFIERS}verbs?\b",
+                rf"(?P<named_pack>{pack_alternation})(?:[- ]substrate)?(?:\.)?\s+"
+                rf"(?:pack\s+)?{VERB_COUNT_MODIFIERS}verbs?(?:\s+names?)?\b",
+                re.IGNORECASE,
+            )
+            prefixed_count_re = re.compile(
+                rf"(?<![\w.-])(?P<named_pack>{pack_alternation})(?![\w.-])"
+                rf"(?:\s+pack)?\s*(?::|-)\s*(?P<count>{COUNT_TOKEN})\s+"
+                rf"{VERB_COUNT_MODIFIERS}verbs?(?:\s+names?)?\b",
+                re.IGNORECASE,
+            )
+            heading_count_re = re.compile(
+                rf"(?<![\w.-])(?P<named_pack>{pack_alternation})(?![\w.-])"
+                rf"(?:[- ]substrate)?\s+pack\s+verbs?\s*\(\s*"
+                rf"(?P<count>{COUNT_TOKEN})\b",
                 re.IGNORECASE,
             )
             verb_matches.extend(named_count_re.finditer(plain))
+            verb_matches.extend(prefixed_count_re.finditer(plain))
+            verb_matches.extend(heading_count_re.finditer(plain))
+            explicit_total_patterns = (prefixed_count_re, heading_count_re)
         for match in verb_matches:
             if not starts_on_current_line(match):
                 continue
@@ -383,21 +436,27 @@ def scan_document(path: str, text: str, pack_names: Iterable[str]) -> list[Count
                 continue
             matched_spans.add(match.span())
             value = _number(match.group("count"))
+            explicit_pack = match.groupdict().get("named_pack")
             count_span = (
                 context_offset + match.start(),
                 context_offset + match.end(),
             )
-            clause_pack = _context_pack(
-                context,
-                names,
-                count_span,
-                local_clause_only=True,
+            clause_pack = (
+                explicit_pack.lower()
+                if explicit_pack is not None
+                else _context_pack(
+                    context,
+                    names,
+                    count_span,
+                    local_clause_only=True,
+                )
             )
             pack = clause_pack or path_pack or _context_pack(context, names, count_span)
             claim_plain = _plain(claim_text(match))
             pack_context = (
                 claim_plain
-                if path_pack is not None and clause_pack is None
+                if explicit_pack is not None
+                or (path_pack is not None and clause_pack is None)
                 else _plain(context)
             )
             unqualified_path_inverted = (
@@ -406,7 +465,9 @@ def scan_document(path: str, text: str, pack_names: Iterable[str]) -> list[Count
                 and not _has_explicit_aggregate_verb_context(claim_plain)
             )
             if pack is not None and (
-                unqualified_path_inverted or _is_pack_total_context(pack_context, match)
+                match.re in explicit_total_patterns
+                or unqualified_path_inverted
+                or _is_pack_total_context(pack_context, match)
             ):
                 claims.append(
                     _claim(
