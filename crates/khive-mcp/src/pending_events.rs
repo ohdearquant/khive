@@ -72,7 +72,7 @@ use serde_json::{json, Value};
 
 use crate::server::KhiveMcpServer;
 use crate::tools::request::RequestParams;
-use khive_runtime::{KhiveRuntime, Namespace};
+use khive_runtime::{KhiveRuntime, Namespace, VerifiedActor};
 use khive_storage::types::{SqlStatement, SqlValue};
 use khive_types::{EventKind, EventOutcome, SubstrateKind};
 
@@ -670,7 +670,9 @@ pub async fn run_pending_events_on(
                 // ── Dispatch the action ──────────────────────────────────
                 let mut reminder_delivery_error = None;
                 if let Some(dsl) = &action_dsl {
-                    let dispatch_result = dispatch_action(dsl, ns_str, server, verbose).await;
+                    let dispatch_result =
+                        dispatch_action(dsl, ns_str, server, reminder_actor.as_deref(), verbose)
+                            .await;
                     if let Err(e) = dispatch_result {
                         tracing::error!(
                             scheduled_event_id = %id,
@@ -1054,6 +1056,7 @@ async fn dispatch_action(
     action_dsl: &str,
     namespace: &str,
     server: &KhiveMcpServer,
+    acting_actor: Option<&str>,
     verbose: bool,
 ) -> Result<()> {
     // Parse the stored DSL to inject namespace into each op.
@@ -1094,18 +1097,29 @@ async fn dispatch_action(
         eprintln!("[pending-events] dispatch ns={namespace}: {ops_str}");
     }
 
-    let result = server
-        .dispatch_request_local(RequestParams {
-            ops: ops_str,
-            presentation: None,
-            presentation_per_op: None,
-            save_to: None,
-            format: None,
-            format_per_op: None,
-            request_id: None,
-        })
-        .await
-        .map_err(|e| anyhow::anyhow!("pending-events: dispatch error: {e}"))?;
+    let request = RequestParams {
+        ops: ops_str,
+        presentation: None,
+        presentation_per_op: None,
+        save_to: None,
+        format: None,
+        format_per_op: None,
+        request_id: None,
+    };
+    let result = match acting_actor {
+        Some(actor) => {
+            let actor = if actor == "local" {
+                None
+            } else {
+                Some(VerifiedActor::new(actor).map_err(|e| {
+                    anyhow::anyhow!("pending-events: invalid reminder actor {actor:?}: {e}")
+                })?)
+            };
+            server.dispatch_request_local_as(request, actor).await
+        }
+        None => server.dispatch_request_local(request).await,
+    }
+    .map_err(|e| anyhow::anyhow!("pending-events: dispatch error: {e}"))?;
 
     // The MCP response is a JSON string. Check for per-op failures.
     let parsed_result: Value = serde_json::from_str(&result).unwrap_or(Value::Null);
@@ -1552,6 +1566,7 @@ mod tests {
         );
         assert_eq!(messages[0].0, "test reminder");
         assert_eq!(messages[0].1["direction"], "inbound");
+        assert_eq!(messages[0].1["from_actor"], creator);
         assert_eq!(messages[0].1["to_actor"], creator);
         assert_eq!(messages[0].1["subject"], "[Reminder] test reminder");
         assert!(daemon_messages.is_empty());
@@ -2252,7 +2267,7 @@ mod tests {
         let rt = make_rt(&db_path).await;
         let server = KhiveMcpServer::new(rt.clone()).expect("server");
 
-        let err = dispatch_action("stats() | get(id=$prev.id)", "local", &server, false)
+        let err = dispatch_action("stats() | get(id=$prev.id)", "local", &server, None, false)
             .await
             .unwrap_err();
         let msg = err.to_string();

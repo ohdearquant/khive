@@ -38,6 +38,15 @@ actor identity, and `--pack` selection once at startup, and a
 freshly-reconstructed `RuntimeConfig::default()` would drain
 `$HOME/.khive/khive.db` instead of the configured backend (the PR #782 bug).
 
+## Reminder creator identity
+
+A reminder's persisted `created_by_actor` is both the `comm.send` recipient
+and the acting identity for that delivery dispatch. The drain supplies it to
+the server through the typed per-request identity seam, so `from_actor` and
+`to_actor` both remain the creator even when a different actor owns the daemon
+that fires the event. This override is reminder-only: `schedule.schedule`
+actions continue to dispatch under the scheduler server's normal identity.
+
 ## Why the tick loop uses a fixed interval with `Skip`
 
 `schedule_tick_loop` ticks on `tokio::time::interval_at` with

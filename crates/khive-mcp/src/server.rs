@@ -1908,6 +1908,30 @@ impl KhiveMcpServer {
             .await
     }
 
+    /// Dispatch locally under an actor identity resolved outside the request DSL.
+    ///
+    /// The override applies only to this request; the server's construction-baked
+    /// actor and concurrent dispatches are unchanged. `None` explicitly selects
+    /// the anonymous/local actor rather than falling back to the baked actor.
+    pub(crate) async fn dispatch_request_local_as(
+        &self,
+        p: RequestParams,
+        actor: Option<khive_runtime::VerifiedActor>,
+    ) -> Result<String, McpError> {
+        let identity = khive_runtime::RequestIdentity {
+            namespace: self.default_namespace.clone(),
+            actor_id: actor.map(|actor| actor.as_str().to_string()),
+            visible_namespaces: self
+                .visible_namespaces()
+                .iter()
+                .map(|ns| ns.as_str().to_string())
+                .collect(),
+            request_id: p.request_id,
+        };
+        self.dispatch_request_inner(p, false, Some(identity), DispatchOrigin::Local)
+            .await
+    }
+
     /// Wire-surface dispatch: same as [`Self::dispatch_request_local`] but
     /// enforces verb visibility (`Visibility::Subhandler` verbs are rejected).
     /// Used by the stdio `request` tool's local-fallback path.
