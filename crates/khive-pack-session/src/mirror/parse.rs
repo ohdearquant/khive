@@ -45,6 +45,33 @@ pub struct ParsedEvent {
     pub slug: Option<String>,
 }
 
+/// Session metadata parsed independently of retained message events.
+///
+/// Whole-file exports can contain valid conversations with no displayable
+/// messages. Keeping this record separate from [`ParsedEvent`] lets the
+/// ingester create the required `sessions` row without inventing a synthetic
+/// `session_messages` row.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ParsedSession {
+    /// Provider conversation/session identifier.
+    pub(crate) session_id: String,
+    /// Source timestamp as microseconds since the Unix epoch; 0 if absent or unparseable.
+    pub(crate) created_at_micros: i64,
+    /// `cwd` if present.
+    pub(crate) cwd: Option<String>,
+    /// Source git branch if present.
+    pub(crate) git_branch: Option<String>,
+    /// Provider conversation title or project slug if present.
+    pub(crate) slug: Option<String>,
+}
+
+/// Parsed whole-file export payload used by the ingest layer.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ParsedExport {
+    pub(crate) sessions: Vec<ParsedSession>,
+    pub(crate) events: Vec<ParsedEvent>,
+}
+
 /// Parse one Claude Code JSONL line.
 ///
 /// Returns `None` for:
@@ -300,6 +327,12 @@ pub fn parse_chatgpt_export(content: &str) -> Option<Vec<ParsedEvent>> {
 /// Returns `None` when `content` is not valid JSON or the top level is not an
 /// array. Malformed conversation objects inside a valid array are skipped.
 pub fn parse_claude_ai_export(content: &str) -> Option<Vec<ParsedEvent>> {
+    parse_claude_ai_export_with_sessions(content).map(|parsed| parsed.events)
+}
+
+/// Parse a claude.ai export while retaining conversation metadata even when a
+/// conversation has no displayable messages.
+pub(crate) fn parse_claude_ai_export_with_sessions(content: &str) -> Option<ParsedExport> {
     let value: Value = serde_json::from_str(content).ok()?;
     let conversations = value.as_array()?;
 
@@ -310,11 +343,14 @@ pub fn parse_claude_ai_export(content: &str) -> Option<Vec<ParsedEvent>> {
         return None;
     }
 
+    let mut sessions = Vec::new();
     let mut events = Vec::new();
     for conversation in conversations {
-        parse_claude_ai_conversation(conversation, &mut events);
+        if let Some(session) = parse_claude_ai_conversation(conversation, &mut events) {
+            sessions.push(session);
+        }
     }
-    Some(events)
+    Some(ParsedExport { sessions, events })
 }
 
 fn is_chatgpt_conversation(conversation: &Value) -> bool {
@@ -339,19 +375,22 @@ fn is_claude_ai_conversation(conversation: &Value) -> bool {
     })
 }
 
-fn parse_claude_ai_conversation(conversation: &Value, out: &mut Vec<ParsedEvent>) {
+fn parse_claude_ai_conversation(
+    conversation: &Value,
+    out: &mut Vec<ParsedEvent>,
+) -> Option<ParsedSession> {
     let Some(conversation) = conversation.as_object() else {
-        return;
+        return None;
     };
     let Some(session_id) = conversation
         .get("uuid")
         .and_then(Value::as_str)
         .filter(|id| !id.is_empty())
     else {
-        return;
+        return None;
     };
     let Some(messages) = conversation.get("chat_messages").and_then(Value::as_array) else {
-        return;
+        return None;
     };
 
     let slug = conversation
@@ -442,6 +481,14 @@ fn parse_claude_ai_conversation(conversation: &Value, out: &mut Vec<ParsedEvent>
             event.parent_uuid = None;
         }
     }
+
+    Some(ParsedSession {
+        session_id: session_id.to_string(),
+        created_at_micros: conversation_created_at_micros,
+        cwd: None,
+        git_branch: None,
+        slug: slug.map(str::to_string),
+    })
 }
 
 fn claude_ai_current_path(

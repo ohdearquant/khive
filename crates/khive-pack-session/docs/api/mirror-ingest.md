@@ -158,6 +158,11 @@ parser. `KHIVE_MIRROR_CLAUDE_AI_MAX_BYTES` independently overrides the same
 256 MiB default ceiling. Parse, IO, or DB failures leave the cursor untouched;
 successful commits advance it to the full file length.
 
+The claude.ai parser returns conversation metadata separately from retained
+message events. Every valid conversation therefore creates its create-only
+`sessions` row even when `chat_messages` is empty or contains only unsupported
+display blocks; no synthetic `session_messages` row is introduced.
+
 `WholeFileExportSpec` keeps the shared bound/read/commit mechanism in one
 place while fixing the provider-specific parser, source value, diagnostic
 name, and size environment variable at each public entry point.
@@ -186,10 +191,11 @@ entirely — this function must not, and does not, issue its own
 `BEGIN`/`COMMIT`/`ROLLBACK`. Per-section notes:
 
 - **sessions row (create-only)**: first sight of a session creates the row
-  (`first_seen_at = last_seen_at` = this event's timestamp). Replays are a
-  cheap no-op (`DO NOTHING`), so a pass that inserts no new messages writes
-  no session metadata at all — strict replay idempotency. `last_seen_at` is
-  advanced only when a genuinely new message lands.
+  (`first_seen_at = last_seen_at` = the conversation or first event timestamp).
+  Whole-file parsers may supply session metadata before message events, which
+  preserves valid zero-message conversations. Replays are a cheap no-op
+  (`DO NOTHING`), so they do not rewrite existing session metadata;
+  `last_seen_at` is advanced only when a genuinely new message lands.
 - **session_messages insert**: idempotent via `INSERT OR IGNORE` keyed by the
   event UUID.
 - **advance session metadata only when a new message landed**: keeps
@@ -271,6 +277,10 @@ test-only byte cap forcing multi-pass behavior instead of giant fixtures:
 - **claude.ai export over `max_bytes` is skipped without reading**: the same
   untouched-cursor guarantee is exercised through the claude.ai-specific
   entry point and source specification.
+- **claude.ai zero-message conversations remain sessions**: empty
+  `chat_messages` arrays and conversations containing only unsupported display
+  blocks create one idempotent session row, zero message rows, and advance the
+  cursor only in the same successful atomic commit.
 
 ### Replay-idempotency invariant
 

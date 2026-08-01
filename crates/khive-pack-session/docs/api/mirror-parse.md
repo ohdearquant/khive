@@ -62,6 +62,14 @@ before it becomes a `ParsedEvent`.
 Malformed conversations are skipped individually; invalid JSON or a non-array
 top level returns `None` so the ingest cursor cannot advance.
 
+The ingest-facing `parse_claude_ai_export_with_sessions` result carries one
+`ParsedSession` for every valid conversation separately from its retained
+`ParsedEvent`s. Consequently, an empty `chat_messages` array—or one containing
+only thinking/unknown blocks—still creates the conversation's session metadata
+without manufacturing a message row. The public `parse_claude_ai_export`
+helper remains the event-only view used by parser tests and callers that do not
+need session metadata.
+
 Both provider exports use the filename `conversations.json`. Each parser also
 rejects a file containing the other provider's conversation shape (including a
 mixed file). This keeps one source from advancing the shared path cursor first

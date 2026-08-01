@@ -399,6 +399,7 @@ async fn mirror_file_with_limits(
         runtime,
         path,
         MirrorSource::from(source).as_str(),
+        &[],
         &chunk.events,
         chunk.scanned,
         chunk.new_offset,
@@ -418,15 +419,22 @@ const DEFAULT_CLAUDE_AI_MAX_BYTES: u64 = 256 * 1024 * 1024;
 #[derive(Clone, Copy)]
 struct WholeFileExportSpec {
     source: MirrorSource,
-    parser: fn(&str) -> Option<Vec<parse::ParsedEvent>>,
+    parser: fn(&str) -> Option<parse::ParsedExport>,
     operation: &'static str,
     format_name: &'static str,
     max_bytes_env: &'static str,
 }
 
+fn parse_chatgpt_export_for_ingest(content: &str) -> Option<parse::ParsedExport> {
+    parse::parse_chatgpt_export(content).map(|events| parse::ParsedExport {
+        sessions: Vec::new(),
+        events,
+    })
+}
+
 const CHATGPT_EXPORT_SPEC: WholeFileExportSpec = WholeFileExportSpec {
     source: MirrorSource::ChatGptExport,
-    parser: parse::parse_chatgpt_export,
+    parser: parse_chatgpt_export_for_ingest,
     operation: "mirror_chatgpt_export_file",
     format_name: "ChatGPT",
     max_bytes_env: "KHIVE_MIRROR_CHATGPT_MAX_BYTES",
@@ -434,7 +442,7 @@ const CHATGPT_EXPORT_SPEC: WholeFileExportSpec = WholeFileExportSpec {
 
 const CLAUDE_AI_EXPORT_SPEC: WholeFileExportSpec = WholeFileExportSpec {
     source: MirrorSource::ClaudeAiExport,
-    parser: parse::parse_claude_ai_export,
+    parser: parse::parse_claude_ai_export_with_sessions,
     operation: "mirror_claude_ai_export_file",
     format_name: "claude.ai",
     max_bytes_env: "KHIVE_MIRROR_CLAUDE_AI_MAX_BYTES",
@@ -566,27 +574,29 @@ async fn mirror_whole_file_export(
         RuntimeError::Internal(format!("{}: failed to read {path:?}: {e}", spec.operation))
     })?;
 
-    let events = (spec.parser)(&content).ok_or_else(|| {
+    let parsed = (spec.parser)(&content).ok_or_else(|| {
         RuntimeError::Internal(format!(
             "{}: {path:?} is not a valid {} export (expected its conversations.json array shape)",
             spec.operation, spec.format_name
         ))
     })?;
 
-    let scanned = events.len() as u64;
+    let scanned = parsed.events.len() as u64;
 
     write_events_and_cursor(
         runtime,
         path,
         spec.source.as_str(),
-        &events,
+        &parsed.sessions,
+        &parsed.events,
         scanned,
         file_len,
     )
     .await
 }
 
-/// Upsert `events` and the mirror cursor for `path` in one transaction.
+/// Upsert explicit sessions, `events`, and the mirror cursor for `path` in one
+/// transaction.
 /// Shared by `mirror_file`'s line-tail path and both provider-export
 /// whole-file paths. See
 /// `crates/khive-pack-session/docs/api/mirror-ingest.md#write-path-write_events_and_cursor-and-friends-adr-099-d5`
@@ -595,6 +605,7 @@ async fn write_events_and_cursor(
     runtime: &KhiveRuntime,
     path: &Path,
     source_value: &'static str,
+    sessions: &[parse::ParsedSession],
     events: &[parse::ParsedEvent],
     scanned: u64,
     new_offset: u64,
@@ -602,6 +613,7 @@ async fn write_events_and_cursor(
     let now_us = Utc::now().timestamp_micros();
     let sql = runtime.sql();
 
+    let sessions_owned: Vec<parse::ParsedSession> = sessions.to_vec();
     let events_owned: Vec<parse::ParsedEvent> = events.to_vec();
     let path_owned: PathBuf = path.to_path_buf();
 
@@ -611,6 +623,7 @@ async fn write_events_and_cursor(
                 writer,
                 &path_owned,
                 source_value,
+                &sessions_owned,
                 &events_owned,
                 scanned,
                 new_offset,
@@ -638,6 +651,60 @@ async fn write_events_and_cursor(
     }))
 }
 
+/// Create one session row without mutating an existing session. This accepts
+/// metadata separately from [`parse::ParsedEvent`] so whole-file exports can
+/// persist valid zero-message conversations.
+#[allow(clippy::too_many_arguments)]
+async fn ensure_session_on_writer(
+    writer: &mut dyn SqlWriter,
+    source_value: &'static str,
+    session_id: &str,
+    cwd: Option<&str>,
+    git_branch: Option<&str>,
+    slug: Option<&str>,
+    created_at_micros: i64,
+    now_us: i64,
+) -> khive_storage::types::StorageResult<()> {
+    let created_at = if created_at_micros != 0 {
+        created_at_micros
+    } else {
+        now_us
+    };
+
+    writer
+        .execute(SqlStatement {
+            sql: format!(
+                "INSERT INTO sessions \
+                  (id, provider_session_id, source, cwd, git_branch, slug, \
+                   message_count, first_seen_at, last_seen_at, namespace) \
+                  VALUES(?1, ?1, '{}', ?2, ?3, ?4, 0, ?5, ?5, 'local') \
+                  ON CONFLICT(id) DO NOTHING",
+                source_value
+            ),
+            params: vec![
+                SqlValue::Text(session_id.to_string()),
+                cwd.map(|s| SqlValue::Text(s.to_string()))
+                    .unwrap_or(SqlValue::Null),
+                git_branch
+                    .map(|s| SqlValue::Text(s.to_string()))
+                    .unwrap_or(SqlValue::Null),
+                slug.map(|s| SqlValue::Text(s.to_string()))
+                    .unwrap_or(SqlValue::Null),
+                SqlValue::Integer(created_at),
+            ],
+            label: Some("session_mirror_create_session".into()),
+        })
+        .await
+        .map_err(|e| {
+            khive_storage::StorageError::driver(
+                khive_storage::StorageCapability::Sql,
+                "mirror: session create",
+                e,
+            )
+        })?;
+    Ok(())
+}
+
 /// The synchronous-DML body of `write_events_and_cursor`, run inside one
 /// `atomic_unit` closure. Takes a plain `&mut dyn SqlWriter` (not `&mut dyn
 /// SqlTransaction`) because `atomic_unit` owns the transaction boundary
@@ -647,6 +714,7 @@ async fn write_events_and_cursor_on_writer(
     writer: &mut dyn SqlWriter,
     path: &Path,
     source_value: &'static str,
+    sessions: &[parse::ParsedSession],
     events: &[parse::ParsedEvent],
     scanned: u64,
     new_offset: u64,
@@ -654,6 +722,27 @@ async fn write_events_and_cursor_on_writer(
 ) -> khive_storage::types::StorageResult<MirrorStats> {
     let mut inserted: u64 = 0;
     let mut last_session_id: Option<String> = None;
+    let mut ensured_session_ids = std::collections::HashSet::new();
+
+    // Whole-file parsers can identify a valid conversation independently of
+    // whether any of its messages produce displayable events. Create those
+    // session rows first, within the same atomic unit as messages and cursor.
+    for session in sessions {
+        if !ensured_session_ids.insert(session.session_id.clone()) {
+            continue;
+        }
+        ensure_session_on_writer(
+            writer,
+            source_value,
+            &session.session_id,
+            session.cwd.as_deref(),
+            session.git_branch.as_deref(),
+            session.slug.as_deref(),
+            session.created_at_micros,
+            now_us,
+        )
+        .await?;
+    }
 
     for ev in events {
         let created_at = if ev.created_at_micros != 0 {
@@ -664,42 +753,19 @@ async fn write_events_and_cursor_on_writer(
 
         // sessions row: create-only (see docs guide — replay is a no-op via
         // `DO NOTHING`; `last_seen_at` advances below only on a new message).
-        writer
-            .execute(SqlStatement {
-                sql: format!(
-                    "INSERT INTO sessions \
-                      (id, provider_session_id, source, cwd, git_branch, slug, \
-                       message_count, first_seen_at, last_seen_at, namespace) \
-                      VALUES(?1, ?1, '{}', ?2, ?3, ?4, 0, ?5, ?5, 'local') \
-                      ON CONFLICT(id) DO NOTHING",
-                    source_value
-                ),
-                params: vec![
-                    SqlValue::Text(ev.session_id.clone()),
-                    ev.cwd
-                        .as_deref()
-                        .map(|s| SqlValue::Text(s.to_string()))
-                        .unwrap_or(SqlValue::Null),
-                    ev.git_branch
-                        .as_deref()
-                        .map(|s| SqlValue::Text(s.to_string()))
-                        .unwrap_or(SqlValue::Null),
-                    ev.slug
-                        .as_deref()
-                        .map(|s| SqlValue::Text(s.to_string()))
-                        .unwrap_or(SqlValue::Null),
-                    SqlValue::Integer(created_at),
-                ],
-                label: Some("session_mirror_create_session".into()),
-            })
-            .await
-            .map_err(|e| {
-                khive_storage::StorageError::driver(
-                    khive_storage::StorageCapability::Sql,
-                    "mirror: session create",
-                    e,
-                )
-            })?;
+        if ensured_session_ids.insert(ev.session_id.clone()) {
+            ensure_session_on_writer(
+                writer,
+                source_value,
+                &ev.session_id,
+                ev.cwd.as_deref(),
+                ev.git_branch.as_deref(),
+                ev.slug.as_deref(),
+                ev.created_at_micros,
+                now_us,
+            )
+            .await?;
+        }
 
         // session_messages insert, idempotent via INSERT OR IGNORE.
         let affected = writer
@@ -2527,6 +2593,125 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_claude_ai_empty_conversation_creates_session_and_advances_cursor() {
+        let (rt, _dir) = setup().await;
+        let export = serde_json::to_string(&json!([{
+            "uuid": "claude-conv-empty",
+            "name": "Empty Claude Conversation",
+            "created_at": "2026-07-31T10:00:00Z",
+            "chat_messages": []
+        }]))
+        .unwrap();
+        let (_file, path) = write_export_file(&export);
+        let file_len = std::fs::metadata(&path).unwrap().len();
+
+        let first = mirror_claude_ai_export_file(&rt, &path, 0)
+            .await
+            .expect("empty claude.ai conversation ingest");
+        assert_eq!(first.inserted, 0);
+        assert_eq!(first.scanned, 0);
+        assert_eq!(first.new_offset, file_len);
+        assert_eq!(count_rows(&rt, "sessions").await, 1);
+        assert_eq!(count_rows(&rt, "session_messages").await, 0);
+        assert_eq!(
+            cursor_offset(&rt, &path.to_string_lossy()).await,
+            Some(file_len as i64)
+        );
+
+        let replay = mirror_claude_ai_export_file(&rt, &path, 0)
+            .await
+            .expect("empty conversation replay");
+        assert_eq!(replay.inserted, 0);
+        assert_eq!(count_rows(&rt, "sessions").await, 1);
+
+        let sql = rt.sql();
+        let mut reader = sql.reader().await.expect("reader");
+        let session = reader
+            .query_row(SqlStatement {
+                sql: "SELECT provider_session_id, source, slug, message_count \
+                      FROM sessions WHERE id='claude-conv-empty'"
+                    .into(),
+                params: vec![],
+                label: None,
+            })
+            .await
+            .expect("query empty session")
+            .expect("empty session row");
+        assert!(matches!(
+            session.get("provider_session_id"),
+            Some(SqlValue::Text(value)) if value == "claude-conv-empty"
+        ));
+        assert!(matches!(
+            session.get("source"),
+            Some(SqlValue::Text(value)) if value == "claude_ai_export"
+        ));
+        assert!(matches!(
+            session.get("slug"),
+            Some(SqlValue::Text(value)) if value == "Empty Claude Conversation"
+        ));
+        assert!(matches!(
+            session.get("message_count"),
+            Some(SqlValue::Integer(0))
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_claude_ai_unsupported_only_conversation_creates_session() {
+        let (rt, _dir) = setup().await;
+        let export = serde_json::to_string(&json!([{
+            "uuid": "claude-conv-internal-only",
+            "summary": "Internal-only Claude Conversation",
+            "updated_at": "2026-07-31T10:00:00Z",
+            "chat_messages": [{
+                "uuid": "claude-msg-internal-only",
+                "sender": "assistant",
+                "content": [
+                    {"type": "thinking", "thinking": "not display text"},
+                    {"type": "provider_internal", "payload": {"hidden": true}}
+                ]
+            }]
+        }]))
+        .unwrap();
+        let (_file, path) = write_export_file(&export);
+        let file_len = std::fs::metadata(&path).unwrap().len();
+
+        let stats = mirror_claude_ai_export_file(&rt, &path, 0)
+            .await
+            .expect("unsupported-only claude.ai conversation ingest");
+        assert_eq!(stats.inserted, 0);
+        assert_eq!(stats.scanned, 0);
+        assert_eq!(stats.new_offset, file_len);
+        assert_eq!(count_rows(&rt, "sessions").await, 1);
+        assert_eq!(count_rows(&rt, "session_messages").await, 0);
+        assert_eq!(
+            cursor_offset(&rt, &path.to_string_lossy()).await,
+            Some(file_len as i64)
+        );
+
+        let sql = rt.sql();
+        let mut reader = sql.reader().await.expect("reader");
+        let session = reader
+            .query_row(SqlStatement {
+                sql: "SELECT slug, message_count FROM sessions \
+                      WHERE id='claude-conv-internal-only'"
+                    .into(),
+                params: vec![],
+                label: None,
+            })
+            .await
+            .expect("query unsupported-only session")
+            .expect("unsupported-only session row");
+        assert!(matches!(
+            session.get("slug"),
+            Some(SqlValue::Text(value)) if value == "Internal-only Claude Conversation"
+        ));
+        assert!(matches!(
+            session.get("message_count"),
+            Some(SqlValue::Integer(0))
+        ));
+    }
+
+    #[tokio::test]
     async fn test_claude_ai_export_over_max_bytes_leaves_cursor_untouched() {
         let (rt, _dir) = setup().await;
         let (_file, path) = write_export_file("[]");
@@ -2654,6 +2839,7 @@ mod tests {
                     writer,
                     &path,
                     "claude_code",
+                    &[],
                     &events,
                     1,
                     100,
@@ -2751,6 +2937,7 @@ mod tests {
                     writer,
                     &path,
                     "claude_code",
+                    &[],
                     &events,
                     1,
                     100,

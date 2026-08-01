@@ -118,7 +118,8 @@ Four sources are implemented (`MirrorSource` in
   `conversations.json` shape from Claude's data export, under
   `KHIVE_MIRROR_CLAUDE_AI_DIR`. Conversation and message UUIDs are preserved;
   alternate branches are retained when the export supplies parent/active-leaf
-  metadata.
+  metadata. Every valid conversation creates a session row even when it has no
+  displayable messages.
 
 ### Enabling it
 
