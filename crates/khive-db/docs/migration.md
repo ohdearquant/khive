@@ -56,6 +56,8 @@ V1 baseline at v0.2.8. The live post-consolidation sequence is:
 - **V13**: Adds immutable entity, note, and edge insertion-sequence ledgers,
   ordered upgrade backfills, and atomic assignment triggers for stable list
   cursors.
+- **V14**: Adds an idempotent compatibility guard enforcing global uniqueness
+  of `graph_edges.id`, ahead of the UUID-keyed edge ledger.
 
 The historical pre-consolidation allocation table remains in ADR-015 for
 provenance; its version numbers do not describe the live migration array.
