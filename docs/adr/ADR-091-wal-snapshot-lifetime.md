@@ -559,10 +559,11 @@ Existing, unchanged: `KHIVE_CHECKPOINT_INTERVAL_MS` (500), `KHIVE_WAL_WARN_PAGES
   reject, no rollback, no kill. This is the accepted gap this ADR's first shipped
   iteration lands on. ADR-067's `atomic_unit` already eliminates the "held past the
   return of an async function" class of risk for every production write path, which is
-  most of what the deferred closure-scoped-API follow-up would have targeted; the
-  remaining un-bounded spans are `graph.rs`'s chunked-traversal read snapshot
-  (`graph_traverse_read`) and any future caller of a registry-registered span this ADR
-  did not anticipate.
+  most of what the deferred closure-scoped-API follow-up would have targeted. Before
+  Amendment 4, the remaining unbounded span was `graph.rs`'s chunked-traversal read
+  snapshot (`graph_traverse_read`); Amendment 4 replaces it with bounded,
+  statement-scoped spans. The remaining class is any future caller of a
+  registry-registered span this ADR did not anticipate.
 - **TRUNCATE contention**: bounded to `truncate_busy_timeout` (default 2s) per attempt,
   at most once per `truncate_min_interval` under normal conditions (see the flap/backoff
   note: a skipped attempt due to writer contention does not consume the interval).
@@ -614,8 +615,9 @@ Existing, unchanged: `KHIVE_CHECKPOINT_INTERVAL_MS` (500), `KHIVE_WAL_WARN_PAGES
 - Two new config knobs for the shared transaction-registry sweep (Plank 1), covering
   every `khive_storage::tx_registry`-registered span — `begin_tx`'s historical
   `SqliteTransaction` target no longer exists; the real coverage today is `atomic_unit`'s
-  registered span for every production write path, plus `graph.rs`'s chunked-traversal
-  read snapshot — three carried-over knobs narrowed in scope, three for TRUNCATE
+  registered span for every production write path, plus `graph.rs`'s bounded,
+  statement-scoped traversal reads after Amendment 4 — three carried-over knobs
+  narrowed in scope, three for TRUNCATE
   escalation (Plank 2); the two new keys are explicitly marked provisional pending one
   cycle of production telemetry rather than presented as tuned defaults.
 - `SqlTxOptions`/`SqlStatement`'s existing `label: Option<String>` field
@@ -670,17 +672,19 @@ site left that holds a caller-controlled handle across multiple statements for s
 intercept.
 
 This does **not** by itself explain or fix #580's specific 2026-07-12 recurrence. The one
-remaining candidate this review turned up that fits "long-lived reader holding a chunked span
-open" is `crates/khive-db/src/stores/graph.rs`'s `traverse`, which opens a deferred read
-transaction and holds it across a `roots.chunks(400)` loop — already registered in `tx_registry`
-(its own comment names it "the most WAL-pin-relevant span in the store") and now covered by this
-sweep's _visibility_, but this ADR's original Inventory item (3) ("a pathologically long single
+remaining candidate this review turned up at the time that fit "long-lived reader holding a
+chunked span open" was `crates/khive-db/src/stores/graph.rs`'s `traverse`, which opened a
+deferred read transaction and held it across a `roots.chunks(400)` loop. It was already
+registered in `tx_registry` (its own comment named it "the most WAL-pin-relevant span in
+the store") and covered by this sweep's _visibility_, but this ADR's original Inventory
+item (3) ("a pathologically long single
 closure... cannot be fully ruled out for pathological queries") explicitly left any enforcement
 for that case as an open question, not a specified mechanism. Bounding or aborting that
-traversal past an age cap is a genuine new design decision (which cap, whether a partial-result
+traversal past an age cap was a genuine new design decision (which cap, whether a partial-result
 error is acceptable to callers, whether other single-closure spans need the same treatment) and
-is out of scope for this amendment — tracked as a follow-up rather than invented here. The other
-possibility this ADR's own Alternatives section already named — the pin is outside this process
+was out of scope for this amendment — tracked as a follow-up rather than invented here, then
+resolved by Amendment 4. The other possibility this ADR's own Alternatives section already
+named — the pin is outside this process
 entirely (a separate `kkernel mcp` stdio session's own connection; `tx_registry` is
 process-local and cannot see it) — remains unruled-out and is exactly the "route reads through
 the daemon" alternative this ADR already deferred.
@@ -1020,3 +1024,66 @@ rules, the filesystem trust boundary, and the beacon refresh mechanism are
 unchanged; beacon content changes only by gaining the same `sweep_interval_ms`
 declaration heartbeats gain. This amendment adds no fields beyond the three
 named here (`oldest_tx_started_at`, `attribution_basis`, `sweep_interval_ms`).
+
+### 2026-08-01 amendment (Amendment 4): bounded traversal work and statement snapshots
+
+**Motivation.** Issues #1443 and #1444 close the unresolved pathological-query
+case in inventory item (3). The SQLite graph store previously evaluated a
+recursive CTE to exhaustion, retained every emitted path row in Rust, and only
+then applied the caller's `limit`. It also wrapped every root chunk in one
+deferred read transaction. A small response limit therefore bounded neither
+SQL work nor retained rows, while a dense traversal could pin one WAL snapshot
+for the full caller-controlled operation.
+
+**Public shape bounds.** One `traverse` operation has the following fixed
+ceilings. Validation happens before storage work, and a violation is an invalid
+input error rather than silent clamping:
+
+- at most **100 raw roots**, checked before name/ID resolution; resolved UUIDs
+  are then de-duplicated while preserving first-root order;
+- `max_depth` defaults to 3 and may not exceed **10**, retaining the bound
+  already established by ADR-008 and ADR-012;
+- `limit` counts non-root first visits independently per distinct root,
+  defaults to **100**, and may not exceed **1,000**; a depth-0 root never
+  consumes this quota.
+
+**Execution bounds.** Every public operation owns one non-serializable
+execution budget shared by all request clones used to read visible namespaces:
+
+- at most **100,000 returned adjacency rows** may be admitted across all roots
+  and namespaces; rows count before visited-set de-duplication, so self-loops,
+  parallel paths, and already-seen nodes consume work;
+- a **five-second** wall-clock deadline covers storage traversal, enforced at
+  frontier/row boundaries and by SQLite's VM progress handler so a statement
+  that stops producing rows is still interruptible.
+
+To distinguish "exactly exhausted" from "more work exists," storage may read
+one additional, non-retained sentinel row. That row is reported in
+`usage.graph_hops` because it was actually returned by SQLite, but it is not
+admitted by the 100,000-row budget and causes the whole operation to fail. A
+work or deadline failure returns **no partial path set**.
+
+**Traversal algorithm.** SQLite traversal is level-synchronous breadth-first
+search driven by indexed, direction-specific adjacency statements. A node is
+marked visited on first enqueue, which guarantees its retained occurrence has
+minimum depth. Storage stops reading immediately when the root's result quota
+is full. Same-depth edge/node order remains backend-defined and is not a public
+ordering contract; `Direction::Both` may process its two indexed arms in a
+fixed implementation order.
+
+**Snapshot lifetime.** The traversal no longer opens a deferred transaction
+around the operation. Each adjacency statement runs in autocommit mode and
+owns one `graph_traverse_read` registry span, so its WAL snapshot ends when
+that statement/cursor is dropped. Concurrent commits may consequently become
+visible between frontier expansions. This is the chosen consistency contract:
+the runtime already reads visible namespaces independently and never promised
+one cross-namespace point-in-time snapshot, while bounded statement snapshots
+remove the caller-controlled WAL pin. Attribution remains backend-scoped under
+Amendment 2 even though each span is now intentionally short-lived.
+
+**Consequences.** Dense and cyclic graph tests must assert shallowest-depth
+results plus measured work at low limits, boundary tests must cover every
+public ceiling and the over-budget sentinel, and snapshot tests must prove a
+live statement is attributed while no registry entry survives the statement.
+Changing any numeric ceiling, partial-result rule, traversal ordering guarantee,
+or snapshot consistency model requires another ADR amendment.

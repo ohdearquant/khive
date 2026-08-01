@@ -2620,9 +2620,11 @@ impl KhiveRuntime {
         request: TraversalRequest,
     ) -> RuntimeResult<Vec<GraphPath>> {
         let mut request = request;
+        request.validate().map_err(RuntimeError::InvalidInput)?;
         let mut visible_roots = Vec::with_capacity(request.roots.len());
+        let mut seen_roots = std::collections::HashSet::with_capacity(request.roots.len());
         for root in request.roots.drain(..) {
-            if self.substrate_exists_in_ns(token, root).await? {
+            if seen_roots.insert(root) && self.substrate_exists_in_ns(token, root).await? {
                 visible_roots.push(root);
             }
         }
@@ -2640,7 +2642,8 @@ impl KhiveRuntime {
         // Reconcile the per-namespace GraphPaths back down to one per
         // distinct root_id (see merge_traversal_paths_by_root for why this
         // is needed and what it enforces).
-        let mut paths = merge_traversal_paths_by_root(paths, request.options.limit);
+        let mut paths =
+            merge_traversal_paths_by_root(paths, Some(request.options.effective_limit()));
         self.enrich_path_nodes(token, &mut paths, request.include_properties)
             .await;
         // Filter out soft-deleted entity nodes from all path nodes.
@@ -12227,6 +12230,7 @@ mod tests {
                     },
                     include_roots: true,
                     include_properties: false,
+                    execution_budget: Default::default(),
                 },
             )
             .await;
@@ -12276,6 +12280,7 @@ mod tests {
                     },
                     include_roots: true,
                     include_properties: false,
+                    execution_budget: Default::default(),
                 },
             )
             .await
@@ -12296,6 +12301,85 @@ mod tests {
             "merged path must retain the neighbor discovered in the owning \
              namespace, got {result:#?}"
         );
+    }
+
+    /// Namespace fan-out clones one request but must not clone a fresh work
+    /// allowance. With one adjacency row in each visible namespace, a one-row
+    /// shared budget admits the first and makes the later namespace fail the
+    /// whole operation instead of returning a partial merged path.
+    #[tokio::test]
+    async fn traverse_visible_namespaces_share_one_work_budget() {
+        use khive_storage::types::{TraversalExecutionBudget, TraversalOptions};
+
+        let rt = rt();
+        let ns_a = Namespace::parse("traverse-budget-a").unwrap();
+        let ns_b = Namespace::parse("traverse-budget-b").unwrap();
+        let tok_a = NamespaceToken::for_namespace(ns_a.clone());
+        let tok_b = NamespaceToken::for_namespace(ns_b.clone());
+        let visible = NamespaceToken::mint_with_visibility(ns_a, vec![ns_b], ActorRef::anonymous());
+
+        let root = rt
+            .create_entity(&tok_a, "concept", None, "BudgetRoot", None, None, vec![])
+            .await
+            .unwrap();
+        let child_a = rt
+            .create_entity(&tok_a, "concept", None, "BudgetChildA", None, None, vec![])
+            .await
+            .unwrap();
+        let child_b = rt
+            .create_entity(&tok_b, "concept", None, "BudgetChildB", None, None, vec![])
+            .await
+            .unwrap();
+        rt.link(
+            &tok_a,
+            root.id,
+            child_a.id,
+            EdgeRelation::Extends,
+            1.0,
+            None,
+        )
+        .await
+        .unwrap();
+        rt.link(
+            &tok_b,
+            root.id,
+            child_b.id,
+            EdgeRelation::Extends,
+            1.0,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let result = rt
+            .traverse(
+                &visible,
+                TraversalRequest {
+                    roots: vec![root.id],
+                    options: TraversalOptions {
+                        max_depth: 1,
+                        direction: Direction::Out,
+                        relations: None,
+                        min_weight: None,
+                        limit: Some(2),
+                    },
+                    include_roots: false,
+                    include_properties: false,
+                    execution_budget: TraversalExecutionBudget::new(
+                        1,
+                        std::time::Duration::from_secs(5),
+                    ),
+                },
+            )
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(RuntimeError::Storage(khive_storage::StorageError::InvalidInput {
+                message,
+                ..
+            })) if message.contains("work budget exceeded after 1 adjacency rows")
+        ));
     }
 
     // ── Multi-root traverse: one object per distinct root, including a
@@ -12331,6 +12415,7 @@ mod tests {
                     },
                     include_roots: true,
                     include_properties: false,
+                    execution_budget: Default::default(),
                 },
             )
             .await
@@ -12404,6 +12489,7 @@ mod tests {
                     },
                     include_roots: false,
                     include_properties: false,
+                    execution_budget: Default::default(),
                 },
             )
             .await
@@ -12483,6 +12569,7 @@ mod tests {
                     },
                     include_roots: false,
                     include_properties: false,
+                    execution_budget: Default::default(),
                 },
             )
             .await
@@ -14951,90 +15038,41 @@ mod tests {
         );
     }
 
-    /// Regression: GraphStore::traverse must not fail with "too many SQL variables"
-    /// or "too many terms in compound SELECT" when the root set exceeds the chunk
-    /// boundary (400 roots per CTE VALUES clause after the fix).
-    ///
-    /// Graph: 1 000 roots, each with one distinct outgoing edge to a unique child.
-    /// The graph store's `traverse` is exercised directly (bypassing the runtime-level
-    /// entity-existence filter) to keep the test fast and targeted.
-    ///
-    /// Correctness: every root must appear in the result with exactly one reachable node.
+    /// The runtime enforces the public root cap before doing any root-existence
+    /// lookups or handing work to storage.
     #[tokio::test]
-    async fn traverse_chunks_root_binds_over_host_param_limit() {
-        use khive_storage::types::TraversalOptions;
+    async fn traverse_rejects_root_count_above_public_cap_before_lookup() {
+        use khive_storage::types::{TraversalOptions, MAX_TRAVERSAL_ROOTS};
 
         let rt = rt();
         let tok = NamespaceToken::local();
-        let graph = rt.graph(&tok).unwrap();
-
-        const N: usize = 1_000;
-        let now = chrono::Utc::now();
-
-        let mut roots: Vec<uuid::Uuid> = Vec::with_capacity(N);
-        let mut expected_children: std::collections::HashMap<uuid::Uuid, uuid::Uuid> =
-            std::collections::HashMap::with_capacity(N);
-
-        for _ in 0..N {
-            let root = uuid::Uuid::new_v4();
-            let child = uuid::Uuid::new_v4();
-            graph
-                .upsert_edge(Edge {
-                    id: LinkId::from(uuid::Uuid::new_v4()),
-                    namespace: "local".to_string(),
-                    source_id: root,
-                    target_id: child,
-                    relation: EdgeRelation::Extends,
-                    weight: 1.0,
-                    created_at: now,
-                    updated_at: now,
-                    deleted_at: None,
-                    metadata: None,
-                    target_backend: None,
-                })
-                .await
-                .unwrap();
-            roots.push(root);
-            expected_children.insert(root, child);
-        }
-
-        // Must return Ok: no "too many SQL variables" or "too many terms in compound SELECT".
-        let paths = graph
-            .traverse(TraversalRequest {
-                roots: roots.clone(),
-                options: TraversalOptions {
-                    max_depth: 1,
-                    direction: Direction::Out,
-                    relations: None,
-                    min_weight: None,
-                    limit: None,
+        let err = rt
+            .traverse(
+                &tok,
+                TraversalRequest {
+                    roots: (0..=MAX_TRAVERSAL_ROOTS)
+                        .map(|_| uuid::Uuid::new_v4())
+                        .collect(),
+                    options: TraversalOptions {
+                        max_depth: 1,
+                        direction: Direction::Out,
+                        relations: None,
+                        min_weight: None,
+                        limit: None,
+                    },
+                    include_roots: false,
+                    include_properties: false,
+                    execution_budget: Default::default(),
                 },
-                include_roots: false,
-                include_properties: false,
-            })
+            )
             .await
-            .unwrap();
+            .unwrap_err();
 
-        assert_eq!(
-            paths.len(),
-            N,
-            "traverse over {N} roots must return one GraphPath per root"
-        );
-
-        for path in &paths {
-            let expected_child = expected_children[&path.root_id];
-            assert_eq!(
-                path.nodes.len(),
-                1,
-                "root {:?} must reach exactly 1 node",
-                path.root_id
-            );
-            assert_eq!(
-                path.nodes[0].node_id, expected_child,
-                "root {:?} must reach its direct child",
-                path.root_id
-            );
-        }
+        assert!(matches!(
+            err,
+            RuntimeError::InvalidInput(message)
+                if message.contains("roots must contain at most 100 entries")
+        ));
     }
 
     // ── Additive EDGE_RULES composition: pack EntityOfType rules must not shadow

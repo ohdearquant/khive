@@ -1,6 +1,8 @@
 use super::*;
 use crate::pool::PoolConfig;
-use khive_storage::types::{Direction, TraversalOptions};
+use khive_storage::types::{
+    Direction, TraversalExecutionBudget, TraversalOptions, MAX_TRAVERSAL_DEPTH, MAX_TRAVERSAL_ROOTS,
+};
 use serial_test::serial;
 use std::collections::{HashMap, HashSet};
 
@@ -80,6 +82,101 @@ pub(super) mod insert_probe_seam {
     }
 }
 
+/// Deterministic observation point inside one statement-scoped traversal
+/// snapshot. It is keyed by frontier node so unrelated tests and later BFS
+/// statements remain unaffected.
+pub(super) mod traverse_snapshot_seam {
+    use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
+    use std::sync::Mutex;
+    use uuid::Uuid;
+
+    struct Barrier {
+        node_id: Uuid,
+        reached_tx: SyncSender<()>,
+        proceed_rx: Receiver<()>,
+    }
+
+    static BARRIER: Mutex<Option<Barrier>> = Mutex::new(None);
+
+    pub(crate) fn install(node_id: Uuid) -> (Receiver<()>, SyncSender<()>) {
+        let (reached_tx, reached_rx) = sync_channel(0);
+        let (proceed_tx, proceed_rx) = sync_channel(0);
+        *BARRIER.lock().unwrap() = Some(Barrier {
+            node_id,
+            reached_tx,
+            proceed_rx,
+        });
+        (reached_rx, proceed_tx)
+    }
+
+    pub(crate) fn hook(node_id: Uuid) {
+        let barrier = {
+            let mut slot = BARRIER.lock().unwrap();
+            if slot
+                .as_ref()
+                .is_none_or(|barrier| barrier.node_id != node_id)
+            {
+                return;
+            }
+            slot.take().unwrap()
+        };
+        barrier.reached_tx.send(()).unwrap();
+        barrier.proceed_rx.recv().unwrap();
+    }
+}
+
+/// Deterministically interrupts SQLite from inside traversal's VM progress
+/// callback. The seam is keyed by root UUID so concurrently-running traversal
+/// tests remain unaffected. It stays installed after its one interrupt so a
+/// same-connection follow-up query can prove the callback was actually removed:
+/// a leaked handler would increment `calls` again even though it no longer
+/// requests interruption.
+pub(super) mod traverse_progress_seam {
+    use std::sync::Mutex;
+    use uuid::Uuid;
+
+    struct State {
+        root_id: Uuid,
+        interrupt_next: bool,
+        calls: usize,
+    }
+
+    static STATE: Mutex<Option<State>> = Mutex::new(None);
+
+    pub(crate) fn install(root_id: Uuid) {
+        *STATE.lock().unwrap() = Some(State {
+            root_id,
+            interrupt_next: true,
+            calls: 0,
+        });
+    }
+
+    pub(crate) fn hook(root_id: Option<Uuid>) -> bool {
+        let mut slot = STATE.lock().unwrap();
+        let Some(state) = slot.as_mut() else {
+            return false;
+        };
+        if root_id != Some(state.root_id) {
+            return false;
+        }
+        state.calls += 1;
+        std::mem::take(&mut state.interrupt_next)
+    }
+
+    pub(crate) fn calls(root_id: Uuid) -> usize {
+        STATE
+            .lock()
+            .unwrap()
+            .as_ref()
+            .filter(|state| state.root_id == root_id)
+            .map_or(0, |state| state.calls)
+    }
+
+    pub(crate) fn uninstall() {
+        *STATE.lock().unwrap() = None;
+    }
+}
+
 fn setup_memory_store() -> SqlGraphStore {
     let config = PoolConfig {
         path: None,
@@ -93,6 +190,32 @@ fn setup_memory_store() -> SqlGraphStore {
     }
 
     SqlGraphStore::new_scoped(pool, false, "default")
+}
+
+/// File-backed store plus an attribution view unique to this test. Cleanup
+/// assertions must not inspect the process-global registry: unrelated tests
+/// legitimately hold spans while this test binary runs in parallel.
+fn setup_file_store_with_origin_view() -> (
+    tempfile::TempDir,
+    SqlGraphStore,
+    khive_storage::tx_registry::TxOriginFilter,
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let config = PoolConfig {
+        path: Some(dir.path().join("graph-test.db")),
+        ..PoolConfig::default()
+    };
+    let pool = Arc::new(ConnectionPool::new(config).unwrap());
+    {
+        let writer = pool.writer().unwrap();
+        writer.conn().execute_batch(GRAPH_DDL).unwrap();
+    }
+    let identity = match pool.origin() {
+        khive_storage::tx_registry::TxOrigin::Database(identity) => identity,
+        other => panic!("expected file-backed test pool, got {other:?}"),
+    };
+    let view = khive_storage::tx_registry::TxOriginFilter::Secondary(identity);
+    (dir, SqlGraphStore::new_scoped(pool, false, "default"), view)
 }
 
 /// Like [`setup_memory_store`] but also seeds minimal `entities`/`notes`
@@ -940,6 +1063,7 @@ async fn test_traverse_depth_2() {
         options: TraversalOptions::new(2).with_direction(Direction::Out),
         include_roots: true,
         include_properties: false,
+        execution_budget: Default::default(),
     };
 
     let paths = store.traverse(request).await.unwrap();
@@ -987,6 +1111,7 @@ async fn test_traverse_dedups_multipath_node() {
         options: TraversalOptions::new(3).with_direction(Direction::Out),
         include_roots: false,
         include_properties: false,
+        execution_budget: Default::default(),
     };
 
     let paths = store.traverse(request).await.unwrap();
@@ -1002,13 +1127,12 @@ async fn test_traverse_dedups_multipath_node() {
     assert_eq!(nodes.iter().filter(|n| n.node_id == c).count(), 1);
 }
 
-/// First-visit (BFS) ordering is deterministic: the node seen at the
-/// shallowest depth wins, and the `via_edge` recorded for it is the one
-/// from that first-visited path.
+/// First-visit BFS keeps the shallowest occurrence of a node, and the
+/// `via_edge` recorded for it is the one from that first-visited path.
 ///
 /// Graph: A→B (depth 1), A→C (depth 1), B→D (depth 2), C→D (depth 2).
-/// D appears at depth 2 via B or C.  Rows are ordered by depth; whichever
-/// path SQLite enumerates first for depth-2 is the keeper.  The test
+/// D appears at depth 2 via B or C. Whichever same-depth frontier path the
+/// backend enumerates first is the keeper. The test
 /// asserts that D has exactly one entry with a non-None `via_edge` — we
 /// do NOT assert *which* edge wins because SQLite row order within the
 /// same depth level is non-deterministic, but we DO assert stability:
@@ -1044,6 +1168,7 @@ async fn test_traverse_preserves_first_path_metadata() {
         options: TraversalOptions::new(3).with_direction(Direction::Out),
         include_roots: false,
         include_properties: false,
+        execution_budget: Default::default(),
     };
 
     let paths1 = store.traverse(make_request()).await.unwrap();
@@ -1067,7 +1192,7 @@ async fn test_traverse_preserves_first_path_metadata() {
     assert_eq!(d_nodes[0].depth, 2, "D lives at depth 2");
 }
 
-/// Multi-root batched traversal: two independent chains A→B→C and D→E→F.
+/// Multi-root traversal: two independent chains A→B→C and D→E→F.
 /// Each root must produce its own GraphPath with the correct node set.
 #[tokio::test]
 async fn test_traverse_multi_root_independent_chains() {
@@ -1092,6 +1217,7 @@ async fn test_traverse_multi_root_independent_chains() {
         options: TraversalOptions::new(2).with_direction(Direction::Out),
         include_roots: true,
         include_properties: false,
+        execution_budget: Default::default(),
     };
 
     let paths = store.traverse(request).await.unwrap();
@@ -1142,6 +1268,7 @@ async fn test_traverse_multi_root_shared_neighbor_appears_in_both() {
         options: TraversalOptions::new(1).with_direction(Direction::Out),
         include_roots: false,
         include_properties: false,
+        execution_budget: Default::default(),
     };
 
     let paths = store.traverse(request).await.unwrap();
@@ -1157,10 +1284,8 @@ async fn test_traverse_multi_root_shared_neighbor_appears_in_both() {
     }
 }
 
-/// Query-count regression: a 15-node binary tree at max_depth=3 must be
-/// traversed in a single CTE execution (one conn.prepare call), not N CTEs.
-/// This test asserts the node-count result is correct, which would fail if
-/// the batched CTE produced duplicates or missed nodes.
+/// A 15-node binary tree at max_depth=3 must retain every shallowest node
+/// exactly once under level-synchronous BFS.
 #[tokio::test]
 async fn test_traverse_binary_tree_result_count() {
     let store = setup_memory_store();
@@ -1190,6 +1315,7 @@ async fn test_traverse_binary_tree_result_count() {
         options: TraversalOptions::new(3).with_direction(Direction::Out),
         include_roots: true,
         include_properties: false,
+        execution_budget: Default::default(),
     };
 
     let paths = store.traverse(request).await.unwrap();
@@ -1209,18 +1335,11 @@ async fn test_traverse_binary_tree_result_count() {
     }
 }
 
-/// ADR-091 Amendment 3 / design-note test plan "Traversal coverage test":
-/// the `graph_traverse_read` registration inside `traverse` (the long-lived
-/// deferred-read snapshot the whole design exists for) must carry the
-/// store's own pool origin, so it is visible through a `Secondary` filter
-/// scoped to THIS backend's identity and invisible through a `Main` filter
-/// scoped to a DIFFERENT backend's identity. Exercises the real
-/// `SqlGraphStore::traverse` call site rather than a hand-registered span —
-/// a wide root set (with real matching edges) forces the chunked traversal
-/// past `CHUNK_ROOTS` (400) more than once inside the single registered
-/// closure, giving the polling loop below a real window in which the span
-/// is observably open (registered before, dropped after, the whole chunked
-/// loop — see `traverse`'s doc comment).
+/// ADR-091 Amendment 4: each adjacency statement retains backend-scoped
+/// attribution, but the span is released with that statement instead of
+/// covering the whole traversal. A commit made while the first cursor is
+/// live becomes visible to the next frontier statement, proving there is no
+/// operation-wide deferred snapshot.
 #[tokio::test]
 #[serial(tx_registry)]
 async fn graph_traverse_read_span_scoped_to_secondary_backend_visible_only_in_its_own_view() {
@@ -1246,49 +1365,57 @@ async fn graph_traverse_read_span_scoped_to_secondary_backend_visible_only_in_it
     );
 
     let store = SqlGraphStore::new_scoped(Arc::clone(&pool), false, "default");
-    let roots: Vec<Uuid> = (0..900).map(|_| Uuid::new_v4()).collect();
-    let edges: Vec<Edge> = roots
-        .iter()
-        .map(|&root| make_edge(root, Uuid::new_v4(), EdgeRelation::Extends, 1.0))
-        .collect();
-    store.upsert_edges(edges).await.unwrap();
+    let writer_store = SqlGraphStore::new_scoped(Arc::clone(&pool), false, "default");
+    let root = Uuid::new_v4();
+    let child = Uuid::new_v4();
+    let grandchild = Uuid::new_v4();
+    store
+        .upsert_edge(make_edge(root, child, EdgeRelation::Extends, 1.0))
+        .await
+        .unwrap();
+    let (reached, proceed) = traverse_snapshot_seam::install(root);
 
     let request = TraversalRequest {
-        roots,
-        options: TraversalOptions::new(10).with_direction(Direction::Out),
+        roots: vec![root],
+        options: TraversalOptions::new(2).with_direction(Direction::Out),
         include_roots: false,
         include_properties: false,
+        execution_budget: Default::default(),
     };
 
     let traverse_handle = tokio::spawn(async move { store.traverse(request).await });
+    tokio::task::spawn_blocking(move || reached.recv().unwrap())
+        .await
+        .unwrap();
 
     let secondary_view =
         khive_storage::tx_registry::TxOriginFilter::Secondary(secondary_identity.clone());
     let main_view = khive_storage::tx_registry::TxOriginFilter::Main(other_identity);
 
-    let mut seen_via_secondary = false;
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-    while std::time::Instant::now() < deadline && !traverse_handle.is_finished() {
-        if let Some(span) = khive_storage::tx_registry::oldest_for(&secondary_view) {
-            if span.label.as_deref() == Some("graph_traverse_read") {
-                seen_via_secondary = true;
-                assert!(
-                    khive_storage::tx_registry::oldest_for(&main_view).is_none(),
-                    "a secondary-origin graph_traverse_read span must never be visible \
-                     through a different backend's Main view"
-                );
-                break;
-            }
-        }
-        tokio::task::yield_now().await;
-    }
-
-    let result = traverse_handle.await.unwrap();
-    assert!(result.is_ok(), "traverse should succeed: {result:?}");
+    let span = khive_storage::tx_registry::oldest_for(&secondary_view)
+        .expect("statement-scoped traversal span must be visible while its seam is held");
+    assert_eq!(span.label.as_deref(), Some("graph_traverse_read"));
     assert!(
-        seen_via_secondary,
-        "expected to observe a graph_traverse_read span through the secondary backend's own \
-         filtered view while the traversal's read transaction was open"
+        khive_storage::tx_registry::oldest_for(&main_view).is_none(),
+        "a secondary-origin graph_traverse_read span must never be visible through a different backend's Main view"
+    );
+
+    writer_store
+        .upsert_edge(make_edge(child, grandchild, EdgeRelation::Extends, 1.0))
+        .await
+        .expect("WAL writer must commit while the first traversal cursor is live");
+    proceed.send(()).unwrap();
+
+    let result = traverse_handle.await.unwrap().unwrap();
+    let grandchild_node = result[0]
+        .nodes
+        .iter()
+        .find(|node| node.node_id == grandchild)
+        .expect("the next frontier statement must see the concurrent commit");
+    assert_eq!(grandchild_node.depth, 2);
+    assert!(
+        khive_storage::tx_registry::oldest_for(&secondary_view).is_none(),
+        "the statement-scoped traversal span must be gone when its bounded query returns"
     );
 }
 
@@ -2276,16 +2403,13 @@ async fn batch_neighbors_both_chunk_boundary() {
 
 // ---- per-root limit regression ----
 
-/// Regression guard for the per-root `limit` regression introduced when N
-/// roots were batched into a single CTE with one global SQL LIMIT.
+/// Regression guard that `limit` is applied independently to each root.
 ///
 /// Graph: A→B and C→D (two independent chains).  With `limit=1` and
 /// `include_roots=false`, EVERY root must receive its own capped result —
 /// not just the lexicographically-first root_id.
 ///
-/// This test FAILs on the pre-fix code (global LIMIT returns 1 row total,
-/// so only one root gets a path) and PASSes after the fix (Rust-level
-/// per-root truncation after SQL returns all rows).
+/// A single global cap would let only one root receive a path.
 #[tokio::test]
 async fn test_traverse_per_root_limit_capped_independently() {
     let store = setup_memory_store();
@@ -2316,6 +2440,7 @@ async fn test_traverse_per_root_limit_capped_independently() {
         },
         include_roots: false,
         include_properties: false,
+        execution_budget: Default::default(),
     };
 
     let paths = store.traverse(request).await.unwrap();
@@ -2345,9 +2470,346 @@ async fn test_traverse_per_root_limit_capped_independently() {
     assert_eq!(path_c.nodes[0].node_id, d, "root C must reach child D");
 }
 
-// ---- batch == per-root decomposition equivalence tests ----
+/// #1444: a dense cyclic component behind the first hop must not be expanded
+/// when `limit=1`. The response and measured work are both one row.
+#[tokio::test]
+async fn traverse_limit_one_bounds_dense_cycle_work() {
+    let store = setup_memory_store();
+    let root = Uuid::from_u128(1);
+    let children = (2_u128..18).map(Uuid::from_u128).collect::<Vec<_>>();
+    let mut edges = children
+        .iter()
+        .map(|child| make_edge(root, *child, EdgeRelation::Extends, 1.0))
+        .collect::<Vec<_>>();
+    for source in &children {
+        for target in &children {
+            if source != target {
+                edges.push(make_edge(*source, *target, EdgeRelation::VariantOf, 1.0));
+            }
+        }
+    }
+    store.upsert_edges(edges).await.unwrap();
 
-/// Equivalence fixture: for a small deterministic graph, batched
+    let ctx = khive_storage::usage::UsageContext::new();
+    let paths = khive_storage::usage::scope(ctx.clone(), async {
+        store
+            .traverse(TraversalRequest {
+                roots: vec![root],
+                options: TraversalOptions {
+                    max_depth: MAX_TRAVERSAL_DEPTH,
+                    direction: Direction::Out,
+                    relations: None,
+                    min_weight: None,
+                    limit: Some(1),
+                },
+                include_roots: false,
+                include_properties: false,
+                execution_budget: Default::default(),
+            })
+            .await
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(paths.len(), 1);
+    assert_eq!(paths[0].nodes.len(), 1);
+    assert_eq!(paths[0].nodes[0].depth, 1);
+    assert!(children.contains(&paths[0].nodes[0].node_id));
+    assert_eq!(ctx.snapshot()["graph_hops"], 1);
+    assert_eq!(ctx.snapshot()["db_round_trips"], 1);
+}
+
+#[tokio::test]
+async fn traverse_omitted_limit_uses_finite_public_default_during_execution() {
+    let store = setup_memory_store();
+    let root = Uuid::from_u128(50);
+    let edges = (1_u128..=101)
+        .map(|offset| {
+            make_edge(
+                root,
+                Uuid::from_u128(1_000 + offset),
+                EdgeRelation::Extends,
+                1.0,
+            )
+        })
+        .collect();
+    store.upsert_edges(edges).await.unwrap();
+
+    let ctx = khive_storage::usage::UsageContext::new();
+    let paths = khive_storage::usage::scope(ctx.clone(), async {
+        store
+            .traverse(TraversalRequest {
+                roots: vec![root],
+                options: TraversalOptions {
+                    max_depth: 1,
+                    direction: Direction::Out,
+                    relations: None,
+                    min_weight: None,
+                    limit: None,
+                },
+                include_roots: false,
+                include_properties: false,
+                execution_budget: Default::default(),
+            })
+            .await
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(
+        paths[0].nodes.len(),
+        khive_storage::DEFAULT_TRAVERSAL_LIMIT as usize
+    );
+    assert_eq!(
+        ctx.snapshot()["graph_hops"],
+        khive_storage::DEFAULT_TRAVERSAL_LIMIT as u64,
+        "the default result cap must stop cursor consumption, not truncate afterward"
+    );
+}
+
+/// Cyclic rows count against work before visited de-duplication. A root with
+/// one self-loop per relation must read those bounded duplicates before the
+/// first new child, but it retains only that child.
+#[tokio::test]
+async fn traverse_limit_one_bounds_duplicate_cycle_rows() {
+    let store = setup_memory_store();
+    let root = Uuid::from_u128(100);
+    let child = Uuid::from_u128(101);
+    let mut edges = EdgeRelation::ALL
+        .iter()
+        .map(|relation| make_edge(root, root, *relation, 1.0))
+        .collect::<Vec<_>>();
+    edges.push(make_edge(root, child, EdgeRelation::VariantOf, 1.0));
+    store.upsert_edges(edges).await.unwrap();
+
+    let ctx = khive_storage::usage::UsageContext::new();
+    let paths = khive_storage::usage::scope(ctx.clone(), async {
+        store
+            .traverse(TraversalRequest {
+                roots: vec![root],
+                options: TraversalOptions {
+                    max_depth: MAX_TRAVERSAL_DEPTH,
+                    direction: Direction::Out,
+                    relations: None,
+                    min_weight: None,
+                    limit: Some(1),
+                },
+                include_roots: false,
+                include_properties: false,
+                execution_budget: Default::default(),
+            })
+            .await
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(paths[0].nodes.len(), 1);
+    assert_eq!(paths[0].nodes[0].node_id, child);
+    assert_eq!(paths[0].nodes[0].depth, 1);
+    assert_eq!(
+        ctx.snapshot()["graph_hops"],
+        (EdgeRelation::ALL.len() + 1) as u64,
+        "self-loop rows are bounded work even though the visited set rejects them"
+    );
+}
+
+/// A result quota filled at depth one must never be displaced by a node from
+/// a deeper frontier, regardless of same-depth tie order.
+#[tokio::test]
+async fn traverse_limit_keeps_shallowest_breadth_first_nodes() {
+    let store = setup_memory_store();
+    let root = Uuid::from_u128(200);
+    let shallow_a = Uuid::from_u128(201);
+    let shallow_b = Uuid::from_u128(202);
+    let deep = Uuid::from_u128(199);
+    for (source, target) in [(root, shallow_a), (root, shallow_b), (shallow_a, deep)] {
+        store
+            .upsert_edge(make_edge(source, target, EdgeRelation::Extends, 1.0))
+            .await
+            .unwrap();
+    }
+
+    let paths = store
+        .traverse(TraversalRequest {
+            roots: vec![root],
+            options: TraversalOptions {
+                max_depth: 2,
+                direction: Direction::Out,
+                relations: None,
+                min_weight: None,
+                limit: Some(2),
+            },
+            include_roots: false,
+            include_properties: false,
+            execution_budget: Default::default(),
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(paths[0].nodes.len(), 2);
+    assert!(paths[0].nodes.iter().all(|node| node.depth == 1));
+    assert!(!paths[0].nodes.iter().any(|node| node.node_id == deep));
+}
+
+/// The work ceiling admits exactly the configured rows and rejects the first
+/// over-budget probe without returning partial paths. Usage still reports that
+/// sentinel row because it came off SQLite's cursor before enforcement.
+#[tokio::test]
+#[serial(tx_registry)]
+async fn traverse_work_budget_boundary_and_error_are_deterministic() {
+    let (_dir, store, origin_view) = setup_file_store_with_origin_view();
+    let root = Uuid::from_u128(300);
+    for target in (301_u128..305).map(Uuid::from_u128) {
+        store
+            .upsert_edge(make_edge(root, target, EdgeRelation::Extends, 1.0))
+            .await
+            .unwrap();
+    }
+
+    let success = store
+        .traverse(TraversalRequest {
+            roots: vec![root],
+            options: TraversalOptions {
+                max_depth: 1,
+                direction: Direction::Out,
+                relations: None,
+                min_weight: None,
+                limit: Some(3),
+            },
+            include_roots: false,
+            include_properties: false,
+            execution_budget: TraversalExecutionBudget::new(3, std::time::Duration::from_secs(5)),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        success[0].nodes.len(),
+        3,
+        "the exact work boundary succeeds"
+    );
+
+    let ctx = khive_storage::usage::UsageContext::new();
+    let error = khive_storage::usage::scope(ctx.clone(), async {
+        store
+            .traverse(TraversalRequest {
+                roots: vec![root],
+                options: TraversalOptions {
+                    max_depth: 1,
+                    direction: Direction::Out,
+                    relations: None,
+                    min_weight: None,
+                    limit: Some(4),
+                },
+                include_roots: false,
+                include_properties: false,
+                execution_budget: TraversalExecutionBudget::new(
+                    3,
+                    std::time::Duration::from_secs(5),
+                ),
+            })
+            .await
+    })
+    .await
+    .expect_err("the fourth adjacency row must exceed a three-row budget");
+    match error {
+        StorageError::InvalidInput { message, .. } => {
+            assert!(message.contains("work budget exceeded after 3 adjacency rows"));
+        }
+        other => panic!("expected bounded-work InvalidInput, got {other:?}"),
+    }
+    assert_eq!(ctx.snapshot()["graph_hops"], 4);
+    assert!(
+        khive_storage::tx_registry::oldest_for(&origin_view).is_none(),
+        "an over-budget return must drop its statement-scoped registry span"
+    );
+}
+
+#[tokio::test]
+async fn traverse_expired_deadline_returns_timeout_before_sql() {
+    let store = setup_memory_store();
+    let result = store
+        .traverse(TraversalRequest {
+            roots: vec![Uuid::new_v4()],
+            options: TraversalOptions::new(1).with_direction(Direction::Out),
+            include_roots: false,
+            include_properties: false,
+            execution_budget: TraversalExecutionBudget::new(1, std::time::Duration::ZERO),
+        })
+        .await;
+    assert!(matches!(result, Err(StorageError::Timeout { .. })));
+}
+
+/// The VM progress handler, rather than a frontier-boundary deadline check,
+/// interrupts an executing adjacency statement. The operation returns only a
+/// timeout (never partial paths), drops its statement registry span, and clears
+/// the connection-global handler before the same connection is reused.
+#[tokio::test]
+#[serial(tx_registry)]
+async fn traverse_progress_handler_interrupts_statement_and_is_cleared() {
+    let (_dir, store, origin_view) = setup_file_store_with_origin_view();
+    let root = Uuid::new_v4();
+    let edges = (0..512)
+        .map(|_| make_edge(root, Uuid::new_v4(), EdgeRelation::Extends, 1.0))
+        .collect();
+    store.upsert_edges(edges).await.unwrap();
+
+    let reader = store.pool.reader().unwrap();
+    let counted_rows = std::sync::atomic::AtomicU64::new(0);
+    let counted_queries = std::sync::atomic::AtomicU64::new(0);
+    traverse_progress_seam::install(root);
+
+    let result = run_bounded_traversal(
+        reader.conn(),
+        vec![root],
+        TraversalOptions {
+            max_depth: 1,
+            direction: Direction::Out,
+            relations: None,
+            min_weight: None,
+            limit: Some(512),
+        },
+        false,
+        "default".to_string(),
+        store.pool.origin(),
+        TraversalExecutionBudget::default(),
+        &counted_rows,
+        &counted_queries,
+    );
+
+    assert!(
+        matches!(result, Err(StorageError::Timeout { .. })),
+        "the executing statement must be interrupted as a timeout, got {result:?}"
+    );
+    assert!(
+        traverse_progress_seam::calls(root) >= 1,
+        "the test must enter SQLite's VM progress callback"
+    );
+    assert!(
+        khive_storage::tx_registry::oldest_for(&origin_view).is_none(),
+        "the interrupted statement must drop its graph_traverse_read span"
+    );
+
+    let calls_after_traversal = traverse_progress_seam::calls(root);
+    let sum: i64 = reader
+        .conn()
+        .query_row(
+            "WITH RECURSIVE n(x) AS (VALUES(0) UNION ALL SELECT x + 1 FROM n WHERE x < 10000) SELECT sum(x) FROM n",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(sum, 50_005_000);
+    assert_eq!(
+        traverse_progress_seam::calls(root),
+        calls_after_traversal,
+        "the traversal progress handler must be removed before connection reuse"
+    );
+    traverse_progress_seam::uninstall();
+}
+
+// ---- multi-root == per-root decomposition equivalence tests ----
+
+/// Equivalence fixture: for a small deterministic graph, multi-root
 /// `traverse([R0, R1])` must produce the same per-root results as running
 /// `traverse([R0])` and `traverse([R1])` independently, across four sections:
 ///
@@ -2360,11 +2822,11 @@ async fn test_traverse_per_root_limit_capped_independently() {
 ///   H → VI (w=1.0, Extends) → K (w=1.0, Extends)
 ///   H → K  (w=0.5, PartOf)  ← shortcut; K is at depth 1 from H via H→K,
 ///                                          NOT depth 2 via H→VI→K.
-///   Batched CTE must attribute K's first visit to depth=1, via_edge=H→K edge.
+///   Multi-root BFS must attribute K's first visit to depth=1, via_edge=H→K edge.
 ///
 /// **Section C** – same diamond, Direction::In (bidirectional traversal):
 ///   roots [K, N].  K has two distinct incoming edges (H→K and VI→K); the
-///   batched CTE must assign each one its own via_edge independently.
+///   multi-root BFS must assign each one its own via_edge independently.
 ///
 /// **Section D** – same diamond + chain, Direction::Both:
 ///   roots [VI, N].  VI has both in-edges (H→VI) and out-edges (VI→K).
@@ -2419,7 +2881,7 @@ async fn test_traverse_batch_equals_per_root_decomposition() {
         .await
         .unwrap();
     // Shortcut: K is reachable from H in one hop; the depth-2 path via VI→K must
-    // be suppressed by BFS first-visit in both batched and single-root traversals.
+    // be suppressed by BFS first-visit in both multi-root and single-root traversals.
     store
         .upsert_edge(make_edge(h, k, EdgeRelation::PartOf, 0.5))
         .await
@@ -2430,7 +2892,7 @@ async fn test_traverse_batch_equals_per_root_decomposition() {
         .unwrap();
 
     // Sort PathNodes by (depth, node_id) for a stable comparison even when
-    // same-depth nodes appear in different orders between CTE executions.
+    // same-depth nodes may appear in different backend-defined orders.
     // This resolves depth-1 tie-breaking without requiring a new ordering
     // contract in production code.
     let sort_nodes = |nodes: &mut Vec<khive_storage::types::PathNode>| {
@@ -2470,6 +2932,7 @@ async fn test_traverse_batch_equals_per_root_decomposition() {
                     options: opts.clone(),
                     include_roots: case.include_roots,
                     include_properties: false,
+                    execution_budget: Default::default(),
                 })
                 .await
                 .unwrap();
@@ -2479,6 +2942,7 @@ async fn test_traverse_batch_equals_per_root_decomposition() {
                     options: opts.clone(),
                     include_roots: case.include_roots,
                     include_properties: false,
+                    execution_budget: Default::default(),
                 })
                 .await
                 .unwrap();
@@ -2488,6 +2952,7 @@ async fn test_traverse_batch_equals_per_root_decomposition() {
                     options: opts,
                     include_roots: case.include_roots,
                     include_properties: false,
+                    execution_budget: Default::default(),
                 })
                 .await
                 .unwrap();
@@ -2617,7 +3082,7 @@ async fn test_traverse_batch_equals_per_root_decomposition() {
 
     // ── Section B: diamond, Direction::Out ────────────────────────────────────
     // K must appear at depth=1 via the H→K shortcut edge, NOT at depth=2 via
-    // H→VI→K.  A bug in the batched CTE's per-root seen-set tracking would
+    // H→VI→K. A bug in the multi-root BFS's per-root seen-set tracking would
     // produce the wrong depth or via_edge for K.
     run_cases(
         &store,
@@ -2728,6 +3193,7 @@ async fn test_traverse_limit_zero_include_roots_false_emits_no_path() {
             },
             include_roots: false,
             include_properties: false,
+            execution_budget: Default::default(),
         })
         .await
         .unwrap();
@@ -2740,30 +3206,15 @@ async fn test_traverse_limit_zero_include_roots_false_emits_no_path() {
     );
 }
 
-/// Regression: traverse must not fail with "too many terms in compound SELECT"
-/// when the root set is larger than CHUNK_ROOTS (400).
-///
-/// Pre-fix, all root UUIDs were bound into a single recursive-CTE VALUES clause.
-/// SQLite's SQLITE_LIMIT_COMPOUND_SELECT (default 500) counts each VALUES row as
-/// one compound-SELECT term; with 1 000 roots the query returned a StorageError
-/// before the 999-variable limit was even reached.  After the fix, roots are
-/// split into chunks of 400 (safely below both the 500 compound-SELECT limit and
-/// the 999 variable limit), so a call with 1 000 roots is split into three chunks
-/// and completes successfully.
-///
-/// Graph: 1 000 roots, each with one distinct outgoing edge to a unique target.
-/// Correctness check: every root must appear in the result with exactly one
-/// reachable node (its direct child).
 #[tokio::test]
-async fn traverse_chunks_root_binds_over_host_param_limit() {
+async fn traverse_accepts_root_cap_and_rejects_cap_plus_one_before_sql() {
     let store = setup_memory_store();
 
-    const N: usize = 1_000;
-    let mut roots: Vec<Uuid> = Vec::with_capacity(N);
+    let mut roots = Vec::with_capacity(MAX_TRAVERSAL_ROOTS);
     let mut expected_children: std::collections::HashMap<Uuid, Uuid> =
-        std::collections::HashMap::with_capacity(N);
+        std::collections::HashMap::with_capacity(MAX_TRAVERSAL_ROOTS);
 
-    for _ in 0..N {
+    for _ in 0..MAX_TRAVERSAL_ROOTS {
         let root = Uuid::new_v4();
         let child = Uuid::new_v4();
         store
@@ -2774,7 +3225,6 @@ async fn traverse_chunks_root_binds_over_host_param_limit() {
         expected_children.insert(root, child);
     }
 
-    // Must return Ok — no "too many SQL variables" error.
     let paths = store
         .traverse(TraversalRequest {
             roots: roots.clone(),
@@ -2783,10 +3233,11 @@ async fn traverse_chunks_root_binds_over_host_param_limit() {
                 direction: Direction::Out,
                 relations: None,
                 min_weight: None,
-                limit: None,
+                limit: Some(1),
             },
             include_roots: false,
             include_properties: false,
+            execution_budget: Default::default(),
         })
         .await
         .unwrap();
@@ -2794,8 +3245,8 @@ async fn traverse_chunks_root_binds_over_host_param_limit() {
     // Every root must have exactly one reachable node (its direct child).
     assert_eq!(
         paths.len(),
-        N,
-        "traverse over {N} roots must return one GraphPath per root"
+        MAX_TRAVERSAL_ROOTS,
+        "the inclusive root cap must return one path per root"
     );
 
     for path in &paths {
@@ -2812,21 +3263,36 @@ async fn traverse_chunks_root_binds_over_host_param_limit() {
             path.root_id
         );
     }
+
+    roots.push(Uuid::new_v4());
+    let ctx = khive_storage::usage::UsageContext::new();
+    let result = khive_storage::usage::scope(ctx.clone(), async {
+        store
+            .traverse(TraversalRequest {
+                roots,
+                options: TraversalOptions::new(1).with_direction(Direction::Out),
+                include_roots: false,
+                include_properties: false,
+                execution_budget: Default::default(),
+            })
+            .await
+    })
+    .await;
+    assert!(matches!(result, Err(StorageError::InvalidInput { .. })));
+    assert_eq!(
+        ctx.snapshot(),
+        serde_json::json!({}),
+        "cap+1 must be rejected before any traversal SQL is issued"
+    );
 }
 
-/// ADR-103 Amendment 2 regression: `DbRoundTrips` must count one increment
-/// per executed chunk query, not one flat increment per `traverse` call.
-/// Pre-fix, the single `.inspect` after the `with_reader` closure counted a
-/// flat `1` regardless of how many `CHUNK_ROOTS`-sized (400) SQL executions
-/// actually ran — a 1 000-root call executes 3 chunk queries (400 + 400 +
-/// 200) but reported only 1 round trip.
+/// One-hop, limit-one roots issue one bounded indexed statement and retain one
+/// adjacency row each. This is the execution accounting contract after #1444.
 #[tokio::test]
-async fn traverse_over_chunk_limit_counts_one_db_round_trip_per_chunk() {
+async fn traverse_limit_one_counts_one_query_and_row_per_root() {
     let store = setup_memory_store();
 
-    const N: usize = 1_000;
-    const CHUNK_ROOTS: usize = 400;
-    let expected_chunks = N.div_ceil(CHUNK_ROOTS) as u64;
+    const N: usize = 8;
 
     let mut roots: Vec<Uuid> = Vec::with_capacity(N);
     for _ in 0..N {
@@ -2849,27 +3315,27 @@ async fn traverse_over_chunk_limit_counts_one_db_round_trip_per_chunk() {
                     direction: Direction::Out,
                     relations: None,
                     min_weight: None,
-                    limit: None,
+                    limit: Some(1),
                 },
                 include_roots: false,
                 include_properties: false,
+                execution_budget: Default::default(),
             })
             .await
     })
     .await
     .unwrap();
 
-    assert_eq!(
-        paths.len(),
-        N,
-        "traverse over {N} roots must return one GraphPath per root"
-    );
+    assert_eq!(paths.len(), N, "each root must retain its own result quota");
 
     let snap = ctx.snapshot();
     assert_eq!(
-        snap["db_round_trips"], expected_chunks,
-        "a {N}-root traverse split into {expected_chunks} chunk queries must count \
-         {expected_chunks} db_round_trips, not a flat 1; got {snap:?}"
+        snap["db_round_trips"], N as u64,
+        "one bounded adjacency query per root; got {snap:?}"
+    );
+    assert_eq!(
+        snap["graph_hops"], N as u64,
+        "limit=1 must read exactly one unique one-hop row per root; got {snap:?}"
     );
 }
 
@@ -2931,11 +3397,8 @@ async fn query_edges_after_exact_multiple_final_page_has_no_next_after() {
     );
 }
 
-/// STORAGE-AUD-003 / #485: TraversalOptions.max_depth > i64::MAX must return
-/// InvalidInput from the backend instead of silently narrowing to a negative
-/// i64 depth and returning an empty/wrong traversal.
 #[tokio::test]
-async fn traverse_max_depth_over_i64max_rejected() {
+async fn traverse_max_depth_over_public_cap_rejected() {
     let store = setup_memory_store();
     let a = Uuid::new_v4();
     let b = Uuid::new_v4();
@@ -2946,9 +3409,10 @@ async fn traverse_max_depth_over_i64max_rejected() {
 
     let request = TraversalRequest {
         roots: vec![a],
-        options: TraversalOptions::new((i64::MAX as usize) + 1).with_direction(Direction::Out),
+        options: TraversalOptions::new(MAX_TRAVERSAL_DEPTH + 1).with_direction(Direction::Out),
         include_roots: false,
         include_properties: false,
+        execution_budget: Default::default(),
     };
 
     let result = store.traverse(request).await;
@@ -3632,8 +4096,8 @@ async fn batch_neighbors_counts_the_query_and_the_rows_returned_before_the_failu
     );
 }
 
-/// Same rule as the `neighbors` twin, on the traversal path: a chunk whose
-/// statement never prepared issued nothing to the store, so it must count
+/// Same rule as the `neighbors` twin, on the traversal path: a frontier
+/// statement that never prepared issued nothing to the store, so it must count
 /// nothing — the increment sits after `prepare` succeeds, exactly where the
 /// neighbors and batch paths put theirs.
 #[tokio::test]
@@ -3648,6 +4112,7 @@ async fn traverse_counts_nothing_when_the_statement_never_prepared() {
                 options: TraversalOptions::new(2).with_direction(Direction::Out),
                 include_roots: false,
                 include_properties: false,
+                execution_budget: Default::default(),
             })
             .await
     })
@@ -3661,74 +4126,54 @@ async fn traverse_counts_nothing_when_the_statement_never_prepared() {
     let usage = ctx.snapshot();
     assert!(
         usage.get("db_round_trips").is_none(),
-        "the chunk statement never prepared, so no round trip may be counted; got {usage}"
+        "the frontier statement never prepared, so no round trip may be counted; got {usage}"
     );
 }
 
-/// khive#1229: `Direction::Both`'s recursive-CTE join predicate used to be a
-/// single `(e.source_id = t.node_id OR e.target_id = t.node_id)` arm, which
-/// SQLite cannot satisfy with one index seek — it falls back to a full
-/// namespace scan of `graph_edges` per frontier row. This asserts the fixed
-/// `traverse_recursive_member_sql` shape plans as two separately-indexed
-/// `SEARCH` operations (one on `idx_graph_edges_ns_src_rel` binding
-/// `source_id=?`, one on `idx_graph_edges_ns_tgt_rel` binding `target_id=?`),
-/// not a scan qualified by `namespace=?` alone.
+/// Both directions remain two separately indexed statements. Reintroducing a
+/// single OR predicate would turn each bounded frontier expansion into a full
+/// namespace scan (#1229).
 #[tokio::test]
-async fn traverse_both_direction_recursive_member_seeks_by_source_and_target_id() {
+async fn traversal_neighbor_statements_seek_by_source_and_target_id() {
     let store = setup_memory_store();
-    // Same schema `traverse()` runs against; EXPLAIN QUERY PLAN doesn't
-    // execute the statement, so no rows need to exist.
-    let seeds = "(?1, ?1, NULL, 0, ?1, 0.0)";
-    let recursive_member = traverse_recursive_member_sql(Direction::Both, 2, 3, "", "");
-    let cte_sql = format!(
-        "WITH RECURSIVE traversal(\
-             root_id, node_id, edge_id, depth, path, total_weight\
-         ) AS (\
-             VALUES {seeds} \
-             UNION ALL \
-             {recursive_member} \
-         ) \
-         SELECT root_id, node_id, edge_id, depth, total_weight \
-         FROM traversal WHERE depth > 0 \
-         ORDER BY root_id, depth",
-        seeds = seeds,
-        recursive_member = recursive_member,
-    );
-
     let reader = store.pool.reader().unwrap();
-    let plan_sql = format!("EXPLAIN QUERY PLAN {cte_sql}");
-    let mut stmt = reader.conn().prepare(&plan_sql).unwrap();
-    let params: [&str; 3] = ["root", "default", "2"];
-    let details: Vec<String> = stmt
-        .query_map(rusqlite::params_from_iter(params.iter()), |row| row.get(3))
-        .unwrap()
-        .collect::<Result<_, _>>()
-        .unwrap();
-
-    assert!(
-        details
-            .iter()
-            .any(|d| d.contains("idx_graph_edges_ns_src_rel") && d.contains("source_id=?")),
-        "expected an out-arm SEARCH binding source_id=? via idx_graph_edges_ns_src_rel, got: {details:?}"
-    );
-    assert!(
-        details
-            .iter()
-            .any(|d| d.contains("idx_graph_edges_ns_tgt_rel") && d.contains("target_id=?")),
-        "expected an in-arm SEARCH binding target_id=? via idx_graph_edges_ns_tgt_rel, got: {details:?}"
-    );
-    assert!(
-        !details.iter().any(|d| d.contains("SCAN e")),
-        "no arm may fall back to a full graph_edges scan, got: {details:?}"
-    );
+    for (direction, expected_index, endpoint) in [
+        (Direction::Out, "idx_graph_edges_ns_src_rel", "source_id=?"),
+        (Direction::In, "idx_graph_edges_ns_tgt_rel", "target_id=?"),
+    ] {
+        let plan_sql = format!(
+            "EXPLAIN QUERY PLAN {}",
+            traversal_neighbor_sql(direction, 0, false)
+        );
+        let mut stmt = reader.conn().prepare(&plan_sql).unwrap();
+        let details: Vec<String> = stmt
+            .query_map(rusqlite::params!["default", "root", 10_i64], |row| {
+                row.get(3)
+            })
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(
+            details
+                .iter()
+                .any(|detail| detail.contains(expected_index) && detail.contains(endpoint)),
+            "expected indexed {endpoint} seek via {expected_index}, got: {details:?}"
+        );
+        assert!(
+            !details
+                .iter()
+                .any(|detail| detail.contains("SCAN graph_edges")),
+            "bounded adjacency statements must not scan graph_edges: {details:?}"
+        );
+    }
 }
 
 /// khive#1229 correctness: a hub node with mixed out- and in-edges to its
 /// spokes, each spoke extending one hop further to its own tail node.
 /// `Direction::Both` at `max_depth=2` from the hub must return every spoke
 /// (reached via whichever direction connects it to the hub) AND every tail
-/// (reached via the spoke's outgoing edge), regardless of which arm of the
-/// recursive member found the spoke. This is the exact shape the OR-predicate
+/// (reached via the spoke's outgoing edge), regardless of which indexed
+/// directional statement found the spoke. This is the exact shape the OR-predicate
 /// bug silently returned correct results for at small scale but 380x slower
 /// at hub scale — this test locks the result set the perf fix must preserve.
 #[tokio::test]
@@ -3772,6 +4217,7 @@ async fn traverse_both_direction_hub_depth_two_returns_full_node_set() {
             options: TraversalOptions::new(2).with_direction(Direction::Both),
             include_roots: false,
             include_properties: false,
+            execution_budget: Default::default(),
         })
         .await
         .unwrap();

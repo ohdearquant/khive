@@ -10,14 +10,14 @@ specific backend.
 
 ## Capability traits
 
-| Trait                                                      | Surface                                                                          |
-| ---------------------------------------------------------- | -------------------------------------------------------------------------------- |
-| `SqlAccess` / `SqlReader` / `SqlWriter`                    | pooled connections, atomic units, query planning                                 |
-| `VectorStore`                                              | dense embedding insert/search/rebuild, optional filter pushdown and batch search |
-| `TextSearch`                                               | FTS document upsert/search/stats, optional term-stats (IDF)                      |
-| `GraphStore`                                               | edge CRUD, neighbor queries, multi-hop traversal, batched neighbor/edge fetch    |
-| `NoteStore` / `EntityStore` / `EventStore`                 | substrate-specific CRUD and filtered listing                                     |
-| `SparseStore`                                              | sparse (BM25-style) vector storage                                               |
+| Trait                                      | Surface                                                                          |
+| ------------------------------------------ | -------------------------------------------------------------------------------- |
+| `SqlAccess` / `SqlReader` / `SqlWriter`    | pooled connections, atomic units, query planning                                 |
+| `VectorStore`                              | dense embedding insert/search/rebuild, optional filter pushdown and batch search |
+| `TextSearch`                               | FTS document upsert/search/stats, optional term-stats (IDF)                      |
+| `GraphStore`                               | edge CRUD, neighbor queries, multi-hop traversal, batched neighbor/edge fetch    |
+| `NoteStore` / `EntityStore` / `EventStore` | substrate-specific CRUD and filtered listing                                     |
+| `SparseStore`                              | sparse (BM25-style) vector storage                                               |
 
 Every method returns `StorageResult<T> = Result<T, StorageError>`.
 `StorageError` variants (`NotFound`, `AlreadyExists`, `Conflict`,
@@ -42,7 +42,8 @@ impl GraphStore for MyBackend {
     //     delete_edge, query_edges, count_edges, neighbors, purge_incident_edges
 
     async fn traverse(&self, request: TraversalRequest) -> StorageResult<Vec<GraphPath>> {
-        // multi-hop BFS from request.roots
+        // Validate the request, then run bounded BFS while consuming its
+        // shared execution budget (ADR-091 Amendment 4).
         Ok(Vec::new())
     }
 }

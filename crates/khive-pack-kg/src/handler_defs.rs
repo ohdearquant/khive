@@ -629,9 +629,12 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 20] = [
     // Assertive: retrieves multi-hop traversal results
     HandlerDef {
         name: "traverse",
-        description: "Multi-hop BFS traversal returning one path per distinct root. \
-                      Entity and note nodes both include name/kind; note names use the \
-                      same fallback as `neighbors` when no explicit name is stored.",
+        description: "Bounded multi-hop BFS traversal returning one path per distinct root. \
+                      At most 100 roots, depth 10, 1,000 non-root results per root, 100,000 \
+                      adjacency rows, and five seconds of storage expansion per request; \
+                      over-budget calls fail without partial paths. Entity and note nodes \
+                      both include name/kind; note names use the same fallback as \
+                      `neighbors` when no explicit name is stored.",
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,
         params: &[
@@ -639,19 +642,49 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 20] = [
                 name: "roots",
                 param_type: "array of uuid",
                 required: true,
-                description: "Starting node UUIDs for the traversal.",
+                description: "Starting node UUIDs for the traversal (maximum 100; aliases resolving to the same UUID are de-duplicated).",
             },
             ParamDef {
                 name: "max_depth",
                 param_type: "integer",
                 required: false,
-                description: "Maximum traversal depth (default 3).",
+                description: "Maximum traversal depth (default 3, maximum 10).",
             },
             ParamDef {
                 name: "relations",
                 param_type: "array of string",
                 required: false,
                 description: "Restrict traversal to these relation types.",
+            },
+            ParamDef {
+                name: "direction",
+                param_type: "string",
+                required: false,
+                description: "out|outgoing|in|incoming|both (default both).",
+            },
+            ParamDef {
+                name: "min_weight",
+                param_type: "number",
+                required: false,
+                description: "Minimum edge weight (finite, 0.0–1.0).",
+            },
+            ParamDef {
+                name: "limit",
+                param_type: "integer",
+                required: false,
+                description: "Maximum non-root first-visit nodes per root (default 100, maximum 1000).",
+            },
+            ParamDef {
+                name: "include_roots",
+                param_type: "boolean",
+                required: false,
+                description: "Include each root as a depth-0 path node (default true; roots do not consume limit).",
+            },
+            ParamDef {
+                name: "include_properties",
+                param_type: "boolean",
+                required: false,
+                description: "Include entity properties on enriched path nodes (default false).",
             },
         ],
     },

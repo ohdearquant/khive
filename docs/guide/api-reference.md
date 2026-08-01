@@ -515,18 +515,28 @@ entity-kind vocabulary (§"The 9 entity kinds" in AGENTS.md) vs. the note-kind v
 
 ### `traverse` — Assertive
 
-Multi-hop BFS traversal.
+Bounded multi-hop BFS traversal. Nodes are selected at their shallowest depth;
+same-depth tie order is intentionally unspecified. Limits count non-root
+first-visit nodes independently per distinct root.
 
-| Param                | Type            | Required | Notes                                                       |
-| -------------------- | --------------- | -------- | ----------------------------------------------------------- |
-| `roots`              | array\<uuid\>   | yes      | Starting node UUIDs.                                        |
-| `max_depth`          | integer         | no       | Default 3.                                                  |
-| `direction`          | string          | no       | `outgoing`\|`incoming`\|`both` (default `both`).            |
-| `relations`          | array\<string\> | no       | Restrict traversal to these relations.                      |
-| `min_weight`         | number          | no       | Exclude edges below this weight.                            |
-| `limit`              | integer         | no       | Maximum non-root nodes retained in each distinct root path. |
-| `include_roots`      | boolean         | no       | Include each root as a depth-zero node (default `true`).    |
-| `include_properties` | boolean         | no       | Include entity properties on path nodes (default `false`).  |
+| Param                | Type            | Required | Notes                                                                      |
+| -------------------- | --------------- | -------- | -------------------------------------------------------------------------- |
+| `roots`              | array\<uuid\>   | yes      | Starting UUIDs; maximum 100 raw entries, then de-duplicated after resolve. |
+| `max_depth`          | integer         | no       | Default 3; maximum 10; values above 10 are rejected.                       |
+| `direction`          | string          | no       | `out`/`outgoing`, `in`/`incoming`, or `both` (default `both`).             |
+| `relations`          | array\<string\> | no       | Restrict traversal to these relations.                                     |
+| `min_weight`         | number          | no       | Minimum edge weight, finite and within 0.0–1.0.                            |
+| `limit`              | integer         | no       | Non-root results per root; default 100, maximum 1,000.                     |
+| `include_roots`      | boolean         | no       | Include depth-0 roots (default `true`; they do not consume `limit`).       |
+| `include_properties` | boolean         | no       | Include entity properties on path nodes (default `false`).                 |
+
+One public request shares a 100,000-adjacency-row work budget and five-second
+storage-expansion deadline across all roots and visible namespaces. Self-loops, parallel paths,
+and rows rejected by first-visit de-duplication still consume work. Exceeding a
+shape bound, work budget, or deadline returns an error and never partial paths.
+Traversal reads use statement-scoped snapshots, so concurrent writes may become
+visible between frontier expansions; a single old WAL snapshot is never held for
+the full operation.
 
 ```
 request(ops="traverse(roots=[\"<uuid>\"], max_depth=2)")

@@ -46,9 +46,11 @@ pub use types::{
     SeekPage, SortDirection, SortOrder, SparseRecord, SparseSearchHit, SparseSearchRequest,
     SparseVector, SqlRow, SqlStatement, SqlValue, TextDocument, TextFilter, TextGatherMode,
     TextIndexStats, TextQueryMode, TextSearchHit, TextSearchOptions, TextSearchRequest,
-    TextTermStats, TextTermStatsRequest, TimeRange, TraversalOptions, TraversalRequest,
-    VectorIndexKind, VectorMetadataFilter, VectorRecord, VectorSearchHit, VectorSearchRequest,
-    VectorStoreCapabilities, VectorStoreInfo, MAX_SPARSE_SEARCH_TOP_K,
+    TextTermStats, TextTermStatsRequest, TimeRange, TraversalExecutionBudget, TraversalOptions,
+    TraversalRequest, VectorIndexKind, VectorMetadataFilter, VectorRecord, VectorSearchHit,
+    VectorSearchRequest, VectorStoreCapabilities, VectorStoreInfo, DEFAULT_TRAVERSAL_LIMIT,
+    MAX_SPARSE_SEARCH_TOP_K, MAX_TRAVERSAL_DEPTH, MAX_TRAVERSAL_LIMIT, MAX_TRAVERSAL_MILLIS,
+    MAX_TRAVERSAL_ROOTS, MAX_TRAVERSAL_WORK,
 };
 
 pub use khive_types::{EdgeCategory, EdgeRelation, EventOutcome, SubstrateKind};

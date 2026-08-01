@@ -196,9 +196,9 @@ See `crates/khive-db/src/checkpoint.rs` — `TxAgeSweepState`, `TxAgeSweepState:
 
 `tx_registry::oldest()` can be pinned by any registered span regardless of
 which call site created it (`atomic_unit`, `WriterGuard::transaction`, a
-store's own batch-upsert helper, or `graph.rs`'s chunked-traversal read
-snapshot). This is deliberately a different signal from the WAL-pressure
-ladder: a registered span can go stale while `wal_pages` sits well under
+store's own batch-upsert helper, or one of `graph.rs`'s bounded,
+statement-scoped traversal reads). This is deliberately a different signal
+from the WAL-pressure ladder: a registered span can go stale while `wal_pages` sits well under
 `warn_pages` (nothing has pinned the checkpoint boundary yet), and
 conversely `wal_pages` can be elevated with an empty registry (the pin, if
 any, is outside this process — see the ADR's own "route reads through the
@@ -332,8 +332,9 @@ Integration-level regression for the incident this ADR fixes: a real `BEGIN
 DEFERRED` reader pins a WAL snapshot (exactly like
 `checkpoint_high_water_does_not_block_behind_reader`) while also being
 registered in the shared `tx_registry` (simulating an instrumented
-long-lived-reader call site such as `graph.rs`'s `graph_traverse_read`),
-writes drive `wal_pages` past `high_water_pages`, and — with a
+long-lived-reader call site; `graph.rs`'s `graph_traverse_read` is no longer
+such a site after ADR-091 Amendment 4), writes drive `wal_pages` past
+`high_water_pages`, and — with a
 millisecond-scale `tx_max_age_secs` so the test does not sleep for real
 minutes — the Plank 1 sweep escalates to `Stale` naming that exact reader,
 alongside the existing Plank 0 high-water WARN. This is the "detection

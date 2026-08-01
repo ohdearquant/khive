@@ -217,6 +217,7 @@ async fn traverse_multi_hop() {
         },
         include_roots: false,
         include_properties: false,
+        execution_budget: Default::default(),
     };
 
     let paths = rt.traverse(&tok, request).await.unwrap();
@@ -271,6 +272,7 @@ async fn traverse_total_weight_excludes_soft_deleted_nodes() {
         },
         include_roots: false,
         include_properties: false,
+        execution_budget: Default::default(),
     };
 
     let before = rt.traverse(&tok, request()).await.unwrap();
