@@ -364,7 +364,7 @@ pub(crate) enum FeedbackEventWrite {
 enum MutationOutcome<R> {
     Committed {
         result: R,
-        state: BrainState,
+        state: Box<BrainState>,
         snapshot_version: i64,
     },
     Rejected(RuntimeError),
@@ -373,7 +373,7 @@ enum MutationOutcome<R> {
 enum FeedbackMutationOutcome {
     Committed {
         event: Event,
-        state: BrainState,
+        state: Box<BrainState>,
         snapshot_version: i64,
     },
     Deduped,
@@ -447,17 +447,19 @@ pub async fn persist_brain_state_mutation<R: Send + 'static>(
                                 khive_storage::StorageError::driver(
                                     khive_storage::StorageCapability::Sql,
                                     "brain_persist_load_snapshot",
-                                    "snapshot disappeared inside the write transaction",
+                                    std::io::Error::other(
+                                        "snapshot disappeared inside the write transaction",
+                                    ),
                                 )
                             })?;
                     if reloaded_updated_at != updated_at {
                         return Err(khive_storage::StorageError::driver(
                             khive_storage::StorageCapability::Sql,
                             "brain_persist_load_snapshot",
-                            format!(
+                            std::io::Error::other(format!(
                                 "snapshot generation changed inside the write transaction: \
                                  expected {updated_at}, got {reloaded_updated_at}"
-                            ),
+                            )),
                         ));
                     }
                     durable_snapshot
@@ -505,7 +507,7 @@ pub async fn persist_brain_state_mutation<R: Send + 'static>(
                 })?;
             Ok(Box::new(MutationOutcome::Committed {
                 result,
-                state: proposed,
+                state: Box::new(proposed),
                 snapshot_version: commit_at_us,
             }) as Box<dyn std::any::Any + Send>)
         })
@@ -526,7 +528,7 @@ pub async fn persist_brain_state_mutation<R: Send + 'static>(
             let mut t = tracker.lock().unwrap();
             if !matches!(t.snapshot_version(&namespace), Some(current) if current > snapshot_version)
             {
-                *state.lock().unwrap() = proposed;
+                *state.lock().unwrap() = *proposed;
                 t.reset_dirty(&namespace);
                 t.mark_loaded_at(namespace, Some(snapshot_version));
             }
@@ -586,17 +588,19 @@ pub(crate) async fn persist_feedback_state_mutation(
                                 khive_storage::StorageError::driver(
                                     khive_storage::StorageCapability::Sql,
                                     "brain_feedback_load_snapshot",
-                                    "snapshot disappeared inside the write transaction",
+                                    std::io::Error::other(
+                                        "snapshot disappeared inside the write transaction",
+                                    ),
                                 )
                             })?;
                     if reloaded_updated_at != updated_at {
                         return Err(khive_storage::StorageError::driver(
                             khive_storage::StorageCapability::Sql,
                             "brain_feedback_load_snapshot",
-                            format!(
+                            std::io::Error::other(format!(
                                 "snapshot generation changed inside the write transaction: \
                                  expected {updated_at}, got {reloaded_updated_at}"
-                            ),
+                            )),
                         ));
                     }
                     durable_snapshot
@@ -739,7 +743,7 @@ pub(crate) async fn persist_feedback_state_mutation(
 
             Ok(Box::new(FeedbackMutationOutcome::Committed {
                 event,
-                state: proposed,
+                state: Box::new(proposed),
                 snapshot_version: commit_at_us,
             }) as Box<dyn std::any::Any + Send>)
         })
@@ -763,7 +767,7 @@ pub(crate) async fn persist_feedback_state_mutation(
                 tracker.snapshot_version(&namespace),
                 Some(current) if current > snapshot_version
             ) {
-                *state.lock().unwrap() = proposed;
+                *state.lock().unwrap() = *proposed;
                 tracker.reset_dirty(&namespace);
                 tracker.mark_loaded_at(namespace, Some(snapshot_version));
             }

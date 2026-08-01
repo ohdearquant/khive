@@ -4329,9 +4329,15 @@ async fn feedback_revalidates_lifecycle_inside_cross_process_transaction() {
         .await
         .expect("read feedback side-effect counts")
         .expect("count row");
-    assert_eq!(row.get("public_events"), Some(&SqlValue::Integer(0)));
-    assert_eq!(row.get("private_events"), Some(&SqlValue::Integer(0)));
-    assert_eq!(row.get("mass_rows"), Some(&SqlValue::Integer(0)));
+    assert!(matches!(
+        row.get("public_events"),
+        Some(SqlValue::Integer(0))
+    ));
+    assert!(matches!(
+        row.get("private_events"),
+        Some(SqlValue::Integer(0))
+    ));
+    assert!(matches!(row.get("mass_rows"), Some(SqlValue::Integer(0))));
 }
 
 #[tokio::test]
