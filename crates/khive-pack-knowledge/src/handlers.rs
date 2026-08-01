@@ -848,7 +848,8 @@ mod tests {
         let mut builder = VerbRegistryBuilder::new();
         builder.register(KgPack::new(rt.clone()));
         builder.register(BrainPack::new(rt.clone()));
-        let registry = builder.build().expect("kg+brain registry builds");
+        builder.register(KnowledgePack::new(rt.clone()));
+        let registry = builder.build().expect("kg+brain+knowledge registry builds");
         let arm_ns = "bench-arm-a";
 
         registry
