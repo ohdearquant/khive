@@ -142,7 +142,16 @@ future caller-supplied idempotency/correlation contract and is out of scope.
 
 ## `handlers.rs::handle_inbox`
 
-Lists inbound messages for the caller's actor label (ADR-057).
+Lists inbound messages for the caller's actor label by default (ADR-057).
+`box="sent"` selects outbound rows authored by that caller instead; no separate
+storage format or verb is involved. An attributed caller's sent view requires
+an exact `from_actor` match. The anonymous `local` single-actor fallback also
+admits legacy outbound rows without `from_actor`. `to_actor` is an optional
+exact recipient filter for the sent box. Read `status` and sender filters are
+inbox-only and are rejected with `box="sent"`, while `to_actor` is rejected for
+the default inbox, so a misplaced filter cannot silently return the wrong box.
+The existing envelope remains stable; `unread_count` is zero for the sent box
+because outbound rows have no recipient read state.
 
 When the caller's actor label is `"local"` (single-actor fallback), no
 `to_actor` filter is applied and the inbox behaves as before (party-line).
@@ -170,6 +179,19 @@ the top-level note `created_at` exposed in the response, not optional transport
 metadata in `properties.sent_at`. Empty substring filters are rejected, and a
 missing/non-string subject does not match `subject_contains`.
 
+`fields` is the same strict, non-empty projection used by `comm.thread`.
+Omitting it preserves the full message object. The accepted top-level names are
+`id`, `short_id`, `full_id`, `kind`, `from`, `to`, `subject`, `read`,
+`direction`, `preview`, `content`, `namespace`, `properties`, `created_at`, and
+`updated_at`. Stable property aliases `comm_schema_version`, `from_actor`,
+`to_actor`, `thread_id`, `sent_at`, `outbound_ref`, and `sent_by_process` are
+also available without returning the full `properties` map; an absent optional
+property projects as null, except `from_actor`/`to_actor`, which retain the
+full view's documented legacy `from`/`to` fallbacks. Unknown names and an empty
+list are hard errors.
+Authorization, filtering, unread counting, pagination lookahead, and thread
+deduplication all operate on the complete internal view before projection.
+
 ## `handlers.rs::handle_read`
 
 Marks a message as read. Rejects `read()` on outbound messages — "read" is a
@@ -190,7 +212,7 @@ back an earlier successful item.
 Patches only the `read` key via `NoteStore::try_patch_note_property`, a
 storage-side `json_set`, not a caller-side merge-then-overwrite of the whole
 `properties` column: the write re-evaluates namespace, message kind, direction,
-and addressee against the row's *current* state in the same `UPDATE`, so a
+and addressee against the row's _current_ state in the same `UPDATE`, so a
 property written by another caller between validation and this call (the bulk
 form's window can span up to 500 targets) survives untouched, and an
 eligibility change in that window degrades the mark instead of silently
@@ -324,6 +346,10 @@ compare exact `(i64, Uuid)` tuples instead of re-parsing the ISO string
 embedded in the JSON. `AfterCursor::Id` carries the full tuple for
 tie-breaking; `AfterCursor::Timestamp` carries only the parsed microsecond
 value since there is no specific row to break ties against.
+
+The optional `fields` projection is identical to `comm.inbox` and is applied
+only after visibility filtering, dual-write deduplication, cursor filtering,
+ordering, and truncation. Omitting it preserves the full thread response.
 
 ## `handlers.rs::handle_ingest`
 

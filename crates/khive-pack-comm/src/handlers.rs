@@ -15,8 +15,8 @@ use khive_storage::note::{FilterOp, Note, NoteFilter, PropertyFilter};
 use khive_storage::types::{PageRequest, SqlValue};
 
 use crate::message::{
-    dual_write_message, note_to_message_json, resolve_id, short_id, COMM_SCHEMA_VERSION,
-    COMM_STABLE_PROPERTY_KEYS,
+    dual_write_message, note_to_message_json, project_message_json, resolve_id, short_id,
+    validate_message_projection_fields, COMM_SCHEMA_VERSION, COMM_STABLE_PROPERTY_KEYS,
 };
 use crate::params::{
     deser, CursorCommitParams, CursorGetParams, DeliveredParams, HeartbeatParams, InboxParams,
@@ -343,7 +343,7 @@ pub(crate) async fn handle_delivered(
     }))
 }
 
-/// `inbox` — list inbound messages for the caller's actor label (ADR-057).
+/// `inbox` — list inbound messages by default, or caller-authored sent rows (ADR-057).
 /// See crates/khive-pack-comm/docs/api/message-lifecycle.md#handlersrshandle_inbox
 pub(crate) async fn handle_inbox(
     runtime: &KhiveRuntime,
@@ -351,6 +351,7 @@ pub(crate) async fn handle_inbox(
     params: Value,
 ) -> Result<Value, RuntimeError> {
     let p: InboxParams = deser(params)?;
+    validate_message_projection_fields("inbox", p.fields.as_deref())?;
     let raw_limit = p.limit.unwrap_or(20);
     let offset = p.offset.unwrap_or(0);
     if offset > i64::MAX as u64 {
@@ -360,6 +361,33 @@ pub(crate) async fn handle_inbox(
         )));
     }
 
+    let mailbox = match p.mailbox.as_deref().unwrap_or("inbox") {
+        mailbox @ ("inbox" | "sent") => mailbox,
+        other => {
+            return Err(RuntimeError::InvalidInput(format!(
+                "inbox: invalid `box` {other:?}; expected one of: inbox, sent"
+            )));
+        }
+    };
+
+    if mailbox == "sent" {
+        if p.status.is_some() {
+            return Err(RuntimeError::InvalidInput(
+                "inbox: `status` applies only to box=\"inbox\"; omit it for box=\"sent\"".into(),
+            ));
+        }
+        if p.from_actor.is_some() || p.from_prefix.is_some() || p.exclude_from_actor.is_some() {
+            return Err(RuntimeError::InvalidInput(
+                "inbox: sender filters apply only to box=\"inbox\"; use `to_actor` to filter box=\"sent\""
+                    .into(),
+            ));
+        }
+    } else if p.to_actor.is_some() {
+        return Err(RuntimeError::InvalidInput(
+            "inbox: `to_actor` applies only to box=\"sent\"".into(),
+        ));
+    }
+
     // #493: from_actor / from_prefix sender filter — mutually exclusive.
     if p.from_actor.is_some() && p.from_prefix.is_some() {
         return Err(RuntimeError::InvalidInput(
@@ -367,14 +395,19 @@ pub(crate) async fn handle_inbox(
         ));
     }
 
-    let status = match p.status.as_deref().unwrap_or("unread") {
-        s @ ("unread" | "read" | "all") => s,
-        other => {
-            return Err(RuntimeError::InvalidInput(format!(
-                "inbox: invalid status {other:?}; expected one of: unread, read, all"
-            )));
-        }
-    };
+    let status =
+        match p
+            .status
+            .as_deref()
+            .unwrap_or(if mailbox == "inbox" { "unread" } else { "all" })
+        {
+            s @ ("unread" | "read" | "all") => s,
+            other => {
+                return Err(RuntimeError::InvalidInput(format!(
+                    "inbox: invalid status {other:?}; expected one of: unread, read, all"
+                )));
+            }
+        };
 
     validate_inbox_substring("subject_contains", p.subject_contains.as_deref())?;
     validate_inbox_substring("content_contains", p.content_contains.as_deref())?;
@@ -396,7 +429,11 @@ pub(crate) async fn handle_inbox(
     }
 
     if raw_limit == 0 {
-        let unread_count = count_unread_messages(runtime, token, &token.actor().id).await?;
+        let unread_count = if mailbox == "inbox" {
+            count_unread_messages(runtime, token, &token.actor().id).await?
+        } else {
+            0
+        };
         return Ok(json!({
             "messages": [],
             "count": 0,
@@ -415,35 +452,63 @@ pub(crate) async fn handle_inbox(
     let mut property_filters = vec![PropertyFilter {
         json_path: "$.direction".to_string(),
         op: FilterOp::Eq,
-        value: SqlValue::Text("inbound".to_string()),
+        value: SqlValue::Text(
+            if mailbox == "inbox" {
+                "inbound"
+            } else {
+                "outbound"
+            }
+            .to_string(),
+        ),
     }];
-    match status {
-        "unread" => property_filters.push(PropertyFilter {
-            json_path: "$.read".to_string(),
-            op: FilterOp::JsonTypeNeMissing,
-            value: SqlValue::Text("true".to_string()),
-        }),
-        "read" => property_filters.push(PropertyFilter {
-            json_path: "$.read".to_string(),
-            op: FilterOp::JsonTypeEq,
-            value: SqlValue::Text("true".to_string()),
-        }),
-        _ => {} // "all" — no read-status filter
+    if mailbox == "inbox" {
+        match status {
+            "unread" => property_filters.push(PropertyFilter {
+                json_path: "$.read".to_string(),
+                op: FilterOp::JsonTypeNeMissing,
+                value: SqlValue::Text("true".to_string()),
+            }),
+            "read" => property_filters.push(PropertyFilter {
+                json_path: "$.read".to_string(),
+                op: FilterOp::JsonTypeEq,
+                value: SqlValue::Text("true".to_string()),
+            }),
+            _ => {} // "all" — no read-status filter
+        }
     }
 
-    // ADR-057 Q3: to_actor filter, EqOrMissing so legacy to_actor-less messages stay
-    // visible; closes the #199 multi-actor read leak for non-"local" callers.
-    property_filters.push(PropertyFilter {
-        json_path: "$.to_actor".to_string(),
-        op: FilterOp::EqOrMissing,
-        value: SqlValue::Text(caller_actor.clone()),
-    });
-    if let Some(from_actor) = p.from_actor.as_ref() {
+    if mailbox == "inbox" {
+        // ADR-057 Q3: to_actor filter, EqOrMissing so legacy to_actor-less messages stay
+        // visible; closes the #199 multi-actor read leak for non-"local" callers.
+        property_filters.push(PropertyFilter {
+            json_path: "$.to_actor".to_string(),
+            op: FilterOp::EqOrMissing,
+            value: SqlValue::Text(caller_actor.clone()),
+        });
+        if let Some(from_actor) = p.from_actor.as_ref() {
+            property_filters.push(PropertyFilter {
+                json_path: "$.from_actor".to_string(),
+                op: FilterOp::Eq,
+                value: SqlValue::Text(from_actor.clone()),
+            });
+        }
+    } else {
         property_filters.push(PropertyFilter {
             json_path: "$.from_actor".to_string(),
-            op: FilterOp::Eq,
-            value: SqlValue::Text(from_actor.clone()),
+            op: if caller_actor == "local" {
+                FilterOp::EqOrMissing
+            } else {
+                FilterOp::Eq
+            },
+            value: SqlValue::Text(caller_actor.clone()),
         });
+        if let Some(to_actor) = p.to_actor.as_ref() {
+            property_filters.push(PropertyFilter {
+                json_path: "$.to_actor".to_string(),
+                op: FilterOp::Eq,
+                value: SqlValue::Text(to_actor.clone()),
+            });
+        }
     }
 
     let filter = NoteFilter {
@@ -536,14 +601,18 @@ pub(crate) async fn handle_inbox(
     }
     let count = messages.len();
     // #66: cheap derived stat over the page already fetched above — no extra
-    // DB round-trip. For `status="unread"` every returned message is unread
-    // by definition, so this equals `count`; for `"read"`/`"all"` it counts
-    // however many of the *returned* rows are unread (not a global total —
-    // `comm.unread` is the verb for that).
-    let unread_count = messages
-        .iter()
-        .filter(|m| !m["read"].as_bool().unwrap_or(false))
-        .count();
+    // DB round-trip. The count is inbox-only: sent rows have no recipient read
+    // state and report zero. For inbox `status="unread"`, this equals `count`;
+    // for `"read"`/`"all"`, it counts unread rows in this page (not a global
+    // total — `comm.unread` is the verb for that).
+    let unread_count = if mailbox == "inbox" {
+        messages
+            .iter()
+            .filter(|m| !m["read"].as_bool().unwrap_or(false))
+            .count()
+    } else {
+        0
+    };
     let next_offset = if has_more {
         Some(offset.checked_add(count as u64).ok_or_else(|| {
             RuntimeError::InvalidInput("inbox: pagination offset overflowed".into())
@@ -551,6 +620,10 @@ pub(crate) async fn handle_inbox(
     } else {
         None
     };
+    let messages: Vec<Value> = messages
+        .into_iter()
+        .map(|message| project_message_json(message, p.fields.as_deref()))
+        .collect();
     Ok(json!({
         "messages": messages,
         "count": count,
@@ -1164,6 +1237,7 @@ pub(crate) async fn handle_thread(
     params: Value,
 ) -> Result<Value, RuntimeError> {
     let p: ThreadParams = deser(params)?;
+    validate_message_projection_fields("thread", p.fields.as_deref())?;
     let limit = p.limit.unwrap_or(100).clamp(1, 500) as usize;
 
     // #494: order — "asc" (default, unchanged) | "desc". Closed set.
@@ -1452,7 +1526,10 @@ pub(crate) async fn handle_thread(
     });
     rows.truncate(limit);
     let count = rows.len();
-    let messages: Vec<Value> = rows.into_iter().map(|r| r.json).collect();
+    let messages: Vec<Value> = rows
+        .into_iter()
+        .map(|row| project_message_json(row.json, p.fields.as_deref()))
+        .collect();
 
     Ok(json!({
         "thread_id": canonical_thread_id,

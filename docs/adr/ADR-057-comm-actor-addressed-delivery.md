@@ -7,7 +7,8 @@
 Schedule Packs)\
 **Related issues**: #57 (actor-addressed delivery -- primary), #13 (cross-namespace policy
 gate), #75 (actor identity on every request), #1447 (sender-side dual-write confirmation),
-#1428 (process provenance), #1490 (versioned message properties)
+#1428 (process provenance), #1490 (versioned message properties), #1468 (list-read field
+projection), #1471 (sender-visible sent history)
 
 ## Context
 
@@ -194,6 +195,24 @@ extracted at view time and are additive (no existing keys are removed or renamed
 The `preview` field is computed from `content` in the view layer. Stored content is never
 mutated. When `subject` is null, `preview` provides a fallback scan line for the inbox.
 
+#### Amendment: sent box and list-read projection (2026-08-01)
+
+`comm.inbox` remains inbound-only when `box` is omitted. The additive
+`box="sent"` form selects outbound rows whose `from_actor` is the calling actor,
+with an optional exact `to_actor` recipient filter and the same pagination and
+time-window machinery as the inbox. Attributed callers do not inherit legacy
+rows with no `from_actor`; the `local` single-actor fallback does. Read-status
+and sender filters remain inbox-only and fail when combined with the sent box.
+
+`comm.inbox` and `comm.thread` accept the same closed `fields` list. The
+projection is applied after actor visibility, filtering, pagination, and thread
+deduplication. It can select ordinary top-level view fields or stable message
+property aliases such as `from_actor`, `to_actor`, and `sent_at`; absent optional
+properties render as null, while `from_actor`/`to_actor` retain the full view's
+legacy `from`/`to` fallback semantics. Omitting `fields` preserves the complete
+historical response, while an empty list or an unknown field is rejected rather
+than silently changing shape.
+
 ### `comm.send` behavior change
 
 The `to` parameter is reinterpreted. When `to` does not start with a recognized remote
@@ -288,6 +307,10 @@ the properties JSON for both copies.
   to actor-scoped callers; see Open Question Q3.
 
 The `status` filter (`unread`, `read`, `all`) is unchanged.
+
+The optional `box="sent"` path reverses the actor predicate: it requires
+`direction=outbound` and `from_actor=caller`, then optionally filters
+`to_actor`. The default remains this section's inbound behavior.
 
 The `idx_comm_message_direction` index (vocab.rs:17) covers `(namespace, kind, direction,
 read, created_at)`. When actor filtering is active, a separate index covering

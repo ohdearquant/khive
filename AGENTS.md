@@ -168,7 +168,7 @@ it does not train the default/live namespace's posterior state.
 | ---------------- | ------------------------------------------------------------------------------------------------------ | --------------------------------------------- |
 | `comm.send`      | Send a message (optionally threaded)                                                                   | Inter-agent or inter-namespace messaging      |
 | `comm.delivered` | Confirm the internal inbound sibling for an outbound UUID                                              | Resolve an ambiguous atomic-write outcome     |
-| `comm.inbox`     | Page and filter inbound messages                                                                       | Check or triage what's waiting                |
+| `comm.inbox`     | Page/filter inbound or caller-authored sent messages; optionally project fields                        | Triage inbox or inspect sent history          |
 | `comm.unread`    | Count-only view of unread inbound messages (no args, no payloads)                                      | Cheap unread check without listing            |
 | `comm.read`      | Mark one or more **inbound** messages as read (best-effort: inspect each result's `read`/`mark_error`) | Acknowledge receipt (recipient action)        |
 | `comm.reply`     | Reply to a message (threading linkage)                                                                 | Respond in-thread                             |
@@ -188,6 +188,11 @@ Use `offset=<next_offset>` with otherwise-identical `comm.inbox` arguments until
 changing read state. Filters include exact/prefix/excluded sender, inclusive `since`, exclusive
 `before`, and case-insensitive `subject_contains`/`content_contains`; time bounds use the
 response's top-level `created_at`.
+
+`comm.inbox(box="sent", to_actor="lambda:x", since="...")` lists only the calling actor's
+outbound rows; omitting `box` keeps the inbound default. `status` and sender filters are inbox-only.
+Both `comm.inbox` and `comm.thread` accept the same strict, non-empty `fields=[...]` projection;
+unknown names fail and omission preserves the full message object.
 
 **`comm.read` is inbound-only.** It marks a received message as read; calling it on an outbound
 (sent) message returns `read: message <uuid> is outbound; only received (inbound) messages can be

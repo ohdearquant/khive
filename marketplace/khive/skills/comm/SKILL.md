@@ -77,7 +77,11 @@ operation. Always pass a `limit` — active inboxes are large. If `next_offset` 
 the same inbox filters with `offset=<next_offset>` until it is null; pagination itself never marks
 messages read. Use `content_contains` when automated notifications omit `subject`; sender
 exact/prefix/exclusion, RFC3339 `since`/`before`, and subject/content substring filters can be
-combined. Mark writes are best-effort and cross-message updates are not atomic: inspect every
+combined. Use `box="sent"` with optional `to_actor` and `since` to inspect your own outbound
+history; omitting `box` remains inbound-only. For cheap list reads, pass the same strict
+`fields=[...]` projection to `comm.inbox` or `comm.thread` (for example
+`fields=["id","subject","from_actor","sent_at"]`); unknown fields fail rather than being
+ignored. Mark writes are best-effort and cross-message updates are not atomic: inspect every
 result's `read`/`mark_error`, and re-issue failures later.
 
 ### 4. Reply to thread, don't start a new one

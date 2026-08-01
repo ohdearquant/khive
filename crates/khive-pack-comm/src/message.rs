@@ -23,6 +23,85 @@ pub(crate) const COMM_STABLE_PROPERTY_KEYS: &[&str] = &[
     "sent_by_process",
 ];
 
+/// Closed field vocabulary accepted by list-read message projections.
+///
+/// The first group is the ordinary top-level message view. The second group
+/// exposes stable property keys as top-level aliases only when a caller opts
+/// into projection, so callers can request routing/timestamp metadata without
+/// paying for the entire `properties` object.
+pub(crate) const MESSAGE_PROJECTION_FIELDS: &[&str] = &[
+    "id",
+    "short_id",
+    "full_id",
+    "kind",
+    "from",
+    "to",
+    "subject",
+    "read",
+    "direction",
+    "preview",
+    "content",
+    "namespace",
+    "properties",
+    "created_at",
+    "updated_at",
+    "comm_schema_version",
+    "from_actor",
+    "to_actor",
+    "thread_id",
+    "sent_at",
+    "outbound_ref",
+    "sent_by_process",
+];
+
+pub(crate) fn validate_message_projection_fields(
+    verb: &str,
+    fields: Option<&[String]>,
+) -> Result<(), RuntimeError> {
+    let Some(fields) = fields else {
+        return Ok(());
+    };
+    if fields.is_empty() {
+        return Err(RuntimeError::InvalidInput(format!(
+            "{verb}: `fields` must contain at least one field"
+        )));
+    }
+    if let Some(unknown) = fields
+        .iter()
+        .find(|field| !MESSAGE_PROJECTION_FIELDS.contains(&field.as_str()))
+    {
+        return Err(RuntimeError::InvalidInput(format!(
+            "{verb}: unknown projection field {unknown:?}; expected one of: {}",
+            MESSAGE_PROJECTION_FIELDS.join(", ")
+        )));
+    }
+    Ok(())
+}
+
+pub(crate) fn project_message_json(message: Value, fields: Option<&[String]>) -> Value {
+    let Some(fields) = fields else {
+        return message;
+    };
+
+    let mut projected = serde_json::Map::new();
+    for field in fields {
+        let value = message.get(field).cloned().unwrap_or_else(|| {
+            message
+                .get("properties")
+                .and_then(|properties| properties.get(field))
+                .cloned()
+                .or_else(|| match field.as_str() {
+                    "from_actor" => message.get("from").cloned(),
+                    "to_actor" => message.get("to").cloned(),
+                    _ => None,
+                })
+                .unwrap_or(Value::Null)
+        });
+        projected.insert(field.clone(), value);
+    }
+    Value::Object(projected)
+}
+
 pub(crate) fn short_id(uuid: Uuid) -> String {
     uuid.as_hyphenated().to_string().chars().take(8).collect()
 }

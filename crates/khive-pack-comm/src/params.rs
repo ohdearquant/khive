@@ -37,6 +37,9 @@ pub(crate) struct DeliveredParams {
 pub(crate) struct InboxParams {
     #[serde(default)]
     pub limit: Option<u32>,
+    /// `"inbox"` (default) or `"sent"`.
+    #[serde(default, rename = "box")]
+    pub mailbox: Option<String>,
     /// Offset in the fully-filtered, newest-first result set.
     #[serde(default)]
     pub offset: Option<u64>,
@@ -52,6 +55,9 @@ pub(crate) struct InboxParams {
     /// Exclude messages whose `properties.from_actor` exactly matches this label.
     #[serde(default)]
     pub exclude_from_actor: Option<String>,
+    /// Exact recipient match for `box="sent"`.
+    #[serde(default)]
+    pub to_actor: Option<String>,
     /// Inclusive lower `created_at` bound, expressed as RFC 3339.
     #[serde(default)]
     pub since: Option<String>,
@@ -64,6 +70,9 @@ pub(crate) struct InboxParams {
     /// Case-insensitive substring match on the message body.
     #[serde(default)]
     pub content_contains: Option<String>,
+    /// Optional projection applied to every returned message record.
+    #[serde(default)]
+    pub fields: Option<Vec<String>>,
 }
 
 #[derive(Deserialize)]
@@ -107,6 +116,9 @@ pub(crate) struct ThreadParams {
     /// crates/khive-pack-comm/docs/api/message-lifecycle.md#handlersrshandle_thread
     #[serde(default)]
     pub after: Option<String>,
+    /// Optional projection applied to every returned message record.
+    #[serde(default)]
+    pub fields: Option<Vec<String>>,
 }
 
 /// Parameters for `comm.ingest` — ingests a single inbound message from a

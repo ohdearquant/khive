@@ -9613,3 +9613,184 @@ async fn i1422_rejects_invalid_filter_and_bulk_shapes() {
         .await
         .is_err());
 }
+
+// ── #1468 / #1471: projected inbox/thread reads and sent history ─────────────
+
+#[tokio::test]
+async fn i1471_sent_box_is_sender_scoped_and_filters_recipient_and_since() {
+    let backend = shared_backend();
+    let (registry_a, _runtime_a) = build_actor_registry(backend.clone(), "lambda:a");
+    let (registry_other, _runtime_other) = build_actor_registry(backend, "lambda:other");
+    let since = (chrono::Utc::now() - chrono::Duration::seconds(1)).to_rfc3339();
+
+    let to_b = registry_a
+        .dispatch(
+            "comm.send",
+            serde_json::json!({
+                "to": "lambda:b",
+                "subject": "for B",
+                "content": "sender A to B",
+            }),
+        )
+        .await
+        .expect("A sends to B");
+    registry_a
+        .dispatch(
+            "comm.send",
+            serde_json::json!({ "to": "lambda:c", "content": "sender A to C" }),
+        )
+        .await
+        .expect("A sends to C");
+    registry_other
+        .dispatch(
+            "comm.send",
+            serde_json::json!({ "to": "lambda:b", "content": "other sender to B" }),
+        )
+        .await
+        .expect("other actor sends to B");
+
+    let default_box = registry_a
+        .dispatch(
+            "comm.inbox",
+            serde_json::json!({ "status": "all", "limit": 10 }),
+        )
+        .await
+        .expect("default inbox remains inbound-only");
+    assert_eq!(default_box["count"], 0);
+
+    let sent_to_b = registry_a
+        .dispatch(
+            "comm.inbox",
+            serde_json::json!({
+                "box": "sent",
+                "to_actor": "lambda:b",
+                "since": since,
+                "limit": 10,
+            }),
+        )
+        .await
+        .expect("sent history");
+    assert_eq!(sent_to_b["count"], 1);
+    assert_eq!(sent_to_b["messages"][0]["full_id"], to_b["full_id"]);
+    assert_eq!(sent_to_b["messages"][0]["from"], "lambda:a");
+    assert_eq!(sent_to_b["messages"][0]["to"], "lambda:b");
+    assert_eq!(sent_to_b["messages"][0]["direction"], "outbound");
+    assert_eq!(sent_to_b["unread_count"], 0);
+
+    let all_sent = registry_a
+        .dispatch(
+            "comm.inbox",
+            serde_json::json!({ "box": "sent", "limit": 10 }),
+        )
+        .await
+        .expect("all caller-authored sent rows");
+    assert_eq!(
+        all_sent["count"], 2,
+        "another actor's outbound row must not leak"
+    );
+
+    let future = (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339();
+    let none = registry_a
+        .dispatch(
+            "comm.inbox",
+            serde_json::json!({ "box": "sent", "since": future }),
+        )
+        .await
+        .expect("sent since filter");
+    assert_eq!(none["count"], 0);
+
+    let status_error = registry_a
+        .dispatch(
+            "comm.inbox",
+            serde_json::json!({ "box": "sent", "status": "all" }),
+        )
+        .await
+        .expect_err("read status has no meaning for sent rows");
+    assert!(status_error.to_string().contains("applies only"));
+}
+
+#[tokio::test]
+async fn i1468_fields_projects_inbox_and_thread_with_one_strict_vocabulary() {
+    let backend = shared_backend();
+    let (registry_a, _runtime_a) = build_actor_registry(backend.clone(), "lambda:a");
+    let (registry_b, _runtime_b) = build_actor_registry(backend, "lambda:b");
+
+    let sent = registry_a
+        .dispatch(
+            "comm.send",
+            serde_json::json!({
+                "to": "lambda:b",
+                "subject": "projection contract",
+                "content": "body must be omitted from the projected view",
+            }),
+        )
+        .await
+        .expect("send for projection test");
+    let fields = serde_json::json!(["id", "subject", "from_actor", "sent_at", "created_at"]);
+
+    let inbox = registry_b
+        .dispatch(
+            "comm.inbox",
+            serde_json::json!({ "status": "all", "fields": fields.clone() }),
+        )
+        .await
+        .expect("projected inbox");
+    assert_eq!(inbox["count"], 1);
+    let inbox_message = inbox["messages"][0].as_object().unwrap();
+    let expected: std::collections::BTreeSet<&str> =
+        ["id", "subject", "from_actor", "sent_at", "created_at"]
+            .into_iter()
+            .collect();
+    let actual: std::collections::BTreeSet<&str> =
+        inbox_message.keys().map(String::as_str).collect();
+    assert_eq!(actual, expected);
+    assert_eq!(inbox_message["from_actor"], "lambda:a");
+    assert!(inbox_message["sent_at"].as_str().is_some());
+    assert!(inbox_message["created_at"].as_str().is_some());
+
+    let thread = registry_a
+        .dispatch(
+            "comm.thread",
+            serde_json::json!({ "id": sent["full_id"], "fields": fields }),
+        )
+        .await
+        .expect("projected thread");
+    assert_eq!(thread["count"], 1);
+    let thread_message = thread["messages"][0].as_object().unwrap();
+    let thread_keys: std::collections::BTreeSet<&str> =
+        thread_message.keys().map(String::as_str).collect();
+    assert_eq!(thread_keys, expected);
+
+    let full = registry_b
+        .dispatch("comm.inbox", serde_json::json!({ "status": "all" }))
+        .await
+        .expect("omitted projection preserves the full view");
+    assert!(full["messages"][0].get("content").is_some());
+    assert!(full["messages"][0].get("properties").is_some());
+
+    for (verb, params) in [
+        (
+            "comm.inbox",
+            serde_json::json!({ "fields": ["not_a_message_field"] }),
+        ),
+        (
+            "comm.thread",
+            serde_json::json!({
+                "id": sent["full_id"],
+                "fields": ["not_a_message_field"],
+            }),
+        ),
+    ] {
+        let error = registry_a
+            .dispatch(verb, params)
+            .await
+            .expect_err("unknown projection field must fail");
+        assert!(error.to_string().contains("unknown projection field"));
+    }
+
+    let empty = registry_a
+        .dispatch("comm.inbox", serde_json::json!({ "fields": [] }))
+        .await
+        .expect_err("an empty projection is ambiguous and must fail");
+    assert!(empty.to_string().contains("at least one field"));
+}
