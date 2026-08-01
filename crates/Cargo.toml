@@ -73,7 +73,7 @@ lettre = { version = "0.11", default-features = false, features = ["tokio1-rustl
 async-imap = "0.9"
 async-native-tls = "0.5"
 mail-parser = "0.9"
-rusqlite = { version = "0.33" }
+rusqlite = { version = "0.40" }
 anyhow = "1.0.103"
 thiserror = "2.0"
 tracing = "0.1"
