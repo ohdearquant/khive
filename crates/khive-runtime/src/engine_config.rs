@@ -1262,7 +1262,10 @@ id = "lambda:explicit"
         .expect("home fallback should be selected");
 
         assert_eq!(config.actor.id.as_deref(), Some("lambda:home"));
-        assert_eq!(source, selected);
+        assert_eq!(
+            source,
+            std::fs::canonicalize(selected).expect("canonical selected config path")
+        );
     }
 
     #[test]
