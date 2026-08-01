@@ -719,14 +719,19 @@ request(ops="db_diagnostics()")
 List all MCP-callable verbs registered on this server. Internal subhandlers are
 excluded.
 
-| Param      | Type   | Required | Notes                                                                                                    |
-| ---------- | ------ | -------- | -------------------------------------------------------------------------------------------------------- |
-| `category` | string | no       | Filter: `Assertive`\|`Commissive`\|`Declaration`\|`Directive`.                                           |
-| `pack`     | string | no       | Filter by pack name (`kg`, `gtd`, `memory`, `brain`, `comm`, `schedule`, `knowledge`, `session`, `git`). |
+| Param      | Type   | Required | Notes                                                                                                                                 |
+| ---------- | ------ | -------- | ------------------------------------------------------------------------------------------------------------------------------------- |
+| `category` | string | no       | Filter: `Assertive`\|`Commissive`\|`Declaration`\|`Directive`.                                                                        |
+| `pack`     | string | no       | Filter by pack name (`kg`, `gtd`, `memory`, `brain`, `comm`, `schedule`, `knowledge`, `session`, `git`, `code`, `workspace`, `blob`). |
 
 ```
 request(ops="verbs()")
 ```
+
+The result includes the filtered `verbs` array and `total`, plus an unfiltered
+`pack_counts` object for every loaded pack. Zero-verb packs remain present in
+`pack_counts`, so callers can distinguish an ontology-only pack from one that
+was not loaded.
 
 ---
 

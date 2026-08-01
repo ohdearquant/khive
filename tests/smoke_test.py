@@ -21,7 +21,10 @@ import json
 import subprocess
 import sys
 import os
+from pathlib import Path
 from datetime import datetime, timedelta, timezone
+
+from documented_verb_counts import validate_documented_counts
 
 BINARY = os.environ.get(
     "KKERNEL_BINARY",
@@ -192,12 +195,24 @@ def main():
         print(f"  [ok] stats — entities={counts['entities']} edges={counts['edges']} notes={counts['notes']}")
 
         # verbs: verb discovery introspection.
-        # Result shape from handler_defs.rs:746-748: {"verbs": list, "total": int}.
+        # Result shape: {"verbs": list, "total": int, "pack_counts": object}.
         # Each entry has verb, pack, description, category (handler_defs.rs:735-742).
         verbs_result = call_verb(proc, "verbs", {})
         assert "verbs" in verbs_result, f"verbs must return 'verbs' key: {verbs_result}"
         assert "total" in verbs_result, f"verbs must return 'total' key: {verbs_result}"
+        assert "pack_counts" in verbs_result, f"verbs must return 'pack_counts' key: {verbs_result}"
         assert isinstance(verbs_result["verbs"], list), f"verbs must be a list: {verbs_result}"
+        assert isinstance(verbs_result["pack_counts"], dict), (
+            f"verbs.pack_counts must be an object: {verbs_result}"
+        )
+        documented_count_errors = validate_documented_counts(
+            Path(__file__).resolve().parent.parent,
+            verbs_result,
+        )
+        assert not documented_count_errors, (
+            "published verb/pack counts drifted from the live registry:\n"
+            + "\n".join(f"  - {error}" for error in documented_count_errors)
+        )
         # Surface-contract tripwire: the default config (no --pack, KHIVE_PACKS
         # unset) loads 12 production packs (kg, gtd, memory, brain, comm, schedule,
         # knowledge, session, git, code, workspace, blob), so verbs() returns exactly
@@ -275,16 +290,16 @@ def main():
         kg_verb_names = [v["verb"] for v in kg_verbs["verbs"]]
         assert "create" in kg_verb_names, f"'create' must appear in kg-filtered verbs: {kg_verb_names}"
         assert "stats" in kg_verb_names, f"'stats' must appear in kg-filtered verbs: {kg_verb_names}"
-        print(f"  [ok] verbs — {verbs_result['total']} total verbs, {kg_verbs['total']} in kg pack")
+        print(
+            f"  [ok] verbs — {verbs_result['total']} total verbs across "
+            f"{len(verbs_result['pack_counts'])} packs, {kg_verbs['total']} in kg pack; "
+            "published counts match registry"
+        )
 
-        # 3b. Zero-verb pack load tripwire (khive#848 F6): `code` contributes
-        # no MCP verbs, so a stale/dropped default-pack entry for it would
-        # not show up in the verbs() total above at all. `finding` is a note
-        # kind declared ONLY by khive-pack-code's NOTE_KIND_SPECS (ADR-085
-        # D4/Amendment 3) — if `code` were missing from the default pack set,
-        # this create would be rejected as an unknown note kind. A
-        # successful create is therefore direct proof the pack is loaded
-        # under default config, independent of the verb count.
+        # 3b. Code vocabulary load tripwire (khive#848 F6): `finding` is a note
+        # kind declared only by khive-pack-code's NOTE_KIND_SPECS (ADR-085
+        # D4/Amendment 3). A successful create proves the pack's vocabulary is
+        # loaded under default config, independently of its `code.ingest` verb.
         code_pack_finding = call_verb(proc, "create", {
             "kind": "note",
             "note_kind": "finding",

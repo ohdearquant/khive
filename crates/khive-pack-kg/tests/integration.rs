@@ -4972,11 +4972,57 @@ impl PackRuntime for FakeSubhandlerPack {
     }
 }
 
+struct FakeZeroVerbPack;
+
+impl Pack for FakeZeroVerbPack {
+    const NAME: &'static str = "empty";
+    const NOTE_KINDS: &'static [&'static str] = &[];
+    const ENTITY_KINDS: &'static [&'static str] = &[];
+    const HANDLERS: &'static [HandlerDef] = &[];
+    const REQUIRES: &'static [&'static str] = &["kg"];
+}
+
+#[async_trait]
+impl PackRuntime for FakeZeroVerbPack {
+    fn name(&self) -> &str {
+        FakeZeroVerbPack::NAME
+    }
+
+    fn note_kinds(&self) -> &'static [&'static str] {
+        FakeZeroVerbPack::NOTE_KINDS
+    }
+
+    fn entity_kinds(&self) -> &'static [&'static str] {
+        FakeZeroVerbPack::ENTITY_KINDS
+    }
+
+    fn handlers(&self) -> &'static [HandlerDef] {
+        FakeZeroVerbPack::HANDLERS
+    }
+
+    fn requires(&self) -> &'static [&'static str] {
+        FakeZeroVerbPack::REQUIRES
+    }
+
+    async fn dispatch(
+        &self,
+        verb: &str,
+        _params: Value,
+        _registry: &VerbRegistry,
+        _token: &NamespaceToken,
+    ) -> Result<Value, RuntimeError> {
+        Err(RuntimeError::InvalidInput(format!(
+            "FakeZeroVerbPack does not handle verb {verb:?}"
+        )))
+    }
+}
+
 fn pack_with_subhandler_pack() -> Fixture {
     let rt = KhiveRuntime::memory().expect("in-memory runtime must succeed");
     let mut builder = VerbRegistryBuilder::new();
     builder.register(KgPack::new(rt));
     builder.register(FakeSubhandlerPack);
+    builder.register(FakeZeroVerbPack);
     Fixture {
         registry: builder.build().expect("registry builds"),
     }
@@ -5017,6 +5063,7 @@ async fn verbs_dispatch_unfiltered_returns_public_verbs() {
         verbs_arr.len(),
         "verbs.total must match verbs array length"
     );
+    assert_eq!(result["pack_counts"], json!({"kg": verbs_arr.len()}));
 }
 
 /// `verbs(category="Assertive")` returns only Assertive verbs and no others.
@@ -5083,6 +5130,8 @@ async fn verbs_dispatch_pack_filter_kg() {
         !names.contains(&"fake.pub"),
         "verbs(pack=kg) must not include fake.pub; got: {names:?}"
     );
+    assert_eq!(result["pack_counts"]["fake"], 1);
+    assert_eq!(result["pack_counts"]["empty"], 0);
 }
 
 /// `verbs()` must exclude subhandlers even when a second pack has them.
@@ -5110,6 +5159,8 @@ async fn verbs_dispatch_excludes_subhandlers_across_packs() {
         !names.contains(&"fake.internal"),
         "verbs() must NOT include subhandler fake.internal; got: {names:?}"
     );
+    assert_eq!(result["pack_counts"]["fake"], 1);
+    assert_eq!(result["pack_counts"]["empty"], 0);
 }
 
 /// `verbs(pack="fake")` returns the one public fake verb and excludes the subhandler.

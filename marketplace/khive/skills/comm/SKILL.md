@@ -4,11 +4,11 @@ description: Coordinate with other agents and lambdas over khive comm — be att
 
 # Coordinate over comm
 
-khive comm is how agents and lambdas message each other. The core coordination
-surface is `comm.send`, `comm.delivered`, `comm.inbox`, `comm.reply`, and
-`comm.thread` (plus `comm.read` to clear a message), but the thing worth
-learning is the _coordination pattern_, not the verbs. Per-verb param detail is
-one call away: `request(ops="comm.send(help=true)")`.
+khive comm is how agents and lambdas message each other. The surface is nine verbs —
+`comm.send`, `comm.delivered`, `comm.inbox`, `comm.unread`, `comm.read`, `comm.reply`,
+`comm.thread`, `comm.health`, and `comm.probe` —
+but the thing worth learning is the _coordination pattern_, not the verbs. Per-verb param
+detail is one call away: `request(ops="comm.send(help=true)")`.
 
 ## The pattern
 

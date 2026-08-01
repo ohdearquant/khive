@@ -10,7 +10,7 @@ use khive_types::{HandlerDef, Pack};
 use crate::handlers;
 use crate::vocab::{COMM_HANDLERS, COMM_SCHEMA_PLAN_STMTS};
 
-/// Communication pack providing the public `comm.*` verbs and channel subhandlers.
+/// Communication pack providing nine public `comm.*` verbs.
 ///
 /// Stores and queries `message` notes in the standard notes table; message
 /// metadata lives in the `properties` JSON column.

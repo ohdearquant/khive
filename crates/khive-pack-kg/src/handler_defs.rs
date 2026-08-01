@@ -1028,8 +1028,19 @@ pub(crate) fn handle_verbs(params: Value, registry: &VerbRegistry) -> Result<Val
     let p: VerbsParams =
         serde_json::from_value(params).map_err(|e| RuntimeError::InvalidInput(e.to_string()))?;
 
-    let verbs: Vec<Value> = registry
-        .all_verbs_with_names()
+    let all_verbs = registry.all_verbs_with_names();
+    let pack_counts: serde_json::Map<String, Value> = registry
+        .pack_names()
+        .into_iter()
+        .map(|pack_name| {
+            let count = all_verbs
+                .iter()
+                .filter(|(owner, _)| *owner == pack_name)
+                .count();
+            (pack_name.to_string(), serde_json::json!(count))
+        })
+        .collect();
+    let verbs: Vec<Value> = all_verbs
         .into_iter()
         .filter(|(pack_name, handler)| {
             let cat_ok = p
@@ -1057,6 +1068,7 @@ pub(crate) fn handle_verbs(params: Value, registry: &VerbRegistry) -> Result<Val
     Ok(serde_json::json!({
         "verbs": verbs,
         "total": total,
+        "pack_counts": pack_counts,
     }))
 }
 

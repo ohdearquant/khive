@@ -1,8 +1,8 @@
 //! Verb handler implementations for the comm pack.
 //!
-//! Public comm verbs store and query `message` notes in the standard notes
-//! table. Message-specific metadata lives in the `properties` JSON column;
-//! `content` is the message body.
+//! All nine public verbs (`send`, `delivered`, `inbox`, `unread`, `read`, `reply`,
+//! `thread`, `health`, `probe`) store or query comm state. Message-specific metadata lives
+//! in the `properties` JSON column; `content` is the message body.
 
 use std::collections::{HashMap, HashSet};
 

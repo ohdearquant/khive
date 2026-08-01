@@ -261,7 +261,7 @@ jobs:
             echo
             echo "> A research knowledge graph runtime for AI agents: typed entities, a closed"
             echo "> 17-relation edge ontology, hybrid FTS+vector search, and GQL/SPARQL queries,"
-            echo "> all dispatched through one MCP tool (\`request\`). 74 verbs across 9 packs."
+            echo "> all dispatched through one MCP tool (\`request\`). 89 verbs across 12 packs."
             echo
             echo "## Docs"
             echo

@@ -9,27 +9,27 @@ workspace declares it as a dependency.
 
 20 handlers, registered under [ADR-017](https://github.com/ohdearquant/khive/blob/main/docs/adr/ADR-017-pack-standard.md):
 
-| Verb        | What it does                                                                    |
-| ----------- | ------------------------------------------------------------------------------- |
-| `create`    | Create an entity or note (singleton), or a batch of entities (bulk via `items`) |
-| `get`       | Fetch any record by UUID (short hex prefix accepted, min 8 chars)               |
-| `list`      | List records with optional filtering                                            |
-| `update`    | Patch an entity or edge                                                         |
-| `delete`    | Soft- or hard-delete a record                                                   |
-| `merge`     | Merge two entities                                                              |
-| `search`    | Hybrid FTS + vector search over entities or notes                               |
-| `link`      | Create a typed directed edge between two entities                               |
-| `neighbors` | Immediate graph neighbors of a node                                             |
-| `traverse`  | Multi-hop BFS over the graph with relation/depth filters                        |
-| `query`     | GQL or SPARQL pattern query compiled to SQL                                     |
-| `propose`   | Create an event-sourced KG change proposal                                      |
-| `review`    | Approve, reject, or comment on a proposal                                       |
-| `withdraw`  | Rescind an open proposal (proposer-only)                                        |
-| `verbs`     | List all MCP-callable verbs registered on the server                            |
-| `stats`     | Aggregate KG substrate counts (entities, edges, notes)                          |
-| `context`   | Entity-anchored graph context in one call (ADR-089)                             |
-| `resolve`   | Resolve natural-language references to record ids                               |
-| `whoami`    | Report the caller identity this request resolved to                             |
+| Verb             | What it does                                                                                                                                                 |
+| ---------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `create`         | Create an entity or note (singleton), or a batch of entities (bulk via `items`)                                                                              |
+| `get`            | Fetch any record by UUID (short hex prefix accepted, min 8 chars)                                                                                            |
+| `list`           | List records with optional filtering                                                                                                                         |
+| `update`         | Patch an entity or edge                                                                                                                                      |
+| `delete`         | Soft- or hard-delete a record                                                                                                                                |
+| `merge`          | Merge two entities                                                                                                                                           |
+| `search`         | Hybrid FTS + vector search over entities or notes                                                                                                            |
+| `link`           | Create a typed directed edge between two entities                                                                                                            |
+| `neighbors`      | Immediate graph neighbors of a node                                                                                                                          |
+| `traverse`       | Multi-hop BFS over the graph with relation/depth filters                                                                                                     |
+| `query`          | GQL or SPARQL pattern query compiled to SQL                                                                                                                  |
+| `propose`        | Create an event-sourced KG change proposal                                                                                                                   |
+| `review`         | Approve, reject, or comment on a proposal                                                                                                                    |
+| `withdraw`       | Rescind an open proposal (proposer-only)                                                                                                                     |
+| `verbs`          | List all MCP-callable verbs registered on the server                                                                                                         |
+| `stats`          | Aggregate KG substrate counts (entities, edges, notes)                                                                                                       |
+| `context`        | Entity-anchored graph context in one call (ADR-089)                                                                                                          |
+| `resolve`        | Resolve natural-language references to record ids                                                                                                            |
+| `whoami`         | Report the caller identity this request resolved to                                                                                                          |
 | `db_diagnostics` | WAL/checkpoint diagnostics: counters, PASSIVE probe, WAL size, holder census (probe may backfill WAL frames; never TRUNCATE, never creates or deletes files) |
 
 `propose`/`review`/`withdraw` implement the event-sourced proposal lifecycle from
@@ -80,8 +80,8 @@ Over MCP, the same call is issued as a DSL string:
 request(ops="create(kind=\"entity\", entity_kind=\"concept\", name=\"RoPE\")")
 ```
 
-`khive-mcp` loads a default set of eleven packs: `kg`, `gtd`, `memory`, `brain`,
-`comm`, `schedule`, `knowledge`, `session`, `git`, `code`, `workspace`, with `kg`
+`khive-mcp` loads a default set of twelve packs: `kg`, `gtd`, `memory`, `brain`,
+`comm`, `schedule`, `knowledge`, `session`, `git`, `code`, `workspace`, `blob`, with `kg`
 always present; `KHIVE_PACKS` / `--pack` select a subset.
 
 ## Where this sits
