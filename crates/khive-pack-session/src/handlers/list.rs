@@ -12,6 +12,21 @@ use crate::vocab::{DEFAULT_LIMIT, MAX_LIMIT, SESSION_KIND};
 
 const VERB: &str = "session.list";
 
+/// Round a parsed timestamp up to the nearest whole microsecond.
+///
+/// Storage records `created_at` at microsecond precision, but RFC 3339 permits
+/// finer sub-microsecond fractions. Flooring (`timestamp_micros`) would let a
+/// `since` value that falls strictly after a stored microsecond boundary still
+/// match that boundary, silently admitting a session older than the requested
+/// instant. Ceiling instead preserves the documented inclusive lower bound:
+/// the resulting bound equals the boundary exactly when `since` lands on it,
+/// and moves past it otherwise.
+fn ceil_to_micros<Tz: chrono::TimeZone>(value: &DateTime<Tz>) -> i64 {
+    let secs = value.timestamp();
+    let subsec_nanos = i64::from(value.timestamp_subsec_nanos());
+    secs * 1_000_000 + (subsec_nanos + 999) / 1000
+}
+
 pub(crate) async fn handle_list(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
@@ -51,7 +66,7 @@ pub(crate) async fn handle_list(
     let min_created_at = p
         .since
         .as_deref()
-        .map(|raw| DateTime::parse_from_rfc3339(raw).map(|value| value.timestamp_micros()))
+        .map(|raw| DateTime::parse_from_rfc3339(raw).map(|value| ceil_to_micros(&value)))
         .transpose()
         .map_err(|_| {
             RuntimeError::InvalidInput(format!(
@@ -92,6 +107,7 @@ pub(crate) async fn handle_list(
 
 #[cfg(test)]
 mod tests {
+    use chrono::DateTime;
     use khive_runtime::{KhiveRuntime, Namespace};
     use serde_json::json;
 
@@ -209,5 +225,49 @@ mod tests {
         };
         assert!(msg.contains("since must be an RFC 3339 timestamp"));
         assert!(msg.contains("yesterday"));
+    }
+
+    #[test]
+    fn ceil_to_micros_preserves_exact_microsecond_boundary() {
+        let value = DateTime::parse_from_rfc3339("2026-01-01T00:00:00.123456Z").unwrap();
+        assert_eq!(super::ceil_to_micros(&value), 1_767_225_600_123_456);
+    }
+
+    #[test]
+    fn ceil_to_micros_rounds_up_sub_microsecond_fraction() {
+        let value = DateTime::parse_from_rfc3339("2026-01-01T00:00:00.1234561Z").unwrap();
+        assert_eq!(super::ceil_to_micros(&value), 1_767_225_600_123_457);
+    }
+
+    #[tokio::test]
+    async fn since_excludes_session_floored_to_an_earlier_microsecond() {
+        use khive_storage::note::Note;
+
+        let rt = KhiveRuntime::memory().expect("in-memory runtime");
+        let token = rt.authorize(Namespace::local()).expect("authorize local");
+
+        let created_at_micros: i64 = 1_767_225_600_123_456; // 2026-01-01T00:00:00.123456Z
+        let mut note = Note::new("local", "session", "boundary session");
+        note.created_at = created_at_micros;
+        note.updated_at = created_at_micros;
+        rt.core()
+            .notes(&token)
+            .expect("notes store")
+            .upsert_note(note)
+            .await
+            .expect("insert boundary session");
+
+        // One tenth of a microsecond after the stored session: floors to the
+        // same microsecond, but is strictly later, so it must exclude it.
+        let result = handle_list(
+            &rt,
+            &token,
+            json!({ "since": "2026-01-01T00:00:00.1234561Z" }),
+        )
+        .await
+        .expect("list since");
+
+        assert_eq!(result["sessions"].as_array().expect("sessions array").len(), 0);
+        assert_eq!(result["total"], 0);
     }
 }
