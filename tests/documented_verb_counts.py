@@ -3,7 +3,8 @@
 
 Merged ADRs are historical records and intentionally excluded. The scanner
 covers the living documentation surfaces shipped from this repository,
-including pack rustdoc comments and the Pages-generated ``llms.txt`` summary.
+including CLI help/goldens, pack rustdoc comments, and the Pages-generated
+``llms.txt`` summary.
 """
 
 from __future__ import annotations
@@ -40,7 +41,7 @@ NUMBER_WORDS = {
 }
 COUNT_TOKEN = rf"(?:\d+|{'|'.join(NUMBER_WORDS)})"
 VERB_COUNT_MODIFIERS = r"(?:(?:public|agent-facing|production|mcp-callable)\s+)*"
-PACK_COUNT_MODIFIERS = r"(?:(?:default(?:-loaded)?|loaded|production)\s+)*"
+PACK_COUNT_MODIFIERS = r"(?:(?:built-in|default(?:-loaded)?|loaded|production)\s+)*"
 VERB_COUNT_RE = re.compile(
     rf"\b(?P<count>{COUNT_TOKEN})\s*(?:-\s*|\s+)"
     rf"{VERB_COUNT_MODIFIERS}verbs?(?:\s+handlers?)?\b",
@@ -158,9 +159,14 @@ def _pack_from_path(path: str, pack_names: set[str]) -> str | None:
     return None
 
 
-def _context_pack(context: str, pack_names: set[str]) -> str | None:
+def _context_pack(
+    context: str,
+    pack_names: set[str],
+    count_span: tuple[int, int],
+) -> str | None:
     plain = _plain(context)
-    candidates: list[tuple[int, str]] = []
+    count_start, count_end = count_span
+    candidates: list[tuple[int, bool, int, str]] = []
     for pack in pack_names:
         marker = re.compile(
             rf"(?:khive-pack-{re.escape(pack)}\b|"
@@ -173,11 +179,19 @@ def _context_pack(context: str, pack_names: set[str]) -> str | None:
             re.IGNORECASE,
         )
         for match in marker.finditer(plain):
-            candidates.append((match.start(), pack))
+            if match.end() <= count_start:
+                distance = count_start - match.end()
+                follows_count = False
+            elif match.start() >= count_end:
+                distance = match.start() - count_end
+                follows_count = True
+            else:
+                distance = 0
+                follows_count = False
+            candidates.append((distance, follows_count, match.start(), pack))
     if not candidates:
         return None
-    candidates.sort(reverse=True)
-    return candidates[0][1]
+    return min(candidates)[3]
 
 
 def _is_reference_count(plain: str, match: re.Match[str]) -> bool:
@@ -280,7 +294,11 @@ def scan_document(path: str, text: str, pack_names: Iterable[str]) -> list[Count
         raw_window = f"{raw} {next_raw}" if next_raw else raw
         plain = _plain(raw_window)
         current_line_end = len(_plain(raw))
-        context = "\n".join(lines[max(0, line_number - 3) : line_number])
+        preceding_context = "\n".join(
+            lines[max(0, line_number - 3) : line_number - 1]
+        )
+        context = f"{preceding_context}\n{raw}" if preceding_context else raw
+        context_offset = len(_plain(preceding_context)) + (1 if preceding_context else 0)
 
         def starts_on_current_line(match: re.Match[str]) -> bool:
             return match.start() <= current_line_end
@@ -352,7 +370,14 @@ def scan_document(path: str, text: str, pack_names: Iterable[str]) -> list[Count
                 continue
             matched_spans.add(match.span())
             value = _number(match.group("count"))
-            pack = path_pack or _context_pack(context, names)
+            pack = path_pack or _context_pack(
+                context,
+                names,
+                (
+                    context_offset + match.start(),
+                    context_offset + match.end(),
+                ),
+            )
             claim_plain = _plain(claim_text(match))
             pack_context = claim_plain if path_pack is not None else _plain(context)
             unqualified_path_inverted = (
@@ -468,7 +493,14 @@ def scan_document(path: str, text: str, pack_names: Iterable[str]) -> list[Count
 
 def _published_files(repo_root: Path, pack_names: Iterable[str]) -> list[Path]:
     paths: set[Path] = set()
-    for name in ("README.md", "AGENTS.md", "CLAUDE.md", "npm/README.md"):
+    for name in (
+        "README.md",
+        "AGENTS.md",
+        "CLAUDE.md",
+        "npm/README.md",
+        "cli/main.ts",
+        "cli/tests/golden/help_toplevel.txt",
+    ):
         candidate = repo_root / name
         if candidate.is_file():
             paths.add(candidate)

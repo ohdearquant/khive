@@ -217,6 +217,82 @@ The server config loads all three (`kg`, `comm`, `workspace`).
         )
         self.assertEqual([(c.pack, c.value) for c in claims], [("comm", 8)])
 
+    def test_each_count_uses_nearest_pack_marker_in_same_window(self) -> None:
+        claims = scan_document(
+            "AGENTS.md",
+            "`kg` provides twenty verbs; `comm` provides eight verbs.\n",
+            PACK_COUNTS,
+        )
+        self.assertEqual(
+            [(claim.pack, claim.value) for claim in claims],
+            [("kg", 20), ("comm", 8)],
+        )
+
+        claims = scan_document(
+            "README.md",
+            "khive-pack-kg: graph operations (20 verbs)\n"
+            "khive-pack-comm: messaging (8 verbs)\n",
+            PACK_COUNTS,
+        )
+        self.assertEqual(
+            [(claim.pack, claim.value) for claim in claims],
+            [("kg", 20), ("comm", 8)],
+        )
+
+    def test_stale_second_pack_count_in_same_window_is_attributed_correctly(self) -> None:
+        published = """28 verbs across 3 built-in packs.
+| Pack | Verbs |
+| --- | --- |
+| kg | 20 |
+| comm | 8 |
+| workspace | 0 |
+"""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "README.md").write_text(published, encoding="utf-8")
+            guide = root / "docs/guide/api.md"
+            guide.parent.mkdir(parents=True)
+            guide.write_text(
+                "`kg` provides twenty verbs; `comm` provides seven verbs.\n",
+                encoding="utf-8",
+            )
+            errors = validate_documented_counts(root, verbs_result())
+
+        self.assertEqual(len(errors), 1)
+        self.assertIn("claims comm verbs=7, registry says 8", errors[0])
+
+    def test_shipped_cli_help_detects_built_in_pack_count_mutations(self) -> None:
+        published = """28 verbs across 3 built-in packs.
+| Pack | Verbs |
+| --- | --- |
+| kg | 20 |
+| comm | 8 |
+| workspace | 0 |
+"""
+        help_paths = ("cli/main.ts", "cli/tests/golden/help_toplevel.txt")
+        for stale_path in help_paths:
+            with self.subTest(stale_path=stale_path), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                (root / "README.md").write_text(published, encoding="utf-8")
+                for relative in help_paths:
+                    help_file = root / relative
+                    help_file.parent.mkdir(parents=True, exist_ok=True)
+                    help_file.write_text(
+                        "All 3 built-in packs load by default.\n",
+                        encoding="utf-8",
+                    )
+                (root / stale_path).write_text(
+                    "All 2 built-in packs load by default.\n",
+                    encoding="utf-8",
+                )
+                errors = validate_documented_counts(root, verbs_result())
+
+            self.assertEqual(len(errors), 1)
+            self.assertIn(
+                f"{stale_path}:1: claims total packs=2, registry says 3",
+                errors[0],
+            )
+
     def test_scanner_ignores_subset_and_reference_numbers(self) -> None:
         text = """`propose` is the one verb that requires JSON form.
 [ADR-017](docs/adr/ADR-017-pack-standard.md) defines the Pack trait.
