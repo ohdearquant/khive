@@ -39,8 +39,11 @@ NUMBER_WORDS = {
     "twenty": 20,
 }
 COUNT_TOKEN = rf"(?:\d+|{'|'.join(NUMBER_WORDS)})"
+VERB_COUNT_MODIFIERS = r"(?:(?:public|agent-facing|production|mcp-callable)\s+)*"
+PACK_COUNT_MODIFIERS = r"(?:(?:default(?:-loaded)?|loaded|production)\s+)*"
 VERB_COUNT_RE = re.compile(
-    rf"\b(?P<count>{COUNT_TOKEN})\s*(?:-\s*|\s+)(?:public\s+)?verbs?(?:\s+handlers?)?\b",
+    rf"\b(?P<count>{COUNT_TOKEN})\s*(?:-\s*|\s+)"
+    rf"{VERB_COUNT_MODIFIERS}verbs?(?:\s+handlers?)?\b",
     re.IGNORECASE,
 )
 INVERTED_VERB_COUNT_RE = re.compile(
@@ -48,7 +51,7 @@ INVERTED_VERB_COUNT_RE = re.compile(
     re.IGNORECASE,
 )
 PACK_COUNT_RE = re.compile(
-    rf"\b(?P<count>{COUNT_TOKEN})\s*(?:-\s*|\s+)packs?\b",
+    rf"\b(?P<count>{COUNT_TOKEN})\s*(?:-\s*|\s+){PACK_COUNT_MODIFIERS}packs?\b",
     re.IGNORECASE,
 )
 INVERTED_PACK_COUNT_RE = re.compile(
@@ -197,9 +200,7 @@ def _is_pack_total_context(plain: str, match: re.Match[str]) -> bool:
     return ":" in suffix or "-" in suffix
 
 
-def _is_aggregate_verb_context(plain: str, match: re.Match[str]) -> bool:
-    if match.re is INVERTED_VERB_COUNT_RE:
-        return True
+def _has_explicit_aggregate_verb_context(plain: str) -> bool:
     lowered = plain.lower()
     if any(
         cue in lowered
@@ -217,6 +218,12 @@ def _is_aggregate_verb_context(plain: str, match: re.Match[str]) -> bool:
         cue in lowered
         for cue in ("default", "load by default", "loaded by default", "production")
     )
+
+
+def _is_aggregate_verb_context(plain: str, match: re.Match[str]) -> bool:
+    if match.re is INVERTED_VERB_COUNT_RE:
+        return True
+    return _has_explicit_aggregate_verb_context(plain)
 
 
 def _is_aggregate_pack_context(plain: str, match: re.Match[str]) -> bool:
@@ -260,7 +267,7 @@ def scan_document(path: str, text: str, pack_names: Iterable[str]) -> list[Count
     names = {name.lower() for name in pack_names}
     path_pack = _pack_from_path(path, names)
     claims: list[CountClaim] = []
-    pack_table = False
+    pack_table_columns: tuple[int, int] | None = None
 
     lines = text.splitlines()
     for line_number, raw in enumerate(lines, 1):
@@ -282,19 +289,47 @@ def scan_document(path: str, text: str, pack_names: Iterable[str]) -> list[Count
             return raw_window if match.end() > current_line_end else raw
 
         if stripped.startswith("|"):
-            cells = [re.sub(r"[`*_]", "", cell).strip() for cell in stripped.strip("|").split("|")]
-            if len(cells) >= 2 and cells[0].lower() == "pack" and cells[1].lower().startswith("verb"):
-                pack_table = True
+            cells = [
+                re.sub(r"[`*_]", "", cell).strip()
+                for cell in stripped.strip("|").split("|")
+            ]
+            lowered_cells = [cell.lower() for cell in cells]
+            pack_column = next(
+                (index for index, cell in enumerate(lowered_cells) if cell == "pack"),
+                None,
+            )
+            verbs_column = next(
+                (
+                    index
+                    for index, cell in enumerate(lowered_cells)
+                    if re.fullmatch(r"(?:public\s+)?verbs?", cell)
+                ),
+                None,
+            )
+            if pack_column is not None and verbs_column is not None:
+                pack_table_columns = (pack_column, verbs_column)
                 continue
-            if pack_table and len(cells) >= 2:
-                pack = cells[0].lower()
-                if pack in names and re.fullmatch(r"\d+", cells[1]):
+            if pack_table_columns is not None:
+                pack_column, verbs_column = pack_table_columns
+                if max(pack_column, verbs_column) >= len(cells):
+                    continue
+                pack = lowered_cells[pack_column]
+                count = lowered_cells[verbs_column]
+                if pack in names and re.fullmatch(COUNT_TOKEN, count, re.IGNORECASE):
                     claims.append(
-                        _claim(path, line_number, "pack_verbs", int(cells[1]), raw, "per-pack-table", pack)
+                        _claim(
+                            path,
+                            line_number,
+                            "pack_verbs",
+                            _number(count),
+                            raw,
+                            "per-pack-table",
+                            pack,
+                        )
                     )
                 continue
-        elif pack_table:
-            pack_table = False
+        elif pack_table_columns is not None:
+            pack_table_columns = None
 
         matched_spans: set[tuple[int, int]] = set()
         verb_matches = list(VERB_COUNT_RE.finditer(plain)) + list(
@@ -302,7 +337,9 @@ def scan_document(path: str, text: str, pack_names: Iterable[str]) -> list[Count
         )
         if names:
             named_count_re = re.compile(
-                rf"\b(?P<count>{COUNT_TOKEN})\s+(?:public\s+)?(?:{'|'.join(map(re.escape, sorted(names)))})(?:\.)?\s+(?:public\s+)?verbs?\b",
+                rf"\b(?P<count>{COUNT_TOKEN})\s+{VERB_COUNT_MODIFIERS}"
+                rf"(?:{'|'.join(map(re.escape, sorted(names)))})(?:\.)?\s+"
+                rf"{VERB_COUNT_MODIFIERS}verbs?\b",
                 re.IGNORECASE,
             )
             verb_matches.extend(named_count_re.finditer(plain))
@@ -316,10 +353,16 @@ def scan_document(path: str, text: str, pack_names: Iterable[str]) -> list[Count
             matched_spans.add(match.span())
             value = _number(match.group("count"))
             pack = path_pack or _context_pack(context, names)
-            pack_context = (
-                _plain(claim_text(match)) if path_pack is not None else _plain(context)
+            claim_plain = _plain(claim_text(match))
+            pack_context = claim_plain if path_pack is not None else _plain(context)
+            unqualified_path_inverted = (
+                path_pack is not None
+                and match.re is INVERTED_VERB_COUNT_RE
+                and not _has_explicit_aggregate_verb_context(claim_plain)
             )
-            if pack is not None and _is_pack_total_context(pack_context, match):
+            if pack is not None and (
+                unqualified_path_inverted or _is_pack_total_context(pack_context, match)
+            ):
                 claims.append(
                     _claim(
                         path,

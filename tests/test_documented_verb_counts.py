@@ -67,6 +67,108 @@ The server config loads all three (`kg`, `comm`, `workspace`).
         self.assertEqual(values.count(("total_verbs", 28)), 2)
         self.assertEqual(values.count(("total_packs", 3)), 2)
 
+    def test_living_multicolumn_pack_table_detects_stale_mutation(self) -> None:
+        published = """28 verbs across 3 production packs.
+| Pack          | Prefix   | Verbs | What it does |
+| ------------- | -------- | ----- | ------------ |
+| **kg**        | _(bare)_ | 20    | Graph        |
+| **comm**      | `comm.`  | 8     | Messaging    |
+| **workspace** | _(none)_ | 0     | Vocabulary   |
+"""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            readme = root / "README.md"
+            readme.write_text(published, encoding="utf-8")
+            self.assertEqual(validate_documented_counts(root, verbs_result()), [])
+
+            readme.write_text(
+                published.replace(
+                    "| **comm**      | `comm.`  | 8",
+                    "| **comm**      | `comm.`  | 7",
+                ),
+                encoding="utf-8",
+            )
+            errors = validate_documented_counts(root, verbs_result())
+
+        self.assertEqual(len(errors), 1)
+        self.assertIn("claims comm verbs=7, registry says 8", errors[0])
+
+    def test_living_pages_and_inverted_mutations_fail_validation(self) -> None:
+        published = """28 verbs across 3 production packs.
+| Pack | Verbs |
+| ---- | ----- |
+| kg | 20 |
+| comm | 8 |
+| workspace | 0 |
+"""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "README.md").write_text(published, encoding="utf-8")
+            workflow = root / ".github/workflows/pages.yml"
+            workflow.parent.mkdir(parents=True)
+            workflow.write_text(
+                "Full verb catalog for all 2 production packs.\n",
+                encoding="utf-8",
+            )
+            errors = validate_documented_counts(root, verbs_result())
+            self.assertEqual(len(errors), 1)
+            self.assertIn("claims total packs=2, registry says 3", errors[0])
+
+            workflow.write_text(
+                "Full verb catalog for all 3 production packs.\n",
+                encoding="utf-8",
+            )
+            pack_readme = root / "crates/khive-pack-comm/README.md"
+            pack_readme.parent.mkdir(parents=True)
+            pack_readme.write_text("Verbs: 7\n", encoding="utf-8")
+            errors = validate_documented_counts(root, verbs_result())
+
+        self.assertEqual(len(errors), 1)
+        self.assertIn("claims comm verbs=7, registry says 8", errors[0])
+
+    def test_living_modifier_forms_are_scanned(self) -> None:
+        pages_claims = scan_document(
+            ".github/workflows/pages.yml",
+            'Full verb catalog for all 3 production packs: params and examples.\n',
+            PACK_COUNTS,
+        )
+        self.assertIn(
+            ("total_packs", 3),
+            {(claim.kind, claim.value) for claim in pages_claims},
+        )
+
+        session_counts = {**PACK_COUNTS, "session": 4}
+        session_claims = scan_document(
+            "crates/khive-pack-session/README.md",
+            "Session pack: registers the session note kind and four agent-facing verbs.\n",
+            session_counts,
+        )
+        self.assertEqual(
+            [(claim.kind, claim.pack, claim.value) for claim in session_claims],
+            [("pack_verbs", "session", 4)],
+        )
+
+    def test_pack_path_wins_for_unqualified_inverted_claim(self) -> None:
+        pack_claims = scan_document(
+            "crates/khive-pack-comm/README.md",
+            "Verbs: 8\nRuntime details follow.\n",
+            PACK_COUNTS,
+        )
+        self.assertEqual(
+            [(claim.kind, claim.pack, claim.value) for claim in pack_claims],
+            [("pack_verbs", "comm", 8)],
+        )
+
+        aggregate_claims = scan_document(
+            "crates/khive-pack-comm/README.md",
+            "Verbs: 28 across 3 packs.\n",
+            PACK_COUNTS,
+        )
+        self.assertIn(
+            ("total_verbs", None, 28),
+            {(claim.kind, claim.pack, claim.value) for claim in aggregate_claims},
+        )
+
     def test_pack_path_supplies_named_window(self) -> None:
         claims = scan_document(
             "marketplace/khive/skills/comm/SKILL.md",
