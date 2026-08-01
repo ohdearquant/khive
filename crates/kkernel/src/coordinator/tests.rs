@@ -1,3 +1,4 @@
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -135,6 +136,39 @@ fn locator_cache_purge_removes_expired() {
     std::thread::sleep(Duration::from_micros(1));
     cache.purge_expired();
     assert_eq!(cache.len(), 0);
+}
+
+#[test]
+fn locator_cache_insert_purges_expired_entry() {
+    let cache = LocatorCache::with_ttl(Duration::from_nanos(1));
+    let expired_id = Uuid::new_v4();
+    cache.insert(expired_id, BackendId::new("main"));
+    std::thread::sleep(Duration::from_micros(1));
+
+    let live_id = Uuid::new_v4();
+    cache.insert(live_id, BackendId::new("main"));
+
+    assert_eq!(cache.len(), 1);
+    assert!(cache.get(expired_id).is_none());
+}
+
+#[test]
+fn locator_cache_evicts_least_recently_used_at_capacity() {
+    let cache =
+        LocatorCache::with_ttl_and_capacity(Duration::from_secs(60), NonZeroUsize::new(2).unwrap());
+    let first = Uuid::new_v4();
+    let second = Uuid::new_v4();
+    let third = Uuid::new_v4();
+    cache.insert(first, BackendId::new("main"));
+    cache.insert(second, BackendId::new("main"));
+    assert!(cache.get(first).is_some());
+
+    cache.insert(third, BackendId::new("main"));
+
+    assert_eq!(cache.len(), 2);
+    assert!(cache.get(second).is_none());
+    assert!(cache.get(first).is_some());
+    assert!(cache.get(third).is_some());
 }
 
 // ---- D2: locate() integration tests ----
