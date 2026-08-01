@@ -2068,6 +2068,15 @@ same `ChannelCheckpoint` value, so the reset commits atomically with the rest of
 than as a separate write. This is the precise, API-level statement of the `cursor_get -> poll_page
 -> handle each -> cursor_commit` sequencing described in §Restart durability above.
 
+> **Migration-sequence reconciliation (2026-08-01).** The V11 reservation in the
+> amendment below was never implemented and is superseded. The live post-consolidation
+> ledger now assigns V11 to `ann_write_log`, V12 to its model/sequence index, and V13
+> to stable list-cursor sequences. A future implementation of the
+> `comm_channel_cursor` widening MUST claim the next available version in ADR-015 in
+> the same PR. References below to V10 as the then-current tree and to V11/`011-*` as
+> the target are retained as the amendment's historical snapshot, not as a live schema
+> allocation. The ownership, atomic rebuild, and rollback requirements are unchanged.
+
 **Migration: owner and sequence.** The comm pack owns `comm_channel_cursor` and today ships it
 via a constant `CREATE TABLE IF NOT EXISTS` declaration (`COMM_CHANNEL_CURSOR_SCHEMA_STMT`) with a
 two-column primary key `(channel_kind, channel_slug)` -- idempotent on a fresh database, but a

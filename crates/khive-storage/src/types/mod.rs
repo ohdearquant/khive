@@ -18,7 +18,7 @@ pub use graph::{
     NeighborHit, NeighborQuery, PathNode, SortDirection, SortOrder, TimeRange, TraversalOptions,
     TraversalRequest,
 };
-pub use pagination::{Page, PageRequest};
+pub use pagination::{Page, PageRequest, SeekCursor, SeekPage};
 pub use sparse::{
     SparseRecord, SparseSearchHit, SparseSearchRequest, SparseVector, MAX_SPARSE_SEARCH_TOP_K,
 };

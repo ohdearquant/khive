@@ -11490,6 +11490,28 @@ async fn list_kind_edge_after_cursor_tiles_full_set() {
     assert_eq!(seen.len(), 5, "cursor walk must tile the full edge set");
 }
 
+#[tokio::test]
+async fn list_cursor_mode_rejects_offset_and_unsupported_event_kind() {
+    let fixture = pack();
+    let mixed = fixture
+        .dispatch("list", json!({"kind": "entity", "after": "", "offset": 0}))
+        .await
+        .expect_err("explicit offset and after must not be silently mixed");
+    assert!(
+        invalid_input_message(&mixed).contains("mutually exclusive"),
+        "unexpected error: {mixed}"
+    );
+
+    let event = fixture
+        .dispatch("list", json!({"kind": "event", "after": ""}))
+        .await
+        .expect_err("event lists do not implement cursor mode");
+    assert!(
+        invalid_input_message(&event).contains("entity, note, and edge"),
+        "unexpected error: {event}"
+    );
+}
+
 /// #702.3: `stats()` must break edge counts down by relation, matching the
 /// created fixtures.
 #[tokio::test]
@@ -11814,6 +11836,40 @@ async fn list_entity_limit_over_cap_truncates_with_metadata() {
     assert_eq!(resp["requested_limit"], 600);
     assert_eq!(resp["effective_limit"], 500);
     assert_eq!(resp["limit_clamped"], true);
+
+    // #1462: cursor mode crosses the cap without asking the caller to advance
+    // an offset by either the requested or effective limit.
+    let first = pack
+        .dispatch("list", json!({"kind": "entity", "limit": 600, "after": ""}))
+        .await
+        .expect("entity cursor page one must succeed");
+    let first_entities = first["entities"]
+        .as_array()
+        .expect("entity cursor envelope must contain entities");
+    assert_eq!(first_entities.len(), 500);
+    let cursor = first["next_after"]
+        .as_str()
+        .expect("a 501-row corpus must continue after the 500-row cap");
+    assert_eq!(first["effective_limit"], 500);
+
+    let second = pack
+        .dispatch(
+            "list",
+            json!({"kind": "entity", "limit": 600, "after": cursor}),
+        )
+        .await
+        .expect("entity cursor page two must succeed");
+    let second_entities = second["entities"]
+        .as_array()
+        .expect("entity cursor envelope must contain entities");
+    assert_eq!(second_entities.len(), 1);
+    assert!(second["next_after"].is_null());
+    let unique_ids: std::collections::HashSet<_> = first_entities
+        .iter()
+        .chain(second_entities)
+        .map(|entity| entity["id"].as_str().expect("entity id"))
+        .collect();
+    assert_eq!(unique_ids.len(), 501, "cursor pages must tile all entities");
 }
 
 /// Same "under cap honored exactly" behavior as the entity test, at the note
@@ -11878,6 +11934,37 @@ async fn list_note_limit_over_cap_truncates_with_metadata() {
     assert_eq!(resp["requested_limit"], 300);
     assert_eq!(resp["effective_limit"], 200);
     assert_eq!(resp["limit_clamped"], true);
+
+    let first = pack
+        .dispatch("list", json!({"kind": "note", "limit": 300, "after": ""}))
+        .await
+        .expect("note cursor page one must succeed");
+    let first_notes = first["notes"]
+        .as_array()
+        .expect("note cursor envelope must contain notes");
+    assert_eq!(first_notes.len(), 200);
+    let cursor = first["next_after"]
+        .as_str()
+        .expect("a 201-row corpus must continue after the 200-row cap");
+
+    let second = pack
+        .dispatch(
+            "list",
+            json!({"kind": "note", "limit": 300, "after": cursor}),
+        )
+        .await
+        .expect("note cursor page two must succeed");
+    let second_notes = second["notes"]
+        .as_array()
+        .expect("note cursor envelope must contain notes");
+    assert_eq!(second_notes.len(), 1);
+    assert!(second["next_after"].is_null());
+    let unique_ids: std::collections::HashSet<_> = first_notes
+        .iter()
+        .chain(second_notes)
+        .map(|note| note["id"].as_str().expect("note id"))
+        .collect();
+    assert_eq!(unique_ids.len(), 201, "cursor pages must tile all notes");
 }
 
 /// `list(kind="edge")` offset mode keeps the existing bare-array shape when

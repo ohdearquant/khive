@@ -214,7 +214,8 @@ List records with optional filtering.
 | ---------------------------- | ------------------------ | -------- | ----------------------------------------------------------------------------- |
 | `kind`                       | string                   | yes      | `entity`\|`note`\|`edge`\|`event`\|`proposal`\|`message`, or a granular kind. |
 | `limit`                      | integer                  | no       | Default 20.                                                                   |
-| `offset`                     | integer                  | no       | Default 0.                                                                    |
+| `offset`                     | integer                  | no       | Default 0; mutually exclusive with `after`.                                   |
+| `after`                      | string                   | no       | Entity/note/edge cursor UUID, or `""` to begin cursor mode.                   |
 | `entity_kind`                | string                   | no       | Filter when `kind="entity"`.                                                  |
 | `entity_type`                | string                   | no       | Filter by type field when `kind="entity"`.                                    |
 | `note_kind`                  | string                   | no       | Filter when `kind="note"`.                                                    |
@@ -237,10 +238,26 @@ Requests within the kind's server-side row cap keep the existing array response.
 exceeds the cap, the response is `{"items": [...], "requested_limit": N,
 "effective_limit": CAP, "limit_clamped": true}`. This lets offset-based clients advance by
 the effective limit instead of silently skipping rows. The caps are entity 500, note 200, edge
-1000, event 1000, and proposal 500. Edge cursor mode keeps its existing `{"edges": [...],
-"next_after": ...}` shape and adds the same limit metadata when clamped.
+1000, event 1000, and proposal 500. Entity, note, and edge cursor modes return
+`{"entities": [...], "next_after": ...}`, `{"notes": [...], "next_after": ...}`, or
+`{"edges": [...], "next_after": ...}` and add the same limit metadata when clamped.
 
-Row shape (each item in the array, or in `"items"`/`"edges"` when clamped) depends on `kind`.
+Set `after=""` to begin a stable cursor walk, then pass each non-null `next_after` value into the
+next request with the same filters. The cursor's public value is a UUID; storage resolves it to an
+immutable, database-assigned insertion sequence and performs a sequence seek. Every genuinely new id
+committed after an issued boundary receives a greater sequence, so equal timestamps, backward clock
+movement, and lower UUIDs cannot make it fall behind that boundary.
+
+Cursor mode is a live walk, not an MVCC snapshot. Inserts committed before a later page query may
+extend the walk. After a substrate/namespace query returns `next_after: null`, rows committed after
+that terminal query require a new walk from `after=""`. Updates and deletes can change whether an
+unvisited row matches the filters. A cursor that was hard-deleted, is outside the caller's visible
+namespaces, or otherwise cannot be resolved returns an error instead of silently restarting. Cursor
+mode and `offset` are mutually exclusive. Filtered message walks may additionally return
+`scan_incomplete: true` with a continuation cursor when their 10,000-row safety ceiling is reached
+before another matching message is proven.
+
+Row shape (each item in the array or cursor/clamp envelope) depends on `kind`.
 For `kind="entity"`, `"note"`, `"edge"`, and `"event"`, the row is the **full stored record**
 for that substrate, listed below in its **verbose** form (the shape returned with
 `presentation="verbose"`, which is also the default for `kkernel exec` and the `khive` CLI).

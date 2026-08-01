@@ -3,6 +3,7 @@
 use serde_json::Value;
 
 use khive_runtime::{KhiveRuntime, NamespaceToken, RuntimeError, VerbRegistry};
+use khive_storage::note::Note;
 use khive_storage::types::PageRequest;
 use khive_storage::EntityFilter;
 
@@ -45,6 +46,81 @@ fn add_list_limit_metadata(response: &mut Value, requested: u32, effective: u32)
     response["limit_clamped"] = serde_json::json!(true);
 }
 
+fn parse_after_cursor(raw: &str) -> Result<Option<uuid::Uuid>, RuntimeError> {
+    if raw.is_empty() {
+        return Ok(None);
+    }
+    uuid::Uuid::parse_str(raw).map(Some).map_err(|error| {
+        RuntimeError::InvalidInput(format!("after: invalid UUID {raw:?}: {error}"))
+    })
+}
+
+fn note_matches_message_filters(note: &Note, params: &ListParams) -> bool {
+    let properties = note.properties.as_ref();
+    if let Some(wanted_thread) = params.thread_id.as_deref() {
+        let Some(stored) = properties
+            .and_then(|value| value.get("thread_id"))
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+        else {
+            return false;
+        };
+        let matches = stored == wanted_thread
+            || matches!(
+                (stored.get(..8), wanted_thread.get(..8)),
+                (Some(left), Some(right)) if left == right
+            );
+        if !matches {
+            return false;
+        }
+    }
+    if let Some(wanted) = params.direction.as_deref() {
+        let stored = properties
+            .and_then(|value| value.get("direction"))
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        if stored != wanted {
+            return false;
+        }
+    }
+    if let Some(wanted) = params.from.as_deref() {
+        let stored = properties
+            .and_then(|value| value.get("from"))
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        if stored != wanted {
+            return false;
+        }
+    }
+    if let Some(wanted) = params.to.as_deref() {
+        let stored = properties
+            .and_then(|value| value.get("to"))
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        if stored != wanted {
+            return false;
+        }
+    }
+    if let Some(wanted) = params.read {
+        let stored = properties
+            .and_then(|value| value.get("read"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if stored != wanted {
+            return false;
+        }
+    }
+    if let Some(wanted) = params.delivered {
+        let stored = properties
+            .and_then(|value| value.get("delivered_at"))
+            .is_some_and(|value| !value.is_null());
+        if stored != wanted {
+            return false;
+        }
+    }
+    true
+}
+
 impl KgPack {
     pub(crate) async fn handle_list(
         &self,
@@ -63,6 +139,16 @@ impl KgPack {
         }
 
         let p: ListParams = deser(params)?;
+        if p.after.is_some() && p.offset.is_some() {
+            return Err(RuntimeError::InvalidInput(
+                "after and offset are mutually exclusive pagination modes".into(),
+            ));
+        }
+        if p.after.is_some() && p.limit == Some(0) {
+            return Err(RuntimeError::InvalidInput(
+                "cursor pagination requires limit greater than zero".into(),
+            ));
+        }
         let spec = resolve_kind_spec(&p.kind, registry)?;
         match spec {
             KindSpec::Entity { specific } => {
@@ -89,6 +175,27 @@ impl KgPack {
                 };
                 let requested = p.limit.unwrap_or(50);
                 let limit = effective_list_limit(requested, ENTITY_LIST_CAP);
+                if let Some(after_raw) = p.after.as_deref() {
+                    let after = parse_after_cursor(after_raw)?;
+                    let tags = p.tags.as_deref().unwrap_or_default();
+                    let (entities, next_after) = self
+                        .runtime
+                        .list_entities_after(
+                            token,
+                            kind_filter.as_deref(),
+                            validated_et.as_deref(),
+                            tags,
+                            after,
+                            limit,
+                        )
+                        .await?;
+                    let mut response = serde_json::json!({
+                        "entities": normalize_entity_timestamps_array(to_json(&entities)?),
+                        "next_after": next_after,
+                    });
+                    add_list_limit_metadata(&mut response, requested, limit);
+                    return Ok(response);
+                }
                 let offset = p.offset.unwrap_or(0);
                 let entities = if let Some(ref tag_list) = p.tags {
                     if tag_list.is_empty() {
@@ -179,15 +286,7 @@ impl KgPack {
                 if let Some(ref after_str) = p.after {
                     // An empty string opts into cursor-mode pagination while
                     // starting from the beginning of the set (no prior page).
-                    let after = if after_str.is_empty() {
-                        None
-                    } else {
-                        Some(uuid::Uuid::parse_str(after_str).map_err(|e| {
-                            RuntimeError::InvalidInput(format!(
-                                "after: invalid UUID {after_str:?}: {e}"
-                            ))
-                        })?)
-                    };
+                    let after = parse_after_cursor(after_str)?;
                     let (edges, next_after) = self
                         .runtime
                         .list_edges_after(token, filter, after, limit)
@@ -216,25 +315,108 @@ impl KgPack {
                 )?;
                 let requested = p.limit.unwrap_or(20);
                 let limit = effective_list_limit(requested, NOTE_LIST_CAP);
-                let offset = p.offset.unwrap_or(0);
-
                 let has_msg_filter = p.thread_id.is_some()
                     || p.direction.is_some()
                     || p.from.is_some()
                     || p.to.is_some()
                     || p.read.is_some()
                     || p.delivered.is_some();
-
-                let thread_id_filter = p.thread_id.as_deref();
-                let direction_filter = p.direction.as_deref();
-                let from_filter = p.from.as_deref();
-                let to_filter = p.to.as_deref();
-                let read_filter = p.read;
-                let delivered_filter = p.delivered;
-
                 const PAGE_SIZE: u32 = 200;
                 const MAX_SCAN_TOTAL: u32 = 10_000;
 
+                if let Some(after_raw) = p.after.as_deref() {
+                    let after = parse_after_cursor(after_raw)?;
+                    let (mut notes, next_after, scan_incomplete) = if has_msg_filter {
+                        let mut collected = Vec::new();
+                        let mut raw_after = after;
+                        let mut scanned = 0u32;
+                        let mut last_scanned = None;
+                        let target = (limit as usize).saturating_add(1);
+
+                        let raw_more = loop {
+                            if scanned >= MAX_SCAN_TOTAL || collected.len() >= target {
+                                break collected.len() >= target;
+                            }
+                            let scan_limit = MAX_SCAN_TOTAL.saturating_sub(scanned).min(PAGE_SIZE);
+                            let (page, next_raw_after) = self
+                                .runtime
+                                .list_notes_after(
+                                    token,
+                                    kind_filter.as_deref(),
+                                    raw_after,
+                                    scan_limit,
+                                )
+                                .await?;
+                            if page.is_empty() {
+                                break false;
+                            }
+                            for note in page {
+                                scanned = scanned.saturating_add(1);
+                                last_scanned = Some(note.id);
+                                if note_matches_message_filters(&note, &p) {
+                                    collected.push(note);
+                                    if collected.len() >= target {
+                                        break;
+                                    }
+                                }
+                            }
+                            if collected.len() >= target {
+                                break true;
+                            }
+                            match next_raw_after {
+                                Some(next) => {
+                                    raw_after = Some(next);
+                                    if scanned >= MAX_SCAN_TOTAL {
+                                        break true;
+                                    }
+                                }
+                                None => break false,
+                            }
+                        };
+
+                        let has_more_match = collected.len() > limit as usize;
+                        let continuation = if has_more_match && limit > 0 {
+                            collected.get(limit as usize - 1).map(|note| note.id)
+                        } else if raw_more && scanned >= MAX_SCAN_TOTAL {
+                            last_scanned
+                        } else {
+                            None
+                        };
+                        collected.truncate(limit as usize);
+                        (
+                            collected,
+                            continuation,
+                            !has_more_match && raw_more && scanned >= MAX_SCAN_TOTAL,
+                        )
+                    } else {
+                        let (notes, next_after) = self
+                            .runtime
+                            .list_notes_after(token, kind_filter.as_deref(), after, limit)
+                            .await?;
+                        (notes, next_after, false)
+                    };
+
+                    let remapped: Vec<Value> = notes
+                        .drain(..)
+                        .map(|note| {
+                            to_json(&note)
+                                .map(normalize_entity_timestamps)
+                                .map(remap_note_status)
+                                .unwrap_or_else(|_| serde_json::json!({}))
+                        })
+                        .collect();
+                    let mut response = serde_json::json!({
+                        "notes": remapped,
+                        "next_after": next_after,
+                    });
+                    if scan_incomplete {
+                        response["scan_incomplete"] = Value::Bool(true);
+                    }
+                    add_list_limit_metadata(&mut response, requested, limit);
+                    return Ok(response);
+                }
+
+                let offset = p.offset.unwrap_or(0);
                 let notes: Vec<_> = if has_msg_filter {
                     let mut collected: Vec<_> = Vec::new();
                     let mut db_offset: u32 = 0;
@@ -250,79 +432,12 @@ impl KgPack {
                             .list_notes(token, kind_filter.as_deref(), remaining_scan, db_offset)
                             .await?;
                         let fetched = page.len() as u32;
-                        for n in page {
-                            if n.deleted_at.is_some() {
+                        for note in page {
+                            if note.deleted_at.is_some() {
                                 continue;
                             }
-                            let props = n.properties.as_ref();
-                            let passes = (|| {
-                                if let Some(wanted_thread) = thread_id_filter {
-                                    let stored = match props
-                                        .and_then(|p| p.get("thread_id"))
-                                        .and_then(Value::as_str)
-                                        .filter(|s| !s.is_empty())
-                                    {
-                                        Some(s) => s,
-                                        None => return false,
-                                    };
-                                    let matches = stored == wanted_thread
-                                        || matches!(
-                                            (stored.get(..8), wanted_thread.get(..8)),
-                                            (Some(a), Some(b)) if a == b
-                                        );
-                                    if !matches {
-                                        return false;
-                                    }
-                                }
-                                if let Some(wanted_dir) = direction_filter {
-                                    let stored = props
-                                        .and_then(|p| p.get("direction"))
-                                        .and_then(Value::as_str)
-                                        .unwrap_or("");
-                                    if stored != wanted_dir {
-                                        return false;
-                                    }
-                                }
-                                if let Some(wanted_from) = from_filter {
-                                    let stored = props
-                                        .and_then(|p| p.get("from"))
-                                        .and_then(Value::as_str)
-                                        .unwrap_or("");
-                                    if stored != wanted_from {
-                                        return false;
-                                    }
-                                }
-                                if let Some(wanted_to) = to_filter {
-                                    let stored = props
-                                        .and_then(|p| p.get("to"))
-                                        .and_then(Value::as_str)
-                                        .unwrap_or("");
-                                    if stored != wanted_to {
-                                        return false;
-                                    }
-                                }
-                                if let Some(wanted_read) = read_filter {
-                                    let stored = props
-                                        .and_then(|p| p.get("read"))
-                                        .and_then(Value::as_bool)
-                                        .unwrap_or(false);
-                                    if stored != wanted_read {
-                                        return false;
-                                    }
-                                }
-                                if let Some(wanted_delivered) = delivered_filter {
-                                    let is_delivered = props
-                                        .and_then(|p| p.get("delivered_at"))
-                                        .map(|v| !v.is_null())
-                                        .unwrap_or(false);
-                                    if is_delivered != wanted_delivered {
-                                        return false;
-                                    }
-                                }
-                                true
-                            })();
-                            if passes {
-                                collected.push(n);
+                            if note_matches_message_filters(&note, &p) {
+                                collected.push(note);
                                 if collected.len() >= target_after_skip {
                                     break;
                                 }
@@ -368,6 +483,12 @@ impl KgPack {
             }
             KindSpec::Proposal => unreachable!("kind=proposal fast-pathed before deser"),
             KindSpec::Event => {
+                if p.after.is_some() {
+                    return Err(RuntimeError::InvalidInput(
+                        "after cursor pagination is supported only for entity, note, and edge lists"
+                            .into(),
+                    ));
+                }
                 let requested = p.limit.unwrap_or(100).max(1);
                 let limit = effective_list_limit(requested, EVENT_LIST_CAP);
                 let offset = p.offset.unwrap_or(0);
