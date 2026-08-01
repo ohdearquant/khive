@@ -34,6 +34,7 @@ use khive_storage::{Edge, EdgeRelation, Entity, EntityFilter, Event, EventFilter
 use khive_types::{EdgeEndpointRule, EndpointKind, EventKind, KhiveError, SubstrateKind};
 
 use khive_db::stores::entity::{entity_hard_delete_statement, entity_upsert_statement};
+use khive_db::stores::event::hard_delete_lineage_warning_statements;
 use khive_db::stores::graph::{edge_hard_delete_statement, purge_incident_edges_statement};
 use khive_db::stores::note::note_hard_delete_statement;
 use khive_db::stores::text::insert_document_statement;
@@ -4035,7 +4036,10 @@ impl KhiveRuntime {
     /// already purged.
     ///
     /// `row_statement` is the exact hard-delete `DELETE` for the target row
-    /// (entity, note, or edge). Returns `Ok(true)` if the row was deleted,
+    /// (entity, note, or edge). Before the incident-edge purge, the same plan
+    /// appends any ADR-002 lineage-loss warnings from the still-present edge
+    /// rows, so the warning payload and cascade commit or roll back together.
+    /// Returns `Ok(true)` if the row was deleted,
     /// `Ok(false)` if it no longer existed (lost a race with a concurrent
     /// delete of the same row) — never an error for that case, matching the
     /// non-atomic bool-returning shape callers had before this fix.
@@ -4043,19 +4047,29 @@ impl KhiveRuntime {
         &self,
         row_statement: SqlStatement,
         node_id: Uuid,
+        namespace: &str,
+        actor: &str,
+        substrate: SubstrateKind,
     ) -> RuntimeResult<bool> {
+        let mut statements = vec![PlanStatement {
+            statement: row_statement,
+            guard: Some(AffectedRowGuard::exactly(1)),
+        }];
+        statements.extend(
+            hard_delete_lineage_warning_statements(namespace, actor, node_id, substrate)
+                .into_iter()
+                .map(|statement| PlanStatement {
+                    statement,
+                    guard: None,
+                }),
+        );
+        statements.push(PlanStatement {
+            statement: purge_incident_edges_statement(node_id),
+            guard: None,
+        });
         let plan = AtomicOpPlan::Delete(DeletePlan {
             target_id: node_id,
-            statements: vec![
-                PlanStatement {
-                    statement: row_statement,
-                    guard: Some(AffectedRowGuard::exactly(1)),
-                },
-                PlanStatement {
-                    statement: purge_incident_edges_statement(node_id),
-                    guard: None,
-                },
-            ],
+            statements,
             post_commit: PostCommitEffect::None,
         });
         match run_atomic_unit(self.sql().as_ref(), vec![plan]).await {
@@ -4117,6 +4131,7 @@ impl KhiveRuntime {
                 .map_err(|e| RuntimeError::Internal(format!("note namespace invalid: {e}")))?,
         );
         let record_ns = note.namespace.clone();
+        let actor = format!("{}:{}", token.actor().kind, token.actor().id);
 
         // On hard delete, the row delete and the incident-edge cascade (including
         // already-soft-deleted edges) run as ONE write transaction: see
@@ -4124,7 +4139,13 @@ impl KhiveRuntime {
         // commit; it is best-effort and idempotent, unlike the row/edge pair.
         let deleted = if hard {
             let deleted = self
-                .atomic_hard_delete_with_edge_purge(note_hard_delete_statement(id), id)
+                .atomic_hard_delete_with_edge_purge(
+                    note_hard_delete_statement(id),
+                    id,
+                    &record_ns,
+                    &actor,
+                    SubstrateKind::Note,
+                )
                 .await?;
             self.text_for_notes(&record_tok)?
                 .delete_document(&record_ns, id)
@@ -4406,6 +4427,7 @@ impl KhiveRuntime {
             khive_types::Namespace::parse(&entity.namespace)
                 .map_err(|e| RuntimeError::Internal(format!("entity namespace invalid: {e}")))?,
         );
+        let actor = format!("{}:{}", token.actor().kind, token.actor().id);
 
         // On hard delete, the row delete and the incident-edge cascade (including
         // already-soft-deleted edges) run as ONE write transaction: see
@@ -4413,7 +4435,13 @@ impl KhiveRuntime {
         // commit; it is best-effort and idempotent, unlike the row/edge pair.
         let deleted = if hard {
             let deleted = self
-                .atomic_hard_delete_with_edge_purge(entity_hard_delete_statement(id), id)
+                .atomic_hard_delete_with_edge_purge(
+                    entity_hard_delete_statement(id),
+                    id,
+                    &entity.namespace,
+                    &actor,
+                    SubstrateKind::Entity,
+                )
                 .await?;
             self.remove_from_indexes(&record_tok, id).await?;
             deleted
@@ -5091,6 +5119,7 @@ impl KhiveRuntime {
                 .map_err(|e| RuntimeError::Internal(format!("edge namespace invalid: {e}")))?,
         );
         let graph = self.graph(&record_tok)?;
+        let actor = format!("{}:{}", token.actor().kind, token.actor().id);
 
         // Cascade: on hard delete, remove ALL annotates edges targeting this edge — including
         // already-soft-deleted ones: to prevent dangling graph_edges rows. The row
@@ -5099,8 +5128,14 @@ impl KhiveRuntime {
         // On soft delete the cascade is skipped (data-vs-view principle: soft-deleting the base
         // edge does not cascade to annotation edges; only a hard purge cleans up incident rows).
         let deleted = if hard {
-            self.atomic_hard_delete_with_edge_purge(edge_hard_delete_statement(edge_id), edge_id)
-                .await?
+            self.atomic_hard_delete_with_edge_purge(
+                edge_hard_delete_statement(edge_id),
+                edge_id,
+                &record_ns,
+                &actor,
+                SubstrateKind::Entity,
+            )
+            .await?
         } else {
             graph.delete_edge(LinkId::from(edge_id), mode).await?
         };
@@ -11905,6 +11940,329 @@ mod tests {
             Some(SqlValue::Integer(n)) => n as u64,
             _ => panic!("count must return an integer"),
         }
+    }
+
+    async fn lineage_warning_events(
+        rt: &KhiveRuntime,
+        tok: &NamespaceToken,
+        target_id: Uuid,
+    ) -> Vec<Event> {
+        rt.events(tok)
+            .expect("event store")
+            .query_events(
+                EventFilter {
+                    kinds: vec![EventKind::Audit],
+                    ..Default::default()
+                },
+                PageRequest::default(),
+            )
+            .await
+            .expect("query warning events")
+            .items
+            .into_iter()
+            .filter(|event| event.target_id == Some(target_id))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn hard_delete_emits_relation_specific_lineage_warnings_only() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let doomed = rt
+            .create_entity(&tok, "document", None, "doomed", None, None, vec![])
+            .await
+            .unwrap();
+
+        let provenance_source = rt
+            .create_entity(&tok, "artifact", None, "source", None, None, vec![])
+            .await
+            .unwrap();
+        rt.link(
+            &tok,
+            provenance_source.id,
+            doomed.id,
+            EdgeRelation::DerivedFrom,
+            1.0,
+            None,
+        )
+        .await
+        .unwrap();
+
+        for (kind, name, relation) in [
+            ("document", "old", EdgeRelation::Supersedes),
+            ("document", "next", EdgeRelation::Precedes),
+            ("concept", "supported", EdgeRelation::Supports),
+            ("concept", "refuted", EdgeRelation::Refutes),
+        ] {
+            let target = rt
+                .create_entity(&tok, kind, None, name, None, None, vec![])
+                .await
+                .unwrap();
+            rt.link(&tok, doomed.id, target.id, relation, 1.0, None)
+                .await
+                .unwrap();
+        }
+        let unrelated = rt
+            .create_entity(&tok, "concept", None, "unrelated", None, None, vec![])
+            .await
+            .unwrap();
+        rt.link(
+            &tok,
+            unrelated.id,
+            doomed.id,
+            EdgeRelation::IntroducedBy,
+            1.0,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(rt.delete_entity(&tok, doomed.id, false).await.unwrap());
+        assert!(
+            lineage_warning_events(&rt, &tok, doomed.id)
+                .await
+                .is_empty(),
+            "soft delete must not emit cascade-loss warnings"
+        );
+
+        assert!(rt.delete_entity(&tok, doomed.id, true).await.unwrap());
+        let warnings = lineage_warning_events(&rt, &tok, doomed.id).await;
+        assert_eq!(warnings.len(), 5);
+
+        let mut actual = warnings
+            .iter()
+            .map(|event| {
+                assert_eq!(event.substrate, SubstrateKind::Entity);
+                assert_eq!(event.payload["severity"], "warning");
+                assert_eq!(event.payload["deleted_id"], doomed.id.to_string());
+                assert_eq!(event.payload["edge_count"], 1);
+                assert_eq!(event.payload["edges"].as_array().unwrap().len(), 1);
+                (
+                    event.payload["relation"].as_str().unwrap().to_string(),
+                    event.payload["warning"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect::<Vec<_>>();
+        actual.sort();
+        assert_eq!(
+            actual,
+            vec![
+                ("derived_from".into(), "provenance_loss".into()),
+                ("precedes".into(), "temporal_sequence_loss".into()),
+                ("refutes".into(), "evidential_link_loss".into()),
+                ("supersedes".into(), "replacement_lineage_loss".into()),
+                ("supports".into(), "evidential_link_loss".into()),
+            ]
+        );
+        assert!(warnings
+            .iter()
+            .all(|event| event.payload["relation"] != "introduced_by"));
+    }
+
+    #[tokio::test]
+    async fn hard_delete_lineage_warning_is_filterable_by_caller_actor() {
+        let rt = rt();
+        let tok = NamespaceToken::mint_authorized(
+            Namespace::local(),
+            ActorRef::new("agent", "lineage-deleter"),
+        );
+        let expected_actor = "agent:lineage-deleter";
+        let doomed = rt
+            .create_entity(&tok, "document", None, "actor-doomed", None, None, vec![])
+            .await
+            .unwrap();
+        let source = rt
+            .create_entity(&tok, "artifact", None, "actor-source", None, None, vec![])
+            .await
+            .unwrap();
+        rt.link(
+            &tok,
+            source.id,
+            doomed.id,
+            EdgeRelation::DerivedFrom,
+            1.0,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(rt.delete_entity(&tok, doomed.id, true).await.unwrap());
+
+        let warnings = rt
+            .events(&tok)
+            .expect("event store")
+            .query_events(
+                EventFilter {
+                    kinds: vec![EventKind::Audit],
+                    actors: vec![expected_actor.to_string()],
+                    ..Default::default()
+                },
+                PageRequest::default(),
+            )
+            .await
+            .expect("query actor-filtered warning events")
+            .items
+            .into_iter()
+            .filter(|event| event.target_id == Some(doomed.id))
+            .collect::<Vec<_>>();
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].actor, expected_actor);
+        assert_eq!(warnings[0].payload["relation"], "derived_from");
+    }
+
+    #[tokio::test]
+    async fn hard_delete_warns_for_tombstoned_protected_incident_edge() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let doomed = rt
+            .create_entity(
+                &tok,
+                "document",
+                None,
+                "tombstoned-edge-doomed",
+                None,
+                None,
+                vec![],
+            )
+            .await
+            .unwrap();
+        let source = rt
+            .create_entity(
+                &tok,
+                "artifact",
+                None,
+                "tombstoned-edge-source",
+                None,
+                None,
+                vec![],
+            )
+            .await
+            .unwrap();
+        let edge = rt
+            .link(
+                &tok,
+                source.id,
+                doomed.id,
+                EdgeRelation::DerivedFrom,
+                1.0,
+                None,
+            )
+            .await
+            .unwrap();
+        let edge_id = Uuid::from(edge.id);
+        assert!(rt.delete_edge(&tok, edge_id, false).await.unwrap());
+
+        assert!(rt.delete_entity(&tok, doomed.id, true).await.unwrap());
+
+        let warnings = lineage_warning_events(&rt, &tok, doomed.id).await;
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].payload["edge_count"], 1);
+        let warned_edge = &warnings[0].payload["edges"].as_array().unwrap()[0];
+        assert_eq!(warned_edge["id"], edge_id.to_string());
+        assert!(
+            warned_edge["deleted_at"].is_number(),
+            "warning must preserve the edge's prior tombstone timestamp"
+        );
+        assert!(
+            rt.get_edge_including_deleted(&tok, edge_id)
+                .await
+                .unwrap()
+                .is_none(),
+            "the warned tombstoned edge must still be physically cascaded"
+        );
+    }
+
+    #[tokio::test]
+    async fn hard_delete_note_emits_evidential_lineage_warning() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let evidence = rt
+            .create_note(&tok, "observation", None, "evidence", None, None, vec![])
+            .await
+            .unwrap();
+        let claim = rt
+            .create_note(&tok, "insight", None, "claim", None, None, vec![])
+            .await
+            .unwrap();
+        rt.link(
+            &tok,
+            evidence.id,
+            claim.id,
+            EdgeRelation::Supports,
+            1.0,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(rt.delete_note(&tok, evidence.id, true).await.unwrap());
+        let warnings = lineage_warning_events(&rt, &tok, evidence.id).await;
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].substrate, SubstrateKind::Note);
+        assert_eq!(warnings[0].payload["relation"], "supports");
+        assert_eq!(warnings[0].payload["warning"], "evidential_link_loss");
+    }
+
+    #[tokio::test]
+    async fn lineage_warning_insert_failure_rolls_back_hard_delete_and_cascade() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let doomed = rt
+            .create_entity(&tok, "document", None, "doomed", None, None, vec![])
+            .await
+            .unwrap();
+        let source = rt
+            .create_entity(&tok, "artifact", None, "source", None, None, vec![])
+            .await
+            .unwrap();
+        let edge = rt
+            .link(
+                &tok,
+                source.id,
+                doomed.id,
+                EdgeRelation::DerivedFrom,
+                1.0,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let mut writer = rt.sql().writer().await.expect("sql writer");
+        writer
+            .execute_script(
+                "CREATE TRIGGER reject_lineage_warning \
+                 BEFORE INSERT ON events \
+                 WHEN NEW.kind = 'audit' \
+                   AND json_extract(NEW.payload, '$.severity') = 'warning' \
+                 BEGIN \
+                   SELECT RAISE(ABORT, 'injected lineage warning failure'); \
+                 END;"
+                    .into(),
+            )
+            .await
+            .expect("install warning failure trigger");
+        drop(writer);
+
+        let error = rt.delete_entity(&tok, doomed.id, true).await.unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("injected lineage warning failure"));
+        assert!(
+            rt.entities(&tok)
+                .unwrap()
+                .get_entity(doomed.id)
+                .await
+                .unwrap()
+                .is_some(),
+            "the endpoint row must roll back with the failed warning insert"
+        );
+        assert!(
+            rt.get_edge(&tok, Uuid::from(edge.id))
+                .await
+                .unwrap()
+                .is_some(),
+            "the incident edge must roll back with the failed warning insert"
+        );
     }
 
     #[tokio::test]

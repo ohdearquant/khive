@@ -149,6 +149,13 @@ pub(crate) async fn is_current(ann: &SharedAnn, key: &AnnKey) -> bool {
     installed_is_fresh(ann, key, target_generation).await
 }
 
+/// Read the monotonic write generation so mutation-hook tests can assert the
+/// invalidation signal without racing the background rebuild it schedules.
+#[cfg(test)]
+pub(crate) async fn generation_for_test(ann: &SharedAnn, key: &AnnKey) -> u64 {
+    current_generation(ann, key).await
+}
+
 /// Debounce interval for the cross-process durable-epoch query.
 #[cfg(not(test))]
 const DURABLE_EPOCH_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
