@@ -9,14 +9,16 @@ pin each tier's behavior.
 1. **Tier 1** — an explicit `brain_profile` passed by the caller.
 2. **Tier 2** — a namespace-bound brain profile registered via `brain.bind`, dispatched
    across the pack boundary through `load_profile_type_weights`.
-3. **Tier 3** — this pack's own tuned `section_posteriors` (Bayesian per-section
-   feedback state), falling back to `SectionPosteriorState::default()` only when no
-   feedback has been recorded.
+3. **Tier 3** — this pack's own namespace-keyed tuned `section_posteriors` (Bayesian
+   per-section feedback state), falling back to `SectionPosteriorState::default()` only
+   when no feedback has been recorded in the effective namespace.
 
-An explicit `knowledge.compose(namespace=...)` derives one exact namespace token before this
-ladder runs. `brain.resolve` and the follow-up `brain.profile` dispatch both receive that
-namespace; omitting it from the second dispatch would silently read the default namespace and
-fall through to Tier 3 when the selected profile exists only in the compose arm (#1505).
+An explicit `knowledge.compose(namespace=...)` uses one exact authorized namespace token before
+this ladder runs. `brain.resolve` and the follow-up `brain.profile` dispatch both receive that
+namespace and preserve the token's per-request actor at their Gate boundaries; omitting either
+would silently read or authorize as the registry's default identity. Direct pack calls first
+validate that the requested namespace matches their authorized token, then narrow any broader
+visible set to the one arm. Tier-3 feedback from another namespace is never inherited (#1505).
 
 Each tier is tried in order; the first one present wins. A pre-#346 regression returned
 `SectionPosteriorState::default()` unconditionally from Tier 3, ignoring learned feedback
@@ -25,8 +27,10 @@ entirely — the tests below exist to pin that this cannot recur.
 ## Tier 3: tuned `section_posteriors` (`resolve_compose_type_weights_reads_tuned_section_posteriors_at_tier3`)
 
 With Tiers 1 and 2 absent (empty registry, no brain pack), Tier 3 must read the pack-local
-`section_posteriors` rather than silently returning fresh default priors. The test skews
-posteriors heavily toward `Formalism` and against `OperationalGuidance` — enough that the
+`section_posteriors` for the effective namespace rather than silently returning fresh default
+priors. A companion isolation test tunes `local` and proves an untouched measurement arm retains
+fresh defaults. The original regression test skews local posteriors heavily toward `Formalism`
+and against `OperationalGuidance` — enough that the
 tuned formalism weight exceeds the tuned operational_guidance weight, the opposite of the
 default prior ordering (`α_og=6, β_og=1.5` vs `α_form=1.5, β_form=4`). Against the old
 `SectionPosteriorState::default()`-inside-`compose` code path, this assertion fails,

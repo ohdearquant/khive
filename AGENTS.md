@@ -223,7 +223,8 @@ or `comm.thread`.
 `knowledge.search` supports `decompose=true` for multi-concept query splitting (avoids FTS edge
 cases). Scores are normalized to [0,1] when `rerank` is active (default).
 `knowledge.compose(namespace=...)` uses that exact namespace for corpus, section, KG-blend, and
-brain-profile weight reads; absent preserves the caller-token default.
+brain-profile weight reads, including its namespace-keyed Tier-3 fallback; absent preserves the
+caller-token default.
 Pass `kind=` (`"atom"` or `"domain"`) to filter by result type; `type=` is accepted as a legacy
 alias. `knowledge.list` accepts the same `kind=`/`type=` discriminant.
 

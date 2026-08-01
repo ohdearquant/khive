@@ -1871,26 +1871,20 @@ impl BrainPack {
         let p: AutoFeedbackParams = serde_json::from_value(params)
             .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?;
 
-        // Re-derive dispatch's exact namespace as direct-call defense in
-        // depth. Public registry dispatch already supplies this token, while
-        // direct PackRuntime callers may pass a broader/default token plus the
-        // business parameter. BrainPack owns one live state slot, so switch it
-        // before forwarding into handle_feedback; otherwise a bench-arm event
-        // could be stamped with one namespace while mutating another arm's
-        // in-memory posteriors.
-        let effective_token: NamespaceToken = match p.namespace.as_deref() {
-            Some(ns_str) => {
-                let ns = Namespace::parse(ns_str).map_err(|e| {
-                    RuntimeError::InvalidInput(format!("invalid namespace {ns_str:?}: {e}"))
-                })?;
-                token.with_namespace(ns)
+        // Registry dispatch pre-mints an exact token for an explicit
+        // namespace. Direct PackRuntime callers must supply that same token;
+        // a business parameter is never authority to mint a capability.
+        if let Some(ns_str) = p.namespace.as_deref() {
+            let requested = Namespace::parse(ns_str).map_err(|e| {
+                RuntimeError::InvalidInput(format!("invalid namespace {ns_str:?}: {e}"))
+            })?;
+            if &requested != token.namespace() {
+                return Err(RuntimeError::InvalidInput(format!(
+                    "auto_feedback: namespace {ns_str:?} does not match authorized token namespace {:?}",
+                    token.namespace().as_str()
+                )));
             }
-            None => token.clone(),
-        };
-        if effective_token.namespace() != token.namespace() {
-            self.ensure_loaded(&effective_token).await?;
         }
-        let token = &effective_token;
 
         if p.query.trim().is_empty() {
             return Err(RuntimeError::InvalidInput(

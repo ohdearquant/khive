@@ -230,13 +230,9 @@ pub(super) async fn resolve_serving_profile(
     if let Some(profile_id) = brain_profile {
         return Some(profile_id.clone());
     }
-    let ns = token.namespace().as_str().to_string();
-    // Actor identity is required for actor-scoped, not merely namespace-scoped, bindings.
-    let actor = token.actor().binding_id();
     khive_brain_core::resolve_consumer_profile(
         registry,
-        actor,
-        &ns,
+        token,
         khive_brain_core::ConsumerKind::Recall,
     )
     .await

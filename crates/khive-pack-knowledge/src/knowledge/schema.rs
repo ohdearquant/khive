@@ -303,7 +303,8 @@ pub(crate) struct SuggestParams {
 #[serde(deny_unknown_fields)]
 pub(crate) struct ComposeParams {
     /// Exact read namespace. Registry dispatch pre-applies this to the token;
-    /// the handler retains it for direct-call defense in depth.
+    /// direct handlers validate a matching authorized token and narrow any
+    /// broader visibility before reading.
     #[serde(default)]
     pub namespace: Option<String>,
     #[serde(default)]

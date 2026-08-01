@@ -56,7 +56,9 @@ the serving profile so scoring weights don't drift mid-measurement.
    ```
 
    Auto-feedback stamps its event and folds only the arm's posterior state;
-   compose uses the arm for corpus, section, KG-blend, and profile-weight reads.
+   compose uses the arm for corpus, section, KG-blend, profile-weight reads, and
+   its namespace-keyed Tier-3 fallback. Nested profile lookups retain the
+   request actor at their own Gate checks.
 
 6. **Tear down** by deleting the arm's memories (`delete(id="...",
    hard=true)` — one call per memory id; `delete` takes `id`/`kind`/`hard`,

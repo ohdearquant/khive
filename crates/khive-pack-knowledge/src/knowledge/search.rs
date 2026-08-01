@@ -1512,14 +1512,22 @@ impl KnowledgeHandlers {
         let p: ComposeParams = deser(params)?;
 
         // Registry dispatch already mints an exact token for an explicit
-        // namespace. Re-derive it here as defense in depth for direct handler
-        // callers so every compose leg (suggest, corpus/section fetch, and KG
-        // blend) observes the same single-namespace scope.
-        let effective_token: NamespaceToken = match p.namespace.as_deref() {
+        // namespace. Direct handler callers must provide that same authorized
+        // token; never turn an untrusted business parameter into a stronger
+        // namespace capability here.
+        let effective_token = match p.namespace.as_deref() {
             Some(ns_str) => {
                 let ns = Namespace::parse(ns_str).map_err(|e| {
                     RuntimeError::InvalidInput(format!("invalid namespace {ns_str:?}: {e}"))
                 })?;
+                if &ns != token.namespace() {
+                    return Err(RuntimeError::InvalidInput(
+                        "knowledge.compose namespace does not match authorized token namespace"
+                            .to_string(),
+                    ));
+                }
+                // Equality above makes this a safe exact-scope narrowing of
+                // any broader direct-call token.
                 token.with_namespace(ns)
             }
             None => token.clone(),
@@ -1951,6 +1959,31 @@ impl KnowledgeHandlers {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn compose_direct_handler_rejects_namespace_token_mismatch() {
+        let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+        let token = runtime.authorize(Namespace::local()).expect("local token");
+        let ann = vamana::new_shared();
+
+        let err = KnowledgeHandlers::compose(
+            &runtime,
+            &token,
+            json!({
+                "namespace": "bench-arm-a",
+                "query": "must reject before reading",
+            }),
+            &ann,
+            HashMap::new(),
+        )
+        .await
+        .expect_err("a local token must not elevate into a measurement arm");
+
+        assert!(
+            matches!(err, RuntimeError::InvalidInput(ref msg) if msg.contains("does not match authorized token namespace")),
+            "unexpected error: {err:?}"
+        );
+    }
 
     // ── embed-intent regression ───────────────────────────────────────────────
     // Guard that the ANN query paths in `search` and `suggest` use the

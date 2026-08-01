@@ -111,5 +111,6 @@ $$\text{Beta}(\alpha_1 + \alpha_2 - \alpha_{\text{prior}},\; \beta_1 + \beta_2 -
   underscores, or wildcards; leading/trailing whitespace is trimmed (issue R3-3).
 - `brain.auto_feedback(namespace=...)` applies ADR-007's exact escape to both sides of the
   mutation: the feedback event/fold-gate row and the selected namespace's live + durable
-  posterior state. Target IDs remain globally resolvable by ID. Handler-side token derivation
-  protects direct `PackRuntime` callers in addition to registry dispatch (issue #1505).
+  posterior state. Target IDs remain globally resolvable by ID. Direct `PackRuntime` calls must
+  present an authorized token whose namespace matches the parameter; the handler validates that
+  equality and never treats the business parameter itself as authority (issue #1505).

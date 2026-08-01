@@ -6,8 +6,10 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
-use khive_brain_core::{resolve_consumer_profile, ConsumerKind, FeedbackSignal, SectionType};
-use khive_runtime::{KhiveRuntime, NamespaceToken, RuntimeError, VerbRegistry};
+use khive_brain_core::{
+    resolve_consumer_profile, ConsumerKind, FeedbackSignal, SectionPosteriorState, SectionType,
+};
+use khive_runtime::{KhiveRuntime, NamespaceToken, RequestIdentity, RuntimeError, VerbRegistry};
 use khive_storage::EdgeRelation;
 
 use crate::knowledge::section_feedback::on_section_feedback;
@@ -337,7 +339,7 @@ impl KnowledgePack {
     /// 3-tier profile resolution (ADR-035) — exclusive flow (each tier returns early):
     /// 1. Explicit brain profile in config (`self.brain_profile`) → route via `brain.feedback`
     /// 2. Namespace-bound profile via `brain.resolve(consumer_kind="knowledge_compose")` → route via `brain.feedback`
-    /// 3. Global section_posteriors → update in-memory state directly (tier-3 only when neither 1 nor 2 resolves)
+    /// 3. Namespace-local section_posteriors → update in-memory state directly (tier-3 only when neither 1 nor 2 resolves)
     pub(crate) async fn handle_feedback(
         &self,
         token: &NamespaceToken,
@@ -390,7 +392,13 @@ impl KnowledgePack {
                     "served_by_profile_id": profile_id,
                     "section_signals": section_signals_val,
                 });
-                let result = registry.dispatch("brain.feedback", brain_params).await?;
+                let result = registry
+                    .dispatch_with_identity(
+                        "brain.feedback",
+                        brain_params,
+                        Some(RequestIdentity::from_token(token)),
+                    )
+                    .await?;
                 return Ok(json!({
                     "ok": true,
                     "brain_profile": profile_id,
@@ -405,9 +413,8 @@ impl KnowledgePack {
         // feedback has its own consumer_kind bucket (ADR-058 amendment, #542) so it no
         // longer shares posteriors with the memory pack's recall bucket.
         if let Some(ref tid) = target_id_str {
-            let actor = token.actor().binding_id();
             if let Some(profile_id) =
-                resolve_consumer_profile(registry, actor, &ns, ConsumerKind::KnowledgeCompose).await
+                resolve_consumer_profile(registry, token, ConsumerKind::KnowledgeCompose).await
             {
                 let brain_params = json!({
                     "namespace": ns,
@@ -416,7 +423,13 @@ impl KnowledgePack {
                     "served_by_profile_id": profile_id,
                     "section_signals": section_signals_val,
                 });
-                let result = registry.dispatch("brain.feedback", brain_params).await?;
+                let result = registry
+                    .dispatch_with_identity(
+                        "brain.feedback",
+                        brain_params,
+                        Some(RequestIdentity::from_token(token)),
+                    )
+                    .await?;
                 return Ok(json!({
                     "ok": true,
                     "brain_profile": profile_id,
@@ -426,12 +439,14 @@ impl KnowledgePack {
             }
         }
 
-        // Tier 3: global tuning prior — update pack-local section_posteriors directly.
+        // Tier 3: namespace-local tuning prior — update only this exact
+        // namespace's pack-local section posteriors.
         let total_events = {
-            let mut state = self.section_posteriors.lock().map_err(|_| {
+            let mut states = self.section_posteriors.lock().map_err(|_| {
                 RuntimeError::Internal("section_posteriors lock poisoned".to_string())
             })?;
-            on_section_feedback(&mut state, &signals);
+            let state = states.entry(ns).or_insert_with(SectionPosteriorState::new);
+            on_section_feedback(state, &signals);
             state.total_events
         };
 
@@ -449,7 +464,7 @@ impl KnowledgePack {
     ///
     /// Tier 1: explicit `brain_profile` config → `brain.profile` → extract `weight` per section.
     /// Tier 2: namespace-bound profile via `brain.resolve(consumer_kind="knowledge_compose")` → same.
-    /// Tier 3: pack-local `section_posteriors` mutex → `deterministic_weights()`.
+    /// Tier 3: pack-local, namespace-keyed `section_posteriors` mutex → `deterministic_weights()`.
     /// Fallback: `SectionPosteriorState::default()`.
     pub(crate) async fn resolve_compose_type_weights(
         &self,
@@ -460,28 +475,31 @@ impl KnowledgePack {
 
         // Tier 1: explicit profile from config.
         if let Some(ref profile_id) = self.brain_profile {
-            if let Some(weights) = load_profile_type_weights(registry, profile_id, &ns).await {
+            if let Some(weights) = load_profile_type_weights(registry, profile_id, token).await {
                 return weights;
             }
         }
 
         // Tier 2: namespace-bound profile via brain.resolve(consumer_kind="knowledge_compose").
-        let actor = token.actor().binding_id();
         if let Some(profile_id) =
-            resolve_consumer_profile(registry, actor, &ns, ConsumerKind::KnowledgeCompose).await
+            resolve_consumer_profile(registry, token, ConsumerKind::KnowledgeCompose).await
         {
-            if let Some(weights) = load_profile_type_weights(registry, &profile_id, &ns).await {
+            if let Some(weights) = load_profile_type_weights(registry, &profile_id, token).await {
                 return weights;
             }
         }
 
-        // Tier 3: pack-local section_posteriors (updated by global-tuning feedback).
-        if let Ok(state) = self.section_posteriors.lock() {
-            return state
-                .deterministic_weights()
-                .into_iter()
-                .map(|(st, w)| (st.as_str().to_string(), w as f32))
-                .collect();
+        // Tier 3: exact-namespace pack-local section_posteriors. An arm with
+        // no feedback gets fresh defaults rather than inheriting another
+        // namespace's tuning.
+        if let Ok(states) = self.section_posteriors.lock() {
+            if let Some(state) = states.get(&ns) {
+                return state
+                    .deterministic_weights()
+                    .into_iter()
+                    .map(|(st, w)| (st.as_str().to_string(), w as f32))
+                    .collect();
+            }
         }
 
         // Fallback: fresh default (lock poisoned — should not occur in normal operation).
@@ -504,12 +522,14 @@ impl KnowledgePack {
 async fn load_profile_type_weights(
     registry: &VerbRegistry,
     profile_id: &str,
-    namespace: &str,
+    token: &NamespaceToken,
 ) -> Option<HashMap<String, f32>> {
+    let namespace = token.namespace().as_str();
     let result = registry
-        .dispatch(
+        .dispatch_with_identity(
             "brain.profile",
             json!({ "profile_id": profile_id, "namespace": namespace }),
+            Some(RequestIdentity::from_token(token)),
         )
         .await
         .ok()?;
@@ -618,10 +638,11 @@ mod tests {
         // OperationalGuidance.  Force exploration_epoch=0 so deterministic_weights()
         // uses posterior means directly (no Thompson sampling noise).
         {
-            let mut state = pack.section_posteriors.lock().unwrap();
+            let mut states = pack.section_posteriors.lock().unwrap();
+            let state = states.entry("local".to_string()).or_default();
             for _ in 0..80 {
                 on_section_feedback(
-                    &mut state,
+                    state,
                     &[
                         (SectionType::Formalism, FeedbackSignal::Useful),
                         (SectionType::OperationalGuidance, FeedbackSignal::Wrong),
@@ -666,6 +687,59 @@ mod tests {
         assert!(
             formalism_tuned > og_tuned,
             "after skewing, formalism {formalism_tuned:.4} must outweigh og {og_tuned:.4}"
+        );
+    }
+
+    /// #1505: Tier-3 feedback is isolated by exact namespace. Local/live
+    /// tuning must not alter the fallback weights used by a measurement arm
+    /// that has recorded no feedback of its own.
+    #[tokio::test]
+    async fn tier3_section_posteriors_do_not_cross_namespaces() {
+        let rt = KhiveRuntime::memory().expect("in-memory runtime");
+        let pack = KnowledgePack::new(rt.clone());
+        let registry = VerbRegistryBuilder::new()
+            .build()
+            .expect("empty registry builds");
+        let local_token = rt.authorize(Namespace::local()).expect("local token");
+        let arm_token = rt
+            .authorize(Namespace::parse("bench-arm-a").expect("arm namespace"))
+            .expect("arm token");
+
+        for _ in 0..80 {
+            pack.dispatch(
+                "knowledge.feedback",
+                json!({
+                    "section_signals": {
+                        "formalism": "useful",
+                        "operational_guidance": "wrong"
+                    }
+                }),
+                &registry,
+                &local_token,
+            )
+            .await
+            .expect("local Tier-3 feedback");
+        }
+
+        let local = pack
+            .resolve_compose_type_weights(&registry, &local_token)
+            .await;
+        let arm = pack
+            .resolve_compose_type_weights(&registry, &arm_token)
+            .await;
+        let defaults: HashMap<String, f32> = SectionPosteriorState::default()
+            .deterministic_weights()
+            .into_iter()
+            .map(|(st, w)| (st.as_str().to_string(), w as f32))
+            .collect();
+
+        assert!(
+            local["formalism"] > local["operational_guidance"],
+            "local feedback must tune the local fallback"
+        );
+        assert_eq!(
+            arm, defaults,
+            "an untouched measurement arm must retain fresh Tier-3 defaults"
         );
     }
 

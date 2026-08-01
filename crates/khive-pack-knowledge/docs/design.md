@@ -93,7 +93,10 @@ namespace. The `knowledge.import` verb delegates to `upsert_atoms` and `edit`, w
 enforce the caller namespace — no cross-namespace write is possible. `knowledge.compose`
 accepts an explicit `namespace` as ADR-007's exact single-namespace escape. The same derived
 token scopes automatic suggestion, corpus/section reads, KG blending, and the cross-pack
-brain-profile weight read; an absent parameter preserves the existing caller-token scope.
+brain-profile weight read; Tier-3 pack-local feedback state is keyed by that namespace too.
+Nested profile dispatches preserve the authorized token's per-request actor and scope. Direct
+pack calls must present a matching authorized token, whose visibility is then narrowed to the
+one explicit namespace. An absent parameter preserves the existing caller-token scope.
 Other corpus handlers continue to consume the registry's transport-level namespace routing.
 
 ## Test Coverage

@@ -241,8 +241,9 @@ fields; no existing caller changes shape).
 
 The optional `namespace` follows ADR-007's explicit exact-scope escape. When absent,
 `brain.auto_feedback` retains the caller's normal/default dispatch namespace. When present, the
-runtime mints a single-namespace token and the handler re-derives it for direct-call defense in
-depth; target-ID resolution remains namespace-agnostic, while the emitted event, fold-gate
+runtime mints a single-namespace token and the handler validates that direct callers present a
+token authorized for the same namespace; target-ID resolution remains namespace-agnostic, while
+the emitted event, fold-gate
 accounting key, durable snapshot, and live posterior mutation all belong to exactly that
 namespace. Invalid namespace strings fail closed. In particular, feedback emitted into a
 measurement namespace cannot mutate the default/live namespace's posteriors.

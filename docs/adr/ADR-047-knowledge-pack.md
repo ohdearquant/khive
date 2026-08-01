@@ -11,8 +11,11 @@ preserves the existing caller-token scope. An explicit value is parsed with `Nam
 and scopes the operation to exactly one namespace under ADR-007's precise escape: automatic
 domain suggestion, domain and atom resolution, section loading, KG blending, and brain-profile
 type-weight reads all use the same derived token. Invalid values fail closed. The handler repeats
-the derivation for direct-call defense in depth, while registry dispatch remains the Gate and
-authorization seam.
+the namespace parse for direct-call defense in depth, requires it to match the already-authorized
+token, and then narrows any broader visible set to that exact namespace; it never elevates a token.
+Nested brain dispatches preserve the token's request actor and scope through their own Gate checks.
+The pack-local Tier-3 section-posterior fallback is keyed by namespace so live feedback cannot
+change an untouched measurement arm. Registry dispatch remains the authorization seam.
 
 ## Amendment (2026-06-10b): exclude_status precedence fix; auto-compose member filter; atom status taxonomy clarification
 
