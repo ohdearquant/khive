@@ -224,7 +224,8 @@ impl KgPack {
                     return Err(RuntimeError::InvalidInput(
                         "scheduled_event notes are not editable via `update` — their creator \
                          identity and action payload are a trust boundary for replay dispatch; \
-                         use `schedule.cancel` to remove a pending one".into(),
+                         use `schedule.cancel` to remove a pending one"
+                            .into(),
                     ));
                 }
                 let patch = NotePatch::new(
