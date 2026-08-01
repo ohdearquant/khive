@@ -46,6 +46,20 @@ impl ServeAttribution {
             _ => Self::Unattributed,
         }
     }
+
+    /// Decode a stored `brain_serve_ledger.serve_attribution` column value.
+    ///
+    /// `None` covers both an absent column value and an unrecognized string —
+    /// callers must treat either as "no stored marker" (a legacy row), never
+    /// silently coerce to a specific state.
+    pub fn from_column(value: Option<&str>) -> Option<Self> {
+        match value? {
+            "profile" => Some(Self::Profile),
+            "unattributed" => Some(Self::Unattributed),
+            "unspecified" => Some(Self::Unspecified),
+            _ => None,
+        }
+    }
 }
 
 /// Interpreted brain signal for profile state updates.

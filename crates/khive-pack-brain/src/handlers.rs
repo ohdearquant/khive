@@ -1572,11 +1572,20 @@ impl BrainPack {
                 }
                 crate::serve_ledger::ServeLedgerResolution::Proceed {
                     accounting_profile_id,
+                    serve_attribution: ledger_attribution,
                 } => {
                     // ADR-081 §4 fail-safe: an implicit event whose serve row has
                     // no resolvable profile is recorded at zero weight — never
-                    // folded under a guessed profile.
-                    if accounting_profile_id.is_none() {
+                    // folded under a guessed profile. The stored tri-state marker
+                    // preserves the one exception: a row stamped `unspecified`
+                    // (no profile was ever selected at serve time) keeps the
+                    // legacy binding/default fallback already resolved above,
+                    // instead of being forced to zero like a genuine
+                    // `unattributed` (failed profile read) or a legacy row with
+                    // no stored marker at all.
+                    if accounting_profile_id.is_none()
+                        && ledger_attribution != Some(ServeAttribution::Unspecified)
+                    {
                         forced_zero_weight = true;
                         effective_profile = None;
                         profile_resolution = "serve_ledger_unattributed";
@@ -2024,6 +2033,8 @@ impl BrainPack {
         struct RecordServeParams {
             consumer_kind: String,
             served_by_profile_id: Option<String>,
+            #[serde(default)]
+            serve_attribution: Option<ServeAttribution>,
             target_ids: Vec<String>,
             query_raw: String,
             served_at: Option<i64>,
@@ -2064,6 +2075,7 @@ impl BrainPack {
             &query_class,
             &p.query_raw,
             served_at,
+            p.serve_attribution.map(ServeAttribution::as_str),
         )
         .await
         {

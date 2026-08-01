@@ -5714,6 +5714,7 @@ mod adr081_retune_driver_tests {
             "class-1",
             "raw query",
             1_000,
+            None,
         )
         .await
         .expect("record_serve");
@@ -5783,6 +5784,7 @@ mod adr081_retune_driver_tests {
             "class-2",
             "raw query",
             1_000,
+            None,
         )
         .await
         .expect("record_serve");
@@ -5832,6 +5834,7 @@ mod adr081_retune_driver_tests {
             "class-3",
             "raw query",
             1_000,
+            None,
         )
         .await
         .expect("record_serve");
@@ -5860,6 +5863,122 @@ mod adr081_retune_driver_tests {
         );
         assert_eq!(result["serve_attribution"], json!("unattributed"));
         assert_eq!(result["served_by_profile_id"], Value::Null);
+    }
+
+    /// ADR-081 amendment regression: a serve row stamped with the tri-state
+    /// `unattributed` marker (a recall whose bound profile record could not be
+    /// read) must force zero weight exactly like the legacy no-marker row
+    /// above — the marker must not accidentally unlock crediting a guessed
+    /// profile.
+    #[tokio::test]
+    async fn serve_ledger_stored_unattributed_marker_forces_zero_weight_failsafe() {
+        let (pack, rt) = make_pack();
+        let registry = empty_registry();
+        let token = rt.authorize(Namespace::local()).unwrap();
+        let target = create_test_entity(&rt, &token).await;
+
+        crate::serve_ledger::record_serve(
+            rt.sql().as_ref(),
+            "ledger-row-unattributed",
+            "local",
+            "recall",
+            None,
+            None,
+            None,
+            &target,
+            "class-unattributed",
+            "raw query",
+            1_000,
+            Some("unattributed"),
+        )
+        .await
+        .expect("record_serve");
+
+        let state_before = pack.snapshot().balanced_recall;
+
+        let result = pack
+            .dispatch(
+                "brain.feedback",
+                json!({
+                    "target_id": target,
+                    "signal": "implicit_positive",
+                    "scorer_run_id": "scorer-run-unattributed",
+                    "serve_ledger_id": "ledger-row-unattributed",
+                }),
+                &registry,
+                &token,
+            )
+            .await
+            .expect("stored-unattributed row must still succeed, just at zero weight");
+
+        let state_after = pack.snapshot().balanced_recall;
+        assert_eq!(
+            state_after, state_before,
+            "a stored unattributed marker must force zero weight, same as a legacy null row"
+        );
+        assert_eq!(result["serve_attribution"], json!("unattributed"));
+        assert_eq!(result["served_by_profile_id"], Value::Null);
+    }
+
+    /// ADR-081 amendment regression, paired with the two forced-zero tests
+    /// above: a serve row stamped `unspecified` (no profile was ever selected
+    /// at serve time — never a failed read) must keep the legacy
+    /// binding/default resolution permitted, not collapse into the same
+    /// forced-zero state as `unattributed`.
+    #[tokio::test]
+    async fn serve_ledger_stored_unspecified_marker_permits_legacy_fallback() {
+        let (pack, rt) = make_pack();
+        let registry = empty_registry();
+        let token = rt.authorize(Namespace::local()).unwrap();
+        let target = create_test_entity(&rt, &token).await;
+
+        crate::serve_ledger::record_serve(
+            rt.sql().as_ref(),
+            "ledger-row-unspecified",
+            "local",
+            "recall",
+            None,
+            None,
+            None,
+            &target,
+            "class-unspecified",
+            "raw query",
+            1_000,
+            Some("unspecified"),
+        )
+        .await
+        .expect("record_serve");
+
+        let state_before = pack.snapshot().balanced_recall;
+
+        let result = pack
+            .dispatch(
+                "brain.feedback",
+                json!({
+                    "target_id": target,
+                    "signal": "implicit_positive",
+                    "scorer_run_id": "scorer-run-unspecified",
+                    "serve_ledger_id": "ledger-row-unspecified",
+                }),
+                &registry,
+                &token,
+            )
+            .await
+            .expect("stored-unspecified row must resolve via legacy binding/default fallback");
+
+        let state_after = pack.snapshot().balanced_recall;
+        assert_ne!(
+            state_after, state_before,
+            "a stored unspecified marker must keep the legacy binding/default \
+             fallback permitted — it must NOT be forced to zero weight like a \
+             genuine unattributed (failed profile read) row"
+        );
+        assert_eq!(result["serve_attribution"], json!("unspecified"));
+        assert_eq!(
+            result["served_by_profile_id"],
+            json!("balanced-recall-v1"),
+            "no explicit profile was supplied, so the default fallback profile must be credited"
+        );
     }
 
     #[tokio::test]
@@ -5917,6 +6036,7 @@ mod adr081_retune_driver_tests {
             "dup-class",
             "raw query",
             42_000,
+            None,
         )
         .await
         .expect("first insert must succeed");
@@ -5934,6 +6054,7 @@ mod adr081_retune_driver_tests {
             "dup-class",
             "raw query",
             42_000,
+            None,
         )
         .await
         .expect("duplicate key must be tolerated, not errored");
@@ -5964,6 +6085,7 @@ mod adr081_retune_driver_tests {
             "class-a",
             "raw query a",
             1_000,
+            None,
         )
         .await
         .expect("first insert must succeed");
@@ -5982,6 +6104,7 @@ mod adr081_retune_driver_tests {
             "class-b",
             "raw query b",
             2_000,
+            None,
         )
         .await
         .expect_err("a PK collision with a mismatched natural key must not be tolerated");

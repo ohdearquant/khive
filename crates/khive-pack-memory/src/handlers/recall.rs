@@ -911,6 +911,7 @@ impl MemoryPack {
                     "target_ids": target_ids.clone(),
                     "query_raw": query_raw.clone(),
                     "served_at": served_at_us,
+                    "serve_attribution": serve_attribution,
                 });
                 if let Some(ref profile_id) = served_by_profile_id {
                     ledger_params["served_by_profile_id"] = json!(profile_id);
@@ -1606,6 +1607,123 @@ mod tests {
                         Some(khive_storage::types::SqlValue::Text(s)) if s == "adr081-recall-v1"
                     ),
                     "ledger row must carry the same served_by_profile_id as the response stamp"
+                );
+                found = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            found,
+            "serve ledger row for the recalled target must appear within 2s"
+        );
+    }
+
+    // ADR-081 amendment regression, paired with
+    // `recall_stamps_served_by_profile_id_and_appends_serve_ledger_row` above:
+    // a bound default profile whose record cannot be read must persist the
+    // `unattributed` marker on the serve ledger row itself, not just on the
+    // response — see `serve_ledger_stored_unattributed_marker_forces_zero_weight_failsafe`
+    // in khive-pack-brain for the paired downstream-scorer assertion this
+    // stored marker exists to preserve.
+    #[tokio::test]
+    #[serial(background_tasks)]
+    async fn recall_with_unreadable_bound_profile_persists_unattributed_marker_on_ledger_row() {
+        use khive_pack_brain::BrainPack;
+
+        let tmp = tempfile::Builder::new()
+            .prefix("khive-mem-recall-adr081-unattributed-")
+            .tempdir_in(std::env::temp_dir())
+            .expect("temp dir");
+        let db_path = tmp.path().join("khive.db");
+        std::mem::forget(tmp);
+
+        let rt = khive_runtime::KhiveRuntime::new(khive_runtime::RuntimeConfig {
+            db_path: Some(db_path),
+            embedding_model: None,
+            additional_embedding_models: vec![],
+            packs: vec!["kg".to_string(), "memory".to_string(), "brain".to_string()],
+            // Never created via `brain.create_profile` below — `brain.profile`
+            // dispatch fails, which recall.rs treats as an unreadable bound
+            // profile (ADR-104 §1), not a hard error.
+            brain_profile: Some("ghost-unreadable-recall-v1".to_string()),
+            ..khive_runtime::RuntimeConfig::default()
+        })
+        .expect("runtime");
+        let ns = Namespace::parse("local").expect("local namespace");
+        let token = rt.authorize(ns.clone()).expect("authorize local");
+
+        let note_id = rt
+            .create_note(
+                &token,
+                "memory",
+                None,
+                "adr081 unattributed ledger marker note",
+                Some(0.7),
+                None,
+                vec![],
+            )
+            .await
+            .expect("create note");
+
+        let brain = BrainPack::new(rt.clone());
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(KgPack::new(rt.clone()));
+        builder.register(MemoryPack::new(rt.clone()));
+        builder.register(brain);
+        let registry = builder.build().expect("registry");
+
+        let result = registry
+            .dispatch(
+                "memory.recall",
+                serde_json::json!({
+                    "namespace": ns.as_str(),
+                    "query": "adr081 unattributed ledger marker note",
+                    "limit": 10
+                }),
+            )
+            .await
+            .expect("memory.recall succeeds with an unreadable bound profile");
+
+        let hits = result.as_array().expect("bare array result");
+        assert!(!hits.is_empty(), "must find the seeded note");
+        assert!(
+            hits[0].get("served_by_profile_id").is_none()
+                || hits[0]["served_by_profile_id"].is_null(),
+            "unreadable bound profile must not be stamped as served_by"
+        );
+        assert_eq!(hits[0]["serve_attribution"], json!("unattributed"));
+
+        // The ledger append is fired via track_background_task off the response
+        // path, so poll briefly rather than assume it has landed by the time recall returns.
+        let target_id = note_id.id.to_string();
+        let mut found = false;
+        for _ in 0..100 {
+            let mut reader = rt.sql().reader().await.expect("reader");
+            let row = reader
+                .query_row(khive_storage::types::SqlStatement {
+                    sql: "SELECT served_by_profile_id, serve_attribution \
+                          FROM brain_serve_ledger WHERE target_id = ?1"
+                        .into(),
+                    params: vec![khive_storage::types::SqlValue::Text(target_id.clone())],
+                    label: None,
+                })
+                .await
+                .expect("query row");
+            if let Some(row) = row {
+                assert!(
+                    matches!(
+                        row.get("served_by_profile_id"),
+                        None | Some(khive_storage::types::SqlValue::Null)
+                    ),
+                    "ledger row must not carry a served_by_profile_id for an unreadable profile"
+                );
+                assert!(
+                    matches!(
+                        row.get("serve_attribution"),
+                        Some(khive_storage::types::SqlValue::Text(s)) if s == "unattributed"
+                    ),
+                    "ledger row must persist the unattributed marker, not collapse into a bare null; got {row:?}"
                 );
                 found = true;
                 break;
