@@ -3663,6 +3663,125 @@ backend = "sessions"
         );
     }
 
+    /// #1474: the user-facing `--atomic` executor prepares every operation
+    /// before its commit pass. Two individually acyclic task writes can
+    /// therefore form a cycle only inside the unit. The V15 commit-time
+    /// guards must reject the later statement and roll the earlier one back
+    /// for both authoritative dependency stores.
+    #[tokio::test]
+    async fn atomic_ops_file_rejects_same_unit_gtd_dependency_cycles() {
+        let db_file = NamedTempFile::new().expect("temp db");
+        let db_path = db_file.path().to_str().expect("utf8").to_string();
+
+        let (a_id, b_id) = {
+            let server = isolated_server(&db_path);
+            let response = dispatch_json(
+                &server,
+                r#"[gtd.assign(title="AtomicCycleA", status="next"), gtd.assign(title="AtomicCycleB", status="next")]"#,
+            )
+            .await;
+            (
+                response["results"][0]["result"]["full_id"]
+                    .as_str()
+                    .expect("task A id")
+                    .to_string(),
+                response["results"][1]["result"]["full_id"]
+                    .as_str()
+                    .expect("task B id")
+                    .to_string(),
+            )
+        };
+
+        let property_envelope = crate::atomic_apply::execute_atomic_ops_file(
+            vec![
+                atomic_op(
+                    "update",
+                    serde_json::json!({
+                        "id": a_id.clone(),
+                        "properties": {"depends_on": [b_id.clone()]}
+                    }),
+                ),
+                atomic_op(
+                    "update",
+                    serde_json::json!({
+                        "id": b_id.clone(),
+                        "properties": {"depends_on": [a_id.clone()]}
+                    }),
+                ),
+            ],
+            atomic_cfg(&db_path),
+            &KhiveConfig::default(),
+            khive_types::pack::ATOMIC_MAX_OPS_DEFAULT,
+        )
+        .await
+        .expect("cycle is a clean atomic rollback, not a seam failure");
+        assert_eq!(property_envelope["atomic"]["rolled_back"], true);
+        assert_eq!(property_envelope["atomic"]["failed_op_index"], 1);
+        assert!(
+            property_envelope["atomic"]["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("dependency cycle")),
+            "envelope: {property_envelope}"
+        );
+
+        let server = isolated_server(&db_path);
+        for task_id in [&a_id, &b_id] {
+            let response = dispatch_json(&server, &format!(r#"get(id="{task_id}")"#)).await;
+            assert!(
+                response["results"][0]["result"]["properties"]
+                    .get("depends_on")
+                    .is_none(),
+                "the earlier update must roll back too: {response}"
+            );
+        }
+
+        let edge_envelope = crate::atomic_apply::execute_atomic_ops_file(
+            vec![
+                atomic_op(
+                    "link",
+                    serde_json::json!({
+                        "source_id": a_id.clone(),
+                        "target_id": b_id.clone(),
+                        "relation": "depends_on"
+                    }),
+                ),
+                atomic_op(
+                    "link",
+                    serde_json::json!({
+                        "source_id": b_id.clone(),
+                        "target_id": a_id.clone(),
+                        "relation": "depends_on"
+                    }),
+                ),
+            ],
+            atomic_cfg(&db_path),
+            &KhiveConfig::default(),
+            khive_types::pack::ATOMIC_MAX_OPS_DEFAULT,
+        )
+        .await
+        .expect("edge cycle is a clean atomic rollback, not a seam failure");
+        assert_eq!(edge_envelope["atomic"]["rolled_back"], true);
+        assert_eq!(edge_envelope["atomic"]["failed_op_index"], 1);
+        assert!(
+            edge_envelope["atomic"]["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("dependency cycle")),
+            "envelope: {edge_envelope}"
+        );
+
+        let server = isolated_server(&db_path);
+        let response = dispatch_json(
+            &server,
+            &format!(r#"neighbors(id="{a_id}", direction="out", relations=["depends_on"])"#),
+        )
+        .await;
+        assert_eq!(
+            response["results"][0]["result"],
+            serde_json::json!([]),
+            "the earlier link must roll back too: {response}"
+        );
+    }
+
     /// ADR-099 B3 (second half): the inverse
     /// same-unit race — `[link(A, B, competes_with), update(X
     /// extends A-B -> competes_with)]`, where the CANONICAL row the update

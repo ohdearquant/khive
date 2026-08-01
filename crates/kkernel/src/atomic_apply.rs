@@ -8,7 +8,6 @@
 
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
-#[cfg(test)]
 use uuid::Uuid;
 
 use khive_pack_gtd::handlers::{ensure_audit_schema, write_audit_record};
@@ -19,7 +18,7 @@ use khive_runtime::atomic_plan::{
 use khive_runtime::atomic_runner::{AtomicOpFailure, AtomicOpPlan, AtomicRunOutcome};
 use khive_runtime::pack::{PackRegistry, VerbRegistry, VerbRegistryBuilder};
 use khive_runtime::{
-    EdgeListFilter, KhiveConfig, KhiveRuntime, NamespaceToken, Resolved, RuntimeConfig,
+    EdgeListFilter, KhiveConfig, KhiveRuntime, LinkSpec, NamespaceToken, Resolved, RuntimeConfig,
 };
 use khive_storage::EdgeRelation;
 #[cfg(test)]
@@ -135,6 +134,11 @@ pub(crate) async fn execute_atomic_ops_file(
     let verb_registry = verb_registry_builder
         .build()
         .context("building VerbRegistry for --atomic kind resolution")?;
+    // Canonical server startup installs the aggregate before dispatch. Atomic
+    // preparation calls the same runtime endpoint validator directly, so it
+    // must receive pack extensions too (notably GTD's task->task depends_on
+    // rule) rather than silently behaving like a kg-only runtime.
+    runtime.install_edge_rules(verb_registry.all_edge_rules());
     // #750: every other entry point that
     // builds a `VerbRegistry` from a freshly constructed `KhiveRuntime`
     // (`khive-mcp`'s `serve.rs`/`server.rs`) calls this so a pack-installed
@@ -386,11 +390,58 @@ async fn prepare_one(
             )
             .await
             .map_err(|e| anyhow::anyhow!("{e}"))?;
+            let id = resolved
+                .get("id")
+                .and_then(Value::as_str)
+                .and_then(|raw| Uuid::parse_str(raw).ok())
+                .ok_or_else(|| anyhow::anyhow!("resolved update id must be a full UUID"))?;
+            if let Some(Resolved::Note(note)) = runtime
+                .resolve_by_id(token, id)
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))?
+            {
+                let properties = resolved.get("properties").filter(|value| !value.is_null());
+                registry
+                    .validate_note_update_hook(runtime, token, &note, properties)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+            }
             Ok((plan, resolved))
         }
         "link" => {
             let resolved = resolve_kg_ids_in_args(runtime, token, tool, args).await?;
             let plan = khive_runtime::atomic_prepare::prepare_op(runtime, token, tool, &resolved)
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            let source_id = resolved
+                .get("source_id")
+                .and_then(Value::as_str)
+                .and_then(|raw| Uuid::parse_str(raw).ok())
+                .ok_or_else(|| anyhow::anyhow!("resolved link source_id must be a full UUID"))?;
+            let target_id = resolved
+                .get("target_id")
+                .and_then(Value::as_str)
+                .and_then(|raw| Uuid::parse_str(raw).ok())
+                .ok_or_else(|| anyhow::anyhow!("resolved link target_id must be a full UUID"))?;
+            let relation = resolved
+                .get("relation")
+                .and_then(Value::as_str)
+                .ok_or_else(|| anyhow::anyhow!("resolved link relation must be a string"))?
+                .parse::<EdgeRelation>()
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            let spec = LinkSpec {
+                namespace: Some(token.namespace().as_str().to_owned()),
+                source_id,
+                target_id,
+                relation,
+                weight: resolved
+                    .get("weight")
+                    .and_then(Value::as_f64)
+                    .unwrap_or(1.0),
+                metadata: resolved.get("metadata").cloned(),
+            };
+            registry
+                .validate_link_hooks(runtime, token, std::slice::from_ref(&spec))
                 .await
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
             Ok((plan, resolved))

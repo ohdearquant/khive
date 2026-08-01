@@ -2,7 +2,7 @@
 
 use serde_json::{json, Value};
 
-use khive_runtime::{merge_entry_metadata, LinkSpec, NamespaceToken, RuntimeError};
+use khive_runtime::{merge_entry_metadata, LinkSpec, NamespaceToken, RuntimeError, VerbRegistry};
 
 use super::common::{
     deser, enrich_allowlist_error, format_edge_output, parse_relation, resolve_uuid_unfiltered,
@@ -15,6 +15,7 @@ impl KgPack {
         &self,
         token: &NamespaceToken,
         params: Value,
+        registry: &VerbRegistry,
     ) -> Result<Value, RuntimeError> {
         let p: LinkParams = deser(params)?;
         let verbose = p.verbose.unwrap_or(false);
@@ -58,6 +59,9 @@ impl KgPack {
                         metadata,
                     });
                 }
+                registry
+                    .validate_link_hooks(&self.runtime, token, &specs)
+                    .await?;
                 let edges = self.runtime.link_many(token, specs).await?;
                 let mut resp = serde_json::json!({
                     "attempted": attempted,
@@ -126,6 +130,21 @@ impl KgPack {
                             continue;
                         }
                     };
+                    let spec = LinkSpec {
+                        namespace: Some(token.namespace().as_str().to_owned()),
+                        source_id: source,
+                        target_id: target,
+                        relation,
+                        weight,
+                        metadata: metadata.clone(),
+                    };
+                    if let Err(e) = registry
+                        .validate_link_hooks(&self.runtime, token, std::slice::from_ref(&spec))
+                        .await
+                    {
+                        error_list.push(json!({"index": idx, "error": format!("{e}")}));
+                        continue;
+                    }
                     match self
                         .runtime
                         .link(token, source, target, relation, weight, metadata)
@@ -163,6 +182,17 @@ impl KgPack {
         let weight = validate_weight(p.weight)?;
         let relation = parse_relation(&relation_str)?;
         let metadata = merge_entry_metadata(p.metadata, p.dependency_kind)?;
+        let spec = LinkSpec {
+            namespace: Some(token.namespace().as_str().to_owned()),
+            source_id: source,
+            target_id: target,
+            relation,
+            weight,
+            metadata: metadata.clone(),
+        };
+        registry
+            .validate_link_hooks(&self.runtime, token, std::slice::from_ref(&spec))
+            .await?;
 
         let edge = match self
             .runtime

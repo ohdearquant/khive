@@ -23,6 +23,38 @@ fn column_exists(conn: &Connection, table: &str, column: &str) -> bool {
     .unwrap_or(false)
 }
 
+fn insert_dependency_test_note(
+    conn: &Connection,
+    id: &str,
+    kind: &str,
+    properties: &str,
+    deleted_at: Option<i64>,
+) {
+    conn.execute(
+        "INSERT INTO notes \
+         (id, namespace, kind, status, name, content, properties, created_at, updated_at, deleted_at) \
+         VALUES (?1, 'local', ?2, 'active', ?1, '', ?3, 1, 1, ?4)",
+        rusqlite::params![id, kind, properties, deleted_at],
+    )
+    .expect("insert dependency-test note");
+}
+
+fn insert_dependency_test_edge(
+    conn: &Connection,
+    id: &str,
+    source_id: &str,
+    target_id: &str,
+    relation: &str,
+    deleted_at: Option<i64>,
+) -> rusqlite::Result<usize> {
+    conn.execute(
+        "INSERT INTO graph_edges \
+         (namespace, id, source_id, target_id, relation, weight, created_at, updated_at, deleted_at) \
+         VALUES ('local', ?1, ?2, ?3, ?4, 1.0, 1, 1, ?5)",
+        rusqlite::params![id, source_id, target_id, relation, deleted_at],
+    )
+}
+
 #[test]
 fn apply_schema_plan_rolls_back_migration_when_ledger_insert_fails() {
     static MIGRATIONS: &[Migration] = &[Migration {
@@ -83,6 +115,264 @@ fn fresh_db_migrates_to_latest() {
         MIGRATIONS.len() as i64,
         "ledger row count must equal the number of migrations"
     );
+}
+
+#[test]
+fn v15_fresh_start_installs_narrow_gtd_dependency_cycle_guards() {
+    let mut conn = open_memory();
+    run_migrations(&mut conn).expect("migrations should succeed");
+
+    for trigger in [
+        "gtd_task_dependency_cycle_notes_bi",
+        "gtd_task_dependency_cycle_notes_bu",
+        "gtd_task_dependency_cycle_edges_bi",
+        "gtd_task_dependency_cycle_edges_bu",
+    ] {
+        let exists: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type = 'trigger' AND name = ?1",
+                rusqlite::params![trigger],
+                |row| row.get(0),
+            )
+            .expect("query trigger catalog");
+        assert!(exists, "V15 must install {trigger}");
+    }
+
+    insert_dependency_test_note(&conn, "task-a", "task", r#"{"status":"next"}"#, None);
+    insert_dependency_test_note(&conn, "task-b", "task", r#"{"status":"next"}"#, None);
+    insert_dependency_test_note(&conn, "task-c", "task", r#"{"status":"next"}"#, None);
+    let insert_error = conn
+        .execute(
+            "INSERT INTO notes \
+             (id, namespace, kind, status, content, properties, created_at, updated_at) \
+             VALUES ('task-self', 'local', 'task', 'active', '', \
+                     '{\"depends_on\":[\"task-self\"]}', 1, 1)",
+            [],
+        )
+        .expect_err("the insert trigger must reject a direct property cycle");
+    assert!(
+        insert_error.to_string().contains("dependency cycle"),
+        "unexpected insert trigger error: {insert_error}"
+    );
+
+    conn.execute(
+        r#"UPDATE notes SET properties = '{"status":"next","depends_on":["task-b"]}' WHERE id = 'task-a'"#,
+        [],
+    )
+    .expect("first property dependency");
+    conn.execute(
+        r#"UPDATE notes SET properties = '{"status":"next","depends_on":["task-c"]}' WHERE id = 'task-b'"#,
+        [],
+    )
+    .expect("second property dependency");
+    let property_error = conn
+        .execute(
+            r#"UPDATE notes SET properties = '{"status":"next","depends_on":["task-a"]}' WHERE id = 'task-c'"#,
+            [],
+        )
+        .expect_err("closing a property cycle must fail at write time");
+    assert!(
+        property_error.to_string().contains("dependency cycle"),
+        "unexpected property trigger error: {property_error}"
+    );
+
+    insert_dependency_test_edge(&conn, "edge-a-b", "task-a", "task-b", "depends_on", None)
+        .expect("first edge dependency");
+    insert_dependency_test_edge(&conn, "edge-b-c", "task-b", "task-c", "depends_on", None)
+        .expect("second edge dependency");
+    let edge_error =
+        insert_dependency_test_edge(&conn, "edge-c-a", "task-c", "task-a", "depends_on", None)
+            .expect_err("closing an edge cycle must fail at write time");
+    assert!(
+        edge_error.to_string().contains("dependency cycle"),
+        "unexpected edge trigger error: {edge_error}"
+    );
+
+    // Soft-deleted rows are not live reachability. Removing B -> C from the
+    // live edge graph makes C -> A acyclic even though the tombstone remains.
+    conn.execute(
+        "UPDATE graph_edges SET deleted_at = 2 WHERE id = 'edge-b-c'",
+        [],
+    )
+    .expect("soft-delete dependency edge");
+    insert_dependency_test_edge(&conn, "edge-c-a", "task-c", "task-a", "depends_on", None)
+        .expect("soft-deleted edges must not participate in reachability");
+    let reactivation_error = conn
+        .execute(
+            "UPDATE graph_edges SET deleted_at = NULL WHERE id = 'edge-b-c'",
+            [],
+        )
+        .expect_err("the update trigger must reject reactivating a cycle");
+    assert!(
+        reactivation_error.to_string().contains("dependency cycle"),
+        "unexpected edge-update trigger error: {reactivation_error}"
+    );
+
+    // A soft-deleted task's old properties likewise do not contribute a live
+    // path. Direct storage can still create a broken reference; GTD read-time
+    // diagnostics classify it and typed public hooks reject it earlier.
+    insert_dependency_test_note(
+        &conn,
+        "task-deleted",
+        "task",
+        r#"{"depends_on":["task-a"]}"#,
+        Some(2),
+    );
+    conn.execute(
+        r#"UPDATE notes SET properties = '{"depends_on":["task-deleted"]}' WHERE id = 'task-a'"#,
+        [],
+    )
+    .expect("soft-deleted notes must not participate in reachability");
+
+    // The migration governs only the GTD task dependency graph. Other note
+    // kinds and other edge relations retain their existing write behavior.
+    insert_dependency_test_note(
+        &conn,
+        "observation-self",
+        "observation",
+        r#"{"depends_on":["observation-self"]}"#,
+        None,
+    );
+    insert_dependency_test_edge(&conn, "related-a-b", "task-a", "task-b", "related_to", None)
+        .expect("unrelated edge relation must remain writable");
+    insert_dependency_test_edge(&conn, "related-b-a", "task-b", "task-a", "related_to", None)
+        .expect("unrelated edge cycle must remain writable");
+
+    // Edge reachability is scoped to the edge row's namespace, even though
+    // UUID endpoint resolution itself is namespace-agnostic (ADR-007). An
+    // opposite direction in another graph namespace is independent, while a
+    // cycle completed inside that namespace is still rejected.
+    conn.execute(
+        "INSERT INTO graph_edges \
+         (namespace, id, source_id, target_id, relation, weight, created_at, updated_at) \
+         VALUES ('other', 'other-b-a', 'task-b', 'task-a', 'depends_on', 1.0, 1, 1)",
+        [],
+    )
+    .expect("opposite direction in another edge namespace remains independent");
+    let other_namespace_error = conn
+        .execute(
+            "INSERT INTO graph_edges \
+             (namespace, id, source_id, target_id, relation, weight, created_at, updated_at) \
+             VALUES ('other', 'other-a-b', 'task-a', 'task-b', 'depends_on', 1.0, 1, 1)",
+            [],
+        )
+        .expect_err("a cycle inside the other edge namespace must still fail");
+    assert!(
+        other_namespace_error
+            .to_string()
+            .contains("dependency cycle"),
+        "unexpected cross-namespace guard error: {other_namespace_error}"
+    );
+}
+
+#[test]
+fn v13_serializes_opposite_property_updates_without_committing_a_cycle() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("gtd-cycle-race.db");
+    let mut setup = Connection::open(&path).expect("open setup connection");
+    run_migrations(&mut setup).expect("migrations should succeed");
+    insert_dependency_test_note(&setup, "race-a", "task", r#"{"status":"next"}"#, None);
+    insert_dependency_test_note(&setup, "race-b", "task", r#"{"status":"next"}"#, None);
+    drop(setup);
+
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let mut handles = Vec::new();
+    for (source, target) in [("race-a", "race-b"), ("race-b", "race-a")] {
+        let path = path.clone();
+        let barrier = barrier.clone();
+        handles.push(std::thread::spawn(move || {
+            let mut conn = Connection::open(path).expect("open racing connection");
+            conn.busy_timeout(std::time::Duration::from_secs(5))
+                .expect("set busy timeout");
+            barrier.wait();
+            let tx = conn
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .expect("begin immediate");
+            let properties = format!(r#"{{"status":"next","depends_on":["{target}"]}}"#);
+            let result = tx.execute(
+                "UPDATE notes SET properties = ?1 WHERE id = ?2",
+                rusqlite::params![properties, source],
+            );
+            match result {
+                Ok(_) => tx.commit().map(|_| ()),
+                Err(error) => {
+                    tx.rollback().expect("rollback rejected update");
+                    Err(error)
+                }
+            }
+        }));
+    }
+
+    let outcomes: Vec<_> = handles
+        .into_iter()
+        .map(|handle| handle.join().expect("race thread"))
+        .collect();
+    assert_eq!(
+        outcomes.iter().filter(|result| result.is_ok()).count(),
+        1,
+        "exactly one direction may commit: {outcomes:?}"
+    );
+    let rejected = outcomes
+        .iter()
+        .find_map(|result| result.as_ref().err())
+        .expect("one direction must be rejected");
+    assert!(
+        rejected.to_string().contains("dependency cycle"),
+        "unexpected race rejection: {rejected}"
+    );
+
+    let verify = Connection::open(path).expect("open verification connection");
+    let dependency_rows: i64 = verify
+        .query_row(
+            "SELECT COUNT(*) FROM notes WHERE id IN ('race-a', 'race-b') \
+             AND json_array_length(properties, '$.depends_on') = 1",
+            [],
+            |row| row.get(0),
+        )
+        .expect("count committed dependency directions");
+    assert_eq!(dependency_rows, 1, "the committed graph must stay acyclic");
+}
+
+#[test]
+fn v13_edge_guard_ignores_paths_through_soft_deleted_tasks() {
+    let mut conn = open_memory();
+    run_migrations(&mut conn).expect("migrations should succeed");
+    insert_dependency_test_note(&conn, "live-a", "task", r#"{"status":"next"}"#, None);
+    insert_dependency_test_note(&conn, "deleted-b", "task", r#"{"status":"next"}"#, None);
+    insert_dependency_test_note(&conn, "live-c", "task", r#"{"status":"next"}"#, None);
+    insert_dependency_test_edge(
+        &conn,
+        "live-a-deleted-b",
+        "live-a",
+        "deleted-b",
+        "depends_on",
+        None,
+    )
+    .expect("first live edge");
+    insert_dependency_test_edge(
+        &conn,
+        "deleted-b-live-c",
+        "deleted-b",
+        "live-c",
+        "depends_on",
+        None,
+    )
+    .expect("second live edge");
+    conn.execute(
+        "UPDATE notes SET status = 'deleted', deleted_at = 2 WHERE id = 'deleted-b'",
+        [],
+    )
+    .expect("soft-delete the intermediate task without deleting its edges");
+
+    insert_dependency_test_edge(
+        &conn,
+        "live-c-live-a",
+        "live-c",
+        "live-a",
+        "depends_on",
+        None,
+    )
+    .expect("tombstoned task edges must not form a live dependency path");
 }
 
 #[test]

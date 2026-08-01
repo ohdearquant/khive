@@ -23,8 +23,9 @@ domains without forking the substrate.
 The system must satisfy:
 
 1. **No substrate fork.** Tasks ride on the existing notes table. No new storage
-   trait, no migration, no parallel CRUD path. The `properties` JSON column carries
-   GTD-specific fields.
+   trait or parallel CRUD path exists; the `properties` JSON column carries
+   GTD-specific fields. V15 adds invariant triggers without changing the task row
+   shape.
 2. **Five disjoint verbs.** No collision with the kg pack's shared CRUD. GTD's verbs
    express lifecycle intent (`assign`, `next`, `complete`, `tasks`, `transition`),
    not generic CRUD.
@@ -91,8 +92,10 @@ The `properties` JSON column carries every GTD field:
 }
 ```
 
-The notes table schema is unchanged. The pack's only schema artifact is the additional
-`"task"` value in `note.kind`. No DDL, no migration.
+The notes table's column shape is unchanged: `"task"` in `note.kind` and the JSON
+properties above carry task state. GTD separately owns the auxiliary lifecycle-audit
+table described below. Core migration V15 adds cycle-guard triggers to `notes` and
+`graph_edges`; it adds no task columns or parallel task table.
 
 ### GTD lifecycle
 
@@ -137,7 +140,7 @@ task-specific knowledge in retrieval.
 | Verb             | Purpose                                                                                                                                       |
 | ---------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
 | `gtd.assign`     | Create a task. Args: `title`, `priority?`, `status?`, `assignee?`, `due?`, `depends_on?`, `tags?`, `description?`. Returns the task envelope. |
-| `gtd.next`       | List actionable tasks (`status ∈ {next, active}`), priority-sorted. Args: `limit?`, `assignee?`.                                              |
+| `gtd.next`       | List actionable tasks (`status ∈ {next, active}`), priority-sorted. Args: `limit?`, `assignee?`, `include_blocked?`.                          |
 | `gtd.complete`   | Validate transition to `done`, record `completed_at` and optional `result`. Args: `id`, `result?`.                                            |
 | `gtd.tasks`      | Filtered list. Args: `status?`, `assignee?`, `priority?`, `limit?`, `offset?`.                                                                |
 | `gtd.transition` | Explicit lifecycle change with full transition validation. Args: `id`, `status`, `note?`.                                                     |
@@ -174,6 +177,43 @@ failures are logged via `tracing::warn!` and do not propagate to the caller — 
 storage write already succeeded. The property captures the same information; a
 missing edge is a degraded result, not a failure.
 
+### Dependency integrity and diagnostics (2026-08-01 amendment)
+
+Task dependency graphs are acyclic at both public write surfaces. Before a generic
+`update` writes `properties.depends_on` on a task, the task kind hook validates full
+UUIDs, live task targets in the same namespace, direct self-dependencies, and
+property reachability. Before the generic `link` verb writes a task-to-task
+`depends_on` edge, the same hook checks edge reachability. Atomic bulk-link input is
+validated as one proposed graph, so a cycle formed entirely inside one batch is
+rejected before any edge is stored. Both walks fail closed at a 20,000-node/edge
+safety bound instead of accepting an unverified dependency.
+
+Typed hooks are necessary for precise request errors but insufficient as the durable
+invariant: two processes can both validate against the same pre-write snapshot, and
+`kkernel exec --ops-file --atomic` prepares every operation before its single commit
+pass. Core migration V15 (`015-gtd-dependency-cycle-guards.sql`) therefore installs
+narrow `BEFORE INSERT`/`BEFORE UPDATE` triggers on `notes` and `graph_edges`. The trigger
+walk runs inside SQLite's serialized writer transaction, sees earlier writes in the
+same atomic unit, and rejects the later direction of an opposite-request race. It
+considers only live task property paths and live task-to-task `depends_on` edges;
+soft-deleted rows and unrelated writes are excluded. Existing cyclic data is not
+rewritten at migration time, but a later governed mutation cannot preserve or close a
+cycle.
+
+Reads keep dependency failure distinct from lifecycle status. Task envelopes returned
+by `gtd.tasks` and `gtd.next` carry:
+
+- `dependency_state`: `ready`, `blocked`, or `broken`;
+- `actionable`: true only for a `next`/`active` task whose dependencies are ready;
+- `blocked_by`: one entry per unresolved blocker, with a structural state such as
+  `pending`, `cancelled`, `soft_deleted`, `missing`, or `invalid`.
+
+`gtd.next` preserves its default actionable-only behavior. Passing
+`include_blocked=true` also returns `next`/`active` tasks whose dependency state is
+blocked or broken, sorted after ready work. This gives operators a diagnostic view
+without silently scheduling broken tasks. `gtd.tasks` always adds diagnostics to the
+tasks on the requested page.
+
 ### `TaskHook`: kind specialization for shared CRUD
 
 The kg pack's shared `create` handles `note_kind="task"` through GTD's `KindHook`:
@@ -202,6 +242,16 @@ impl KindHook for TaskHook {
     ) -> Result<(), RuntimeError> {
         // Resolve depends_on IDs and create depends_on edges (best-effort).
         // Log on failure; do not propagate.
+        // ...
+    }
+
+    async fn validate_note_update(/* ... */) -> Result<(), RuntimeError> {
+        // Reject direct or transitive properties.depends_on cycles.
+        // ...
+    }
+
+    async fn validate_links(/* batch ... */) -> Result<(), RuntimeError> {
+        // Reject direct, transitive, and same-batch depends_on edge cycles.
         // ...
     }
 }
@@ -255,6 +305,9 @@ substrate operations through the request DSL."
 kg `update` — `update` patches arbitrary fields without lifecycle awareness, while
 `transition` validates against the allowed-set table. A `done → inbox` `update` would
 silently succeed; `gtd.transition(id, "inbox")` from `done` returns `InvalidInput`.
+The dependency-integrity amendment is deliberately narrower: the task hook validates
+`properties.depends_on` updates because graph cycles are a cross-record invariant,
+without moving the lifecycle state machine into shared CRUD.
 
 `next` and `tasks` are GTD-specific list queries. `tasks` filters by `status`,
 `assignee`, `priority`. `next` is a specialized form of `tasks` returning actionable
@@ -350,6 +403,11 @@ Every successful op returns a stable task envelope:
   "properties": { ... full property bag ... }
 }
 ```
+
+The `gtd.next` and `gtd.tasks` query renderers add
+`dependency_state`, `actionable`, and `blocked_by` to this base task envelope.
+Creation and by-ID retrieval keep the base envelope because they do not perform
+the blocker-resolution read required to classify dependency state.
 
 `transition` returns a delta envelope:
 
@@ -560,6 +618,12 @@ minimal. Operators who want GTD configure it explicitly.
   - `TaskHook` implementing `KindHook`.
   - `prepare_create`: normalize GTD args into kg shape.
   - `after_create`: fire `depends_on` edges (best-effort, logged on failure).
+  - `validate_note_update` / `validate_links`: reject dependency cycles before writes.
+- `crates/khive-pack-gtd/src/dependency.rs`:
+  - Bounded property and edge reachability validation.
+  - Read-time blocker classification for `next` and `tasks` task envelopes.
+- `crates/khive-db/sql/015-gtd-dependency-cycle-guards.sql`:
+  - Transaction-time property/edge cycle backstops shared by every SQLite write path.
 - `crates/khive-pack-gtd/src/schema.rs`:
   - `gtd_lifecycle_audit` table DDL.
 - `crates/kkernel/src/server.rs` (or pack registration):

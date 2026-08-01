@@ -49,6 +49,11 @@ assignee. It defaults to `limit=10` and silently clamps `limit` to 1–200. If
 more than 20,000 actionable tasks match, it returns an error; narrow the query
 (for example with the exact `assignee` filter) and retry.
 
+By default it omits tasks with unfinished or structurally broken dependencies.
+Pass `include_blocked=true` to include those candidates after ready work for
+triage. Both `gtd.next` and `gtd.tasks` annotate tasks with `dependency_state`,
+`actionable`, and `blocked_by` diagnostics.
+
 ```text
 request(ops="gtd.next(assignee=\"docs-maintainer\", limit=10)")
 ```
@@ -82,7 +87,11 @@ only `transitioned`, `id`, `full_id`, `from`, `to`, and `note` are present.
 Pass task identifiers in `depends_on` when creating a task to express blockers.
 The GTD pack adds a `depends_on` endpoint rule for task-to-task edges; other
 note or entity types are not valid dependency targets. `gtd.next` omits a task
-until every listed dependency is `done`.
+until every listed dependency is `done`. A cancelled, soft-deleted, hard-missing,
+malformed, cross-namespace, or wrong-kind dependency makes the task `broken` and
+is identified in `blocked_by`; an unfinished live task makes it `blocked`.
+Dependency writes reject direct and transitive cycles on both generic task-property
+updates and graph links.
 
 ## Gotchas
 
