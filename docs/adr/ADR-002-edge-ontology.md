@@ -498,6 +498,45 @@ The second expansion (→ 17, [ADR-055](ADR-055-epistemic-edge-relations.md)) ad
   does not connect two entities. The relation choice carries polarity; the weight carries
   strength. This is the signal a confidence model consumes.
 
+### How is the closed set calculable and auditable?
+
+[ADR-076](ADR-076-relation-calculability-and-system-role.md) records why there is no
+first-principles relation algebra whose closure uniquely derives these 17 relations: khive's
+query classes are design inputs, not deductions. The calculable result is instead a repeatable
+falsification audit. Each relation names a system role, and a proposed relation is tested against
+seven cheaper encodings: converse (Cv), endpoint restriction (Er), attribute (At), polarity
+(Po), fixed property chain (Ch), materialized reachability view (Mv), and typed sub-relation
+(Sr).
+
+The audit disposition for the current set is:
+
+- Exactly the 15 base relations in this ADR are registered as the grandfathered
+  `SurvivesAll` set. No base relation is treated as a converse, fixed composition, or
+  materialized reachability view of another. In particular, `contains`/`part_of` do not collapse:
+  housing or scope and constitution or membership can diverge. `depends_on`/`enables` also do not
+  collapse: a hard requirement is not the converse of making an outcome possible.
+- `supports`/`refutes` are the one algebraically collapsible pair. They fail Po because a single
+  `assesses` relation plus a polarity value can answer the same queries. ADR-055 nevertheless
+  keeps both as top-level relations under an explicit system-role exception so polarity remains
+  visible to planners, indexes, federation, and the public API rather than residing in open
+  metadata.
+- The live base-plus-KG-pack endpoint-signature audit finds only the ratified
+  `supports`/`refutes` collision. An identical signature is a signal to run Er analysis, not by
+  itself proof of redundancy; relations with the same legal endpoint kinds can still answer
+  different questions.
+
+Accordingly, the audit does not replace the stored vocabulary with a smaller inferred generating
+set. The only demonstrated algebraic collapse is retained by a declared system role, and khive
+does not create converse, chained, or materialized derived edges automatically.
+
+The decision is executable, not prose-only. The seven-eliminator harness and closed-set coverage
+gate live in `crates/khive-types/tests/certificate/`; the live endpoint-signature tripwire lives
+in `crates/khive-pack-kg/tests/certificate/endpoint_signatures.rs`. A new Tier-1 relation must
+provide non-vacuous fixtures that defeat all seven eliminators, or record the eliminator it fails
+and the explicit system role that justifies keeping it. A proposed Tier-2 native label (#293)
+must clear the same irreducibility and system-role analysis before its separate storage mechanism
+is designed; an honest mapping to an existing core relation does not qualify as a new label.
+
 ### Why the 2026-07-08 endpoint amendment?
 
 The base contract did not distinguish "who first described this concept" from "who authored
