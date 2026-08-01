@@ -5,6 +5,7 @@ use uuid::Uuid;
 
 use khive_runtime::{micros_to_iso, KhiveRuntime, Namespace, NamespaceToken, RuntimeError};
 use khive_storage::{note::Note, StorageError, WriterTaskRequestState};
+use khive_types::{Details, KhiveError};
 
 pub(crate) fn short_id(uuid: Uuid) -> String {
     uuid.as_hyphenated().to_string().chars().take(8).collect()
@@ -35,12 +36,18 @@ pub(crate) async fn resolve_id(
 
 fn attach_outbound_id_to_ambiguous_write(outbound_id: Uuid, error: RuntimeError) -> RuntimeError {
     match error {
-        original @ RuntimeError::Storage(StorageError::WriterTaskTerminated {
+        RuntimeError::Storage(StorageError::WriterTaskTerminated {
             request_state: WriterTaskRequestState::SideEffectsUnknown,
-        }) => RuntimeError::Ambiguous(format!(
-            "dual_write delivery outcome is uncertain: outbound_id={outbound_id}; \
-             original error: {original}; call comm.delivered(id=\"{outbound_id}\") before retrying"
-        )),
+        }) => RuntimeError::Khive(
+            KhiveError::conflict(format!(
+                "dual_write delivery outcome is uncertain (side_effects_unknown); \
+                 call comm.delivered(id=\"{outbound_id}\") before retrying"
+            ))
+            .with_details(Details::new_owned([(
+                "outbound_id",
+                outbound_id.to_string(),
+            )])),
+        ),
         other => other,
     }
 }
@@ -656,11 +663,22 @@ mod tests {
         });
 
         let annotated = attach_outbound_id_to_ambiguous_write(outbound_id, error);
-        assert!(matches!(&annotated, RuntimeError::Ambiguous(_)));
-        let message = annotated.to_string();
-        assert!(message.contains("side_effects_unknown"));
-        assert!(message.contains(&format!("outbound_id={outbound_id}")));
-        assert!(message.contains(&format!("comm.delivered(id=\"{outbound_id}\")")));
+        let RuntimeError::Khive(khive_error) = &annotated else {
+            panic!("expected RuntimeError::Khive, got {annotated:?}");
+        };
+        assert_eq!(khive_error.kind(), khive_types::ErrorKind::Conflict);
+        assert_eq!(khive_error.retry_hint(), khive_types::RetryHint::NoRetry);
+        assert_eq!(
+            khive_error
+                .details()
+                .and_then(|d| d.get("outbound_id"))
+                .map(str::to_string),
+            Some(outbound_id.to_string())
+        );
+        assert!(khive_error.message().contains("side_effects_unknown"));
+        assert!(khive_error
+            .message()
+            .contains(&format!("comm.delivered(id=\"{outbound_id}\")")));
     }
 
     #[test]

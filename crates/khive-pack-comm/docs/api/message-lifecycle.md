@@ -16,9 +16,11 @@ is resolved via `runtime.resolve_prefix` (namespace-scoped).
 Preserves ordinary `create_notes_atomic` failures unchanged. A
 `WriterTaskTerminated { request_state: SideEffectsUnknown }` error is different:
 the request was accepted, but the caller cannot establish whether the complete
-pair committed. The helper turns that case into `RuntimeError::Ambiguous` and
-includes the pre-generated full `outbound_id`, allowing an exact
-`comm.delivered` lookup before retry.
+pair committed. The helper turns that case into a structured
+`RuntimeError::Khive(KhiveError)` (`kind=Conflict`) carrying the pre-generated
+full `outbound_id` as `details.outbound_id`, so an automated caller can read
+the correlation id back out of the MCP error object instead of parsing prose,
+and use it for an exact `comm.delivered` lookup before retry.
 
 ## `message.rs::dual_write_message`
 

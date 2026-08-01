@@ -213,8 +213,11 @@ Atomicity does not by itself prove the outcome to a caller when an accepted
 writer request loses its typed reply. The writer-task contract reports that
 case as `request_state=side_effects_unknown`: either the complete pair may have
 committed or neither copy did. `dual_write_message` pre-generates the outbound
-UUID and surfaces this case as `RuntimeError::Ambiguous` containing the full
-`outbound_id`.
+UUID and surfaces this case as a structured `RuntimeError::Khive(KhiveError)`
+(`kind=conflict`) whose `details.outbound_id` field carries the full
+`outbound_id` as a machine-readable wire value — not embedded in the
+free-text `message` field — so an automated caller can read it directly off
+the MCP error object.
 
 The comm pack exposes `comm.delivered(id=<full-outbound-uuid>)`, a read-only
 Assertive verb. It queries for a live inbound `message` in the caller's

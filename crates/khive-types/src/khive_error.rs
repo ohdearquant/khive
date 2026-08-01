@@ -239,6 +239,17 @@ impl Details {
         )
     }
 
+    /// Build `Details` from static keys paired with owned, dynamically
+    /// computed values — e.g. a UUID or other runtime-generated string that
+    /// cannot be expressed as `&'static str`. Same bounding/truncation rules
+    /// as [`Details::new`].
+    pub fn new_owned<I>(pairs: I) -> Self
+    where
+        I: IntoIterator<Item = (&'static str, String)>,
+    {
+        Self::from_owned(pairs.into_iter().map(|(k, v)| (Cow::Borrowed(k), Cow::Owned(v))))
+    }
+
     /// Shared bounding/truncation logic for the constructor: partition the
     /// source into ordinary pairs and reserved-key collisions, then hand
     /// off to [`Details::build`] for the bound + indicator logic.
