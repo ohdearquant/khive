@@ -136,6 +136,10 @@ pub(crate) struct HeartbeatParams {
     pub channel_kind: String,
     pub channel_slug: String,
     pub outcome: String,
+    /// The writer's nominal cadence for this channel. Optional so a newer
+    /// comm pack remains compatible with older/internal heartbeat writers.
+    #[serde(default)]
+    pub poll_interval_secs: Option<u64>,
     #[serde(default)]
     pub error_class: Option<String>,
     #[serde(default)]

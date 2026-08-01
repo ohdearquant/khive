@@ -1245,12 +1245,15 @@ request(ops="comm.probe(actor=\"lambda:leo\", since_us=42)")
 ### `comm.health` — Assertive
 
 Read-only per-channel health snapshot. Returns the daemon-persisted heartbeat row for
-every known channel: timestamps and consecutive-failure counts only, never a computed
-healthy bool. Health judgment belongs to the caller. Rows are read from the caller's
-injected namespace (`namespace=`, defaulting to `local` like every other comm verb) —
-`comm.heartbeat` is the only handler pinned to the fixed `local` operational namespace.
-The response echoes the namespace actually read in a `namespace` field, so an empty
-`channels` array is unambiguous even under a scoped read. See the
+every known channel, including `poll_interval_secs` and nullable advisory `stalled`.
+For current rows with no known failure, `stalled` becomes true after three missed nominal
+intervals; it is null for legacy/malformed rows or active failure/backoff state. This is
+not a computed healthy or authoritative supervisor verdict. Health judgment belongs to
+the caller. Rows are read from the caller's injected namespace (`namespace=`, defaulting
+to `local` like every other comm verb). The shipped poll loop explicitly writes its
+heartbeats to `local`; authorized per-tenant writers can write their own namespace. The
+response echoes the namespace actually read in a `namespace` field, so an empty
+`channels` array is scoped unambiguously. See the
 [communication guide](communication.md) for the full response contract.
 
 No parameters.
