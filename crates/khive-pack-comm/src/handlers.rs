@@ -1361,6 +1361,11 @@ pub(crate) async fn handle_heartbeat(
             "heartbeat: `channel_slug` must not be empty".into(),
         ));
     }
+    if p.poll_interval_secs == Some(0) {
+        return Err(RuntimeError::InvalidInput(
+            "heartbeat: `poll_interval_secs` must be greater than zero".into(),
+        ));
+    }
     let outcome = match p.outcome.as_str() {
         s @ ("success" | "failure") => s,
         other => {
@@ -1424,6 +1429,9 @@ pub(crate) async fn handle_heartbeat(
     props["channel_kind"] = json!(p.channel_kind);
     props["channel_slug"] = json!(p.channel_slug);
     props["last_poll_attempt_at"] = json!(at);
+    if let Some(poll_interval_secs) = p.poll_interval_secs {
+        props["poll_interval_secs"] = json!(poll_interval_secs);
+    }
 
     match outcome {
         "success" => {
@@ -1486,15 +1494,53 @@ pub(crate) async fn handle_heartbeat(
     }))
 }
 
+/// A channel is schedule-stale after three complete nominal poll intervals.
+/// The grace avoids flagging a live poller during ordinary tick and I/O jitter.
+const STALLED_AFTER_INTERVALS: u64 = 3;
+
+fn channel_stalled(props: &Value, as_of: &DateTime<Utc>) -> Option<bool> {
+    // A known failure enters intentional exponential backoff, so the nominal
+    // cadence cannot distinguish an overdue poll from a scheduled retry.
+    let consecutive_failures = props.get("consecutive_failures").and_then(Value::as_u64)?;
+    if consecutive_failures > 0 {
+        return None;
+    }
+    let poll_interval_secs = props.get("poll_interval_secs")?.as_u64()?;
+    if poll_interval_secs == 0 {
+        return None;
+    }
+    let stall_after_millis = poll_interval_secs
+        .checked_mul(STALLED_AFTER_INTERVALS)?
+        .checked_mul(1_000)?;
+    let last_poll_attempt =
+        DateTime::parse_from_rfc3339(props.get("last_poll_attempt_at")?.as_str()?)
+            .ok()?
+            .with_timezone(&Utc);
+    let elapsed_millis = u64::try_from(
+        as_of
+            .signed_duration_since(last_poll_attempt)
+            .num_milliseconds(),
+    )
+    .ok()?;
+    Some(elapsed_millis > stall_after_millis)
+}
+
 /// Project a persisted `channel_health` note into the `comm.health()` channel
-/// entry shape. Missing fields (a row written before a given property existed)
-/// default to `null`/`0` rather than panicking — forward-compatible with rows
-/// written by an older heartbeat writer.
-fn channel_health_to_json(note: &Note) -> Value {
+/// entry shape. Missing or malformed cadence/timestamp fields (including rows
+/// written before #1472) produce `stalled: null` rather than pretending the
+/// channel is current.
+fn channel_health_to_json(note: &Note, as_of: &DateTime<Utc>) -> Value {
     let props = note.properties.clone().unwrap_or_else(|| json!({}));
+    let poll_interval_secs = props
+        .get("poll_interval_secs")
+        .and_then(Value::as_u64)
+        .filter(|interval| *interval > 0);
+    let stalled = channel_stalled(&props, as_of);
     json!({
         "channel_kind": props.get("channel_kind").cloned().unwrap_or(Value::Null),
         "channel_slug": props.get("channel_slug").cloned().unwrap_or(Value::Null),
+        "poll_interval_secs": poll_interval_secs,
+        "stalled": stalled,
         "last_success_at": props.get("last_success_at").cloned().unwrap_or(Value::Null),
         "last_poll_attempt_at": props.get("last_poll_attempt_at").cloned().unwrap_or(Value::Null),
         "last_failure_at": props.get("last_failure_at").cloned().unwrap_or(Value::Null),
@@ -1505,8 +1551,9 @@ fn channel_health_to_json(note: &Note) -> Value {
 
 /// `health` — read-only per-channel health snapshot (khive #606). Reads
 /// `channel_health` rows from `token.namespace()` (khive #877 namespace
-/// scoping); never returns a computed `healthy: bool` — that judgment belongs
-/// to the caller. See crates/khive-pack-comm/docs/api/channel-health.md#handlersrshandle_health
+/// scoping). The additive `stalled` schedule fact is deliberately narrower
+/// than a computed `healthy: bool`; overall health judgment still belongs to
+/// the caller. See crates/khive-pack-comm/docs/api/channel-health.md#handlersrshandle_health
 /// for the `role`/`namespace`/`resource` field semantics (ADR-103 Stage 1).
 ///
 /// `resource` is a process-level self-report of this process's own CPU/RSS
@@ -1554,8 +1601,13 @@ pub(crate) async fn handle_health(
         );
     }
 
-    let channels: Vec<Value> = page.items.iter().map(channel_health_to_json).collect();
-    let as_of = Utc::now().to_rfc3339();
+    let now = Utc::now();
+    let channels: Vec<Value> = page
+        .items
+        .iter()
+        .map(|note| channel_health_to_json(note, &now))
+        .collect();
+    let as_of = now.to_rfc3339();
 
     let (role, source) = if channels.is_empty() {
         ("client", None::<&str>)
@@ -2109,12 +2161,48 @@ fn build_references_header(parent_chain: Option<&str>, parent_message_id: &str) 
 #[cfg(test)]
 mod tests {
     use super::{
-        build_references_header, heartbeat_note_id, message_id_match_candidates,
+        build_references_header, channel_stalled, heartbeat_note_id, message_id_match_candidates,
         parent_references_chain, parent_wire_message_id, read_response, sanitize_reference_token,
         wrap_message_id,
     };
     use khive_storage::StorageError;
     use serde_json::{json, Value};
+
+    #[test]
+    fn channel_stalled_uses_strict_three_interval_threshold() {
+        let props = json!({
+            "poll_interval_secs": 5,
+            "last_poll_attempt_at": "2026-08-01T12:00:00Z",
+            "consecutive_failures": 0,
+        });
+        let at_threshold = chrono::DateTime::parse_from_rfc3339("2026-08-01T12:00:15Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let overdue = chrono::DateTime::parse_from_rfc3339("2026-08-01T12:00:15.001Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+
+        assert_eq!(channel_stalled(&props, &at_threshold), Some(false));
+        assert_eq!(channel_stalled(&props, &overdue), Some(true));
+    }
+
+    #[test]
+    fn channel_stalled_requires_valid_consecutive_failures() {
+        let as_of = chrono::DateTime::parse_from_rfc3339("2026-08-01T12:01:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let mut props = json!({
+            "poll_interval_secs": 5,
+            "last_poll_attempt_at": "2026-08-01T12:00:00Z",
+        });
+
+        assert_eq!(channel_stalled(&props, &as_of), None);
+
+        for malformed in [json!("1"), json!(-1)] {
+            props["consecutive_failures"] = malformed;
+            assert_eq!(channel_stalled(&props, &as_of), None);
+        }
+    }
 
     // #606: a delimiter-joined
     // `format!("...:{a}:{b}:{c}")` id encoding is not injective once

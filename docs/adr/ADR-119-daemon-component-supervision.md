@@ -238,6 +238,12 @@ ADR-119 adds no MCP verb, resource, subscription, notification, or capability en
 Component status is operator-local structured logging/metrics in the first
 implementation. Any public introspection surface requires a separate additive decision.
 
+**2026-08-01 clarification (#1472):** ADR-056's additive `comm.health`
+`poll_interval_secs`/nullable `stalled` fields are that separate decision for the persisted
+channel-heartbeat snapshot. They are advisory schedule facts, not the component host's
+authoritative `HealthReporter` state, hung-task verdict, or restart signal; this ADR's
+supervision ownership remains unchanged.
+
 `tools/list`, the `request` schema and parser, the request tool description, and legacy
 stdio response bytes MUST remain byte-identical for the same pack/configuration set.
 Existing packs MUST compile without modification because neither `Pack` nor
