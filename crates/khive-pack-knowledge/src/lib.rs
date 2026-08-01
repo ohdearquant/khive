@@ -31,9 +31,9 @@ pub struct KnowledgeReindexOptions {
 ///
 /// Library entry for `kkernel reindex` — callable without an MCP server.
 /// Knowledge is single-model (search retrieves via the default embedder's ANN),
-/// so this does not fan out across registered models the way entity/note
-/// reindex does. Returns `{atoms_indexed, sections_indexed, failed, ann_failed,
-/// sections_failed}`.
+/// The atom pass also fans out to secondary registered engines on a best-effort
+/// basis. Returns `{atoms_indexed, sections_indexed, failed, ann_failed,
+/// sections_failed, truncation_by_model}`.
 ///
 /// Optional progress callbacks receive `(processed, total)` after each batch.
 pub async fn reindex_knowledge(
@@ -46,6 +46,7 @@ pub async fn reindex_knowledge(
     let mut atoms_indexed = 0u64;
     let mut failed = 0u64;
     let mut ann_failed = false;
+    let mut truncation_by_model = serde_json::Map::new();
     if opts.atoms {
         let ann = knowledge::vamana::new_shared();
         let mut params = serde_json::Map::new();
@@ -68,6 +69,11 @@ pub async fn reindex_knowledge(
             .get("ann_failed")
             .and_then(|b| b.as_bool())
             .unwrap_or(false);
+        truncation_by_model = result
+            .get("truncation_by_model")
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
     }
 
     let mut sections_indexed = 0u64;
@@ -77,17 +83,37 @@ pub async fn reindex_knowledge(
             .batch_size
             .map(|b| b as usize)
             .unwrap_or(knowledge::util::DEFAULT_EMBED_BATCH);
-        let (indexed, _skipped, sec_failed) = knowledge::sections_index::embed_sections(
-            runtime,
-            token,
-            opts.drop_existing,
-            batch,
-            on_section_progress,
-            None,
-        )
-        .await?;
+        let (indexed, _skipped, sec_failed, section_truncation) =
+            knowledge::sections_index::embed_sections(
+                runtime,
+                token,
+                opts.drop_existing,
+                batch,
+                on_section_progress,
+                None,
+            )
+            .await?;
         sections_indexed = indexed as u64;
         sections_failed = sec_failed as u64;
+        if section_truncation.any_truncated() {
+            let model = runtime.default_embedder_name().to_string();
+            let existing = truncation_by_model
+                .remove(&model)
+                .and_then(|value| {
+                    serde_json::from_value::<khive_runtime::retrieval::EmbeddingTruncationReport>(
+                        value,
+                    )
+                    .ok()
+                })
+                .unwrap_or_default();
+            let mut combined: khive_runtime::retrieval::EmbeddingTruncationReport = existing;
+            combined.merge(section_truncation);
+            truncation_by_model.insert(
+                model,
+                serde_json::to_value(combined)
+                    .expect("EmbeddingTruncationReport serialization cannot fail"),
+            );
+        }
     }
 
     Ok(json!({
@@ -96,5 +122,6 @@ pub async fn reindex_knowledge(
         "failed": failed,
         "ann_failed": ann_failed,
         "sections_failed": sections_failed,
+        "truncation_by_model": truncation_by_model,
     }))
 }

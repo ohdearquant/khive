@@ -36,7 +36,7 @@ pub use khive_storage::usage;
 pub mod validation;
 
 pub use actor_identity::{actor_is_unattributed, resolve_actor, should_warn_unattributed_actor};
-pub use atomic_message::{create_notes_atomic, AtomicNoteSpec};
+pub use atomic_message::{create_notes_atomic, create_notes_atomic_with_report, AtomicNoteSpec};
 pub use atomic_plan::{
     AddEntityPlan, AddNotePlan, AffectedRowGuard, DeletePlan, GovernanceOp, GovernancePlan,
     GtdCompletePlan, GtdTransitionPlan, LinkPlan, MergePlan, PlanPredicate, PlanStatement,

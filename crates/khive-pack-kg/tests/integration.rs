@@ -81,14 +81,15 @@ fn invalid_input_message(err: &RuntimeError) -> &str {
 // ADR-046 (cluster-22) added propose, review, and withdraw — bringing the
 // handler count from 11 to 14, then 15 with verbs introspection, then 16
 // with stats, then 17 with context (ADR-089), then 18 with resolve
-// (unified-verb draft ADR Slice 1), then 19 with whoami.
+// (unified-verb draft ADR Slice 1), then 19 with whoami, then 20 with
+// db_diagnostics (ADR-091 operator surface).
 #[test]
-fn pack_verbs_returns_nineteen() {
+fn pack_verbs_returns_twenty() {
     let pack = pack();
     assert_eq!(
         pack.verbs().len(),
-        19,
-        "KgPack must expose exactly 19 verbs (18 previous + whoami)"
+        20,
+        "KgPack must expose exactly 20 verbs (19 previous + db_diagnostics)"
     );
 }
 
@@ -116,6 +117,7 @@ fn pack_verbs_names_are_correct() {
         "context",
         "resolve",
         "whoami",
+        "db_diagnostics",
     ] {
         assert!(names.contains(expected), "verbs() missing {expected:?}");
     }
@@ -1511,6 +1513,116 @@ async fn traverse_from_root_with_depth_one_returns_linked_node() {
         !arr.is_empty(),
         "traverse must find the child node at depth 1"
     );
+}
+
+/// #1484: traversal must collapse the root-only path contributed by a visible
+/// namespace that does not own the root, while enriching an annotation note
+/// exactly as `neighbors` enriches the same node.
+#[tokio::test]
+async fn traverse_note_shape_matches_neighbors_without_duplicate_root_path() {
+    let owner = Namespace::parse("traverse-note-owner").unwrap();
+    let rt = KhiveRuntime::memory().expect("in-memory runtime must succeed");
+    let mut builder = VerbRegistryBuilder::new();
+    builder.with_visible_namespaces(vec![owner.clone()]);
+    builder.register(KgPack::new(rt));
+    let fixture = Fixture {
+        registry: builder.build().expect("registry builds"),
+    };
+
+    let root = fixture
+        .dispatch(
+            "create",
+            json!({
+                "namespace": owner.as_str(),
+                "kind": "concept",
+                "name": "TraversalNoteRoot"
+            }),
+        )
+        .await
+        .expect("create root must succeed");
+    let root_id = root
+        .get("full_id")
+        .or_else(|| root.get("id"))
+        .and_then(Value::as_str)
+        .expect("root response must include an id")
+        .to_string();
+
+    let note = fixture
+        .dispatch(
+            "create",
+            json!({
+                "namespace": owner.as_str(),
+                "kind": "observation",
+                "name": "TraversalAnnotation",
+                "content": "note reached through an annotation edge",
+                "annotates": [root_id]
+            }),
+        )
+        .await
+        .expect("create annotation note must succeed");
+    let note_id = note
+        .get("full_id")
+        .or_else(|| note.get("id"))
+        .and_then(Value::as_str)
+        .expect("note response must include an id")
+        .to_string();
+
+    let neighbors = fixture
+        .dispatch(
+            "neighbors",
+            json!({
+                "node_id": root_id,
+                "direction": "in",
+                "relations": ["annotates"]
+            }),
+        )
+        .await
+        .expect("neighbors must succeed");
+    let neighbor_note = neighbors
+        .as_array()
+        .expect("neighbors must return an array")
+        .iter()
+        .find(|hit| {
+            hit.get("id")
+                .and_then(Value::as_str)
+                .is_some_and(|id| id.starts_with(note_id.as_str()) || note_id.starts_with(id))
+        })
+        .unwrap_or_else(|| panic!("neighbors must include the annotation note: {neighbors}"));
+
+    let paths = fixture
+        .dispatch(
+            "traverse",
+            json!({
+                "roots": [root_id],
+                "max_depth": 1,
+                "direction": "in",
+                "relations": ["annotates"],
+                "include_roots": true
+            }),
+        )
+        .await
+        .expect("traverse must succeed");
+    let paths = paths.as_array().expect("traverse must return an array");
+    assert_eq!(
+        paths.len(),
+        1,
+        "one requested root must produce one path across local and owner namespaces"
+    );
+
+    let traversal_note = paths[0]["nodes"]
+        .as_array()
+        .expect("path must contain nodes")
+        .iter()
+        .find(|node| {
+            node.get("id")
+                .and_then(Value::as_str)
+                .is_some_and(|id| id.starts_with(note_id.as_str()) || note_id.starts_with(id))
+        })
+        .unwrap_or_else(|| panic!("traverse must include the annotation note: {paths:?}"));
+    assert_eq!(traversal_note["name"], neighbor_note["name"]);
+    assert_eq!(traversal_note["kind"], neighbor_note["kind"]);
+    assert_eq!(traversal_note["name"], "TraversalAnnotation");
+    assert_eq!(traversal_note["kind"], "observation");
 }
 
 /// STORAGE-AUD-003 / #485: an oversized max_depth (> i64::MAX) must reject at

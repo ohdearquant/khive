@@ -1,6 +1,6 @@
 # ADR-035: CLI Configuration and Automatic Embedding
 
-**Status**: accepted
+**Status**: accepted (amended 2026-08-01)
 **Date**: 2026-05-23
 **Authors**: khive maintainers
 
@@ -194,14 +194,15 @@ brain_profile = "project-recall-v1"
 2. **Namespace-bound profile**: if no explicit profile is set but a namespace is configured,
    the feedback handler calls `brain.resolve(consumer_kind="recall")` for that
    namespace and uses the resolved profile.
-3. **Global tuning prior**: if neither explicit nor namespace-bound profile resolves, the
-   pack-local in-memory state (`BalancedRecallState` for memory, `SectionPosteriorState` for
-   knowledge) receives the update directly. This is the intended global fallback — it is
-   not a bug.
+3. **Pack-local tuning prior**: if neither explicit nor namespace-bound profile resolves, the
+   pack-local in-memory state receives the update directly. `BalancedRecallState` retains the
+   original memory-pack fallback. As amended by #1505, knowledge's `SectionPosteriorState` is
+   keyed by the effective namespace so an explicit measurement arm cannot inherit live/local
+   compose feedback. The default `local` path remains backward compatible.
 
 This resolution is automatic: packs attempt tiers 1 and 2 silently and fall through to tier 3
-when nothing is bound. No configuration is required for the global-prior behavior to continue
-working as before.
+when nothing is bound. No configuration is required for the default-namespace fallback to
+continue working as before.
 
 ### 3. `[embed]` and `[schema]` sections
 
@@ -463,8 +464,9 @@ as separating source files from build artifacts in a standard software project.
   through the same config path used by namespace — no per-call parameter needed.
 - Deployments that bind a namespace to a brain profile via `brain.bind` benefit automatically
   from tier-2 resolution without any `khive.toml` change.
-- The global tuning prior (tier 3) continues to work unchanged for deployments that do not
-  configure a profile. No existing behavior is removed.
+- The pack-local tuning prior (tier 3) continues without configuration. Memory behavior and the
+  default knowledge namespace remain unchanged; explicit knowledge namespaces receive isolated
+  fallback state instead of sharing local feedback (#1505).
 
 ### Positive
 

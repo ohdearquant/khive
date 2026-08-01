@@ -43,10 +43,10 @@
 
 ### Verb namespace contract (ADR-023)
 
-- The kg substrate pack owns 19 bare verb names (no dot prefix): `create`, `get`,
+- The kg substrate pack owns 20 bare verb names (no dot prefix): `create`, `get`,
   `list`, `stats`, `update`, `delete`, `search`, `link`, `neighbors`, `traverse`,
   `query`, `merge`, `propose`, `review`, `withdraw`, `resolve`, `verbs`, `context`
-  (ADR-089), `whoami`.
+  (ADR-089), `whoami`, `db_diagnostics` (ADR-091).
 - Every other pack must prefix verbs with `<pack>.` (e.g. `memory.recall`).
 - Sub-variants use underscore, not nested dots: `memory.recall_embed`, not
   `memory.recall.embed`.
@@ -98,7 +98,7 @@
 ### Proposal lifecycle (ADR-046)
 
 - The kg pack exposes `propose`, `review`, and `withdraw` verbs as part of the
-  19 kg-substrate bare verbs. These are validated by the contract test.
+  20 kg-substrate bare verbs. These are validated by the contract test.
 
 ### Atomic `exec --ops-file --atomic` execution path (ADR-099 Slice B3)
 
@@ -115,7 +115,11 @@ It runs, in order:
    in `kkernel` (not `khive-pack-gtd`) because `AtomicOpPlan`/`PlanStatement` are
    `khive-runtime` atomic-plan vocabulary this CLI orchestrator owns.
 3. The synchronous commit pass (`khive_runtime::atomic_runner::run_atomic_unit`, B2).
-4. The async post-commit reindex pass (`khive_runtime::atomic_prepare::apply_post_commit_effects`).
+4. The async post-commit reindex pass
+   (`khive_runtime::atomic_prepare::apply_post_commit_effects_with_report`).
+   Its typed embedding outcomes are matched back to the originating update plan, so an atomic
+   update whose embedding input was bounded carries the same per-result `warnings` advisory as
+   the canonical non-atomic handler.
 
 **Verbs without a prepare implementation.** `propose`/`review`/`withdraw` are listed in
 `khive_types::pack::ATOMIC_ADMISSIBLE_VERBS` (ADR-099 D3 intends them to eventually gain a

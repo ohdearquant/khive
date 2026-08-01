@@ -1458,6 +1458,36 @@ async fn w4_c4_feedback_accepts_valid_target_and_profile() {
     assert_eq!(result["signal"], json!("useful"));
 }
 
+#[tokio::test]
+async fn feedback_success_counts_one_event_row_for_each_append_path() {
+    for signal in ["explicit_positive", "correction", "implicit_positive"] {
+        let (pack, rt) = make_pack();
+        let registry = empty_registry();
+        let token = rt.authorize(Namespace::local()).unwrap();
+        let target = create_test_entity(&rt, &token).await;
+        let usage = khive_storage::usage::UsageContext::new();
+
+        let result = khive_storage::usage::scope(
+            usage.clone(),
+            pack.dispatch(
+                "brain.feedback",
+                json!({"target_id": target, "signal": signal}),
+                &registry,
+                &token,
+            ),
+        )
+        .await
+        .expect("feedback append must commit");
+
+        assert_eq!(result["emitted"], json!(true));
+        assert_eq!(
+            usage.snapshot()["event_rows"],
+            json!(1u64),
+            "signal {signal:?} must count its one committed public event row"
+        );
+    }
+}
+
 /// Regression (#831): a note-target `brain.feedback` signal must resolve via
 /// `observed_as_signal` (previously unreachable — the decoder hard-coded
 /// `ReferentKind::Entity`). See crates/khive-pack-brain/docs/dispatch-namespace-isolation.md#feedback_note_target_resolves_through_observed_as_signal.
@@ -3125,6 +3155,166 @@ async fn brain_auto_feedback_accepts_short_note_id_prefix() {
     assert_eq!(result["target_id"].as_str().unwrap_or("").len(), 36);
 }
 
+/// #1505 direct-call defense: PackRuntime callers must provide a token for the
+/// explicit namespace instead of treating the business parameter as authority.
+#[tokio::test]
+async fn brain_auto_feedback_direct_dispatch_honors_exact_namespace() {
+    let (pack, rt) = make_pack();
+    let registry = empty_registry();
+    let local_token = rt.authorize(Namespace::local()).expect("local token");
+    let arm_token = rt
+        .authorize(Namespace::parse("bench-arm-a").expect("arm namespace"))
+        .expect("arm token");
+    let target = create_test_entity(&rt, &local_token).await;
+
+    pack.dispatch(
+        "brain.auto_feedback",
+        json!({
+            "query": "direct namespace regression",
+            "results": [{"id": target}],
+            "namespace": "bench-arm-a",
+        }),
+        &registry,
+        &arm_token,
+    )
+    .await
+    .expect("direct auto_feedback accepts matching namespace token");
+
+    let local = pack
+        .dispatch(
+            "brain.profile",
+            json!({"profile_id": "balanced-recall-v1"}),
+            &registry,
+            &local_token,
+        )
+        .await
+        .expect("local profile");
+    let arm = pack
+        .dispatch(
+            "brain.profile",
+            json!({"profile_id": "balanced-recall-v1"}),
+            &registry,
+            &arm_token,
+        )
+        .await
+        .expect("arm profile");
+
+    assert_eq!(local["total_events"], json!(0u64));
+    assert_eq!(arm["total_events"], json!(1u64));
+}
+
+/// #1505: an explicit namespace is not a capability. A direct caller cannot
+/// use a local token to emit or fold feedback into another namespace.
+#[tokio::test]
+async fn brain_auto_feedback_direct_dispatch_rejects_namespace_token_mismatch() {
+    let (pack, rt) = make_pack();
+    let registry = empty_registry();
+    let local_token = rt.authorize(Namespace::local()).expect("local token");
+    let arm_token = rt
+        .authorize(Namespace::parse("bench-arm-a").expect("arm namespace"))
+        .expect("arm token");
+    let target = create_test_entity(&rt, &local_token).await;
+
+    let local_before = pack
+        .dispatch(
+            "brain.profile",
+            json!({"profile_id": "balanced-recall-v1"}),
+            &registry,
+            &local_token,
+        )
+        .await
+        .expect("local profile before mismatch");
+    let arm_before = pack
+        .dispatch(
+            "brain.profile",
+            json!({"profile_id": "balanced-recall-v1"}),
+            &registry,
+            &arm_token,
+        )
+        .await
+        .expect("arm profile before mismatch");
+    let local_log_before = pack
+        .dispatch(
+            "brain.events",
+            json!({"limit": 100}),
+            &registry,
+            &local_token,
+        )
+        .await
+        .expect("local event log before mismatch");
+    let arm_log_before = pack
+        .dispatch("brain.events", json!({"limit": 100}), &registry, &arm_token)
+        .await
+        .expect("arm event log before mismatch");
+
+    let err = pack
+        .dispatch(
+            "brain.auto_feedback",
+            json!({
+                "query": "unauthorized direct namespace",
+                "results": [{"id": target}],
+                "namespace": "bench-arm-a",
+            }),
+            &registry,
+            &local_token,
+        )
+        .await
+        .expect_err("local token must not authorize arm feedback");
+    assert!(
+        matches!(err, RuntimeError::InvalidInput(ref msg) if msg.contains("does not match authorized token namespace")),
+        "expected namespace mismatch InvalidInput, got {err:?}"
+    );
+
+    let local_after = pack
+        .dispatch(
+            "brain.profile",
+            json!({"profile_id": "balanced-recall-v1"}),
+            &registry,
+            &local_token,
+        )
+        .await
+        .expect("local profile after mismatch");
+    let arm_after = pack
+        .dispatch(
+            "brain.profile",
+            json!({"profile_id": "balanced-recall-v1"}),
+            &registry,
+            &arm_token,
+        )
+        .await
+        .expect("arm profile after mismatch");
+    let local_log_after = pack
+        .dispatch(
+            "brain.events",
+            json!({"limit": 100}),
+            &registry,
+            &local_token,
+        )
+        .await
+        .expect("local event log after mismatch");
+    let arm_log_after = pack
+        .dispatch("brain.events", json!({"limit": 100}), &registry, &arm_token)
+        .await
+        .expect("arm event log after mismatch");
+
+    assert_eq!(
+        local_after["total_events"], local_before["total_events"],
+        "rejected feedback must not mutate local posterior state"
+    );
+    assert_eq!(
+        arm_after["total_events"], arm_before["total_events"],
+        "rejected feedback must not mutate arm posterior state"
+    );
+    assert_eq!(
+        local_log_after["count"], local_log_before["count"],
+        "rejected feedback must not append a local event"
+    );
+    assert_eq!(
+        arm_log_after["count"], arm_log_before["count"],
+        "rejected feedback must not append an arm event"
+    );
+}
+
 // BRAIN-AUD-001: verify namespace isolation — state from namespace A must
 // not be visible when dispatching under namespace B.
 #[tokio::test]
@@ -3270,6 +3460,17 @@ mod help_tests {
         assert!(
             h.params.iter().any(|p| p.name == "results" && p.required),
             "brain.auto_feedback must have required results param"
+        );
+        let namespace = h
+            .params
+            .iter()
+            .find(|p| p.name == "namespace")
+            .unwrap_or_else(|| panic!("brain.auto_feedback must declare namespace"));
+        assert!(!namespace.required);
+        assert!(
+            namespace.description.contains("Exact") && namespace.description.contains("posterior"),
+            "namespace help must document exact posterior isolation: {:?}",
+            namespace.description
         );
     }
 
@@ -3522,6 +3723,93 @@ mod help_tests {
         builder.register(BrainPack::new(rt.clone()));
         let registry = builder.build().expect("kg+brain registry builds");
         (registry, rt)
+    }
+
+    /// #1505: an explicit auto-feedback namespace is both the event stamp and
+    /// the posterior-state owner. The default/live namespace must remain
+    /// byte-for-byte at its pre-call event count.
+    #[tokio::test]
+    async fn auto_feedback_namespace_does_not_train_default_posteriors() {
+        let (registry, rt) = make_brain_registry();
+        let local_token = rt.authorize(Namespace::local()).expect("local token");
+        let target = create_test_entity(&rt, &local_token).await;
+
+        let profile_total = |value: &serde_json::Value| {
+            value["total_events"]
+                .as_u64()
+                .expect("profile total_events")
+        };
+        let local_before = registry
+            .dispatch("brain.profile", json!({"profile_id": "balanced-recall-v1"}))
+            .await
+            .expect("read local profile before feedback");
+        let arm_before = registry
+            .dispatch(
+                "brain.profile",
+                json!({
+                    "profile_id": "balanced-recall-v1",
+                    "namespace": "bench-arm-a",
+                }),
+            )
+            .await
+            .expect("read arm profile before feedback");
+
+        let feedback = registry
+            .dispatch(
+                "brain.auto_feedback",
+                json!({
+                    "query": "isolated recall measurement",
+                    "results": [{"id": target}],
+                    "namespace": "bench-arm-a",
+                }),
+            )
+            .await
+            .expect("namespace-scoped auto_feedback");
+        assert_eq!(feedback["emitted"], json!(true), "got: {feedback}");
+
+        let arm_after = registry
+            .dispatch(
+                "brain.profile",
+                json!({
+                    "profile_id": "balanced-recall-v1",
+                    "namespace": "bench-arm-a",
+                }),
+            )
+            .await
+            .expect("read arm profile after feedback");
+        let local_after = registry
+            .dispatch("brain.profile", json!({"profile_id": "balanced-recall-v1"}))
+            .await
+            .expect("read local profile after feedback");
+
+        assert_eq!(
+            profile_total(&arm_after),
+            profile_total(&arm_before) + 1,
+            "the explicit arm must receive exactly one feedback fold"
+        );
+        assert_eq!(
+            profile_total(&local_after),
+            profile_total(&local_before),
+            "arm feedback must not train the default/live posterior"
+        );
+
+        let arm_token = rt
+            .authorize(Namespace::parse("bench-arm-a").expect("arm namespace"))
+            .expect("arm token");
+        let event_id = uuid::Uuid::parse_str(
+            feedback["event_id"]
+                .as_str()
+                .expect("feedback response event_id"),
+        )
+        .expect("event UUID");
+        let event = rt
+            .events(&arm_token)
+            .expect("event store")
+            .get_event(event_id)
+            .await
+            .expect("event lookup")
+            .expect("feedback event exists");
+        assert_eq!(event.namespace, "bench-arm-a");
     }
 
     /// brain.bind via VerbRegistry must store the caller-supplied namespace,
@@ -3983,6 +4271,442 @@ async fn ensure_loaded_concurrent_same_namespace_is_safe() {
         result["count"].as_u64().unwrap_or(0) >= 1,
         "at least the built-in profile must be present"
     );
+}
+
+#[tokio::test]
+async fn warm_pack_refreshes_profiles_and_bindings_written_by_peer() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let config = khive_runtime::RuntimeConfig {
+        db_path: Some(dir.path().join("cross-process-visibility.db")),
+        ..khive_runtime::RuntimeConfig::no_embeddings()
+    };
+    let writer_rt = KhiveRuntime::new(config.clone()).expect("writer runtime");
+    let reader_rt = KhiveRuntime::new(config).expect("reader runtime");
+    let writer = BrainPack::new(writer_rt.clone());
+    let reader = BrainPack::new(reader_rt.clone());
+    let registry = empty_registry();
+    let writer_token = writer_rt
+        .authorize(Namespace::local())
+        .expect("writer token");
+    let reader_token = reader_rt
+        .authorize(Namespace::local())
+        .expect("reader token");
+
+    let initial = reader
+        .dispatch("brain.profiles", json!({}), &registry, &reader_token)
+        .await
+        .expect("warm reader profile registry");
+    assert_eq!(initial["count"], json!(1u64));
+
+    writer
+        .dispatch(
+            "brain.create_profile",
+            json!({
+                "name": "peer-visible-profile",
+                "consumer_kind": "recall",
+            }),
+            &registry,
+            &writer_token,
+        )
+        .await
+        .expect("peer creates profile");
+
+    let refreshed = reader
+        .dispatch("brain.profiles", json!({}), &registry, &reader_token)
+        .await
+        .expect("warm reader refreshes profile registry");
+    assert!(
+        refreshed["profiles"]
+            .as_array()
+            .expect("profiles array")
+            .iter()
+            .any(|profile| profile["id"] == json!("peer-visible-profile")),
+        "a warm pack must observe a profile committed by another pack"
+    );
+
+    let target = create_test_entity(&writer_rt, &writer_token).await;
+    let feedback = reader
+        .dispatch(
+            "brain.feedback",
+            json!({
+                "target_id": target,
+                "signal": "useful",
+                "served_by_profile_id": "peer-visible-profile",
+            }),
+            &registry,
+            &reader_token,
+        )
+        .await
+        .expect("warm peer accepts feedback for newly visible profile");
+    assert_eq!(feedback["emitted"], json!(true));
+
+    let profile = writer
+        .dispatch(
+            "brain.profile",
+            json!({"profile_id": "peer-visible-profile"}),
+            &registry,
+            &writer_token,
+        )
+        .await
+        .expect("original writer refreshes peer feedback");
+    assert_eq!(profile["total_events"], json!(1u64));
+
+    writer
+        .dispatch(
+            "brain.bind",
+            json!({
+                "profile_id": "peer-visible-profile",
+                "actor": "peer-actor",
+                "namespace": "local",
+                "consumer_kind": "recall",
+            }),
+            &registry,
+            &writer_token,
+        )
+        .await
+        .expect("peer creates binding");
+
+    let bindings = reader
+        .dispatch(
+            "brain.bindings",
+            json!({"profile_id": "peer-visible-profile"}),
+            &registry,
+            &reader_token,
+        )
+        .await
+        .expect("warm reader refreshes bindings");
+    assert_eq!(bindings["count"], json!(1u64));
+    assert_eq!(bindings["bindings"][0]["actor"], json!("peer-actor"));
+}
+
+#[tokio::test]
+async fn stale_pack_mutation_rebases_on_durable_snapshot() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let config = khive_runtime::RuntimeConfig {
+        db_path: Some(dir.path().join("stale-writer.db")),
+        ..khive_runtime::RuntimeConfig::no_embeddings()
+    };
+    let first_rt = KhiveRuntime::new(config.clone()).expect("first runtime");
+    let stale_rt = KhiveRuntime::new(config.clone()).expect("stale runtime");
+    let observer_rt = KhiveRuntime::new(config).expect("observer runtime");
+    let first = BrainPack::new(first_rt.clone());
+    let stale = BrainPack::new(stale_rt.clone());
+    let observer = BrainPack::new(observer_rt.clone());
+    let registry = empty_registry();
+    let first_token = first_rt.authorize(Namespace::local()).expect("first token");
+    let stale_token = stale_rt.authorize(Namespace::local()).expect("stale token");
+    let observer_token = observer_rt
+        .authorize(Namespace::local())
+        .expect("observer token");
+
+    first
+        .dispatch("brain.profiles", json!({}), &registry, &first_token)
+        .await
+        .expect("warm first pack");
+    stale
+        .dispatch("brain.profiles", json!({}), &registry, &stale_token)
+        .await
+        .expect("warm stale pack before either write");
+
+    first
+        .handle_create_profile(
+            &first_token,
+            json!({"name": "first-process-profile", "consumer_kind": "recall"}),
+        )
+        .await
+        .expect("first process writes profile");
+
+    // Call the handler directly so this pack deliberately skips dispatch's
+    // freshness check. The persistence transaction itself must still read the
+    // latest durable snapshot before applying its mutation.
+    stale
+        .handle_create_profile(
+            &stale_token,
+            json!({"name": "stale-process-profile", "consumer_kind": "recall"}),
+        )
+        .await
+        .expect("stale process rebases its mutation");
+
+    let profiles = observer
+        .dispatch("brain.profiles", json!({}), &registry, &observer_token)
+        .await
+        .expect("fresh observer loads merged registry");
+    let ids: std::collections::HashSet<&str> = profiles["profiles"]
+        .as_array()
+        .expect("profiles array")
+        .iter()
+        .filter_map(|profile| profile["id"].as_str())
+        .collect();
+    assert!(ids.contains("first-process-profile"));
+    assert!(ids.contains("stale-process-profile"));
+}
+
+#[tokio::test]
+async fn feedback_revalidates_lifecycle_inside_cross_process_transaction() {
+    use khive_storage::types::{SqlStatement, SqlValue};
+    use std::sync::Arc;
+    use tokio::sync::oneshot;
+
+    struct HookGuard;
+    impl Drop for HookGuard {
+        fn drop(&mut self) {
+            crate::pack::clear_feedback_precommit_hook();
+        }
+    }
+    let _guard = HookGuard;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let config = khive_runtime::RuntimeConfig {
+        db_path: Some(dir.path().join("feedback-archive-race.db")),
+        ..khive_runtime::RuntimeConfig::no_embeddings()
+    };
+    let feedback_rt = KhiveRuntime::new(config.clone()).expect("feedback runtime");
+    let archive_rt = KhiveRuntime::new(config.clone()).expect("archive runtime");
+    let observer_rt = KhiveRuntime::new(config).expect("observer runtime");
+    let feedback_pack = Arc::new(BrainPack::new(feedback_rt.clone()));
+    let archive_pack = BrainPack::new(archive_rt.clone());
+    let observer_pack = BrainPack::new(observer_rt.clone());
+    let registry = Arc::new(empty_registry());
+    let feedback_token = Arc::new(
+        feedback_rt
+            .authorize(Namespace::local())
+            .expect("feedback token"),
+    );
+    let archive_token = archive_rt
+        .authorize(Namespace::local())
+        .expect("archive token");
+    let observer_token = observer_rt
+        .authorize(Namespace::local())
+        .expect("observer token");
+    let profile_id = "feedback-archive-race-profile";
+
+    feedback_pack
+        .dispatch(
+            "brain.create_profile",
+            json!({"name": profile_id, "consumer_kind": "recall"}),
+            &registry,
+            &feedback_token,
+        )
+        .await
+        .expect("create feedback profile");
+    archive_pack
+        .dispatch("brain.profiles", json!({}), &registry, &archive_token)
+        .await
+        .expect("archive runtime observes profile");
+    let target = create_test_entity(&feedback_rt, &feedback_token).await;
+
+    let (reached_tx, reached_rx) = oneshot::channel();
+    let (proceed_tx, proceed_rx) = oneshot::channel();
+    crate::pack::set_feedback_precommit_hook(crate::pack::FeedbackPrecommitHook {
+        profile_id: profile_id.to_string(),
+        reached_tx,
+        proceed_rx,
+    });
+
+    let feedback_pack_task = Arc::clone(&feedback_pack);
+    let feedback_token_task = Arc::clone(&feedback_token);
+    let registry_task = Arc::clone(&registry);
+    let target_for_task = target.clone();
+    let feedback_usage = khive_storage::usage::UsageContext::new();
+    let feedback_usage_task = feedback_usage.clone();
+    let feedback_task = tokio::spawn(khive_storage::usage::scope(
+        feedback_usage_task,
+        async move {
+            feedback_pack_task
+                .dispatch(
+                    "brain.feedback",
+                    json!({
+                        "target_id": target_for_task,
+                        "signal": "implicit_positive",
+                        "served_by_profile_id": profile_id,
+                    }),
+                    &registry_task,
+                    &feedback_token_task,
+                )
+                .await
+        },
+    ));
+
+    reached_rx
+        .await
+        .expect("feedback reaches post-preflight hook");
+    archive_pack
+        .dispatch(
+            "brain.archive",
+            json!({"profile_id": profile_id}),
+            &registry,
+            &archive_token,
+        )
+        .await
+        .expect("peer archives inactive profile");
+    proceed_tx.send(()).expect("release feedback transaction");
+
+    let error = feedback_task
+        .await
+        .expect("feedback task joins")
+        .expect_err("rebased feedback must reject the archived profile");
+    assert!(
+        matches!(error, RuntimeError::InvalidInput(ref message) if message.contains("archived")),
+        "rebased feedback rejection must report the archived lifecycle: {error:?}"
+    );
+    assert!(
+        feedback_usage.snapshot().get("event_rows").is_none(),
+        "a lifecycle rejection inside the atomic unit must not count an event row"
+    );
+
+    let profile = observer_pack
+        .dispatch(
+            "brain.profile",
+            json!({"profile_id": profile_id}),
+            &registry,
+            &observer_token,
+        )
+        .await
+        .expect("observer reads archived profile");
+    assert_eq!(profile["lifecycle"], json!("archived"));
+    assert_eq!(profile["total_events"], json!(0u64));
+
+    let mut reader = observer_rt.sql().reader().await.expect("observer reader");
+    let row = reader
+        .query_row(SqlStatement {
+            sql: "SELECT \
+                    (SELECT COUNT(*) FROM events \
+                     WHERE namespace = ?1 AND verb = 'brain.feedback') AS public_events, \
+                    (SELECT COUNT(*) FROM brain_event_log \
+                     WHERE namespace = ?1 AND event_kind = 'brain.feedback') AS private_events, \
+                    (SELECT COUNT(*) FROM brain_implicit_mass \
+                     WHERE namespace = ?1 AND profile_id = ?2 AND target_id = ?3) AS mass_rows"
+                .into(),
+            params: vec![
+                SqlValue::Text(observer_token.namespace().as_str().to_string()),
+                SqlValue::Text(profile_id.to_string()),
+                SqlValue::Text(target),
+            ],
+            label: Some("brain_test_feedback_archive_race_counts".into()),
+        })
+        .await
+        .expect("read feedback side-effect counts")
+        .expect("count row");
+    assert!(matches!(
+        row.get("public_events"),
+        Some(SqlValue::Integer(0))
+    ));
+    assert!(matches!(
+        row.get("private_events"),
+        Some(SqlValue::Integer(0))
+    ));
+    assert!(matches!(row.get("mass_rows"), Some(SqlValue::Integer(0))));
+}
+
+#[tokio::test]
+async fn matching_generation_reuses_local_snapshot_without_decoding_durable_json() {
+    use khive_storage::types::{SqlStatement, SqlValue};
+
+    let (pack, rt) = make_pack();
+    let registry = empty_registry();
+    let token = rt.authorize(Namespace::local()).expect("local token");
+
+    pack.dispatch(
+        "brain.create_profile",
+        json!({"name": "generation-reuse-seed", "consumer_kind": "recall"}),
+        &registry,
+        &token,
+    )
+    .await
+    .expect("seed durable snapshot and local generation");
+
+    // Poison only the durable JSON while preserving updated_at. This is a
+    // decode sentinel, not a supported external mutation: the next dispatch's
+    // generation check still matches the live local snapshot, so the mutation
+    // transaction must not fetch or deserialize this blob.
+    {
+        let mut writer = rt.sql().writer().await.expect("writer");
+        let changed = writer
+            .execute(SqlStatement {
+                sql: "UPDATE brain_profile_snapshots SET snapshot_json = ?1 \
+                      WHERE profile_id = ?2 AND namespace = ?3"
+                    .into(),
+                params: vec![
+                    SqlValue::Text("{decode-sentinel".to_string()),
+                    SqlValue::Text("__brain__".to_string()),
+                    SqlValue::Text(token.namespace().as_str().to_string()),
+                ],
+                label: Some("brain_test_poison_matching_snapshot".into()),
+            })
+            .await
+            .expect("install decode sentinel without advancing generation");
+        assert_eq!(changed, 1, "decode sentinel must replace the snapshot row");
+    }
+
+    pack.dispatch(
+        "brain.create_profile",
+        json!({"name": "generation-reuse-next", "consumer_kind": "recall"}),
+        &registry,
+        &token,
+    )
+    .await
+    .expect("matching generation must reuse local snapshot");
+
+    let (snapshot, _) = crate::persist::load_latest_snapshot(
+        rt.sql().as_ref(),
+        token.namespace().as_str(),
+        ENTITY_CACHE_CAPACITY,
+    )
+    .await
+    .expect("load replacement snapshot")
+    .expect("replacement snapshot exists");
+    assert!(snapshot.profiles.contains_key("generation-reuse-seed"));
+    assert!(snapshot.profiles.contains_key("generation-reuse-next"));
+}
+
+#[tokio::test]
+async fn mutation_timestamp_advances_past_existing_snapshot() {
+    let rt = KhiveRuntime::memory().expect("in-memory runtime");
+    let token = rt.authorize(Namespace::local()).expect("local token");
+    let namespace = token.namespace().as_str();
+    let future_updated_at = chrono::Utc::now().timestamp_micros() + 1_000_000;
+    let snapshot = khive_brain_core::BrainState::new(ENTITY_CACHE_CAPACITY).to_snapshot();
+    crate::persist::upsert_snapshot(rt.sql().as_ref(), namespace, &snapshot, future_updated_at)
+        .await
+        .expect("seed future-dated snapshot");
+
+    let tracker = std::sync::Mutex::new(crate::persist::PersistenceTracker::new());
+    let state = std::sync::Mutex::new(khive_brain_core::BrainState::new(ENTITY_CACHE_CAPACITY));
+    let event = khive_storage::event::Event::new(
+        namespace,
+        "brain.test_monotonic_timestamp",
+        khive_types::EventKind::Audit,
+        khive_types::SubstrateKind::Event,
+        "brain",
+    )
+    .with_payload(json!({"probe": true}));
+    crate::persist::persist_brain_state_mutation(
+        rt.sql().as_ref(),
+        &token,
+        &tracker,
+        &state,
+        crate::persist::BrainMutationEvent {
+            profile_id: "balanced-recall-v1".to_string(),
+            event_kind: event.verb.clone(),
+            payload: serde_json::to_value(event).expect("test event serializes"),
+        },
+        ENTITY_CACHE_CAPACITY,
+        |_state| Ok::<(), RuntimeError>(()),
+    )
+    .await
+    .expect("persist mutation after future-dated snapshot");
+
+    let (_, updated_at) =
+        crate::persist::load_latest_snapshot(rt.sql().as_ref(), namespace, ENTITY_CACHE_CAPACITY)
+            .await
+            .expect("load snapshot")
+            .expect("snapshot exists");
+    assert!(updated_at > future_updated_at);
+
+    let replay = crate::persist::load_events_since(rt.sql().as_ref(), namespace, future_updated_at)
+        .await
+        .expect("load post-snapshot events");
+    assert_eq!(replay.events.len(), 1);
 }
 
 /// Cross-namespace concurrent loads must not cause one namespace to save the
@@ -5247,8 +5971,10 @@ mod adr081_retune_driver_tests {
         .await
         .expect("record_serve");
 
-        let first = pack
-            .dispatch(
+        let first_usage = khive_storage::usage::UsageContext::new();
+        let first = khive_storage::usage::scope(
+            first_usage.clone(),
+            pack.dispatch(
                 "brain.feedback",
                 json!({
                     "target_id": target,
@@ -5258,15 +5984,19 @@ mod adr081_retune_driver_tests {
                 }),
                 &registry,
                 &token,
-            )
-            .await
-            .expect("first emit must succeed");
+            ),
+        )
+        .await
+        .expect("first emit must succeed");
         assert_eq!(first["emitted"], json!(true));
+        assert_eq!(first_usage.snapshot()["event_rows"], json!(1u64));
 
         let sal_beta_after_first = pack.snapshot().balanced_recall.salience.beta();
 
-        let second = pack
-            .dispatch(
+        let second_usage = khive_storage::usage::UsageContext::new();
+        let second = khive_storage::usage::scope(
+            second_usage.clone(),
+            pack.dispatch(
                 "brain.feedback",
                 json!({
                     "target_id": target,
@@ -5276,15 +6006,20 @@ mod adr081_retune_driver_tests {
                 }),
                 &registry,
                 &token,
-            )
-            .await
-            .expect("duplicate emit must be a no-op, not an error");
+            ),
+        )
+        .await
+        .expect("duplicate emit must be a no-op, not an error");
         assert_eq!(
             second["deduped"],
             json!(true),
             "second emit with the same (scorer_run_id, serve_ledger_id) must be deduped"
         );
         assert_eq!(second["emitted"], json!(false));
+        assert!(
+            second_usage.snapshot().get("event_rows").is_none(),
+            "deduped feedback must not count an event row"
+        );
 
         let sal_beta_after_second = pack.snapshot().balanced_recall.salience.beta();
         assert_eq!(
@@ -5933,16 +6668,23 @@ mod durable_write_tests {
                 .expect("drop brain_profile_snapshots to simulate schema drift");
         }
 
-        let err = pack
-            .dispatch(
+        let usage = khive_storage::usage::UsageContext::new();
+        let err = khive_storage::usage::scope(
+            usage.clone(),
+            pack.dispatch(
                 "brain.feedback",
                 json!({"target_id": target, "signal": "useful"}),
                 &registry,
                 &token,
-            )
-            .await
-            .expect_err("brain.feedback must fail when brain-specific persistence fails");
+            ),
+        )
+        .await
+        .expect_err("brain.feedback must fail when brain-specific persistence fails");
         let _ = err;
+        assert!(
+            usage.snapshot().get("event_rows").is_none(),
+            "a rolled-back feedback append must not count an event row"
+        );
 
         let total_after = pack.snapshot().balanced_recall.total_events;
         assert_eq!(

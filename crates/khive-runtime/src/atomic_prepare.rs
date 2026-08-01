@@ -1484,26 +1484,61 @@ async fn prepare_merge(
 // post-commit effects
 // ---------------------------------------------------------------------------
 
-/// Run every deferred [`PostCommitEffect`] after a committed atomic unit,
-/// outside any transaction. Re-fetches each target's now-committed row and
-/// reuses the existing `reindex_entity`/`reindex_note` (FTS + embedding,
-/// same as the non-atomic path) for exact parity.
+/// Embedding metadata produced by one successfully applied reindex effect.
+///
+/// The effect identity is retained so response builders can attach an advisory
+/// to the exact atomic op that scheduled the reindex. Effects whose target is
+/// no longer present are omitted from the returned outcome list.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PostCommitEmbeddingOutcome {
+    /// The committed reindex effect that produced this outcome.
+    pub effect: PostCommitEffect,
+    /// Actual input bounding observed while executing the effect.
+    pub truncation: crate::retrieval::EmbeddingTruncationReport,
+}
+
+/// Run every deferred [`PostCommitEffect`] after a committed atomic unit.
 pub async fn apply_post_commit_effects(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
     effects: CommittedPostCommitEffects,
 ) -> RuntimeResult<()> {
+    apply_post_commit_effects_with_report(runtime, token, effects)
+        .await
+        .map(|_| ())
+}
+
+/// Truncation-reporting form of [`apply_post_commit_effects`]. Re-fetches each
+/// target's now-committed row outside any transaction and reuses the existing
+/// `reindex_entity`/`reindex_note` (FTS + embedding, same as the non-atomic
+/// path) for exact parity. Returns the typed embedding outcome for each reindex
+/// effect so callers can preserve write-response advisories instead of
+/// discarding them after commit.
+pub async fn apply_post_commit_effects_with_report(
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+    effects: CommittedPostCommitEffects,
+) -> RuntimeResult<Vec<PostCommitEmbeddingOutcome>> {
+    let mut embedding_outcomes = Vec::new();
     for effect in effects.into_effects() {
         match effect {
             PostCommitEffect::None => {}
             PostCommitEffect::ReindexEntity { entity_id } => {
                 if let Some(entity) = runtime.entities(token)?.get_entity(entity_id).await? {
-                    runtime.reindex_entity(token, &entity).await?;
+                    let truncation = runtime.reindex_entity(token, &entity).await?;
+                    embedding_outcomes.push(PostCommitEmbeddingOutcome {
+                        effect: PostCommitEffect::ReindexEntity { entity_id },
+                        truncation,
+                    });
                 }
             }
             PostCommitEffect::ReindexNote { note_id } => {
                 if let Some(note) = runtime.notes(token)?.get_note(note_id).await? {
-                    runtime.reindex_note(token, &note).await?;
+                    let truncation = runtime.reindex_note(token, &note).await?;
+                    embedding_outcomes.push(PostCommitEmbeddingOutcome {
+                        effect: PostCommitEffect::ReindexNote { note_id },
+                        truncation,
+                    });
                     // This handler calls `reindex_note` directly, bypassing
                     // `update_note()` and the note-mutation hook it fires
                     // after its own reindex (see `curation.rs`). Fire it
@@ -1535,7 +1570,7 @@ pub async fn apply_post_commit_effects(
             }
         }
     }
-    Ok(())
+    Ok(embedding_outcomes)
 }
 
 #[cfg(test)]
@@ -1543,7 +1578,7 @@ mod tests {
     use super::*;
 
     use async_trait::async_trait;
-    use lattice_embed::{EmbedError, EmbeddingModel, EmbeddingService};
+    use lattice_embed::{EmbedError, EmbeddingModel, EmbeddingService, MAX_TEXT_CHARS};
     use serde_json::json;
 
     use khive_types::Namespace;
@@ -1747,10 +1782,11 @@ mod tests {
             .expect("vec store");
         assert_eq!(vec_store.count().await.expect("count before"), 0);
 
+        let updated_content = format!("freshly-updated-content-xyz{}", "x".repeat(MAX_TEXT_CHARS));
         let plan = prepare_update(
             &runtime,
             &token,
-            &json!({"id": note_id.to_string(), "content": "freshly-updated-content-xyz"}),
+            &json!({"id": note_id.to_string(), "content": updated_content}),
             None,
         )
         .await
@@ -1769,9 +1805,17 @@ mod tests {
             "content change must schedule exactly one ReindexNote post-commit effect"
         );
 
-        apply_post_commit_effects(&runtime, &token, post_commit)
-            .await
-            .expect("apply post-commit effects");
+        let embedding_outcomes =
+            apply_post_commit_effects_with_report(&runtime, &token, post_commit)
+                .await
+                .expect("apply post-commit effects");
+        assert_eq!(embedding_outcomes.len(), 1);
+        assert_eq!(
+            embedding_outcomes[0].effect,
+            PostCommitEffect::ReindexNote { note_id }
+        );
+        assert_eq!(embedding_outcomes[0].truncation.truncated, 1);
+        assert!(embedding_outcomes[0].truncation.discarded_bytes > 0);
 
         // FTS: the note must be recallable under its NEW content.
         let doc = runtime

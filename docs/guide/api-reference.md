@@ -7,8 +7,8 @@ parameter contract, so an agent can call khive correctly without reading Rust so
 
 The live registry is authoritative: run `request(ops="verbs()")` against your server to
 discover its loaded pack set and total. The static sections below are audited against pack
-`HandlerDef`/`ParamDef` declarations; the kg catalog was refreshed against the 19-entry
-`KG_HANDLERS` table and its integration contract when `whoami` shipped.
+`HandlerDef`/`ParamDef` declarations; the kg catalog was refreshed against the 20-entry
+`KG_HANDLERS` table and its integration contract when `db_diagnostics` shipped.
 
 An always-machine-readable copy of this page is at
 [`/md/api-reference.md`](md/api-reference.md). The site also publishes
@@ -19,11 +19,11 @@ An always-machine-readable copy of this page is at
 
 | Pack        | Verbs | Load with                                  | Optional?           |
 | ----------- | ----- | ------------------------------------------ | ------------------- |
-| `kg`        | 19    | `KHIVE_PACKS=kg`                           | No — base substrate |
+| `kg`        | 20    | `KHIVE_PACKS=kg`                           | No — base substrate |
 | `gtd`       | 5     | `KHIVE_PACKS=kg,gtd`                       | Yes                 |
 | `memory`    | 5     | `KHIVE_PACKS=kg,memory`                    | Yes                 |
-| `brain`     | 15    | `KHIVE_PACKS=kg,brain`                     | Yes                 |
-| `comm`      | 7     | `KHIVE_PACKS=kg,comm`                      | Yes                 |
+| `brain`     | 16    | `KHIVE_PACKS=kg,brain`                     | Yes                 |
+| `comm`      | 8     | `KHIVE_PACKS=kg,comm`                      | Yes                 |
 | `schedule`  | 4     | `KHIVE_PACKS=kg,schedule`                  | Yes                 |
 | `knowledge` | 19    | `KHIVE_PACKS=kg,knowledge`                 | Yes                 |
 | `session`   | 4     | `KHIVE_PACKS=kg,session`                   | Yes                 |
@@ -157,7 +157,7 @@ parallel batches, since parallel failures do not cascade.
 
 ---
 
-## `kg` pack — 19 verbs
+## `kg` pack — 20 verbs
 
 Base substrate verbs, bare names (no `kg.` prefix). Category is the illocutionary act
 (Searle 1976): Assertive = retrieves state, Commissive = commits a persistent change,
@@ -166,6 +166,10 @@ Declaration = changes institutional status by fiat.
 ### `create` — Commissive
 
 Create an entity or note (singleton) or a batch of entities (bulk via `items`).
+
+Singleton writes preserve the complete source in storage and FTS. If a configured embedder
+receives a UTF-8-safe bounded prefix, the successful response includes a `warnings` array; the
+warning is derived from the embedding outcome, not from a separate registry prediction.
 
 | Param               | Type            | Required    | Notes                                                                                                                                                                                                                                                                                      |
 | ------------------- | --------------- | ----------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
@@ -303,6 +307,9 @@ Patch entity, note, or edge fields. Field set depends on substrate: entities acc
 `name`/`content`/`salience`/`decay_factor`/`properties`; edges accept
 `relation`/`weight`/`properties`.
 
+Entity/note text updates use the same full-source storage and bounded embedding contract as
+singleton `create`; a successful response includes `warnings` when embedding actually truncated.
+
 | Param          | Type            | Required | Notes                                                                     |
 | -------------- | --------------- | -------- | ------------------------------------------------------------------------- |
 | `id`           | uuid            | yes      | Record to patch.                                                          |
@@ -344,6 +351,8 @@ tags_unioned, content_appended, dry_run}` — chain with `$prev.kept_id`, **not*
 existing edge natural key, `edge_conflict_preimages` records the surviving edge
 id, the complete dropped edge, and any incident annotation edges removed by the
 hard-delete cascade. The same preimages are stored in the merge audit event.
+When the surviving entity or note is reindexed and an embedder bounds its input, the successful
+response also includes the standard embedding-truncation `warnings` advisory.
 
 | Param     | Type | Required | Notes                                       |
 | --------- | ---- | -------- | ------------------------------------------- |
@@ -491,15 +500,26 @@ entity-kind vocabulary (§"The 9 entity kinds" in AGENTS.md) vs. the note-kind v
 
 Multi-hop BFS traversal.
 
-| Param       | Type            | Required | Notes                                  |
-| ----------- | --------------- | -------- | -------------------------------------- |
-| `roots`     | array\<uuid\>   | yes      | Starting node UUIDs.                   |
-| `max_depth` | integer         | no       | Default 3.                             |
-| `relations` | array\<string\> | no       | Restrict traversal to these relations. |
+| Param                | Type            | Required | Notes                                                       |
+| -------------------- | --------------- | -------- | ----------------------------------------------------------- |
+| `roots`              | array\<uuid\>   | yes      | Starting node UUIDs.                                        |
+| `max_depth`          | integer         | no       | Default 3.                                                  |
+| `direction`          | string          | no       | `outgoing`\|`incoming`\|`both` (default `both`).            |
+| `relations`          | array\<string\> | no       | Restrict traversal to these relations.                      |
+| `min_weight`         | number          | no       | Exclude edges below this weight.                            |
+| `limit`              | integer         | no       | Maximum non-root nodes retained in each distinct root path. |
+| `include_roots`      | boolean         | no       | Include each root as a depth-zero node (default `true`).    |
+| `include_properties` | boolean         | no       | Include entity properties on path nodes (default `false`).  |
 
 ```
 request(ops="traverse(roots=[\"<uuid>\"], max_depth=2)")
 ```
+
+The response contains exactly one traversal object per distinct requested root. Each path node
+has `id`, `via_edge`, and `depth`; resolvable entity and note nodes also carry `name` and `kind`.
+Note enrichment matches `neighbors`, including its `[kind]` display-name fallback for a nameless
+note reached through an annotation edge. `properties` remains entity-only and is included only
+when `include_properties=true`.
 
 ### `context` — Assertive
 
@@ -595,6 +615,9 @@ request(ops="[{\"tool\":\"propose\",\"args\":{\"title\":\"Add GQE\",\"descriptio
 
 Approve, reject, comment, or request changes on a proposal.
 
+When approval immediately applies an embedding-bearing changeset, the response includes the
+standard `warnings` advisory if that committed apply bounded any embedding input.
+
 | Param      | Type   | Required | Notes                                              |
 | ---------- | ------ | -------- | -------------------------------------------------- |
 | `id`       | uuid   | yes      | Full UUID or 8-char short ID of the proposal.      |
@@ -645,6 +668,23 @@ It takes no parameters and returns only identity labels, never tokens or credent
 
 ```
 request(ops="whoami()")
+```
+
+### `db_diagnostics` — Assertive
+
+Report WAL/checkpoint diagnostics for the main database: build identity, the checkpoint
+counters, a single PASSIVE checkpoint probe, the `-wal` sidecar file size, and a WAL-pin
+holder census. Takes no parameters.
+
+The PASSIVE probe may backfill WAL frames into the database — that is normal checkpoint
+I/O and is what the reported `checkpointed_frames` counts. It never changes logical
+state, never escalates to TRUNCATE, never creates a missing database file, and never
+deletes WAL-pin sidecar evidence. Sections that cannot be collected (in-memory backend,
+missing file, unsupported platform) carry explicit `unavailable_reason` strings rather
+than being silently omitted.
+
+```
+request(ops="db_diagnostics()")
 ```
 
 ### `verbs` — Assertive
@@ -792,6 +832,7 @@ Recall memory notes with decay-aware hybrid ranking. Each hit carries resolved
 | `full_content`      | bool    | no       | Default true; false truncates content to 200 chars.                       |
 | `tags`              | array   | no       | Filter by `properties.tags`.                                              |
 | `tag_mode`          | string  | no       | `any` (default, OR) or `all` (AND).                                       |
+| `namespace`         | string  | no       | Exact-match read scope; absent uses the caller's visible namespace set.   |
 
 ```
 request(ops="memory.recall(query=\"ADR-016 DSL grammar\", limit=5, min_score=0.3)")
@@ -836,7 +877,7 @@ request(ops="memory.vacuum()")
 
 ---
 
-## `brain` pack — 15 verbs
+## `brain` pack — 16 verbs
 
 Recall-tuning profiles: Beta-posterior scoring, profile lifecycle, and the actor/
 namespace/consumer-kind resolution table that picks which profile serves a given
@@ -976,17 +1017,36 @@ request(ops="brain.feedback(target_id=\"<uuid>\", signal=\"useful\")")
 Emit implicit feedback for recall results supplied by an agent — the convenience verb
 to call right after `memory.recall` instead of hand-building `brain.feedback`.
 
-| Param                  | Type   | Required | Notes                                                                 |
-| ---------------------- | ------ | -------- | --------------------------------------------------------------------- |
-| `query`                | string | yes      | The recall query that produced the results.                           |
-| `results`              | array  | yes      | Recall result objects; the first object's `id` is credited.           |
-| `signal`               | string | no       | Defaults to `implicit_positive`.                                      |
-| `served_by_profile_id` | string | no       | Profile that served the recall.                                       |
-| `scorer_run_id`        | string | no       | Forwarded verbatim to `brain.feedback`; pairs with `serve_ledger_id`. |
-| `serve_ledger_id`      | string | no       | Forwarded verbatim to `brain.feedback`; pairs with `scorer_run_id`.   |
+| Param                  | Type   | Required | Notes                                                                  |
+| ---------------------- | ------ | -------- | ---------------------------------------------------------------------- |
+| `query`                | string | yes      | The recall query that produced the results.                            |
+| `results`              | array  | yes      | Recall result objects; the first object's `id` is credited.            |
+| `signal`               | string | no       | Defaults to `implicit_positive`.                                       |
+| `served_by_profile_id` | string | no       | Profile that served the recall.                                        |
+| `scorer_run_id`        | string | no       | Forwarded verbatim to `brain.feedback`; pairs with `serve_ledger_id`.  |
+| `serve_ledger_id`      | string | no       | Forwarded verbatim to `brain.feedback`; pairs with `scorer_run_id`.    |
+| `namespace`            | string | no       | Exact namespace for the event and posterior fold; invalid values fail. |
 
 ```
 request(ops="memory.recall(query=\"x\", limit=5) | brain.auto_feedback(query=\"x\", results=[{\"id\": \"$prev.items[0].id\"}])")
+```
+
+### `brain.mark_turn` — Commissive
+
+Emit a `PhaseStarted` event with `work_class="actor_turn"` carrying the calling actor and
+a timestamp. Callers invoke it once per bounded unit of work (a wake, a turn) so
+`brain.event_counts`'s `counts_by_work_class["actor_turn"]`, grouped by actor, gives a
+per-actor denominator (e.g. `feedback_explicit / actor_turn`) that is not biased toward
+whichever actor issues the most raw verb calls. Reuses the existing ADR-103 Stage 1
+`PhaseStarted`/`work_class` vocabulary rather than a new event kind. Best-effort — never
+fails the caller's turn.
+
+| Param   | Type   | Required | Notes                                                                                                                                             |
+| ------- | ------ | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `label` | string | no       | Free-form label for this unit of work (e.g. `"wake"`, `"turn"`), recorded in the event payload's `phase` field. Does not affect the `work_class`. |
+
+```
+request(ops="brain.mark_turn(label=\"wake\")")
 ```
 
 ### `brain.bind` — Declaration
@@ -1068,13 +1128,16 @@ request(ops="brain.register_adapter(adapter_id=\"lora-v3\", content_hash=\"<sha2
 
 ---
 
-## `comm` pack — 7 verbs
+## `comm` pack — 8 verbs
 
 Actor-to-actor messaging with threading. Optional; load with `KHIVE_PACKS=kg,comm`.
 
 ### `comm.send` — Commissive
 
 Send a message, optionally threaded.
+
+The atomic outbound/inbound write preserves the full body on both notes. If either copy's
+embedding input is bounded, the successful response includes the standard `warnings` advisory.
 
 | Param       | Type   | Required | Notes                                                                                                                                                                                           |
 | ----------- | ------ | -------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -1106,6 +1169,15 @@ always accepted unchanged by `comm.read`, `comm.reply`, or `comm.thread`, even
 when two messages share an eight-character prefix. `full_id` remains an alias
 for compatibility, while `short_id` is the compact display-only prefix.
 
+### `comm.unread` — Assertive
+
+Count-only view of the caller's unread inbound messages — the same filter as
+`comm.inbox(status="unread")`, without message payloads. Takes no parameters.
+
+```
+request(ops="comm.unread()")
+```
+
 ### `comm.read` — Declaration
 
 Mark an inbound message as read. Outbound messages cannot be marked read. The mark-read
@@ -1125,6 +1197,9 @@ request(ops="comm.read(id=\"<message-id>\")")
 ### `comm.reply` — Commissive
 
 Reply to a message, threading linkage.
+
+Replies use the same full-source storage and embedding-truncation `warnings` contract as
+`comm.send`.
 
 | Param     | Type   | Required | Notes                                                       |
 | --------- | ------ | -------- | ----------------------------------------------------------- |
@@ -1333,6 +1408,10 @@ request(ops="knowledge.stats()")
 
 Backfill embeddings + FTS for atoms/domains.
 
+The response includes `truncation_by_model`, keyed by every model that completed embedding work.
+Each value contains `truncated` and `discarded_bytes` counters derived from the actual embedding
+outcomes; atom source content remains complete in SQL and FTS.
+
 | Param         | Type            | Required | Notes                                                   |
 | ------------- | --------------- | -------- | ------------------------------------------------------- |
 | `ids`         | array\<string\> | no       | Atom slugs/IDs to index; omit to index all.             |
@@ -1406,11 +1485,12 @@ request(ops="knowledge.suggest(query=\"async middleware retry circuit breaker pa
 
 Compose a markdown briefing from selected knowledge domains and atoms.
 
-| Param        | Type            | Required | Notes                                             |
-| ------------ | --------------- | -------- | ------------------------------------------------- |
-| `domain_ids` | array\<string\> | no       | Domain UUIDs/slugs whose member atoms to include. |
-| `atom_ids`   | array\<string\> | no       | Atom UUIDs/slugs to include directly.             |
-| `query`      | string          | yes      | Reranks the selected atom bodies.                 |
+| Param        | Type            | Required | Notes                                                     |
+| ------------ | --------------- | -------- | --------------------------------------------------------- |
+| `domain_ids` | array\<string\> | no       | Domain UUIDs/slugs whose member atoms to include.         |
+| `atom_ids`   | array\<string\> | no       | Atom UUIDs/slugs to include directly.                     |
+| `query`      | string          | yes      | Reranks the selected atom bodies.                         |
+| `namespace`  | string          | no       | Exact namespace for all compose and profile-weight reads. |
 
 ```
 request(ops="knowledge.compose(query=\"FastAPI JWT middleware validation patterns\", domain_ids=[\"attention\"])")
@@ -1419,6 +1499,10 @@ request(ops="knowledge.compose(query=\"FastAPI JWT middleware validation pattern
 ### `knowledge.edit` — Commissive
 
 Upsert sections for an atom without wiping other sections.
+
+The response combines the inline section and atom refresh outcomes in `truncation_by_model` and
+includes the standard `warnings` advisory when any model bounded an embedding input. Stored section
+and atom content remains complete.
 
 | Param      | Type            | Required | Notes                                                                                                                                                                                                                                                                             |
 | ---------- | --------------- | -------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |

@@ -140,8 +140,7 @@ pub async fn apply_fold_gate(
 /// Which gating applies to the implicit event participating in the ADR-081
 /// §2/§6 atomic claim+fold+event-append unit
 /// (`apply_fold_gate_and_append_event`). Explicit/correction signals never
-/// reach this — `handlers.rs` keeps their append path unchanged, per ADR-081
-/// §6: "no dedup claim to keep consistent" for those signals.
+/// reach this because they have no dedup claim or implicit mass to update.
 pub enum FeedbackGateMode {
     /// The nominal implicit weight, subject to the ADR-081 §2 mass cap.
     Nominal(f64),
@@ -250,7 +249,7 @@ where
 /// `writer`, which must already be inside an open transaction. Does not
 /// commit or roll back — the caller owns transaction boundaries.
 #[allow(clippy::too_many_arguments)]
-async fn apply_gate_and_append_within_tx<F>(
+pub(crate) async fn apply_gate_and_append_within_tx<F>(
     writer: &mut dyn SqlWriter,
     namespace: &str,
     profile_id: &str,

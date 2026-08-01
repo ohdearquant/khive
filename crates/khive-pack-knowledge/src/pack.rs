@@ -1,5 +1,6 @@
 //! `KnowledgePack` struct, factory, and `PackRuntime` impl.
 
+use std::collections::HashMap;
 use std::sync::Mutex;
 
 use async_trait::async_trait;
@@ -8,7 +9,9 @@ use uuid::Uuid;
 
 use khive_brain_core::SectionPosteriorState;
 use khive_runtime::pack::{PackByIdResolver, PackRuntime};
-use khive_runtime::{KhiveRuntime, NamespaceToken, Resolved, RuntimeError, VerbRegistry};
+use khive_runtime::{
+    KhiveRuntime, Namespace, NamespaceToken, Resolved, RuntimeError, VerbRegistry,
+};
 use khive_storage::types::{SqlStatement, SqlValue};
 use khive_storage::{PhaseCancelledPayload, PhaseCompletedPayload, PhaseStartedPayload};
 use khive_types::{EventKind, HandlerDef, Pack};
@@ -22,12 +25,17 @@ use crate::vocab::KNOWLEDGE_HANDLERS;
 pub struct KnowledgePack {
     pub(crate) runtime: KhiveRuntime,
     pub(crate) ann: vamana::SharedAnn,
-    pub(crate) section_posteriors: Mutex<SectionPosteriorState>,
+    /// Pack-local Tier-3 feedback state, isolated by exact namespace.
+    ///
+    /// This fallback is used only when no configured or bound brain profile
+    /// resolves. Keying it by namespace keeps explicit measurement arms from
+    /// inheriting live/default feedback while preserving existing local behavior.
+    pub(crate) section_posteriors: Mutex<HashMap<String, SectionPosteriorState>>,
     /// Explicit brain profile ID from config (ADR-035 §Brain profile configuration).
     ///
     /// Tier-1 of the 3-tier feedback resolution: when set, `knowledge.feedback` directs
     /// feedback to this profile via `brain.feedback`. When absent, tier-2
-    /// (namespace-bound profile) and tier-3 (global prior) are tried in order.
+    /// (namespace-bound profile) and tier-3 (namespace-local prior) are tried in order.
     pub(crate) brain_profile: Option<String>,
 }
 
@@ -46,7 +54,7 @@ impl KnowledgePack {
         Self {
             runtime,
             ann: vamana::new_shared(),
-            section_posteriors: Mutex::new(SectionPosteriorState::new()),
+            section_posteriors: Mutex::new(HashMap::new()),
             brain_profile,
         }
     }
@@ -215,9 +223,45 @@ impl PackRuntime for KnowledgePack {
                 KnowledgeHandlers::suggest(&self.runtime, token, params, &self.ann).await
             }
             "knowledge.compose" => {
-                let type_weights = self.resolve_compose_type_weights(registry, token).await;
-                KnowledgeHandlers::compose(&self.runtime, token, params, &self.ann, type_weights)
-                    .await
+                // Public registry dispatch pre-applies an explicit namespace,
+                // while PackRuntime can also be called directly by embedders.
+                // A direct caller must supply a token already authorized for
+                // the requested namespace; handlers may not mint a stronger
+                // capability from an untrusted business parameter.
+                let effective_token = match params.get("namespace") {
+                    None => token.clone(),
+                    Some(Value::String(ns_str)) => {
+                        let ns = Namespace::parse(ns_str).map_err(|e| {
+                            RuntimeError::InvalidInput(format!("invalid namespace {ns_str:?}: {e}"))
+                        })?;
+                        if &ns != token.namespace() {
+                            return Err(RuntimeError::InvalidInput(
+                                "knowledge.compose namespace does not match authorized token namespace"
+                                    .to_string(),
+                            ));
+                        }
+                        // Equality proves this is capability narrowing, not
+                        // elevation. Replace any broader visible set so every
+                        // compose leg observes exactly the requested arm.
+                        token.with_namespace(ns)
+                    }
+                    Some(_) => {
+                        return Err(RuntimeError::InvalidInput(
+                            "invalid namespace: expected a string".to_string(),
+                        ));
+                    }
+                };
+                let type_weights = self
+                    .resolve_compose_type_weights(registry, &effective_token)
+                    .await;
+                KnowledgeHandlers::compose(
+                    &self.runtime,
+                    &effective_token,
+                    params,
+                    &self.ann,
+                    type_weights,
+                )
+                .await
             }
             "knowledge.edit" => {
                 KnowledgeHandlers::edit(&self.runtime, token, params, &self.ann).await

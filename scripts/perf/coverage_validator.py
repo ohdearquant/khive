@@ -118,7 +118,7 @@ FRESHNESS_DAYS_SELF_HOSTED = 14
 HOSTED_RUNNER_CLASSES = {"hosted_hash"}
 
 AVAILABLE_OPERATIONS_BY_SURFACE = {
-    # kg pack's 19 bare verbs plus the dotted pack.verb operations exercised
+    # kg pack's 20 bare verbs plus the dotted pack.verb operations exercised
     # by the flagship manifest today (gtd/memory/brain/comm/schedule/
     # knowledge/session/git/code/workspace/blob all load by default in this
     # distribution — this is not an exhaustive verb catalog, just the set of
@@ -128,6 +128,7 @@ AVAILABLE_OPERATIONS_BY_SURFACE = {
         {
             "context",
             "create",
+            "db_diagnostics",
             "delete",
             "get",
             "link",

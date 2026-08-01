@@ -25,6 +25,39 @@ use crate::error::{RuntimeError, RuntimeResult};
 use crate::operations::{base_entity_rule_allows, canonical_edge_endpoints, endpoint_matches};
 use crate::runtime::{KhiveRuntime, NamespaceToken};
 
+/// Immutable embedding-registry view for one logical write.
+///
+/// Document byte budgets are derived from the model name at the embedding seam,
+/// so retaining the exact name set keeps merge cleanup, table preparation, and
+/// survivor reindexing on one plan during concurrent registration.
+#[derive(Clone, Debug, Default)]
+struct EmbeddingModelPlan {
+    model_names: Vec<String>,
+}
+
+impl EmbeddingModelPlan {
+    fn capture(runtime: &KhiveRuntime) -> Self {
+        Self {
+            model_names: runtime.registered_embedding_model_names(),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.model_names.is_empty()
+    }
+
+    fn model_names(&self) -> &[String] {
+        &self.model_names
+    }
+
+    fn vector_tables(&self) -> Vec<String> {
+        self.model_names
+            .iter()
+            .map(|name| format!("vec_{}", crate::config::sanitize_key(name)))
+            .collect()
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Public types
 // ---------------------------------------------------------------------------
@@ -243,6 +276,9 @@ pub struct MergeSummary {
     pub tags_unioned: usize,
     pub content_appended: bool,
     pub dry_run: bool,
+    /// Actual embedding-input truncation observed while reindexing the survivor.
+    #[serde(skip)]
+    pub embedding_truncation: crate::retrieval::EmbeddingTruncationReport,
 }
 
 /// Complete stored state of an edge removed while resolving a merge conflict.
@@ -713,15 +749,29 @@ impl KhiveRuntime {
         id: Uuid,
         patch: EntityPatch,
     ) -> RuntimeResult<Entity> {
+        Ok(self
+            .update_entity_with_embedding_report(token, id, patch)
+            .await?
+            .0)
+    }
+
+    pub async fn update_entity_with_embedding_report(
+        &self,
+        token: &NamespaceToken,
+        id: Uuid,
+        patch: EntityPatch,
+    ) -> RuntimeResult<(Entity, crate::retrieval::EmbeddingTruncationReport)> {
         let (entity, text_changed, changed_fields) =
             self.prepare_update_entity(token, id, patch).await?;
 
         let store = self.entities(token)?;
         store.upsert_entity(entity.clone()).await?;
 
-        if text_changed {
-            self.reindex_entity(token, &entity).await?;
-        }
+        let embedding_report = if text_changed {
+            self.reindex_entity(token, &entity).await?
+        } else {
+            crate::retrieval::EmbeddingTruncationReport::default()
+        };
 
         let event_store = self.events(token)?;
         let event = khive_storage::event::Event::new(
@@ -741,7 +791,7 @@ impl KhiveRuntime {
             RuntimeError::Internal(format!("update_entity: event store write failed: {e}"))
         })?;
 
-        Ok(entity)
+        Ok((entity, embedding_report))
     }
 
     /// Merge `from_id` into `into_id`.
@@ -864,11 +914,11 @@ impl KhiveRuntime {
         }
         let ns = token.namespace().as_str().to_owned();
         let fts_table = "fts_entities".to_string();
-        let vec_tables: Vec<String> = self
-            .registered_embedding_model_names()
-            .iter()
-            .map(|name| format!("vec_{}", crate::config::sanitize_key(name)))
-            .collect();
+        // One immutable registry view governs transactional deletion, table
+        // preparation, and survivor reindex. A late model belongs to a later
+        // write/backfill rather than only one leg of this merge.
+        let embedding_plan = EmbeddingModelPlan::capture(self);
+        let vec_tables = embedding_plan.vector_tables();
         // Loaded once here (sync, cheap) so the rewire loop can evaluate the
         // endpoint contract without an async round-trip per edge (khive#1216).
         let pack_rules = self.pack_edge_rules();
@@ -879,7 +929,7 @@ impl KhiveRuntime {
         let _ = self.text(token)?;
         // vectors_for_model (not the default-model-only self.vectors()) so
         // custom-only runtimes (no default embedding_model) still get DDL primed.
-        for model_name in &self.registered_embedding_model_names() {
+        for model_name in embedding_plan.model_names() {
             let _ = self.vectors_for_model(token, model_name)?;
         }
 
@@ -889,7 +939,7 @@ impl KhiveRuntime {
         // failure degrades to the legacy mutex path rather than failing the merge.
         let writer_task = pool.writer_task_handle().ok().flatten();
 
-        let (summary, updated_entity) = if let Some(writer_task) = writer_task {
+        let (mut summary, updated_entity) = if let Some(writer_task) = writer_task {
             writer_task
                 .send(move |conn| {
                     merge_entity_sql(
@@ -954,8 +1004,10 @@ impl KhiveRuntime {
 
         // FTS and vec-deletes already committed inside the transaction above;
         // only the embedding re-insert needs an async step outside it.
-        if !dry_run && !self.registered_embedding_model_names().is_empty() {
-            self.reindex_entity(token, &updated_entity).await?;
+        if !dry_run && !embedding_plan.is_empty() {
+            summary.embedding_truncation = self
+                .reindex_entity_with_plan(token, &updated_entity, &embedding_plan)
+                .await?;
         }
 
         // Dry-run is a read-only preview: it must not append a merge event.
@@ -1018,46 +1070,60 @@ impl KhiveRuntime {
         &self,
         token: &NamespaceToken,
         entity: &Entity,
-    ) -> RuntimeResult<()> {
+    ) -> RuntimeResult<crate::retrieval::EmbeddingTruncationReport> {
+        let embedding_plan = EmbeddingModelPlan::capture(self);
+        self.reindex_entity_with_plan(token, entity, &embedding_plan)
+            .await
+    }
+
+    async fn reindex_entity_with_plan(
+        &self,
+        token: &NamespaceToken,
+        entity: &Entity,
+        embedding_plan: &EmbeddingModelPlan,
+    ) -> RuntimeResult<crate::retrieval::EmbeddingTruncationReport> {
         // Use entity.namespace (authoritative) rather than token.namespace().as_str() (caller claim).
         let ns = entity.namespace.clone();
         let doc = entity_fts_document(entity);
         let embed_body = doc.body.clone();
         self.text(token)?.upsert_document(doc).await?;
 
-        let embed_model_names = self.registered_embedding_model_names();
-        for model_name in &embed_model_names {
+        let mut report = crate::retrieval::EmbeddingTruncationReport::default();
+        for model_name in embedding_plan.model_names() {
             match self
-                .embed_document_with_model_for_token(token, model_name, &embed_body)
+                .embed_document_with_model_outcome_for_token(token, model_name, &embed_body)
                 .await
             {
-                Ok(vector) => match self.vectors_for_model(token, model_name) {
-                    Ok(vs) => {
-                        if let Err(e) = vs
-                            .insert(
-                                entity.id,
-                                SubstrateKind::Entity,
-                                &ns,
-                                "entity.body",
-                                vec![vector],
-                            )
-                            .await
-                        {
+                Ok(outcome) => {
+                    report.observe(&outcome);
+                    match self.vectors_for_model(token, model_name) {
+                        Ok(vs) => {
+                            if let Err(e) = vs
+                                .insert(
+                                    entity.id,
+                                    SubstrateKind::Entity,
+                                    &ns,
+                                    "entity.body",
+                                    vec![outcome.vector],
+                                )
+                                .await
+                            {
+                                tracing::warn!(
+                                    model = model_name,
+                                    id = %entity.id,
+                                    "reindex_entity: vector insert failed, skipping model: {e}"
+                                );
+                            }
+                        }
+                        Err(e) => {
                             tracing::warn!(
                                 model = model_name,
                                 id = %entity.id,
-                                "reindex_entity: vector insert failed, skipping model: {e}"
+                                "reindex_entity: could not access vector store for model, skipping: {e}"
                             );
                         }
                     }
-                    Err(e) => {
-                        tracing::warn!(
-                            model = model_name,
-                            id = %entity.id,
-                            "reindex_entity: could not access vector store for model, skipping: {e}"
-                        );
-                    }
-                },
+                }
                 Err(e) => {
                     tracing::warn!(
                         model = model_name,
@@ -1068,7 +1134,7 @@ impl KhiveRuntime {
             }
         }
 
-        Ok(())
+        Ok(report)
     }
 
     /// Remove an entity from FTS5 and vector indexes across all registered models.
@@ -1094,45 +1160,63 @@ impl KhiveRuntime {
         &self,
         token: &NamespaceToken,
         note: &khive_storage::note::Note,
-    ) -> RuntimeResult<()> {
+    ) -> RuntimeResult<crate::retrieval::EmbeddingTruncationReport> {
+        let embedding_plan = EmbeddingModelPlan::capture(self);
+        self.reindex_note_with_plan(token, note, &embedding_plan)
+            .await
+    }
+
+    async fn reindex_note_with_plan(
+        &self,
+        token: &NamespaceToken,
+        note: &khive_storage::note::Note,
+        embedding_plan: &EmbeddingModelPlan,
+    ) -> RuntimeResult<crate::retrieval::EmbeddingTruncationReport> {
         self.text_for_notes(token)?
             .upsert_document(note_fts_document(note))
             .await?;
 
         let ns = note.namespace.clone();
-        let embed_model_names = self.registered_embedding_model_names();
-        for model_name in &embed_model_names {
+        let mut report = crate::retrieval::EmbeddingTruncationReport::default();
+        for model_name in embedding_plan.model_names() {
             match self
-                .embed_document_with_model_for_token(token, model_name, &note_embedding_text(note))
+                .embed_document_with_model_outcome_for_token(
+                    token,
+                    model_name,
+                    &note_embedding_text(note),
+                )
                 .await
             {
-                Ok(vector) => match self.vectors_for_model(token, model_name) {
-                    Ok(vs) => {
-                        if let Err(e) = vs
-                            .insert(
-                                note.id,
-                                SubstrateKind::Note,
-                                &ns,
-                                "note.content",
-                                vec![vector],
-                            )
-                            .await
-                        {
+                Ok(outcome) => {
+                    report.observe(&outcome);
+                    match self.vectors_for_model(token, model_name) {
+                        Ok(vs) => {
+                            if let Err(e) = vs
+                                .insert(
+                                    note.id,
+                                    SubstrateKind::Note,
+                                    &ns,
+                                    "note.content",
+                                    vec![outcome.vector],
+                                )
+                                .await
+                            {
+                                tracing::warn!(
+                                    model = model_name,
+                                    id = %note.id,
+                                    "reindex_note: vector insert failed, skipping model: {e}"
+                                );
+                            }
+                        }
+                        Err(e) => {
                             tracing::warn!(
                                 model = model_name,
                                 id = %note.id,
-                                "reindex_note: vector insert failed, skipping model: {e}"
+                                "reindex_note: could not access vector store for model, skipping: {e}"
                             );
                         }
                     }
-                    Err(e) => {
-                        tracing::warn!(
-                            model = model_name,
-                            id = %note.id,
-                            "reindex_note: could not access vector store for model, skipping: {e}"
-                        );
-                    }
-                },
+                }
                 Err(e) => {
                     tracing::warn!(
                         model = model_name,
@@ -1142,7 +1226,7 @@ impl KhiveRuntime {
                 }
             }
         }
-        Ok(())
+        Ok(report)
     }
 
     /// Computes the patched `Note` and `text_changed` without writing, mirroring
@@ -1224,20 +1308,38 @@ impl KhiveRuntime {
         id: Uuid,
         patch: NotePatch,
     ) -> RuntimeResult<khive_storage::note::Note> {
+        Ok(self
+            .update_note_with_embedding_report(token, id, patch)
+            .await?
+            .0)
+    }
+
+    pub async fn update_note_with_embedding_report(
+        &self,
+        token: &NamespaceToken,
+        id: Uuid,
+        patch: NotePatch,
+    ) -> RuntimeResult<(
+        khive_storage::note::Note,
+        crate::retrieval::EmbeddingTruncationReport,
+    )> {
         let (note, text_changed) = self.prepare_update_note(token, id, patch).await?;
 
         let store = self.notes(token)?;
         store.upsert_note(note.clone()).await?;
 
-        if text_changed {
-            self.reindex_note(token, &note).await?;
+        let embedding_report = if text_changed {
+            let report = self.reindex_note(token, &note).await?;
             // Notify any pack-owned vector cache (e.g. a warm ANN index) that this
             // note's embedding changed, via a generic hook so khive-runtime/pack-kg
             // never take a dependency on the consuming pack. No-op if unregistered.
             self.fire_note_mutation_hook(&note.kind, note.id).await;
-        }
+            report
+        } else {
+            crate::retrieval::EmbeddingTruncationReport::default()
+        };
 
-        Ok(note)
+        Ok((note, embedding_report))
     }
 
     /// Merge `from_id` note into `into_id` note.
@@ -1293,11 +1395,10 @@ impl KhiveRuntime {
         }
         let ns = token.namespace().as_str().to_string();
         let fts_table = "fts_notes".to_string();
-        let vec_tables: Vec<String> = self
-            .registered_embedding_model_names()
-            .iter()
-            .map(|name| format!("vec_{}", crate::config::sanitize_key(name)))
-            .collect();
+        // Keep deletion, table preparation, and survivor reindex on the same
+        // immutable registry view; see the entity merge path above.
+        let embedding_plan = EmbeddingModelPlan::capture(self);
+        let vec_tables = embedding_plan.vector_tables();
         let pack_rules = self.pack_edge_rules();
 
         let note_store = self.notes(token)?;
@@ -1315,14 +1416,14 @@ impl KhiveRuntime {
 
         let _ = self.graph(token)?;
         let _ = self.text_for_notes(token)?;
-        for model_name in &self.registered_embedding_model_names() {
+        for model_name in embedding_plan.model_names() {
             let _ = self.vectors_for_model(token, model_name)?;
         }
 
         let pool = self.backend().pool_arc();
         let writer_task = pool.writer_task_handle().ok().flatten();
 
-        let (summary, updated_note) = if let Some(writer_task) = writer_task {
+        let (mut summary, updated_note) = if let Some(writer_task) = writer_task {
             writer_task
                 .send(move |conn| {
                     merge_note_sql(
@@ -1369,8 +1470,10 @@ impl KhiveRuntime {
             .map_err(|e| RuntimeError::Internal(e.to_string()))??
         };
 
-        if !dry_run && !self.registered_embedding_model_names().is_empty() {
-            self.reindex_note(token, &updated_note).await?;
+        if !dry_run && !embedding_plan.is_empty() {
+            summary.embedding_truncation = self
+                .reindex_note_with_plan(token, &updated_note, &embedding_plan)
+                .await?;
             // A merge changes the same ANN corpus as update_note's text_changed
             // branch, so fire the same mutation hook regardless of which public
             // write path reached the corpus change.
@@ -2065,6 +2168,7 @@ fn merge_entity_sql(
             tags_unioned,
             content_appended,
             dry_run,
+            embedding_truncation: Default::default(),
         },
         updated_entity,
     ))
@@ -2579,6 +2683,7 @@ fn merge_note_sql(
             tags_unioned: 0,
             content_appended,
             dry_run,
+            embedding_truncation: Default::default(),
         },
         updated_note,
     ))
@@ -6775,6 +6880,106 @@ mod tests {
         {
             Ok(std::sync::Arc::new(MergeTestVecService { dims: self.dims }))
         }
+    }
+
+    #[tokio::test]
+    async fn entity_reindex_with_captured_merge_plan_excludes_late_model() {
+        const DIMS: usize = 4;
+        const PLANNED: &str = "merge-entity-plan-existing";
+        const LATE: &str = "merge-entity-plan-late";
+        let rt = KhiveRuntime::memory().unwrap();
+        let ns = crate::Namespace::parse("merge-entity-plan-snapshot").unwrap();
+        let tok = NamespaceToken::for_namespace(ns);
+        let entity = rt
+            .create_entity(
+                &tok,
+                "concept",
+                None,
+                "CapturedEntityPlan",
+                Some("full source remains indexed"),
+                None,
+                vec![],
+            )
+            .await
+            .expect("create entity before registering embedders");
+
+        rt.register_embedder(MergeTestVecProvider::new(PLANNED, DIMS));
+        let embedding_plan = EmbeddingModelPlan::capture(&rt);
+        rt.register_embedder(MergeTestVecProvider::new(LATE, DIMS));
+
+        rt.reindex_entity_with_plan(&tok, &entity, &embedding_plan)
+            .await
+            .expect("reindex entity with captured merge plan");
+
+        assert_eq!(embedding_plan.model_names().len(), 1);
+        assert_eq!(embedding_plan.model_names()[0].as_str(), PLANNED);
+        assert_eq!(
+            rt.vectors_for_model(&tok, PLANNED)
+                .unwrap()
+                .count()
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            rt.vectors_for_model(&tok, LATE)
+                .unwrap()
+                .count()
+                .await
+                .unwrap(),
+            0,
+            "a provider registered after plan capture must not join survivor reindex"
+        );
+    }
+
+    #[tokio::test]
+    async fn note_reindex_with_captured_merge_plan_excludes_late_model() {
+        const DIMS: usize = 4;
+        const PLANNED: &str = "merge-note-plan-existing";
+        const LATE: &str = "merge-note-plan-late";
+        let rt = KhiveRuntime::memory().unwrap();
+        let ns = crate::Namespace::parse("merge-note-plan-snapshot").unwrap();
+        let tok = NamespaceToken::for_namespace(ns);
+        let note = rt
+            .create_note(
+                &tok,
+                "observation",
+                None,
+                "full note source remains indexed",
+                None,
+                None,
+                vec![],
+            )
+            .await
+            .expect("create note before registering embedders");
+
+        rt.register_embedder(MergeTestVecProvider::new(PLANNED, DIMS));
+        let embedding_plan = EmbeddingModelPlan::capture(&rt);
+        rt.register_embedder(MergeTestVecProvider::new(LATE, DIMS));
+
+        rt.reindex_note_with_plan(&tok, &note, &embedding_plan)
+            .await
+            .expect("reindex note with captured merge plan");
+
+        assert_eq!(embedding_plan.model_names().len(), 1);
+        assert_eq!(embedding_plan.model_names()[0].as_str(), PLANNED);
+        assert_eq!(
+            rt.vectors_for_model(&tok, PLANNED)
+                .unwrap()
+                .count()
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            rt.vectors_for_model(&tok, LATE)
+                .unwrap()
+                .count()
+                .await
+                .unwrap(),
+            0,
+            "a provider registered after plan capture must not join survivor reindex"
+        );
     }
 
     /// merge_entity must delete from_id vectors from ALL registered model tables.
