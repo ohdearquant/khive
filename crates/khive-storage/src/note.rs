@@ -357,9 +357,12 @@ pub trait NoteStore: Send + Sync + 'static {
     /// writing, so a target that stopped matching an eligibility predicate
     /// between validation and this call is not mutated. Any other property
     /// written concurrently between the caller's read and this call survives
-    /// untouched either way. Returns `Ok(false)` — not an error — when no
-    /// live row currently matches `filter` (id not found, soft-deleted, or an
-    /// eligibility property changed since the caller last validated it); the
+    /// untouched either way. A live row whose stored `properties` document is
+    /// a non-object (scalar, array, or otherwise) is not modified and returns
+    /// `false`, mirroring `set_note_property`. Returns `Ok(false)` — not an
+    /// error — when no live row currently matches `filter` (id not found,
+    /// soft-deleted, an eligibility property changed since the caller last
+    /// validated it, or the stored document is not a JSON object); the
     /// caller degrades that the same way as `update_note_properties`'s
     /// `Ok(false)`.
     async fn try_patch_note_property(

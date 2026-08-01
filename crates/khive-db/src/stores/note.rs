@@ -826,7 +826,8 @@ impl NoteStore for SqlNoteStore {
             let base = params.len();
             let sql = format!(
                 "UPDATE notes SET properties = json_set(COALESCE(properties, '{{}}'), ?{p1}, json(?{p2})), \
-                 updated_at = ?{p3} {where_clause} AND id = ?{p4}",
+                 updated_at = ?{p3} {where_clause} \
+                 AND (properties IS NULL OR json_type(properties) = 'object') AND id = ?{p4}",
                 p1 = base + 1,
                 p2 = base + 2,
                 p3 = base + 3,

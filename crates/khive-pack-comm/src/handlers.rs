@@ -3111,4 +3111,93 @@ mod tests {
              survive — the mark must never write back the stale snapshot; got {props}"
         );
     }
+
+    // Regression: a message whose stored `properties` document is not a JSON
+    // object (scalar or array) must never be reported as read. `json_set`
+    // silently leaves such a document unchanged while still returning it, so
+    // without a non-object guard the `UPDATE` would still match the row and
+    // `comm.read` would falsely report `read: true` for a patch that stored
+    // nothing.
+    #[tokio::test]
+    async fn mark_read_target_reports_unread_for_non_object_properties() {
+        use khive_runtime::{AllowAllGate, BackendId, Namespace, RuntimeConfig};
+        use khive_storage::note::Note;
+        use uuid::Uuid;
+
+        for (case, properties) in [
+            ("scalar", json!(1)),
+            ("array", json!(["not", "an", "object"])),
+        ] {
+            let ns = format!("mark-read-non-object-{case}-{}", Uuid::new_v4().simple());
+            let runtime = super::KhiveRuntime::new(RuntimeConfig {
+                git_write: Default::default(),
+                db_path: None,
+                default_namespace: Namespace::parse(&ns).unwrap(),
+                embedding_model: None,
+                additional_embedding_models: vec![],
+                gate: std::sync::Arc::new(AllowAllGate),
+                packs: vec!["kg".to_string(), "comm".to_string()],
+                backend_id: BackendId::main(),
+                brain_profile: None,
+                visible_namespaces: vec![],
+                allowed_outbound_namespaces: vec![],
+                actor_id: None,
+            })
+            .expect("in-memory runtime");
+            let token = runtime
+                .authorize(Namespace::parse(&ns).unwrap())
+                .expect("authorize");
+            let store = runtime.notes(&token).expect("notes store");
+
+            let id = Uuid::new_v4();
+            let created_at = chrono::Utc::now().timestamp_micros();
+            let note = Note {
+                id,
+                namespace: ns.clone(),
+                kind: "message".to_string(),
+                status: "active".to_string(),
+                name: None,
+                content: format!("{case} properties"),
+                salience: None,
+                decay_factor: None,
+                expires_at: None,
+                properties: Some(properties.clone()),
+                created_at,
+                updated_at: created_at,
+                deleted_at: None,
+            };
+            store
+                .upsert_note(note.clone())
+                .await
+                .expect("insert message");
+
+            let result = mark_read_target(&runtime, &token, id, note)
+                .await
+                .expect("mark_read_target");
+            assert_eq!(
+                result["read"],
+                json!(false),
+                "{case} properties document must not be reported as read; got {result}"
+            );
+            assert_eq!(
+                result["properties"], properties,
+                "{case} properties must round-trip unchanged; got {result}"
+            );
+
+            let stored = store
+                .get_note(id)
+                .await
+                .expect("get_note")
+                .expect("note still present");
+            assert_eq!(
+                stored.properties,
+                Some(properties),
+                "{case} properties must remain unchanged in storage"
+            );
+            assert_eq!(
+                stored.updated_at, created_at,
+                "{case} updated_at must not advance when the patch is refused"
+            );
+        }
+    }
 }
