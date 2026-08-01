@@ -41,12 +41,13 @@ Mirrors `khive-runtime::operations::KhiveRuntime::update_edge`'s patch semantics
 entity/note branches' `merge_properties`).
 
 DML shape:
+
 - non-symmetric relation: a single `edge_upsert_statement` call on the patched `Edge` — the same
   builder `update_edge`'s own non-symmetric branch calls via `graph.upsert_edge(edge.clone())`
   (`khive-db::stores::graph::SqlGraphStore::upsert_edge`), so parity is exact by construction.
 - symmetric relation (`competes_with`, `composed_with`): `update_edge` does NOT use the upsert
   builder here, because `upsert_edge` resolves `ON CONFLICT(namespace, id)` first and cannot
-  detect a natural-key collision with a *different* id. Canonical (`update_edge_symmetric_dml`)
+  detect a natural-key collision with a _different_ id. Canonical (`update_edge_symmetric_dml`)
   runs a conflict probe and branches in Rust inside a single uninterrupted transaction, which is
   safe there. This atomic path cannot do that (see the in-source invariant note on
   `prepare_update_edge`).
@@ -64,3 +65,9 @@ best-effort or non-SQL work): the insert is a small number of plain, determinist
 computed entirely from data already on hand at prepare time, unlike the
 `ReindexEntity`/`ReindexNote` post-commit effects this module defers because those need an
 embedding call.
+
+`apply_post_commit_effects_with_report` returns one `PostCommitEmbeddingOutcome` for every reindex
+effect it successfully executes. Each outcome retains the originating effect identity plus its
+typed truncation report, allowing CLI or pack response builders to attach warnings to the exact
+write without rerunning registry prediction. The original `apply_post_commit_effects` remains the
+unit-returning compatibility wrapper.

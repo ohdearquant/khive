@@ -194,9 +194,16 @@ impl KgPack {
                     properties: p.properties,
                     tags: p.tags,
                 };
-                Ok(normalize_entity_timestamps(to_json(
-                    &self.runtime.update_entity(token, id, patch).await?,
-                )?))
+                let (entity, report) = self
+                    .runtime
+                    .update_entity_with_embedding_report(token, id, patch)
+                    .await?;
+                let mut response = normalize_entity_timestamps(to_json(&entity)?);
+                super::create::add_embedding_truncation_warning(
+                    &mut response,
+                    report.any_truncated(),
+                );
+                Ok(response)
             }
             KindSpec::Edge => {
                 let relation = p.relation.as_deref().map(parse_relation).transpose()?;
@@ -227,9 +234,16 @@ impl KgPack {
                     p.decay_factor,
                     p.properties,
                 );
-                Ok(normalize_entity_timestamps(to_json(
-                    &self.runtime.update_note(token, id, patch).await?,
-                )?))
+                let (note, report) = self
+                    .runtime
+                    .update_note_with_embedding_report(token, id, patch)
+                    .await?;
+                let mut response = normalize_entity_timestamps(to_json(&note)?);
+                super::create::add_embedding_truncation_warning(
+                    &mut response,
+                    report.any_truncated(),
+                );
+                Ok(response)
             }
             KindSpec::Event => Err(immutable_event_error()),
             KindSpec::Proposal => Err(RuntimeError::InvalidInput(

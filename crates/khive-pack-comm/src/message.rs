@@ -118,15 +118,21 @@ fn build_preview(content: &str) -> String {
 }
 
 /// Writes an outbound copy (caller namespace) and an inbound copy (recipient
-/// namespace) as ONE atomic unit (`khive_runtime::create_notes_atomic`): one
-/// writer transaction covers both notes' rows, FTS documents, and vector
-/// rows. Returns the outbound `Note` on success.
+/// namespace) as ONE atomic unit
+/// (`khive_runtime::create_notes_atomic_with_report`): one writer transaction
+/// covers both notes' rows, FTS documents, and vector rows. Returns the
+/// outbound `Note` and aggregate embedding-truncation report on success.
 ///
-/// The two note writes used to be separate `create_note` calls with an
-/// in-process compensating delete. `create_notes_atomic` now makes the pair
-/// all-or-none: an ordinary prepare/plan failure leaves neither copy, while a
-/// successful commit leaves both. If the writer seam cannot establish whether
-/// an accepted request committed (`side_effects_unknown`), the pre-generated
+/// Resolved gap (external desk review, 2026-07-21; closed by construction
+/// here): the two note writes used to be separate `create_note` calls with
+/// only an in-process rollback compensating an inbound-write failure, so a
+/// process crash between them could leave a durable orphan outbound note
+/// with no inbound copy. `create_notes_atomic_with_report` commits both copies under one
+/// `SqlAccess::atomic_unit` — a crash or failure anywhere in the unit rolls
+/// back everything, so no partial pair can ever be observed durably: an
+/// ordinary prepare/plan failure leaves neither copy, while a successful
+/// commit leaves both. If the writer seam cannot establish whether an
+/// accepted request committed (`side_effects_unknown`), the pre-generated
 /// outbound UUID is attached to the error so `comm.delivered` can distinguish
 /// the two complete outcomes without relying on message content.
 ///
@@ -158,7 +164,7 @@ pub(crate) async fn dual_write_message(
     in_reply_to_message_id: Option<&str>,
     references_chain: Option<&str>,
     tags: Option<&[String]>,
-) -> Result<Note, RuntimeError> {
+) -> Result<(Note, khive_runtime::retrieval::EmbeddingTruncationReport), RuntimeError> {
     let recipient_ns_str = to.trim();
     if from != recipient_ns_str {
         // When actor labels are provided this is an actor-addressed local send;
@@ -280,7 +286,7 @@ pub(crate) async fn dual_write_message(
         }
     }
 
-    let mut notes = khive_runtime::create_notes_atomic(
+    let (mut notes, embedding_truncation) = khive_runtime::create_notes_atomic_with_report(
         runtime,
         vec![
             khive_runtime::AtomicNoteSpec {
@@ -304,9 +310,9 @@ pub(crate) async fn dual_write_message(
     .await
     .map_err(|error| attach_outbound_id_to_ambiguous_write(outbound_id, error))?;
 
-    // create_notes_atomic returns notes in the same order as the specs above:
-    // [outbound, inbound].
-    Ok(notes.remove(0))
+    // create_notes_atomic_with_report returns notes in the same order as the
+    // specs above: [outbound, inbound].
+    Ok((notes.remove(0), embedding_truncation))
 }
 
 #[cfg(test)]
@@ -437,7 +443,7 @@ mod tests {
         let ns = format!("thread-id-canonical-{}", Uuid::new_v4().simple());
         let (runtime, token) = scratch_runtime_and_token(&ns);
 
-        let outbound_note = dual_write_message(
+        let (outbound_note, _) = dual_write_message(
             &runtime,
             &token,
             &ns,
