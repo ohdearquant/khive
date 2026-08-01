@@ -625,9 +625,11 @@ async fn write_events_and_cursor(
                 source_value,
                 &sessions_owned,
                 &events_owned,
-                scanned,
-                new_offset,
-                now_us,
+                MirrorWriteProgress {
+                    scanned,
+                    new_offset,
+                    now_us,
+                },
             )
             .await
             .map(|stats| Box::new(stats) as Box<dyn std::any::Any + Send>)
@@ -710,16 +712,26 @@ async fn ensure_session_on_writer(
 /// SqlTransaction`) because `atomic_unit` owns the transaction boundary
 /// entirely — this function must not, and does not, issue its own
 /// `BEGIN`/`COMMIT`/`ROLLBACK`.
+#[derive(Clone, Copy)]
+struct MirrorWriteProgress {
+    scanned: u64,
+    new_offset: u64,
+    now_us: i64,
+}
+
 async fn write_events_and_cursor_on_writer(
     writer: &mut dyn SqlWriter,
     path: &Path,
     source_value: &'static str,
     sessions: &[parse::ParsedSession],
     events: &[parse::ParsedEvent],
-    scanned: u64,
-    new_offset: u64,
-    now_us: i64,
+    progress: MirrorWriteProgress,
 ) -> khive_storage::types::StorageResult<MirrorStats> {
+    let MirrorWriteProgress {
+        scanned,
+        new_offset,
+        now_us,
+    } = progress;
     let mut inserted: u64 = 0;
     let mut last_session_id: Option<String> = None;
     let mut ensured_session_ids = std::collections::HashSet::new();
@@ -2841,9 +2853,11 @@ mod tests {
                     "claude_code",
                     &[],
                     &events,
-                    1,
-                    100,
-                    now_us,
+                    MirrorWriteProgress {
+                        scanned: 1,
+                        new_offset: 100,
+                        now_us,
+                    },
                 )
                 .await
                 .map(|stats| Box::new(stats) as Box<dyn std::any::Any + Send>)
@@ -2939,9 +2953,11 @@ mod tests {
                     "claude_code",
                     &[],
                     &events,
-                    1,
-                    100,
-                    now_us,
+                    MirrorWriteProgress {
+                        scanned: 1,
+                        new_offset: 100,
+                        now_us,
+                    },
                 )
                 .await
                 .map(|stats| Box::new(stats) as Box<dyn std::any::Any + Send>)

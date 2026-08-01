@@ -379,19 +379,14 @@ fn parse_claude_ai_conversation(
     conversation: &Value,
     out: &mut Vec<ParsedEvent>,
 ) -> Option<ParsedSession> {
-    let Some(conversation) = conversation.as_object() else {
-        return None;
-    };
-    let Some(session_id) = conversation
+    let conversation = conversation.as_object()?;
+    let session_id = conversation
         .get("uuid")
         .and_then(Value::as_str)
-        .filter(|id| !id.is_empty())
-    else {
-        return None;
-    };
-    let Some(messages) = conversation.get("chat_messages").and_then(Value::as_array) else {
-        return None;
-    };
+        .filter(|id| !id.is_empty())?;
+    let messages = conversation
+        .get("chat_messages")
+        .and_then(Value::as_array)?;
 
     let slug = conversation
         .get("name")
