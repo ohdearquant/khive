@@ -13,6 +13,11 @@ pin each tier's behavior.
    feedback state), falling back to `SectionPosteriorState::default()` only when no
    feedback has been recorded.
 
+An explicit `knowledge.compose(namespace=...)` derives one exact namespace token before this
+ladder runs. `brain.resolve` and the follow-up `brain.profile` dispatch both receive that
+namespace; omitting it from the second dispatch would silently read the default namespace and
+fall through to Tier 3 when the selected profile exists only in the compose arm (#1505).
+
 Each tier is tried in order; the first one present wins. A pre-#346 regression returned
 `SectionPosteriorState::default()` unconditionally from Tier 3, ignoring learned feedback
 entirely — the tests below exist to pin that this cannot recur.

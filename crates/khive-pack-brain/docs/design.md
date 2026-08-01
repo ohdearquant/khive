@@ -109,3 +109,7 @@ $$\text{Beta}(\alpha_1 + \alpha_2 - \alpha_{\text{prior}},\; \beta_1 + \beta_2 -
 - `brain.bind` rejects archived profiles to prevent creating unresolvable bindings (issue C3).
 - `brain.create_profile` enforces a profile-id grammar: alphanumeric + hyphens only, no dots,
   underscores, or wildcards; leading/trailing whitespace is trimmed (issue R3-3).
+- `brain.auto_feedback(namespace=...)` applies ADR-007's exact escape to both sides of the
+  mutation: the feedback event/fold-gate row and the selected namespace's live + durable
+  posterior state. Target IDs remain globally resolvable by ID. Handler-side token derivation
+  protects direct `PackRuntime` callers in addition to registry dispatch (issue #1505).

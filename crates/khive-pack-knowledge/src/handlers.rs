@@ -460,7 +460,7 @@ impl KnowledgePack {
 
         // Tier 1: explicit profile from config.
         if let Some(ref profile_id) = self.brain_profile {
-            if let Some(weights) = load_profile_type_weights(registry, profile_id).await {
+            if let Some(weights) = load_profile_type_weights(registry, profile_id, &ns).await {
                 return weights;
             }
         }
@@ -470,7 +470,7 @@ impl KnowledgePack {
         if let Some(profile_id) =
             resolve_consumer_profile(registry, actor, &ns, ConsumerKind::KnowledgeCompose).await
         {
-            if let Some(weights) = load_profile_type_weights(registry, &profile_id).await {
+            if let Some(weights) = load_profile_type_weights(registry, &profile_id, &ns).await {
                 return weights;
             }
         }
@@ -504,9 +504,13 @@ impl KnowledgePack {
 async fn load_profile_type_weights(
     registry: &VerbRegistry,
     profile_id: &str,
+    namespace: &str,
 ) -> Option<HashMap<String, f32>> {
     let result = registry
-        .dispatch("brain.profile", json!({ "profile_id": profile_id }))
+        .dispatch(
+            "brain.profile",
+            json!({ "profile_id": profile_id, "namespace": namespace }),
+        )
         .await
         .ok()?;
     let sections = result.get("section_posteriors")?.as_object()?;
@@ -752,6 +756,75 @@ mod tests {
             "Tier-2 bound-profile: formalism {formalism_w:.4} must exceed og {og_w:.4}; \
              ordering reflects seed_priors (formalism β(8,1) >> og β(1,8)), \
              not default priors where og α=6,β=1.5 dominates"
+        );
+    }
+
+    /// #1505: after resolving a binding in a non-default namespace, the
+    /// follow-up `brain.profile` read must stay in that namespace too. Before
+    /// the fix, the second cross-pack dispatch silently fell back to local,
+    /// missed the arm profile, and compose used Tier-3 default weights.
+    #[tokio::test]
+    async fn resolve_compose_type_weights_keeps_nonlocal_namespace_for_profile_read() {
+        use khive_pack_brain::BrainPack;
+        use khive_pack_kg::KgPack;
+
+        let rt = KhiveRuntime::memory().expect("in-memory runtime");
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(KgPack::new(rt.clone()));
+        builder.register(BrainPack::new(rt.clone()));
+        let registry = builder.build().expect("kg+brain registry builds");
+        let arm_ns = "bench-arm-a";
+
+        registry
+            .dispatch(
+                "brain.create_profile",
+                json!({
+                    "namespace": arm_ns,
+                    "name": "compose-bench-arm-v1",
+                    "consumer_kind": "knowledge_compose",
+                    "seed_priors": {
+                        "section_posteriors": {
+                            "formalism": {"alpha": 8.0, "beta": 1.0},
+                            "operational_guidance": {"alpha": 1.0, "beta": 8.0}
+                        }
+                    }
+                }),
+            )
+            .await
+            .expect("create arm profile");
+        registry
+            .dispatch(
+                "brain.activate",
+                json!({
+                    "namespace": arm_ns,
+                    "profile_id": "compose-bench-arm-v1",
+                }),
+            )
+            .await
+            .expect("activate arm profile");
+        registry
+            .dispatch(
+                "brain.bind",
+                json!({
+                    "namespace": arm_ns,
+                    "profile_id": "compose-bench-arm-v1",
+                    "consumer_kind": "knowledge_compose",
+                }),
+            )
+            .await
+            .expect("bind arm profile");
+
+        let pack = KnowledgePack::new(rt.clone());
+        let token = rt
+            .authorize(Namespace::parse(arm_ns).expect("arm namespace"))
+            .expect("arm token");
+        let weights = pack.resolve_compose_type_weights(&registry, &token).await;
+        let formalism = weights["formalism"];
+        let operational = weights["operational_guidance"];
+        assert!(
+            formalism > operational,
+            "nonlocal Tier-2 profile must supply its inverted weights; got \
+             formalism={formalism:.4}, operational_guidance={operational:.4}"
         );
     }
 

@@ -302,6 +302,10 @@ pub(crate) struct SuggestParams {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ComposeParams {
+    /// Exact read namespace. Registry dispatch pre-applies this to the token;
+    /// the handler retains it for direct-call defense in depth.
+    #[serde(default)]
+    pub namespace: Option<String>,
     #[serde(default)]
     pub domain_ids: Option<Vec<String>>,
     #[serde(default)]

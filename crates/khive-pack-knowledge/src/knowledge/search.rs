@@ -8,7 +8,9 @@ use std::collections::{HashMap, HashSet};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
-use khive_runtime::{hex_prefix_to_uuid_pattern, KhiveRuntime, NamespaceToken, RuntimeError};
+use khive_runtime::{
+    hex_prefix_to_uuid_pattern, KhiveRuntime, Namespace, NamespaceToken, RuntimeError,
+};
 use khive_score::DeterministicScore;
 use khive_storage::types::{PageRequest, SqlStatement, SqlValue};
 use khive_storage::EntityFilter;
@@ -1508,6 +1510,22 @@ impl KnowledgeHandlers {
         type_weights: HashMap<String, f32>,
     ) -> Result<Value, RuntimeError> {
         let p: ComposeParams = deser(params)?;
+
+        // Registry dispatch already mints an exact token for an explicit
+        // namespace. Re-derive it here as defense in depth for direct handler
+        // callers so every compose leg (suggest, corpus/section fetch, and KG
+        // blend) observes the same single-namespace scope.
+        let effective_token: NamespaceToken = match p.namespace.as_deref() {
+            Some(ns_str) => {
+                let ns = Namespace::parse(ns_str).map_err(|e| {
+                    RuntimeError::InvalidInput(format!("invalid namespace {ns_str:?}: {e}"))
+                })?;
+                token.with_namespace(ns)
+            }
+            None => token.clone(),
+        };
+        let token = &effective_token;
+
         let raw_query = p.query.trim().to_string();
         if raw_query.is_empty() {
             return Err(RuntimeError::InvalidInput("query must not be empty".into()));

@@ -90,9 +90,11 @@
 
 All corpus SQL queries include `AND namespace = ?` predicates scoped to the caller token's
 namespace. The `knowledge.import` verb delegates to `upsert_atoms` and `edit`, which each
-enforce the caller namespace — no cross-namespace write is possible. An explicit `namespace`
-parameter is not supported (it was removed to prevent contract/implementation mismatches;
-see KPK-AUD-006).
+enforce the caller namespace — no cross-namespace write is possible. `knowledge.compose`
+accepts an explicit `namespace` as ADR-007's exact single-namespace escape. The same derived
+token scopes automatic suggestion, corpus/section reads, KG blending, and the cross-pack
+brain-profile weight read; an absent parameter preserves the existing caller-token scope.
+Other corpus handlers continue to consume the registry's transport-level namespace routing.
 
 ## Test Coverage
 

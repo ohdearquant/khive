@@ -1865,6 +1865,84 @@ async fn compose_returns_markdown_for_atoms() {
     assert_eq!(count, 2);
 }
 
+/// #1505: the public namespace parameter is an exact compose scope, not a
+/// widened visible set. Identical slugs in local and a measurement arm must
+/// resolve to the arm's atom only, while an absent parameter preserves the
+/// unchanged local default.
+#[tokio::test]
+async fn compose_namespace_selects_exact_atom_corpus() {
+    let f = pack(rt());
+    let shared_slug = "namespace-compose-target";
+
+    f.dispatch(
+        "knowledge.upsert_atoms",
+        json!({
+            "atoms": [{
+                "slug": shared_slug,
+                "name": "Local Compose Marker",
+                "content": "Local corpus marker for namespace composition regression coverage with enough distinct retrieval words to satisfy the atom content validation contract and remain readable in generated markdown output."
+            }]
+        }),
+    )
+    .await
+    .expect("upsert local atom");
+    f.dispatch(
+        "knowledge.upsert_atoms",
+        json!({
+            "namespace": "bench-arm-a",
+            "atoms": [{
+                "slug": shared_slug,
+                "name": "Bench Arm Compose Marker",
+                "content": "Bench arm corpus marker for exact namespace composition regression coverage with enough distinct retrieval words to satisfy the atom content validation contract and remain readable in generated markdown output."
+            }]
+        }),
+    )
+    .await
+    .expect("upsert bench-arm atom");
+
+    let arm = f
+        .dispatch(
+            "knowledge.compose",
+            json!({
+                "namespace": "bench-arm-a",
+                "atom_ids": [shared_slug],
+                "query": "namespace composition marker",
+            }),
+        )
+        .await
+        .expect("compose exact bench-arm namespace");
+    let arm_atom = &arm["data"]["atoms"][0];
+    assert_eq!(arm_atom["name"], json!("Bench Arm Compose Marker"));
+    assert!(
+        arm["data"]["markdown"]
+            .as_str()
+            .expect("arm markdown")
+            .contains("Bench arm corpus marker")
+    );
+    assert!(
+        !arm["data"]["markdown"]
+            .as_str()
+            .expect("arm markdown")
+            .contains("Local corpus marker"),
+        "exact arm compose must not blend the same slug from local"
+    );
+
+    let local = f
+        .dispatch(
+            "knowledge.compose",
+            json!({
+                "atom_ids": [shared_slug],
+                "query": "namespace composition marker",
+            }),
+        )
+        .await
+        .expect("compose unchanged local default");
+    assert_eq!(
+        local["data"]["atoms"][0]["name"],
+        json!("Local Compose Marker")
+    );
+}
+
 #[tokio::test]
 async fn compose_returns_markdown_for_domain() {
     let f = pack(rt());

@@ -47,30 +47,25 @@ the serving profile so scoring weights don't drift mid-measurement.
    `local`. An invalid namespace string is a hard per-op error, not a silent
    fallback.
 
-5. **Tear down** by deleting the arm's memories (`delete(id="...",
+5. **Keep feedback and knowledge composition in the arm** when those paths are
+   part of the measurement:
+
+   ```text
+   brain.auto_feedback(query="...", results=[{"id":"..."}], namespace="bench-arm-a")
+   knowledge.compose(query="...", atom_ids=["..."], namespace="bench-arm-a")
+   ```
+
+   Auto-feedback stamps its event and folds only the arm's posterior state;
+   compose uses the arm for corpus, section, KG-blend, and profile-weight reads.
+
+6. **Tear down** by deleting the arm's memories (`delete(id="...",
    hard=true)` — one call per memory id; `delete` takes `id`/`kind`/`hard`,
    not a `type=` param) once the measurement is done, or simply let the arm
    namespace age out unread — it costs nothing beyond the storage of its own
    rows.
 
-## What is NOT yet isolated
+## Remaining shared machinery
 
-- **Feedback events.** `brain.auto_feedback` / `brain.feedback` write into the
-  _profile's_ live posterior state, not the namespace. If a measurement arm
-  pins an existing (non-scratch) profile via `profile_id`, feedback recorded
-  during the arm still trains that profile's posteriors going forward — there
-  is no namespace-scoped posterior isolation. Use a freshly created,
-  arm-specific profile (step 3) to avoid contaminating a shared profile's
-  state. Tracked as issue #733 remainder.
-- **`knowledge.compose`.** Compose does scope section loading to the caller's
-  token namespace (`WHERE namespace = ?1`) — it is not global. What it lacks
-  is _this feature_: there is no `namespace=` exact-match parameter on
-  compose analogous to the one this slice adds to `memory.recall`, and no
-  `profile_id`-style pinning either. A measurement arm cannot point compose
-  at a specific scratch namespace independent of the caller's token the way
-  it can for recall; compose calls in an arm are scoped by whatever namespace
-  the caller is already authorized for, not covered by recall's new
-  exact-match parameter.
 - **The serve ledger.** `brain.record_serve` stamps the _effective_ namespace
   used for the fetch (the arm namespace when `namespace=` was passed), so
   ledger rows are attributable to the arm — but the ledger itself is a single

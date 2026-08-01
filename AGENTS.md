@@ -134,6 +134,8 @@ false, id, full_id, from, to, note: "already in target status"}` — the task fi
 | `memory.vacuum`   | Run SQLite VACUUM to reclaim space freed by soft-deleted rows | Periodic maintenance after heavy prune runs         |
 
 `memory.recall` supports `tags` and `tag_mode` ("any"|"all") for tag-based post-filtering.
+Its optional `namespace` is an exact-match read override; absent means the caller's normal
+visible namespace set.
 Composite scores are always in [0,1]. Typical production floor: 0.3-0.7.
 
 ### Brain pack — 16 verbs (`brain.` prefix)
@@ -156,6 +158,9 @@ Composite scores are always in [0,1]. Typical production floor: 0.3-0.7.
 | `brain.unbind`           | Remove a binding                                                                         | Stop routing                                                    |
 | `brain.bindings`         | List binding rows                                                                        | Audit profile routing                                           |
 | `brain.register_adapter` | Register an adapter integrity record                                                     | Gate adapter composition to the active base-model revision      |
+
+`brain.auto_feedback(namespace=...)` writes and folds feedback only in that exact namespace;
+it does not train the default/live namespace's posterior state.
 
 ### Comm pack — 8 verbs (`comm.` prefix)
 
@@ -217,6 +222,8 @@ or `comm.thread`.
 
 `knowledge.search` supports `decompose=true` for multi-concept query splitting (avoids FTS edge
 cases). Scores are normalized to [0,1] when `rerank` is active (default).
+`knowledge.compose(namespace=...)` uses that exact namespace for corpus, section, KG-blend, and
+brain-profile weight reads; absent preserves the caller-token default.
 Pass `kind=` (`"atom"` or `"domain"`) to filter by result type; `type=` is accepted as a legacy
 alias. `knowledge.list` accepts the same `kind=`/`type=` discriminant.
 

@@ -8,7 +8,9 @@ use uuid::Uuid;
 
 use khive_brain_core::SectionPosteriorState;
 use khive_runtime::pack::{PackByIdResolver, PackRuntime};
-use khive_runtime::{KhiveRuntime, NamespaceToken, Resolved, RuntimeError, VerbRegistry};
+use khive_runtime::{
+    KhiveRuntime, Namespace, NamespaceToken, Resolved, RuntimeError, VerbRegistry,
+};
 use khive_storage::types::{SqlStatement, SqlValue};
 use khive_storage::{PhaseCancelledPayload, PhaseCompletedPayload, PhaseStartedPayload};
 use khive_types::{EventKind, HandlerDef, Pack};
@@ -215,9 +217,36 @@ impl PackRuntime for KnowledgePack {
                 KnowledgeHandlers::suggest(&self.runtime, token, params, &self.ann).await
             }
             "knowledge.compose" => {
-                let type_weights = self.resolve_compose_type_weights(registry, token).await;
-                KnowledgeHandlers::compose(&self.runtime, token, params, &self.ann, type_weights)
-                    .await
+                // Public registry dispatch pre-applies an explicit namespace,
+                // but PackRuntime is also called directly in tests and by
+                // embedders. Derive the exact token before the cross-pack
+                // profile lookup so weights and corpus rows cannot come from
+                // different namespace arms.
+                let effective_token = match params.get("namespace") {
+                    None => token.clone(),
+                    Some(Value::String(ns_str)) => {
+                        let ns = Namespace::parse(ns_str).map_err(|e| {
+                            RuntimeError::InvalidInput(format!("invalid namespace {ns_str:?}: {e}"))
+                        })?;
+                        token.with_namespace(ns)
+                    }
+                    Some(_) => {
+                        return Err(RuntimeError::InvalidInput(
+                            "invalid namespace: expected a string".to_string(),
+                        ));
+                    }
+                };
+                let type_weights = self
+                    .resolve_compose_type_weights(registry, &effective_token)
+                    .await;
+                KnowledgeHandlers::compose(
+                    &self.runtime,
+                    &effective_token,
+                    params,
+                    &self.ann,
+                    type_weights,
+                )
+                .await
             }
             "knowledge.edit" => {
                 KnowledgeHandlers::edit(&self.runtime, token, params, &self.ann).await

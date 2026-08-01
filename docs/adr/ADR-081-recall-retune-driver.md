@@ -6,6 +6,8 @@
 **Measurement evidence**: hook scorer v0 dry run over 19 serve ledgers, 7 sessions (2026-07-02)\
 **Depends on**: [ADR-021](ADR-021-memory-pack.md) (Memory Pack), [ADR-033](ADR-033-recall-pipeline.md) (Recall Pipeline), [ADR-032](ADR-032-brain-profile-orchestration.md) (Brain Profile Orchestration), [ADR-035](ADR-035-cli-config-and-auto-embed.md) (Feedback Profile Resolution Order), [ADR-055](ADR-055-epistemic-edge-relations.md) (Epistemic Relations)\
 **Amends**: the brain feedback weight table (`FeedbackEventKind::update_weight()`, khive-brain-core, issue #268) and the `brain.feedback` / `brain.auto_feedback` parameter surface (additive optional scorer-provenance fields, section 6)\
+**Amended**: 2026-08-01, issue #1505 adds an optional exact `namespace` to
+`brain.auto_feedback`; the selected namespace owns both the event and posterior fold.\
 **GitHub**: #517 (auto_feedback), #394 (recall latency), #391/#393 (resolver legs)
 
 ---
@@ -216,17 +218,19 @@ Scorer batches emit through the existing surface: DSL batches of `brain.auto_fee
 `brain.auto_feedback` cannot be chained through `$prev` (recall returns a bare array),
 so emission is two-step with ids inlined.
 
-**Parameter surface amendment.** The current handlers reject unknown fields
-(`deny_unknown_fields`), so the scorer provenance that sections 2 and 4 require cannot
-ride the verbs as they stand. This ADR amends `brain.feedback` and
-`brain.auto_feedback` with two additive optional parameters:
+**Parameter surface amendment.** The handlers reject unknown fields
+(`deny_unknown_fields`). This ADR amends `brain.feedback` and `brain.auto_feedback` with
+two additive scorer-provenance parameters, and the 2026-08-01 amendment adds the exact
+namespace escape to `brain.auto_feedback`:
 
 | Parameter         | Type   | Required | Semantics                                     |
 | ----------------- | ------ | -------- | --------------------------------------------- |
 | `scorer_run_id`   | string | optional | scorer pass identifier, half of the dedup key |
 | `serve_ledger_id` | string | optional | serve row being graded, half of the dedup key |
+| `namespace`       | string | optional | exact event and posterior-state namespace     |
 
-Both are persisted on the feedback event payload. They must be supplied together: a call
+The two scorer-provenance fields are persisted on the feedback event payload and must be
+supplied together: a call
 carrying exactly one of the two is rejected as invalid parameters (no silent coercion).
 Calls carrying neither remain valid — ordinary non-scorer implicit and explicit feedback
 is unchanged, folds without dedup, and is still subject to the section 2 clamp. When
@@ -234,6 +238,14 @@ both are present, the fold applies the `(scorer_run_id, serve_ledger_id)` dedup 
 the clamp check and backfills the ledger row's grade. The verb-vocabulary and AGENTS.md
 updates for the new parameters ride with the implementation PR (additive optional
 fields; no existing caller changes shape).
+
+The optional `namespace` follows ADR-007's explicit exact-scope escape. When absent,
+`brain.auto_feedback` retains the caller's normal/default dispatch namespace. When present, the
+runtime mints a single-namespace token and the handler re-derives it for direct-call defense in
+depth; target-ID resolution remains namespace-agnostic, while the emitted event, fold-gate
+accounting key, durable snapshot, and live posterior mutation all belong to exactly that
+namespace. Invalid namespace strings fail closed. In particular, feedback emitted into a
+measurement namespace cannot mutate the default/live namespace's posteriors.
 
 ADR-016 batches are per-op independent with no cross-op transaction; that is acceptable
 here **because no correctness property lives on the emission surface**: the clamp and
