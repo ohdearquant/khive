@@ -496,15 +496,26 @@ entity-kind vocabulary (§"The 9 entity kinds" in AGENTS.md) vs. the note-kind v
 
 Multi-hop BFS traversal.
 
-| Param       | Type            | Required | Notes                                  |
-| ----------- | --------------- | -------- | -------------------------------------- |
-| `roots`     | array\<uuid\>   | yes      | Starting node UUIDs.                   |
-| `max_depth` | integer         | no       | Default 3.                             |
-| `relations` | array\<string\> | no       | Restrict traversal to these relations. |
+| Param                | Type            | Required | Notes                                                       |
+| -------------------- | --------------- | -------- | ----------------------------------------------------------- |
+| `roots`              | array\<uuid\>   | yes      | Starting node UUIDs.                                        |
+| `max_depth`          | integer         | no       | Default 3.                                                  |
+| `direction`          | string          | no       | `outgoing`\|`incoming`\|`both` (default `both`).            |
+| `relations`          | array\<string\> | no       | Restrict traversal to these relations.                      |
+| `min_weight`         | number          | no       | Exclude edges below this weight.                            |
+| `limit`              | integer         | no       | Maximum non-root nodes retained in each distinct root path. |
+| `include_roots`      | boolean         | no       | Include each root as a depth-zero node (default `true`).    |
+| `include_properties` | boolean         | no       | Include entity properties on path nodes (default `false`).  |
 
 ```
 request(ops="traverse(roots=[\"<uuid>\"], max_depth=2)")
 ```
+
+The response contains exactly one traversal object per distinct requested root. Each path node
+has `id`, `via_edge`, and `depth`; resolvable entity and note nodes also carry `name` and `kind`.
+Note enrichment matches `neighbors`, including its `[kind]` display-name fallback for a nameless
+note reached through an annotation edge. `properties` remains entity-only and is included only
+when `include_properties=true`.
 
 ### `context` — Assertive
 

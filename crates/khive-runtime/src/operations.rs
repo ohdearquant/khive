@@ -969,6 +969,14 @@ fn note_props_match(note_props: Option<&serde_json::Value>, filter: &serde_json:
         .all(|(k, v)| actual.get(k).is_some_and(|av| av == v))
 }
 
+fn note_graph_name(note: &Note) -> String {
+    note.name
+        .as_deref()
+        .filter(|name| !name.trim().is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| format!("[{}]", note.kind))
+}
+
 /// Collapse per-namespace `GraphPath`s from [`KhiveRuntime::traverse`] down to
 /// exactly one entry per distinct `root_id`.
 ///
@@ -2730,30 +2738,14 @@ impl KhiveRuntime {
                 hit.kind = Some(entity.kind.clone());
                 hit.entity_type = entity.entity_type.clone();
             } else if let Some(note) = note_map.get(&hit.node_id) {
-                let kind = note.kind.clone();
-                let name = note
-                    .name
-                    .as_deref()
-                    .filter(|s| !s.trim().is_empty())
-                    .map(|s| s.to_owned())
-                    .unwrap_or_else(|| format!("[{kind}]"));
-                hit.name = Some(name);
-                hit.kind = Some(kind);
+                hit.name = Some(note_graph_name(note));
+                hit.kind = Some(note.kind.clone());
             }
         }
     }
 
     /// Populate `name` and `kind` on each `PathNode` from the corresponding
-    /// entity record.
-    ///
-    /// Unlike `enrich_neighbor_hits`, this is entity-only by design: it does
-    /// not fall back to a note lookup for IDs that aren't entities.
-    /// A traversal can still reach note nodes (e.g. via an `annotates`
-    /// edge) — they are not filtered out of `GraphPath::nodes` — but they are
-    /// left with `name = None, kind = None` rather than resolved. Widening
-    /// this to notes would change every existing caller's enriched output
-    /// for note-reaching traversals, so it stays scoped to entities until
-    /// that is an intentional product decision.
+    /// entity or note record. Same best-effort policy as `enrich_neighbor_hits`.
     ///
     /// Uses `get_entities_by_ids_visible` so that path nodes whose entities
     /// live in extra-visible namespaces are enriched correctly. Node IDs that
@@ -2796,6 +2788,28 @@ impl KhiveRuntime {
             .map(|e| (e.id, e))
             .collect();
 
+        let residual_ids: Vec<Uuid> = unique_ids
+            .iter()
+            .filter(|id| !entity_map.contains_key(id))
+            .copied()
+            .collect();
+
+        let note_map: HashMap<Uuid, Note> = if !residual_ids.is_empty() {
+            if let Ok(store) = self.notes(token) {
+                store
+                    .get_notes_batch(&residual_ids)
+                    .await
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|n| (n.id, n))
+                    .collect()
+            } else {
+                HashMap::new()
+            }
+        } else {
+            HashMap::new()
+        };
+
         for path in paths.iter_mut() {
             for node in path.nodes.iter_mut() {
                 if let Some(entity) = entity_map.get(&node.node_id) {
@@ -2804,6 +2818,9 @@ impl KhiveRuntime {
                     if include_properties {
                         node.properties = entity.properties.clone();
                     }
+                } else if let Some(note) = note_map.get(&node.node_id) {
+                    node.name = Some(note_graph_name(note));
+                    node.kind = Some(note.kind.clone());
                 }
             }
         }
@@ -11946,23 +11963,93 @@ mod tests {
         assert!(root_ids.contains(&c.id));
     }
 
-    // ── Note-kind nodes reached via traversal appear in the result but are
-    //    never enriched with name/kind (entity-only enrichment, unchanged
-    //    behavior — see `enrich_path_nodes`) ────────────────────────────────
-    //
-    // The recursive SQL walks `graph_edges` without any node-kind
-    // restriction, and the soft-delete screen consults both `entities` and
-    // `notes`, so a note reached via an `annotates` edge is NOT dropped from
-    // the traversal. What it does not get is enrichment: `enrich_path_nodes`
-    // only batch-fetches entities (a deliberate entity-only scope), unlike
-    // `enrich_neighbor_hits` which falls back to a note lookup. This test
-    // pins that documented split rather than changing it.
+    // ── Note-kind nodes reached via traversal must use the same enrichment
+    //    shape as neighbors, without restoring per-namespace phantom paths ──
     #[tokio::test]
-    async fn traverse_reaches_note_nodes_but_leaves_them_unenriched() {
+    async fn traverse_note_node_matches_neighbors_in_one_path() {
         use khive_storage::types::TraversalOptions;
 
         let rt = rt();
         let owner = NamespaceToken::for_namespace(Namespace::parse("owner-ns3").unwrap());
+        let a = rt
+            .create_entity(&owner, "concept", None, "A", None, None, vec![])
+            .await
+            .unwrap();
+        let note = rt
+            .create_note(
+                &owner,
+                "observation",
+                Some("TraversalNote"),
+                "note body",
+                None,
+                None,
+                vec![a.id],
+            )
+            .await
+            .unwrap();
+
+        let caller = NamespaceToken::mint_with_visibility(
+            Namespace::parse("caller-ns3").unwrap(),
+            vec![Namespace::parse("owner-ns3").unwrap()],
+            ActorRef::anonymous(),
+        );
+        let neighbors = rt
+            .neighbors(
+                &caller,
+                a.id,
+                Direction::In,
+                None,
+                Some(vec![EdgeRelation::Annotates]),
+            )
+            .await
+            .unwrap();
+        let note_hit = neighbors
+            .iter()
+            .find(|hit| hit.node_id == note.id)
+            .unwrap_or_else(|| panic!("note must be present in neighbors, got {neighbors:#?}"));
+
+        let result = rt
+            .traverse(
+                &caller,
+                TraversalRequest {
+                    roots: vec![a.id],
+                    options: TraversalOptions {
+                        max_depth: 1,
+                        direction: Direction::In,
+                        relations: Some(vec![EdgeRelation::Annotates]),
+                        ..Default::default()
+                    },
+                    include_roots: false,
+                    include_properties: false,
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result.len(),
+            1,
+            "one requested root must yield one path across the caller and owner namespaces"
+        );
+        let note_node = result[0]
+            .nodes
+            .iter()
+            .find(|n| n.node_id == note.id)
+            .unwrap_or_else(|| panic!("note must be present in traversal nodes, got {result:#?}"));
+        assert_eq!(note_node.name.as_deref(), note_hit.name.as_deref());
+        assert_eq!(note_node.kind.as_deref(), note_hit.kind.as_deref());
+        assert_eq!(note_node.name.as_deref(), Some("TraversalNote"));
+        assert_eq!(note_node.kind.as_deref(), Some("observation"));
+    }
+
+    // ── A nameless annotation note reached via traversal must fall back to
+    //    the same `[kind]` placeholder that `neighbors` produces ──
+    #[tokio::test]
+    async fn traverse_nameless_note_falls_back_to_bracketed_kind() {
+        use khive_storage::types::TraversalOptions;
+
+        let rt = rt();
+        let owner = NamespaceToken::for_namespace(Namespace::parse("owner-ns4").unwrap());
         let a = rt
             .create_entity(&owner, "concept", None, "A", None, None, vec![])
             .await
@@ -11980,14 +12067,35 @@ mod tests {
             .await
             .unwrap();
 
+        let caller = NamespaceToken::mint_with_visibility(
+            Namespace::parse("caller-ns4").unwrap(),
+            vec![Namespace::parse("owner-ns4").unwrap()],
+            ActorRef::anonymous(),
+        );
+        let neighbors = rt
+            .neighbors(
+                &caller,
+                a.id,
+                Direction::In,
+                None,
+                Some(vec![EdgeRelation::Annotates]),
+            )
+            .await
+            .unwrap();
+        let note_hit = neighbors
+            .iter()
+            .find(|hit| hit.node_id == note.id)
+            .unwrap_or_else(|| panic!("note must be present in neighbors, got {neighbors:#?}"));
+
         let result = rt
             .traverse(
-                &owner,
+                &caller,
                 TraversalRequest {
                     roots: vec![a.id],
                     options: TraversalOptions {
                         max_depth: 1,
                         direction: Direction::In,
+                        relations: Some(vec![EdgeRelation::Annotates]),
                         ..Default::default()
                     },
                     include_roots: false,
@@ -11997,20 +12105,15 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(result.len(), 1);
         let note_node = result[0]
             .nodes
             .iter()
             .find(|n| n.node_id == note.id)
             .unwrap_or_else(|| panic!("note must be present in traversal nodes, got {result:#?}"));
-        assert_eq!(
-            note_node.name, None,
-            "note enrichment is deliberately entity-only; name stays None"
-        );
-        assert_eq!(
-            note_node.kind, None,
-            "note enrichment is deliberately entity-only; kind stays None"
-        );
+        assert_eq!(note_node.name.as_deref(), note_hit.name.as_deref());
+        assert_eq!(note_node.kind.as_deref(), note_hit.kind.as_deref());
+        assert_eq!(note_node.name.as_deref(), Some("[observation]"));
+        assert_eq!(note_node.kind.as_deref(), Some("observation"));
     }
 
     // ---- purge cascade must include already-soft-deleted edges ----
