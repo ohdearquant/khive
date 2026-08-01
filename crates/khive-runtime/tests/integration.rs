@@ -2389,6 +2389,7 @@ mod embedder_registry_tests {
                     namespace: tenant.as_str().to_string(),
                     actor_id: Some("request-actor".to_string()),
                     visible_namespaces: vec![],
+                    process_ref: None,
                     request_id: None,
                 }),
             )

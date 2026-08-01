@@ -111,6 +111,8 @@ path = "{}"
         pending_events: false,
         db: None, // the repro shape: --db left unset
         namespace: "local".to_string(),
+        actor: None,
+        expect_actor: None,
         presentation: Some("agent".to_string()),
         output_format: None,
         verbose: false,

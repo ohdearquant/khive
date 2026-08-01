@@ -1872,6 +1872,7 @@ impl KhiveMcpServer {
             // identity serves the request under this caller's identity instead
             // of rejecting it or silently stamping writes under its own actor.
             actor_id: self.actor_id().map(str::to_string),
+            process_ref: khive_runtime::process_ref_from_env(),
             visible_namespaces: self
                 .visible_namespaces()
                 .iter()
@@ -1973,6 +1974,7 @@ impl KhiveMcpServer {
                 .map(|request_id| khive_runtime::RequestIdentity {
                     namespace: self.default_namespace.clone(),
                     actor_id: self.actor_id().map(str::to_string),
+                    process_ref: khive_runtime::process_ref_from_env(),
                     visible_namespaces: self
                         .visible_namespaces()
                         .iter()
@@ -3450,6 +3452,7 @@ mod tests {
         std::env::remove_var("KHIVE_PID");
         std::env::remove_var("KHIVE_NO_DAEMON");
         std::env::remove_var("KHIVE_LOCK");
+        std::env::remove_var("KHIVE_PROCESS_REF");
     }
 
     /// khive#948: `wire_daemon_frame` forwards `RequestParams::request_id`

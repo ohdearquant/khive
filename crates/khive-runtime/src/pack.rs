@@ -819,6 +819,11 @@ pub struct RequestIdentity {
     /// failing the whole request — a single malformed visibility entry from a
     /// caller-supplied frame must not block dispatch.
     pub visible_namespaces: Vec<String>,
+    /// Opaque process provenance resolved by the originating request process.
+    /// `None` means the origin did not set one; a warm daemon must not replace
+    /// it with its own process environment. This field is attribution-only and
+    /// never participates in the gate or token authority.
+    pub process_ref: Option<String>,
     /// Caller-supplied correlation id for this request (khive#948), carried
     /// unchanged from the daemon frame's `request_id` field. Stamped into the
     /// audit event's `resource.request_id` on every outcome (success, error,
@@ -837,8 +842,12 @@ impl RequestIdentity {
     /// the registry's construction-baked identity would silently replace a
     /// warm daemon request's actor and visibility (ADR-096). This projection
     /// preserves the token's exact primary namespace, actor, and read-visible
-    /// namespaces. A `NamespaceToken` does not carry the ingress correlation
-    /// id, so nested calls intentionally use `request_id: None`.
+    /// namespaces, and the origin's process provenance rider. A
+    /// `NamespaceToken` does not carry the ingress correlation id, so nested
+    /// calls intentionally use `request_id: None`; `process_ref` IS carried by
+    /// the token (ADR-096: an absent value stays absent, a present origin
+    /// rider survives nested dispatch without reading the daemon
+    /// environment).
     pub fn from_token(token: &NamespaceToken) -> Self {
         Self {
             namespace: token.namespace().as_str().to_string(),
@@ -848,6 +857,7 @@ impl RequestIdentity {
                 .iter()
                 .map(|namespace| namespace.as_str().to_string())
                 .collect(),
+            process_ref: token.process_ref().map(str::to_owned),
             request_id: None,
         }
     }
@@ -1542,7 +1552,11 @@ impl VerbRegistry {
             };
             extra_visible.push(Namespace::local()); // 'local' always readable; mint dedups
             NamespaceToken::mint_with_visibility(primary, extra_visible, resolved_actor)
-        };
+        }
+        .with_process_ref(match identity.as_ref() {
+            Some(id) => id.process_ref.clone(),
+            None => crate::config::process_ref_from_env(),
+        });
 
         for pack in self.packs.iter() {
             if let Some(handler_def) = pack.handlers().iter().find(|v| v.name == verb) {
@@ -1818,6 +1832,7 @@ impl VerbRegistry {
                 .iter()
                 .map(|ns| ns.as_str().to_string())
                 .collect(),
+            process_ref: crate::config::process_ref_from_env(),
             request_id: None,
         };
         self.dispatch_with_identity(verb, params, Some(identity))
@@ -2629,6 +2644,24 @@ mod tests {
     use super::*;
     use crate::ActorRef;
     use khive_types::Pack;
+
+    #[test]
+    fn from_token_preserves_process_ref() {
+        let with_ref = NamespaceToken::mint_authorized(
+            Namespace::local(),
+            ActorRef::new("agent", "provenance-carrier"),
+        )
+        .with_process_ref(Some("proc:origin-abc123".to_string()));
+        let identity = RequestIdentity::from_token(&with_ref);
+        assert_eq!(identity.process_ref.as_deref(), Some("proc:origin-abc123"));
+
+        let without_ref = NamespaceToken::mint_authorized(
+            Namespace::local(),
+            ActorRef::new("agent", "provenance-absent"),
+        );
+        let identity = RequestIdentity::from_token(&without_ref);
+        assert_eq!(identity.process_ref, None);
+    }
 
     struct AlphaPack;
 
