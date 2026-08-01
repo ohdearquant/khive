@@ -133,6 +133,7 @@ Architecture Decision Records (ADRs) for khive v1. These are **desired-state spe
 | [ADR-131](ADR-131-batch-write-admission-control.md)                     | Admission control for parallel write batches                                                               |
 | [ADR-133](ADR-133-incidental-writes-off-the-request-hot-path.md)        | Reduce writer acquisitions on the request path                                                             |
 | [ADR-134](ADR-134-store-durability-posture.md)                          | Store durability posture, and the obligation it carries for accounting records                             |
+| [ADR-135](ADR-135-write-scaling-demand-before-ownership.md)             | Scale SQLite writes by reducing writer demand before changing ownership                                    |
 
 <!-- END GENERATED ADR CATALOG -->
 
