@@ -27,6 +27,32 @@ use khive_storage::{types::SqlValue, SqlStatement};
 
 use crate::exec::OpsFileEntry;
 
+fn add_post_commit_embedding_warning(
+    result: &mut Value,
+    effect: Option<&PostCommitEffect>,
+    outcomes: &[khive_runtime::atomic_prepare::PostCommitEmbeddingOutcome],
+) {
+    // More than one atomic update may schedule the same target effect. Treat
+    // those outcomes as one aggregate advisory: a late model registration can
+    // make a later duplicate reindex truncate even when the first did not, and
+    // first-match lookup would silently lose that real outcome.
+    let truncated = effect.is_some_and(|effect| {
+        outcomes
+            .iter()
+            .filter(|outcome| &outcome.effect == effect)
+            .any(|outcome| outcome.truncation.any_truncated())
+    });
+    if !truncated {
+        return;
+    }
+    if let Some(object) = result.as_object_mut() {
+        object.insert(
+            "warnings".to_string(),
+            json!([khive_runtime::retrieval::EMBEDDING_INPUT_TRUNCATED_WARNING]),
+        );
+    }
+}
+
 /// Run `ops` as ONE ADR-099 atomic unit against a freshly built in-process
 /// runtime. Returns the additive result envelope
 /// (`{"results", "summary", "atomic"}`) on success or a rolled-back run; the
@@ -165,7 +191,12 @@ pub(crate) async fn execute_atomic_ops_file(
             // functions and never propagated — a missing audit row must
             // never fail an already-committed atomic unit.
             apply_gtd_audit_post_commit_effects(&runtime, post_commit.as_slice()).await;
-            khive_runtime::atomic_prepare::apply_post_commit_effects(&runtime, &token, post_commit)
+            let embedding_outcomes =
+                khive_runtime::atomic_prepare::apply_post_commit_effects_with_report(
+                    &runtime,
+                    &token,
+                    post_commit,
+                )
                 .await
                 .context("post-commit reindex after atomic unit commit")?;
             // ADR-099 B3: render each committed op's
@@ -175,7 +206,7 @@ pub(crate) async fn execute_atomic_ops_file(
             // safe post-commit, same reasoning as the reindex pass above.
             let mut results: Vec<Value> = Vec::with_capacity(ops.len());
             for (idx, op) in ops.iter().enumerate() {
-                let result = build_op_result(
+                let mut result = build_op_result(
                     &runtime,
                     &token,
                     &op.tool,
@@ -190,6 +221,15 @@ pub(crate) async fn execute_atomic_ops_file(
                         op.tool
                     )
                 })?;
+                let embedding_effect = match &plans[idx] {
+                    AtomicOpPlan::Update(plan) => Some(plan.post_commit()),
+                    _ => None,
+                };
+                add_post_commit_embedding_warning(
+                    &mut result,
+                    embedding_effect,
+                    &embedding_outcomes,
+                );
                 results
                     .push(json!({"ok": true, "tool": op.tool, "op_index": idx, "result": result}));
             }
@@ -907,8 +947,64 @@ async fn prepare_gtd_complete(
 /// `kkernel::exec::tests::atomic_update_unknown_field_is_rejected_and_does_not_mutate_row`.
 #[cfg(test)]
 mod validate_atomic_args_tests {
-    use super::validate_atomic_args;
+    use super::{add_post_commit_embedding_warning, validate_atomic_args, PostCommitEffect, Uuid};
     use serde_json::json;
+
+    #[test]
+    fn atomic_update_result_uses_matching_post_commit_truncation_outcome() {
+        let note_id = Uuid::new_v4();
+        let effect = PostCommitEffect::ReindexNote { note_id };
+        let outcomes = vec![khive_runtime::atomic_prepare::PostCommitEmbeddingOutcome {
+            effect: effect.clone(),
+            truncation: khive_runtime::retrieval::EmbeddingTruncationReport {
+                truncated: 1,
+                discarded_bytes: 17,
+            },
+        }];
+        let mut result = json!({"id": note_id});
+
+        add_post_commit_embedding_warning(&mut result, Some(&effect), &outcomes);
+
+        assert_eq!(
+            result["warnings"],
+            json!([khive_runtime::retrieval::EMBEDDING_INPUT_TRUNCATED_WARNING])
+        );
+
+        let mut unrelated = json!({"id": Uuid::new_v4()});
+        let other_effect = PostCommitEffect::ReindexEntity {
+            entity_id: Uuid::new_v4(),
+        };
+        add_post_commit_embedding_warning(&mut unrelated, Some(&other_effect), &outcomes);
+        assert!(unrelated.get("warnings").is_none());
+    }
+
+    #[test]
+    fn atomic_duplicate_update_effect_aggregates_later_truncation_outcome() {
+        let note_id = Uuid::new_v4();
+        let effect = PostCommitEffect::ReindexNote { note_id };
+        let outcomes = vec![
+            khive_runtime::atomic_prepare::PostCommitEmbeddingOutcome {
+                effect: effect.clone(),
+                truncation: khive_runtime::retrieval::EmbeddingTruncationReport::default(),
+            },
+            khive_runtime::atomic_prepare::PostCommitEmbeddingOutcome {
+                effect: effect.clone(),
+                truncation: khive_runtime::retrieval::EmbeddingTruncationReport {
+                    truncated: 1,
+                    discarded_bytes: 23,
+                },
+            },
+        ];
+        let mut first_result = json!({"id": note_id});
+        let mut second_result = json!({"id": note_id});
+
+        add_post_commit_embedding_warning(&mut first_result, Some(&effect), &outcomes);
+        add_post_commit_embedding_warning(&mut second_result, Some(&effect), &outcomes);
+
+        let expected = json!([khive_runtime::retrieval::EMBEDDING_INPUT_TRUNCATED_WARNING]);
+        assert_eq!(first_result["warnings"], expected);
+        assert_eq!(second_result["warnings"], expected);
+    }
 
     #[test]
     fn update_rejects_unknown_field() {

@@ -23,6 +23,21 @@ use crate::params::{
     ProbeParams, ReadParams, ReplyParams, SendParams, ThreadParams, UnreadParams,
 };
 
+fn add_embedding_truncation_warning(
+    response: &mut Value,
+    report: &khive_runtime::retrieval::EmbeddingTruncationReport,
+) {
+    if !report.any_truncated() {
+        return;
+    }
+    if let Some(object) = response.as_object_mut() {
+        object.insert(
+            "warnings".to_string(),
+            json!([khive_runtime::retrieval::EMBEDDING_INPUT_TRUNCATED_WARNING]),
+        );
+    }
+}
+
 /// Validate an actor label: non-empty, no control characters, ≤255 bytes (ADR-057 Q1 loose).
 fn validate_actor_label(verb: &str, label: &str, field: &str) -> Result<(), RuntimeError> {
     if label.trim().is_empty() {
@@ -170,7 +185,7 @@ pub(crate) async fn handle_send(
     // Pass caller_ns as both `from` and `to` so `from == recipient_ns_str` in
     // dual_write_message, naturally bypassing the cross-namespace allowlist gate
     // (ADR-057 §"Interaction with ADR-040"). Actor labels are stored via from_actor/to_actor.
-    let outbound_note = dual_write_message(
+    let (outbound_note, embedding_truncation) = dual_write_message(
         runtime,
         token,
         &caller_ns,
@@ -188,14 +203,16 @@ pub(crate) async fn handle_send(
     )
     .await?;
 
-    Ok(json!({
+    let mut response = json!({
         "id": short_id(outbound_note.id),
         "full_id": outbound_note.id.as_hyphenated().to_string(),
         "from": from_actor,
         "to": p.to,
         "subject": p.subject,
         "sent_at": sent_at,
-    }))
+    });
+    add_embedding_truncation_warning(&mut response, &embedding_truncation);
+    Ok(response)
 }
 
 /// `inbox` — list inbound messages for the caller's actor label (ADR-057).
@@ -733,7 +750,7 @@ pub(crate) async fn handle_reply(
     // Pass caller_ns as both `from` and `to` so `from == recipient_ns_str` in
     // dual_write_message, naturally bypassing the cross-namespace allowlist gate
     // (ADR-057 §"Interaction with ADR-040"). Actor labels are stored via from_actor/to_actor.
-    let reply_note = dual_write_message(
+    let (reply_note, embedding_truncation) = dual_write_message(
         runtime,
         token,
         &caller_ns,
@@ -789,7 +806,7 @@ pub(crate) async fn handle_reply(
         )
     };
 
-    Ok(json!({
+    let mut response = json!({
         "id": short_id(reply_note.id),
         "full_id": reply_note.id.as_hyphenated().to_string(),
         "thread_id": thread_id,
@@ -798,7 +815,9 @@ pub(crate) async fn handle_reply(
         "subject": reply_subject,
         "sent_at": sent_at,
         "marked_read": marked_read,
-    }))
+    });
+    add_embedding_truncation_warning(&mut response, &embedding_truncation);
+    Ok(response)
 }
 
 /// `thread` — retrieve all messages in a conversation thread, ordered
@@ -2195,12 +2214,28 @@ fn build_references_header(parent_chain: Option<&str>, parent_message_id: &str) 
 #[cfg(test)]
 mod tests {
     use super::{
-        build_references_header, heartbeat_note_id, message_id_match_candidates,
-        parent_references_chain, parent_wire_message_id, read_response, sanitize_reference_token,
-        wrap_message_id,
+        add_embedding_truncation_warning, build_references_header, heartbeat_note_id,
+        message_id_match_candidates, parent_references_chain, parent_wire_message_id,
+        read_response, sanitize_reference_token, wrap_message_id,
     };
     use khive_storage::StorageError;
     use serde_json::{json, Value};
+
+    #[test]
+    fn comm_write_response_reports_atomic_note_embedding_truncation() {
+        let mut response = json!({"id": "abc123"});
+        add_embedding_truncation_warning(
+            &mut response,
+            &khive_runtime::retrieval::EmbeddingTruncationReport {
+                truncated: 2,
+                discarded_bytes: 18,
+            },
+        );
+        assert_eq!(
+            response["warnings"],
+            json!([khive_runtime::retrieval::EMBEDDING_INPUT_TRUNCATED_WARNING])
+        );
+    }
 
     // #606: a delimiter-joined
     // `format!("...:{a}:{b}:{c}")` id encoding is not injective once

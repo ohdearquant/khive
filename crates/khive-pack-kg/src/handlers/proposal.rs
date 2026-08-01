@@ -321,18 +321,25 @@ impl KgPack {
             )));
         }
 
-        if decision == ProposalDecision::Approve {
+        let embedding_truncation = if decision == ProposalDecision::Approve {
             crate::apply_worker::ProposalApplyWorker::new(self.runtime.clone())
-                .maybe_apply(token, proposal_id, registry, p.max_new_entries)
-                .await?;
-        }
+                .maybe_apply_with_report(token, proposal_id, registry, p.max_new_entries)
+                .await?
+        } else {
+            khive_runtime::retrieval::EmbeddingTruncationReport::default()
+        };
 
-        to_json(&serde_json::json!({
+        let mut response = to_json(&serde_json::json!({
             "id": proposal_id.to_string(),
             "reviewer": actor,
             "decision": p.decision,
             "status": new_status,
-        }))
+        }))?;
+        super::create::add_embedding_truncation_warning(
+            &mut response,
+            embedding_truncation.any_truncated(),
+        );
+        Ok(response)
     }
 
     pub(crate) async fn handle_withdraw(

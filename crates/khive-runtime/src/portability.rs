@@ -78,6 +78,10 @@ pub struct ImportSummary {
     /// A non-zero value indicates the archive contained dangling edges (edges
     /// referencing entities not present in the archive or the existing graph).
     pub edges_skipped: usize,
+    /// Aggregate actual outcomes from reindexing imported entities. Source
+    /// text remains complete in the entity store and FTS when this is non-zero.
+    #[serde(default)]
+    pub embedding_truncation: crate::retrieval::EmbeddingTruncationReport,
 }
 
 // ── KhiveRuntime impl ─────────────────────────────────────────────────────────
@@ -206,6 +210,7 @@ impl KhiveRuntime {
 
         let store = self.entities(token)?;
         let mut entities_imported = 0usize;
+        let mut embedding_truncation = crate::retrieval::EmbeddingTruncationReport::default();
         for ee in &archive.entities {
             self.validate_entity_kind(&ee.kind)?;
             let created_micros = ee.created_at.timestamp_micros();
@@ -228,7 +233,7 @@ impl KhiveRuntime {
             };
             store.upsert_entity(entity.clone()).await?;
             // Reindex so imported entities are searchable via hybrid_search immediately.
-            self.reindex_entity(token, &entity).await?;
+            embedding_truncation.merge(self.reindex_entity(token, &entity).await?);
             entities_imported += 1;
         }
 
@@ -314,6 +319,7 @@ impl KhiveRuntime {
             entities_imported,
             edges_imported,
             edges_skipped,
+            embedding_truncation,
         })
     }
 
@@ -335,13 +341,99 @@ impl KhiveRuntime {
 // helpers that would otherwise need to be made pub to test from tests/.
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
     use crate::runtime::{KhiveRuntime, NamespaceToken};
-    use crate::Namespace;
+    use crate::{EmbedderProvider, Namespace};
+    use async_trait::async_trait;
     use khive_storage::EdgeRelation;
+    use lattice_embed::{EmbedError, EmbeddingModel, EmbeddingService, MAX_TEXT_CHARS};
+
+    const IMPORT_TEST_MODEL: &str = "all-minilm-l6-v2";
+
+    struct ImportEmbeddingService;
+
+    #[async_trait]
+    impl EmbeddingService for ImportEmbeddingService {
+        async fn embed(
+            &self,
+            texts: &[String],
+            _model: EmbeddingModel,
+        ) -> std::result::Result<Vec<Vec<f32>>, EmbedError> {
+            let dimensions = EmbeddingModel::AllMiniLmL6V2.dimensions();
+            Ok(texts.iter().map(|_| vec![1.0; dimensions]).collect())
+        }
+
+        fn supports_model(&self, _model: EmbeddingModel) -> bool {
+            true
+        }
+
+        fn name(&self) -> &'static str {
+            "kg-import-truncation-test"
+        }
+    }
+
+    struct ImportEmbeddingProvider;
+
+    #[async_trait]
+    impl EmbedderProvider for ImportEmbeddingProvider {
+        fn name(&self) -> &str {
+            IMPORT_TEST_MODEL
+        }
+
+        fn dimensions(&self) -> usize {
+            EmbeddingModel::AllMiniLmL6V2.dimensions()
+        }
+
+        async fn build(&self) -> std::result::Result<Arc<dyn EmbeddingService>, RuntimeError> {
+            Ok(Arc::new(ImportEmbeddingService))
+        }
+    }
 
     async fn make_rt() -> KhiveRuntime {
         KhiveRuntime::memory().expect("in-memory runtime")
+    }
+
+    fn make_rt_with_embedder() -> KhiveRuntime {
+        let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+        runtime.register_embedder(ImportEmbeddingProvider);
+        runtime
+    }
+
+    #[tokio::test]
+    async fn import_summary_reports_actual_embedding_truncation() {
+        let runtime = make_rt_with_embedder();
+        let token = NamespaceToken::local();
+        let archive = KgArchive {
+            format: "khive-kg".to_string(),
+            version: "0.1".to_string(),
+            namespace: "local".to_string(),
+            exported_at: Utc::now(),
+            entities: vec![ExportedEntity {
+                id: Uuid::new_v4(),
+                kind: "concept".to_string(),
+                entity_type: None,
+                name: "Imported long entity".to_string(),
+                description: Some("x".repeat(MAX_TEXT_CHARS + 1)),
+                properties: None,
+                tags: vec![],
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            }],
+            edges: vec![],
+        };
+
+        let summary = runtime
+            .import_kg(&archive, &token)
+            .await
+            .expect("import with bounded embedding input");
+
+        assert_eq!(summary.entities_imported, 1);
+        assert_eq!(summary.embedding_truncation.truncated, 1);
+        assert!(summary.embedding_truncation.discarded_bytes > 0);
+        let wire = serde_json::to_value(&summary).expect("serialize import summary");
+        assert_eq!(wire["embedding_truncation"]["truncated"], 1);
     }
 
     /// 1. Roundtrip: 3 entities + 2 edges survive export → import on a fresh runtime.

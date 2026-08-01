@@ -167,6 +167,10 @@ Declaration = changes institutional status by fiat.
 
 Create an entity or note (singleton) or a batch of entities (bulk via `items`).
 
+Singleton writes preserve the complete source in storage and FTS. If a configured embedder
+receives a UTF-8-safe bounded prefix, the successful response includes a `warnings` array; the
+warning is derived from the embedding outcome, not from a separate registry prediction.
+
 | Param               | Type            | Required    | Notes                                                                                                                                                                                                                                                                                      |
 | ------------------- | --------------- | ----------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `kind`              | string          | conditional | Substrate (`entity`\|`note`) or granular kind (`concept`, `document`, `observation`, …). Required for the singleton path; not required when `items` is present.                                                                                                                            |
@@ -303,6 +307,9 @@ Patch entity, note, or edge fields. Field set depends on substrate: entities acc
 `name`/`content`/`salience`/`decay_factor`/`properties`; edges accept
 `relation`/`weight`/`properties`.
 
+Entity/note text updates use the same full-source storage and bounded embedding contract as
+singleton `create`; a successful response includes `warnings` when embedding actually truncated.
+
 | Param          | Type            | Required | Notes                                                                     |
 | -------------- | --------------- | -------- | ------------------------------------------------------------------------- |
 | `id`           | uuid            | yes      | Record to patch.                                                          |
@@ -340,6 +347,8 @@ request(ops="delete(id=\"<uuid>\")")
 Deduplicate two entities. Returns `{kept_id, removed_id, edges_rewired,
 properties_merged, tags_unioned, content_appended, dry_run}` — chain with
 `$prev.kept_id`, **not** `$prev.id` (merge has no top-level `id` field).
+When the surviving entity or note is reindexed and an embedder bounds its input, the successful
+response also includes the standard embedding-truncation `warnings` advisory.
 
 | Param     | Type | Required | Notes                                       |
 | --------- | ---- | -------- | ------------------------------------------- |
@@ -487,15 +496,26 @@ entity-kind vocabulary (§"The 9 entity kinds" in AGENTS.md) vs. the note-kind v
 
 Multi-hop BFS traversal.
 
-| Param       | Type            | Required | Notes                                  |
-| ----------- | --------------- | -------- | -------------------------------------- |
-| `roots`     | array\<uuid\>   | yes      | Starting node UUIDs.                   |
-| `max_depth` | integer         | no       | Default 3.                             |
-| `relations` | array\<string\> | no       | Restrict traversal to these relations. |
+| Param                | Type            | Required | Notes                                                       |
+| -------------------- | --------------- | -------- | ----------------------------------------------------------- |
+| `roots`              | array\<uuid\>   | yes      | Starting node UUIDs.                                        |
+| `max_depth`          | integer         | no       | Default 3.                                                  |
+| `direction`          | string          | no       | `outgoing`\|`incoming`\|`both` (default `both`).            |
+| `relations`          | array\<string\> | no       | Restrict traversal to these relations.                      |
+| `min_weight`         | number          | no       | Exclude edges below this weight.                            |
+| `limit`              | integer         | no       | Maximum non-root nodes retained in each distinct root path. |
+| `include_roots`      | boolean         | no       | Include each root as a depth-zero node (default `true`).    |
+| `include_properties` | boolean         | no       | Include entity properties on path nodes (default `false`).  |
 
 ```
 request(ops="traverse(roots=[\"<uuid>\"], max_depth=2)")
 ```
+
+The response contains exactly one traversal object per distinct requested root. Each path node
+has `id`, `via_edge`, and `depth`; resolvable entity and note nodes also carry `name` and `kind`.
+Note enrichment matches `neighbors`, including its `[kind]` display-name fallback for a nameless
+note reached through an annotation edge. `properties` remains entity-only and is included only
+when `include_properties=true`.
 
 ### `context` — Assertive
 
@@ -590,6 +610,9 @@ request(ops="[{\"tool\":\"propose\",\"args\":{\"title\":\"Add GQE\",\"descriptio
 ### `review` — Declaration
 
 Approve, reject, comment, or request changes on a proposal.
+
+When approval immediately applies an embedding-bearing changeset, the response includes the
+standard `warnings` advisory if that committed apply bounded any embedding input.
 
 | Param      | Type   | Required | Notes                                              |
 | ---------- | ------ | -------- | -------------------------------------------------- |
@@ -1109,6 +1132,9 @@ Actor-to-actor messaging with threading. Optional; load with `KHIVE_PACKS=kg,com
 
 Send a message, optionally threaded.
 
+The atomic outbound/inbound write preserves the full body on both notes. If either copy's
+embedding input is bounded, the successful response includes the standard `warnings` advisory.
+
 | Param       | Type   | Required | Notes                                                                                                                                                                                           |
 | ----------- | ------ | -------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `to`        | string | yes      | Actor label, e.g. `"lambda:leo"`. Both copies land in the caller's namespace; no cross-namespace write occurs.                                                                                  |
@@ -1167,6 +1193,9 @@ request(ops="comm.read(id=\"<message-id>\")")
 ### `comm.reply` — Commissive
 
 Reply to a message, threading linkage.
+
+Replies use the same full-source storage and embedding-truncation `warnings` contract as
+`comm.send`.
 
 | Param     | Type   | Required | Notes                                                       |
 | --------- | ------ | -------- | ----------------------------------------------------------- |
@@ -1375,6 +1404,10 @@ request(ops="knowledge.stats()")
 
 Backfill embeddings + FTS for atoms/domains.
 
+The response includes `truncation_by_model`, keyed by every model that completed embedding work.
+Each value contains `truncated` and `discarded_bytes` counters derived from the actual embedding
+outcomes; atom source content remains complete in SQL and FTS.
+
 | Param         | Type            | Required | Notes                                                   |
 | ------------- | --------------- | -------- | ------------------------------------------------------- |
 | `ids`         | array\<string\> | no       | Atom slugs/IDs to index; omit to index all.             |
@@ -1462,6 +1495,10 @@ request(ops="knowledge.compose(query=\"FastAPI JWT middleware validation pattern
 ### `knowledge.edit` — Commissive
 
 Upsert sections for an atom without wiping other sections.
+
+The response combines the inline section and atom refresh outcomes in `truncation_by_model` and
+includes the standard `warnings` advisory when any model bounded an embedding input. Stored section
+and atom content remains complete.
 
 | Param      | Type            | Required | Notes                                                                                                                                                                                                                                                                             |
 | ---------- | --------------- | -------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
