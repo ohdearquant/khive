@@ -4,10 +4,11 @@ description: Coordinate with other agents and lambdas over khive comm — be att
 
 # Coordinate over comm
 
-khive comm is how agents and lambdas message each other. The surface is four verbs —
-`comm.send`, `comm.inbox`, `comm.reply`, `comm.thread` (plus `comm.read` to clear a message) —
-but the thing worth learning is the _coordination pattern_, not the verbs. Per-verb param
-detail is one call away: `request(ops="comm.send(help=true)")`.
+khive comm is how agents and lambdas message each other. The core coordination
+surface is `comm.send`, `comm.delivered`, `comm.inbox`, `comm.reply`, and
+`comm.thread` (plus `comm.read` to clear a message), but the thing worth
+learning is the _coordination pattern_, not the verbs. Per-verb param detail is
+one call away: `request(ops="comm.send(help=true)")`.
 
 ## The pattern
 
@@ -42,6 +43,14 @@ request(ops="comm.send(to=\"lambda:leo\", subject=\"CI status\", content=\"all 7
   sender actor, `comm.send` rejects by default; the anonymous `local` fallback is exempt. If the
   message is genuinely a note to yourself, resend with `self_send=true`. If you meant to reach a
   distinct parent or sub-agent, configure distinct actor identities instead of opting in.
+- **Confirm an ambiguous atomic-write error before retrying.** Ordinary
+  failures roll back the pair. If an error is marked `ambiguous`, extract its
+  full `outbound_id` and call
+  `comm.delivered(id="<full-outbound-uuid>")`. `status="delivered"` means the
+  internal inbound sibling exists; `status="undelivered"` means it does not.
+  This is sender-scoped exact UUID correlation, not a body search, and it does
+  not claim SMTP or other external-transport delivery. It also cannot resolve
+  complete MCP response loss, because that loses the server-generated UUID.
 
 ### 3. Triage your inbox by sender + subject
 
@@ -94,3 +103,6 @@ Any message id in the thread resolves to the same canonical thread.
 - **Reading `properties` to find the sender.** `from` / `subject` / `preview` are top-level.
 - **`comm.send` with a `thread_id` for a follow-up.** Use `comm.reply` — it threads, prefixes,
   and routes for you.
+- **Blindly retrying an ambiguous send/reply.** Call `comm.delivered` with the
+  surfaced full `outbound_id` first; otherwise a committed inbound sibling can
+  become a duplicate.

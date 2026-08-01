@@ -24,6 +24,14 @@ pub(crate) struct SendParams {
     pub self_send: bool,
 }
 
+/// Parameters for `comm.delivered` — confirm the inbound sibling of one
+/// outbound dual-write by its stable correlation UUID.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct DeliveredParams {
+    pub id: String,
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct InboxParams {

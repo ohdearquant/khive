@@ -1,8 +1,8 @@
 //! Verb handler implementations for the comm pack.
 //!
-//! All five verbs (`send`, `inbox`, `read`, `reply`, `thread`) store and query
-//! `message` notes in the standard notes table. Message-specific metadata lives
-//! in the `properties` JSON column; `content` is the message body.
+//! Public comm verbs store and query `message` notes in the standard notes
+//! table. Message-specific metadata lives in the `properties` JSON column;
+//! `content` is the message body.
 
 use std::collections::{HashMap, HashSet};
 
@@ -16,8 +16,8 @@ use khive_storage::types::{PageRequest, SqlValue};
 
 use crate::message::{dual_write_message, note_to_message_json, resolve_id, short_id};
 use crate::params::{
-    deser, CursorCommitParams, CursorGetParams, HeartbeatParams, InboxParams, IngestParams,
-    ProbeParams, ReadParams, ReplyParams, SendParams, ThreadParams, UnreadParams,
+    deser, CursorCommitParams, CursorGetParams, DeliveredParams, HeartbeatParams, InboxParams,
+    IngestParams, ProbeParams, ReadParams, ReplyParams, SendParams, ThreadParams, UnreadParams,
 };
 
 /// Validate an actor label: non-empty, no control characters, ≤255 bytes (ADR-057 Q1 loose).
@@ -137,6 +137,71 @@ pub(crate) async fn handle_send(
         "to": p.to,
         "subject": p.subject,
         "sent_at": sent_at,
+    }))
+}
+
+/// `delivered` — confirm that the inbound half of an internal dual-write
+/// exists, using the outbound UUID copied into `properties.outbound_ref`.
+///
+/// The outbound row is deliberately not resolved or fetched first. An
+/// ambiguous atomic-write outcome may have committed both copies or neither,
+/// and legacy/injected half-pairs can lack the outbound row. A full UUID is
+/// therefore required instead of a display prefix.
+/// This result says nothing about a later external transport attempt (SMTP,
+/// Telegram, and so on); it only confirms the comm pack's inbound sibling.
+pub(crate) async fn handle_delivered(
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+    params: Value,
+) -> Result<Value, RuntimeError> {
+    let p: DeliveredParams = deser(params)?;
+    let outbound_id = Uuid::parse_str(p.id.trim()).map_err(|_| {
+        RuntimeError::InvalidInput(
+            "delivered: `id` must be the full outbound UUID returned as `full_id` by \
+             comm.send or comm.reply, or surfaced as `outbound_id` in an ambiguous \
+             atomic-write error"
+                .into(),
+        )
+    })?;
+
+    let sql = runtime.sql();
+    let mut reader = sql.reader().await.map_err(RuntimeError::Storage)?;
+    let row = reader
+        .query_row(khive_storage::types::SqlStatement {
+            sql: "SELECT COUNT(*) AS inbound_count \
+                  FROM notes \
+                  WHERE namespace = ?1 \
+                    AND kind = 'message' \
+                    AND deleted_at IS NULL \
+                    AND json_extract(properties, '$.direction') = 'inbound' \
+                    AND json_extract(properties, '$.from_actor') = ?2 \
+                    AND json_extract(properties, '$.outbound_ref') = ?3"
+                .into(),
+            params: vec![
+                SqlValue::Text(token.namespace().as_str().to_string()),
+                SqlValue::Text(token.actor().id.clone()),
+                SqlValue::Text(outbound_id.to_string()),
+            ],
+            label: Some("comm_delivered".into()),
+        })
+        .await
+        .map_err(RuntimeError::Storage)?;
+
+    let inbound_count = match row.and_then(|row| row.get("inbound_count").cloned()) {
+        Some(SqlValue::Integer(count)) if count >= 0 => count,
+        other => {
+            return Err(RuntimeError::InvalidInput(format!(
+                "delivered: storage returned an invalid inbound count: {other:?}"
+            )))
+        }
+    };
+    let delivered = inbound_count > 0;
+
+    Ok(json!({
+        "id": outbound_id,
+        "status": if delivered { "delivered" } else { "undelivered" },
+        "delivered": delivered,
+        "inbound_count": inbound_count,
     }))
 }
 

@@ -1,22 +1,25 @@
 # khive-pack-comm
 
-The communication pack for khive — inter-agent messaging (`send`, `inbox`,
-`read`, `unread`, `reply`, `thread`) over a dedicated `message` note kind, with
-dual-write, actor-addressed delivery.
+The communication pack for khive — inter-agent messaging over a dedicated
+`message` note kind, with dual-write, actor-addressed delivery and sender-side
+confirmation.
 
 ## Verbs
 
-| Verb          | What it does                                                                                                                                                  |
-| ------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `comm.send`   | Send a message, optionally threaded                                                                                                                           |
-| `comm.inbox`  | List inbound messages for the caller (filter: unread / read / all)                                                                                            |
-| `comm.read`   | Mark an inbound message as read (best-effort: inspect `read`; `false` plus `mark_error` means re-issue later)                                                 |
-| `comm.unread` | Count the caller's unread inbound messages without message payloads                                                                                           |
-| `comm.reply`  | Reply to a message, preserving thread linkage                                                                                                                 |
-| `comm.thread` | Retrieve all messages in a conversation thread, chronologically                                                                                               |
-| `comm.probe`  | Read-only poll for new inbound message metadata and a stale unread count (takes an explicit `actor`; unlike `comm.inbox`, it is not inferred from the caller) |
+| Verb             | What it does                                                                                                                                                  |
+| ---------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `comm.send`      | Send a message, optionally threaded                                                                                                                           |
+| `comm.delivered` | Confirm the internal inbound sibling for an outbound UUID                                                                                                     |
+| `comm.inbox`     | List inbound messages for the caller (filter: unread / read / all)                                                                                            |
+| `comm.read`      | Mark an inbound message as read (best-effort: inspect `read`; `false` plus `mark_error` means re-issue later)                                                 |
+| `comm.unread`    | Count the caller's unread inbound messages without message payloads                                                                                           |
+| `comm.reply`     | Reply to a message, preserving thread linkage                                                                                                                 |
+| `comm.thread`    | Retrieve all messages in a conversation thread, chronologically                                                                                               |
+| `comm.probe`     | Read-only poll for new inbound message metadata and a stale unread count (takes an explicit `actor`; unlike `comm.inbox`, it is not inferred from the caller) |
+| `comm.health`    | Read-only per-channel health snapshot                                                                                                                         |
 
-A sixth handler, `comm.ingest`, is `Visibility::Subhandler` — it lets an
+Additional channel handlers such as `comm.ingest` are `Visibility::Subhandler`.
+`comm.ingest` lets an
 out-of-band channel adapter (email, Telegram, etc.) write an inbound message
 directly, deduplicated by `external_id`, but it is not callable on the MCP wire.
 
@@ -60,9 +63,26 @@ opaque so it can change again without a breaking rename.
 
 Every `comm.send` writes two `message` notes via `dual_write_message`
 (`src/message.rs`): an **outbound** copy (`direction=outbound`) and an
-**inbound** copy (`direction=inbound`), linked by `outbound_ref`. If the
-inbound write fails, the outbound note is deleted before the error is
-returned — the pair is atomic.
+**inbound** copy (`direction=inbound`), linked by `outbound_ref`. Rows, FTS
+documents, and vector rows for both copies commit in one atomic unit. An
+ordinary prepare or plan failure therefore leaves neither copy. If the writer
+seam reports `side_effects_unknown`, however, the caller cannot tell whether
+the complete pair committed. That error is surfaced as `ambiguous` with the
+pre-generated full `outbound_id`; pass the UUID to `comm.delivered` before
+deciding whether to retry.
+
+`comm.delivered(id=<full-outbound-uuid>)` performs one indexed, read-only
+lookup for a live inbound message whose `outbound_ref` is that UUID and whose
+`from_actor` is the caller. Its
+response is `{id, status, delivered, inbound_count}`, where `status` is
+`"delivered"` when at least one inbound sibling exists and `"undelivered"`
+otherwise. It does not require the outbound row to exist and never compares
+message bodies, so it also works for legacy/injected half-pairs and identical
+templated content. An operation error means the lookup itself is uncertain.
+This confirms only khive's internal inbound copy; it does not report later
+SMTP or other external-transport delivery. Loss of the entire MCP response is
+outside this contract: without the structured error, the caller never receives
+the server-generated UUID needed for confirmation.
 
 Two addressing modes govern where the inbound copy lands:
 

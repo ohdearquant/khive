@@ -225,8 +225,8 @@ def main():
         # until a backend is installed via [storage.blob] or KHIVE_BLOB_ROOT.
         # Update this number when the pack set or verb surface changes; a
         # silent drift here is the bug this assertion exists to catch.
-        assert verbs_result["total"] == 88, (
-            f"expected 88 user-facing verbs from the 12 default packs "
+        assert verbs_result["total"] == 89, (
+            f"expected 89 user-facing verbs from the 12 default packs "
             f"(session contributes 4 T1 verbs promoted to Visibility::Verb per "
             f"ADR-083; context is the 17th kg-substrate bare verb per ADR-089; "
             f"resolve is the 18th kg-substrate bare verb per the unified-verb "
@@ -238,7 +238,8 @@ def main():
             f"workspace (#873) contributes zero verbs; "
             f"blob contributes blob.put/blob.get/blob.stat per ADR-111; "
             f"brain.mark_turn is the per-actor work-unit marker; "
-            f"comm.unread lists unread inbound messages), "
+            f"comm.unread lists unread inbound messages; comm.delivered confirms "
+            f"the internal inbound sibling after an ambiguous atomic write), "
             f"got {verbs_result['total']}: {verbs_result}"
         )
         verb_names = [v["verb"] for v in verbs_result["verbs"]]
@@ -247,6 +248,9 @@ def main():
         assert "context" in verb_names, f"'context' (ADR-089) must appear in verbs listing: {verb_names}"
         assert "code.ingest" in verb_names, (
             f"'code.ingest' (ADR-085 Amendment 2, PR #1039) must appear in verbs listing: {verb_names}"
+        )
+        assert "comm.delivered" in verb_names, (
+            f"'comm.delivered' (#1447) must appear in verbs listing: {verb_names}"
         )
         # each entry carries verb, pack, description, category per handler_defs.rs:735-742
         first = verbs_result["verbs"][0]

@@ -4,13 +4,15 @@
 
 ### Communication Pack (ADR-040)
 
-This crate is the primary implementation of ADR-040. It provides five `comm.*` verbs over the
+This crate is the primary implementation of ADR-040. It provides public `comm.*` verbs over the
 standard `message` note kind stored in the notes table.
 
 Key design decisions from ADR-040:
+
 - **Dual-write delivery**: every `comm.send` writes an outbound copy (caller namespace) and an
-  inbound copy (recipient namespace). If the inbound write fails, the outbound note is rolled back
-  before returning the error.
+  inbound copy (recipient namespace) in one atomic unit. Ordinary failures leave neither copy;
+  a `side_effects_unknown` writer result is surfaced as ambiguous with the outbound correlation
+  UUID so `comm.delivered` can resolve whether the complete pair committed.
 - **Cross-namespace delivery**: controlled by the sender-side `actor.allowed_outbound_namespaces`
   allowlist. An empty allowlist (the default) reproduces the prior deny-all behavior. Namespaces
   listed in the allowlist may receive inbound notes via `dual_write_message`. Unlisted namespaces
@@ -21,13 +23,15 @@ Key design decisions from ADR-040:
   ensures `comm.thread(id=outbound_id)` can find replies across namespaces.
 - **Verb categories (speech-act classification)**:
   - `comm.send` — Commissive (the sender commits to delivery)
+  - `comm.delivered` — Assertive (queries the internal dual-write outcome)
   - `comm.inbox` — Assertive (queries state)
   - `comm.read` — Declaration (changes the read/unread state)
   - `comm.unread` — Assertive (queries state; count-only, khive #66)
   - `comm.reply` — Commissive (the sender commits to a reply)
   - `comm.thread` — Assertive (queries state)
-- **Pack-auxiliary indexes**: two partial indexes on the `notes` table (`idx_comm_message_direction`
-  and `idx_comm_message_thread`) are declared via `schema_plan()`. These use
+- **Pack-auxiliary indexes**: partial indexes on the `notes` table, including
+  `idx_comm_message_direction`, `idx_comm_message_thread`, and
+  `idx_comm_message_outbound_ref`, are declared via `schema_plan()`. These use
   `WHERE deleted_at IS NULL` rather than `WHERE kind = 'message'` so that the SQLite query planner
   can match them when queries use a parameterized `kind = ?N` predicate.
 - **`read()` is a recipient-only action**: marking an outbound (sent) message as read is rejected.
@@ -41,10 +45,11 @@ taxonomy from ADR-025. The mapping is enforced by the `verb_categories_match_spe
 ### ADR-017: Pack Standard
 
 `CommPack` implements the `Pack` trait with:
+
 - `NOTE_KINDS = ["message"]`
 - `ENTITY_KINDS = []`
 - `REQUIRES = ["kg"]`
-- `HANDLERS = COMM_HANDLERS` (5 entries)
+- `HANDLERS = COMM_HANDLERS`
 
 The pack self-registers via `inventory::submit!` so it is available when loaded by name.
 

@@ -135,7 +135,7 @@ false, id, full_id, from, to, note: "already in target status"}` — the task fi
 `memory.recall` supports `tags` and `tag_mode` ("any"|"all") for tag-based post-filtering.
 Composite scores are always in [0,1]. Typical production floor: 0.3-0.7.
 
-### Brain pack — 15 verbs (`brain.` prefix)
+### Brain pack — 16 verbs (`brain.` prefix)
 
 | Verb                     | What it does                                                                             | When to use                                                     |
 | ------------------------ | ---------------------------------------------------------------------------------------- | --------------------------------------------------------------- |
@@ -154,18 +154,21 @@ Composite scores are always in [0,1]. Typical production floor: 0.3-0.7.
 | `brain.unbind`           | Remove a binding                                                                         | Stop routing                                                    |
 | `brain.bindings`         | List binding rows                                                                        | Audit profile routing                                           |
 | `brain.register_adapter` | Register an adapter integrity record                                                     | Gate adapter composition to the active base-model revision      |
+| `brain.mark_turn`        | Emit a best-effort per-actor work-unit marker                                            | Supply the discipline-ratio denominator                         |
 
-### Comm pack — 7 verbs (`comm.` prefix)
+### Comm pack — 9 verbs (`comm.` prefix)
 
-| Verb          | What it does                                                                                                                 | When to use                                   |
-| ------------- | ---------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------- |
-| `comm.send`   | Send a message (optionally threaded)                                                                                         | Inter-agent or inter-namespace messaging      |
-| `comm.inbox`  | List inbound messages                                                                                                        | Check what's waiting                          |
-| `comm.read`   | Mark an **inbound** message as read (best-effort: check `read` in the response; `false` + `mark_error` means re-issue later) | Acknowledge receipt (recipient action)        |
-| `comm.reply`  | Reply to a message (threading linkage)                                                                                       | Respond in-thread                             |
-| `comm.thread` | Retrieve full conversation thread                                                                                            | Read the whole conversation                   |
-| `comm.health` | Per-channel health snapshot (no args)                                                                                        | Check daemon channel-poll state               |
-| `comm.probe`  | Read-only poll for new inbound message metadata and stale unread count                                                       | Cheap wake-up check without a full inbox scan |
+| Verb             | What it does                                                                                                                 | When to use                                   |
+| ---------------- | ---------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------- |
+| `comm.send`      | Send a message (optionally threaded)                                                                                         | Inter-agent or inter-namespace messaging      |
+| `comm.delivered` | Confirm the internal inbound sibling for an outbound UUID                                                                    | Resolve an ambiguous atomic-write outcome     |
+| `comm.inbox`     | List inbound messages                                                                                                        | Check what's waiting                          |
+| `comm.read`      | Mark an **inbound** message as read (best-effort: check `read` in the response; `false` + `mark_error` means re-issue later) | Acknowledge receipt (recipient action)        |
+| `comm.unread`    | Count unread inbound messages without returning payloads                                                                     | Cheap unread-count check                      |
+| `comm.reply`     | Reply to a message (threading linkage)                                                                                       | Respond in-thread                             |
+| `comm.thread`    | Retrieve full conversation thread                                                                                            | Read the whole conversation                   |
+| `comm.health`    | Per-channel health snapshot (no args)                                                                                        | Check daemon channel-poll state               |
+| `comm.probe`     | Read-only poll for new inbound message metadata and stale unread count                                                       | Cheap wake-up check without a full inbox scan |
 
 **Inbox shape (ADR-057).** `comm.inbox` is scannable: each entry carries top-level `from`, `to`,
 `subject`, `read`, `direction`, and a derived `preview` (whitespace-collapsed, truncated to 80
@@ -176,8 +179,10 @@ sends and reads as the shared `"local"` party line.
 
 **`comm.read` is inbound-only.** It marks a received message as read; calling it on an outbound
 (sent) message returns `read: message <uuid> is outbound; only received (inbound) messages can be
-marked as read`. To confirm a sent message was received, read it from the recipient's `comm.inbox`
-or `comm.thread`.
+marked as read`. If a send/reply returns an `ambiguous` error containing a full
+`outbound_id`, pass that UUID to `comm.delivered` before retrying. This checks the atomic pair's
+internal inbound sibling; it does not claim later SMTP delivery and cannot help when the whole MCP
+response is lost before the caller receives the server-generated UUID.
 
 ### Schedule pack — 4 verbs (`schedule.` prefix)
 

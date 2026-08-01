@@ -4,7 +4,7 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 
 use khive_runtime::{micros_to_iso, KhiveRuntime, Namespace, NamespaceToken, RuntimeError};
-use khive_storage::note::Note;
+use khive_storage::{note::Note, StorageError, WriterTaskRequestState};
 
 pub(crate) fn short_id(uuid: Uuid) -> String {
     uuid.as_hyphenated().to_string().chars().take(8).collect()
@@ -31,6 +31,18 @@ pub(crate) async fn resolve_id(
     Err(RuntimeError::InvalidInput(format!(
         "{verb}: invalid id {raw:?}; expected full UUID or 8-char hex prefix"
     )))
+}
+
+fn attach_outbound_id_to_ambiguous_write(outbound_id: Uuid, error: RuntimeError) -> RuntimeError {
+    match error {
+        original @ RuntimeError::Storage(StorageError::WriterTaskTerminated {
+            request_state: WriterTaskRequestState::SideEffectsUnknown,
+        }) => RuntimeError::Ambiguous(format!(
+            "dual_write delivery outcome is uncertain: outbound_id={outbound_id}; \
+             original error: {original}; call comm.delivered(id=\"{outbound_id}\") before retrying"
+        )),
+        other => other,
+    }
 }
 
 pub(crate) fn note_to_message_json(note: &Note) -> Value {
@@ -103,13 +115,13 @@ fn build_preview(content: &str) -> String {
 /// writer transaction covers both notes' rows, FTS documents, and vector
 /// rows. Returns the outbound `Note` on success.
 ///
-/// Resolved gap (external desk review, 2026-07-21; closed by construction
-/// here): the two note writes used to be separate `create_note` calls with
-/// only an in-process rollback compensating an inbound-write failure, so a
-/// process crash between them could leave a durable orphan outbound note
-/// with no inbound copy. `create_notes_atomic` commits both copies under one
-/// `SqlAccess::atomic_unit` — a crash or failure anywhere in the unit rolls
-/// back everything, so no partial pair can ever be observed durably.
+/// The two note writes used to be separate `create_note` calls with an
+/// in-process compensating delete. `create_notes_atomic` now makes the pair
+/// all-or-none: an ordinary prepare/plan failure leaves neither copy, while a
+/// successful commit leaves both. If the writer seam cannot establish whether
+/// an accepted request committed (`side_effects_unknown`), the pre-generated
+/// outbound UUID is attached to the error so `comm.delivered` can distinguish
+/// the two complete outcomes without relying on message content.
 ///
 /// Invariant: the outbound id is generated BEFORE either write (rather than
 /// patched in after, as the old two-call version did) so both copies can
@@ -282,7 +294,8 @@ pub(crate) async fn dual_write_message(
             },
         ],
     )
-    .await?;
+    .await
+    .map_err(|error| attach_outbound_id_to_ambiguous_write(outbound_id, error))?;
 
     // create_notes_atomic returns notes in the same order as the specs above:
     // [outbound, inbound].
@@ -364,7 +377,6 @@ mod tests {
             err_msg.contains("rolled back"),
             "error must report the atomic unit rolled back; got: {err_msg}"
         );
-
         for (token, ns) in [(&caller_token, "sender"), (&recipient_token, "recipient")] {
             let alive = runtime
                 .list_notes(token, Some("message"), 100, 0)
@@ -634,6 +646,30 @@ mod tests {
                 "no ann_write_log row may survive a mid-unit vector failure in {label}_ns; got {ann_count:?}"
             );
         }
+    }
+
+    #[test]
+    fn side_effects_unknown_surfaces_outbound_confirmation_id() {
+        let outbound_id = Uuid::new_v4();
+        let error = RuntimeError::Storage(StorageError::WriterTaskTerminated {
+            request_state: WriterTaskRequestState::SideEffectsUnknown,
+        });
+
+        let annotated = attach_outbound_id_to_ambiguous_write(outbound_id, error);
+        assert!(matches!(&annotated, RuntimeError::Ambiguous(_)));
+        let message = annotated.to_string();
+        assert!(message.contains("side_effects_unknown"));
+        assert!(message.contains(&format!("outbound_id={outbound_id}")));
+        assert!(message.contains(&format!("comm.delivered(id=\"{outbound_id}\")")));
+    }
+
+    #[test]
+    fn known_atomic_rollback_is_not_mislabeled_ambiguous() {
+        let error = RuntimeError::Internal("atomic multi-note write rolled back at op 1".into());
+        let annotated = attach_outbound_id_to_ambiguous_write(Uuid::new_v4(), error);
+
+        assert!(matches!(&annotated, RuntimeError::Internal(_)));
+        assert!(!annotated.to_string().contains("outbound_id="));
     }
 
     fn make_note(namespace: &str, content: &str, props: Option<Value>) -> Note {
