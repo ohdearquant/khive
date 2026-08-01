@@ -1,7 +1,7 @@
 # ADR-135: Scale SQLite writes by reducing writer demand before changing ownership
 
-- **Status:** Accepted
-- **Date:** 2026-07-30
+- Status: accepted (2026-08-01)
+- Date: 2026-07-30
 
 ## Context
 
