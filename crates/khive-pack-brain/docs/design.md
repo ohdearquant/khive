@@ -44,7 +44,9 @@ must go through Inactive before archiving. `brain.reset` is only valid on non-ar
 **Profile resolution** (`brain.resolve`): Longest-match wins — actor + namespace + consumer_kind
 scores higher than actor + consumer_kind, which scores higher than consumer_kind alone.
 Archived profiles are filtered out before scoring. The `balanced-recall-v1` profile is the
-system-default fallback for `consumer_kind="recall"` when no explicit binding matches.
+system-default fallback for `consumer_kind="recall"` when no explicit binding matches. Specific
+`brain.bind` consumer kinds must appear in the loaded registry's composed
+`BRAIN_CONSUMER_KINDS`; `"*"` remains the explicit wildcard.
 
 **Event interpretation** (`event::interpret`): The `brain.feedback` verb is the
 `FeedbackExplicit` event emitter. `brain.emit` predates this design and its log entries are
