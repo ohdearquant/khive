@@ -12,6 +12,7 @@ use khive_runtime::{
     AllowAllGate, BackendId, KhiveRuntime, Namespace, NamespaceToken, RuntimeConfig, VerbRegistry,
     VerbRegistryBuilder,
 };
+use khive_storage::types::{SqlRow, SqlValue};
 use khive_types::Pack;
 
 fn build_registry() -> (VerbRegistry, KhiveRuntime) {
@@ -37,6 +38,62 @@ fn build_registry_for_ns(ns: &str) -> (VerbRegistry, KhiveRuntime) {
 #[test]
 fn comm_pack_declares_message_note_kind() {
     assert!(CommPack::NOTE_KINDS.contains(&"message"));
+}
+
+#[tokio::test]
+async fn pack_registered_message_notes_are_queryable_through_gql() {
+    let (registry, rt) = build_registry_for_ns("local");
+    assert!(
+        registry.all_note_kinds().contains(&"message"),
+        "the built registry must expose comm's message note kind"
+    );
+
+    registry
+        .dispatch(
+            "comm.send",
+            serde_json::json!({
+                "to": "local",
+                "content": "GQL pack-note regression"
+            }),
+        )
+        .await
+        .expect("self-send creates message notes");
+
+    let token = rt.authorize(Namespace::local()).expect("local token");
+    let by_granular_label = rt
+        .query(&token, "MATCH (m:message) RETURN m.id")
+        .await
+        .expect("pack-registered granular label compiles and executes");
+    let by_note_kind = rt
+        .query(
+            &token,
+            "MATCH (m:note) WHERE m.kind = 'message' RETURN m.id",
+        )
+        .await
+        .expect("note substrate plus kind predicate compiles and executes");
+
+    fn ids(rows: &[SqlRow]) -> Vec<String> {
+        let mut ids: Vec<String> = rows
+            .iter()
+            .map(|row| match row.get("m_id") {
+                Some(SqlValue::Text(id)) => id.clone(),
+                value => panic!("GQL m.id projection must be text; got {value:?}"),
+            })
+            .collect();
+        ids.sort();
+        ids
+    }
+
+    let granular_ids = ids(&by_granular_label);
+    assert!(
+        !granular_ids.is_empty(),
+        "MATCH (m:message) must return the message rows just written"
+    );
+    assert_eq!(
+        granular_ids,
+        ids(&by_note_kind),
+        "granular and substrate-plus-kind spellings must select the same message notes"
+    );
 }
 
 #[test]
