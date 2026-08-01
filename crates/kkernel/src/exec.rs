@@ -647,9 +647,25 @@ fn apply_actor_pin_and_expectation(
     if let Some(raw) = actor {
         let parsed =
             Namespace::parse(raw).map_err(|e| anyhow::anyhow!("invalid --actor {raw:?}: {e}"))?;
+
+        // The resolver may have already folded the displaced actor (project
+        // `[actor] id`, `KHIVE_ACTOR`, etc.) into the default read visible-set
+        // (ADR-007 Rev 4 Rule 3b). Drop exactly that entry before pinning, so
+        // the new identity's default reads don't keep exposing the actor it
+        // replaced; any other explicitly configured `visible_namespaces` entry
+        // is untouched.
+        if let Some(prev) = cfg.actor_id.as_deref() {
+            if let Ok(prev_ns) = Namespace::parse(prev) {
+                cfg.visible_namespaces.retain(|ns| *ns != prev_ns);
+            }
+        }
+
         cfg.actor_id = if parsed == Namespace::local() {
             None
         } else {
+            if !cfg.visible_namespaces.contains(&parsed) {
+                cfg.visible_namespaces.push(parsed.clone());
+            }
             Some(parsed.as_str().to_owned())
         };
     }
@@ -1237,21 +1253,57 @@ mod tests {
         let mut cfg = RuntimeConfig {
             default_namespace: Namespace::parse("project:data").unwrap(),
             actor_id: Some("lambda:fallback".to_string()),
+            visible_namespaces: vec![Namespace::parse("lambda:fallback").unwrap()],
             ..RuntimeConfig::default()
         };
         apply_actor_pin_and_expectation(&mut cfg, Some("lambda:cli"), Some("lambda:cli")).unwrap();
         assert_eq!(cfg.actor_id.as_deref(), Some("lambda:cli"));
         assert_eq!(cfg.default_namespace.as_str(), "project:data");
+        assert_eq!(
+            cfg.visible_namespaces,
+            vec![Namespace::parse("lambda:cli").unwrap()],
+            "pinning must drop the displaced actor's folded read visibility and add the pinned one"
+        );
     }
 
     #[test]
     fn explicit_local_actor_authoritatively_clears_fallback() {
         let mut cfg = RuntimeConfig {
             actor_id: Some("lambda:fallback".to_string()),
+            visible_namespaces: vec![Namespace::parse("lambda:fallback").unwrap()],
             ..RuntimeConfig::default()
         };
         apply_actor_pin_and_expectation(&mut cfg, Some("local"), Some("local")).unwrap();
         assert_eq!(cfg.actor_id, None);
+        assert!(
+            cfg.visible_namespaces.is_empty(),
+            "pinning to local must drop the displaced fallback actor's read visibility \
+             without adding a replacement: {:?}",
+            cfg.visible_namespaces
+        );
+    }
+
+    #[test]
+    fn explicit_actor_pin_retains_unrelated_configured_visibility() {
+        let mut cfg = RuntimeConfig {
+            actor_id: Some("lambda:fallback".to_string()),
+            visible_namespaces: vec![
+                Namespace::parse("lambda:fallback").unwrap(),
+                Namespace::parse("project:shared").unwrap(),
+            ],
+            ..RuntimeConfig::default()
+        };
+        apply_actor_pin_and_expectation(&mut cfg, Some("lambda:cli"), None).unwrap();
+        assert_eq!(
+            cfg.visible_namespaces,
+            vec![
+                Namespace::parse("project:shared").unwrap(),
+                Namespace::parse("lambda:cli").unwrap(),
+            ],
+            "an explicitly configured extra visibility entry unrelated to the displaced \
+             actor must survive the pin: {:?}",
+            cfg.visible_namespaces
+        );
     }
 
     #[test]
@@ -1556,6 +1608,96 @@ default = true
             compute_config_id(&exec_cfg, None),
             compute_config_id(&serve_cfg, None),
             "exec-path config_id must match the serve/daemon-path config_id for the same db"
+        );
+    }
+
+    /// Regression guard: an explicit `--actor` pin must rebuild the
+    /// actor-derived portion of `visible_namespaces`, not just `actor_id`.
+    ///
+    /// Builds the config exactly the way `run_exec` does — through
+    /// `resolve_runtime_config`, from a project `[actor] id = "lambda:fallback"`
+    /// with no explicit extra visibility — so the displaced actor is folded
+    /// into `visible_namespaces` (ADR-007 Rev 4 Rule 3b) before the pin is
+    /// ever applied. A non-local pin must give default reads `local ∪
+    /// lambda:pinned`; a `local` pin must leave only `local`. Neither case may
+    /// retain `lambda:fallback`.
+    #[test]
+    #[serial]
+    fn actor_pin_rebuilds_visible_namespaces_dropping_displaced_fallback() {
+        std::env::remove_var("KHIVE_EMBEDDING_MODEL");
+        std::env::remove_var("KHIVE_ADDITIONAL_EMBEDDING_MODELS");
+        std::env::remove_var("KHIVE_ACTOR");
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let khive_dir = dir.path().join(".khive");
+        std::fs::create_dir_all(&khive_dir).expect("mkdir .khive");
+        std::fs::write(
+            khive_dir.join("config.toml"),
+            r#"
+[actor]
+id = "lambda:fallback"
+"#,
+        )
+        .expect("write config.toml");
+
+        let db_path = khive_dir.join("actor-pin-visibility-test.db");
+        let db_str = db_path.to_str().expect("utf8 path").to_string();
+        let pinned_packs = Some(vec!["kg".to_string()]);
+
+        let resolve = |db: &str| {
+            resolve_runtime_config(RuntimeConfigInputs {
+                db: Some(db),
+                config: None,
+                namespace: Namespace::parse("local").expect("ns"),
+                namespace_explicit: true,
+                actor_explicit: false,
+                no_embed: true,
+                packs: pinned_packs.clone(),
+                brain_profile: None,
+            })
+            .expect("resolve exec-shaped config")
+        };
+
+        // Sanity: the fallback actor really is folded into the default read
+        // visible-set before any pin is applied — otherwise this test would
+        // pass vacuously.
+        let baseline = resolve(&db_str);
+        assert_eq!(baseline.actor_id.as_deref(), Some("lambda:fallback"));
+        assert!(baseline
+            .visible_namespaces
+            .contains(&Namespace::parse("lambda:fallback").expect("ns")));
+
+        // A non-local pin must replace the fallback's read visibility with the
+        // pinned actor's — never both, never neither.
+        let mut pinned_cfg = resolve(&db_str);
+        apply_actor_pin_and_expectation(&mut pinned_cfg, Some("lambda:pinned"), None).unwrap();
+        assert_eq!(pinned_cfg.actor_id.as_deref(), Some("lambda:pinned"));
+        assert!(
+            pinned_cfg
+                .visible_namespaces
+                .contains(&Namespace::parse("lambda:pinned").expect("ns")),
+            "pinned actor must be added to the default read scope: {:?}",
+            pinned_cfg.visible_namespaces
+        );
+        assert!(
+            !pinned_cfg
+                .visible_namespaces
+                .contains(&Namespace::parse("lambda:fallback").expect("ns")),
+            "the displaced fallback actor must not remain visible under the pinned \
+             identity: {:?}",
+            pinned_cfg.visible_namespaces
+        );
+
+        // A `local` pin must authoritatively clear the fallback's visibility
+        // without adding a replacement.
+        let mut local_cfg = resolve(&db_str);
+        apply_actor_pin_and_expectation(&mut local_cfg, Some("local"), None).unwrap();
+        assert_eq!(local_cfg.actor_id, None);
+        assert!(
+            local_cfg.visible_namespaces.is_empty(),
+            "pinning to local must leave only local visible, retaining neither the \
+             fallback actor nor adding a new one: {:?}",
+            local_cfg.visible_namespaces
         );
     }
 
