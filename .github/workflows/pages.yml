@@ -116,9 +116,10 @@ jobs:
             [sessions-and-ingest]="9|Agent Sessions and Data Ingest|Session record verbs and provider transcript mirror ingest."
             [specialized-packs]="10|Specialized Packs|Niche packs beyond the production set, starting with the formal-math pack."
             [prompt-cookbook]="11|Prompt Cookbook|Ready-to-use verb patterns for common agent workflows."
-            [tips-and-tricks]="12|Tips and Tricks|Query craft, DSL round-trips, param gotchas, and troubleshooting for the request tool."
-            [proof-graph-case-study]="13|Proof Graph Case Study|Mathlib ingested as a 320K-entity, 4.4M-edge khive graph: ingestion path and traversal at scale."
-            [api-reference]="14|API Reference|Full verb catalog for all 9 production packs: params, DSL examples, response envelope."
+            [query-cookbook]="12|Query Cookbook|Question classes mapped to the right verb, plus verified GQL/SPARQL idioms and known gaps."
+            [tips-and-tricks]="13|Tips and Tricks|Query craft, DSL round-trips, param gotchas, and troubleshooting for the request tool."
+            [proof-graph-case-study]="14|Proof Graph Case Study|Mathlib ingested as a 320K-entity, 4.4M-edge khive graph: ingestion path and traversal at scale."
+            [api-reference]="15|API Reference|Full verb catalog for all 9 production packs: params, DSL examples, response envelope."
           )
 
           cat > "$SRC/index.md" <<'EOF'
@@ -148,38 +149,6 @@ jobs:
           - [`/llms-full.txt`](llms-full.txt): every doc page, concatenated, in one fetch
           - [`/md/*.md`](md/getting-started.md): raw, unconverted markdown for each page (also
             linked from the bottom of every page)
-
-          ## Documentation
-
-          - [Getting Started](getting-started.html): install, connect, first session
-          - [Knowledge Graph Modeling](knowledge-graph.html): entity kinds, edge relations, modeling patterns
-          - [Memory and Recall](memory.html): episodic vs semantic, salience, decay
-          - [Search and Retrieval](search.html): FTS, vector, hybrid fusion, reranking
-          - [GTD Task Management](tasks.html): task lifecycle, priorities, dependencies
-          - [Prompt Cookbook](prompt-cookbook.html): ready-to-use verb patterns
-          - [API Reference](api-reference.html): full verb catalog, params, DSL examples
-
-          ## Demos
-
-          Runnable transcripts, captured against a scratch database, in the repo's
-          [`demos/`](https://github.com/ohdearquant/khive/tree/main/demos) directory:
-
-          - [research-ingest](https://github.com/ohdearquant/khive/blob/main/demos/research-ingest.md): create entities, link them, search, and traverse the graph
-          - [gtd-memory](https://github.com/ohdearquant/khive/blob/main/demos/gtd-memory.md): task lifecycle and salience-weighted memory recall
-
-          ## Install
-
-          ```bash
-          cargo install kkernel
-          ```
-
-          `kkernel` is the single shipped binary; `kkernel mcp` serves the MCP `request` surface.
-          Full install and MCP client setup: [Getting Started](getting-started.html).
-
-          ## Reference
-
-          - [AGENTS.md](https://github.com/ohdearquant/khive/blob/main/AGENTS.md): full verb reference for agents using khive
-          - [Architecture Decision Records](https://github.com/ohdearquant/khive/tree/main/docs/adr): the design contract
           EOF
 
           # Per-guide-page assembly: inject nav_order/title/description front matter,
@@ -247,6 +216,43 @@ jobs:
           # (nav_order, then basename, ascending) — not a separately maintained
           # list.
           mapfile -t ORDERED_BASENAMES < <(printf '%s\n' "${PAGE_ORDER_LIST[@]}" | sort -t'|' -k1,1n -k2,2 | cut -d'|' -f2)
+
+          # Homepage "## Documentation" index — derived from the same
+          # NAV_ORDER-driven loop as the sidebar and agent surfaces, so a new
+          # guide page can never be present in the nav but missing from the
+          # homepage (the drift PR #1552 fixed by construction).
+          {
+            echo "## Documentation"
+            echo
+            for base in "${ORDERED_BASENAMES[@]}"; do
+              echo "- [${PAGE_TITLE[$base]}](${base}.html): ${PAGE_DESC[$base]}"
+            done
+            echo
+          } >> "$SRC/index.md"
+
+          cat >> "$SRC/index.md" <<'EOF'
+          ## Demos
+
+          Runnable transcripts, captured against a scratch database, in the repo's
+          [`demos/`](https://github.com/ohdearquant/khive/tree/main/demos) directory:
+
+          - [research-ingest](https://github.com/ohdearquant/khive/blob/main/demos/research-ingest.md): create entities, link them, search, and traverse the graph
+          - [gtd-memory](https://github.com/ohdearquant/khive/blob/main/demos/gtd-memory.md): task lifecycle and salience-weighted memory recall
+
+          ## Install
+
+          ```bash
+          cargo install kkernel
+          ```
+
+          `kkernel` is the single shipped binary; `kkernel mcp` serves the MCP `request` surface.
+          Full install and MCP client setup: [Getting Started](getting-started.html).
+
+          ## Reference
+
+          - [AGENTS.md](https://github.com/ohdearquant/khive/blob/main/AGENTS.md): full verb reference for agents using khive
+          - [Architecture Decision Records](https://github.com/ohdearquant/khive/tree/main/docs/adr): the design contract
+          EOF
 
           # llms.txt — the llms.txt convention: short summary + linked index,
           # HTML and raw-markdown URLs for every page.
