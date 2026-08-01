@@ -537,17 +537,16 @@ pub async fn run_pending_events_on(
                 // (legacy data predating that provenance guarantee) has no
                 // verifiable identity and must fail closed rather than replay
                 // under the daemon's own identity.
-                let scheduled_actor = if !is_missed
-                    && (event_type == "remind" || event_type == "schedule")
-                {
-                    properties
-                        .as_ref()
-                        .and_then(|p| p.get("created_by_actor"))
-                        .and_then(Value::as_str)
-                        .map(str::to_string)
-                } else {
-                    None
-                };
+                let scheduled_actor =
+                    if !is_missed && (event_type == "remind" || event_type == "schedule") {
+                        properties
+                            .as_ref()
+                            .and_then(|p| p.get("created_by_actor"))
+                            .and_then(Value::as_str)
+                            .map(str::to_string)
+                    } else {
+                        None
+                    };
                 let missing_provenance = !is_missed
                     && (event_type == "remind" || event_type == "schedule")
                     && scheduled_actor.is_none();
@@ -1822,9 +1821,11 @@ mod tests {
         let rt = make_rt_with_actor(&db_path, Some(daemon_actor)).await;
         let server = KhiveMcpServer::new(rt.clone()).expect("server");
 
-        let action = "comm.send(to=\"lambda:daemon-legacy\", subject=\"x\", content=\"x\", self_send=true)";
-        let id = create_scheduled_event(&rt, "local", &due_rfc3339(), Some(action), None, "schedule")
-            .await;
+        let action =
+            "comm.send(to=\"lambda:daemon-legacy\", subject=\"x\", content=\"x\", self_send=true)";
+        let id =
+            create_scheduled_event(&rt, "local", &due_rfc3339(), Some(action), None, "schedule")
+                .await;
 
         // Simulate a legacy row written before creator provenance was captured.
         let mut writer = rt.sql().writer().await.expect("writer");
@@ -1858,10 +1859,9 @@ mod tests {
         // from anything reading the note row after the fact.
         let props = get_note_props(&rt, id).await;
         assert!(
-            props["policy_error"]
-                .as_str()
-                .is_some_and(|error| error.contains("fail-closed")
-                    && error.contains("created_by_actor")),
+            props["policy_error"].as_str().is_some_and(
+                |error| error.contains("fail-closed") && error.contains("created_by_actor")
+            ),
             "fail-closed row must persist a policy error distinguishing it from a clean fire: \
              {props:?}"
         );
