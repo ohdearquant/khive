@@ -12106,6 +12106,7 @@ mod tests {
                     },
                     include_roots: false,
                     include_properties: false,
+                    execution_budget: Default::default(),
                 },
             )
             .await
