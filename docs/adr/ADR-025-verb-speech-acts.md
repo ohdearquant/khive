@@ -271,9 +271,10 @@ section stated a kg verb total that had gone stale.
 
 The total is removed rather than corrected. The argument that section makes is that the surface
 grows, which the list of shipped additions carries on its own; the number added nothing except
-another thing to keep in sync. `db_diagnostics` remains a future-design name and is deliberately
-excluded from the current classified surface: no such `HandlerDef` exists, and it is absent from
-the enforced `KG_SUBSTRATE_VERBS` list in
+another thing to keep in sync. `db_diagnostics`, listed here as a future-design name when this
+amendment was written, shipped 2026-08-01: its `HandlerDef` is classified **assertive** (it
+reports state — the PASSIVE checkpoint probe's backfill I/O changes no logical state), and it
+is present in the enforced `KG_SUBSTRATE_VERBS` list in
 `crates/kkernel/tests/verb_namespace_contract.rs`.
 
 The taxonomy and the extension criterion this ADR records are unchanged.

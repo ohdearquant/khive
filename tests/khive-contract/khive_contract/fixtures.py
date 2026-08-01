@@ -83,7 +83,7 @@ ANNOTATES_SOURCE_MUST_BE_NOTE = True
 
 # ---------------------------------------------------------------------------
 # Product verb manifest (ADR-023 / ADR-025 / ADR-027)
-# KG pack ships 19 verbs; bare names (no pack prefix).
+# KG pack ships 20 verbs; bare names (no pack prefix).
 # Source of truth: crates/khive-pack-kg/src/handler_defs.rs KG_HANDLERS
 # ---------------------------------------------------------------------------
 
@@ -108,6 +108,7 @@ KG_VERBS: frozenset[str] = frozenset(
         "context",
         "resolve",
         "whoami",
+        "db_diagnostics",
     }
 )
 

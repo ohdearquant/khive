@@ -7,8 +7,8 @@ parameter contract, so an agent can call khive correctly without reading Rust so
 
 The live registry is authoritative: run `request(ops="verbs()")` against your server to
 discover its loaded pack set and total. The static sections below are audited against pack
-`HandlerDef`/`ParamDef` declarations; the kg catalog was refreshed against the 19-entry
-`KG_HANDLERS` table and its integration contract when `whoami` shipped.
+`HandlerDef`/`ParamDef` declarations; the kg catalog was refreshed against the 20-entry
+`KG_HANDLERS` table and its integration contract when `db_diagnostics` shipped.
 
 An always-machine-readable copy of this page is at
 [`/md/api-reference.md`](md/api-reference.md). The site also publishes
@@ -157,7 +157,7 @@ parallel batches, since parallel failures do not cascade.
 
 ---
 
-## `kg` pack — 19 verbs
+## `kg` pack — 20 verbs
 
 Base substrate verbs, bare names (no `kg.` prefix). Category is the illocutionary act
 (Searle 1976): Assertive = retrieves state, Commissive = commits a persistent change,
@@ -641,6 +641,23 @@ It takes no parameters and returns only identity labels, never tokens or credent
 
 ```
 request(ops="whoami()")
+```
+
+### `db_diagnostics` — Assertive
+
+Report WAL/checkpoint diagnostics for the main database: build identity, the checkpoint
+counters, a single PASSIVE checkpoint probe, the `-wal` sidecar file size, and a WAL-pin
+holder census. Takes no parameters.
+
+The PASSIVE probe may backfill WAL frames into the database — that is normal checkpoint
+I/O and is what the reported `checkpointed_frames` counts. It never changes logical
+state, never escalates to TRUNCATE, never creates a missing database file, and never
+deletes WAL-pin sidecar evidence. Sections that cannot be collected (in-memory backend,
+missing file, unsupported platform) carry explicit `unavailable_reason` strings rather
+than being silently omitted.
+
+```
+request(ops="db_diagnostics()")
 ```
 
 ### `verbs` — Assertive

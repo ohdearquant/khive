@@ -325,10 +325,13 @@ impl KhiveRuntime {
         self.backend.ann_root()
     }
 
-    /// Read-only-by-intent WAL/checkpoint diagnostics (ADR-091 operator
-    /// surface): build identity, checkpoint counters, a PASSIVE checkpoint
-    /// probe, WAL file size, and WAL-pin census. See
-    /// `khive_db::diagnostics` for the safety properties this preserves.
+    /// WAL/checkpoint diagnostics (ADR-091 operator surface): build identity,
+    /// checkpoint counters, a PASSIVE checkpoint probe, WAL file size, and
+    /// WAL-pin census. Not write-free: the PASSIVE probe may backfill WAL
+    /// frames into the database (normal checkpoint I/O). It never changes
+    /// logical state, escalates to TRUNCATE, creates a missing database file,
+    /// or deletes sidecar evidence — see `khive_db::diagnostics` for the
+    /// narrowings that make those claims hold.
     ///
     /// Always targets the *main* backend via [`Self::core`], regardless of
     /// which backend this runtime handle is bound to, so a report never

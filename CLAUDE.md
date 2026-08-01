@@ -214,7 +214,7 @@ Mixing a granular `kind` with a contradicting `entity_kind`/`note_kind` sub-filt
 | `verbs`     | `category?`, `pack?`                                                                         | List all MCP-callable verbs registered on this server                                            |
 | `context`   | `query?`, `entity_ids?`, `hops?`, `budget?`, `relations?`, `direction?`, `limit?`, `fanout?` | Entity-anchored graph context in one call (ADR-089)                                              |
 | `whoami`    | —                                                                                            | Report the caller's already-resolved identity and namespace scope; never returns credentials     |
-| `db_diagnostics` | —                                                                                       | Read-only-by-intent WAL/checkpoint diagnostics: build identity, checkpoint counters, PASSIVE checkpoint probe, WAL file size, WAL-pin census |
+| `db_diagnostics` | —                                                                                       | WAL/checkpoint diagnostics: build identity, checkpoint counters, PASSIVE checkpoint probe, WAL file size, WAL-pin census. The probe may backfill WAL frames (normal checkpoint I/O); it never changes logical state, escalates to TRUNCATE, or deletes sidecar evidence |
 
 ### GTD pack verbs (5 — ADR-019, optional)
 
