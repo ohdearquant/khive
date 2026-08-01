@@ -21,6 +21,17 @@ pub enum AliasError {
     /// An alias with this name already exists.
     AliasAlreadyExists(String),
 
+    /// A migration lost ownership because its alias no longer targets the
+    /// collection captured before the replacement build began.
+    AliasTargetChanged {
+        /// Alias whose migration lost the compare-and-switch race.
+        alias: String,
+        /// Collection captured when the migration began.
+        expected: String,
+        /// Collection targeted when the migration attempted to publish.
+        actual: String,
+    },
+
     /// The pre-swap validation failed.
     ValidationFailed {
         /// Human-readable reason.
@@ -57,6 +68,14 @@ impl fmt::Display for AliasError {
                 write!(f, "collection is still referenced by an alias: {name}")
             }
             Self::AliasAlreadyExists(name) => write!(f, "alias already exists: {name}"),
+            Self::AliasTargetChanged {
+                alias,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "alias target changed during migration: {alias} expected {expected}, found {actual}"
+            ),
             Self::ValidationFailed {
                 reason,
                 recall,
