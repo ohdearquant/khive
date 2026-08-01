@@ -3529,6 +3529,148 @@ mod tests {
         }
     }
 
+    // A dry run must predict the same conflict preimages a committing merge
+    // would produce, without deleting or mutating a single row.
+    #[tokio::test]
+    async fn merge_entity_dry_run_conflict_returns_preimages_without_mutating() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let into = rt
+            .create_entity(&tok, "concept", None, "Into", None, None, vec![])
+            .await
+            .unwrap();
+        let from = rt
+            .create_entity(&tok, "concept", None, "From", None, None, vec![])
+            .await
+            .unwrap();
+        let shared = rt
+            .create_entity(&tok, "concept", None, "Shared", None, None, vec![])
+            .await
+            .unwrap();
+        let annotator = rt
+            .create_entity(&tok, "concept", None, "Annotator", None, None, vec![])
+            .await
+            .unwrap();
+
+        let survivor = rt
+            .link(
+                &tok,
+                into.id,
+                shared.id,
+                EdgeRelation::Extends,
+                0.9,
+                Some(serde_json::json!({"source": "survivor"})),
+            )
+            .await
+            .unwrap();
+        let dropped = rt
+            .link(
+                &tok,
+                from.id,
+                shared.id,
+                EdgeRelation::Extends,
+                0.2,
+                Some(serde_json::json!({"source": "dropped"})),
+            )
+            .await
+            .unwrap();
+        let annotation = rt
+            .link(
+                &tok,
+                annotator.id,
+                dropped.id.into(),
+                EdgeRelation::Annotates,
+                0.7,
+                Some(serde_json::json!({"basis": "manual"})),
+            )
+            .await
+            .unwrap();
+        rt.delete_edge(&tok, annotation.id.into(), false)
+            .await
+            .unwrap();
+
+        let summary = rt
+            .merge_entity(
+                &tok,
+                into.id,
+                from.id,
+                EntityDedupMergePolicy::PreferInto,
+                ContentMergeStrategy::Append,
+                true,
+            )
+            .await
+            .unwrap();
+
+        let [conflict] = summary.edge_conflict_preimages.as_slice() else {
+            panic!(
+                "expected one edge-conflict preimage from the dry run, got {:?}",
+                summary.edge_conflict_preimages
+            );
+        };
+        assert_eq!(conflict.surviving_edge_id, Uuid::from(survivor.id));
+        assert_eq!(conflict.dropped_edge.id, Uuid::from(dropped.id));
+        assert_eq!(conflict.dropped_edge.source_id, from.id);
+        assert_eq!(conflict.dropped_edge.target_id, shared.id);
+        assert_eq!(conflict.dropped_edge.weight, 0.2);
+        assert_eq!(conflict.incident_edge_preimages.len(), 1);
+        assert_eq!(
+            conflict.incident_edge_preimages[0].id,
+            Uuid::from(annotation.id)
+        );
+        assert!(
+            conflict.incident_edge_preimages[0].deleted_at.is_some(),
+            "dry-run preimage must retain the annotation's tombstone state"
+        );
+
+        let live_dropped = rt
+            .get_edge_including_deleted(&tok, dropped.id.into())
+            .await
+            .unwrap()
+            .expect("dry run must not delete the dropped edge");
+        assert!(live_dropped.deleted_at.is_none());
+        let live_annotation = rt
+            .get_edge_including_deleted(&tok, annotation.id.into())
+            .await
+            .unwrap()
+            .expect("dry run must not delete the cascaded annotation");
+        assert!(live_annotation.deleted_at.is_some());
+        let live_survivor = rt
+            .get_edge_including_deleted(&tok, survivor.id.into())
+            .await
+            .unwrap()
+            .expect("survivor edge must remain");
+        assert!((live_survivor.weight - 0.9).abs() < f64::EPSILON);
+
+        let into_entity = rt
+            .get_entity(&tok, into.id)
+            .await
+            .expect("into entity must remain unmerged after a dry run");
+        assert!(into_entity.merged_into.is_none());
+        rt.get_entity(&tok, from.id)
+            .await
+            .expect("from entity must not be merged away by a dry run");
+
+        let events = rt
+            .events(&tok)
+            .unwrap()
+            .query_events(
+                khive_storage::EventFilter {
+                    kinds: vec![EventKind::EntityMerged],
+                    ..Default::default()
+                },
+                khive_storage::types::PageRequest {
+                    offset: 0,
+                    limit: 10,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            events.items.is_empty(),
+            "a dry run must not record a merge audit event"
+        );
+    }
+
     // A soft-deleted surviving edge must not be resurrected by a conflicting
     // rewire — the from-edge is dropped and the tombstone stays.
     #[tokio::test]
@@ -5026,6 +5168,159 @@ mod tests {
         assert_eq!(
             events.items[0].payload["edge_conflict_preimages"],
             serde_json::to_value(&summary.edge_conflict_preimages).unwrap()
+        );
+    }
+
+    // A dry run must predict the same conflict preimages a committing note
+    // merge would produce, without deleting or mutating a single row.
+    #[tokio::test]
+    async fn merge_note_dry_run_conflict_returns_preimages_without_mutating() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let into = rt
+            .create_note(&tok, "observation", None, "Into", None, None, vec![])
+            .await
+            .unwrap();
+        let from = rt
+            .create_note(&tok, "observation", None, "From", None, None, vec![])
+            .await
+            .unwrap();
+        let annotator = rt
+            .create_note(
+                &tok,
+                "observation",
+                None,
+                "edge annotation",
+                None,
+                None,
+                vec![],
+            )
+            .await
+            .unwrap();
+        let shared = rt
+            .create_entity(&tok, "concept", None, "Shared", None, None, vec![])
+            .await
+            .unwrap();
+
+        let survivor = rt
+            .link(
+                &tok,
+                into.id,
+                shared.id,
+                EdgeRelation::Annotates,
+                1.0,
+                Some(serde_json::json!({"source": "survivor"})),
+            )
+            .await
+            .unwrap();
+        let dropped = rt
+            .link(
+                &tok,
+                from.id,
+                shared.id,
+                EdgeRelation::Annotates,
+                0.4,
+                Some(serde_json::json!({"source": "dropped"})),
+            )
+            .await
+            .unwrap();
+        let annotation = rt
+            .link(
+                &tok,
+                annotator.id,
+                dropped.id.into(),
+                EdgeRelation::Annotates,
+                0.8,
+                Some(serde_json::json!({"why": "duplicate claim"})),
+            )
+            .await
+            .unwrap();
+        rt.delete_edge(&tok, annotation.id.into(), false)
+            .await
+            .unwrap();
+
+        let summary = rt
+            .merge_note(
+                &tok,
+                into.id,
+                from.id,
+                EntityDedupMergePolicy::PreferInto,
+                ContentMergeStrategy::Append,
+                true,
+            )
+            .await
+            .unwrap();
+
+        let [conflict] = summary.edge_conflict_preimages.as_slice() else {
+            panic!(
+                "expected one note-merge edge conflict from the dry run, got {:?}",
+                summary.edge_conflict_preimages
+            );
+        };
+        assert_eq!(conflict.surviving_edge_id, Uuid::from(survivor.id));
+        assert_eq!(conflict.dropped_edge.id, Uuid::from(dropped.id));
+        assert_eq!(conflict.dropped_edge.source_id, from.id);
+        assert_eq!(conflict.dropped_edge.weight, 0.4);
+        assert_eq!(conflict.incident_edge_preimages.len(), 1);
+        assert_eq!(
+            conflict.incident_edge_preimages[0].id,
+            Uuid::from(annotation.id)
+        );
+        assert!(
+            conflict.incident_edge_preimages[0].deleted_at.is_some(),
+            "dry-run preimage must retain the annotation's tombstone state"
+        );
+
+        let live_dropped = rt
+            .get_edge_including_deleted(&tok, dropped.id.into())
+            .await
+            .unwrap()
+            .expect("dry run must not delete the dropped edge");
+        assert!(live_dropped.deleted_at.is_none());
+        let live_annotation = rt
+            .get_edge_including_deleted(&tok, annotation.id.into())
+            .await
+            .unwrap()
+            .expect("dry run must not delete the cascaded annotation");
+        assert!(live_annotation.deleted_at.is_some());
+        let live_survivor = rt
+            .get_edge_including_deleted(&tok, survivor.id.into())
+            .await
+            .unwrap()
+            .expect("survivor edge must remain");
+        assert!((live_survivor.weight - 1.0).abs() < f64::EPSILON);
+
+        let into_note = rt
+            .get_note_including_deleted(&tok, into.id)
+            .await
+            .unwrap()
+            .expect("into note must remain unmerged after a dry run");
+        assert!(into_note.deleted_at.is_none());
+        let from_note = rt
+            .get_note_including_deleted(&tok, from.id)
+            .await
+            .unwrap()
+            .expect("from note must not be deleted by a dry run");
+        assert!(from_note.deleted_at.is_none());
+
+        let events = rt
+            .events(&tok)
+            .unwrap()
+            .query_events(
+                khive_storage::EventFilter {
+                    kinds: vec![EventKind::NoteMerged],
+                    ..Default::default()
+                },
+                khive_storage::types::PageRequest {
+                    offset: 0,
+                    limit: 10,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            events.items.is_empty(),
+            "a dry run must not record a merge audit event"
         );
     }
 
