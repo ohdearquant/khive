@@ -756,7 +756,8 @@ fn v13_upgrade_backfills_all_substrate_ledgers_in_legacy_order() {
         .unwrap();
     }
 
-    assert_eq!(run_migrations(&mut conn).unwrap(), 14);
+    let latest = MIGRATIONS.last().expect("at least one migration").version;
+    assert_eq!(run_migrations(&mut conn).unwrap(), latest);
 
     fn ordered_ids(conn: &Connection, table: &str, id_column: &str) -> Vec<String> {
         let sql = format!("SELECT {id_column} FROM {table} ORDER BY seq ASC");
