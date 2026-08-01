@@ -2,9 +2,8 @@
 // the complete Vamana ANN lifecycle for knowledge search: SharedAnn type, AnnKey, snapshot
 // persistence (warm_known_snapshots / ensure_ann_background), index build (build_ann),
 // search (search_loaded), and all associated SQL queries and serialization logic. These
-// responsibilities are tightly coupled through the shared AnnState and cannot be split
-// without breaking the atomic lock protocol. Refactoring is deferred until
-// a stable snapshot format and the warm-start contract are defined.
+// responsibilities are tightly coupled through the shared AnnState and its generation-fenced
+// warm/install protocol; splitting them would obscure the lock ordering and ownership contract.
 
 //! Vamana ANN bridge — parallel semantic signal for `knowledge.search`.
 //!
@@ -16,7 +15,8 @@
 //! crates/khive-pack-knowledge/docs/api/vamana.md for the persistence
 //! fallback chain and the file-size/module-coupling rationale.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use khive_runtime::{KhiveRuntime, Namespace, NamespaceToken, RuntimeError};
@@ -54,13 +54,66 @@ impl AnnKey {
     }
 }
 
-/// Shared ANN state: per-{namespace, model} indexes plus a single-flight guard
-/// so at most one background warm runs per key at a time.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AnnWarmFailure {
+    EmptyCorpus,
+    Operational,
+    Interrupted,
+}
+
+/// Result of one load/rebuild worker. Kept separate from `AnnWarmState` so a
+/// failed replacement can remain retryable even when ADR-079 rule 8 left a
+/// stale-but-servable bridge installed during the attempt.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum AnnWarmOutcome {
+    Ready,
+    Empty,
+    Failed,
+}
+
+/// Lifecycle for one per-{namespace, model} warm slot.
+///
+/// `Failed` is deliberately retryable: an empty corpus may become populated,
+/// and an operational load failure says nothing about the next attempt. A
+/// namespace invalidation removes every matching state, returning those keys
+/// to the implicit `Absent` state.
+#[derive(Debug)]
+enum AnnWarmState {
+    Warming {
+        attempt_id: u64,
+        generation: u64,
+        started_at: std::time::Instant,
+    },
+    Ready {
+        generation: u64,
+    },
+    Failed {
+        generation: u64,
+        error: AnnWarmFailure,
+    },
+}
+
+/// Ownership token for one warm attempt. Only the matching attempt may
+/// transition its slot out of `Warming`, so a late completion cannot erase or
+/// complete a newer post-invalidation warm.
+struct AnnWarmPermit {
+    ann: SharedAnn,
+    key: AnnKey,
+    attempt_id: u64,
+    generation: u64,
+    finished: bool,
+}
+
+/// Shared ANN state: per-{namespace, model} indexes plus a warm lifecycle that
+/// permits at most one load/rebuild attempt per key at a time.
 pub(crate) struct AnnState {
     indexes: RwLock<HashMap<AnnKey, AnnBridge>>,
-    /// Keys currently being warmed (or already warmed). `std::sync::Mutex`
-    /// so the fire-and-check guard in `ensure_ann_background` stays sync.
-    warming: std::sync::Mutex<HashSet<AnnKey>>,
+    /// Per-key warm lifecycle. `std::sync::Mutex` keeps `begin_warm` usable by
+    /// the fire-and-return query path before it spawns an async task.
+    warm_states: std::sync::Mutex<HashMap<AnnKey, AnnWarmState>>,
+    /// Monotonic ownership token for warm attempts. Generation alone cannot
+    /// distinguish a failed retry from its predecessor at the same generation.
+    next_warm_attempt_id: AtomicU64,
     /// Per-namespace write-generation counter (issue #770), keyed by
     /// namespace (not the full `AnnKey`). Bumped by `clear_namespace`;
     /// `install_if_fresher` uses it to reject stale builds. See
@@ -72,7 +125,7 @@ pub(crate) struct AnnState {
     /// a rebuild error is operational (store open, SQL reader, corpus
     /// query) and says nothing about the corpus, so error paths keep the
     /// bounded-wait retry behavior instead of a marker. A marker is
-    /// terminal — `wait_for_ann` returns immediately rather than polling out
+    /// terminal — `wait_ready` returns immediately rather than polling out
     /// `ANN_WARM_WAIT_TIMEOUT_MS` — exactly when its stored generation is
     /// still >= the namespace's CURRENT generation: nothing can have changed
     /// the outcome since the scan that produced it. A marker whose stored
@@ -88,7 +141,8 @@ pub(crate) type SharedAnn = Arc<AnnState>;
 pub(crate) fn new_shared() -> SharedAnn {
     Arc::new(AnnState {
         indexes: RwLock::new(HashMap::new()),
-        warming: std::sync::Mutex::new(HashSet::new()),
+        warm_states: std::sync::Mutex::new(HashMap::new()),
+        next_warm_attempt_id: AtomicU64::new(1),
         generations: std::sync::Mutex::new(HashMap::new()),
         unavailable: std::sync::Mutex::new(HashMap::new()),
     })
@@ -186,12 +240,144 @@ pub(crate) async fn install_replacing(ann: &SharedAnn, key: &AnnKey, candidate: 
     unavailable_guard(&ann.unavailable).remove(key);
 }
 
-// Recover a poisoned warming Mutex rather than aborting: the guarded HashSet<AnnKey>
-// stays logically valid through a poison (spurious presence/absence is tolerable).
-fn warming_guard(
-    m: &std::sync::Mutex<HashSet<AnnKey>>,
-) -> std::sync::MutexGuard<'_, HashSet<AnnKey>> {
+// Recover a poisoned warm-state Mutex rather than aborting: each transition is
+// one HashMap replacement, so the previous or next complete state remains safe
+// to inspect after a poison.
+fn warm_states_guard(
+    m: &std::sync::Mutex<HashMap<AnnKey, AnnWarmState>>,
+) -> std::sync::MutexGuard<'_, HashMap<AnnKey, AnnWarmState>> {
     m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Claim the single warm slot for `key`.
+///
+/// `Warming` and `Ready` at the current namespace generation suppress a
+/// duplicate attempt. `Failed`, `Absent`, and stale-generation states all
+/// transition to a newly owned `Warming` attempt so empty/operational failures
+/// remain retryable after the current request degrades.
+fn begin_warm(ann: &SharedAnn, key: AnnKey) -> Option<AnnWarmPermit> {
+    let mut states = warm_states_guard(&ann.warm_states);
+    let generation = current_generation(ann, &key.namespace);
+
+    match states.get(&key) {
+        Some(
+            AnnWarmState::Warming {
+                generation: state_generation,
+                ..
+            }
+            | AnnWarmState::Ready {
+                generation: state_generation,
+            },
+        ) if *state_generation >= generation => return None,
+        Some(AnnWarmState::Failed {
+            generation: failed_generation,
+            error,
+        }) => {
+            tracing::debug!(
+                key = ?key,
+                failed_generation,
+                error = ?error,
+                "retrying failed knowledge ANN warm"
+            );
+        }
+        _ => {}
+    }
+
+    let attempt_id = ann.next_warm_attempt_id.fetch_add(1, Ordering::Relaxed);
+    states.insert(
+        key.clone(),
+        AnnWarmState::Warming {
+            attempt_id,
+            generation,
+            started_at: std::time::Instant::now(),
+        },
+    );
+    Some(AnnWarmPermit {
+        ann: ann.clone(),
+        key,
+        attempt_id,
+        generation,
+        finished: false,
+    })
+}
+
+/// Apply the terminal transition only when `permit` still owns the slot.
+/// Namespace invalidation or a newer retry makes an older completion a no-op.
+fn finish_warm_state(permit: &mut AnnWarmPermit, next: AnnWarmState) {
+    let mut states = warm_states_guard(&permit.ann.warm_states);
+    let started_at = match states.get(&permit.key) {
+        Some(AnnWarmState::Warming {
+            attempt_id,
+            generation,
+            started_at,
+        }) if *attempt_id == permit.attempt_id && *generation == permit.generation => *started_at,
+        _ => {
+            permit.finished = true;
+            return;
+        }
+    };
+
+    tracing::debug!(
+        key = ?permit.key,
+        attempt_id = permit.attempt_id,
+        elapsed_ms = started_at.elapsed().as_millis(),
+        state = ?next,
+        "knowledge ANN warm finished"
+    );
+    states.insert(permit.key.clone(), next);
+    permit.finished = true;
+}
+
+/// Finish a normally-returning warm from the worker's explicit outcome. A
+/// `Ready` outcome is still verified against the attempt's generation before
+/// publication into the lifecycle state.
+async fn finish_warm(mut permit: AnnWarmPermit, outcome: AnnWarmOutcome) {
+    let next = match outcome {
+        AnnWarmOutcome::Ready => match permit
+            .ann
+            .indexes
+            .read()
+            .await
+            .get(&permit.key)
+            .map(|bridge| bridge.generation)
+            .filter(|generation| *generation >= permit.generation)
+        {
+            Some(generation) => AnnWarmState::Ready { generation },
+            None => AnnWarmState::Failed {
+                generation: permit.generation,
+                error: AnnWarmFailure::Operational,
+            },
+        },
+        AnnWarmOutcome::Empty => AnnWarmState::Failed {
+            generation: permit.generation,
+            error: AnnWarmFailure::EmptyCorpus,
+        },
+        AnnWarmOutcome::Failed => AnnWarmState::Failed {
+            generation: permit.generation,
+            error: AnnWarmFailure::Operational,
+        },
+    };
+    finish_warm_state(&mut permit, next);
+}
+
+impl Drop for AnnWarmPermit {
+    fn drop(&mut self) {
+        if !self.finished {
+            let next = AnnWarmState::Failed {
+                generation: self.generation,
+                error: AnnWarmFailure::Interrupted,
+            };
+            finish_warm_state(self, next);
+        }
+    }
+}
+
+#[cfg(test)]
+impl AnnWarmPermit {
+    /// Leave the state in `Warming` for deterministic cold-start tests.
+    fn leave_in_flight_for_test(mut self) {
+        self.finished = true;
+    }
 }
 
 // Recover a poisoned unavailable Mutex rather than aborting: the guarded
@@ -207,7 +393,7 @@ fn unavailable_guard(
 /// Record that `key`'s corpus scan at `generation` completed and found an
 /// empty corpus. Callers must not pass error outcomes here — see the
 /// `unavailable` field doc on `AnnState` for the generation-fencing
-/// invariant `wait_for_ann` relies on and why errors never mark.
+/// invariant `wait_ready` relies on and why errors never mark.
 fn mark_unavailable(ann: &SharedAnn, key: &AnnKey, generation: u64) {
     unavailable_guard(&ann.unavailable).insert(key.clone(), generation);
 }
@@ -249,22 +435,20 @@ pub(crate) async fn insert_ann_if_absent(ann: &SharedAnn, key: AnnKey, bridge: A
     }
 }
 
-/// Remove all in-memory ANN slots and warming-guard entries for `namespace`.
+/// Remove all in-memory ANN slots and warm states for `namespace`.
 ///
 /// Called after any corpus mutation so the next search triggers a fresh load.
 pub(crate) async fn clear_namespace(ann: &SharedAnn, namespace: &str) {
-    {
-        // Evict and bump the generation counter inside the SAME write-lock
-        // scope (PR #815). `install_if_fresher` takes this same
-        // lock before reading the namespace's current generation, so there
-        // is no window between "slot emptied" and "generation bumped" where
-        // a concurrent install could read a stale (pre-bump) generation and
-        // self-approve into the just-emptied slot.
-        let mut idxs = ann.indexes.write().await;
-        idxs.retain(|k, _| k.namespace != namespace);
-        bump_generation(ann, namespace);
-    }
-    warming_guard(&ann.warming).retain(|k| k.namespace != namespace);
+    // Evict, retire warm ownership, and bump the generation counter while
+    // holding both state locks. `begin_warm` serializes on `warm_states`, and
+    // `install_if_fresher` serializes on `indexes`, so a post-invalidation
+    // attempt cannot be accidentally removed and a pre-invalidation build
+    // cannot self-approve into the emptied slot.
+    let mut idxs = ann.indexes.write().await;
+    let mut states = warm_states_guard(&ann.warm_states);
+    idxs.retain(|k, _| k.namespace != namespace);
+    states.retain(|k, _| k.namespace != namespace);
+    bump_generation(ann, namespace);
 }
 
 /// Search the already-loaded index for `key`. Returns `None` on cache miss.
@@ -278,13 +462,23 @@ pub(crate) async fn search_loaded(
     guard.get(key).map(|bridge| bridge.search(query, k))
 }
 
-/// Returns `true` when `key` is registered in the warming set but its index has
-/// not yet been inserted — i.e. a background load is in flight right now.
+/// Returns `true` when `key` has a current-generation `Warming` owner but its
+/// index has not yet been inserted — i.e. a load is in flight right now.
 ///
 /// `false` means either (a) the index is already loaded, or (b) no warm has
 /// been triggered for this key at all (e.g. the corpus is empty).
 pub(crate) fn is_warming_not_loaded(ann: &SharedAnn, key: &AnnKey) -> bool {
-    let in_warming = warming_guard(&ann.warming).contains(key);
+    let in_warming = {
+        let states = warm_states_guard(&ann.warm_states);
+        let generation = current_generation(ann, &key.namespace);
+        matches!(
+            states.get(key),
+            Some(AnnWarmState::Warming {
+                generation: state_generation,
+                ..
+            }) if *state_generation >= generation
+        )
+    };
     if !in_warming {
         return false;
     }
@@ -304,7 +498,7 @@ pub(crate) fn is_warming_not_loaded(ann: &SharedAnn, key: &AnnKey) -> bool {
 /// out the full timeout on every query wastes `timeout_ms` for nothing).
 ///
 /// Returns `true` if the index became available within the timeout.
-pub(crate) async fn wait_for_ann(
+pub(crate) async fn wait_ready(
     ann: &SharedAnn,
     key: &AnnKey,
     timeout_ms: u64,
@@ -1303,6 +1497,37 @@ pub(crate) async fn invalidate_snapshot(rt: &KhiveRuntime, namespace: &str) {
     }
 }
 
+/// Run one already-owned warm attempt to completion.
+async fn run_warm_attempt(
+    rt: &KhiveRuntime,
+    token: &NamespaceToken,
+    ann: &SharedAnn,
+    model: &str,
+    permit: AnnWarmPermit,
+) {
+    let outcome = ensure_ann_for_model(rt, token, ann, model).await;
+    finish_warm(permit, outcome).await;
+}
+
+/// Await one single-flight warm for the explicit model. Used by both v1 and
+/// v2 startup discovery so they share the same lifecycle while retaining the
+/// preload path's existing await-before-next-key timing.
+async fn warm_ann_for_model_once(
+    rt: &KhiveRuntime,
+    token: &NamespaceToken,
+    ann: &SharedAnn,
+    model: &str,
+) {
+    if model.is_empty() {
+        return;
+    }
+    let key = AnnKey::new(token.namespace().as_str(), model);
+    let Some(permit) = begin_warm(ann, key) else {
+        return;
+    };
+    run_warm_attempt(rt, token, ann, model, permit).await;
+}
+
 /// Pre-load Vamana snapshots for all `{ns}::vamana::{model}` keys found in
 /// `retrieval_snapshots`.  Called from `KnowledgePack::warm()` before the first
 /// search request so in-memory indexes are ready without a first-query spike.
@@ -1349,19 +1574,7 @@ pub(crate) async fn warm_known_snapshots(rt: &KhiveRuntime, ann: &SharedAnn) {
             Ok(t) => t,
             Err(_) => continue,
         };
-        let key = AnnKey::new(ns_str, model);
-        {
-            let mut warming = warming_guard(&ann.warming);
-            if warming.contains(&key) {
-                continue; // another path is already warming this key
-            }
-            warming.insert(key.clone());
-        }
-        ensure_ann_for_model(rt, &token, ann, model).await;
-        let loaded = ann.indexes.read().await.contains_key(&key);
-        if !loaded {
-            warming_guard(&ann.warming).remove(&key);
-        }
+        warm_ann_for_model_once(rt, &token, ann, model).await;
     }
 
     // Enumerate v2 segment directories under this database's own ANN root and
@@ -1388,19 +1601,13 @@ pub(crate) async fn warm_known_snapshots(rt: &KhiveRuntime, ann: &SharedAnn) {
             Ok(t) => t,
             Err(_) => continue,
         };
-        // Guard: skip if already loaded by the v1 pass.
-        let key = AnnKey::new(&ns_str, &model);
-        if ann.indexes.read().await.contains_key(&key) {
-            continue;
-        }
-        ensure_ann_for_model(rt, &token, ann, &model).await;
+        warm_ann_for_model_once(rt, &token, ann, &model).await;
     }
 }
 
-/// Fire-once per-key background warm. Returns immediately. If the key is already
-/// loaded or warming is in flight for it, does nothing. On a completed attempt
-/// that produced no index (e.g. no corpus yet), removes the key from the warming
-/// guard so a later search can retry.
+/// Spawn one per-key background warm and return immediately. Current-generation
+/// `Warming`/`Ready` states suppress duplicates; `Failed` remains retryable by
+/// the next search.
 pub(crate) fn ensure_ann_background(rt: &KhiveRuntime, token: &NamespaceToken, ann: &SharedAnn) {
     let model = rt.default_embedder_name().to_string();
     if model.is_empty() {
@@ -1408,27 +1615,17 @@ pub(crate) fn ensure_ann_background(rt: &KhiveRuntime, token: &NamespaceToken, a
     }
     let ns = token.namespace().as_str().to_owned();
     let key = AnnKey::new(&ns, &model);
-
-    {
-        let mut warming = warming_guard(&ann.warming);
-        if warming.contains(&key) {
-            return; // already warming or warmed
-        }
-        warming.insert(key.clone());
-    }
+    let Some(permit) = begin_warm(ann, key) else {
+        return;
+    };
 
     let rt = rt.clone();
     let ann = ann.clone();
-    let token_ns = token.namespace().clone();
+    // Preserve the request-minted actor/visibility context (ADR-096). Reauthorizing
+    // from the namespace here would silently replace it with runtime defaults.
+    let token = token.clone();
     tokio::spawn(async move {
-        if let Ok(token) = rt.authorize(token_ns) {
-            ensure_ann_for_model(&rt, &token, &ann, &model).await;
-        }
-        // If loading failed, remove from warming so a later search can retry.
-        let loaded = ann.indexes.read().await.contains_key(&key);
-        if !loaded {
-            warming_guard(&ann.warming).remove(&key);
-        }
+        run_warm_attempt(&rt, &token, &ann, &model, permit).await;
     });
 }
 
@@ -1609,15 +1806,16 @@ async fn classify_and_adopt_segment(
 /// legacy v1 JSON snapshot, (4) full corpus rebuild, atomically persisted
 /// as v2 for next restart. See
 /// crates/khive-pack-knowledge/docs/api/vamana.md#ensure_ann_for_model-load-order
-/// for the per-step detail.
+/// for the per-step detail. The explicit outcome lets the lifecycle retain a
+/// served stale fallback while keeping a failed replacement retryable.
 pub(crate) async fn ensure_ann_for_model(
     rt: &KhiveRuntime,
     token: &NamespaceToken,
     ann: &SharedAnn,
     model: &str,
-) {
+) -> AnnWarmOutcome {
     if model.is_empty() {
-        return;
+        return AnnWarmOutcome::Empty;
     }
     let ns = token.namespace().as_str().to_owned();
     let key = AnnKey::new(&ns, model);
@@ -1642,7 +1840,7 @@ pub(crate) async fn ensure_ann_for_model(
         .map(|bridge| bridge.generation)
     {
         if loaded_generation >= target_generation {
-            return;
+            return AnnWarmOutcome::Ready;
         }
         tracing::debug!(
             namespace = %ns,
@@ -1660,10 +1858,10 @@ pub(crate) async fn ensure_ann_for_model(
         match classify_and_adopt_segment(rt, ann, &key, &ns, model, &seg_dir, target_generation)
             .await
         {
-            SegmentOutcome::Installed => return,
+            SegmentOutcome::Installed => return AnnWarmOutcome::Ready,
             SegmentOutcome::Empty => {
                 mark_unavailable(ann, &key, target_generation);
-                return;
+                return AnnWarmOutcome::Empty;
             }
             SegmentOutcome::Cold => {} // fall through to v1 / rebuild
         }
@@ -1678,7 +1876,7 @@ pub(crate) async fn ensure_ann_for_model(
                     Ok(bridge) => {
                         install_if_fresher(ann, &key, bridge.with_generation(target_generation))
                             .await;
-                        return;
+                        return AnnWarmOutcome::Ready;
                     }
                     Err(e) => {
                         tracing::warn!(error = %e, "corrupt Vamana v1 snapshot; rebuilding");
@@ -1700,31 +1898,35 @@ pub(crate) async fn ensure_ann_for_model(
         Ok(Some(bridge)) => {
             checkpoint_raise_compact_readopt(rt, ann, &key, &ns, model, bridge, target_generation)
                 .await;
+            AnnWarmOutcome::Ready
         }
         Ok(None) => {
             // Empty corpus: this scan (at target_generation) proves nothing is
-            // buildable right now. Mark it so wait_for_ann can short-circuit
+            // buildable right now. Mark it so wait_ready can short-circuit
             // instead of polling out the full warm-wait timeout (issue #1026).
             mark_unavailable(ann, &key, target_generation);
+            AnnWarmOutcome::Empty
         }
         Err(e) => {
             // Operational failure (store open, SQL reader, corpus query) —
             // not proof the corpus is unbuildable. Do NOT mark unavailable:
-            // the warming key is removed by the caller so the next request
-            // retries at the same generation, and a marker here would make
-            // wait_for_ann short-circuit false while that retry is in
-            // flight.
+            // the caller transitions the warm state to retryable `Failed`, and
+            // a marker here would make wait_ready short-circuit false while
+            // that retry is in flight.
             tracing::warn!(error = %e, "failed to rebuild Vamana ANN index");
+            AnnWarmOutcome::Failed
         }
     }
 }
 
-/// Simulate an in-flight warm by inserting `key` into the warming set without
-/// populating the index.  Call this in tests to construct the "warming but not
-/// yet loaded" state that triggers the cold-start guard in `suggest`/`search`.
+/// Simulate an in-flight warm without populating the index. Call this in tests
+/// to construct the state that triggers the cold-start guard in
+/// `suggest`/`search`.
 #[cfg(test)]
 pub(crate) fn simulate_warming_in_flight(ann: &SharedAnn, key: AnnKey) {
-    warming_guard(&ann.warming).insert(key);
+    begin_warm(ann, key)
+        .expect("fresh test ANN state must accept a warm")
+        .leave_in_flight_for_test();
 }
 
 #[cfg(test)]
@@ -2247,26 +2449,26 @@ mod tests {
         );
     }
 
-    // ── wait_for_ann ──────────────────────────────────────────────────────────
+    // ── wait_ready ────────────────────────────────────────────────────────────
 
     #[tokio::test]
-    async fn wait_for_ann_returns_true_immediately_when_already_loaded() {
+    async fn wait_ready_returns_true_immediately_when_already_loaded() {
         let ann = new_shared();
         let key = AnnKey::new("local", "test-model");
         let bridge =
             AnnBridge::build(vec![1.0f32, 0.0, 0.0, 0.0], 4, vec![Uuid::new_v4()]).expect("build");
         insert_ann_if_absent(&ann, key.clone(), bridge).await;
         // Already loaded — should return true without sleeping.
-        let ready = wait_for_ann(&ann, &key, 100, 10).await;
+        let ready = wait_ready(&ann, &key, 100, 10).await;
         assert!(ready, "must return true when index is already in the map");
     }
 
     #[tokio::test]
-    async fn wait_for_ann_returns_false_on_timeout_when_never_loaded() {
+    async fn wait_ready_returns_false_on_timeout_when_never_loaded() {
         let ann = new_shared();
         let key = AnnKey::new("local", "test-model");
         // Nothing inserted — should time out and return false.
-        let ready = wait_for_ann(&ann, &key, 60, 10).await;
+        let ready = wait_ready(&ann, &key, 60, 10).await;
         assert!(
             !ready,
             "must return false when index never appears within timeout"
@@ -2274,7 +2476,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn wait_for_ann_returns_true_when_index_appears_mid_poll() {
+    async fn wait_ready_returns_true_when_index_appears_mid_poll() {
         let ann = new_shared();
         let key = AnnKey::new("local", "test-model");
         let ann2 = ann.clone();
@@ -2287,14 +2489,14 @@ mod tests {
             insert_ann_if_absent(&ann2, key2, bridge).await;
         });
         // Poll with a 500ms timeout; the insert happens at ~40ms so it should succeed.
-        let ready = wait_for_ann(&ann, &key, 500, 10).await;
+        let ready = wait_ready(&ann, &key, 500, 10).await;
         assert!(ready, "must return true when index appears before timeout");
     }
 
     // ── unavailable marker: terminal warm outcome (issue #1026) ──────────────
 
     #[tokio::test]
-    async fn wait_for_ann_returns_false_immediately_when_marked_unavailable() {
+    async fn wait_ready_returns_false_immediately_when_marked_unavailable() {
         let ann = new_shared();
         let key = AnnKey::new("local", "test-model");
         mark_unavailable(&ann, &key, current_generation(&ann, "local"));
@@ -2302,7 +2504,7 @@ mod tests {
         let start = std::time::Instant::now();
         // Timeout is generous (5s, matching production ANN_WARM_WAIT_TIMEOUT_MS)
         // to prove the short-circuit fires rather than the deadline.
-        let ready = wait_for_ann(&ann, &key, 5_000, 50).await;
+        let ready = wait_ready(&ann, &key, 5_000, 50).await;
         let elapsed = start.elapsed();
 
         assert!(
@@ -2316,7 +2518,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn wait_for_ann_resumes_polling_when_unavailable_marker_is_stale() {
+    async fn wait_ready_resumes_polling_when_unavailable_marker_is_stale() {
         let ann = new_shared();
         let key = AnnKey::new("local", "test-model");
 
@@ -2336,7 +2538,7 @@ mod tests {
             install_if_fresher(&ann2, &key2, bridge).await;
         });
 
-        let ready = wait_for_ann(&ann, &key, 500, 10).await;
+        let ready = wait_ready(&ann, &key, 500, 10).await;
         assert!(
             ready,
             "a stale unavailable marker must not block polling; the index installed \
@@ -2388,14 +2590,15 @@ mod tests {
 
     // ── poison recovery ───────────────────────────────────────────────────────
 
-    /// Poison the warming Mutex by panicking while holding the guard, then verify
-    /// that `warming_guard` and callers built on it survive and return sane results.
+    /// Poison the warm-state Mutex by panicking while holding the guard, then
+    /// verify that `warm_states_guard` and callers built on it survive and
+    /// return sane results.
     ///
-    /// This test WOULD panic if `warming_guard` were reverted to `.expect("warming
-    /// lock")`, because a poisoned Mutex causes `lock()` to return `Err`, and
-    /// `.expect()` converts that to a panic.
+    /// This test WOULD panic if `warm_states_guard` were reverted to
+    /// `.expect("warm-state lock")`, because a poisoned Mutex causes `lock()`
+    /// to return `Err`, and `.expect()` converts that to a panic.
     #[test]
-    fn warming_guard_recovers_from_poison() {
+    fn warm_states_guard_recovers_from_poison() {
         let ann = new_shared();
         let key = AnnKey::new("poison-ns", "poison-model");
 
@@ -2403,100 +2606,185 @@ mod tests {
         // while holding the guard.
         let ann2 = ann.clone();
         let join_result = std::thread::spawn(move || {
-            let _guard = ann2.warming.lock().expect("pre-poison lock");
+            let _guard = ann2.warm_states.lock().expect("pre-poison lock");
             panic!("deliberate poison");
         })
         .join();
         assert!(join_result.is_err(), "poison thread must have panicked");
         assert!(
-            ann.warming.is_poisoned(),
+            ann.warm_states.is_poisoned(),
             "mutex must be poisoned before recovery"
         );
 
-        // `warming_guard` must recover the guard without panicking.
-        let guard = warming_guard(&ann.warming);
+        // `warm_states_guard` must recover the guard without panicking.
+        let guard = warm_states_guard(&ann.warm_states);
         assert!(
-            !guard.contains(&key),
-            "recovered guard must report key absent (HashSet is empty after poison)"
+            !guard.contains_key(&key),
+            "recovered guard must report key absent"
         );
         drop(guard);
 
-        // Higher-level callers built on `warming_guard` must also succeed.
+        // Higher-level callers built on `warm_states_guard` must also succeed.
         assert!(
             !is_warming_not_loaded(&ann, &key),
             "is_warming_not_loaded must not panic on poisoned Mutex"
         );
     }
 
-    // ── warm-path-unification (Change D) invariants ───────────────────────────
+    // ── shared warm-state machine (issue #566) ────────────────────────────────
 
     #[tokio::test]
-    async fn warm_path_key_in_warming_set_before_and_after_successful_load() {
-        // Verifies the warm-path-unification protocol introduced for warm_known_snapshots:
-        // (1) key is registered in warming BEFORE the load attempt,
-        // (2) after a successful load, key is in both warming AND indexes,
-        //     so is_warming_not_loaded returns false (warm complete, not in flight).
-        // (3) during (1)→(2), is_warming_not_loaded returns true — a concurrent query
-        //     that arrives mid-warm correctly identifies the in-flight state.
+    async fn warm_state_success_becomes_ready_and_suppresses_duplicates() {
         let ann = new_shared();
         let key = AnnKey::new("local", "warm-unify-model");
 
-        // Step 1: register key in warming (mirrors new warm_known_snapshots pre-warm step).
-        {
-            let mut warming = warming_guard(&ann.warming);
-            warming.insert(key.clone());
-        }
+        let permit = begin_warm(&ann, key.clone()).expect("Absent -> Warming");
         assert!(
             is_warming_not_loaded(&ann, &key),
-            "key in warming but not indexes must report warming in flight"
+            "owned Warming state without an index must report in flight"
+        );
+        assert!(
+            begin_warm(&ann, key.clone()).is_none(),
+            "a current Warming owner must singleflight duplicate callers"
         );
 
-        // Step 2: simulate successful ensure_ann_for_model (bridge inserted into indexes).
         let bridge = AnnBridge::build(vec![1.0f32, 0.0, 0.0, 0.0], 4, vec![Uuid::new_v4()])
             .expect("build bridge for warm-path test");
         insert_ann_if_absent(&ann, key.clone(), bridge).await;
+        finish_warm(permit, AnnWarmOutcome::Ready).await;
 
-        // Step 3: key now in both warming and indexes → warm is complete, not in-flight.
         assert!(
             !is_warming_not_loaded(&ann, &key),
-            "key in both warming and indexes must not report warming in flight"
+            "Ready state must not report warming in flight"
         );
         assert!(
-            ann.indexes.read().await.contains_key(&key),
-            "index must be present after successful build"
+            matches!(
+                warm_states_guard(&ann.warm_states).get(&key),
+                Some(AnnWarmState::Ready { generation: 0 })
+            ),
+            "a published index must finish in Ready"
+        );
+        assert!(
+            begin_warm(&ann, key).is_none(),
+            "Ready at the current generation must suppress redundant loads"
         );
     }
 
     #[tokio::test]
-    async fn warm_path_failed_load_removes_key_from_warming_set() {
-        // Verifies that when warm_known_snapshots fails to load an index (e.g. no corpus
-        // vectors), the key is removed from the warming set, allowing a later search
-        // to trigger a fresh load attempt.
+    async fn warm_state_failed_and_empty_outcomes_remain_retryable() {
         let ann = new_shared();
         let key = AnnKey::new("local", "warm-unify-fail-model");
 
-        // Pre-warm step: insert key into warming (mirrors new warm_known_snapshots code).
-        warming_guard(&ann.warming).insert(key.clone());
+        let failed = begin_warm(&ann, key.clone()).expect("first warm");
+        finish_warm(failed, AnnWarmOutcome::Failed).await;
         assert!(
-            is_warming_not_loaded(&ann, &key),
-            "pre-condition: key must show as warming in flight"
+            matches!(
+                warm_states_guard(&ann.warm_states).get(&key),
+                Some(AnnWarmState::Failed {
+                    error: AnnWarmFailure::Operational,
+                    ..
+                })
+            ),
+            "no index and no empty marker is an operational failure"
         );
 
-        // Load failed — no bridge inserted. Cleanup step removes key from warming.
-        let loaded = ann.indexes.read().await.contains_key(&key);
-        if !loaded {
-            warming_guard(&ann.warming).remove(&key);
-        }
+        let empty_retry = begin_warm(&ann, key.clone()).expect("Failed -> Warming retry");
+        mark_unavailable(&ann, &key, current_generation(&ann, "local"));
+        finish_warm(empty_retry, AnnWarmOutcome::Empty).await;
+        assert!(
+            matches!(
+                warm_states_guard(&ann.warm_states).get(&key),
+                Some(AnnWarmState::Failed {
+                    error: AnnWarmFailure::EmptyCorpus,
+                    ..
+                })
+            ),
+            "current-generation empty scan must retain its distinct failure reason"
+        );
 
-        // After cleanup, key is in neither set → is_warming_not_loaded = false.
-        // A subsequent search can now trigger a fresh load attempt.
         assert!(
             !is_warming_not_loaded(&ann, &key),
-            "after failed-load cleanup, warming must not show in-flight"
+            "Failed must not masquerade as an in-flight warm"
+        );
+        let retry = begin_warm(&ann, key).expect("empty failures must remain retryable");
+        drop(retry);
+    }
+
+    #[tokio::test]
+    async fn failed_replacement_stays_retryable_with_servable_stale_index() {
+        let ann = new_shared();
+        let key = AnnKey::new("local", "warm-stale-retry-model");
+        let permit = begin_warm(&ann, key.clone()).expect("replacement warm");
+
+        // ADR-079 rule 8 serves a stale bridge while its replacement rebuilds.
+        let stale = AnnBridge::build(vec![1.0f32, 0.0, 0.0, 0.0], 4, vec![Uuid::new_v4()])
+            .expect("build stale bridge");
+        insert_ann_if_absent(&ann, key.clone(), stale).await;
+        finish_warm(permit, AnnWarmOutcome::Failed).await;
+
+        assert!(
+            search_loaded(&ann, &key, &[1.0, 0.0, 0.0, 0.0], 1)
+                .await
+                .is_some(),
+            "the stale fallback must remain available to search"
         );
         assert!(
-            !ann.indexes.read().await.contains_key(&key),
-            "index must remain absent after failed load"
+            begin_warm(&ann, key).is_some(),
+            "a failed replacement must retry despite the servable stale fallback"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_finish_cannot_steal_new_post_invalidation_owner() {
+        let ann = new_shared();
+        let key = AnnKey::new("local", "warm-owner-model");
+
+        let stale = begin_warm(&ann, key.clone()).expect("warm A");
+        clear_namespace(&ann, "local").await;
+        let current = begin_warm(&ann, key.clone()).expect("warm B after invalidation");
+        let current_id = current.attempt_id;
+
+        finish_warm(stale, AnnWarmOutcome::Failed).await;
+        assert!(
+            matches!(
+                warm_states_guard(&ann.warm_states).get(&key),
+                Some(AnnWarmState::Warming { attempt_id, .. }) if *attempt_id == current_id
+            ),
+            "warm A's late cleanup must not erase or complete warm B's ownership"
+        );
+        assert!(
+            begin_warm(&ann, key.clone()).is_none(),
+            "warm B must remain the only current singleflight owner"
+        );
+
+        finish_warm(current, AnnWarmOutcome::Failed).await;
+        assert!(
+            begin_warm(&ann, key).is_some(),
+            "warm B's failed completion must make the slot retryable"
+        );
+    }
+
+    #[test]
+    fn dropped_warm_permit_cannot_leave_stale_warming_ownership() {
+        let ann = new_shared();
+        let key = AnnKey::new("local", "warm-cancel-model");
+
+        let permit = begin_warm(&ann, key.clone()).expect("warm attempt");
+        drop(permit);
+
+        assert!(
+            matches!(
+                warm_states_guard(&ann.warm_states).get(&key),
+                Some(AnnWarmState::Failed {
+                    error: AnnWarmFailure::Interrupted,
+                    ..
+                })
+            ),
+            "cancellation must transition the owned slot out of Warming"
+        );
+        assert!(
+            begin_warm(&ann, key).is_some(),
+            "an interrupted warm must be retryable"
         );
     }
 
@@ -3046,7 +3334,7 @@ mod tests {
         );
         assert!(
             is_terminally_unavailable(&ann2, &key),
-            "Empty must set the terminal unavailable marker for wait_for_ann"
+            "Empty must set the terminal unavailable marker for wait_ready"
         );
     }
 
@@ -3255,7 +3543,7 @@ mod tests {
     }
 
     /// End-to-end reproduction of issue #1026: an empty corpus must leave the
-    /// key marked unavailable so `wait_for_ann` short-circuits instead of
+    /// key marked unavailable so `wait_ready` short-circuits instead of
     /// polling out the full warm-wait timeout on every query.
     #[tokio::test]
     async fn ensure_ann_for_model_empty_corpus_marks_unavailable_and_wait_short_circuits() {
@@ -3273,7 +3561,7 @@ mod tests {
         );
 
         let start = std::time::Instant::now();
-        let ready = wait_for_ann(&ann, &key, 5_000, 50).await;
+        let ready = wait_ready(&ann, &key, 5_000, 50).await;
         let elapsed = start.elapsed();
 
         assert!(!ready, "empty corpus must never become ready");
@@ -3327,7 +3615,7 @@ mod tests {
         assert!(
             !unavailable_guard(&ann.unavailable).contains_key(&key),
             "a rebuild ERROR must not mark the key unavailable — only a completed \
-             empty-corpus scan may; a marker here would short-circuit wait_for_ann \
+             empty-corpus scan may; a marker here would short-circuit wait_ready \
              while the same-generation retry is in flight"
         );
 
@@ -3342,7 +3630,7 @@ mod tests {
                 .with_generation(0);
             install_if_fresher(&ann2, &key2, bridge).await;
         });
-        let ready = wait_for_ann(&ann, &key, 500, 10).await;
+        let ready = wait_ready(&ann, &key, 500, 10).await;
         assert!(
             ready,
             "after a rebuild error the wait must keep polling and observe the \
@@ -3385,7 +3673,7 @@ mod tests {
                 .with_generation(0);
             install_if_fresher(&ann2, &key2, bridge).await;
         });
-        let ready = wait_for_ann(&ann, &key, 500, 10).await;
+        let ready = wait_ready(&ann, &key, 500, 10).await;
         assert!(
             ready,
             "after a store-opening failure the wait must keep polling and observe \

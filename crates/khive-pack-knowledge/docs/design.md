@@ -37,8 +37,10 @@
 - `knowledge.challenge` marks a section as disputed and increments `dispute_count` on the parent
   atom. `knowledge.adjudicate` resolves the dispute: `accept` → `verified`, `reject` → `reviewed`.
   This governance is specified in ADR-047 (Knowledge Pack) §section lifecycle governance.
-- The Vamana warm-start protocol (`ensure_ann_background`) fires at most once per
-  `{namespace, model}` key using a `Mutex<HashSet>` single-flight guard.
+- The Vamana warm-start protocol (`ensure_ann_background`) uses one `AnnWarmState` lifecycle per
+  `{namespace, model}` key. Startup v1/v2 discovery and request background warm
+  share the same attempt-owned `begin_warm` / `finish_warm` singleflight; a late
+  pre-invalidation completion cannot release or complete a newer attempt.
 
 ### Pack Self-Registration (ADR-027)
 
@@ -67,8 +69,8 @@
   duplicating context structs across submodules. This will be revisited when the section-read
   verb surface stabilizes.
 - `knowledge/vamana.rs` also exceeds 700 lines by design: the ANN lifecycle (SharedAnn type,
-  snapshot persistence, build, search) is tightly coupled through the shared `AnnState` lock
-  and cannot be split without breaking the atomic lock protocol.
+  snapshot persistence, build, search) is tightly coupled through the shared `AnnState`
+  generation and warm-ownership locks and cannot be split without obscuring their ordering.
 - The `Section` struct and its associated helper functions (`section_from_row`, `section_to_json`)
   are forward-deployed for Phase 3; they carry `#[allow(dead_code)]` with REASON annotations.
 
