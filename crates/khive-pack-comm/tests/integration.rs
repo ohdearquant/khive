@@ -1032,9 +1032,9 @@ async fn test_reply_marks_directionless_legacy_original() {
     );
 }
 
-/// The read-patch must not clobber properties written between the original's
-/// fetch and the patch: reply re-reads current properties before setting
-/// `read`, since the store replaces the properties object wholesale.
+/// The read patch must not clobber an unrelated property. Both writes use the
+/// storage layer's one-statement JSON-property setter, so the invariant does
+/// not depend on a best-effort re-read immediately before replacement.
 #[tokio::test]
 async fn test_reply_read_patch_preserves_concurrent_properties() {
     use khive_storage::note::Note;
@@ -1066,15 +1066,15 @@ async fn test_reply_read_patch_preserves_concurrent_properties() {
         .await
         .expect("insert message");
 
-    // Stand in for another writer stamping metadata after the original was
-    // fetched: patch a new property directly, then reply.
-    let mut with_stamp = serde_json::json!({
-        "direction": "inbound", "from": "x", "to": "local", "read": false,
-        "delivery_stamp": "channel-email"
-    });
-    with_stamp["read"] = serde_json::json!(false);
+    // Stand in for another writer stamping metadata, then let reply perform
+    // its independent atomic `read` set.
     store
-        .update_note_properties(id, Some(with_stamp), now + 1)
+        .set_note_property(
+            id,
+            "delivery_stamp",
+            serde_json::json!("channel-email"),
+            now + 1,
+        )
         .await
         .expect("stamp applied");
 

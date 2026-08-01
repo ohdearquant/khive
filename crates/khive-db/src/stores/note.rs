@@ -109,8 +109,8 @@ pub fn note_upsert_statement(note: &Note) -> SqlStatement {
 }
 
 /// The exact `properties`/`updated_at` `UPDATE` this store's
-/// `update_note_properties` issues. A real `UPDATE` never triggers SQLite's
-/// `INSERT OR REPLACE` delete+insert, so the row is patched in place (#780).
+/// `update_note_properties` issues. The row is patched in place without
+/// rewriting any other note column or its stable row identity (#780).
 /// The `comm.probe` cursor is keyed on `notes_seq.seq`, which is fixed at
 /// first insert and survives a delete+reinsert of the same note id, so this
 /// is defensive rather than load-bearing for cursor correctness; a metadata
@@ -137,6 +137,48 @@ pub fn note_update_properties_statement(
         ],
         label: Some("note-update-properties".to_string()),
     }
+}
+
+/// The atomic top-level JSON-property `UPDATE` issued by
+/// [`NoteStore::set_note_property`]. The key is encoded as one quoted JSON
+/// path segment, so punctuation is literal rather than interpreted as nested
+/// path syntax. `json(?2)` preserves the bound value's JSON type instead of
+/// storing objects, arrays, booleans, or numbers as JSON strings.
+///
+/// SQL-NULL documents start from `{}`. JSON arrays/scalars/null are not
+/// property objects and are left untouched; the caller receives `false`.
+pub fn note_set_property_statement(
+    id: Uuid,
+    key: &str,
+    value: &serde_json::Value,
+    updated_at: i64,
+) -> Result<SqlStatement, StorageError> {
+    // SQLite JSON-path object labels terminate at U+0000. Passing such a key
+    // through `json_set` can therefore select a shorter sibling key instead
+    // of the requested literal key, so reject it before constructing SQL.
+    if key.contains('\0') {
+        return Err(StorageError::InvalidInput {
+            capability: StorageCapability::Notes,
+            operation: "set_note_property".into(),
+            message: "property key must not contain U+0000".to_string(),
+        });
+    }
+    let path = format!("$.{}", serde_json::Value::String(key.to_string()));
+    Ok(SqlStatement {
+        sql: "UPDATE notes \
+              SET properties = json_set(COALESCE(properties, '{}'), ?1, json(?2)), \
+                  updated_at = ?3 \
+              WHERE id = ?4 AND deleted_at IS NULL \
+                AND (properties IS NULL OR json_type(properties) = 'object')"
+            .to_string(),
+        params: vec![
+            SqlValue::Text(path),
+            SqlValue::Text(value.to_string()),
+            SqlValue::Integer(updated_at),
+            SqlValue::Text(id.to_string()),
+        ],
+        label: Some("note-set-property".to_string()),
+    })
 }
 
 /// The exact soft-delete `UPDATE` this store's `delete_note(Soft)` issues.
@@ -218,12 +260,13 @@ impl SqlNoteStore {
     /// to the legacy pool-mutex path (ADR-067 Component A, Fork C slice 2).
     ///
     /// This is the routing point for single-statement `with_writer` callers
-    /// in this store (`update_note_properties`, `delete_note`). `f` must be
-    /// DML-only — on the flag-on path it runs inside the WriterTask's own
-    /// transaction, so a bare `BEGIN IMMEDIATE` would violate SQLite's
-    /// nested-transaction rule. `upsert_notes` (the batch method) does its
-    /// own flag check and returns early on `Some`, so its fallback call
-    /// into this helper only ever executes on the flag-off path
+    /// in this store (`update_note_properties`, `set_note_property`,
+    /// `delete_note`). `f` must be DML-only — on the flag-on path it runs
+    /// inside the WriterTask's own transaction, so a bare `BEGIN IMMEDIATE`
+    /// would violate SQLite's nested-transaction rule. `upsert_notes` (the
+    /// batch method) does its own flag check and returns early on `Some`, so
+    /// its fallback call into this helper only ever executes on the flag-off
+    /// path
     /// (`self.writer_task` is `None` by construction whenever that call is
     /// reached) — no double-routing. Callers whose `f` issues more than one
     /// DML statement that must land atomically together (`upsert_note`,
@@ -727,6 +770,22 @@ impl NoteStore for SqlNoteStore {
     ) -> Result<bool, StorageError> {
         let statement = note_update_properties_statement(id, &properties, updated_at);
         self.with_writer("update_note_properties", move |conn| {
+            let mut stmt = conn.prepare(&statement.sql)?;
+            bind_params(&mut stmt, &statement.params)?;
+            Ok(stmt.raw_execute()? > 0)
+        })
+        .await
+    }
+
+    async fn set_note_property(
+        &self,
+        id: Uuid,
+        key: &str,
+        value: serde_json::Value,
+        updated_at: i64,
+    ) -> Result<bool, StorageError> {
+        let statement = note_set_property_statement(id, key, &value, updated_at)?;
+        self.with_writer("set_note_property", move |conn| {
             let mut stmt = conn.prepare(&statement.sql)?;
             bind_params(&mut stmt, &statement.params)?;
             Ok(stmt.raw_execute()? > 0)

@@ -458,6 +458,145 @@ async fn test_note_status_field_roundtrip() {
     assert_eq!(fetched.status, "active");
 }
 
+#[tokio::test]
+async fn set_note_property_initializes_null_and_preserves_json_type() {
+    let store = setup_memory_store();
+    let note = make_note("default", "observation", "atomic property set");
+    let id = note.id;
+    let updated_at = note.updated_at + 1;
+    store.upsert_note(note).await.unwrap();
+
+    assert!(store
+        .set_note_property(
+            id,
+            "delivery.stamp",
+            serde_json::json!({ "channel": "email", "attempt": 1 }),
+            updated_at,
+        )
+        .await
+        .unwrap());
+    assert!(store
+        .set_note_property(id, "explicit_null", serde_json::Value::Null, updated_at + 1)
+        .await
+        .unwrap());
+
+    let fetched = store.get_note(id).await.unwrap().unwrap();
+    assert_eq!(
+        fetched.properties,
+        Some(serde_json::json!({
+            "delivery.stamp": { "channel": "email", "attempt": 1 },
+            "explicit_null": null
+        })),
+        "keys must be literal top-level segments and values must keep their JSON types"
+    );
+    assert_eq!(fetched.updated_at, updated_at + 1);
+}
+
+#[tokio::test]
+async fn concurrent_distinct_note_property_sets_both_survive() {
+    let store = Arc::new(setup_memory_store());
+    let note = make_note("default", "message", "concurrent atomic properties")
+        .with_properties(serde_json::json!({ "existing": "preserved" }));
+    let id = note.id;
+    let updated_at = note.updated_at;
+    store.upsert_note(note).await.unwrap();
+
+    let gate = Arc::new(tokio::sync::Barrier::new(3));
+    let left = {
+        let store = Arc::clone(&store);
+        let gate = Arc::clone(&gate);
+        tokio::spawn(async move {
+            gate.wait().await;
+            store
+                .set_note_property(
+                    id,
+                    "delivery_stamp",
+                    serde_json::json!("email"),
+                    updated_at + 1,
+                )
+                .await
+        })
+    };
+    let right = {
+        let store = Arc::clone(&store);
+        let gate = Arc::clone(&gate);
+        tokio::spawn(async move {
+            gate.wait().await;
+            store
+                .set_note_property(id, "ingest_marker", serde_json::json!(true), updated_at + 2)
+                .await
+        })
+    };
+
+    gate.wait().await;
+    assert!(left.await.unwrap().unwrap());
+    assert!(right.await.unwrap().unwrap());
+
+    let fetched = store.get_note(id).await.unwrap().unwrap();
+    assert_eq!(
+        fetched.properties,
+        Some(serde_json::json!({
+            "existing": "preserved",
+            "delivery_stamp": "email",
+            "ingest_marker": true
+        })),
+        "one-statement property sets must not lose a different concurrent key"
+    );
+}
+
+#[tokio::test]
+async fn set_note_property_refuses_non_object_document() {
+    let store = setup_memory_store();
+    let note = make_note("default", "observation", "scalar properties")
+        .with_properties(serde_json::json!(["not", "an", "object"]));
+    let id = note.id;
+    let original_updated_at = note.updated_at;
+    store.upsert_note(note).await.unwrap();
+
+    assert!(!store
+        .set_note_property(id, "read", serde_json::json!(true), original_updated_at + 1)
+        .await
+        .unwrap());
+    let fetched = store.get_note(id).await.unwrap().unwrap();
+    assert_eq!(
+        fetched.properties,
+        Some(serde_json::json!(["not", "an", "object"]))
+    );
+    assert_eq!(fetched.updated_at, original_updated_at);
+}
+
+#[tokio::test]
+async fn set_note_property_rejects_nul_key_without_mutation() {
+    let store = setup_memory_store();
+    let note = make_note("default", "observation", "nul property key").with_properties(
+        serde_json::json!({
+            "a": 0,
+            "a\u{0000}b": 9,
+        }),
+    );
+    let id = note.id;
+    let original_updated_at = note.updated_at;
+    let original_properties = note.properties.clone();
+    store.upsert_note(note).await.unwrap();
+
+    let result = store
+        .set_note_property(
+            id,
+            "a\u{0000}b",
+            serde_json::json!(1),
+            original_updated_at + 1,
+        )
+        .await;
+    assert!(
+        matches!(result, Err(StorageError::InvalidInput { .. })),
+        "expected InvalidInput, got {result:?}"
+    );
+
+    let fetched = store.get_note(id).await.unwrap().unwrap();
+    assert_eq!(fetched.properties, original_properties);
+    assert_eq!(fetched.updated_at, original_updated_at);
+}
+
 // -- query_notes_filtered tests --
 
 fn make_note_with_props(

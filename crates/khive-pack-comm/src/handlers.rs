@@ -438,8 +438,8 @@ pub(crate) async fn handle_read(
         );
     }
 
-    // Patch via a real `UPDATE`, not `upsert_note`'s `INSERT OR REPLACE` (#780
-    // silently re-inserts the row on conflict). See docs/api/message-lifecycle.md#handlersrshandle_read
+    // Patch via one atomic JSON-property `UPDATE`, not a get/replace cycle or
+    // `upsert_note` (#1483, #780). See docs/api/message-lifecycle.md#handlersrshandle_read
     //
     // `orig_props` is kept as the stored `Option<Value>` (a SQL-NULL
     // properties column is a real, distinct state from `{}`) so a degraded
@@ -447,7 +447,12 @@ pub(crate) async fn handle_read(
     // separately-normalized object used only for the attempted patch.
     let orig_props = note.properties.clone();
     let mut props = orig_props.clone().unwrap_or_else(|| json!({}));
-    props["read"] = json!(true);
+    match props.as_object_mut() {
+        Some(object) => {
+            object.insert("read".to_string(), json!(true));
+        }
+        None => props = json!({ "read": true }),
+    }
     let updated_at = Utc::now().timestamp_micros();
 
     // Best-effort: under multi-client writer contention the pool checkout can
@@ -460,7 +465,7 @@ pub(crate) async fn handle_read(
     // polling unread counts simply sees the message still unread and can
     // re-issue `read` — self-healing, no retry loop needed here.
     let patch_result = store
-        .update_note_properties(id, Some(props.clone()), updated_at)
+        .set_note_property(id, "read", json!(true), updated_at)
         .await;
 
     Ok(read_response(
@@ -711,24 +716,14 @@ pub(crate) async fn handle_reply(
     let marked_read = if original_direction == "outbound" || !caller_is_addressee {
         None
     } else {
-        // Re-fetch: `orig_props` predates the dual write above, so writing it
-        // back wholesale would erase any property another writer set in that
-        // window (the store replaces `properties`, it does not merge).
-        let current = store
-            .get_note(id)
-            .await
-            .ok()
-            .flatten()
-            .and_then(|n| n.properties)
-            .unwrap_or_else(|| orig_props.clone());
-        let mut props = current;
-        props["read"] = json!(true);
         let updated_at = Utc::now().timestamp_micros();
         // `Ok(false)` means no live row was updated (e.g. the original was
-        // soft-deleted mid-flight) — that is not a successful mark.
+        // soft-deleted mid-flight, or its properties ceased to be an object)
+        // — that is not a successful mark. The one-statement property set
+        // preserves every unrelated key without a race window (#1483).
         Some(
             store
-                .update_note_properties(id, Some(props), updated_at)
+                .set_note_property(id, "read", json!(true), updated_at)
                 .await
                 .unwrap_or(false),
         )
@@ -2402,7 +2397,7 @@ mod tests {
 
     // read_response's three arms are unit-tested directly because the
     // `Ok(false)` case (a live row vanishing between handle_read's `get_note`
-    // and its `update_note_properties` call) cannot be arranged honestly
+    // and its `set_note_property` call) cannot be arranged honestly
     // through the public dispatch path: the two calls are sequential within
     // one handler invocation with no seam to inject a concurrent delete.
 
@@ -2479,7 +2474,7 @@ mod tests {
         let original = json!({ "direction": "inbound", "read": false });
         let patched = json!({ "direction": "inbound", "read": true });
         let err = StorageError::Timeout {
-            operation: "update_note_properties".into(),
+            operation: "set_note_property".into(),
         };
         let err_text = err.to_string();
         let resp = read_response(
@@ -2503,7 +2498,7 @@ mod tests {
     fn read_response_err_preserves_stored_null_properties() {
         let patched = json!({ "read": true });
         let err = StorageError::Timeout {
-            operation: "update_note_properties".into(),
+            operation: "set_note_property".into(),
         };
         let resp = read_response(
             "abc123".to_string(),
