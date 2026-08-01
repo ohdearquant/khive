@@ -56,22 +56,18 @@ trips people up:
   `.khive/khive.toml` is not read.
 
 So the common global file in practice is `~/.khive/config.toml`, not
-`~/.khive/khive.toml`, even though most doc comments and error messages in
-the source refer to the config generically as "khive.toml" (the annotated
-reference file is literally named `docs/khive-config-example.toml`, and code
-comments say things like "the resolved config file (`khive.toml`)" regardless
-of which tier actually supplied it). When you see "khive.toml" in an error
-message or a comment, treat it as shorthand for "your resolved config file,"
-not as a literal filename requirement outside tier 2.
+`~/.khive/khive.toml`. Database-override refusals report the exact selected
+file path. A source comment that uses "khive.toml" generically still means
+"the selected config file," not a literal filename outside tier 2.
 
 ### Daemon working-directory sensitivity
 
 `kkernel mcp --daemon` (the warm daemon auto-spawned behind stdio clients,
-ADR-049) resolves its config the same way, from its own working directory.
-Tiers 2 and 3 are relative to _the daemon's_ cwd, not the client's. If the
-daemon is spawned from an unexpected directory it can pick up a different
-project-local config than you expect, or none. The reliable ways to pin this
-down:
+ADR-049) resolves its config the same way. Tier 2 is relative to _the daemon's_
+cwd. Tier 3 is database-anchored when a database is explicit and cwd-anchored
+otherwise. A daemon started from an unexpected directory can therefore select
+a different project config when neither an explicit config nor an explicit
+database anchors discovery. The reliable ways to pin this down:
 
 - Pass `--config <absolute-path>` explicitly on the `kkernel mcp` invocation.
 - Rely on tier 4 (`~/.khive/config.toml`), which is found regardless of
@@ -159,8 +155,8 @@ Three cases:
   here is ambiguous (it could silently collapse distinct declared backends
   onto a single file). Edit the selected config file at <resolved-path> to
   change persistent backend paths. Use --config <path> or
-  KHIVE_CONFIG=<path> to select a different config, or pass --db :memory: to
-  force all backends in-memory for this invocation.
+  KHIVE_CONFIG=<path> to select a different config, or use --db :memory: only
+  for an ephemeral all-in-memory invocation.
   ```
 
   `kkernel exec` additionally writes a compact JSON refusal envelope to stdout:

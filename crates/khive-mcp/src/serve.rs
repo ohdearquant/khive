@@ -106,7 +106,7 @@ impl std::fmt::Display for DatabaseOverrideConflict {
         write!(
             formatter,
             "Use --config <path> or KHIVE_CONFIG=<path> to select a different config, \
-             or pass --db :memory: to force all backends in-memory for this invocation."
+             or use --db :memory: only for an ephemeral all-in-memory invocation."
         )
     }
 }

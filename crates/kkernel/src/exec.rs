@@ -1608,9 +1608,8 @@ default = true
 
         let ns = Namespace::parse("local").expect("ns");
 
-        // exec-shaped inputs: `config: None` (kkernel exec has no `--config`
-        // flag today), `namespace_explicit: true` (the choice made in `run_exec`
-        // above).
+        // Exec-shaped inputs using automatic config discovery (`config: None`)
+        // and `namespace_explicit: true` (the choice made in `run_exec` above).
         // Pin the pack list explicitly rather than inheriting `KHIVE_PACKS`
         // from the ambient environment (same rationale as `isolated_server`
         // above, #1276): `RuntimeConfig::default()` reads `KHIVE_PACKS` fresh
