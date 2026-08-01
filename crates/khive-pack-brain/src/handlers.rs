@@ -209,7 +209,7 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
     },
     HandlerDef {
         name: "brain.deactivate",
-        description: "Move a profile to Inactive (stop live updates, retain state)",
+        description: "Move a profile to Inactive (lifecycle transition; retain state)",
         visibility: khive_types::Visibility::Verb,
         category: khive_types::VerbCategory::Commissive,
         params: &[khive_types::ParamDef {
@@ -2879,9 +2879,11 @@ pub(crate) async fn resolve_auto_feedback_target(
 /// `BrainPack` as a post-dispatch hook.
 ///
 /// When registered via `VerbRegistryBuilder::with_dispatch_hook`, every
-/// successful verb dispatch calls `on_dispatch` with a synthesized `Event`.
-/// The event is fed into `BalancedRecallFold::reduce`, updating the brain's
-/// posteriors in real time — no polling required.
+/// successful non-brain verb dispatch calls `on_dispatch` with a synthetic
+/// `EventView` whose observations are empty. The event is fed into
+/// `BalancedRecallFold::reduce`, updating in-memory posteriors in real time.
+/// This path appends no event and writes no snapshot, so it provides no
+/// durability or replay guarantee.
 #[async_trait]
 impl DispatchHook for BrainPack {
     async fn on_dispatch(&self, view: &EventView) {

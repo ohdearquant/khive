@@ -219,18 +219,18 @@ given but cannot decide to swap the underlying model. This is the architectural
 boundary: model selection is operator territory; brain-tuned weights and adapters
 are agent-influenced territory.
 
-### 7. New event kinds
+### 7. Reserved event kinds
 
-Added to `EventKind` (ADR-032 §3) and to the closed substrate event log:
+Added to the `EventKind` enum (ADR-032 §3) for the deferred migration worker:
 
 - `EmbeddingModelChanged` — migration started
 - `EmbeddingMigrationCompleted` — swap committed
 - `EmbeddingMigrationFailed` — controller entered `Failed`
 - `EmbeddingDriftDetected` — drift-check threshold breach (advisory)
 
-All four carry `engine_name` and the relevant `_embedding_models.id`(s) in payload.
-None carries `served_by_profile_id` — these are operator/system events, not
-profile-served (ADR-032 §3 rule).
+When a future worker emits them, all four carry `engine_name` and the relevant
+`_embedding_models.id`(s) in payload. None carries `served_by_profile_id` — these are
+operator/system events, not profile-served (ADR-032 §3 rule).
 
 ### 8. Backward compatibility — one-shot startup migration (V14 + V16)
 
@@ -343,12 +343,10 @@ Tracked in `.khive/plans/embedding-version-config.md`.
 
 ### Neutral
 
-- New event kinds: `EmbeddingModelChanged`, `EmbeddingMigrationCompleted`,
-  `EmbeddingMigrationFailed`, `EmbeddingDriftDetected`. Brain folds see these
-  events but typically ignore them (they carry no `served_by_profile_id`).
-- The startup backward-compat migration emits one `EmbeddingModelChanged` event
-  per existing engine. Brain folds replaying history must accept these without
-  side effect.
+- Four event kinds are reserved: `EmbeddingModelChanged`, `EmbeddingMigrationCompleted`,
+  `EmbeddingMigrationFailed`, and `EmbeddingDriftDetected`. No production emitter or durable
+  brain consumer ships today. Any future brain replay must accept these system events without
+  changing profile state merely because they lack `served_by_profile_id`.
 
 ## Implementation
 
@@ -407,10 +405,13 @@ The ADR-043 schema work landed in two ledger versions in
    `_embedding_models` from `[[engines]]`; per-table model-inferred tag rewrite
    for deployments with non-default models (deferred — see §1.1 final paragraph).
 
-### Worker registration
+### Deferred worker registration
 
-`khive-runtime::Pack::on_register` adds `EmbedMigrationWorker` to the
-runtime's `PackEventConsumer` list. The full trait implementation (ADR-017):
+Neither `Pack::on_register` nor a runtime `PackEventConsumer` list ships today, and the
+`kkernel engine migrate` command below remains `NotImplemented`. ADR-017 now defers the
+consumer lifecycle, cursor, and replay seam. Therefore this ADR does not register an
+`EmbedMigrationWorker`; the following snippet preserves only the proposed event filter
+and worker shape for a future ADR:
 
 ```rust
 #[async_trait]

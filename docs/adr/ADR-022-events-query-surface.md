@@ -264,10 +264,12 @@ validation reports over event streams, or dashboard counters fit the same abstra
 The combinators from ADR-024 (`SequentialFold`, `FilterFold`, `MapFold`, `DualFold`)
 compose naturally over event streams.
 
-**Dispatch boundary**: the runtime is responsible for event _delivery_, not Fold
-_execution_. Runtime-level Fold registries are out of scope for v1. Pack consumers
-own their state, snapshots, schema migrations, and cursor persistence — see ADR-017's
-`PackEventConsumer` trait for the dispatch contract.
+**Deferred dispatch boundary**: no runtime event-delivery or Fold registry ships in v1.
+ADR-017 now records `PackEventConsumer` as deferred design rather than an accepted
+dispatch contract. The shipped surface is event append plus explicit event queries. A
+future consumer contract may make the runtime responsible for delivery while leaving
+Fold execution, state, snapshots, migrations, and cursor persistence with the pack, but
+must first satisfy ADR-017's implementation prerequisites.
 
 ### 3b. Event ordering — weakly monotonic timestamps + deterministic tiebreaker
 
@@ -294,9 +296,10 @@ insertion order — it only needs to provide a stable total order among events w
 equal `created_at`. UUID v4's randomness is sufficient; UUID v7's time-ordering is
 welcome but not required.
 
-**Timestamp-only cursors are unsafe.** A consumer that resumes with `since=t` after
+**Timestamp-only cursors are unsafe.** A future consumer that resumes with `since=t` after
 processing event `(created_at=t, event_id=A)` may skip `(created_at=t, event_id=B)`.
-Event consumers MUST use a compound cursor:
+Any future event consumer MUST use a compound cursor. `EventCursor` is an illustrative
+design shape here; it is not a shipped storage or runtime type:
 
 ```rust
 pub struct EventCursor {
@@ -322,9 +325,11 @@ ORDER BY created_at DESC, event_id DESC
 ```
 
 `EventStore` implementations that return ordered results MUST include `event_id` as
-the deterministic tiebreaker. The `since` / `until` parameters on `list(kind="event")`
-remain timestamp-only (human-facing); programmatic event consumers persist the full
-`EventCursor` themselves.
+the deterministic tiebreaker. The shipped newest-first query does so. The ascending
+catch-up query above remains deferred with the consumer contract because the current
+API has no order or compound-cursor parameter. The `since` / `until` parameters on
+`list(kind="event")` remain timestamp-only (human-facing); any future programmatic
+consumer must persist the full cursor itself.
 
 **Deferred**: a monotonic append-sequence counter (`event_seq`) is NOT introduced in
 v1. The timestamp+id pair gives deterministic replay order. A true commit-order
@@ -334,10 +339,10 @@ ordering — a different invariant from replay determinism. Add when evidence de
 ### 4. Composite index — schema migration
 
 The existing events table has four single-column indexes (`namespace`, `verb`,
-`substrate`, `created_at DESC`). The dominant query patterns are:
+`substrate`, `created_at DESC`). The current and reserved future query patterns are:
 
 1. Unfiltered listing: `WHERE namespace = ? ORDER BY created_at DESC LIMIT ?`
-2. Cursor-based catch-up (§3b): `WHERE namespace = ? AND (created_at > :ts OR
+2. Future cursor-based catch-up (§3b): `WHERE namespace = ? AND (created_at > :ts OR
    (created_at = :ts AND event_id > :id)) ORDER BY created_at ASC, event_id ASC`
 
 A composite index covering both `created_at` and `event_id` lets the planner satisfy

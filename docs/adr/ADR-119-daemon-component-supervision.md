@@ -30,10 +30,10 @@ narrow construction boundary has been proved.
 
 Nor does the current evidence establish a need for an event-topic bus. Polling at the
 present fleet scale is not a throughput problem, and no concrete consumer has yet shown
-that freshness requires push. Durable event consumption and replay already have a pack
-contract: ADR-017's `PackEventConsumer` reads the event log through the cursor semantics
-specified by [ADR-022](ADR-022-events-query-surface.md). A
-second at-least-once delivery mechanism would duplicate that authority.
+that freshness requires push. ADR-022 ships a durable event query surface, while ADR-017
+now marks `PackEventConsumer` catch-up and live delivery as deferred design. A future
+push or consumer proposal must reconcile with that durable source of truth rather than
+introduce a second log or cursor authority.
 
 ## Assumptions examined
 
@@ -53,9 +53,10 @@ second at-least-once delivery mechanism would duplicate that authority.
    A future bus must be justified by latency/freshness and staleness-summary ergonomics,
    not by a load-reduction claim.
 5. **“An at-least-once topic is a missing capability.” — Refuted for event-plane facts.**
-   ADR-022 supplies the durable query side and ADR-017 supplies cursor-based pack
-   catch-up plus live delivery. A new ephemeral topic could only be a wake-up
-   optimization over durable state, not a second source of truth.
+   ADR-022 supplies the durable query side. ADR-017 records cursor-based pack catch-up
+   and live delivery only as deferred design. A new ephemeral topic could at most be a
+   wake-up optimization over durable state; it cannot become a second source of truth
+   or silently make the deferred consumer contract real.
 6. **“The change is cheap.” — Unsupported and dropped.** No LOC or complexity estimate
    is accepted without a prototype. This ADR makes no cheapness claim.
 
@@ -253,9 +254,9 @@ must preserve:
 > a fact.
 
 Where the notification refers to an event-plane fact, the durable side is ADR-022's
-event query surface and ADR-017's cursor replay contract. A future topic MUST compose
-with those contracts; it MUST NOT shadow them with a second durable log or cursor
-authority.
+event query surface. A future topic MUST compose with that surface and with any later
+ADR that accepts cursor replay; it MUST NOT shadow them with a second durable log or
+cursor authority.
 
 Minimum tests for any future bus are: rollback-after-publish is unobservable;
 capacity-2 publish-3 yields `Lagged(1)`; a stale cursor yields
@@ -269,7 +270,8 @@ sequence reinterpretation.
 Rejected. It gives pack authors a uniform declaration locus, but both current
 cross-crate candidates depend on MCP-host construction. Adding default trait methods
 would make existing packs compile while still freezing an unproved dependency boundary.
-The event-topic half also lacks a current latency consumer and overlaps ADR-017.
+The event-topic half also lacks a current latency consumer and overlaps ADR-017's
+deferred consumer design.
 
 ### Keep hand-spawned tasks and repair each loop independently
 
@@ -301,8 +303,8 @@ descriptor outward to `Pack` later is additive. Moving a prematurely broad
 
 Splitting event topics is also deliberate. The service registry has current consumers
 and a concrete incident. The bus has estimated magnitudes, no measured latency need,
-and an existing durable consumer contract to reconcile. Combining them would let the
-stronger service case smuggle an unproved bus into acceptance.
+and a durable query surface plus a deferred consumer design to reconcile. Combining
+them would let the stronger service case smuggle an unproved bus into acceptance.
 
 ## Risks and unknowns
 

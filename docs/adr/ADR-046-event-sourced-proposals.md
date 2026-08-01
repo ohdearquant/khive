@@ -9,7 +9,7 @@
 - ADR-017 (Pack Standard — KG pack handler surface; async event-consumer worker registration is deferred)
 - ADR-018 (Authorization Gate — gates the apply step)
 - ADR-022 (Events Query Surface — proposals live as events)
-- ADR-032 (Brain Profile Orchestration — brain folds over proposal events)
+- ADR-032 (Brain Profile Orchestration — future proposal-event Fold design; no v1 consumer)
 - ADR-041 (Event Provenance Projection — open-proposal projection lives here)
 
 ## Context
@@ -24,9 +24,10 @@ without a replacement.
 The accepted decision selected option (c) **event-sourced proposals**: the
 proposal lifecycle is encoded purely as events on the existing log substrate
 (ADR-022). No new substrate. No new branch model. No git verbs over MCP. The
-brain already consumes events natively (ADR-032 §6); proposals slot into the
-same fold path. The projection table (ADR-041) handles "show me all open
-proposals" as a query that doesn't require scanning every event.
+proposal events preserve input for a future brain fold, but shipped v1 has no
+automatic shared-log consumer (ADR-032 §6). The projection table (ADR-041)
+handles "show me all open proposals" as a query that doesn't require scanning
+every event.
 
 ### What this ADR adds
 
@@ -565,10 +566,10 @@ supersede, compound). Future arms add to the enum via additive semver bumps.
 
 - Proposal workflow lands without a new substrate, new store trait, or git
   dependency. Minimal incremental complexity.
-- Brain folds over the proposal event stream natively — proposer-quality and
-  reviewer-agreement learning is free signal.
-- Cross-pack proposals work the same way as KG-pack proposals; any pack can
-  consume the four `EventKind`s.
+- Proposal events preserve the signal needed for future proposer-quality and
+  reviewer-agreement folds; v1 brain has no proposal-specific fold or automatic delivery.
+- Cross-pack proposals work the same way as KG-pack proposals. Packs can query the four
+  `EventKind`s explicitly; automatic pack consumption remains deferred with ADR-017.
 - The audit trail is the event log. Review history for a proposal is retrieved
   via the events query surface (ADR-022):
 
@@ -595,8 +596,8 @@ supersede, compound). Future arms add to the enum via additive semver bumps.
 
 ### Neutral
 
-- Brain receives four new event kinds with no v1 fold logic — brain folds
-  ignore them by default (existing `EventFilter` doesn't match).
+- The shared `EventKind` enum gains four proposal kinds, but v1 brain has no
+  proposal-specific fold and receives no automatic shared-log delivery.
 - The three new verbs (`propose`, `review`, `withdraw`) bring the pack-kg
   verb count from 11 to 14. The verb surface stays well under the ADR-016
   single-tool `request` envelope's practical limits.
@@ -742,7 +743,7 @@ Lookup wire shape:
 - ADR-022 (Events Query Surface) — proposal events live as substrate events
 - ADR-016 (Request DSL) — `propose`, `review`, and `withdraw` ride the standard
   single-tool `request` envelope
-- ADR-032 (Brain Profile Orchestration) — brain folds extend to proposal events
+- ADR-032 (Brain Profile Orchestration) — future brain folds may extend to proposal events
   in future ADRs
 - ADR-041 (Event Provenance Projection) — projection-table pattern this ADR
   reuses

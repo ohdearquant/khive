@@ -901,7 +901,8 @@ request(ops="brain.resolve(consumer_kind=\"recall\", actor=\"agent:docs\")")
 
 ### `brain.activate` — Commissive
 
-Move a profile to Active (starts the live update loop).
+Move a profile to Active. This is a lifecycle transition; serving reads profile state
+per request and no background update loop is started.
 
 | Param        | Type   | Required | Notes                |
 | ------------ | ------ | -------- | -------------------- |
@@ -913,7 +914,7 @@ request(ops="brain.activate(profile_id=\"implementer-recall-v1\")")
 
 ### `brain.deactivate` — Commissive
 
-Move a profile to Inactive (stop live updates, retain state).
+Move a profile to Inactive (lifecycle transition; retain state).
 
 | Param        | Type   | Required | Notes                  |
 | ------------ | ------ | -------- | ---------------------- |

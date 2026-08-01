@@ -4,7 +4,10 @@
 
 ### Brain Pack (ADR-032)
 
-The brain pack implements profile-oriented Bayesian auto-tuning over the shared event log.
+The brain pack implements profile-oriented Bayesian auto-tuning through synchronous explicit
+feedback and a best-effort post-dispatch hook. Durable handler-owned mutations append to the
+private `brain_event_log` and write JSON snapshots; the hook updates in-memory state without a
+durability guarantee. Automatic shared-log catch-up and replay remain deferred by ADR-017.
 
 **Profile registry**: `BrainState` holds the profile registry and lifecycle metadata. Posteriors
 live inside each profile's own state, opaque to brain core. This means the brain pack has no
@@ -20,13 +23,13 @@ Posterior mean: $\mu = \alpha / (\alpha + \beta)$
 
 **Feedback signal taxonomy** (`FeedbackSignal` + `FeedbackEventKind`):
 
-| Signal | Update magnitude | Posterior effect |
-|--------|-----------------|-----------------|
-| `useful` / `explicit_positive` | 1.0 / 1.5× | $\alpha += w$ |
-| `not_useful` / `explicit_negative` | 1.0 / 1.5× | $\beta += w$ |
-| `wrong` / `correction` | 1.0 / 2.0× | $\beta += w$ (+ relevance $\beta$ for correction) |
-| `implicit_positive` | 0.5× | $\alpha += w$ |
-| `implicit_negative` | 0.5× | $\beta += w$ |
+| Signal                             | Update magnitude | Posterior effect                                  |
+| ---------------------------------- | ---------------- | ------------------------------------------------- |
+| `useful` / `explicit_positive`     | 1.0 / 1.5×       | $\alpha += w$                                     |
+| `not_useful` / `explicit_negative` | 1.0 / 1.5×       | $\beta += w$                                      |
+| `wrong` / `correction`             | 1.0 / 2.0×       | $\beta += w$ (+ relevance $\beta$ for correction) |
+| `implicit_positive`                | 0.5×             | $\alpha += w$                                     |
+| `implicit_negative`                | 0.5×             | $\beta += w$                                      |
 
 **Profile lifecycle DAG**: `Active ↔ Inactive → Archived`. Archived is terminal. Active profiles
 must go through Inactive before archiving. `brain.reset` is only valid on non-archived profiles.
@@ -49,18 +52,18 @@ ExpertLens, References, Other).
 
 **Default priors per section type**:
 
-| Section | $\alpha$ | $\beta$ | Mean |
-|---------|---------|---------|------|
-| Overview | 2 | 2 | 0.50 |
-| CoreModel | 4 | 2 | 0.67 |
-| BoundaryConditions | 2 | 3 | 0.40 |
-| Formalism | 1.5 | 4 | 0.27 |
-| OperationalGuidance | 6 | 1.5 | 0.80 |
-| Examples | 5 | 2 | 0.71 |
-| FailureModes | 3 | 2 | 0.60 |
-| ExpertLens | 3 | 2 | 0.60 |
-| References | 2 | 2 | 0.50 |
-| Other | 2 | 2 | 0.50 |
+| Section             | $\alpha$ | $\beta$ | Mean |
+| ------------------- | -------- | ------- | ---- |
+| Overview            | 2        | 2       | 0.50 |
+| CoreModel           | 4        | 2       | 0.67 |
+| BoundaryConditions  | 2        | 3       | 0.40 |
+| Formalism           | 1.5      | 4       | 0.27 |
+| OperationalGuidance | 6        | 1.5     | 0.80 |
+| Examples            | 5        | 2       | 0.71 |
+| FailureModes        | 3        | 2       | 0.60 |
+| ExpertLens          | 3        | 2       | 0.60 |
+| References          | 2        | 2       | 0.50 |
+| Other               | 2        | 2       | 0.50 |
 
 **Thompson sampling** (explore mode, `exploration_epoch > 0`):
 

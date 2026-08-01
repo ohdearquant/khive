@@ -144,8 +144,8 @@ Composite scores are always in [0,1]. Typical production floor: 0.3-0.7.
 | `brain.profile`          | Full detail: metadata, snapshot, state summary                                           | Inspect a specific profile                                      |
 | `brain.create_profile`   | Create a new profile with optional seed priors                                           | Custom tuning for a new consumer                                |
 | `brain.resolve`          | Which profile serves a given consumer context?                                           | Before recall — check active tuning                             |
-| `brain.activate`         | Start live update loop for a profile                                                     | Enable feedback-driven tuning                                   |
-| `brain.deactivate`       | Stop live updates, retain state                                                          | Pause tuning without losing progress                            |
+| `brain.activate`         | Move a profile to Active; serving reads state per request                                | Enable active resolution and feedback-driven tuning             |
+| `brain.deactivate`       | Move a profile to Inactive and retain state                                              | Record the inactive lifecycle state without discarding progress |
 | `brain.archive`          | Read-only, audit-retained                                                                | Retire a profile permanently                                    |
 | `brain.reset`            | Reset posteriors to priors (preserves event history)                                     | Start tuning fresh                                              |
 | `brain.feedback`         | Emit explicit feedback event                                                             | Rate a recall result as useful/not_useful/wrong                 |

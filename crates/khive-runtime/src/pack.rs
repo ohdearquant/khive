@@ -68,10 +68,12 @@ impl SchemaPlan {
     }
 }
 
-/// Hook called after every successful verb dispatch.
+/// Best-effort hook called after every successful verb dispatch.
 ///
-/// Packs observe enriched event views so provenance-aware consumers can use
-/// `view.observations` while legacy folds can still consume `view.event`.
+/// The runtime supplies a synthetic [`EventView`] whose `event` describes the
+/// dispatch outcome and whose `observations` vector is currently empty. Loading
+/// persisted provenance observations belongs to an explicit caller or the
+/// deferred event-consumer contract; this hook does not provide it.
 #[async_trait]
 pub trait DispatchHook: Send + Sync {
     /// Called with the dispatch-outcome event view after a successful pack dispatch.
@@ -363,9 +365,9 @@ pub struct VerbRegistryBuilder {
     event_store: Option<Arc<dyn EventStore>>,
     /// Optional post-dispatch hook.
     ///
-    /// When set, every successful pack dispatch calls `hook.on_dispatch(event)`
-    /// with a synthesized Event describing the outcome. Opt-in: when None,
-    /// no overhead is incurred.
+    /// When set, every successful pack dispatch calls `hook.on_dispatch(view)`
+    /// with a synthetic `EventView` describing the outcome and carrying no
+    /// observations. Opt-in: when None, no overhead is incurred.
     dispatch_hook: Option<Arc<dyn DispatchHook>>,
 }
 
@@ -473,14 +475,14 @@ impl VerbRegistryBuilder {
 
     /// Register a post-dispatch hook.
     ///
-    /// When set, every successful pack dispatch calls `hook.on_dispatch(event)`
-    /// with a synthesized [`Event`] describing the verb outcome. The hook is
-    /// opt-in: registries without a hook incur zero overhead on the dispatch
-    /// hot path.
+    /// When set, every successful pack dispatch calls `hook.on_dispatch(view)`
+    /// with a synthetic [`EventView`] describing the verb outcome. Its
+    /// `observations` vector is empty; callers that need persisted provenance
+    /// must load it explicitly. The hook is opt-in: registries without a hook
+    /// incur zero overhead on the dispatch hot path.
     ///
-    /// Brain pack uses this to update its posteriors in real time without
-    /// polling the EventStore. Errors from `on_dispatch` are logged via
-    /// `tracing::warn!` and never propagated.
+    /// Brain pack uses this as a best-effort in-memory update path. Errors from
+    /// `on_dispatch` are logged via `tracing::warn!` and never propagated.
     pub fn with_dispatch_hook(&mut self, hook: Arc<dyn DispatchHook>) -> &mut Self {
         self.dispatch_hook = Some(hook);
         self
