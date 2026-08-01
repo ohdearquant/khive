@@ -42,10 +42,16 @@ following `properties` shape:
 ```
 
 `event_type` distinguishes `remind` (no action payload; delivers its content to
-the `created_by_actor` inbox) from `schedule` (stores a serialized verb+args
-payload for replay). Both event types persist the creator. Generic replay uses
-that actor as its explicit request identity, so gates, audits, and writes cannot
-inherit daemon authority; legacy generic rows missing the field fail closed.
+the creating actor's inbox) from `schedule` (stores a serialized verb+args
+payload for replay). Both event types mirror the creator in `created_by_actor`
+for display, but authority comes only from a target-bound, append-only
+`schedule.creator_provenance` event written from the dispatch token. Generic KG
+CRUD can forge note properties but cannot append that event. The note is staged
+as `provisioning` and becomes `pending` only after provenance is durable.
+Replay reconstructs the exact verified actor kind from the event (including
+preserving `anonymous:local`), preserves public verb visibility, and therefore
+cannot inherit daemon authority or invoke an internal subhandler; legacy generic
+rows without provenance fail closed.
 `payload` is null for reminders and a JSON-encoded verb call string for scheduled
 dispatch. Reminder delivery uses the same dual-write path as `comm.send`. Use
 `schedule.schedule(action="comm.send(...)")` for delivery to an actor other than
@@ -101,10 +107,11 @@ tracked as a known limitation — see `COMPLETION.md`). Stored actions may also
 not declare a business `namespace` argument for a verb that accepts one (e.g.
 `brain.bind`); replay always injects the firing event's own namespace, so a
 stored `namespace` value would be silently overwritten. At dispatch time, the
-payload runs with the permissions of the namespace that created the event —
-no privilege escalation is possible via stored payloads.
+payload runs under the immutable creator identity and inside the namespace
+bound to the scheduled event. Both authority dimensions are preserved, so
+delaying a payload cannot grant daemon authority or cross a namespace boundary.
 
-**Pack-auxiliary index.** The `idx_schedule_trigger` index is declared via
+**Pack-auxiliary indexes.** The `idx_schedule_trigger` index is declared via
 `SchemaPlan` as idempotent DDL (`CREATE INDEX IF NOT EXISTS`) outside the core
 versioned migration chain. It uses `WHERE deleted_at IS NULL` rather than
 `WHERE kind = 'scheduled_event'` so that the parameterized `kind = ?N` predicate
@@ -118,7 +125,11 @@ The two concepts are deliberately named to avoid confusion.
 
 ### ADR-015: Schema Migrations
 
-Pack-auxiliary DDL (the `idx_schedule_trigger` index) uses idempotent
+Creator replay additionally uses `idx_schedule_creator_provenance` on
+`events(namespace, verb, target_id, outcome)` so the immutable binding lookup is
+bounded by the scheduled note rather than scanning the event history per fire.
+
+Pack-auxiliary DDL (the schedule indexes) uses idempotent
 `CREATE INDEX IF NOT EXISTS` and is NOT part of the core versioned migration
 chain. It is declared via `schema_plan()` on `PackRuntime`.
 

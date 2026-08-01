@@ -36,12 +36,16 @@ when nobody is watching.
 ## `validate_replayable_single_action` — replay-safety gate (issue #461)
 
 The pending-events runner reparses the stored DSL at trigger time and dispatches it
-through the normal request surface with the event namespace and persisted
-`created_by_actor` as the explicit request identity. A legacy generic row missing that
-actor fails closed. For replay to succeed, the stored action must be:
+through the public-visibility request surface with the event namespace and a
+verified replay identity derived from the immutable, target-bound creator-provenance
+event; attributed principals use `VerifiedActor`, while `anonymous:local` remains
+anonymous. The caller-editable `created_by_actor` note property is not an authority source. A legacy
+generic row missing provenance fails closed. For replay to succeed, the stored action must be:
 
 - A single op against an exactly-registered handler name (not a bare shorthand
   resolved via a `schedule.{tool}` fallback).
+- Publicly callable (`Visibility::Verb`); registered internal subhandlers are rejected
+  both when intent is created and again by the replay dispatch boundary.
 - Built from literal argument values only (no `$prev` references — those are only
   meaningful inside a chain the replay path does not reconstruct).
 - Complete with respect to all required handler parameters.

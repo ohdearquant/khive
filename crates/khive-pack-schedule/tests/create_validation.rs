@@ -104,6 +104,31 @@ async fn remind_persists_the_creating_actor_for_delivery() {
             .and_then(|props| props["created_by_actor"].as_str()),
         Some("lambda:reminder-owner")
     );
+    let provenance = runtime
+        .events(&token)
+        .expect("events")
+        .query_events(
+            khive_storage::EventFilter {
+                verbs: vec![khive_pack_schedule::CREATOR_PROVENANCE_VERB.to_string()],
+                ..Default::default()
+            },
+            khive_storage::types::PageRequest {
+                limit: 10,
+                offset: 0,
+            },
+        )
+        .await
+        .expect("query provenance");
+    let event = provenance
+        .items
+        .iter()
+        .find(|event| event.target_id == Some(id))
+        .expect("target-bound reminder provenance");
+    assert_eq!(event.actor, "actor:lambda:reminder-owner");
+    assert_eq!(
+        event.payload["provenance"],
+        serde_json::Value::String(khive_pack_schedule::CREATOR_PROVENANCE_MARKER_V1.to_string())
+    );
 }
 
 #[tokio::test]
@@ -166,6 +191,31 @@ async fn schedule_persists_the_creating_actor_for_replay() {
             .as_ref()
             .and_then(|props| props["created_by_actor"].as_str()),
         Some("lambda:schedule-owner")
+    );
+    let provenance = runtime
+        .events(&token)
+        .expect("events")
+        .query_events(
+            khive_storage::EventFilter {
+                verbs: vec![khive_pack_schedule::CREATOR_PROVENANCE_VERB.to_string()],
+                ..Default::default()
+            },
+            khive_storage::types::PageRequest {
+                limit: 10,
+                offset: 0,
+            },
+        )
+        .await
+        .expect("query provenance");
+    let event = provenance
+        .items
+        .iter()
+        .find(|event| event.target_id == Some(id))
+        .expect("target-bound schedule provenance");
+    assert_eq!(event.actor, "actor:lambda:schedule-owner");
+    assert_eq!(
+        event.payload["event_type"],
+        serde_json::Value::String("schedule".to_string())
     );
 }
 
@@ -716,6 +766,31 @@ async fn schedule_schedule_rejects_bare_schedule_pack_action() {
     assert!(
         msg.contains("not registered") || msg.contains("pack-prefixed"),
         "#461: bare unqualified schedule-pack verb must be rejected; got: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn schedule_schedule_rejects_internal_subhandler_action() {
+    let (registry, _rt) = build_registry();
+
+    let err = registry
+        .dispatch(
+            "schedule.schedule",
+            serde_json::json!({
+                // `comm.ingest` is registered and introspectable, but its
+                // HandlerDef is Visibility::Subhandler. Delaying execution
+                // must not turn a public caller into an operator caller.
+                "action": "comm.ingest()",
+                "at": "2099-06-01T10:00:00Z"
+            }),
+        )
+        .await
+        .unwrap_err();
+
+    let msg = err.to_string();
+    assert!(
+        msg.contains("internal subhandler") && msg.contains("comm.ingest"),
+        "registered internal handlers must be rejected before intent is stored; got: {msg}"
     );
 }
 

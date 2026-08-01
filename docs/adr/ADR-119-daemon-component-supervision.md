@@ -213,20 +213,23 @@ blesses is a confused-deputy seam. Generic scheduled actions (`schedule.schedule
 MUST replay under the creator's authenticated actor identity, not the daemon's own
 identity. Concretely:
 
-- The creator's authenticated actor MUST be persisted on the scheduled event at
-  schedule time.
-- Replay MUST dispatch with that persisted actor as the request identity, so any policy
-  gate evaluates the creator's authority, never the daemon's. A caller MUST NOT be able
-  to schedule an action the caller is denied but the daemon is allowed to perform.
-- Stored rows without a persisted creator identity MUST fail closed — the event
+- The creator actor from the dispatch-minted token MUST be persisted in an immutable,
+  target-bound provenance record at schedule time. A caller-editable note property is
+  not sufficient provenance.
+- Replay MUST derive a typed verified identity (including the original actor kind) from
+  that provenance and dispatch with it as the request identity, so any policy gate evaluates the creator's authority, never the
+  daemon's. Replay MUST retain public verb visibility; delayed execution cannot expose
+  internal subhandlers. A caller MUST NOT be able to schedule an action the caller is
+  denied but the daemon is allowed to perform.
+- Stored rows without immutable creator provenance MUST fail closed — the event
   transitions to its failure state with a policy error and is never dispatched under
   the daemon identity — unless a separate, explicit migration policy is adopted for
   them.
 
-The current replay path predates this ADR and does not carry a creator identity; that
-is a defect this ADR surfaces, not one it introduces. The registry migration MUST NOT
-ship with the identity gap intact: the identity contract is an acceptance criterion
-below.
+The replay path that predated this ADR did not carry a creator identity; that was a
+defect surfaced here, not one introduced by supervision. The registry migration was
+therefore required not to ship with the identity gap intact: the identity contract is
+an acceptance criterion below and is implemented by Amendment 4.
 
 Email, session-mirror, ANN, and checkpoint loops MAY migrate only after the schedule
 reference proves the registry contract. Their migrations MUST preserve their existing
@@ -362,10 +365,12 @@ In addition, ADR-119 is accepted only when:
    isolation.
 5. Golden compatibility tests prove identical `tools/list`, request parsing, and legacy
    stdio bytes.
-6. Generic scheduled-action replay dispatches under the persisted creator actor; a test
-   proves a caller cannot schedule an action the caller is denied but the daemon is
-   allowed to perform; stored rows without a creator identity fail closed or follow a
-   documented migration policy.
+6. Generic scheduled-action replay dispatches under the immutable, target-bound creator
+   provenance and retains public verb visibility; tests prove a caller cannot schedule
+   an action the caller is denied but the daemon is
+   allowed to perform, mutable note metadata cannot forge authority, internal subhandlers
+   remain denied, and rows without creator provenance fail closed or follow a documented
+   migration policy.
 
 ADR-079 Amendment 1's daemon-resource reference is corrected from issues #1126/#1127 to
 issues #1127/#1129 in the change that introduces this ADR; issue #1126 is cited here
@@ -388,8 +393,8 @@ solely as the email poison-message supervision incident.
   `tools/list`, or legacy stdio bytes.
 - Add an MCP resource, subscription, notification, event topic, or public health verb.
 - Treat restart as correctness recovery for work that has not committed durable state.
-- Dispatch a stored scheduled action under the daemon's own identity; replay carries the
-  persisted creator actor or fails closed.
+- Dispatch a stored scheduled action under the daemon's own identity or a mutable note
+  property; replay derives its actor from immutable creator provenance or fails closed.
 - Put blocking or unbounded work on async runtime workers.
 - Claim that supervision fixes issue #1127's scan complexity.
 - Claim complexity, memory, latency, or load benefits without measurement.
@@ -654,7 +659,8 @@ registrations and this dynamic host registration enter the same supervisor and r
 The schedule registration fixes the following concrete policy:
 
 - restart class `OnFailure`, with five restarts over the daemon process lifetime;
-- exponential backoff from 1 second to a 60-second cap;
+- exponential backoff with positive jitter from 1 second to a hard 60-second total-delay cap
+  (the jittered delay, not merely its base, is capped);
 - a 5-second cooperative shutdown bound, clamped inside the daemon drain window;
 - cancellation observed between ticks through `HostContext::cancellation()`;
 - component heartbeat after every successful drain, including an empty drain; and
@@ -667,16 +673,20 @@ removed from both serve entrypoints.
 
 ### Identity fence and migration policy
 
-The accepted identity fence is delivered in the same migration. `schedule.schedule`
-persists `created_by_actor`, and replay supplies it as the explicit request actor while
-retaining the row namespace. Gate checks, audit records, and writes therefore execute as
-the creator rather than the daemon. A policy test denies `create` to the creator while
-allowing the daemon and proves the scheduled side effect remains denied.
+The accepted identity fence is delivered in the same migration. `schedule.schedule` stages
+its note, appends a target-bound creator-provenance event from the dispatch token, and only
+then activates the row as pending. `created_by_actor` remains display metadata, never an
+authority source. Replay reconstructs the exact actor kind from immutable provenance while
+retaining the row namespace and public verb-visibility boundary. Attributed principals use
+`VerifiedActor`; `anonymous:local` remains anonymous. Gate checks, audit records, and writes
+therefore execute as the creator rather than the daemon, and internal subhandlers remain
+unreachable. Policy tests deny `create` to the creator while allowing the daemon, reject a
+forged note property, and prove concurrent actor/namespace pairs do not cross.
 
-Generic legacy rows without `created_by_actor` fail closed and terminally: no dispatch
+Generic legacy rows without immutable creator provenance fail closed and terminally: no dispatch
 occurs, `status` becomes `failed`, and `dispatch_error`/`dispatch_failed_at` record the
-policy failure. ADR-106 Amendment C's reminder-only fallback is an explicit pre-existing
-migration policy and remains unchanged. Ordinary generic dispatch failures remain
+policy failure. ADR-106 Amendment C's reminder-only fallback ignores any unprovenanced note
+actor claim and uses the current server actor (then `local`). Ordinary generic dispatch failures remain
 per-event, persist the same error fields, and follow normal cadence finalization.
 
 ### Health compatibility

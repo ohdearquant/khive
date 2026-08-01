@@ -1976,18 +1976,32 @@ impl KhiveMcpServer {
             .await
     }
 
-    /// Trusted in-process dispatch with an explicit effective identity.
+    /// Replay one stored public-surface request under a host-verified actor.
     ///
-    /// Host-owned replay components use this to preserve the actor that
-    /// created durable work instead of inheriting the daemon process actor.
-    /// It keeps operator/subhandler visibility semantics, while token minting,
-    /// gate checks, audit attribution, and writes all observe `identity`.
-    pub(crate) async fn dispatch_request_local_with_identity(
+    /// An attributed actor must come from an out-of-band provenance check,
+    /// never from a field inside the stored request. `None` is reserved for a
+    /// provenance-verified anonymous/local creator, preserving that actor kind.
+    /// Replay deliberately sets `from_wire=true`: scheduling delays a public
+    /// request; it does not upgrade that request into the operator-only local
+    /// surface where [`khive_runtime::Visibility::Subhandler`] verbs are callable.
+    pub(crate) async fn dispatch_request_replay_as(
         &self,
         p: RequestParams,
-        identity: khive_runtime::RequestIdentity,
+        namespace: &str,
+        verified_actor: Option<khive_runtime::VerifiedActor>,
     ) -> Result<String, McpError> {
-        self.dispatch_request_inner(p, false, Some(identity), DispatchOrigin::Local)
+        let identity = khive_runtime::RequestIdentity {
+            namespace: namespace.to_string(),
+            // `None` is the provenance-verified anonymous/local identity;
+            // spelling that identity as `Some("local")` would incorrectly
+            // reconstruct it as the distinct authenticated `actor:local`.
+            actor_id: verified_actor.map(|actor| actor.as_str().to_string()),
+            // A scheduled action is scoped exactly to its event namespace;
+            // it never inherits the daemon's broader read visibility.
+            visible_namespaces: Vec::new(),
+            request_id: None,
+        };
+        self.dispatch_request_inner(p, true, Some(identity), DispatchOrigin::Local)
             .await
     }
 

@@ -444,6 +444,16 @@ fn jitter_ms(backoff_ms: u64) -> u64 {
     nanos % (backoff_ms / 4 + 1)
 }
 
+/// Apply positive jitter without ever exceeding the registration's hard
+/// backoff cap. `backoff_max_ms` is an operator-facing maximum delay, not only
+/// a cap on the un-jittered base; allowing `base + jitter` past it makes a
+/// documented 60-second ceiling reach 75 seconds at steady state.
+fn restart_delay_ms(backoff_ms: u64, backoff_max_ms: u64) -> u64 {
+    let cap = backoff_max_ms.max(1);
+    let base = backoff_ms.min(cap);
+    base.saturating_add(jitter_ms(base)).min(cap)
+}
+
 async fn supervise(
     reg: ComponentRegistration,
     server: KhiveMcpServer,
@@ -561,7 +571,7 @@ async fn supervise(
         }
 
         restarts += 1;
-        let delay = Duration::from_millis(backoff_ms.saturating_add(jitter_ms(backoff_ms)));
+        let delay = Duration::from_millis(restart_delay_ms(backoff_ms, reg.backoff_max_ms));
         tracing::warn!(
             component = reg.name,
             error = %error,
@@ -652,6 +662,21 @@ mod tests {
         assert_eq!(
             clamped_shutdown_wait_ms(100, SHUTDOWN_DRAIN_MARGIN_MS / 2),
             0
+        );
+    }
+
+    #[test]
+    fn restart_delay_including_jitter_never_exceeds_hard_cap() {
+        for base in [1, 1_000, 30_000, 59_999, 60_000, u64::MAX] {
+            assert!(
+                restart_delay_ms(base, SCHEDULE_BACKOFF_MAX_MS) <= SCHEDULE_BACKOFF_MAX_MS,
+                "base={base} exceeded the documented 60-second schedule restart cap"
+            );
+        }
+        assert_eq!(
+            restart_delay_ms(u64::MAX, u64::MAX),
+            u64::MAX,
+            "saturating jitter arithmetic must remain overflow-safe"
         );
     }
 
@@ -748,6 +773,18 @@ mod tests {
             wait_for_state(&health, SCHEDULE_COMPONENT_NAME, ComponentState::Stopped).await;
         assert_eq!(status.restart_count, 0);
         assert!(status.last_error.is_none());
+        let stopped_heartbeat = status
+            .last_heartbeat
+            .expect("schedule component heartbeated before shutdown");
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        assert_eq!(
+            health
+                .status(SCHEDULE_COMPONENT_NAME)
+                .and_then(|status| status.last_heartbeat),
+            Some(stopped_heartbeat),
+            "the inner ticker must be joined before the supervisor reports Stopped; no \
+             schedule task may survive component shutdown"
+        );
     }
 
     static DUP_A_RUNS: AtomicU32 = AtomicU32::new(0);
@@ -1064,6 +1101,81 @@ mod tests {
         let status = wait_for_state(&health, "test-panic", ComponentState::Unhealthy).await;
         assert_eq!(PANIC_RUNS.load(Ordering::SeqCst), 2);
         assert!(status.last_error.as_deref().unwrap().contains("panic"));
+    }
+
+    #[tokio::test]
+    async fn failed_component_is_isolated_from_independent_sibling() {
+        let healthy_cycles = Arc::new(AtomicU32::new(0));
+        let healthy_cycles_for_start = healthy_cycles.clone();
+        let healthy = ComponentRegistration {
+            name: "test-isolated-healthy",
+            restart: RestartClass::Never,
+            max_restarts: 0,
+            backoff_initial_ms: 1,
+            backoff_max_ms: 2,
+            shutdown_timeout_ms: 100,
+            start: Arc::new(move |ctx: HostContext| -> ComponentFuture {
+                let cycles = healthy_cycles_for_start.clone();
+                Box::pin(async move {
+                    loop {
+                        tokio::select! {
+                            _ = ctx.cancellation().cancelled() => return Ok(()),
+                            _ = tokio::time::sleep(Duration::from_millis(2)) => {
+                                cycles.fetch_add(1, Ordering::SeqCst);
+                                ctx.heartbeat();
+                            }
+                        }
+                    }
+                })
+            }),
+        };
+        let failing = ComponentRegistration {
+            name: "test-isolated-failing",
+            restart: RestartClass::Never,
+            max_restarts: 0,
+            backoff_initial_ms: 1,
+            backoff_max_ms: 2,
+            shutdown_timeout_ms: 100,
+            start: Arc::new(|_ctx: HostContext| -> ComponentFuture {
+                Box::pin(async move {
+                    panic!("isolated sibling panic");
+                })
+            }),
+        };
+        let (_f, db) = tmp_db();
+        let server = make_server(&db).await;
+        let health = HealthReporter::default();
+        let parent = CancellationToken::new();
+        assert_eq!(
+            start_component_registrations(
+                vec![failing, healthy],
+                &server,
+                parent.clone(),
+                health.clone(),
+            ),
+            2
+        );
+
+        wait_for_state(&health, "test-isolated-failing", ComponentState::Unhealthy).await;
+        for _ in 0..400 {
+            if healthy_cycles.load(Ordering::SeqCst) >= 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(
+            healthy_cycles.load(Ordering::SeqCst) >= 2,
+            "one component's panic must not cancel or starve an independent sibling"
+        );
+        assert_eq!(
+            health
+                .status("test-isolated-healthy")
+                .map(|status| status.state),
+            Some(ComponentState::Running)
+        );
+
+        parent.cancel();
+        wait_for_state(&health, "test-isolated-healthy", ComponentState::Stopped).await;
     }
 
     static DISPATCH_OK: AtomicU32 = AtomicU32::new(0);

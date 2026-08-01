@@ -280,8 +280,12 @@ A `scheduled_event` is a note. `properties` carries the scheduling metadata:
 
 `event_type` distinguishes `remind` (no action payload; fires a notification) from
 `schedule` (stores a serialized verb+args payload for replay). Both creation paths
-persist `created_by_actor`. `payload` is null for reminders and a JSON-encoded verb call
-string for scheduled dispatch.
+mirror `created_by_actor` for display. Replay authority does not come from that mutable
+property: the handler stages the note as `provisioning`, writes a target-bound creator
+event to the append-only event substrate from its dispatch token, then activates the note
+as `pending`. `payload` is null for reminders and a JSON-encoded verb call string for
+scheduled dispatch. Scheduled payloads may name only public `Visibility::Verb` handlers;
+delayed execution does not grant access to internal subhandlers.
 
 #### Four verbs
 

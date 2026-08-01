@@ -6886,17 +6886,36 @@ backend = "kg-backend"
         });
         let ns = Namespace::parse("local").expect("ns");
         let token = rt.authorize(ns).expect("authorize schedule runtime");
-        rt.create_note(
-            &token,
-            "scheduled_event",
-            None,
-            &action_dsl,
-            None,
-            Some(props),
-            vec![],
-        )
-        .await
-        .expect("create scheduled_event through the schedule runtime");
+        let scheduled = rt
+            .create_note(
+                &token,
+                "scheduled_event",
+                None,
+                &action_dsl,
+                None,
+                Some(props),
+                vec![],
+            )
+            .await
+            .expect("create scheduled_event through the schedule runtime");
+        rt.events(&token)
+            .expect("schedule event store")
+            .append_event(
+                khive_storage::Event::new(
+                    "local",
+                    khive_pack_schedule::CREATOR_PROVENANCE_VERB,
+                    khive_types::EventKind::Audit,
+                    khive_types::SubstrateKind::Note,
+                    format!("{}:{}", token.actor().kind, token.actor().id),
+                )
+                .with_target(scheduled.id)
+                .with_payload(serde_json::json!({
+                    "provenance": khive_pack_schedule::CREATOR_PROVENANCE_MARKER_V1,
+                    "event_type": "schedule",
+                })),
+            )
+            .await
+            .expect("append schedule creator provenance");
 
         let summary = crate::pending_events::run_pending_events_on(&rt, &server, false)
             .await

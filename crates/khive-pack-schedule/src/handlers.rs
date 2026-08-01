@@ -12,6 +12,10 @@ use uuid::Uuid;
 use khive_runtime::{micros_to_iso, KhiveRuntime, NamespaceToken, RuntimeError, VerbRegistry};
 use khive_storage::note::{FilterOp, Note, NoteFilter, PropertyFilter, SortDir};
 use khive_storage::types::{PageRequest, SqlStatement, SqlValue};
+use khive_storage::Event;
+use khive_types::{EventKind, SubstrateKind};
+
+use crate::{CREATOR_PROVENANCE_MARKER_V1, CREATOR_PROVENANCE_VERB};
 
 fn short_id(uuid: Uuid) -> String {
     uuid.as_hyphenated().to_string().chars().take(8).collect()
@@ -172,6 +176,19 @@ fn validate_replayable_single_action(
         ))
     })?;
 
+    // A scheduled action originates on the public request surface and must
+    // retain that surface's visibility boundary when it fires. Describing an
+    // internal subhandler is intentionally allowed for introspection, so
+    // `describe_verb` succeeding is not enough: reject the explicit
+    // `callable_via_mcp:false` marker as well. The replay host repeats this
+    // check at dispatch time so a hand-written/legacy row cannot bypass it.
+    if help.get("callable_via_mcp").and_then(Value::as_bool) == Some(false) {
+        return Err(RuntimeError::InvalidInput(format!(
+            "schedule.action: verb {:?} is an internal subhandler and cannot be scheduled",
+            op.tool
+        )));
+    }
+
     for value in op.args.values() {
         if !matches!(value, khive_request::ArgValue::Value(_)) {
             return Err(RuntimeError::InvalidInput(
@@ -202,6 +219,52 @@ fn validate_replayable_single_action(
 
     validate_args_against_help(&op.tool, &op.args, &help)?;
     validate_conditional_requirements(&op.tool, &op.args, registry)
+}
+
+/// Persist immutable creator provenance, then make a staged scheduled-event
+/// note visible to the agenda/drain by transitioning it to `pending`.
+///
+/// `created_by_actor` in note properties is deliberately only a display
+/// mirror: generic KG `create`/`update` can write arbitrary note properties,
+/// whereas no public verb can append an event. The runner therefore derives
+/// replay authority from this event's actor column and never from the note.
+/// Creating the note as `provisioning` closes the crash window: a failure
+/// before provenance and activation can leave an inert diagnostic row, never
+/// executable unprovenanced work.
+async fn activate_with_creator_provenance(
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+    note: &Note,
+    mut properties: Value,
+    event_type: &str,
+) -> Result<(), RuntimeError> {
+    let actor = format!("{}:{}", token.actor().kind, token.actor().id);
+    let provenance = Event::new(
+        token.namespace().as_str(),
+        CREATOR_PROVENANCE_VERB,
+        EventKind::Audit,
+        SubstrateKind::Note,
+        actor,
+    )
+    .with_target(note.id)
+    .with_payload(json!({
+        "provenance": CREATOR_PROVENANCE_MARKER_V1,
+        "event_type": event_type,
+    }));
+    runtime.events(token)?.append_event(provenance).await?;
+
+    properties["status"] = json!("pending");
+    let activated = runtime
+        .notes(token)?
+        .update_note_properties(note.id, Some(properties), Utc::now().timestamp_micros())
+        .await?;
+    if !activated {
+        return Err(RuntimeError::Internal(format!(
+            "schedule: staged event {} disappeared before provenance activation",
+            note.id
+        )));
+    }
+    Ok(())
 }
 
 /// Rejects scheduled actions known to fail a handler's *conditional*
@@ -694,7 +757,7 @@ pub(crate) async fn handle_remind(
     let properties = json!({
         "trigger_at": trigger_at_original,
         "repeat": p.repeat,
-        "status": "pending",
+        "status": "provisioning",
         "event_type": "remind",
         "created_by_actor": token.actor().id.clone(),
         "payload": null,
@@ -709,10 +772,11 @@ pub(crate) async fn handle_remind(
             None,
             &p.content,
             None,
-            Some(properties),
+            Some(properties.clone()),
             Vec::new(),
         )
         .await?;
+    activate_with_creator_provenance(runtime, token, &note, properties, "remind").await?;
 
     Ok(json!({
         "id": short_id(note.id),
@@ -767,7 +831,7 @@ pub(crate) async fn handle_schedule(
     let properties = json!({
         "trigger_at": trigger_at_original,
         "repeat": p.repeat,
-        "status": "pending",
+        "status": "provisioning",
         "event_type": "schedule",
         "created_by_actor": token.actor().id.clone(),
         "payload": p.action,
@@ -782,10 +846,11 @@ pub(crate) async fn handle_schedule(
             None,
             &p.action,
             None,
-            Some(properties),
+            Some(properties.clone()),
             Vec::new(),
         )
         .await?;
+    activate_with_creator_provenance(runtime, token, &note, properties, "schedule").await?;
 
     Ok(json!({
         "id": short_id(note.id),

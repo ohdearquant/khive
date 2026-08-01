@@ -776,14 +776,16 @@ this ADR has delivered so far.
 
 ## Amendment C: Reminder delivery and failure observability (2026-07-12)
 
-`schedule.remind` persists the creating actor's identity in the scheduled-event row as
-`created_by_actor`. When an in-grace reminder fires, the drain reads that stored value
-and dispatches `comm.send(to=<created_by_actor>, ...)`, producing an inbound message in
-the creator's actor-addressed inbox. Delivery therefore remains attributed to the
-creator across daemon restarts and changes in the daemon's own actor identity. Rows
-created before `created_by_actor` existed are the only exception: the drain logs a
-warning and falls back to the current server actor, then to `local` when the server has
-no configured actor.
+`schedule.remind` mirrors the creating actor in the scheduled-event row as
+`created_by_actor`, but the authoritative binding is a target-bound event appended from
+the dispatch token before the staged note becomes pending. When an in-grace reminder
+fires, the drain derives the recipient and dispatch actor from that immutable provenance
+and dispatches `comm.send`, producing an inbound message in the creator's actor-addressed
+inbox. Delivery therefore remains attributed to the creator across daemon restarts and
+changes in the daemon's own actor identity without trusting mutable note properties.
+Rows created before immutable provenance existed are the exception: the drain ignores
+any unprovenanced actor claim, logs a warning, and falls back to the current server actor,
+then to `local` when the server has no configured actor.
 
 A reminder-delivery failure is observable through the drain and persisted state. The
 drain logs the error, increments `DrainSummary.failed`, and persists `delivery_error` plus
@@ -865,16 +867,22 @@ operator state; this amendment adds no generic component-health verb or wire sch
 
 ### Creator-bound replay and legacy policy
 
-`schedule.schedule`, like `schedule.remind`, now persists `created_by_actor`. When a generic
-action fires, the drain supplies that actor and the event namespace as an explicit
-per-request identity to the live server. Token minting, gate checks, audit attribution, and
-writes therefore run as the creator, never as the daemon. The stored DSL still cannot
-override identity.
+`schedule.schedule`, like `schedule.remind`, mirrors `created_by_actor` for display but
+records authority in a target-bound, append-only creator-provenance event written from the
+dispatch token. Creation is ordered `provisioning note -> provenance event -> pending`, so
+no executable row exists before the immutable binding is durable. When a generic action
+fires, the drain reconstructs the exact verified actor kind from that event and supplies it
+with the event namespace to the live server. Attributed principals use `VerifiedActor`;
+`anonymous:local` remains anonymous. Token minting, gate checks, audit attribution, and writes
+therefore run as the creator, never as the daemon. Neither the stored DSL nor mutable note
+properties can override identity. Replay also retains the public visibility gate, so a
+scheduled payload cannot invoke a `Visibility::Subhandler`.
 
-A generic scheduled-action row without `created_by_actor` fails closed: the payload is not
+A generic scheduled-action row without immutable creator provenance fails closed: the payload is not
 dispatched, the claimed row becomes terminal `status="failed"`, and the drain persists
 `dispatch_error` plus `dispatch_failed_at`. This is the migration policy for rows written
 before creator attribution and deliberately differs from Amendment C's reminder-only legacy
-fallback, which remains current. Other generic dispatch failures remain per-event and follow
+fallback: an unprovenanced reminder ignores its note actor claim and targets only the current
+server actor (then `local`). Other generic dispatch failures remain per-event and follow
 normal cadence finalization (`fired` or re-armed `pending`) while persisting those same error
 fields; a later successful repeat clears them.

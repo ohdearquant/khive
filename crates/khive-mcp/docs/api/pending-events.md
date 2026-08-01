@@ -60,7 +60,8 @@ the already-resolved schedule runtime and receives the daemon's live server thro
 add no ticker.
 
 The concrete policy is `OnFailure`, five restarts per daemon lifetime, exponential
-backoff from 1 second to a 60-second cap, and a 5-second cooperative-shutdown bound.
+backoff with positive jitter from 1 second to a hard 60-second total-delay cap, and a
+5-second cooperative-shutdown bound.
 The loop selects between cancellation and each interval tick. A successful drain,
 including an empty one or one containing per-event action failures, records the
 component heartbeat. A drain-level error returns `ComponentError::Retryable` so the
@@ -69,13 +70,18 @@ inside `DrainSummary` and never consume the component restart budget.
 
 ## Replay identity and legacy rows
 
-Both `schedule.remind` and `schedule.schedule` persist `created_by_actor`. At fire time,
-the pending-event runner uses that actor as the explicit request identity for gate
-evaluation, auditing, and writes; it never inherits the daemon actor. Generic scheduled
-actions written before creator attribution existed fail closed: the payload is not
-dispatched, the row becomes terminal `status="failed"`, and `dispatch_error` plus
-`dispatch_failed_at` explain the migration-policy failure. Reminder rows retain ADR-106
-Amendment C's explicit legacy fallback to the current server actor and then `local`.
+Both `schedule.remind` and `schedule.schedule` mirror `created_by_actor` into the note for
+display, but create the note in inert `status="provisioning"`, append a target-bound creator
+event to the immutable event substrate, and only then activate it as `pending`. At fire time,
+the runner reconstructs the exact verified actor kind from that event's actor column:
+attributed principals use `VerifiedActor`, while `anonymous:local` remains anonymous. It
+never treats the caller-editable note property or stored DSL as authority, and replay preserves the public
+verb-visibility boundary (internal subhandlers stay denied). Generic scheduled actions
+written before immutable provenance existed fail closed: the payload is not dispatched, the
+row becomes terminal `status="failed"`, and `dispatch_error` plus `dispatch_failed_at`
+explain the migration-policy failure. Legacy reminders ignore any unprovenanced actor claim
+and use the current server actor, then `local`, preserving a safe form of Amendment C's
+fallback without permitting forged delivery identity.
 
 Other generic dispatch failures remain per-event: they are persisted as
 `dispatch_error`/`dispatch_failed_at`, then the row follows its normal one-shot or repeat

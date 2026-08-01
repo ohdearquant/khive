@@ -2,19 +2,24 @@
 
 use khive_types::{HandlerDef, ParamDef, Visibility};
 
-/// Pack-auxiliary index for agenda() efficiency.
+/// Pack-auxiliary indexes for agenda scans and creator-provenance lookup.
 ///
 /// Uses `WHERE deleted_at IS NULL` instead of `WHERE kind = 'scheduled_event'` so
 /// that the parameterized `kind = ?N` predicate in `build_note_filter_where` can
 /// use this index.  A literal-value partial condition (`WHERE kind = 'scheduled_event'`)
 /// is invisible to the planner when the query uses a bound parameter for `kind`.
 /// `namespace` and `kind` are included as indexed columns for efficient namespace+kind
-/// range scans.  The statement is idempotent (`CREATE INDEX IF NOT EXISTS`) and is NOT
-/// part of the core versioned migration chain.
-pub(crate) static SCHEDULE_SCHEMA_PLAN_STMTS: [&str; 1] =
-    ["CREATE INDEX IF NOT EXISTS idx_schedule_trigger \
+/// range scans. The statements are idempotent (`CREATE INDEX IF NOT EXISTS`) and are NOT
+/// part of the core versioned migration chain. The second index binds provenance lookup
+/// to namespace + internal verb + target note + outcome, avoiding an event-history scan
+/// for each fired row.
+pub(crate) static SCHEDULE_SCHEMA_PLAN_STMTS: [&str; 2] = [
+    "CREATE INDEX IF NOT EXISTS idx_schedule_trigger \
         ON notes(namespace, kind, json_extract(properties, '$.trigger_at')) \
-        WHERE deleted_at IS NULL"];
+        WHERE deleted_at IS NULL",
+    "CREATE INDEX IF NOT EXISTS idx_schedule_creator_provenance \
+        ON events(namespace, verb, target_id, outcome)",
+];
 
 pub(crate) static SCHEDULE_HANDLERS: [HandlerDef; 4] = [
     HandlerDef {

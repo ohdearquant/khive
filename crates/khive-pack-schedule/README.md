@@ -25,10 +25,12 @@ This pack creates and queries `scheduled_event` notes; the daemon or pending-eve
 runner evaluates their triggers. At fire time, `schedule.remind` delivers its
 content to the creating actor's inbox through the same dual-write path as
 `comm.send`. Use `schedule.schedule(action="comm.send(...)")` when the recipient
-is a different actor. Both creation verbs persist `created_by_actor`.
-Generic actions replay under that stored actor for gate checks, audit attribution,
-and writes; they never inherit the daemon's authority. A legacy generic row without
-creator attribution fails closed instead of being dispatched. `schedule.schedule`'s
+is a different actor. Both creation verbs mirror `created_by_actor` for display and
+write an immutable, target-bound creator-provenance event before activating the note.
+Generic actions replay under the actor derived from that event for gate checks, audit
+attribution, and writes; mutable note properties cannot grant authority and replay
+cannot invoke internal subhandlers. A legacy generic row without provenance fails
+closed instead of being dispatched. `schedule.schedule`'s
 `action` parameter
 is a full verb-dispatch string (e.g.
 `"schedule.remind(content=\"hello\", at=\"2099-06-01T09:00:00Z\")"`) that must
