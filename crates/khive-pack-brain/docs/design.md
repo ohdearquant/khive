@@ -109,8 +109,10 @@ $$\text{Beta}(\alpha_1 + \alpha_2 - \alpha_{\text{prior}},\; \beta_1 + \beta_2 -
 - Archived profiles are filtered out by `brain.resolve` before scoring so that stale bindings
   pointing at archived profiles do not block resolution of live lower-priority bindings (issue #357).
 - `brain.feedback` validates `target_id` existence against the KG before folding, and validates
-  `served_by_profile_id` lifecycle before updating (must be non-archived). Lifecycle check
-  precedes the event-log append so rejected calls leave no trace in the log (issue C4, R3-1).
+  `served_by_profile_id` lifecycle before updating (must be non-archived). The authoritative
+  lifecycle check runs against the rebased snapshot inside the write transaction before the
+  public event, private event, fold-gate state, or replacement snapshot is written, so a peer
+  archive racing a warm preflight leaves no partial feedback trace (issue C4, R3-1).
 - `brain.unbind` requires at least one filter (`profile_id`, `actor`, `namespace`, or
   `consumer_kind`) to prevent accidental wipe of all bindings (issue C2).
 - `brain.bind` rejects archived profiles to prevent creating unresolvable bindings (issue C3).

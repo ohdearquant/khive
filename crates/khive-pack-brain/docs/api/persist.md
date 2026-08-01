@@ -28,6 +28,13 @@ The event and snapshot share a transaction timestamp chosen as
 `max(wall_clock, previous_updated_at + 1)`, so a writer that waited behind a newer process
 cannot move the replay boundary backward and cause already-snapshotted feedback to replay twice.
 
+`persist_feedback_state_mutation` uses the same generation/rebase boundary, then validates the
+selected profile against that authoritative state. For accepted feedback, the implicit-mass fold
+and dedup claim (when applicable), public `FeedbackExplicit` event, private `brain_event_log` row,
+and replacement snapshot commit in that same atomic unit. An absent or archived profile is
+rejected before any of those writes, so a peer lifecycle transition cannot leave a partial
+feedback trace after the warm process-local preflight has passed.
+
 The monotonically-raised snapshot `updated_at` is the namespace's durable generation.
 `ensure_loaded` checks that primary-key row even for an already-active namespace and reloads
 when another process has advanced it. This keeps profile and binding reads coherent across

@@ -4154,6 +4154,148 @@ async fn stale_pack_mutation_rebases_on_durable_snapshot() {
 }
 
 #[tokio::test]
+async fn feedback_revalidates_lifecycle_inside_cross_process_transaction() {
+    use khive_storage::types::{SqlStatement, SqlValue};
+    use std::sync::Arc;
+    use tokio::sync::oneshot;
+
+    struct HookGuard;
+    impl Drop for HookGuard {
+        fn drop(&mut self) {
+            crate::pack::clear_feedback_precommit_hook();
+        }
+    }
+    let _guard = HookGuard;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let config = khive_runtime::RuntimeConfig {
+        db_path: Some(dir.path().join("feedback-archive-race.db")),
+        ..khive_runtime::RuntimeConfig::no_embeddings()
+    };
+    let feedback_rt = KhiveRuntime::new(config.clone()).expect("feedback runtime");
+    let archive_rt = KhiveRuntime::new(config.clone()).expect("archive runtime");
+    let observer_rt = KhiveRuntime::new(config).expect("observer runtime");
+    let feedback_pack = Arc::new(BrainPack::new(feedback_rt.clone()));
+    let archive_pack = BrainPack::new(archive_rt.clone());
+    let observer_pack = BrainPack::new(observer_rt.clone());
+    let registry = Arc::new(empty_registry());
+    let feedback_token = Arc::new(
+        feedback_rt
+            .authorize(Namespace::local())
+            .expect("feedback token"),
+    );
+    let archive_token = archive_rt
+        .authorize(Namespace::local())
+        .expect("archive token");
+    let observer_token = observer_rt
+        .authorize(Namespace::local())
+        .expect("observer token");
+    let profile_id = "feedback-archive-race-profile";
+
+    feedback_pack
+        .dispatch(
+            "brain.create_profile",
+            json!({"name": profile_id, "consumer_kind": "recall"}),
+            &registry,
+            &feedback_token,
+        )
+        .await
+        .expect("create feedback profile");
+    archive_pack
+        .dispatch("brain.profiles", json!({}), &registry, &archive_token)
+        .await
+        .expect("archive runtime observes profile");
+    let target = create_test_entity(&feedback_rt, &feedback_token).await;
+
+    let (reached_tx, reached_rx) = oneshot::channel();
+    let (proceed_tx, proceed_rx) = oneshot::channel();
+    crate::pack::set_feedback_precommit_hook(crate::pack::FeedbackPrecommitHook {
+        profile_id: profile_id.to_string(),
+        reached_tx,
+        proceed_rx,
+    });
+
+    let feedback_pack_task = Arc::clone(&feedback_pack);
+    let feedback_token_task = Arc::clone(&feedback_token);
+    let registry_task = Arc::clone(&registry);
+    let target_for_task = target.clone();
+    let feedback_task = tokio::spawn(async move {
+        feedback_pack_task
+            .dispatch(
+                "brain.feedback",
+                json!({
+                    "target_id": target_for_task,
+                    "signal": "implicit_positive",
+                    "served_by_profile_id": profile_id,
+                }),
+                &registry_task,
+                &feedback_token_task,
+            )
+            .await
+    });
+
+    reached_rx
+        .await
+        .expect("feedback reaches post-preflight hook");
+    archive_pack
+        .dispatch(
+            "brain.archive",
+            json!({"profile_id": profile_id}),
+            &registry,
+            &archive_token,
+        )
+        .await
+        .expect("peer archives inactive profile");
+    proceed_tx.send(()).expect("release feedback transaction");
+
+    let error = feedback_task
+        .await
+        .expect("feedback task joins")
+        .expect_err("rebased feedback must reject the archived profile");
+    assert!(
+        matches!(error, RuntimeError::InvalidInput(ref message) if message.contains("archived")),
+        "rebased feedback rejection must report the archived lifecycle: {error:?}"
+    );
+
+    let profile = observer_pack
+        .dispatch(
+            "brain.profile",
+            json!({"profile_id": profile_id}),
+            &registry,
+            &observer_token,
+        )
+        .await
+        .expect("observer reads archived profile");
+    assert_eq!(profile["lifecycle"], json!("archived"));
+    assert_eq!(profile["total_events"], json!(0u64));
+
+    let mut reader = observer_rt.sql().reader().await.expect("observer reader");
+    let row = reader
+        .query_row(SqlStatement {
+            sql: "SELECT \
+                    (SELECT COUNT(*) FROM events \
+                     WHERE namespace = ?1 AND verb = 'brain.feedback') AS public_events, \
+                    (SELECT COUNT(*) FROM brain_event_log \
+                     WHERE namespace = ?1 AND event_kind = 'brain.feedback') AS private_events, \
+                    (SELECT COUNT(*) FROM brain_implicit_mass \
+                     WHERE namespace = ?1 AND profile_id = ?2 AND target_id = ?3) AS mass_rows"
+                .into(),
+            params: vec![
+                SqlValue::Text(observer_token.namespace().as_str().to_string()),
+                SqlValue::Text(profile_id.to_string()),
+                SqlValue::Text(target),
+            ],
+            label: Some("brain_test_feedback_archive_race_counts".into()),
+        })
+        .await
+        .expect("read feedback side-effect counts")
+        .expect("count row");
+    assert_eq!(row.get("public_events"), Some(&SqlValue::Integer(0)));
+    assert_eq!(row.get("private_events"), Some(&SqlValue::Integer(0)));
+    assert_eq!(row.get("mass_rows"), Some(&SqlValue::Integer(0)));
+}
+
+#[tokio::test]
 async fn matching_generation_reuses_local_snapshot_without_decoding_durable_json() {
     use khive_storage::types::{SqlStatement, SqlValue};
 

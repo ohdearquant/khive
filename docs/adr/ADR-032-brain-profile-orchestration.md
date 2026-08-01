@@ -673,6 +673,10 @@ concurrent writers serialize as read-current → mutate → write-current instea
 stale full-state blob to win last. The event and replacement snapshot use the same
 transaction timestamp, monotonically raised above the prior snapshot timestamp when
 necessary, so lock wait order cannot move the event-replay boundary backward.
+For `brain.feedback`, profile existence and the non-`Archived` lifecycle precondition are checked
+against that rebased state. Only after they pass may the same transaction write the implicit-mass
+fold/dedup claim (when applicable), public `FeedbackExplicit` event, private brain event, and
+replacement snapshot. Rejection therefore commits none of those feedback side effects.
 
 The snapshot row's monotonically-raised `updated_at` is the durable namespace generation.
 Every brain dispatch compares it with the generation represented by its in-memory state. An
@@ -1092,7 +1096,9 @@ from the moment it is created. The built-in `balanced-recall-v1` profile uses th
   and syncs `total_events` + `state_snapshot` to the record.
 - If `served_by_profile_id` is absent, feedback defaults to `balanced-recall-v1`.
 - Archived profiles are rejected on the feedback write path (not just the lifecycle-transition
-  path) — `served_by_profile_id` pointing at an archived profile returns `InvalidInput`.
+  path) — `served_by_profile_id` pointing at an archived profile returns `InvalidInput`. The
+  decisive lifecycle check uses the latest snapshot inside the feedback write transaction, so a
+  peer archive cannot race a warm process-local check and still receive posterior credit.
 
 ### 12. Brain registers as a pack
 

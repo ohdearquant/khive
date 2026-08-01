@@ -36,6 +36,46 @@ pub(crate) fn clear_dispatch_interleave_hook() {
     *DISPATCH_INTERLEAVE_HOOK.lock().unwrap() = None;
 }
 
+#[cfg(test)]
+pub(crate) struct FeedbackPrecommitHook {
+    pub profile_id: String,
+    pub reached_tx: tokio::sync::oneshot::Sender<()>,
+    pub proceed_rx: tokio::sync::oneshot::Receiver<()>,
+}
+
+#[cfg(test)]
+pub(crate) static FEEDBACK_PRECOMMIT_HOOK: std::sync::Mutex<Option<FeedbackPrecommitHook>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(test)]
+pub(crate) fn set_feedback_precommit_hook(hook: FeedbackPrecommitHook) {
+    *FEEDBACK_PRECOMMIT_HOOK.lock().unwrap() = Some(hook);
+}
+
+#[cfg(test)]
+pub(crate) fn clear_feedback_precommit_hook() {
+    *FEEDBACK_PRECOMMIT_HOOK.lock().unwrap() = None;
+}
+
+#[cfg(test)]
+pub(crate) async fn run_feedback_precommit_hook(profile_id: &str) {
+    let hook = {
+        let mut slot = FEEDBACK_PRECOMMIT_HOOK.lock().unwrap();
+        if slot
+            .as_ref()
+            .is_some_and(|hook| hook.profile_id == profile_id)
+        {
+            slot.take()
+        } else {
+            None
+        }
+    };
+    if let Some(hook) = hook {
+        let _ = hook.reached_tx.send(());
+        let _ = hook.proceed_rx.await;
+    }
+}
+
 /// Sync the `balanced-recall-v1` profile record to match the live `balanced_recall` state.
 pub(crate) fn sync_balanced_recall_record(state: &mut BrainState) {
     let total_ev = state.balanced_recall.total_events;
