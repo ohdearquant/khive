@@ -3530,7 +3530,13 @@ mod tests {
     }
 
     // A dry run must predict the same conflict preimages a committing merge
-    // would produce, without deleting or mutating a single row.
+    // would produce, without deleting or mutating a single row. The incident
+    // cascade is two levels deep (an annotation on the dropped edge, and a
+    // nested annotation on that annotation) so the root-to-leaf ordering
+    // ADR-014 promises is actually exercised, not just a one-element vec that
+    // trivially satisfies any order. Every row touched by the merge — both
+    // entities and every edge — is snapshotted before the dry run and
+    // compared field-for-field against its post-run state.
     #[tokio::test]
     async fn merge_entity_dry_run_conflict_returns_preimages_without_mutating() {
         let rt = rt();
@@ -3549,6 +3555,10 @@ mod tests {
             .unwrap();
         let annotator = rt
             .create_entity(&tok, "concept", None, "Annotator", None, None, vec![])
+            .await
+            .unwrap();
+        let nested_annotator = rt
+            .create_entity(&tok, "concept", None, "NestedAnnotator", None, None, vec![])
             .await
             .unwrap();
 
@@ -3585,9 +3595,49 @@ mod tests {
             )
             .await
             .unwrap();
-        rt.delete_edge(&tok, annotation.id.into(), false)
+        let nested_annotation = rt
+            .link(
+                &tok,
+                nested_annotator.id,
+                annotation.id.into(),
+                EdgeRelation::Annotates,
+                0.6,
+                Some(serde_json::json!({"basis": "nested"})),
+            )
             .await
             .unwrap();
+        rt.delete_edge(&tok, nested_annotation.id.into(), false)
+            .await
+            .unwrap();
+
+        let survivor_before = rt
+            .get_edge_including_deleted(&tok, survivor.id.into())
+            .await
+            .unwrap()
+            .expect("survivor edge exists");
+        let dropped_before = rt
+            .get_edge_including_deleted(&tok, dropped.id.into())
+            .await
+            .unwrap()
+            .expect("dropped edge exists");
+        let annotation_before = rt
+            .get_edge_including_deleted(&tok, annotation.id.into())
+            .await
+            .unwrap()
+            .expect("annotation edge exists");
+        let nested_annotation_before = rt
+            .get_edge_including_deleted(&tok, nested_annotation.id.into())
+            .await
+            .unwrap()
+            .expect("nested annotation edge exists");
+        let into_before = rt
+            .get_entity(&tok, into.id)
+            .await
+            .expect("into entity exists");
+        let from_before = rt
+            .get_entity(&tok, from.id)
+            .await
+            .expect("from entity exists");
 
         let summary = rt
             .merge_entity(
@@ -3612,43 +3662,88 @@ mod tests {
         assert_eq!(conflict.dropped_edge.source_id, from.id);
         assert_eq!(conflict.dropped_edge.target_id, shared.id);
         assert_eq!(conflict.dropped_edge.weight, 0.2);
-        assert_eq!(conflict.incident_edge_preimages.len(), 1);
+        // Root-to-leaf order (ADR-014): the direct annotation on the dropped
+        // edge must precede the annotation nested on top of it.
+        assert_eq!(conflict.incident_edge_preimages.len(), 2);
         assert_eq!(
             conflict.incident_edge_preimages[0].id,
             Uuid::from(annotation.id)
         );
         assert!(
-            conflict.incident_edge_preimages[0].deleted_at.is_some(),
-            "dry-run preimage must retain the annotation's tombstone state"
+            conflict.incident_edge_preimages[0].deleted_at.is_none(),
+            "the direct annotation was never soft-deleted"
+        );
+        assert_eq!(
+            conflict.incident_edge_preimages[1].id,
+            Uuid::from(nested_annotation.id)
+        );
+        assert!(
+            conflict.incident_edge_preimages[1].deleted_at.is_some(),
+            "dry-run preimage must retain the nested annotation's tombstone state"
         );
 
-        let live_dropped = rt
+        let survivor_after = rt
+            .get_edge_including_deleted(&tok, survivor.id.into())
+            .await
+            .unwrap()
+            .expect("dry run must not delete the survivor edge");
+        let dropped_after = rt
             .get_edge_including_deleted(&tok, dropped.id.into())
             .await
             .unwrap()
             .expect("dry run must not delete the dropped edge");
-        assert!(live_dropped.deleted_at.is_none());
-        let live_annotation = rt
+        let annotation_after = rt
             .get_edge_including_deleted(&tok, annotation.id.into())
             .await
             .unwrap()
             .expect("dry run must not delete the cascaded annotation");
-        assert!(live_annotation.deleted_at.is_some());
-        let live_survivor = rt
-            .get_edge_including_deleted(&tok, survivor.id.into())
+        let nested_annotation_after = rt
+            .get_edge_including_deleted(&tok, nested_annotation.id.into())
             .await
             .unwrap()
-            .expect("survivor edge must remain");
-        assert!((live_survivor.weight - 0.9).abs() < f64::EPSILON);
+            .expect("dry run must not delete the nested cascaded annotation");
+        assert_eq!(
+            serde_json::to_value(&survivor_before).unwrap(),
+            serde_json::to_value(&survivor_after).unwrap(),
+            "dry run must not mutate the surviving edge's row at all"
+        );
+        assert_eq!(
+            serde_json::to_value(&dropped_before).unwrap(),
+            serde_json::to_value(&dropped_after).unwrap(),
+            "dry run must not mutate the would-be-dropped edge's row at all"
+        );
+        assert_eq!(
+            serde_json::to_value(&annotation_before).unwrap(),
+            serde_json::to_value(&annotation_after).unwrap(),
+            "dry run must not mutate the incident annotation's row at all"
+        );
+        assert_eq!(
+            serde_json::to_value(&nested_annotation_before).unwrap(),
+            serde_json::to_value(&nested_annotation_after).unwrap(),
+            "dry run must not mutate the nested incident annotation's row at all"
+        );
 
-        let into_entity = rt
+        let into_after = rt
             .get_entity(&tok, into.id)
             .await
             .expect("into entity must remain unmerged after a dry run");
-        assert!(into_entity.merged_into.is_none());
-        rt.get_entity(&tok, from.id)
+        let from_after = rt
+            .get_entity(&tok, from.id)
             .await
             .expect("from entity must not be merged away by a dry run");
+        assert_eq!(
+            serde_json::to_value(&into_before).unwrap(),
+            serde_json::to_value(&into_after).unwrap(),
+            "dry run must not mutate the into entity's row at all"
+        );
+        assert_eq!(
+            serde_json::to_value(&from_before).unwrap(),
+            serde_json::to_value(&from_after).unwrap(),
+            "dry run must not mutate the from entity's row at all"
+        );
+        assert_eq!(from_after.deleted_at, None);
+        assert_eq!(from_after.merged_into, None);
+        assert_eq!(from_after.merge_event_id, None);
 
         let events = rt
             .events(&tok)
@@ -5172,7 +5267,13 @@ mod tests {
     }
 
     // A dry run must predict the same conflict preimages a committing note
-    // merge would produce, without deleting or mutating a single row.
+    // merge would produce, without deleting or mutating a single row. The
+    // incident cascade is two levels deep (an annotation on the dropped
+    // edge, and a nested annotation on that annotation) so the root-to-leaf
+    // ordering ADR-014 promises is actually exercised, not just a
+    // one-element vec that trivially satisfies any order. Every row touched
+    // by the merge — both notes and every edge — is snapshotted before the
+    // dry run and compared field-for-field against its post-run state.
     #[tokio::test]
     async fn merge_note_dry_run_conflict_returns_preimages_without_mutating() {
         let rt = rt();
@@ -5191,6 +5292,18 @@ mod tests {
                 "observation",
                 None,
                 "edge annotation",
+                None,
+                None,
+                vec![],
+            )
+            .await
+            .unwrap();
+        let nested_annotator = rt
+            .create_note(
+                &tok,
+                "observation",
+                None,
+                "nested edge annotation",
                 None,
                 None,
                 vec![],
@@ -5235,9 +5348,51 @@ mod tests {
             )
             .await
             .unwrap();
-        rt.delete_edge(&tok, annotation.id.into(), false)
+        let nested_annotation = rt
+            .link(
+                &tok,
+                nested_annotator.id,
+                annotation.id.into(),
+                EdgeRelation::Annotates,
+                0.6,
+                Some(serde_json::json!({"why": "nested duplicate claim"})),
+            )
             .await
             .unwrap();
+        rt.delete_edge(&tok, nested_annotation.id.into(), false)
+            .await
+            .unwrap();
+
+        let survivor_before = rt
+            .get_edge_including_deleted(&tok, survivor.id.into())
+            .await
+            .unwrap()
+            .expect("survivor edge exists");
+        let dropped_before = rt
+            .get_edge_including_deleted(&tok, dropped.id.into())
+            .await
+            .unwrap()
+            .expect("dropped edge exists");
+        let annotation_before = rt
+            .get_edge_including_deleted(&tok, annotation.id.into())
+            .await
+            .unwrap()
+            .expect("annotation edge exists");
+        let nested_annotation_before = rt
+            .get_edge_including_deleted(&tok, nested_annotation.id.into())
+            .await
+            .unwrap()
+            .expect("nested annotation edge exists");
+        let into_before = rt
+            .get_note_including_deleted(&tok, into.id)
+            .await
+            .unwrap()
+            .expect("into note exists");
+        let from_before = rt
+            .get_note_including_deleted(&tok, from.id)
+            .await
+            .unwrap()
+            .expect("from note exists");
 
         let summary = rt
             .merge_note(
@@ -5261,47 +5416,89 @@ mod tests {
         assert_eq!(conflict.dropped_edge.id, Uuid::from(dropped.id));
         assert_eq!(conflict.dropped_edge.source_id, from.id);
         assert_eq!(conflict.dropped_edge.weight, 0.4);
-        assert_eq!(conflict.incident_edge_preimages.len(), 1);
+        // Root-to-leaf order (ADR-014): the direct annotation on the dropped
+        // edge must precede the annotation nested on top of it.
+        assert_eq!(conflict.incident_edge_preimages.len(), 2);
         assert_eq!(
             conflict.incident_edge_preimages[0].id,
             Uuid::from(annotation.id)
         );
         assert!(
-            conflict.incident_edge_preimages[0].deleted_at.is_some(),
-            "dry-run preimage must retain the annotation's tombstone state"
+            conflict.incident_edge_preimages[0].deleted_at.is_none(),
+            "the direct annotation was never soft-deleted"
+        );
+        assert_eq!(
+            conflict.incident_edge_preimages[1].id,
+            Uuid::from(nested_annotation.id)
+        );
+        assert!(
+            conflict.incident_edge_preimages[1].deleted_at.is_some(),
+            "dry-run preimage must retain the nested annotation's tombstone state"
         );
 
-        let live_dropped = rt
+        let survivor_after = rt
+            .get_edge_including_deleted(&tok, survivor.id.into())
+            .await
+            .unwrap()
+            .expect("dry run must not delete the survivor edge");
+        let dropped_after = rt
             .get_edge_including_deleted(&tok, dropped.id.into())
             .await
             .unwrap()
             .expect("dry run must not delete the dropped edge");
-        assert!(live_dropped.deleted_at.is_none());
-        let live_annotation = rt
+        let annotation_after = rt
             .get_edge_including_deleted(&tok, annotation.id.into())
             .await
             .unwrap()
             .expect("dry run must not delete the cascaded annotation");
-        assert!(live_annotation.deleted_at.is_some());
-        let live_survivor = rt
-            .get_edge_including_deleted(&tok, survivor.id.into())
+        let nested_annotation_after = rt
+            .get_edge_including_deleted(&tok, nested_annotation.id.into())
             .await
             .unwrap()
-            .expect("survivor edge must remain");
-        assert!((live_survivor.weight - 1.0).abs() < f64::EPSILON);
+            .expect("dry run must not delete the nested cascaded annotation");
+        assert_eq!(
+            serde_json::to_value(&survivor_before).unwrap(),
+            serde_json::to_value(&survivor_after).unwrap(),
+            "dry run must not mutate the surviving edge's row at all"
+        );
+        assert_eq!(
+            serde_json::to_value(&dropped_before).unwrap(),
+            serde_json::to_value(&dropped_after).unwrap(),
+            "dry run must not mutate the would-be-dropped edge's row at all"
+        );
+        assert_eq!(
+            serde_json::to_value(&annotation_before).unwrap(),
+            serde_json::to_value(&annotation_after).unwrap(),
+            "dry run must not mutate the incident annotation's row at all"
+        );
+        assert_eq!(
+            serde_json::to_value(&nested_annotation_before).unwrap(),
+            serde_json::to_value(&nested_annotation_after).unwrap(),
+            "dry run must not mutate the nested incident annotation's row at all"
+        );
 
-        let into_note = rt
+        let into_after = rt
             .get_note_including_deleted(&tok, into.id)
             .await
             .unwrap()
             .expect("into note must remain unmerged after a dry run");
-        assert!(into_note.deleted_at.is_none());
-        let from_note = rt
+        let from_after = rt
             .get_note_including_deleted(&tok, from.id)
             .await
             .unwrap()
             .expect("from note must not be deleted by a dry run");
-        assert!(from_note.deleted_at.is_none());
+        assert_eq!(
+            serde_json::to_value(&into_before).unwrap(),
+            serde_json::to_value(&into_after).unwrap(),
+            "dry run must not mutate the into note's row at all"
+        );
+        assert_eq!(
+            serde_json::to_value(&from_before).unwrap(),
+            serde_json::to_value(&from_after).unwrap(),
+            "dry run must not mutate the from note's row at all"
+        );
+        assert_eq!(from_after.status, from_before.status);
+        assert_eq!(from_after.deleted_at, None);
 
         let events = rt
             .events(&tok)
