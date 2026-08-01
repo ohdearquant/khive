@@ -122,8 +122,9 @@ pub(crate) struct IngestParams {
     /// so a later reply can extend the full ancestor chain (issue #403).
     #[serde(default)]
     pub wire_references: Option<String>,
-    /// Transport-layer metadata passthrough, merged verbatim into the stored
-    /// note's properties. Generic and channel-agnostic — see
+    /// Transport-layer metadata passthrough, merged into the stored note's
+    /// properties without overriding reserved stable message fields. Generic
+    /// and channel-agnostic — see
     /// docs/api/message-lifecycle.md#handlersrshandle_ingest.
     #[serde(default)]
     pub metadata: Option<serde_json::Map<String, Value>>,

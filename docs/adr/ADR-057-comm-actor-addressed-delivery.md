@@ -6,7 +6,8 @@
 **Depends on**: ADR-007 (Namespace), ADR-017 (Pack Standard), ADR-040 (Communication and
 Schedule Packs)\
 **Related issues**: #57 (actor-addressed delivery -- primary), #13 (cross-namespace policy
-gate), #75 (actor identity on every request)
+gate), #75 (actor identity on every request), #1428 (process provenance), #1490 (versioned
+message properties)
 
 ## Context
 
@@ -149,6 +150,25 @@ this ADR.
 Existing messages that lack these fields are treated as if `from_actor == namespace` and
 `to_actor == "local"` (the single-actor fallback). No database migration is required; these
 are JSON properties, not columns.
+
+#### Amendment: versioned properties and process provenance (2026-07-31)
+
+The message-note `properties` object is a stable, versioned reader contract. Every message
+written by `comm.send`, `comm.reply`, or `comm.ingest` carries integer
+`comm_schema_version = 1`. A missing marker identifies the pre-versioning layout; it does not
+implicitly mean v1. Any later change to the presence, type, or meaning of a stable field, or an
+addition to the stable-field table, requires a version bump. Existing rows are not rewritten.
+
+The normative field table and reader rules live in
+[`message-properties.md`](../../crates/khive-pack-comm/docs/api/message-properties.md).
+
+`comm.send` and `comm.reply` also receive optional `KHIVE_PROCESS_REF` provenance resolved by the
+originating request process at dispatch time. When present as Unicode, the exact opaque value is
+carried through the warm-daemon request context when necessary and stored as `sent_by_process` on
+both delivery copies. When absent, that property is omitted; a shared daemon never substitutes its
+own environment. It never participates in identity, routing, authorization, visibility,
+threading, or deduplication; `from_actor` remains the actor identity. `comm.ingest` does not stamp
+process provenance because the adapter process is not the author of the received message.
 
 ### `comm.inbox` response shape
 

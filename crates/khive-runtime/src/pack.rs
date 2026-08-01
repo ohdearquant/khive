@@ -792,6 +792,11 @@ pub struct RequestIdentity {
     /// failing the whole request — a single malformed visibility entry from a
     /// caller-supplied frame must not block dispatch.
     pub visible_namespaces: Vec<String>,
+    /// Opaque process provenance resolved by the originating request process.
+    /// `None` means the origin did not set one; a warm daemon must not replace
+    /// it with its own process environment. This field is attribution-only and
+    /// never participates in the gate or token authority.
+    pub process_ref: Option<String>,
     /// Caller-supplied correlation id for this request (khive#948), carried
     /// unchanged from the daemon frame's `request_id` field. Stamped into the
     /// audit event's `resource.request_id` on every outcome (success, error,
@@ -1491,7 +1496,11 @@ impl VerbRegistry {
             };
             extra_visible.push(Namespace::local()); // 'local' always readable; mint dedups
             NamespaceToken::mint_with_visibility(primary, extra_visible, resolved_actor)
-        };
+        }
+        .with_process_ref(match identity.as_ref() {
+            Some(id) => id.process_ref.clone(),
+            None => crate::config::process_ref_from_env(),
+        });
 
         for pack in self.packs.iter() {
             if let Some(handler_def) = pack.handlers().iter().find(|v| v.name == verb) {
@@ -1767,6 +1776,7 @@ impl VerbRegistry {
                 .iter()
                 .map(|ns| ns.as_str().to_string())
                 .collect(),
+            process_ref: crate::config::process_ref_from_env(),
             request_id: None,
         };
         self.dispatch_with_identity(verb, params, Some(identity))

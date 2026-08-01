@@ -95,6 +95,12 @@ requests from many attribution identities over the same shared backend (same db,
 indexes) instead of rejecting or silently dispatching under its own baked identity (ADR-096 Fork
 1).
 
+`RequestIdentity.process_ref` is a non-authoritative request-context rider. The dispatcher copies
+it to `NamespaceToken::process_ref()` for pack handlers but never consults it for gate decisions,
+namespace visibility, or actor resolution. An explicit `None` on a daemon-origin identity remains
+absent; it never falls back to the warm daemon's own environment. Identity-less local dispatch
+resolves `KHIVE_PROCESS_REF` in the current process at dispatch time.
+
 ## build_audit_storage_event
 
 Shared by the immediate-append path (all verbs, denied calls, bulk `links`) and the deferred

@@ -30,7 +30,9 @@ both copies in the caller namespace (see below).
 
 `subject`, `thread_id` are optional. `sent_at` is the RFC3339 timestamp for
 both copies. `from_actor` and `to_actor` are optional actor labels (ADR-057)
-stored in properties.
+stored in properties. Both copies follow the versioned
+[`message-properties` v1 contract](message-properties.md); optional
+`sent_by_process` provenance is copied unchanged to both copies.
 
 Cross-namespace thread root invariant: when a root message is sent (i.e.,
 `thread_id` is `None`), both the outbound and inbound copies must share the
@@ -39,7 +41,8 @@ same canonical `thread_id` — the sender's outbound UUID. This ensures that
 because all replies carry the same canonical thread_id regardless of which
 copy they were replying to.
 
-When `thread_id` is already supplied (reply path), it is forwarded unchanged
+When `thread_id` is already supplied, the handler first parses it and serializes
+the UUID in full-hyphenated form, then forwards that canonical value unchanged
 to both copies.
 
 `in_reply_to_message_id` is the parent's wire Message-ID (angle-bracketed),
@@ -75,6 +78,11 @@ this naturally bypasses the cross-namespace allowlist gate in
 `dual_write_message` (ADR-057 §"Interaction with ADR-040"). The actor labels
 are propagated via the `from_actor`/`to_actor` arguments and stored in message
 properties.
+
+Message properties follow the versioned
+[`message-properties` v1 contract](message-properties.md). When the request
+origin set `KHIVE_PROCESS_REF`, its exact Unicode value is copied to
+`sent_by_process` on both delivery copies as attribution-only metadata.
 
 ### Self-send collapse guard (#820)
 
@@ -165,6 +173,10 @@ Replies to a message, threading linkage.
   regardless of whether the original message carried actor labels. No legacy
   code path can cause `dual_write_message` to mint a token in a foreign
   namespace.
+- Message properties follow the versioned
+  [`message-properties` v1 contract](message-properties.md). An optional
+  `KHIVE_PROCESS_REF` is copied verbatim to both reply delivery copies as
+  attribution-only `sent_by_process` metadata.
 
 ## `handlers.rs::handle_thread`
 
@@ -178,6 +190,11 @@ Cross-namespace thread resolution: when the resolved note carries a
 or a non-root message). `comm.thread` resolves to that canonical root so that
 `thread(id=id_A)` and `thread(id=id_B)` both return the full conversation
 regardless of which copy UUID the caller holds.
+
+Legacy compact or braced stored roots are parsed and normalized for the
+response. The indexed read also queries the selected row's exact legacy
+spelling alongside the canonical v1 spelling, so looking up a pre-v1 child
+does not split its thread; existing rows are not rewritten.
 
 The root ID is validated: it must exist in the caller namespace and its
 `kind` must be `"message"`.
@@ -223,10 +240,22 @@ from within the process (e.g. the polling loop in `khive-mcp`). It is the
 authoritative write path for all channel-delivered messages; the polling loop
 must not bypass it.
 
+The resulting properties follow the versioned
+[`message-properties` v1 contract](message-properties.md). Ingested messages
+do not receive `sent_by_process`: the adapter process delivered the message but
+did not author it.
+
 Issue #479a: a present, non-empty `thread_id` that is not a valid UUID must
 fail closed rather than being silently dropped and replaced with a fresh UUID,
 which would split the message into the wrong conversation. A blank/absent
-value is not an error — it just means "no caller-supplied thread_id".
+value is not an error — it just means "no caller-supplied thread_id". Valid
+compact, braced, and hyphenated UUID spellings are accepted and normalized to
+the full-hyphenated v1 representation before storage. Roots recovered from a
+correlated legacy message are normalized through the same UUID parse.
+
+An omitted `sent_at` defaults to the current time. A supplied value must parse
+as RFC 3339 or ingest fails before writing a note; valid values are normalized
+to UTC RFC 3339 before the v1 marker is stamped.
 
 Thread resolution: when `correlation_external_id` is supplied, the handler
 queries for an existing message note whose `external_id` matches that value,
@@ -257,12 +286,13 @@ confirmed duplicate returns `Ok(None)` without error; only an external_id
 collision is treated as dedup, other constraint violations surface as errors.
 
 Generic transport-layer metadata passthrough (issue #448, `IngestParams::metadata`):
-merged additively so it can never clobber the identity/routing fields (from,
-to, from_actor, to_actor, direction, read, thread_id, sent_at, subject,
-external_id, wire_message_id, wire_references, channel_kind) — a key already
-present always wins. The comm pack does not interpret any metadata key; the
-email channel happens to use it for quarantine markers. `deny_unknown_fields`
-is intentionally absent on `IngestParams` (and `HeartbeatParams`) — the
+merged additively so it can never clobber a key already present. Names in the
+stable [`message-properties` v1 contract](message-properties.md) are reserved
+even when an optional field is absent, so metadata cannot fabricate a subject,
+an outbound twin, or originating-process provenance. Other metadata is generic
+and channel-agnostic; the email channel happens to use it for quarantine
+markers. `deny_unknown_fields` is intentionally absent on `IngestParams` (and
+`HeartbeatParams`) — the
 polling loop may pass extra fields (including the `namespace` routing key
 consumed by the dispatch layer) that future handler versions can extend
 without breaking existing deployments; the `namespace` key is consumed by
@@ -292,7 +322,7 @@ from the struct.
   all.
 - `parent_references_chain`: direction-aware — an inbound parent's chain (as
   received over the wire) lives in `wire_references`; an outbound parent's
-  chain is whatever was persisted on it as `references_chain` when *it* was
+  chain is whatever was persisted on it as `references_chain` when _it_ was
   sent (an outbound note that was a fresh send, not a reply, carries no
   `references_chain`). Returns `None` when the parent has no chain to extend;
   the caller then falls back to the parent's Message-ID alone, matching RFC

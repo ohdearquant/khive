@@ -2806,9 +2806,10 @@ async fn send_rejects_malformed_thread_id() {
     );
 }
 
-/// send with a valid UUID thread_id must succeed.
+/// `send` accepts UUID parser variants but stores only the v1 hyphenated form,
+/// so later exact-string thread queries cannot split the conversation.
 #[tokio::test]
-async fn send_accepts_valid_uuid_thread_id() {
+async fn send_canonicalizes_compact_and_braced_thread_ids_for_thread_lookup() {
     let (registry, _rt) = build_registry_for_ns("local");
 
     // First send to get a real thread root UUID.
@@ -2819,21 +2820,61 @@ async fn send_accepts_valid_uuid_thread_id() {
         )
         .await
         .expect("root send succeeds");
-    let thread_uuid = root
+    let canonical_thread_id = root
         .get("full_id")
         .and_then(|v| v.as_str())
-        .expect("full_id present");
+        .expect("full_id present")
+        .to_string();
+    let thread_uuid = canonical_thread_id
+        .parse::<uuid::Uuid>()
+        .expect("root full_id is a UUID");
 
-    let result = registry
+    for (content, supplied_thread_id) in [
+        ("compact child", thread_uuid.simple().to_string()),
+        ("braced child", format!("{{{canonical_thread_id}}}")),
+    ] {
+        registry
+            .dispatch(
+                "comm.send",
+                serde_json::json!({
+                    "to": "local",
+                    "content": content,
+                    "thread_id": supplied_thread_id,
+                }),
+            )
+            .await
+            .unwrap_or_else(|error| {
+                panic!("send with a valid alternate UUID spelling must succeed: {error}")
+            });
+    }
+
+    let thread = registry
         .dispatch(
-            "comm.send",
-            serde_json::json!({ "to": "local", "content": "threaded reply", "thread_id": thread_uuid }),
+            "comm.thread",
+            serde_json::json!({ "id": canonical_thread_id }),
         )
-        .await;
-    assert!(
-        result.is_ok(),
-        "send with valid UUID thread_id must succeed; got: {result:?}"
+        .await
+        .expect("thread lookup succeeds after alternate UUID spellings");
+    assert_eq!(
+        thread["thread_id"].as_str(),
+        Some(canonical_thread_id.as_str())
     );
+    let messages = thread["messages"].as_array().expect("messages array");
+    for expected_content in ["compact child", "braced child"] {
+        assert!(
+            messages
+                .iter()
+                .any(|message| message["content"].as_str() == Some(expected_content)),
+            "thread lookup must retain {expected_content:?}; got {thread}"
+        );
+    }
+    for message in messages {
+        assert_eq!(
+            message["properties"]["thread_id"].as_str(),
+            Some(canonical_thread_id.as_str()),
+            "every v1 row returned from the thread must use the canonical root; got {message}"
+        );
+    }
 }
 
 // ── COMM-AUD-004: ThreadParams deny_unknown_fields ────────────────────────────
@@ -4826,9 +4867,10 @@ async fn ingest_routing_reply_via_thread_uuid_routes_to_original_sender() {
         store.upsert_note(note).await.expect("upsert outbound note");
     }
 
-    // Ingest a reply whose correlation_external_id is the thread_uuid (X-Khive-Thread-ID).
-    // Pass-1 (external_id match) will find nothing because thread_uuid ≠ external_id.
-    // Pass-2 (thread_id match on outbound) must recover from_actor=lambda:khive.
+    // Ingest a reply whose X-Khive-Thread-ID uses an accepted braced UUID
+    // spelling. Pass 2 must query with the canonical spelling stored above,
+    // recover from_actor=lambda:khive, and keep the selected root canonical.
+    let braced_thread_uuid = format!("{{{thread_uuid}}}");
     let props = ingest_and_get_props(
         &registry,
         &rt,
@@ -4836,7 +4878,7 @@ async fn ingest_routing_reply_via_thread_uuid_routes_to_original_sender() {
             "from": "email:user@example.com",
             "to": "email:mailbox@example.com",
             "content": "this is a reply via X-Khive-Thread-ID",
-            "correlation_external_id": thread_uuid,
+            "correlation_external_id": braced_thread_uuid,
             "external_id": "imap:mail:thread-uuid-reply:1",
             "namespace": "local",
         }),
@@ -4846,7 +4888,7 @@ async fn ingest_routing_reply_via_thread_uuid_routes_to_original_sender() {
     assert_eq!(
         props["to_actor"].as_str(),
         Some("lambda:khive"),
-        "reply correlating via thread-UUID must route to lambda:khive \
+        "reply correlating via a braced thread UUID must route to lambda:khive \
          (original sender's actor); got props={props}"
     );
     assert_eq!(
@@ -5444,12 +5486,11 @@ async fn ingest_without_metadata_persists_no_quarantine_keys() {
     );
 }
 
-/// Metadata must merge additively: it must never be able to override an
-/// identity/routing field the handler already stamped (from, from_actor,
-/// to_actor, direction). This is the safety property that makes the generic
-/// passthrough non-leaky even though the comm pack does not special-case any key.
+/// Metadata must merge additively: it must never be able to override a stable
+/// field the handler stamped or fabricate an optional stable field that is not
+/// meaningful for direct ingest (`outbound_ref`, `sent_by_process`).
 #[tokio::test]
-async fn ingest_metadata_cannot_override_stamped_identity_fields() {
+async fn ingest_metadata_cannot_override_or_fabricate_stable_fields() {
     let (registry, rt) = build_registry_for_ns("local");
 
     let props = ingest_and_get_props(
@@ -5465,6 +5506,10 @@ async fn ingest_metadata_cannot_override_stamped_identity_fields() {
                 "from_actor": "lambda:leo",
                 "to_actor": "lambda:leo",
                 "direction": "outbound",
+                "comm_schema_version": 999,
+                "subject": ["not", "a", "string"],
+                "outbound_ref": "fabricated-twin",
+                "sent_by_process": "fabricated-process",
             },
         }),
     )
@@ -5479,6 +5524,23 @@ async fn ingest_metadata_cannot_override_stamped_identity_fields() {
         props["direction"].as_str(),
         Some("inbound"),
         "metadata must never override the handler-stamped direction; got props={props}"
+    );
+    assert_eq!(
+        props["comm_schema_version"].as_u64(),
+        Some(1),
+        "metadata must never override the handler-stamped schema version; got props={props}"
+    );
+    assert!(
+        props.get("subject").is_none(),
+        "metadata must not fabricate an absent stable subject; got props={props}"
+    );
+    assert!(
+        props.get("outbound_ref").is_none(),
+        "direct ingest has no outbound twin; metadata must not fabricate one; got props={props}"
+    );
+    assert!(
+        props.get("sent_by_process").is_none(),
+        "adapter metadata must not fabricate originating-process provenance; got props={props}"
     );
 }
 
@@ -5530,12 +5592,16 @@ async fn ingest_rejects_malformed_thread_id_without_writing_note() {
     );
 }
 
-/// `comm.ingest` with a valid UUID `thread_id` must succeed and persist it verbatim.
+/// `comm.ingest` accepts a compact UUID but reports and persists the canonical
+/// full-hyphenated v1 spelling.
 #[tokio::test]
-async fn ingest_accepts_valid_uuid_thread_id() {
+async fn ingest_canonicalizes_valid_uuid_thread_id() {
     let (registry, rt) = build_registry_for_ns("local");
 
-    let supplied_thread_id = uuid::Uuid::new_v4().as_hyphenated().to_string();
+    let thread_uuid =
+        uuid::Uuid::parse_str("aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee").expect("fixed test UUID");
+    let supplied_thread_id = thread_uuid.simple().to_string();
+    let canonical_thread_id = thread_uuid.as_hyphenated().to_string();
     let result = registry
         .dispatch(
             "comm.ingest",
@@ -5552,8 +5618,8 @@ async fn ingest_accepts_valid_uuid_thread_id() {
 
     assert_eq!(
         result["thread_id"].as_str(),
-        Some(supplied_thread_id.as_str()),
-        "response thread_id must equal the supplied UUID; got {result}"
+        Some(canonical_thread_id.as_str()),
+        "response thread_id must be the canonical UUID; got {result}"
     );
 
     let full_id = result["full_id"].as_str().expect("full_id present");
@@ -5572,8 +5638,100 @@ async fn ingest_accepts_valid_uuid_thread_id() {
             .as_ref()
             .and_then(|p| p.get("thread_id"))
             .and_then(|v| v.as_str()),
-        Some(supplied_thread_id.as_str()),
-        "stored note properties.thread_id must equal the supplied UUID"
+        Some(canonical_thread_id.as_str()),
+        "stored note properties.thread_id must be the canonical UUID"
+    );
+}
+
+/// A transport timestamp is an instant, not opaque adapter text: accepted
+/// RFC 3339 offsets are normalized to UTC before the v1 marker is written.
+#[tokio::test]
+async fn ingest_canonicalizes_rfc3339_sent_at() {
+    let (registry, rt) = build_registry_for_ns("local");
+    let supplied_sent_at = "2026-07-31T08:15:30.1200-04:00";
+    let expected_sent_at = chrono::DateTime::parse_from_rfc3339(supplied_sent_at)
+        .expect("fixed RFC 3339 timestamp")
+        .with_timezone(&chrono::Utc)
+        .to_rfc3339();
+    assert_ne!(
+        expected_sent_at, supplied_sent_at,
+        "fixture must exercise canonicalization rather than identity"
+    );
+
+    let result = registry
+        .dispatch(
+            "comm.ingest",
+            serde_json::json!({
+                "from": "email:a@example.com",
+                "to": "email:b@example.com",
+                "content": "timestamped inbound",
+                "sent_at": supplied_sent_at,
+                "namespace": "local",
+            }),
+        )
+        .await
+        .expect("valid RFC 3339 sent_at succeeds");
+
+    let full_id = result["full_id"].as_str().expect("full_id present");
+    let id = full_id.parse::<uuid::Uuid>().expect("valid note UUID");
+    let token = rt
+        .authorize(khive_runtime::Namespace::local())
+        .expect("authorize local");
+    let note = rt
+        .notes(&token)
+        .expect("notes store")
+        .get_note(id)
+        .await
+        .expect("get_note ok")
+        .expect("note exists");
+    assert_eq!(
+        note.properties
+            .as_ref()
+            .and_then(|properties| properties.get("sent_at"))
+            .and_then(|value| value.as_str()),
+        Some(expected_sent_at.as_str()),
+        "stored v1 sent_at must be canonical RFC 3339"
+    );
+}
+
+/// A supplied timestamp that names no instant must fail before any v1 message
+/// is persisted; silently accepting it would make `comm_schema_version=1` lie.
+#[tokio::test]
+async fn ingest_rejects_malformed_sent_at_without_writing_note() {
+    let (registry, rt) = build_registry_for_ns("local");
+
+    let error = registry
+        .dispatch(
+            "comm.ingest",
+            serde_json::json!({
+                "from": "email:a@example.com",
+                "to": "email:b@example.com",
+                "content": "bad timestamp",
+                "sent_at": "last tuesday",
+                "namespace": "local",
+            }),
+        )
+        .await
+        .expect_err("malformed sent_at must fail");
+    assert!(
+        matches!(error, khive_runtime::RuntimeError::InvalidInput(_)),
+        "expected InvalidInput, got {error:?}"
+    );
+    assert!(
+        error.to_string().contains("sent_at"),
+        "error must name sent_at; got {error}"
+    );
+
+    let token = rt
+        .authorize(khive_runtime::Namespace::local())
+        .expect("authorize local");
+    let notes = rt
+        .list_notes(&token, Some("message"), 100, 0)
+        .await
+        .expect("list notes");
+    assert!(
+        notes.iter().all(|note| note.deleted_at.is_some()),
+        "malformed sent_at must not write a message; got {notes:?}"
     );
 }
 
@@ -5670,6 +5828,126 @@ async fn ingest_correlation_without_thread_id_uses_matched_message_id_as_root() 
         Some("lambda:khive"),
         "reply must route to the original from_actor, not default_inbound_actor; got props={props}"
     );
+}
+
+/// Correlation against a legacy outbound row may recover a UUID stored in a
+/// compact spelling. The new inbound row must canonicalize that root, and a
+/// thread lookup through a pre-v1 child id must still include every spelling.
+#[tokio::test]
+async fn ingest_correlation_canonicalizes_legacy_compact_root_for_thread_lookup() {
+    let (registry, rt) = build_registry_for_ns("local");
+    let root_id =
+        uuid::Uuid::parse_str("12345678-1234-4abc-8def-1234567890ab").expect("fixed root UUID");
+    let legacy_child_id =
+        uuid::Uuid::parse_str("87654321-4321-4cba-8fed-ba0987654321").expect("fixed child UUID");
+    let canonical_thread_id = root_id.as_hyphenated().to_string();
+    let external_id = "<legacy-compact-root@khive.ai>";
+
+    {
+        use khive_storage::note::Note;
+        let token = rt
+            .authorize(khive_runtime::Namespace::local())
+            .expect("authorize");
+        let store = rt.notes(&token).expect("notes store");
+        let now = chrono::Utc::now().timestamp_micros();
+        store
+            .upsert_note(Note {
+                id: root_id,
+                namespace: "local".into(),
+                kind: "message".into(),
+                status: "active".into(),
+                name: None,
+                content: "legacy compact root".into(),
+                salience: None,
+                decay_factor: None,
+                expires_at: None,
+                properties: Some(serde_json::json!({
+                    "direction": "outbound",
+                    "from": "local",
+                    "to": "email:user@example.com",
+                    "from_actor": "local",
+                    "to_actor": "email:user@example.com",
+                    "external_id": external_id,
+                    "thread_id": root_id.simple().to_string(),
+                    "sent_at": "2026-07-31T12:00:00Z",
+                })),
+                created_at: now,
+                updated_at: now,
+                deleted_at: None,
+            })
+            .await
+            .expect("seed legacy outbound root");
+        store
+            .upsert_note(Note {
+                id: legacy_child_id,
+                namespace: "local".into(),
+                kind: "message".into(),
+                status: "active".into(),
+                name: None,
+                content: "legacy compact child".into(),
+                salience: None,
+                decay_factor: None,
+                expires_at: None,
+                properties: Some(serde_json::json!({
+                    "direction": "outbound",
+                    "from": "local",
+                    "to": "email:user@example.com",
+                    "from_actor": "local",
+                    "to_actor": "email:user@example.com",
+                    "thread_id": root_id.simple().to_string(),
+                    "sent_at": "2026-07-31T12:00:01Z",
+                })),
+                created_at: now + 1,
+                updated_at: now + 1,
+                deleted_at: None,
+            })
+            .await
+            .expect("seed legacy compact child");
+    }
+
+    let ingested = registry
+        .dispatch(
+            "comm.ingest",
+            serde_json::json!({
+                "from": "email:user@example.com",
+                "to": "email:mailbox@example.com",
+                "content": "reply to compact root",
+                "correlation_external_id": external_id,
+                "namespace": "local",
+            }),
+        )
+        .await
+        .expect("correlated ingest succeeds");
+    assert_eq!(
+        ingested["thread_id"].as_str(),
+        Some(canonical_thread_id.as_str()),
+        "correlation-derived root must be canonicalized"
+    );
+
+    let thread = registry
+        .dispatch(
+            "comm.thread",
+            serde_json::json!({ "id": legacy_child_id.as_hyphenated().to_string() }),
+        )
+        .await
+        .expect("thread lookup succeeds");
+    assert_eq!(
+        thread["thread_id"].as_str(),
+        Some(canonical_thread_id.as_str())
+    );
+    let messages = thread["messages"].as_array().expect("messages array");
+    for expected_content in [
+        "legacy compact root",
+        "legacy compact child",
+        "reply to compact root",
+    ] {
+        assert!(
+            messages
+                .iter()
+                .any(|message| message["content"].as_str() == Some(expected_content)),
+            "thread lookup must include {expected_content:?}; got {thread}"
+        );
+    }
 }
 
 /// `comm.thread` must include a root message that has no `thread_id` property

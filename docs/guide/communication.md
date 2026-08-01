@@ -12,6 +12,12 @@ sender's namespace) and an inbound copy (addressed to the recipient), so a
 send always produces two notes and no cross-namespace write occurs even when
 `to` names a different actor.
 
+New messages follow the stable
+[`properties` v1 contract](../../crates/khive-pack-comm/docs/api/message-properties.md).
+Workers may set `KHIVE_PROCESS_REF` to an opaque run or job reference; `comm.send`
+and `comm.reply` then persist it verbatim as `sent_by_process` on both copies.
+It is provenance only and does not change addressing or authorization.
+
 ## Actor addressing
 
 Actors are labeled strings such as `lambda:leo` or `lambda:khive`. `comm.send`

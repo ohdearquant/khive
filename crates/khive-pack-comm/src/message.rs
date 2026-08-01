@@ -6,6 +6,22 @@ use uuid::Uuid;
 use khive_runtime::{micros_to_iso, KhiveRuntime, Namespace, NamespaceToken, RuntimeError};
 use khive_storage::note::Note;
 
+pub(crate) const COMM_SCHEMA_VERSION: u64 = 1;
+pub(crate) const COMM_STABLE_PROPERTY_KEYS: &[&str] = &[
+    "comm_schema_version",
+    "direction",
+    "read",
+    "from_actor",
+    "to_actor",
+    "from",
+    "to",
+    "thread_id",
+    "subject",
+    "sent_at",
+    "outbound_ref",
+    "sent_by_process",
+];
+
 pub(crate) fn short_id(uuid: Uuid) -> String {
     uuid.as_hyphenated().to_string().chars().take(8).collect()
 }
@@ -137,14 +153,15 @@ fn build_preview(content: &str) -> String {
 /// Invariant: when `thread_id` is `None` (root send), both copies are patched
 /// to share the sender's outbound UUID as their canonical `thread_id`, so
 /// `comm.thread` finds replies regardless of which copy they replied to. When
-/// `thread_id` is already supplied (reply path), it is forwarded unchanged.
+/// `thread_id` is supplied, handlers parse and canonicalize it before calling
+/// this helper, and that canonical value is copied unchanged to both rows.
 ///
 /// See crates/khive-pack-comm/docs/api/message-lifecycle.md#messagersdual_write_message for
 /// the `in_reply_to_message_id`/`references_chain` header-threading contract.
-// REASON: dual_write_message mirrors the send wire shape exactly (from, to, subject,
-// content, thread_id, sent_at) plus the two context args (runtime, token). Grouping them into
-// a struct would not reduce overall complexity and would require an extra allocation on the
-// hot path; the current flat signature is intentional.
+// REASON: dual_write_message mirrors the send wire shape plus its persisted metadata and the
+// two context args (runtime, token). Grouping them into a struct would not reduce overall
+// complexity and would require an extra allocation on the hot path; the flat signature is
+// intentional.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn dual_write_message(
     runtime: &KhiveRuntime,
@@ -155,6 +172,7 @@ pub(crate) async fn dual_write_message(
     content: &str,
     thread_id: Option<&str>,
     sent_at: &str,
+    sent_by_process: Option<&str>,
     from_actor: Option<&str>,
     to_actor: Option<&str>,
     in_reply_to_message_id: Option<&str>,
@@ -200,6 +218,7 @@ pub(crate) async fn dual_write_message(
     }
 
     let mut outbound_props = json!({
+        "comm_schema_version": COMM_SCHEMA_VERSION,
         "from": from,
         "to": to,
         "direction": "outbound",
@@ -213,6 +232,9 @@ pub(crate) async fn dual_write_message(
     }
     if let Some(ta) = to_actor {
         outbound_props["to_actor"] = json!(ta);
+    }
+    if let Some(process_ref) = sent_by_process {
+        outbound_props["sent_by_process"] = json!(process_ref);
     }
     if let Some(irt) = in_reply_to_message_id {
         outbound_props["in_reply_to_message_id"] = json!(irt);
@@ -239,7 +261,7 @@ pub(crate) async fn dual_write_message(
         .await?;
 
     // Canonical thread_id for both copies:
-    // - If the caller supplied a thread_id (reply path), propagate it as-is.
+    // - If the caller supplied a prevalidated canonical thread_id, propagate it.
     // - If this is a new root message (thread_id is None), use the outbound note's
     //   UUID so that both copies share the same canonical root across namespaces.
     let canonical_thread_id: String = match thread_id {
@@ -294,6 +316,7 @@ pub(crate) async fn dual_write_message(
         };
 
         let mut inbound_props = json!({
+            "comm_schema_version": COMM_SCHEMA_VERSION,
             "from": from,
             "to": to,
             "direction": "inbound",
@@ -308,6 +331,9 @@ pub(crate) async fn dual_write_message(
         }
         if let Some(ta) = to_actor {
             inbound_props["to_actor"] = json!(ta);
+        }
+        if let Some(process_ref) = sent_by_process {
+            inbound_props["sent_by_process"] = json!(process_ref);
         }
         if let Some(irt) = in_reply_to_message_id {
             inbound_props["in_reply_to_message_id"] = json!(irt);
@@ -413,6 +439,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .await;
 
@@ -438,6 +465,103 @@ mod tests {
             "no live outbound note may remain after rollback, even though the \
              compensation cleanup itself failed; got {alive}"
         );
+    }
+
+    #[tokio::test]
+    async fn dual_write_versions_both_copies_and_stamps_optional_process_provenance() {
+        use khive_runtime::{AllowAllGate, BackendId, RuntimeConfig};
+
+        let runtime = KhiveRuntime::new(RuntimeConfig {
+            git_write: Default::default(),
+            db_path: None,
+            default_namespace: Namespace::local(),
+            embedding_model: None,
+            additional_embedding_models: vec![],
+            gate: std::sync::Arc::new(AllowAllGate),
+            packs: vec!["kg".to_string(), "comm".to_string()],
+            backend_id: BackendId::main(),
+            brain_profile: None,
+            visible_namespaces: vec![],
+            allowed_outbound_namespaces: vec![],
+            actor_id: None,
+        })
+        .expect("in-memory runtime");
+        let caller_token = runtime
+            .authorize(Namespace::local())
+            .expect("authorize local");
+
+        dual_write_message(
+            &runtime,
+            &caller_token,
+            "local",
+            "local",
+            None,
+            "with process provenance",
+            None,
+            "2026-07-31T00:00:00Z",
+            Some("worker/run:42"),
+            Some("local"),
+            Some("local"),
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("dual write with provenance");
+        dual_write_message(
+            &runtime,
+            &caller_token,
+            "local",
+            "local",
+            None,
+            "without process provenance",
+            None,
+            "2026-07-31T00:00:01Z",
+            None,
+            Some("local"),
+            Some("local"),
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("dual write without provenance");
+
+        let notes = runtime
+            .list_notes(&caller_token, Some("message"), 100, 0)
+            .await
+            .expect("list messages");
+        for (content, expected_process) in [
+            ("with process provenance", Some("worker/run:42")),
+            ("without process provenance", None),
+        ] {
+            let matching: Vec<_> = notes
+                .iter()
+                .filter(|note| note.content == content)
+                .collect();
+            assert_eq!(matching.len(), 2, "one outbound and one inbound copy");
+
+            let mut directions = Vec::new();
+            for note in matching {
+                let props = note.properties.as_ref().expect("message properties");
+                assert_eq!(
+                    props.get("comm_schema_version").and_then(Value::as_u64),
+                    Some(COMM_SCHEMA_VERSION)
+                );
+                assert_eq!(
+                    props.get("sent_by_process").and_then(Value::as_str),
+                    expected_process
+                );
+                directions.push(
+                    props
+                        .get("direction")
+                        .and_then(Value::as_str)
+                        .expect("direction"),
+                );
+            }
+            directions.sort_unstable();
+            assert_eq!(directions, ["inbound", "outbound"]);
+        }
     }
 
     fn make_note(namespace: &str, content: &str, props: Option<Value>) -> Note {
