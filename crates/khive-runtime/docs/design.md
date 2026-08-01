@@ -62,6 +62,11 @@
   merged (this is the one by-ID operation with a namespace check — see ADR-007 below; it is
   not a general by-ID access rule)
 - Symmetric relations are canonicalized (source_uuid < target_uuid) before merge conflict checks
+- A merge edge-rewire collision keeps the existing natural-key row and records a complete
+  preimage of the dropped edge in both `MergeSummary` and the merge audit event
+- Dropping a conflicting edge applies the hard-edge-delete cascade recursively; incident
+  annotation edges are removed rather than left dangling, and their preimages are nested under
+  the conflict preimage so the complete destructive step can be restored
 - Soft-delete preserves existing edges; queries filter by `deleted_at IS NULL`
 - Entity tombstone records preserve provenance for audit
 

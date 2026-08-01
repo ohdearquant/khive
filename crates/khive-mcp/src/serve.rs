@@ -434,6 +434,9 @@ fn preflight_ingest_namespace(ns_str: &str, registry: &khive_runtime::VerbRegist
     }
 }
 
+#[cfg(feature = "channel-email")]
+const CHANNEL_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Background task that polls all registered channels every 5 seconds and
 /// ingests new inbound messages via `comm.ingest`.
 ///
@@ -460,10 +463,6 @@ async fn channel_poll_loop(
     use khive_channel_email::{is_backoff_eligible, ImapBackoff};
     use serde_json::json;
     use std::collections::HashMap;
-    use std::time::Duration;
-
-    const HAPPY_PATH_INTERVAL: Duration = Duration::from_secs(5);
-
     // Per-channel bootstrap "since" floor (issue #449). This
     // only feeds the date-based SINCE search used while a channel has no
     // committed UID high-water yet (first-ever poll, or a UIDVALIDITY
@@ -488,7 +487,7 @@ async fn channel_poll_loop(
     // (first failure since success, or a change in error class) rather than
     // once per retry. Cleared on every success.
     let mut last_error_class: HashMap<(String, String), &'static str> = HashMap::new();
-    let mut next_interval = HAPPY_PATH_INTERVAL;
+    let mut next_interval = CHANNEL_POLL_INTERVAL;
     let event_store = registry.event_store();
     // Captured before the loop's first sleep (issue #449 follow-up).
     // A channel's very first bootstrap floor must reflect
@@ -503,7 +502,7 @@ async fn channel_poll_loop(
 
     loop {
         tokio::time::sleep(next_interval).await;
-        next_interval = HAPPY_PATH_INTERVAL;
+        next_interval = CHANNEL_POLL_INTERVAL;
 
         let now = Utc::now();
 
@@ -815,12 +814,14 @@ async fn record_channel_heartbeat(
             "namespace": namespace,
             "channel_kind": channel_kind,
             "channel_slug": channel_slug,
+            "poll_interval_secs": CHANNEL_POLL_INTERVAL.as_secs(),
             "outcome": "success",
         }),
         HeartbeatOutcome::Failure { class, message } => json!({
             "namespace": namespace,
             "channel_kind": channel_kind,
             "channel_slug": channel_slug,
+            "poll_interval_secs": CHANNEL_POLL_INTERVAL.as_secs(),
             "outcome": "failure",
             "error_class": class,
             "error_message": message,
@@ -6879,10 +6880,13 @@ backend = "kg-backend"
             "repeat": repeat,
             "status": "pending",
             "event_type": "schedule",
-            "created_by_actor": "local",
             "payload": action_dsl,
             "fired_at": fired_at,
             "cancelled_at": cancelled_at,
+            // The schedule pack stamps the creating token's actor; this
+            // fixture writes through the runtime directly, so it must carry
+            // the provenance itself — the drain fail-closes without it.
+            "created_by_actor": "local",
         });
         let ns = Namespace::parse("local").expect("ns");
         let token = rt.authorize(ns).expect("authorize schedule runtime");
@@ -7065,6 +7069,8 @@ backend = "kg-backend"
                 channels[0]["channel_slug"].as_str(),
                 Some("recipient@example.com")
             );
+            assert_eq!(channels[0]["poll_interval_secs"].as_u64(), Some(5));
+            assert_eq!(channels[0]["stalled"].as_bool(), Some(false));
         }
 
         /// #606: a daemon polling under a

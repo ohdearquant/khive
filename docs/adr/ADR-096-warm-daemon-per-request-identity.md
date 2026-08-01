@@ -9,7 +9,7 @@ multi-namespace daemon" clause, lines 108-111) and §"Socket protocol" (request-
 attribution, Rev 4 Rule 0), [ADR-018](ADR-018-authorization-gate.md) (Gate = the auth seam),
 [ADR-057](ADR-057-comm-actor-addressed-delivery.md) (actor-addressed
 write-stamp), [ADR-091](ADR-091-wal-snapshot-lifetime.md) (WAL snapshot
-lifetime — interaction only, not solved here).
+lifetime — interaction only, not solved here), #1428 (optional process provenance).
 
 ---
 
@@ -432,6 +432,29 @@ different and much smaller job than enabling anything new.
 - **Does not add** a socket auth/admin plane, an HTTP listener, or a snapshot-format change —
   ADR-049's other scope boundaries are unchanged. Only the "No multi-namespace daemon" clause
   (lines 108-111) and the request-frame shape are amended.
+
+---
+
+## Amendment 3: request-origin process provenance (2026-07-31)
+
+`KHIVE_PROCESS_REF` is an optional attribution rider, not a fourth identity scalar. A client
+resolves it in the process originating the request and carries it as optional `process_ref` on
+`DaemonRequestFrame`; the daemon copies that value into the per-request context and token. This
+prevents a shared warm daemon from stamping its own environment (or the environment of the first
+worker that spawned it) onto messages submitted by another worker.
+
+`process_ref` is excluded from `config_id`, the Gate, namespace visibility, and actor resolution.
+An absent frame field remains absent even if the daemon process itself has `KHIVE_PROCESS_REF`
+set. Identity-less local dispatch reads the current process environment at dispatch time.
+
+The field is optional and has a serde default, but it changes durable dispatch semantics when it
+is present: a daemon built before this amendment would deserialize and ignore the unknown field,
+execute a mutating `comm.send`/`comm.reply`, and return success without the requested provenance.
+Because a client cannot safely retry an already-executed mutation, this amendment bumps
+`PROTOCOL_VERSION` from 3 to 4. Either upgrade direction is rejected before verb dispatch: a v4
+client receives the v3 daemon's explicit lower-version response, while a v4 daemon rejects a v3
+frame and reports its own version. The existing hard mismatch path remains the rollout mechanism;
+there is no local retry that could duplicate a message.
 
 ---
 

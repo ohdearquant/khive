@@ -8,7 +8,7 @@
 // logic into `curation/merge.rs` once the dedup policy API stabilises.
 //! Curation operations: entity update/merge and edge-list filter type.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -267,6 +267,11 @@ pub struct MergeSummary {
     /// contract-violating edge.
     #[serde(default)]
     pub edges_contract_skipped: usize,
+    /// Full preimages for natural-key edge conflicts resolved by this merge.
+    /// Each entry names the surviving row, the dropped duplicate, and every
+    /// incident edge cascaded with it so the destructive step is reversible.
+    #[serde(default)]
+    pub edge_conflict_preimages: Vec<MergeEdgeConflictPreimage>,
     pub properties_merged: usize,
     pub tags_unioned: usize,
     pub content_appended: bool,
@@ -274,6 +279,38 @@ pub struct MergeSummary {
     /// Actual embedding-input truncation observed while reindexing the survivor.
     #[serde(skip)]
     pub embedding_truncation: crate::retrieval::EmbeddingTruncationReport,
+}
+
+/// Complete stored state of an edge removed while resolving a merge conflict.
+///
+/// Timestamps use the storage layer's microsecond representation. `relation`
+/// remains a string so a legacy row predating the closed relation enum can
+/// still be captured without making an otherwise valid merge fail.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct MergeEdgePreimage {
+    pub id: Uuid,
+    pub namespace: String,
+    pub source_id: Uuid,
+    pub target_id: Uuid,
+    pub relation: String,
+    pub weight: f64,
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub deleted_at: Option<i64>,
+    pub target_backend: Option<String>,
+    pub metadata: Option<Value>,
+}
+
+/// One natural-key collision resolved by a direct entity or note merge.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct MergeEdgeConflictPreimage {
+    pub surviving_edge_id: Uuid,
+    pub dropped_edge: MergeEdgePreimage,
+    /// Edges removed by the hard-delete cascade because they referenced the
+    /// dropped edge as a node. Under the accepted endpoint contract these are
+    /// `annotates` edges, including already-soft-deleted rows.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub incident_edge_preimages: Vec<MergeEdgePreimage>,
 }
 
 /// Patch for `update_edge`. Only `Some(_)` fields are applied; `None` means "leave unchanged".
@@ -440,7 +477,7 @@ fn map_merge_entity_storage_error(error: khive_storage::StorageError) -> Runtime
 // REASON: EdgeRow fields are populated via rusqlite row mapping. The struct is fully
 // constructed even when not all fields are read back after construction. The complete
 // field mapping guards against column-order bugs when the schema changes.
-#[allow(dead_code)]
+#[derive(Clone)]
 struct EdgeRow {
     id: Uuid,
     /// The edge's own attribution namespace (khive#1236) — may differ from the
@@ -458,6 +495,93 @@ struct EdgeRow {
     deleted_at: Option<i64>,
     target_backend: Option<String>,
     metadata: Option<String>,
+}
+
+fn edge_row_preimage(edge: &EdgeRow) -> Result<MergeEdgePreimage, SqliteError> {
+    let metadata = edge
+        .metadata
+        .as_deref()
+        .map(serde_json::from_str)
+        .transpose()
+        .map_err(|error| SqliteError::InvalidData(error.to_string()))?;
+    Ok(MergeEdgePreimage {
+        id: edge.id,
+        namespace: edge.namespace.clone(),
+        source_id: edge.source_id,
+        target_id: edge.target_id,
+        relation: edge.relation.clone(),
+        weight: edge.weight,
+        created_at: edge.created_at,
+        updated_at: edge.updated_at,
+        deleted_at: edge.deleted_at,
+        target_backend: edge.target_backend.clone(),
+        metadata,
+    })
+}
+
+/// Capture every row that the accepted hard-edge-delete cascade would remove
+/// when `root_edge_id` is purged. The traversal is recursive because an
+/// `annotates` edge may itself be an annotation target. Rows that also touch a
+/// merge participant use their transaction-start snapshot from `original_edges`
+/// so the preimage never reflects an earlier rewire in the same merge.
+fn collect_conflict_incident_edge_preimages(
+    conn: &rusqlite::Connection,
+    root_edge_id: Uuid,
+    original_edges: &HashMap<Uuid, EdgeRow>,
+) -> Result<Vec<MergeEdgePreimage>, SqliteError> {
+    let parse_id =
+        |s: String| Uuid::parse_str(&s).map_err(|e| SqliteError::InvalidData(e.to_string()));
+    let mut queue = VecDeque::from([root_edge_id]);
+    let mut seen = HashSet::from([root_edge_id]);
+    let mut preimages = Vec::new();
+
+    while let Some(target_edge_id) = queue.pop_front() {
+        let mut stmt = conn.prepare(
+            "SELECT id, namespace, source_id, target_id, relation, weight, created_at, \
+                    updated_at, deleted_at, target_backend, metadata \
+             FROM graph_edges WHERE source_id = ?1 OR target_id = ?1 ORDER BY id",
+        )?;
+        let mut rows = stmt.query(rusqlite::params![target_edge_id.to_string()])?;
+        while let Some(row) = rows.next()? {
+            let edge = EdgeRow {
+                id: parse_id(row.get(0)?)?,
+                namespace: row.get(1)?,
+                source_id: parse_id(row.get(2)?)?,
+                target_id: parse_id(row.get(3)?)?,
+                relation: row.get(4)?,
+                weight: row.get(5)?,
+                created_at: row.get(6)?,
+                updated_at: row.get(7)?,
+                deleted_at: row.get(8)?,
+                target_backend: row.get(9)?,
+                metadata: row.get(10)?,
+            };
+            if !seen.insert(edge.id) {
+                continue;
+            }
+            let preimage = match original_edges.get(&edge.id) {
+                Some(original) => edge_row_preimage(original)?,
+                None => edge_row_preimage(&edge)?,
+            };
+            queue.push_back(edge.id);
+            preimages.push(preimage);
+        }
+    }
+
+    Ok(preimages)
+}
+
+fn delete_conflict_incident_edges(
+    conn: &rusqlite::Connection,
+    preimages: &[MergeEdgePreimage],
+) -> Result<(), SqliteError> {
+    for edge in preimages.iter().rev() {
+        conn.execute(
+            khive_db::stores::graph::EDGE_SYMMETRIC_DELETE_NONCANONICAL_SQL,
+            rusqlite::params![&edge.namespace, edge.id.to_string()],
+        )?;
+    }
+    Ok(())
 }
 
 /// Resolves the substrate (`"entity"` or `"note"`), kind, and entity_type (entities
@@ -903,6 +1027,7 @@ impl KhiveRuntime {
                 "content_strategy": format!("{:?}", content_strategy),
                 "edges_rewired": summary.edges_rewired,
                 "edges_contract_skipped": summary.edges_contract_skipped,
+                "edge_conflict_preimages": &summary.edge_conflict_preimages,
             });
             if let Some(reason) = reason {
                 payload["reason"] = serde_json::Value::String(reason);
@@ -1378,6 +1503,7 @@ impl KhiveRuntime {
                 "content_strategy": format!("{:?}", content_strategy),
                 "edges_rewired": summary.edges_rewired,
                 "edges_contract_skipped": summary.edges_contract_skipped,
+                "edge_conflict_preimages": &summary.edge_conflict_preimages,
             });
             if let Some(reason) = reason {
                 payload["reason"] = serde_json::Value::String(reason);
@@ -1730,6 +1856,10 @@ fn merge_entity_sql(
             all_edges.push(edge);
         }
     }
+    let original_edges: HashMap<Uuid, EdgeRow> = all_edges
+        .iter()
+        .map(|edge| (edge.id, edge.clone()))
+        .collect();
 
     // --- Merge entity fields ---
     let (merged_props, properties_merged) =
@@ -1764,9 +1894,14 @@ fn merge_entity_sql(
 
     // Writes are gated on `!dry_run` below, but the loop itself always runs so a
     // dry-run response reports a predictive `edges_rewired` count instead of zero.
-    let mut edges_rewired = 0usize;
+    let mut rewired_edge_ids = HashSet::new();
     let mut edges_contract_skipped = 0usize;
+    let mut edge_conflict_preimages = Vec::new();
+    let mut conflict_deleted_edge_ids = HashSet::new();
     for edge in all_edges {
+        if conflict_deleted_edge_ids.contains(&edge.id) {
+            continue;
+        }
         let raw_src = if edge.source_id == from_id {
             into_id
         } else {
@@ -1867,12 +2002,6 @@ fn merge_entity_sql(
             continue;
         }
 
-        if dry_run {
-            // Predictive count only — no write in a dry-run.
-            edges_rewired += 1;
-            continue;
-        }
-
         let now_ts = chrono::Utc::now().timestamp_micros();
         // Preserve the original edge ID where possible so callers can still get()
         // it by the ID returned from link(): update in-place when there's no
@@ -1898,16 +2027,41 @@ fn merge_entity_sql(
             .map_err(SqliteError::Rusqlite)?
         };
 
-        let changed = if conflict_id.is_some() {
+        if let Some(conflict_id) = conflict_id {
             // A live or soft-deleted row already owns this natural key: drop the
             // incoming duplicate. The surviving row's weight/metadata/deleted_at
-            // are never mutated or resurrected.
-            conn.execute(
-                khive_db::stores::graph::EDGE_SYMMETRIC_DELETE_NONCANONICAL_SQL,
-                rusqlite::params![&edge.namespace, edge.id.to_string()],
-            )?
+            // are never mutated or resurrected. Capture the duplicate and the
+            // complete hard-delete cascade before removing either, so the audit
+            // event contains enough state to restore every destroyed row.
+            let surviving_edge_id = Uuid::parse_str(&conflict_id)
+                .map_err(|error| SqliteError::InvalidData(error.to_string()))?;
+            let incident_edge_preimages =
+                collect_conflict_incident_edge_preimages(conn, edge.id, &original_edges)?;
+            for incident in &incident_edge_preimages {
+                conflict_deleted_edge_ids.insert(incident.id);
+                rewired_edge_ids.remove(&incident.id);
+            }
+            conflict_deleted_edge_ids.insert(edge.id);
+            rewired_edge_ids.insert(edge.id);
+
+            if !dry_run {
+                delete_conflict_incident_edges(conn, &incident_edge_preimages)?;
+                conn.execute(
+                    khive_db::stores::graph::EDGE_SYMMETRIC_DELETE_NONCANONICAL_SQL,
+                    rusqlite::params![&edge.namespace, edge.id.to_string()],
+                )?;
+            }
+            edge_conflict_preimages.push(MergeEdgeConflictPreimage {
+                surviving_edge_id,
+                dropped_edge: edge_row_preimage(&edge)?,
+                incident_edge_preimages,
+            });
         } else {
-            conn.execute(
+            if dry_run {
+                rewired_edge_ids.insert(edge.id);
+                continue;
+            }
+            let changed = conn.execute(
                 "UPDATE graph_edges SET \
                      source_id = ?1, target_id = ?2, updated_at = ?3 \
                      WHERE namespace = ?4 AND id = ?5",
@@ -1918,12 +2072,13 @@ fn merge_entity_sql(
                     &edge.namespace,
                     edge.id.to_string(),
                 ],
-            )?
-        };
-        if changed > 0 {
-            edges_rewired += 1;
+            )?;
+            if changed > 0 {
+                rewired_edge_ids.insert(edge.id);
+            }
         }
     }
+    let edges_rewired = rewired_edge_ids.len();
 
     if !dry_run {
         // UPDATE only the merged fields — a full-row INSERT OR REPLACE silently
@@ -2033,6 +2188,7 @@ fn merge_entity_sql(
             removed_id: from_id,
             edges_rewired,
             edges_contract_skipped,
+            edge_conflict_preimages,
             properties_merged,
             tags_unioned,
             content_appended,
@@ -2231,6 +2387,10 @@ fn merge_note_sql(
             all_edges.push(edge);
         }
     }
+    let original_edges: HashMap<Uuid, EdgeRow> = all_edges
+        .iter()
+        .map(|edge| (edge.id, edge.clone()))
+        .collect();
 
     // Merge note fields.
     let (merged_content, content_appended) = match content_strategy {
@@ -2278,10 +2438,15 @@ fn merge_note_sql(
 
     // The loop always runs so a dry-run reports a predictive `edges_rewired`
     // count instead of zero (mirrors the entity merge path).
-    let mut edges_rewired = 0usize;
+    let mut rewired_edge_ids = HashSet::new();
     let mut edges_contract_skipped = 0usize;
+    let mut edge_conflict_preimages = Vec::new();
+    let mut conflict_deleted_edge_ids = HashSet::new();
     {
         for edge in all_edges {
+            if conflict_deleted_edge_ids.contains(&edge.id) {
+                continue;
+            }
             let raw_src = if edge.source_id == from_id {
                 into_id
             } else {
@@ -2365,11 +2530,6 @@ fn merge_note_sql(
                 continue;
             }
 
-            if dry_run {
-                // Predictive count only — no write in a dry-run.
-                edges_rewired += 1;
-                continue;
-            }
             let now_ts = chrono::Utc::now().timestamp_micros();
             let conflict_id: Option<String> = {
                 let conflict_src = new_src.to_string();
@@ -2389,17 +2549,41 @@ fn merge_note_sql(
                 .map_err(SqliteError::Rusqlite)?
             };
 
-            let changed = if conflict_id.is_some() {
+            if let Some(conflict_id) = conflict_id {
                 // A live or soft-deleted row already owns this natural key: drop
                 // the incoming duplicate (ADR-039 `ON CONFLICT ... DO NOTHING`).
                 // The surviving row's weight/metadata/deleted_at are never
-                // mutated or resurrected.
-                conn.execute(
-                    khive_db::stores::graph::EDGE_SYMMETRIC_DELETE_NONCANONICAL_SQL,
-                    rusqlite::params![&edge.namespace, edge.id.to_string()],
-                )?
+                // mutated or resurrected. Match hard `delete_edge`: cascade
+                // incident annotations, and preserve every removed row first.
+                let surviving_edge_id = Uuid::parse_str(&conflict_id)
+                    .map_err(|error| SqliteError::InvalidData(error.to_string()))?;
+                let incident_edge_preimages =
+                    collect_conflict_incident_edge_preimages(conn, edge.id, &original_edges)?;
+                for incident in &incident_edge_preimages {
+                    conflict_deleted_edge_ids.insert(incident.id);
+                    rewired_edge_ids.remove(&incident.id);
+                }
+                conflict_deleted_edge_ids.insert(edge.id);
+                rewired_edge_ids.insert(edge.id);
+
+                if !dry_run {
+                    delete_conflict_incident_edges(conn, &incident_edge_preimages)?;
+                    conn.execute(
+                        khive_db::stores::graph::EDGE_SYMMETRIC_DELETE_NONCANONICAL_SQL,
+                        rusqlite::params![&edge.namespace, edge.id.to_string()],
+                    )?;
+                }
+                edge_conflict_preimages.push(MergeEdgeConflictPreimage {
+                    surviving_edge_id,
+                    dropped_edge: edge_row_preimage(&edge)?,
+                    incident_edge_preimages,
+                });
             } else {
-                conn.execute(
+                if dry_run {
+                    rewired_edge_ids.insert(edge.id);
+                    continue;
+                }
+                let changed = conn.execute(
                     "UPDATE graph_edges SET \
                      source_id = ?1, target_id = ?2, updated_at = ?3 \
                      WHERE namespace = ?4 AND id = ?5",
@@ -2410,13 +2594,14 @@ fn merge_note_sql(
                         &edge.namespace,
                         edge.id.to_string(),
                     ],
-                )?
-            };
-            if changed > 0 {
-                edges_rewired += 1;
+                )?;
+                if changed > 0 {
+                    rewired_edge_ids.insert(edge.id);
+                }
             }
         }
     }
+    let edges_rewired = rewired_edge_ids.len();
 
     if !dry_run {
         conn.prepare_cached(khive_db::stores::note::NOTE_UPSERT_SQL)?
@@ -2518,6 +2703,7 @@ fn merge_note_sql(
             removed_id: from_id,
             edges_rewired,
             edges_contract_skipped,
+            edge_conflict_preimages,
             properties_merged,
             tags_unioned: 0,
             content_appended,
@@ -2656,6 +2842,55 @@ mod tests {
             .map(|index| char::from(ALPHANUMERIC[(index * 17 + 11) % ALPHANUMERIC.len()]))
             .collect();
         format!("secret value: {candidate}")
+    }
+
+    async fn restore_edge_preimage(
+        rt: &KhiveRuntime,
+        token: &NamespaceToken,
+        preimage: &MergeEdgePreimage,
+    ) {
+        let edge = khive_storage::types::Edge {
+            id: preimage.id.into(),
+            namespace: preimage.namespace.clone(),
+            source_id: preimage.source_id,
+            target_id: preimage.target_id,
+            relation: preimage.relation.parse().expect("stored relation"),
+            weight: preimage.weight,
+            created_at: chrono::DateTime::from_timestamp_micros(preimage.created_at)
+                .expect("stored created_at"),
+            updated_at: chrono::DateTime::from_timestamp_micros(preimage.updated_at)
+                .expect("stored updated_at"),
+            deleted_at: preimage.deleted_at.map(|value| {
+                chrono::DateTime::from_timestamp_micros(value).expect("stored deleted_at")
+            }),
+            metadata: preimage.metadata.clone(),
+            target_backend: preimage.target_backend.clone(),
+        };
+        rt.graph(token)
+            .expect("graph store")
+            .upsert_edge(edge)
+            .await
+            .expect("restore edge preimage");
+    }
+
+    fn assert_edge_matches_preimage(
+        edge: &khive_storage::types::Edge,
+        preimage: &MergeEdgePreimage,
+    ) {
+        assert_eq!(Uuid::from(edge.id), preimage.id);
+        assert_eq!(edge.namespace, preimage.namespace);
+        assert_eq!(edge.source_id, preimage.source_id);
+        assert_eq!(edge.target_id, preimage.target_id);
+        assert_eq!(edge.relation.to_string(), preimage.relation);
+        assert_eq!(edge.weight, preimage.weight);
+        assert_eq!(edge.created_at.timestamp_micros(), preimage.created_at);
+        assert_eq!(edge.updated_at.timestamp_micros(), preimage.updated_at);
+        assert_eq!(
+            edge.deleted_at.map(|value| value.timestamp_micros()),
+            preimage.deleted_at
+        );
+        assert_eq!(edge.metadata, preimage.metadata);
+        assert_eq!(edge.target_backend, preimage.target_backend);
     }
 
     // Helper: search FTS5 for `query` in a runtime namespace.
@@ -3247,6 +3482,433 @@ mod tests {
             (edges[0].weight - 0.9).abs() < f64::EPSILON,
             "survivor weight must not be overwritten by the merged-from edge; got {}",
             edges[0].weight
+        );
+    }
+
+    #[tokio::test]
+    async fn merge_entity_conflict_records_restorable_edge_and_annotation_preimages() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let into = rt
+            .create_entity(&tok, "concept", None, "Into", None, None, vec![])
+            .await
+            .unwrap();
+        let from = rt
+            .create_entity(&tok, "concept", None, "From", None, None, vec![])
+            .await
+            .unwrap();
+        let shared = rt
+            .create_entity(&tok, "concept", None, "Shared", None, None, vec![])
+            .await
+            .unwrap();
+        let annotator = rt
+            .create_note(
+                &tok,
+                "observation",
+                None,
+                "edge judgment",
+                None,
+                None,
+                vec![],
+            )
+            .await
+            .unwrap();
+        let nested_annotator = rt
+            .create_note(
+                &tok,
+                "observation",
+                None,
+                "judgment review",
+                None,
+                None,
+                vec![],
+            )
+            .await
+            .unwrap();
+
+        let survivor = rt
+            .link(
+                &tok,
+                into.id,
+                shared.id,
+                EdgeRelation::Extends,
+                0.9,
+                Some(serde_json::json!({"source": "survivor"})),
+            )
+            .await
+            .unwrap();
+        let dropped = rt
+            .link(
+                &tok,
+                from.id,
+                shared.id,
+                EdgeRelation::Extends,
+                0.2,
+                Some(serde_json::json!({"source": "dropped"})),
+            )
+            .await
+            .unwrap();
+        let annotation = rt
+            .link(
+                &tok,
+                annotator.id,
+                dropped.id.into(),
+                EdgeRelation::Annotates,
+                0.7,
+                Some(serde_json::json!({"basis": "manual"})),
+            )
+            .await
+            .unwrap();
+        let nested_annotation = rt
+            .link(
+                &tok,
+                nested_annotator.id,
+                annotation.id.into(),
+                EdgeRelation::Annotates,
+                0.6,
+                Some(serde_json::json!({"review": "confirmed"})),
+            )
+            .await
+            .unwrap();
+        rt.delete_edge(&tok, annotation.id.into(), false)
+            .await
+            .unwrap();
+
+        let summary = rt
+            .merge_entity(
+                &tok,
+                into.id,
+                from.id,
+                EntityDedupMergePolicy::PreferInto,
+                ContentMergeStrategy::Append,
+                false,
+            )
+            .await
+            .unwrap();
+
+        let [conflict] = summary.edge_conflict_preimages.as_slice() else {
+            panic!(
+                "expected one edge-conflict preimage, got {:?}",
+                summary.edge_conflict_preimages
+            );
+        };
+        assert_eq!(conflict.surviving_edge_id, Uuid::from(survivor.id));
+        assert_eq!(conflict.dropped_edge.id, Uuid::from(dropped.id));
+        assert_eq!(conflict.dropped_edge.source_id, from.id);
+        assert_eq!(conflict.dropped_edge.target_id, shared.id);
+        assert_eq!(conflict.dropped_edge.relation, "extends");
+        assert_eq!(conflict.dropped_edge.weight, 0.2);
+        assert_eq!(
+            conflict.dropped_edge.metadata,
+            Some(serde_json::json!({"source": "dropped"}))
+        );
+        assert_eq!(conflict.incident_edge_preimages.len(), 2);
+        assert_eq!(
+            conflict.incident_edge_preimages[0].id,
+            Uuid::from(annotation.id)
+        );
+        assert_eq!(
+            conflict.incident_edge_preimages[1].id,
+            Uuid::from(nested_annotation.id)
+        );
+
+        for id in [dropped.id, annotation.id, nested_annotation.id] {
+            assert!(
+                rt.get_edge_including_deleted(&tok, id.into())
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "merge conflict cascade must leave no dangling edge row for {id}"
+            );
+        }
+
+        let events = rt
+            .events(&tok)
+            .unwrap()
+            .query_events(
+                khive_storage::EventFilter {
+                    kinds: vec![EventKind::EntityMerged],
+                    ..Default::default()
+                },
+                khive_storage::types::PageRequest {
+                    offset: 0,
+                    limit: 10,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(events.items.len(), 1);
+        assert_eq!(
+            events.items[0].payload["edge_conflict_preimages"],
+            serde_json::to_value(&summary.edge_conflict_preimages).unwrap()
+        );
+
+        restore_edge_preimage(&rt, &tok, &conflict.dropped_edge).await;
+        for preimage in &conflict.incident_edge_preimages {
+            restore_edge_preimage(&rt, &tok, preimage).await;
+        }
+        for preimage in
+            std::iter::once(&conflict.dropped_edge).chain(conflict.incident_edge_preimages.iter())
+        {
+            let restored = rt
+                .get_edge_including_deleted(&tok, preimage.id)
+                .await
+                .unwrap()
+                .expect("restored edge");
+            assert_edge_matches_preimage(&restored, preimage);
+        }
+    }
+
+    // A dry run must predict the same conflict preimages a committing merge
+    // would produce, without deleting or mutating a single row. The incident
+    // cascade is two levels deep (an annotation on the dropped edge, and a
+    // nested annotation on that annotation) so the root-to-leaf ordering
+    // ADR-014 promises is actually exercised, not just a one-element vec that
+    // trivially satisfies any order. Every row touched by the merge — both
+    // entities and every edge — is snapshotted before the dry run and
+    // compared field-for-field against its post-run state.
+    #[tokio::test]
+    async fn merge_entity_dry_run_conflict_returns_preimages_without_mutating() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let into = rt
+            .create_entity(&tok, "concept", None, "Into", None, None, vec![])
+            .await
+            .unwrap();
+        let from = rt
+            .create_entity(&tok, "concept", None, "From", None, None, vec![])
+            .await
+            .unwrap();
+        let shared = rt
+            .create_entity(&tok, "concept", None, "Shared", None, None, vec![])
+            .await
+            .unwrap();
+        let annotator = rt
+            .create_note(
+                &tok,
+                "observation",
+                None,
+                "edge judgment",
+                None,
+                None,
+                vec![],
+            )
+            .await
+            .unwrap();
+        let nested_annotator = rt
+            .create_note(
+                &tok,
+                "observation",
+                None,
+                "judgment review",
+                None,
+                None,
+                vec![],
+            )
+            .await
+            .unwrap();
+
+        let survivor = rt
+            .link(
+                &tok,
+                into.id,
+                shared.id,
+                EdgeRelation::Extends,
+                0.9,
+                Some(serde_json::json!({"source": "survivor"})),
+            )
+            .await
+            .unwrap();
+        let dropped = rt
+            .link(
+                &tok,
+                from.id,
+                shared.id,
+                EdgeRelation::Extends,
+                0.2,
+                Some(serde_json::json!({"source": "dropped"})),
+            )
+            .await
+            .unwrap();
+        let annotation = rt
+            .link(
+                &tok,
+                annotator.id,
+                dropped.id.into(),
+                EdgeRelation::Annotates,
+                0.7,
+                Some(serde_json::json!({"basis": "manual"})),
+            )
+            .await
+            .unwrap();
+        let nested_annotation = rt
+            .link(
+                &tok,
+                nested_annotator.id,
+                annotation.id.into(),
+                EdgeRelation::Annotates,
+                0.6,
+                Some(serde_json::json!({"basis": "nested"})),
+            )
+            .await
+            .unwrap();
+        rt.delete_edge(&tok, nested_annotation.id.into(), false)
+            .await
+            .unwrap();
+
+        let survivor_before = rt
+            .get_edge_including_deleted(&tok, survivor.id.into())
+            .await
+            .unwrap()
+            .expect("survivor edge exists");
+        let dropped_before = rt
+            .get_edge_including_deleted(&tok, dropped.id.into())
+            .await
+            .unwrap()
+            .expect("dropped edge exists");
+        let annotation_before = rt
+            .get_edge_including_deleted(&tok, annotation.id.into())
+            .await
+            .unwrap()
+            .expect("annotation edge exists");
+        let nested_annotation_before = rt
+            .get_edge_including_deleted(&tok, nested_annotation.id.into())
+            .await
+            .unwrap()
+            .expect("nested annotation edge exists");
+        let into_before = rt
+            .get_entity(&tok, into.id)
+            .await
+            .expect("into entity exists");
+        let from_before = rt
+            .get_entity(&tok, from.id)
+            .await
+            .expect("from entity exists");
+
+        let summary = rt
+            .merge_entity(
+                &tok,
+                into.id,
+                from.id,
+                EntityDedupMergePolicy::PreferInto,
+                ContentMergeStrategy::Append,
+                true,
+            )
+            .await
+            .unwrap();
+
+        let [conflict] = summary.edge_conflict_preimages.as_slice() else {
+            panic!(
+                "expected one edge-conflict preimage from the dry run, got {:?}",
+                summary.edge_conflict_preimages
+            );
+        };
+        assert_eq!(conflict.surviving_edge_id, Uuid::from(survivor.id));
+        assert_eq!(conflict.dropped_edge.id, Uuid::from(dropped.id));
+        assert_eq!(conflict.dropped_edge.source_id, from.id);
+        assert_eq!(conflict.dropped_edge.target_id, shared.id);
+        assert_eq!(conflict.dropped_edge.weight, 0.2);
+        // Root-to-leaf order (ADR-014): the direct annotation on the dropped
+        // edge must precede the annotation nested on top of it.
+        assert_eq!(conflict.incident_edge_preimages.len(), 2);
+        assert_eq!(
+            conflict.incident_edge_preimages[0].id,
+            Uuid::from(annotation.id)
+        );
+        assert!(
+            conflict.incident_edge_preimages[0].deleted_at.is_none(),
+            "the direct annotation was never soft-deleted"
+        );
+        assert_eq!(
+            conflict.incident_edge_preimages[1].id,
+            Uuid::from(nested_annotation.id)
+        );
+        assert!(
+            conflict.incident_edge_preimages[1].deleted_at.is_some(),
+            "dry-run preimage must retain the nested annotation's tombstone state"
+        );
+
+        let survivor_after = rt
+            .get_edge_including_deleted(&tok, survivor.id.into())
+            .await
+            .unwrap()
+            .expect("dry run must not delete the survivor edge");
+        let dropped_after = rt
+            .get_edge_including_deleted(&tok, dropped.id.into())
+            .await
+            .unwrap()
+            .expect("dry run must not delete the dropped edge");
+        let annotation_after = rt
+            .get_edge_including_deleted(&tok, annotation.id.into())
+            .await
+            .unwrap()
+            .expect("dry run must not delete the cascaded annotation");
+        let nested_annotation_after = rt
+            .get_edge_including_deleted(&tok, nested_annotation.id.into())
+            .await
+            .unwrap()
+            .expect("dry run must not delete the nested cascaded annotation");
+        assert_eq!(
+            serde_json::to_value(&survivor_before).unwrap(),
+            serde_json::to_value(&survivor_after).unwrap(),
+            "dry run must not mutate the surviving edge's row at all"
+        );
+        assert_eq!(
+            serde_json::to_value(&dropped_before).unwrap(),
+            serde_json::to_value(&dropped_after).unwrap(),
+            "dry run must not mutate the would-be-dropped edge's row at all"
+        );
+        assert_eq!(
+            serde_json::to_value(&annotation_before).unwrap(),
+            serde_json::to_value(&annotation_after).unwrap(),
+            "dry run must not mutate the incident annotation's row at all"
+        );
+        assert_eq!(
+            serde_json::to_value(&nested_annotation_before).unwrap(),
+            serde_json::to_value(&nested_annotation_after).unwrap(),
+            "dry run must not mutate the nested incident annotation's row at all"
+        );
+
+        let into_after = rt
+            .get_entity(&tok, into.id)
+            .await
+            .expect("into entity must remain unmerged after a dry run");
+        let from_after = rt
+            .get_entity(&tok, from.id)
+            .await
+            .expect("from entity must not be merged away by a dry run");
+        assert_eq!(
+            serde_json::to_value(&into_before).unwrap(),
+            serde_json::to_value(&into_after).unwrap(),
+            "dry run must not mutate the into entity's row at all"
+        );
+        assert_eq!(
+            serde_json::to_value(&from_before).unwrap(),
+            serde_json::to_value(&from_after).unwrap(),
+            "dry run must not mutate the from entity's row at all"
+        );
+        assert_eq!(from_after.deleted_at, None);
+        assert_eq!(from_after.merged_into, None);
+        assert_eq!(from_after.merge_event_id, None);
+
+        let events = rt
+            .events(&tok)
+            .unwrap()
+            .query_events(
+                khive_storage::EventFilter {
+                    kinds: vec![EventKind::EntityMerged],
+                    ..Default::default()
+                },
+                khive_storage::types::PageRequest {
+                    offset: 0,
+                    limit: 10,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            events.items.is_empty(),
+            "a dry run must not record a merge audit event"
         );
     }
 
@@ -4700,6 +5362,401 @@ mod tests {
             into_edges.len(),
             1,
             "exactly one live into→shared annotates edge must exist after merge; got: {into_edges:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn merge_note_conflict_records_dropped_edge_and_cascades_annotation() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let into = rt
+            .create_note(&tok, "observation", None, "Into", None, None, vec![])
+            .await
+            .unwrap();
+        let from = rt
+            .create_note(&tok, "observation", None, "From", None, None, vec![])
+            .await
+            .unwrap();
+        let annotator = rt
+            .create_note(
+                &tok,
+                "observation",
+                None,
+                "edge annotation",
+                None,
+                None,
+                vec![],
+            )
+            .await
+            .unwrap();
+        let shared = rt
+            .create_entity(&tok, "concept", None, "Shared", None, None, vec![])
+            .await
+            .unwrap();
+
+        let survivor = rt
+            .link(
+                &tok,
+                into.id,
+                shared.id,
+                EdgeRelation::Annotates,
+                1.0,
+                Some(serde_json::json!({"source": "survivor"})),
+            )
+            .await
+            .unwrap();
+        let dropped = rt
+            .link(
+                &tok,
+                from.id,
+                shared.id,
+                EdgeRelation::Annotates,
+                0.4,
+                Some(serde_json::json!({"source": "dropped"})),
+            )
+            .await
+            .unwrap();
+        let annotation = rt
+            .link(
+                &tok,
+                annotator.id,
+                dropped.id.into(),
+                EdgeRelation::Annotates,
+                0.8,
+                Some(serde_json::json!({"why": "duplicate claim"})),
+            )
+            .await
+            .unwrap();
+        rt.delete_edge(&tok, annotation.id.into(), false)
+            .await
+            .unwrap();
+
+        let summary = rt
+            .merge_note(
+                &tok,
+                into.id,
+                from.id,
+                EntityDedupMergePolicy::PreferInto,
+                ContentMergeStrategy::Append,
+                false,
+            )
+            .await
+            .unwrap();
+
+        let [conflict] = summary.edge_conflict_preimages.as_slice() else {
+            panic!(
+                "expected one note-merge edge conflict, got {:?}",
+                summary.edge_conflict_preimages
+            );
+        };
+        assert_eq!(conflict.surviving_edge_id, Uuid::from(survivor.id));
+        assert_eq!(conflict.dropped_edge.id, Uuid::from(dropped.id));
+        assert_eq!(conflict.dropped_edge.source_id, from.id);
+        assert_eq!(conflict.dropped_edge.weight, 0.4);
+        assert_eq!(
+            conflict.dropped_edge.metadata,
+            Some(serde_json::json!({"source": "dropped"}))
+        );
+        assert_eq!(conflict.incident_edge_preimages.len(), 1);
+        assert_eq!(
+            conflict.incident_edge_preimages[0].id,
+            Uuid::from(annotation.id)
+        );
+        assert_eq!(
+            conflict.incident_edge_preimages[0].metadata,
+            Some(serde_json::json!({"why": "duplicate claim"}))
+        );
+        assert!(
+            conflict.incident_edge_preimages[0].deleted_at.is_some(),
+            "the cascade preimage must retain an annotation's tombstone state"
+        );
+        assert!(rt
+            .get_edge_including_deleted(&tok, dropped.id.into())
+            .await
+            .unwrap()
+            .is_none());
+        assert!(
+            rt.get_edge_including_deleted(&tok, annotation.id.into())
+                .await
+                .unwrap()
+                .is_none(),
+            "annotation targeting the dropped edge must be cascaded, not left dangling"
+        );
+
+        let events = rt
+            .events(&tok)
+            .unwrap()
+            .query_events(
+                khive_storage::EventFilter {
+                    kinds: vec![EventKind::NoteMerged],
+                    ..Default::default()
+                },
+                khive_storage::types::PageRequest {
+                    offset: 0,
+                    limit: 10,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(events.items.len(), 1);
+        assert_eq!(
+            events.items[0].payload["edge_conflict_preimages"],
+            serde_json::to_value(&summary.edge_conflict_preimages).unwrap()
+        );
+    }
+
+    // A dry run must predict the same conflict preimages a committing note
+    // merge would produce, without deleting or mutating a single row. The
+    // incident cascade is two levels deep (an annotation on the dropped
+    // edge, and a nested annotation on that annotation) so the root-to-leaf
+    // ordering ADR-014 promises is actually exercised, not just a
+    // one-element vec that trivially satisfies any order. Every row touched
+    // by the merge — both notes and every edge — is snapshotted before the
+    // dry run and compared field-for-field against its post-run state.
+    #[tokio::test]
+    async fn merge_note_dry_run_conflict_returns_preimages_without_mutating() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let into = rt
+            .create_note(&tok, "observation", None, "Into", None, None, vec![])
+            .await
+            .unwrap();
+        let from = rt
+            .create_note(&tok, "observation", None, "From", None, None, vec![])
+            .await
+            .unwrap();
+        let annotator = rt
+            .create_note(
+                &tok,
+                "observation",
+                None,
+                "edge annotation",
+                None,
+                None,
+                vec![],
+            )
+            .await
+            .unwrap();
+        let nested_annotator = rt
+            .create_note(
+                &tok,
+                "observation",
+                None,
+                "nested edge annotation",
+                None,
+                None,
+                vec![],
+            )
+            .await
+            .unwrap();
+        let shared = rt
+            .create_entity(&tok, "concept", None, "Shared", None, None, vec![])
+            .await
+            .unwrap();
+
+        let survivor = rt
+            .link(
+                &tok,
+                into.id,
+                shared.id,
+                EdgeRelation::Annotates,
+                1.0,
+                Some(serde_json::json!({"source": "survivor"})),
+            )
+            .await
+            .unwrap();
+        let dropped = rt
+            .link(
+                &tok,
+                from.id,
+                shared.id,
+                EdgeRelation::Annotates,
+                0.4,
+                Some(serde_json::json!({"source": "dropped"})),
+            )
+            .await
+            .unwrap();
+        let annotation = rt
+            .link(
+                &tok,
+                annotator.id,
+                dropped.id.into(),
+                EdgeRelation::Annotates,
+                0.8,
+                Some(serde_json::json!({"why": "duplicate claim"})),
+            )
+            .await
+            .unwrap();
+        let nested_annotation = rt
+            .link(
+                &tok,
+                nested_annotator.id,
+                annotation.id.into(),
+                EdgeRelation::Annotates,
+                0.6,
+                Some(serde_json::json!({"why": "nested duplicate claim"})),
+            )
+            .await
+            .unwrap();
+        rt.delete_edge(&tok, nested_annotation.id.into(), false)
+            .await
+            .unwrap();
+
+        let survivor_before = rt
+            .get_edge_including_deleted(&tok, survivor.id.into())
+            .await
+            .unwrap()
+            .expect("survivor edge exists");
+        let dropped_before = rt
+            .get_edge_including_deleted(&tok, dropped.id.into())
+            .await
+            .unwrap()
+            .expect("dropped edge exists");
+        let annotation_before = rt
+            .get_edge_including_deleted(&tok, annotation.id.into())
+            .await
+            .unwrap()
+            .expect("annotation edge exists");
+        let nested_annotation_before = rt
+            .get_edge_including_deleted(&tok, nested_annotation.id.into())
+            .await
+            .unwrap()
+            .expect("nested annotation edge exists");
+        let into_before = rt
+            .get_note_including_deleted(&tok, into.id)
+            .await
+            .unwrap()
+            .expect("into note exists");
+        let from_before = rt
+            .get_note_including_deleted(&tok, from.id)
+            .await
+            .unwrap()
+            .expect("from note exists");
+
+        let summary = rt
+            .merge_note(
+                &tok,
+                into.id,
+                from.id,
+                EntityDedupMergePolicy::PreferInto,
+                ContentMergeStrategy::Append,
+                true,
+            )
+            .await
+            .unwrap();
+
+        let [conflict] = summary.edge_conflict_preimages.as_slice() else {
+            panic!(
+                "expected one note-merge edge conflict from the dry run, got {:?}",
+                summary.edge_conflict_preimages
+            );
+        };
+        assert_eq!(conflict.surviving_edge_id, Uuid::from(survivor.id));
+        assert_eq!(conflict.dropped_edge.id, Uuid::from(dropped.id));
+        assert_eq!(conflict.dropped_edge.source_id, from.id);
+        assert_eq!(conflict.dropped_edge.weight, 0.4);
+        // Root-to-leaf order (ADR-014): the direct annotation on the dropped
+        // edge must precede the annotation nested on top of it.
+        assert_eq!(conflict.incident_edge_preimages.len(), 2);
+        assert_eq!(
+            conflict.incident_edge_preimages[0].id,
+            Uuid::from(annotation.id)
+        );
+        assert!(
+            conflict.incident_edge_preimages[0].deleted_at.is_none(),
+            "the direct annotation was never soft-deleted"
+        );
+        assert_eq!(
+            conflict.incident_edge_preimages[1].id,
+            Uuid::from(nested_annotation.id)
+        );
+        assert!(
+            conflict.incident_edge_preimages[1].deleted_at.is_some(),
+            "dry-run preimage must retain the nested annotation's tombstone state"
+        );
+
+        let survivor_after = rt
+            .get_edge_including_deleted(&tok, survivor.id.into())
+            .await
+            .unwrap()
+            .expect("dry run must not delete the survivor edge");
+        let dropped_after = rt
+            .get_edge_including_deleted(&tok, dropped.id.into())
+            .await
+            .unwrap()
+            .expect("dry run must not delete the dropped edge");
+        let annotation_after = rt
+            .get_edge_including_deleted(&tok, annotation.id.into())
+            .await
+            .unwrap()
+            .expect("dry run must not delete the cascaded annotation");
+        let nested_annotation_after = rt
+            .get_edge_including_deleted(&tok, nested_annotation.id.into())
+            .await
+            .unwrap()
+            .expect("dry run must not delete the nested cascaded annotation");
+        assert_eq!(
+            serde_json::to_value(&survivor_before).unwrap(),
+            serde_json::to_value(&survivor_after).unwrap(),
+            "dry run must not mutate the surviving edge's row at all"
+        );
+        assert_eq!(
+            serde_json::to_value(&dropped_before).unwrap(),
+            serde_json::to_value(&dropped_after).unwrap(),
+            "dry run must not mutate the would-be-dropped edge's row at all"
+        );
+        assert_eq!(
+            serde_json::to_value(&annotation_before).unwrap(),
+            serde_json::to_value(&annotation_after).unwrap(),
+            "dry run must not mutate the incident annotation's row at all"
+        );
+        assert_eq!(
+            serde_json::to_value(&nested_annotation_before).unwrap(),
+            serde_json::to_value(&nested_annotation_after).unwrap(),
+            "dry run must not mutate the nested incident annotation's row at all"
+        );
+
+        let into_after = rt
+            .get_note_including_deleted(&tok, into.id)
+            .await
+            .unwrap()
+            .expect("into note must remain unmerged after a dry run");
+        let from_after = rt
+            .get_note_including_deleted(&tok, from.id)
+            .await
+            .unwrap()
+            .expect("from note must not be deleted by a dry run");
+        assert_eq!(
+            serde_json::to_value(&into_before).unwrap(),
+            serde_json::to_value(&into_after).unwrap(),
+            "dry run must not mutate the into note's row at all"
+        );
+        assert_eq!(
+            serde_json::to_value(&from_before).unwrap(),
+            serde_json::to_value(&from_after).unwrap(),
+            "dry run must not mutate the from note's row at all"
+        );
+        assert_eq!(from_after.status, from_before.status);
+        assert_eq!(from_after.deleted_at, None);
+
+        let events = rt
+            .events(&tok)
+            .unwrap()
+            .query_events(
+                khive_storage::EventFilter {
+                    kinds: vec![EventKind::NoteMerged],
+                    ..Default::default()
+                },
+                khive_storage::types::PageRequest {
+                    offset: 0,
+                    limit: 10,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            events.items.is_empty(),
+            "a dry run must not record a merge audit event"
         );
     }
 

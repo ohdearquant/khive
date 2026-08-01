@@ -14,7 +14,10 @@ use khive_runtime::{KhiveRuntime, NamespaceToken, RuntimeError};
 use khive_storage::note::{FilterOp, Note, NoteFilter, PropertyFilter};
 use khive_storage::types::{PageRequest, SqlValue};
 
-use crate::message::{dual_write_message, note_to_message_json, resolve_id, short_id};
+use crate::message::{
+    dual_write_message, note_to_message_json, resolve_id, short_id, COMM_SCHEMA_VERSION,
+    COMM_STABLE_PROPERTY_KEYS,
+};
 use crate::params::{
     deser, CursorCommitParams, CursorGetParams, HeartbeatParams, InboxParams, IngestParams,
     ProbeParams, ReadParams, ReplyParams, SendParams, ThreadParams, UnreadParams,
@@ -55,6 +58,62 @@ fn validate_actor_label(verb: &str, label: &str, field: &str) -> Result<(), Runt
     Ok(())
 }
 
+/// Parse a caller- or transport-supplied thread root and return the one wire
+/// spelling accepted by message-properties v1. `Uuid` deliberately accepts
+/// compact, braced, URN, and upper-hex input forms; normalizing here keeps
+/// those convenient inputs from leaking into the stored contract or splitting
+/// SQL thread lookups, which compare the JSON string exactly.
+fn canonicalize_thread_id(verb: &str, raw: &str) -> Result<String, RuntimeError> {
+    raw.trim()
+        .parse::<Uuid>()
+        .map(|id| id.as_hyphenated().to_string())
+        .map_err(|_| {
+            RuntimeError::InvalidInput(format!(
+                "{verb}: `thread_id` must be a valid UUID, got: {raw:?}"
+            ))
+        })
+}
+
+/// Return the exact, indexable spellings a pre-v1 handler could have stored
+/// for one UUID root. Before v1, valid caller input was persisted verbatim
+/// after `Uuid` parsing, so compact, braced, URN, and upper-hex formatter
+/// outputs may coexist with the canonical lower-case hyphenated value.
+///
+/// `selected_raw` retains an arbitrary mixed-case spelling from the row the
+/// caller selected. The common lower/upper formatter outputs cover rows other
+/// than that selected row without falling back to a namespace-wide scan.
+fn thread_id_query_spellings(root: Uuid, selected_raw: Option<&str>) -> Vec<String> {
+    let mut spellings = vec![
+        root.as_hyphenated().to_string(),
+        root.simple().to_string(),
+        root.braced().to_string(),
+        root.urn().to_string(),
+        format!("{:X}", root.as_hyphenated()),
+        format!("{:X}", root.simple()),
+        format!("{:X}", root.braced()),
+        format!("{:X}", root.urn()),
+    ];
+    if let Some(raw) = selected_raw.map(str::trim).filter(|raw| !raw.is_empty()) {
+        spellings.push(raw.to_string());
+    }
+
+    let mut seen = HashSet::new();
+    spellings.retain(|spelling| seen.insert(spelling.clone()));
+    spellings
+}
+
+/// Validate an adapter timestamp before it can be certified as a v1 `sent_at`
+/// value, then serialize the instant in one RFC 3339 representation (UTC).
+fn canonicalize_ingest_sent_at(raw: &str) -> Result<String, RuntimeError> {
+    DateTime::parse_from_rfc3339(raw.trim())
+        .map(|timestamp| timestamp.with_timezone(&Utc).to_rfc3339())
+        .map_err(|error| {
+            RuntimeError::InvalidInput(format!(
+                "ingest: `sent_at` must be a valid RFC 3339 timestamp, got {raw:?}: {error}"
+            ))
+        })
+}
+
 /// `send` — create a message note in the caller's namespace (outbound) AND
 /// deliver an inbound copy addressed to the actor label in `to` (ADR-057).
 /// Both copies land in the caller's namespace; no cross-namespace write occurs.
@@ -81,14 +140,11 @@ pub(crate) async fn handle_send(
             "send: `content` must not be empty".into(),
         ));
     }
-    // Validate thread_id is a well-formed UUID when supplied (thread_id is a root UUID).
-    if let Some(ref tid) = p.thread_id {
-        if tid.parse::<Uuid>().is_err() {
-            return Err(RuntimeError::InvalidInput(format!(
-                "send: `thread_id` must be a valid UUID, got: {tid:?}"
-            )));
-        }
-    }
+    let thread_id = p
+        .thread_id
+        .as_deref()
+        .map(|raw| canonicalize_thread_id("send", raw))
+        .transpose()?;
 
     let caller_ns = token.namespace().as_str().to_string();
     let from_actor = token.actor().id.clone();
@@ -124,6 +180,7 @@ pub(crate) async fn handle_send(
     }
 
     let sent_at = Utc::now().to_rfc3339();
+    let sent_by_process = token.process_ref();
 
     // Pass caller_ns as both `from` and `to` so `from == recipient_ns_str` in
     // dual_write_message, naturally bypassing the cross-namespace allowlist gate
@@ -135,8 +192,9 @@ pub(crate) async fn handle_send(
         &caller_ns,
         p.subject.as_deref(),
         &p.content,
-        p.thread_id.as_deref(),
+        thread_id.as_deref(),
         &sent_at,
+        sent_by_process,
         Some(&from_actor),
         Some(&to_actor),
         None,
@@ -669,6 +727,7 @@ pub(crate) async fn handle_reply(
     let caller_ns = token.namespace().as_str().to_string();
     let from_actor_label = token.actor().id.clone();
     let sent_at = Utc::now().to_rfc3339();
+    let sent_by_process = token.process_ref();
 
     // UE6-H1: route to the "other party" — not always the original sender.
     let reply_to = if from_actor_label == original_from {
@@ -700,6 +759,7 @@ pub(crate) async fn handle_reply(
         &p.content,
         Some(&thread_id),
         &sent_at,
+        sent_by_process,
         Some(&reply_from_actor),
         Some(&reply_to_actor),
         in_reply_to_message_id.as_deref(),
@@ -786,7 +846,7 @@ pub(crate) async fn handle_thread(
     // Resolve and validate the passed ID.
     let passed_uuid = resolve_id(runtime, token, &p.id, "thread").await?;
 
-    let (canonical_thread_id, root_note): (String, Note) = {
+    let (canonical_thread_id, selected_raw_thread_id, root_note): (String, Option<String>, Note) = {
         let store = runtime.notes(token)?;
         let note = store
             .get_note(passed_uuid)
@@ -812,38 +872,51 @@ pub(crate) async fn handle_thread(
         // when it differs from the note's own UUID (dual_write_message patches both
         // copies to match); falls back to the note's own UUID otherwise (issue #479b,
         // ADR-040). See crates/khive-pack-comm/docs/api/message-lifecycle.md#handlersrshandle_thread
-        let canonical = match note
+        let stored_root = note
             .properties
             .as_ref()
             .and_then(|p| p.get("thread_id"))
             .and_then(Value::as_str)
-            .filter(|s| s.len() == 36)
-            .and_then(|s| s.parse::<Uuid>().ok())
-        {
-            Some(stored_root) if stored_root != passed_uuid => {
+            .and_then(|raw| raw.trim().parse::<Uuid>().ok().map(|id| (id, raw)));
+        let canonical = match stored_root {
+            Some((stored_root, _)) if stored_root != passed_uuid => {
                 stored_root.as_hyphenated().to_string()
             }
             _ => passed_uuid.as_hyphenated().to_string(),
         };
-        (canonical, note)
+        // Keep the selected row's exact pre-v1 spelling as an additional
+        // compatibility probe. The full formatter-derived set is built below
+        // once the canonical root UUID is known; no row is mutated.
+        let selected_raw = stored_root.map(|(_, raw)| raw.trim().to_string());
+        (canonical, selected_raw, note)
     };
 
-    // Push thread_id predicate into SQL so idx_comm_message_thread can be used.
+    // Push every exact pre-v1 UUID spelling into one indexed IN predicate. This
+    // keeps a mixed legacy/v1 conversation whole regardless of whether lookup
+    // starts from its canonical root, a new v1 child, or a legacy child.
     let thread_store = runtime.notes(token)?;
+    const PAGE_SIZE: u32 = 200;
+    let mut rows: Vec<ThreadRow> = Vec::new();
+    let canonical_root = canonical_thread_id
+        .parse::<Uuid>()
+        .expect("canonical_thread_id is produced from a parsed UUID");
+    let thread_id_values =
+        thread_id_query_spellings(canonical_root, selected_raw_thread_id.as_deref())
+            .into_iter()
+            .map(SqlValue::Text)
+            .collect();
     let thread_filter = NoteFilter {
         kind: Some("message".to_string()),
         property_filters: vec![PropertyFilter {
             json_path: "$.thread_id".to_string(),
-            op: FilterOp::Eq,
-            value: SqlValue::Text(canonical_thread_id.clone()),
+            op: FilterOp::In(thread_id_values),
+            value: SqlValue::Null,
         }],
         order_by: None,
         ..Default::default()
     };
-    const PAGE_SIZE: u32 = 200;
-    let mut rows: Vec<ThreadRow> = Vec::new();
     let mut db_offset: u32 = 0;
-
+    let mut seen_row_ids = HashSet::new();
     loop {
         let page = thread_store
             .query_notes_filtered(
@@ -857,11 +930,13 @@ pub(crate) async fn handle_thread(
             .await?;
         let fetched = page.items.len() as u32;
         for n in &page.items {
-            rows.push(ThreadRow {
-                created_at: n.created_at,
-                full_id: n.id,
-                json: note_to_message_json(n),
-            });
+            if seen_row_ids.insert(n.id) {
+                rows.push(ThreadRow {
+                    created_at: n.created_at,
+                    full_id: n.id,
+                    json: note_to_message_json(n),
+                });
+            }
         }
         if fetched < PAGE_SIZE {
             break;
@@ -1099,18 +1174,23 @@ pub(crate) async fn handle_ingest(
     }
     // #479a: a non-empty malformed thread_id must fail closed, not silently get a
     // fresh UUID (which would split the message into the wrong conversation).
-    if let Some(tid) = p
+    // Accepted compact/braced UUID inputs are canonicalized before any v1 row
+    // can be stamped so exact-string thread lookups remain coherent.
+    let supplied_thread_id = p
         .thread_id
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty())
-    {
-        if tid.parse::<Uuid>().is_err() {
-            return Err(RuntimeError::InvalidInput(format!(
-                "ingest: `thread_id` must be a valid UUID, got: {tid:?}"
-            )));
-        }
-    }
+        .map(|raw| canonicalize_thread_id("ingest", raw))
+        .transpose()?;
+
+    // An omitted timestamp means "observed now". A supplied value, including
+    // an empty string, must resolve to an instant before the row is labelled as
+    // message-properties v1; accepting arbitrary text would make the marker lie.
+    let sent_at = match p.sent_at.as_deref() {
+        Some(raw) => canonicalize_ingest_sent_at(raw)?,
+        None => Utc::now().to_rfc3339(),
+    };
 
     let ns = token.namespace().as_str();
     let store = runtime.notes(token)?;
@@ -1157,8 +1237,8 @@ pub(crate) async fn handle_ingest(
                         .as_ref()
                         .and_then(|props| props.get("thread_id"))
                         .and_then(Value::as_str)
-                        .filter(|s| s.parse::<Uuid>().is_ok())
-                        .map(|s| s.to_string())
+                        .and_then(|s| s.parse::<Uuid>().ok())
+                        .map(|id| id.as_hyphenated().to_string())
                         .unwrap_or_else(|| n.id.as_hyphenated().to_string());
                     let from_actor = n
                         .properties
@@ -1176,44 +1256,59 @@ pub(crate) async fn handle_ingest(
 
             if pass1.is_some() {
                 pass1
-            } else if corr.parse::<Uuid>().is_ok() {
+            } else if let Ok(correlation_root) = corr.trim().parse::<Uuid>() {
                 // Pass 2: `corr` is a UUID — may be a thread UUID from X-Khive-Thread-ID.
-                // Match against $.thread_id on an outbound note to recover from_actor.
-                let thread_filter = NoteFilter {
-                    kind: Some("message".to_string()),
-                    property_filters: vec![
-                        PropertyFilter {
-                            json_path: "$.thread_id".to_string(),
-                            op: FilterOp::Eq,
-                            value: SqlValue::Text(corr.clone()),
-                        },
-                        PropertyFilter {
-                            json_path: "$.direction".to_string(),
-                            op: FilterOp::Eq,
-                            value: SqlValue::Text("outbound".to_string()),
-                        },
-                    ],
-                    ..Default::default()
-                };
-                let thread_page = store
-                    .query_notes_filtered(
-                        ns,
-                        &thread_filter,
-                        PageRequest {
-                            limit: 1,
-                            offset: 0,
-                        },
-                    )
-                    .await?;
-                thread_page.items.first().and_then(|n| {
-                    let props = n.properties.as_ref()?;
-                    let from_actor = props
-                        .get("from_actor")
-                        .and_then(Value::as_str)
-                        .unwrap_or("")
-                        .to_string();
-                    Some((corr.clone(), from_actor))
-                })
+                // Match the canonical spelling written by v1 against $.thread_id on an
+                // outbound note to recover from_actor. The selected root stays canonical
+                // even when the transport supplied a compact or braced UUID.
+                let canonical_correlation_root = correlation_root.as_hyphenated().to_string();
+                // No backfill rewrites pre-v1 rows, so probe every spelling older
+                // handlers could have stored (canonical, compact, braced, URN, and
+                // upper-hex) as well as the canonical v1 form. Whatever spelling
+                // matched, the selected root returned below is always canonical.
+                let candidates = thread_id_query_spellings(correlation_root, Some(corr.trim()));
+
+                let mut thread_match = None;
+                for candidate in candidates {
+                    let thread_filter = NoteFilter {
+                        kind: Some("message".to_string()),
+                        property_filters: vec![
+                            PropertyFilter {
+                                json_path: "$.thread_id".to_string(),
+                                op: FilterOp::Eq,
+                                value: SqlValue::Text(candidate),
+                            },
+                            PropertyFilter {
+                                json_path: "$.direction".to_string(),
+                                op: FilterOp::Eq,
+                                value: SqlValue::Text("outbound".to_string()),
+                            },
+                        ],
+                        ..Default::default()
+                    };
+                    let thread_page = store
+                        .query_notes_filtered(
+                            ns,
+                            &thread_filter,
+                            PageRequest {
+                                limit: 1,
+                                offset: 0,
+                            },
+                        )
+                        .await?;
+                    if let Some(note) = thread_page.items.first() {
+                        let from_actor = note
+                            .properties
+                            .as_ref()
+                            .and_then(|props| props.get("from_actor"))
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string();
+                        thread_match = Some((canonical_correlation_root.clone(), from_actor));
+                        break;
+                    }
+                }
+                thread_match
             } else {
                 None
             }
@@ -1225,13 +1320,9 @@ pub(crate) async fn handle_ingest(
     };
 
     // Determine thread_id: caller-supplied > resolved from correlation > new root.
-    // `p.thread_id` was already validated above (present+non-empty implies valid UUID).
-    let thread_id: String = p
-        .thread_id
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_string())
+    // Both supplied and correlation-derived roots have already been normalized
+    // to the v1 full-hyphenated representation above.
+    let thread_id: String = supplied_thread_id
         .or_else(|| resolved.as_ref().map(|(tid, _)| tid.clone()))
         .unwrap_or_else(|| Uuid::new_v4().as_hyphenated().to_string());
 
@@ -1252,14 +1343,8 @@ pub(crate) async fn handle_ingest(
         })
         .unwrap_or_else(|| p.to.trim().to_string());
 
-    let sent_at = p.sent_at.as_deref().unwrap_or("").to_string();
-    let sent_at_value = if sent_at.is_empty() {
-        json!(Utc::now().to_rfc3339())
-    } else {
-        json!(sent_at)
-    };
-
     let mut props = json!({
+        "comm_schema_version": COMM_SCHEMA_VERSION,
         "from": p.from.trim(),
         "to": p.to.trim(),
         "from_actor": p.from.trim(),
@@ -1267,7 +1352,7 @@ pub(crate) async fn handle_ingest(
         "direction": "inbound",
         "read": false,
         "thread_id": thread_id,
-        "sent_at": sent_at_value,
+        "sent_at": sent_at,
     });
     if let Some(ref s) = p.subject {
         props["subject"] = json!(s);
@@ -1288,11 +1373,17 @@ pub(crate) async fn handle_ingest(
     if let Some(ref kind) = p.channel_kind {
         props["channel_kind"] = json!(kind);
     }
-    // Metadata passthrough (#448): merged additively so it never clobbers the
-    // identity/routing fields set above — a key already present always wins.
+    // Metadata passthrough (#448): merged additively so it never clobbers a
+    // field set above. Stable v1 names are reserved even when their optional
+    // field is absent on an ingest (`subject`, `outbound_ref`,
+    // `sent_by_process`), preventing adapter metadata from fabricating a
+    // contract field or process provenance.
     if let Some(metadata) = p.metadata {
         if let Some(obj) = props.as_object_mut() {
             for (k, v) in metadata {
+                if COMM_STABLE_PROPERTY_KEYS.contains(&k.as_str()) {
+                    continue;
+                }
                 obj.entry(k).or_insert(v);
             }
         }
@@ -1375,6 +1466,11 @@ pub(crate) async fn handle_heartbeat(
             "heartbeat: `channel_slug` must not be empty".into(),
         ));
     }
+    if p.poll_interval_secs == Some(0) {
+        return Err(RuntimeError::InvalidInput(
+            "heartbeat: `poll_interval_secs` must be greater than zero".into(),
+        ));
+    }
     let outcome = match p.outcome.as_str() {
         s @ ("success" | "failure") => s,
         other => {
@@ -1438,6 +1534,9 @@ pub(crate) async fn handle_heartbeat(
     props["channel_kind"] = json!(p.channel_kind);
     props["channel_slug"] = json!(p.channel_slug);
     props["last_poll_attempt_at"] = json!(at);
+    if let Some(poll_interval_secs) = p.poll_interval_secs {
+        props["poll_interval_secs"] = json!(poll_interval_secs);
+    }
 
     match outcome {
         "success" => {
@@ -1500,15 +1599,53 @@ pub(crate) async fn handle_heartbeat(
     }))
 }
 
+/// A channel is schedule-stale after three complete nominal poll intervals.
+/// The grace avoids flagging a live poller during ordinary tick and I/O jitter.
+const STALLED_AFTER_INTERVALS: u64 = 3;
+
+fn channel_stalled(props: &Value, as_of: &DateTime<Utc>) -> Option<bool> {
+    // A known failure enters intentional exponential backoff, so the nominal
+    // cadence cannot distinguish an overdue poll from a scheduled retry.
+    let consecutive_failures = props.get("consecutive_failures").and_then(Value::as_u64)?;
+    if consecutive_failures > 0 {
+        return None;
+    }
+    let poll_interval_secs = props.get("poll_interval_secs")?.as_u64()?;
+    if poll_interval_secs == 0 {
+        return None;
+    }
+    let stall_after_millis = poll_interval_secs
+        .checked_mul(STALLED_AFTER_INTERVALS)?
+        .checked_mul(1_000)?;
+    let last_poll_attempt =
+        DateTime::parse_from_rfc3339(props.get("last_poll_attempt_at")?.as_str()?)
+            .ok()?
+            .with_timezone(&Utc);
+    let elapsed_millis = u64::try_from(
+        as_of
+            .signed_duration_since(last_poll_attempt)
+            .num_milliseconds(),
+    )
+    .ok()?;
+    Some(elapsed_millis > stall_after_millis)
+}
+
 /// Project a persisted `channel_health` note into the `comm.health()` channel
-/// entry shape. Missing fields (a row written before a given property existed)
-/// default to `null`/`0` rather than panicking — forward-compatible with rows
-/// written by an older heartbeat writer.
-fn channel_health_to_json(note: &Note) -> Value {
+/// entry shape. Missing or malformed cadence/timestamp fields (including rows
+/// written before #1472) produce `stalled: null` rather than pretending the
+/// channel is current.
+fn channel_health_to_json(note: &Note, as_of: &DateTime<Utc>) -> Value {
     let props = note.properties.clone().unwrap_or_else(|| json!({}));
+    let poll_interval_secs = props
+        .get("poll_interval_secs")
+        .and_then(Value::as_u64)
+        .filter(|interval| *interval > 0);
+    let stalled = channel_stalled(&props, as_of);
     json!({
         "channel_kind": props.get("channel_kind").cloned().unwrap_or(Value::Null),
         "channel_slug": props.get("channel_slug").cloned().unwrap_or(Value::Null),
+        "poll_interval_secs": poll_interval_secs,
+        "stalled": stalled,
         "last_success_at": props.get("last_success_at").cloned().unwrap_or(Value::Null),
         "last_poll_attempt_at": props.get("last_poll_attempt_at").cloned().unwrap_or(Value::Null),
         "last_failure_at": props.get("last_failure_at").cloned().unwrap_or(Value::Null),
@@ -1519,8 +1656,9 @@ fn channel_health_to_json(note: &Note) -> Value {
 
 /// `health` — read-only per-channel health snapshot (khive #606). Reads
 /// `channel_health` rows from `token.namespace()` (khive #877 namespace
-/// scoping); never returns a computed `healthy: bool` — that judgment belongs
-/// to the caller. See crates/khive-pack-comm/docs/api/channel-health.md#handlersrshandle_health
+/// scoping). The additive `stalled` schedule fact is deliberately narrower
+/// than a computed `healthy: bool`; overall health judgment still belongs to
+/// the caller. See crates/khive-pack-comm/docs/api/channel-health.md#handlersrshandle_health
 /// for the `role`/`namespace`/`resource` field semantics (ADR-103 Stage 1).
 ///
 /// `resource` is a process-level self-report of this process's own CPU/RSS
@@ -1568,8 +1706,13 @@ pub(crate) async fn handle_health(
         );
     }
 
-    let channels: Vec<Value> = page.items.iter().map(channel_health_to_json).collect();
-    let as_of = Utc::now().to_rfc3339();
+    let now = Utc::now();
+    let channels: Vec<Value> = page
+        .items
+        .iter()
+        .map(|note| channel_health_to_json(note, &now))
+        .collect();
+    let as_of = now.to_rfc3339();
 
     let (role, source) = if channels.is_empty() {
         ("client", None::<&str>)
@@ -2123,12 +2266,48 @@ fn build_references_header(parent_chain: Option<&str>, parent_message_id: &str) 
 #[cfg(test)]
 mod tests {
     use super::{
-        add_embedding_truncation_warning, build_references_header, heartbeat_note_id,
-        message_id_match_candidates, parent_references_chain, parent_wire_message_id,
-        read_response, sanitize_reference_token, wrap_message_id,
+        add_embedding_truncation_warning, build_references_header, channel_stalled,
+        heartbeat_note_id, message_id_match_candidates, parent_references_chain,
+        parent_wire_message_id, read_response, sanitize_reference_token, wrap_message_id,
     };
     use khive_storage::StorageError;
     use serde_json::{json, Value};
+
+    #[test]
+    fn channel_stalled_uses_strict_three_interval_threshold() {
+        let props = json!({
+            "poll_interval_secs": 5,
+            "last_poll_attempt_at": "2026-08-01T12:00:00Z",
+            "consecutive_failures": 0,
+        });
+        let at_threshold = chrono::DateTime::parse_from_rfc3339("2026-08-01T12:00:15Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let overdue = chrono::DateTime::parse_from_rfc3339("2026-08-01T12:00:15.001Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+
+        assert_eq!(channel_stalled(&props, &at_threshold), Some(false));
+        assert_eq!(channel_stalled(&props, &overdue), Some(true));
+    }
+
+    #[test]
+    fn channel_stalled_requires_valid_consecutive_failures() {
+        let as_of = chrono::DateTime::parse_from_rfc3339("2026-08-01T12:01:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let mut props = json!({
+            "poll_interval_secs": 5,
+            "last_poll_attempt_at": "2026-08-01T12:00:00Z",
+        });
+
+        assert_eq!(channel_stalled(&props, &as_of), None);
+
+        for malformed in [json!("1"), json!(-1)] {
+            props["consecutive_failures"] = malformed;
+            assert_eq!(channel_stalled(&props, &as_of), None);
+        }
+    }
 
     #[test]
     fn comm_write_response_reports_atomic_note_embedding_truncation() {

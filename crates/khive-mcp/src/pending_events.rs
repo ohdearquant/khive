@@ -2951,10 +2951,15 @@ mod tests {
             update_response["results"][0]["ok"], false,
             "{update_response}"
         );
+        // Two layered defenses reject this: the KG update handler refuses the
+        // `scheduled_event` kind outright, and the runtime curation fence
+        // refuses schedule-managed notes. Whichever layer fires first, the
+        // rejection must name the scheduled-event trust boundary.
         assert!(
             update_response["results"][0]["error"]
                 .as_str()
-                .is_some_and(|error| error.contains("schedule-managed")),
+                .is_some_and(|error| error.contains("schedule-managed")
+                    || error.contains("scheduled_event notes are not editable")),
             "the generic mutation fence must reject executable schedule changes: \
              {update_response}"
         );

@@ -227,6 +227,14 @@ impl KgPack {
                 {
                     return Err(RuntimeError::NotFound(format!("note {}", p.id)));
                 }
+                if note.as_ref().is_some_and(|n| n.kind == "scheduled_event") {
+                    return Err(RuntimeError::InvalidInput(
+                        "scheduled_event notes are not editable via `update` — their creator \
+                         identity and action payload are a trust boundary for replay dispatch; \
+                         use `schedule.cancel` to remove a pending one"
+                            .into(),
+                    ));
+                }
                 let patch = NotePatch::new(
                     optional_string_patch(p.name, "name")?,
                     p.content,

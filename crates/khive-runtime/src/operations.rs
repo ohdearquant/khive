@@ -27,8 +27,8 @@ use khive_score::DeterministicScore;
 use khive_storage::note::Note;
 use khive_storage::types::{
     DeleteMode, DirectedNeighborHit, Direction, EdgeSortField, GraphPath, LinkId, NeighborHit,
-    NeighborQuery, Page, PageRequest, SortOrder, SqlRow, SqlStatement, SqlValue, TextFilter,
-    TextQueryMode, TextSearchRequest, TraversalRequest,
+    NeighborQuery, Page, PageRequest, SeekCursor, SortOrder, SqlRow, SqlStatement, SqlValue,
+    TextFilter, TextQueryMode, TextSearchRequest, TraversalRequest,
 };
 use khive_storage::{Edge, EdgeRelation, Entity, EntityFilter, Event, EventFilter};
 use khive_types::{EdgeEndpointRule, EndpointKind, EventKind, KhiveError, SubstrateKind};
@@ -1629,6 +1629,59 @@ impl KhiveRuntime {
         Ok(page.items)
     }
 
+    /// List an immutable insertion-sequence page of visible entities.
+    ///
+    /// The public cursor remains the UUID of the last returned entity. We
+    /// resolve its immutable database-assigned sequence before querying so callers do
+    /// not need to serialize storage details. A missing or out-of-scope cursor
+    /// fails explicitly instead of silently resuming from the wrong boundary.
+    pub async fn list_entities_after(
+        &self,
+        token: &NamespaceToken,
+        kind: Option<&str>,
+        entity_type: Option<&str>,
+        tags_any: &[String],
+        after: Option<Uuid>,
+        limit: u32,
+    ) -> RuntimeResult<(Vec<Entity>, Option<Uuid>)> {
+        let store = self.entities(token)?;
+        let after = match after {
+            Some(id) => {
+                let entity = self
+                    .get_entity_including_deleted(token, id)
+                    .await?
+                    .ok_or_else(|| RuntimeError::NotFound(format!("entity cursor {id}")))?;
+                Self::ensure_namespace_visible(&entity.namespace, token)?;
+                let sequence = store.entity_sequence(id).await?.ok_or_else(|| {
+                    RuntimeError::Internal(format!(
+                        "entity cursor {id} has no insertion-sequence ledger row"
+                    ))
+                })?;
+                Some(SeekCursor { sequence, id })
+            }
+            None => None,
+        };
+        let filter = EntityFilter {
+            kinds: kind
+                .map(|value| vec![value.to_string()])
+                .unwrap_or_default(),
+            entity_types: entity_type
+                .map(|value| vec![value.to_string()])
+                .unwrap_or_default(),
+            tags_any: tags_any.to_vec(),
+            namespaces: token
+                .visible_namespaces()
+                .iter()
+                .map(|namespace| namespace.as_str().to_owned())
+                .collect(),
+            ..Default::default()
+        };
+        let page = store
+            .query_entities_after(token.namespace().as_str(), filter, after, limit)
+            .await?;
+        Ok((page.items, page.next_after.map(|cursor| cursor.id)))
+    }
+
     /// List entities filtered by kind, optional domain tag, limit, and offset.
     ///
     /// When `domain_tag` is Some, the query is restricted at the storage layer via
@@ -2567,9 +2620,11 @@ impl KhiveRuntime {
         request: TraversalRequest,
     ) -> RuntimeResult<Vec<GraphPath>> {
         let mut request = request;
+        request.validate().map_err(RuntimeError::InvalidInput)?;
         let mut visible_roots = Vec::with_capacity(request.roots.len());
+        let mut seen_roots = std::collections::HashSet::with_capacity(request.roots.len());
         for root in request.roots.drain(..) {
-            if self.substrate_exists_in_ns(token, root).await? {
+            if seen_roots.insert(root) && self.substrate_exists_in_ns(token, root).await? {
                 visible_roots.push(root);
             }
         }
@@ -2587,7 +2642,8 @@ impl KhiveRuntime {
         // Reconcile the per-namespace GraphPaths back down to one per
         // distinct root_id (see merge_traversal_paths_by_root for why this
         // is needed and what it enforces).
-        let mut paths = merge_traversal_paths_by_root(paths, request.options.limit);
+        let mut paths =
+            merge_traversal_paths_by_root(paths, Some(request.options.effective_limit()));
         self.enrich_path_nodes(token, &mut paths, request.include_properties)
             .await;
         // Filter out soft-deleted entity nodes from all path nodes.
@@ -3542,6 +3598,50 @@ impl KhiveRuntime {
             )
             .await?;
         Ok(page.items)
+    }
+
+    /// List an immutable insertion-sequence page of visible notes.
+    ///
+    /// Soft-deleting the prior page's last note does not invalidate the
+    /// cursor because the boundary is resolved including tombstones. A hard
+    /// deletion makes the cursor unresolvable and returns an explicit error.
+    pub async fn list_notes_after(
+        &self,
+        token: &NamespaceToken,
+        kind: Option<&str>,
+        after: Option<Uuid>,
+        limit: u32,
+    ) -> RuntimeResult<(Vec<Note>, Option<Uuid>)> {
+        let store = self.notes(token)?;
+        let after = match after {
+            Some(id) => {
+                let note = self
+                    .get_note_including_deleted(token, id)
+                    .await?
+                    .ok_or_else(|| RuntimeError::NotFound(format!("note cursor {id}")))?;
+                Self::ensure_namespace_visible(&note.namespace, token)?;
+                let sequence = store.note_sequence(id).await?.ok_or_else(|| {
+                    RuntimeError::Internal(format!(
+                        "note cursor {id} has no insertion-sequence ledger row"
+                    ))
+                })?;
+                Some(SeekCursor { sequence, id })
+            }
+            None => None,
+        };
+        let filter = khive_storage::note::NoteFilter {
+            kind: kind.map(str::to_string),
+            namespaces: token
+                .visible_namespaces()
+                .iter()
+                .map(|namespace| namespace.as_str().to_owned())
+                .collect(),
+            ..Default::default()
+        };
+        let page = store
+            .query_notes_filtered_after(token.namespace().as_str(), &filter, after, limit)
+            .await?;
+        Ok((page.items, page.next_after.map(|cursor| cursor.id)))
     }
 
     /// Count notes matching `kind` across the caller's visible namespaces.
@@ -4796,16 +4896,17 @@ impl KhiveRuntime {
         Ok(results[start..end].to_vec())
     }
 
-    /// Keyset (seek) page of edges matching `filter`, ordered by edge `id`
-    /// ascending. `after` is the last edge id from the previous page
-    /// (exclusive); omit to start from the beginning. Returns
+    /// Keyset (seek) page of edges matching `filter`, ordered by immutable
+    /// database-assigned insertion sequence. `after` is the last edge id from the
+    /// previous page (exclusive); omit to start from the beginning. Returns
     /// `(items, next_after)` — `next_after` is `Some` when more rows remain
     /// past this page.
     ///
-    /// Unlike [`Self::list_edges`], this is O(log n + limit) at any depth: the
-    /// underlying store issues an indexed `id > ?` range scan instead of an
-    /// `OFFSET` skip, avoiding the O(offset) daemon CPU cost of a naive
-    /// offset-based paging loop over a large edge population.
+    /// Unlike [`Self::list_edges`], this is O(log n + limit) at any depth and
+    /// genuinely new inserts are appended after already-issued boundaries. The
+    /// cursor row is resolved including tombstones; a hard-deleted or
+    /// out-of-scope cursor fails explicitly rather than hiding an incomplete
+    /// traversal.
     pub async fn list_edges_after(
         &self,
         token: &NamespaceToken,
@@ -4816,30 +4917,64 @@ impl KhiveRuntime {
         let limit = limit.clamp(1, Self::EDGE_LIST_MAX_LIMIT);
         let visible = token.visible_namespaces();
         let limit_usize = limit as usize;
+        let cursor_store = self.graph(token)?;
+        let after = match after {
+            Some(id) => {
+                let edge = self
+                    .get_edge_including_deleted(token, id)
+                    .await?
+                    .ok_or_else(|| RuntimeError::NotFound(format!("edge cursor {id}")))?;
+                Self::ensure_namespace_visible(&edge.namespace, token)?;
+                let sequence = cursor_store.edge_sequence(id).await?.ok_or_else(|| {
+                    RuntimeError::Internal(format!(
+                        "edge cursor {id} has no insertion-sequence ledger row"
+                    ))
+                })?;
+                Some(SeekCursor { sequence, id })
+            }
+            None => None,
+        };
 
         if let [ns] = visible {
             let temp = NamespaceToken::for_namespace(ns.clone());
             let page = self
                 .graph(&temp)?
-                .query_edges_after(filter.into(), after, limit)
+                .query_edges_sequence_after(filter.into(), after, limit)
                 .await?;
-            return Ok((page.items, page.next_after));
+            return Ok((page.items, page.next_after.map(|cursor| cursor.id)));
         }
 
         // Multi-namespace visibility: seek each namespace from the same
-        // cursor (ids are globally unique UUIDs), merge, then take the head
-        // of the merged set as this page.
-        let probe_limit = limit + 1;
+        // immutable boundary, merge in global insertion order, then take the head of
+        // the merged set as this page.
+        let probe_limit = limit.saturating_add(1);
         let mut results = Vec::new();
         for ns in visible {
             let temp = NamespaceToken::for_namespace(ns.clone());
             let page = self
                 .graph(&temp)?
-                .query_edges_after(filter.clone().into(), after, probe_limit)
+                .query_edges_sequence_after(filter.clone().into(), after, probe_limit)
                 .await?;
             results.extend(page.items);
         }
-        results.sort_by_key(|e| Uuid::from(e.id));
+        let ids = results
+            .iter()
+            .map(|edge| Uuid::from(edge.id))
+            .collect::<Vec<_>>();
+        let sequences = cursor_store
+            .edge_sequences(&ids)
+            .await?
+            .into_iter()
+            .collect::<HashMap<_, _>>();
+        if let Some(missing) = ids.iter().find(|id| !sequences.contains_key(id)) {
+            return Err(RuntimeError::Internal(format!(
+                "edge {missing} has no insertion-sequence ledger row"
+            )));
+        }
+        results.sort_by_key(|edge| {
+            let id = Uuid::from(edge.id);
+            (sequences[&id], id)
+        });
         results.dedup_by_key(|e| Uuid::from(e.id));
         let has_more = results.len() > limit_usize;
         if has_more {
@@ -6726,9 +6861,8 @@ mod tests {
         );
     }
 
-    /// `list_edges_after` seeks via `id > cursor` against the
-    /// `(namespace, id)` primary key index instead of paging through OFFSET,
-    /// so cost does not grow with how deep the walk goes.
+    /// `list_edges_after` seeks via a durable insertion sequence instead of
+    /// paging through OFFSET, so cost does not grow with walk depth.
     #[tokio::test]
     async fn list_edges_after_keyset_tiles_full_set() {
         let rt = rt();
@@ -6773,11 +6907,8 @@ mod tests {
         seen.dedup();
         assert_eq!(seen.len(), 5, "keyset walk must tile the full edge set");
 
-        // Stability: repeating the same cursor returns the same page — no
-        // drift under a fixed snapshot. The seek is `WHERE id > ?` against
-        // the `(namespace, id)` primary key index with `ORDER BY id ASC`
-        // matching the index order, so this is an indexed range scan, not a
-        // full-table scan+sort (see `query_edges_after` in khive-db).
+        // With no intervening writes, repeating the same cursor returns the
+        // same insertion-sequence page.
         let (first_a, next_a) = rt
             .list_edges_after(&tok, filter.clone(), None, 2)
             .await
@@ -6791,6 +6922,261 @@ mod tests {
             first_b.iter().map(|e| e.id.0).collect::<Vec<_>>(),
         );
         assert_eq!(next_a, next_b);
+    }
+
+    #[tokio::test]
+    async fn list_entities_after_same_timestamp_lower_uuid_insert_is_not_skipped() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let ids = [
+            Uuid::parse_str("f0000000-0000-4000-8000-000000000011").unwrap(),
+            Uuid::parse_str("f0000000-0000-4000-8000-000000000012").unwrap(),
+            Uuid::parse_str("f0000000-0000-4000-8000-000000000013").unwrap(),
+        ];
+        let store = rt.entities(&tok).unwrap();
+        for (index, id) in ids.into_iter().enumerate() {
+            let mut entity = Entity::new("local", "concept", format!("Entity{index}"));
+            entity.id = id;
+            entity.created_at = 1_000_000;
+            entity.updated_at = 1_000_000;
+            store.upsert_entity(entity).await.unwrap();
+        }
+
+        let (first, next) = rt
+            .list_entities_after(&tok, None, None, &[], None, 2)
+            .await
+            .unwrap();
+        assert_eq!(
+            first.iter().map(|entity| entity.id).collect::<Vec<_>>(),
+            ids[..2]
+        );
+        let cursor = next.expect("one original entity remains after page one");
+
+        let low_id = Uuid::parse_str("00000000-0000-4000-8000-000000000011").unwrap();
+        assert!(low_id < cursor);
+        let mut inserted = Entity::new("local", "concept", "InsertedEntity");
+        inserted.id = low_id;
+        inserted.created_at = 1_000_000;
+        inserted.updated_at = 1_000_000;
+        store.upsert_entity(inserted).await.unwrap();
+
+        let (second, final_cursor) = rt
+            .list_entities_after(&tok, None, None, &[], Some(cursor), 2)
+            .await
+            .unwrap();
+        assert_eq!(
+            second.iter().map(|entity| entity.id).collect::<Vec<_>>(),
+            vec![ids[2], low_id]
+        );
+        assert_eq!(final_cursor, None);
+    }
+
+    #[tokio::test]
+    async fn list_notes_after_same_timestamp_lower_uuid_insert_is_not_skipped() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let ids = [
+            Uuid::parse_str("f0000000-0000-4000-8000-000000000021").unwrap(),
+            Uuid::parse_str("f0000000-0000-4000-8000-000000000022").unwrap(),
+            Uuid::parse_str("f0000000-0000-4000-8000-000000000023").unwrap(),
+        ];
+        let store = rt.notes(&tok).unwrap();
+        for (index, id) in ids.into_iter().enumerate() {
+            let mut note = Note::new("local", "observation", format!("Note {index}"));
+            note.id = id;
+            note.created_at = 1_000_000;
+            note.updated_at = 1_000_000;
+            store.upsert_note(note).await.unwrap();
+        }
+
+        let (first, next) = rt.list_notes_after(&tok, None, None, 2).await.unwrap();
+        assert_eq!(
+            first.iter().map(|note| note.id).collect::<Vec<_>>(),
+            ids[..2]
+        );
+        let cursor = next.expect("one original note remains after page one");
+
+        let low_id = Uuid::parse_str("00000000-0000-4000-8000-000000000021").unwrap();
+        assert!(low_id < cursor);
+        let mut inserted = Note::new("local", "observation", "Inserted note");
+        inserted.id = low_id;
+        inserted.created_at = 1_000_000;
+        inserted.updated_at = 1_000_000;
+        store.upsert_note(inserted).await.unwrap();
+
+        let (second, final_cursor) = rt
+            .list_notes_after(&tok, None, Some(cursor), 2)
+            .await
+            .unwrap();
+        assert_eq!(
+            second.iter().map(|note| note.id).collect::<Vec<_>>(),
+            vec![ids[2], low_id]
+        );
+        assert_eq!(final_cursor, None);
+    }
+
+    #[tokio::test]
+    async fn list_edges_after_same_timestamp_lower_uuid_insert_is_not_skipped() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let source = rt
+            .create_entity(&tok, "concept", None, "CursorSource", None, None, vec![])
+            .await
+            .unwrap();
+        let mut targets = Vec::new();
+        for index in 0..4 {
+            targets.push(
+                rt.create_entity(
+                    &tok,
+                    "concept",
+                    None,
+                    &format!("CursorTarget{index}"),
+                    None,
+                    None,
+                    vec![],
+                )
+                .await
+                .unwrap(),
+            );
+        }
+
+        let ids = [
+            Uuid::parse_str("f0000000-0000-4000-8000-000000000001").unwrap(),
+            Uuid::parse_str("f0000000-0000-4000-8000-000000000002").unwrap(),
+            Uuid::parse_str("f0000000-0000-4000-8000-000000000003").unwrap(),
+        ];
+        let graph = rt.graph(&tok).unwrap();
+        let created_at = chrono::DateTime::<chrono::Utc>::from_timestamp_micros(1_000_000).unwrap();
+        for (index, id) in ids.into_iter().enumerate() {
+            graph
+                .upsert_edge(Edge {
+                    id: id.into(),
+                    namespace: "local".into(),
+                    source_id: source.id,
+                    target_id: targets[index].id,
+                    relation: EdgeRelation::Extends,
+                    weight: 1.0,
+                    created_at,
+                    updated_at: created_at,
+                    deleted_at: None,
+                    metadata: None,
+                    target_backend: None,
+                })
+                .await
+                .unwrap();
+        }
+
+        let filter = EdgeListFilter {
+            source_id: Some(source.id),
+            relations: vec![EdgeRelation::Extends],
+            ..Default::default()
+        };
+        let (first, next) = rt
+            .list_edges_after(&tok, filter.clone(), None, 2)
+            .await
+            .unwrap();
+        assert_eq!(
+            first.iter().map(|edge| edge.id.0).collect::<Vec<_>>(),
+            ids[..2]
+        );
+        let cursor = next.expect("one original edge remains after page one");
+
+        // The later insert has the same wall-clock microsecond and sorts before
+        // the cursor UUID. Its database-assigned sequence still places it after
+        // the issued boundary.
+        let low_id = Uuid::parse_str("00000000-0000-4000-8000-000000000001").unwrap();
+        assert!(low_id < cursor);
+        graph
+            .upsert_edge(Edge {
+                id: low_id.into(),
+                namespace: "local".into(),
+                source_id: source.id,
+                target_id: targets[3].id,
+                relation: EdgeRelation::Extends,
+                weight: 1.0,
+                created_at,
+                updated_at: created_at,
+                deleted_at: None,
+                metadata: None,
+                target_backend: None,
+            })
+            .await
+            .unwrap();
+
+        let (second, final_cursor) = rt
+            .list_edges_after(&tok, filter, Some(cursor), 2)
+            .await
+            .unwrap();
+        assert_eq!(
+            second.iter().map(|edge| edge.id.0).collect::<Vec<_>>(),
+            vec![ids[2], low_id]
+        );
+        assert_eq!(final_cursor, None);
+    }
+
+    #[tokio::test]
+    async fn list_entity_cursor_survives_soft_delete_and_rejects_hard_delete_or_hidden_scope() {
+        let rt = rt();
+        let local = NamespaceToken::local();
+        for index in 0..3 {
+            rt.create_entity(
+                &local,
+                "concept",
+                None,
+                &format!("CursorLifecycle{index}"),
+                None,
+                None,
+                vec![],
+            )
+            .await
+            .unwrap();
+        }
+
+        let (_, next) = rt
+            .list_entities_after(&local, None, None, &[], None, 2)
+            .await
+            .unwrap();
+        let cursor = next.expect("three entities require a second page");
+        let store = rt.entities(&local).unwrap();
+        assert!(store.delete_entity(cursor, DeleteMode::Soft).await.unwrap());
+
+        let (remaining, next) = rt
+            .list_entities_after(&local, None, None, &[], Some(cursor), 2)
+            .await
+            .expect("a soft-deleted cursor must retain its sequence boundary");
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(next, None);
+
+        assert!(store.delete_entity(cursor, DeleteMode::Hard).await.unwrap());
+        let hard_deleted = rt
+            .list_entities_after(&local, None, None, &[], Some(cursor), 2)
+            .await;
+        assert!(
+            matches!(hard_deleted, Err(RuntimeError::NotFound(_))),
+            "a hard-deleted cursor must fail explicitly: {hard_deleted:?}"
+        );
+
+        let hidden_ns = Namespace::parse("cursor-hidden").unwrap();
+        let hidden_token = NamespaceToken::for_namespace(hidden_ns);
+        let hidden = rt
+            .create_entity(
+                &hidden_token,
+                "concept",
+                None,
+                "HiddenCursor",
+                None,
+                None,
+                vec![],
+            )
+            .await
+            .unwrap();
+        let out_of_scope = rt
+            .list_entities_after(&local, None, None, &[], Some(hidden.id), 2)
+            .await;
+        assert!(
+            matches!(out_of_scope, Err(RuntimeError::NotFound(_))),
+            "an out-of-scope cursor must not reveal or resume from the hidden row: {out_of_scope:?}"
+        );
     }
 
     #[tokio::test]
@@ -11844,6 +12230,7 @@ mod tests {
                     },
                     include_roots: true,
                     include_properties: false,
+                    execution_budget: Default::default(),
                 },
             )
             .await;
@@ -11893,6 +12280,7 @@ mod tests {
                     },
                     include_roots: true,
                     include_properties: false,
+                    execution_budget: Default::default(),
                 },
             )
             .await
@@ -11913,6 +12301,85 @@ mod tests {
             "merged path must retain the neighbor discovered in the owning \
              namespace, got {result:#?}"
         );
+    }
+
+    /// Namespace fan-out clones one request but must not clone a fresh work
+    /// allowance. With one adjacency row in each visible namespace, a one-row
+    /// shared budget admits the first and makes the later namespace fail the
+    /// whole operation instead of returning a partial merged path.
+    #[tokio::test]
+    async fn traverse_visible_namespaces_share_one_work_budget() {
+        use khive_storage::types::{TraversalExecutionBudget, TraversalOptions};
+
+        let rt = rt();
+        let ns_a = Namespace::parse("traverse-budget-a").unwrap();
+        let ns_b = Namespace::parse("traverse-budget-b").unwrap();
+        let tok_a = NamespaceToken::for_namespace(ns_a.clone());
+        let tok_b = NamespaceToken::for_namespace(ns_b.clone());
+        let visible = NamespaceToken::mint_with_visibility(ns_a, vec![ns_b], ActorRef::anonymous());
+
+        let root = rt
+            .create_entity(&tok_a, "concept", None, "BudgetRoot", None, None, vec![])
+            .await
+            .unwrap();
+        let child_a = rt
+            .create_entity(&tok_a, "concept", None, "BudgetChildA", None, None, vec![])
+            .await
+            .unwrap();
+        let child_b = rt
+            .create_entity(&tok_b, "concept", None, "BudgetChildB", None, None, vec![])
+            .await
+            .unwrap();
+        rt.link(
+            &tok_a,
+            root.id,
+            child_a.id,
+            EdgeRelation::Extends,
+            1.0,
+            None,
+        )
+        .await
+        .unwrap();
+        rt.link(
+            &tok_b,
+            root.id,
+            child_b.id,
+            EdgeRelation::Extends,
+            1.0,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let result = rt
+            .traverse(
+                &visible,
+                TraversalRequest {
+                    roots: vec![root.id],
+                    options: TraversalOptions {
+                        max_depth: 1,
+                        direction: Direction::Out,
+                        relations: None,
+                        min_weight: None,
+                        limit: Some(2),
+                    },
+                    include_roots: false,
+                    include_properties: false,
+                    execution_budget: TraversalExecutionBudget::new(
+                        1,
+                        std::time::Duration::from_secs(5),
+                    ),
+                },
+            )
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(RuntimeError::Storage(khive_storage::StorageError::InvalidInput {
+                message,
+                ..
+            })) if message.contains("work budget exceeded after 1 adjacency rows")
+        ));
     }
 
     // ── Multi-root traverse: one object per distinct root, including a
@@ -11948,6 +12415,7 @@ mod tests {
                     },
                     include_roots: true,
                     include_properties: false,
+                    execution_budget: Default::default(),
                 },
             )
             .await
@@ -12021,6 +12489,7 @@ mod tests {
                     },
                     include_roots: false,
                     include_properties: false,
+                    execution_budget: Default::default(),
                 },
             )
             .await
@@ -12100,6 +12569,7 @@ mod tests {
                     },
                     include_roots: false,
                     include_properties: false,
+                    execution_budget: Default::default(),
                 },
             )
             .await
@@ -14568,90 +15038,41 @@ mod tests {
         );
     }
 
-    /// Regression: GraphStore::traverse must not fail with "too many SQL variables"
-    /// or "too many terms in compound SELECT" when the root set exceeds the chunk
-    /// boundary (400 roots per CTE VALUES clause after the fix).
-    ///
-    /// Graph: 1 000 roots, each with one distinct outgoing edge to a unique child.
-    /// The graph store's `traverse` is exercised directly (bypassing the runtime-level
-    /// entity-existence filter) to keep the test fast and targeted.
-    ///
-    /// Correctness: every root must appear in the result with exactly one reachable node.
+    /// The runtime enforces the public root cap before doing any root-existence
+    /// lookups or handing work to storage.
     #[tokio::test]
-    async fn traverse_chunks_root_binds_over_host_param_limit() {
-        use khive_storage::types::TraversalOptions;
+    async fn traverse_rejects_root_count_above_public_cap_before_lookup() {
+        use khive_storage::types::{TraversalOptions, MAX_TRAVERSAL_ROOTS};
 
         let rt = rt();
         let tok = NamespaceToken::local();
-        let graph = rt.graph(&tok).unwrap();
-
-        const N: usize = 1_000;
-        let now = chrono::Utc::now();
-
-        let mut roots: Vec<uuid::Uuid> = Vec::with_capacity(N);
-        let mut expected_children: std::collections::HashMap<uuid::Uuid, uuid::Uuid> =
-            std::collections::HashMap::with_capacity(N);
-
-        for _ in 0..N {
-            let root = uuid::Uuid::new_v4();
-            let child = uuid::Uuid::new_v4();
-            graph
-                .upsert_edge(Edge {
-                    id: LinkId::from(uuid::Uuid::new_v4()),
-                    namespace: "local".to_string(),
-                    source_id: root,
-                    target_id: child,
-                    relation: EdgeRelation::Extends,
-                    weight: 1.0,
-                    created_at: now,
-                    updated_at: now,
-                    deleted_at: None,
-                    metadata: None,
-                    target_backend: None,
-                })
-                .await
-                .unwrap();
-            roots.push(root);
-            expected_children.insert(root, child);
-        }
-
-        // Must return Ok: no "too many SQL variables" or "too many terms in compound SELECT".
-        let paths = graph
-            .traverse(TraversalRequest {
-                roots: roots.clone(),
-                options: TraversalOptions {
-                    max_depth: 1,
-                    direction: Direction::Out,
-                    relations: None,
-                    min_weight: None,
-                    limit: None,
+        let err = rt
+            .traverse(
+                &tok,
+                TraversalRequest {
+                    roots: (0..=MAX_TRAVERSAL_ROOTS)
+                        .map(|_| uuid::Uuid::new_v4())
+                        .collect(),
+                    options: TraversalOptions {
+                        max_depth: 1,
+                        direction: Direction::Out,
+                        relations: None,
+                        min_weight: None,
+                        limit: None,
+                    },
+                    include_roots: false,
+                    include_properties: false,
+                    execution_budget: Default::default(),
                 },
-                include_roots: false,
-                include_properties: false,
-            })
+            )
             .await
-            .unwrap();
+            .unwrap_err();
 
-        assert_eq!(
-            paths.len(),
-            N,
-            "traverse over {N} roots must return one GraphPath per root"
-        );
-
-        for path in &paths {
-            let expected_child = expected_children[&path.root_id];
-            assert_eq!(
-                path.nodes.len(),
-                1,
-                "root {:?} must reach exactly 1 node",
-                path.root_id
-            );
-            assert_eq!(
-                path.nodes[0].node_id, expected_child,
-                "root {:?} must reach its direct child",
-                path.root_id
-            );
-        }
+        assert!(matches!(
+            err,
+            RuntimeError::InvalidInput(message)
+                if message.contains("roots must contain at most 100 entries")
+        ));
     }
 
     // ── Additive EDGE_RULES composition: pack EntityOfType rules must not shadow

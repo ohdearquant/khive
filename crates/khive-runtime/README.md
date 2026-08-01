@@ -15,7 +15,8 @@ verb-dispatch machinery that lets packs (`kg`, `gtd`, `memory`, …) extend the 
   every pack declares handlers, owned entity/note kinds, edge-endpoint extensions, and
   an optional auxiliary `SchemaPlan`
 - **Curation** (`EntityPatch`, `NotePatch`, `EdgePatch`, `MergeSummary`,
-  `EntityDedupMergePolicy`) — update/merge semantics per
+  `MergeEdgeConflictPreimage`, `MergeEdgePreimage`, `EntityDedupMergePolicy`) —
+  update/merge semantics, including reversible natural-key edge-conflict drops, per
   [ADR-014](https://github.com/ohdearquant/khive/blob/main/docs/adr/ADR-014-curation-operations.md)
 - **Retrieval objectives** (`RrfFusionObjective`, `VectorSimilarityObjective`,
   `TextRelevanceObjective`, `TemporalRecencyObjective`,

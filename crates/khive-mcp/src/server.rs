@@ -1940,6 +1940,7 @@ impl KhiveMcpServer {
             // identity serves the request under this caller's identity instead
             // of rejecting it or silently stamping writes under its own actor.
             actor_id: self.actor_id().map(str::to_string),
+            process_ref: khive_runtime::process_ref_from_env(),
             visible_namespaces: self
                 .visible_namespaces()
                 .iter()
@@ -1996,6 +1997,7 @@ impl KhiveMcpServer {
             // spelling that identity as `Some("local")` would incorrectly
             // reconstruct it as the distinct authenticated `actor:local`.
             actor_id: verified_actor.map(|actor| actor.as_str().to_string()),
+            process_ref: khive_runtime::process_ref_from_env(),
             // A scheduled action is scoped exactly to its event namespace;
             // it never inherits the daemon's broader read visibility.
             visible_namespaces: Vec::new(),
@@ -2046,6 +2048,7 @@ impl KhiveMcpServer {
                 .map(|request_id| khive_runtime::RequestIdentity {
                     namespace: self.default_namespace.clone(),
                     actor_id: self.actor_id().map(str::to_string),
+                    process_ref: khive_runtime::process_ref_from_env(),
                     visible_namespaces: self
                         .visible_namespaces()
                         .iter()
@@ -3523,6 +3526,7 @@ mod tests {
         std::env::remove_var("KHIVE_PID");
         std::env::remove_var("KHIVE_NO_DAEMON");
         std::env::remove_var("KHIVE_LOCK");
+        std::env::remove_var("KHIVE_PROCESS_REF");
     }
 
     /// khive#948: `wire_daemon_frame` forwards `RequestParams::request_id`

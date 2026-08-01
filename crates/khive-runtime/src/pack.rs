@@ -107,6 +107,12 @@ pub trait PackRuntime: Send + Sync {
     /// Entity kinds this pack owns — must equal `<Self as Pack>::ENTITY_KINDS`.
     fn entity_kinds(&self) -> &'static [&'static str];
 
+    /// Brain profile consumer kinds this pack requests — must equal
+    /// `<Self as Pack>::BRAIN_CONSUMER_KINDS`.
+    fn brain_consumer_kinds(&self) -> &'static [&'static str] {
+        &[]
+    }
+
     /// Handlers this pack registers — must equal `<Self as Pack>::HANDLERS`.
     fn handlers(&self) -> &'static [HandlerDef];
 
@@ -573,6 +579,7 @@ impl VerbRegistryBuilder {
         validate_unique_note_kinds(&ordered_packs)?;
         validate_unique_verb_names(&ordered_packs)?;
         validate_unique_entity_types(&ordered_packs)?;
+        validate_brain_consumer_kinds(&ordered_packs)?;
 
         let available_verbs: Vec<&'static str> = ordered_packs
             .iter()
@@ -608,6 +615,26 @@ fn validate_unique_note_kinds(packs: &[Box<dyn PackRuntime>]) -> Result<(), Runt
             if let Some(first_pack) = seen.insert(kind, pack.name()) {
                 return Err(RuntimeError::InvalidInput(format!(
                     "duplicate note kind {kind:?}: claimed by both {first_pack:?} and {:?}",
+                    pack.name()
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Validate pack-declared brain consumer kinds at the composition boundary.
+///
+/// The wildcard belongs to the binding matcher rather than any consumer, and
+/// whitespace-bearing values can never equal the exact wire values callers
+/// request. Reject both at boot so a malformed declaration cannot make an
+/// otherwise unreachable binding appear valid.
+fn validate_brain_consumer_kinds(packs: &[Box<dyn PackRuntime>]) -> Result<(), RuntimeError> {
+    for pack in packs {
+        for &kind in pack.brain_consumer_kinds() {
+            if kind == "*" || kind.trim().is_empty() || kind.trim() != kind {
+                return Err(RuntimeError::InvalidInput(format!(
+                    "pack {:?} declares invalid brain consumer kind {kind:?}; declarations must be non-empty exact wire values and must not use the registry-owned \"*\" wildcard",
                     pack.name()
                 )));
             }
@@ -792,6 +819,11 @@ pub struct RequestIdentity {
     /// failing the whole request — a single malformed visibility entry from a
     /// caller-supplied frame must not block dispatch.
     pub visible_namespaces: Vec<String>,
+    /// Opaque process provenance resolved by the originating request process.
+    /// `None` means the origin did not set one; a warm daemon must not replace
+    /// it with its own process environment. This field is attribution-only and
+    /// never participates in the gate or token authority.
+    pub process_ref: Option<String>,
     /// Caller-supplied correlation id for this request (khive#948), carried
     /// unchanged from the daemon frame's `request_id` field. Stamped into the
     /// audit event's `resource.request_id` on every outcome (success, error,
@@ -810,8 +842,12 @@ impl RequestIdentity {
     /// the registry's construction-baked identity would silently replace a
     /// warm daemon request's actor and visibility (ADR-096). This projection
     /// preserves the token's exact primary namespace, actor, and read-visible
-    /// namespaces. A `NamespaceToken` does not carry the ingress correlation
-    /// id, so nested calls intentionally use `request_id: None`.
+    /// namespaces, and the origin's process provenance rider. A
+    /// `NamespaceToken` does not carry the ingress correlation id, so nested
+    /// calls intentionally use `request_id: None`; `process_ref` IS carried by
+    /// the token (ADR-096: an absent value stays absent, a present origin
+    /// rider survives nested dispatch without reading the daemon
+    /// environment).
     pub fn from_token(token: &NamespaceToken) -> Self {
         Self {
             namespace: token.namespace().as_str().to_string(),
@@ -821,6 +857,7 @@ impl RequestIdentity {
                 .iter()
                 .map(|namespace| namespace.as_str().to_string())
                 .collect(),
+            process_ref: token.process_ref().map(str::to_owned),
             request_id: None,
         }
     }
@@ -1515,7 +1552,11 @@ impl VerbRegistry {
             };
             extra_visible.push(Namespace::local()); // 'local' always readable; mint dedups
             NamespaceToken::mint_with_visibility(primary, extra_visible, resolved_actor)
-        };
+        }
+        .with_process_ref(match identity.as_ref() {
+            Some(id) => id.process_ref.clone(),
+            None => crate::config::process_ref_from_env(),
+        });
 
         for pack in self.packs.iter() {
             if let Some(handler_def) = pack.handlers().iter().find(|v| v.name == verb) {
@@ -1791,6 +1832,7 @@ impl VerbRegistry {
                 .iter()
                 .map(|ns| ns.as_str().to_string())
                 .collect(),
+            process_ref: crate::config::process_ref_from_env(),
             request_id: None,
         };
         self.dispatch_with_identity(verb, params, Some(identity))
@@ -1902,6 +1944,17 @@ impl VerbRegistry {
             .iter()
             .flat_map(|p| p.entity_kinds().iter().copied())
             .filter(|k| seen.insert(*k))
+            .collect()
+    }
+
+    /// Merged set of brain profile consumer kinds requested by registered
+    /// packs (deduplicated, first-seen order preserved).
+    pub fn all_brain_consumer_kinds(&self) -> Vec<&'static str> {
+        let mut seen = std::collections::HashSet::new();
+        self.packs
+            .iter()
+            .flat_map(|p| p.brain_consumer_kinds().iter().copied())
+            .filter(|kind| seen.insert(*kind))
             .collect()
     }
 
@@ -2592,12 +2645,31 @@ mod tests {
     use crate::ActorRef;
     use khive_types::Pack;
 
+    #[test]
+    fn from_token_preserves_process_ref() {
+        let with_ref = NamespaceToken::mint_authorized(
+            Namespace::local(),
+            ActorRef::new("agent", "provenance-carrier"),
+        )
+        .with_process_ref(Some("proc:origin-abc123".to_string()));
+        let identity = RequestIdentity::from_token(&with_ref);
+        assert_eq!(identity.process_ref.as_deref(), Some("proc:origin-abc123"));
+
+        let without_ref = NamespaceToken::mint_authorized(
+            Namespace::local(),
+            ActorRef::new("agent", "provenance-absent"),
+        );
+        let identity = RequestIdentity::from_token(&without_ref);
+        assert_eq!(identity.process_ref, None);
+    }
+
     struct AlphaPack;
 
     impl Pack for AlphaPack {
         const NAME: &'static str = "alpha";
         const NOTE_KINDS: &'static [&'static str] = &["memo", "log"];
         const ENTITY_KINDS: &'static [&'static str] = &["widget"];
+        const BRAIN_CONSUMER_KINDS: &'static [&'static str] = &["recall", "search"];
         const HANDLERS: &'static [HandlerDef] = &[
             HandlerDef {
                 name: "create",
@@ -2626,6 +2698,9 @@ mod tests {
         }
         fn entity_kinds(&self) -> &'static [&'static str] {
             AlphaPack::ENTITY_KINDS
+        }
+        fn brain_consumer_kinds(&self) -> &'static [&'static str] {
+            AlphaPack::BRAIN_CONSUMER_KINDS
         }
         fn handlers(&self) -> &'static [HandlerDef] {
             AlphaPack::HANDLERS
@@ -2691,6 +2766,7 @@ mod tests {
         const NAME: &'static str = "beta";
         const NOTE_KINDS: &'static [&'static str] = &["alert"];
         const ENTITY_KINDS: &'static [&'static str] = &["widget", "gadget"];
+        const BRAIN_CONSUMER_KINDS: &'static [&'static str] = &["search", "knowledge_compose"];
         const HANDLERS: &'static [HandlerDef] = &[
             HandlerDef {
                 name: "notify",
@@ -2776,6 +2852,9 @@ mod tests {
         }
         fn entity_kinds(&self) -> &'static [&'static str] {
             BetaPack::ENTITY_KINDS
+        }
+        fn brain_consumer_kinds(&self) -> &'static [&'static str] {
+            BetaPack::BRAIN_CONSUMER_KINDS
         }
         fn handlers(&self) -> &'static [HandlerDef] {
             BetaPack::HANDLERS
@@ -2941,6 +3020,64 @@ mod tests {
         let reg = build_registry();
         let kinds = reg.all_note_kinds();
         assert_eq!(kinds, vec!["memo", "log", "alert"]);
+    }
+
+    #[test]
+    fn brain_consumer_kinds_are_ordered_and_deduplicated() {
+        let reg = build_registry();
+        assert_eq!(
+            reg.all_brain_consumer_kinds(),
+            vec!["recall", "search", "knowledge_compose"]
+        );
+    }
+
+    #[test]
+    fn brain_consumer_kind_wildcard_is_rejected_at_build_time() {
+        struct WildcardConsumerPack;
+
+        impl khive_types::Pack for WildcardConsumerPack {
+            const NAME: &'static str = "wildcard-consumer";
+            const NOTE_KINDS: &'static [&'static str] = &[];
+            const ENTITY_KINDS: &'static [&'static str] = &[];
+            const BRAIN_CONSUMER_KINDS: &'static [&'static str] = &["*"];
+            const HANDLERS: &'static [HandlerDef] = &[];
+        }
+
+        #[async_trait]
+        impl PackRuntime for WildcardConsumerPack {
+            fn name(&self) -> &str {
+                Self::NAME
+            }
+            fn note_kinds(&self) -> &'static [&'static str] {
+                Self::NOTE_KINDS
+            }
+            fn entity_kinds(&self) -> &'static [&'static str] {
+                Self::ENTITY_KINDS
+            }
+            fn brain_consumer_kinds(&self) -> &'static [&'static str] {
+                Self::BRAIN_CONSUMER_KINDS
+            }
+            fn handlers(&self) -> &'static [HandlerDef] {
+                Self::HANDLERS
+            }
+            async fn dispatch(
+                &self,
+                _verb: &str,
+                _params: Value,
+                _registry: &VerbRegistry,
+                _token: &NamespaceToken,
+            ) -> Result<Value, RuntimeError> {
+                Ok(Value::Null)
+            }
+        }
+
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(WildcardConsumerPack);
+        let Err(RuntimeError::InvalidInput(message)) = builder.build() else {
+            panic!("registry must reject a pack-declared brain wildcard");
+        };
+        assert!(message.contains("wildcard-consumer"), "{message}");
+        assert!(message.contains("registry-owned"), "{message}");
     }
 
     #[test]

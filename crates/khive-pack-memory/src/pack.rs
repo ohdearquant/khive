@@ -64,6 +64,8 @@ impl Pack for MemoryPack {
     const NAME: &'static str = "memory";
     const NOTE_KINDS: &'static [&'static str] = &["memory"];
     const ENTITY_KINDS: &'static [&'static str] = &[];
+    const BRAIN_CONSUMER_KINDS: &'static [&'static str] =
+        &[khive_brain_core::ConsumerKind::Recall.as_str()];
     const HANDLERS: &'static [HandlerDef] = &MEMORY_HANDLERS;
     const REQUIRES: &'static [&'static str] = &["kg"];
     /// Pack-owned durable ANN epoch schema, applied during registry boot.
@@ -376,6 +378,10 @@ impl PackRuntime for MemoryPack {
 
     fn entity_kinds(&self) -> &'static [&'static str] {
         <MemoryPack as Pack>::ENTITY_KINDS
+    }
+
+    fn brain_consumer_kinds(&self) -> &'static [&'static str] {
+        <MemoryPack as Pack>::BRAIN_CONSUMER_KINDS
     }
 
     fn handlers(&self) -> &'static [HandlerDef] {

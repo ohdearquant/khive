@@ -9,7 +9,8 @@ use crate::error::StorageError;
 use crate::types::{
     BatchWriteSummary, DeleteMode, DirectedNeighborHit, Direction, Edge, EdgeFilter, EdgeSeekPage,
     EdgeSortField, GraphPath, GuardedBatchOutcome, GuardedWriteOutcome, LinkId, NeighborHit,
-    NeighborQuery, Page, PageRequest, SortOrder, StorageResult, TraversalRequest,
+    NeighborQuery, Page, PageRequest, SeekCursor, SeekPage, SortOrder, StorageResult,
+    TraversalRequest,
 };
 
 /// Directed edge CRUD and graph traversal over the knowledge graph.
@@ -137,14 +138,49 @@ pub trait GraphStore: Send + Sync + 'static {
     /// Seek-pagination page of edges ordered by `id` ascending, using an
     /// indexed range scan (`id > after`) against the `(namespace, id)`
     /// primary key instead of `OFFSET`. `after` is exclusive; `None` starts
-    /// from the beginning of the set. Stable under concurrent writes and
-    /// O(log n + limit) at any depth, unlike offset paging (#702.2).
+    /// from the beginning of the set. This remains an efficient compatibility
+    /// path for a fixed edge set, but random UUIDs inserted concurrently may
+    /// sort behind an issued boundary. Public concurrent walks use
+    /// [`Self::query_edges_sequence_after`] instead (#1424).
     async fn query_edges_after(
         &self,
         filter: EdgeFilter,
         after: Option<Uuid>,
         limit: u32,
     ) -> StorageResult<EdgeSeekPage>;
+    /// Resolve an edge id to its immutable insertion sequence.
+    async fn edge_sequence(&self, _id: Uuid) -> StorageResult<Option<i64>> {
+        Err(StorageError::Unsupported {
+            capability: StorageCapability::Graph,
+            operation: "edge_sequence".into(),
+            message: "this backend does not implement edge insertion sequences".into(),
+        })
+    }
+    /// Resolve edge ids to immutable insertion sequences. Implementations may
+    /// override this to batch the lookup; the default preserves correctness.
+    async fn edge_sequences(&self, ids: &[Uuid]) -> StorageResult<Vec<(Uuid, i64)>> {
+        let mut resolved = Vec::with_capacity(ids.len());
+        for id in ids {
+            if let Some(sequence) = self.edge_sequence(*id).await? {
+                resolved.push((*id, sequence));
+            }
+        }
+        Ok(resolved)
+    }
+    /// Seek-pagination page ordered by immutable insertion sequence. This is
+    /// the stable public-list contract for walks overlapping inserts (#1424).
+    async fn query_edges_sequence_after(
+        &self,
+        _filter: EdgeFilter,
+        _after: Option<SeekCursor>,
+        _limit: u32,
+    ) -> StorageResult<SeekPage<Edge>> {
+        Err(StorageError::Unsupported {
+            capability: StorageCapability::Graph,
+            operation: "query_edges_sequence_after".into(),
+            message: "this backend does not implement insertion-sequence edge pagination".into(),
+        })
+    }
     /// Return immediate neighbors of a graph node.
     async fn neighbors(
         &self,
@@ -225,7 +261,14 @@ pub trait GraphStore: Send + Sync + 'static {
         }
         Ok(out)
     }
-    /// Multi-hop BFS traversal from the given roots.
+    /// Bounded multi-hop BFS traversal from the given roots.
+    ///
+    /// Implementations must validate [`TraversalRequest::validate`], count
+    /// adjacency rows before first-visit de-duplication against the request's
+    /// shared execution budget, stop a root as soon as its effective result
+    /// limit is filled, and return an error rather than partial paths when the
+    /// work or time budget expires. Minimum-depth BFS selection is normative;
+    /// same-depth tie ordering is not.
     async fn traverse(&self, request: TraversalRequest) -> StorageResult<Vec<GraphPath>>;
     /// Hard-delete every incident edge (source or target) for `node_id`, regardless of soft-delete
     /// state. Used during endpoint hard-delete to prevent dangling `graph_edges` rows (ADR-002

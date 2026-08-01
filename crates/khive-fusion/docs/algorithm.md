@@ -85,7 +85,7 @@ $$\hat{s}_i(d) = \frac{s_i(d) - \min_i}{\max_i - \min_i}$$
 
 When all scores in a source are equal (or the source has one element), every entry receives
 $1.0$ so it still contributes to the weighted combination. This ensures BM25 (unbounded) and
-cosine similarity ($[0, 1]$) contribute proportionally to their configured weights regardless
+cosine similarity ($[-1, 1]$) contribute proportionally to their configured weights regardless
 of original score scale.
 
 ### Weight/source length mismatch

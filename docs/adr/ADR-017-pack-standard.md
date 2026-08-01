@@ -85,6 +85,10 @@ pub trait Pack {
     /// Entity kinds this pack registers. Validated against the merged set at boot.
     const ENTITY_KINDS: &'static [&'static str];
 
+    /// Brain profile consumer kinds this pack requests. Additive and deduplicated;
+    /// `"*"` is a registry-owned binding wildcard, not a pack declaration.
+    const BRAIN_CONSUMER_KINDS: &'static [&'static str] = &[];
+
     /// Handlers this pack registers. Boot-time verb-name collisions across packs
     /// are errors. Only entries with `visibility: Visibility::Verb` are surfaced
     /// on the MCP wire; `Visibility::Subhandler` entries are internal.
@@ -137,6 +141,7 @@ pub trait PackRuntime: Send + Sync + std::fmt::Debug {
     fn name(&self) -> &str;
     fn note_kinds(&self) -> &'static [&'static str];
     fn entity_kinds(&self) -> &'static [&'static str];
+    fn brain_consumer_kinds(&self) -> &'static [&'static str] { &[] }
     fn handlers(&self) -> &'static [HandlerDef];
     fn edge_rules(&self) -> &'static [EdgeEndpointRule] { &[] }
 
@@ -233,6 +238,9 @@ impl VerbRegistry {
 
     /// All registered entity kinds, deduplicated.
     pub fn all_entity_kinds(&self) -> Vec<&'static str>;
+
+    /// All brain profile consumer kinds requested by loaded packs, deduplicated.
+    pub fn all_brain_consumer_kinds(&self) -> Vec<&'static str>;
 
     /// All registered handlers with their owning pack.
     pub fn all_handlers(&self) -> Vec<(HandlerDef, &str)>;
@@ -493,6 +501,7 @@ At boot, the registry aggregates:
 ```text
 all_note_kinds   = ∪ pack.note_kinds()      for pack in registered_packs
 all_entity_kinds = ∪ pack.entity_kinds()    for pack in registered_packs
+all_brain_consumer_kinds = ∪ pack.brain_consumer_kinds() for pack in registered_packs
 all_handlers     = { (handler, pack) : pack in registered_packs, handler in pack.handlers() }
 all_verbs        = { (handler, pack) : handler in all_handlers, handler.visibility == Verb }
 all_edge_rules   = ∪ pack.edge_rules()      for pack in registered_packs
@@ -502,6 +511,13 @@ all_storage_profiles = { (pack.name, pack.storage_profile()) : pack ∈ packs }
 `create`, `list`, `search` consult the merged kind sets. Unknown kinds at the verb
 boundary return `RuntimeError::UnknownKind { kind, registered: Vec<&'static str> }`
 with the full registered set in the error message.
+
+`brain.bind` similarly consults `all_brain_consumer_kinds`. A specific
+`consumer_kind` that no loaded pack declares is rejected with the composed valid set;
+the explicit `"*"` wildcard remains legal without appearing in pack metadata. Unlike
+owned note kinds, brain consumer declarations are uses, so duplicate declarations by
+multiple packs are expected and deduplicated rather than treated as ownership
+collisions.
 
 ### Pack-extensible edge endpoints
 

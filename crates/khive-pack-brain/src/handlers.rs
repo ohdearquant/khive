@@ -429,7 +429,7 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
                 name: "consumer_kind",
                 param_type: "string",
                 required: false,
-                description: "Verb / operation kind to match. Default \"*\" (all kinds).",
+                description: "Registered brain consumer kind to match. Default \"*\" (all kinds). Unknown kinds are rejected with the loaded valid set.",
             },
             khive_types::ParamDef {
                 name: "priority",
@@ -1973,6 +1973,7 @@ impl BrainPack {
         &self,
         token: &NamespaceToken,
         params: Value,
+        registry: &VerbRegistry,
     ) -> Result<Value, RuntimeError> {
         #[derive(Deserialize)]
         #[serde(deny_unknown_fields)]
@@ -2013,6 +2014,17 @@ impl BrainPack {
         }
         if consumer_kind != "*" {
             khive_runtime::secret_gate::check(&consumer_kind)?;
+        }
+
+        if consumer_kind != "*" {
+            let mut valid = registry.all_brain_consumer_kinds();
+            if !valid.contains(&consumer_kind.as_str()) {
+                valid.sort_unstable();
+                return Err(RuntimeError::InvalidInput(format!(
+                    "unknown consumer_kind {consumer_kind:?}; valid: * | {}",
+                    valid.join(" | ")
+                )));
+            }
         }
 
         let profile_id = p.profile_id;
@@ -2860,6 +2872,10 @@ impl khive_runtime::pack::PackRuntime for BrainPack {
         <BrainPack as khive_types::Pack>::ENTITY_KINDS
     }
 
+    fn brain_consumer_kinds(&self) -> &'static [&'static str] {
+        <BrainPack as khive_types::Pack>::BRAIN_CONSUMER_KINDS
+    }
+
     fn handlers(&self) -> &'static [HandlerDef] {
         BRAIN_HANDLERS
     }
@@ -2872,7 +2888,7 @@ impl khive_runtime::pack::PackRuntime for BrainPack {
         &self,
         verb: &str,
         params: Value,
-        _registry: &VerbRegistry,
+        registry: &VerbRegistry,
         token: &NamespaceToken,
     ) -> Result<Value, RuntimeError> {
         // Serialise the (ensure_loaded → handler) pair under the dispatch gate
@@ -2919,7 +2935,7 @@ impl khive_runtime::pack::PackRuntime for BrainPack {
             "brain.record_serve" => self.handle_record_serve(token, params).await,
             "brain.mark_turn" => self.handle_mark_turn(token, params).await,
             // Declaration
-            "brain.bind" => self.handle_bind(token, params).await,
+            "brain.bind" => self.handle_bind(token, params, registry).await,
             "brain.unbind" => self.handle_unbind(token, params).await,
             "brain.create_profile" => self.handle_create_profile(token, params).await,
             "brain.register_adapter" => self.handle_register_adapter(token, params).await,

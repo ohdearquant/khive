@@ -38,23 +38,29 @@ runtime. To add a migration, append a `VersionedMigration` entry with
 
 ## Per-version notes
 
-- **V2**: `NOTES_DDL` already includes `name TEXT` for in-process schema
-  creation. The migration runner checks column existence before applying V2 to
-  stay idempotent.
-- **V4**: Deduplicates existing `graph_edges` rows sharing the same
-  `(namespace, source_id, target_id, relation)` triple, then adds a unique
-  index.
-- **V5**: `ENTITIES_DDL` already includes `entity_type TEXT`. Same
-  column-existence guard as V2.
-- **V9**: Adds lifecycle columns (`updated_at`, `deleted_at`) and
-  `target_backend` to `graph_edges` via table rebuild.
-- **V13**: Event observability columns. DDL computed at runtime via
-  `build_v13_event_observability_sql` to avoid duplicate-column errors.
-- **V14**: Embedding model registry (`_embedding_models`). DDL computed at
-  runtime to discover existing `vec_*` tables.
-- **V16**: Adds `embedding_model` column to regular `vec_*` tables.
-- **V17**: Preserving rebuild of `vec0` virtual tables to add `field` and
-  `embedding_model` columns without data loss.
+The repository consolidated its earlier V1--V22 development ledger into a new
+V1 baseline at v0.2.8. The live post-consolidation sequence is:
+
+- **V1**: Complete consolidated `initial_schema` baseline.
+- **V2**: Narrows the FTS sections update trigger.
+- **V3**: Backfills domain mirror atoms.
+- **V4**: Consolidates entity and note FTS tables.
+- **V5**: Adds the unique comm external-message-id index.
+- **V6**: Adds the brain retune driver state.
+- **V7**: Adds the durable `notes_seq` ledger.
+- **V8**: Repairs partially populated `notes_seq` ledgers.
+- **V9**: Adds the case-insensitive entity-name index.
+- **V10**: Adds entity `content_ref` storage and its partial index.
+- **V11**: Adds the ANN write-log table.
+- **V12**: Adds the model-leading ANN write-log sequence index.
+- **V13**: Adds immutable entity, note, and edge insertion-sequence ledgers,
+  ordered upgrade backfills, and atomic assignment triggers for stable list
+  cursors.
+- **V14**: Adds an idempotent compatibility guard enforcing global uniqueness
+  of `graph_edges.id`, ahead of the UUID-keyed edge ledger.
+
+The historical pre-consolidation allocation table remains in ADR-015 for
+provenance; its version numbers do not describe the live migration array.
 
 ## Legacy API
 

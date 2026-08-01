@@ -222,6 +222,10 @@ pub(crate) struct ListParams {
     pub offset: Option<u32>,
     #[serde(default)]
     pub provider: Option<String>,
+    #[serde(default)]
+    pub agent_id: Option<String>,
+    #[serde(default)]
+    pub since: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

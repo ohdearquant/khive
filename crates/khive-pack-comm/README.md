@@ -2,7 +2,7 @@
 
 The communication pack for khive — inter-agent messaging (`send`, `inbox`,
 `read`, `unread`, `reply`, `thread`) over a dedicated `message` note kind, with
-dual-write, actor-addressed delivery.
+dual-write, actor-addressed delivery, and channel polling observability.
 
 ## Verbs
 
@@ -14,9 +14,10 @@ dual-write, actor-addressed delivery.
 | `comm.unread` | Count the caller's unread inbound messages without message payloads                                                                                           |
 | `comm.reply`  | Reply to a message, preserving thread linkage                                                                                                                 |
 | `comm.thread` | Retrieve all messages in a conversation thread, chronologically                                                                                               |
+| `comm.health` | Read per-channel heartbeat state, nominal poll cadence, and nullable advisory schedule staleness                                                              |
 | `comm.probe`  | Read-only poll for new inbound message metadata and a stale unread count (takes an explicit `actor`; unlike `comm.inbox`, it is not inferred from the caller) |
 
-A sixth handler, `comm.ingest`, is `Visibility::Subhandler` — it lets an
+The internal `comm.ingest` handler is `Visibility::Subhandler` — it lets an
 out-of-band channel adapter (email, Telegram, etc.) write an inbound message
 directly, deduplicated by `external_id`, but it is not callable on the MCP wire.
 
@@ -60,9 +61,14 @@ opaque so it can change again without a breaking rename.
 
 Every `comm.send` writes two `message` notes via `dual_write_message`
 (`src/message.rs`): an **outbound** copy (`direction=outbound`) and an
-**inbound** copy (`direction=inbound`), linked by `outbound_ref`. If the
-inbound write fails, the outbound note is deleted before the error is
-returned — the pair is atomic.
+**inbound** copy (`direction=inbound`), linked by `outbound_ref`. Both notes
+commit through one atomic writer transaction; a failure on either note rolls
+back the whole pair.
+
+New comm-authored messages use the versioned
+[`properties` v1 contract](docs/api/message-properties.md). If `KHIVE_PROCESS_REF` is set for a
+`comm.send` or `comm.reply`, its opaque value is copied to `sent_by_process` on both delivery
+copies without affecting routing or authorization.
 
 Two addressing modes govern where the inbound copy lands:
 
@@ -78,8 +84,9 @@ Two addressing modes govern where the inbound copy lands:
   namespace returns `RuntimeError::PermissionDenied`.
 
 A root message (`thread_id` absent) gets a canonical `thread_id` equal to the
-outbound note's own UUID, patched into both copies, so `comm.thread` finds
-every reply regardless of which copy it answered.
+outbound note's own UUID, generated before either note is written and set on
+both copies, so `comm.thread` finds every reply regardless of which copy it
+answered.
 
 ## Usage
 

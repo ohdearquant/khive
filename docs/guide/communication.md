@@ -12,6 +12,12 @@ sender's namespace) and an inbound copy (addressed to the recipient), so a
 send always produces two notes and no cross-namespace write occurs even when
 `to` names a different actor.
 
+New messages follow the stable
+[`properties` v1 contract](../../crates/khive-pack-comm/docs/api/message-properties.md).
+Workers may set `KHIVE_PROCESS_REF` to an opaque run or job reference; `comm.send`
+and `comm.reply` then persist it verbatim as `sent_by_process` on both copies.
+It is provenance only and does not change addressing or authorization.
+
 ## Actor addressing
 
 Actors are labeled strings such as `lambda:leo` or `lambda:khive`. `comm.send`
@@ -90,8 +96,9 @@ request(ops="comm.thread(id=\"<root_message_id_or_prefix>\", limit=50)")
 
 `comm.health()` is a read-only, no-argument verb that reports per-channel
 polling state, keyed by `(channel_kind, channel_slug)`. It never returns a
-computed `healthy` boolean: staleness and alerting judgment stay with the
-caller, not the pack.
+computed `healthy` boolean. It does expose the nominal cadence and a narrower,
+nullable schedule-staleness advisory; overall health judgment stays with the
+caller.
 
 ```
 request(ops="comm.health()")
@@ -99,30 +106,38 @@ request(ops="comm.health()")
 
 Each entry in the returned `channels` array carries:
 
-| Field                  | Notes                                                                                                                                                    |
-| ---------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `channel_kind`         | e.g. `"email"`.                                                                                                                                          |
-| `channel_slug`         | Per-credential identifier (the configured mailbox address for the email channel), so two accounts of the same `channel_kind` get distinct rows.          |
-| `last_success_at`      | Timestamp of the most recent successful poll attempt, or `null`.                                                                                         |
-| `last_failure_at`      | Timestamp of the most recent failed poll attempt, or `null`.                                                                                             |
-| `last_poll_attempt_at` | Timestamp of the most recent poll attempt regardless of outcome.                                                                                         |
-| `last_error`           | `{class, message, at}` of the most recent failure. `class` is one of `auth`, `transport`, `config` (an open enum; callers must tolerate unknown values). |
-| `consecutive_failures` | Resets to 0 on success, increments on failure.                                                                                                           |
+| Field                  | Notes                                                                                                                                                      |
+| ---------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `channel_kind`         | e.g. `"email"`.                                                                                                                                            |
+| `channel_slug`         | Per-credential identifier (the configured mailbox address for the email channel), so two accounts of the same `channel_kind` get distinct rows.            |
+| `poll_interval_secs`   | Positive nominal/minimum poll cadence, or `null` for a legacy/malformed heartbeat row.                                                                     |
+| `stalled`              | Advisory schedule staleness: `true` after three missed nominal intervals, `false` when current, or `null` when the facts are unknown or backoff is active. |
+| `last_success_at`      | Timestamp of the most recent successful poll attempt, or `null`.                                                                                           |
+| `last_failure_at`      | Timestamp of the most recent failed poll attempt, or `null`.                                                                                               |
+| `last_poll_attempt_at` | Timestamp of the most recent poll attempt regardless of outcome.                                                                                           |
+| `last_error`           | `{class, message, at}` of the most recent failure. `class` is one of `auth`, `transport`, `config` (an open enum; callers must tolerate unknown values).   |
+| `consecutive_failures` | Resets to 0 on success, increments on failure.                                                                                                             |
 
 `last_error` is retained after a later success: a success updates
 `last_success_at` and resets `consecutive_failures` to 0 but never clears
 `last_error`. Compare `last_error.at` against `last_success_at` to tell a
 resolved failure from one that is still live.
 
-Heartbeat rows are always persisted to the fixed `local` operational
-namespace by `comm.heartbeat`, regardless of the caller's own namespace or
-`KHIVE_EMAIL_INGEST_NAMESPACE` — that write path is intentionally pinned,
-since heartbeat rows are an operational surface, not message data.
-`comm.health` itself is not pinned (khive #877): it reads from the caller's
+`stalled` is computed against the response's single `as_of` timestamp and is
+deliberately not a supervisor verdict. The loop polls channels sequentially,
+and a transport operation can run longer than the nominal interval, so `true`
+means the persisted schedule is overdue; it does not prove the task is dead.
+Rows with `consecutive_failures > 0` report `stalled: null` because intentional
+exponential backoff can exceed the nominal cadence. ADR-119's component
+supervisor remains responsible for authoritative hung-task detection/restart.
+
+`comm.heartbeat` persists under its dispatch-authorized namespace
+(`token.namespace()`, khive #917). The shipped local poll loop explicitly
+dispatches heartbeat writes to the fixed `local` operational namespace,
+regardless of `KHIVE_EMAIL_INGEST_NAMESPACE`; an authorized per-tenant writer
+can instead write its own namespace. `comm.health` reads from the caller's
 injected namespace, the same `namespace=` escape / `"local"` default every
-other comm verb resolves. An unscoped call still defaults to `"local"` and
-so still sees what `comm.heartbeat` wrote; a call with an explicit non-local
-`namespace=` reads only that namespace's rows, never `"local"`'s. The
+other comm verb resolves. A scoped read never falls back to `"local"`. The
 response carries a `namespace` field naming the namespace actually read.
 
 The `role` field is `"daemon"` (with `source: "daemon-heartbeat"`) whenever
@@ -138,14 +153,11 @@ The comm pack has no visibility into channel configuration (that lives in
 `khive-mcp` / `khive-channel-email`), so `role: "client"` with an empty
 `channels` array means only "no daemon heartbeat state exists in the
 namespace read," not "nothing is configured." The `namespace` field
-disambiguates which namespace that is: since the shipped OSS
-`comm.heartbeat` only ever writes to `"local"`, a call scoped to a non-local
-`namespace=` is expected to return `role: "client"` with empty `channels`
-even while a daemon is actively heartbeating under `"local"` — check the
-response's `namespace` field before reading that as "no daemon running."
-Producing heartbeat rows under a non-local namespace (e.g. per-tenant
-channel state on a cloud deployment) has no supported writer yet; it is
-tracked as separate follow-up work, not a `comm.health` read-path gap.
+disambiguates which namespace that is. A call scoped to a non-local
+`namespace=` returns `role: "client"` with empty `channels` until an authorized
+writer has produced heartbeat state there, even while the shipped local loop
+is actively heartbeating under `"local"` — check the response's `namespace`
+field before reading that as "no daemon running."
 
 Results are capped at 200 channels. A full page logs a `tracing::debug!`
 line noting that results may be silently truncated.
