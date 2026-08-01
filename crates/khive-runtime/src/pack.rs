@@ -816,7 +816,10 @@ impl RequestIdentity {
     /// warm daemon request's actor and visibility (ADR-096). This projection
     /// preserves the token's exact primary namespace, actor, and read-visible
     /// namespaces. A `NamespaceToken` does not carry the ingress correlation
-    /// id, so nested calls intentionally use `request_id: None`.
+    /// id or the origin's process provenance, so nested calls intentionally
+    /// use `request_id: None` and `process_ref: None` — substituting the
+    /// dispatching process's own environment here would violate the
+    /// attribution-only contract on `process_ref`.
     pub fn from_token(token: &NamespaceToken) -> Self {
         Self {
             namespace: token.namespace().as_str().to_string(),
@@ -826,6 +829,7 @@ impl RequestIdentity {
                 .iter()
                 .map(|namespace| namespace.as_str().to_string())
                 .collect(),
+            process_ref: None,
             request_id: None,
         }
     }
