@@ -2,8 +2,8 @@
 
 Technical reference for the bounded tail-read ingest algorithm in
 `crates/khive-pack-session/src/mirror/ingest.rs` — how `mirror_file` and
-`mirror_chatgpt_export_file` read, bound, and durably checkpoint session transcripts. The
-`.rs` file keeps the published contract for those two entry points plus short pointers
+the ChatGPT/claude.ai whole-file entry points read, bound, and durably checkpoint session
+transcripts. The `.rs` file keeps the published contract for those entry points plus short pointers
 back to the sections below.
 
 ## Bounded tail-read algorithm (module overview)
@@ -79,7 +79,7 @@ past the cap — bytes beyond it are scanned for `\n` and dropped immediately,
 bounding this function's own resident memory to `max_line_bytes` (plus one
 `BufRead` internal buffer) no matter how long the real line is.
 
-The same bound applies to the number of bytes *read* per call, not just
+The same bound applies to the number of bytes _read_ per call, not just
 buffered: once a line has crossed `max_line_bytes` without a terminating
 `\n`, the very next `fill_buf` window that still has no `\n` returns
 `OversizedUnterminated` immediately rather than looping `fill_buf`/`consume`
@@ -93,6 +93,7 @@ at EOF — instead of scanning the remainder of the file (or forever, on a
 still-growing file) in a single pass.
 
 `LineRead` variants:
+
 - `Eof` — EOF with nothing read at all.
 - `Partial` — EOF reached before a terminating `\n`: an incomplete trailing
   line, left for the next pass. No bytes are considered consumed by the
@@ -138,7 +139,7 @@ export is retried whole on the next tick, never half-consumed.
 
 `DEFAULT_CHATGPT_MAX_BYTES` (256 MiB), overridable via
 `KHIVE_MIRROR_CHATGPT_MAX_BYTES`: unlike the JSONL line-tail sources, this is
-a ceiling on the *entire file*, not a per-pass delta. An export over this
+a ceiling on the _entire file_, not a per-pass delta. An export over this
 size is skipped for that pass (loudly logged via `tracing::warn!`, never a
 crash or an unbounded `read_to_string`), and the cursor is left untouched so
 the oversized source keeps being retried — and re-warned — on every later
@@ -147,10 +148,24 @@ tick instead of silently dropping forever (PACKSESSION-AUD-003).
 zero env values (a zero ceiling would skip every export unconditionally,
 which is never useful, so it is treated the same as unset).
 
+## claude.ai export whole-file re-parse (`mirror_claude_ai_export_file`)
+
+The claude.ai data export uses the same whole-file/cursor algorithm but a
+distinct parser and source value (`claude_ai_export`). Its incompatible
+`conversations.json` shape carries conversation `uuid` values and
+`chat_messages`, so it is never routed through the ChatGPT mapping-tree
+parser. `KHIVE_MIRROR_CLAUDE_AI_MAX_BYTES` independently overrides the same
+256 MiB default ceiling. Parse, IO, or DB failures leave the cursor untouched;
+successful commits advance it to the full file length.
+
+`WholeFileExportSpec` keeps the shared bound/read/commit mechanism in one
+place while fixing the provider-specific parser, source value, diagnostic
+name, and size environment variable at each public entry point.
+
 ## Write path: `write_events_and_cursor` and friends (ADR-099 D5)
 
 `write_events_and_cursor` is shared by `mirror_file`'s eventful line-tail
-path and `mirror_chatgpt_export_file`'s whole-file path, so the
+path and both provider-export whole-file paths, so the
 session/message row construction and cursor semantics (create-only sessions,
 `INSERT OR IGNORE` message dedup, monotonic `last_seen_at`, cursor advances
 only on success) live in exactly one place.
@@ -253,6 +268,9 @@ test-only byte cap forcing multi-pass behavior instead of giant fixtures:
   parsed, not erroring) and the cursor must stay untouched so the oversized
   source is retried — and re-warned — on the next tick rather than silently
   dropped.
+- **claude.ai export over `max_bytes` is skipped without reading**: the same
+  untouched-cursor guarantee is exercised through the claude.ai-specific
+  entry point and source specification.
 
 ### Replay-idempotency invariant
 

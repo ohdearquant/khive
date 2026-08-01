@@ -237,11 +237,11 @@ ADR-071 `BackendHandle` seam per ADR-080 §5.
 ### 5. The session mirror is unaffected
 
 ADR-080 §6 documents the session mirror: a read-only background poll loop, spawned from
-`PackRuntime::warm()`, that tails Claude Code, Codex CLI, and ChatGPT-export transcripts into three
-auxiliary tables (`sessions`, `session_messages`, `session_mirror_cursor`) declared through the
-pack's `SCHEMA_PLAN` (`SESSION_SCHEMA_PLAN_STMTS`, the ADR-028 mechanism). It shipped as the pack's
-M2 milestone (issue #350, PR #368), gained the Codex CLI source in PR #375, and is disabled by
-default.
+`PackRuntime::warm()`, that ingests Claude Code, Codex CLI, ChatGPT-export, and claude.ai-export
+transcripts into three auxiliary tables (`sessions`, `session_messages`,
+`session_mirror_cursor`) declared through the pack's `SCHEMA_PLAN`
+(`SESSION_SCHEMA_PLAN_STMTS`, the ADR-028 mechanism). It shipped as the pack's M2 milestone
+(issue #350, PR #368), gained the Codex CLI source in PR #375, and is disabled by default.
 
 The T1 verb surface and the session mirror are additive, not a replacement. This is a deliberate
 design ruling. T1's four verbs read and write `kind=session` notes in the shared `notes` table.

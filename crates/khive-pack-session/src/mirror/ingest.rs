@@ -25,9 +25,9 @@ use super::parse;
 /// "Mirror sources — closed set"). Adding a source requires amending that ADR
 /// section and this enum together.
 ///
-/// This is a superset of [`LineTailSource`]: `ChatGptExport` ingests via
-/// whole-file re-parse (`mirror_chatgpt_export_file`), not the per-line
-/// dispatch `LineTailSource` selects, so it has no `LineTailSource` variant.
+/// This is a superset of [`LineTailSource`]: the provider export variants
+/// ingest via whole-file re-parse, not the per-line dispatch
+/// `LineTailSource` selects, so they have no `LineTailSource` variants.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MirrorSource {
     /// Claude Code (`~/.claude/projects/<slug>/<uuid>.jsonl`).
@@ -36,6 +36,8 @@ pub enum MirrorSource {
     Codex,
     /// ChatGPT data export (`<exports dir>/**/conversations.json`).
     ChatGptExport,
+    /// claude.ai data export (`<exports dir>/**/conversations.json`).
+    ClaudeAiExport,
 }
 
 impl MirrorSource {
@@ -45,6 +47,7 @@ impl MirrorSource {
             MirrorSource::ClaudeCode => "claude_code",
             MirrorSource::Codex => "codex",
             MirrorSource::ChatGptExport => "chatgpt_export",
+            MirrorSource::ClaudeAiExport => "claude_ai_export",
         }
     }
 }
@@ -62,9 +65,10 @@ impl From<LineTailSource> for MirrorSource {
 /// purpose of selecting `mirror_file`'s per-line parser.
 ///
 /// This is narrower than [`MirrorSource`]: it covers only the line-tail
-/// sources (append-only JSONL, tailed by byte offset). ChatGPT export
-/// ingestion is whole-file re-parse, not line-tail, so it has no variant
-/// here — see [`mirror_chatgpt_export_file`].
+/// sources (append-only JSONL, tailed by byte offset). Provider-export
+/// ingestion is whole-file re-parse, not line-tail, so those sources have no
+/// variants here — see [`mirror_chatgpt_export_file`] and
+/// [`mirror_claude_ai_export_file`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LineTailSource {
     /// Claude Code (`~/.claude/projects/<slug>/<uuid>.jsonl`).
@@ -78,7 +82,7 @@ pub enum LineTailSource {
 pub struct MirrorStats {
     /// Number of new message rows inserted (0 if all were already present).
     pub inserted: u64,
-    /// Number of complete lines scanned (including duplicates).
+    /// Number of complete lines or whole-file events scanned (including duplicates).
     pub scanned: u64,
     /// Byte offset advanced to (only past complete lines; partial trailing line excluded).
     pub new_offset: u64,
@@ -409,17 +413,54 @@ async fn mirror_file_with_limits(
 /// so it is retried on every later tick rather than dropped (PACKSESSION-AUD-003).
 /// See `crates/khive-pack-session/docs/api/mirror-ingest.md#chatgpt-export-whole-file-re-parse-mirror_chatgpt_export_file`.
 const DEFAULT_CHATGPT_MAX_BYTES: u64 = 256 * 1024 * 1024;
+const DEFAULT_CLAUDE_AI_MAX_BYTES: u64 = 256 * 1024 * 1024;
+
+#[derive(Clone, Copy)]
+struct WholeFileExportSpec {
+    source: MirrorSource,
+    parser: fn(&str) -> Option<Vec<parse::ParsedEvent>>,
+    operation: &'static str,
+    format_name: &'static str,
+    max_bytes_env: &'static str,
+}
+
+const CHATGPT_EXPORT_SPEC: WholeFileExportSpec = WholeFileExportSpec {
+    source: MirrorSource::ChatGptExport,
+    parser: parse::parse_chatgpt_export,
+    operation: "mirror_chatgpt_export_file",
+    format_name: "ChatGPT",
+    max_bytes_env: "KHIVE_MIRROR_CHATGPT_MAX_BYTES",
+};
+
+const CLAUDE_AI_EXPORT_SPEC: WholeFileExportSpec = WholeFileExportSpec {
+    source: MirrorSource::ClaudeAiExport,
+    parser: parse::parse_claude_ai_export,
+    operation: "mirror_claude_ai_export_file",
+    format_name: "claude.ai",
+    max_bytes_env: "KHIVE_MIRROR_CLAUDE_AI_MAX_BYTES",
+};
 
 /// Resolve the ChatGPT export size ceiling from `KHIVE_MIRROR_CHATGPT_MAX_BYTES`,
 /// falling back to [`DEFAULT_CHATGPT_MAX_BYTES`] for missing, non-numeric, or
 /// zero values (zero would skip every export unconditionally, so it is
 /// treated the same as unset).
 fn chatgpt_max_bytes() -> u64 {
-    std::env::var("KHIVE_MIRROR_CHATGPT_MAX_BYTES")
+    export_max_bytes(CHATGPT_EXPORT_SPEC.max_bytes_env, DEFAULT_CHATGPT_MAX_BYTES)
+}
+
+fn claude_ai_max_bytes() -> u64 {
+    export_max_bytes(
+        CLAUDE_AI_EXPORT_SPEC.max_bytes_env,
+        DEFAULT_CLAUDE_AI_MAX_BYTES,
+    )
+}
+
+fn export_max_bytes(variable: &str, default: u64) -> u64 {
+    std::env::var(variable)
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .filter(|&n| n > 0)
-        .unwrap_or(DEFAULT_CHATGPT_MAX_BYTES)
+        .unwrap_or(default)
 }
 
 /// Read the whole ChatGPT export `conversations.json` at `path`, parse every
@@ -455,10 +496,46 @@ async fn mirror_chatgpt_export_file_with_max_bytes(
     start_offset: u64,
     max_bytes: u64,
 ) -> Result<MirrorStats, RuntimeError> {
+    mirror_whole_file_export(runtime, path, start_offset, max_bytes, CHATGPT_EXPORT_SPEC).await
+}
+
+/// Read a whole claude.ai export `conversations.json`, parse its
+/// `chat_messages` arrays via [`parse::parse_claude_ai_export`], and commit
+/// the resulting sessions, messages, and cursor atomically.
+pub async fn mirror_claude_ai_export_file(
+    runtime: &KhiveRuntime,
+    path: &Path,
+    start_offset: u64,
+) -> Result<MirrorStats, RuntimeError> {
+    mirror_claude_ai_export_file_with_max_bytes(runtime, path, start_offset, claude_ai_max_bytes())
+        .await
+}
+
+async fn mirror_claude_ai_export_file_with_max_bytes(
+    runtime: &KhiveRuntime,
+    path: &Path,
+    start_offset: u64,
+    max_bytes: u64,
+) -> Result<MirrorStats, RuntimeError> {
+    mirror_whole_file_export(
+        runtime,
+        path,
+        start_offset,
+        max_bytes,
+        CLAUDE_AI_EXPORT_SPEC,
+    )
+    .await
+}
+
+async fn mirror_whole_file_export(
+    runtime: &KhiveRuntime,
+    path: &Path,
+    start_offset: u64,
+    max_bytes: u64,
+    spec: WholeFileExportSpec,
+) -> Result<MirrorStats, RuntimeError> {
     let file_len = std::fs::metadata(path).map(|m| m.len()).map_err(|e| {
-        RuntimeError::Internal(format!(
-            "mirror_chatgpt_export_file: failed to stat {path:?}: {e}"
-        ))
+        RuntimeError::Internal(format!("{}: failed to stat {path:?}: {e}", spec.operation))
     })?;
 
     if file_len <= start_offset {
@@ -472,9 +549,11 @@ async fn mirror_chatgpt_export_file_with_max_bytes(
     if file_len > max_bytes {
         tracing::warn!(
             path = %path.display(),
+            source = spec.source.as_str(),
             file_bytes = file_len,
             max_bytes,
-            "session mirror: skipping oversized ChatGPT export (exceeds KHIVE_MIRROR_CHATGPT_MAX_BYTES)"
+            max_bytes_env = spec.max_bytes_env,
+            "session mirror: skipping oversized whole-file export"
         );
         return Ok(MirrorStats {
             inserted: 0,
@@ -484,14 +563,13 @@ async fn mirror_chatgpt_export_file_with_max_bytes(
     }
 
     let content = std::fs::read_to_string(path).map_err(|e| {
-        RuntimeError::Internal(format!(
-            "mirror_chatgpt_export_file: failed to read {path:?}: {e}"
-        ))
+        RuntimeError::Internal(format!("{}: failed to read {path:?}: {e}", spec.operation))
     })?;
 
-    let events = parse::parse_chatgpt_export(&content).ok_or_else(|| {
+    let events = (spec.parser)(&content).ok_or_else(|| {
         RuntimeError::Internal(format!(
-            "mirror_chatgpt_export_file: {path:?} is not a valid ChatGPT export (expected a top-level JSON array)"
+            "{}: {path:?} is not a valid {} export (expected its conversations.json array shape)",
+            spec.operation, spec.format_name
         ))
     })?;
 
@@ -500,7 +578,7 @@ async fn mirror_chatgpt_export_file_with_max_bytes(
     write_events_and_cursor(
         runtime,
         path,
-        MirrorSource::ChatGptExport.as_str(),
+        spec.source.as_str(),
         &events,
         scanned,
         file_len,
@@ -509,8 +587,8 @@ async fn mirror_chatgpt_export_file_with_max_bytes(
 }
 
 /// Upsert `events` and the mirror cursor for `path` in one transaction.
-/// Shared by `mirror_file`'s line-tail path and `mirror_chatgpt_export_file`'s
-/// whole-file path. See
+/// Shared by `mirror_file`'s line-tail path and both provider-export
+/// whole-file paths. See
 /// `crates/khive-pack-session/docs/api/mirror-ingest.md#write-path-write_events_and_cursor-and-friends-adr-099-d5`
 /// for the ADR-099 D5 suspension-free rationale.
 async fn write_events_and_cursor(
@@ -2323,6 +2401,141 @@ mod tests {
             stored_raw.contains("***MASKED***"),
             "stored raw must carry the secret_gate redaction marker"
         );
+    }
+
+    fn claude_ai_happy_export_json() -> String {
+        serde_json::to_string(&json!([{
+            "uuid": "claude-conv-happy",
+            "name": "Synthetic Claude.ai Export",
+            "created_at": "2026-07-31T10:00:00Z",
+            "current_leaf_message_uuid": "claude-msg-main",
+            "chat_messages": [
+                {
+                    "uuid": "claude-msg-user",
+                    "sender": "human",
+                    "index": 0,
+                    "parent_message_uuid": "00000000-0000-4000-8000-000000000000",
+                    "created_at": "2026-07-31T10:00:01Z",
+                    "content": [{"type": "text", "text": "Question"}]
+                },
+                {
+                    "uuid": "claude-msg-main",
+                    "sender": "assistant",
+                    "index": 1,
+                    "parent_message_uuid": "claude-msg-user",
+                    "created_at": "2026-07-31T10:00:02Z",
+                    "content": [{"type": "text", "text": "Current answer"}]
+                },
+                {
+                    "uuid": "claude-msg-alt",
+                    "sender": "assistant",
+                    "index": 2,
+                    "parent_message_uuid": "claude-msg-user",
+                    "created_at": "2026-07-31T10:00:03Z",
+                    "content": [{"type": "text", "text": "Alternate answer"}]
+                }
+            ]
+        }]))
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_claude_ai_export_ingest_is_idempotent_and_preserves_branches() {
+        let (rt, _dir) = setup().await;
+        let (_file, path) = write_export_file(&claude_ai_happy_export_json());
+        let file_len = std::fs::metadata(&path).unwrap().len();
+
+        let first = mirror_claude_ai_export_file(&rt, &path, 0)
+            .await
+            .expect("claude.ai export ingest");
+        assert_eq!(first.inserted, 3);
+        assert_eq!(first.scanned, 3);
+        assert_eq!(first.new_offset, file_len);
+
+        let replay = mirror_claude_ai_export_file(&rt, &path, 0)
+            .await
+            .expect("idempotent replay");
+        assert_eq!(replay.inserted, 0);
+        assert_eq!(count_rows(&rt, "sessions").await, 1);
+        assert_eq!(count_rows(&rt, "session_messages").await, 3);
+        assert_eq!(
+            cursor_offset(&rt, &path.to_string_lossy()).await,
+            Some(file_len as i64)
+        );
+
+        let sql = rt.sql();
+        let mut reader = sql.reader().await.expect("reader");
+        let session = reader
+            .query_row(SqlStatement {
+                sql: "SELECT provider_session_id, source, slug, message_count \
+                      FROM sessions WHERE id='claude-conv-happy'"
+                    .into(),
+                params: vec![],
+                label: None,
+            })
+            .await
+            .expect("query ok")
+            .expect("session row");
+        assert!(matches!(
+            session.get("provider_session_id"),
+            Some(SqlValue::Text(value)) if value == "claude-conv-happy"
+        ));
+        assert!(matches!(
+            session.get("source"),
+            Some(SqlValue::Text(value)) if value == "claude_ai_export"
+        ));
+        assert!(matches!(
+            session.get("slug"),
+            Some(SqlValue::Text(value)) if value == "Synthetic Claude.ai Export"
+        ));
+        assert!(matches!(
+            session.get("message_count"),
+            Some(SqlValue::Integer(3))
+        ));
+
+        let messages = reader
+            .query_all(SqlStatement {
+                sql: "SELECT id, parent_uuid, is_sidechain FROM session_messages \
+                      WHERE session_id='claude-conv-happy' ORDER BY seq"
+                    .into(),
+                params: vec![],
+                label: None,
+            })
+            .await
+            .expect("message query");
+        assert_eq!(messages.len(), 3);
+        assert!(matches!(
+            messages[0].get("parent_uuid"),
+            Some(SqlValue::Null) | None
+        ));
+        assert!(matches!(
+            messages[1].get("is_sidechain"),
+            Some(SqlValue::Integer(0))
+        ));
+        assert!(matches!(
+            messages[2].get("id"),
+            Some(SqlValue::Text(value)) if value == "claude-msg-alt"
+        ));
+        assert!(matches!(
+            messages[2].get("parent_uuid"),
+            Some(SqlValue::Text(value)) if value == "claude-msg-user"
+        ));
+        assert!(matches!(
+            messages[2].get("is_sidechain"),
+            Some(SqlValue::Integer(1))
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_claude_ai_export_over_max_bytes_leaves_cursor_untouched() {
+        let (rt, _dir) = setup().await;
+        let (_file, path) = write_export_file("[]");
+
+        let stats = mirror_claude_ai_export_file_with_max_bytes(&rt, &path, 0, 1)
+            .await
+            .expect("oversized export is skipped");
+        assert_eq!(stats, MirrorStats::default());
+        assert_eq!(cursor_offset(&rt, &path.to_string_lossy()).await, None);
     }
 
     /// SS6 invariants #4/#5 (error never advances cursor; one transaction per

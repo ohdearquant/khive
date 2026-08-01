@@ -1,9 +1,9 @@
-//! JSONL line parsers for Claude Code and Codex CLI session transcripts.
+//! Parsers for CLI transcripts and provider conversation exports.
 //!
 //! Every function here is deterministic and side-effect-free so the unit tests
 //! can run without any runtime or DB setup.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use chrono::DateTime;
 use khive_runtime::secret_gate;
@@ -18,6 +18,7 @@ pub struct ParsedEvent {
     /// For Codex events (which carry no per-message uuid) this is synthesised
     /// as `"{session_id}:{abs_byte_offset}"`.
     /// For ChatGPT export events this is the mapping node's `message.id`.
+    /// For Claude.ai export events this is `chat_messages[].uuid`.
     pub uuid: String,
     /// Session UUID.
     pub session_id: String,
@@ -25,22 +26,22 @@ pub struct ParsedEvent {
     pub parent_uuid: Option<String>,
     /// Whether this event is on a sidechain.
     pub is_sidechain: bool,
-    /// `message.role` (CC) or `payload.role` (Codex) when present.
+    /// Normalized provider role when present.
     pub role: Option<String>,
-    /// Top-level `type` field.
+    /// Source event or content type.
     pub msg_type: String,
     /// Extracted display text, secrets masked; `None` for non-message events.
     pub text: Option<String>,
-    /// Full original line with secrets masked.
+    /// Original line or serialized export message/node with secrets masked.
     pub raw: String,
-    /// `timestamp` as microseconds since the Unix epoch; 0 if absent or unparseable.
+    /// Source timestamp as microseconds since the Unix epoch; 0 if absent or unparseable.
     pub created_at_micros: i64,
     /// `cwd` if present.
     pub cwd: Option<String>,
     /// `gitBranch` (CC) or `payload.git.branch` (Codex) if present.
     pub git_branch: Option<String>,
-    /// `slug` if present (CC: project slug; ChatGPT export: conversation
-    /// title; Codex files carry no slug concept).
+    /// `slug` if present (CC: project slug; ChatGPT/Claude.ai export:
+    /// conversation title; Codex files carry no slug concept).
     pub slug: Option<String>,
 }
 
@@ -273,11 +274,293 @@ pub fn parse_chatgpt_export(content: &str) -> Option<Vec<ParsedEvent>> {
     let value: Value = serde_json::from_str(content).ok()?;
     let conversations = value.as_array()?;
 
+    // Both providers use the filename `conversations.json`. If operators point
+    // both roots at the same directory, rejecting an unmistakable Claude.ai
+    // file here prevents the ChatGPT ingester from consuming its cursor first.
+    if conversations.iter().any(is_claude_ai_conversation) {
+        return None;
+    }
+
     let mut events = Vec::new();
     for conv in conversations {
         parse_conversation(conv, &mut events);
     }
     Some(events)
+}
+
+/// Parse a claude.ai data-export `conversations.json` file.
+///
+/// Claude.ai exports are a top-level JSON array whose conversation objects
+/// carry `uuid`, `name`, and `chat_messages`. Message UUIDs and conversation
+/// UUIDs are preserved as the idempotency and provider-session anchors. When
+/// `current_leaf_message_uuid` is present, messages outside its parent chain
+/// are retained with `is_sidechain = true`; older flat exports without that
+/// field keep every message on the main path.
+///
+/// Returns `None` when `content` is not valid JSON or the top level is not an
+/// array. Malformed conversation objects inside a valid array are skipped.
+pub fn parse_claude_ai_export(content: &str) -> Option<Vec<ParsedEvent>> {
+    let value: Value = serde_json::from_str(content).ok()?;
+    let conversations = value.as_array()?;
+
+    // Symmetric source-shape check for accidentally overlapping export roots.
+    // Empty and wholly malformed arrays remain valid so per-conversation
+    // isolation keeps its existing semantics.
+    if conversations.iter().any(is_chatgpt_conversation) {
+        return None;
+    }
+
+    let mut events = Vec::new();
+    for conversation in conversations {
+        parse_claude_ai_conversation(conversation, &mut events);
+    }
+    Some(events)
+}
+
+fn is_chatgpt_conversation(conversation: &Value) -> bool {
+    conversation.as_object().is_some_and(|conversation| {
+        conversation
+            .get("id")
+            .and_then(Value::as_str)
+            .is_some_and(|id| !id.is_empty())
+            && conversation.get("mapping").is_some_and(Value::is_object)
+    })
+}
+
+fn is_claude_ai_conversation(conversation: &Value) -> bool {
+    conversation.as_object().is_some_and(|conversation| {
+        conversation
+            .get("uuid")
+            .and_then(Value::as_str)
+            .is_some_and(|id| !id.is_empty())
+            && conversation
+                .get("chat_messages")
+                .is_some_and(Value::is_array)
+    })
+}
+
+fn parse_claude_ai_conversation(conversation: &Value, out: &mut Vec<ParsedEvent>) {
+    let Some(conversation) = conversation.as_object() else {
+        return;
+    };
+    let Some(session_id) = conversation
+        .get("uuid")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+    else {
+        return;
+    };
+    let Some(messages) = conversation.get("chat_messages").and_then(Value::as_array) else {
+        return;
+    };
+
+    let slug = conversation
+        .get("name")
+        .and_then(Value::as_str)
+        .filter(|name| !name.is_empty())
+        .or_else(|| {
+            conversation
+                .get("summary")
+                .and_then(Value::as_str)
+                .filter(|summary| !summary.is_empty())
+        });
+    let conversation_created_at_micros = conversation
+        .get("created_at")
+        .and_then(parse_rfc3339_micros)
+        .or_else(|| {
+            conversation
+                .get("updated_at")
+                .and_then(parse_rfc3339_micros)
+        })
+        .unwrap_or(0);
+
+    let mut parent_by_id: HashMap<String, Option<String>> = HashMap::new();
+    for message in messages {
+        let Some(message) = message.as_object() else {
+            continue;
+        };
+        let Some(uuid) = message
+            .get("uuid")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+        else {
+            continue;
+        };
+        parent_by_id
+            .entry(uuid.to_string())
+            .or_insert_with(|| claude_ai_parent_uuid(message));
+    }
+
+    let current_path = claude_ai_current_path(conversation, &parent_by_id);
+    let mut order: Vec<usize> = (0..messages.len()).collect();
+    order.sort_by_key(|&position| {
+        let source_index = messages[position]
+            .as_object()
+            .and_then(|message| message.get("index"))
+            .and_then(Value::as_i64)
+            .unwrap_or(position as i64);
+        (source_index, position)
+    });
+
+    let mut emitted = HashSet::new();
+    let start = out.len();
+    for position in order {
+        let Some(message) = messages[position].as_object() else {
+            continue;
+        };
+        let Some(uuid) = message
+            .get("uuid")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+        else {
+            continue;
+        };
+        if !emitted.insert(uuid.to_string()) {
+            continue;
+        }
+        if let Some(event) = build_claude_ai_event(
+            message,
+            session_id,
+            slug,
+            conversation_created_at_micros,
+            &current_path,
+        ) {
+            out.push(event);
+        }
+    }
+
+    let stored_ids: HashSet<String> = out[start..]
+        .iter()
+        .map(|event| event.uuid.clone())
+        .collect();
+    for event in &mut out[start..] {
+        if event
+            .parent_uuid
+            .as_ref()
+            .is_some_and(|parent| !stored_ids.contains(parent))
+        {
+            event.parent_uuid = None;
+        }
+    }
+}
+
+fn claude_ai_current_path(
+    conversation: &Map<String, Value>,
+    parent_by_id: &HashMap<String, Option<String>>,
+) -> HashSet<String> {
+    let Some(current_leaf) = conversation
+        .get("current_leaf_message_uuid")
+        .and_then(Value::as_str)
+        .filter(|id| parent_by_id.contains_key(*id))
+    else {
+        return parent_by_id.keys().cloned().collect();
+    };
+
+    let mut path = HashSet::new();
+    let mut cursor = Some(current_leaf.to_string());
+    while let Some(message_id) = cursor {
+        if !path.insert(message_id.clone()) {
+            break;
+        }
+        cursor = parent_by_id.get(&message_id).cloned().flatten();
+    }
+    path
+}
+
+fn build_claude_ai_event(
+    message: &Map<String, Value>,
+    session_id: &str,
+    slug: Option<&str>,
+    conversation_created_at_micros: i64,
+    current_path: &HashSet<String>,
+) -> Option<ParsedEvent> {
+    let uuid = message
+        .get("uuid")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())?
+        .to_string();
+
+    let role = message
+        .get("sender")
+        .or_else(|| message.get("role"))
+        .and_then(Value::as_str)
+        .filter(|sender| !sender.is_empty())
+        .map(|sender| match sender {
+            "human" | "user" => "user".to_string(),
+            other => other.to_string(),
+        });
+    let text = extract_claude_ai_text(message)?;
+    if text.trim().is_empty() {
+        return None;
+    }
+
+    let created_at_micros = message
+        .get("created_at")
+        .and_then(parse_rfc3339_micros)
+        .or_else(|| message.get("updated_at").and_then(parse_rfc3339_micros))
+        .unwrap_or(conversation_created_at_micros);
+    let parent_uuid = claude_ai_parent_uuid(message);
+    let raw_json = serde_json::to_string(message).unwrap_or_default();
+
+    Some(ParsedEvent {
+        uuid: uuid.clone(),
+        session_id: session_id.to_string(),
+        parent_uuid,
+        is_sidechain: !current_path.contains(&uuid),
+        role,
+        msg_type: "message".to_string(),
+        text: Some(secret_gate::mask_secrets(&text).into_owned()),
+        raw: secret_gate::mask_secrets(&raw_json).into_owned(),
+        created_at_micros,
+        cwd: None,
+        git_branch: None,
+        slug: slug.map(str::to_string),
+    })
+}
+
+fn claude_ai_parent_uuid(message: &Map<String, Value>) -> Option<String> {
+    message
+        .get("parent_message_uuid")
+        .and_then(Value::as_str)
+        .filter(|parent| !parent.is_empty() && *parent != "00000000-0000-4000-8000-000000000000")
+        .map(str::to_string)
+}
+
+fn extract_claude_ai_text(message: &Map<String, Value>) -> Option<String> {
+    let top_level_text = message
+        .get("text")
+        .and_then(Value::as_str)
+        .filter(|text| !text.trim().is_empty());
+    let mut parts = Vec::new();
+
+    match message.get("content") {
+        Some(Value::Array(blocks)) => {
+            for part in blocks
+                .iter()
+                .filter_map(extract_block)
+                .filter(|part| !part.trim().is_empty())
+            {
+                parts.push(part);
+            }
+        }
+        Some(Value::String(text)) if !text.trim().is_empty() => parts.push(text.clone()),
+        Some(_) | None => {}
+    }
+
+    if let Some(text) = top_level_text {
+        if !parts.iter().any(|part| part == text) {
+            parts.push(text.to_string());
+        }
+    }
+
+    (!parts.is_empty()).then(|| parts.join("\n"))
+}
+
+fn parse_rfc3339_micros(value: &Value) -> Option<i64> {
+    value
+        .as_str()
+        .and_then(|timestamp| DateTime::parse_from_rfc3339(timestamp).ok())
+        .map(|timestamp| timestamp.timestamp_micros())
 }
 
 /// Extract a display-friendly text string from a message `content` value
@@ -298,14 +581,15 @@ fn extract_text(content: Option<&Value>) -> Option<String> {
 }
 
 /// Extract a display string from a single content block (`"text"` /
-/// `"input_text"` / `"output_text"` / `"tool_use"` / `"tool_result"`). See
-/// `crates/khive-pack-session/docs/api/mirror-parse.md#extract_text--extract_block-claude-code--codex-block-extraction`.
+/// `"input_text"` / `"output_text"` / `"voice_note"` / `"tool_use"` /
+/// `"tool_result"`). See
+/// `crates/khive-pack-session/docs/api/mirror-parse.md#extract_text--extract_block-claude-code-codex-and-claudeai-blocks`.
 fn extract_block(block: &Value) -> Option<String> {
     let map = block.as_object()?;
     match map.get("type")?.as_str()? {
         // Claude Code text block and Codex user/assistant text blocks all carry
         // their display text in a "text" field — same extraction logic.
-        "text" | "input_text" | "output_text" => {
+        "text" | "input_text" | "output_text" | "voice_note" => {
             map.get("text").and_then(|v| v.as_str()).map(str::to_string)
         }
         "tool_use" => {
@@ -880,6 +1164,224 @@ mod tests {
         let line = r#"{"uuid":"cc-t1","sessionId":"cc-sess","type":"assistant","timestamp":"2026-06-30T09:00:00Z","message":{"role":"assistant","content":[{"type":"text","text":"CC still works"}]}}"#;
         let ev = parse_cc_line(line).expect("CC text block must parse");
         assert_eq!(ev.text.as_deref(), Some("CC still works"));
+    }
+
+    // ── parse_claude_ai_export: direct unit tests ───────────────────────────
+
+    #[test]
+    fn test_claude_ai_export_preserves_ids_order_roles_and_title() {
+        let export = serde_json::json!([{
+            "uuid": "claude-conv-1",
+            "name": "Claude Web Conversation",
+            "created_at": "2026-07-31T10:00:00Z",
+            "current_leaf_message_uuid": "claude-msg-2",
+            "chat_messages": [
+                {
+                    "uuid": "claude-msg-2",
+                    "sender": "assistant",
+                    "index": 1,
+                    "parent_message_uuid": "claude-msg-1",
+                    "created_at": "2026-07-31T10:00:02Z",
+                    "content": [
+                        {"type": "thinking", "thinking": "not display text"},
+                        {"type": "text", "text": "Hello from Claude"}
+                    ]
+                },
+                {
+                    "uuid": "claude-msg-1",
+                    "sender": "human",
+                    "index": 0,
+                    "parent_message_uuid": "00000000-0000-4000-8000-000000000000",
+                    "created_at": "2026-07-31T10:00:01Z",
+                    "content": [{"type": "text", "text": "Hello"}]
+                }
+            ]
+        }]);
+
+        let events = parse_claude_ai_export(&export.to_string()).expect("valid export");
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].uuid, "claude-msg-1");
+        assert_eq!(events[0].session_id, "claude-conv-1");
+        assert_eq!(events[0].role.as_deref(), Some("user"));
+        assert_eq!(events[0].text.as_deref(), Some("Hello"));
+        assert_eq!(events[0].parent_uuid, None);
+        assert_eq!(events[0].slug.as_deref(), Some("Claude Web Conversation"));
+        assert!(!events[0].is_sidechain);
+
+        assert_eq!(events[1].uuid, "claude-msg-2");
+        assert_eq!(events[1].role.as_deref(), Some("assistant"));
+        assert_eq!(events[1].text.as_deref(), Some("Hello from Claude"));
+        assert_eq!(events[1].parent_uuid.as_deref(), Some("claude-msg-1"));
+        assert!(!events[1].is_sidechain);
+        assert!(events[1].created_at_micros > events[0].created_at_micros);
+    }
+
+    #[test]
+    fn test_claude_ai_export_preserves_branches_and_marks_inactive_path() {
+        let export = serde_json::json!([{
+            "uuid": "claude-conv-branch",
+            "name": "Branching Claude Conversation",
+            "current_leaf_message_uuid": "claude-main",
+            "chat_messages": [
+                {
+                    "uuid": "claude-user",
+                    "sender": "human",
+                    "index": 0,
+                    "parent_message_uuid": null,
+                    "content": [{"type": "text", "text": "Question"}]
+                },
+                {
+                    "uuid": "claude-main",
+                    "sender": "assistant",
+                    "index": 1,
+                    "parent_message_uuid": "claude-user",
+                    "content": [{"type": "text", "text": "Current answer"}]
+                },
+                {
+                    "uuid": "claude-alt",
+                    "sender": "assistant",
+                    "index": 2,
+                    "parent_message_uuid": "claude-user",
+                    "content": [{"type": "text", "text": "Alternate answer"}]
+                }
+            ]
+        }]);
+
+        let events = parse_claude_ai_export(&export.to_string()).expect("valid branch export");
+        assert_eq!(events.len(), 3, "alternate branches must be retained");
+        assert!(!events[0].is_sidechain);
+        assert!(!events[1].is_sidechain);
+        assert!(events[2].is_sidechain);
+        assert_eq!(events[2].uuid, "claude-alt");
+        assert_eq!(events[2].parent_uuid.as_deref(), Some("claude-user"));
+    }
+
+    #[test]
+    fn test_claude_ai_export_keeps_blocks_and_distinct_top_level_answer() {
+        let export = serde_json::json!([{
+            "uuid": "claude-conv-agent",
+            "chat_messages": [
+                {
+                    "uuid": "claude-agent-turn",
+                    "sender": "assistant",
+                    "text": "Final answer",
+                    "content": [
+                        {"type": "tool_use", "name": "bash_tool", "input": {"command": "pwd"}},
+                        {"type": "tool_result", "content": [{"type": "text", "text": "/tmp"}]}
+                    ]
+                },
+                {
+                    "uuid": "claude-deduplicated-text",
+                    "sender": "assistant",
+                    "text": "Already present",
+                    "content": [{"type": "text", "text": "Already present"}]
+                }
+            ]
+        }]);
+
+        let events = parse_claude_ai_export(&export.to_string()).expect("valid agent export");
+        assert_eq!(events.len(), 2);
+        let agent_text = events[0].text.as_deref().expect("agent turn text");
+        assert!(agent_text.contains("[tool_use: bash_tool]"));
+        assert!(agent_text.contains("[tool_result]"));
+        assert!(agent_text.ends_with("Final answer"));
+        assert_eq!(events[1].text.as_deref(), Some("Already present"));
+    }
+
+    #[test]
+    fn test_claude_ai_export_accepts_legacy_role_and_voice_note_text() {
+        let export = serde_json::json!([{
+            "uuid": "claude-conv-voice",
+            "chat_messages": [{
+                "uuid": "claude-voice-turn",
+                "role": "human",
+                "content": [{"type": "voice_note", "title": "Memo", "text": "Spoken prompt"}]
+            }]
+        }]);
+
+        let events = parse_claude_ai_export(&export.to_string()).expect("valid legacy export");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].role.as_deref(), Some("user"));
+        assert_eq!(events[0].text.as_deref(), Some("Spoken prompt"));
+    }
+
+    #[test]
+    fn test_claude_ai_export_legacy_flat_text_is_masked() {
+        let secret = format!("{}{}", "AKIA", "FAKEKEY1234567890");
+        let export = serde_json::json!([{
+            "uuid": "claude-conv-flat",
+            "summary": "Legacy export",
+            "chat_messages": [
+                {
+                    "uuid": "claude-flat-user",
+                    "sender": "human",
+                    "text": format!("key={secret}"),
+                    "created_at": "2026-07-31T10:00:00Z"
+                },
+                {
+                    "uuid": "claude-flat-assistant",
+                    "sender": "assistant",
+                    "text": "Legacy assistant text",
+                    "content": [{"type": "thinking", "thinking": "not visible"}],
+                    "created_at": "2026-07-31T10:00:01Z"
+                }
+            ]
+        }]);
+
+        let events = parse_claude_ai_export(&export.to_string()).expect("legacy export");
+        assert_eq!(events.len(), 2);
+        assert!(events.iter().all(|event| !event.is_sidechain));
+        assert_eq!(events[0].slug.as_deref(), Some("Legacy export"));
+        assert!(!events[0].text.as_deref().unwrap().contains(&secret));
+        assert!(events[0].text.as_deref().unwrap().contains("***MASKED***"));
+        assert!(!events[0].raw.contains(&secret));
+        assert_eq!(events[1].text.as_deref(), Some("Legacy assistant text"));
+    }
+
+    #[test]
+    fn test_claude_ai_export_rejects_bad_top_level_and_skips_bad_conversations() {
+        assert!(parse_claude_ai_export("not json").is_none());
+        assert!(parse_claude_ai_export(r#"{"uuid":"not-an-array"}"#).is_none());
+
+        let export = serde_json::json!([
+            {"uuid": "missing-messages"},
+            {
+                "uuid": "claude-valid",
+                "chat_messages": [{
+                    "uuid": "claude-valid-message",
+                    "sender": "human",
+                    "text": "kept"
+                }]
+            }
+        ]);
+        let events = parse_claude_ai_export(&export.to_string()).expect("valid array");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].session_id, "claude-valid");
+    }
+
+    #[test]
+    fn test_provider_export_parsers_reject_the_other_source_shape() {
+        let claude_ai = serde_json::json!([{
+            "uuid": "claude-conversation",
+            "chat_messages": []
+        }]);
+        assert!(parse_chatgpt_export(&claude_ai.to_string()).is_none());
+
+        let chatgpt = serde_json::json!([{
+            "id": "chatgpt-conversation",
+            "mapping": {}
+        }]);
+        assert!(parse_claude_ai_export(&chatgpt.to_string()).is_none());
+
+        let mixed = serde_json::json!([
+            {"uuid": "claude-conversation", "chat_messages": []},
+            {"id": "chatgpt-conversation", "mapping": {}}
+        ]);
+        assert!(parse_chatgpt_export(&mixed.to_string()).is_none());
+        assert!(parse_claude_ai_export(&mixed.to_string()).is_none());
+
+        assert_eq!(parse_chatgpt_export("[]"), Some(Vec::new()));
+        assert_eq!(parse_claude_ai_export("[]"), Some(Vec::new()));
     }
 
     // ── parse_chatgpt_export: direct unit tests ─────────────────────────────
