@@ -3,7 +3,6 @@
 - **Status:** Proposed
 - **Date:** 2026-07-30
 
-
 ## Context
 
 khive uses SQLite in WAL mode as its embedded primary store. WAL permits concurrent readers, but one WAL file admits exactly one writer transaction at a time. The capacity knee is therefore not a client-count threshold. It is the utilization and variance of the single writer:
@@ -28,6 +27,14 @@ ADR-067 Component A remains the description of the present process-local `Writer
 
 Compatibility constrains rollout. In the first shipped slice, absent environment variables retain byte-identical behavior. Routing, overload, scheduling, acknowledgement, and error-semantic changes are introduced behind explicit flags or in a major version.
 
+## Relationship to ADR-131
+
+ADR-131 (batch write admission control, accepted) governs admission for every write call in the serialization domain. This ADR amends it in exactly two places and preserves the rest. Where the two texts differ and no amendment is declared here, ADR-131 controls.
+
+**Amendment 1 (to ADR-131 Decision 1): default queue enablement is deferred until routing is strict.** ADR-131 Decision 1 sets `PoolConfig::write_queue_enabled` to default `true` for batch-surface-serving deployments. That default assumed queue routing was complete. The census recorded in Context shows it is not: `SqlBridge::writer` opens a standalone writer before checking for a queue handle, and `with_writer_unmanaged` bypasses the queue unconditionally. A default-on queue beside live bypass paths asserts a single-admission property the code does not have, and the admission metrics of ADR-131 Decision 4 would undercount real writer demand by exactly the bypassed share. F2 therefore defers the default flip until its five strict-routing conditions hold and one release of production-representative evidence shows no direct-writer violations. ADR-131's admission contract (Decisions 2 through 5) remains binding and unchanged for every queue-enabled deployment in the interim; only the default in Decision 1 moves.
+
+**Amendment 2 (to ADR-131 Decision 3): class weighting is layered onto the call-aware rotation; the rotation itself is preserved.** ADR-131 Decision 3's call-aware round-robin remains the admission fairness mechanism, with all of its invariants intact: FIFO within a call, new calls join the rotation tail, no caller may bypass the rotation to reach the writer channel, and work already accepted into the channel is never reordered. F5's reserved capacity and weighted service for interactive semantic writes are defined only within that invariant: writes are classified (interactive semantic, bulk, best-effort audit/telemetry), each class runs Decision 3's rotation among its own calls unchanged, and the weighting selects which class's rotation is offered the next enqueue, with bulk work guaranteed a minimum service share so that weighting is bounded rather than strict. This does not reintroduce the strict small-call priority ADR-131 rejected: that rejection targeted unbounded priority, under which sustained small-call traffic can starve a large batch indefinitely. F5's kill condition, which removes priority scheduling in favor of FIFO when admitted bulk work starves beyond its SLO, enforces the same non-starvation property that rejection protects.
+
 ## Decision
 
 ### F1. Write-ownership topology
@@ -48,7 +55,7 @@ Strongest case against this decision: implementing measurement before ownership 
 
 ### F2. Queue-on-by-default and bypasses
 
-`KHIVE_WRITE_QUEUE` remains off by default in the compatibility slice. Enabling it continues to be explicit. Before any default flip, queue-enabled mode must become strict:
+`KHIVE_WRITE_QUEUE` remains off by default in the compatibility slice. This defers ADR-131 Decision 1's default-on setting; see "Relationship to ADR-131", Amendment 1. Enabling it continues to be explicit. Before any default flip, queue-enabled mode must become strict:
 
 - `SqlBridge::writer` must check and route through the queue before opening a standalone writer;
 - `with_writer_unmanaged` must be removed from runtime request paths or replaced with an owner-executed top-level/atomic operation;
@@ -98,7 +105,7 @@ Strongest case against this decision: one large operation transaction can hold t
 
 Strict queue mode defaults to immediate typed rejection when admission capacity or the request's queue-age budget is exhausted. It does not block without a bound. Accepted work continues to completion even if the caller disconnects; cancellation after admission is not implied.
 
-Interactive semantic writes receive reserved admission capacity and weighted service relative to bulk work. FIFO is preserved within a semantic ordering key, such as a conversation or explicitly atomic client batch, but strict global FIFO is not required. Best-effort audit and telemetry use a separate bounded class and are shed first according to their declared loss budget. Compliance-required work is never reclassified as best-effort by overload machinery.
+Interactive semantic writes receive reserved admission capacity and weighted service relative to bulk work, defined within ADR-131 Decision 3's call-aware rotation rather than replacing it (see "Relationship to ADR-131", Amendment 2). FIFO is preserved within a semantic ordering key, such as a conversation or explicitly atomic client batch, but strict global FIFO is not required. Best-effort audit and telemetry use a separate bounded class and are shed first according to their declared loss budget. Compliance-required work is never reclassified as best-effort by overload machinery.
 
 The caller receives one of: rejected-before-admission, accepted-and-pending, committed, failed-before-commit, or outcome-unknown. A durable operation handle is deferred until accepted writes can outlive ordinary caller deadlines or owner restarts; if implemented, its idempotency record must commit consistently with the mutation.
 
@@ -225,5 +232,3 @@ Out of scope, not rejected on technical merit. Independent files can scale aggre
 ## Provenance
 
 This decision is grounded in a static write-path code census (every cited path and symbol re-read at a pinned revision), and in an independent queueing-theory analysis of embedded-store writer scaling whose `NEEDS-EXPERIMENT` qualifications bound how its claims are used here. The bundled SQLite version was established from the vendored `libsqlite3-sys` source, not from a claim. A bundled-SQLite upgrade past the WAL-reset fix serves the F7 version gate and remains an open prerequisite in this tree (`libsqlite3-sys` 0.31.0 / SQLite 3.48.0 at the time of writing); it should merge before any concurrency experiment produces an architectural verdict.
-
-
