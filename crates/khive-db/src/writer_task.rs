@@ -122,6 +122,37 @@ pub trait AnyWriteRequest: sealed::Sealed + Send {
     fn is_top_level(&self) -> bool;
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RollbackDisposition {
+    RolledBack,
+    SideEffectsUnknown,
+}
+
+/// Roll back a failed wrapped request and verify that the connection really
+/// returned to autocommit mode before it can serve another request.
+fn rollback_after_failure(conn: &Connection, failure_context: &'static str) -> RollbackDisposition {
+    match conn.execute_batch("ROLLBACK") {
+        Ok(()) if conn.is_autocommit() => RollbackDisposition::RolledBack,
+        Ok(()) => {
+            tracing::error!(
+                failure_context,
+                "writer task: ROLLBACK returned success but the connection is still in a \
+                 transaction; request side effects are unknown"
+            );
+            RollbackDisposition::SideEffectsUnknown
+        }
+        Err(rollback_error) => {
+            tracing::error!(
+                error = %rollback_error,
+                failure_context,
+                "writer task: rollback after request failure failed; request side effects are \
+                 unknown"
+            );
+            RollbackDisposition::SideEffectsUnknown
+        }
+    }
+}
+
 impl<R: Send + 'static> sealed::Sealed for WriteRequest<R> {
     fn execute_and_reply_reporting_terminal(
         self: Box<Self>,
@@ -132,40 +163,59 @@ impl<R: Send + 'static> sealed::Sealed for WriteRequest<R> {
         // leaving the active caller with only an untyped RecvError.
         let WriteRequest { op, reply, .. } = *self;
         match catch_unwind(AssertUnwindSafe(|| op(conn))) {
-            Ok(outcome) => {
-                let final_result = match outcome {
-                    Ok(value) => match conn.execute_batch("COMMIT") {
-                        Ok(()) => Ok(value),
-                        Err(e) => {
-                            let _ = conn.execute_batch("ROLLBACK");
-                            Err(StorageError::Pool {
-                                operation: "writer_task_commit".into(),
-                                message: e.to_string(),
-                            })
-                        }
-                    },
-                    Err(e) => {
-                        let _ = conn.execute_batch("ROLLBACK");
-                        Err(e)
+            Ok(Ok(value)) => match conn.execute_batch("COMMIT") {
+                Ok(()) if conn.is_autocommit() => {
+                    // The receiver may already be gone (caller dropped its
+                    // future) — that is not this task's problem to report.
+                    let _ = reply.send(Ok(value));
+                    None
+                }
+                Ok(()) => {
+                    tracing::error!(
+                        "writer task: COMMIT returned success but the connection is still in a \
+                         transaction; request side effects are unknown"
+                    );
+                    let request_state = WriterTaskRequestState::SideEffectsUnknown;
+                    let _ = reply.send(Err(writer_task_terminated(request_state)));
+                    Some(request_state)
+                }
+                Err(commit_error) => match rollback_after_failure(conn, "commit failure") {
+                    RollbackDisposition::RolledBack => {
+                        let _ = reply.send(Err(StorageError::Pool {
+                            operation: "writer_task_commit".into(),
+                            message: commit_error.to_string(),
+                        }));
+                        None
                     }
-                };
-                // The receiver may already be gone (caller dropped its
-                // future) — that is not this task's problem to report.
-                let _ = reply.send(final_result);
-                None
+                    RollbackDisposition::SideEffectsUnknown => {
+                        let request_state = WriterTaskRequestState::SideEffectsUnknown;
+                        let _ = reply.send(Err(writer_task_terminated(request_state)));
+                        Some(request_state)
+                    }
+                },
+            },
+            Ok(Err(operation_error)) => {
+                match rollback_after_failure(conn, "request operation failure") {
+                    RollbackDisposition::RolledBack => {
+                        let _ = reply.send(Err(operation_error));
+                        None
+                    }
+                    RollbackDisposition::SideEffectsUnknown => {
+                        let request_state = WriterTaskRequestState::SideEffectsUnknown;
+                        let _ = reply.send(Err(writer_task_terminated(request_state)));
+                        Some(request_state)
+                    }
+                }
             }
             Err(_panic_payload) => {
                 // The transaction and connection are owned by this blocking
                 // thread, so rollback happens here rather than from the async
                 // task on a foreign connection.
-                let request_state = match conn.execute_batch("ROLLBACK") {
-                    Ok(()) => WriterTaskRequestState::TransactionRolledBack,
-                    Err(rollback_error) => {
-                        tracing::error!(
-                            error = %rollback_error,
-                            "writer task: rollback after request panic failed; \
-                             request side effects are unknown"
-                        );
+                let request_state = match rollback_after_failure(conn, "request panic") {
+                    RollbackDisposition::RolledBack => {
+                        WriterTaskRequestState::TransactionRolledBack
+                    }
+                    RollbackDisposition::SideEffectsUnknown => {
                         WriterTaskRequestState::SideEffectsUnknown
                     }
                 };
@@ -181,11 +231,20 @@ impl<R: Send + 'static> sealed::Sealed for WriteRequest<R> {
     ) -> Option<WriterTaskRequestState> {
         let WriteRequest { op, reply, .. } = *self;
         match catch_unwind(AssertUnwindSafe(|| op(conn))) {
-            Ok(outcome) => {
+            Ok(outcome) if conn.is_autocommit() => {
                 // No COMMIT/ROLLBACK here: this request explicitly did not
                 // open a transaction, so there is nothing to close.
                 let _ = reply.send(outcome);
                 None
+            }
+            Ok(_outcome) => {
+                tracing::error!(
+                    "writer task: top-level request returned with an open transaction; request \
+                     side effects are unknown"
+                );
+                let request_state = WriterTaskRequestState::SideEffectsUnknown;
+                let _ = reply.send(Err(writer_task_terminated(request_state)));
+                Some(request_state)
             }
             Err(_panic_payload) => {
                 // Statements completed before a top-level panic may already
@@ -386,8 +445,9 @@ impl WriterTaskHandle {
 /// ([`ConnectionPool::open_standalone_writer`]), independent of the pool's
 /// Mutex-guarded `writer()` connection used by unmigrated paths. Returns the
 /// cloneable [`WriterTaskHandle`] sender half. The task normally runs until
-/// every handle clone is dropped and the channel closes; a request panic puts
-/// it into the permanent terminal state documented below.
+/// every handle clone is dropped and the channel closes; a request panic,
+/// failed rollback, or poisoned connection puts it into the permanent
+/// terminal state documented below.
 ///
 /// `capacity` bounds the channel (`PoolConfig::write_queue_capacity` /
 /// `KHIVE_WRITE_QUEUE_CAPACITY`, ADR-067 recommends 256).
@@ -426,11 +486,12 @@ async fn close_and_fail_queued_requests(rx: &mut mpsc::Receiver<Box<dyn AnyWrite
 /// request's closure; no retry — the connection tries fresh next request.
 ///
 /// A request-operation panic is contained inside the concrete
-/// [`WriteRequest<R>`] so its typed reply survives. The task then closes
-/// admission, explicitly fails every already-queued request as
+/// [`WriteRequest<R>`] so its typed reply survives. A panic, failed rollback,
+/// or otherwise poisoned connection makes the task terminal. The task then
+/// closes admission, explicitly fails every already-queued request as
 /// [`WriterTaskRequestState::NotStarted`], and exits permanently. There is no
-/// supervisor or connection restart; later sends observe the closed channel
-/// as the same typed terminal state. See
+/// supervisor or connection restart; later sends observe the closed channel.
+/// See
 /// `crates/khive-db/docs/api/writer-task.md` for the full failure matrix.
 async fn run_writer_task(
     mut conn: Connection,
@@ -440,6 +501,20 @@ async fn run_writer_task(
     while let Some(request) = rx.recv().await {
         let origin = origin.clone();
         let outcome = tokio::task::spawn_blocking(move || {
+            // A top-level request deliberately skips BEGIN, so it would
+            // silently join any transaction leaked by an earlier request.
+            // Refuse every request before dispatch if the connection is not
+            // demonstrably clean, then retire the writer task.
+            if !conn.is_autocommit() {
+                tracing::error!(
+                    "writer task: connection is not in autocommit mode before request dispatch; \
+                     retiring the poisoned writer without running the request"
+                );
+                let request_state = WriterTaskRequestState::NotStarted;
+                request.reply_error(writer_task_terminated(request_state));
+                return (conn, Some(request_state));
+            }
+
             let terminal_state = if request.is_top_level() {
                 // ADR-067 Component A:
                 // no BEGIN IMMEDIATE for this request — some statements
@@ -484,8 +559,8 @@ async fn run_writer_task(
             Ok((_returned_conn, Some(request_state))) => {
                 tracing::error!(
                     request_state = %request_state,
-                    "writer task request panicked; closing and failing the \
-                     queue without restarting"
+                    "writer task reached a terminal request or connection state; closing and \
+                     failing the queue without restarting"
                 );
                 close_and_fail_queued_requests(&mut rx).await;
                 return;
@@ -507,6 +582,7 @@ async fn run_writer_task(
 mod tests {
     use super::*;
     use crate::pool::PoolConfig;
+    use rusqlite::hooks::{AuthAction, AuthContext, Authorization, TransactionOperation};
     use serial_test::serial;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc as std_mpsc;
@@ -519,6 +595,35 @@ mod tests {
             ..PoolConfig::default()
         };
         ConnectionPool::new(cfg).expect("pool open")
+    }
+
+    fn deny_commit_and_rollback(ctx: AuthContext<'_>) -> Authorization {
+        match ctx.action {
+            // SQLite reports COMMIT as the non-exhaustive Unknown transaction
+            // operation in rusqlite 0.40; ROLLBACK has its own variant.
+            AuthAction::Transaction {
+                operation: TransactionOperation::Unknown | TransactionOperation::Rollback,
+            } => Authorization::Deny,
+            _ => Authorization::Allow,
+        }
+    }
+
+    fn deny_commit(ctx: AuthContext<'_>) -> Authorization {
+        match ctx.action {
+            AuthAction::Transaction {
+                operation: TransactionOperation::Unknown,
+            } => Authorization::Deny,
+            _ => Authorization::Allow,
+        }
+    }
+
+    fn deny_rollback(ctx: AuthContext<'_>) -> Authorization {
+        match ctx.action {
+            AuthAction::Transaction {
+                operation: TransactionOperation::Rollback,
+            } => Authorization::Deny,
+            _ => Authorization::Allow,
+        }
     }
 
     fn assert_writer_task_terminal_state<T: std::fmt::Debug>(
@@ -796,6 +901,359 @@ mod tests {
             .query_row("SELECT v FROM t WHERE id = 1", [], |row| row.get(0))
             .expect("the slow op's write must have committed");
         assert_eq!(v, "slow");
+    }
+
+    #[tokio::test]
+    #[serial(tx_registry)]
+    async fn operation_failure_with_successful_rollback_preserves_error_and_writer_continues() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("writer_task_operation_rollback.db");
+        let pool = file_pool(&path);
+        {
+            let writer = pool.try_writer().unwrap();
+            writer
+                .conn()
+                .execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
+                .unwrap();
+        }
+        let handle = spawn(&pool, 8).expect("writer task spawn");
+
+        let original_error = handle
+            .send(|conn| -> Result<(), StorageError> {
+                conn.execute("INSERT INTO t (id, v) VALUES (1, 'rolled-back')", [])
+                    .map_err(|e| StorageError::Pool {
+                        operation: "test_operation_error_insert".into(),
+                        message: e.to_string(),
+                    })?;
+                Err(StorageError::Internal(
+                    "intentional operation failure".into(),
+                ))
+            })
+            .await;
+        assert!(
+            matches!(
+                &original_error,
+                Err(StorageError::Internal(message))
+                    if message == "intentional operation failure"
+            ),
+            "a confirmed rollback must preserve the operation error, got {original_error:?}"
+        );
+
+        let affected = handle
+            .send(|conn| {
+                conn.execute("INSERT INTO t (id, v) VALUES (2, 'committed')", [])
+                    .map_err(|e| StorageError::Pool {
+                        operation: "test_operation_error_followup_insert".into(),
+                        message: e.to_string(),
+                    })
+            })
+            .await
+            .expect("the writer must continue after a confirmed rollback");
+        assert_eq!(affected, 1);
+
+        let reader = pool.reader().expect("reader");
+        let rolled_back: i64 = reader
+            .conn()
+            .query_row("SELECT COUNT(*) FROM t WHERE id = 1", [], |row| row.get(0))
+            .unwrap();
+        let committed: i64 = reader
+            .conn()
+            .query_row("SELECT COUNT(*) FROM t WHERE id = 2", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(rolled_back, 0);
+        assert_eq!(committed, 1);
+    }
+
+    #[tokio::test]
+    #[serial(tx_registry)]
+    async fn commit_failure_with_successful_rollback_preserves_error_and_writer_continues() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("writer_task_commit_rollback.db");
+        let pool = file_pool(&path);
+        {
+            let writer = pool.try_writer().unwrap();
+            writer
+                .conn()
+                .execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
+                .unwrap();
+        }
+        let handle = spawn(&pool, 8).expect("writer task spawn");
+
+        let commit_error = handle
+            .send(|conn| -> Result<usize, StorageError> {
+                let affected = conn
+                    .execute("INSERT INTO t (id, v) VALUES (1, 'rolled-back')", [])
+                    .map_err(|e| StorageError::Pool {
+                        operation: "test_commit_error_insert".into(),
+                        message: e.to_string(),
+                    })?;
+                conn.authorizer(Some(deny_commit))
+                    .map_err(|e| StorageError::Pool {
+                        operation: "test_install_authorizer".into(),
+                        message: e.to_string(),
+                    })?;
+                Ok(affected)
+            })
+            .await;
+        assert!(
+            matches!(
+                &commit_error,
+                Err(StorageError::Pool { operation, .. })
+                    if operation == "writer_task_commit"
+            ),
+            "a confirmed rollback must preserve the commit error, got {commit_error:?}"
+        );
+        assert!(
+            commit_error
+                .as_ref()
+                .expect_err("COMMIT must be denied")
+                .is_retryable(),
+            "the existing retryable commit-error contract must remain unchanged after a \
+             confirmed rollback"
+        );
+
+        let affected = handle
+            .send(|conn| {
+                conn.authorizer(None::<fn(AuthContext<'_>) -> Authorization>)
+                    .map_err(|e| StorageError::Pool {
+                        operation: "test_remove_authorizer".into(),
+                        message: e.to_string(),
+                    })?;
+                conn.execute("INSERT INTO t (id, v) VALUES (2, 'committed')", [])
+                    .map_err(|e| StorageError::Pool {
+                        operation: "test_commit_error_followup_insert".into(),
+                        message: e.to_string(),
+                    })
+            })
+            .await
+            .expect("the writer must continue after the failed COMMIT is rolled back");
+        assert_eq!(affected, 1);
+
+        let reader = pool.reader().expect("reader");
+        let rolled_back: i64 = reader
+            .conn()
+            .query_row("SELECT COUNT(*) FROM t WHERE id = 1", [], |row| row.get(0))
+            .unwrap();
+        let committed: i64 = reader
+            .conn()
+            .query_row("SELECT COUNT(*) FROM t WHERE id = 2", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(rolled_back, 0);
+        assert_eq!(committed, 1);
+    }
+
+    #[test]
+    fn top_level_request_returning_with_open_transaction_reports_side_effects_unknown() {
+        let conn = Connection::open_in_memory().expect("in-memory connection");
+        conn.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+            .unwrap();
+        let (reply_tx, mut reply_rx) = oneshot::channel();
+        let request = WriteRequest {
+            op: Box::new(|conn| -> Result<usize, StorageError> {
+                conn.execute_batch("BEGIN IMMEDIATE")
+                    .map_err(|e| StorageError::Pool {
+                        operation: "test_top_level_begin".into(),
+                        message: e.to_string(),
+                    })?;
+                conn.execute("INSERT INTO t (id) VALUES (1)", [])
+                    .map_err(|e| StorageError::Pool {
+                        operation: "test_top_level_insert".into(),
+                        message: e.to_string(),
+                    })
+            }),
+            reply: reply_tx,
+            top_level: true,
+        };
+
+        let terminal_state = sealed::Sealed::execute_and_reply_top_level_reporting_terminal(
+            Box::new(request),
+            &conn,
+        );
+        assert_eq!(
+            terminal_state,
+            Some(WriterTaskRequestState::SideEffectsUnknown)
+        );
+        let reply = reply_rx
+            .try_recv()
+            .expect("active request must receive a typed terminal reply");
+        assert_writer_task_terminal_state(reply, WriterTaskRequestState::SideEffectsUnknown);
+        assert!(
+            !conn.is_autocommit(),
+            "the fixture must prove the post-request autocommit check observed an open transaction"
+        );
+    }
+
+    #[test]
+    fn commit_failure_with_failed_rollback_reports_side_effects_unknown() {
+        let conn = Connection::open_in_memory().expect("in-memory connection");
+        conn.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY); BEGIN IMMEDIATE")
+            .unwrap();
+        let (reply_tx, mut reply_rx) = oneshot::channel();
+        let request = WriteRequest {
+            op: Box::new(|conn| -> Result<usize, StorageError> {
+                let affected = conn
+                    .execute("INSERT INTO t (id) VALUES (1)", [])
+                    .map_err(|e| StorageError::Pool {
+                        operation: "test_insert_before_commit_failure".into(),
+                        message: e.to_string(),
+                    })?;
+                conn.authorizer(Some(deny_commit_and_rollback))
+                    .map_err(|e| StorageError::Pool {
+                        operation: "test_install_authorizer".into(),
+                        message: e.to_string(),
+                    })?;
+                Ok(affected)
+            }),
+            reply: reply_tx,
+            top_level: false,
+        };
+
+        let terminal_state =
+            sealed::Sealed::execute_and_reply_reporting_terminal(Box::new(request), &conn);
+        assert_eq!(
+            terminal_state,
+            Some(WriterTaskRequestState::SideEffectsUnknown)
+        );
+        let reply = reply_rx
+            .try_recv()
+            .expect("active request must receive a typed terminal reply");
+        assert_writer_task_terminal_state(reply, WriterTaskRequestState::SideEffectsUnknown);
+        assert!(
+            !conn.is_autocommit(),
+            "the denied COMMIT and ROLLBACK must leave the test connection poisoned"
+        );
+    }
+
+    #[tokio::test]
+    #[serial(tx_registry)]
+    async fn poisoned_connection_retires_before_queued_top_level_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("writer_task_rollback_poison.db");
+        let pool = file_pool(&path);
+        {
+            let writer = pool.try_writer().unwrap();
+            writer
+                .conn()
+                .execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
+                .unwrap();
+        }
+        let handle = spawn(&pool, 8).expect("writer task spawn");
+        let (started_tx, started_rx) = oneshot::channel::<()>();
+        let (release_tx, release_rx) = std_mpsc::channel::<()>();
+
+        let active = tokio::spawn({
+            let handle = handle.clone();
+            async move {
+                handle
+                    .send(move |conn| -> Result<usize, StorageError> {
+                        let affected = conn
+                            .execute("INSERT INTO t (id, v) VALUES (1, 'active')", [])
+                            .map_err(|e| StorageError::Pool {
+                                operation: "test_active_insert".into(),
+                                message: e.to_string(),
+                            })?;
+                        conn.authorizer(Some(deny_commit_and_rollback))
+                            .map_err(|e| StorageError::Pool {
+                                operation: "test_install_authorizer".into(),
+                                message: e.to_string(),
+                            })?;
+                        let _ = started_tx.send(());
+                        release_rx.recv().expect("test must release active op");
+                        Ok(affected)
+                    })
+                    .await
+            }
+        });
+
+        tokio::time::timeout(Duration::from_secs(5), started_rx)
+            .await
+            .expect("active request did not start")
+            .expect("active request dropped its start signal");
+
+        let queued_ran = Arc::new(AtomicBool::new(false));
+        let queued_ran_in_op = Arc::clone(&queued_ran);
+        let queued_top_level = handle
+            .enqueue_inner(
+                move |conn| {
+                    queued_ran_in_op.store(true, Ordering::SeqCst);
+                    conn.execute("INSERT INTO t (id, v) VALUES (2, 'queued')", [])
+                        .map_err(|e| StorageError::Pool {
+                            operation: "test_queued_top_level_insert".into(),
+                            message: e.to_string(),
+                        })
+                },
+                true,
+            )
+            .await
+            .expect("top-level request must queue behind active request");
+        release_tx.send(()).expect("release active op");
+
+        let active_result = tokio::time::timeout(Duration::from_secs(5), active)
+            .await
+            .expect("active caller hung after rollback failure")
+            .expect("active caller task join");
+        assert_writer_task_terminal_state(
+            active_result,
+            WriterTaskRequestState::SideEffectsUnknown,
+        );
+
+        let queued_result = tokio::time::timeout(Duration::from_secs(5), queued_top_level)
+            .await
+            .expect("queued top-level caller hung after terminal failure")
+            .expect("terminal drain must preserve queued typed reply");
+        assert_writer_task_terminal_state(queued_result, WriterTaskRequestState::NotStarted);
+        assert!(
+            !queued_ran.load(Ordering::SeqCst),
+            "a top-level request must never run on the poisoned connection"
+        );
+
+        let future_ran = Arc::new(AtomicBool::new(false));
+        let future_ran_in_op = Arc::clone(&future_ran);
+        let future_result = handle
+            .send_top_level(move |_conn| {
+                future_ran_in_op.store(true, Ordering::SeqCst);
+                Ok::<(), StorageError>(())
+            })
+            .await;
+        assert_writer_task_terminal_state(future_result, WriterTaskRequestState::NotStarted);
+        assert!(!future_ran.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn operation_failure_with_failed_rollback_reports_side_effects_unknown() {
+        let conn = Connection::open_in_memory().expect("in-memory connection");
+        conn.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY); BEGIN IMMEDIATE")
+            .unwrap();
+        let (reply_tx, mut reply_rx) = oneshot::channel();
+        let request = WriteRequest {
+            op: Box::new(|conn| -> Result<(), StorageError> {
+                conn.authorizer(Some(deny_rollback))
+                    .map_err(|e| StorageError::Pool {
+                        operation: "test_install_authorizer".into(),
+                        message: e.to_string(),
+                    })?;
+                Err(StorageError::Internal(
+                    "intentional operation failure before denied rollback".into(),
+                ))
+            }),
+            reply: reply_tx,
+            top_level: false,
+        };
+
+        let terminal_state =
+            sealed::Sealed::execute_and_reply_reporting_terminal(Box::new(request), &conn);
+        assert_eq!(
+            terminal_state,
+            Some(WriterTaskRequestState::SideEffectsUnknown)
+        );
+        let reply = reply_rx
+            .try_recv()
+            .expect("active request must receive a typed terminal reply");
+        assert_writer_task_terminal_state(reply, WriterTaskRequestState::SideEffectsUnknown);
+        assert!(
+            !conn.is_autocommit(),
+            "the denied ROLLBACK must leave the test connection poisoned"
+        );
     }
 
     #[test]
