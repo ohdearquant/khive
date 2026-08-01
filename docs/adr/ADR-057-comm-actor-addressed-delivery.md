@@ -159,10 +159,11 @@ completed message write by `comm.send`, `comm.reply`, or `comm.ingest` carries i
 implicitly mean v1. Any later change to the presence, type, or meaning of a stable field, or an
 addition to the stable-field table, requires a version bump. Existing rows are not rewritten.
 
-A root send learns its canonical thread UUID only after the outbound insert allocates the note ID.
-That first insert omits the version marker; the immediate patch publishes the canonical
-`thread_id` and v1 marker in one row update. A crash can therefore leave an unversioned orphan but
-never a row that advertises v1 with an incomplete root.
+A root send generates its canonical thread UUID before either note is written, so the outbound
+and inbound copies both carry the final `thread_id` and `comm_schema_version = 1` from their
+first (and only) write. Both notes commit through one atomic two-note transaction
+(`khive_runtime::create_notes_atomic`); a failure on either note rolls back the whole unit, so no
+unversioned or partial row can be observed.
 
 The normative field table and reader rules live in
 [`message-properties.md`](../../crates/khive-pack-comm/docs/api/message-properties.md).

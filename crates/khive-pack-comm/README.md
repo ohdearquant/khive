@@ -60,9 +60,9 @@ opaque so it can change again without a breaking rename.
 
 Every `comm.send` writes two `message` notes via `dual_write_message`
 (`src/message.rs`): an **outbound** copy (`direction=outbound`) and an
-**inbound** copy (`direction=inbound`), linked by `outbound_ref`. If the
-inbound write fails, the outbound note is deleted before the error is
-returned — the pair is atomic.
+**inbound** copy (`direction=inbound`), linked by `outbound_ref`. Both notes
+commit through one atomic writer transaction; a failure on either note rolls
+back the whole pair.
 
 New comm-authored messages use the versioned
 [`properties` v1 contract](docs/api/message-properties.md). If `KHIVE_PROCESS_REF` is set for a
@@ -83,8 +83,9 @@ Two addressing modes govern where the inbound copy lands:
   namespace returns `RuntimeError::PermissionDenied`.
 
 A root message (`thread_id` absent) gets a canonical `thread_id` equal to the
-outbound note's own UUID, patched into both copies, so `comm.thread` finds
-every reply regardless of which copy it answered.
+outbound note's own UUID, generated before either note is written and set on
+both copies, so `comm.thread` finds every reply regardless of which copy it
+answered.
 
 ## Usage
 

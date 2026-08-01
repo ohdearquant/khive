@@ -9,9 +9,8 @@ read these fields directly, but must branch on `comm_schema_version` before inte
 Every successfully completed message write by `comm.send`, `comm.reply`, or `comm.ingest` carries
 the integer `comm_schema_version`. The current value is `1`.
 
-- A missing marker identifies a non-v1 row and must be treated as the pre-versioning layout. In
-  particular, a process crash may leave the first, pre-publication root insert unversioned; it must
-  not be assumed to use v1.
+- A missing marker identifies a row written before this schema existed (the pre-versioning
+  layout); it must not be assumed to use v1.
 - An unknown value must be handled explicitly rather than silently interpreted as v1.
 - Readers must ignore unknown properties. Transport adapters may add metadata outside the stable
   table below.

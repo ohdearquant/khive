@@ -10,16 +10,6 @@ spanning `message.rs`, `handlers.rs`, `params.rs`, and the inbox/thread indexes 
 Accepts a 36-char hyphenated UUID or an 8+ hex-char short prefix. The prefix
 is resolved via `runtime.resolve_prefix` (namespace-scoped).
 
-## `message.rs::rollback_outbound`
-
-Rolls back a partially-written outbound note after a later `dual_write_message`
-step fails (issue #460). Uses a row-first compensating delete so that a
-cleanup failure cannot leave the outbound row (and thus the failed send's live
-message) behind. Returns `original` unchanged when rollback fully succeeds;
-returns a composite `RuntimeError::Internal` naming both the original failure
-and the rollback cleanup failure when the row was removed but cleanup did not
-complete.
-
 ## `message.rs::dual_write_message`
 
 Writes an outbound copy (caller namespace) and an inbound copy (recipient
@@ -41,14 +31,12 @@ same canonical `thread_id` — the sender's outbound UUID. This ensures that
 because all replies carry the same canonical thread_id regardless of which
 copy they were replying to.
 
-The runtime allocates that outbound UUID during the first note insert. For a
-root only, the first committed row therefore omits `comm_schema_version`; the
-immediate row update publishes the canonical string `thread_id` and
-`comm_schema_version = 1` together. A concurrent reader or process crash can
-observe a pre-versioned orphan, but can never observe a row that claims v1
-while still carrying the temporary `thread_id = null`. Successful root sends
-patch the outbound note before creating the inbound copy and return that
-patched v1 value after both writes succeed.
+The runtime pre-generates that outbound UUID before either note is written, so
+the canonical `thread_id` and `comm_schema_version = 1` are already known when
+both notes are constructed. `dual_write_message` commits both fully-formed v1
+notes through `khive_runtime::create_notes_atomic` in one atomic writer
+transaction — a failure on either note rolls back the whole unit, so no
+partial or unversioned row can ever be observed.
 
 When `thread_id` is already supplied, the handler first parses it and serializes
 the UUID in full-hyphenated form, then forwards that canonical value unchanged
