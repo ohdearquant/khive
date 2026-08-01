@@ -126,6 +126,50 @@ async fn schedule_creates_pending_event_with_action() {
 }
 
 #[tokio::test]
+async fn schedule_persists_the_creating_actor_for_replay() {
+    let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+    let mut builder = VerbRegistryBuilder::new();
+    builder.with_actor_id(Some("lambda:schedule-owner".to_string()));
+    builder.register(khive_pack_kg::KgPack::new(runtime.clone()));
+    builder.register(SchedulePack::new(runtime.clone()));
+    let registry = builder.build().expect("registry builds");
+
+    let result = registry
+        .dispatch(
+            "schedule.schedule",
+            serde_json::json!({
+                "action": "create(kind=\"concept\", name=\"future concept\")",
+                "at": "2099-06-01T10:00:00Z"
+            }),
+        )
+        .await
+        .expect("schedule succeeds");
+
+    let id = result["full_id"]
+        .as_str()
+        .expect("full_id present")
+        .parse()
+        .expect("full_id is a UUID");
+    let token = runtime
+        .authorize(khive_runtime::Namespace::local())
+        .expect("authorize");
+    let note = runtime
+        .notes(&token)
+        .expect("notes")
+        .get_note(id)
+        .await
+        .expect("read scheduled action")
+        .expect("scheduled action exists");
+
+    assert_eq!(
+        note.properties
+            .as_ref()
+            .and_then(|props| props["created_by_actor"].as_str()),
+        Some("lambda:schedule-owner")
+    );
+}
+
+#[tokio::test]
 async fn test_full_id_returns_36_char_schedule() {
     let (registry, _rt) = build_registry();
 

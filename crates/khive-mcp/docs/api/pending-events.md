@@ -2,17 +2,19 @@
 
 `pending_events` (`src/pending_events.rs`) drains due `scheduled_event` notes
 written by the `schedule` pack: for each due row it CAS-claims the row,
-replays the stored action DSL, and CAS-finalizes the row to `fired` or a
-re-armed `pending`. It runs from two entry points — a one-shot CLI drain
+replays the stored action DSL when policy permits, and CAS-finalizes the row to
+`fired`, a re-armed `pending`, `missed`, or identity-policy `failed`. It runs
+from two entry points — a one-shot CLI drain
 (`kkernel exec --pending-events`) and a daemon-resident periodic loop
 (`schedule_tick_loop`, ADR-106) — both funnelling into the same
 `run_pending_events_on`.
 
 ## Why `rt` and `server` are two separate handles (PR #782)
 
-`run_pending_events_on(rt, server, ...)` and `schedule_tick_loop(rt, server, ...)`
-both take a `KhiveRuntime` AND a `KhiveMcpServer`, and the two must never be
-collapsed into one:
+`run_pending_events_on(rt, server, ...)` takes a `KhiveRuntime` AND a
+`KhiveMcpServer`, and the two must never be collapsed into one. The supervised
+`schedule_tick_loop(rt, host, ...)` receives that same server through its ADR-119
+`HostContext`:
 
 - `rt` is the **schedule pack's own runtime**. The scan/claim/finalize SQL
   reads and CAS-writes `scheduled_event` notes directly through it, so it
@@ -46,8 +48,57 @@ loop's effective cadence is `interval + drain_duration`, which drifts further
 behind on every pass that finds a nontrivial backlog (PR #782); ADR-106
 specifies a fixed interval. The first tick fires after one full `interval`
 has elapsed, matching the original sleep-based boot behavior instead of
-draining immediately at daemon start. A per-tick failure (e.g. a transient
-SQL error) is logged and does not stop the loop.
+draining immediately at daemon start.
+
+## ADR-119 component supervision (issue #1409)
+
+The daemon no longer drops a bare `tokio::spawn` handle for this loop. When the
+resolved daemon pack set includes `schedule`, the host adds exactly one dynamic
+`schedule-tick` registration to the ADR-119 component roster. The factory captures
+the already-resolved schedule runtime and receives the daemon's live server through
+`HostContext`. Client/stdio roles and daemon configurations without the schedule pack
+add no ticker.
+
+The concrete policy is `OnFailure`, five restarts per daemon lifetime, exponential
+backoff from 1 second to a 60-second cap, and a 5-second cooperative-shutdown bound.
+The loop selects between cancellation and each interval tick. A successful drain,
+including an empty one or one containing per-event action failures, records the
+component heartbeat. A drain-level error returns `ComponentError::Retryable` so the
+supervisor records degradation and applies the restart policy. Per-event failures stay
+inside `DrainSummary` and never consume the component restart budget.
+
+## Replay identity and legacy rows
+
+Both `schedule.remind` and `schedule.schedule` persist `created_by_actor`. At fire time,
+the pending-event runner uses that actor as the explicit request identity for gate
+evaluation, auditing, and writes; it never inherits the daemon actor. Generic scheduled
+actions written before creator attribution existed fail closed: the payload is not
+dispatched, the row becomes terminal `status="failed"`, and `dispatch_error` plus
+`dispatch_failed_at` explain the migration-policy failure. Reminder rows retain ADR-106
+Amendment C's explicit legacy fallback to the current server actor and then `local`.
+
+Other generic dispatch failures remain per-event: they are persisted as
+`dispatch_error`/`dispatch_failed_at`, then the row follows its normal one-shot or repeat
+finalization so a permanently broken action cannot retry forever. A later successful
+repeat clears those fields.
+
+## Ticker liveness on `schedule.agenda` (issue #1352)
+
+The daemon's `KhiveMcpServer` owns a process-local ticker heartbeat. After each interval
+yields, `schedule_tick_loop` records the tick before it starts the drain, including passes
+that find no due rows or return an error. Successful MCP dispatches of `schedule.agenda`
+include a host-added health field:
+
+```json
+{ "events": [], "count": 0, "ticker": { "last_tick_at": "2026-08-01T12:34:56.123456Z" } }
+```
+
+`last_tick_at` is null before this server instance observes a tick. It is intentionally
+not persisted: a newly constructed server over the same database starts with no heartbeat,
+while a stopped or wedged loop leaves its last value frozen for caller-side staleness
+judgment. The host does not compute a `healthy` flag because the acceptable age depends on
+the configured tick interval. Agent presentation may render the timestamp relatively;
+request `presentation="verbose"` when the exact RFC 3339 value is required.
 
 ## Claim / finalize CAS state machine (issue #462)
 
@@ -72,8 +123,9 @@ maximally stale and reclaimed unconditionally — there is no timestamp to
 compare against, and leaving them wedged forever is strictly worse.
 
 `finalize_fired_event`'s terminal write clears `firing_at` — the event has
-reached a terminal state for this cycle (`fired` or re-armed `pending`), so
-no claim token should survive to be mistaken for a live claim later.
+reached its post-cycle state (`fired`, re-armed `pending`, `missed`, or
+identity-policy `failed`), so no claim token should survive to be mistaken for
+a live claim later.
 
 ## `discover_pending_namespaces` — offset-safe due-time comparison (PR #782)
 

@@ -24,9 +24,9 @@
 //! - **Daemon-resident tick** (ADR-106): [`schedule_tick_loop`] calls
 //!   [`run_pending_events_on`] against the daemon's own resolved `KhiveRuntime`
 //!   handle on a fixed interval for the lifetime of the warm `khived` daemon
-//!   process. Spawned only by the daemon role (mirrors the
-//!   `is_daemon_role` gate `khive-mcp::serve` already uses for the email
-//!   channel loops), never by a short-lived stdio client. Running both an
+//!   process. It runs as the ADR-119 `schedule-tick` component only in daemon
+//!   role, never from a short-lived stdio client, with tracked cancellation,
+//!   bounded restart, and component health. Running both an
 //!   external cron entry and the daemon tick at once is safe: the drain's
 //!   `pending -> firing` CAS claim (`claim_pending_event`) makes concurrent or
 //!   overlapping invocations harmless by construction — at most one caller
@@ -36,7 +36,9 @@
 //!
 //! Each event fires in its own namespace: the action is dispatched through the
 //! MCP server's registry with the event's namespace injected as the `namespace=`
-//! parameter, so all writes land in the event's namespace.
+//! parameter, so all writes land in the event's namespace. Replay also supplies
+//! the persisted `created_by_actor` as the request identity; a generic legacy
+//! row without it fails closed instead of inheriting daemon authority.
 //!
 //! ## Repeat advancement
 //!
@@ -64,7 +66,8 @@
 //! (or a first boot against a store with a large stale backlog) marks the
 //! entire overdue backlog missed on its first tick and dispatches zero of
 //! them. See the ADR-106 amendment for the full rationale and the prior-art
-//! comparison.
+//! comparison. The creator-identity fence runs first for generic actions:
+//! an unattributed legacy row becomes `failed`, not `missed`, even when stale.
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Duration, FixedOffset, Months, Utc};
@@ -548,6 +551,16 @@ pub async fn run_pending_events_on(
                 } else {
                     None
                 };
+                let schedule_actor = if event_type == "schedule" {
+                    properties
+                        .as_ref()
+                        .and_then(|p| p.get("created_by_actor"))
+                        .and_then(Value::as_str)
+                        .filter(|actor| !actor.trim().is_empty())
+                        .map(str::to_string)
+                } else {
+                    None
+                };
                 let action_dsl: Option<String> = if is_missed {
                     None
                 } else if event_type == "schedule" {
@@ -602,6 +615,50 @@ pub async fn run_pending_events_on(
                     summary.skipped_race += 1;
                     continue;
                 };
+
+                // Generic scheduled actions must replay as their persisted
+                // creator, never as the daemon. Rows written before creator
+                // attribution was persisted cannot satisfy that identity
+                // fence, so fail them closed and terminally instead of
+                // guessing an actor (ADR-119 Amendment 4).
+                if event_type == "schedule" && schedule_actor.is_none() {
+                    let error = "scheduled action is missing created_by_actor; legacy row cannot be replayed safely";
+                    tracing::error!(
+                        scheduled_event_id = %id,
+                        "pending-events: refusing unattributed scheduled action replay"
+                    );
+                    if verbose {
+                        eprintln!("[pending-events] dispatch refused for note {id}: {error}");
+                    }
+                    summary.failed += 1;
+                    let mut props = properties.clone().unwrap_or_else(|| json!({}));
+                    props["status"] = json!("failed");
+                    props["dispatch_error"] = json!(error);
+                    props["dispatch_failed_at"] = json!(Utc::now().to_rfc3339());
+                    let updated_at = Utc::now().timestamp_micros();
+                    match finalize_fired_event(
+                        rt,
+                        ns_str,
+                        id,
+                        &props,
+                        updated_at,
+                        claimed_firing_at,
+                    )
+                    .await
+                    {
+                        Ok(true) => {}
+                        Ok(false) => tracing::error!(
+                            scheduled_event_id = %id,
+                            "pending-events: failed-identity finalization lost its firing claim"
+                        ),
+                        Err(e) => tracing::error!(
+                            scheduled_event_id = %id,
+                            error = %e,
+                            "pending-events: failed-identity finalization failed"
+                        ),
+                    }
+                    continue;
+                }
 
                 if is_missed {
                     // ── Missed path: never dispatch. Mark terminally
@@ -669,8 +726,15 @@ pub async fn run_pending_events_on(
 
                 // ── Dispatch the action ──────────────────────────────────
                 let mut reminder_delivery_error = None;
+                let mut scheduled_dispatch_error = None;
                 if let Some(dsl) = &action_dsl {
-                    let dispatch_result = dispatch_action(dsl, ns_str, server, verbose).await;
+                    let dispatch_actor = if event_type == "schedule" {
+                        schedule_actor.as_deref().expect("checked above")
+                    } else {
+                        reminder_actor.as_deref().unwrap_or("local")
+                    };
+                    let dispatch_result =
+                        dispatch_action(dsl, ns_str, dispatch_actor, server, verbose).await;
                     if let Err(e) = dispatch_result {
                         tracing::error!(
                             scheduled_event_id = %id,
@@ -694,13 +758,15 @@ pub async fn run_pending_events_on(
                             )
                             .await;
                             reminder_delivery_error = Some(error);
+                        } else {
+                            scheduled_dispatch_error = Some(e.to_string());
                         }
                         // Per-event failure does NOT abort the drain. Continue.
                         // Still mark as fired so the drain doesn't retry infinitely
                         // on a permanently broken action. The error is reported
                         // in the summary.
-                        // (Callers can inspect fired_at + a future dispatch_error
-                        // field to distinguish clean fires from error fires.)
+                        // Callers can inspect fired_at + dispatch_error to
+                        // distinguish clean fires from error fires.
                     }
                 }
 
@@ -713,6 +779,14 @@ pub async fn run_pending_events_on(
                     } else if let Some(obj) = props.as_object_mut() {
                         obj.remove("delivery_error");
                         obj.remove("delivery_failed_at");
+                    }
+                } else if event_type == "schedule" {
+                    if let Some(error) = scheduled_dispatch_error {
+                        props["dispatch_error"] = json!(error);
+                        props["dispatch_failed_at"] = json!(fired_at_rfc);
+                    } else if let Some(obj) = props.as_object_mut() {
+                        obj.remove("dispatch_error");
+                        obj.remove("dispatch_failed_at");
                     }
                 }
                 let updated_at;
@@ -873,8 +947,9 @@ async fn reclaim_stale_firing_events(rt: &KhiveRuntime, stale_before_micros: i64
     Ok(rows)
 }
 
-/// CAS-persist the post-dispatch state of a claimed event: `firing -> {fired
-/// | pending}` (the latter for an advanced repeat). `claimed_firing_at` is
+/// CAS-persist the post-drain state of a claimed event: `firing -> {fired |
+/// pending | missed | failed}` (`pending` is an advanced repeat; `failed` is
+/// the unattributed-generic-action policy state). `claimed_firing_at` is
 /// the claim token from `claim_pending_event`; the CAS requires the row's
 /// CURRENT `firing_at` to still equal it, not merely `status='firing'`
 /// (issue #462). Clears `firing_at` on the terminal write. Returns
@@ -1048,11 +1123,14 @@ async fn append_reminder_delivery_failure_event(
 ///
 /// The action is wrapped as a JSON-form batch with `namespace` injected into
 /// each op's args so the VerbRegistry mints a token scoped to the event's
-/// namespace. This preserves namespace isolation: all writes from the action
-/// land in the event's namespace, not in the server's default `local` namespace.
+/// namespace. Dispatch also uses the persisted creator actor as the effective
+/// request identity. Together these preserve the original authority boundary:
+/// writes land in the event's namespace and gate/audit decisions never inherit
+/// the daemon process identity.
 async fn dispatch_action(
     action_dsl: &str,
     namespace: &str,
+    creator_actor: &str,
     server: &KhiveMcpServer,
     verbose: bool,
 ) -> Result<()> {
@@ -1095,15 +1173,23 @@ async fn dispatch_action(
     }
 
     let result = server
-        .dispatch_request_local(RequestParams {
-            ops: ops_str,
-            presentation: None,
-            presentation_per_op: None,
-            save_to: None,
-            format: None,
-            format_per_op: None,
-            request_id: None,
-        })
+        .dispatch_request_local_with_identity(
+            RequestParams {
+                ops: ops_str,
+                presentation: None,
+                presentation_per_op: None,
+                save_to: None,
+                format: None,
+                format_per_op: None,
+                request_id: None,
+            },
+            khive_runtime::RequestIdentity {
+                namespace: namespace.to_string(),
+                actor_id: Some(creator_actor.to_string()),
+                visible_namespaces: Vec::new(),
+                request_id: None,
+            },
+        )
         .await
         .map_err(|e| anyhow::anyhow!("pending-events: dispatch error: {e}"))?;
 
@@ -1244,24 +1330,31 @@ pub fn tick_interval_from_env() -> std::time::Duration {
 ///
 /// Runs [`run_pending_events_on`] on `interval` for as long as the daemon
 /// process lives; only the daemon role spawns this loop. `rt` MUST be the
-/// daemon's own already-resolved runtime handle for the `"schedule"` pack
-/// and `server` MUST be the daemon's own live [`KhiveMcpServer`] — never
-/// freshly reconstructed — or replayed actions can silently dispatch against
-/// the wrong backend (PR #782). Ticks on a fixed interval with
+/// daemon's own already-resolved runtime handle for the `"schedule"` pack.
+/// The host context carries the daemon's live [`KhiveMcpServer`] — never a
+/// freshly reconstructed server — or replayed actions can silently dispatch
+/// against the wrong backend (PR #782). Ticks on a fixed interval with
 /// `Skip`-missed-tick behavior so a long drain cannot make the loop drift
-/// behind. A per-tick failure is logged; the loop never stops.
+/// behind. Drain-level failures are retryable component failures; individual
+/// event failures remain part of a successful drain summary and do not spend
+/// the supervisor's restart budget.
 /// See `crates/khive-mcp/docs/api/pending-events.md` for the full rationale.
 pub async fn schedule_tick_loop(
     rt: KhiveRuntime,
-    server: KhiveMcpServer,
+    ctx: crate::components::HostContext,
     interval: std::time::Duration,
-) {
+) -> Result<(), crate::components::ComponentError> {
     let mut ticker = tokio::time::interval_at(tokio::time::Instant::now() + interval, interval);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
-        ticker.tick().await;
-        match run_pending_events_on(&rt, &server, false).await {
+        tokio::select! {
+            _ = ctx.cancellation().cancelled() => return Ok(()),
+            _ = ticker.tick() => {}
+        }
+        ctx.server().record_schedule_ticker_tick();
+        match run_pending_events_on(&rt, ctx.server(), false).await {
             Ok(summary) => {
+                ctx.heartbeat();
                 if summary.fired > 0
                     || summary.advanced > 0
                     || summary.failed > 0
@@ -1279,7 +1372,9 @@ pub async fn schedule_tick_loop(
                 }
             }
             Err(e) => {
-                tracing::warn!(error = %e, "schedule tick: drain pass failed");
+                return Err(crate::components::ComponentError::Retryable(format!(
+                    "schedule drain pass failed: {e}"
+                )));
             }
         }
     }
@@ -1294,6 +1389,7 @@ mod tests {
     use khive_storage::event::EventFilter;
     use khive_storage::types::PageRequest;
     use tempfile::NamedTempFile;
+    use tokio_util::sync::CancellationToken;
 
     #[derive(Debug)]
     struct DenyCommSendGate;
@@ -1303,6 +1399,21 @@ mod tests {
             if request.verb == "comm.send" {
                 Ok(GateDecision::deny(
                     "comm.send denied by delivery-failure test",
+                ))
+            } else {
+                Ok(GateDecision::allow())
+            }
+        }
+    }
+
+    #[derive(Debug)]
+    struct DenyCreatorCreateGate;
+
+    impl Gate for DenyCreatorCreateGate {
+        fn check(&self, request: &GateRequest) -> Result<GateDecision, GateError> {
+            if request.verb == "create" && request.actor.id == "lambda:schedule-owner" {
+                Ok(GateDecision::deny(
+                    "creator is not authorized to replay create",
                 ))
             } else {
                 Ok(GateDecision::allow())
@@ -1381,6 +1492,111 @@ mod tests {
         let rt = make_rt(db_path).await;
         let server = KhiveMcpServer::new(rt.clone()).map_err(|e| anyhow::anyhow!("{e}"))?;
         run_pending_events_on(&rt, &server, false).await
+    }
+
+    async fn agenda_ticker_last_tick_at(server: &KhiveMcpServer) -> Option<DateTime<Utc>> {
+        let response = server
+            .dispatch_request_local(RequestParams {
+                ops: "schedule.agenda()".to_string(),
+                presentation: Some("verbose".to_string()),
+                presentation_per_op: None,
+                save_to: None,
+                format: None,
+                format_per_op: None,
+                request_id: None,
+            })
+            .await
+            .expect("agenda dispatch");
+        let envelope: Value = serde_json::from_str(&response).expect("agenda response JSON");
+        assert_eq!(envelope["results"][0]["ok"], true, "{envelope:?}");
+        envelope["results"][0]["result"]["ticker"]["last_tick_at"]
+            .as_str()
+            .map(|timestamp| {
+                timestamp
+                    .parse::<DateTime<Utc>>()
+                    .expect("last_tick_at is RFC 3339")
+            })
+    }
+
+    async fn wait_for_agenda_tick_after(
+        server: &KhiveMcpServer,
+        after: Option<DateTime<Utc>>,
+    ) -> DateTime<Utc> {
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if let Some(tick) = agenda_ticker_last_tick_at(server).await {
+                    if after.as_ref().is_none_or(|prior| tick > *prior) {
+                        return tick;
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("schedule ticker heartbeat did not advance")
+    }
+
+    #[tokio::test]
+    async fn quiet_schedule_tick_loop_surfaces_an_advancing_then_stale_heartbeat() {
+        let (_file, db_path) = tmp_db();
+        let rt = make_rt(&db_path).await;
+        let server = KhiveMcpServer::new(rt.clone()).expect("server");
+        assert_eq!(agenda_ticker_last_tick_at(&server).await, None);
+
+        let interval = std::time::Duration::from_millis(15);
+        let cancellation = CancellationToken::new();
+        let health = crate::components::HealthReporter::default();
+        let ctx = crate::components::HostContext::new(
+            server.clone(),
+            cancellation.clone(),
+            "schedule-tick",
+            health.clone(),
+        );
+        let task = tokio::spawn(schedule_tick_loop(rt, ctx, interval));
+        let first = wait_for_agenda_tick_after(&server, None).await;
+        let second = wait_for_agenda_tick_after(&server, Some(first)).await;
+        assert!(second > first);
+        assert!(
+            health
+                .status("schedule-tick")
+                .and_then(|status| status.last_heartbeat)
+                .is_some(),
+            "a successful quiet drain must heartbeat through component health"
+        );
+
+        cancellation.cancel();
+        task.await
+            .expect("tick task joins")
+            .expect("cooperative cancellation is a clean stop");
+        let stopped_at = agenda_ticker_last_tick_at(&server)
+            .await
+            .expect("the loop recorded at least two ticks before stopping");
+        assert!(stopped_at >= second);
+        tokio::time::sleep(interval.saturating_mul(2)).await;
+        assert_eq!(
+            agenda_ticker_last_tick_at(&server).await,
+            Some(stopped_at),
+            "a stopped loop must leave a stale timestamp, not fabricate liveness"
+        );
+    }
+
+    #[tokio::test]
+    async fn schedule_ticker_heartbeat_is_process_local_and_missing_without_a_loop() {
+        let (_file, db_path) = tmp_db();
+        let rt = make_rt(&db_path).await;
+        let server = KhiveMcpServer::new(rt).expect("server");
+        assert_eq!(agenda_ticker_last_tick_at(&server).await, None);
+
+        server.record_schedule_ticker_tick();
+        assert!(agenda_ticker_last_tick_at(&server).await.is_some());
+
+        let replacement_rt = make_rt(&db_path).await;
+        let replacement = KhiveMcpServer::new(replacement_rt).expect("replacement server");
+        assert_eq!(
+            agenda_ticker_last_tick_at(&replacement).await,
+            None,
+            "a replacement process must not inherit its predecessor's heartbeat"
+        );
     }
 
     /// Create a scheduled_event note directly via runtime.create_note, replicating
@@ -1467,6 +1683,28 @@ mod tests {
                 (content, properties)
             })
             .collect()
+    }
+
+    async fn note_content_count(rt: &KhiveRuntime, kind: &str, content: &str) -> usize {
+        let token = rt
+            .authorize(Namespace::parse("local").expect("namespace"))
+            .expect("authorize");
+        rt.notes(&token)
+            .expect("notes")
+            .query_notes(
+                "local",
+                Some(kind),
+                PageRequest {
+                    limit: 200,
+                    offset: 0,
+                },
+            )
+            .await
+            .expect("query notes")
+            .items
+            .into_iter()
+            .filter(|note| note.content == content)
+            .count()
     }
 
     async fn make_repeat_due_again(rt: &KhiveRuntime, id: uuid::Uuid) {
@@ -2143,6 +2381,123 @@ mod tests {
         let _ = props_bad2["status"].as_str(); // just verify it's accessible
     }
 
+    #[tokio::test]
+    async fn legacy_scheduled_action_without_creator_fails_closed() {
+        let (_tmp, db_path) = tmp_db();
+        let rt = make_rt_with_actor(&db_path, Some("lambda:daemon")).await;
+        let server = KhiveMcpServer::new(rt.clone()).expect("server");
+        let action = "create(kind=\"observation\", content=\"legacy action marker\")";
+        let token = rt
+            .authorize(Namespace::parse("local").expect("namespace"))
+            .expect("authorize");
+        let note = rt
+            .create_note(
+                &token,
+                "scheduled_event",
+                None,
+                action,
+                None,
+                Some(json!({
+                    "trigger_at": "2000-01-01T00:00:00Z",
+                    "repeat": null,
+                    "status": "pending",
+                    "event_type": "schedule",
+                    "payload": action,
+                    "fired_at": null,
+                    "cancelled_at": null,
+                })),
+                vec![],
+            )
+            .await
+            .expect("create legacy scheduled action");
+
+        let summary = run_pending_events_on(&rt, &server, false)
+            .await
+            .expect("drain");
+
+        assert_eq!(summary.failed, 1, "legacy row must report one failure");
+        assert_eq!(summary.fired, 0, "unsafe action must never count as fired");
+        assert_eq!(
+            note_content_count(&rt, "observation", "legacy action marker").await,
+            0,
+            "missing attribution must never inherit daemon authority"
+        );
+        let props = get_note_props(&rt, note.id).await;
+        assert_eq!(props["status"], "failed", "{props}");
+        assert!(
+            props["dispatch_error"]
+                .as_str()
+                .is_some_and(|error| error.contains("missing created_by_actor")),
+            "policy error must explain why replay was refused: {props}"
+        );
+        assert!(props["dispatch_failed_at"].as_str().is_some(), "{props}");
+    }
+
+    #[tokio::test]
+    async fn scheduled_action_replay_uses_creator_not_daemon_identity() {
+        let (_tmp, db_path) = tmp_db();
+        let cfg = RuntimeConfig {
+            db_path: Some(std::path::PathBuf::from(&db_path)),
+            default_namespace: Namespace::parse("local").unwrap(),
+            embedding_model: None,
+            additional_embedding_models: vec![],
+            gate: std::sync::Arc::new(DenyCreatorCreateGate),
+            actor_id: Some("lambda:daemon".to_string()),
+            packs: vec!["kg".to_string(), "schedule".to_string()],
+            ..Default::default()
+        };
+        let rt = KhiveRuntime::new(cfg).expect("runtime");
+        let server = KhiveMcpServer::new(rt.clone()).expect("server");
+        let action = "create(kind=\"observation\", content=\"identity fence marker\")";
+        let token = rt
+            .authorize(Namespace::parse("local").expect("namespace"))
+            .expect("authorize");
+        let note = rt
+            .create_note(
+                &token,
+                "scheduled_event",
+                None,
+                action,
+                None,
+                Some(json!({
+                    "trigger_at": due_rfc3339(),
+                    "repeat": null,
+                    "status": "pending",
+                    "event_type": "schedule",
+                    "created_by_actor": "lambda:schedule-owner",
+                    "payload": action,
+                    "fired_at": null,
+                    "cancelled_at": null,
+                })),
+                vec![],
+            )
+            .await
+            .expect("create scheduled action");
+
+        let summary = run_pending_events_on(&rt, &server, false)
+            .await
+            .expect("drain");
+
+        assert_eq!(summary.failed, 1, "creator gate denial must be visible");
+        assert_eq!(
+            note_content_count(&rt, "observation", "identity fence marker").await,
+            0,
+            "replay as the daemon would bypass the creator's denial"
+        );
+        let props = get_note_props(&rt, note.id).await;
+        assert_eq!(
+            props["status"], "fired",
+            "per-event failures do not retry forever"
+        );
+        assert!(
+            props["dispatch_error"]
+                .as_str()
+                .is_some_and(|error| error.contains("creator is not authorized")),
+            "dispatch failure must be persisted: {props}"
+        );
+        assert!(props["dispatch_failed_at"].as_str().is_some(), "{props}");
+    }
+
     /// Issue #461: a `schedule.schedule` payload that write-time validation
     /// now accepts (single op, exactly-registered handler name, literal args,
     /// all required params present) must actually dispatch successfully at
@@ -2252,9 +2607,15 @@ mod tests {
         let rt = make_rt(&db_path).await;
         let server = KhiveMcpServer::new(rt.clone()).expect("server");
 
-        let err = dispatch_action("stats() | get(id=$prev.id)", "local", &server, false)
-            .await
-            .unwrap_err();
+        let err = dispatch_action(
+            "stats() | get(id=$prev.id)",
+            "local",
+            "lambda:test",
+            &server,
+            false,
+        )
+        .await
+        .unwrap_err();
         let msg = err.to_string();
         assert!(
             msg.contains("not replayable"),
@@ -2427,6 +2788,7 @@ mod tests {
                 "repeat": null,
                 "status": "firing",
                 "event_type": "schedule",
+                "created_by_actor": "local",
                 "payload": "stats()",
                 "fired_at": null,
                 "cancelled_at": null,

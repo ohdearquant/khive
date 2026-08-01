@@ -11,8 +11,8 @@ This crate implements the schedule half of ADR-040.
 `trigger_at` against the current time, and dispatching the stored payload — is
 not performed by this pack in process. Two supported execution modes exist:
 
-1. `kkernel scheduler` daemon mode (future): polls pending events and dispatches
-   them via the internal verb registry.
+1. The daemon's ADR-119-supervised `schedule-tick` component polls pending events
+   and dispatches them through the live multi-backend verb registry.
 2. External scheduler integration: an operator configures OS cron or a cloud
    scheduler to call `kkernel exec --pending-events` at an appropriate polling
    interval (minimum 1 minute).
@@ -43,30 +43,34 @@ following `properties` shape:
 
 `event_type` distinguishes `remind` (no action payload; delivers its content to
 the `created_by_actor` inbox) from `schedule` (stores a serialized verb+args
-payload for replay). `payload` is null for reminders and a JSON-encoded verb
-call string for scheduled dispatch. Reminder delivery uses the same dual-write
-path as `comm.send`. Use `schedule.schedule(action="comm.send(...)")` for
-delivery to an actor other than the creator.
+payload for replay). Both event types persist the creator. Generic replay uses
+that actor as its explicit request identity, so gates, audits, and writes cannot
+inherit daemon authority; legacy generic rows missing the field fail closed.
+`payload` is null for reminders and a JSON-encoded verb call string for scheduled
+dispatch. Reminder delivery uses the same dual-write path as `comm.send`. Use
+`schedule.schedule(action="comm.send(...)")` for delivery to an actor other than
+the creator.
 
 **Four verbs:**
 
-| Verb | Speech act | Args | What it does |
-|------|-----------|------|-------------|
-| `schedule.remind` | commissive | `content`, `at`, `repeat?` | Create a `scheduled_event` that delivers `content` to the creating actor's inbox at fire time |
-| `schedule.schedule` | commissive | `action`, `at`, `repeat?` | Create a `scheduled_event` with `event_type="schedule"`; `action` is a DSL verb string |
-| `schedule.agenda` | assertive | `from?`, `to?`, `limit?` | List pending `scheduled_event` notes ordered by `trigger_at` ascending |
-| `schedule.cancel` | declaration | `id` | Set `properties.status = "cancelled"`, record `cancelled_at` |
+| Verb                | Speech act  | Args                       | What it does                                                                                  |
+| ------------------- | ----------- | -------------------------- | --------------------------------------------------------------------------------------------- |
+| `schedule.remind`   | commissive  | `content`, `at`, `repeat?` | Create a `scheduled_event` that delivers `content` to the creating actor's inbox at fire time |
+| `schedule.schedule` | commissive  | `action`, `at`, `repeat?`  | Create a `scheduled_event` with `event_type="schedule"`; `action` is a DSL verb string        |
+| `schedule.agenda`   | assertive   | `from?`, `to?`, `limit?`   | List pending `scheduled_event` notes ordered by `trigger_at` ascending                        |
+| `schedule.cancel`   | declaration | `id`                       | Set `properties.status = "cancelled"`, record `cancelled_at`                                  |
 
 **Recurrence specification.** `repeat` accepts:
 
-| Value | Semantics |
-|-------|-----------|
-| `"daily"` | Repeat every 24 hours from `trigger_at` |
-| `"weekly"` | Repeat every 7 days |
-| `"monthly"` | Repeat on the same day-of-month each month |
+| Value                | Semantics                                                               |
+| -------------------- | ----------------------------------------------------------------------- |
+| `"daily"`            | Repeat every 24 hours from `trigger_at`                                 |
+| `"weekly"`           | Repeat every 7 days                                                     |
+| `"monthly"`          | Repeat on the same day-of-month each month                              |
 | limited 5-field form | Each field is `*` or one in-range integer: `"0 9 * * 1"` (Monday 09:00) |
 
 Field ranges:
+
 - $\text{MIN} \in [0, 59]$
 - $\text{HOUR} \in [0, 23]$
 - $\text{DOM} \in [1, 31]$
@@ -86,7 +90,7 @@ before it enters storage, and (2) `validate_replayable_single_action` further
 requires a single call (no chains, no `$prev` references) against an
 exactly-registered, pack-prefixed verb name, with only literal argument
 values, every metadata-`required:true` argument present, and — for the small
-set of verbs with a *conditional* requirement not expressible in metadata
+set of verbs with a _conditional_ requirement not expressible in metadata
 (currently: `create`, which needs `kind` or `items`) — that alternative
 present too. This second stage exists because `kkernel`'s pending-events
 runner re-parses and re-dispatches the exact stored string at trigger time;
@@ -155,3 +159,7 @@ persisting a reminder; the other three schedule verbs do not require `comm`.
   is consistent with the pattern in other packs.
 - Pagination in `agenda` uses `u64` offsets (not `u32`) to prevent overflow on
   very large stores. This is a defensive coding choice beyond ADR-040's spec.
+- The direct pack handler returns schedule intent only (`events` and `count`).
+  `khive-mcp`, which owns the daemon tick loop, decorates successful
+  `schedule.agenda` results with process-local `ticker.last_tick_at` per ADR-106
+  Amendment D. The heartbeat is not pack data and is never persisted.

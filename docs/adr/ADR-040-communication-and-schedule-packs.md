@@ -271,6 +271,7 @@ A `scheduled_event` is a note. `properties` carries the scheduling metadata:
   "repeat": "daily",
   "status": "pending",
   "event_type": "remind",
+  "created_by_actor": "lambda:owner",
   "payload": null,
   "fired_at": null,
   "cancelled_at": null
@@ -278,17 +279,18 @@ A `scheduled_event` is a note. `properties` carries the scheduling metadata:
 ```
 
 `event_type` distinguishes `remind` (no action payload; fires a notification) from
-`schedule` (stores a serialized verb+args payload for replay). `payload` is null for
-reminders and a JSON-encoded verb call string for scheduled dispatch.
+`schedule` (stores a serialized verb+args payload for replay). Both creation paths
+persist `created_by_actor`. `payload` is null for reminders and a JSON-encoded verb call
+string for scheduled dispatch.
 
 #### Four verbs
 
-| Verb                | Speech act (ADR-025) | Args                       | What it does                                                                                                                                                                                                                                                                                                                                                           |
-| ------------------- | -------------------- | -------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `schedule.remind`   | commissive           | `content`, `at`, `repeat?` | Create a `scheduled_event` note with `event_type="remind"`. `content` is the reminder body. `at` is ISO 8601. `repeat` is optional recurrence.                                                                                                                                                                                                                         |
-| `schedule.schedule` | commissive           | `action`, `at`, `repeat?`  | Create a `scheduled_event` note with `event_type="schedule"`. `action` is a serialized verb+args payload — a single, exactly-registered pack-prefixed verb call with only literal args and all required args present (issue #461; stricter than plain request-DSL parseability, since it must survive trigger-time replay unmodified). `at` and `repeat` are as above. |
-| `schedule.agenda`   | assertive            | `from?`, `to?`, `limit?`   | List `scheduled_event` notes with `status="pending"`, ordered by `trigger_at` ascending. `from` / `to` are ISO 8601 window bounds. Default `limit=20`.                                                                                                                                                                                                                 |
-| `schedule.cancel`   | declaration          | `id`                       | Set `properties.status = "cancelled"` and record `cancelled_at`. Returns the updated event envelope.                                                                                                                                                                                                                                                                   |
+| Verb                | Speech act (ADR-025) | Args                       | What it does                                                                                                                                                                                                                                                                                                                                                                            |
+| ------------------- | -------------------- | -------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `schedule.remind`   | commissive           | `content`, `at`, `repeat?` | Create a `scheduled_event` note with `event_type="remind"`. `content` is the reminder body. `at` is ISO 8601. `repeat` is optional recurrence.                                                                                                                                                                                                                                          |
+| `schedule.schedule` | commissive           | `action`, `at`, `repeat?`  | Create a `scheduled_event` note with `event_type="schedule"`. `action` is a serialized verb+args payload — a single, exactly-registered pack-prefixed verb call with only literal args and all required args present (issue #461; stricter than plain request-DSL parseability, since it must survive trigger-time replay unmodified). `at` and `repeat` are as above.                  |
+| `schedule.agenda`   | assertive            | `from?`, `to?`, `limit?`   | List `scheduled_event` notes with `status="pending"`, ordered by `trigger_at` ascending. `from` / `to` are ISO 8601 window bounds. Default `limit=20`. On the MCP surface, the loop-owning host additionally decorates the result with process-local `ticker.last_tick_at` under [ADR-106 Amendment D](ADR-106-schedule-pack-executor.md); the pack handler itself remains intent-only. |
+| `schedule.cancel`   | declaration          | `id`                       | Set `properties.status = "cancelled"` and record `cancelled_at`. Returns the updated event envelope.                                                                                                                                                                                                                                                                                    |
 
 #### Recurrence specification
 
@@ -315,9 +317,8 @@ Trigger evaluation — reading pending `scheduled_event` notes, checking `trigge
 the current time, and dispatching the stored payload — is **not performed by the pack in
 process**. The pack stores intent. Two supported execution modes:
 
-1. **`kkernel scheduler` daemon mode** (future): `kkernel scheduler --db <path>` polls
-   pending events and dispatches them via the internal verb registry. This mode is deferred
-   to a future implementation ADR.
+1. **Warm-daemon mode**: the ADR-119-supervised `schedule-tick` component polls pending
+   events and dispatches them through the daemon's live multi-backend verb registry.
 2. **External scheduler integration**: An operator configures OS cron or an external scheduler
    to call `kkernel exec --pending-events` at an appropriate polling interval (minimum 1
    minute). The command fetches `schedule.agenda()`, dispatches due events, and marks them `fired`.
@@ -328,9 +329,11 @@ execution environment decides when and how to evaluate triggers.
 #### `schedule` payload security
 
 The `action` payload accepted by `schedule` is a verb+args string interpreted by the request
-DSL parser (ADR-016). The payload runs with the permissions of the namespace that created the
-scheduled event — the same authorization gate (ADR-018) applies at dispatch time as at write
-time. Agents cannot escalate privileges by storing a payload with a different actor identity.
+DSL parser (ADR-016). The payload runs with the namespace and persisted actor identity that
+created the scheduled event — the same authorization gate (ADR-018) applies at dispatch time
+as at write time. The daemon actor is never substituted. Legacy generic rows lacking creator
+identity fail closed under ADR-119, so agents cannot escalate privileges by storing a payload
+for later replay by a more privileged daemon.
 
 #### Storage profile
 
@@ -514,9 +517,9 @@ standard `delete(id)` path.
 - `inbox` performance at large message volumes depends on a filtered scan on notes where
   `kind="message"` and `properties.direction="inbound"`. At thousands of messages, a
   promoted column or auxiliary index will be needed. Deferred until benchmarked.
-- Trigger evaluation for scheduled events is out of scope for the pack. Operators must wire
-  either daemon mode (future) or an external scheduler. This is the correct separation but
-  creates an operator onboarding step not present in the other three packs.
+- Trigger evaluation for scheduled events is out of scope for the pack. The warm daemon's
+  ADR-119 component owns the default executor; an external scheduler remains an optional,
+  CAS-safe fallback. This preserves the intent/execution separation across crate boundaries.
 - Cross-namespace messaging is gated on the sender's `actor.allowed_outbound_namespaces`
   allowlist (specified 2026-06-15; see "Cross-namespace messaging" section above). The field
   defaults to empty, preserving the prior deny-all behavior for existing deployments.

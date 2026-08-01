@@ -3,6 +3,7 @@
 **Status**: accepted (2026-07-19)\
 **Date**: 2026-07-19\
 **Scope**: daemon-resident work that is not a caller-invoked operation\
+**Amended**: 2026-08-01 (schedule reference migration delivered, Amendment 4)\
 **Amended by**: [ADR-122](ADR-122-email-outbound-delivery.md) (email Phase 2)
 
 ## Context
@@ -630,3 +631,72 @@ allowlist failure, transient retry/backoff, a fault between transport
 acceptance and durable stamp with same-Message-ID redelivery, and distinct
 supervisor health rows for `email-channel` and `email-outbound`. Static binary
 inspection or a roster-string match alone is not delivery evidence.
+
+---
+
+## Amendment 4: Schedule Reference Migration Delivered (2026-08-01)
+
+**Status**: accepted (2026-08-01)\
+**Trigger**: issue #1409 identified that the shipped schedule drain still used a detached
+task despite this ADR selecting it as the reference supervised component. Issue #1352
+also required positive quiet-agenda liveness without turning the internal generic health
+registry into a public component-inspection API.
+
+### Decision
+
+The reference migration is delivered as a host-owned dynamic registration named
+`schedule-tick`. It is dynamic, rather than an `inventory` submission, because the factory
+must capture the exact schedule-pack runtime produced by resolved backend routing. The host
+adds it after pack resolution only for daemon role and only when the schedule pack exists;
+client/stdio processes and schedule-absent daemons add none. Static externally linked
+registrations and this dynamic host registration enter the same supervisor and roster.
+
+The schedule registration fixes the following concrete policy:
+
+- restart class `OnFailure`, with five restarts over the daemon process lifetime;
+- exponential backoff from 1 second to a 60-second cap;
+- a 5-second cooperative shutdown bound, clamped inside the daemon drain window;
+- cancellation observed between ticks through `HostContext::cancellation()`;
+- component heartbeat after every successful drain, including an empty drain; and
+- drain-level errors returned as retryable component failures, while per-event failures
+  remain absorbed in `DrainSummary` and spend no restart budget.
+
+The supervisor task is registered through `track_background_task`; cancellation therefore
+runs before/concurrently with the daemon's bounded drain and the detached schedule task is
+removed from both serve entrypoints.
+
+### Identity fence and migration policy
+
+The accepted identity fence is delivered in the same migration. `schedule.schedule`
+persists `created_by_actor`, and replay supplies it as the explicit request actor while
+retaining the row namespace. Gate checks, audit records, and writes therefore execute as
+the creator rather than the daemon. A policy test denies `create` to the creator while
+allowing the daemon and proves the scheduled side effect remains denied.
+
+Generic legacy rows without `created_by_actor` fail closed and terminally: no dispatch
+occurs, `status` becomes `failed`, and `dispatch_error`/`dispatch_failed_at` record the
+policy failure. ADR-106 Amendment C's reminder-only fallback is an explicit pre-existing
+migration policy and remains unchanged. Ordinary generic dispatch failures remain
+per-event, persist the same error fields, and follow normal cadence finalization.
+
+### Health compatibility
+
+The generic `HealthReporter` remains in-process operator state and gains no public verb,
+resource, notification, or schema. ADR-106 Amendment D separately authorizes the narrow
+host decoration `schedule.agenda.ticker.last_tick_at`: it is a schedule-loop attempt
+timestamp, not a serialization of component status. It advances before a drain attempt,
+whereas the generic component heartbeat advances only after a successful cycle. This
+preserves the public-health fence here while satisfying schedule's separate liveness
+contract.
+
+### Verification
+
+- Dynamic roster tests prove exactly one `schedule-tick` with a resolved schedule runtime
+  and none without it; the serve role gate proves client processes start zero components.
+- A supervised quiet-drain test proves heartbeat advancement and cooperative cancellation
+  to terminal `Stopped` without consuming restart budget.
+- Existing generic supervisor tests continue to cover retryable/permanent failure, panic,
+  budget exhaustion, cancellation, timeout/abort, and independent progress.
+- Schedule drain tests prove creator-bound gate evaluation and legacy generic fail-closed
+  behavior; schedule-pack tests prove both creation verbs persist the creator.
+- Existing multi-backend and CAS regressions remain the routing and state-machine fences.

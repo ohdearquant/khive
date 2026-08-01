@@ -9,7 +9,7 @@ The schedule pack for khive — time-triggered intent storage (`remind`,
 | ------------------- | ----------------------------------------------------------------------- |
 | `schedule.remind`   | Deliver a time-triggered reminder to your inbox                         |
 | `schedule.schedule` | Schedule a future verb dispatch (a DSL string, validated at write time) |
-| `schedule.agenda`   | List upcoming scheduled events, optionally within a time window         |
+| `schedule.agenda`   | List upcoming events; MCP also reports process-local ticker liveness    |
 | `schedule.cancel`   | Cancel a scheduled event                                                |
 
 `at` is an RFC 3339 timestamp; `repeat` accepts `daily` / `weekly` / `monthly`
@@ -25,10 +25,14 @@ This pack creates and queries `scheduled_event` notes; the daemon or pending-eve
 runner evaluates their triggers. At fire time, `schedule.remind` delivers its
 content to the creating actor's inbox through the same dual-write path as
 `comm.send`. Use `schedule.schedule(action="comm.send(...)")` when the recipient
-is a different actor. `schedule.schedule`'s `action` parameter
+is a different actor. Both creation verbs persist `created_by_actor`.
+Generic actions replay under that stored actor for gate checks, audit attribution,
+and writes; they never inherit the daemon's authority. A legacy generic row without
+creator attribution fails closed instead of being dispatched. `schedule.schedule`'s
+`action` parameter
 is a full verb-dispatch string (e.g.
 `"schedule.remind(content=\"hello\", at=\"2099-06-01T09:00:00Z\")"`) that must
-satisfy a stricter *replayable* contract, validated at write time (issue
+satisfy a stricter _replayable_ contract, validated at write time (issue
 \#461): a single call (no chains, no `$prev` references) against an
 exactly-registered, pack-prefixed verb name, with only literal argument
 values and every one of that verb's own required arguments present. This is
@@ -38,8 +42,15 @@ pending-events runner re-parses and re-dispatches the stored string
 unmodified at trigger time. An `action` that fails any of these checks is
 rejected before the event is stored, not at trigger time. Reading pending
 events and dispatching at `trigger_at` is the execution environment's
-responsibility (the daemon tick or an external cron / cloud scheduler invoking
-the pending-event runner).
+responsibility (the ADR-119-supervised daemon component or an external cron / cloud
+scheduler invoking the pending-event runner).
+
+On the MCP surface, the host decorates `schedule.agenda` with
+`ticker.last_tick_at`. It is null until the current server process observes a daemon tick
+and then advances on every tick, including empty agendas. The value is process-local and
+never stored with schedule intent, so restarting the server resets it instead of exposing
+a predecessor's heartbeat as current liveness. Direct `SchedulePack` registry dispatch has
+no host loop to report and therefore retains the pack-only `{events, count}` result.
 
 ## Usage
 

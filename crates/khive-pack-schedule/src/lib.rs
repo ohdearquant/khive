@@ -2,7 +2,7 @@
 //!
 //! All verbs operate on `scheduled_event` notes. At fire time, the execution
 //! environment delivers reminders to the creating actor's inbox and dispatches
-//! scheduled actions.
+//! scheduled actions under the persisted creator identity.
 pub mod handlers;
 mod pack;
 mod tests;

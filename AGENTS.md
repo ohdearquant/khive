@@ -193,7 +193,7 @@ or `comm.thread`.
 | ------------------- | --------------------------------------------- | ------------------------------------------------------------- |
 | `schedule.remind`   | Deliver a reminder to your inbox at fire time | "Remind me to X at Y"                                         |
 | `schedule.schedule` | Schedule a future verb dispatch               | Deferred or cross-actor actions (action is a DSL verb string) |
-| `schedule.agenda`   | List upcoming scheduled events                | "What's on the calendar?"                                     |
+| `schedule.agenda`   | List upcoming events and ticker liveness      | "What's on the calendar, and is its ticker running?"          |
 | `schedule.cancel`   | Cancel a scheduled event                      | Remove a pending reminder/action                              |
 
 ### Knowledge pack — 19 verbs (`knowledge.` prefix)

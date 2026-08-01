@@ -4,10 +4,12 @@
 //! A daemon component is not a verb. It is host-constructed background work
 //! (channel ingest loops, drains, maintenance scans) supervised by this
 //! registry for cancellation, restart budgets, backoff, health, and bounded
-//! shutdown. Components register at link time through `inventory`
+//! shutdown. External components register at link time through `inventory`
 //! (ADR-119 Amendment 1), so a distribution binary's components participate
-//! without this crate naming any of them; a plain core build has an empty
-//! inventory and the registry is a no-op beyond the startup roster line.
+//! without this crate naming any of them. The host additionally contributes
+//! the dynamic `schedule-tick` registration when its resolved pack set carries
+//! a schedule runtime (ADR-119 Amendment 4); a plain core build still has an
+//! empty external inventory.
 //!
 //! Supervision joins the daemon's existing shutdown path: every supervisor
 //! task is registered through `track_background_task`, and cancellation
@@ -98,6 +100,61 @@ pub struct DaemonComponentRegistration {
 
 inventory::collect!(DaemonComponentRegistration);
 
+type ComponentFactory = Arc<dyn Fn(HostContext) -> ComponentFuture + Send + Sync + 'static>;
+
+#[derive(Clone)]
+struct ComponentRegistration {
+    name: &'static str,
+    restart: RestartClass,
+    max_restarts: u32,
+    backoff_initial_ms: u64,
+    backoff_max_ms: u64,
+    shutdown_timeout_ms: u64,
+    start: ComponentFactory,
+}
+
+impl From<&'static DaemonComponentRegistration> for ComponentRegistration {
+    fn from(reg: &'static DaemonComponentRegistration) -> Self {
+        let start = reg.start;
+        Self {
+            name: reg.name,
+            restart: reg.restart,
+            max_restarts: reg.max_restarts,
+            backoff_initial_ms: reg.backoff_initial_ms,
+            backoff_max_ms: reg.backoff_max_ms,
+            shutdown_timeout_ms: reg.shutdown_timeout_ms,
+            start: Arc::new(move |ctx| start(ctx)),
+        }
+    }
+}
+
+const SCHEDULE_COMPONENT_NAME: &str = "schedule-tick";
+const SCHEDULE_MAX_RESTARTS: u32 = 5;
+const SCHEDULE_BACKOFF_INITIAL_MS: u64 = 1_000;
+const SCHEDULE_BACKOFF_MAX_MS: u64 = 60_000;
+const SCHEDULE_SHUTDOWN_TIMEOUT_MS: u64 = 5_000;
+
+fn schedule_component_registration(
+    runtime: khive_runtime::KhiveRuntime,
+    interval: Duration,
+) -> ComponentRegistration {
+    ComponentRegistration {
+        name: SCHEDULE_COMPONENT_NAME,
+        restart: RestartClass::OnFailure,
+        max_restarts: SCHEDULE_MAX_RESTARTS,
+        backoff_initial_ms: SCHEDULE_BACKOFF_INITIAL_MS,
+        backoff_max_ms: SCHEDULE_BACKOFF_MAX_MS,
+        shutdown_timeout_ms: SCHEDULE_SHUTDOWN_TIMEOUT_MS,
+        start: Arc::new(move |ctx| {
+            Box::pin(crate::pending_events::schedule_tick_loop(
+                runtime.clone(),
+                ctx,
+                interval,
+            ))
+        }),
+    }
+}
+
 /// Supervisor-observed component state.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ComponentState {
@@ -132,8 +189,9 @@ impl Default for ComponentStatus {
 }
 
 /// Process-local component status registry. Operator-visible through
-/// structured logs; the snapshot is in-process only — ADR-119 adds no wire
-/// surface for it.
+/// structured logs; the snapshot is in-process only — ADR-119 adds no generic
+/// wire surface for it. ADR-106's narrow schedule-attempt timestamp is tracked
+/// separately by `KhiveMcpServer` and is not a serialization of these rows.
 #[derive(Clone, Default)]
 pub struct HealthReporter {
     inner: Arc<Mutex<HashMap<&'static str, ComponentStatus>>>,
@@ -212,6 +270,22 @@ pub struct HostContext {
 }
 
 impl HostContext {
+    pub(crate) fn new(
+        server: KhiveMcpServer,
+        cancellation: CancellationToken,
+        name: &'static str,
+        health: HealthReporter,
+    ) -> Self {
+        Self {
+            actor: server.actor_id().map(str::to_string),
+            namespace: server.default_namespace().to_string(),
+            server,
+            cancellation,
+            name,
+            health,
+        }
+    }
+
     pub fn server(&self) -> &KhiveMcpServer {
         &self.server
     }
@@ -251,18 +325,64 @@ impl HostContext {
 /// one — so zero-components-where-N-expected is one visible line at daemon
 /// startup. Call only from a daemon-role process.
 pub fn start_daemon_components(server: &KhiveMcpServer) -> usize {
-    let regs: Vec<&'static DaemonComponentRegistration> =
-        inventory::iter::<DaemonComponentRegistration>().collect();
-    start_components(
-        &regs,
+    start_daemon_components_with_schedule(server, None)
+}
+
+/// Start the linked daemon components plus the host-owned schedule drain when
+/// the daemon resolved the `schedule` pack. The schedule component is dynamic
+/// because it must capture that exact pack runtime; reconstructing a runtime
+/// here can point the drain at a different backend (ADR-106, PR #782).
+pub(crate) fn start_daemon_components_with_schedule(
+    server: &KhiveMcpServer,
+    schedule_runtime: Option<khive_runtime::KhiveRuntime>,
+) -> usize {
+    let regs = component_registrations(schedule_runtime);
+    start_component_registrations(
+        regs,
         server,
         khive_runtime::daemon_shutdown_token(),
         component_health().clone(),
     )
 }
 
+fn component_registrations(
+    schedule_runtime: Option<khive_runtime::KhiveRuntime>,
+) -> Vec<ComponentRegistration> {
+    let linked: Vec<&'static DaemonComponentRegistration> =
+        inventory::iter::<DaemonComponentRegistration>().collect();
+    let mut regs: Vec<ComponentRegistration> = linked
+        .into_iter()
+        .map(ComponentRegistration::from)
+        .collect();
+    if let Some(runtime) = schedule_runtime {
+        regs.push(schedule_component_registration(
+            runtime,
+            crate::pending_events::tick_interval_from_env(),
+        ));
+    }
+    regs
+}
+
+#[cfg(test)]
 fn start_components(
     regs: &[&'static DaemonComponentRegistration],
+    server: &KhiveMcpServer,
+    parent: CancellationToken,
+    health: HealthReporter,
+) -> usize {
+    start_component_registrations(
+        regs.iter()
+            .copied()
+            .map(ComponentRegistration::from)
+            .collect(),
+        server,
+        parent,
+        health,
+    )
+}
+
+fn start_component_registrations(
+    regs: Vec<ComponentRegistration>,
     server: &KhiveMcpServer,
     parent: CancellationToken,
     health: HealthReporter,
@@ -287,6 +407,7 @@ fn start_components(
             );
         }
     }
+    let count = regs.len();
     for reg in regs {
         khive_runtime::track_background_task(supervise(
             reg,
@@ -295,7 +416,7 @@ fn start_components(
             health.clone(),
         ));
     }
-    regs.len()
+    count
 }
 
 /// Reserved slice of the drain window for post-grace supervisor work: the
@@ -324,7 +445,7 @@ fn jitter_ms(backoff_ms: u64) -> u64 {
 }
 
 async fn supervise(
-    reg: &'static DaemonComponentRegistration,
+    reg: ComponentRegistration,
     server: KhiveMcpServer,
     token: CancellationToken,
     health: HealthReporter,
@@ -349,14 +470,7 @@ async fn supervise(
             restart = restarts,
             "daemon component: starting"
         );
-        let ctx = HostContext {
-            server: server.clone(),
-            actor: server.actor_id().map(str::to_string),
-            namespace: server.default_namespace().to_string(),
-            cancellation: token.clone(),
-            name: reg.name,
-            health: health.clone(),
-        };
+        let ctx = HostContext::new(server.clone(), token.clone(), reg.name, health.clone());
         // A separate task per run isolates panics at the task boundary: a
         // panicking component surfaces as a JoinError here instead of
         // unwinding through the supervisor.
@@ -549,6 +663,91 @@ mod tests {
         let started = start_components(&[], &server, CancellationToken::new(), health.clone());
         assert_eq!(started, 0);
         assert!(health.snapshot().is_empty());
+    }
+
+    #[test]
+    fn schedule_roster_contains_exactly_one_dynamic_component_when_resolved() {
+        let (_f, db) = tmp_db();
+        let cfg = RuntimeConfig {
+            db_path: Some(std::path::PathBuf::from(db)),
+            default_namespace: Namespace::parse("local").unwrap(),
+            embedding_model: None,
+            additional_embedding_models: vec![],
+            packs: vec!["kg".to_string(), "schedule".to_string()],
+            ..Default::default()
+        };
+        let rt = KhiveRuntime::new(cfg).expect("runtime");
+
+        let absent = component_registrations(None)
+            .into_iter()
+            .filter(|reg| reg.name == SCHEDULE_COMPONENT_NAME)
+            .count();
+        let present: Vec<_> = component_registrations(Some(rt))
+            .into_iter()
+            .filter(|reg| reg.name == SCHEDULE_COMPONENT_NAME)
+            .collect();
+
+        assert_eq!(absent, 0, "pack-absent roster must omit schedule-tick");
+        assert_eq!(
+            present.len(),
+            1,
+            "resolved schedule pack contributes one ticker"
+        );
+        let reg = &present[0];
+        assert_eq!(reg.restart, RestartClass::OnFailure);
+        assert_eq!(reg.max_restarts, 5);
+        assert_eq!(reg.backoff_initial_ms, 1_000);
+        assert_eq!(reg.backoff_max_ms, 60_000);
+        assert_eq!(reg.shutdown_timeout_ms, 5_000);
+    }
+
+    #[tokio::test]
+    async fn supervised_schedule_component_heartbeats_and_stops_cooperatively() {
+        let (_f, db) = tmp_db();
+        let cfg = RuntimeConfig {
+            db_path: Some(std::path::PathBuf::from(&db)),
+            default_namespace: Namespace::parse("local").unwrap(),
+            embedding_model: None,
+            additional_embedding_models: vec![],
+            packs: vec!["kg".to_string(), "schedule".to_string()],
+            ..Default::default()
+        };
+        let rt = KhiveRuntime::new(cfg).expect("runtime");
+        let server = KhiveMcpServer::new(rt.clone()).expect("server");
+        let health = HealthReporter::default();
+        let parent = CancellationToken::new();
+
+        let started = start_component_registrations(
+            vec![schedule_component_registration(
+                rt,
+                Duration::from_millis(10),
+            )],
+            &server,
+            parent.clone(),
+            health.clone(),
+        );
+        assert_eq!(started, 1);
+        for _ in 0..400 {
+            if health
+                .status(SCHEDULE_COMPONENT_NAME)
+                .is_some_and(|status| status.last_heartbeat.is_some())
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(
+            health
+                .status(SCHEDULE_COMPONENT_NAME)
+                .is_some_and(|status| status.last_heartbeat.is_some()),
+            "quiet agenda drains must still prove liveness"
+        );
+
+        parent.cancel();
+        let status =
+            wait_for_state(&health, SCHEDULE_COMPONENT_NAME, ComponentState::Stopped).await;
+        assert_eq!(status.restart_count, 0);
+        assert!(status.last_error.is_none());
     }
 
     static DUP_A_RUNS: AtomicU32 = AtomicU32::new(0);
