@@ -1885,6 +1885,11 @@ async fn issue_ingest_never_echoes_credential_shaped_state_reason() {
         "the raw credential-shaped stateReason must never appear in report.warnings: {:?}",
         report.warnings
     );
+    assert_eq!(
+        report.writes_refused, 0,
+        "a governed-field validation failure is not a secret-gate refusal"
+    );
+    assert!(report.write_refusals.is_empty());
 
     let issues_list = registry
         .dispatch("list", json!({"kind": "issue", "limit": 10}))
@@ -3135,6 +3140,122 @@ async fn digest_verb_auto_creates_project_and_enriches_references() {
         precedes_hits[0]["id"].as_str().unwrap(),
         closing["id"].as_str().unwrap()
     );
+}
+
+/// A per-record secret-gate refusal remains non-fatal so the rest of the
+/// digest can land, but the public result must make the partial outcome
+/// mechanically detectable and identify the refused write without echoing
+/// the rejected content.
+#[tokio::test]
+async fn digest_verb_counts_and_describes_partial_secret_gate_refusals() {
+    let _guard = ENV_MUTEX.lock().await;
+    let (_rt, _token, registry) = fixture().await;
+
+    let project_id = create(
+        &registry,
+        json!({"kind": "project", "name": "refusal-accounting-repo"}),
+    )
+    .await;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo: PathBuf = dir.path().join("repo");
+    std::fs::create_dir_all(&repo).expect("mk repo dir");
+    init_repo(&repo);
+
+    let bin_dir = dir.path().join("bin");
+    std::fs::create_dir_all(&bin_dir).expect("mk bin dir");
+    let log_dir = dir.path().join("log");
+    std::fs::create_dir_all(&log_dir).expect("mk log dir");
+
+    const CREDENTIAL: &str = "ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+    let pr_json = json!([
+        {
+            "number": 1,
+            "title": "clean pull request",
+            "author": {"login": "contributor"},
+            "createdAt": "2026-01-01T00:00:00Z",
+            "mergedAt": null,
+            "closedAt": null,
+            "updatedAt": "2026-01-01T00:00:00Z",
+            "baseRefName": "main",
+            "headRefName": "feature/clean",
+            "mergeCommit": null,
+            "body": "ordinary content"
+        },
+        {
+            "number": 2,
+            "title": "refused pull request",
+            "author": {"login": "contributor"},
+            "createdAt": CREDENTIAL,
+            "mergedAt": null,
+            "closedAt": null,
+            "updatedAt": "2026-01-02T00:00:00Z",
+            "baseRefName": "main",
+            "headRefName": "feature/refused",
+            "mergeCommit": null,
+            "body": "ordinary content"
+        }
+    ])
+    .to_string();
+    write_fake_gh(&bin_dir, &log_dir, &pr_json, "[]");
+    let _path_guard = PathGuard::install(&bin_dir);
+
+    let result = registry
+        .dispatch(
+            "git.digest",
+            json!({
+                "source": repo.to_str().expect("utf-8 repo path"),
+                "project": project_id.to_string(),
+                "max_items": 10,
+                "include": ["pull_requests"]
+            }),
+        )
+        .await
+        .expect("a partial refusal remains an in-band digest result");
+
+    assert_eq!(
+        result["prs_ingested"], 1,
+        "the clean write must land: {result}"
+    );
+    assert_eq!(
+        result["writes_refused"], 1,
+        "callers must be able to assert zero refused writes: {result}"
+    );
+    let refusals = result["write_refusals"]
+        .as_array()
+        .expect("write_refusals array");
+    assert_eq!(refusals.len(), 1, "one detail per counted refusal");
+    assert_eq!(refusals[0]["verb"], "create");
+    assert_eq!(refusals[0]["record_kind"], "pull_request");
+    assert_eq!(refusals[0]["record_key"], "#2");
+    assert!(
+        refusals[0]["detector"]
+            .as_str()
+            .is_some_and(|d| !d.is_empty()),
+        "the detector must be named: {refusals:?}"
+    );
+    assert!(
+        refusals[0]["masked"]
+            .as_str()
+            .is_some_and(|m| !m.is_empty()),
+        "the masked diagnostic must be present: {refusals:?}"
+    );
+    assert!(
+        !result.to_string().contains(CREDENTIAL),
+        "the rejected content must never be copied into the result: {result}"
+    );
+
+    let stored = registry
+        .dispatch("list", json!({"kind": "pull_request", "limit": 10}))
+        .await
+        .expect("list pull requests");
+    let numbers: Vec<u64> = stored
+        .as_array()
+        .expect("list result array")
+        .iter()
+        .filter_map(|item| item["properties"]["number"].as_u64())
+        .collect();
+    assert_eq!(numbers, vec![1], "only the clean record may persist");
 }
 
 /// `max_items` bounds work per call and the response is cursor-resumable:

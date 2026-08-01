@@ -55,7 +55,13 @@ git.digest(source, project?, max_items?, include?)
 Return shape: the existing `IngestReport` (counts, skips, warnings, `gh_available`)
 extended with `done: bool`, `project_id`, `project_created: bool`, and
 `commit_embeddings_truncated: u64` (count of commits whose vector-embedding input was
-capped this pass; see "Commit embedding truncation" below).
+capped this pass; see "Commit embedding truncation" below). It also includes
+`writes_refused: u64` and `write_refusals: [...]`: a per-call secret-gate refusal count
+and one safe structured diagnostic per refused record write. Each diagnostic names the
+attempted verb, record kind, trusted natural key, detector, and masked excerpt; it never
+copies the rejected content. Per-record refusal remains non-fatal so the pass can surface
+all affected records and ingest clean siblings, but a caller requiring a clean run must
+assert `writes_refused == 0` as well as loop until `done == true`.
 
 ### Remote-URL mode
 
@@ -84,7 +90,10 @@ capped this pass; see "Commit embedding truncation" below).
 - Local-path mode requires an absolute path; relative paths are rejected. The path must
   contain a `.git` directory; arbitrary directory walking is not performed.
 - Secret masking is unchanged: ingested text goes through the same `create`-verb gate
-  (ADR-088 acceptance note 5). Blocked writes surface as report warnings, fail-closed.
+  (ADR-088 acceptance note 5). Blocked writes remain fail-closed and surface both as
+  warnings and through the result's `writes_refused` / `write_refusals` contract. This
+  accounting is call-local rather than a process-global daemon counter, so overlapping
+  digest calls cannot make one caller's zero-refusal assertion ambiguous.
 - Namespace/attribution: writes stamp the caller's token namespace exactly as the CLI
   ingester does today; no new authorization surface. The Gate (ADR-018) remains the
   authorization seam for callers who should not write.

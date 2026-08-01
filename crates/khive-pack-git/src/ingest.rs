@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use uuid::Uuid;
 
-use khive_runtime::{secret_gate, KhiveRuntime, NamespaceToken, VerbRegistry};
+use khive_runtime::{secret_gate, KhiveRuntime, NamespaceToken, RuntimeError, VerbRegistry};
 use khive_storage::types::{SqlStatement, SqlValue};
 
 use crate::hook;
@@ -99,6 +99,21 @@ struct NewRecordForRef {
     text: String,
 }
 
+/// Caller-visible detail for one content write the secret gate refused.
+///
+/// The record key is a trusted natural key (commit SHA or GitHub number),
+/// and the secret itself is represented only by [`secret_gate::SecretMatch`]'s
+/// detector name and masked excerpt. The rejected content is never copied
+/// into the report.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct IngestWriteRefusal {
+    pub verb: String,
+    pub record_kind: String,
+    pub record_key: String,
+    pub detector: String,
+    pub masked: String,
+}
+
 /// Outcome of one ingest pass. Serializable so CLI callers can emit it as JSON.
 #[derive(Debug, Default, Serialize)]
 pub struct IngestReport {
@@ -112,6 +127,14 @@ pub struct IngestReport {
     /// skipped but commits still ingested (ADR-088 §5 graceful-absence rule).
     pub gh_available: bool,
     pub warnings: Vec<String>,
+    /// Number of per-record content writes refused by the runtime secret gate
+    /// during this pass. Callers can assert this is zero independently of
+    /// unrelated warnings.
+    pub writes_refused: u64,
+    /// Safe structured details for every entry counted by `writes_refused`.
+    /// Each item names the refused verb and record without echoing the
+    /// rejected content.
+    pub write_refusals: Vec<IngestWriteRefusal>,
     /// `false` when `max_items` was exhausted before this pass reached the
     /// end of every included kind's history — callers loop until `true`
     /// (ADR-088 Amendment 1). Always `true` for an unbounded
@@ -166,6 +189,28 @@ pub struct IngestReport {
     /// to compare directly against an independent source of truth (e.g.
     /// `git rev-list --count <ref>`).
     pub commits_total_in_db: u64,
+}
+
+fn record_write_failure(
+    report: &mut IngestReport,
+    verb: &str,
+    record_kind: &str,
+    record_key: String,
+    error: RuntimeError,
+) {
+    if let RuntimeError::SecretDetected(secret) = &error {
+        report.writes_refused += 1;
+        report.write_refusals.push(IngestWriteRefusal {
+            verb: verb.to_string(),
+            record_kind: record_kind.to_string(),
+            record_key: record_key.clone(),
+            detector: secret.detector.to_string(),
+            masked: secret.masked.clone(),
+        });
+    }
+    report
+        .warnings
+        .push(format!("{verb} {record_kind} {record_key}: {error}"));
 }
 
 /// Run one ingest pass over `opts.repo`: issues + PRs first (via `gh`, when
@@ -1084,9 +1129,7 @@ async fn ingest_commits(
                 }
             }
             Err(e) => {
-                report
-                    .warnings
-                    .push(format!("create commit {}: {e}", c.sha));
+                record_write_failure(report, "create", "commit", c.sha.clone(), e);
                 cursor_stalled = true;
             }
         }
@@ -1559,9 +1602,13 @@ async fn ingest_prs(
             {
                 Ok(v) => v,
                 Err(e) => {
-                    report
-                        .warnings
-                        .push(format!("create pull_request #{}: {e}", masked.number));
+                    record_write_failure(
+                        report,
+                        "create",
+                        "pull_request",
+                        format!("#{}", masked.number),
+                        e,
+                    );
                     cursor_stalled = true;
                     continue;
                 }
@@ -1752,7 +1799,7 @@ async fn ingest_issues(
             {
                 Ok(v) => v,
                 Err(e) => {
-                    report.warnings.push(format!("create issue #{number}: {e}"));
+                    record_write_failure(report, "create", "issue", format!("#{number}"), e);
                     cursor_stalled = true;
                     continue;
                 }

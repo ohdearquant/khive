@@ -89,13 +89,14 @@ pub async fn run_git_ingest(args: GitIngestArgs) -> Result<()> {
 
     if args.human {
         println!(
-            "commits: {} ingested, {} skipped\nissues: {} ingested, {} skipped\nprs: {} ingested, {} skipped\ngh_available: {}",
+            "commits: {} ingested, {} skipped\nissues: {} ingested, {} skipped\nprs: {} ingested, {} skipped\nwrites refused by secret gate: {}\ngh_available: {}",
             report.commits_ingested,
             report.commits_skipped_existing,
             report.issues_ingested,
             report.issues_skipped_existing,
             report.prs_ingested,
             report.prs_skipped_existing,
+            report.writes_refused,
             report.gh_available,
         );
         for w in &report.warnings {
