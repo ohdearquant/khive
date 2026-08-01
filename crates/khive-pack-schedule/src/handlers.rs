@@ -769,6 +769,7 @@ pub(crate) async fn handle_schedule(
         "repeat": p.repeat,
         "status": "pending",
         "event_type": "schedule",
+        "created_by_actor": token.actor().id.clone(),
         "payload": p.action,
         "fired_at": null,
         "cancelled_at": null,
