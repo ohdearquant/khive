@@ -56,7 +56,7 @@ The periodic tick stays PASSIVE-only and non-blocking; on top of it,
 `checkpoint_once` also evaluates a much rarer escalation to `PRAGMA
 wal_checkpoint(TRUNCATE)` once the WAL has grown past
 `truncate_high_water_pages` and at least `truncate_min_interval` has elapsed
-since the last TRUNCATE *attempt* (not the last successful reclaim).
+since the last TRUNCATE _attempt_ (not the last successful reclaim).
 
 This is a **single writer checkout per tick**: PASSIVE and any due TRUNCATE
 both run under the one guard `checkpoint_once` already holds — there is
@@ -135,6 +135,24 @@ backend is in-memory and only secondary file-backed tasks are spawned, the
 first secondary task owns emission. Other tasks receive no owner, so the API
 cannot silently discard a caller-supplied event store based on `is_main`.
 
+Lifecycle persistence is isolated from the scheduler (issue #1434). The task
+serializes each outcome and uses a zero-wait `try_send` into a dedicated append
+worker with capacity for one queued event behind the append in progress. If
+both slots are occupied, that outcome is dropped; the first drop in each
+uninterrupted full-queue episode warns, and a later successful enqueue re-arms
+the warning. The worker logs sink failures and continues. This preserves
+accepted-event order and bounds work and memory under writer contention while
+ensuring event-store checkout or SQLite busy waits cannot delay a later
+PASSIVE/TRUNCATE cycle. Checkpoint-task shutdown aborts the scheduler-owned
+async worker instead of waiting for its current append future. That guarantee
+is local to `run_checkpoint_task`, not daemon, runtime, or process shutdown: if
+the event store already admitted the append to `spawn_blocking` or a
+`WriterTask`, aborting the worker does not cancel it, and at most one such sink
+operation may outlive the checkpoint task. If a recovery/drain row meets a full
+queue, the task keeps the elevation episode open and retries that drain on the
+next healthy tick; a dropped enqueue therefore cannot permanently suppress the
+row that closes a previously accepted elevated sequence.
+
 ## Private tx-registry logging helpers (Plank 0)
 
 See `crates/khive-db/src/checkpoint.rs` — `log_tx_registry_oldest_debug`,
@@ -192,8 +210,8 @@ separately: if the oldest entry's `TxId` differs from the previous tick's,
 both latches are force-reset before re-evaluating the new entry's age, even
 though this happens on the SAME tick as the age check (not a separate
 below-threshold tick in between). Without this, an already-latched-`true`
-state from the *departed* entry would silently suppress the crossing for a
-*different* span that replaced it while already stale — naming nobody at
+state from the _departed_ entry would silently suppress the crossing for a
+_different_ span that replaced it while already stale — naming nobody at
 exactly the moment a new long-lived span starts pinning the database, which
 is the scenario this sweep exists to catch. A merely fresher replacement
 still reads as below-threshold either way, so the identity check changes
