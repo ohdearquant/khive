@@ -191,6 +191,49 @@ the wrong value would silently ignore an operator's in-memory isolation request.
 the canonical anchor captured alongside `cfg`, threaded through so fallback construction never
 re-reads a changed `HOME`.
 
+### `exec` daemon-bypass second-writer contract (#548; ADR-067, ADR-099)
+
+**Decision:** keep `exec --save-file` and both `exec --ops-file` modes on the in-process path.
+They do not forward through, stop, or lease a live daemon. If that daemon has the same SQLite
+file open, the CLI runtime is a second process with an independent connection pool. ADR-067's
+writer task and `KHIVE_WRITE_QUEUE=1` serialize writes only inside one pool/process; they do not
+coordinate the CLI process with the daemon. The boot/recovery guard in `exec.rs` protects runtime
+construction and schema initialization only and is dropped before request execution.
+
+Cross-process writes therefore use SQLite's WAL writer lock as their only serialization seam.
+Every normal file-backed connection waits for that lock for `KHIVE_BUSY_TIMEOUT_SECS` (30 seconds
+by default). If the other process still holds the lock when that process-local timeout expires,
+the operation fails with SQLite `BUSY`/`database is locked`. `kkernel exec` does not automatically
+retry: a generic replay is unsafe for non-idempotent verbs and could duplicate a write whose
+outcome the caller has not established.
+
+The observable failure contract stays mode-specific:
+
+- `--save-file` may carry read or write verbs. A contended op's error detail is written to that
+  op's JSONL result row; stdout carries the save manifest, whose `summary` reports the failure
+  counts. `--strict` makes any failed op a non-zero exit; a fully failed invocation is non-zero
+  even without `--strict`.
+- Non-atomic `--ops-file` preserves per-op commits and continues collecting results. A contended
+  op can fail after earlier ops committed; the final summary identifies every failed op.
+  `--strict` makes any failure a non-zero exit, while a fully failed file is always non-zero.
+- `--ops-file --atomic` holds one bounded, DML-only `BEGIN IMMEDIATE` during its commit pass, per
+  ADR-099. Daemon writes wait behind that unit and can fail if its hold exceeds their own busy
+  timeout. Admissibility, prepare, and atomic-unit seam errors return a top-level error and a
+  non-zero exit before an atomic result envelope is printed. A plan-level guard or SQL failure
+  instead prints the additive envelope with `atomic.committed=false` and
+  `atomic.rolled_back=true`; the CLI currently exits zero for that rolled-back outcome, and
+  `--strict` is ignored because it is not meaningful in atomic mode. Callers must inspect
+  `atomic.committed`. The op-count guard bounds the unit; operators should run a large atomic file
+  against an idle daemon or in a maintenance window.
+
+Routing these modes through the daemon remains rejected. `--save-file` is a trusted local output
+sink not represented in `DaemonRequestFrame`; bulk apply deliberately avoids the daemon frame cap,
+and atomic bulk apply would require a new daemon transaction protocol. Refusing based on a daemon
+liveness probe would be racy. Any future daemon-routed design must be an explicit protocol change,
+not a liveness-dependent fallback. Until then, operators configure busy timeouts independently in
+both processes, inspect the complete result before retrying, and retry only operations known to be
+idempotent.
+
 ### `exec.rs` regression test notes
 
 - `strict_mode_rejects_before_daemon_forward_when_comm_and_no_actor`: `run_exec_inline` must
