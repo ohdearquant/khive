@@ -667,35 +667,81 @@ async fn mark_read_target(
     // silently re-inserts the row on conflict). See docs/api/message-lifecycle.md#handlersrshandle_read
     let store = runtime.notes(token)?;
 
-    //
     // `orig_props` is kept as the stored `Option<Value>` (a SQL-NULL
     // properties column is a real, distinct state from `{}`) so a degraded
-    // response can report exactly what is stored; `props` is a
-    // separately-normalized object used only for the attempted patch.
+    // response can report exactly what is stored.
     let orig_props = note.properties.clone();
-    let mut props = orig_props.clone().unwrap_or_else(|| json!({}));
-    props["read"] = json!(true);
     let updated_at = Utc::now().timestamp_micros();
+    let caller_actor = token.actor().id.as_str();
+
+    // Storage-side compare-and-swap: patches only the `$.read` key via
+    // `json_set` instead of overwriting the whole `properties` column with
+    // this call's snapshot (which bulk read's up-to-500-target
+    // validate-then-mark window can leave stale — a concurrent write to any
+    // other property between validation and this call must survive), and
+    // rechecks kind/direction/addressee against the row's *current* state in
+    // the same `UPDATE` — the same eligibility predicate
+    // `validate_read_target` already checked, re-evaluated at mutation time
+    // rather than trusted from an earlier read.
+    let recheck_filter = NoteFilter {
+        kind: Some("message".to_string()),
+        property_filters: vec![
+            PropertyFilter {
+                json_path: "$.direction".to_string(),
+                op: FilterOp::NotInOrMissing(vec![SqlValue::Text("outbound".to_string())]),
+                value: SqlValue::Null,
+            },
+            PropertyFilter {
+                json_path: "$.to_actor".to_string(),
+                op: FilterOp::EqOrMissing,
+                value: SqlValue::Text(caller_actor.to_string()),
+            },
+        ],
+        ..Default::default()
+    };
 
     // Best-effort: under multi-client writer contention the pool checkout can
     // time out. The read itself already succeeded above — failing the whole
     // call over a delivery-state patch would throw away a successful read for
     // a caller who cannot retry the fetch half. Mirrors handle_reply's
-    // fold-in mark-read: `Ok(false)` (no live row
-    // updated, e.g. soft-deleted mid-flight) and `Err` both degrade to
-    // `read: false` + `mark_error` instead of failing the response. A caller
-    // polling unread counts simply sees the message still unread and can
-    // re-issue `read` — self-healing, no retry loop needed here.
+    // fold-in mark-read: `Ok(false)` (no live row currently matches, e.g.
+    // soft-deleted or an eligibility property changed mid-flight) and `Err`
+    // both degrade to `read: false` + `mark_error` instead of failing the
+    // response. A caller polling unread counts simply sees the message still
+    // unread and can re-issue `read` — self-healing, no retry loop needed here.
     let patch_result = store
-        .update_note_properties(id, Some(props.clone()), updated_at)
+        .try_patch_note_property(
+            id,
+            token.namespace().as_str(),
+            &recheck_filter,
+            "$.read",
+            json!(true),
+            updated_at,
+        )
         .await;
+
+    // Only a successful patch needs the fresh row: `read_response`'s
+    // `Ok(false)`/`Err` arms report `orig_props` (what is still stored), not
+    // this value.
+    let patched_properties = if matches!(patch_result, Ok(true)) {
+        match store.get_note(id).await {
+            Ok(Some(fresh)) => fresh.properties.unwrap_or_else(|| json!({})),
+            _ => {
+                let mut fallback = orig_props.clone().unwrap_or_else(|| json!({}));
+                fallback["read"] = json!(true);
+                fallback
+            }
+        }
+    } else {
+        Value::Null
+    };
 
     Ok(read_response(
         short_id(id),
         id.as_hyphenated().to_string(),
         patch_result,
         orig_props,
-        props,
+        patched_properties,
     ))
 }
 
@@ -2336,9 +2382,9 @@ fn build_references_header(parent_chain: Option<&str>, parent_message_id: &str) 
 #[cfg(test)]
 mod tests {
     use super::{
-        build_references_header, heartbeat_note_id, message_id_match_candidates,
+        build_references_header, heartbeat_note_id, mark_read_target, message_id_match_candidates,
         parent_references_chain, parent_wire_message_id, read_response, sanitize_reference_token,
-        wrap_message_id,
+        validate_read_target, wrap_message_id,
     };
     use khive_storage::StorageError;
     use serde_json::{json, Value};
@@ -2747,6 +2793,117 @@ mod tests {
             Value::Null,
             "a stored SQL-NULL properties column must round-trip as JSON \
              null, never as {{}}; got {resp}"
+        );
+    }
+
+    // Regression for the bulk-read lost-update: prevalidation (`validate_read_target`)
+    // snapshots a `Note`, but bulk read's validate-then-mark window can span up to
+    // 500 targets, during which another writer can change an unrelated property.
+    // `mark_read_target` must never write that stale snapshot's `properties` back —
+    // only the `read` key may change, and any property that landed after the
+    // snapshot but before the mark must survive.
+    #[tokio::test]
+    async fn mark_read_target_preserves_a_property_written_after_prevalidation() {
+        use khive_runtime::{AllowAllGate, BackendId, Namespace, RuntimeConfig};
+        use khive_storage::note::Note;
+        use uuid::Uuid;
+
+        let ns = format!("mark-read-cas-{}", Uuid::new_v4().simple());
+        let runtime = super::KhiveRuntime::new(RuntimeConfig {
+            git_write: Default::default(),
+            db_path: None,
+            default_namespace: Namespace::parse(&ns).unwrap(),
+            embedding_model: None,
+            additional_embedding_models: vec![],
+            gate: std::sync::Arc::new(AllowAllGate),
+            packs: vec!["kg".to_string(), "comm".to_string()],
+            backend_id: BackendId::main(),
+            brain_profile: None,
+            visible_namespaces: vec![],
+            allowed_outbound_namespaces: vec![],
+            actor_id: None,
+        })
+        .expect("in-memory runtime");
+        let token = runtime
+            .authorize(Namespace::parse(&ns).unwrap())
+            .expect("authorize");
+        let store = runtime.notes(&token).expect("notes store");
+
+        let id = Uuid::new_v4();
+        let created_at = chrono::Utc::now().timestamp_micros();
+        store
+            .upsert_note(Note {
+                id,
+                namespace: ns.clone(),
+                kind: "message".to_string(),
+                status: "active".to_string(),
+                name: None,
+                content: "concurrency regression".to_string(),
+                salience: None,
+                decay_factor: None,
+                expires_at: None,
+                properties: Some(json!({
+                    "direction": "inbound",
+                    // `actor_id: None` in the config below resolves to the
+                    // anonymous actor, whose id is always "local" regardless
+                    // of namespace — see `khive_runtime::actor_identity::resolve_actor`.
+                    "to_actor": "local",
+                    "read": false,
+                })),
+                created_at,
+                updated_at: created_at,
+                deleted_at: None,
+            })
+            .await
+            .expect("insert message");
+
+        // Prevalidation snapshot — this is what a bulk read's validate phase
+        // would have captured for this target before iterating the rest of a
+        // (possibly large) id list.
+        let (validated_id, stale_note) = validate_read_target(&runtime, &token, &id.to_string())
+            .await
+            .expect("prevalidation");
+        assert_eq!(validated_id, id);
+
+        // Simulate a concurrent write landing after prevalidation but before
+        // this target's mark step: another property changes, `read` stays false.
+        let concurrent_updated_at = created_at + 1;
+        store
+            .update_note_properties(
+                id,
+                Some(json!({
+                    "direction": "inbound",
+                    "to_actor": stale_note.properties.as_ref().unwrap()["to_actor"].clone(),
+                    "read": false,
+                    "flagged": true,
+                })),
+                concurrent_updated_at,
+            )
+            .await
+            .expect("concurrent property write");
+
+        // Mark using the now-stale snapshot, exactly as the bulk mark loop does.
+        let result = mark_read_target(&runtime, &token, id, stale_note)
+            .await
+            .expect("mark_read_target");
+        assert_eq!(result["read"], json!(true), "got {result}");
+
+        let stored = store
+            .get_note(id)
+            .await
+            .expect("get_note")
+            .expect("note still present");
+        let props = stored.properties.expect("properties present");
+        assert_eq!(
+            props["read"],
+            json!(true),
+            "the mark itself must still land; got {props}"
+        );
+        assert_eq!(
+            props["flagged"],
+            json!(true),
+            "a property written after prevalidation but before the mark must \
+             survive — the mark must never write back the stale snapshot; got {props}"
         );
     }
 }

@@ -734,6 +734,58 @@ impl NoteStore for SqlNoteStore {
         .await
     }
 
+    async fn try_patch_note_property(
+        &self,
+        id: Uuid,
+        namespace: &str,
+        filter: &NoteFilter,
+        json_path: &str,
+        value: serde_json::Value,
+        updated_at: i64,
+    ) -> Result<bool, StorageError> {
+        let namespace = namespace.to_string();
+        let filter = filter.clone();
+        let value_json = serde_json::to_string(&value).map_err(|e| {
+            StorageError::driver(StorageCapability::Notes, "try_patch_note_property", e)
+        })?;
+        let json_path = json_path.to_string();
+        let id_str = id.to_string();
+
+        // `build_note_filter_where`'s params are `Box<dyn ToSql>` (not
+        // `Send`), so — matching every other caller in this file — it is
+        // built inside the writer closure rather than moved across the
+        // `with_writer` boundary.
+        self.with_writer("try_patch_note_property", move |conn| {
+            let (where_clause, mut params) = build_note_filter_where(&namespace, &filter)?;
+
+            // Explicit `?N` indices (SQLite numbered params bind by index,
+            // not by text position) so this SET clause's params can be
+            // appended after `where_clause`'s already-self-consistent
+            // `?1..?k` numbering instead of renumbering every filter
+            // placeholder.
+            let base = params.len();
+            let sql = format!(
+                "UPDATE notes SET properties = json_set(COALESCE(properties, '{{}}'), ?{p1}, json(?{p2})), \
+                 updated_at = ?{p3} {where_clause} AND id = ?{p4}",
+                p1 = base + 1,
+                p2 = base + 2,
+                p3 = base + 3,
+                p4 = base + 4,
+            );
+            params.push(Box::new(json_path));
+            params.push(Box::new(value_json));
+            params.push(Box::new(updated_at));
+            params.push(Box::new(id_str));
+
+            let mut stmt = conn.prepare(&sql)?;
+            let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+                params.iter().map(|p| p.as_ref()).collect();
+            let rows = stmt.execute(param_refs.as_slice())?;
+            Ok(rows > 0)
+        })
+        .await
+    }
+
     async fn try_insert_note(&self, note: Note) -> Result<bool, StorageError> {
         let namespace = note.namespace.clone();
         let id_str = note.id.to_string();

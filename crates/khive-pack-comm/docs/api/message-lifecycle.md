@@ -152,12 +152,19 @@ transaction: a validation failure rejects the call before any update, while an
 item-level storage failure returns `read=false` plus `mark_error` without rolling
 back an earlier successful item.
 
-Merges `read: true` into properties and patches in place via a real `UPDATE`
-(not `upsert_note`'s `INSERT OR REPLACE`): the latter silently deletes and
-re-inserts the row on a primary-key conflict (#780). The `comm.probe` cursor
-is keyed on `notes_seq.seq`, which is fixed at first insert and survives such
-churn, so this is defensive rather than load-bearing; a metadata patch should
-never rewrite the row regardless.
+Patches only the `read` key via a storage-side `json_set`, not a caller-side
+merge-then-overwrite of the whole `properties` column: the write re-evaluates
+namespace, message kind, direction, and addressee against the row's *current*
+state in the same `UPDATE`, so a property written by another caller between
+validation and this call (the bulk form's window can span up to 500 targets)
+survives untouched, and an eligibility change in that window degrades the
+mark instead of silently landing on stale data. This also patches in place
+via a real `UPDATE`, never `upsert_note`'s `INSERT OR REPLACE` (the latter
+silently deletes and re-inserts the row on a primary-key conflict — #780).
+The `comm.probe` cursor is keyed on `notes_seq.seq`, which is fixed at first
+insert and survives such churn, so avoiding `upsert_note` here is defensive
+rather than load-bearing; a metadata patch should never rewrite the row
+regardless.
 
 The mark-read patch is best-effort: under multi-client burst traffic the
 sqlite writer pool can time out (`checkout_timeout`, 5s default), and the
@@ -168,12 +175,12 @@ been best-effort since its introduction. Three outcomes:
 
 - `Ok(true)` — the row was live and updated: `read: true`, `properties` is
   the patched value (including the new `read: true`).
-- `Ok(false)` — no live row was found to update (e.g. soft-deleted
-  mid-flight, between this handler's `get_note` and its
-  `update_note_properties` call): `read: false`, `mark_error: "no live row
-  updated"`, `properties` is the note's ORIGINAL stored value (a stored
-  SQL-NULL properties column round-trips as JSON `null`, never `{}`) — the
-  response never claims a write that did not land.
+- `Ok(false)` — no live row currently matches (soft-deleted mid-flight, or an
+  eligibility property — namespace, kind, direction, addressee — changed
+  since this handler's prior validation): `read: false`, `mark_error: "no
+  live row updated"`, `properties` is the note's ORIGINAL stored value (a
+  stored SQL-NULL properties column round-trips as JSON `null`, never `{}`)
+  — the response never claims a write that did not land.
 - `Err(e)` — the patch failed (writer timeout, pool exhaustion, etc.):
   logged via `tracing::warn!` with the full error detail, then `read:
   false`, `mark_error` is the error's `Display` string, `properties` is the

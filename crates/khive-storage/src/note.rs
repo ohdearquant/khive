@@ -325,6 +325,30 @@ pub trait NoteStore: Send + Sync + 'static {
         properties: Option<Value>,
         updated_at: i64,
     ) -> StorageResult<bool>;
+    /// Atomically patch a single `properties` JSON key on a note, but only
+    /// when the row's *current* state (re-evaluated inside this same
+    /// statement, not a snapshot the caller fetched earlier) still satisfies
+    /// `filter`'s namespace/kind/property_filters.
+    ///
+    /// Unlike `update_note_properties` (which replaces the whole `properties`
+    /// column with a value the caller already computed — safe only when
+    /// nothing else can have written to the row since the caller's read),
+    /// this only ever touches `json_path`, so any other property written
+    /// concurrently between the caller's read and this call survives
+    /// untouched. Returns `Ok(false)` — not an error — when no live row
+    /// currently matches `filter` (id not found, soft-deleted, or an
+    /// eligibility property changed since the caller last validated it); the
+    /// caller degrades that the same way as `update_note_properties`'s
+    /// `Ok(false)`.
+    async fn try_patch_note_property(
+        &self,
+        id: Uuid,
+        namespace: &str,
+        filter: &NoteFilter,
+        json_path: &str,
+        value: Value,
+        updated_at: i64,
+    ) -> StorageResult<bool>;
     /// Query notes by namespace and optional kind with pagination.
     /// The returned total and page items must come from one consistent
     /// backend snapshot.
