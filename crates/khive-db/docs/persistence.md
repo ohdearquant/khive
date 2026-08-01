@@ -32,6 +32,12 @@ The backend also provides:
 - `apply_pack_ddl_statements(stmts)` -- run pack-auxiliary DDL (ADR-017)
 - `sql()` -- raw `SqlAccess` bridge for the query compiler
 
+`SqlNoteStore::set_note_property` applies one top-level JSON-key update with a
+single parameterized SQLite `json_set` statement. This is the note capability's
+atomic patch path; whole-document replacement remains a separate explicit
+operation. Keys containing U+0000 are rejected before dispatch because SQLite
+JSON paths cannot address those labels without ambiguous prefix matching.
+
 Each pack DDL plan is applied atomically in one transaction and remains idempotent on repeat application.
 
 ## Connection pooling

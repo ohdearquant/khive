@@ -3125,6 +3125,166 @@ async fn brain_auto_feedback_accepts_short_note_id_prefix() {
     assert_eq!(result["target_id"].as_str().unwrap_or("").len(), 36);
 }
 
+/// #1505 direct-call defense: PackRuntime callers must provide a token for the
+/// explicit namespace instead of treating the business parameter as authority.
+#[tokio::test]
+async fn brain_auto_feedback_direct_dispatch_honors_exact_namespace() {
+    let (pack, rt) = make_pack();
+    let registry = empty_registry();
+    let local_token = rt.authorize(Namespace::local()).expect("local token");
+    let arm_token = rt
+        .authorize(Namespace::parse("bench-arm-a").expect("arm namespace"))
+        .expect("arm token");
+    let target = create_test_entity(&rt, &local_token).await;
+
+    pack.dispatch(
+        "brain.auto_feedback",
+        json!({
+            "query": "direct namespace regression",
+            "results": [{"id": target}],
+            "namespace": "bench-arm-a",
+        }),
+        &registry,
+        &arm_token,
+    )
+    .await
+    .expect("direct auto_feedback accepts matching namespace token");
+
+    let local = pack
+        .dispatch(
+            "brain.profile",
+            json!({"profile_id": "balanced-recall-v1"}),
+            &registry,
+            &local_token,
+        )
+        .await
+        .expect("local profile");
+    let arm = pack
+        .dispatch(
+            "brain.profile",
+            json!({"profile_id": "balanced-recall-v1"}),
+            &registry,
+            &arm_token,
+        )
+        .await
+        .expect("arm profile");
+
+    assert_eq!(local["total_events"], json!(0u64));
+    assert_eq!(arm["total_events"], json!(1u64));
+}
+
+/// #1505: an explicit namespace is not a capability. A direct caller cannot
+/// use a local token to emit or fold feedback into another namespace.
+#[tokio::test]
+async fn brain_auto_feedback_direct_dispatch_rejects_namespace_token_mismatch() {
+    let (pack, rt) = make_pack();
+    let registry = empty_registry();
+    let local_token = rt.authorize(Namespace::local()).expect("local token");
+    let arm_token = rt
+        .authorize(Namespace::parse("bench-arm-a").expect("arm namespace"))
+        .expect("arm token");
+    let target = create_test_entity(&rt, &local_token).await;
+
+    let local_before = pack
+        .dispatch(
+            "brain.profile",
+            json!({"profile_id": "balanced-recall-v1"}),
+            &registry,
+            &local_token,
+        )
+        .await
+        .expect("local profile before mismatch");
+    let arm_before = pack
+        .dispatch(
+            "brain.profile",
+            json!({"profile_id": "balanced-recall-v1"}),
+            &registry,
+            &arm_token,
+        )
+        .await
+        .expect("arm profile before mismatch");
+    let local_log_before = pack
+        .dispatch(
+            "brain.events",
+            json!({"limit": 100}),
+            &registry,
+            &local_token,
+        )
+        .await
+        .expect("local event log before mismatch");
+    let arm_log_before = pack
+        .dispatch("brain.events", json!({"limit": 100}), &registry, &arm_token)
+        .await
+        .expect("arm event log before mismatch");
+
+    let err = pack
+        .dispatch(
+            "brain.auto_feedback",
+            json!({
+                "query": "unauthorized direct namespace",
+                "results": [{"id": target}],
+                "namespace": "bench-arm-a",
+            }),
+            &registry,
+            &local_token,
+        )
+        .await
+        .expect_err("local token must not authorize arm feedback");
+    assert!(
+        matches!(err, RuntimeError::InvalidInput(ref msg) if msg.contains("does not match authorized token namespace")),
+        "expected namespace mismatch InvalidInput, got {err:?}"
+    );
+
+    let local_after = pack
+        .dispatch(
+            "brain.profile",
+            json!({"profile_id": "balanced-recall-v1"}),
+            &registry,
+            &local_token,
+        )
+        .await
+        .expect("local profile after mismatch");
+    let arm_after = pack
+        .dispatch(
+            "brain.profile",
+            json!({"profile_id": "balanced-recall-v1"}),
+            &registry,
+            &arm_token,
+        )
+        .await
+        .expect("arm profile after mismatch");
+    let local_log_after = pack
+        .dispatch(
+            "brain.events",
+            json!({"limit": 100}),
+            &registry,
+            &local_token,
+        )
+        .await
+        .expect("local event log after mismatch");
+    let arm_log_after = pack
+        .dispatch("brain.events", json!({"limit": 100}), &registry, &arm_token)
+        .await
+        .expect("arm event log after mismatch");
+
+    assert_eq!(
+        local_after["total_events"], local_before["total_events"],
+        "rejected feedback must not mutate local posterior state"
+    );
+    assert_eq!(
+        arm_after["total_events"], arm_before["total_events"],
+        "rejected feedback must not mutate arm posterior state"
+    );
+    assert_eq!(
+        local_log_after["count"], local_log_before["count"],
+        "rejected feedback must not append a local event"
+    );
+    assert_eq!(
+        arm_log_after["count"], arm_log_before["count"],
+        "rejected feedback must not append an arm event"
+    );
+}
+
 // BRAIN-AUD-001: verify namespace isolation — state from namespace A must
 // not be visible when dispatching under namespace B.
 #[tokio::test]
@@ -3270,6 +3430,17 @@ mod help_tests {
         assert!(
             h.params.iter().any(|p| p.name == "results" && p.required),
             "brain.auto_feedback must have required results param"
+        );
+        let namespace = h
+            .params
+            .iter()
+            .find(|p| p.name == "namespace")
+            .unwrap_or_else(|| panic!("brain.auto_feedback must declare namespace"));
+        assert!(!namespace.required);
+        assert!(
+            namespace.description.contains("Exact") && namespace.description.contains("posterior"),
+            "namespace help must document exact posterior isolation: {:?}",
+            namespace.description
         );
     }
 
@@ -3522,6 +3693,93 @@ mod help_tests {
         builder.register(BrainPack::new(rt.clone()));
         let registry = builder.build().expect("kg+brain registry builds");
         (registry, rt)
+    }
+
+    /// #1505: an explicit auto-feedback namespace is both the event stamp and
+    /// the posterior-state owner. The default/live namespace must remain
+    /// byte-for-byte at its pre-call event count.
+    #[tokio::test]
+    async fn auto_feedback_namespace_does_not_train_default_posteriors() {
+        let (registry, rt) = make_brain_registry();
+        let local_token = rt.authorize(Namespace::local()).expect("local token");
+        let target = create_test_entity(&rt, &local_token).await;
+
+        let profile_total = |value: &serde_json::Value| {
+            value["total_events"]
+                .as_u64()
+                .expect("profile total_events")
+        };
+        let local_before = registry
+            .dispatch("brain.profile", json!({"profile_id": "balanced-recall-v1"}))
+            .await
+            .expect("read local profile before feedback");
+        let arm_before = registry
+            .dispatch(
+                "brain.profile",
+                json!({
+                    "profile_id": "balanced-recall-v1",
+                    "namespace": "bench-arm-a",
+                }),
+            )
+            .await
+            .expect("read arm profile before feedback");
+
+        let feedback = registry
+            .dispatch(
+                "brain.auto_feedback",
+                json!({
+                    "query": "isolated recall measurement",
+                    "results": [{"id": target}],
+                    "namespace": "bench-arm-a",
+                }),
+            )
+            .await
+            .expect("namespace-scoped auto_feedback");
+        assert_eq!(feedback["emitted"], json!(true), "got: {feedback}");
+
+        let arm_after = registry
+            .dispatch(
+                "brain.profile",
+                json!({
+                    "profile_id": "balanced-recall-v1",
+                    "namespace": "bench-arm-a",
+                }),
+            )
+            .await
+            .expect("read arm profile after feedback");
+        let local_after = registry
+            .dispatch("brain.profile", json!({"profile_id": "balanced-recall-v1"}))
+            .await
+            .expect("read local profile after feedback");
+
+        assert_eq!(
+            profile_total(&arm_after),
+            profile_total(&arm_before) + 1,
+            "the explicit arm must receive exactly one feedback fold"
+        );
+        assert_eq!(
+            profile_total(&local_after),
+            profile_total(&local_before),
+            "arm feedback must not train the default/live posterior"
+        );
+
+        let arm_token = rt
+            .authorize(Namespace::parse("bench-arm-a").expect("arm namespace"))
+            .expect("arm token");
+        let event_id = uuid::Uuid::parse_str(
+            feedback["event_id"]
+                .as_str()
+                .expect("feedback response event_id"),
+        )
+        .expect("event UUID");
+        let event = rt
+            .events(&arm_token)
+            .expect("event store")
+            .get_event(event_id)
+            .await
+            .expect("event lookup")
+            .expect("feedback event exists");
+        assert_eq!(event.namespace, "bench-arm-a");
     }
 
     /// brain.bind via VerbRegistry must store the caller-supplied namespace,

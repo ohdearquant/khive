@@ -219,13 +219,19 @@ mod tests {
             "kg pack must expose verbs; got {:?}",
             info.verbs
         );
-        // kg pack ships 19 verbs: 11 base + propose/review/withdraw (3) + verbs
+        // kg pack ships 20 verbs: 11 base + propose/review/withdraw (3) + verbs
         // + stats (2) + context (1, ADR-089) + resolve (1) + whoami (1)
+        // + db_diagnostics (1, ADR-091)
         assert_eq!(
             info.verbs.len(),
-            19,
-            "kg pack must expose 19 verbs; got {}: {:?}",
+            20,
+            "kg pack must expose 20 verbs; got {}: {:?}",
             info.verbs.len(),
+            info.verbs.iter().map(|v| &v.name).collect::<Vec<_>>()
+        );
+        assert!(
+            info.verbs.iter().any(|v| v.name == "db_diagnostics"),
+            "kg pack must expose db_diagnostics; got {:?}",
             info.verbs.iter().map(|v| &v.name).collect::<Vec<_>>()
         );
         // F126: VerbInfo must include visibility and category fields.

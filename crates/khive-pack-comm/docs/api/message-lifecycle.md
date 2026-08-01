@@ -151,12 +151,11 @@ Marks a message as read. Rejects `read()` on outbound messages — "read" is a
 recipient action; marking an outbound (sent) message as read corrupts the
 read/unread invariant and has no semantic meaning to the sender.
 
-Merges `read: true` into properties and patches in place via a real `UPDATE`
-(not `upsert_note`'s `INSERT OR REPLACE`): the latter silently deletes and
-re-inserts the row on a primary-key conflict (#780). The `comm.probe` cursor
-is keyed on `notes_seq.seq`, which is fixed at first insert and survives such
-churn, so this is defensive rather than load-bearing; a metadata patch should
-never rewrite the row regardless.
+Sets `read: true` through `NoteStore::set_note_property`, which lowers to one
+`UPDATE ... json_set(...)` statement. It never reads and replaces the whole
+properties document, so another writer setting a different key cannot be
+silently overwritten between those two steps (#1483). The operation also
+leaves every non-property column and the row's identity untouched (#780).
 
 The mark-read patch is best-effort: under multi-client burst traffic the
 sqlite writer pool can time out (`checkout_timeout`, 5s default), and the
@@ -169,10 +168,11 @@ been best-effort since its introduction. Three outcomes:
   the patched value (including the new `read: true`).
 - `Ok(false)` — no live row was found to update (e.g. soft-deleted
   mid-flight, between this handler's `get_note` and its
-  `update_note_properties` call): `read: false`, `mark_error: "no live row
-  updated"`, `properties` is the note's ORIGINAL stored value (a stored
-  SQL-NULL properties column round-trips as JSON `null`, never `{}`) — the
-  response never claims a write that did not land.
+  `set_note_property` call), or the stored properties value was not an
+  object: `read: false`, `mark_error: "no live row updated"`, `properties`
+  is the note's ORIGINAL stored value (a stored SQL-NULL properties column
+  round-trips as JSON `null`, never `{}`) — the response never claims a
+  write that did not land.
 - `Err(e)` — the patch failed (writer timeout, pool exhaustion, etc.):
   logged via `tracing::warn!` with the full error detail, then `read:
   false`, `mark_error` is the error's `Display` string, `properties` is the
@@ -211,6 +211,11 @@ Replies to a message, threading linkage.
   regardless of whether the original message carried actor labels. No legacy
   code path can cause `dual_write_message` to mint a token in a foreign
   namespace.
+- Replying folds in the addressee's read mark with the same atomic
+  `set_note_property("read", true)` operation as `comm.read`; it does not
+  re-fetch and replace the properties document. The delivery of the reply is
+  already committed, so this mark remains best-effort and reports
+  `marked_read: false` on a failed/no-op property set.
 
 ## `handlers.rs::handle_thread`
 

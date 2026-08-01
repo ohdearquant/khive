@@ -26,7 +26,14 @@ All scope values, relation filters, property values, depths, and limits are boun
 
 Inline property equality continues to map arbitrary keys through `json_extract`. In `WHERE`, dedicated fields such as `name` or `content` map directly to columns, while only explicit `properties.<path>` references map to `json_extract(alias.properties, '$.path')`. Unknown direct fields and the bare `properties` container are rejected; the same resolver is used by fixed- and variable-length compilation. Event predicates require a known event column, and edge predicates accept only `relation` and `weight`; neither accepts JSON-property paths. `entity_type` always uses its dedicated column. For `LIKE`-family operations, literal `%`, `_`, and `\` are escaped before compiler-supplied wildcards are added.
 
-Node kind labels `entity`, `note`, `event`, and `edge` select a substrate in the primary-node union; granular values such as `concept` or `task` filter the stored `kind`. No stored row is expected to have the literal granular kind `entity` (issue #849).
+Node kind labels `entity`, `note`, `event`, and `edge` select a substrate in the primary-node union; granular values such as `concept`, `task`, or comm's pack-registered `message` filter the stored `kind`. No stored row is expected to have the literal granular kind `entity` (issue #849).
+
+Granular kind filtering is intentionally data-driven. The compiler has no `VerbRegistry`
+dependency and does not keep a second allowlist of pack-owned kinds: registration validates the
+write, while GQL binds the stored kind as a SQL parameter. `MATCH (m:message)` and
+`MATCH (m:note) WHERE m.kind = "message"` therefore select the same caller-visible message
+notes. GQL's field is `kind`; `note_kind` is terminology from the verb parameter surface and is
+not a query field. Runtime-supplied namespace scopes still apply to every union member.
 
 ## Fixed-length JOIN compilation
 

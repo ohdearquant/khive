@@ -7,8 +7,8 @@ parameter contract, so an agent can call khive correctly without reading Rust so
 
 The live registry is authoritative: run `request(ops="verbs()")` against your server to
 discover its loaded pack set and total. The static sections below are audited against pack
-`HandlerDef`/`ParamDef` declarations; the kg catalog was refreshed against the 19-entry
-`KG_HANDLERS` table and its integration contract when `whoami` shipped.
+`HandlerDef`/`ParamDef` declarations; the kg catalog was refreshed against the 20-entry
+`KG_HANDLERS` table and its integration contract when `db_diagnostics` shipped.
 
 An always-machine-readable copy of this page is at
 [`/md/api-reference.md`](md/api-reference.md). The site also publishes
@@ -19,11 +19,11 @@ An always-machine-readable copy of this page is at
 
 | Pack        | Verbs | Load with                                  | Optional?           |
 | ----------- | ----- | ------------------------------------------ | ------------------- |
-| `kg`        | 19    | `KHIVE_PACKS=kg`                           | No — base substrate |
+| `kg`        | 20    | `KHIVE_PACKS=kg`                           | No — base substrate |
 | `gtd`       | 5     | `KHIVE_PACKS=kg,gtd`                       | Yes                 |
 | `memory`    | 5     | `KHIVE_PACKS=kg,memory`                    | Yes                 |
-| `brain`     | 15    | `KHIVE_PACKS=kg,brain`                     | Yes                 |
-| `comm`      | 7     | `KHIVE_PACKS=kg,comm`                      | Yes                 |
+| `brain`     | 16    | `KHIVE_PACKS=kg,brain`                     | Yes                 |
+| `comm`      | 8     | `KHIVE_PACKS=kg,comm`                      | Yes                 |
 | `schedule`  | 4     | `KHIVE_PACKS=kg,schedule`                  | Yes                 |
 | `knowledge` | 19    | `KHIVE_PACKS=kg,knowledge`                 | Yes                 |
 | `session`   | 4     | `KHIVE_PACKS=kg,session`                   | Yes                 |
@@ -157,7 +157,7 @@ parallel batches, since parallel failures do not cascade.
 
 ---
 
-## `kg` pack — 19 verbs
+## `kg` pack — 20 verbs
 
 Base substrate verbs, bare names (no `kg.` prefix). Category is the illocutionary act
 (Searle 1976): Assertive = retrieves state, Commissive = commits a persistent change,
@@ -643,6 +643,23 @@ It takes no parameters and returns only identity labels, never tokens or credent
 request(ops="whoami()")
 ```
 
+### `db_diagnostics` — Assertive
+
+Report WAL/checkpoint diagnostics for the main database: build identity, the checkpoint
+counters, a single PASSIVE checkpoint probe, the `-wal` sidecar file size, and a WAL-pin
+holder census. Takes no parameters.
+
+The PASSIVE probe may backfill WAL frames into the database — that is normal checkpoint
+I/O and is what the reported `checkpointed_frames` counts. It never changes logical
+state, never escalates to TRUNCATE, never creates a missing database file, and never
+deletes WAL-pin sidecar evidence. Sections that cannot be collected (in-memory backend,
+missing file, unsupported platform) carry explicit `unavailable_reason` strings rather
+than being silently omitted.
+
+```
+request(ops="db_diagnostics()")
+```
+
 ### `verbs` — Assertive
 
 List all MCP-callable verbs registered on this server. Internal subhandlers are
@@ -788,6 +805,7 @@ Recall memory notes with decay-aware hybrid ranking. Each hit carries resolved
 | `full_content`      | bool    | no       | Default true; false truncates content to 200 chars.                       |
 | `tags`              | array   | no       | Filter by `properties.tags`.                                              |
 | `tag_mode`          | string  | no       | `any` (default, OR) or `all` (AND).                                       |
+| `namespace`         | string  | no       | Exact-match read scope; absent uses the caller's visible namespace set.   |
 
 ```
 request(ops="memory.recall(query=\"ADR-016 DSL grammar\", limit=5, min_score=0.3)")
@@ -972,17 +990,36 @@ request(ops="brain.feedback(target_id=\"<uuid>\", signal=\"useful\")")
 Emit implicit feedback for recall results supplied by an agent — the convenience verb
 to call right after `memory.recall` instead of hand-building `brain.feedback`.
 
-| Param                  | Type   | Required | Notes                                                                 |
-| ---------------------- | ------ | -------- | --------------------------------------------------------------------- |
-| `query`                | string | yes      | The recall query that produced the results.                           |
-| `results`              | array  | yes      | Recall result objects; the first object's `id` is credited.           |
-| `signal`               | string | no       | Defaults to `implicit_positive`.                                      |
-| `served_by_profile_id` | string | no       | Profile that served the recall.                                       |
-| `scorer_run_id`        | string | no       | Forwarded verbatim to `brain.feedback`; pairs with `serve_ledger_id`. |
-| `serve_ledger_id`      | string | no       | Forwarded verbatim to `brain.feedback`; pairs with `scorer_run_id`.   |
+| Param                  | Type   | Required | Notes                                                                  |
+| ---------------------- | ------ | -------- | ---------------------------------------------------------------------- |
+| `query`                | string | yes      | The recall query that produced the results.                            |
+| `results`              | array  | yes      | Recall result objects; the first object's `id` is credited.            |
+| `signal`               | string | no       | Defaults to `implicit_positive`.                                       |
+| `served_by_profile_id` | string | no       | Profile that served the recall.                                        |
+| `scorer_run_id`        | string | no       | Forwarded verbatim to `brain.feedback`; pairs with `serve_ledger_id`.  |
+| `serve_ledger_id`      | string | no       | Forwarded verbatim to `brain.feedback`; pairs with `scorer_run_id`.    |
+| `namespace`            | string | no       | Exact namespace for the event and posterior fold; invalid values fail. |
 
 ```
 request(ops="memory.recall(query=\"x\", limit=5) | brain.auto_feedback(query=\"x\", results=[{\"id\": \"$prev.items[0].id\"}])")
+```
+
+### `brain.mark_turn` — Commissive
+
+Emit a `PhaseStarted` event with `work_class="actor_turn"` carrying the calling actor and
+a timestamp. Callers invoke it once per bounded unit of work (a wake, a turn) so
+`brain.event_counts`'s `counts_by_work_class["actor_turn"]`, grouped by actor, gives a
+per-actor denominator (e.g. `feedback_explicit / actor_turn`) that is not biased toward
+whichever actor issues the most raw verb calls. Reuses the existing ADR-103 Stage 1
+`PhaseStarted`/`work_class` vocabulary rather than a new event kind. Best-effort — never
+fails the caller's turn.
+
+| Param   | Type   | Required | Notes                                                                                                                                             |
+| ------- | ------ | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `label` | string | no       | Free-form label for this unit of work (e.g. `"wake"`, `"turn"`), recorded in the event payload's `phase` field. Does not affect the `work_class`. |
+
+```
+request(ops="brain.mark_turn(label=\"wake\")")
 ```
 
 ### `brain.bind` — Declaration
@@ -1124,6 +1161,15 @@ Every returned message uses the hyphenated full UUID for `id`, so the value is
 always accepted unchanged by `comm.read`, `comm.reply`, or `comm.thread`, even
 when two messages share an eight-character prefix. `full_id` remains an alias
 for compatibility, while `short_id` is the compact display-only prefix.
+
+### `comm.unread` — Assertive
+
+Count-only view of the caller's unread inbound messages — the same filter as
+`comm.inbox(status="unread")`, without message payloads. Takes no parameters.
+
+```
+request(ops="comm.unread()")
+```
 
 ### `comm.read` — Declaration
 
@@ -1425,11 +1471,12 @@ request(ops="knowledge.suggest(query=\"async middleware retry circuit breaker pa
 
 Compose a markdown briefing from selected knowledge domains and atoms.
 
-| Param        | Type            | Required | Notes                                             |
-| ------------ | --------------- | -------- | ------------------------------------------------- |
-| `domain_ids` | array\<string\> | no       | Domain UUIDs/slugs whose member atoms to include. |
-| `atom_ids`   | array\<string\> | no       | Atom UUIDs/slugs to include directly.             |
-| `query`      | string          | yes      | Reranks the selected atom bodies.                 |
+| Param        | Type            | Required | Notes                                                     |
+| ------------ | --------------- | -------- | --------------------------------------------------------- |
+| `domain_ids` | array\<string\> | no       | Domain UUIDs/slugs whose member atoms to include.         |
+| `atom_ids`   | array\<string\> | no       | Atom UUIDs/slugs to include directly.                     |
+| `query`      | string          | yes      | Reranks the selected atom bodies.                         |
+| `namespace`  | string          | no       | Exact namespace for all compose and profile-weight reads. |
 
 ```
 request(ops="knowledge.compose(query=\"FastAPI JWT middleware validation patterns\", domain_ids=[\"attention\"])")
