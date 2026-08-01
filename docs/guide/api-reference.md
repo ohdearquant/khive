@@ -805,6 +805,7 @@ Recall memory notes with decay-aware hybrid ranking. Each hit carries resolved
 | `full_content`      | bool    | no       | Default true; false truncates content to 200 chars.                       |
 | `tags`              | array   | no       | Filter by `properties.tags`.                                              |
 | `tag_mode`          | string  | no       | `any` (default, OR) or `all` (AND).                                       |
+| `namespace`         | string  | no       | Exact-match read scope; absent uses the caller's visible namespace set.   |
 
 ```
 request(ops="memory.recall(query=\"ADR-016 DSL grammar\", limit=5, min_score=0.3)")
@@ -989,14 +990,15 @@ request(ops="brain.feedback(target_id=\"<uuid>\", signal=\"useful\")")
 Emit implicit feedback for recall results supplied by an agent — the convenience verb
 to call right after `memory.recall` instead of hand-building `brain.feedback`.
 
-| Param                  | Type   | Required | Notes                                                                 |
-| ---------------------- | ------ | -------- | --------------------------------------------------------------------- |
-| `query`                | string | yes      | The recall query that produced the results.                           |
-| `results`              | array  | yes      | Recall result objects; the first object's `id` is credited.           |
-| `signal`               | string | no       | Defaults to `implicit_positive`.                                      |
-| `served_by_profile_id` | string | no       | Profile that served the recall.                                       |
-| `scorer_run_id`        | string | no       | Forwarded verbatim to `brain.feedback`; pairs with `serve_ledger_id`. |
-| `serve_ledger_id`      | string | no       | Forwarded verbatim to `brain.feedback`; pairs with `scorer_run_id`.   |
+| Param                  | Type   | Required | Notes                                                                  |
+| ---------------------- | ------ | -------- | ---------------------------------------------------------------------- |
+| `query`                | string | yes      | The recall query that produced the results.                            |
+| `results`              | array  | yes      | Recall result objects; the first object's `id` is credited.            |
+| `signal`               | string | no       | Defaults to `implicit_positive`.                                       |
+| `served_by_profile_id` | string | no       | Profile that served the recall.                                        |
+| `scorer_run_id`        | string | no       | Forwarded verbatim to `brain.feedback`; pairs with `serve_ledger_id`.  |
+| `serve_ledger_id`      | string | no       | Forwarded verbatim to `brain.feedback`; pairs with `scorer_run_id`.    |
+| `namespace`            | string | no       | Exact namespace for the event and posterior fold; invalid values fail. |
 
 ```
 request(ops="memory.recall(query=\"x\", limit=5) | brain.auto_feedback(query=\"x\", results=[{\"id\": \"$prev.items[0].id\"}])")
@@ -1446,11 +1448,12 @@ request(ops="knowledge.suggest(query=\"async middleware retry circuit breaker pa
 
 Compose a markdown briefing from selected knowledge domains and atoms.
 
-| Param        | Type            | Required | Notes                                             |
-| ------------ | --------------- | -------- | ------------------------------------------------- |
-| `domain_ids` | array\<string\> | no       | Domain UUIDs/slugs whose member atoms to include. |
-| `atom_ids`   | array\<string\> | no       | Atom UUIDs/slugs to include directly.             |
-| `query`      | string          | yes      | Reranks the selected atom bodies.                 |
+| Param        | Type            | Required | Notes                                                     |
+| ------------ | --------------- | -------- | --------------------------------------------------------- |
+| `domain_ids` | array\<string\> | no       | Domain UUIDs/slugs whose member atoms to include.         |
+| `atom_ids`   | array\<string\> | no       | Atom UUIDs/slugs to include directly.                     |
+| `query`      | string          | yes      | Reranks the selected atom bodies.                         |
+| `namespace`  | string          | no       | Exact namespace for all compose and profile-weight reads. |
 
 ```
 request(ops="knowledge.compose(query=\"FastAPI JWT middleware validation patterns\", domain_ids=[\"attention\"])")

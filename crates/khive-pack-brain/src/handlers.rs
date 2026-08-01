@@ -8,7 +8,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use khive_runtime::{
-    micros_to_iso, DispatchHook, EventView, KhiveRuntime, NamespaceToken, RuntimeError,
+    micros_to_iso, DispatchHook, EventView, KhiveRuntime, Namespace, NamespaceToken, RuntimeError,
     VerbRegistry,
 };
 use khive_storage::event::{Event, EventFilter};
@@ -330,6 +330,12 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
                 param_type: "string",
                 required: false,
                 description: "ADR-081: forwarded verbatim to brain.feedback. Must be supplied together with scorer_run_id.",
+            },
+            khive_types::ParamDef {
+                name: "namespace",
+                param_type: "string",
+                required: false,
+                description: "Exact feedback namespace override (ADR-007 Rev 6 escape hatch). The event and posterior fold are scoped to exactly this namespace; the default namespace state is unchanged. Invalid values are rejected.",
             },
         ],
     },
@@ -1851,6 +1857,10 @@ impl BrainPack {
             // together-or-rejected validation and the dedup/fold-gate logic.
             scorer_run_id: Option<String>,
             serve_ledger_id: Option<String>,
+            /// Exact namespace for the emitted event and posterior fold. The
+            /// registry normally pre-applies this to `token`; retaining the
+            /// field here gives direct `PackRuntime` callers the same contract.
+            namespace: Option<String>,
         }
 
         #[derive(Deserialize)]
@@ -1860,6 +1870,22 @@ impl BrainPack {
 
         let p: AutoFeedbackParams = serde_json::from_value(params)
             .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?;
+
+        // Registry dispatch pre-mints an exact token for an explicit
+        // namespace. Direct PackRuntime callers must supply that same token;
+        // a business parameter is never authority to mint a capability.
+        if let Some(ns_str) = p.namespace.as_deref() {
+            let requested = Namespace::parse(ns_str).map_err(|e| {
+                RuntimeError::InvalidInput(format!("invalid namespace {ns_str:?}: {e}"))
+            })?;
+            if &requested != token.namespace() {
+                return Err(RuntimeError::InvalidInput(format!(
+                    "auto_feedback: namespace {ns_str:?} does not match authorized token namespace {:?}",
+                    token.namespace().as_str()
+                )));
+            }
+        }
+
         if p.query.trim().is_empty() {
             return Err(RuntimeError::InvalidInput(
                 "auto_feedback: `query` must not be empty".into(),
