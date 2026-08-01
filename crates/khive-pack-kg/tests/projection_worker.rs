@@ -6,8 +6,9 @@
 use khive_pack_kg::projection_worker::ProposalsProjectionWorker;
 
 use khive_runtime::{KhiveRuntime, Namespace, NamespaceToken};
+use khive_storage::event::Event;
 use khive_storage::types::{SqlStatement, SqlValue};
-use khive_types::{Id128, ProposalDecision, ProposalReviewedPayload};
+use khive_types::{EventKind, Id128, ProposalDecision, ProposalReviewedPayload, SubstrateKind};
 use uuid::Uuid;
 
 fn setup() -> (KhiveRuntime, NamespaceToken) {
@@ -42,6 +43,20 @@ async fn ensure_schema(rt: &KhiveRuntime) {
         })
         .await
         .expect("create table");
+}
+
+fn proposal_applied_event(token: &NamespaceToken, proposal_id: Uuid) -> Event {
+    let mut event = Event::new(
+        token.namespace().as_str(),
+        "propose-apply",
+        EventKind::ProposalApplied,
+        SubstrateKind::Entity,
+        "system:propose-apply",
+    );
+    event.payload = serde_json::json!({ "proposal_id": proposal_id });
+    event.aggregate_kind = Some("proposal".to_string());
+    event.aggregate_id = Some(proposal_id);
+    event
 }
 
 #[tokio::test]
@@ -127,7 +142,7 @@ async fn on_proposal_withdrawn_sets_status_withdrawn() {
 }
 
 #[tokio::test]
-async fn on_proposal_applied_sets_status_applied() {
+async fn applied_and_emit_sets_status_applied() {
     let (rt, tok) = setup();
     ensure_schema(&rt).await;
     let worker = ProposalsProjectionWorker::new(rt.clone());
@@ -158,10 +173,11 @@ async fn on_proposal_applied_sets_status_applied() {
         "pre_apply_cas must return true when status='approved'"
     );
 
+    let event = proposal_applied_event(&tok, pid);
     let applied = worker
-        .on_proposal_applied(&tok, pid)
+        .applied_and_emit(&tok, pid, event)
         .await
-        .expect("on_proposal_applied must succeed");
+        .expect("applied_and_emit must succeed");
     assert!(applied, "CAS must succeed when status='applying'");
 
     let row = worker
@@ -565,7 +581,7 @@ async fn same_microsecond_timestamp_no_duplicate_event_changes_guard() {
 }
 
 #[tokio::test]
-async fn on_proposal_applied_cas_fails_when_already_withdrawn() {
+async fn applied_and_emit_cas_fails_when_already_withdrawn() {
     let (rt, tok) = setup();
     ensure_schema(&rt).await;
     let worker = ProposalsProjectionWorker::new(rt.clone());
@@ -592,13 +608,14 @@ async fn on_proposal_applied_cas_fails_when_already_withdrawn() {
         .await
         .expect("withdraw");
 
+    let event = proposal_applied_event(&tok, pid);
     let applied = worker
-        .on_proposal_applied(&tok, pid)
+        .applied_and_emit(&tok, pid, event)
         .await
-        .expect("on_proposal_applied must not error");
+        .expect("applied_and_emit must not error");
     assert!(
         !applied,
-        "H1: on_proposal_applied CAS must return false when status='withdrawn'"
+        "H1: applied_and_emit CAS must return false when status='withdrawn'"
     );
 
     let row = worker

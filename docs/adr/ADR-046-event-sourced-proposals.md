@@ -292,7 +292,11 @@ background worker:
 - `ProposalCreated` → INSERT with status='open'
 - `ProposalReviewed` → UPDATE counts; if `decision = Approve` and approval
   threshold met, set status='approved' (threshold logic in §6)
-- `ProposalApplied` → UPDATE status='applied' (CAS: `WHERE status='applying'`)
+- successful `ProposalApplied` → atomically UPDATE status='applied' (CAS:
+  `WHERE status='applying'`) and INSERT the success event; a missed CAS or update
+  error publishes no success event
+- failed `ProposalApplied` → INSERT the failure event, then best-effort revert
+  status from 'applying' to 'approved'
 - `ProposalWithdrawn` → UPDATE status='withdrawn'
 
 **`applying` — transient in-flight state (V18 amendment):** The apply worker
@@ -301,9 +305,11 @@ before executing any KG mutations. This prevents a concurrent `withdraw` from
 landing while the apply is in progress — `withdraw`'s own CAS requires
 `status NOT IN ('applied', 'applying', 'withdrawn', 'rejected')`, so it fails
 with an error when the apply worker holds `'applying'`. The apply worker
-transitions to `'applied'` on success, or reverts to `'approved'` on failure so
-the proposal is not permanently stuck. `'applying'` is never written to the
-event log — it is a purely transient projection state.
+transitions to `'applied'` and inserts the success event in one transaction, or
+reverts to `'approved'` on failure so the proposal is not permanently stuck.
+The success event INSERT is conditional on the transition changing exactly one
+row, so a missed CAS cannot publish success. `'applying'` is never written to
+the event log — it is a purely transient projection state.
 
 Hard-state (status != 'open' | 'changes_requested') rows are retained for
 audit. A `proposal_cleanup` operator command is deferred; future work must
@@ -343,7 +349,10 @@ Call flow:
 
 1. `handle_review` resolves the proposal id and validates state.
 2. `reviewed_and_emit` atomically advances `proposals_open` and inserts `ProposalReviewed`.
-3. On `Approve`, `ProposalApplyWorker::maybe_apply` claims `approved` to `applying`, applies the changeset, emits `ProposalApplied`, then marks `applied` or reverts to `approved` on failure.
+3. On `Approve`, `ProposalApplyWorker::maybe_apply` claims `approved` to `applying`
+   and applies the changeset. Success atomically marks `applied` and inserts
+   `ProposalApplied`; failure inserts `ProposalApplied { Failed }` and then
+   reverts to `approved`.
 
 Future async worker wiring, if added, must filter by `EventKind::ProposalReviewed`,
 not by verb string. Current v1 code calls the worker directly from `handle_review`.
@@ -363,7 +372,10 @@ On each approved review handled by `handle_review`, `ProposalApplyWorker::maybe_
    - `SupersedeEntity` → adds `supersedes` edge via `runtime.graph.link(...)`
    - `Compound` → recursive within a single transaction (multi-step Compound
      currently rejected before this stage — see the current-restriction note above)
-4. Emits `ProposalApplied` with `Success { created_records }` or `Failed { error }`.
+4. On success, calls `applied_and_emit`, which executes the `applying` →
+   `applied` CAS and the conditional `ProposalApplied { Success { created_records } }`
+   INSERT in one write transaction. On failure, emits
+   `ProposalApplied { Failed { error } }` and best-effort reverts to `approved`.
 
 Authorization (ADR-018) checks the apply attempt. The worker's actor identity
 is (Fix 9):
@@ -461,6 +473,7 @@ verbs and the apply worker each have policy hooks:
 | Proposer withdraws after Approve but before Apply | If `withdraw` arrives before the apply worker claims `'applying'`: `ProposalWithdrawn` emitted; worker sees status≠'approved' (pre-apply CAS fails); skips KG mutations; no `ProposalApplied` emitted. If `withdraw` arrives after the apply worker claims `'applying'`: `withdraw` CAS finds status='applying' and returns an error — the withdraw is rejected. KG mutations proceed and `ProposalApplied` is emitted normally.                                                                                                                                                                                                                                                                        |
 | Apply fails (validation, network, etc.)           | `ProposalApplied { Failed }` emitted; status is reverted from `'applying'` back to `'approved'` (best-effort CAS) so the proposal is not permanently stuck. Apply retry is deferred to a follow-up ADR. v1 behavior: failed applies return to `'approved'`; operators may issue a new `propose` (with `parent_id` referencing the failed proposal) to retry. Direct re-emission of `apply` events is not supported in v1.                                                                                                                                                                                                                                                                               |
 | Apply policy denied                               | Same as Apply fails with `error = "denied by policy"`. Operator adjusts policy and issues a new `propose` (with `parent_id`) to retry; direct `apply` re-emission is not supported in v1.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
+| Success finalization CAS misses or errors         | The transaction publishes no `ProposalApplied { Success }` event. A failed batch leaves the projection at `applying`; committed KG mutations remain visible, but event consumers cannot observe success while projection readers still see a non-applied proposal. The condition is logged for operator reconciliation.                                                                                                                                                                                                                                                                                                                                                                                 |
 | Reviewer reverses Approve to Reject               | Each review is its own event; the worker uses the latest decision per reviewer. If a previously-approved proposal hits Reject before Apply fires, status moves to 'rejected'.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
 | Two reviewers race (both Approve simultaneously)  | Each `review(approve)` call invokes the apply worker synchronously after `reviewed_and_emit`. The `reviewed_and_emit` CAS serializes concurrent reviews at the projection layer; the apply worker’s `approved → applying` CAS ensures only one invocation executes the changeset. The worker checks `proposals_open.status` before applying; if already `applied` or `applying`, it returns without re-executing.                                                                                                                                                                                                                                                                                       |
 | Proposal expires                                  | A background sweep (TBD: cron-style, not v1) emits `ProposalWithdrawn` with `by = "system:expiry"` on proposals past their `expiry` timestamp.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
@@ -768,3 +781,15 @@ No dual-emit. Matches PR #109 (`note_id → id`) discipline.
 **Unchanged permanently**: `ProposalCreatedPayload.proposal_id` struct field,
 `proposals_open.proposal_id` DB column, `EventFilter.payload_proposal_id` filter field,
 and all internal worker references.
+
+## Amendment (2026-07-31): atomic success finalization (#1433)
+
+Successful proposal application finalizes the projection and publishes the
+`ProposalApplied { Success }` event through one `execute_batch` transaction. The
+projection CAS runs first; the event INSERT is guarded by connection-local
+`changes() = 1`. A false CAS therefore inserts no event, and any projection or
+event-write error rolls back both statements. The already-committed KG changeset
+is not part of this finalization transaction, but success never becomes externally
+visible while `proposals_open` remains `applying`. Because this path bypasses the
+`EventStore::append_event` seam, it increments ADR-103 `event_rows` exactly once
+after and only after the two-row atomic batch succeeds.

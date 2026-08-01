@@ -1,6 +1,7 @@
 use super::*;
 use khive_runtime::{KhiveRuntime, Namespace};
-use khive_types::{Id128, ProposalDecision};
+use khive_storage::event::Event;
+use khive_types::{EventKind, Id128, ProposalDecision, SubstrateKind};
 use uuid::Uuid;
 
 fn setup() -> (KhiveRuntime, NamespaceToken) {
@@ -35,6 +36,34 @@ async fn ensure_schema(rt: &KhiveRuntime) {
         })
         .await
         .expect("create table");
+}
+
+fn proposal_applied_event(token: &NamespaceToken, proposal_id: Uuid) -> Event {
+    let mut event = Event::new(
+        token.namespace().as_str(),
+        "propose-apply",
+        EventKind::ProposalApplied,
+        SubstrateKind::Entity,
+        "system:propose-apply",
+    );
+    event.payload = serde_json::json!({ "proposal_id": proposal_id });
+    event.aggregate_kind = Some("proposal".to_string());
+    event.aggregate_id = Some(proposal_id);
+    event
+}
+
+async fn event_exists(rt: &KhiveRuntime, event_id: Uuid) -> bool {
+    let sql = rt.sql();
+    let mut reader = sql.reader().await.expect("reader");
+    reader
+        .query_row(SqlStatement {
+            sql: "SELECT 1 AS present FROM events WHERE id = ?1".to_string(),
+            params: vec![SqlValue::Text(event_id.to_string())],
+            label: Some("test.proposal_applied_event_exists".into()),
+        })
+        .await
+        .expect("query event")
+        .is_some()
 }
 
 #[tokio::test]
@@ -120,7 +149,7 @@ async fn on_proposal_withdrawn_sets_status_withdrawn() {
 }
 
 #[tokio::test]
-async fn on_proposal_applied_sets_status_applied() {
+async fn applied_and_emit_sets_status_applied_and_publishes_success() {
     let (rt, tok) = setup();
     ensure_schema(&rt).await;
     let worker = ProposalsProjectionWorker::new(rt.clone());
@@ -153,12 +182,20 @@ async fn on_proposal_applied_sets_status_applied() {
         "pre_apply_cas must return true when status='approved'"
     );
 
-    // H1: on_proposal_applied now uses WHERE status='applying'.
-    let applied = worker
-        .on_proposal_applied(&tok, pid)
-        .await
-        .expect("on_proposal_applied must succeed");
+    let event = proposal_applied_event(&tok, pid);
+    let event_id = event.id;
+    let usage = khive_runtime::usage::UsageContext::new();
+    let applied = khive_runtime::usage::scope(usage.clone(), async {
+        worker.applied_and_emit(&tok, pid, event).await
+    })
+    .await
+    .expect("applied_and_emit must succeed");
     assert!(applied, "CAS must succeed when status='applying'");
+    assert_eq!(
+        usage.snapshot()["event_rows"],
+        1,
+        "the raw atomic INSERT must preserve EventStore append accounting"
+    );
 
     let row = worker
         .get_proposal_row(&tok, pid)
@@ -167,6 +204,10 @@ async fn on_proposal_applied_sets_status_applied() {
         .expect("row must exist");
 
     assert_eq!(row.status, "applied");
+    assert!(
+        event_exists(&rt, event_id).await,
+        "ProposalApplied success must be published with the applied projection"
+    );
 }
 
 // H1 regression: pre_apply_cas must fail when proposal was already withdrawn.
@@ -617,9 +658,9 @@ async fn same_microsecond_timestamp_no_duplicate_event_changes_guard() {
     );
 }
 
-// H1 regression: on_proposal_applied CAS must fail when status='withdrawn'.
+// A missed finalization CAS must not publish a success event.
 #[tokio::test]
-async fn on_proposal_applied_cas_fails_when_already_withdrawn() {
+async fn applied_and_emit_cas_miss_suppresses_success_event() {
     let (rt, tok) = setup();
     ensure_schema(&rt).await;
     let worker = ProposalsProjectionWorker::new(rt.clone());
@@ -647,14 +688,19 @@ async fn on_proposal_applied_cas_fails_when_already_withdrawn() {
         .await
         .expect("withdraw");
 
-    // on_proposal_applied requires status='applying'; 'withdrawn' fails the CAS.
+    let event = proposal_applied_event(&tok, pid);
+    let event_id = event.id;
     let applied = worker
-        .on_proposal_applied(&tok, pid)
+        .applied_and_emit(&tok, pid, event)
         .await
-        .expect("on_proposal_applied must not error");
+        .expect("applied_and_emit must not error");
     assert!(
         !applied,
-        "H1: on_proposal_applied CAS must return false when status='withdrawn' (not 'applying')"
+        "applied_and_emit must return false when status is not 'applying'"
+    );
+    assert!(
+        !event_exists(&rt, event_id).await,
+        "a missed applied projection CAS must suppress ProposalApplied success"
     );
 
     // Verify the status did not flip back to 'applied'.
@@ -666,5 +712,73 @@ async fn on_proposal_applied_cas_fails_when_already_withdrawn() {
     assert_eq!(
         row.status, "withdrawn",
         "status must remain 'withdrawn' after failed apply CAS"
+    );
+}
+
+// A projection update error must roll back the batch before success is visible.
+#[tokio::test]
+async fn applied_and_emit_projection_error_suppresses_success_event() {
+    let (rt, tok) = setup();
+    ensure_schema(&rt).await;
+    let worker = ProposalsProjectionWorker::new(rt.clone());
+    let pid = Uuid::new_v4();
+
+    worker
+        .on_proposal_created(&tok, pid, "alice", "Projection Failure", None)
+        .await
+        .expect("create");
+    let approve_payload = ProposalReviewedPayload {
+        proposal_id: Id128::from_u128(pid.as_u128()),
+        reviewer: "bob".to_string(),
+        decision: ProposalDecision::Approve,
+        comment: None,
+    };
+    worker
+        .on_proposal_reviewed(&tok, &approve_payload)
+        .await
+        .expect("approve");
+    assert!(
+        worker
+            .pre_apply_cas(&tok, pid)
+            .await
+            .expect("pre_apply_cas"),
+        "precondition: proposal must be applying"
+    );
+
+    let sql = rt.sql();
+    let mut writer = sql.writer().await.expect("writer");
+    writer
+        .execute_script(
+            "CREATE TRIGGER fail_applied_projection \
+             BEFORE UPDATE OF status ON proposals_open \
+             WHEN NEW.status = 'applied' \
+             BEGIN \
+               SELECT RAISE(ABORT, 'forced applied projection failure'); \
+             END"
+            .to_string(),
+        )
+        .await
+        .expect("install failure trigger");
+    drop(writer);
+
+    let event = proposal_applied_event(&tok, pid);
+    let event_id = event.id;
+    worker
+        .applied_and_emit(&tok, pid, event)
+        .await
+        .expect_err("forced projection failure must surface");
+
+    let row = worker
+        .get_proposal_row(&tok, pid)
+        .await
+        .expect("get row")
+        .expect("row must exist");
+    assert_eq!(
+        row.status, "applying",
+        "failed finalization must leave the projection uncommitted"
+    );
+    assert!(
+        !event_exists(&rt, event_id).await,
+        "a projection update error must suppress ProposalApplied success"
     );
 }

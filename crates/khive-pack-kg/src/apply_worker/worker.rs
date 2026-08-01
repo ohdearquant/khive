@@ -138,29 +138,8 @@ impl ProposalApplyWorker {
                     .iter()
                     .map(|id| Id128::from_u128(id.as_u128()))
                     .collect();
-                self.emit_apply_success(token, proposal_id, created_ids)
+                self.finalize_apply_success(token, proposal_id, created_ids)
                     .await;
-                match self
-                    .projection
-                    .on_proposal_applied(token, proposal_id)
-                    .await
-                {
-                    Ok(true) => {}
-                    Ok(false) => {
-                        tracing::warn!(
-                            proposal_id = %proposal_id,
-                            "ProposalApplyWorker: CAS missed on applied projection update — \
-                             unexpected; KG mutations committed but status may not reflect 'applied'"
-                        );
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            proposal_id = %proposal_id,
-                            error = %e,
-                            "ProposalApplyWorker: projection update failed after successful apply (non-fatal)"
-                        );
-                    }
-                }
             }
             Err(e) => {
                 self.emit_apply_failed(token, proposal_id, e.to_string(), 0)
@@ -446,8 +425,8 @@ impl ProposalApplyWorker {
         Ok(ids)
     }
 
-    /// Emit a `ProposalApplied` event with a success result.
-    async fn emit_apply_success(
+    /// Persist the applied projection and success event in one transaction.
+    async fn finalize_apply_success(
         &self,
         token: &NamespaceToken,
         proposal_id: Uuid,
@@ -459,7 +438,31 @@ impl ProposalApplyWorker {
             applied_by: "system:propose-apply".to_string(),
             result: khive_types::ApplyResult::Success { created_records },
         };
-        self.emit_apply_event(token, proposal_id, payload).await;
+        let Some(event) = Self::build_apply_event(token, proposal_id, payload) else {
+            return;
+        };
+        match self
+            .projection
+            .applied_and_emit(token, proposal_id, event)
+            .await
+        {
+            Ok(true) => {}
+            Ok(false) => {
+                tracing::warn!(
+                    proposal_id = %proposal_id,
+                    "ProposalApplyWorker: applied projection CAS missed after successful apply; \
+                     ProposalApplied success event suppressed"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    proposal_id = %proposal_id,
+                    error = %e,
+                    "ProposalApplyWorker: atomic applied projection/event finalization failed \
+                     after successful apply; success event suppressed"
+                );
+            }
+        }
     }
 
     /// Emit a `ProposalApplied` event with a failure result.
@@ -488,28 +491,9 @@ impl ProposalApplyWorker {
         proposal_id: Uuid,
         payload: ProposalAppliedPayload,
     ) {
-        let ns = token.namespace().as_str().to_owned();
-        let payload_json = match serde_json::to_value(&payload) {
-            Ok(v) => v,
-            Err(e) => {
-                tracing::warn!(
-                    proposal_id = %proposal_id,
-                    error = %e,
-                    "ProposalApplyWorker: failed to serialize ProposalAppliedPayload"
-                );
-                return;
-            }
+        let Some(event) = Self::build_apply_event(token, proposal_id, payload) else {
+            return;
         };
-        let mut event = khive_storage::event::Event::new(
-            &ns,
-            "propose-apply",
-            EventKind::ProposalApplied,
-            khive_storage::SubstrateKind::Entity,
-            "system:propose-apply",
-        );
-        event.payload = payload_json;
-        event.aggregate_kind = Some("proposal".to_string());
-        event.aggregate_id = Some(proposal_id);
 
         let Ok(event_store) = self.runtime.events(token) else {
             tracing::warn!(
@@ -525,5 +509,35 @@ impl ProposalApplyWorker {
                 "ProposalApplyWorker: failed to emit ProposalApplied event (non-fatal)"
             );
         }
+    }
+
+    fn build_apply_event(
+        token: &NamespaceToken,
+        proposal_id: Uuid,
+        payload: ProposalAppliedPayload,
+    ) -> Option<khive_storage::event::Event> {
+        let ns = token.namespace().as_str().to_owned();
+        let payload_json = match serde_json::to_value(&payload) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(
+                    proposal_id = %proposal_id,
+                    error = %e,
+                    "ProposalApplyWorker: failed to serialize ProposalAppliedPayload"
+                );
+                return None;
+            }
+        };
+        let mut event = khive_storage::event::Event::new(
+            &ns,
+            "propose-apply",
+            EventKind::ProposalApplied,
+            khive_storage::SubstrateKind::Entity,
+            "system:propose-apply",
+        );
+        event.payload = payload_json;
+        event.aggregate_kind = Some("proposal".to_string());
+        event.aggregate_id = Some(proposal_id);
+        Some(event)
     }
 }
