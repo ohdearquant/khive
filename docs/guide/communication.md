@@ -84,6 +84,7 @@ the structured error and therefore does not know the server-generated UUID.
 | `limit`              | integer | no       | Default 20, max 200.                                                         |
 | `offset`             | integer | no       | Default 0; offset in the fully-filtered newest-first result set.             |
 | `status`             | string  | no       | `"unread"` (default) \| `"read"` \| `"all"`.                                 |
+| `wait_ms`            | integer | no       | Long-poll only when the initial page is empty; default 0, max 30,000.        |
 | `from_actor`         | string  | no       | Exact sender; mutually exclusive with `from_prefix`.                         |
 | `from_prefix`        | string  | no       | Sender prefix; mutually exclusive with `from_actor`.                         |
 | `exclude_from_actor` | string  | no       | Exclude an exact sender actor label.                                         |
@@ -96,6 +97,7 @@ the structured error and therefore does not know the server-generated UUID.
 request(ops="comm.inbox(limit=10)")
 request(ops="comm.inbox(status=\"all\")")
 request(ops="comm.inbox(status=\"all\", content_contains=\"timeout\", since=\"2026-07-31T00:00:00Z\")")
+request(ops="comm.inbox(limit=10, wait_ms=30000)")
 ```
 
 Responses include `offset`, `has_more`, and `next_offset`. Repeat the same call
@@ -103,6 +105,12 @@ with `offset=<next_offset>` until `next_offset` is null to enumerate every
 matching message without changing its read state. Filters are ANDed and offsets
 apply after all filters. Time bounds use the always-present top-level
 `created_at`, not optional transport `sent_at` metadata.
+
+Long-polling preserves that paginated response shape and every actor/status/
+sender/time/text filter, including the requested offset. Existing matches
+return immediately. A new committed message wakes the call and causes the full
+filtered query to run again; unrelated messages cannot leak through or end the
+wait early. `limit=0` remains immediate.
 
 ### Read
 
