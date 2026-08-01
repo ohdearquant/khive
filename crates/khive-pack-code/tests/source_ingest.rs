@@ -113,6 +113,25 @@ async fn edge_fingerprints(rt: &KhiveRuntime) -> Vec<(String, String, String, St
         .collect()
 }
 
+async fn entity_names(rt: &KhiveRuntime) -> Vec<String> {
+    let sql = rt.sql();
+    let mut reader = sql.reader().await.expect("reader");
+    let rows = reader
+        .query_all(SqlStatement {
+            sql: "SELECT name FROM entities WHERE deleted_at IS NULL".into(),
+            params: vec![],
+            label: Some("test_entity_names".into()),
+        })
+        .await
+        .expect("query entity names");
+    rows.into_iter()
+        .filter_map(|r| match r.get("name") {
+            Some(SqlValue::Text(s)) => Some(s.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
 async fn entity_count(rt: &KhiveRuntime) -> i64 {
     let sql = rt.sql();
     let mut reader = sql.reader().await.expect("reader");
@@ -370,6 +389,93 @@ async fn manifestless_rust_folder_uses_basename_fallback() {
             && tgt == "util"
             && kinds == "import"),
         "expected one crate -> util depends_on edge with dependency_kinds=[\"import\"], got: {edges:?}"
+    );
+}
+
+/// `pkg_a` declares a dependency whose name is itself a secret-shaped string
+/// (`scheme://user:pass@host` — the exact url-userinfo pattern the runtime
+/// secret gate blocks, ADR-085 D6 #4). `pkg_b` is an ordinary sibling
+/// project with no such dependency.
+fn write_gate_blocked_dependency_fixture(root: &Path) {
+    let pkg_a = root.join("pkg_a");
+    let pkg_b = root.join("pkg_b");
+    std::fs::create_dir_all(pkg_a.join("src")).unwrap();
+    std::fs::create_dir_all(pkg_b.join("src")).unwrap();
+
+    std::fs::write(
+        pkg_a.join("Cargo.toml"),
+        "[package]\nname = \"pkg_a\"\n\n[dependencies]\n\"scheme://user:pass@host\" = \"0.1\"\n",
+    )
+    .unwrap();
+    std::fs::write(pkg_a.join("src/lib.rs"), "pub fn call_it() {}\n").unwrap();
+
+    std::fs::write(pkg_b.join("Cargo.toml"), "[package]\nname = \"pkg_b\"\n").unwrap();
+    std::fs::write(pkg_b.join("src/lib.rs"), "pub fn helper() {}\n").unwrap();
+}
+
+/// issue #1594: a single secret-gate refusal during `code.ingest` must
+/// quarantine the refused item, not abort the whole pass. `pkg_a`'s
+/// gate-blocked dependency name is recorded in `report.blocked` and skipped;
+/// both `pkg_a`'s own project entity and the unrelated sibling `pkg_b` are
+/// still ingested normally.
+#[tokio::test]
+async fn gate_blocked_write_is_quarantined_and_siblings_ingest() {
+    let root = TempDir::new().expect("tempdir");
+    write_gate_blocked_dependency_fixture(root.path());
+    let db = root.path().join("gate_blocked.db");
+    let rt = rt_at(&db);
+    let token = rt.authorize(Namespace::local()).expect("token");
+
+    let report = run_code_ingest(
+        &rt,
+        &token,
+        CodeSourceIngestOptions {
+            path: root.path(),
+            languages: all_languages(),
+            sweep_time: Utc::now(),
+        },
+    )
+    .await
+    .unwrap_or_else(|e| panic!("ingest must complete despite one gate-blocked write: {e}"));
+
+    assert_eq!(
+        report.blocked.len(),
+        1,
+        "expected exactly one quarantined write, got: {:?}",
+        report.blocked
+    );
+    assert_eq!(
+        report.blocked_count, 1,
+        "blocked_count must match the single entry in blocked"
+    );
+    for entry in &report.blocked {
+        assert_eq!(entry.detector, "url-userinfo");
+        assert!(
+            !entry.masked_excerpt.contains("user:pass"),
+            "masked excerpt must not echo the credential-shaped span: {}",
+            entry.masked_excerpt
+        );
+    }
+
+    assert!(
+        report.projects_created >= 2,
+        "both pkg_a and the unrelated sibling pkg_b must be created, got {} \
+         (report: {report:?})",
+        report.projects_created
+    );
+
+    let names = entity_names(&rt).await;
+    assert!(
+        names.iter().any(|n| n == "pkg_a"),
+        "pkg_a's own project must still be ingested despite its blocked dependency: {names:?}"
+    );
+    assert!(
+        names.iter().any(|n| n == "pkg_b"),
+        "unrelated sibling pkg_b must be ingested: {names:?}"
+    );
+    assert!(
+        !names.iter().any(|n| n.contains("user:pass")),
+        "the gate-blocked dependency name must never be written as an entity: {names:?}"
     );
 }
 
