@@ -9,8 +9,8 @@ parts that are easy to conflate but serve different purposes:
   `session.export`): explicit, caller-driven persistence of a session record
   as a khive note.
 - **Provider mirror ingest**: an optional background service that tails
-  agent CLI transcript files and ChatGPT data exports into their own SQL
-  tables, entirely separate from the note substrate.
+  agent CLI transcript files and ChatGPT or claude.ai data exports into their
+  own SQL tables, entirely separate from the note substrate.
 
 Do not assume these two share storage. A session stored via `session.store`
 is a `kind=session` note, queryable like any other note. A conversation
@@ -43,18 +43,24 @@ field.
 
 ### List
 
-| Param      | Type    | Required | Notes                                        |
-| ---------- | ------- | -------- | -------------------------------------------- |
-| `limit`    | integer | no       | 1 to 200; default 20.                        |
-| `offset`   | integer | no       | Default 0.                                   |
-| `provider` | string  | no       | Exact match filter on `properties.provider`. |
+| Param      | Type    | Required | Notes                                            |
+| ---------- | ------- | -------- | ------------------------------------------------ |
+| `limit`    | integer | no       | 1 to 200; default 20.                            |
+| `offset`   | integer | no       | Default 0.                                       |
+| `provider` | string  | no       | Exact match filter on `properties.provider`.     |
+| `agent_id` | string  | no       | Exact match on the legacy `properties.agent_id`. |
+| `since`    | string  | no       | Inclusive RFC 3339 lower bound on `created_at`.  |
 
 ```
 request(ops="session.list(provider=\"codex\", limit=10)")
 ```
 
 Results are ordered newest first and returned as summaries (no `content`
-field) with a `total` count when the underlying store can supply one.
+field) with a `total` count when the underlying store can supply one. All
+filters and pagination are applied by the note store, so a sparse match is not
+lost behind an in-memory overfetch window. `agent_id` is a compatibility query
+for records that already carry that property; it does not add an `agent_id`
+parameter to `session.store`.
 
 ### Resume
 
@@ -98,7 +104,7 @@ does not create `session` notes.
 
 ### Supported providers
 
-Only three sources are implemented (`MirrorSource` in
+Four sources are implemented (`MirrorSource` in
 [`src/mirror/ingest.rs`](../../crates/khive-pack-session/src/mirror/ingest.rs)):
 
 - **Claude Code CLI transcripts** (`claude_code`): JSONL files under
@@ -108,10 +114,12 @@ Only three sources are implemented (`MirrorSource` in
 - **ChatGPT data exports** (`chatgpt_export`): a `conversations.json` file
   (the format ChatGPT's "export data" produces) under
   `KHIVE_MIRROR_CHATGPT_DIR`.
-
-There is no ingest path for claude.ai (the web product) conversation history.
-If a future provider adds that, it belongs here as a fourth `MirrorSource`
-variant, not folded into the existing ChatGPT or Claude Code parsers.
+- **claude.ai data exports** (`claude_ai_export`): the distinct
+  `conversations.json` shape from Claude's data export, under
+  `KHIVE_MIRROR_CLAUDE_AI_DIR`. Conversation and message UUIDs are preserved;
+  alternate branches are retained when the export supplies parent/active-leaf
+  metadata. Every valid conversation creates a session row even when it has no
+  displayable messages.
 
 ### Enabling it
 
@@ -126,16 +134,18 @@ not run that daemon warm path. So, like the email channel loops described in
 is what actually starts background ingestion; a stdio session never spawns
 its own mirror poller.
 
-| Variable                       | Default                  |
-| ------------------------------ | ------------------------ |
-| `KHIVE_MIRROR_ENABLED`         | `false`                  |
-| `KHIVE_MIRROR_PROJECTS_DIR`    | `$HOME/.claude/projects` |
-| `KHIVE_MIRROR_CODEX_ENABLED`   | `false`                  |
-| `KHIVE_MIRROR_CODEX_DIR`       | `$HOME/.codex/sessions`  |
-| `KHIVE_MIRROR_CHATGPT_ENABLED` | `false`                  |
-| `KHIVE_MIRROR_CHATGPT_DIR`     | `$HOME/.chatgpt/exports` |
-| `KHIVE_MIRROR_POLL_SECS`       | `2`                      |
-| `KHIVE_MIRROR_BACKFILL`        | `true`                   |
+| Variable                         | Default                  |
+| -------------------------------- | ------------------------ |
+| `KHIVE_MIRROR_ENABLED`           | `false`                  |
+| `KHIVE_MIRROR_PROJECTS_DIR`      | `$HOME/.claude/projects` |
+| `KHIVE_MIRROR_CODEX_ENABLED`     | `false`                  |
+| `KHIVE_MIRROR_CODEX_DIR`         | `$HOME/.codex/sessions`  |
+| `KHIVE_MIRROR_CHATGPT_ENABLED`   | `false`                  |
+| `KHIVE_MIRROR_CHATGPT_DIR`       | `$HOME/.chatgpt/exports` |
+| `KHIVE_MIRROR_CLAUDE_AI_ENABLED` | `false`                  |
+| `KHIVE_MIRROR_CLAUDE_AI_DIR`     | `$HOME/.claude/exports`  |
+| `KHIVE_MIRROR_POLL_SECS`         | `2`                      |
+| `KHIVE_MIRROR_BACKFILL`          | `true`                   |
 
 `KHIVE_MIRROR_POLL_SECS=0` is rejected (falls back to the default rather than
 busy-looping); a non-numeric value likewise falls back to the default, with a
@@ -151,8 +161,9 @@ rather than re-reading from the start. Writes into `sessions` and
 re-processed byte range does not duplicate rows. `provider_session_id`
 values are the mirror's continuity anchor across restarts. Reads are bounded
 in size (a byte/line/event cap per read) so a single oversized file cannot
-stall the tailer; the ChatGPT export path additionally caps the whole file
-at `KHIVE_MIRROR_CHATGPT_MAX_BYTES` (default 256 MiB).
+stall the tailer; the export paths additionally cap each whole file at
+`KHIVE_MIRROR_CHATGPT_MAX_BYTES` or
+`KHIVE_MIRROR_CLAUDE_AI_MAX_BYTES` (both default 256 MiB).
 
 ### Worked example
 

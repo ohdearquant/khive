@@ -118,15 +118,13 @@ fn preceded_by_closing_keyword(text: &str, hash_idx: usize) -> bool {
     let trimmed = before.trim_end_matches(|c: char| c.is_whitespace() || c == ':');
     let lower = trimmed.to_ascii_lowercase();
     for kw in CLOSING_KEYWORDS {
-        if let Some(boundary_idx) = lower.len().checked_sub(kw.len()) {
-            if &lower[boundary_idx..] == *kw {
-                let prev_char = lower[..boundary_idx].chars().next_back();
-                if prev_char
-                    .map(|c| !c.is_ascii_alphanumeric())
-                    .unwrap_or(true)
-                {
-                    return true;
-                }
+        if let Some(prefix) = lower.strip_suffix(*kw) {
+            let prev_char = prefix.chars().next_back();
+            if prev_char
+                .map(|c| !c.is_ascii_alphanumeric())
+                .unwrap_or(true)
+            {
+                return true;
             }
         }
     }
@@ -195,6 +193,45 @@ mod tests {
         let mentions = extract_references("Fixes #12, Resolves #34, see also #56");
         assert_eq!(numbers_of(RefKind::Closes, &mentions), vec![12, 34]);
         assert_eq!(numbers_of(RefKind::Mentions, &mentions), vec![56]);
+    }
+
+    #[test]
+    fn reference_scanning_handles_multibyte_boundaries_across_keyword_lengths() {
+        // Each prefix is one byte longer than a distinct closing-keyword length
+        // (3, 5, 6, 7, or 8), so subtracting that length lands inside `—`.
+        for (text, number) in [
+            ("—x#1", 1),
+            ("—xxx#2", 2),
+            ("—xxxx#3", 3),
+            ("—xxxxx#4", 4),
+            ("—xxxxxx#5", 5),
+        ] {
+            assert_eq!(
+                extract_references(text),
+                vec![RefMention {
+                    number,
+                    kind: RefKind::Mentions,
+                }],
+                "{text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn multibyte_body_preserves_closing_and_mention_classification() {
+        assert_eq!(
+            extract_references("修复说明 — Fixes #41; 中文说明 #42"),
+            vec![
+                RefMention {
+                    number: 41,
+                    kind: RefKind::Closes,
+                },
+                RefMention {
+                    number: 42,
+                    kind: RefKind::Mentions,
+                },
+            ]
+        );
     }
 
     #[test]

@@ -4,10 +4,11 @@ use uuid::Uuid;
 
 use khive_runtime::{
     atomic_prepare::{
-        apply_post_commit_effects, prepare_add_entity, prepare_add_note, prepare_op,
+        apply_post_commit_effects_with_report, prepare_add_entity, prepare_add_note, prepare_op,
         prepare_update_entity_plan,
     },
     curation::{ContentMergeStrategy, EntityDedupMergePolicy, EntityPatch},
+    retrieval::EmbeddingTruncationReport,
     AtomicOpPlan, AtomicRunOutcome, EdgeListFilter, KhiveRuntime, NamespaceToken, RuntimeError,
     VerbRegistry,
 };
@@ -65,13 +66,27 @@ impl ProposalApplyWorker {
         registry: &VerbRegistry,
         max_new_entries: Option<u64>,
     ) -> Result<(), RuntimeError> {
+        self.maybe_apply_with_report(token, proposal_id, registry, max_new_entries)
+            .await
+            .map(|_| ())
+    }
+
+    /// Truncation-reporting form of [`Self::maybe_apply`]. Returns aggregate
+    /// embedding-input truncation observed by a successful apply.
+    pub async fn maybe_apply_with_report(
+        &self,
+        token: &NamespaceToken,
+        proposal_id: Uuid,
+        registry: &VerbRegistry,
+        max_new_entries: Option<u64>,
+    ) -> Result<EmbeddingTruncationReport, RuntimeError> {
         let row = match self.projection.get_proposal_row(token, proposal_id).await? {
             Some(r) => r,
-            None => return Ok(()),
+            None => return Ok(EmbeddingTruncationReport::default()),
         };
 
         if row.status != "approved" || row.reject_count > 0 {
-            return Ok(());
+            return Ok(EmbeddingTruncationReport::default());
         }
 
         let changeset = match self.load_changeset(token, proposal_id).await {
@@ -79,7 +94,7 @@ impl ProposalApplyWorker {
             Err(e) => {
                 self.emit_apply_failed(token, proposal_id, e.to_string(), 0)
                     .await;
-                return Ok(());
+                return Ok(EmbeddingTruncationReport::default());
             }
         };
 
@@ -92,7 +107,7 @@ impl ProposalApplyWorker {
                 0,
             )
             .await;
-            return Ok(());
+            return Ok(EmbeddingTruncationReport::default());
         }
 
         if let Some(max) = max_new_entries {
@@ -109,7 +124,7 @@ impl ProposalApplyWorker {
                     0,
                 )
                 .await;
-                return Ok(());
+                return Ok(EmbeddingTruncationReport::default());
             }
         }
 
@@ -120,7 +135,7 @@ impl ProposalApplyWorker {
                 "ProposalApplyWorker: pre-apply CAS missed — proposal already in \
                  non-approved state (withdrawn or applied concurrently); skipping"
             );
-            return Ok(());
+            return Ok(EmbeddingTruncationReport::default());
         }
 
         let apply_result = self
@@ -132,14 +147,15 @@ impl ProposalApplyWorker {
             )
             .await;
 
-        match apply_result {
-            Ok(created_records) => {
+        let embedding_truncation = match apply_result {
+            Ok((created_records, embedding_truncation)) => {
                 let created_ids: Vec<Id128> = created_records
                     .iter()
                     .map(|id| Id128::from_u128(id.as_u128()))
                     .collect();
                 self.finalize_apply_success(token, proposal_id, created_ids)
                     .await;
+                embedding_truncation
             }
             Err(e) => {
                 self.emit_apply_failed(token, proposal_id, e.to_string(), 0)
@@ -156,10 +172,11 @@ impl ProposalApplyWorker {
                          after failed apply — proposal may be stuck in 'applying'"
                     );
                 }
+                EmbeddingTruncationReport::default()
             }
-        }
+        };
 
-        Ok(())
+        Ok(embedding_truncation)
     }
 
     /// Load the ProposalCreated event payload to get the changeset.
@@ -207,7 +224,7 @@ impl ProposalApplyWorker {
         changeset: &ProposalChangeset,
         registry: &VerbRegistry,
         budget: &mut WriteBudget,
-    ) -> Result<Vec<Uuid>, RuntimeError> {
+    ) -> Result<(Vec<Uuid>, EmbeddingTruncationReport), RuntimeError> {
         match self
             .prepare_changeset(token, changeset, registry, budget)
             .await?
@@ -221,8 +238,19 @@ impl ProposalApplyWorker {
                     .map_err(|error| RuntimeError::Storage(error.0))?;
                 match outcome {
                     AtomicRunOutcome::Committed { post_commit } => {
-                        apply_post_commit_effects(&self.runtime, token, post_commit).await?;
-                        self.resolve_created_records(token, created_records).await
+                        let outcomes = apply_post_commit_effects_with_report(
+                            &self.runtime,
+                            token,
+                            post_commit,
+                        )
+                        .await?;
+                        let mut embedding_truncation = EmbeddingTruncationReport::default();
+                        for outcome in outcomes {
+                            embedding_truncation.merge(outcome.truncation);
+                        }
+                        let created_records =
+                            self.resolve_created_records(token, created_records).await?;
+                        Ok((created_records, embedding_truncation))
                     }
                     AtomicRunOutcome::RolledBack {
                         failed_op_index,
@@ -233,7 +261,8 @@ impl ProposalApplyWorker {
                 }
             }
             PreparedApply::CanonicalMerge { into_id, from_id } => {
-                self.runtime
+                let summary = self
+                    .runtime
                     .merge_entity(
                         token,
                         into_id,
@@ -243,7 +272,7 @@ impl ProposalApplyWorker {
                         false,
                     )
                     .await?;
-                Ok(vec![])
+                Ok((vec![], summary.embedding_truncation))
             }
         }
     }

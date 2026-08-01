@@ -41,6 +41,18 @@ fixes a code citation (§4).
 
 ## Decision
 
+### Amendment 1 (2026-08-01): complete the list filter contract
+
+Issue #1493 establishes the concrete query need anticipated below: callers
+must be able to page a sparse subset without first loading an unbounded result
+set. `session.list` therefore adds two optional, server-side filters:
+`agent_id`, an exact match on legacy `properties.agent_id`, and `since`, an
+inclusive RFC 3339 lower bound on `notes.created_at`. Both feed the existing
+`query_notes_filtered` storage request before `offset` and `limit` are applied.
+This amendment does not restore `agent_id` or open-ended `metadata` to
+`session.store`; it only makes existing property-bearing session notes
+queryable. No response shape or other verb changes.
+
 ### 1. ADR-080 §3's shipped-surface record is superseded for T1
 
 This accepted ADR supersedes ADR-080 §3's intervening shipped-surface record
@@ -109,15 +121,18 @@ Return shape:
 
 #### `session.list`
 
-| Parameter  | Type    | Required | Description                            |
-| ---------- | ------- | -------- | -------------------------------------- |
-| `limit`    | integer | no       | Page size, 1 through 200, default 20.  |
-| `offset`   | integer | no       | Pagination offset, default 0.          |
-| `provider` | string  | no       | Exact filter on `properties.provider`. |
+| Parameter  | Type    | Required | Description                                           |
+| ---------- | ------- | -------- | ----------------------------------------------------- |
+| `limit`    | integer | no       | Page size, 1 through 200, default 20.                 |
+| `offset`   | integer | no       | Pagination offset, default 0.                         |
+| `provider` | string  | no       | Exact filter on `properties.provider`.                |
+| `agent_id` | string  | no       | Exact filter on legacy `properties.agent_id`.         |
+| `since`    | string  | no       | Inclusive RFC 3339 lower bound on `notes.created_at`. |
 
 List summaries omit `content`; `SessionSummary` carries no `content` field.
 
-Errors: a present-but-empty `provider` is rejected the same way as `session.store`. A `limit` outside
+Errors: a present-but-empty `provider` or `agent_id` is rejected. An invalid
+`since` is rejected with the required RFC 3339 format. A `limit` outside
 `1..=200` is rejected (`session.list: limit must be in 1..=200; valid values: integers 1 through
 200; got {limit}`).
 
@@ -222,11 +237,11 @@ ADR-071 `BackendHandle` seam per ADR-080 §5.
 ### 5. The session mirror is unaffected
 
 ADR-080 §6 documents the session mirror: a read-only background poll loop, spawned from
-`PackRuntime::warm()`, that tails Claude Code, Codex CLI, and ChatGPT-export transcripts into three
-auxiliary tables (`sessions`, `session_messages`, `session_mirror_cursor`) declared through the
-pack's `SCHEMA_PLAN` (`SESSION_SCHEMA_PLAN_STMTS`, the ADR-028 mechanism). It shipped as the pack's
-M2 milestone (issue #350, PR #368), gained the Codex CLI source in PR #375, and is disabled by
-default.
+`PackRuntime::warm()`, that ingests Claude Code, Codex CLI, ChatGPT-export, and claude.ai-export
+transcripts into three auxiliary tables (`sessions`, `session_messages`,
+`session_mirror_cursor`) declared through the pack's `SCHEMA_PLAN`
+(`SESSION_SCHEMA_PLAN_STMTS`, the ADR-028 mechanism). It shipped as the pack's M2 milestone
+(issue #350, PR #368), gained the Codex CLI source in PR #375, and is disabled by default.
 
 The T1 verb surface and the session mirror are additive, not a replacement. This is a deliberate
 design ruling. T1's four verbs read and write `kind=session` notes in the shared `notes` table.
@@ -275,7 +290,9 @@ service, and the `session_messages` table. These are shipped today (§5).
   `provider` and `provider_session_id` name the actual continuity anchor T1 needs: which external
   system, and which session in that system. `metadata` (an open-ended object) and `since` (a
   list-time filter) are dropped from the T1 parameter surface; filtering by time can be added later
-  without a breaking change if a real query need appears.
+  without a breaking change if a real query need appears. Amendment 1 records that later query need
+  and restores `agent_id` and `since` only as additive `session.list` filters; the T1 store contract
+  remains unchanged.
 - **Why not fold this into ADR-080.** ADR-080 already carries three same-day amendments (Context,
   §3, §6). A verb-visibility, verb-count, and parameter-vocabulary change is a public-contract
   decision, not a storage-mechanism refinement, which is what ADR-080 is about. A separate ADR that
@@ -330,8 +347,9 @@ repeated here. Alternatives specific to this ADR's verb-surface decision:
 The implementation's integration suite (`crates/khive-pack-session/tests/integration.rs`) covers, by scenario:
 store-to-resume content equality, list visibility (summaries omit `content`), export as JSON, export
 as markdown, UUID short-prefix resolution, provider filtering, invalid-`format` errors listing valid
-values, invalid-`limit` range errors, and rejection of a non-session UUID. All nine scenarios are
-present and passing as of the recorded implementation commit `28215e07`.
+values, invalid-`limit` range errors, and rejection of a non-session UUID. Amendment 1 adds
+server-side `agent_id` and `since` filtering, an exact offset window, and explicit resume/export
+regressions for soft-deleted sessions.
 
 ## References
 

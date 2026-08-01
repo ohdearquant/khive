@@ -1,5 +1,5 @@
 ---
-description: Coordinate with other agents and lambdas over khive comm — be attributable (set KHIVE_ACTOR), address by actor (to="lambda:X") with a subject, triage your inbox by sender + subject, and reply to thread. Use whenever you send a message, check your inbox, follow up in a conversation, or read a thread.
+description: Coordinate with other agents and lambdas over khive comm — be attributable (set KHIVE_ACTOR), address by actor (to="lambda:X") with a subject, triage your inbox by sender + subject, reply to thread, and inspect channel polling freshness. Use whenever you send a message, check your inbox, follow up in a conversation, read a thread, or diagnose channel delivery.
 ---
 
 # Coordinate over comm
@@ -63,10 +63,13 @@ The fields you triage on are surfaced at the **top level** — no digging into `
 ```
 
 Scan `from` + `subject` + `preview`, open `content` for the ones that matter, then
-`comm.read(id="<full_id>")` to clear them. Always pass a `limit` — active inboxes are large.
-The mark-read write is best-effort: a successful response can carry `read: false` plus a
-`mark_error` when the mark did not land (e.g. under writer contention). Check `read` in the
-response; if it is `false`, the message stays unread — re-issue `comm.read` later.
+`comm.read(id="<full_id>")` to clear one or `comm.read(ids=[...])` to clear up to 500 in one
+operation. Always pass a `limit` — active inboxes are large. If `next_offset` is non-null, repeat
+the same inbox filters with `offset=<next_offset>` until it is null; pagination itself never marks
+messages read. Use `content_contains` when automated notifications omit `subject`; sender
+exact/prefix/exclusion, RFC3339 `since`/`before`, and subject/content substring filters can be
+combined. Mark writes are best-effort and cross-message updates are not atomic: inspect every
+result's `read`/`mark_error`, and re-issue failures later.
 
 ### 4. Reply to thread, don't start a new one
 
@@ -83,6 +86,20 @@ request(ops="comm.thread(id=\"<any-message-in-thread>\")")
 
 Any message id in the thread resolves to the same canonical thread.
 
+### 5. Check channel polling freshness
+
+```
+request(ops="comm.health()")
+```
+
+Each channel reports `poll_interval_secs` (its nominal/minimum cadence) and nullable
+`stalled`. A `true` value means the persisted poll schedule is more than three nominal
+intervals overdue; `null` means the row is legacy/malformed or the channel is in a known
+failure/backoff episode. Treat `stalled` as an advisory, not proof that the task is dead:
+sequential or slow in-flight polls can also make a row overdue. Inspect
+`consecutive_failures`, `last_error`, and `last_poll_attempt_at` together, and use the daemon
+component supervisor for authoritative task-liveness/restart decisions.
+
 ## Anti-patterns
 
 - **Sending as `"local"`.** Unattributed and unscoped. Set `KHIVE_ACTOR` first.
@@ -94,3 +111,5 @@ Any message id in the thread resolves to the same canonical thread.
 - **Reading `properties` to find the sender.** `from` / `subject` / `preview` are top-level.
 - **`comm.send` with a `thread_id` for a follow-up.** Use `comm.reply` — it threads, prefixes,
   and routes for you.
+- **Treating `comm.health.channels[].stalled` as a supervisor verdict.** It is a persisted
+  schedule heuristic; correlate it with failure and timestamp fields.

@@ -310,7 +310,7 @@ def brain_smoke():
             bind_result = call_verb(proc, "brain.bind", {
                 "profile_id": "balanced-recall-v1",
                 "actor": "test-actor",
-                "consumer_kind": "mcp",
+                "consumer_kind": "recall",
             })
             assert bind_result.get("bound") is True, f"bind must return bound=true: {bind_result}"
             assert bind_result.get("actor") == "test-actor", f"actor mismatch: {bind_result}"
@@ -318,10 +318,10 @@ def brain_smoke():
             bindings = call_verb(proc, "brain.bindings", {})
             rows = bindings.get("bindings", [])
             found = any(
-                r.get("actor") == "test-actor" and r.get("consumer_kind") == "mcp"
+                r.get("actor") == "test-actor" and r.get("consumer_kind") == "recall"
                 for r in rows
             )
-            assert found, f"test-actor/mcp binding must appear in bindings: {rows}"
+            assert found, f"test-actor/recall binding must appear in bindings: {rows}"
             ok(f"bind + bindings — binding appears in listing")
         except Exception as e:
             fail("bind + bindings", e)
@@ -330,7 +330,7 @@ def brain_smoke():
         try:
             unbind_result = call_verb(proc, "brain.unbind", {
                 "actor": "test-actor",
-                "consumer_kind": "mcp",
+                "consumer_kind": "recall",
             })
             removed = unbind_result.get("unbound", 0)
             assert removed >= 1, f"unbind must remove at least 1 row: {unbind_result}"
@@ -338,7 +338,7 @@ def brain_smoke():
             bindings_after = call_verb(proc, "brain.bindings", {})
             rows_after = bindings_after.get("bindings", [])
             still_there = any(
-                r.get("actor") == "test-actor" and r.get("consumer_kind") == "mcp"
+                r.get("actor") == "test-actor" and r.get("consumer_kind") == "recall"
                 for r in rows_after
             )
             assert not still_there, (

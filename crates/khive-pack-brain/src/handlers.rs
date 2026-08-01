@@ -441,7 +441,7 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
                 name: "consumer_kind",
                 param_type: "string",
                 required: false,
-                description: "Verb / operation kind to match. Default \"*\" (all kinds).",
+                description: "Registered brain consumer kind to match. Default \"*\" (all kinds). Unknown kinds are rejected with the loaded valid set.",
             },
             khive_types::ParamDef {
                 name: "priority",
@@ -1502,6 +1502,13 @@ impl BrainPack {
             _ => {}
         }
 
+        // Compute the effective serving profile (explicit, else a matching
+        // actor+namespace binding, else the system default — #697), unless the
+        // serve was explicitly unattributed, in which case there is no profile
+        // to resolve at all. Then perform a warm-state fast-path check that it
+        // exists and is not Archived; the persistence transaction repeats this
+        // against the authoritative rebased snapshot before writing any side
+        // effect on every path where a profile was actually resolved.
         let (mut effective_profile, mut profile_resolution) =
             if serve_attribution == ServeAttribution::Unattributed {
                 (None, "serve_unattributed")
@@ -1604,15 +1611,15 @@ impl BrainPack {
 
         // ADR-081 §2/§6: when both scorer fields are present, the dedup claim
         // is made atomically inside the SAME `BEGIN IMMEDIATE` transaction as
-        // the fold gate's mass check-and-write AND
-        // the durable feedback event append (fold_gate.rs) — the `resolve`
+        // the fold gate's mass check-and-write, the public event, the private
+        // brain event, and the posterior snapshot — the `resolve`
         // check above is a non-atomic fast path only (it still handles the
         // common sequential case and the NotFound / forced-zero-weight
         // determination); this is the authoritative correctness mechanism
         // under concurrent duplicate submissions.
-        let dedup_key: Option<(&str, &str)> =
+        let dedup_key: Option<(String, String)> =
             match (p.scorer_run_id.as_deref(), p.serve_ledger_id.as_deref()) {
-                (Some(r), Some(l)) => Some((r, l)),
+                (Some(r), Some(l)) => Some((r.to_string(), l.to_string())),
                 _ => None,
             };
 
@@ -1652,169 +1659,70 @@ impl BrainPack {
 
         // ADR-081 §2: the bounded-mass fold gate applies only to implicit
         // signals. Explicit/correction signals are never gated (they are the
-        // clamp's own comparator, ADR-081 §1) and — ADR-081 §6 — need not
-        // join the event append into the fold transaction: there is no
-        // dedup claim to keep consistent for them, so their append path
-        // below is unchanged from before this fix.
-        let event = if is_gated_implicit {
+        // clamp's own comparator, ADR-081 §1).
+        let duration_us = feedback_start.elapsed().as_micros().max(1) as i64;
+        let event = Event::new(
+            token.namespace().as_str().to_string(),
+            "brain.feedback",
+            khive_types::EventKind::FeedbackExplicit,
+            target_substrate,
+            format!("{}:{}", token.actor().kind, token.actor().id),
+        )
+        .with_target(target)
+        .with_payload(base_data)
+        .with_duration_us(duration_us);
+
+        let event_write = if is_gated_implicit {
             let nominal_weight = FeedbackEventKind::from_signal_str(signal)
                 .expect("is_gated_implicit implies from_signal_str is Some")
                 .update_weight();
-            // The forced-zero fail-safe path now
-            // runs through the SAME atomic claim+append unit as the nominal
-            // path below — only the mass fold write itself is skipped — so
-            // it participates in the dedup claim instead of bypassing it.
             let gate_mode = if forced_zero_weight {
                 crate::fold_gate::FeedbackGateMode::ForcedZero
             } else {
                 crate::fold_gate::FeedbackGateMode::Nominal(nominal_weight)
             };
-
-            let namespace = token.namespace().as_str().to_string();
-            // ADR-096 per-request identity: stamp the resolved caller actor,
-            // not a hardcoded pack name — matches the `kind:id` convention
-            // the generic Audit event already uses (khive-runtime pack.rs
-            // `build_audit_storage_event`). `ActorRef::anonymous()` resolves
-            // to the explicit `"anonymous:local"` string rather than
-            // silently mislabeling the event, so unresolved-actor calls are
-            // still distinguishable from configured caller attribution.
-            let actor_label = format!("{}:{}", token.actor().kind, token.actor().id);
-            // `apply_fold_gate_and_append_event`'s `build_event` closure is
-            // now required to be `'static` (ADR-067 Component A, Fork C
-            // slice 2 — it is boxed into an `AtomicUnitOp` and may run
-            // inside the writer task's `spawn_blocking`), so it must own
-            // its captures rather than borrow `namespace`/`base_data` — a
-            // separate `namespace_for_event` clone avoids conflicting with
-            // the `&namespace` borrow passed as this call's own argument.
-            let namespace_for_event = namespace.clone();
-            let actor_label_for_event = actor_label.clone();
-            let base_data_for_event = base_data.clone();
-            // Forced-zero unattributed events do not touch the mass table, so
-            // this sentinel is an atomic-unit routing key only and can never be
-            // mistaken for a registered serving profile.
-            let fold_profile_id = effective_profile.as_deref().unwrap_or("__unattributed__");
-            let outcome = crate::fold_gate::apply_fold_gate_and_append_event(
-                sql.as_ref(),
-                &namespace,
-                fold_profile_id,
-                &target.to_string(),
+            crate::persist::FeedbackEventWrite::Gated {
+                event,
+                target_id: target.to_string(),
                 gate_mode,
-                now_us,
+                gate_now_us: now_us,
                 dedup_key,
-                move |fold_outcome, forced_zero| {
-                    let mut data = base_data_for_event;
-                    let (effective_weight, mass_before, mass_after) = match fold_outcome {
-                        Some(o) => (o.effective_weight, o.mass_before, o.mass_after),
-                        None => (0.0, 0.0, 0.0),
-                    };
-                    data["gate"] = json!({
-                        "effective_weight": effective_weight,
-                        "mass_before": mass_before,
-                        "mass_after": mass_after,
-                        "forced_zero_weight": forced_zero,
-                    });
-                    let duration_us = feedback_start.elapsed().as_micros().max(1) as i64;
-                    Event::new(
-                        namespace_for_event,
-                        "brain.feedback",
-                        khive_types::EventKind::FeedbackExplicit,
-                        target_substrate,
-                        actor_label_for_event,
-                    )
-                    .with_target(target)
-                    .with_payload(data)
-                    .with_duration_us(duration_us)
-                },
-            )
-            .await?;
-
-            match outcome {
-                // This is now the ONLY place a scorer-tagged
-                // implicit call returns `deduped` — reached only when the
-                // atomic unit's claim conflicted, meaning either a prior call
-                // already committed claim+fold+event together, or (never)
-                // a partially-failed prior attempt, since a failed attempt
-                // rolls back its claim too.
-                crate::fold_gate::GateAndAppendOutcome::Deduped => {
-                    return Ok(json!({
-                        "emitted": false,
-                        "deduped": true,
-                        "verb": "brain.feedback",
-                        "signal": signal,
-                        "target_id": target.to_string(),
-                        "serve_ledger_id": p.serve_ledger_id,
-                        "scorer_run_id": p.scorer_run_id,
-                        "served_by_profile_id": effective_profile.as_deref(),
-                        "serve_attribution": serve_attribution,
-                    }));
-                }
-                crate::fold_gate::GateAndAppendOutcome::Applied(result) => result.event,
             }
         } else {
-            // Unchanged: explicit/correction signals (and non-scorer implicit
-            // feedback would also land here if it ever reached this branch,
-            // but `is_gated_implicit` already routes all implicit signals
-            // above) append through the ordinary `EventStore` path, in its
-            // own transaction — ADR-081 §6 does not require these to join
-            // the fold gate's atomic unit.
-            let duration_us = feedback_start.elapsed().as_micros().max(1) as i64;
-            let event = Event::new(
-                token.namespace().as_str().to_string(),
-                "brain.feedback",
-                khive_types::EventKind::FeedbackExplicit,
-                target_substrate,
-                format!("{}:{}", token.actor().kind, token.actor().id),
-            )
-            .with_target(target)
-            .with_payload(base_data)
-            .with_duration_us(duration_us);
-
-            let store = self.runtime.events(token)?;
-            store
-                .append_event(event.clone())
-                .await
-                .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?;
-            event
+            crate::persist::FeedbackEventWrite::Direct(event)
         };
 
-        if let Some(serving_profile_owned) = effective_profile.clone() {
-            let brain_signal = interpret(&event);
-
-            // Issue #458: apply the posterior mutation and make its durability
-            // part of the success contract. `persist_brain_state_mutation` runs
-            // this closure against a *proposed* state copy, then commits the
-            // brain event-log append + snapshot upsert in one transaction —
-            // `self.state` is only replaced with the proposed copy after that
-            // commit succeeds. If persistence fails, this returns `Err` and
-            // `self.state` is left completely untouched (no phantom in-memory
-            // posterior update that vanishes on restart).
-            crate::persist::persist_brain_state_mutation(
+        let event: Event = if let Some(serving_profile_owned) = effective_profile.clone() {
+            // #1592: profile existence/lifecycle was already fast-path-checked
+            // above under the warm-state lock; `persist_feedback_state_mutation`
+            // repeats that check against the authoritative rebased snapshot
+            // inside the same atomic unit that appends the event and mutates
+            // the posterior, so a profile archived/deleted between the two
+            // checks is still caught.
+            #[cfg(test)]
+            crate::pack::run_feedback_precommit_hook(serving_profile_owned.as_str()).await;
+            let event = crate::persist::persist_feedback_state_mutation(
                 self.runtime.sql().as_ref(),
                 token,
                 &self.persistence,
                 &self.state,
-                crate::persist::BrainMutationEvent {
-                    profile_id: serving_profile_owned.clone(),
-                    event_kind: event.verb.clone(),
-                    payload: serde_json::to_value(&event)
-                        .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?,
-                },
+                serving_profile_owned.clone(),
+                event_write,
                 ENTITY_CACHE_CAPACITY,
                 {
-                    let brain_signal = brain_signal.clone();
                     let serving_profile_owned = serving_profile_owned.clone();
-                    move |state: &mut khive_brain_core::BrainState| -> Result<(), RuntimeError> {
+                    move |state: &mut khive_brain_core::BrainState, brain_signal| {
                         let serving_profile = serving_profile_owned.as_str();
 
                         if serving_profile == "balanced-recall-v1" {
-                            state.balanced_recall.apply_signal(&brain_signal);
+                            state.balanced_recall.apply_signal(brain_signal);
                             sync_balanced_recall_record(state);
                         } else if state.profile_states.contains_key(serving_profile) {
                             let ps = state
                                 .profile_states
                                 .get_mut(serving_profile)
                                 .expect("key checked above");
-                            ps.apply_signal(&brain_signal);
+                            ps.apply_signal(brain_signal);
                             let snap = serde_json::to_value(ps.to_snapshot()).ok();
                             let total = ps.total_events;
                             if let Some(record) = state.profiles.get_mut(serving_profile) {
@@ -1822,25 +1730,33 @@ impl BrainPack {
                                 record.state_snapshot = snap;
                             }
                         } else {
-                            state.balanced_recall.apply_signal(&brain_signal);
+                            state.balanced_recall.apply_signal(brain_signal);
                             sync_balanced_recall_record(state);
                         }
 
-                        // Seed and backfill section posteriors, then apply the signal.
-                        // Shared contract with the replay path — see `ensure_section_state_seeded`.
-                        {
-                            let section_state = crate::ensure_section_state_seeded(
-                                &mut state.section_states,
-                                &serving_profile_owned,
-                            );
-                            section_state.apply_signal(&brain_signal);
-                        }
-
-                        Ok(())
+                        let section_state = crate::ensure_section_state_seeded(
+                            &mut state.section_states,
+                            &serving_profile_owned,
+                        );
+                        section_state.apply_signal(brain_signal);
                     }
                 },
             )
             .await?;
+            let Some(event) = event else {
+                return Ok(json!({
+                    "emitted": false,
+                    "deduped": true,
+                    "verb": "brain.feedback",
+                    "signal": signal,
+                    "target_id": target.to_string(),
+                    "serve_ledger_id": p.serve_ledger_id,
+                    "scorer_run_id": p.scorer_run_id,
+                    "served_by_profile_id": effective_profile.as_deref(),
+                    "serve_attribution": serve_attribution,
+                }));
+            };
+            khive_storage::usage::count(khive_storage::usage::UsageUnit::EventRows, 1);
 
             // lattice-router: build the context vector from the now-published live
             // state and forward through the fann network. This is a best-effort
@@ -1879,7 +1795,89 @@ impl BrainPack {
                 let ctx = build_context_vector(&rel, &sal, &temp, sec.as_ref());
                 let _routed = route_via_fann(&ctx);
             }
-        }
+
+            event
+        } else {
+            // ADR-081 §4 fail-safe: no profile was resolved at all (an explicit
+            // serve-time `unattributed` marker, or a ledger row whose accounting
+            // profile could not be resolved and was not `unspecified`). The
+            // guard above already rejected this case unless `is_gated_implicit`,
+            // so `event_write` is always `Gated` here. There is no posterior to
+            // mutate and no profile to validate against the registry, so this
+            // bypasses `persist_feedback_state_mutation` (and its #1592
+            // authoritative re-check, which only applies where a profile was
+            // actually resolved) and appends the audit event directly through
+            // the fold gate's own atomic unit instead.
+            let crate::persist::FeedbackEventWrite::Gated {
+                event,
+                target_id,
+                gate_mode,
+                gate_now_us,
+                dedup_key,
+            } = event_write
+            else {
+                unreachable!(
+                    "effective_profile=None implies is_gated_implicit, so event_write is always Gated"
+                );
+            };
+            let dedup_ref = dedup_key
+                .as_ref()
+                .map(|(scorer, ledger)| (scorer.as_str(), ledger.as_str()));
+            let namespace = token.namespace().as_str().to_string();
+            // Forced-zero unattributed events do not touch the mass table, so
+            // this sentinel is an atomic-unit routing key only and can never be
+            // mistaken for a registered serving profile.
+            let outcome = crate::fold_gate::apply_fold_gate_and_append_event(
+                sql.as_ref(),
+                &namespace,
+                "__unattributed__",
+                &target_id,
+                gate_mode,
+                gate_now_us,
+                dedup_ref,
+                move |fold_outcome, forced_zero| {
+                    let mut event = event;
+                    let (effective_weight, mass_before, mass_after) = match fold_outcome {
+                        Some(o) => (o.effective_weight, o.mass_before, o.mass_after),
+                        None => (0.0, 0.0, 0.0),
+                    };
+                    event.payload["gate"] = json!({
+                        "effective_weight": effective_weight,
+                        "mass_before": mass_before,
+                        "mass_after": mass_after,
+                        "forced_zero_weight": forced_zero,
+                    });
+                    event
+                },
+            )
+            .await?;
+
+            match outcome {
+                // This is now the ONLY place a scorer-tagged
+                // implicit call returns `deduped` — reached only when the
+                // atomic unit's claim conflicted, meaning either a prior call
+                // already committed claim+fold+event together, or (never)
+                // a partially-failed prior attempt, since a failed attempt
+                // rolls back its claim too.
+                crate::fold_gate::GateAndAppendOutcome::Deduped => {
+                    return Ok(json!({
+                        "emitted": false,
+                        "deduped": true,
+                        "verb": "brain.feedback",
+                        "signal": signal,
+                        "target_id": target.to_string(),
+                        "serve_ledger_id": p.serve_ledger_id,
+                        "scorer_run_id": p.scorer_run_id,
+                        "served_by_profile_id": effective_profile.as_deref(),
+                        "serve_attribution": serve_attribution,
+                    }));
+                }
+                crate::fold_gate::GateAndAppendOutcome::Applied(result) => {
+                    khive_storage::usage::count(khive_storage::usage::UsageUnit::EventRows, 1);
+                    result.event
+                }
+            }
+        };
 
         // ADR-081 §6: "the fold... backfills the ledger row's grade." Runs after
         // the fold itself so a ledger-write failure never blocks the feedback
@@ -2157,6 +2155,7 @@ impl BrainPack {
         &self,
         token: &NamespaceToken,
         params: Value,
+        registry: &VerbRegistry,
     ) -> Result<Value, RuntimeError> {
         #[derive(Deserialize)]
         #[serde(deny_unknown_fields)]
@@ -2197,6 +2196,17 @@ impl BrainPack {
         }
         if consumer_kind != "*" {
             khive_runtime::secret_gate::check(&consumer_kind)?;
+        }
+
+        if consumer_kind != "*" {
+            let mut valid = registry.all_brain_consumer_kinds();
+            if !valid.contains(&consumer_kind.as_str()) {
+                valid.sort_unstable();
+                return Err(RuntimeError::InvalidInput(format!(
+                    "unknown consumer_kind {consumer_kind:?}; valid: * | {}",
+                    valid.join(" | ")
+                )));
+            }
         }
 
         let profile_id = p.profile_id;
@@ -3043,6 +3053,10 @@ impl khive_runtime::pack::PackRuntime for BrainPack {
         <BrainPack as khive_types::Pack>::ENTITY_KINDS
     }
 
+    fn brain_consumer_kinds(&self) -> &'static [&'static str] {
+        <BrainPack as khive_types::Pack>::BRAIN_CONSUMER_KINDS
+    }
+
     fn handlers(&self) -> &'static [HandlerDef] {
         BRAIN_HANDLERS
     }
@@ -3055,7 +3069,7 @@ impl khive_runtime::pack::PackRuntime for BrainPack {
         &self,
         verb: &str,
         params: Value,
-        _registry: &VerbRegistry,
+        registry: &VerbRegistry,
         token: &NamespaceToken,
     ) -> Result<Value, RuntimeError> {
         // Serialise the (ensure_loaded → handler) pair under the dispatch gate
@@ -3102,7 +3116,7 @@ impl khive_runtime::pack::PackRuntime for BrainPack {
             "brain.record_serve" => self.handle_record_serve(token, params).await,
             "brain.mark_turn" => self.handle_mark_turn(token, params).await,
             // Declaration
-            "brain.bind" => self.handle_bind(token, params).await,
+            "brain.bind" => self.handle_bind(token, params, registry).await,
             "brain.unbind" => self.handle_unbind(token, params).await,
             "brain.create_profile" => self.handle_create_profile(token, params).await,
             "brain.register_adapter" => self.handle_register_adapter(token, params).await,

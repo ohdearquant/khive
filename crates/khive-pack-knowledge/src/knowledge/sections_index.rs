@@ -8,7 +8,7 @@
 use khive_runtime::{KhiveRuntime, NamespaceToken, RuntimeError};
 use khive_storage::types::{SqlStatement, SqlValue};
 
-use super::util::{now_us, row_str, sql_err, MAX_EMBED_BYTES};
+use super::util::{now_us, row_str, sql_err};
 
 fn unit_normalize(v: &mut [f32]) {
     let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
@@ -27,23 +27,12 @@ fn f32_to_le_bytes(v: &[f32]) -> Vec<u8> {
     out
 }
 
-fn truncate_bytes(t: &str) -> String {
-    if t.len() <= MAX_EMBED_BYTES {
-        return t.to_string();
-    }
-    let mut end = MAX_EMBED_BYTES;
-    while !t.is_char_boundary(end) {
-        end -= 1;
-    }
-    t[..end].to_string()
-}
-
 /// Embed sections in `token`'s namespace into `knowledge_sections.embedding`.
 ///
 /// With `drop_existing`, every section is re-embedded; otherwise only sections
 /// whose `embedding` is currently NULL are filled. When `atom_id` is `Some`, only
 /// sections belonging to that atom are processed (used by `knowledge.edit` for
-/// inline re-embed after a write). Returns `(indexed, skipped, failed)`. Genuine
+/// inline re-embed after a write). Returns `(indexed, skipped, failed, truncation)`. Genuine
 /// skips (blank section text) go to `skipped`; embed errors and vector-count
 /// mismatches go to `failed` (fail-closed contract).
 pub(crate) async fn embed_sections(
@@ -53,9 +42,17 @@ pub(crate) async fn embed_sections(
     batch_size: usize,
     on_progress: Option<&(dyn Fn(u64, u64) + Send + Sync)>,
     atom_id: Option<&str>,
-) -> Result<(usize, usize, usize), RuntimeError> {
+) -> Result<
+    (
+        usize,
+        usize,
+        usize,
+        khive_runtime::retrieval::EmbeddingTruncationReport,
+    ),
+    RuntimeError,
+> {
     if runtime.default_embedder_name().is_empty() {
-        return Ok((0, 0, 0));
+        return Ok((0, 0, 0, Default::default()));
     }
     let ns = token.namespace().as_str().to_owned();
     let sql = runtime.sql();
@@ -109,6 +106,7 @@ pub(crate) async fn embed_sections(
     let mut indexed = 0usize;
     let mut skipped = 0usize;
     let mut failed = 0usize;
+    let mut truncation_report = khive_runtime::retrieval::EmbeddingTruncationReport::default();
     let mut last_id: Option<String> = None;
 
     loop {
@@ -185,15 +183,29 @@ pub(crate) async fn embed_sections(
         // batch, so there is no inner re-chunk. `staged` holds the non-empty rows
         // of this page (≤ batch_size).
         if !staged.is_empty() {
-            let texts: Vec<String> = staged.iter().map(|(_, t)| truncate_bytes(t)).collect();
-            match runtime.embed_document_batch(&texts).await {
-                Ok(embeddings) if embeddings.len() == staged.len() => {
+            let texts: Vec<String> = staged.iter().map(|(_, text)| text.clone()).collect();
+            match runtime.embed_document_batch_outcomes(&texts).await {
+                Ok(outcomes) if outcomes.len() == staged.len() => {
+                    let mut truncation =
+                        khive_runtime::retrieval::EmbeddingTruncationReport::default();
+                    for outcome in &outcomes {
+                        truncation.observe(outcome);
+                    }
+                    truncation_report.merge(truncation.clone());
+                    if truncation.any_truncated() {
+                        tracing::warn!(
+                            truncated = truncation.truncated,
+                            discarded_bytes = truncation.discarded_bytes,
+                            "knowledge section embedding inputs truncated; full section text remains stored"
+                        );
+                    }
                     let mut writer = sql
                         .writer()
                         .await
                         .map_err(|e| sql_err("section index writer", e))?;
                     let now = now_us();
-                    for ((id, _), mut emb) in staged.iter().zip(embeddings) {
+                    for ((id, _), outcome) in staged.iter().zip(outcomes) {
+                        let mut emb = outcome.vector;
                         unit_normalize(&mut emb);
                         if let Err(e) = writer
                             .execute(SqlStatement {
@@ -247,5 +259,5 @@ pub(crate) async fn embed_sections(
         }
     }
 
-    Ok((indexed, skipped, failed))
+    Ok((indexed, skipped, failed, truncation_report))
 }

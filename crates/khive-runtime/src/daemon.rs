@@ -45,7 +45,7 @@ pub const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 /// that names both sides so the operator knows exactly what to do
 /// (`make local` rebuilds the client binary).
 /// See `docs/api/daemon.md#protocol_version` for the version-by-version history.
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 4;
 
 const DEFAULT_DRAIN_TIMEOUT_SECS: u64 = 10;
 
@@ -420,6 +420,13 @@ pub struct DaemonRequestFrame {
     /// mints `ActorRef::anonymous()`, matching an unconfigured actor.
     #[serde(default)]
     pub actor_id: Option<String>,
+    /// Opaque process provenance resolved in the originating client process.
+    /// It is carried per request because a shared warm daemon's environment
+    /// does not identify the worker that submitted the operation. Protocol v4
+    /// makes this field part of dispatch semantics: a v3 daemon must reject the
+    /// request rather than execute it while silently discarding provenance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_ref: Option<String>,
     /// The client's resolved extra read-visibility namespaces (ADR-007 Rule
     /// 3b), carried on the frame so the warm daemon widens read scope to
     /// match the caller's own configuration rather than its own baked
@@ -1058,6 +1065,7 @@ async fn handle_conn<D: DaemonDispatch>(mut stream: UnixStream, dispatcher: D) {
             namespace: frame.namespace.clone(),
             actor_id: frame.actor_id.clone(),
             visible_namespaces: frame.visible_namespaces.clone(),
+            process_ref: frame.process_ref.clone(),
             request_id: frame.request_id,
         };
         match dispatcher
@@ -2421,6 +2429,7 @@ mod tests {
             presentation_per_op: None,
             namespace: "local".to_string(),
             actor_id: None,
+            process_ref: None,
             visible_namespaces: Vec::new(),
             config_id: config_id.to_string(),
             protocol_version: PROTOCOL_VERSION,
@@ -2447,6 +2456,41 @@ mod tests {
         let raw = read_frame(&mut client).await.expect("read response frame");
         handle.await.expect("handle_conn task panicked");
         serde_json::from_slice(&raw).expect("decode response frame")
+    }
+
+    /// Protocol v4 makes `process_ref` part of dispatch semantics. A still-warm
+    /// v3 daemon/client pairing must fail before the verb runs; otherwise the
+    /// older peer can ignore the unknown field, persist a message without the
+    /// requested provenance, and leave the caller unable to retry safely.
+    #[tokio::test]
+    async fn protocol_v3_frame_is_rejected_before_process_ref_dispatch() {
+        assert_eq!(PROTOCOL_VERSION, 4, "process_ref is the protocol-v4 change");
+        let dispatch_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let dispatcher = MockDispatch {
+            namespace: "local".to_string(),
+            config_id: "cfg-v4".to_string(),
+            dispatch_calls: Arc::clone(&dispatch_calls),
+            pool: None,
+            dispatch_err: None,
+        };
+        let mut request = base_request_frame("cfg-v4");
+        request.protocol_version = 3;
+        request.process_ref = Some("worker/legacy-rollout".to_string());
+
+        let response = round_trip(dispatcher, &request).await;
+        assert!(!response.ok);
+        assert!(response.version_mismatch);
+        assert_eq!(response.daemon_protocol_version, 4);
+        assert_eq!(
+            dispatch_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a v3 frame must be rejected before a provenance-bearing mutation dispatches"
+        );
+        let error = response.error.expect("mismatch explains both versions");
+        assert!(
+            error.contains("client=3") && error.contains("daemon=4"),
+            "mismatch must identify the exact rollout boundary; got {error:?}"
+        );
     }
 
     /// Test 1: a `metrics_only: true` request
@@ -2828,12 +2872,12 @@ mod tests {
         assert!(snapshot_no_pool.write_queue_capacity.is_none());
     }
 
-    /// Test 5: serde default back-compat in
-    /// both directions — a request JSON without `metrics_only` deserializes
-    /// with it `false`, and a response JSON without `metrics` (an old
-    /// daemon's shape) deserializes with it `None`.
+    /// Test 5: serde default back-compat in both directions — a request JSON
+    /// without additive request fields deserializes to their defaults, and a
+    /// response JSON without `metrics` (an old daemon's shape) deserializes
+    /// with it `None`.
     #[test]
-    fn frame_serde_defaults_metrics_fields_when_absent() {
+    fn frame_serde_defaults_additive_fields_when_absent() {
         let req_json = serde_json::json!({
             "ops": "",
             "presentation": null,
@@ -2857,6 +2901,15 @@ mod tests {
         assert_eq!(
             frame.request_id, None,
             "request_id must default to None when absent from the wire payload (khive#948)"
+        );
+        assert_eq!(
+            frame.process_ref, None,
+            "process_ref must default to None when absent from the wire payload (khive#1428)"
+        );
+        let encoded_frame = serde_json::to_value(&frame).expect("encode request frame");
+        assert!(
+            encoded_frame.get("process_ref").is_none(),
+            "absent provenance must not change the serialized request wire shape"
         );
 
         let resp_json = serde_json::json!({

@@ -75,6 +75,7 @@ pub struct NamespaceToken {
     namespace: Namespace,
     visible: Vec<Namespace>,
     actor: ActorRef,
+    process_ref: Option<String>,
     _sealed: private::Sealed,
 }
 
@@ -100,6 +101,7 @@ impl NamespaceToken {
             namespace,
             visible,
             actor,
+            process_ref: None,
             _sealed: private::Sealed,
         }
     }
@@ -159,6 +161,19 @@ impl NamespaceToken {
         &self.actor
     }
 
+    /// Return the originating process's opaque attribution reference, when set.
+    ///
+    /// This is request metadata only. It never participates in gate checks,
+    /// namespace visibility, or actor identity.
+    pub fn process_ref(&self) -> Option<&str> {
+        self.process_ref.as_deref()
+    }
+
+    pub(crate) fn with_process_ref(mut self, process_ref: Option<String>) -> Self {
+        self.process_ref = process_ref;
+        self
+    }
+
     /// Return a new token with the same actor but a different namespace.
     ///
     /// The visible set is replaced with `[ns]`: this is a full read+write token
@@ -169,7 +184,24 @@ impl NamespaceToken {
     /// security model should replace this pattern with a type-enforced
     /// append-only capability that goes through the Gate.
     pub fn with_namespace(&self, ns: Namespace) -> Self {
-        Self::mint_authorized(ns, self.actor.clone())
+        Self::mint_authorized(ns, self.actor.clone()).with_process_ref(self.process_ref.clone())
+    }
+}
+
+/// Read the optional request-origin process reference without normalization.
+///
+/// A non-Unicode environment value cannot be represented in JSON and is
+/// treated as absent after emitting a warning that does not expose its bytes.
+pub fn process_ref_from_env() -> Option<String> {
+    match std::env::var("KHIVE_PROCESS_REF") {
+        Ok(value) => Some(value),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(std::env::VarError::NotUnicode(_)) => {
+            tracing::warn!(
+                "KHIVE_PROCESS_REF is not valid Unicode and cannot be represented in request metadata"
+            );
+            None
+        }
     }
 }
 

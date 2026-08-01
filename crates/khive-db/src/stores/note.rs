@@ -4,12 +4,13 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use rusqlite::OptionalExtension;
 use uuid::Uuid;
 
 use khive_storage::error::StorageError;
 use khive_storage::note::{FilterOp, Note, NoteFilter, SortDir};
 use khive_storage::types::{
-    BatchWriteSummary, DeleteMode, Page, PageRequest, SqlStatement, SqlValue,
+    BatchWriteSummary, DeleteMode, Page, PageRequest, SeekCursor, SeekPage, SqlStatement, SqlValue,
 };
 use khive_storage::NoteStore;
 use khive_storage::StorageCapability;
@@ -793,6 +794,59 @@ impl NoteStore for SqlNoteStore {
         .await
     }
 
+    async fn try_patch_note_property(
+        &self,
+        id: Uuid,
+        namespace: &str,
+        filter: &NoteFilter,
+        json_path: &str,
+        value: serde_json::Value,
+        updated_at: i64,
+    ) -> Result<bool, StorageError> {
+        let namespace = namespace.to_string();
+        let filter = filter.clone();
+        let value_json = serde_json::to_string(&value).map_err(|e| {
+            StorageError::driver(StorageCapability::Notes, "try_patch_note_property", e)
+        })?;
+        let json_path = json_path.to_string();
+        let id_str = id.to_string();
+
+        // `build_note_filter_where`'s params are `Box<dyn ToSql>` (not
+        // `Send`), so — matching every other caller in this file — it is
+        // built inside the writer closure rather than moved across the
+        // `with_writer` boundary.
+        self.with_writer("try_patch_note_property", move |conn| {
+            let (where_clause, mut params) = build_note_filter_where(&namespace, &filter)?;
+
+            // Explicit `?N` indices (SQLite numbered params bind by index,
+            // not by text position) so this SET clause's params can be
+            // appended after `where_clause`'s already-self-consistent
+            // `?1..?k` numbering instead of renumbering every filter
+            // placeholder.
+            let base = params.len();
+            let sql = format!(
+                "UPDATE notes SET properties = json_set(COALESCE(properties, '{{}}'), ?{p1}, json(?{p2})), \
+                 updated_at = ?{p3} {where_clause} \
+                 AND (properties IS NULL OR json_type(properties) = 'object') AND id = ?{p4}",
+                p1 = base + 1,
+                p2 = base + 2,
+                p3 = base + 3,
+                p4 = base + 4,
+            );
+            params.push(Box::new(json_path));
+            params.push(Box::new(value_json));
+            params.push(Box::new(updated_at));
+            params.push(Box::new(id_str));
+
+            let mut stmt = conn.prepare(&sql)?;
+            let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+                params.iter().map(|p| p.as_ref()).collect();
+            let rows = stmt.execute(param_refs.as_slice())?;
+            Ok(rows > 0)
+        })
+        .await
+    }
+
     async fn try_insert_note(&self, note: Note) -> Result<bool, StorageError> {
         let namespace = note.namespace.clone();
         let id_str = note.id.to_string();
@@ -930,6 +984,19 @@ impl NoteStore for SqlNoteStore {
                 Some(row) => Ok(Some(read_note(row)?)),
                 None => Ok(None),
             }
+        })
+        .await
+    }
+
+    async fn note_sequence(&self, id: Uuid) -> Result<Option<i64>, StorageError> {
+        let id = id.to_string();
+        self.with_reader("note_sequence", move |conn| {
+            conn.query_row(
+                "SELECT seq FROM notes_seq WHERE note_id = ?1",
+                rusqlite::params![id],
+                |row| row.get(0),
+            )
+            .optional()
         })
         .await
     }
@@ -1111,6 +1178,73 @@ impl NoteStore for SqlNoteStore {
                 &data_sql,
                 &data_params,
             )
+        })
+        .await
+    }
+
+    async fn query_notes_filtered_after(
+        &self,
+        namespace: &str,
+        filter: &NoteFilter,
+        after: Option<SeekCursor>,
+        limit: u32,
+    ) -> Result<SeekPage<Note>, StorageError> {
+        if limit == 0 {
+            return Ok(SeekPage::default());
+        }
+        if filter.order_by.is_some() {
+            return Err(StorageError::InvalidInput {
+                capability: StorageCapability::Notes,
+                operation: "query_notes_filtered_after".into(),
+                message: "custom order_by is not compatible with insertion-sequence pagination"
+                    .into(),
+            });
+        }
+        for property_filter in &filter.property_filters {
+            validate_json_path(&property_filter.json_path)?;
+        }
+
+        let namespace = namespace.to_string();
+        let filter = filter.clone();
+        let limit_usize = limit as usize;
+        let probe_limit_i64 = i64::from(limit) + 1;
+        self.with_reader("query_notes_filtered_after", move |conn| {
+            let (mut where_sql, mut params) = build_note_filter_where(&namespace, &filter)?;
+            if let Some(cursor) = after {
+                params.push(Box::new(cursor.sequence));
+                where_sql.push_str(&format!(" AND notes_seq.seq > ?{}", params.len()));
+            }
+            params.push(Box::new(probe_limit_i64));
+            let limit_idx = params.len();
+            // CROSS JOIN fixes the ledger as the outer loop, preserving an
+            // indexed `seq > boundary` scan with no full-match sort.
+            let sql = format!(
+                "SELECT id, namespace, kind, status, name, content, salience, decay_factor, \
+                 expires_at, properties, created_at, updated_at, deleted_at, notes_seq.seq \
+                 FROM notes_seq CROSS JOIN notes ON notes.id = notes_seq.note_id{where_sql} \
+                 ORDER BY notes_seq.seq ASC LIMIT ?{limit_idx}"
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+                params.iter().map(|param| param.as_ref()).collect();
+            let rows = stmt.query_map(param_refs.as_slice(), |row| {
+                Ok((read_note(row)?, row.get::<_, i64>(13)?))
+            })?;
+            let mut entries = rows.collect::<Result<Vec<_>, _>>()?;
+            let has_more = entries.len() > limit_usize;
+            if has_more {
+                entries.truncate(limit_usize);
+            }
+            let next_after = if has_more {
+                entries.last().map(|(note, sequence)| SeekCursor {
+                    sequence: *sequence,
+                    id: note.id,
+                })
+            } else {
+                None
+            };
+            let items = entries.into_iter().map(|(note, _)| note).collect();
+            Ok(SeekPage { items, next_after })
         })
         .await
     }

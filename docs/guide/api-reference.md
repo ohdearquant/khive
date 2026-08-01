@@ -167,6 +167,10 @@ Declaration = changes institutional status by fiat.
 
 Create an entity or note (singleton) or a batch of entities (bulk via `items`).
 
+Singleton writes preserve the complete source in storage and FTS. If a configured embedder
+receives a UTF-8-safe bounded prefix, the successful response includes a `warnings` array; the
+warning is derived from the embedding outcome, not from a separate registry prediction.
+
 | Param               | Type            | Required    | Notes                                                                                                                                                                                                                                                                                      |
 | ------------------- | --------------- | ----------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `kind`              | string          | conditional | Substrate (`entity`\|`note`) or granular kind (`concept`, `document`, `observation`, …). Required for the singleton path; not required when `items` is present.                                                                                                                            |
@@ -214,7 +218,8 @@ List records with optional filtering.
 | ---------------------------- | ------------------------ | -------- | ----------------------------------------------------------------------------- |
 | `kind`                       | string                   | yes      | `entity`\|`note`\|`edge`\|`event`\|`proposal`\|`message`, or a granular kind. |
 | `limit`                      | integer                  | no       | Default 20.                                                                   |
-| `offset`                     | integer                  | no       | Default 0.                                                                    |
+| `offset`                     | integer                  | no       | Default 0; mutually exclusive with `after`.                                   |
+| `after`                      | string                   | no       | Entity/note/edge cursor UUID, or `""` to begin cursor mode.                   |
 | `entity_kind`                | string                   | no       | Filter when `kind="entity"`.                                                  |
 | `entity_type`                | string                   | no       | Filter by type field when `kind="entity"`.                                    |
 | `note_kind`                  | string                   | no       | Filter when `kind="note"`.                                                    |
@@ -237,10 +242,26 @@ Requests within the kind's server-side row cap keep the existing array response.
 exceeds the cap, the response is `{"items": [...], "requested_limit": N,
 "effective_limit": CAP, "limit_clamped": true}`. This lets offset-based clients advance by
 the effective limit instead of silently skipping rows. The caps are entity 500, note 200, edge
-1000, event 1000, and proposal 500. Edge cursor mode keeps its existing `{"edges": [...],
-"next_after": ...}` shape and adds the same limit metadata when clamped.
+1000, event 1000, and proposal 500. Entity, note, and edge cursor modes return
+`{"entities": [...], "next_after": ...}`, `{"notes": [...], "next_after": ...}`, or
+`{"edges": [...], "next_after": ...}` and add the same limit metadata when clamped.
 
-Row shape (each item in the array, or in `"items"`/`"edges"` when clamped) depends on `kind`.
+Set `after=""` to begin a stable cursor walk, then pass each non-null `next_after` value into the
+next request with the same filters. The cursor's public value is a UUID; storage resolves it to an
+immutable, database-assigned insertion sequence and performs a sequence seek. Every genuinely new id
+committed after an issued boundary receives a greater sequence, so equal timestamps, backward clock
+movement, and lower UUIDs cannot make it fall behind that boundary.
+
+Cursor mode is a live walk, not an MVCC snapshot. Inserts committed before a later page query may
+extend the walk. After a substrate/namespace query returns `next_after: null`, rows committed after
+that terminal query require a new walk from `after=""`. Updates and deletes can change whether an
+unvisited row matches the filters. A cursor that was hard-deleted, is outside the caller's visible
+namespaces, or otherwise cannot be resolved returns an error instead of silently restarting. Cursor
+mode and `offset` are mutually exclusive. Filtered message walks may additionally return
+`scan_incomplete: true` with a continuation cursor when their 10,000-row safety ceiling is reached
+before another matching message is proven.
+
+Row shape (each item in the array or cursor/clamp envelope) depends on `kind`.
 For `kind="entity"`, `"note"`, `"edge"`, and `"event"`, the row is the **full stored record**
 for that substrate, listed below in its **verbose** form (the shape returned with
 `presentation="verbose"`, which is also the default for `kkernel exec` and the `khive` CLI).
@@ -303,6 +324,9 @@ Patch entity, note, or edge fields. Field set depends on substrate: entities acc
 `name`/`content`/`salience`/`decay_factor`/`properties`; edges accept
 `relation`/`weight`/`properties`.
 
+Entity/note text updates use the same full-source storage and bounded embedding contract as
+singleton `create`; a successful response includes `warnings` when embedding actually truncated.
+
 | Param          | Type            | Required | Notes                                                                     |
 | -------------- | --------------- | -------- | ------------------------------------------------------------------------- |
 | `id`           | uuid            | yes      | Record to patch.                                                          |
@@ -337,9 +361,15 @@ request(ops="delete(id=\"<uuid>\")")
 
 ### `merge` — Declaration
 
-Deduplicate two entities. Returns `{kept_id, removed_id, edges_rewired,
-properties_merged, tags_unioned, content_appended, dry_run}` — chain with
-`$prev.kept_id`, **not** `$prev.id` (merge has no top-level `id` field).
+Deduplicate two entities or notes. Returns `{kept_id, removed_id, edges_rewired,
+edges_contract_skipped, edge_conflict_preimages, properties_merged,
+tags_unioned, content_appended, dry_run}` — chain with `$prev.kept_id`, **not**
+`$prev.id` (merge has no top-level `id` field). When rewiring collides with an
+existing edge natural key, `edge_conflict_preimages` records the surviving edge
+id, the complete dropped edge, and any incident annotation edges removed by the
+hard-delete cascade. The same preimages are stored in the merge audit event.
+When the surviving entity or note is reindexed and an embedder bounds its input, the successful
+response also includes the standard embedding-truncation `warnings` advisory.
 
 | Param     | Type | Required | Notes                                       |
 | --------- | ---- | -------- | ------------------------------------------- |
@@ -485,17 +515,38 @@ entity-kind vocabulary (§"The 9 entity kinds" in AGENTS.md) vs. the note-kind v
 
 ### `traverse` — Assertive
 
-Multi-hop BFS traversal.
+Bounded multi-hop BFS traversal. Nodes are selected at their shallowest depth;
+same-depth tie order is intentionally unspecified. Limits count non-root
+first-visit nodes independently per distinct root.
 
-| Param       | Type            | Required | Notes                                  |
-| ----------- | --------------- | -------- | -------------------------------------- |
-| `roots`     | array\<uuid\>   | yes      | Starting node UUIDs.                   |
-| `max_depth` | integer         | no       | Default 3.                             |
-| `relations` | array\<string\> | no       | Restrict traversal to these relations. |
+| Param                | Type            | Required | Notes                                                                      |
+| -------------------- | --------------- | -------- | -------------------------------------------------------------------------- |
+| `roots`              | array\<uuid\>   | yes      | Starting UUIDs; maximum 100 raw entries, then de-duplicated after resolve. |
+| `max_depth`          | integer         | no       | Default 3; maximum 10; values above 10 are rejected.                       |
+| `direction`          | string          | no       | `out`/`outgoing`, `in`/`incoming`, or `both` (default `both`).             |
+| `relations`          | array\<string\> | no       | Restrict traversal to these relations.                                     |
+| `min_weight`         | number          | no       | Minimum edge weight, finite and within 0.0–1.0.                            |
+| `limit`              | integer         | no       | Non-root results per root; default 100, maximum 1,000.                     |
+| `include_roots`      | boolean         | no       | Include depth-0 roots (default `true`; they do not consume `limit`).       |
+| `include_properties` | boolean         | no       | Include entity properties on path nodes (default `false`).                 |
+
+One public request shares a 100,000-adjacency-row work budget and five-second
+storage-expansion deadline across all roots and visible namespaces. Self-loops, parallel paths,
+and rows rejected by first-visit de-duplication still consume work. Exceeding a
+shape bound, work budget, or deadline returns an error and never partial paths.
+Traversal reads use statement-scoped snapshots, so concurrent writes may become
+visible between frontier expansions; a single old WAL snapshot is never held for
+the full operation.
 
 ```
 request(ops="traverse(roots=[\"<uuid>\"], max_depth=2)")
 ```
+
+The response contains exactly one traversal object per distinct requested root. Each path node
+has `id`, `via_edge`, and `depth`; resolvable entity and note nodes also carry `name` and `kind`.
+Note enrichment matches `neighbors`, including its `[kind]` display-name fallback for a nameless
+note reached through an annotation edge. `properties` remains entity-only and is included only
+when `include_properties=true`.
 
 ### `context` — Assertive
 
@@ -590,6 +641,9 @@ request(ops="[{\"tool\":\"propose\",\"args\":{\"title\":\"Add GQE\",\"descriptio
 ### `review` — Declaration
 
 Approve, reject, comment, or request changes on a proposal.
+
+When approval immediately applies an embedding-bearing changeset, the response includes the
+standard `warnings` advisory if that committed apply bounded any embedding input.
 
 | Param      | Type   | Required | Notes                                              |
 | ---------- | ------ | -------- | -------------------------------------------------- |
@@ -1037,13 +1091,13 @@ request(ops="brain.mark_turn(label=\"wake\")")
 
 Write a row in the profile resolution table.
 
-| Param           | Type    | Required | Notes                                        |
-| --------------- | ------- | -------- | -------------------------------------------- |
-| `profile_id`    | string  | yes      | Must exist.                                  |
-| `actor`         | string  | no       | Default `*` (all actors).                    |
-| `namespace`     | string  | no       | Default `*` (all namespaces).                |
-| `consumer_kind` | string  | no       | Default `*` (all kinds).                     |
-| `priority`      | integer | no       | Higher wins on multiple matches (default 0). |
+| Param           | Type    | Required | Notes                                                                                                                    |
+| --------------- | ------- | -------- | ------------------------------------------------------------------------------------------------------------------------ |
+| `profile_id`    | string  | yes      | Must exist.                                                                                                              |
+| `actor`         | string  | no       | Default `*` (all actors).                                                                                                |
+| `namespace`     | string  | no       | Default `*` (all namespaces).                                                                                            |
+| `consumer_kind` | string  | no       | Default `*`; specific values must be declared by a loaded consumer pack. Unknown values are rejected with the valid set. |
+| `priority`      | integer | no       | Higher wins on multiple matches (default 0).                                                                             |
 
 ```
 request(ops="brain.bind(profile_id=\"implementer-recall-v1\", actor=\"role:implementer\")")
@@ -1120,6 +1174,9 @@ Actor-to-actor messaging with threading. Optional; load with `KHIVE_PACKS=kg,com
 
 Send a message, optionally threaded.
 
+The atomic outbound/inbound write preserves the full body on both notes. If either copy's
+embedding input is bounded, the successful response includes the standard `warnings` advisory.
+
 | Param       | Type   | Required | Notes                                                                                                                                                                                           |
 | ----------- | ------ | -------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `to`        | string | yes      | Actor label, e.g. `"lambda:leo"`. Both copies land in the caller's namespace; no cross-namespace write occurs.                                                                                  |
@@ -1134,21 +1191,34 @@ request(ops="comm.send(to=\"lambda:leo\", subject=\"PR ready\", content=\"#600 i
 
 ### `comm.inbox` — Assertive
 
-List inbound messages for the caller.
+List and page through filtered inbound messages for the caller.
 
-| Param    | Type    | Required | Notes                              |
-| -------- | ------- | -------- | ---------------------------------- |
-| `limit`  | integer | no       | Default 20, max 200.               |
-| `status` | string  | no       | `unread` (default)\|`read`\|`all`. |
+| Param                | Type    | Required | Notes                                                                     |
+| -------------------- | ------- | -------- | ------------------------------------------------------------------------- |
+| `limit`              | integer | no       | Default 20, max 200.                                                      |
+| `offset`             | integer | no       | Default 0; offset after every supplied filter.                            |
+| `status`             | string  | no       | `unread` (default)\|`read`\|`all`.                                        |
+| `from_actor`         | string  | no       | Exact sender; mutually exclusive with `from_prefix`.                      |
+| `from_prefix`        | string  | no       | Sender prefix; mutually exclusive with `from_actor`.                      |
+| `exclude_from_actor` | string  | no       | Exclude an exact sender actor label.                                      |
+| `since`              | string  | no       | Inclusive RFC 3339 lower bound on top-level `created_at`.                 |
+| `before`             | string  | no       | Exclusive RFC 3339 upper bound on top-level `created_at`.                 |
+| `subject_contains`   | string  | no       | Case-insensitive non-empty subject substring; null subjects do not match. |
+| `content_contains`   | string  | no       | Case-insensitive non-empty content substring.                             |
 
 ```
 request(ops="comm.inbox(limit=10)")
+request(ops="comm.inbox(status=\"all\", content_contains=\"timeout\", offset=200)")
 ```
 
 Every returned message uses the hyphenated full UUID for `id`, so the value is
 always accepted unchanged by `comm.read`, `comm.reply`, or `comm.thread`, even
 when two messages share an eight-character prefix. `full_id` remains an alias
 for compatibility, while `short_id` is the compact display-only prefix.
+Responses also carry `offset`, `has_more`, and `next_offset`; repeat the same
+filtered call with each non-null `next_offset` to enumerate every match without
+marking it read. All filters are ANDed. Time bounds use response `created_at`,
+not optional transport `sent_at` metadata.
 
 ### `comm.unread` — Assertive
 
@@ -1161,23 +1231,33 @@ request(ops="comm.unread()")
 
 ### `comm.read` — Declaration
 
-Mark an inbound message as read. Outbound messages cannot be marked read. The mark-read
-write is best-effort: validation errors (not found, wrong kind, outbound direction, wrong
-addressee) remain fatal, but when the post-read mark write fails or finds no live row the
-call still succeeds with `read: false` and a `mark_error` field — inspect `read` and
-re-issue later if it is `false`.
+Mark one or more inbound messages as read. Outbound messages cannot be marked read. Mark writes
+are best-effort: validation errors (not found, wrong kind, outbound direction, wrong addressee)
+remain fatal, but a post-read mark failure returns `read: false` with `mark_error`. Inspect each
+single or bulk result and re-issue failures later.
 
-| Param | Type   | Required | Notes                                              |
-| ----- | ------ | -------- | -------------------------------------------------- |
-| `id`  | string | yes      | 8-char prefix or full UUID of the inbound message. |
+| Param | Type            | Required    | Notes                                                                   |
+| ----- | --------------- | ----------- | ----------------------------------------------------------------------- |
+| `id`  | string          | conditional | One 8-char prefix or full UUID; mutually exclusive with `ids`.          |
+| `ids` | array of string | conditional | 1-500 IDs; mutually exclusive with `id`. All targets validate up front. |
 
 ```
 request(ops="comm.read(id=\"<message-id>\")")
+request(ops="comm.read(ids=[\"<message-id-1>\", \"<message-id-2>\"])")
 ```
+
+Exactly one of `id` or `ids` is required. The bulk response contains ordered
+`results` plus `requested_count`, `unique_count`, `marked_count`, and
+`failed_count`. Bulk updates are not atomic across messages: validation errors
+reject the call before any write, while later storage errors appear in each
+item's `read` and optional `mark_error`.
 
 ### `comm.reply` — Commissive
 
 Reply to a message, threading linkage.
+
+Replies use the same full-source storage and embedding-truncation `warnings` contract as
+`comm.send`.
 
 | Param     | Type   | Required | Notes                                                       |
 | --------- | ------ | -------- | ----------------------------------------------------------- |
@@ -1227,12 +1307,15 @@ request(ops="comm.probe(actor=\"lambda:leo\", since_us=42)")
 ### `comm.health` — Assertive
 
 Read-only per-channel health snapshot. Returns the daemon-persisted heartbeat row for
-every known channel: timestamps and consecutive-failure counts only, never a computed
-healthy bool. Health judgment belongs to the caller. Rows are read from the caller's
-injected namespace (`namespace=`, defaulting to `local` like every other comm verb) —
-`comm.heartbeat` is the only handler pinned to the fixed `local` operational namespace.
-The response echoes the namespace actually read in a `namespace` field, so an empty
-`channels` array is unambiguous even under a scoped read. See the
+every known channel, including `poll_interval_secs` and nullable advisory `stalled`.
+For current rows with no known failure, `stalled` becomes true after three missed nominal
+intervals; it is null for legacy/malformed rows or active failure/backoff state. This is
+not a computed healthy or authoritative supervisor verdict. Health judgment belongs to
+the caller. Rows are read from the caller's injected namespace (`namespace=`, defaulting
+to `local` like every other comm verb). The shipped poll loop explicitly writes its
+heartbeats to `local`; authorized per-tenant writers can write their own namespace. The
+response echoes the namespace actually read in a `namespace` field, so an empty
+`channels` array is scoped unambiguously. See the
 [communication guide](communication.md) for the full response contract.
 
 No parameters.
@@ -1386,6 +1469,10 @@ request(ops="knowledge.stats()")
 
 Backfill embeddings + FTS for atoms/domains.
 
+The response includes `truncation_by_model`, keyed by every model that completed embedding work.
+Each value contains `truncated` and `discarded_bytes` counters derived from the actual embedding
+outcomes; atom source content remains complete in SQL and FTS.
+
 | Param         | Type            | Required | Notes                                                   |
 | ------------- | --------------- | -------- | ------------------------------------------------------- |
 | `ids`         | array\<string\> | no       | Atom slugs/IDs to index; omit to index all.             |
@@ -1473,6 +1560,10 @@ request(ops="knowledge.compose(query=\"FastAPI JWT middleware validation pattern
 ### `knowledge.edit` — Commissive
 
 Upsert sections for an atom without wiping other sections.
+
+The response combines the inline section and atom refresh outcomes in `truncation_by_model` and
+includes the standard `warnings` advisory when any model bounded an embedding input. Stored section
+and atom content remains complete.
 
 | Param      | Type            | Required | Notes                                                                                                                                                                                                                                                                             |
 | ---------- | --------------- | -------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -1610,11 +1701,13 @@ request(ops="session.store(content=\"...\", provider=\"claude_code\", title=\"pa
 
 List stored sessions newest first.
 
-| Param      | Type    | Required | Notes                                  |
-| ---------- | ------- | -------- | -------------------------------------- |
-| `limit`    | integer | no       | 1–200, default 20.                     |
-| `offset`   | integer | no       | Default 0.                             |
-| `provider` | string  | no       | Exact filter on `properties.provider`. |
+| Param      | Type    | Required | Notes                                               |
+| ---------- | ------- | -------- | --------------------------------------------------- |
+| `limit`    | integer | no       | 1–200, default 20.                                  |
+| `offset`   | integer | no       | Default 0.                                          |
+| `provider` | string  | no       | Exact filter on `properties.provider`.              |
+| `agent_id` | string  | no       | Exact filter on legacy `properties.agent_id`.       |
+| `since`    | string  | no       | Inclusive RFC 3339 lower bound on session creation. |
 
 ```
 request(ops="session.list(provider=\"claude_code\", limit=10)")

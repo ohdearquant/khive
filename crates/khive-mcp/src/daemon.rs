@@ -1049,6 +1049,7 @@ async fn probe_daemon_identity(config_id: &str, namespace: &str, timeout_ms: u64
         // short-circuits on `probe_only` right after the protocol/config_id
         // checks), so no per-request identity is meaningful here.
         actor_id: None,
+        process_ref: None,
         visible_namespaces: Vec::new(),
         config_id: config_id.to_string(),
         protocol_version: PROTOCOL_VERSION,
@@ -2199,6 +2200,7 @@ mod tests {
         std::env::remove_var("KHIVE_NO_DAEMON");
         std::env::remove_var("KHIVE_LOCK");
         std::env::remove_var("KHIVE_RECOVERER_LOCK");
+        std::env::remove_var("KHIVE_PROCESS_REF");
     }
 
     struct RecoveryTestGuard {
@@ -2895,6 +2897,7 @@ mod tests {
             presentation_per_op: None,
             namespace: "test".to_string(),
             actor_id: None,
+            process_ref: None,
             visible_namespaces: Vec::new(),
             config_id: "test".to_string(),
             protocol_version: PROTOCOL_VERSION,
@@ -2938,6 +2941,7 @@ mod tests {
             presentation_per_op: None,
             namespace: "test".to_string(),
             actor_id: None,
+            process_ref: None,
             visible_namespaces: Vec::new(),
             config_id: config_id.to_string(),
             protocol_version: PROTOCOL_VERSION,
@@ -3346,6 +3350,7 @@ mod tests {
             presentation_per_op: None,
             namespace: "test".to_string(),
             actor_id: None,
+            process_ref: None,
             visible_namespaces: Vec::new(),
             config_id: config_id.clone(),
             protocol_version: PROTOCOL_VERSION,
@@ -3393,6 +3398,7 @@ mod tests {
             presentation_per_op: None,
             namespace: "other".to_string(),
             actor_id: None,
+            process_ref: None,
             visible_namespaces: Vec::new(),
             config_id: config_id.clone(),
             protocol_version: PROTOCOL_VERSION,
@@ -3430,6 +3436,7 @@ mod tests {
             presentation_per_op: None,
             namespace: "test".to_string(),
             actor_id: None,
+            process_ref: None,
             visible_namespaces: Vec::new(),
             config_id: "packs=[kg];db=:memory:;embed=none;extra=[];backend=main".to_string(),
             protocol_version: PROTOCOL_VERSION,
@@ -3455,6 +3462,7 @@ mod tests {
             presentation_per_op: None,
             namespace: "test".to_string(),
             actor_id: None,
+            process_ref: None,
             visible_namespaces: Vec::new(),
             config_id: config_id.clone(),
             protocol_version: 0,
@@ -3548,6 +3556,7 @@ mod tests {
             presentation_per_op: None,
             namespace: "test".to_string(),
             actor_id: None,
+            process_ref: None,
             visible_namespaces: Vec::new(),
             config_id: revoked_config_id.clone(),
             protocol_version: PROTOCOL_VERSION,
@@ -3580,13 +3589,12 @@ mod tests {
 
     // ── ADR-096 Fork 1: per-request identity over one warm registry ──────────
     //
-    // Core capability test: two requests carrying DIFFERENT frame namespaces
-    // AND DIFFERENT frame actors, dispatched against ONE already-running warm
-    // daemon, must both be served over the shared backend — and each write
-    // must be stamped with its OWN frame's actor, never the other request's
-    // and never a daemon-baked default. `comm.send` is the vehicle: its JSON
-    // response echoes the dispatching actor directly (`"from": from_actor`),
-    // so this needs no readback/inbox round-trip.
+    // Core capability test: requests carrying DIFFERENT frame namespaces and
+    // actors, dispatched against ONE already-running warm daemon, must all be
+    // served over the shared backend — and each write must be stamped with its
+    // OWN frame's actor and process provenance, never the other request's and
+    // never a daemon-baked default. `comm.send` is the
+    // vehicle; a chained `comm.thread` reads its persisted properties back.
     #[tokio::test]
     #[serial]
     async fn daemon_serves_per_request_identity_over_one_warm_registry() {
@@ -3597,6 +3605,7 @@ mod tests {
         std::env::set_var("KHIVE_SOCKET", &sock);
         std::env::set_var("KHIVE_PID", &pid);
         std::env::remove_var("KHIVE_NO_DAEMON");
+        std::env::set_var("KHIVE_PROCESS_REF", "daemon/stale-origin");
 
         // No baked actor_id on the daemon-side server: every actor must come
         // from the per-request frame, never a construction-time default.
@@ -3611,11 +3620,13 @@ mod tests {
         drop(_ready);
 
         let alice_frame = DaemonRequestFrame {
-            ops: "comm.send(to=\"bob\", content=\"hello from alice\")".to_string(),
+            ops: "comm.send(to=\"bob\", content=\"hello from alice\") | comm.thread(id=$prev.full_id)"
+                .to_string(),
             presentation: None,
             presentation_per_op: None,
             namespace: "alpha".to_string(),
             actor_id: Some("alice".to_string()),
+            process_ref: Some("worker/alice:17".to_string()),
             visible_namespaces: Vec::new(),
             config_id: config_id.clone(),
             protocol_version: PROTOCOL_VERSION,
@@ -3627,11 +3638,31 @@ mod tests {
             request_id: None,
         };
         let bob_frame = DaemonRequestFrame {
-            ops: "comm.send(to=\"alice\", content=\"hello from bob\")".to_string(),
+            ops: "comm.send(to=\"alice\", content=\"hello from bob\") | comm.thread(id=$prev.full_id)"
+                .to_string(),
             presentation: None,
             presentation_per_op: None,
             namespace: "beta".to_string(),
             actor_id: Some("bob".to_string()),
+            process_ref: Some("worker/bob:29".to_string()),
+            visible_namespaces: Vec::new(),
+            config_id: config_id.clone(),
+            protocol_version: PROTOCOL_VERSION,
+            probe_only: false,
+            metrics_only: false,
+            format: None,
+            format_per_op: None,
+            from_wire: false,
+            request_id: None,
+        };
+        let charlie_frame = DaemonRequestFrame {
+            ops: "comm.send(to=\"alice\", content=\"hello from charlie\") | comm.thread(id=$prev.full_id)"
+                .to_string(),
+            presentation: None,
+            presentation_per_op: None,
+            namespace: "gamma".to_string(),
+            actor_id: Some("charlie".to_string()),
+            process_ref: None,
             visible_namespaces: Vec::new(),
             config_id: config_id.clone(),
             protocol_version: PROTOCOL_VERSION,
@@ -3658,6 +3689,12 @@ mod tests {
             body_alice["results"][0]["result"]["from"], "alice",
             "write dispatched under alice's frame must stamp actor=alice, got: {body_alice}"
         );
+        assert_eq!(
+            body_alice["results"][1]["result"]["messages"][0]["properties"]["sent_by_process"],
+            "worker/alice:17",
+            "the warm daemon must persist alice's frame provenance, not its own environment: \
+             {body_alice}"
+        );
 
         let resp_bob = exchange(&sock, &bob_frame).await;
         assert!(
@@ -3674,6 +3711,30 @@ mod tests {
             body_bob["results"][0]["result"]["from"], "bob",
             "write dispatched under bob's frame must stamp actor=bob, NOT cross-\
              contaminated with alice's actor; got: {body_bob}"
+        );
+        assert_eq!(
+            body_bob["results"][1]["result"]["messages"][0]["properties"]["sent_by_process"],
+            "worker/bob:29",
+            "the warm daemon must persist bob's frame provenance independently: {body_bob}"
+        );
+
+        let resp_charlie = exchange(&sock, &charlie_frame).await;
+        assert!(
+            resp_charlie.ok,
+            "charlie's request must be served over the SAME shared warm registry; error={:?}",
+            resp_charlie.error
+        );
+        let body_charlie: serde_json::Value =
+            serde_json::from_str(resp_charlie.result.as_deref().expect("charlie result body"))
+                .expect("decode charlie result json");
+        assert_eq!(body_charlie["results"][0]["result"]["from"], "charlie");
+        let charlie_properties = body_charlie["results"][1]["result"]["messages"][0]["properties"]
+            .as_object()
+            .expect("charlie message properties");
+        assert!(
+            !charlie_properties.contains_key("sent_by_process"),
+            "an explicitly absent frame provenance must stay absent rather than falling back to \
+             the daemon environment; got: {body_charlie}"
         );
 
         handle.abort();
@@ -3746,6 +3807,7 @@ mod tests {
             presentation_per_op: None,
             namespace: "local".to_string(),
             actor_id: Some(actor.to_string()),
+            process_ref: None,
             visible_namespaces: visible.iter().map(|ns| ns.as_str().to_string()).collect(),
             config_id: id_a.clone(),
             protocol_version: PROTOCOL_VERSION,
@@ -3903,6 +3965,7 @@ mod tests {
             presentation_per_op: None,
             namespace: "braintest".to_string(),
             actor_id: None,
+            process_ref: None,
             visible_namespaces: Vec::new(),
             config_id: config_id.clone(),
             protocol_version: PROTOCOL_VERSION,
@@ -4067,6 +4130,7 @@ mod tests {
             presentation_per_op: None,
             namespace: "test".to_string(),
             actor_id: None,
+            process_ref: None,
             visible_namespaces: Vec::new(),
             config_id: config_id.to_string(),
             protocol_version: PROTOCOL_VERSION,
@@ -4175,6 +4239,7 @@ mod tests {
             presentation_per_op: None,
             namespace: "test".to_string(),
             actor_id: None,
+            process_ref: None,
             visible_namespaces: Vec::new(),
             config_id: config_id.to_string(),
             protocol_version: PROTOCOL_VERSION,
@@ -4663,6 +4728,7 @@ mod tests {
             presentation_per_op: None,
             namespace: "test".to_string(),
             actor_id: None,
+            process_ref: None,
             visible_namespaces: Vec::new(),
             config_id: config_id.to_string(),
             protocol_version: PROTOCOL_VERSION,
@@ -4884,6 +4950,7 @@ mod tests {
             presentation_per_op: None,
             namespace: "test".to_string(),
             actor_id: None,
+            process_ref: None,
             visible_namespaces: Vec::new(),
             config_id: config_id.to_string(),
             protocol_version: PROTOCOL_VERSION,
@@ -5442,6 +5509,7 @@ mod tests {
             presentation_per_op: None,
             namespace: "test".to_string(),
             actor_id: None,
+            process_ref: None,
             visible_namespaces: Vec::new(),
             config_id: config_id.to_string(),
             protocol_version: PROTOCOL_VERSION,
@@ -5492,8 +5560,9 @@ mod tests {
     // `ForwardOutcome::ProtocolMismatch`, routing it through kill_and_respawn
     // exactly like the implicit (no version_mismatch flag) old-daemon case.
     //
-    // This test serves one connection returning an explicit-mismatch frame
-    // (version_mismatch=true, daemon_protocol_version=0) and asserts that
+    // This test serves one connection returning the protocol-v3 shape that a
+    // still-warm pre-process_ref daemon reports to a v4 client
+    // (version_mismatch=true, daemon_protocol_version=3) and asserts that
     // try_forward_inner classifies it as ProtocolMismatch (not Response).
 
     fn explicit_version_mismatch_response(config_id: &str) -> DaemonResponseFrame {
@@ -5501,7 +5570,7 @@ mod tests {
             ok: false,
             result: None,
             error: Some(format!(
-                "daemon protocol mismatch: client={} daemon=0 — \
+                "daemon protocol mismatch: client={} daemon=3 — \
                  rebuild/update the client binary (make local)",
                 PROTOCOL_VERSION
             )),
@@ -5509,7 +5578,7 @@ mod tests {
             config_mismatch: false,
             served_config_id: Some(config_id.to_string()),
             version_mismatch: true,
-            daemon_protocol_version: 0,
+            daemon_protocol_version: 3,
             metrics: None,
             request_id: None,
         }
@@ -5517,8 +5586,9 @@ mod tests {
 
     #[tokio::test]
     #[serial]
-    async fn try_forward_inner_routes_explicit_version_mismatch_to_protocol_mismatch() {
+    async fn v4_client_rejects_warm_v3_daemon_before_accepting_result() {
         clear_daemon_env();
+        assert_eq!(PROTOCOL_VERSION, 4, "process_ref is the protocol-v4 change");
         let dir = tempfile::tempdir().expect("tempdir");
         let sock = dir.path().join("khived.sock");
         let pid_file = dir.path().join("khived.pid");
@@ -5542,6 +5612,7 @@ mod tests {
             presentation_per_op: None,
             namespace: "test".to_string(),
             actor_id: None,
+            process_ref: None,
             visible_namespaces: Vec::new(),
             config_id: config_id.to_string(),
             protocol_version: PROTOCOL_VERSION,
@@ -5624,6 +5695,7 @@ mod tests {
             presentation_per_op: None,
             namespace: "test".to_string(),
             actor_id: None,
+            process_ref: None,
             visible_namespaces: Vec::new(),
             config_id: config_id.to_string(),
             protocol_version: PROTOCOL_VERSION,
@@ -5715,6 +5787,7 @@ mod tests {
             presentation_per_op: None,
             namespace: "test".to_string(),
             actor_id: None,
+            process_ref: None,
             visible_namespaces: Vec::new(),
             config_id: config_id.to_string(),
             protocol_version: PROTOCOL_VERSION,
@@ -5819,6 +5892,7 @@ mod tests {
             presentation_per_op: None,
             namespace: "test".to_string(),
             actor_id: None,
+            process_ref: None,
             visible_namespaces: Vec::new(),
             config_id: config_id.to_string(),
             protocol_version: PROTOCOL_VERSION,
@@ -5919,6 +5993,7 @@ mod tests {
             presentation_per_op: None,
             namespace: "test".to_string(),
             actor_id: None,
+            process_ref: None,
             visible_namespaces: Vec::new(),
             config_id: config_id.to_string(),
             protocol_version: PROTOCOL_VERSION,
@@ -6048,6 +6123,7 @@ mod tests {
             presentation_per_op: None,
             namespace: "test".to_string(),
             actor_id: None,
+            process_ref: None,
             visible_namespaces: Vec::new(),
             config_id: config_id.to_string(),
             protocol_version: PROTOCOL_VERSION,

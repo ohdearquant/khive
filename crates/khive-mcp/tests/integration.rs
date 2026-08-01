@@ -2252,9 +2252,9 @@ async fn send_help_returns_required_to_and_content() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `comm.inbox(help=true)` must return optional `limit` and `status`.
+/// `comm.inbox(help=true)` must advertise every optional pagination/filter parameter.
 #[tokio::test]
-async fn inbox_help_returns_optional_limit_and_status() -> anyhow::Result<()> {
+async fn inbox_help_returns_optional_pagination_and_filters() -> anyhow::Result<()> {
     let client = connect_comm_schedule().await?;
     let result = ok_one(&client, "comm.inbox(help=true)").await?;
 
@@ -2266,17 +2266,44 @@ async fn inbox_help_returns_optional_limit_and_status() -> anyhow::Result<()> {
         .expect("params must be an array");
     assert!(!params.is_empty(), "inbox help must have non-empty params");
 
-    let limit = params
-        .iter()
-        .find(|p| p["name"] == "limit")
-        .expect("inbox help must include 'limit'");
-    assert_eq!(limit["required"], serde_json::json!(false));
+    for name in [
+        "limit",
+        "offset",
+        "status",
+        "from_actor",
+        "from_prefix",
+        "exclude_from_actor",
+        "since",
+        "before",
+        "subject_contains",
+        "content_contains",
+    ] {
+        let param = params
+            .iter()
+            .find(|param| param["name"] == name)
+            .unwrap_or_else(|| panic!("inbox help must include {name:?}"));
+        assert_eq!(param["required"], serde_json::json!(false));
+    }
 
-    let status = params
-        .iter()
-        .find(|p| p["name"] == "status")
-        .expect("inbox help must include 'status'");
-    assert_eq!(status["required"], serde_json::json!(false));
+    Ok(())
+}
+
+/// `comm.read(help=true)` advertises the exactly-one-of `id`/`ids` bulk surface.
+#[tokio::test]
+async fn read_help_returns_optional_id_and_ids() -> anyhow::Result<()> {
+    let client = connect_comm_schedule().await?;
+    let result = ok_one(&client, "comm.read(help=true)").await?;
+    let params = result["params"]
+        .as_array()
+        .expect("params must be an array");
+
+    for name in ["id", "ids"] {
+        let param = params
+            .iter()
+            .find(|param| param["name"] == name)
+            .unwrap_or_else(|| panic!("read help must include {name:?}"));
+        assert_eq!(param["required"], serde_json::json!(false));
+    }
 
     Ok(())
 }

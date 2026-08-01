@@ -2,7 +2,7 @@
 
 **Status**: accepted
 **Date**: 2026-06-28
-**Amended**: 2026-07-02 — shipped-surface record (§3), session mirror (§6), scope revision (Context)
+**Amended**: 2026-07-02 — shipped-surface record (§3), session mirror (§6), scope revision (Context); 2026-08-01 — claude.ai export source (§6)
 **Superseded by**: [ADR-083](ADR-083-session-pack-t1-verbs.md) for §3 only; ADR-083 is
 the current authority for the public session verb surface, while the rest of this record
 remains in force.
@@ -117,7 +117,8 @@ live declaration has:
 - four `Visibility::Verb` handlers: `session.store`, `session.list`,
   `session.resume`, and `session.export`;
 - `session.store(content, title?, provider?, provider_session_id?, tags?)`;
-- `session.list(limit?, offset?, provider?)`;
+- `session.list(limit?, offset?, provider?, agent_id?, since?)` (ADR-083
+  Amendment 1 adds the two server-side filters without changing `session.store`);
 - `session.resume(id)` by full UUID or an 8+ hex prefix; and
 - `session.export(id, format?)`, where `format` is `json` or `markdown`.
 
@@ -202,18 +203,20 @@ spawned from `PackRuntime::warm()` when enabled, that tails known transcript loc
 the local filesystem and lands their content in the pack's auxiliary tables. It shipped as
 the M2 milestone of the session pack build (issue #350, PR #368) with the Claude Code
 source, gained the Codex CLI source in PR #375, and gains the ChatGPT export source with
-this amendment. The mirror is disabled by default and never writes to, moves, or deletes
-the files it reads.
+the 2026-07-02 amendment. The 2026-08-01 amendment adds claude.ai data exports as a
+separate fourth source. The mirror is disabled by default and never writes to, moves, or
+deletes the files it reads.
 
 #### Mirror sources — closed set
 
 `MirrorSource` is a closed enum. Adding a source requires amending this section.
 
-| Source         | `source` value   | Input shape                                        | Ingestion mode |
-| -------------- | ---------------- | -------------------------------------------------- | -------------- |
-| Claude Code    | `claude_code`    | `<projects dir>/**/<session-uuid>.jsonl`           | line-tail      |
-| Codex CLI      | `codex`          | `<sessions dir>/**/rollout-*-<session-uuid>.jsonl` | line-tail      |
-| ChatGPT export | `chatgpt_export` | `<exports dir>/**/conversations.json` (JSON array) | whole-file     |
+| Source           | `source` value     | Input shape                                        | Ingestion mode |
+| ---------------- | ------------------ | -------------------------------------------------- | -------------- |
+| Claude Code      | `claude_code`      | `<projects dir>/**/<session-uuid>.jsonl`           | line-tail      |
+| Codex CLI        | `codex`            | `<sessions dir>/**/rollout-*-<session-uuid>.jsonl` | line-tail      |
+| ChatGPT export   | `chatgpt_export`   | `<exports dir>/**/conversations.json` (JSON array) | whole-file     |
+| claude.ai export | `claude_ai_export` | `<exports dir>/**/conversations.json` (JSON array) | whole-file     |
 
 **Line-tail** (append-only JSONL): each pass reads from the file's stored byte offset,
 parses complete lines, and advances the cursor to the last complete line boundary. A file
@@ -235,6 +238,12 @@ true EOF mid-line), it resolves through the ordinary skip-and-advance path above
 the cursor is set to the file's byte length, so an unchanged export is skipped by the same
 length fast-path on every later pass. On parse failure — including a partially downloaded
 export — the cursor does not advance and the file is retried on the next pass.
+
+ChatGPT and claude.ai both name this file `conversations.json`, while the cursor key is the
+file path. Each export parser therefore rejects a document containing the other provider's
+recognizable conversation shape, and a mixed-provider array is unsupported. This leaves the
+cursor untouched instead of allowing a misconfigured overlapping root to let the wrong source
+consume that path first.
 
 #### Auxiliary schema
 
@@ -283,21 +292,54 @@ array of conversation objects, each carrying a `mapping` of message nodes formin
 - Discovery is a recursive scan of the configured directory for files named exactly
   `conversations.json`, so both a bare file and unpacked export archives work.
 
+#### claude.ai export mapping (Amendment, 2026-08-01)
+
+The claude.ai source ingests the `conversations.json` from Claude's data export through a
+parser distinct from both Claude Code and ChatGPT. Its top-level array contains conversation
+objects with `uuid`, `name`, and `chat_messages` rather than ChatGPT's `id` / `mapping` tree.
+
+- One conversation object becomes one `sessions` row. `id` and
+  `provider_session_id` are the conversation `uuid`; `slug` carries `name` (falling back to
+  `summary`); `cwd` and `git_branch` are null.
+- Each non-empty message with a `uuid` becomes a `session_messages` row keyed on that UUID.
+  `human` is normalized to role `user`; `assistant` remains `assistant`, with legacy `role`
+  accepted when `sender` is absent. Events are emitted by numeric `index`, with source-array
+  position as the deterministic fallback and tie-breaker.
+- `parent_uuid` comes from `parent_message_uuid`. The provider's all-zero root sentinel and
+  parents that did not produce a stored event become null, so the stored graph has no dangling
+  export-only parent reference.
+- When `current_leaf_message_uuid` is present, the parent chain to that leaf is the current
+  path and all other retained messages have `is_sidechain = true`. Older flat exports without
+  an active-leaf field keep every message on the main path. Alternate branches are preserved;
+  selecting one remains a view concern.
+- Timestamps fall back per message: `created_at`, then `updated_at`, then the conversation's
+  `created_at` / `updated_at`, else zero — parsed as RFC 3339 and converted to microseconds.
+- Visible text comes from supported structured blocks (`text`, `voice_note`, `tool_use`,
+  `tool_result`); thinking and unknown internal blocks are not display text. A distinct
+  top-level `text` value is appended after the blocks because agent turns can carry both tool
+  activity and a separate final answer; an exact duplicate of a text block is emitted once.
+  Text and serialized raw messages use the same unconditional secret masking as every source.
+- Discovery recursively scans the independently configured claude.ai export root for files
+  named exactly `conversations.json`; the separate root is necessary because ChatGPT uses the
+  same filename for an incompatible JSON shape.
+
 #### Configuration
 
 Most configuration is environment-driven, read once into `MirrorConfig` when `warm()`
 starts the service:
 
-| Variable                       | Default                  |
-| ------------------------------ | ------------------------ |
-| `KHIVE_MIRROR_ENABLED`         | `false`                  |
-| `KHIVE_MIRROR_PROJECTS_DIR`    | `$HOME/.claude/projects` |
-| `KHIVE_MIRROR_CODEX_ENABLED`   | `false`                  |
-| `KHIVE_MIRROR_CODEX_DIR`       | `$HOME/.codex/sessions`  |
-| `KHIVE_MIRROR_CHATGPT_ENABLED` | `false`                  |
-| `KHIVE_MIRROR_CHATGPT_DIR`     | `$HOME/.chatgpt/exports` |
-| `KHIVE_MIRROR_POLL_SECS`       | `2`                      |
-| `KHIVE_MIRROR_BACKFILL`        | `true`                   |
+| Variable                         | Default                  |
+| -------------------------------- | ------------------------ |
+| `KHIVE_MIRROR_ENABLED`           | `false`                  |
+| `KHIVE_MIRROR_PROJECTS_DIR`      | `$HOME/.claude/projects` |
+| `KHIVE_MIRROR_CODEX_ENABLED`     | `false`                  |
+| `KHIVE_MIRROR_CODEX_DIR`         | `$HOME/.codex/sessions`  |
+| `KHIVE_MIRROR_CHATGPT_ENABLED`   | `false`                  |
+| `KHIVE_MIRROR_CHATGPT_DIR`       | `$HOME/.chatgpt/exports` |
+| `KHIVE_MIRROR_CLAUDE_AI_ENABLED` | `false`                  |
+| `KHIVE_MIRROR_CLAUDE_AI_DIR`     | `$HOME/.claude/exports`  |
+| `KHIVE_MIRROR_POLL_SECS`         | `2`                      |
+| `KHIVE_MIRROR_BACKFILL`          | `true`                   |
 
 `KHIVE_MIRROR_CHATGPT_MAX_BYTES` (default `268435456`, 256 MiB) is read separately, per
 pass, by `mirror_chatgpt_export_file` itself rather than through `MirrorConfig`. It is a
@@ -306,6 +348,9 @@ has no incremental delta to bound the way the line-tail sources do): an export o
 ceiling is skipped for that pass — `tracing::warn!`-logged, never `read_to_string`'d — and
 its cursor is left untouched, so it is retried (and re-warned) on every later tick rather
 than silently dropped forever. A zero or non-numeric value falls back to the default.
+
+`KHIVE_MIRROR_CLAUDE_AI_MAX_BYTES` applies the same 256 MiB default and fallback behavior
+independently to `mirror_claude_ai_export_file`.
 
 #### What remains out of scope
 

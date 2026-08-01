@@ -1,8 +1,9 @@
 # Session mirror parse
 
-Technical reference for the ChatGPT-export parsing helpers in
-`crates/khive-pack-session/src/mirror/parse.rs` — the DFS conversation walk, per-conversation
-context, and text/block extraction that turn a raw export tree into mirrored session events.
+Technical reference for the provider-export parsing helpers in
+`crates/khive-pack-session/src/mirror/parse.rs` — the conversation walks, per-conversation
+context, and text/block extraction that turn ChatGPT and claude.ai exports into mirrored
+session events.
 
 ## `parse_chatgpt_export` — DFS walk and per-conversation isolation
 
@@ -14,7 +15,7 @@ event across every conversation it contains.
 Returns `None` when `content` is not valid JSON or the top level is not a
 JSON array. The caller treats that as a per-file error so the mirror cursor
 does not advance: a partially-downloaded export is retried whole on the next
-tick, never half-consumed. A malformed *conversation* inside an otherwise-valid
+tick, never half-consumed. A malformed _conversation_ inside an otherwise-valid
 array is skipped individually (`parse_conversation`) so one bad entry cannot
 sink the rest of the file.
 
@@ -32,6 +33,47 @@ that don't change as the DFS walks the mapping tree: `mapping`,
 `conv_created_at_micros` (conversation-level `create_time` in micros, 0 if
 absent — the fallback used when a message's own `create_time` is
 null/absent), and `slug`.
+
+## `parse_claude_ai_export` — `chat_messages` and active branches
+
+A claude.ai export is also a top-level JSON array, but its shape is distinct:
+conversation identity and title are `uuid` and `name`, and messages live in
+`chat_messages`. Each message's `uuid` becomes the event id, the conversation
+`uuid` becomes `session_id` / `provider_session_id`, `human` is normalized to
+the `user` role, and ISO-8601 `created_at` values are converted to microseconds.
+
+Messages are emitted in ascending `index` order with source-array position as
+the deterministic fallback and tie-breaker. When the export supplies
+`current_leaf_message_uuid`, the parser follows `parent_message_uuid` to mark
+the active path and retains other messages as sidechains. Older flat exports
+without an active-leaf field keep every message on the main path. Root
+sentinels and parents that did not produce a stored event become `None`, so
+stored rows never gain a dangling provider-export parent reference.
+
+Visible text comes from structured `content` blocks using the same text,
+voice-note, and tool-block extraction as the CLI parsers; `thinking` and
+unknown internal blocks are not display text. The parser then appends a
+distinct top-level `text` value because agent turns can carry tool blocks and
+a separate final answer at the same time; when `text` exactly duplicates a
+text block it is emitted only once. Older exports that use `role` instead of
+`sender` retain the same user/assistant normalization. Every extracted text
+and serialized raw message is passed through the canonical secret masker
+before it becomes a `ParsedEvent`.
+Malformed conversations are skipped individually; invalid JSON or a non-array
+top level returns `None` so the ingest cursor cannot advance.
+
+The ingest-facing `parse_claude_ai_export_with_sessions` result carries one
+`ParsedSession` for every valid conversation separately from its retained
+`ParsedEvent`s. Consequently, an empty `chat_messages` array—or one containing
+only thinking/unknown blocks—still creates the conversation's session metadata
+without manufacturing a message row. The public `parse_claude_ai_export`
+helper remains the event-only view used by parser tests and callers that do not
+need session metadata.
+
+Both provider exports use the filename `conversations.json`. Each parser also
+rejects a file containing the other provider's conversation shape (including a
+mixed file). This keeps one source from advancing the shared path cursor first
+if an operator accidentally configures overlapping export roots.
 
 ## `parse_conversation`
 
@@ -64,13 +106,15 @@ message but was itself skipped as an event (e.g. empty-parts scaffolding)
 still counts — this is provenance linkage, matching how CC parent chains can
 reference events that were never mirrored.
 
-## `extract_text` / `extract_block` (Claude Code + Codex block extraction)
+## `extract_text` / `extract_block` (Claude Code, Codex, and claude.ai blocks)
 
 `extract_text` handles both the string form and the structured-block array
 form of a message `content` value.
 
 `extract_block` extracts a display string from a single content block:
+
 - `"text"` — Claude Code plain text block.
+- `"voice_note"` — claude.ai voice-note transcript text.
 - `"input_text"` / `"output_text"` — Codex user and assistant text blocks
   (same field, `text`, as the Claude Code `"text"` block, hence shared
   extraction logic).

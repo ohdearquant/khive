@@ -125,7 +125,11 @@ const V11_UP: &str = include_str!("../sql/011-ann-write-log.sql");
 
 const V12_UP: &str = include_str!("../sql/012-ann-write-log-model-seq-index.sql");
 
-const V13_UP: &str = include_str!("../sql/013-serve-ledger-attribution.sql");
+const V13_UP: &str = include_str!("../sql/013-list-cursor-sequences.sql");
+
+const V14_UP: &str = include_str!("../sql/014-graph-edges-id-unique.sql");
+
+const V15_UP: &str = include_str!("../sql/015-serve-ledger-attribution.sql");
 
 /// DDL for the `ann_write_log` delta table.
 ///
@@ -213,8 +217,18 @@ pub const MIGRATIONS: &[VersionedMigration] = &[
     },
     VersionedMigration {
         version: 13,
-        name: "serve_ledger_attribution",
+        name: "list_cursor_sequences",
         up: V13_UP,
+    },
+    VersionedMigration {
+        version: 14,
+        name: "graph_edges_id_unique",
+        up: V14_UP,
+    },
+    VersionedMigration {
+        version: 15,
+        name: "serve_ledger_attribution",
+        up: V15_UP,
     },
 ];
 

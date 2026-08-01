@@ -3102,7 +3102,7 @@ mod edit_inline_reembed {
     use async_trait::async_trait;
     use khive_runtime::{AllowAllGate, BackendId, EmbedderProvider, RuntimeConfig};
     use khive_types::Namespace;
-    use lattice_embed::{EmbedError, EmbeddingModel, EmbeddingService};
+    use lattice_embed::{EmbedError, EmbeddingModel, EmbeddingService, MAX_TEXT_CHARS};
     use std::sync::Arc;
 
     const MODEL_KEY: &str = "all-minilm-l6-v2";
@@ -3322,6 +3322,57 @@ mod edit_inline_reembed {
             }
             other => panic!("unexpected embedding value for new sibling: {other:?}"),
         }
+    }
+
+    /// The edit response must be derived from the section and atom embedding
+    /// calls that actually ran, including the model that bounded the input.
+    #[tokio::test]
+    async fn edit_reports_actual_section_embedding_truncation_by_model() {
+        let rt = rt_with_embedder();
+        let f = pack(rt.clone());
+
+        f.dispatch(
+            "knowledge.upsert_atoms",
+            json!({
+                "atoms": [{
+                    "slug": "edit-truncation-report",
+                    "name": "Edit Truncation Report",
+                    "content": "dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity"
+                }]
+            }),
+        )
+        .await
+        .expect("upsert atom");
+
+        let response = f
+            .dispatch(
+                "knowledge.edit",
+                json!({
+                    "id": "edit-truncation-report",
+                    "sections": [{
+                        "section_type": "overview",
+                        "content": format!("{}tail", "x".repeat(MAX_TEXT_CHARS + 1))
+                    }]
+                }),
+            )
+            .await
+            .expect("edit with bounded embedding input");
+
+        assert_eq!(
+            response["truncation_by_model"][MODEL_KEY]["truncated"], 1,
+            "the newly inserted section is the one bounded input: {response}"
+        );
+        assert!(
+            response["truncation_by_model"][MODEL_KEY]["discarded_bytes"]
+                .as_u64()
+                .is_some_and(|bytes| bytes > 0),
+            "the report must include bytes actually discarded by the embedder: {response}"
+        );
+        assert_eq!(
+            response["warnings"],
+            json!([khive_runtime::retrieval::EMBEDDING_INPUT_TRUNCATED_WARNING]),
+            "the wire advisory must be derived from the merged actual outcomes"
+        );
     }
 
     /// knowledge.edit must refresh the atom-level vector-store entry (knowledge.atom field)

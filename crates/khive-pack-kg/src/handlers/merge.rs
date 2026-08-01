@@ -85,6 +85,9 @@ impl KgPack {
                 ))
             }
         };
-        to_json(&summary)
+        let truncated = summary.embedding_truncation.any_truncated();
+        let mut response = to_json(&summary)?;
+        super::create::add_embedding_truncation_warning(&mut response, truncated);
+        Ok(response)
     }
 }

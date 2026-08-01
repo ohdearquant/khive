@@ -10,16 +10,6 @@ spanning `message.rs`, `handlers.rs`, `params.rs`, and the inbox/thread indexes 
 Accepts a 36-char hyphenated UUID or an 8+ hex-char short prefix. The prefix
 is resolved via `runtime.resolve_prefix` (namespace-scoped).
 
-## `message.rs::rollback_outbound`
-
-Rolls back a partially-written outbound note after a later `dual_write_message`
-step fails (issue #460). Uses a row-first compensating delete so that a
-cleanup failure cannot leave the outbound row (and thus the failed send's live
-message) behind. Returns `original` unchanged when rollback fully succeeds;
-returns a composite `RuntimeError::Internal` naming both the original failure
-and the rollback cleanup failure when the row was removed but cleanup did not
-complete.
-
 ## `message.rs::dual_write_message`
 
 Writes an outbound copy (caller namespace) and an inbound copy (recipient
@@ -30,7 +20,9 @@ both copies in the caller namespace (see below).
 
 `subject`, `thread_id` are optional. `sent_at` is the RFC3339 timestamp for
 both copies. `from_actor` and `to_actor` are optional actor labels (ADR-057)
-stored in properties.
+stored in properties. Both copies follow the versioned
+[`message-properties` v1 contract](message-properties.md); optional
+`sent_by_process` provenance is copied unchanged to both copies.
 
 Cross-namespace thread root invariant: when a root message is sent (i.e.,
 `thread_id` is `None`), both the outbound and inbound copies must share the
@@ -39,7 +31,15 @@ same canonical `thread_id` — the sender's outbound UUID. This ensures that
 because all replies carry the same canonical thread_id regardless of which
 copy they were replying to.
 
-When `thread_id` is already supplied (reply path), it is forwarded unchanged
+The runtime pre-generates that outbound UUID before either note is written, so
+the canonical `thread_id` and `comm_schema_version = 1` are already known when
+both notes are constructed. `dual_write_message` commits both fully-formed v1
+notes through `khive_runtime::create_notes_atomic` in one atomic writer
+transaction — a failure on either note rolls back the whole unit, so no
+partial or unversioned row can ever be observed.
+
+When `thread_id` is already supplied, the handler first parses it and serializes
+the UUID in full-hyphenated form, then forwards that canonical value unchanged
 to both copies.
 
 `in_reply_to_message_id` is the parent's wire Message-ID (angle-bracketed),
@@ -75,6 +75,11 @@ this naturally bypasses the cross-namespace allowlist gate in
 `dual_write_message` (ADR-057 §"Interaction with ADR-040"). The actor labels
 are propagated via the `from_actor`/`to_actor` arguments and stored in message
 properties.
+
+Message properties follow the versioned
+[`message-properties` v1 contract](message-properties.md). When the request
+origin set `KHIVE_PROCESS_REF`, its exact Unicode value is copied to
+`sent_by_process` on both delivery copies as attribution-only metadata.
 
 ### Self-send collapse guard (#820)
 
@@ -118,12 +123,22 @@ visible regardless (Q3: OR IS NULL).
 `from_actor`/`from_prefix` (#493) sender filters are mutually exclusive.
 Direction + read-status + `to_actor` filters are pushed into SQL so
 `idx_comm_message_direction`/`idx_comm_message_to_actor` are usable; the read
-filter uses `json_type` to match the old `as_bool().unwrap_or(false)`
-semantics — only JSON boolean `true` counts as read, missing/false/string/
-integer all count as unread. `from_prefix` has no SQL `FilterOp`, so when a
-sender filter is supplied, pages are scanned in Rust (same unbounded-page-loop
-shape `handle_thread` uses) until `limit` matches are collected or the store is
-exhausted.
+filter uses `json_type` to match the old `as_bool().unwrap_or(false)` semantics —
+only JSON boolean `true` counts as read, missing/false/string/integer all count as
+unread. Exact `from_actor` and inclusive `since` (`created_at >=`) also stay in
+SQL. `from_prefix`, `exclude_from_actor`, exclusive `before`, and case-insensitive
+`subject_contains`/`content_contains` have no corresponding `FilterOp`, so they
+are applied over an unbounded paged scan in Rust.
+
+`offset` is logical rather than a raw database offset: it skips rows only after
+every SQL and Rust filter has matched. The handler collects one extra logical
+match to return `has_more` and `next_offset`; following `next_offset` with the
+same filters enumerates a backlog larger than the 200-message page cap without
+marking anything read. The total order is `(created_at DESC, id ASC)`. `since`
+is inclusive and `before` is exclusive, both RFC 3339 and both evaluated against
+the top-level note `created_at` exposed in the response, not optional transport
+metadata in `properties.sent_at`. Empty substring filters are rejected, and a
+missing/non-string subject does not match `subject_contains`.
 
 ## `handlers.rs::handle_read`
 
@@ -131,11 +146,35 @@ Marks a message as read. Rejects `read()` on outbound messages — "read" is a
 recipient action; marking an outbound (sent) message as read corrupts the
 read/unread invariant and has no semantic meaning to the sender.
 
-Sets `read: true` through `NoteStore::set_note_property`, which lowers to one
-`UPDATE ... json_set(...)` statement. It never reads and replaces the whole
-properties document, so another writer setting a different key cannot be
-silently overwritten between those two steps (#1483). The operation also
-leaves every non-property column and the row's identity untouched (#780).
+Exactly one of `id` or `ids` is required. The single-ID form preserves its
+existing response. The bulk form accepts 1-500 IDs, resolves duplicates to one
+update, validates every target before the first mutation, and returns ordered
+per-target `results` with `requested_count`, `unique_count`, `marked_count`, and
+`failed_count`.
+Validation includes the same namespace, message-kind, direction, addressee, and
+legacy-message rules as the single-ID form. Updates are not a cross-message
+transaction: a validation failure rejects the call before any update, while an
+item-level storage failure returns `read=false` plus `mark_error` without rolling
+back an earlier successful item.
+
+Patches only the `read` key via `NoteStore::try_patch_note_property`, a
+storage-side `json_set`, not a caller-side merge-then-overwrite of the whole
+`properties` column: the write re-evaluates namespace, message kind, direction,
+and addressee against the row's *current* state in the same `UPDATE`, so a
+property written by another caller between validation and this call (the bulk
+form's window can span up to 500 targets) survives untouched, and an
+eligibility change in that window degrades the mark instead of silently
+landing on stale data. This also patches in place via a real `UPDATE`, never
+`upsert_note`'s `INSERT OR REPLACE` (the latter silently deletes and
+re-inserts the row on a primary-key conflict — #780). The `comm.probe` cursor
+is keyed on `notes_seq.seq`, which is fixed at first insert and survives such
+churn, so avoiding `upsert_note` here is defensive rather than load-bearing; a
+metadata patch should never rewrite the row regardless.
+
+`handle_reply`'s fold-in mark (see below) covers the single-original case and
+uses the simpler `NoteStore::set_note_property` — an unconditional atomic
+patch with no eligibility recheck — since a reply has only one target and no
+validate-then-mark window to race.
 
 The mark-read patch is best-effort: under multi-client burst traffic the
 sqlite writer pool can time out (`checkout_timeout`, 5s default), and the
@@ -146,13 +185,12 @@ been best-effort since its introduction. Three outcomes:
 
 - `Ok(true)` — the row was live and updated: `read: true`, `properties` is
   the patched value (including the new `read: true`).
-- `Ok(false)` — no live row was found to update (e.g. soft-deleted
-  mid-flight, between this handler's `get_note` and its
-  `set_note_property` call), or the stored properties value was not an
-  object: `read: false`, `mark_error: "no live row updated"`, `properties`
-  is the note's ORIGINAL stored value (a stored SQL-NULL properties column
-  round-trips as JSON `null`, never `{}`) — the response never claims a
-  write that did not land.
+- `Ok(false)` — no live row currently matches (soft-deleted mid-flight, or an
+  eligibility property — namespace, kind, direction, addressee — changed
+  since this handler's prior validation): `read: false`, `mark_error: "no
+  live row updated"`, `properties` is the note's ORIGINAL stored value (a
+  stored SQL-NULL properties column round-trips as JSON `null`, never `{}`)
+  — the response never claims a write that did not land.
 - `Err(e)` — the patch failed (writer timeout, pool exhaustion, etc.):
   logged via `tracing::warn!` with the full error detail, then `read:
   false`, `mark_error` is the error's `Display` string, `properties` is the
@@ -191,6 +229,10 @@ Replies to a message, threading linkage.
   regardless of whether the original message carried actor labels. No legacy
   code path can cause `dual_write_message` to mint a token in a foreign
   namespace.
+- Message properties follow the versioned
+  [`message-properties` v1 contract](message-properties.md). An optional
+  `KHIVE_PROCESS_REF` is copied verbatim to both reply delivery copies as
+  attribution-only `sent_by_process` metadata.
 - Replying folds in the addressee's read mark with the same atomic
   `set_note_property("read", true)` operation as `comm.read`; it does not
   re-fetch and replace the properties document. The delivery of the reply is
@@ -209,6 +251,13 @@ Cross-namespace thread resolution: when the resolved note carries a
 or a non-root message). `comm.thread` resolves to that canonical root so that
 `thread(id=id_A)` and `thread(id=id_B)` both return the full conversation
 regardless of which copy UUID the caller holds.
+
+Legacy compact, braced, URN, and upper-hex stored roots are parsed and
+normalized for the response. The indexed read queries the deduplicated set of
+lower- and upper-hex formatter spellings accepted before v1, plus the selected
+row's exact spelling. A mixed legacy/v1 thread therefore stays whole whether
+lookup starts from its canonical root, a v1 child, or a pre-v1 child; existing
+rows are not rewritten.
 
 The root ID is validated: it must exist in the caller namespace and its
 `kind` must be `"message"`.
@@ -254,10 +303,23 @@ from within the process (e.g. the polling loop in `khive-mcp`). It is the
 authoritative write path for all channel-delivered messages; the polling loop
 must not bypass it.
 
+The resulting properties follow the versioned
+[`message-properties` v1 contract](message-properties.md). Ingested messages
+do not receive `sent_by_process`: the adapter process delivered the message but
+did not author it.
+
 Issue #479a: a present, non-empty `thread_id` that is not a valid UUID must
 fail closed rather than being silently dropped and replaced with a fresh UUID,
 which would split the message into the wrong conversation. A blank/absent
-value is not an error — it just means "no caller-supplied thread_id".
+value is not an error — it just means "no caller-supplied thread_id". Valid
+compact, braced, URN, hyphenated, and upper-hex UUID spellings are accepted and
+normalized to the full-hyphenated v1 representation before storage. Roots
+recovered from a correlated legacy message are normalized through the same
+UUID parse.
+
+An omitted `sent_at` defaults to the current time. A supplied value must parse
+as RFC 3339 or ingest fails before writing a note; valid values are normalized
+to UTC RFC 3339 before the v1 marker is stamped.
 
 Thread resolution: when `correlation_external_id` is supplied, the handler
 queries for an existing message note whose `external_id` matches that value,
@@ -288,12 +350,13 @@ confirmed duplicate returns `Ok(None)` without error; only an external_id
 collision is treated as dedup, other constraint violations surface as errors.
 
 Generic transport-layer metadata passthrough (issue #448, `IngestParams::metadata`):
-merged additively so it can never clobber the identity/routing fields (from,
-to, from_actor, to_actor, direction, read, thread_id, sent_at, subject,
-external_id, wire_message_id, wire_references, channel_kind) — a key already
-present always wins. The comm pack does not interpret any metadata key; the
-email channel happens to use it for quarantine markers. `deny_unknown_fields`
-is intentionally absent on `IngestParams` (and `HeartbeatParams`) — the
+merged additively so it can never clobber a key already present. Names in the
+stable [`message-properties` v1 contract](message-properties.md) are reserved
+even when an optional field is absent, so metadata cannot fabricate a subject,
+an outbound twin, or originating-process provenance. Other metadata is generic
+and channel-agnostic; the email channel happens to use it for quarantine
+markers. `deny_unknown_fields` is intentionally absent on `IngestParams` (and
+`HeartbeatParams`) — the
 polling loop may pass extra fields (including the `namespace` routing key
 consumed by the dispatch layer) that future handler versions can extend
 without breaking existing deployments; the `namespace` key is consumed by

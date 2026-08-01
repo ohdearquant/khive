@@ -6,6 +6,22 @@ use uuid::Uuid;
 use khive_runtime::{micros_to_iso, KhiveRuntime, Namespace, NamespaceToken, RuntimeError};
 use khive_storage::note::Note;
 
+pub(crate) const COMM_SCHEMA_VERSION: u64 = 1;
+pub(crate) const COMM_STABLE_PROPERTY_KEYS: &[&str] = &[
+    "comm_schema_version",
+    "direction",
+    "read",
+    "from_actor",
+    "to_actor",
+    "from",
+    "to",
+    "thread_id",
+    "subject",
+    "sent_at",
+    "outbound_ref",
+    "sent_by_process",
+];
+
 pub(crate) fn short_id(uuid: Uuid) -> String {
     uuid.as_hyphenated().to_string().chars().take(8).collect()
 }
@@ -99,31 +115,35 @@ fn build_preview(content: &str) -> String {
 }
 
 /// Writes an outbound copy (caller namespace) and an inbound copy (recipient
-/// namespace) as ONE atomic unit (`khive_runtime::create_notes_atomic`): one
-/// writer transaction covers both notes' rows, FTS documents, and vector
-/// rows. Returns the outbound `Note` on success.
+/// namespace) as ONE atomic unit
+/// (`khive_runtime::create_notes_atomic_with_report`): one writer transaction
+/// covers both notes' rows, FTS documents, and vector rows. Returns the
+/// outbound `Note` and aggregate embedding-truncation report on success.
 ///
 /// Resolved gap (external desk review, 2026-07-21; closed by construction
 /// here): the two note writes used to be separate `create_note` calls with
 /// only an in-process rollback compensating an inbound-write failure, so a
 /// process crash between them could leave a durable orphan outbound note
-/// with no inbound copy. `create_notes_atomic` commits both copies under one
+/// with no inbound copy. `create_notes_atomic_with_report` commits both copies under one
 /// `SqlAccess::atomic_unit` — a crash or failure anywhere in the unit rolls
 /// back everything, so no partial pair can ever be observed durably.
 ///
 /// Invariant: the outbound id is generated BEFORE either write (rather than
-/// patched in after, as the old two-call version did) so both copies can
-/// carry the canonical `thread_id` from their first write: for a root send
-/// (`thread_id: None`), that id IS the canonical thread_id; for a reply, the
-/// caller-supplied `thread_id` is forwarded unchanged. Either way there is no
-/// longer a separate thread_id-patch write.
+/// patched in after, as the old two-call version did) so both copies carry
+/// the canonical `thread_id` AND `comm_schema_version` from their first
+/// write: for a root send (`thread_id: None`), that id IS the canonical
+/// thread_id; for a reply, the caller-supplied `thread_id` is forwarded
+/// unchanged. Either way there is no separate patch write, and no row is
+/// ever durably observable with a canonical thread_id but no version marker
+/// (or vice versa) — `create_notes_atomic` commits both in the same
+/// transaction as the row itself.
 ///
 /// See crates/khive-pack-comm/docs/api/message-lifecycle.md#messagersdual_write_message for
 /// the `in_reply_to_message_id`/`references_chain` header-threading contract.
-// REASON: dual_write_message mirrors the send wire shape exactly (from, to, subject,
-// content, thread_id, sent_at) plus the two context args (runtime, token). Grouping them into
-// a struct would not reduce overall complexity and would require an extra allocation on the
-// hot path; the current flat signature is intentional.
+// REASON: dual_write_message mirrors the send wire shape plus its persisted metadata and the
+// two context args (runtime, token). Grouping them into a struct would not reduce overall
+// complexity and would require an extra allocation on the hot path; the flat signature is
+// intentional.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn dual_write_message(
     runtime: &KhiveRuntime,
@@ -134,12 +154,13 @@ pub(crate) async fn dual_write_message(
     content: &str,
     thread_id: Option<&str>,
     sent_at: &str,
+    sent_by_process: Option<&str>,
     from_actor: Option<&str>,
     to_actor: Option<&str>,
     in_reply_to_message_id: Option<&str>,
     references_chain: Option<&str>,
     tags: Option<&[String]>,
-) -> Result<Note, RuntimeError> {
+) -> Result<(Note, khive_runtime::retrieval::EmbeddingTruncationReport), RuntimeError> {
     let recipient_ns_str = to.trim();
     if from != recipient_ns_str {
         // When actor labels are provided this is an actor-addressed local send;
@@ -189,6 +210,7 @@ pub(crate) async fn dual_write_message(
     };
 
     let mut outbound_props = json!({
+        "comm_schema_version": COMM_SCHEMA_VERSION,
         "from": from,
         "to": to,
         "direction": "outbound",
@@ -202,6 +224,9 @@ pub(crate) async fn dual_write_message(
     }
     if let Some(ta) = to_actor {
         outbound_props["to_actor"] = json!(ta);
+    }
+    if let Some(process_ref) = sent_by_process {
+        outbound_props["sent_by_process"] = json!(process_ref);
     }
     if let Some(irt) = in_reply_to_message_id {
         outbound_props["in_reply_to_message_id"] = json!(irt);
@@ -234,6 +259,7 @@ pub(crate) async fn dual_write_message(
     };
 
     let mut inbound_props = json!({
+        "comm_schema_version": COMM_SCHEMA_VERSION,
         "from": from,
         "to": to,
         "direction": "inbound",
@@ -249,6 +275,9 @@ pub(crate) async fn dual_write_message(
     if let Some(ta) = to_actor {
         inbound_props["to_actor"] = json!(ta);
     }
+    if let Some(process_ref) = sent_by_process {
+        inbound_props["sent_by_process"] = json!(process_ref);
+    }
     if let Some(irt) = in_reply_to_message_id {
         inbound_props["in_reply_to_message_id"] = json!(irt);
     }
@@ -261,7 +290,7 @@ pub(crate) async fn dual_write_message(
         }
     }
 
-    let mut notes = khive_runtime::create_notes_atomic(
+    let (mut notes, embedding_truncation) = khive_runtime::create_notes_atomic_with_report(
         runtime,
         vec![
             khive_runtime::AtomicNoteSpec {
@@ -284,9 +313,9 @@ pub(crate) async fn dual_write_message(
     )
     .await?;
 
-    // create_notes_atomic returns notes in the same order as the specs above:
-    // [outbound, inbound].
-    Ok(notes.remove(0))
+    // create_notes_atomic_with_report returns notes in the same order as the
+    // specs above: [outbound, inbound].
+    Ok((notes.remove(0), embedding_truncation))
 }
 
 #[cfg(test)]
@@ -347,6 +376,7 @@ mod tests {
             "F1 regression content",
             None,
             "2026-07-03T00:00:00Z",
+            None,
             None,
             None,
             None,
@@ -418,7 +448,7 @@ mod tests {
         let ns = format!("thread-id-canonical-{}", Uuid::new_v4().simple());
         let (runtime, token) = scratch_runtime_and_token(&ns);
 
-        let outbound_note = dual_write_message(
+        let (outbound_note, _) = dual_write_message(
             &runtime,
             &token,
             &ns,
@@ -427,6 +457,7 @@ mod tests {
             "root send thread id",
             None,
             "2026-08-01T00:00:00Z",
+            None,
             None,
             None,
             None,
@@ -571,6 +602,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .await;
         assert!(
@@ -633,6 +665,103 @@ mod tests {
                 matches!(ann_count, Some(SqlValue::Integer(0))),
                 "no ann_write_log row may survive a mid-unit vector failure in {label}_ns; got {ann_count:?}"
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn dual_write_versions_both_copies_and_stamps_optional_process_provenance() {
+        use khive_runtime::{AllowAllGate, BackendId, RuntimeConfig};
+
+        let runtime = KhiveRuntime::new(RuntimeConfig {
+            git_write: Default::default(),
+            db_path: None,
+            default_namespace: Namespace::local(),
+            embedding_model: None,
+            additional_embedding_models: vec![],
+            gate: std::sync::Arc::new(AllowAllGate),
+            packs: vec!["kg".to_string(), "comm".to_string()],
+            backend_id: BackendId::main(),
+            brain_profile: None,
+            visible_namespaces: vec![],
+            allowed_outbound_namespaces: vec![],
+            actor_id: None,
+        })
+        .expect("in-memory runtime");
+        let caller_token = runtime
+            .authorize(Namespace::local())
+            .expect("authorize local");
+
+        dual_write_message(
+            &runtime,
+            &caller_token,
+            "local",
+            "local",
+            None,
+            "with process provenance",
+            None,
+            "2026-07-31T00:00:00Z",
+            Some("worker/run:42"),
+            Some("local"),
+            Some("local"),
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("dual write with provenance");
+        dual_write_message(
+            &runtime,
+            &caller_token,
+            "local",
+            "local",
+            None,
+            "without process provenance",
+            None,
+            "2026-07-31T00:00:01Z",
+            None,
+            Some("local"),
+            Some("local"),
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("dual write without provenance");
+
+        let notes = runtime
+            .list_notes(&caller_token, Some("message"), 100, 0)
+            .await
+            .expect("list messages");
+        for (content, expected_process) in [
+            ("with process provenance", Some("worker/run:42")),
+            ("without process provenance", None),
+        ] {
+            let matching: Vec<_> = notes
+                .iter()
+                .filter(|note| note.content == content)
+                .collect();
+            assert_eq!(matching.len(), 2, "one outbound and one inbound copy");
+
+            let mut directions = Vec::new();
+            for note in matching {
+                let props = note.properties.as_ref().expect("message properties");
+                assert_eq!(
+                    props.get("comm_schema_version").and_then(Value::as_u64),
+                    Some(COMM_SCHEMA_VERSION)
+                );
+                assert_eq!(
+                    props.get("sent_by_process").and_then(Value::as_str),
+                    expected_process
+                );
+                directions.push(
+                    props
+                        .get("direction")
+                        .and_then(Value::as_str)
+                        .expect("direction"),
+                );
+            }
+            directions.sort_unstable();
+            assert_eq!(directions, ["inbound", "outbound"]);
         }
     }
 

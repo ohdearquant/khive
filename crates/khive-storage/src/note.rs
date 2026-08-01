@@ -5,7 +5,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
 
-use crate::types::{BatchWriteSummary, DeleteMode, Page, PageRequest, SqlValue, StorageResult};
+use crate::types::{
+    BatchWriteSummary, DeleteMode, Page, PageRequest, SeekCursor, SeekPage, SqlValue, StorageResult,
+};
 
 /// A storage-level note record. Flat, SQL-friendly representation.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -342,6 +344,36 @@ pub trait NoteStore: Send + Sync + 'static {
         value: Value,
         updated_at: i64,
     ) -> StorageResult<bool>;
+    /// Atomically patch a single `properties` JSON key on a note, but only
+    /// when the row's *current* state (re-evaluated inside this same
+    /// statement, not a snapshot the caller fetched earlier) still satisfies
+    /// `filter`'s namespace/kind/property_filters.
+    ///
+    /// Unlike `set_note_property` (which patches unconditionally once the row
+    /// is live) or `update_note_properties` (which replaces the whole
+    /// `properties` column with a value the caller already computed — safe
+    /// only when nothing else can have written to the row since the caller's
+    /// read), this also rechecks `filter` against the row's live state before
+    /// writing, so a target that stopped matching an eligibility predicate
+    /// between validation and this call is not mutated. Any other property
+    /// written concurrently between the caller's read and this call survives
+    /// untouched either way. A live row whose stored `properties` document is
+    /// a non-object (scalar, array, or otherwise) is not modified and returns
+    /// `false`, mirroring `set_note_property`. Returns `Ok(false)` — not an
+    /// error — when no live row currently matches `filter` (id not found,
+    /// soft-deleted, an eligibility property changed since the caller last
+    /// validated it, or the stored document is not a JSON object); the
+    /// caller degrades that the same way as `update_note_properties`'s
+    /// `Ok(false)`.
+    async fn try_patch_note_property(
+        &self,
+        id: Uuid,
+        namespace: &str,
+        filter: &NoteFilter,
+        json_path: &str,
+        value: Value,
+        updated_at: i64,
+    ) -> StorageResult<bool>;
     /// Query notes by namespace and optional kind with pagination.
     /// The returned total and page items must come from one consistent
     /// backend snapshot.
@@ -360,6 +392,29 @@ pub trait NoteStore: Send + Sync + 'static {
         filter: &NoteFilter,
         page: PageRequest,
     ) -> StorageResult<Page<Note>>;
+    /// Resolve a note id to its immutable insertion sequence.
+    async fn note_sequence(&self, _id: Uuid) -> StorageResult<Option<i64>> {
+        Err(crate::StorageError::Unsupported {
+            capability: crate::StorageCapability::Notes,
+            operation: "note_sequence".into(),
+            message: "this backend does not implement note insertion sequences".into(),
+        })
+    }
+    /// Query an immutable insertion-sequence keyset page with the same
+    /// predicates as [`Self::query_notes_filtered`].
+    async fn query_notes_filtered_after(
+        &self,
+        _namespace: &str,
+        _filter: &NoteFilter,
+        _after: Option<SeekCursor>,
+        _limit: u32,
+    ) -> StorageResult<SeekPage<Note>> {
+        Err(crate::StorageError::Unsupported {
+            capability: crate::StorageCapability::Notes,
+            operation: "query_notes_filtered_after".into(),
+            message: "this backend does not implement note seek pagination".into(),
+        })
+    }
     /// Fetch up to `max_rows + 1` notes matching `filter` in a single
     /// deterministically-ordered SQL statement, with no separate `COUNT(*)`
     /// and no pagination loop.

@@ -41,10 +41,11 @@ Three source facts set the mechanism:
    `session_messages.id` are each `TEXT PRIMARY KEY` with no tenant component, and both tables carry
    a nullable `namespace TEXT` column that is part of no key
    (`crates/khive-pack-session/src/vocab.rs`, `SESSION_SCHEMA_PLAN_STMTS`). `session_messages.id` is a
-   provider event id (Claude Code top-level `uuid`, ChatGPT `message.id`, or the synthesized
-   `"{session_id}:{byte_offset}"` for Codex — `mirror/parse.rs`), unique enough for the single-writer
-   mirror's idempotency but not across tenants. The mirror is single-tenant by construction; the
-   latent tenant scope is exactly that unused `namespace` column.
+   provider event id (Claude Code top-level `uuid`, ChatGPT `message.id`, claude.ai
+   `chat_messages[].uuid`, or the synthesized `"{session_id}:{byte_offset}"` for Codex —
+   `mirror/parse.rs`), unique enough for the single-writer mirror's idempotency but not across
+   tenants. The mirror is single-tenant by construction; the latent tenant scope is exactly that
+   unused `namespace` column.
 
 2. **The session schema is pack-owned and applied idempotently.** `SESSION_SCHEMA_PLAN_STMTS` is a set
    of `CREATE TABLE/INDEX IF NOT EXISTS` statements applied at boot via the pack's `schema_plan` hook
