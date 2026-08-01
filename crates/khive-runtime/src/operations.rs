@@ -528,8 +528,8 @@ pub fn accepted_pack_relations_for_entities(
 /// Relations accepted for one resolved entity endpoint pair under the full
 /// live contract: the base allowlist plus the loaded packs' additive rules.
 ///
-/// This is the pair-oriented counterpart to
-/// [`accepted_entity_kind_pairs_for_relation`]. It is shared by validation
+/// This is the pair-oriented counterpart to the private
+/// `accepted_entity_kind_pairs_for_relation` helper. It is shared by validation
 /// errors and pack-layer hints so every write path can tell a caller which
 /// relations would be legal without maintaining a second endpoint table.
 /// Pack declarations for relations with dedicated substrate branches are
