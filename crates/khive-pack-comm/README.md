@@ -10,7 +10,7 @@ dual-write, actor-addressed delivery.
 | ------------- | ------------------------------------------------------------------ |
 | `comm.send`   | Send a message, optionally threaded                                |
 | `comm.inbox`  | List inbound messages for the caller (filter: unread / read / all) |
-| `comm.read`   | Mark an inbound message as read                                    |
+| `comm.read`   | Mark an inbound message as read (best-effort: inspect `read`; `false` plus `mark_error` means re-issue later) |
 | `comm.unread` | Count the caller's unread inbound messages without message payloads |
 | `comm.reply`  | Reply to a message, preserving thread linkage                      |
 | `comm.thread` | Retrieve all messages in a conversation thread, chronologically    |
