@@ -36,6 +36,19 @@ CREATE TABLE IF NOT EXISTS notes_seq (
 
 CREATE INDEX IF NOT EXISTS idx_notes_seq_note_id ON notes_seq(note_id);
 
+-- Migration V13 adds this trigger to migrated databases. Keep the idempotent
+-- mirror here so a fresh/direct store built from NOTES_DDL also assigns every
+-- new note its immutable list sequence atomically. The existing explicit
+-- `assign_note_seq` calls remain harmless INSERT OR IGNORE safeguards.
+CREATE TRIGGER IF NOT EXISTS assign_note_list_seq
+AFTER INSERT ON notes
+BEGIN
+    -- Explicit UPSERT keeps the ledger immutable even when an outer caller
+    -- uses `INSERT OR REPLACE` (which overrides legacy trigger OR policies).
+    INSERT INTO notes_seq (note_id) VALUES (NEW.id)
+    ON CONFLICT(note_id) DO NOTHING;
+END;
+
 -- The notes_seq anti-join repair (khive #827) used to run here, on
 -- every `notes_for_namespace` call. On a large, already-repaired ledger that
 -- is a full `notes` scan plus a temp B-tree for the ORDER BY on every single

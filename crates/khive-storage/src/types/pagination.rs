@@ -1,6 +1,35 @@
 //! Pagination types for list operations.
 
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
+
+/// Immutable insertion-sequence boundary for record-list pagination.
+///
+/// `sequence` is assigned by the storage backend when an id is first inserted.
+/// It is strictly increasing, never reused, and remains fixed across updates or
+/// soft deletion. `id` is retained as the public continuation value; it is not
+/// part of the storage ordering key.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SeekCursor {
+    pub sequence: i64,
+    pub id: Uuid,
+}
+
+/// One keyset page plus the boundary needed to continue it.
+#[derive(Clone, Debug)]
+pub struct SeekPage<T> {
+    pub items: Vec<T>,
+    pub next_after: Option<SeekCursor>,
+}
+
+impl<T> Default for SeekPage<T> {
+    fn default() -> Self {
+        Self {
+            items: Vec::new(),
+            next_after: None,
+        }
+    }
+}
 
 /// Raw deserialization target for [`PageRequest`].
 #[derive(Deserialize)]

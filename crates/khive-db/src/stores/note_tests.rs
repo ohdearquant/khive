@@ -1023,11 +1023,15 @@ async fn test_try_insert_note_insert_and_seq_assignment_are_atomic() {
 /// failed `assign_note_seq` mid-batch) propagated via `?` straight out of
 /// the closure, skipping `ROLLBACK` and leaving `BEGIN IMMEDIATE` open on
 /// the shared pool-mutex connection. A `BEFORE INSERT` trigger fails the
-/// sequence assignment for the SECOND note in a two-note batch (the first
-/// note's insert and `assign_note_seq` must already have succeeded by the
-/// time this fires); the whole batch must roll back -- neither note must
-/// survive -- and the connection must not be left poisoned: a subsequent
-/// write through the same pool must still succeed.
+/// redundant explicit `assign_note_seq` safeguard for the SECOND note in a
+/// two-note batch, after V13's `AFTER INSERT ON notes` trigger has made the
+/// first, atomic sequence assignment. This keeps the injected error outside
+/// the per-row UPSERT error path (which intentionally reports partial
+/// success): the first note's insert and sequence assignment must already
+/// have succeeded by the time this fires. The whole batch must roll back --
+/// neither note nor sequence row may survive -- and the connection must not
+/// be left poisoned: a subsequent write through the same pool must still
+/// succeed.
 #[tokio::test]
 async fn test_upsert_notes_batch_rolls_back_fully_on_mid_batch_seq_failure() {
     let store = setup_memory_store();
@@ -1040,6 +1044,7 @@ async fn test_upsert_notes_batch_rolls_back_fully_on_mid_batch_seq_failure() {
             .execute_batch(&format!(
                 "CREATE TRIGGER inject_seq_failure_batch BEFORE INSERT ON notes_seq \
                  WHEN NEW.note_id = '{fail_id}' \
+                   AND EXISTS (SELECT 1 FROM notes_seq WHERE note_id = NEW.note_id) \
                  BEGIN SELECT RAISE(ABORT, 'injected mid-batch failure for #827 test'); END;"
             ))
             .unwrap();
