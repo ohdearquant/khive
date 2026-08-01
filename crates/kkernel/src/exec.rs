@@ -3326,6 +3326,13 @@ backend = "sessions"
         std::env::remove_var("KHIVE_ACTOR");
         std::env::remove_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR");
 
+        // Hermeticity: isolate HOME so the in-process fallback's config
+        // reload (`run_exec_inline_with_forward`'s `khive_cfg` load, which
+        // both calls below must fall through to since `spy_capture_identity`
+        // always returns `None`) can never reach a real `~/.khive/config.toml`
+        // — see `isolate_home_for_test`'s doc comment above.
+        let (prev_home, _home_dir) = isolate_home_for_test();
+
         let dir = tempfile::tempdir().expect("tempdir");
         let khive_dir = dir.path().join(".khive");
         std::fs::create_dir_all(&khive_dir).expect("mkdir .khive");
@@ -3340,6 +3347,16 @@ id = "lambda:fallback"
         let db_path = khive_dir.join("frame-identity-test.db");
         let db_str = db_path.to_str().expect("utf8 path").to_string();
         let pinned_packs = Some(vec!["kg".to_string()]);
+        // Mirror the production `--db` wiring (`run_exec_cmd`, exec.rs:606-609)
+        // instead of `ExecDbContext::default()`: fold the fixture db path into
+        // both `raw` and `anchor` so tier-3 config discovery
+        // (`project_config_anchor_dir`) resolves to `khive_dir` — where the
+        // fixture `config.toml` above actually lives — rather than falling
+        // through to the process cwd or `$HOME`.
+        let db_context = || ExecDbContext {
+            raw: Some(db_str.clone()),
+            anchor: khive_runtime::resolve_db_anchor(Some(&db_str)),
+        };
 
         let resolve = || {
             resolve_runtime_config(RuntimeConfigInputs {
@@ -3366,7 +3383,7 @@ id = "lambda:fallback"
             None,
             None,
             None,
-            ExecDbContext::default(),
+            db_context(),
             false,
             spy_capture_identity,
         )
@@ -3402,7 +3419,7 @@ id = "lambda:fallback"
             None,
             None,
             None,
-            ExecDbContext::default(),
+            db_context(),
             false,
             spy_capture_identity,
         )
@@ -3420,6 +3437,8 @@ id = "lambda:fallback"
             "the forwarded frame's visible_namespaces must be empty under a local pin, \
              retaining neither the fallback actor nor the previous pin: {frame_visible:?}"
         );
+
+        restore_home(prev_home);
     }
 
     // ── #1226: inline --db/[[backends]] guard must fire before daemon-forward ──
