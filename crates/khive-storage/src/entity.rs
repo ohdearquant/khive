@@ -5,7 +5,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
 
-use crate::types::{BatchWriteSummary, DeleteMode, Page, PageRequest, StorageResult};
+use crate::types::{
+    BatchWriteSummary, DeleteMode, Page, PageRequest, SeekCursor, SeekPage, StorageResult,
+};
 
 /// Storage-level entity record. Flat SQL-friendly representation.
 /// Maps to the `entities` substrate table.
@@ -147,6 +149,32 @@ pub trait EntityStore: Send + Sync + 'static {
         filter: EntityFilter,
         page: PageRequest,
     ) -> StorageResult<Page<Entity>>;
+    /// Resolve an entity id to its immutable insertion sequence.
+    async fn entity_sequence(&self, _id: Uuid) -> StorageResult<Option<i64>> {
+        Err(crate::StorageError::Unsupported {
+            capability: crate::StorageCapability::Entities,
+            operation: "entity_sequence".into(),
+            message: "this backend does not implement entity insertion sequences".into(),
+        })
+    }
+    /// Query an immutable insertion-sequence keyset page.
+    ///
+    /// Backends that do not implement seek pagination may retain the default
+    /// unsupported result; callers must not silently fall back to offset
+    /// paging because that would weaken the no-gap/no-duplicate contract.
+    async fn query_entities_after(
+        &self,
+        _namespace: &str,
+        _filter: EntityFilter,
+        _after: Option<SeekCursor>,
+        _limit: u32,
+    ) -> StorageResult<SeekPage<Entity>> {
+        Err(crate::StorageError::Unsupported {
+            capability: crate::StorageCapability::Entities,
+            operation: "query_entities_after".into(),
+            message: "this backend does not implement entity seek pagination".into(),
+        })
+    }
     /// Count entities in a namespace matching the given filter.
     async fn count_entities(&self, namespace: &str, filter: EntityFilter) -> StorageResult<u64>;
     /// Fetch an entity by UUID regardless of soft-deletion state.

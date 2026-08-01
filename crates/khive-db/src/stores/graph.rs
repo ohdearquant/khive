@@ -5,15 +5,16 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use chrono::{DateTime, TimeZone, Utc};
+use rusqlite::OptionalExtension;
 use uuid::Uuid;
 
 use khive_storage::error::StorageError;
 use khive_storage::types::{
     BatchWriteSummary, DeleteMode, DirectedNeighborHit, Direction, Edge, EdgeFilter, EdgeSeekPage,
     EdgeSortField, GraphPath, GuardedBatchOutcome, GuardedBatchRefusal, GuardedWriteOutcome,
-    MissingEndpoints, NeighborHit, NeighborQuery, Page, PageRequest, PathNode, SortDirection,
-    SortOrder, SqlStatement, SqlValue, TraversalExecutionBudget, TraversalOptions,
-    TraversalRequest,
+    MissingEndpoints, NeighborHit, NeighborQuery, Page, PageRequest, PathNode, SeekCursor,
+    SeekPage, SortDirection, SortOrder, SqlStatement, SqlValue, TraversalExecutionBudget,
+    TraversalOptions, TraversalRequest,
 };
 use khive_storage::GraphStore;
 use khive_storage::LinkId;
@@ -1109,7 +1110,8 @@ fn run_bounded_traversal(
             }
             expired
         }),
-    );
+    )
+    .map_err(|e| map_err(e, "traverse_progress_handler"))?;
 
     let result = (|| {
         let result_limit = opts.effective_limit() as usize;
@@ -1252,7 +1254,8 @@ fn run_bounded_traversal(
         Ok(all_paths)
     })();
 
-    conn.progress_handler(0, None::<fn() -> bool>);
+    conn.progress_handler(0, None::<fn() -> bool>)
+        .map_err(|e| map_err(e, "traverse_progress_handler_clear"))?;
     result
 }
 
@@ -1451,6 +1454,52 @@ impl GraphStore for SqlGraphStore {
                 Some(row) => Ok(Some(read_edge(row)?)),
                 None => Ok(None),
             }
+        })
+        .await
+    }
+
+    async fn edge_sequence(&self, id: Uuid) -> Result<Option<i64>, StorageError> {
+        let id = id.to_string();
+        self.with_reader("edge_sequence", move |conn| {
+            conn.query_row(
+                "SELECT seq FROM graph_edges_seq WHERE edge_id = ?1",
+                rusqlite::params![id],
+                |row| row.get(0),
+            )
+            .optional()
+        })
+        .await
+    }
+
+    async fn edge_sequences(&self, ids: &[Uuid]) -> Result<Vec<(Uuid, i64)>, StorageError> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let ids = ids.to_vec();
+        self.with_reader("edge_sequences", move |conn| {
+            const CHUNK: usize = 900;
+            let mut resolved = Vec::with_capacity(ids.len());
+            for chunk in ids.chunks(CHUNK) {
+                let placeholders = (1..=chunk.len())
+                    .map(|index| format!("?{index}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let sql = format!(
+                    "SELECT edge_id, seq FROM graph_edges_seq WHERE edge_id IN ({placeholders})"
+                );
+                let strings = chunk.iter().map(Uuid::to_string).collect::<Vec<_>>();
+                let params = strings
+                    .iter()
+                    .map(|id| id as &dyn rusqlite::types::ToSql)
+                    .collect::<Vec<_>>();
+                let mut stmt = conn.prepare(&sql)?;
+                let rows = stmt.query_map(params.as_slice(), |row| {
+                    let id: String = row.get(0)?;
+                    Ok((parse_uuid(&id)?, row.get::<_, i64>(1)?))
+                })?;
+                resolved.extend(rows.collect::<Result<Vec<_>, _>>()?);
+            }
+            Ok(resolved)
         })
         .await
     }
@@ -2017,6 +2066,61 @@ impl GraphStore for SqlGraphStore {
             };
 
             Ok(EdgeSeekPage { items, next_after })
+        })
+        .await
+    }
+
+    async fn query_edges_sequence_after(
+        &self,
+        filter: EdgeFilter,
+        after: Option<SeekCursor>,
+        limit: u32,
+    ) -> Result<SeekPage<Edge>, StorageError> {
+        if limit == 0 {
+            return Ok(SeekPage::default());
+        }
+        let namespace = self.namespace.clone();
+        let limit_usize = limit as usize;
+        let probe_limit_i64 = i64::from(limit) + 1;
+        self.with_reader("query_edges_sequence_after", move |conn| {
+            let (mut where_clause, mut params) = build_edge_filter_sql(&namespace, &filter);
+            if let Some(cursor) = after {
+                params.push(Box::new(cursor.sequence));
+                where_clause.push_str(&format!(" AND graph_edges_seq.seq > ?{}", params.len()));
+            }
+            params.push(Box::new(probe_limit_i64));
+            let limit_idx = params.len();
+            // CROSS JOIN fixes the ledger as the outer loop, preserving an
+            // indexed `seq > boundary` scan with no full-match sort.
+            let sql = format!(
+                "SELECT namespace, id, source_id, target_id, relation, weight, \
+                        created_at, updated_at, deleted_at, metadata, target_backend, \
+                        graph_edges_seq.seq \
+                 FROM graph_edges_seq CROSS JOIN graph_edges \
+                    ON graph_edges.id = graph_edges_seq.edge_id{where_clause} \
+                 ORDER BY graph_edges_seq.seq ASC LIMIT ?{limit_idx}"
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+                params.iter().map(|param| param.as_ref()).collect();
+            let rows = stmt.query_map(param_refs.as_slice(), |row| {
+                Ok((read_edge(row)?, row.get::<_, i64>(11)?))
+            })?;
+            let mut entries = rows.collect::<Result<Vec<_>, _>>()?;
+            let has_more = entries.len() > limit_usize;
+            if has_more {
+                entries.truncate(limit_usize);
+            }
+            let next_after = if has_more {
+                entries.last().map(|(edge, sequence)| SeekCursor {
+                    sequence: *sequence,
+                    id: Uuid::from(edge.id),
+                })
+            } else {
+                None
+            };
+            let items = entries.into_iter().map(|(edge, _)| edge).collect();
+            Ok(SeekPage { items, next_after })
         })
         .await
     }

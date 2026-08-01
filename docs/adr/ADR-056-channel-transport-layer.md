@@ -2068,6 +2068,15 @@ same `ChannelCheckpoint` value, so the reset commits atomically with the rest of
 than as a separate write. This is the precise, API-level statement of the `cursor_get -> poll_page
 -> handle each -> cursor_commit` sequencing described in §Restart durability above.
 
+> **Migration-sequence reconciliation (2026-08-01).** The V11 reservation in the
+> amendment below was never implemented and is superseded. The live post-consolidation
+> ledger now assigns V11 to `ann_write_log`, V12 to its model/sequence index, and V13
+> to stable list-cursor sequences. A future implementation of the
+> `comm_channel_cursor` widening MUST claim the next available version in ADR-015 in
+> the same PR. References below to V10 as the then-current tree and to V11/`011-*` as
+> the target are retained as the amendment's historical snapshot, not as a live schema
+> allocation. The ownership, atomic rebuild, and rollback requirements are unchanged.
+
 **Migration: owner and sequence.** The comm pack owns `comm_channel_cursor` and today ships it
 via a constant `CREATE TABLE IF NOT EXISTS` declaration (`COMM_CHANNEL_CURSOR_SCHEMA_STMT`) with a
 two-column primary key `(channel_kind, channel_slug)` -- idempotent on a fresh database, but a
@@ -3253,6 +3262,24 @@ The ingest loop enforces a configurable minimum inter-poll interval (default 5 s
 > **Retired 2026-07-17.** The interval is unchanged in shape, but there is no shared `poll_all`
 > sweep for it to govern: it now governs the sleep inside each adapter's own inbound loop. See
 > [§Amendment 2026-07-17](#amendment-2026-07-17----imessage-channel-over-an-ssh-bridge).
+
+#### 2026-08-01 staleness-observability amendment (#1472)
+
+Every new heartbeat writer MUST supply its positive nominal/minimum poll cadence as
+`poll_interval_secs`; omission remains accepted only for mixed-version compatibility. The
+shipped email writer records 5 seconds. `comm.health` exposes that
+configuration fact and a nullable advisory `stalled` projection. For a row with zero
+consecutive failures and valid cadence/timestamp facts, `stalled` is true only when the
+response's shared `as_of` is strictly more than three nominal intervals after
+`last_poll_attempt_at`. Legacy/malformed rows and known failure/backoff state return null.
+
+The nominal interval is not a hard completion deadline: adapters in a sweep are polled
+sequentially, transport work can remain in flight longer than one interval, and intentional
+exponential backoff can exceed it. Consequently `stalled: true` means the persisted schedule
+is overdue; it does not prove that the task is dead and MUST NOT drive an automatic restart.
+ADR-119's component `HealthReporter` remains authoritative for task-liveness and restart
+decisions. This additive persisted-snapshot surface closes #1472's caller-computability gap
+without changing channel lifecycle ownership.
 
 ### 13. Alternatives considered
 

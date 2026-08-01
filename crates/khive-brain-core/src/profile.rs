@@ -36,7 +36,7 @@ pub enum ConsumerKind {
 
 impl ConsumerKind {
     /// The exact wire-level `consumer_kind` string for this variant.
-    pub fn as_str(&self) -> &'static str {
+    pub const fn as_str(&self) -> &'static str {
         match self {
             ConsumerKind::Recall => "recall",
             ConsumerKind::KnowledgeCompose => "knowledge_compose",

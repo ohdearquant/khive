@@ -152,10 +152,10 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 20] = [
         description: "List records with optional filtering. Requests within the kind's row cap \
                       keep the existing array response. If limit exceeds the cap, the result is \
                       {\"items\": [...], \"requested_limit\": N, \"effective_limit\": CAP, \
-                      \"limit_clamped\": true}. Edge cursor mode keeps its existing \
-                      {\"edges\": [...], \"next_after\": ...} shape and adds the same limit \
-                      metadata when clamped. Caps are entity 500, note 200, edge 1000, event \
-                      1000, and proposal 500.",
+                      \"limit_clamped\": true}. Entity, note, and edge cursor modes return \
+                      {\"entities|notes|edges\": [...], \"next_after\": ...} and add the same \
+                      limit metadata when clamped. Caps are entity 500, note 200, edge 1000, \
+                      event 1000, and proposal 500.",
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,
         params: &[
@@ -177,24 +177,24 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 20] = [
                 name: "offset",
                 param_type: "integer",
                 required: false,
-                description: "Pagination offset (default 0). For kind=\"edge\" this pages the full \
-                              matching set (capped at 1000 rows per page); for a full-graph walk \
-                              prefer \"after\" instead, which is O(1) at any depth rather than \
-                              O(offset).",
+                description: "Pagination offset (default 0). For complete entity, note, or edge \
+                              walks prefer \"after\", whose indexed seek cost does not grow with \
+                              depth and whose boundaries are not shifted by concurrent inserts. \
+                              Explicit offset and after values are mutually exclusive.",
             },
             ParamDef {
                 name: "after",
-                param_type: "uuid",
+                param_type: "string",
                 required: false,
-                description: "Keyset cursor for kind=\"edge\" only: the id of the last edge from the \
-                              previous page, or \"\" (empty string) to opt into cursor-mode pagination \
-                              starting from the beginning of the set. Seeks via an indexed id range \
-                              scan instead of OFFSET, so cost does not grow with depth. When set, the \
-                              response shape is \
-                              {\"edges\": [...], \"next_after\": <uuid-or-null>}; \
-                              next_after is non-null while more rows remain. Mutually exclusive with \
-                              offset-based paging within a single walk. Over-cap limits add the \
-                              limit metadata described on the verb.",
+                description: "Insertion-sequence cursor for entity, note, and edge lists: the id from \
+                              the prior page's next_after, or \"\" to start cursor mode. A new id is \
+                              assigned a durable database sequence, so later inserts cannot fall behind \
+                              an issued boundary even when timestamps tie. This is a live walk, not an \
+                              MVCC snapshot: inserts may extend it, and rows committed after a terminal \
+                              page require a new walk. Responses are {\"entities\": [...]}, \
+                              {\"notes\": [...]}, or {\"edges\": [...]}, plus next_after. Reuse the \
+                              same filters throughout a walk. A missing, hard-deleted, or out-of-scope \
+                              cursor fails explicitly. Mutually exclusive with offset.",
             },
             ParamDef {
                 name: "entity_kind",
@@ -417,7 +417,7 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 20] = [
     // Declaration: declares two records identical
     HandlerDef {
         name: "merge",
-        description: "Deduplicate two entities or notes. Entity merges that fail the cheap entity_kind, name_similarity, or project_compatibility guard return a structured conflict error naming the guard in details.guard. force=true bypasses those guards and means the caller accepts responsibility. Successful non-dry-run merges emit an entity_merged or note_merged audit event. Returns {kept_id, removed_id, edges_rewired, properties_merged, tags_unioned, content_appended, dry_run}; \
+        description: "Deduplicate two entities or notes. Entity merges that fail the cheap entity_kind, name_similarity, or project_compatibility guard return a structured conflict error naming the guard in details.guard. force=true bypasses those guards and means the caller accepts responsibility. Successful non-dry-run merges emit an entity_merged or note_merged audit event. Natural-key edge collisions return and audit complete edge_conflict_preimages, including annotations cascaded with the dropped edge. Returns {kept_id, removed_id, edges_rewired, edges_contract_skipped, edge_conflict_preimages, properties_merged, tags_unioned, content_appended, dry_run}; \
                        chain with $prev.kept_id (not $prev.id — merge does not return a top-level id field).",
         visibility: Visibility::Verb,
         category: VerbCategory::Declaration,

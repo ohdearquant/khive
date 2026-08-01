@@ -114,6 +114,18 @@ pub(crate) static SESSION_HANDLERS: [HandlerDef; 4] = [
                 required: false,
                 description: "Exact filter on properties.provider.",
             },
+            ParamDef {
+                name: "agent_id",
+                param_type: "string",
+                required: false,
+                description: "Exact filter on properties.agent_id.",
+            },
+            ParamDef {
+                name: "since",
+                param_type: "string",
+                required: false,
+                description: "RFC 3339 lower bound on note.created_at (inclusive).",
+            },
         ],
     },
     HandlerDef {

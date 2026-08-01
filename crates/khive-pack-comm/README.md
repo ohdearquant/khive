@@ -2,7 +2,7 @@
 
 The communication pack for khive — inter-agent messaging (`send`, `inbox`,
 `read`, `unread`, `reply`, `thread`) over a dedicated `message` note kind, with
-dual-write, actor-addressed delivery.
+dual-write, actor-addressed delivery, and channel polling observability.
 
 ## Verbs
 
@@ -14,9 +14,10 @@ dual-write, actor-addressed delivery.
 | `comm.unread` | Count the caller's unread inbound messages without message payloads                                                                                           |
 | `comm.reply`  | Reply to a message, preserving thread linkage                                                                                                                 |
 | `comm.thread` | Retrieve all messages in a conversation thread, chronologically                                                                                               |
+| `comm.health` | Read per-channel heartbeat state, nominal poll cadence, and nullable advisory schedule staleness                                                              |
 | `comm.probe`  | Read-only poll for new inbound message metadata and a stale unread count (takes an explicit `actor`; unlike `comm.inbox`, it is not inferred from the caller) |
 
-A sixth handler, `comm.ingest`, is `Visibility::Subhandler` — it lets an
+The internal `comm.ingest` handler is `Visibility::Subhandler` — it lets an
 out-of-band channel adapter (email, Telegram, etc.) write an inbound message
 directly, deduplicated by `external_id`, but it is not callable on the MCP wire.
 

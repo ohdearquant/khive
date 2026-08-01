@@ -10,8 +10,10 @@ over the notes substrate (ADR-083).
   persist a session record. `provider_session_id` is the provider-native
   continuity anchor (not a khive UUID); `(provider, provider_session_id)` is
   the strongest grouping key when both are present.
-- `session.list(limit?, offset?, provider?)` — browse stored sessions, newest
-  first. Summaries omit `content`.
+- `session.list(limit?, offset?, provider?, agent_id?, since?)` — browse
+  stored sessions, newest first. `agent_id` matches the legacy
+  `properties.agent_id` field and `since` is an inclusive RFC 3339 creation
+  timestamp. Summaries omit `content`.
 - `session.resume(id)` — fetch one session's full content by full UUID or
   8+ hex short prefix.
 - `session.export(id, format?)` — serialize a session as `json` (default) or
@@ -20,6 +22,7 @@ over the notes substrate (ADR-083).
 ```text
 request(ops="session.store(content=\"...\", provider=\"codex\", provider_session_id=\"abc\")")
 request(ops="session.list(limit=20, provider=\"codex\")")
+request(ops="session.list(agent_id=\"lambda:worker\", since=\"2026-08-01T00:00:00Z\")")
 request(ops="session.resume(id=\"a1b2c3d4\")")
 request(ops="session.export(id=\"a1b2c3d4\", format=\"markdown\")")
 ```

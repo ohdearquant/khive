@@ -172,7 +172,7 @@ it does not train the default/live namespace's posterior state.
 | `comm.read`   | Mark an **inbound** message as read (best-effort: check `read` in the response; `false` + `mark_error` means re-issue later) | Acknowledge receipt (recipient action)        |
 | `comm.reply`  | Reply to a message (threading linkage)                                                                                       | Respond in-thread                             |
 | `comm.thread` | Retrieve full conversation thread                                                                                            | Read the whole conversation                   |
-| `comm.health` | Per-channel health snapshot (no args)                                                                                        | Check daemon channel-poll state               |
+| `comm.health` | Per-channel health snapshot with nominal cadence and advisory staleness (no args)                                            | Check daemon channel-poll state               |
 | `comm.probe`  | Read-only poll for new inbound message metadata and stale unread count                                                       | Cheap wake-up check without a full inbox scan |
 
 **Inbox shape (ADR-057).** `comm.inbox` is scannable: each entry carries top-level `from`, `to`,

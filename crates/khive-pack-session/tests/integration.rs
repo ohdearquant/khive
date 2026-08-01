@@ -10,7 +10,7 @@ use std::sync::Arc;
 use khive_pack_kg::KgPack;
 use khive_pack_session::SessionPack;
 use khive_runtime::{
-    AllowAllGate, BackendId, KhiveRuntime, Namespace, RuntimeConfig, VerbRegistry,
+    AllowAllGate, BackendId, KhiveRuntime, Namespace, RuntimeConfig, RuntimeError, VerbRegistry,
     VerbRegistryBuilder,
 };
 use serde_json::{json, Value};
@@ -266,6 +266,58 @@ async fn list_filter_by_unknown_provider_returns_empty() {
 }
 
 #[tokio::test]
+async fn list_filters_by_agent_id_in_storage() {
+    let dir = TempDir::new().expect("tempdir");
+    let rt = file_rt(dir.path().join("list_agent_id.db"));
+    let registry = build_registry(rt);
+
+    for (content, agent_id) in [("alpha", "lambda:alpha"), ("beta", "lambda:beta")] {
+        registry
+            .dispatch(
+                "create",
+                json!({
+                    "kind": "session",
+                    "content": content,
+                    "properties": {"agent_id": agent_id}
+                }),
+            )
+            .await
+            .expect("create attributed session note");
+    }
+
+    let result = registry
+        .dispatch("session.list", json!({"agent_id": "lambda:alpha"}))
+        .await
+        .expect("list by agent_id");
+    let sessions = result["sessions"].as_array().expect("sessions array");
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(result["total"], 1);
+    assert_eq!(sessions[0]["id"].as_str().map(str::len), Some(36));
+}
+
+#[tokio::test]
+async fn list_filters_by_inclusive_since_bound_in_storage() {
+    let dir = TempDir::new().expect("tempdir");
+    let rt = file_rt(dir.path().join("list_since.db"));
+    let registry = build_registry(rt);
+
+    store_session(&registry, "before").await;
+    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    let after = store_session(&registry, "after").await;
+    let after_id = after["session"]["id"].as_str().expect("after id");
+    let since = after["session"]["created_at"].as_str().expect("created_at");
+
+    let result = registry
+        .dispatch("session.list", json!({"since": since}))
+        .await
+        .expect("list since");
+    let sessions = result["sessions"].as_array().expect("sessions array");
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(result["total"], 1);
+    assert_eq!(sessions[0]["id"], after_id);
+}
+
+#[tokio::test]
 async fn list_limit_respected() {
     let dir = TempDir::new().expect("tempdir");
     let rt = file_rt(dir.path().join("list_limit.db"));
@@ -323,6 +375,158 @@ async fn list_offset_pagination() {
     assert_eq!(paged_arr.len(), 2, "expected exactly 2 items");
     assert_eq!(paged_arr[0]["id"], all_arr[2]["id"]);
     assert_eq!(paged_arr[1]["id"], all_arr[3]["id"]);
+}
+
+#[tokio::test]
+async fn list_filters_before_paginating_sparse_match() {
+    let dir = TempDir::new().expect("tempdir");
+    let rt = file_rt(dir.path().join("list_filter_pagination.db"));
+    let registry = build_registry(rt);
+
+    // A single matching session, buried behind more than one page of newer
+    // nonmatching sessions (sessions list newest-first). An implementation
+    // that fetched an unfiltered page and filtered in memory would miss it.
+    let matching = registry
+        .dispatch(
+            "create",
+            json!({
+                "kind": "session",
+                "content": "matches agent filter",
+                "properties": {"agent_id": "lambda:target"}
+            }),
+        )
+        .await
+        .expect("create matching session");
+    let matching_id = matching["id"].as_str().expect("matching id").to_string();
+    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+
+    for i in 0..5 {
+        registry
+            .dispatch(
+                "create",
+                json!({
+                    "kind": "session",
+                    "content": format!("noise {i}"),
+                    "properties": {"agent_id": "lambda:other"}
+                }),
+            )
+            .await
+            .expect("create nonmatching session");
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+
+    let result = registry
+        .dispatch(
+            "session.list",
+            json!({"agent_id": "lambda:target", "limit": 2, "offset": 0}),
+        )
+        .await
+        .expect("filtered and paged list");
+    let sessions = result["sessions"].as_array().expect("sessions array");
+    assert_eq!(
+        sessions.len(),
+        1,
+        "filtering must apply before the page window, not after fetching a page of newer nonmatches"
+    );
+    assert_eq!(sessions[0]["id"], matching_id);
+    assert_eq!(
+        result["total"], 1,
+        "total must reflect the filtered count, not the unfiltered total"
+    );
+
+    // Combined filters: `since` set to the matching session's own timestamp
+    // matches all six sessions (it is the oldest), but adding `agent_id`
+    // must still narrow the result to the one matching session.
+    let matching_created_at = registry
+        .dispatch("session.resume", json!({"id": matching_id}))
+        .await
+        .expect("resume matching session")["session"]["created_at"]
+        .as_str()
+        .expect("created_at present")
+        .to_string();
+
+    let combined = registry
+        .dispatch(
+            "session.list",
+            json!({
+                "agent_id": "lambda:target",
+                "since": matching_created_at,
+                "limit": 2,
+                "offset": 0
+            }),
+        )
+        .await
+        .expect("combined-filter list");
+    let combined_sessions = combined["sessions"].as_array().expect("sessions array");
+    assert_eq!(combined_sessions.len(), 1);
+    assert_eq!(combined_sessions[0]["id"], matching_id);
+    assert_eq!(combined["total"], 1);
+}
+
+#[tokio::test]
+async fn list_filters_before_paginating_nonzero_offset() {
+    let dir = TempDir::new().expect("tempdir");
+    let rt = file_rt(dir.path().join("list_filter_pagination_offset.db"));
+    let registry = build_registry(rt);
+
+    // Three matching sessions interleaved with newer nonmatching sessions, so
+    // an implementation that pages the raw (unfiltered) row order before
+    // filtering would misalign the offset window against the filtered set.
+    let mut matching_ids = Vec::new();
+    for round in 0..3 {
+        let created = registry
+            .dispatch(
+                "create",
+                json!({
+                    "kind": "session",
+                    "content": format!("matches agent filter {round}"),
+                    "properties": {"agent_id": "lambda:target"}
+                }),
+            )
+            .await
+            .expect("create matching session");
+        matching_ids.push(created["id"].as_str().expect("matching id").to_string());
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+
+        for i in 0..2 {
+            registry
+                .dispatch(
+                    "create",
+                    json!({
+                        "kind": "session",
+                        "content": format!("noise {round}-{i}"),
+                        "properties": {"agent_id": "lambda:other"}
+                    }),
+                )
+                .await
+                .expect("create nonmatching session");
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    }
+
+    // Filtered, newest-first order is [match2, match1, match0]; offset=1
+    // with limit=1 must land on match1, the second matching record.
+    let result = registry
+        .dispatch(
+            "session.list",
+            json!({"agent_id": "lambda:target", "limit": 1, "offset": 1}),
+        )
+        .await
+        .expect("filtered and paged list");
+    let sessions = result["sessions"].as_array().expect("sessions array");
+    assert_eq!(
+        sessions.len(),
+        1,
+        "expected exactly one session in the requested page"
+    );
+    assert_eq!(
+        sessions[0]["id"], matching_ids[1],
+        "offset must apply to the filtered set, not an unfiltered pre-filter page"
+    );
+    assert_eq!(
+        result["total"], 3,
+        "total must reflect the filtered count across all three matches"
+    );
 }
 
 // ── session.resume tests ───────────────────────────────────────────────────────
@@ -438,6 +642,26 @@ async fn resume_rejects_non_session_note() {
     assert!(err.is_err(), "non-session note must be rejected");
 }
 
+#[tokio::test]
+async fn resume_excludes_soft_deleted_session() {
+    let dir = TempDir::new().expect("tempdir");
+    let rt = file_rt(dir.path().join("resume_deleted.db"));
+    let registry = build_registry(rt);
+
+    let stored = store_session(&registry, "deleted resume session").await;
+    let id = stored["session"]["id"].as_str().expect("id").to_string();
+    registry
+        .dispatch("delete", json!({"id": id}))
+        .await
+        .expect("soft delete session");
+
+    let result = registry.dispatch("session.resume", json!({"id": id})).await;
+    assert!(
+        matches!(&result, Err(RuntimeError::NotFound(_))),
+        "resume must report a soft-deleted session as not found: {result:?}"
+    );
+}
+
 // ── session.export tests ──────────────────────────────────────────────────────
 
 #[tokio::test]
@@ -522,6 +746,26 @@ async fn export_rejects_missing_id() {
         .dispatch("session.export", json!({"format": "json"}))
         .await;
     assert!(err.is_err(), "missing required id field must error");
+}
+
+#[tokio::test]
+async fn export_excludes_soft_deleted_session() {
+    let dir = TempDir::new().expect("tempdir");
+    let rt = file_rt(dir.path().join("export_deleted.db"));
+    let registry = build_registry(rt);
+
+    let stored = store_session(&registry, "deleted export session").await;
+    let id = stored["session"]["id"].as_str().expect("id").to_string();
+    registry
+        .dispatch("delete", json!({"id": id}))
+        .await
+        .expect("soft delete session");
+
+    let result = registry.dispatch("session.export", json!({"id": id})).await;
+    assert!(
+        matches!(&result, Err(RuntimeError::NotFound(_))),
+        "export must report a soft-deleted session as not found: {result:?}"
+    );
 }
 
 // ── round-trip regression ────────────────────────────────────────────────────

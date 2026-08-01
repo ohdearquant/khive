@@ -1,7 +1,8 @@
 //! Pack trait — the declarative composition unit for khive.
 //!
-//! A pack declares vocabulary (note kinds, entity kinds), verbs, and edge
-//! endpoint rules. This is purely static metadata — no I/O, no async.
+//! A pack declares vocabulary (note kinds, entity kinds, brain consumer
+//! kinds), verbs, and edge endpoint rules. This is purely static metadata —
+//! no I/O, no async.
 //! Runtime dispatch lives in `khive-runtime` (`PackRuntime` trait +
 //! `VerbRegistry`).
 //!
@@ -278,6 +279,18 @@ pub trait Pack {
 
     /// Entity kinds this pack contributes to the runtime vocabulary.
     const ENTITY_KINDS: &'static [&'static str];
+
+    /// Brain profile consumer kinds this pack requests.
+    ///
+    /// A pack that resolves a brain profile for a consumer (for example,
+    /// `"recall"`) declares that wire-level kind here. The runtime composes
+    /// declarations from all loaded packs so `brain.bind` can reject bindings
+    /// that no registered consumer will ever request. Multiple packs may
+    /// declare the same consumer kind; composition deduplicates them.
+    ///
+    /// The `"*"` binding wildcard is registry-owned and must not be declared
+    /// by a pack.
+    const BRAIN_CONSUMER_KINDS: &'static [&'static str] = &[];
 
     /// Handlers this pack registers.
     ///
