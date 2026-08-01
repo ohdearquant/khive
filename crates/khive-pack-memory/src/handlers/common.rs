@@ -629,9 +629,9 @@ pub(super) fn fuse_candidates(
     let is_weighted = matches!(&cfg.fuse_strategy, FusionStrategy::Weighted { .. });
 
     let sources: Vec<Vec<_>> = if vector_only {
-        vec![combine_vector_sources_union(vector_sources)]
+        vec![combine_vector_sources_union(vector_sources), vec![]]
     } else if keyword_only {
-        vec![text_source]
+        vec![vec![], text_source]
     } else if is_weighted && vector_sources.len() > 1 {
         let combined_vector = combine_vector_sources_union(vector_sources);
         vec![combined_vector, text_source]
