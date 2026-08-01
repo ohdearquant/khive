@@ -113,9 +113,11 @@ async fn actor_pin_default_read_exposes_only_local_and_pinned_records() {
     // Force in-process dispatch for the seed/read calls below — no reliance
     // on a warm/absent daemon socket. `run_exec`'s daemon-forward framing
     // seam (what a live daemon would receive) is exercised separately by
-    // `exec.rs`'s `daemon_forward_frame_reflects_actor_pin_not_displaced_fallback`
-    // unit test, which asserts the forwarded frame's `actor_id`/
-    // `visible_namespaces` directly via a spy, without a live socket.
+    // `daemon_forward_frame_actor_pin.rs`'s
+    // `daemon_forward_frame_reflects_actor_pin_not_displaced_fallback`
+    // integration test, which asserts the forwarded frame's `actor_id`/
+    // `visible_namespaces` directly off the wire, via a hand-rolled fake
+    // daemon socket.
     std::env::set_var("KHIVE_NO_DAEMON", "1");
 
     let home_dir = tempfile::tempdir().expect("tempdir for isolated HOME");
