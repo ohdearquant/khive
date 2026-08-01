@@ -198,6 +198,41 @@ async fn test_upsert_and_get_edge() {
     assert!((fetched.weight - 0.8).abs() < 1e-9);
 }
 
+/// The base `PRIMARY KEY (namespace, id)` alone would let two namespaces
+/// hold the same edge id; the list-cursor ledger (`graph_edges_seq`) and the
+/// multi-namespace cursor merge in the runtime both key on `id` alone, so a
+/// shared id would corrupt cursor ordering across namespaces. The
+/// `idx_graph_edges_id_unique` index closes that gap at the write path
+/// itself -- a second namespace cannot silently acquire an id already used
+/// by another namespace's edge.
+#[tokio::test]
+async fn test_upsert_edge_rejects_duplicate_id_across_namespaces() {
+    let store = setup_memory_store();
+
+    let shared_id = Uuid::new_v4();
+    let mut first = make_edge(Uuid::new_v4(), Uuid::new_v4(), EdgeRelation::Extends, 1.0);
+    first.id = shared_id.into();
+    first.namespace = "ns-a".to_string();
+    store.upsert_edge(first).await.unwrap();
+
+    let mut second = make_edge(Uuid::new_v4(), Uuid::new_v4(), EdgeRelation::Extends, 1.0);
+    second.id = shared_id.into();
+    second.namespace = "ns-b".to_string();
+    let result = store.upsert_edge(second).await;
+
+    assert!(
+        result.is_err(),
+        "a second namespace inserting an already-used edge id must fail, not silently \
+         share the first namespace's list-cursor ledger row"
+    );
+
+    let fetched = store.get_edge(shared_id.into()).await.unwrap().unwrap();
+    assert_eq!(
+        fetched.namespace, "ns-a",
+        "the rejected duplicate-id write must leave the original namespace's edge intact"
+    );
+}
+
 #[tokio::test]
 async fn test_delete_edge() {
     let store = setup_memory_store();

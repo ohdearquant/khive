@@ -127,6 +127,8 @@ const V12_UP: &str = include_str!("../sql/012-ann-write-log-model-seq-index.sql"
 
 const V13_UP: &str = include_str!("../sql/013-list-cursor-sequences.sql");
 
+const V14_UP: &str = include_str!("../sql/014-graph-edges-id-unique.sql");
+
 /// DDL for the `ann_write_log` delta table.
 ///
 /// Shared between migration V11 and the belt-and-suspenders creation in
@@ -215,6 +217,11 @@ pub const MIGRATIONS: &[VersionedMigration] = &[
         version: 13,
         name: "list_cursor_sequences",
         up: V13_UP,
+    },
+    VersionedMigration {
+        version: 14,
+        name: "graph_edges_id_unique",
+        up: V14_UP,
     },
 ];
 

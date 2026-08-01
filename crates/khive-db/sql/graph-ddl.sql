@@ -17,6 +17,12 @@ CREATE TABLE IF NOT EXISTS graph_edges (
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_graph_edges_unique_triple ON graph_edges(namespace, source_id, target_id, relation);
+-- The base PRIMARY KEY is (namespace, id), so it alone would allow the same
+-- UUID in two namespaces. The list-cursor ledger below (graph_edges_seq) and
+-- the by-ID runtime contract (get/update/delete/merge are namespace-agnostic)
+-- both already assume `id` is globally unique; this index makes that
+-- assumption durable instead of merely conventional.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_graph_edges_id_unique ON graph_edges(id);
 CREATE INDEX IF NOT EXISTS idx_graph_edges_ns_source ON graph_edges(namespace, source_id);
 CREATE INDEX IF NOT EXISTS idx_graph_edges_ns_target ON graph_edges(namespace, target_id);
 CREATE INDEX IF NOT EXISTS idx_graph_edges_ns_relation ON graph_edges(namespace, relation);

@@ -989,6 +989,82 @@ fn v13_sequence_trigger_failure_rolls_back_each_substrate_insert() {
     }
 }
 
+// ── V14: graph_edges.id must be globally unique (#1424, #1462 follow-up) ────
+
+#[test]
+fn v14_rejects_legacy_duplicate_edge_id_across_namespaces() {
+    let mut conn = open_memory();
+    conn.execute_batch(MIGRATION_TRACKING_TABLE).unwrap();
+    for migration in MIGRATIONS
+        .iter()
+        .filter(|migration| migration.version <= 13)
+    {
+        let tx = conn.transaction().unwrap();
+        tx.execute_batch(migration.up).unwrap();
+        tx.execute(
+            "INSERT INTO _schema_migrations (version, name, applied_at) VALUES (?1, ?2, 0)",
+            rusqlite::params![migration.version, migration.name],
+        )
+        .unwrap();
+        tx.commit().unwrap();
+    }
+
+    // Pre-V14 schema permits the same edge id in two namespaces because the
+    // base PRIMARY KEY is (namespace, id) -- exactly the legacy state the
+    // list-cursor ledger silently mishandled.
+    for ns in ["ns-a", "ns-b"] {
+        conn.execute(
+            "INSERT INTO graph_edges \
+             (namespace, id, source_id, target_id, relation, created_at, updated_at) \
+             VALUES (?1, 'dup-edge', 's', 't', 'extends', 100, 100)",
+            rusqlite::params![ns],
+        )
+        .unwrap();
+    }
+
+    let result = run_migrations(&mut conn);
+    assert!(
+        result.is_err(),
+        "V14 must fail loudly on a legacy cross-namespace duplicate edge id instead of \
+         silently letting the two namespaces share one ledger row"
+    );
+    assert_eq!(
+        read_schema_version(&conn).unwrap(),
+        13,
+        "a failed V14 migration must leave the database at its last good version"
+    );
+}
+
+#[test]
+fn v14_index_rejects_new_cross_namespace_duplicate_edge_id() {
+    let mut conn = open_memory();
+    run_migrations(&mut conn).unwrap();
+
+    conn.execute(
+        "INSERT INTO graph_edges \
+         (namespace, id, source_id, target_id, relation, created_at, updated_at) \
+         VALUES ('ns-a', 'dup-edge', 's', 't', 'extends', 100, 100)",
+        [],
+    )
+    .unwrap();
+
+    let err = conn
+        .execute(
+            "INSERT INTO graph_edges \
+             (namespace, id, source_id, target_id, relation, created_at, updated_at) \
+             VALUES ('ns-b', 'dup-edge', 's2', 't2', 'extends', 200, 200)",
+            [],
+        )
+        .expect_err(
+            "a second namespace inserting an already-used edge id must hit the unique \
+             index, not silently succeed and share the first namespace's ledger row",
+        );
+    assert!(
+        err.to_string().to_lowercase().contains("unique"),
+        "expected a UNIQUE constraint failure, got: {err}"
+    );
+}
+
 #[test]
 fn read_schema_version_missing_ledger_is_zero() {
     let conn = open_memory();

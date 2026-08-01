@@ -1,0 +1,23 @@
+-- V14: enforce global uniqueness of graph_edges.id (khive #1424, #1462
+-- follow-up).
+--
+-- The V13 list-cursor ledger (graph_edges_seq) keys its AFTER INSERT trigger
+-- and its seek join on `edge_id` alone, and the multi-namespace cursor merge
+-- in the runtime dedups by edge id alone. Both already assume `id` is
+-- globally unique -- matching the existing UUID-only by-ID contract (get /
+-- update / delete / merge do not scope by namespace). The base
+-- `PRIMARY KEY (namespace, id)` never enforced that assumption: two
+-- namespaces could hold the same edge id, in which case the ledger keeps
+-- only the first namespace's sequence row, so a same-id edge in a second
+-- namespace silently reports the first namespace's insertion boundary
+-- instead of its own, and a multi-namespace cursor walk can drop one of the
+-- pair during id-based deduplication.
+--
+-- This index makes the invariant durable going forward. If a legacy
+-- database already holds a duplicate id across namespaces, this
+-- `CREATE UNIQUE INDEX` fails and the migration aborts rather than silently
+-- leaving the ledger ambiguous -- the same fail-loudly posture
+-- `run_migrations` already takes for a schema version it does not
+-- understand. There is no automatic reconciliation: picking a winner would
+-- mean silently dropping a live edge from whichever namespace loses.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_graph_edges_id_unique ON graph_edges(id);
