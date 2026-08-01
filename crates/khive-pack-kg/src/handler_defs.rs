@@ -629,9 +629,9 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 19] = [
     // Assertive: retrieves multi-hop traversal results
     HandlerDef {
         name: "traverse",
-        description: "Multi-hop BFS traversal. Can reach note nodes (e.g. via an \
-                      `annotates` edge) but only enriches entity nodes with name/kind; \
-                      note nodes come back with those fields absent.",
+        description: "Multi-hop BFS traversal returning one path per distinct root. \
+                      Entity and note nodes both include name/kind; note names use the \
+                      same fallback as `neighbors` when no explicit name is stored.",
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,
         params: &[
