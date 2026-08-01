@@ -8182,14 +8182,14 @@ async fn send_lands_outbound_inbound_fts_and_vectors_with_multi_model_counts() {
         6
     );
 
-    let (registry, rt) = build_registry_for_ns("lambda:khive");
+    let (registry, rt) = build_registry_for_ns("agent:sender");
     rt.register_embedder(SendCountsModelA);
     rt.register_embedder(SendCountsModelB);
 
     registry
         .dispatch(
             "comm.send",
-            serde_json::json!({ "to": "lambda:khive", "content": "multi-model counts" }),
+            serde_json::json!({ "to": "agent:sender", "content": "multi-model counts" }),
         )
         .await
         .expect("send succeeds");

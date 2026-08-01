@@ -40,7 +40,7 @@ use uuid::Uuid;
 
 use khive_storage::note::Note;
 use khive_storage::types::SqlValue;
-use khive_storage::SqlStatement;
+use khive_storage::{SqlStatement, StorageCapability, StorageError};
 use khive_types::SubstrateKind;
 
 use crate::atomic_plan::{AddNotePlan, AffectedRowGuard, PlanStatement, PostCommitEffect};
@@ -83,18 +83,46 @@ fn f32_vec_to_bytes(data: &[f32]) -> Vec<u8> {
     bytes
 }
 
-/// A harmless no-op `UPDATE` targeting a row that can never exist, guarded
-/// `exactly(1)` so it always fails its guard inside the atomic unit. Spliced
-/// in by test-only fault injection (see [`maybe_inject_fts_failure`]/
-/// [`maybe_inject_vector_failure`]) to prove the whole unit — not just the
-/// failing note's own plan — rolls back.
+/// Mirrors `khive-db`'s private `non_finite_index` — this crate has no
+/// visibility into that helper, so the check is reproduced here to keep the
+/// atomic path's embedding validation observably identical to the canonical
+/// `create_note_inner` -> `VectorStore::insert` path.
+fn non_finite_index(data: &[f32]) -> Option<usize> {
+    data.iter().position(|v| !v.is_finite())
+}
+
+/// Same error shape (capability, operation label, message) as `khive-db`'s
+/// private `non_finite_vector_error("vec_insert", ..)` — the atomic path
+/// must reject a non-finite embedding exactly as the raw `VectorStore::insert`
+/// DML does, not silently write it.
+fn non_finite_vector_error(idx: usize, value: f32) -> RuntimeError {
+    RuntimeError::Storage(StorageError::InvalidInput {
+        capability: StorageCapability::Vectors,
+        operation: "vec_insert".into(),
+        message: format!(
+            "non-finite value at index {idx}: {value} \
+             (NaN/Inf values corrupt distance computations)"
+        ),
+    })
+}
+
+/// A harmless no-op `UPDATE` with a statically zero-row predicate (`WHERE 1
+/// = 0`, not a match against a specific id), guarded `exactly(1)` so it
+/// always fails its guard inside the atomic unit regardless of which note
+/// ids exist in the store — a fixed nil-UUID predicate would pass its guard
+/// if a caller ever supplied that id. Spliced in by test-only fault
+/// injection (see [`maybe_inject_fts_failure`]/[`maybe_inject_vector_failure`])
+/// to prove the whole unit — not just the failing note's own plan — rolls
+/// back.
+///
+/// `fault-injection` is an ordinary Cargo feature (see this crate's
+/// `Cargo.toml`); it must never be enabled in a packaged/release build —
+/// doing so would compile this fault-injection path into a shipped binary.
 #[cfg(any(test, feature = "fault-injection"))]
 fn injected_failure_statement(label: &str) -> PlanStatement {
     PlanStatement {
         statement: SqlStatement {
-            sql: "UPDATE notes SET updated_at = updated_at \
-                  WHERE id = '00000000-0000-0000-0000-000000000000'"
-                .to_string(),
+            sql: "UPDATE notes SET updated_at = updated_at WHERE 1 = 0".to_string(),
             params: vec![],
             label: Some(label.to_string()),
         },
@@ -305,6 +333,19 @@ pub async fn create_notes_atomic(
         }
     }
 
+    // Reject any non-finite embedding value BEFORE any plan is built — same
+    // validation the canonical `VectorStore::insert` DML performs, applied
+    // here so a bad custom embedding provider never reaches the raw vector
+    // insert on this path (embed-first: no note, FTS document, or vector row
+    // has been written yet).
+    for embeddings_for_note in &embeddings {
+        for embedding in embeddings_for_note.iter().flatten() {
+            if let Some(idx) = non_finite_index(embedding) {
+                return Err(non_finite_vector_error(idx, embedding[idx]));
+            }
+        }
+    }
+
     // ---- 3. Build one AddNotePlan per spec (row + FTS + vector-insert
     // statements), all pre-computed embeddings already in hand. ----
     let mut plans: Vec<AtomicOpPlan> = Vec::with_capacity(notes.len());
@@ -317,6 +358,19 @@ pub async fn create_notes_atomic(
         if let Some(fault) = maybe_inject_fts_failure(&note.namespace, "fault-injected-fts") {
             statements.push(fault);
         } else {
+            // Delete-then-insert upsert — mirrors `text.rs`'s
+            // `upsert_document_dml` exactly, so a caller-supplied/reused note
+            // id never leaves a stale/duplicate FTS document behind (the
+            // note row itself is already an upsert via
+            // `note_upsert_statement`).
+            statements.push(PlanStatement {
+                statement: khive_db::stores::text::delete_document_statement(
+                    "fts_notes",
+                    &note.namespace,
+                    note.id,
+                ),
+                guard: None,
+            });
             statements.push(PlanStatement {
                 statement: khive_db::stores::text::insert_document_statement(
                     "fts_notes",
@@ -361,5 +415,212 @@ pub async fn create_notes_atomic(
             "atomic multi-note write rolled back at op {failed_op_index}: {failure:?}"
         ))),
         Err(e) => Err(RuntimeError::Storage(e.0)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use async_trait::async_trait;
+    use lattice_embed::{EmbedError, EmbeddingModel, EmbeddingService};
+
+    use khive_types::Namespace;
+
+    use crate::embedder_registry::EmbedderProvider;
+
+    const NAN_MODEL: &str = "atomic-message-nan-model";
+    const NAN_DIMS: usize = 4;
+
+    struct NanService;
+    #[async_trait]
+    impl EmbeddingService for NanService {
+        async fn embed(
+            &self,
+            texts: &[String],
+            _model: EmbeddingModel,
+        ) -> Result<Vec<Vec<f32>>, EmbedError> {
+            Ok(texts.iter().map(|_| vec![f32::NAN; NAN_DIMS]).collect())
+        }
+        fn supports_model(&self, _model: EmbeddingModel) -> bool {
+            true
+        }
+        fn name(&self) -> &'static str {
+            NAN_MODEL
+        }
+    }
+    struct NanProvider;
+    #[async_trait]
+    impl EmbedderProvider for NanProvider {
+        fn name(&self) -> &str {
+            NAN_MODEL
+        }
+        fn dimensions(&self) -> usize {
+            NAN_DIMS
+        }
+        async fn build(&self) -> RuntimeResult<std::sync::Arc<dyn EmbeddingService>> {
+            Ok(std::sync::Arc::new(NanService))
+        }
+    }
+
+    async fn fts_row_count(runtime: &KhiveRuntime, namespace: &str) -> i64 {
+        let mut reader = runtime.sql().reader().await.expect("sql reader");
+        match reader
+            .query_scalar(SqlStatement {
+                sql: "SELECT COUNT(*) FROM fts_notes WHERE namespace = ?1".to_string(),
+                params: vec![SqlValue::Text(namespace.to_string())],
+                label: None,
+            })
+            .await
+            .expect("fts count query")
+        {
+            Some(SqlValue::Integer(n)) => n,
+            other => panic!("unexpected fts count result: {other:?}"),
+        }
+    }
+
+    async fn ann_write_log_count(runtime: &KhiveRuntime, namespace: &str, model: &str) -> i64 {
+        let mut reader = runtime.sql().reader().await.expect("sql reader");
+        match reader
+            .query_scalar(SqlStatement {
+                sql: "SELECT COUNT(*) FROM ann_write_log \
+                      WHERE namespace = ?1 AND embedding_model = ?2"
+                    .to_string(),
+                params: vec![
+                    SqlValue::Text(namespace.to_string()),
+                    SqlValue::Text(model.to_string()),
+                ],
+                label: None,
+            })
+            .await
+            .expect("ann_write_log count query")
+        {
+            Some(SqlValue::Integer(n)) => n,
+            other => panic!("unexpected ann_write_log count result: {other:?}"),
+        }
+    }
+
+    /// A custom embedding provider returning NaN must be rejected BEFORE any
+    /// plan is built — same validation `VectorStore::insert` performs on the
+    /// canonical `create_note_inner` path. No note row, FTS document, vector
+    /// row, or `ann_write_log` row may be committed.
+    #[tokio::test]
+    async fn create_notes_atomic_rejects_non_finite_embedding_before_any_write() {
+        let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+        runtime.register_embedder(NanProvider);
+        let ns = "atomic-message-nan-test";
+        let token = runtime
+            .authorize(Namespace::parse(ns).unwrap())
+            .expect("authorize");
+
+        let result = create_notes_atomic(
+            &runtime,
+            vec![AtomicNoteSpec {
+                token: &token,
+                id: None,
+                kind: "observation",
+                name: None,
+                content: "nan embedding content",
+                properties: None,
+            }],
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "a non-finite embedding must be rejected; got {result:?}"
+        );
+
+        let alive = runtime
+            .list_notes(&token, Some("observation"), 100, 0)
+            .await
+            .expect("list_notes")
+            .into_iter()
+            .filter(|n| n.deleted_at.is_none())
+            .count();
+        assert_eq!(
+            alive, 0,
+            "no note row may be committed when an embedding is non-finite"
+        );
+
+        assert_eq!(
+            fts_row_count(&runtime, ns).await,
+            0,
+            "no FTS document may be committed when an embedding is non-finite"
+        );
+
+        let vs = runtime
+            .vectors_for_model(&token, NAN_MODEL)
+            .expect("vec store");
+        assert_eq!(
+            vs.count().await.expect("count"),
+            0,
+            "no vector row may be committed when an embedding is non-finite"
+        );
+
+        assert_eq!(
+            ann_write_log_count(&runtime, ns, NAN_MODEL).await,
+            0,
+            "no ann_write_log row may be committed when an embedding is non-finite"
+        );
+    }
+
+    /// Calling `create_notes_atomic` twice with the SAME caller-supplied id
+    /// (different content each time) must leave exactly one FTS document for
+    /// that id, reflecting the latest content — not an append of two
+    /// documents (the note row is already an upsert; the FTS half must match).
+    #[tokio::test]
+    async fn create_notes_atomic_upserts_fts_document_for_reused_note_id() {
+        let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+        let ns = "atomic-message-fts-upsert-test";
+        let token = runtime
+            .authorize(Namespace::parse(ns).unwrap())
+            .expect("authorize");
+        let id = Uuid::new_v4();
+
+        create_notes_atomic(
+            &runtime,
+            vec![AtomicNoteSpec {
+                token: &token,
+                id: Some(id),
+                kind: "observation",
+                name: None,
+                content: "first content",
+                properties: None,
+            }],
+        )
+        .await
+        .expect("first write with supplied id");
+
+        create_notes_atomic(
+            &runtime,
+            vec![AtomicNoteSpec {
+                token: &token,
+                id: Some(id),
+                kind: "observation",
+                name: None,
+                content: "second content replacing the first",
+                properties: None,
+            }],
+        )
+        .await
+        .expect("second write reusing the same id");
+
+        assert_eq!(
+            fts_row_count(&runtime, ns).await,
+            1,
+            "exactly one FTS document may exist for the reused id"
+        );
+
+        let text = runtime.text_for_notes(&token).expect("text store");
+        let doc = text
+            .get_document(ns, id)
+            .await
+            .expect("get_document")
+            .expect("document exists for the reused id");
+        assert!(
+            doc.body.contains("second content"),
+            "the surviving FTS document must reflect the latest content; got {:?}",
+            doc.body
+        );
     }
 }

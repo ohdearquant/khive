@@ -468,15 +468,24 @@ mod tests {
         }
     }
 
-    /// Failure injection mid-unit: when the vector-insert statement for one
-    /// note's plan fails, the WHOLE atomic unit — both notes' rows, FTS
-    /// documents, and vector rows — must roll back, not just the failing
-    /// note. Absence is asserted positively via `list_notes`/
-    /// `VectorStore::count`, not by inspecting the error.
+    /// Failure injection mid-unit, proven across a CROSS-namespace send: the
+    /// outbound plan (sender namespace) applies its statements before the
+    /// inbound plan (recipient namespace) runs, so arming the fault on the
+    /// recipient namespace only is what actually exercises "an
+    /// already-applied first plan unwinds" — arming the SAME namespace for
+    /// both copies (as same-namespace sends do) lets the one-shot fault be
+    /// consumed by the outbound plan instead, proving nothing about rollback
+    /// of prior work. Absence is asserted positively — `list_notes`,
+    /// `fts_notes` row counts, `VectorStore::count`, and `ann_write_log` row
+    /// counts — in BOTH namespaces, not by inspecting the error.
     #[tokio::test]
     async fn send_vector_failure_mid_unit_rolls_back_both_notes_and_their_vectors() {
         use async_trait::async_trait;
-        use khive_runtime::{arm_vector_fail_scoped, EmbedderProvider};
+        use khive_runtime::{
+            arm_vector_fail_scoped, AllowAllGate, BackendId, EmbedderProvider, RuntimeConfig,
+        };
+        use khive_storage::types::SqlValue;
+        use khive_storage::SqlStatement;
         use lattice_embed::{EmbedError, EmbeddingModel, EmbeddingService};
 
         const MODEL: &str = "message-vecfail-model";
@@ -515,17 +524,44 @@ mod tests {
             }
         }
 
-        let ns = format!("vecfail-mid-unit-{}", Uuid::new_v4().simple());
-        let (runtime, token) = scratch_runtime_and_token(&ns);
+        let sender_ns = format!("vecfail-sender-{}", Uuid::new_v4().simple());
+        let recipient_ns = format!("vecfail-recipient-{}", Uuid::new_v4().simple());
+
+        let runtime = KhiveRuntime::new(RuntimeConfig {
+            git_write: Default::default(),
+            db_path: None,
+            default_namespace: Namespace::parse(&sender_ns).unwrap(),
+            embedding_model: None,
+            additional_embedding_models: vec![],
+            gate: std::sync::Arc::new(AllowAllGate),
+            packs: vec!["kg".to_string(), "comm".to_string()],
+            backend_id: BackendId::main(),
+            brain_profile: None,
+            visible_namespaces: vec![],
+            allowed_outbound_namespaces: vec![Namespace::parse(&recipient_ns).unwrap()],
+            actor_id: None,
+        })
+        .expect("in-memory runtime");
         runtime.register_embedder(StubProvider);
 
-        let _vec_arm = arm_vector_fail_scoped(&ns);
+        let sender_token = runtime
+            .authorize(Namespace::parse(&sender_ns).unwrap())
+            .expect("authorize sender");
+        let recipient_token = runtime
+            .authorize(Namespace::parse(&recipient_ns).unwrap())
+            .expect("authorize recipient");
+
+        // No from_actor: this is a cross-namespace send, so the inbound copy
+        // lands in recipient_ns (not the caller's namespace). Arm the fault
+        // on recipient_ns — the SECOND plan in send order — so the outbound
+        // plan's statements are already applied when the failure hits.
+        let _vec_arm = arm_vector_fail_scoped(&recipient_ns);
 
         let result = dual_write_message(
             &runtime,
-            &token,
-            &ns,
-            &ns,
+            &sender_token,
+            &sender_ns,
+            &recipient_ns,
             None,
             "vector fail mid-unit",
             None,
@@ -543,24 +579,61 @@ mod tests {
              to fail; got {result:?}"
         );
 
-        let alive = runtime
-            .list_notes(&token, Some("message"), 100, 0)
-            .await
-            .expect("list_notes")
-            .into_iter()
-            .filter(|n| n.deleted_at.is_none())
-            .count();
-        assert_eq!(
-            alive, 0,
-            "no note may survive a mid-unit vector failure; got {alive}"
-        );
+        for (token, ns, label) in [
+            (&sender_token, &sender_ns, "sender"),
+            (&recipient_token, &recipient_ns, "recipient"),
+        ] {
+            let alive = runtime
+                .list_notes(token, Some("message"), 100, 0)
+                .await
+                .expect("list_notes")
+                .into_iter()
+                .filter(|n| n.deleted_at.is_none())
+                .count();
+            assert_eq!(
+                alive, 0,
+                "no note may survive a mid-unit vector failure in {label}_ns; got {alive}"
+            );
 
-        let vs = runtime.vectors_for_model(&token, MODEL).expect("vec store");
-        assert_eq!(
-            vs.count().await.expect("count"),
-            0,
-            "no vector row may survive a mid-unit vector failure"
-        );
+            let mut reader = runtime.sql().reader().await.expect("sql reader");
+            let fts_count = reader
+                .query_scalar(SqlStatement {
+                    sql: "SELECT COUNT(*) FROM fts_notes WHERE namespace = ?1".to_string(),
+                    params: vec![SqlValue::Text(ns.clone())],
+                    label: Some("test-fts-count".to_string()),
+                })
+                .await
+                .expect("fts count query");
+            assert!(
+                matches!(fts_count, Some(SqlValue::Integer(0))),
+                "no FTS document may survive a mid-unit vector failure in {label}_ns; got {fts_count:?}"
+            );
+
+            let vs = runtime.vectors_for_model(token, MODEL).expect("vec store");
+            assert_eq!(
+                vs.count().await.expect("count"),
+                0,
+                "no vector row may survive a mid-unit vector failure in {label}_ns"
+            );
+
+            let ann_count = reader
+                .query_scalar(SqlStatement {
+                    sql: "SELECT COUNT(*) FROM ann_write_log \
+                          WHERE namespace = ?1 AND embedding_model = ?2"
+                        .to_string(),
+                    params: vec![
+                        SqlValue::Text(ns.clone()),
+                        SqlValue::Text(MODEL.to_string()),
+                    ],
+                    label: Some("test-ann-log-count".to_string()),
+                })
+                .await
+                .expect("ann_write_log count query");
+            assert!(
+                matches!(ann_count, Some(SqlValue::Integer(0))),
+                "no ann_write_log row may survive a mid-unit vector failure in {label}_ns; got {ann_count:?}"
+            );
+        }
     }
 
     fn make_note(namespace: &str, content: &str, props: Option<Value>) -> Note {
