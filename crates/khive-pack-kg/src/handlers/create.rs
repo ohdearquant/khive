@@ -508,14 +508,12 @@ impl KgPack {
                             continue;
                         }
                     };
-                    let (source, target) = if relation.is_symmetric() && target < new_id {
-                        (target, new_id)
-                    } else {
-                        (new_id, target)
-                    };
+                    // Preserve the requested new-record -> target orientation through
+                    // validation so rejection diagnostics use that ordered kind pair.
+                    // `link` still canonicalizes accepted symmetric edges for persistence.
                     match self
                         .runtime
-                        .link(token, source, target, relation, weight, None)
+                        .link(token, new_id, target, relation, weight, None)
                         .await
                     {
                         Ok(edge) => match to_json(&edge) {

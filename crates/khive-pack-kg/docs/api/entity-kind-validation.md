@@ -17,7 +17,7 @@ this crate directly, so this is not a crate-graph inversion.
 `resolve_uuid_unfiltered` implements the ADR-007 Rev 6 by-ID contract: UUID resolution for
 get/update/delete/merge is namespace-agnostic — the Gate is the authz seam, not storage-layer
 filtering. Full-UUID inputs were already unfiltered (`resolve_by_id`); this function closes
-the gap for the *prefix* form, which previously fell through to the primary-namespace-only
+the gap for the _prefix_ form, which previously fell through to the primary-namespace-only
 `resolve_prefix` and was invisible for any row stamped with a non-primary namespace (#391
 §3). It is an exact copy of `resolve_uuid_async` except the prefix-resolution branch.
 
@@ -73,3 +73,10 @@ hand-picked pairs.
 entity→entity pair regardless of kind and is skipped (matches the hint function's own scope,
 which never emits "annotates"). `supersedes`/`supports`/`refutes` DO validate entity→entity
 pairs against the same base allowlist the hint function reads, so they stay in scope.
+
+The runtime also uses the shared
+`accepted_entity_relations_for_entities` derivation in every entity-pair rejection, including
+local, cross-backend, atomic, bulk, and update validation paths. An invalid triple therefore
+names the ordered endpoint pair and its complete currently legal relation set under the loaded
+packs, or explicitly says `none`; callers do not need a second probe through the singleton
+`link` handler to discover a valid counter-proposal (#1606).

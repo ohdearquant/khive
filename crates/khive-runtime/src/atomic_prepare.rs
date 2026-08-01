@@ -2180,6 +2180,52 @@ mod tests {
         assert!(matches!(count, Some(SqlValue::Integer(2))));
     }
 
+    /// Atomic prepare validates the requested orientation before canonicalizing
+    /// a symmetric edge for persistence. Fixed UUIDs force target < source so a
+    /// regression would report the reverse ordered pair.
+    #[tokio::test]
+    async fn atomic_link_symmetric_rejection_preserves_requested_pair() {
+        let runtime = scratch_runtime();
+        let token = runtime
+            .authorize(Namespace::parse("local").expect("ns"))
+            .expect("authorize");
+        let entities = runtime.entities(&token).expect("entities store");
+        let concept_id =
+            Uuid::parse_str("ffffffff-ffff-ffff-ffff-ffffffffffff").expect("high UUID");
+        let project_id = Uuid::nil();
+        assert!(project_id < concept_id, "test must exercise UUID reversal");
+
+        let mut concept = khive_storage::Entity::new("local", "concept", "Concept source");
+        concept.id = concept_id;
+        let mut project = khive_storage::Entity::new("local", "project", "Project target");
+        project.id = project_id;
+        entities.upsert_entity(concept).await.expect("seed concept");
+        entities.upsert_entity(project).await.expect("seed project");
+
+        let error = prepare_link(
+            &runtime,
+            &token,
+            &json!({
+                "source_id": concept_id.to_string(),
+                "target_id": project_id.to_string(),
+                "relation": "competes_with",
+            }),
+        )
+        .await
+        .expect_err("atomic link must reject concept competes_with project");
+        let message = error.to_string();
+        assert!(
+            message.contains(
+                "currently legal relations for concept -> project under the loaded endpoint rules: none"
+            ),
+            "atomic validation must diagnose caller order before persistence canonicalization; got: {message}"
+        );
+        assert!(
+            !message.contains("currently legal relations for project -> concept"),
+            "atomic validation must not diagnose the UUID-canonical reverse pair; got: {message}"
+        );
+    }
+
     /// Atomic link must persist an explicit top-level `dependency_kind`
     /// param into edge metadata, and must infer one for `depends_on` edges
     /// when absent: parity with

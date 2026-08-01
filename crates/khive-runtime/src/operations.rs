@@ -525,6 +525,71 @@ pub fn accepted_pack_relations_for_entities(
     relations
 }
 
+/// Relations accepted for one resolved entity endpoint pair under the full
+/// live contract: the base allowlist plus the loaded packs' additive rules.
+///
+/// This is the pair-oriented counterpart to the private
+/// `accepted_entity_kind_pairs_for_relation` helper. It is shared by validation
+/// errors and pack-layer hints so every write path can tell a caller which
+/// relations would be legal without maintaining a second endpoint table.
+/// Pack declarations for relations with dedicated substrate branches are
+/// excluded because the live validator resolves `annotates` and the three
+/// same-substrate special relations before pack rules are consulted.
+pub fn accepted_entity_relations_for_entities(
+    rules: &[EdgeEndpointRule],
+    src_kind: &str,
+    src_entity_type: Option<&str>,
+    tgt_kind: &str,
+    tgt_entity_type: Option<&str>,
+) -> Vec<EdgeRelation> {
+    let mut relations: Vec<EdgeRelation> = BASE_ENTITY_ENDPOINT_RULES
+        .iter()
+        .filter(|(src, _relation, tgt)| (*src == "*" || *src == src_kind) && *tgt == tgt_kind)
+        .map(|(_src, relation, _tgt)| *relation)
+        .collect();
+    relations.extend(
+        accepted_pack_relations_for_entities(
+            rules,
+            src_kind,
+            src_entity_type,
+            tgt_kind,
+            tgt_entity_type,
+        )
+        .into_iter()
+        .filter(|relation| {
+            *relation != EdgeRelation::Annotates && !crate::pack::is_special_relation(*relation)
+        }),
+    );
+    relations.sort_by_key(|relation| relation.as_str());
+    relations.dedup();
+    relations
+}
+
+fn accepted_entity_relations_description(
+    rules: &[EdgeEndpointRule],
+    src_kind: &str,
+    src_entity_type: Option<&str>,
+    tgt_kind: &str,
+    tgt_entity_type: Option<&str>,
+) -> String {
+    let relations = accepted_entity_relations_for_entities(
+        rules,
+        src_kind,
+        src_entity_type,
+        tgt_kind,
+        tgt_entity_type,
+    );
+    if relations.is_empty() {
+        "none".to_string()
+    } else {
+        relations
+            .iter()
+            .map(EdgeRelation::as_str)
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
 /// Hint-only counterpart to [`accepted_pack_relations_for_entities`] that
 /// matches via [`pattern_endpoint_matches`] instead of [`endpoint_matches`],
 /// so an absent `entity_type` is treated as unconstrained rather than an
@@ -1865,6 +1930,13 @@ impl KhiveRuntime {
             match (&src, &tgt) {
                 (Resolved::Entity(src_e), Resolved::Entity(tgt_e)) => {
                     if !base_entity_rule_allows(&src_e.kind, relation, &tgt_e.kind) {
+                        let legal_relations = accepted_entity_relations_description(
+                            &self.pack_edge_rules(),
+                            &src_e.kind,
+                            src_e.entity_type.as_deref(),
+                            &tgt_e.kind,
+                            tgt_e.entity_type.as_deref(),
+                        );
                         let rule_hint = match relation {
                             EdgeRelation::Supports | EdgeRelation::Refutes => {
                                 "requires concept|document|dataset|artifact -> concept \
@@ -1874,8 +1946,9 @@ impl KhiveRuntime {
                         };
                         return Err(RuntimeError::InvalidInput(format!(
                             "({}) -[{rel_name}]-> ({}) is not in the base endpoint \
-                             allowlist; {rel_name} {rule_hint}",
-                            src_e.kind, tgt_e.kind
+                             allowlist; {rel_name} {rule_hint}; currently legal relations for \
+                             {} -> {} under the loaded endpoint rules: {legal_relations}",
+                            src_e.kind, tgt_e.kind, src_e.kind, tgt_e.kind
                         )));
                     }
                 }
@@ -1917,19 +1990,15 @@ impl KhiveRuntime {
             // rules; on miss, fall through to the original base-rule error messages.
             let src_res = self.resolve_edge_endpoint(token, source_id).await?;
             let tgt_res = self.resolve_edge_endpoint(token, target_id).await?;
+            let pack_rules = self.pack_edge_rules();
 
-            if pack_rule_allows(
-                &self.pack_edge_rules(),
-                relation,
-                src_res.as_ref(),
-                tgt_res.as_ref(),
-            ) {
+            if pack_rule_allows(&pack_rules, relation, src_res.as_ref(), tgt_res.as_ref()) {
                 return Ok(());
             }
 
             // Substrate check: both endpoints must be entities.
-            let src_kind = match src_res {
-                Some(Resolved::Entity(e)) => e.kind,
+            let (src_kind, src_entity_type) = match src_res.as_ref() {
+                Some(Resolved::Entity(e)) => (e.kind.as_str(), e.entity_type.as_deref()),
                 Some(_) => {
                     return Err(RuntimeError::InvalidInput(format!(
                         "link source {source_id} must be an entity for relation {relation:?} \
@@ -1948,8 +2017,8 @@ impl KhiveRuntime {
                     )));
                 }
             };
-            let tgt_kind = match tgt_res {
-                Some(Resolved::Entity(e)) => e.kind,
+            let (tgt_kind, tgt_entity_type) = match tgt_res.as_ref() {
+                Some(Resolved::Entity(e)) => (e.kind.as_str(), e.entity_type.as_deref()),
                 Some(_) => {
                     return Err(RuntimeError::InvalidInput(format!(
                         "link target {target_id} must be an entity for relation {relation:?} \
@@ -1968,10 +2037,19 @@ impl KhiveRuntime {
                     )));
                 }
             };
-            if !base_entity_rule_allows(&src_kind, relation, &tgt_kind) {
+            if !base_entity_rule_allows(src_kind, relation, tgt_kind) {
+                let legal_relations = accepted_entity_relations_description(
+                    &pack_rules,
+                    src_kind,
+                    src_entity_type,
+                    tgt_kind,
+                    tgt_entity_type,
+                );
                 return Err(RuntimeError::InvalidInput(format!(
                     "({src_kind}) -[{}]-> ({tgt_kind}) is not in the base endpoint \
-                     allowlist; use pack EDGE_RULES to extend the allowlist",
+                     allowlist; use pack EDGE_RULES to extend the allowlist; currently legal \
+                     relations for {src_kind} -> {tgt_kind} under the loaded endpoint rules: \
+                     {legal_relations}",
                     relation.as_str()
                 )));
             }
@@ -2051,6 +2129,13 @@ impl KhiveRuntime {
             match (src, tgt) {
                 (Resolved::Entity(src_e), Resolved::Entity(tgt_e)) => {
                     if !base_entity_rule_allows(&src_e.kind, relation, &tgt_e.kind) {
+                        let legal_relations = accepted_entity_relations_description(
+                            &self.pack_edge_rules(),
+                            &src_e.kind,
+                            src_e.entity_type.as_deref(),
+                            &tgt_e.kind,
+                            tgt_e.entity_type.as_deref(),
+                        );
                         let rule_hint = match relation {
                             EdgeRelation::Supports | EdgeRelation::Refutes => {
                                 "requires concept|document|dataset|artifact -> concept \
@@ -2060,8 +2145,9 @@ impl KhiveRuntime {
                         };
                         return Err(RuntimeError::InvalidInput(format!(
                             "({}) -[{rel_name}]-> ({}) is not in the base endpoint \
-                             allowlist; {rel_name} {rule_hint}",
-                            src_e.kind, tgt_e.kind
+                             allowlist; {rel_name} {rule_hint}; currently legal relations for \
+                             {} -> {} under the loaded endpoint rules: {legal_relations}",
+                            src_e.kind, tgt_e.kind, src_e.kind, tgt_e.kind
                         )));
                     }
                 }
@@ -2096,12 +2182,13 @@ impl KhiveRuntime {
 
         // All remaining base relations: entity→entity with kind-level restrictions.
         // Consult pack rules installed on this (source) runtime first.
-        if pack_rule_allows(&self.pack_edge_rules(), relation, src, tgt) {
+        let pack_rules = self.pack_edge_rules();
+        if pack_rule_allows(&pack_rules, relation, src, tgt) {
             return Ok(());
         }
 
-        let src_kind = match src {
-            Some(Resolved::Entity(e)) => &e.kind,
+        let (src_kind, src_entity_type) = match src {
+            Some(Resolved::Entity(e)) => (e.kind.as_str(), e.entity_type.as_deref()),
             Some(_) => {
                 return Err(RuntimeError::InvalidInput(format!(
                     "link source {source_id} must be an entity for relation {relation:?} \
@@ -2114,8 +2201,8 @@ impl KhiveRuntime {
                 )));
             }
         };
-        let tgt_kind = match tgt {
-            Some(Resolved::Entity(e)) => &e.kind,
+        let (tgt_kind, tgt_entity_type) = match tgt {
+            Some(Resolved::Entity(e)) => (e.kind.as_str(), e.entity_type.as_deref()),
             Some(_) => {
                 return Err(RuntimeError::InvalidInput(format!(
                     "link target {target_id} must be an entity for relation {relation:?} \
@@ -2130,9 +2217,17 @@ impl KhiveRuntime {
         };
 
         if !base_entity_rule_allows(src_kind, relation, tgt_kind) {
+            let legal_relations = accepted_entity_relations_description(
+                &pack_rules,
+                src_kind,
+                src_entity_type,
+                tgt_kind,
+                tgt_entity_type,
+            );
             return Err(RuntimeError::InvalidInput(format!(
                 "({src_kind}) -[{}]-> ({tgt_kind}) is not in the base endpoint \
-                 allowlist; use pack EDGE_RULES to extend the allowlist",
+                 allowlist; use pack EDGE_RULES to extend the allowlist; currently legal relations \
+                 for {src_kind} -> {tgt_kind} under the loaded endpoint rules: {legal_relations}",
                 relation.as_str()
             )));
         }
@@ -11280,6 +11375,90 @@ mod tests {
             result.is_err(),
             "F010: document->document Extends must be rejected by the base allowlist; \
              current generic entity fallthrough incorrectly accepts it"
+        );
+    }
+
+    #[tokio::test]
+    async fn link_illegal_entity_pair_names_loaded_legal_relations() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        rt.install_edge_rules(vec![EdgeEndpointRule {
+            relation: EdgeRelation::DependsOn,
+            source: EndpointKind::EntityOfKind("concept"),
+            target: EndpointKind::EntityOfKind("project"),
+        }]);
+        let concept = rt
+            .create_entity(&tok, "concept", None, "Concept", None, None, vec![])
+            .await
+            .unwrap();
+        let project = rt
+            .create_entity(&tok, "project", None, "Project", None, None, vec![])
+            .await
+            .unwrap();
+
+        let error = rt
+            .link(
+                &tok,
+                concept.id,
+                project.id,
+                EdgeRelation::CompetesWith,
+                1.0,
+                None,
+            )
+            .await
+            .expect_err("concept competes_with project must be rejected");
+        let message = error.to_string();
+        assert!(
+            message.contains(
+                "currently legal relations for concept -> project under the loaded endpoint rules: depends_on"
+            ),
+            "rejection must expose the exact loaded legal set; got: {message}"
+        );
+    }
+
+    #[test]
+    fn cross_backend_legal_set_ignores_unenforced_annotates_pack_rule() {
+        let rt = rt();
+        rt.install_edge_rules(vec![EdgeEndpointRule {
+            relation: EdgeRelation::Annotates,
+            source: EndpointKind::EntityOfKind("concept"),
+            target: EndpointKind::EntityOfKind("project"),
+        }]);
+        let source_id = Uuid::new_v4();
+        let target_id = Uuid::new_v4();
+        let source = Resolved::Entity(Entity::new("local", "concept", "Concept"));
+        let target = Resolved::Entity(Entity::new("local", "project", "Project"));
+
+        rt.validate_link_endpoints_by_resolved(
+            source_id,
+            target_id,
+            EdgeRelation::Annotates,
+            Some(&source),
+            Some(&target),
+        )
+        .expect_err(
+            "an annotates pack rule cannot override the dedicated note-source validator branch",
+        );
+
+        let error = rt
+            .validate_link_endpoints_by_resolved(
+                source_id,
+                target_id,
+                EdgeRelation::CompetesWith,
+                Some(&source),
+                Some(&target),
+            )
+            .expect_err("concept competes_with project must be rejected");
+        let message = error.to_string();
+        assert!(
+            message.contains(
+                "currently legal relations for concept -> project under the loaded endpoint rules: none"
+            ),
+            "an unenforced entity-source annotates pack rule must not be advertised; got: {message}"
+        );
+        assert!(
+            !message.contains("endpoint rules: annotates"),
+            "the rejection must not call annotates legal when the live validator rejects it; got: {message}"
         );
     }
 
