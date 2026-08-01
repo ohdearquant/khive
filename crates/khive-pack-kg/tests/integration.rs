@@ -1515,11 +1515,121 @@ async fn traverse_from_root_with_depth_one_returns_linked_node() {
     );
 }
 
+/// #1484: traversal must collapse the root-only path contributed by a visible
+/// namespace that does not own the root, while enriching an annotation note
+/// exactly as `neighbors` enriches the same node.
+#[tokio::test]
+async fn traverse_note_shape_matches_neighbors_without_duplicate_root_path() {
+    let owner = Namespace::parse("traverse-note-owner").unwrap();
+    let rt = KhiveRuntime::memory().expect("in-memory runtime must succeed");
+    let mut builder = VerbRegistryBuilder::new();
+    builder.with_visible_namespaces(vec![owner.clone()]);
+    builder.register(KgPack::new(rt));
+    let fixture = Fixture {
+        registry: builder.build().expect("registry builds"),
+    };
+
+    let root = fixture
+        .dispatch(
+            "create",
+            json!({
+                "namespace": owner.as_str(),
+                "kind": "concept",
+                "name": "TraversalNoteRoot"
+            }),
+        )
+        .await
+        .expect("create root must succeed");
+    let root_id = root
+        .get("full_id")
+        .or_else(|| root.get("id"))
+        .and_then(Value::as_str)
+        .expect("root response must include an id")
+        .to_string();
+
+    let note = fixture
+        .dispatch(
+            "create",
+            json!({
+                "namespace": owner.as_str(),
+                "kind": "observation",
+                "name": "TraversalAnnotation",
+                "content": "note reached through an annotation edge",
+                "annotates": [root_id]
+            }),
+        )
+        .await
+        .expect("create annotation note must succeed");
+    let note_id = note
+        .get("full_id")
+        .or_else(|| note.get("id"))
+        .and_then(Value::as_str)
+        .expect("note response must include an id")
+        .to_string();
+
+    let neighbors = fixture
+        .dispatch(
+            "neighbors",
+            json!({
+                "node_id": root_id,
+                "direction": "in",
+                "relations": ["annotates"]
+            }),
+        )
+        .await
+        .expect("neighbors must succeed");
+    let neighbor_note = neighbors
+        .as_array()
+        .expect("neighbors must return an array")
+        .iter()
+        .find(|hit| {
+            hit.get("id")
+                .and_then(Value::as_str)
+                .is_some_and(|id| id.starts_with(note_id.as_str()) || note_id.starts_with(id))
+        })
+        .unwrap_or_else(|| panic!("neighbors must include the annotation note: {neighbors}"));
+
+    let paths = fixture
+        .dispatch(
+            "traverse",
+            json!({
+                "roots": [root_id],
+                "max_depth": 1,
+                "direction": "in",
+                "relations": ["annotates"],
+                "include_roots": true
+            }),
+        )
+        .await
+        .expect("traverse must succeed");
+    let paths = paths.as_array().expect("traverse must return an array");
+    assert_eq!(
+        paths.len(),
+        1,
+        "one requested root must produce one path across local and owner namespaces"
+    );
+
+    let traversal_note = paths[0]["nodes"]
+        .as_array()
+        .expect("path must contain nodes")
+        .iter()
+        .find(|node| {
+            node.get("id")
+                .and_then(Value::as_str)
+                .is_some_and(|id| id.starts_with(note_id.as_str()) || note_id.starts_with(id))
+        })
+        .unwrap_or_else(|| panic!("traverse must include the annotation note: {paths:?}"));
+    assert_eq!(traversal_note["name"], neighbor_note["name"]);
+    assert_eq!(traversal_note["kind"], neighbor_note["kind"]);
+    assert_eq!(traversal_note["name"], "TraversalAnnotation");
+    assert_eq!(traversal_note["kind"], "observation");
+}
+
 /// STORAGE-AUD-003 / #485: an oversized max_depth (> i64::MAX) must reject at
 /// the storage boundary, not silently narrow to a negative i64 depth and
 /// return an empty or wrong traversal.
 #[tokio::test]
-async fn traverse_max_depth_over_i64max_rejected() {
+async fn traverse_max_depth_over_public_cap_rejected() {
     let pack = pack();
 
     let root = pack
@@ -1547,24 +1657,57 @@ async fn traverse_max_depth_over_i64max_rejected() {
     .await
     .expect("link must succeed");
 
-    let oversized_max_depth = (i64::MAX as u64) + 1;
     let err = pack
         .dispatch(
             "traverse",
             json!({
                 "roots": [root_id],
-                "max_depth": oversized_max_depth,
+                "max_depth": 11,
                 "direction": "out",
                 "include_roots": false
             }),
         )
         .await
-        .expect_err("traverse with max_depth > i64::MAX must not succeed");
+        .expect_err("traverse with max_depth > 10 must not succeed");
 
     match err {
-        RuntimeError::Storage(khive_storage::StorageError::InvalidInput { .. }) => {}
-        RuntimeError::InvalidInput(_) => {}
-        other => panic!("expected InvalidInput (directly or via Storage), got {other:?}"),
+        RuntimeError::InvalidInput(message) => assert!(message.contains("max_depth must be <= 10")),
+        other => panic!("expected handler InvalidInput, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn traverse_root_and_result_caps_reject_before_resolution() {
+    let pack = pack();
+
+    let roots = vec!["not-a-resolvable-root"; 101];
+    let root_error = pack
+        .dispatch("traverse", json!({"roots": roots, "max_depth": 1}))
+        .await
+        .expect_err("root cap+1 must fail");
+    match root_error {
+        RuntimeError::InvalidInput(message) => {
+            assert!(message.contains("roots must contain at most 100 entries"));
+            assert!(
+                !message.contains("UUID"),
+                "root count must be checked before root resolution"
+            );
+        }
+        other => panic!("expected root-cap InvalidInput, got {other:?}"),
+    }
+
+    let limit_error = pack
+        .dispatch(
+            "traverse",
+            json!({"roots": ["not-a-resolvable-root"], "max_depth": 1, "limit": 1001}),
+        )
+        .await
+        .expect_err("result cap+1 must fail");
+    match limit_error {
+        RuntimeError::InvalidInput(message) => {
+            assert!(message.contains("limit must be <= 1000"));
+        }
+        other => panic!("expected result-cap InvalidInput, got {other:?}"),
     }
 }
 
@@ -3304,6 +3447,14 @@ async fn curation_merge_entity_event_payload_has_adr014_fields() {
     assert!(
         payload.get("edges_rewired").is_some(),
         "entity_merged payload must contain 'edges_rewired'; got {payload}"
+    );
+    assert_eq!(
+        payload
+            .get("edge_conflict_preimages")
+            .and_then(Value::as_array)
+            .map(Vec::len),
+        Some(0),
+        "a conflict-free merge must audit an empty 'edge_conflict_preimages' array; got {payload}"
     );
     assert!(
         payload.get("content_strategy").is_some(),
@@ -11492,6 +11643,28 @@ async fn list_kind_edge_after_cursor_tiles_full_set() {
     assert_eq!(seen.len(), 5, "cursor walk must tile the full edge set");
 }
 
+#[tokio::test]
+async fn list_cursor_mode_rejects_offset_and_unsupported_event_kind() {
+    let fixture = pack();
+    let mixed = fixture
+        .dispatch("list", json!({"kind": "entity", "after": "", "offset": 0}))
+        .await
+        .expect_err("explicit offset and after must not be silently mixed");
+    assert!(
+        invalid_input_message(&mixed).contains("mutually exclusive"),
+        "unexpected error: {mixed}"
+    );
+
+    let event = fixture
+        .dispatch("list", json!({"kind": "event", "after": ""}))
+        .await
+        .expect_err("event lists do not implement cursor mode");
+    assert!(
+        invalid_input_message(&event).contains("entity, note, and edge"),
+        "unexpected error: {event}"
+    );
+}
+
 /// #702.3: `stats()` must break edge counts down by relation, matching the
 /// created fixtures.
 #[tokio::test]
@@ -11816,6 +11989,40 @@ async fn list_entity_limit_over_cap_truncates_with_metadata() {
     assert_eq!(resp["requested_limit"], 600);
     assert_eq!(resp["effective_limit"], 500);
     assert_eq!(resp["limit_clamped"], true);
+
+    // #1462: cursor mode crosses the cap without asking the caller to advance
+    // an offset by either the requested or effective limit.
+    let first = pack
+        .dispatch("list", json!({"kind": "entity", "limit": 600, "after": ""}))
+        .await
+        .expect("entity cursor page one must succeed");
+    let first_entities = first["entities"]
+        .as_array()
+        .expect("entity cursor envelope must contain entities");
+    assert_eq!(first_entities.len(), 500);
+    let cursor = first["next_after"]
+        .as_str()
+        .expect("a 501-row corpus must continue after the 500-row cap");
+    assert_eq!(first["effective_limit"], 500);
+
+    let second = pack
+        .dispatch(
+            "list",
+            json!({"kind": "entity", "limit": 600, "after": cursor}),
+        )
+        .await
+        .expect("entity cursor page two must succeed");
+    let second_entities = second["entities"]
+        .as_array()
+        .expect("entity cursor envelope must contain entities");
+    assert_eq!(second_entities.len(), 1);
+    assert!(second["next_after"].is_null());
+    let unique_ids: std::collections::HashSet<_> = first_entities
+        .iter()
+        .chain(second_entities)
+        .map(|entity| entity["id"].as_str().expect("entity id"))
+        .collect();
+    assert_eq!(unique_ids.len(), 501, "cursor pages must tile all entities");
 }
 
 /// Same "under cap honored exactly" behavior as the entity test, at the note
@@ -11880,6 +12087,37 @@ async fn list_note_limit_over_cap_truncates_with_metadata() {
     assert_eq!(resp["requested_limit"], 300);
     assert_eq!(resp["effective_limit"], 200);
     assert_eq!(resp["limit_clamped"], true);
+
+    let first = pack
+        .dispatch("list", json!({"kind": "note", "limit": 300, "after": ""}))
+        .await
+        .expect("note cursor page one must succeed");
+    let first_notes = first["notes"]
+        .as_array()
+        .expect("note cursor envelope must contain notes");
+    assert_eq!(first_notes.len(), 200);
+    let cursor = first["next_after"]
+        .as_str()
+        .expect("a 201-row corpus must continue after the 200-row cap");
+
+    let second = pack
+        .dispatch(
+            "list",
+            json!({"kind": "note", "limit": 300, "after": cursor}),
+        )
+        .await
+        .expect("note cursor page two must succeed");
+    let second_notes = second["notes"]
+        .as_array()
+        .expect("note cursor envelope must contain notes");
+    assert_eq!(second_notes.len(), 1);
+    assert!(second["next_after"].is_null());
+    let unique_ids: std::collections::HashSet<_> = first_notes
+        .iter()
+        .chain(second_notes)
+        .map(|note| note["id"].as_str().expect("note id"))
+        .collect();
+    assert_eq!(unique_ids.len(), 201, "cursor pages must tile all notes");
 }
 
 /// `list(kind="edge")` offset mode keeps the existing bare-array shape when

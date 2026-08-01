@@ -43,18 +43,24 @@ field.
 
 ### List
 
-| Param      | Type    | Required | Notes                                        |
-| ---------- | ------- | -------- | -------------------------------------------- |
-| `limit`    | integer | no       | 1 to 200; default 20.                        |
-| `offset`   | integer | no       | Default 0.                                   |
-| `provider` | string  | no       | Exact match filter on `properties.provider`. |
+| Param      | Type    | Required | Notes                                            |
+| ---------- | ------- | -------- | ------------------------------------------------ |
+| `limit`    | integer | no       | 1 to 200; default 20.                            |
+| `offset`   | integer | no       | Default 0.                                       |
+| `provider` | string  | no       | Exact match filter on `properties.provider`.     |
+| `agent_id` | string  | no       | Exact match on the legacy `properties.agent_id`. |
+| `since`    | string  | no       | Inclusive RFC 3339 lower bound on `created_at`.  |
 
 ```
 request(ops="session.list(provider=\"codex\", limit=10)")
 ```
 
 Results are ordered newest first and returned as summaries (no `content`
-field) with a `total` count when the underlying store can supply one.
+field) with a `total` count when the underlying store can supply one. All
+filters and pagination are applied by the note store, so a sparse match is not
+lost behind an in-memory overfetch window. `agent_id` is a compatibility query
+for records that already carry that property; it does not add an `agent_id`
+parameter to `session.store`.
 
 ### Resume
 

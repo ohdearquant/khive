@@ -40,8 +40,9 @@ pub(crate) fn clear_post_load_hook() {
 use serde_json::Value;
 
 use khive_runtime::{KhiveRuntime, NamespaceToken, RuntimeError};
+use khive_storage::event::Event;
 use khive_storage::types::{SqlStatement, SqlValue};
-use khive_storage::{SqlAccess, SqlWriter};
+use khive_storage::{SqlAccess, SqlReader, SqlWriter};
 
 use khive_brain_core::{
     validate_brain_state_snapshot_with_capacity, BrainSignal, BrainState, BrainStateSnapshot,
@@ -52,6 +53,14 @@ use crate::event::interpret;
 const SNAPSHOT_PROFILE_ID: &str = "__brain__";
 const DEFAULT_SNAPSHOT_BATCH_SIZE: u64 = 5;
 
+fn version_covers(current: Option<i64>, observed: Option<i64>) -> bool {
+    match (current, observed) {
+        (Some(current), Some(observed)) => current >= observed,
+        (Some(_), None) | (None, None) => true,
+        (None, Some(_)) => false,
+    }
+}
+
 /// Tracks loaded namespaces and dirty event counts; owns the per-namespace state map.
 pub struct PersistenceTracker {
     /// Namespace currently reflected in the shared `BrainState` slot, if any.
@@ -61,6 +70,12 @@ pub struct PersistenceTracker {
     saved_states: HashMap<String, BrainState>,
     /// Namespaces for which state has been initialised (from DB or fresh default).
     pub(crate) loaded_namespaces: HashMap<String, ()>,
+    /// Latest durable snapshot version observed for each loaded namespace.
+    ///
+    /// Snapshot `updated_at` is raised monotonically inside every full-state
+    /// mutation transaction. A warm process compares this version before
+    /// reusing its in-memory registry.
+    snapshot_versions: HashMap<String, i64>,
     dirty_counts: HashMap<String, u64>,
     snapshot_batch_size: u64,
     /// Pre-load accumulator for hook signals that arrive before `ensure_loaded` runs.
@@ -90,6 +105,7 @@ impl PersistenceTracker {
             active_namespace: None,
             saved_states: HashMap::new(),
             loaded_namespaces: HashMap::new(),
+            snapshot_versions: HashMap::new(),
             dirty_counts: HashMap::new(),
             snapshot_batch_size: DEFAULT_SNAPSHOT_BATCH_SIZE,
             pending_hook_signals: HashMap::new(),
@@ -110,6 +126,22 @@ impl PersistenceTracker {
     pub fn mark_loaded(&mut self, namespace: String) {
         self.loaded_namespaces.insert(namespace.clone(), ());
         self.active_namespace = Some(namespace);
+    }
+
+    fn mark_loaded_at(&mut self, namespace: String, snapshot_version: Option<i64>) {
+        match snapshot_version {
+            Some(version) => {
+                self.snapshot_versions.insert(namespace.clone(), version);
+            }
+            None => {
+                self.snapshot_versions.remove(&namespace);
+            }
+        }
+        self.mark_loaded(namespace);
+    }
+
+    fn snapshot_version(&self, namespace: &str) -> Option<i64> {
+        self.snapshot_versions.get(namespace).copied()
     }
 
     /// Save `from_state` for `from_namespace`, then activate `to_namespace` (returning saved state if any).
@@ -317,12 +349,45 @@ pub struct BrainMutationEvent {
     pub payload: Value,
 }
 
+/// Public feedback write to join to the authoritative profile-state transaction.
+pub(crate) enum FeedbackEventWrite {
+    Direct(Event),
+    Gated {
+        event: Event,
+        target_id: String,
+        gate_mode: crate::fold_gate::FeedbackGateMode,
+        gate_now_us: i64,
+        dedup_key: Option<(String, String)>,
+    },
+}
+
+enum MutationOutcome<R> {
+    Committed {
+        result: R,
+        state: Box<BrainState>,
+        snapshot_version: i64,
+    },
+    Rejected(RuntimeError),
+}
+
+enum FeedbackMutationOutcome {
+    Committed {
+        event: Event,
+        state: Box<BrainState>,
+        snapshot_version: i64,
+    },
+    Deduped,
+    Rejected(RuntimeError),
+}
+
 /// Apply a `BrainState` mutation with durability as part of the success
 /// contract (issues #457/#458).
 ///
-/// `mutate` runs against a *proposed* copy of the state (never the live
-/// `state` mutex) built via a snapshot round-trip. Its result and the
-/// resulting snapshot are then persisted — brain event-log append AND
+/// `mutate` runs against a *proposed* state whose generation is verified after
+/// the write transaction begins (never against the live `state` mutex). A
+/// version-matched local copy preserves best-effort hook updates; a mismatch
+/// rebases on the latest durable snapshot. Its result and the resulting
+/// snapshot are then persisted — brain event-log append AND
 /// snapshot upsert — as ONE atomic unit via `SqlAccess::atomic_unit`. Only
 /// after that unit commits does the proposed state replace the live state
 /// and the tracker get marked clean. If `mutate` fails, or the atomic unit
@@ -332,25 +397,23 @@ pub struct BrainMutationEvent {
 /// place. See `crates/khive-pack-brain/docs/api/persist.md` for why this
 /// takes `&dyn SqlAccess` and why it uses `atomic_unit` over a manual
 /// transaction.
-pub async fn persist_brain_state_mutation<R>(
+pub async fn persist_brain_state_mutation<R: Send + 'static>(
     sql: &dyn SqlAccess,
     token: &NamespaceToken,
     tracker: &Mutex<PersistenceTracker>,
     state: &Mutex<BrainState>,
     event: BrainMutationEvent,
     entity_capacity: usize,
-    mutate: impl FnOnce(&mut BrainState) -> Result<R, RuntimeError>,
+    mutate: impl FnOnce(&mut BrainState) -> Result<R, RuntimeError> + Send + 'static,
 ) -> Result<R, RuntimeError> {
     let namespace = token.namespace().as_str().to_string();
     let now_us = chrono::Utc::now().timestamp_micros();
-
-    let mut proposed = {
-        let current = state.lock().unwrap();
-        BrainState::from_snapshot(current.to_snapshot(), entity_capacity)
+    let (local_version, local_snapshot) = {
+        let tracker = tracker.lock().unwrap();
+        let version = tracker.snapshot_version(&namespace);
+        let snapshot = state.lock().unwrap().to_snapshot();
+        (version, snapshot)
     };
-
-    let result = mutate(&mut proposed)?;
-    let snapshot = proposed.to_snapshot();
 
     let namespace_for_op = namespace.clone();
     let profile_id = event.profile_id;
@@ -358,13 +421,72 @@ pub async fn persist_brain_state_mutation<R>(
     let payload = event.payload;
     let op: khive_storage::AtomicUnitOp = Box::new(move |writer| {
         Box::pin(async move {
+            let previous_updated_at = load_snapshot_version_on_reader(writer, &namespace_for_op)
+                .await
+                .map_err(|e| {
+                    khive_storage::StorageError::driver(
+                        khive_storage::StorageCapability::Sql,
+                        "brain_persist_load_snapshot_version",
+                        e,
+                    )
+                })?;
+            let base_snapshot = match previous_updated_at {
+                Some(updated_at) if local_version == Some(updated_at) => local_snapshot,
+                Some(updated_at) => {
+                    let (durable_snapshot, reloaded_updated_at) =
+                        load_latest_snapshot_on_reader(writer, &namespace_for_op, entity_capacity)
+                            .await
+                            .map_err(|e| {
+                                khive_storage::StorageError::driver(
+                                    khive_storage::StorageCapability::Sql,
+                                    "brain_persist_load_snapshot",
+                                    e,
+                                )
+                            })?
+                            .ok_or_else(|| {
+                                khive_storage::StorageError::driver(
+                                    khive_storage::StorageCapability::Sql,
+                                    "brain_persist_load_snapshot",
+                                    std::io::Error::other(
+                                        "snapshot disappeared inside the write transaction",
+                                    ),
+                                )
+                            })?;
+                    if reloaded_updated_at != updated_at {
+                        return Err(khive_storage::StorageError::driver(
+                            khive_storage::StorageCapability::Sql,
+                            "brain_persist_load_snapshot",
+                            std::io::Error::other(format!(
+                                "snapshot generation changed inside the write transaction: \
+                                 expected {updated_at}, got {reloaded_updated_at}"
+                            )),
+                        ));
+                    }
+                    durable_snapshot
+                }
+                None => local_snapshot,
+            };
+            let mut proposed = BrainState::from_snapshot(base_snapshot, entity_capacity);
+
+            let result = match mutate(&mut proposed) {
+                Ok(result) => result,
+                Err(error) => {
+                    return Ok(Box::new(MutationOutcome::<R>::Rejected(error))
+                        as Box<dyn std::any::Any + Send>);
+                }
+            };
+            let snapshot = proposed.to_snapshot();
+            let commit_at_us = previous_updated_at
+                .map(|updated_at| now_us.max(updated_at.saturating_add(1)))
+                .unwrap_or(now_us);
+
             append_brain_event_on_writer(
                 writer,
                 &namespace_for_op,
                 &profile_id,
                 &event_kind,
                 &payload,
-                now_us,
+                commit_at_us,
             )
             .await
             .map_err(|e| {
@@ -374,7 +496,7 @@ pub async fn persist_brain_state_mutation<R>(
                     e,
                 )
             })?;
-            upsert_snapshot_on_writer(writer, &namespace_for_op, &snapshot, now_us)
+            upsert_snapshot_on_writer(writer, &namespace_for_op, &snapshot, commit_at_us)
                 .await
                 .map_err(|e| {
                     khive_storage::StorageError::driver(
@@ -383,31 +505,282 @@ pub async fn persist_brain_state_mutation<R>(
                         e,
                     )
                 })?;
-            Ok(Box::new(()) as Box<dyn std::any::Any + Send>)
+            Ok(Box::new(MutationOutcome::Committed {
+                result,
+                state: Box::new(proposed),
+                snapshot_version: commit_at_us,
+            }) as Box<dyn std::any::Any + Send>)
         })
     });
 
-    sql.atomic_unit(op).await?;
+    let boxed = sql.atomic_unit(op).await?;
+    let outcome = *boxed
+        .downcast::<MutationOutcome<R>>()
+        .expect("persist_brain_state_mutation must return MutationOutcome");
 
-    {
-        let mut live = state.lock().unwrap();
-        *live = proposed;
+    match outcome {
+        MutationOutcome::Rejected(error) => Err(error),
+        MutationOutcome::Committed {
+            result,
+            state: proposed,
+            snapshot_version,
+        } => {
+            let mut t = tracker.lock().unwrap();
+            if !matches!(t.snapshot_version(&namespace), Some(current) if current > snapshot_version)
+            {
+                *state.lock().unwrap() = *proposed;
+                t.reset_dirty(&namespace);
+                t.mark_loaded_at(namespace, Some(snapshot_version));
+            }
+            Ok(result)
+        }
     }
-    {
-        let mut t = tracker.lock().unwrap();
-        t.reset_dirty(&namespace);
-        t.mark_loaded(namespace);
-    }
-
-    Ok(result)
 }
 
-pub async fn load_latest_snapshot(
+/// Revalidate and commit every feedback side effect against one rebased snapshot.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn persist_feedback_state_mutation(
     sql: &dyn SqlAccess,
+    token: &NamespaceToken,
+    tracker: &Mutex<PersistenceTracker>,
+    state: &Mutex<BrainState>,
+    profile_id: String,
+    event_write: FeedbackEventWrite,
+    entity_capacity: usize,
+    apply: impl FnOnce(&mut BrainState, &BrainSignal) + Send + 'static,
+) -> Result<Option<Event>, RuntimeError> {
+    let namespace = token.namespace().as_str().to_string();
+    let now_us = chrono::Utc::now().timestamp_micros();
+    let (local_version, local_snapshot) = {
+        let tracker = tracker.lock().unwrap();
+        let version = tracker.snapshot_version(&namespace);
+        let snapshot = state.lock().unwrap().to_snapshot();
+        (version, snapshot)
+    };
+
+    let namespace_for_op = namespace.clone();
+    let profile_id_for_op = profile_id;
+    let op: khive_storage::AtomicUnitOp = Box::new(move |writer| {
+        Box::pin(async move {
+            let previous_updated_at = load_snapshot_version_on_reader(writer, &namespace_for_op)
+                .await
+                .map_err(|e| {
+                    khive_storage::StorageError::driver(
+                        khive_storage::StorageCapability::Sql,
+                        "brain_feedback_load_snapshot_version",
+                        e,
+                    )
+                })?;
+            let base_snapshot = match previous_updated_at {
+                Some(updated_at) if local_version == Some(updated_at) => local_snapshot,
+                Some(updated_at) => {
+                    let (durable_snapshot, reloaded_updated_at) =
+                        load_latest_snapshot_on_reader(writer, &namespace_for_op, entity_capacity)
+                            .await
+                            .map_err(|e| {
+                                khive_storage::StorageError::driver(
+                                    khive_storage::StorageCapability::Sql,
+                                    "brain_feedback_load_snapshot",
+                                    e,
+                                )
+                            })?
+                            .ok_or_else(|| {
+                                khive_storage::StorageError::driver(
+                                    khive_storage::StorageCapability::Sql,
+                                    "brain_feedback_load_snapshot",
+                                    std::io::Error::other(
+                                        "snapshot disappeared inside the write transaction",
+                                    ),
+                                )
+                            })?;
+                    if reloaded_updated_at != updated_at {
+                        return Err(khive_storage::StorageError::driver(
+                            khive_storage::StorageCapability::Sql,
+                            "brain_feedback_load_snapshot",
+                            std::io::Error::other(format!(
+                                "snapshot generation changed inside the write transaction: \
+                                 expected {updated_at}, got {reloaded_updated_at}"
+                            )),
+                        ));
+                    }
+                    durable_snapshot
+                }
+                None => local_snapshot,
+            };
+            let mut proposed = BrainState::from_snapshot(base_snapshot, entity_capacity);
+
+            match proposed.profiles.get(&profile_id_for_op) {
+                None => {
+                    return Ok(
+                        Box::new(FeedbackMutationOutcome::Rejected(RuntimeError::NotFound(
+                            format!(
+                                "serving profile {:?} not found in profile registry",
+                                profile_id_for_op
+                            ),
+                        ))) as Box<dyn std::any::Any + Send>,
+                    );
+                }
+                Some(record)
+                    if record.lifecycle == khive_brain_core::ProfileLifecycle::Archived =>
+                {
+                    return Ok(Box::new(FeedbackMutationOutcome::Rejected(
+                        RuntimeError::InvalidInput(format!(
+                            "serving profile {:?} is archived; feedback cannot credit archived profiles",
+                            profile_id_for_op
+                        )),
+                    )) as Box<dyn std::any::Any + Send>);
+                }
+                Some(_) => {}
+            }
+
+            let commit_at_us = previous_updated_at
+                .map(|updated_at| now_us.max(updated_at.saturating_add(1)))
+                .unwrap_or(now_us);
+            let event = match event_write {
+                FeedbackEventWrite::Direct(mut event) => {
+                    event.created_at = commit_at_us;
+                    khive_db::stores::event::append_event_on_writer(writer, &event)
+                        .await
+                        .map_err(|e| {
+                            khive_storage::StorageError::driver(
+                                khive_storage::StorageCapability::Sql,
+                                "brain_feedback_append_public_event",
+                                e,
+                            )
+                        })?;
+                    event
+                }
+                FeedbackEventWrite::Gated {
+                    mut event,
+                    target_id,
+                    gate_mode,
+                    gate_now_us,
+                    dedup_key,
+                } => {
+                    event.created_at = commit_at_us;
+                    let dedup_ref = dedup_key
+                        .as_ref()
+                        .map(|(scorer, ledger)| (scorer.as_str(), ledger.as_str()));
+                    let outcome = crate::fold_gate::apply_gate_and_append_within_tx(
+                        writer,
+                        &namespace_for_op,
+                        &profile_id_for_op,
+                        &target_id,
+                        gate_mode,
+                        gate_now_us,
+                        dedup_ref,
+                        move |fold_outcome, forced_zero| {
+                            let (effective_weight, mass_before, mass_after) = match fold_outcome {
+                                Some(outcome) => (
+                                    outcome.effective_weight,
+                                    outcome.mass_before,
+                                    outcome.mass_after,
+                                ),
+                                None => (0.0, 0.0, 0.0),
+                            };
+                            event.payload["gate"] = serde_json::json!({
+                                "effective_weight": effective_weight,
+                                "mass_before": mass_before,
+                                "mass_after": mass_after,
+                                "forced_zero_weight": forced_zero,
+                            });
+                            event
+                        },
+                    )
+                    .await
+                    .map_err(|e| {
+                        khive_storage::StorageError::driver(
+                            khive_storage::StorageCapability::Sql,
+                            "brain_feedback_gate_and_append",
+                            e,
+                        )
+                    })?;
+                    match outcome {
+                        crate::fold_gate::GateAndAppendOutcome::Deduped => {
+                            return Ok(Box::new(FeedbackMutationOutcome::Deduped)
+                                as Box<dyn std::any::Any + Send>);
+                        }
+                        crate::fold_gate::GateAndAppendOutcome::Applied(result) => result.event,
+                    }
+                }
+            };
+
+            let signal = interpret(&event);
+            apply(&mut proposed, &signal);
+            let snapshot = proposed.to_snapshot();
+            let payload = serde_json::to_value(&event).map_err(|e| {
+                khive_storage::StorageError::driver(
+                    khive_storage::StorageCapability::Sql,
+                    "brain_feedback_serialize_private_event",
+                    e,
+                )
+            })?;
+            append_brain_event_on_writer(
+                writer,
+                &namespace_for_op,
+                &profile_id_for_op,
+                &event.verb,
+                &payload,
+                commit_at_us,
+            )
+            .await
+            .map_err(|e| {
+                khive_storage::StorageError::driver(
+                    khive_storage::StorageCapability::Sql,
+                    "brain_feedback_append_private_event",
+                    e,
+                )
+            })?;
+            upsert_snapshot_on_writer(writer, &namespace_for_op, &snapshot, commit_at_us)
+                .await
+                .map_err(|e| {
+                    khive_storage::StorageError::driver(
+                        khive_storage::StorageCapability::Sql,
+                        "brain_feedback_upsert_snapshot",
+                        e,
+                    )
+                })?;
+
+            Ok(Box::new(FeedbackMutationOutcome::Committed {
+                event,
+                state: Box::new(proposed),
+                snapshot_version: commit_at_us,
+            }) as Box<dyn std::any::Any + Send>)
+        })
+    });
+
+    let boxed = sql.atomic_unit(op).await?;
+    let outcome = *boxed
+        .downcast::<FeedbackMutationOutcome>()
+        .expect("persist_feedback_state_mutation must return FeedbackMutationOutcome");
+
+    match outcome {
+        FeedbackMutationOutcome::Rejected(error) => Err(error),
+        FeedbackMutationOutcome::Deduped => Ok(None),
+        FeedbackMutationOutcome::Committed {
+            event,
+            state: proposed,
+            snapshot_version,
+        } => {
+            let mut tracker = tracker.lock().unwrap();
+            if !matches!(
+                tracker.snapshot_version(&namespace),
+                Some(current) if current > snapshot_version
+            ) {
+                *state.lock().unwrap() = *proposed;
+                tracker.reset_dirty(&namespace);
+                tracker.mark_loaded_at(namespace, Some(snapshot_version));
+            }
+            Ok(Some(event))
+        }
+    }
+}
+
+async fn load_latest_snapshot_on_reader<R: SqlReader + ?Sized>(
+    reader: &mut R,
     namespace: &str,
     entity_capacity: usize,
 ) -> Result<Option<(BrainStateSnapshot, i64)>, RuntimeError> {
-    let mut reader = sql.reader().await.map_err(|e| sql_err("reader", e))?;
     let row = reader
         .query_row(SqlStatement {
             sql: "SELECT snapshot_json, updated_at FROM brain_profile_snapshots WHERE profile_id = ?1 AND namespace = ?2 ORDER BY updated_at DESC LIMIT 1".into(),
@@ -438,6 +811,50 @@ pub async fn load_latest_snapshot(
             Ok(Some((snapshot, updated_at)))
         }
     }
+}
+
+pub async fn load_latest_snapshot(
+    sql: &dyn SqlAccess,
+    namespace: &str,
+    entity_capacity: usize,
+) -> Result<Option<(BrainStateSnapshot, i64)>, RuntimeError> {
+    let mut reader = sql.reader().await.map_err(|e| sql_err("reader", e))?;
+    load_latest_snapshot_on_reader(reader.as_mut(), namespace, entity_capacity).await
+}
+
+async fn load_snapshot_version_on_reader<R: SqlReader + ?Sized>(
+    reader: &mut R,
+    namespace: &str,
+) -> Result<Option<i64>, RuntimeError> {
+    let row = reader
+        .query_scalar(SqlStatement {
+            sql: "SELECT updated_at FROM brain_profile_snapshots WHERE profile_id = ?1 AND namespace = ?2"
+                .into(),
+            params: vec![
+                SqlValue::Text(SNAPSHOT_PROFILE_ID.to_string()),
+                SqlValue::Text(namespace.to_string()),
+            ],
+            label: Some("brain_snapshot_version".into()),
+        })
+        .await
+        .map_err(|e| sql_err("load snapshot version", e))?;
+
+    match row {
+        None => Ok(None),
+        Some(SqlValue::Integer(version)) => Ok(Some(version)),
+        other => Err(sql_err(
+            "load snapshot version",
+            format!("expected integer updated_at, got {other:?}"),
+        )),
+    }
+}
+
+async fn load_snapshot_version(
+    sql: &dyn SqlAccess,
+    namespace: &str,
+) -> Result<Option<i64>, RuntimeError> {
+    let mut reader = sql.reader().await.map_err(|e| sql_err("reader", e))?;
+    load_snapshot_version_on_reader(reader.as_mut(), namespace).await
 }
 
 /// A single row that was quarantined during replay, with enough metadata to
@@ -581,23 +998,26 @@ pub async fn ensure_loaded(
     entity_capacity: usize,
 ) -> Result<(), RuntimeError> {
     let namespace = token.namespace().as_str().to_string();
+    let sql = runtime.sql();
+    let observed_version = load_snapshot_version(sql.as_ref(), &namespace).await?;
 
     {
         let t = tracker.lock().unwrap();
-        if t.is_active(&namespace) {
+        if t.is_active(&namespace)
+            && version_covers(t.snapshot_version(&namespace), observed_version)
+        {
             return Ok(());
         }
     }
 
-    let already_loaded = {
+    let already_current = {
         let t = tracker.lock().unwrap();
-        t.is_loaded(&namespace)
+        t.is_loaded(&namespace) && version_covers(t.snapshot_version(&namespace), observed_version)
     };
 
-    let brain_state: Option<BrainState> = if already_loaded {
+    let brain_state: Option<BrainState> = if already_current {
         None
     } else {
-        let sql = runtime.sql();
         let snapshot_result =
             load_latest_snapshot(sql.as_ref(), &namespace, entity_capacity).await?;
 
@@ -657,19 +1077,20 @@ pub async fn ensure_loaded(
     {
         let mut t = tracker.lock().unwrap();
 
-        // Re-check 1: another loader already published this namespace as active.
-        // The shared state slot already contains the live state; return without
-        // clobbering it with our stale cold-loaded copy.
-        if t.is_active(&namespace) {
+        // Another loader or mutation may already have published this namespace
+        // at the same or a newer durable generation while this task awaited DB
+        // reads. Never replace that state with the older copy loaded above.
+        if t.is_active(&namespace)
+            && version_covers(t.snapshot_version(&namespace), observed_version)
+        {
             return Ok(());
         }
 
-        // Re-check 2: another loader completed a cold load for this namespace
-        // (it is now in saved_states) while this task was awaiting the DB.
-        // Our brain_state was derived from a snapshot that is now stale relative
-        // to any mutations that occurred after that loader published.  Discard
-        // it so the save-restore path below uses the live saved state instead.
-        let fresh_brain_state = if t.is_loaded(&namespace) {
+        // The same rule applies when another task published the namespace into
+        // saved_states rather than the active slot.
+        let fresh_brain_state = if t.is_loaded(&namespace)
+            && version_covers(t.snapshot_version(&namespace), observed_version)
+        {
             None
         } else {
             brain_state
@@ -754,13 +1175,7 @@ pub async fn ensure_loaded(
         // all consistent; no concurrent dispatch can observe a partial view.
         *state.lock().unwrap() = final_state;
 
-        // For the no-active-namespace (first-load) path swap_namespace was not
-        // called, so we set active_namespace here before marking loaded.
-        if current_ns.is_none() {
-            t.active_namespace = Some(namespace.clone());
-        }
-
-        t.loaded_namespaces.insert(namespace, ());
+        t.mark_loaded_at(namespace, observed_version);
     }
 
     Ok(())

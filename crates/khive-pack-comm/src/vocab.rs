@@ -367,6 +367,12 @@ pub(crate) static COMM_HANDLERS: [HandlerDef; 12] = [
                 description: "Stable per-credential identifier distinguishing accounts of the same kind (e.g. the mailbox address). Never `channel_kind` alone — two accounts of the same kind must not collapse into one row.",
             },
             ParamDef {
+                name: "poll_interval_secs",
+                param_type: "integer",
+                required: false,
+                description: "Positive nominal poll cadence for this channel. New pollers supply it on every heartbeat; omission remains accepted for mixed-version internal writers.",
+            },
+            ParamDef {
                 name: "outcome",
                 param_type: "string",
                 required: true,
@@ -394,10 +400,13 @@ pub(crate) static COMM_HANDLERS: [HandlerDef; 12] = [
     },
     HandlerDef {
         name: "comm.health",
-        description: "Read-only per-channel health snapshot (khive #606). Returns the \
-                       daemon-persisted heartbeat row for every known channel: timestamps \
-                       and consecutive-failure counts only — never a computed healthy bool. \
-                       Health judgment belongs to the caller. Reads from the caller's injected \
+        description: "Read-only per-channel health snapshot (khive #606, #1472). Returns the \
+                       daemon-persisted heartbeat row for every known channel, including its \
+                       nominal `poll_interval_secs` and a nullable advisory `stalled` schedule \
+                       fact. `stalled` becomes true after three missed nominal intervals; it is \
+                       null for legacy/malformed rows and known failure/backoff state. This is \
+                       not a computed healthy bool; overall \
+                       health judgment belongs to the caller. Reads from the caller's injected \
                        namespace (khive #877) — `token.namespace()`, the same explicit \
                        `namespace=` escape / \"local\" default every other comm verb resolves \
                        (ADR-007 Rev 6 Rule 3). An unscoped call defaults to \"local\", matching \

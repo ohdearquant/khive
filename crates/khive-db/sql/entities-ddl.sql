@@ -29,3 +29,21 @@ CREATE INDEX IF NOT EXISTS idx_entities_merged_into ON entities(namespace, merge
 -- running the versioned migration chain (e.g. StorageBackend::memory() test
 -- setups that apply ENTITIES_DDL directly).
 CREATE INDEX IF NOT EXISTS idx_entities_content_ref ON entities(content_ref) WHERE content_ref IS NOT NULL;
+
+-- Durable list-cursor insertion order. This mirrors migration V13 as a
+-- belt-and-suspenders path for fresh/direct store construction that applies
+-- ENTITIES_DDL without running the core migration chain. Existing databases
+-- are backfilled only by V13, in operator context.
+CREATE TABLE IF NOT EXISTS entities_seq (
+    seq       INTEGER PRIMARY KEY AUTOINCREMENT,
+    entity_id TEXT NOT NULL UNIQUE
+);
+
+CREATE TRIGGER IF NOT EXISTS assign_entity_list_seq
+AFTER INSERT ON entities
+BEGIN
+    -- Do not use legacy `OR IGNORE`: an outer `INSERT OR REPLACE` overrides
+    -- that trigger policy and would reassign this immutable sequence.
+    INSERT INTO entities_seq (entity_id) VALUES (NEW.id)
+    ON CONFLICT(entity_id) DO NOTHING;
+END;

@@ -57,7 +57,7 @@ import time
 
 # ── Wire protocol constants (mirrors crates/khive-runtime/src/daemon.rs) ──────
 
-PROTOCOL_VERSION = 3
+PROTOCOL_VERSION = 4
 
 # Default production pack set (must match RuntimeConfig::default().packs in
 # crates/khive-runtime/src/config.rs so config_id agrees between front-end

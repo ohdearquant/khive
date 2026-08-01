@@ -49,6 +49,15 @@ this worktree) found three mechanisms already in production:
    Durable and queryable via `comm.health()` (`handlers.rs:1060-1075`); answers "what is the
    state right now," not "in what order did the last N transitions happen."
 
+   **2026-08-01 amendment (#1472):** the current-state row also carries the heartbeat
+   writer's positive nominal `poll_interval_secs`. `comm.health` projects that fact and a
+   nullable advisory `stalled` value: for a zero-failure row with valid cadence/timestamp
+   facts, `stalled` is true only when the snapshot `as_of` is strictly more than three
+   nominal intervals after `last_poll_attempt_at`; legacy/malformed and known
+   failure/backoff rows return null. This remains scalar current-state telemetry, not an
+   ordered lifecycle record or ADR-119 supervisor liveness verdict, so it does not change
+   this ADR's need for append-only transition events.
+
 3. **The append-only `events` table**, `crates/khive-storage/src/event.rs:15-32` (struct
    `Event`, doc comment: "Storage-level event record. Every verb execution produces one.
    Immutable once appended.") backed by `crates/khive-db/sql/events-ddl.sql:4-21`, with

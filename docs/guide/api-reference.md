@@ -218,7 +218,8 @@ List records with optional filtering.
 | ---------------------------- | ------------------------ | -------- | ----------------------------------------------------------------------------- |
 | `kind`                       | string                   | yes      | `entity`\|`note`\|`edge`\|`event`\|`proposal`\|`message`, or a granular kind. |
 | `limit`                      | integer                  | no       | Default 20.                                                                   |
-| `offset`                     | integer                  | no       | Default 0.                                                                    |
+| `offset`                     | integer                  | no       | Default 0; mutually exclusive with `after`.                                   |
+| `after`                      | string                   | no       | Entity/note/edge cursor UUID, or `""` to begin cursor mode.                   |
 | `entity_kind`                | string                   | no       | Filter when `kind="entity"`.                                                  |
 | `entity_type`                | string                   | no       | Filter by type field when `kind="entity"`.                                    |
 | `note_kind`                  | string                   | no       | Filter when `kind="note"`.                                                    |
@@ -241,10 +242,26 @@ Requests within the kind's server-side row cap keep the existing array response.
 exceeds the cap, the response is `{"items": [...], "requested_limit": N,
 "effective_limit": CAP, "limit_clamped": true}`. This lets offset-based clients advance by
 the effective limit instead of silently skipping rows. The caps are entity 500, note 200, edge
-1000, event 1000, and proposal 500. Edge cursor mode keeps its existing `{"edges": [...],
-"next_after": ...}` shape and adds the same limit metadata when clamped.
+1000, event 1000, and proposal 500. Entity, note, and edge cursor modes return
+`{"entities": [...], "next_after": ...}`, `{"notes": [...], "next_after": ...}`, or
+`{"edges": [...], "next_after": ...}` and add the same limit metadata when clamped.
 
-Row shape (each item in the array, or in `"items"`/`"edges"` when clamped) depends on `kind`.
+Set `after=""` to begin a stable cursor walk, then pass each non-null `next_after` value into the
+next request with the same filters. The cursor's public value is a UUID; storage resolves it to an
+immutable, database-assigned insertion sequence and performs a sequence seek. Every genuinely new id
+committed after an issued boundary receives a greater sequence, so equal timestamps, backward clock
+movement, and lower UUIDs cannot make it fall behind that boundary.
+
+Cursor mode is a live walk, not an MVCC snapshot. Inserts committed before a later page query may
+extend the walk. After a substrate/namespace query returns `next_after: null`, rows committed after
+that terminal query require a new walk from `after=""`. Updates and deletes can change whether an
+unvisited row matches the filters. A cursor that was hard-deleted, is outside the caller's visible
+namespaces, or otherwise cannot be resolved returns an error instead of silently restarting. Cursor
+mode and `offset` are mutually exclusive. Filtered message walks may additionally return
+`scan_incomplete: true` with a continuation cursor when their 10,000-row safety ceiling is reached
+before another matching message is proven.
+
+Row shape (each item in the array or cursor/clamp envelope) depends on `kind`.
 For `kind="entity"`, `"note"`, `"edge"`, and `"event"`, the row is the **full stored record**
 for that substrate, listed below in its **verbose** form (the shape returned with
 `presentation="verbose"`, which is also the default for `kkernel exec` and the `khive` CLI).
@@ -344,9 +361,13 @@ request(ops="delete(id=\"<uuid>\")")
 
 ### `merge` — Declaration
 
-Deduplicate two entities. Returns `{kept_id, removed_id, edges_rewired,
-properties_merged, tags_unioned, content_appended, dry_run}` — chain with
-`$prev.kept_id`, **not** `$prev.id` (merge has no top-level `id` field).
+Deduplicate two entities or notes. Returns `{kept_id, removed_id, edges_rewired,
+edges_contract_skipped, edge_conflict_preimages, properties_merged,
+tags_unioned, content_appended, dry_run}` — chain with `$prev.kept_id`, **not**
+`$prev.id` (merge has no top-level `id` field). When rewiring collides with an
+existing edge natural key, `edge_conflict_preimages` records the surviving edge
+id, the complete dropped edge, and any incident annotation edges removed by the
+hard-delete cascade. The same preimages are stored in the merge audit event.
 When the surviving entity or note is reindexed and an embedder bounds its input, the successful
 response also includes the standard embedding-truncation `warnings` advisory.
 
@@ -494,17 +515,38 @@ entity-kind vocabulary (§"The 9 entity kinds" in AGENTS.md) vs. the note-kind v
 
 ### `traverse` — Assertive
 
-Multi-hop BFS traversal.
+Bounded multi-hop BFS traversal. Nodes are selected at their shallowest depth;
+same-depth tie order is intentionally unspecified. Limits count non-root
+first-visit nodes independently per distinct root.
 
-| Param       | Type            | Required | Notes                                  |
-| ----------- | --------------- | -------- | -------------------------------------- |
-| `roots`     | array\<uuid\>   | yes      | Starting node UUIDs.                   |
-| `max_depth` | integer         | no       | Default 3.                             |
-| `relations` | array\<string\> | no       | Restrict traversal to these relations. |
+| Param                | Type            | Required | Notes                                                                      |
+| -------------------- | --------------- | -------- | -------------------------------------------------------------------------- |
+| `roots`              | array\<uuid\>   | yes      | Starting UUIDs; maximum 100 raw entries, then de-duplicated after resolve. |
+| `max_depth`          | integer         | no       | Default 3; maximum 10; values above 10 are rejected.                       |
+| `direction`          | string          | no       | `out`/`outgoing`, `in`/`incoming`, or `both` (default `both`).             |
+| `relations`          | array\<string\> | no       | Restrict traversal to these relations.                                     |
+| `min_weight`         | number          | no       | Minimum edge weight, finite and within 0.0–1.0.                            |
+| `limit`              | integer         | no       | Non-root results per root; default 100, maximum 1,000.                     |
+| `include_roots`      | boolean         | no       | Include depth-0 roots (default `true`; they do not consume `limit`).       |
+| `include_properties` | boolean         | no       | Include entity properties on path nodes (default `false`).                 |
+
+One public request shares a 100,000-adjacency-row work budget and five-second
+storage-expansion deadline across all roots and visible namespaces. Self-loops, parallel paths,
+and rows rejected by first-visit de-duplication still consume work. Exceeding a
+shape bound, work budget, or deadline returns an error and never partial paths.
+Traversal reads use statement-scoped snapshots, so concurrent writes may become
+visible between frontier expansions; a single old WAL snapshot is never held for
+the full operation.
 
 ```
 request(ops="traverse(roots=[\"<uuid>\"], max_depth=2)")
 ```
+
+The response contains exactly one traversal object per distinct requested root. Each path node
+has `id`, `via_edge`, and `depth`; resolvable entity and note nodes also carry `name` and `kind`.
+Note enrichment matches `neighbors`, including its `[kind]` display-name fallback for a nameless
+note reached through an annotation edge. `properties` remains entity-only and is included only
+when `include_properties=true`.
 
 ### `context` — Assertive
 
@@ -1038,13 +1080,13 @@ request(ops="brain.mark_turn(label=\"wake\")")
 
 Write a row in the profile resolution table.
 
-| Param           | Type    | Required | Notes                                        |
-| --------------- | ------- | -------- | -------------------------------------------- |
-| `profile_id`    | string  | yes      | Must exist.                                  |
-| `actor`         | string  | no       | Default `*` (all actors).                    |
-| `namespace`     | string  | no       | Default `*` (all namespaces).                |
-| `consumer_kind` | string  | no       | Default `*` (all kinds).                     |
-| `priority`      | integer | no       | Higher wins on multiple matches (default 0). |
+| Param           | Type    | Required | Notes                                                                                                                    |
+| --------------- | ------- | -------- | ------------------------------------------------------------------------------------------------------------------------ |
+| `profile_id`    | string  | yes      | Must exist.                                                                                                              |
+| `actor`         | string  | no       | Default `*` (all actors).                                                                                                |
+| `namespace`     | string  | no       | Default `*` (all namespaces).                                                                                            |
+| `consumer_kind` | string  | no       | Default `*`; specific values must be declared by a loaded consumer pack. Unknown values are rejected with the valid set. |
+| `priority`      | integer | no       | Higher wins on multiple matches (default 0).                                                                             |
 
 ```
 request(ops="brain.bind(profile_id=\"implementer-recall-v1\", actor=\"role:implementer\")")
@@ -1254,12 +1296,15 @@ request(ops="comm.probe(actor=\"lambda:leo\", since_us=42)")
 ### `comm.health` — Assertive
 
 Read-only per-channel health snapshot. Returns the daemon-persisted heartbeat row for
-every known channel: timestamps and consecutive-failure counts only, never a computed
-healthy bool. Health judgment belongs to the caller. Rows are read from the caller's
-injected namespace (`namespace=`, defaulting to `local` like every other comm verb) —
-`comm.heartbeat` is the only handler pinned to the fixed `local` operational namespace.
-The response echoes the namespace actually read in a `namespace` field, so an empty
-`channels` array is unambiguous even under a scoped read. See the
+every known channel, including `poll_interval_secs` and nullable advisory `stalled`.
+For current rows with no known failure, `stalled` becomes true after three missed nominal
+intervals; it is null for legacy/malformed rows or active failure/backoff state. This is
+not a computed healthy or authoritative supervisor verdict. Health judgment belongs to
+the caller. Rows are read from the caller's injected namespace (`namespace=`, defaulting
+to `local` like every other comm verb). The shipped poll loop explicitly writes its
+heartbeats to `local`; authorized per-tenant writers can write their own namespace. The
+response echoes the namespace actually read in a `namespace` field, so an empty
+`channels` array is scoped unambiguously. See the
 [communication guide](communication.md) for the full response contract.
 
 No parameters.
@@ -1645,11 +1690,13 @@ request(ops="session.store(content=\"...\", provider=\"claude_code\", title=\"pa
 
 List stored sessions newest first.
 
-| Param      | Type    | Required | Notes                                  |
-| ---------- | ------- | -------- | -------------------------------------- |
-| `limit`    | integer | no       | 1–200, default 20.                     |
-| `offset`   | integer | no       | Default 0.                             |
-| `provider` | string  | no       | Exact filter on `properties.provider`. |
+| Param      | Type    | Required | Notes                                               |
+| ---------- | ------- | -------- | --------------------------------------------------- |
+| `limit`    | integer | no       | 1–200, default 20.                                  |
+| `offset`   | integer | no       | Default 0.                                          |
+| `provider` | string  | no       | Exact filter on `properties.provider`.              |
+| `agent_id` | string  | no       | Exact filter on legacy `properties.agent_id`.       |
+| `since`    | string  | no       | Inclusive RFC 3339 lower bound on session creation. |
 
 ```
 request(ops="session.list(provider=\"claude_code\", limit=10)")

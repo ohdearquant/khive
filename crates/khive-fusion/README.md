@@ -46,7 +46,7 @@ registry, which this crate does not implement.
 
 RRF's score is rank-based and ignores the input scores entirely:
 `score(d) = sum(1 / (k + rank_i(d)))` across every source that ranks `d`, with
-`k` defaulting to 60 (`DEFAULT_RRF_K`, per Craswell et al. 2009). A document
+`k` defaulting to 60 (`DEFAULT_RRF_K`, per Cormack et al. 2009). A document
 that appears in more source lists accumulates more contributions.
 
 ## Where this sits

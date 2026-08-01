@@ -5,7 +5,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
 
-use crate::types::{BatchWriteSummary, DeleteMode, Page, PageRequest, SqlValue, StorageResult};
+use crate::types::{
+    BatchWriteSummary, DeleteMode, Page, PageRequest, SeekCursor, SeekPage, SqlValue, StorageResult,
+};
 
 /// A storage-level note record. Flat, SQL-friendly representation.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -387,6 +389,29 @@ pub trait NoteStore: Send + Sync + 'static {
         filter: &NoteFilter,
         page: PageRequest,
     ) -> StorageResult<Page<Note>>;
+    /// Resolve a note id to its immutable insertion sequence.
+    async fn note_sequence(&self, _id: Uuid) -> StorageResult<Option<i64>> {
+        Err(crate::StorageError::Unsupported {
+            capability: crate::StorageCapability::Notes,
+            operation: "note_sequence".into(),
+            message: "this backend does not implement note insertion sequences".into(),
+        })
+    }
+    /// Query an immutable insertion-sequence keyset page with the same
+    /// predicates as [`Self::query_notes_filtered`].
+    async fn query_notes_filtered_after(
+        &self,
+        _namespace: &str,
+        _filter: &NoteFilter,
+        _after: Option<SeekCursor>,
+        _limit: u32,
+    ) -> StorageResult<SeekPage<Note>> {
+        Err(crate::StorageError::Unsupported {
+            capability: crate::StorageCapability::Notes,
+            operation: "query_notes_filtered_after".into(),
+            message: "this backend does not implement note seek pagination".into(),
+        })
+    }
     /// Fetch up to `max_rows + 1` notes matching `filter` in a single
     /// deterministically-ordered SQL statement, with no separate `COUNT(*)`
     /// and no pagination loop.

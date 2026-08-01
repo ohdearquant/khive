@@ -6,7 +6,7 @@ use std::sync::{Arc, OnceLock};
 use async_trait::async_trait;
 use uuid::Uuid;
 
-use khive_score::DeterministicScore;
+use khive_score::{cmp_desc_then_id, try_score_from_distance, DeterministicScore, ScoreError};
 use khive_storage::error::StorageError;
 use khive_storage::types::{
     BatchWriteSummary, IndexRebuildScope, OrphanSweepConfig, OrphanSweepResult, SqlStatement,
@@ -16,7 +16,7 @@ use khive_storage::types::{
 use khive_storage::StorageCapability;
 use khive_storage::StorageResult;
 use khive_storage::VectorStore;
-use khive_types::SubstrateKind;
+use khive_types::{DistanceMetric, SubstrateKind};
 
 use crate::error::SqliteError;
 use crate::pool::ConnectionPool;
@@ -164,6 +164,88 @@ fn non_finite_vector_error(op: &'static str, idx: usize, value: f32) -> StorageE
             "non-finite value at index {idx}: {value} \
              (NaN/Inf values corrupt distance computations)"
         ),
+    }
+}
+
+/// Convert sqlite-vec's cosine distance through the canonical score contract.
+///
+/// sqlite-vec accumulates `dot`/`aMag`/`bMag` in `f32` (see
+/// `distance_cosine_float` in sqlite-vec.c) and only widens the final result
+/// to SQLite's `REAL` (f64) on the way out. The roundoff at a mathematically
+/// exact endpoint therefore lands on the `f32` ULP scale — about
+/// `f32::EPSILON` (~1.19e-7) for a self- or exactly-opposite comparison,
+/// not the `f64::EPSILON` (~2.22e-16) scale of the widening cast itself.
+/// Normalize only that f32-scale boundary roundoff, then route through the
+/// strict canonical f32 score contract.
+fn sqlite_cosine_score(distance: f64) -> Result<DeterministicScore, rusqlite::Error> {
+    const BOUNDARY_EPSILON: f64 = 8.0 * f32::EPSILON as f64;
+
+    let conversion_error = |error| {
+        rusqlite::Error::FromSqlConversionFailure(1, rusqlite::types::Type::Real, Box::new(error))
+    };
+    if !distance.is_finite() {
+        return Err(conversion_error(ScoreError::NonFiniteDistance));
+    }
+    if !(-BOUNDARY_EPSILON..=2.0 + BOUNDARY_EPSILON).contains(&distance) {
+        return Err(conversion_error(ScoreError::InvalidDistanceRange {
+            metric_name: "Cosine",
+            dist_bits: (distance as f32).to_bits(),
+        }));
+    }
+
+    try_score_from_distance(distance.clamp(0.0, 2.0) as f32, DistanceMetric::Cosine)
+        .map_err(conversion_error)
+}
+
+#[cfg(test)]
+mod sqlite_cosine_score_tests {
+    use super::*;
+
+    #[test]
+    fn canonical_conversion_keeps_opposite_vectors_negative() {
+        assert_eq!(
+            sqlite_cosine_score(2.0).unwrap(),
+            DeterministicScore::from_f64(-1.0)
+        );
+    }
+
+    #[test]
+    fn canonical_conversion_normalizes_only_endpoint_roundoff() {
+        assert_eq!(
+            sqlite_cosine_score(-f64::EPSILON).unwrap(),
+            DeterministicScore::from_f64(1.0)
+        );
+        assert_eq!(
+            sqlite_cosine_score(2.0 + f64::EPSILON).unwrap(),
+            DeterministicScore::from_f64(-1.0)
+        );
+        // f32-scale roundoff, the magnitude sqlite-vec's own f32 accumulation
+        // actually produces for a non-trivial self- or opposite-comparison.
+        assert_eq!(
+            sqlite_cosine_score(-(f32::EPSILON as f64)).unwrap(),
+            DeterministicScore::from_f64(1.0)
+        );
+        assert_eq!(
+            sqlite_cosine_score(2.0 + f32::EPSILON as f64).unwrap(),
+            DeterministicScore::from_f64(-1.0)
+        );
+    }
+
+    #[test]
+    fn canonical_conversion_rejects_invalid_driver_distances() {
+        for distance in [
+            f64::NAN,
+            f64::INFINITY,
+            -16.0 * f32::EPSILON as f64,
+            2.0 + 16.0 * f32::EPSILON as f64,
+            -0.1,
+            2.1,
+        ] {
+            assert!(
+                sqlite_cosine_score(distance).is_err(),
+                "distance {distance:?} must fail strict canonical validation"
+            );
+        }
     }
 }
 
@@ -1192,13 +1274,9 @@ impl VectorStore for SqliteVecStore {
                     )
                 })?;
 
-                // sqlite-vec cosine distance: 0.0 = identical, 2.0 = opposite.
-                // Convert to similarity in [0, 1]: score = 1.0 - (distance / 2.0)
-                let similarity = 1.0 - (distance / 2.0);
-
                 hits.push(VectorSearchHit {
                     subject_id,
-                    score: DeterministicScore::from_f64(similarity),
+                    score: sqlite_cosine_score(distance)?,
                     rank: (rank_idx + 1) as u32,
                 });
             }
@@ -1469,10 +1547,6 @@ impl SqliteVecStore {
         query_embedding: &[f32],
         candidate_ids: &[Uuid],
     ) -> Result<Vec<VectorSearchHit>, StorageError> {
-        if candidate_ids.is_empty() || query_embedding.is_empty() {
-            return Ok(Vec::new());
-        }
-
         let dims = self.dimensions;
         if query_embedding.len() != dims {
             return Err(StorageError::InvalidInput {
@@ -1484,6 +1558,10 @@ impl SqliteVecStore {
                     dims
                 ),
             });
+        }
+
+        if candidate_ids.is_empty() {
+            return Ok(Vec::new());
         }
 
         if let Some(idx) = non_finite_index(query_embedding) {
@@ -1541,16 +1619,16 @@ impl SqliteVecStore {
                         )
                     })?;
 
-                    let similarity = 1.0 - (distance / 2.0);
                     all_hits.push(VectorSearchHit {
                         subject_id,
-                        score: DeterministicScore::from_f64(similarity),
+                        score: sqlite_cosine_score(distance)?,
                         rank: 0,
                     });
                 }
             }
 
-            all_hits.sort_by_key(|hit| std::cmp::Reverse(hit.score));
+            all_hits
+                .sort_by(|a, b| cmp_desc_then_id(a.score, &a.subject_id, b.score, &b.subject_id));
             for (i, hit) in all_hits.iter_mut().enumerate() {
                 hit.rank = (i + 1) as u32;
             }
@@ -1598,6 +1676,330 @@ mod batch_exists_tests {
             .conn()
             .execute_batch(crate::migrations::ANN_WRITE_LOG_DDL)
             .expect("create ann_write_log");
+    }
+
+    #[tokio::test]
+    async fn sqlite_vector_paths_use_canonical_opposite_cosine_score() {
+        let pool = make_vec_pool();
+        let model_key = "canonical_cosine_score";
+        let namespace = "ns:canonical-score";
+        create_vec_table(&pool, model_key, 2);
+        let store = SqliteVecStore::new(
+            pool,
+            false,
+            model_key.to_string(),
+            model_key.to_string(),
+            2,
+            namespace.to_string(),
+        )
+        .unwrap();
+        let opposite_id = Uuid::from_u128(1);
+        store
+            .insert(
+                opposite_id,
+                SubstrateKind::Entity,
+                namespace,
+                "body",
+                vec![vec![-1.0, 0.0]],
+            )
+            .await
+            .unwrap();
+
+        let candidate_hits = store
+            .score_candidates(&[1.0, 0.0], &[opposite_id])
+            .await
+            .unwrap();
+        assert_eq!(candidate_hits.len(), 1);
+        assert_eq!(candidate_hits[0].score, DeterministicScore::from_f64(-1.0));
+
+        let search_hits = store
+            .search(VectorSearchRequest {
+                query_vectors: vec![vec![1.0, 0.0]],
+                top_k: 1,
+                namespace: Some(namespace.to_string()),
+                kind: Some(SubstrateKind::Entity),
+                embedding_model: None,
+                filter: None,
+                backend_hints: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(search_hits.len(), 1);
+        assert_eq!(search_hits[0].score, DeterministicScore::from_f64(-1.0));
+    }
+
+    /// sqlite-vec's own `distance_cosine_float` (sqlite-vec.c) accumulates
+    /// `dot`/`aMag`/`bMag` in f32, so a non-axis-aligned vector's self- and
+    /// opposite-comparison lands a few f32 ULPs off the exact 0/2 endpoint —
+    /// not the tighter f64 ULP an in-process helper call would produce. This
+    /// drives the real sqlite-vec extension end to end (not just the
+    /// conversion helper) so the endpoint tolerance is checked against the
+    /// roundoff sqlite-vec actually returns.
+    #[tokio::test]
+    async fn sqlite_vector_paths_tolerate_real_f32_endpoint_roundoff() {
+        let pool = make_vec_pool();
+        let model_key = "f32_endpoint_roundoff";
+        let namespace = "ns:f32-roundoff";
+        create_vec_table(&pool, model_key, 3);
+        let store = SqliteVecStore::new(
+            pool,
+            false,
+            model_key.to_string(),
+            model_key.to_string(),
+            3,
+            namespace.to_string(),
+        )
+        .unwrap();
+
+        let identical_id = Uuid::from_u128(1);
+        let opposite_id = Uuid::from_u128(2);
+        store
+            .insert(
+                identical_id,
+                SubstrateKind::Entity,
+                namespace,
+                "body",
+                vec![vec![0.1, 0.2, 0.3]],
+            )
+            .await
+            .unwrap();
+        store
+            .insert(
+                opposite_id,
+                SubstrateKind::Entity,
+                namespace,
+                "body",
+                vec![vec![-0.1, -0.2, -0.3]],
+            )
+            .await
+            .unwrap();
+
+        let candidate_hits = store
+            .score_candidates(&[0.1, 0.2, 0.3], &[identical_id, opposite_id])
+            .await
+            .unwrap();
+        let identical_score = candidate_hits
+            .iter()
+            .find(|hit| hit.subject_id == identical_id)
+            .expect("identical candidate scored")
+            .score;
+        let opposite_score = candidate_hits
+            .iter()
+            .find(|hit| hit.subject_id == opposite_id)
+            .expect("opposite candidate scored")
+            .score;
+        assert_eq!(identical_score, DeterministicScore::from_f64(1.0));
+        assert_eq!(opposite_score, DeterministicScore::from_f64(-1.0));
+
+        let search_hits = store
+            .search(VectorSearchRequest {
+                query_vectors: vec![vec![0.1, 0.2, 0.3]],
+                top_k: 2,
+                namespace: Some(namespace.to_string()),
+                kind: Some(SubstrateKind::Entity),
+                embedding_model: None,
+                filter: None,
+                backend_hints: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(search_hits.len(), 2);
+        let top_hit = search_hits
+            .iter()
+            .find(|hit| hit.subject_id == identical_id)
+            .expect("identical vector present in search results");
+        assert_eq!(top_hit.score, DeterministicScore::from_f64(1.0));
+        assert_eq!(top_hit.rank, 1);
+    }
+
+    /// Derivation (checked against sqlite-vec's `distance_cosine_float` in
+    /// sqlite-vec.c, which accumulates `dot`/`aMag`/`bMag` in f32 but calls
+    /// the C `sqrt` — not `sqrtf` — on those f32 accumulators, so the
+    /// square-root, product, and division all run in `double` before the
+    /// final implicit narrowing back to `f32` on return).
+    ///
+    /// Because the widening to `double` happens before the square root, a
+    /// self- or exactly-proportional comparison (`dot == aMag == bMag`
+    /// bit-for-bit in f32) round-trips through `sqrt` at `double` precision
+    /// and lands within `f64::EPSILON` of the exact endpoint — nowhere near
+    /// the `f32::EPSILON` scale. The f32-scale roundoff this driver actually
+    /// exposes instead comes from the *accumulation* step: `dot` and the two
+    /// magnitudes are summed independently, so an exactly anti-parallel pair
+    /// (`query = -1.5 * stored`, mathematical cosine `-1`, ideal distance
+    /// `2`) can still see `dot` round to a f32 value fractionally larger in
+    /// magnitude than `sqrt(aMag) * sqrt(bMag)` would predict.
+    ///
+    /// For `stored = [-4.8, -0.4, -0.4]` and `query = [7.2, 0.6, 0.6]`, that
+    /// yields a raw distance of `2.0000002384185791` — exactly
+    /// `2 + 2*f32::EPSILON`. Verified against the vendored
+    /// `distance_cosine_float` body compiled standalone under every
+    /// combination of `-O0`/`-O2`/`-O3` and `-ffp-contract=off`/`fast` plus
+    /// explicit `-mavx2 -mfma`, since whether the target architecture fuses
+    /// the per-term multiply-add changes the *path* to this result but not
+    /// the final f32 value — the fixture is architecture-independent. That
+    /// distance is outside the mathematical `[0, 2]` cosine-distance range,
+    /// yet its magnitude is within the widened `8*f32::EPSILON` boundary
+    /// (~9.537e-7) and enormously outside the old `4*f64::EPSILON`
+    /// tolerance (~8.88e-16) that round one shipped. A driver that still
+    /// used the old f64-scale window would reject this distance outright.
+    #[tokio::test]
+    async fn sqlite_vector_paths_tolerate_real_f32_endpoint_roundoff_above_two() {
+        let pool = make_vec_pool();
+        let raw_pool = Arc::clone(&pool);
+        let model_key = "f32_endpoint_roundoff_above_two";
+        let namespace = "ns:f32-roundoff-above-two";
+        create_vec_table(&pool, model_key, 3);
+        let store = SqliteVecStore::new(
+            pool,
+            false,
+            model_key.to_string(),
+            model_key.to_string(),
+            3,
+            namespace.to_string(),
+        )
+        .unwrap();
+
+        let stored_id = Uuid::from_u128(1);
+        let stored_vector = vec![-4.8_f32, -0.4, -0.4];
+        let query_vector = vec![7.2_f32, 0.6, 0.6];
+        store
+            .insert(
+                stored_id,
+                SubstrateKind::Entity,
+                namespace,
+                "body",
+                vec![stored_vector],
+            )
+            .await
+            .unwrap();
+
+        let raw_distance: f64 = {
+            let writer = raw_pool.try_writer().expect("pool writer");
+            let sql = format!(
+                "SELECT vec_distance_cosine(embedding, ?1) FROM vec_{} WHERE subject_id = ?2",
+                model_key
+            );
+            let mut stmt = writer.conn().prepare(&sql).unwrap();
+            stmt.raw_bind_parameter(1, f32_slice_as_bytes(&query_vector))
+                .unwrap();
+            stmt.raw_bind_parameter(2, stored_id.to_string().as_str())
+                .unwrap();
+            let mut rows = stmt.raw_query();
+            let row = rows.next().unwrap().expect("one row");
+            row.get(0).unwrap()
+        };
+
+        assert_eq!(raw_distance, 2.0 + 2.0 * f32::EPSILON as f64);
+        assert!(
+            !(0.0..=2.0).contains(&raw_distance),
+            "fixture must land outside the mathematical [0, 2] cosine range, got {raw_distance}"
+        );
+        let deviation_above_two = raw_distance - 2.0;
+        let boundary_epsilon = 8.0 * f32::EPSILON as f64;
+        assert!(
+            deviation_above_two <= boundary_epsilon,
+            "fixture must stay within the widened f32-scale tolerance, got {raw_distance}"
+        );
+        let old_tolerance = 4.0 * f64::EPSILON;
+        assert!(
+            deviation_above_two > old_tolerance,
+            "fixture must exceed the old f64-scale tolerance so it would have failed under it, got {raw_distance}"
+        );
+
+        let candidate_hits = store
+            .score_candidates(&query_vector, &[stored_id])
+            .await
+            .unwrap();
+        assert_eq!(candidate_hits.len(), 1);
+        assert_eq!(candidate_hits[0].score, DeterministicScore::from_f64(-1.0));
+
+        let search_hits = store
+            .search(VectorSearchRequest {
+                query_vectors: vec![query_vector],
+                top_k: 1,
+                namespace: Some(namespace.to_string()),
+                kind: Some(SubstrateKind::Entity),
+                embedding_model: None,
+                filter: None,
+                backend_hints: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(search_hits.len(), 1);
+        assert_eq!(search_hits[0].score, DeterministicScore::from_f64(-1.0));
+        assert_eq!(search_hits[0].rank, 1);
+    }
+
+    #[tokio::test]
+    async fn score_candidates_rejects_an_empty_query_dimension() {
+        let pool = make_vec_pool();
+        let store = SqliteVecStore::new(
+            pool,
+            false,
+            "empty_query_dimension".to_string(),
+            "empty_query_dimension".to_string(),
+            2,
+            "ns:empty-query".to_string(),
+        )
+        .unwrap();
+
+        let error = store
+            .score_candidates(&[], &[Uuid::from_u128(1)])
+            .await
+            .unwrap_err();
+        match error {
+            StorageError::InvalidInput {
+                operation, message, ..
+            } => {
+                assert_eq!(operation, "score_candidates");
+                assert!(message.contains("query has 0 dims, expected 2"));
+            }
+            other => panic!("expected dimension error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn score_candidates_breaks_equal_scores_by_lower_id() {
+        let pool = make_vec_pool();
+        let model_key = "candidate_score_ties";
+        let namespace = "ns:candidate-ties";
+        create_vec_table(&pool, model_key, 2);
+        let store = SqliteVecStore::new(
+            pool,
+            false,
+            model_key.to_string(),
+            model_key.to_string(),
+            2,
+            namespace.to_string(),
+        )
+        .unwrap();
+        let lower_id = Uuid::from_u128(1);
+        let higher_id = Uuid::from_u128(2);
+        for id in [higher_id, lower_id] {
+            store
+                .insert(
+                    id,
+                    SubstrateKind::Entity,
+                    namespace,
+                    "body",
+                    vec![vec![1.0, 0.0]],
+                )
+                .await
+                .unwrap();
+        }
+
+        let hits = store
+            .score_candidates(&[1.0, 0.0], &[higher_id, lower_id])
+            .await
+            .unwrap();
+        assert_eq!(
+            hits.iter().map(|hit| hit.subject_id).collect::<Vec<_>>(),
+            vec![lower_id, higher_id]
+        );
+        assert_eq!(
+            hits.iter().map(|hit| hit.rank).collect::<Vec<_>>(),
+            vec![1, 2]
+        );
     }
 
     /// Valid (underscored) model key: batch_exists returns the exact set of IDs

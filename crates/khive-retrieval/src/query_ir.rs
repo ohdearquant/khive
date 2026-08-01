@@ -87,7 +87,7 @@ pub enum QueryNode {
 pub enum FuseStrategy {
     /// Reciprocal Rank Fusion with smoothing constant `k`.
     ///
-    /// Standard default: k = 60 (Craswell et al., 2009).
+    /// Standard default: k = 60 (Cormack et al., 2009).
     Rrf {
         /// Smoothing constant.
         k: usize,

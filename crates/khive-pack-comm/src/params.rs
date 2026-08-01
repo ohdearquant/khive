@@ -143,8 +143,9 @@ pub(crate) struct IngestParams {
     /// so a later reply can extend the full ancestor chain (issue #403).
     #[serde(default)]
     pub wire_references: Option<String>,
-    /// Transport-layer metadata passthrough, merged verbatim into the stored
-    /// note's properties. Generic and channel-agnostic — see
+    /// Transport-layer metadata passthrough, merged into the stored note's
+    /// properties without overriding reserved stable message fields. Generic
+    /// and channel-agnostic — see
     /// docs/api/message-lifecycle.md#handlersrshandle_ingest.
     #[serde(default)]
     pub metadata: Option<serde_json::Map<String, Value>>,
@@ -157,6 +158,10 @@ pub(crate) struct HeartbeatParams {
     pub channel_kind: String,
     pub channel_slug: String,
     pub outcome: String,
+    /// The writer's nominal cadence for this channel. Optional so a newer
+    /// comm pack remains compatible with older/internal heartbeat writers.
+    #[serde(default)]
+    pub poll_interval_secs: Option<u64>,
     #[serde(default)]
     pub error_class: Option<String>,
     #[serde(default)]

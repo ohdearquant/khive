@@ -7,6 +7,18 @@ resolution before reaching a pack handler. Each section below is the extended te
 for one hook or dispatch-path function; the in-source doc-comment on each item carries only the
 concise standalone summary plus a pointer here.
 
+## brain_consumer_kinds
+
+Packs that request brain profile resolution declare their exact wire-level consumer values in
+`Pack::BRAIN_CONSUMER_KINDS` and return the same slice from
+`PackRuntime::brain_consumer_kinds`. `VerbRegistry::all_brain_consumer_kinds` composes the loaded
+declarations, deduplicating shared uses such as `recall` while preserving first-seen order.
+
+`brain.bind` validates specific values against that aggregate. The `"*"` wildcard is always legal
+at the binding boundary but is registry-owned and must not appear in a pack declaration. An enum
+variant or ADR mention alone does not make a kind bindable: a loaded pack must declare that it
+actually consumes the kind.
+
 ## register_embedders
 
 `PackRuntime::register_embedders` is called by the transport during pack initialisation, before
@@ -94,6 +106,12 @@ different (or no) identity are independent. This is what lets one warm registry 
 requests from many attribution identities over the same shared backend (same db, same warm ANN
 indexes) instead of rejecting or silently dispatching under its own baked identity (ADR-096 Fork
 1).
+
+`RequestIdentity.process_ref` is a non-authoritative request-context rider. The dispatcher copies
+it to `NamespaceToken::process_ref()` for pack handlers but never consults it for gate decisions,
+namespace visibility, or actor resolution. An explicit `None` on a daemon-origin identity remains
+absent; it never falls back to the warm daemon's own environment. Identity-less local dispatch
+resolves `KHIVE_PROCESS_REF` in the current process at dispatch time.
 
 ## build_audit_storage_event
 
