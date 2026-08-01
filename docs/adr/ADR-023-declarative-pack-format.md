@@ -165,7 +165,7 @@ shipped semantic allowlist by speech act, which is this section's actual subject
 | `search`         | assertive   | Hybrid FTS + vector search                                                                                                                                                                                                                                                                                                                                                                      |
 | `link`           | commissive  | Create a typed directed edge                                                                                                                                                                                                                                                                                                                                                                    |
 | `neighbors`      | assertive   | Immediate graph neighbors; optional `include_entity_type` param enriches each hit with its entity subtype                                                                                                                                                                                                                                                                                       |
-| `traverse`       | assertive   | Multi-hop BFS traversal; optional `include_properties` param enriches each path node with entity properties                                                                                                                                                                                                                                                                                     |
+| `traverse`       | assertive   | Bounded multi-hop BFS traversal: at most 100 roots, depth 10, 1,000 non-root results per root, and one shared 100,000-row/five-second storage-expansion budget; optional `include_properties` enriches entity path nodes (ADR-091 Amendment 4)                                                                                                                                                  |
 | `query`          | assertive   | GQL/SPARQL pattern matching                                                                                                                                                                                                                                                                                                                                                                     |
 | `merge`          | declaration | Deduplicate two entities                                                                                                                                                                                                                                                                                                                                                                        |
 | `propose`        | commissive  | Create a proposal for KG mutation; emits `ProposalCreated`.                                                                                                                                                                                                                                                                                                                                     |
@@ -637,3 +637,43 @@ the registered handlers, and the live surface is readable with
 `request(ops="verbs(pack=\"kg\")")`.
 
 The decision this ADR records is unchanged. Only the restatements of a number are removed.
+
+## Amendment: stable `list` cursors (2026-08-01)
+
+The kg `list` verb supports keyset pagination for entity, note, and edge substrates.
+Supplying `after=""` selects cursor mode from the beginning; subsequent requests pass
+the prior response's `next_after` UUID while preserving the same filters. The response
+envelope is substrate-specific (`entities`, `notes`, or `edges`) and `next_after` is null
+only when the matching walk is exhausted.
+
+The UUID is resolved to its record's immutable, database-assigned insertion sequence.
+Entity, note, and edge inserts assign that sequence atomically in the substrate write's
+SQLite transaction; the sequence is never reused and does not change on update or soft
+deletion. A genuinely new id committed after an issued cursor therefore sorts after that
+boundary even when its wall-clock timestamp ties or moves backward and its UUID is lower.
+The V13 edge-ledger backfill preserves the prior public edge cursor's UUID ordering, so an
+outstanding edge cursor may resume across the schema migration before later inserts append.
+Soft-deleted cursor rows remain resolvable; a missing, hard-deleted, or out-of-scope cursor
+returns an error rather than silently restarting or skipping a range. `after` and an explicit
+`offset` are mutually exclusive. Event and proposal lists retain their existing pagination
+modes.
+
+This is a live, insertion-stable walk, not an MVCC snapshot. Inserts committed before a
+subsequent page query can extend the walk and are returned once after the prior boundary.
+Once a substrate/namespace query returns its terminal page (`next_after: null`), inserts that
+commit after that query are outside the completed walk and require a new walk from `after=""`.
+Updates or deletes may also change whether an unvisited row matches the preserved filters;
+cursor stability does not freeze mutable row membership.
+
+Message-property filters remain a bounded post-filter scan. In cursor mode, reaching the
+10,000-row safety ceiling returns `scan_incomplete: true` plus the last safe scan boundary,
+so callers can continue instead of mistaking a bounded scan for corpus exhaustion.
+
+## Amendment: bounded traversal surface (2026-08-01)
+
+The `traverse` row above adopts ADR-091 Amendment 4's finite shape and execution
+bounds. The public handler rejects an oversized raw root list before resolution,
+defaults an omitted result limit to 100, and returns no partial paths when the
+shared work or deadline budget is exceeded. These are verb semantics, so they
+belong in the generated handler help and public API reference as well as the
+storage contract; they do not add a new verb or change its speech act.

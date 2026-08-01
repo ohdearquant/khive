@@ -102,7 +102,9 @@ Returns paths — each path is a list of nodes from root to leaf. Use
 `include_roots=false` to exclude the starting nodes from results.
 
 Traverse is BFS-based. It respects `direction` (default: `both`) and
-`relations` filters.
+`relations` filters. `limit` defaults to 100 non-root nodes per root and is
+capped at 1,000; the full request also has fixed root, depth, work, and time
+bounds documented in the [API reference](api-reference.md#traverse--assertive).
 
 ## Pattern matching: `query`
 

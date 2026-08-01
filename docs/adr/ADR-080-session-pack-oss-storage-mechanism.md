@@ -117,7 +117,8 @@ live declaration has:
 - four `Visibility::Verb` handlers: `session.store`, `session.list`,
   `session.resume`, and `session.export`;
 - `session.store(content, title?, provider?, provider_session_id?, tags?)`;
-- `session.list(limit?, offset?, provider?)`;
+- `session.list(limit?, offset?, provider?, agent_id?, since?)` (ADR-083
+  Amendment 1 adds the two server-side filters without changing `session.store`);
 - `session.resume(id)` by full UUID or an 8+ hex prefix; and
 - `session.export(id, format?)`, where `format` is `json` or `markdown`.
 

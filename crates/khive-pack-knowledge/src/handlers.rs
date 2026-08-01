@@ -751,12 +751,14 @@ mod tests {
         use khive_pack_brain::BrainPack;
         use khive_pack_kg::KgPack;
 
-        // Build a registry with both brain and kg packs (brain REQUIRES kg).
+        // Build the production-like registry slice: brain requires kg, and the
+        // knowledge pack declares the `knowledge_compose` consumer kind.
         let rt = KhiveRuntime::memory().expect("in-memory runtime");
         let mut builder = VerbRegistryBuilder::new();
         builder.register(KgPack::new(rt.clone()));
         builder.register(BrainPack::new(rt.clone()));
-        let registry = builder.build().expect("kg+brain registry builds");
+        builder.register(KnowledgePack::new(rt.clone()));
+        let registry = builder.build().expect("kg+brain+knowledge registry builds");
         let token = rt.authorize(Namespace::local()).expect("authorize local");
 
         // Create a profile with inverted seed_priors:
@@ -846,7 +848,8 @@ mod tests {
         let mut builder = VerbRegistryBuilder::new();
         builder.register(KgPack::new(rt.clone()));
         builder.register(BrainPack::new(rt.clone()));
-        let registry = builder.build().expect("kg+brain registry builds");
+        builder.register(KnowledgePack::new(rt.clone()));
+        let registry = builder.build().expect("kg+brain+knowledge registry builds");
         let arm_ns = "bench-arm-a";
 
         registry
@@ -942,7 +945,8 @@ mod tests {
         let mut builder = VerbRegistryBuilder::new();
         builder.register(KgPack::new(rt.clone()));
         builder.register(BrainPack::new(rt.clone()));
-        let registry = builder.build().expect("kg+brain registry builds");
+        builder.register(KnowledgePack::new(rt.clone()));
+        let registry = builder.build().expect("kg+brain+knowledge registry builds");
 
         let token = rt.authorize(Namespace::local()).expect("authorize local");
         assert_eq!(
@@ -1037,7 +1041,8 @@ mod tests {
         let mut builder = VerbRegistryBuilder::new();
         builder.register(KgPack::new(rt.clone()));
         builder.register(BrainPack::new(rt.clone()));
-        let registry = builder.build().expect("kg+brain registry builds");
+        builder.register(KnowledgePack::new(rt.clone()));
+        let registry = builder.build().expect("kg+brain+knowledge registry builds");
 
         let token = rt.authorize(Namespace::local()).expect("authorize local");
         assert!(

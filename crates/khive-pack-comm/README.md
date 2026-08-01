@@ -1,8 +1,8 @@
 # khive-pack-comm
 
 The communication pack for khive — inter-agent messaging over a dedicated
-`message` note kind, with dual-write, actor-addressed delivery and sender-side
-confirmation.
+`message` note kind, with dual-write, actor-addressed delivery, sender-side
+delivery confirmation, and channel polling observability.
 
 ## Verbs
 
@@ -15,11 +15,10 @@ confirmation.
 | `comm.unread`    | Count the caller's unread inbound messages without message payloads                                                                                           |
 | `comm.reply`     | Reply to a message, preserving thread linkage                                                                                                                 |
 | `comm.thread`    | Retrieve all messages in a conversation thread, chronologically                                                                                               |
+| `comm.health`    | Read per-channel heartbeat state, nominal poll cadence, and nullable advisory schedule staleness                                                              |
 | `comm.probe`     | Read-only poll for new inbound message metadata and a stale unread count (takes an explicit `actor`; unlike `comm.inbox`, it is not inferred from the caller) |
-| `comm.health`    | Read-only per-channel health snapshot                                                                                                                         |
 
-Additional channel handlers such as `comm.ingest` are `Visibility::Subhandler`.
-`comm.ingest` lets an
+The internal `comm.ingest` handler is `Visibility::Subhandler` — it lets an
 out-of-band channel adapter (email, Telegram, etc.) write an inbound message
 directly, deduplicated by `external_id`, but it is not callable on the MCP wire.
 
@@ -84,6 +83,11 @@ SMTP or other external-transport delivery. Loss of the entire MCP response is
 outside this contract: without the structured error, the caller never receives
 the server-generated UUID needed for confirmation.
 
+New comm-authored messages use the versioned
+[`properties` v1 contract](docs/api/message-properties.md). If `KHIVE_PROCESS_REF` is set for a
+`comm.send` or `comm.reply`, its opaque value is copied to `sent_by_process` on both delivery
+copies without affecting routing or authorization.
+
 Two addressing modes govern where the inbound copy lands:
 
 - **Actor-addressed** ([ADR-057](https://github.com/ohdearquant/khive/blob/main/docs/adr/ADR-057-comm-actor-addressed-delivery.md)) —
@@ -98,8 +102,9 @@ Two addressing modes govern where the inbound copy lands:
   namespace returns `RuntimeError::PermissionDenied`.
 
 A root message (`thread_id` absent) gets a canonical `thread_id` equal to the
-outbound note's own UUID, patched into both copies, so `comm.thread` finds
-every reply regardless of which copy it answered.
+outbound note's own UUID, generated before either note is written and set on
+both copies, so `comm.thread` finds every reply regardless of which copy it
+answered.
 
 ## Usage
 

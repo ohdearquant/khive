@@ -15,7 +15,8 @@ call time and feed back into via explicit or implicit signals.
 - **Context-based resolution** (`brain.resolve`, `brain.bind`, `brain.unbind`,
   `brain.bindings`) — a resolution table maps `(actor, namespace, consumer_kind)`
   wildcards to a profile ID with priority ordering, so different callers can be
-  served different tuned profiles
+  served different tuned profiles; specific bindings are validated against the
+  consumer kinds declared by the loaded packs
 - **Feedback ingestion** (`brain.feedback`, `brain.auto_feedback`) — appends a
   `FeedbackExplicit` event to the shared event log; `brain.auto_feedback` is
   convenience sugar so an agent can credit the top `memory.recall` hit without

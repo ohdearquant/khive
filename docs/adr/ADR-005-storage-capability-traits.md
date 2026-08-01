@@ -452,3 +452,21 @@ is the natural representation.
 - `error.rs`: `StorageError` with `StorageCapability` discriminant.
 - `types.rs`: shared types (`SqlRow`, `SqlValue`, `Page`, `BatchWriteSummary`, filter
   types, hit types).
+
+## Amendment: bounded `GraphStore::traverse` execution (2026-08-01)
+
+ADR-091 Amendment 4 makes traversal safety part of the storage capability
+contract rather than a SQLite-only implementation detail. A `GraphStore`
+implementation must validate `TraversalRequest`, apply the request's finite
+per-root result limit while expanding, and charge every returned adjacency row
+before first-visit de-duplication to the shared one-shot execution budget.
+Clones of a request share that budget so coordinator/runtime fan-out cannot
+multiply the public work or deadline ceiling. Exceeding either ceiling fails
+the operation without returning partial paths.
+
+Traversal selection is breadth-first: each retained node is reached at its
+minimum depth, while order among nodes at the same depth remains unspecified.
+The SQLite implementation uses indexed frontier statements and
+statement-scoped autocommit snapshots; its consistency and WAL-lifetime choice
+is governed by ADR-091, not by a stronger cross-backend snapshot promise in
+this placement-blind trait.

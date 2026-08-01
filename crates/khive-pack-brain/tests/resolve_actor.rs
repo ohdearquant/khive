@@ -29,7 +29,10 @@ fn runtime_with_actor(actor_id: Option<&str>) -> KhiveRuntime {
 }
 
 async fn bind_seat_profile(brain: &BrainPack, rt: &KhiveRuntime, actor: &str) {
-    let registry = VerbRegistryBuilder::new().build().expect("registry");
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(khive_pack_kg::KgPack::new(rt.clone()));
+    builder.register(khive_pack_memory::MemoryPack::new(rt.clone()));
+    let registry = builder.build().expect("kg+memory consumer registry");
     let token = rt.authorize(Namespace::local()).expect("token");
     brain
         .dispatch(

@@ -123,8 +123,11 @@ fn core_tables_exist() {
     run_migrations(&mut conn).expect("migrations");
     for t in [
         "entities",
+        "entities_seq",
         "graph_edges",
+        "graph_edges_seq",
         "notes",
+        "notes_seq",
         "events",
         "event_observations",
         "_embedding_models",
@@ -700,6 +703,376 @@ fn v10_content_ref_defaults_null_and_accepts_a_value() {
         )
         .expect("read content_ref");
     assert_eq!(stored_ref, Some(digest));
+}
+
+// ── V13: stable list-cursor insertion sequences (#1424, #1462) ───────────────
+
+#[test]
+fn v13_upgrade_backfills_all_substrate_ledgers_in_legacy_order() {
+    let mut conn = open_memory();
+    conn.execute_batch(MIGRATION_TRACKING_TABLE).unwrap();
+    for migration in MIGRATIONS
+        .iter()
+        .filter(|migration| migration.version <= 12)
+    {
+        let tx = conn.transaction().unwrap();
+        tx.execute_batch(migration.up).unwrap();
+        tx.execute(
+            "INSERT INTO _schema_migrations (version, name, applied_at) VALUES (?1, ?2, 0)",
+            rusqlite::params![migration.version, migration.name],
+        )
+        .unwrap();
+        tx.commit().unwrap();
+    }
+
+    // Deliberately insert out of order. Entity/note V13 backfills use
+    // `(created_at, id)` ascending; edge backfill must instead preserve the
+    // public pre-V13 cursor's `id` ordering so an outstanding edge cursor can
+    // resume across the migration.
+    for (id, created_at) in [("entity-z", 20), ("entity-b", 10), ("entity-a", 10)] {
+        conn.execute(
+            "INSERT INTO entities (id, namespace, kind, name, created_at, updated_at) \
+             VALUES (?1, 'local', 'concept', ?1, ?2, ?2)",
+            rusqlite::params![id, created_at],
+        )
+        .unwrap();
+    }
+    for (id, created_at) in [("note-z", 20), ("note-b", 10), ("note-a", 10)] {
+        conn.execute(
+            "INSERT INTO notes (id, namespace, kind, content, created_at, updated_at) \
+             VALUES (?1, 'local', 'observation', ?1, ?2, ?2)",
+            rusqlite::params![id, created_at],
+        )
+        .unwrap();
+    }
+    // Timestamp order is z, b, a while the compatibility order is a, b, z.
+    for (id, created_at) in [("edge-a", 30), ("edge-z", 10), ("edge-b", 20)] {
+        conn.execute(
+            "INSERT INTO graph_edges \
+             (namespace, id, source_id, target_id, relation, created_at, updated_at) \
+             VALUES ('local', ?1, ?1 || '-source', ?1 || '-target', 'extends', ?2, ?2)",
+            rusqlite::params![id, created_at],
+        )
+        .unwrap();
+    }
+
+    let latest = MIGRATIONS.last().expect("at least one migration").version;
+    assert_eq!(run_migrations(&mut conn).unwrap(), latest);
+
+    fn ordered_ids(conn: &Connection, table: &str, id_column: &str) -> Vec<String> {
+        let sql = format!("SELECT {id_column} FROM {table} ORDER BY seq ASC");
+        let mut stmt = conn.prepare(&sql).unwrap();
+        stmt.query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    }
+
+    assert_eq!(
+        ordered_ids(&conn, "entities_seq", "entity_id"),
+        vec![
+            "entity-a".to_string(),
+            "entity-b".to_string(),
+            "entity-z".to_string()
+        ]
+    );
+    assert_eq!(
+        ordered_ids(&conn, "notes_seq", "note_id"),
+        vec![
+            "note-a".to_string(),
+            "note-b".to_string(),
+            "note-z".to_string()
+        ]
+    );
+    assert_eq!(
+        ordered_ids(&conn, "graph_edges_seq", "edge_id"),
+        vec![
+            "edge-a".to_string(),
+            "edge-b".to_string(),
+            "edge-z".to_string()
+        ]
+    );
+}
+
+#[test]
+fn v13_insert_triggers_assign_monotonic_sequences_for_all_substrates() {
+    let mut conn = open_memory();
+    run_migrations(&mut conn).unwrap();
+
+    let sequence = |conn: &Connection, table: &str, id_column: &str, id: &str| -> i64 {
+        conn.query_row(
+            &format!("SELECT seq FROM {table} WHERE {id_column} = ?1"),
+            rusqlite::params![id],
+            |row| row.get(0),
+        )
+        .unwrap()
+    };
+
+    conn.execute(
+        "INSERT INTO entities (id, namespace, kind, name, created_at, updated_at) \
+         VALUES ('f-entity', 'local', 'concept', 'first', 100, 100)",
+        [],
+    )
+    .unwrap();
+    let entity_first = sequence(&conn, "entities_seq", "entity_id", "f-entity");
+    conn.execute(
+        "INSERT OR REPLACE INTO entities (id, namespace, kind, name, created_at, updated_at) \
+         VALUES ('f-entity', 'local', 'concept', 'updated', 999, 999)",
+        [],
+    )
+    .unwrap();
+    assert_eq!(
+        sequence(&conn, "entities_seq", "entity_id", "f-entity"),
+        entity_first,
+        "entity replacement must retain its first-insert sequence"
+    );
+    conn.execute("DELETE FROM entities WHERE id = 'f-entity'", [])
+        .unwrap();
+    conn.execute(
+        "INSERT INTO entities (id, namespace, kind, name, created_at, updated_at) \
+         VALUES ('f-entity', 'local', 'concept', 'resurrected', 1000, 1000)",
+        [],
+    )
+    .unwrap();
+    assert_eq!(
+        sequence(&conn, "entities_seq", "entity_id", "f-entity"),
+        entity_first,
+        "hard-delete plus same-id entity resurrection must retain its first sequence"
+    );
+    conn.execute(
+        "INSERT INTO entities (id, namespace, kind, name, created_at, updated_at) \
+         VALUES ('0-entity', 'local', 'concept', 'later', 100, 100)",
+        [],
+    )
+    .unwrap();
+    assert!(sequence(&conn, "entities_seq", "entity_id", "0-entity") > entity_first);
+
+    conn.execute(
+        "INSERT INTO notes (id, namespace, kind, content, created_at, updated_at) \
+         VALUES ('f-note', 'local', 'observation', 'first', 100, 100)",
+        [],
+    )
+    .unwrap();
+    let note_first = sequence(&conn, "notes_seq", "note_id", "f-note");
+    conn.execute(
+        "INSERT OR REPLACE INTO notes \
+         (id, namespace, kind, content, created_at, updated_at) \
+         VALUES ('f-note', 'local', 'observation', 'updated', 999, 999)",
+        [],
+    )
+    .unwrap();
+    assert_eq!(
+        sequence(&conn, "notes_seq", "note_id", "f-note"),
+        note_first,
+        "note upsert must retain its first-insert sequence"
+    );
+    conn.execute("DELETE FROM notes WHERE id = 'f-note'", [])
+        .unwrap();
+    conn.execute(
+        "INSERT INTO notes (id, namespace, kind, content, created_at, updated_at) \
+         VALUES ('f-note', 'local', 'observation', 'resurrected', 1000, 1000)",
+        [],
+    )
+    .unwrap();
+    assert_eq!(
+        sequence(&conn, "notes_seq", "note_id", "f-note"),
+        note_first,
+        "hard-delete plus same-id note resurrection must retain its first sequence"
+    );
+    conn.execute(
+        "INSERT INTO notes (id, namespace, kind, content, created_at, updated_at) \
+         VALUES ('0-note', 'local', 'observation', 'later', 100, 100)",
+        [],
+    )
+    .unwrap();
+    assert!(sequence(&conn, "notes_seq", "note_id", "0-note") > note_first);
+
+    conn.execute(
+        "INSERT INTO graph_edges \
+         (namespace, id, source_id, target_id, relation, created_at, updated_at) \
+         VALUES ('local', 'f-edge', 's1', 't1', 'extends', 100, 100)",
+        [],
+    )
+    .unwrap();
+    let edge_first = sequence(&conn, "graph_edges_seq", "edge_id", "f-edge");
+    conn.execute(
+        "INSERT OR REPLACE INTO graph_edges \
+         (namespace, id, source_id, target_id, relation, weight, created_at, updated_at) \
+         VALUES ('local', 'f-edge', 's1', 't1', 'extends', 0.5, 999, 999)",
+        [],
+    )
+    .unwrap();
+    assert_eq!(
+        sequence(&conn, "graph_edges_seq", "edge_id", "f-edge"),
+        edge_first,
+        "edge upsert must retain its first-insert sequence"
+    );
+    conn.execute(
+        "DELETE FROM graph_edges WHERE namespace = 'local' AND id = 'f-edge'",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO graph_edges \
+         (namespace, id, source_id, target_id, relation, created_at, updated_at) \
+         VALUES ('local', 'f-edge', 's1', 't1', 'extends', 1000, 1000)",
+        [],
+    )
+    .unwrap();
+    assert_eq!(
+        sequence(&conn, "graph_edges_seq", "edge_id", "f-edge"),
+        edge_first,
+        "hard-delete plus same-id edge resurrection must retain its first sequence"
+    );
+    conn.execute(
+        "INSERT INTO graph_edges \
+         (namespace, id, source_id, target_id, relation, created_at, updated_at) \
+         VALUES ('local', '0-edge', 's2', 't2', 'extends', 100, 100)",
+        [],
+    )
+    .unwrap();
+    assert!(sequence(&conn, "graph_edges_seq", "edge_id", "0-edge") > edge_first);
+}
+
+#[test]
+fn v13_sequence_trigger_failure_rolls_back_each_substrate_insert() {
+    let mut conn = open_memory();
+    run_migrations(&mut conn).unwrap();
+    conn.execute_batch(
+        "CREATE TRIGGER reject_entity_list_seq BEFORE INSERT ON entities_seq
+         WHEN NEW.entity_id = 'reject-entity'
+         BEGIN SELECT RAISE(ABORT, 'reject entity sequence'); END;
+         CREATE TRIGGER reject_note_list_seq BEFORE INSERT ON notes_seq
+         WHEN NEW.note_id = 'reject-note'
+         BEGIN SELECT RAISE(ABORT, 'reject note sequence'); END;
+         CREATE TRIGGER reject_edge_list_seq BEFORE INSERT ON graph_edges_seq
+         WHEN NEW.edge_id = 'reject-edge'
+         BEGIN SELECT RAISE(ABORT, 'reject edge sequence'); END;",
+    )
+    .unwrap();
+
+    assert!(conn
+        .execute(
+            "INSERT INTO entities (id, namespace, kind, name, created_at, updated_at) \
+             VALUES ('reject-entity', 'local', 'concept', 'rejected', 100, 100)",
+            [],
+        )
+        .is_err());
+    assert!(conn
+        .execute(
+            "INSERT INTO notes (id, namespace, kind, content, created_at, updated_at) \
+             VALUES ('reject-note', 'local', 'observation', 'rejected', 100, 100)",
+            [],
+        )
+        .is_err());
+    assert!(conn
+        .execute(
+            "INSERT INTO graph_edges \
+             (namespace, id, source_id, target_id, relation, created_at, updated_at) \
+             VALUES ('local', 'reject-edge', 's', 't', 'extends', 100, 100)",
+            [],
+        )
+        .is_err());
+
+    for (table, id_column, id) in [
+        ("entities", "id", "reject-entity"),
+        ("notes", "id", "reject-note"),
+        ("graph_edges", "id", "reject-edge"),
+    ] {
+        let count: i64 = conn
+            .query_row(
+                &format!("SELECT COUNT(*) FROM {table} WHERE {id_column} = ?1"),
+                rusqlite::params![id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0, "failed sequence assignment stranded {table} row");
+    }
+}
+
+// ── V13/V14: graph_edges.id must be globally unique (#1424, #1462 follow-up) ─
+
+#[test]
+fn v13_rejects_legacy_duplicate_edge_id_on_upgrade_from_v12() {
+    let mut conn = open_memory();
+    conn.execute_batch(MIGRATION_TRACKING_TABLE).unwrap();
+    for migration in MIGRATIONS
+        .iter()
+        .filter(|migration| migration.version <= 12)
+    {
+        let tx = conn.transaction().unwrap();
+        tx.execute_batch(migration.up).unwrap();
+        tx.execute(
+            "INSERT INTO _schema_migrations (version, name, applied_at) VALUES (?1, ?2, 0)",
+            rusqlite::params![migration.version, migration.name],
+        )
+        .unwrap();
+        tx.commit().unwrap();
+    }
+
+    // A V12 (pre-list-cursor) database permits the same edge id in two
+    // namespaces because the base PRIMARY KEY is (namespace, id) -- exactly
+    // the legacy state the list-cursor ledger's UUID-only backfill would
+    // otherwise silently collapse onto one shared sequence row.
+    for ns in ["ns-a", "ns-b"] {
+        conn.execute(
+            "INSERT INTO graph_edges \
+             (namespace, id, source_id, target_id, relation, created_at, updated_at) \
+             VALUES (?1, 'dup-edge', 's', 't', 'extends', 100, 100)",
+            rusqlite::params![ns],
+        )
+        .unwrap();
+    }
+
+    // This drives the real upgrade path (unlike a fixture that force-applies
+    // V13 before inserting the duplicate): run_migrations must hit V13's own
+    // uniqueness guard on this legacy pair, not silently backfill a ledger
+    // for V14 to fail on one version later.
+    let result = run_migrations(&mut conn);
+    assert!(
+        result.is_err(),
+        "V13 must fail loudly on a legacy cross-namespace duplicate edge id instead of \
+         backfilling a ledger that collapses the two rows onto one sequence entry"
+    );
+    assert_eq!(
+        read_schema_version(&conn).unwrap(),
+        12,
+        "a failed V13 migration must leave the database at its last good version"
+    );
+    assert!(
+        !table_exists(&conn, "graph_edges_seq"),
+        "V13 must roll back in full on a legacy duplicate -- no ledger table, ambiguous or not"
+    );
+}
+
+#[test]
+fn v14_index_rejects_new_cross_namespace_duplicate_edge_id() {
+    let mut conn = open_memory();
+    run_migrations(&mut conn).unwrap();
+
+    conn.execute(
+        "INSERT INTO graph_edges \
+         (namespace, id, source_id, target_id, relation, created_at, updated_at) \
+         VALUES ('ns-a', 'dup-edge', 's', 't', 'extends', 100, 100)",
+        [],
+    )
+    .unwrap();
+
+    let err = conn
+        .execute(
+            "INSERT INTO graph_edges \
+             (namespace, id, source_id, target_id, relation, created_at, updated_at) \
+             VALUES ('ns-b', 'dup-edge', 's2', 't2', 'extends', 200, 200)",
+            [],
+        )
+        .expect_err(
+            "a second namespace inserting an already-used edge id must hit the unique \
+             index, not silently succeed and share the first namespace's ledger row",
+        );
+    assert!(
+        err.to_string().to_lowercase().contains("unique"),
+        "expected a UNIQUE constraint failure, got: {err}"
+    );
 }
 
 #[test]

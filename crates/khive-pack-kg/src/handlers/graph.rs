@@ -5,7 +5,10 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use khive_runtime::{NamespaceToken, RuntimeError};
-use khive_storage::types::{NeighborHit, NeighborQuery, TraversalOptions, TraversalRequest};
+use khive_storage::types::{
+    NeighborHit, NeighborQuery, TraversalExecutionBudget, TraversalOptions, TraversalRequest,
+    DEFAULT_TRAVERSAL_LIMIT, MAX_TRAVERSAL_DEPTH, MAX_TRAVERSAL_LIMIT, MAX_TRAVERSAL_ROOTS,
+};
 
 use super::common::{
     deser, parse_direction, parse_relation, render_query_result, resolve_uuid_async, to_json,
@@ -75,12 +78,26 @@ impl KgPack {
         params: Value,
     ) -> Result<Value, RuntimeError> {
         let p: TraverseParams = deser(params)?;
-        let mut roots = Vec::with_capacity(p.roots.len());
-        for s in &p.roots {
-            roots.push(resolve_uuid_async(s, &self.runtime, token).await?);
+        if p.roots.len() > MAX_TRAVERSAL_ROOTS {
+            return Err(RuntimeError::InvalidInput(format!(
+                "traverse roots must contain at most {MAX_TRAVERSAL_ROOTS} entries, got {}",
+                p.roots.len()
+            )));
+        }
+        let max_depth = p.max_depth.unwrap_or(3);
+        if max_depth > MAX_TRAVERSAL_DEPTH {
+            return Err(RuntimeError::InvalidInput(format!(
+                "traverse max_depth must be <= {MAX_TRAVERSAL_DEPTH}, got {max_depth}"
+            )));
+        }
+        let limit = p.limit.unwrap_or(DEFAULT_TRAVERSAL_LIMIT);
+        if limit > MAX_TRAVERSAL_LIMIT {
+            return Err(RuntimeError::InvalidInput(format!(
+                "traverse limit must be <= {MAX_TRAVERSAL_LIMIT}, got {limit}"
+            )));
         }
         let direction = parse_direction(p.direction.as_deref())?;
-        let relations = p
+        let mut relations = p
             .relations
             .map(|v| {
                 v.iter()
@@ -88,18 +105,37 @@ impl KgPack {
                     .collect::<Result<Vec<_>, _>>()
             })
             .transpose()?;
+        if let Some(relations) = &mut relations {
+            let mut seen = std::collections::HashSet::with_capacity(relations.len());
+            relations.retain(|relation| seen.insert(*relation));
+        }
         let options = TraversalOptions {
-            max_depth: p.max_depth.unwrap_or(3),
+            max_depth,
             direction,
             relations,
             min_weight: p.min_weight,
-            limit: p.limit,
+            limit: Some(limit),
         };
+        options.validate().map_err(RuntimeError::InvalidInput)?;
+
+        // The raw-root cap is checked before resolution so a caller cannot
+        // turn one request into unbounded sequential lookup work. Resolution
+        // aliases may still collapse to one UUID, so de-duplicate afterward
+        // while preserving the caller's first-root order.
+        let mut roots = Vec::with_capacity(p.roots.len());
+        let mut seen = std::collections::HashSet::with_capacity(p.roots.len());
+        for root in p.roots {
+            let id = resolve_uuid_async(&root, &self.runtime, token).await?;
+            if seen.insert(id) {
+                roots.push(id);
+            }
+        }
         let request = TraversalRequest {
             roots,
             options,
             include_roots: p.include_roots.unwrap_or(true),
             include_properties: p.include_properties.unwrap_or(false),
+            execution_budget: TraversalExecutionBudget::default(),
         };
         let paths = self.runtime.traverse(token, request).await?;
         to_json(&paths)
