@@ -257,10 +257,14 @@ impl KhiveRuntime {
         // Issued-at-dispatch: counted before the await — see embed_with_model.
         crate::usage::count(crate::usage::UsageUnit::EmbedCalls, 1);
         let embeddings = service.embed_passage(&[text.to_string()], emb_model).await;
-        let out = embeddings?
-            .into_iter()
-            .next()
-            .ok_or_else(|| RuntimeError::Internal("embed_passage returned empty vec".into()))?;
+        let mut vectors = embeddings?;
+        if vectors.len() != 1 {
+            return Err(RuntimeError::Internal(format!(
+                "embed_passage returned {} vectors for 1 input",
+                vectors.len()
+            )));
+        }
+        let out = vectors.pop().expect("checked len == 1 above");
         Ok(DocumentEmbeddingOutcome {
             model_name: model_name.to_owned(),
             vector: out,
@@ -2043,6 +2047,46 @@ mod tests {
         }
     }
 
+    struct SurplusCardinalityEmbeddingService;
+
+    #[async_trait::async_trait]
+    impl EmbeddingService for SurplusCardinalityEmbeddingService {
+        async fn embed(
+            &self,
+            texts: &[String],
+            _model: EmbeddingModel,
+        ) -> std::result::Result<Vec<Vec<f32>>, lattice_embed::EmbedError> {
+            let mut vectors: Vec<Vec<f32>> = texts.iter().map(|_| vec![1.0]).collect();
+            vectors.push(vec![1.0]);
+            Ok(vectors)
+        }
+
+        fn supports_model(&self, _model: EmbeddingModel) -> bool {
+            true
+        }
+
+        fn name(&self) -> &'static str {
+            "surplus-cardinality-embedding-service"
+        }
+    }
+
+    struct SurplusCardinalityEmbedderProvider;
+
+    #[async_trait::async_trait]
+    impl EmbedderProvider for SurplusCardinalityEmbedderProvider {
+        fn name(&self) -> &str {
+            "surplus-cardinality-embedding-service"
+        }
+
+        fn dimensions(&self) -> usize {
+            1
+        }
+
+        async fn build(&self) -> crate::error::RuntimeResult<std::sync::Arc<dyn EmbeddingService>> {
+            Ok(std::sync::Arc::new(SurplusCardinalityEmbeddingService))
+        }
+    }
+
     #[async_trait::async_trait]
     impl EmbedderProvider for CapturingEmbedderProvider {
         fn name(&self) -> &str {
@@ -2195,6 +2239,44 @@ mod tests {
             error
                 .to_string()
                 .contains("embed_passage returned 1 vectors for 2 inputs"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn singleton_document_embed_rejects_zero_vectors() {
+        let runtime = KhiveRuntime::memory().unwrap();
+        runtime.register_embedder(WrongCardinalityEmbedderProvider);
+        let model_name = "wrong-cardinality-embedding-service";
+
+        let error = runtime
+            .embed_document_with_model_outcome(model_name, "single document")
+            .await
+            .expect_err("provider returning zero vectors must fail closed");
+
+        assert!(
+            error
+                .to_string()
+                .contains("embed_passage returned 0 vectors for 1 input"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn singleton_document_embed_rejects_surplus_vectors() {
+        let runtime = KhiveRuntime::memory().unwrap();
+        runtime.register_embedder(SurplusCardinalityEmbedderProvider);
+        let model_name = "surplus-cardinality-embedding-service";
+
+        let error = runtime
+            .embed_document_with_model_outcome(model_name, "single document")
+            .await
+            .expect_err("provider returning surplus vectors must fail closed");
+
+        assert!(
+            error
+                .to_string()
+                .contains("embed_passage returned 2 vectors for 1 input"),
             "unexpected error: {error}"
         );
     }
