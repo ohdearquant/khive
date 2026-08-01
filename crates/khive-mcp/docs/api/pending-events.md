@@ -38,14 +38,24 @@ actor identity, and `--pack` selection once at startup, and a
 freshly-reconstructed `RuntimeConfig::default()` would drain
 `$HOME/.khive/khive.db` instead of the configured backend (the PR #782 bug).
 
-## Reminder creator identity
+## Scheduled-event creator identity
 
-A reminder's persisted `created_by_actor` is both the `comm.send` recipient
-and the acting identity for that delivery dispatch. The drain supplies it to
-the server through the typed per-request identity seam, so `from_actor` and
-`to_actor` both remain the creator even when a different actor owns the daemon
-that fires the event. This override is reminder-only: `schedule.schedule`
-actions continue to dispatch under the scheduler server's normal identity.
+A `scheduled_event` row's persisted `created_by_actor` is the acting identity
+for that row's replay dispatch, for both `event_type: "remind"` and
+`event_type: "schedule"`. The drain supplies it to the server through the
+typed per-request identity seam, so a reminder's `from_actor`/`to_actor` and a
+scheduled action's dispatch identity both remain the creator even when a
+different actor owns the daemon that fires the event.
+
+`created_by_actor` is a trust boundary, not descriptive metadata: it is
+stamped once, at write time, from the caller's authenticated token by
+`schedule.remind`/`schedule.schedule`. The generic `create` and `update`
+verbs reject the `scheduled_event` note kind outright, so no other write path
+can set or alter it — a caller cannot forge or reassign a scheduled event's
+replay identity through the shared CRUD surface. A row with no stored
+`created_by_actor` (data written before this guarantee existed) has no
+verifiable provenance; the drain fails closed and does not dispatch it under
+the daemon's own identity.
 
 ## Why the tick loop uses a fixed interval with `Skip`
 

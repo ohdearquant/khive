@@ -249,6 +249,15 @@ impl KgPack {
                     "note_kind",
                 )?
                 .unwrap_or_else(|| "observation".to_string());
+                if canonical == "scheduled_event" {
+                    return Err(RuntimeError::InvalidInput(
+                        "kind=scheduled_event is not creatable via `create` — its \
+                         `created_by_actor` is a trust boundary for replay dispatch and must \
+                         be derived from the authenticated caller, not caller-supplied \
+                         properties; use `schedule.remind` or `schedule.schedule` instead"
+                            .into(),
+                    ));
+                }
                 let hook = registry.find_kind_hook(&canonical);
                 (Some(canonical), hook)
             }

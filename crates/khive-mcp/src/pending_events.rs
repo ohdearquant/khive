@@ -527,28 +527,39 @@ pub async fn run_pending_events_on(
                     .and_then(Value::as_str)
                     .unwrap_or("remind");
 
-                let reminder_actor = if event_type == "remind" && !is_missed {
-                    let stored_actor = properties
+                // The persisted `created_by_actor` is the sole trust anchor for
+                // replay identity (ADR-119): it is stamped at write time by
+                // `schedule.remind`/`schedule.schedule` from the caller's
+                // authenticated token, never from caller-supplied properties —
+                // generic `create`/`update` reject the `scheduled_event` kind
+                // outright (khive-pack-kg's create/update handlers), so no
+                // other path can set or alter it. A row with no stored creator
+                // (legacy data predating that provenance guarantee) has no
+                // verifiable identity and must fail closed rather than replay
+                // under the daemon's own identity.
+                let scheduled_actor = if !is_missed
+                    && (event_type == "remind" || event_type == "schedule")
+                {
+                    properties
                         .as_ref()
                         .and_then(|p| p.get("created_by_actor"))
-                        .and_then(Value::as_str);
-                    if stored_actor.is_none() {
-                        tracing::warn!(
-                            scheduled_event_id = %id,
-                            "pending-events: legacy reminder has no created_by_actor; using the \
-                             scheduler actor"
-                        );
-                    }
-                    Some(
-                        stored_actor
-                            .or_else(|| server.actor_id())
-                            .unwrap_or("local")
-                            .to_string(),
-                    )
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
                 } else {
                     None
                 };
-                let action_dsl: Option<String> = if is_missed {
+                let missing_provenance = !is_missed
+                    && (event_type == "remind" || event_type == "schedule")
+                    && scheduled_actor.is_none();
+                if missing_provenance {
+                    tracing::warn!(
+                        scheduled_event_id = %id,
+                        event_type,
+                        "pending-events: scheduled event has no verifiable created_by_actor; \
+                         fail-closed, not dispatching under the daemon identity"
+                    );
+                }
+                let action_dsl: Option<String> = if is_missed || missing_provenance {
                     None
                 } else if event_type == "schedule" {
                     properties
@@ -557,7 +568,7 @@ pub async fn run_pending_events_on(
                         .and_then(Value::as_str)
                         .map(str::to_string)
                 } else {
-                    reminder_actor
+                    scheduled_actor
                         .as_deref()
                         .map(|actor| reminder_delivery_action(actor, &content))
                 };
@@ -671,13 +682,13 @@ pub async fn run_pending_events_on(
                 let mut reminder_delivery_error = None;
                 if let Some(dsl) = &action_dsl {
                     let dispatch_result =
-                        dispatch_action(dsl, ns_str, server, reminder_actor.as_deref(), verbose)
+                        dispatch_action(dsl, ns_str, server, scheduled_actor.as_deref(), verbose)
                             .await;
                     if let Err(e) = dispatch_result {
                         tracing::error!(
                             scheduled_event_id = %id,
                             event_type,
-                            recipient_actor = reminder_actor.as_deref(),
+                            recipient_actor = scheduled_actor.as_deref(),
                             error = %e,
                             "pending-events: scheduled event delivery failed"
                         );
@@ -691,7 +702,7 @@ pub async fn run_pending_events_on(
                                 server,
                                 ns_str,
                                 id,
-                                reminder_actor.as_deref().unwrap_or("local"),
+                                scheduled_actor.as_deref().unwrap_or("local"),
                                 &error,
                             )
                             .await;
@@ -703,6 +714,22 @@ pub async fn run_pending_events_on(
                         // in the summary.
                         // (Callers can inspect fired_at + a future dispatch_error
                         // field to distinguish clean fires from error fires.)
+                    }
+                } else if missing_provenance {
+                    summary.failed += 1;
+                    let error = "fail-closed: scheduled event has no verifiable \
+                                  created_by_actor; refusing to replay under the daemon identity"
+                        .to_string();
+                    tracing::error!(
+                        scheduled_event_id = %id,
+                        event_type,
+                        error = %error,
+                        "pending-events: scheduled event fail-closed: no verifiable creator provenance"
+                    );
+                    if event_type == "remind" {
+                        append_reminder_delivery_failure_event(server, ns_str, id, "local", &error)
+                            .await;
+                        reminder_delivery_error = Some(error);
                     }
                 }
 
@@ -1574,6 +1601,208 @@ mod tests {
         let props = get_note_props(&rt, id).await;
         assert_eq!(props["status"], "fired");
         assert!(props["fired_at"].as_str().is_some());
+    }
+
+    /// Security regression: the generic `create` verb must not be able to
+    /// forge a `scheduled_event`'s `created_by_actor` — that field is the
+    /// trust anchor the drain replays actions under, and `khive-pack-kg`'s
+    /// `create` handler must reject the kind outright rather than trust
+    /// caller-supplied properties.
+    #[tokio::test]
+    async fn generic_create_cannot_forge_scheduled_event_creator() {
+        let (_tmp, db_path) = tmp_db();
+        let rt = make_rt_with_actor(&db_path, Some("lambda:attacker")).await;
+        let server = KhiveMcpServer::new(rt.clone()).expect("server");
+
+        let ops = serde_json::to_string(&json!([{
+            "tool": "create",
+            "args": {
+                "kind": "note",
+                "note_kind": "scheduled_event",
+                "content": "forged reminder",
+                "properties": {
+                    "trigger_at": "2099-01-01T00:00:00Z",
+                    "status": "pending",
+                    "event_type": "remind",
+                    "created_by_actor": "lambda:victim"
+                }
+            }
+        }]))
+        .expect("serialize create op");
+        let result = server
+            .dispatch_request_local(RequestParams {
+                ops,
+                ..Default::default()
+            })
+            .await
+            .expect("dispatch_request_local must not error at the RPC layer");
+        let result: Value = serde_json::from_str(&result).expect("valid JSON");
+        let op = &result["results"][0];
+        assert_eq!(
+            op["ok"], false,
+            "generic create of a scheduled_event must be rejected: {result}"
+        );
+        let err = op["error"].as_str().unwrap_or("");
+        assert!(
+            err.contains("scheduled_event") && err.contains("not creatable"),
+            "expected a scheduled_event-specific rejection, got: {err}"
+        );
+    }
+
+    /// Security regression: the generic `update` verb must not be able to
+    /// alter a `scheduled_event`'s creator identity or action payload once
+    /// written, even for a legitimately-created row. Only `schedule.cancel`
+    /// remains a valid post-creation mutation.
+    #[tokio::test]
+    async fn generic_update_cannot_alter_scheduled_event_creator() {
+        let (_tmp, db_path) = tmp_db();
+        let creator = "lambda:reminder-owner-2";
+        let rt = make_rt_with_actor(&db_path, Some(creator)).await;
+        let server = KhiveMcpServer::new(rt.clone()).expect("server");
+
+        let remind_ops = serde_json::to_string(&json!([{
+            "tool": "schedule.remind",
+            "args": { "content": "test reminder", "at": "2099-01-01T00:00:00Z" }
+        }]))
+        .expect("serialize reminder op");
+        let result = server
+            .dispatch_request_local(RequestParams {
+                ops: remind_ops,
+                ..Default::default()
+            })
+            .await
+            .expect("create reminder through schedule.remind");
+        let result: Value = serde_json::from_str(&result).expect("reminder result JSON");
+        assert_eq!(result["results"][0]["ok"], true, "{result}");
+        let id_str = result["results"][0]["result"]["full_id"]
+            .as_str()
+            .expect("reminder full_id")
+            .to_string();
+        let id: uuid::Uuid = id_str.parse().expect("reminder UUID");
+
+        let update_ops = serde_json::to_string(&json!([{
+            "tool": "update",
+            "args": {
+                "id": id_str,
+                "properties": { "created_by_actor": "lambda:attacker" }
+            }
+        }]))
+        .expect("serialize update op");
+        let update_result = server
+            .dispatch_request_local_as(
+                RequestParams {
+                    ops: update_ops,
+                    ..Default::default()
+                },
+                Some(VerifiedActor::new("lambda:attacker").expect("verified actor")),
+            )
+            .await
+            .expect("dispatch_request_local_as must not error at the RPC layer");
+        let update_result: Value = serde_json::from_str(&update_result).expect("valid JSON");
+        let op = &update_result["results"][0];
+        assert_eq!(
+            op["ok"], false,
+            "generic update of a scheduled_event must be rejected: {update_result}"
+        );
+        let err = op["error"].as_str().unwrap_or("");
+        assert!(
+            err.contains("scheduled_event") && err.contains("not editable"),
+            "expected a scheduled_event-specific rejection, got: {err}"
+        );
+
+        let props = get_note_props(&rt, id).await;
+        assert_eq!(
+            props["created_by_actor"], creator,
+            "creator must remain unchanged after a rejected forgery attempt: {props}"
+        );
+    }
+
+    /// ADR-119: a generic `schedule.schedule` action must replay under its
+    /// creator's identity, not the daemon's, even when a different actor
+    /// owns the daemon process that drains it — mirroring the reminder
+    /// guarantee above (`fired_reminder_delivers_to_creator_after_daemon_actor_changes`).
+    #[tokio::test]
+    async fn scheduled_action_replays_as_creator_not_daemon() {
+        let (_tmp, db_path) = tmp_db();
+        let creator = "lambda:schedule-owner";
+        let daemon_actor = "lambda:replacement-daemon-2";
+
+        let creator_rt = make_rt_with_actor(&db_path, Some(creator)).await;
+        let action = format!(
+            "comm.send(to={creator:?}, subject=\"scheduled\", content=\"scheduled action fired\", self_send=true)"
+        );
+        let id = create_scheduled_event(
+            &creator_rt,
+            "local",
+            &due_rfc3339(),
+            Some(&action),
+            None,
+            "schedule",
+        )
+        .await;
+        let props = get_note_props(&creator_rt, id).await;
+        assert_eq!(props["created_by_actor"], creator, "{props}");
+
+        let rt = make_rt_with_actor(&db_path, Some(daemon_actor)).await;
+        let server = KhiveMcpServer::new(rt.clone()).expect("replacement daemon server");
+        let summary = run_pending_events_on(&rt, &server, false)
+            .await
+            .expect("drain");
+        assert_eq!(summary.fired, 1);
+        assert_eq!(summary.failed, 0);
+
+        let messages = inbound_reminder_messages(&rt, creator).await;
+        let daemon_messages = inbound_reminder_messages(&rt, daemon_actor).await;
+        assert_eq!(
+            messages.len(),
+            1,
+            "creator={creator}, daemon={daemon_actor}: daemon_messages={daemon_messages:?}"
+        );
+        assert_eq!(messages[0].1["from_actor"], creator);
+        assert!(daemon_messages.is_empty());
+    }
+
+    /// ADR-119 fail-closed requirement: a `scheduled_event` row with no
+    /// verifiable `created_by_actor` (legacy data predating this
+    /// provenance guarantee) must never replay under the daemon's own
+    /// identity — it must be counted as a failure and left undispatched.
+    #[tokio::test]
+    async fn scheduled_event_missing_provenance_fails_closed() {
+        let (_tmp, db_path) = tmp_db();
+        let daemon_actor = "lambda:daemon-legacy";
+        let rt = make_rt_with_actor(&db_path, Some(daemon_actor)).await;
+        let server = KhiveMcpServer::new(rt.clone()).expect("server");
+
+        let action = "comm.send(to=\"lambda:daemon-legacy\", subject=\"x\", content=\"x\", self_send=true)";
+        let id = create_scheduled_event(&rt, "local", &due_rfc3339(), Some(action), None, "schedule")
+            .await;
+
+        // Simulate a legacy row written before creator provenance was captured.
+        let mut writer = rt.sql().writer().await.expect("writer");
+        writer
+            .execute(SqlStatement {
+                sql: "UPDATE notes SET properties = json_remove(properties, \
+                      '$.created_by_actor') WHERE id = ?1"
+                    .to_string(),
+                params: vec![SqlValue::Text(id.to_string())],
+                label: Some("test_strip_provenance".into()),
+            })
+            .await
+            .expect("strip provenance");
+        drop(writer);
+
+        let summary = run_pending_events_on(&rt, &server, false)
+            .await
+            .expect("drain");
+        assert_eq!(
+            summary.failed, 1,
+            "missing provenance must fail closed, not silently succeed: {summary:?}"
+        );
+        let daemon_messages = inbound_reminder_messages(&rt, daemon_actor).await;
+        assert!(
+            daemon_messages.is_empty(),
+            "a fail-closed row must never dispatch under the daemon identity: {daemon_messages:?}"
+        );
     }
 
     #[tokio::test]
