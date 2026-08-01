@@ -116,9 +116,10 @@ jobs:
             [sessions-and-ingest]="9|Agent Sessions and Data Ingest|Session record verbs and provider transcript mirror ingest."
             [specialized-packs]="10|Specialized Packs|Niche packs beyond the production set, starting with the formal-math pack."
             [prompt-cookbook]="11|Prompt Cookbook|Ready-to-use verb patterns for common agent workflows."
-            [tips-and-tricks]="12|Tips and Tricks|Query craft, DSL round-trips, param gotchas, and troubleshooting for the request tool."
-            [proof-graph-case-study]="13|Proof Graph Case Study|Mathlib ingested as a 320K-entity, 4.4M-edge khive graph: ingestion path and traversal at scale."
-            [api-reference]="14|API Reference|Full verb catalog for all 9 production packs: params, DSL examples, response envelope."
+            [query-cookbook]="12|Query Cookbook|Question classes mapped to the right verb, plus verified GQL/SPARQL idioms and known gaps."
+            [tips-and-tricks]="13|Tips and Tricks|Query craft, DSL round-trips, param gotchas, and troubleshooting for the request tool."
+            [proof-graph-case-study]="14|Proof Graph Case Study|Mathlib ingested as a 320K-entity, 4.4M-edge khive graph: ingestion path and traversal at scale."
+            [api-reference]="15|API Reference|Full verb catalog for all 9 production packs: params, DSL examples, response envelope."
           )
 
           cat > "$SRC/index.md" <<'EOF'
