@@ -128,12 +128,14 @@ pub enum FusionStrategy {
 }
 ```
 
-Positional fusion sources and weights use one canonical order everywhere:
+The two-arm vector/text hybrid APIs use one positional order:
 `[vector, keyword]`. Both positions remain present when an arm is empty; deleting
 an empty arm would rebind the surviving source to the wrong positional weight.
 RRF, weighted, and union transforms still run when only one arm has results, so
 post-fusion score floors operate in the same score domain for one-arm and
-two-arm queries.
+two-arm queries. This order is not a global rule for the generic fusion
+primitive: N-engine fusion preserves engine-registry order (ADR-031), while
+dual-index migration uses `[primary, legacy]`.
 
 `Custom` is the openness mechanism. khive's memory pack registers a `decay_weighted`
 strategy that weights candidates by salience and time decay. A brain pack may register
@@ -263,7 +265,7 @@ IS NOT NULL) and superseded notes must not appear in retrieval results. The aliv
 is a single batch query against `EntityStore` or `NoteStore` after fusion:
 
 ```rust
-// After fusion ranks the over-fetched pool, before final top-k truncation.
+// Fuse up to the sum of all fetched arm lengths, then alive-check before top-k.
 let alive_set = entities.query_entities(
     token.namespace(),
     EntityFilter { ids: candidate_ids, ..Default::default() },
@@ -383,8 +385,10 @@ small RRF score range. `hybrid_search_with_strategy` uses the caller's strategy
 `khive-retrieval::HybridConfig` defaults to a 5× pool, while its higher-level
 balanced `SearchConfig`/query-IR preset uses 3×. These pool sizes are
 API-specific latency/quality policies rather than `FusionStrategy` semantics;
-all paths must retain their selected pool through post-fusion alive/filter
-checks before applying the final requested limit.
+all paths must retain the complete fetched pool through post-fusion alive/filter
+checks before applying the final requested limit. When two arms each fetch a
+pool, the fusion cap must admit their combined lengths rather than reusing one
+arm's pool size.
 
 **What v1 deliberately defers:**
 

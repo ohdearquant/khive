@@ -65,18 +65,20 @@ pub trait Reranker<Id: Send + Sync + 'static>: Send + Sync {
 ///
 /// This can be used by implementors of [`HybridSearcher`] to fuse results
 /// from their [`VectorSearch`] and [`KeywordSearch`] implementations.
-/// Sources use the canonical positional order `[vector, keyword]`. Keep empty
-/// arms in that order so positional weighted strategies cannot rebind a
-/// keyword-only result set to the vector weight (or vice versa).
+/// Two-arm vector/text callers use the positional order `[vector, keyword]`.
+/// Keep empty arms in that order so positional weighted strategies cannot
+/// rebind a keyword-only result set to the vector weight (or vice versa).
+/// Generic RRF and Union callers may supply N sources in a caller-defined,
+/// documented order.
 ///
 /// `Ord` is required for deterministic tie-breaking when scores are equal.
 ///
 /// # Weighted strategy validation
 ///
 /// When `config.fusion_strategy` is `Weighted`, this function validates that
-/// exactly 2 canonical source slots are provided in all builds. A missing arm
-/// is represented by an empty slot; any other source count falls back to RRF
-/// to prevent silent positional rebinding. Use
+/// exactly 2 vector/text source slots are provided in all builds. A missing
+/// arm is represented by an empty slot; any other source count falls back to
+/// RRF to prevent silent positional rebinding. Use
 /// [`fuse_search_results_checked`] if you need an explicit error instead.
 pub fn fuse_search_results<Id: Eq + Hash + Clone + Ord>(
     sources: Vec<Vec<(Id, DeterministicScore)>>,
@@ -114,7 +116,7 @@ pub fn fuse_search_results<Id: Eq + Hash + Clone + Ord>(
 }
 
 /// Like [`fuse_search_results`] but returns `Err` when `Weighted` fusion is
-/// configured without exactly two canonical source slots.
+/// configured without exactly two vector/text source slots.
 ///
 /// Use this in code paths that should not silently fall back to RRF.
 pub fn fuse_search_results_checked<Id: Eq + Hash + Clone + Ord>(
