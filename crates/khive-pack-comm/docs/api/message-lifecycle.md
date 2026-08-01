@@ -191,10 +191,12 @@ or a non-root message). `comm.thread` resolves to that canonical root so that
 `thread(id=id_A)` and `thread(id=id_B)` both return the full conversation
 regardless of which copy UUID the caller holds.
 
-Legacy compact or braced stored roots are parsed and normalized for the
-response. The indexed read also queries the selected row's exact legacy
-spelling alongside the canonical v1 spelling, so looking up a pre-v1 child
-does not split its thread; existing rows are not rewritten.
+Legacy compact, braced, URN, and upper-hex stored roots are parsed and
+normalized for the response. The indexed read queries the deduplicated set of
+lower- and upper-hex formatter spellings accepted before v1, plus the selected
+row's exact spelling. A mixed legacy/v1 thread therefore stays whole whether
+lookup starts from its canonical root, a v1 child, or a pre-v1 child; existing
+rows are not rewritten.
 
 The root ID is validated: it must exist in the caller namespace and its
 `kind` must be `"message"`.
@@ -249,9 +251,10 @@ Issue #479a: a present, non-empty `thread_id` that is not a valid UUID must
 fail closed rather than being silently dropped and replaced with a fresh UUID,
 which would split the message into the wrong conversation. A blank/absent
 value is not an error — it just means "no caller-supplied thread_id". Valid
-compact, braced, and hyphenated UUID spellings are accepted and normalized to
-the full-hyphenated v1 representation before storage. Roots recovered from a
-correlated legacy message are normalized through the same UUID parse.
+compact, braced, URN, hyphenated, and upper-hex UUID spellings are accepted and
+normalized to the full-hyphenated v1 representation before storage. Roots
+recovered from a correlated legacy message are normalized through the same
+UUID parse.
 
 An omitted `sent_at` defaults to the current time. A supplied value must parse
 as RFC 3339 or ingest fails before writing a note; valid values are normalized

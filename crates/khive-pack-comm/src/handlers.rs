@@ -45,9 +45,9 @@ fn validate_actor_label(verb: &str, label: &str, field: &str) -> Result<(), Runt
 
 /// Parse a caller- or transport-supplied thread root and return the one wire
 /// spelling accepted by message-properties v1. `Uuid` deliberately accepts
-/// compact and braced input forms; normalizing here keeps those convenient
-/// inputs from leaking into the stored contract or splitting SQL thread
-/// lookups, which compare the JSON string exactly.
+/// compact, braced, URN, and upper-hex input forms; normalizing here keeps
+/// those convenient inputs from leaking into the stored contract or splitting
+/// SQL thread lookups, which compare the JSON string exactly.
 fn canonicalize_thread_id(verb: &str, raw: &str) -> Result<String, RuntimeError> {
     raw.trim()
         .parse::<Uuid>()
@@ -57,6 +57,34 @@ fn canonicalize_thread_id(verb: &str, raw: &str) -> Result<String, RuntimeError>
                 "{verb}: `thread_id` must be a valid UUID, got: {raw:?}"
             ))
         })
+}
+
+/// Return the exact, indexable spellings a pre-v1 handler could have stored
+/// for one UUID root. Before v1, valid caller input was persisted verbatim
+/// after `Uuid` parsing, so compact, braced, URN, and upper-hex formatter
+/// outputs may coexist with the canonical lower-case hyphenated value.
+///
+/// `selected_raw` retains an arbitrary mixed-case spelling from the row the
+/// caller selected. The common lower/upper formatter outputs cover rows other
+/// than that selected row without falling back to a namespace-wide scan.
+fn thread_id_query_spellings(root: Uuid, selected_raw: Option<&str>) -> Vec<String> {
+    let mut spellings = vec![
+        root.as_hyphenated().to_string(),
+        root.simple().to_string(),
+        root.braced().to_string(),
+        root.urn().to_string(),
+        format!("{:X}", root.as_hyphenated()),
+        format!("{:X}", root.simple()),
+        format!("{:X}", root.braced()),
+        format!("{:X}", root.urn()),
+    ];
+    if let Some(raw) = selected_raw.map(str::trim).filter(|raw| !raw.is_empty()) {
+        spellings.push(raw.to_string());
+    }
+
+    let mut seen = HashSet::new();
+    spellings.retain(|spelling| seen.insert(spelling.clone()));
+    spellings
 }
 
 /// Validate an adapter timestamp before it can be certified as a v1 `sent_at`
@@ -739,7 +767,7 @@ pub(crate) async fn handle_thread(
     // Resolve and validate the passed ID.
     let passed_uuid = resolve_id(runtime, token, &p.id, "thread").await?;
 
-    let (canonical_thread_id, alternate_thread_id, root_note): (String, Option<String>, Note) = {
+    let (canonical_thread_id, selected_raw_thread_id, root_note): (String, Option<String>, Note) = {
         let store = runtime.notes(token)?;
         let note = store
             .get_note(passed_uuid)
@@ -777,59 +805,64 @@ pub(crate) async fn handle_thread(
             }
             _ => passed_uuid.as_hyphenated().to_string(),
         };
-        // A pre-v1 row may carry a compact or braced root. Query that exact
-        // legacy spelling in addition to the canonical v1 spelling so reading
-        // via a legacy child does not split the conversation; no row is mutated.
-        let alternate = stored_root
-            .map(|(_, raw)| raw.trim())
-            .filter(|raw| *raw != canonical.as_str())
-            .map(str::to_string);
-        (canonical, alternate, note)
+        // Keep the selected row's exact pre-v1 spelling as an additional
+        // compatibility probe. The full formatter-derived set is built below
+        // once the canonical root UUID is known; no row is mutated.
+        let selected_raw = stored_root.map(|(_, raw)| raw.trim().to_string());
+        (canonical, selected_raw, note)
     };
 
-    // Push thread_id predicates into SQL so idx_comm_message_thread can be used.
-    // New rows need one canonical query; a selected legacy row with an alternate
-    // spelling adds exactly one compatibility query.
+    // Push every exact pre-v1 UUID spelling into one indexed IN predicate. This
+    // keeps a mixed legacy/v1 conversation whole regardless of whether lookup
+    // starts from its canonical root, a new v1 child, or a legacy child.
     let thread_store = runtime.notes(token)?;
     const PAGE_SIZE: u32 = 200;
     let mut rows: Vec<ThreadRow> = Vec::new();
-    let thread_ids = std::iter::once(canonical_thread_id.clone()).chain(alternate_thread_id);
-    for query_thread_id in thread_ids {
-        let thread_filter = NoteFilter {
-            kind: Some("message".to_string()),
-            property_filters: vec![PropertyFilter {
-                json_path: "$.thread_id".to_string(),
-                op: FilterOp::Eq,
-                value: SqlValue::Text(query_thread_id),
-            }],
-            order_by: None,
-            ..Default::default()
-        };
-        let mut db_offset: u32 = 0;
-        loop {
-            let page = thread_store
-                .query_notes_filtered(
-                    token.namespace().as_str(),
-                    &thread_filter,
-                    PageRequest {
-                        limit: PAGE_SIZE,
-                        offset: db_offset.into(),
-                    },
-                )
-                .await?;
-            let fetched = page.items.len() as u32;
-            for n in &page.items {
+    let canonical_root = canonical_thread_id
+        .parse::<Uuid>()
+        .expect("canonical_thread_id is produced from a parsed UUID");
+    let thread_id_values =
+        thread_id_query_spellings(canonical_root, selected_raw_thread_id.as_deref())
+            .into_iter()
+            .map(SqlValue::Text)
+            .collect();
+    let thread_filter = NoteFilter {
+        kind: Some("message".to_string()),
+        property_filters: vec![PropertyFilter {
+            json_path: "$.thread_id".to_string(),
+            op: FilterOp::In(thread_id_values),
+            value: SqlValue::Null,
+        }],
+        order_by: None,
+        ..Default::default()
+    };
+    let mut db_offset: u32 = 0;
+    let mut seen_row_ids = HashSet::new();
+    loop {
+        let page = thread_store
+            .query_notes_filtered(
+                token.namespace().as_str(),
+                &thread_filter,
+                PageRequest {
+                    limit: PAGE_SIZE,
+                    offset: db_offset.into(),
+                },
+            )
+            .await?;
+        let fetched = page.items.len() as u32;
+        for n in &page.items {
+            if seen_row_ids.insert(n.id) {
                 rows.push(ThreadRow {
                     created_at: n.created_at,
                     full_id: n.id,
                     json: note_to_message_json(n),
                 });
             }
-            if fetched < PAGE_SIZE {
-                break;
-            }
-            db_offset += PAGE_SIZE;
         }
+        if fetched < PAGE_SIZE {
+            break;
+        }
+        db_offset += PAGE_SIZE;
     }
 
     // Explicitly include the already-validated root when the SQL filter missed it

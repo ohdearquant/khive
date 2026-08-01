@@ -5950,6 +5950,121 @@ async fn ingest_correlation_canonicalizes_legacy_compact_root_for_thread_lookup(
     }
 }
 
+/// A mixed thread can contain children written before v1 preserved UUID input
+/// verbatim and children written after v1 with a canonical root. Starting from
+/// either the canonical root or a new v1 child must recover every legacy
+/// formatter spelling, not only the spelling carried by the selected row.
+#[tokio::test]
+async fn thread_from_canonical_rows_includes_all_legacy_uuid_spellings_once() {
+    use khive_storage::note::Note;
+
+    let (registry, rt) = build_registry_for_ns("local");
+    let root_id =
+        uuid::Uuid::parse_str("abcdef12-3456-4abc-8def-1234567890ab").expect("fixed root UUID");
+    let canonical_thread_id = root_id.as_hyphenated().to_string();
+
+    let token = rt
+        .authorize(khive_runtime::Namespace::local())
+        .expect("authorize local");
+    let store = rt.notes(&token).expect("notes store");
+    let root_note =
+        Note::new("local", "message", "canonical v1 root").with_properties(serde_json::json!({
+            "comm_schema_version": 1,
+            "direction": "outbound",
+            "read": false,
+            "from": "local",
+            "to": "local",
+            "from_actor": "local",
+            "to_actor": "local",
+            "thread_id": canonical_thread_id.clone(),
+            "sent_at": "2026-07-31T11:59:59Z",
+        }));
+    let root_note = Note {
+        id: root_id,
+        ..root_note
+    };
+    store
+        .upsert_note(root_note)
+        .await
+        .expect("seed canonical v1 root");
+
+    let v1_child = registry
+        .dispatch(
+            "comm.send",
+            serde_json::json!({
+                "to": "local",
+                "content": "canonical v1 child",
+                "thread_id": canonical_thread_id.clone(),
+            }),
+        )
+        .await
+        .expect("v1 child send succeeds");
+    let v1_child_id = v1_child["full_id"]
+        .as_str()
+        .expect("child full_id")
+        .to_string();
+
+    let legacy_rows = [
+        ("legacy compact child", root_id.simple().to_string()),
+        ("legacy braced child", root_id.braced().to_string()),
+        (
+            "legacy upper-hyphenated child",
+            format!("{:X}", root_id.as_hyphenated()),
+        ),
+        ("legacy upper-URN child", format!("{:X}", root_id.urn())),
+    ];
+    for (content, stored_thread_id) in &legacy_rows {
+        assert_eq!(
+            stored_thread_id.parse::<uuid::Uuid>().ok(),
+            Some(root_id),
+            "fixture spelling must have been accepted by the pre-v1 UUID parser"
+        );
+        let note = Note::new("local", "message", *content).with_properties(serde_json::json!({
+            "direction": "outbound",
+            "read": false,
+            "from": "local",
+            "to": "local",
+            "from_actor": "local",
+            "to_actor": "local",
+            "thread_id": stored_thread_id,
+            "sent_at": "2026-07-31T12:00:00Z",
+        }));
+        store
+            .upsert_note(note)
+            .await
+            .unwrap_or_else(|error| panic!("seed {content:?}: {error}"));
+    }
+
+    for lookup_id in [canonical_thread_id.as_str(), v1_child_id.as_str()] {
+        let thread = registry
+            .dispatch(
+                "comm.thread",
+                serde_json::json!({ "id": lookup_id, "limit": 100 }),
+            )
+            .await
+            .unwrap_or_else(|error| panic!("thread lookup from {lookup_id}: {error}"));
+        assert_eq!(
+            thread["thread_id"].as_str(),
+            Some(canonical_thread_id.as_str())
+        );
+        let messages = thread["messages"].as_array().expect("messages array");
+        for expected_content in std::iter::once("canonical v1 root")
+            .chain(std::iter::once("canonical v1 child"))
+            .chain(legacy_rows.iter().map(|(content, _)| *content))
+        {
+            assert_eq!(
+                messages
+                    .iter()
+                    .filter(|message| message["content"].as_str() == Some(expected_content))
+                    .count(),
+                1,
+                "thread lookup from {lookup_id} must return {expected_content:?} exactly once; \
+                 got {thread}"
+            );
+        }
+    }
+}
+
 /// `comm.thread` must include a root message that has no `thread_id` property
 /// at all (issue #479b) -- the SQL query only matches `properties.thread_id ==
 /// root`, which a thread-id-less root can never satisfy on its own.
