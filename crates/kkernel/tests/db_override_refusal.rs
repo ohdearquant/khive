@@ -23,6 +23,7 @@ fn assert_exec_refusal(
     config: &std::path::Path,
     override_path: &std::path::Path,
 ) {
+    let selected_config = std::fs::canonicalize(config).expect("canonical selected config path");
     assert!(
         !output.status.success(),
         "refused invocation must exit nonzero"
@@ -37,7 +38,7 @@ fn assert_exec_refusal(
     );
     assert_eq!(
         envelope["error"]["config_path"],
-        config.display().to_string()
+        selected_config.display().to_string()
     );
     assert_eq!(
         envelope["error"]["db_override"],
@@ -54,7 +55,10 @@ fn assert_exec_refusal(
     );
 
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains(&config.display().to_string()), "{stderr}");
+    assert!(
+        stderr.contains(&selected_config.display().to_string()),
+        "{stderr}"
+    );
     assert!(stderr.contains("--config <path>"), "{stderr}");
     assert!(stderr.contains("KHIVE_CONFIG=<path>"), "{stderr}");
     assert!(stderr.contains("ephemeral"), "{stderr}");
@@ -107,6 +111,7 @@ fn mcp_db_override_refusal_names_selected_config_without_protocol_output() {
     let dir = tempfile::tempdir().expect("tempdir");
     let home = tempfile::tempdir().expect("isolated home");
     let config = write_multi_backend_config(&dir);
+    let selected_config = std::fs::canonicalize(&config).expect("canonical selected config path");
     let override_path = dir.path().join("must-not-open.db");
 
     let output = Command::new(env!("CARGO_BIN_EXE_kkernel"))
@@ -134,7 +139,10 @@ fn mcp_db_override_refusal_names_selected_config_without_protocol_output() {
         "MCP startup errors must not write non-protocol JSON to stdout"
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains(&config.display().to_string()), "{stderr}");
+    assert!(
+        stderr.contains(&selected_config.display().to_string()),
+        "{stderr}"
+    );
     assert!(stderr.contains("--config <path>"), "{stderr}");
     assert!(stderr.contains("KHIVE_CONFIG=<path>"), "{stderr}");
     assert!(

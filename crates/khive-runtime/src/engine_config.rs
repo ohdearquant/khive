@@ -523,6 +523,7 @@ impl KhiveConfig {
     ///   `project_root` (see `project_config_anchor_dir`); falls back to
     ///   `<project_root>/.khive/config.toml` when `db_path` is `None`
     /// - Tier 4: `<home_root>/.khive/config.toml` (skipped when `None`)
+    #[cfg(test)]
     pub(crate) fn load_with_roots(
         project_root: &Path,
         home_root: Option<&Path>,
