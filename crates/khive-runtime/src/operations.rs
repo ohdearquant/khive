@@ -1075,11 +1075,11 @@ fn recompute_total_weight(path: &mut GraphPath) {
 /// await, so detached completion cannot change the operation's usage count.
 /// Each task owns cloned runtime/provider state and only computes an embedding;
 /// storage writes remain in the parent after this drain succeeds.
-async fn drain_embed_join_set(
-    mut join_set: tokio::task::JoinSet<(usize, RuntimeResult<Vec<f32>>)>,
+async fn drain_embed_join_set<T: Send + 'static>(
+    mut join_set: tokio::task::JoinSet<(usize, RuntimeResult<T>)>,
     model_count: usize,
-) -> RuntimeResult<Vec<Vec<f32>>> {
-    let mut vectors: Vec<Option<Vec<f32>>> = (0..model_count).map(|_| None).collect();
+) -> RuntimeResult<Vec<T>> {
+    let mut vectors: Vec<Option<T>> = (0..model_count).map(|_| None).collect();
 
     while let Some(joined) = join_set.join_next().await {
         match joined {
@@ -1197,6 +1197,31 @@ impl KhiveRuntime {
         properties: Option<serde_json::Value>,
         tags: Vec<String>,
     ) -> RuntimeResult<Entity> {
+        Ok(self
+            .create_entity_with_embedding_report(
+                token,
+                kind,
+                entity_type,
+                name,
+                description,
+                properties,
+                tags,
+            )
+            .await?
+            .0)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_entity_with_embedding_report(
+        &self,
+        token: &NamespaceToken,
+        kind: &str,
+        entity_type: Option<&str>,
+        name: &str,
+        description: Option<&str>,
+        properties: Option<serde_json::Value>,
+        tags: Vec<String>,
+    ) -> RuntimeResult<(Entity, crate::retrieval::EmbeddingTruncationReport)> {
         self.validate_entity_kind(kind)?;
         // Secret gate: scan name, description, structured properties, and tags.
         crate::secret_gate::check(name)?;
@@ -1256,38 +1281,43 @@ impl KhiveRuntime {
             }
         };
 
+        let mut embedding_report = crate::retrieval::EmbeddingTruncationReport::default();
         if embed_model_names.len() == 1 {
             let model_name = &embed_model_names[0];
             let vec_result = self
-                .embed_document_with_model_for_token(token, model_name, &embed_body)
+                .embed_document_with_model_outcome_for_token(token, model_name, &embed_body)
                 .await;
 
             #[cfg(any(test, feature = "fault-injection"))]
             let vec_inject = consume_fault(&VECTOR_FAIL_NS, ns);
             #[cfg(not(any(test, feature = "fault-injection")))]
             let vec_inject = false;
-            let vec_result: RuntimeResult<Vec<f32>> = if vec_inject {
-                Err(RuntimeError::Internal(
-                    "injected vector failure".to_string(),
-                ))
-            } else {
-                vec_result
-            };
+            let vec_result: RuntimeResult<crate::retrieval::DocumentEmbeddingOutcome> =
+                if vec_inject {
+                    Err(RuntimeError::Internal(
+                        "injected vector failure".to_string(),
+                    ))
+                } else {
+                    vec_result
+                };
 
             let single_result: RuntimeResult<()> = match vec_result {
-                Ok(vector) => match self.vectors_for_model(token, model_name) {
-                    Ok(vs) => vs
-                        .insert(
-                            entity.id,
-                            SubstrateKind::Entity,
-                            ns,
-                            "entity.body",
-                            vec![vector],
-                        )
-                        .await
-                        .map_err(RuntimeError::from),
-                    Err(e) => Err(e),
-                },
+                Ok(outcome) => {
+                    embedding_report.observe(&outcome);
+                    match self.vectors_for_model(token, model_name) {
+                        Ok(vs) => vs
+                            .insert(
+                                entity.id,
+                                SubstrateKind::Entity,
+                                ns,
+                                "entity.body",
+                                vec![outcome.vector],
+                            )
+                            .await
+                            .map_err(RuntimeError::from),
+                        Err(e) => Err(e),
+                    }
+                }
                 Err(e) => Err(e),
             };
             if let Err(e) = single_result {
@@ -1315,7 +1345,7 @@ impl KhiveRuntime {
                 let ctx = usage_ctx.clone();
                 let token = (*token).clone();
                 join_set.spawn(async move {
-                    let fut = rt.embed_document_with_model_for_token(&token, &name, &text);
+                    let fut = rt.embed_document_with_model_outcome_for_token(&token, &name, &text);
                     let result = match ctx {
                         Some(ctx) => crate::usage::scope(ctx, fut).await,
                         None => fut.await,
@@ -1326,8 +1356,8 @@ impl KhiveRuntime {
             // The first failed or panicked handle aborts and detaches its
             // siblings. Embed usage is counted at dispatch, so a synchronous
             // provider winding down in the background cannot change it.
-            let vectors = match drain_embed_join_set(join_set, embed_model_names.len()).await {
-                Ok(vectors) => vectors,
+            let outcomes = match drain_embed_join_set(join_set, embed_model_names.len()).await {
+                Ok(outcomes) => outcomes,
                 Err(e) => {
                     let cleanup_errors = self
                         .compensate_entity_create(token, entity.id, ns, &[])
@@ -1337,7 +1367,8 @@ impl KhiveRuntime {
             };
             // TODO(P2): parallelize vector inserts
             let mut inserted_models: Vec<String> = Vec::with_capacity(embed_model_names.len());
-            for (model_name, vector) in embed_model_names.iter().zip(vectors) {
+            for (model_name, outcome) in embed_model_names.iter().zip(outcomes) {
+                embedding_report.observe(&outcome);
                 // Count-targetable fault injection for multi-model insert path.
                 #[cfg(any(test, feature = "fault-injection"))]
                 let count_inject = VECTOR_FAIL_AFTER.with(|cell| match cell.get() {
@@ -1366,7 +1397,7 @@ impl KhiveRuntime {
                                 SubstrateKind::Entity,
                                 ns,
                                 "entity.body",
-                                vec![vector],
+                                vec![outcome.vector],
                             )
                             .await
                             .map_err(RuntimeError::from),
@@ -1387,7 +1418,7 @@ impl KhiveRuntime {
             }
         }
 
-        Ok(entity)
+        Ok((entity, embedding_report))
     }
 
     /// Retrieve an entity by ID.
@@ -2802,10 +2833,12 @@ impl KhiveRuntime {
         properties: Option<serde_json::Value>,
         annotates: Vec<Uuid>,
     ) -> RuntimeResult<Note> {
-        self.create_note_inner(
-            token, kind, name, content, None, salience, None, properties, annotates, None,
-        )
-        .await
+        Ok(self
+            .create_note_inner(
+                token, kind, name, content, None, salience, None, properties, annotates, None,
+            )
+            .await?
+            .0)
     }
 
     /// Like [`Self::create_note`], but lets the caller supply a smaller text
@@ -2830,6 +2863,35 @@ impl KhiveRuntime {
         properties: Option<serde_json::Value>,
         annotates: Vec<Uuid>,
     ) -> RuntimeResult<Note> {
+        Ok(self
+            .create_note_inner(
+                token,
+                kind,
+                name,
+                content,
+                embedding_content,
+                salience,
+                None,
+                properties,
+                annotates,
+                None,
+            )
+            .await?
+            .0)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_note_with_embedding_content_and_report(
+        &self,
+        token: &NamespaceToken,
+        kind: &str,
+        name: Option<&str>,
+        content: &str,
+        embedding_content: Option<&str>,
+        salience: Option<f64>,
+        properties: Option<serde_json::Value>,
+        annotates: Vec<Uuid>,
+    ) -> RuntimeResult<(Note, crate::retrieval::EmbeddingTruncationReport)> {
         self.create_note_inner(
             token,
             kind,
@@ -2891,19 +2953,21 @@ impl KhiveRuntime {
         annotates: Vec<Uuid>,
         embedding_model: Option<&str>,
     ) -> RuntimeResult<Note> {
-        self.create_note_inner(
-            token,
-            kind,
-            name,
-            content,
-            None,
-            salience,
-            Some(decay_factor),
-            properties,
-            annotates,
-            embedding_model,
-        )
-        .await
+        Ok(self
+            .create_note_inner(
+                token,
+                kind,
+                name,
+                content,
+                None,
+                salience,
+                Some(decay_factor),
+                properties,
+                annotates,
+                embedding_model,
+            )
+            .await?
+            .0)
     }
 
     /// Insert a note using `INSERT OR IGNORE` semantics for atomic deduplication.
@@ -2964,10 +3028,23 @@ impl KhiveRuntime {
         let embed_model_names = self.registered_embedding_model_names();
         for model_name in &embed_model_names {
             match self
-                .embed_document_with_model_for_token(token, model_name, &note_embedding_text(&note))
+                .embed_document_with_model_outcome_for_token(
+                    token,
+                    model_name,
+                    &note_embedding_text(&note),
+                )
                 .await
             {
-                Ok(vector) => {
+                Ok(outcome) => {
+                    if outcome.truncated {
+                        tracing::warn!(
+                            note_id = %note.id,
+                            model = %outcome.model_name,
+                            source_bytes = outcome.source_bytes,
+                            embedded_bytes = outcome.embedded_bytes,
+                            "try_create_note: embedding input truncated; full content stored unchanged"
+                        );
+                    }
                     if let Ok(vs) = self.vectors_for_model(token, model_name) {
                         if let Err(e) = vs
                             .insert(
@@ -2975,7 +3052,7 @@ impl KhiveRuntime {
                                 SubstrateKind::Note,
                                 ns,
                                 "note.content",
-                                vec![vector],
+                                vec![outcome.vector],
                             )
                             .await
                         {
@@ -3018,7 +3095,7 @@ impl KhiveRuntime {
         properties: Option<serde_json::Value>,
         annotates: Vec<Uuid>,
         embedding_model: Option<&str>,
-    ) -> RuntimeResult<Note> {
+    ) -> RuntimeResult<(Note, crate::retrieval::EmbeddingTruncationReport)> {
         self.validate_note_kind(kind)?;
         // Secret gate: scan content, optional name, and structured properties.
         crate::secret_gate::check(content)?;
@@ -3163,11 +3240,12 @@ impl KhiveRuntime {
         let canonical_embed_text = note_embedding_text(&note);
         let embed_text: &str = embedding_content.unwrap_or(&canonical_embed_text);
 
+        let mut embedding_report = crate::retrieval::EmbeddingTruncationReport::default();
         if embed_model_names.len() == 1 {
             // Single-model path: preserves original sequential behaviour.
             let model_name = &embed_model_names[0];
             let vec_result = self
-                .embed_document_with_model_for_token(token, model_name, embed_text)
+                .embed_document_with_model_outcome_for_token(token, model_name, embed_text)
                 .await;
 
             // Injection: check VECTOR_FAIL_NS (armed by `arm_vector_fail_scoped(ns)`) or
@@ -3197,28 +3275,32 @@ impl KhiveRuntime {
             };
             #[cfg(not(any(test, feature = "fault-injection")))]
             let vec_inject = false;
-            let vec_result: RuntimeResult<Vec<f32>> = if vec_inject {
-                Err(RuntimeError::Internal(
-                    "injected vector failure".to_string(),
-                ))
-            } else {
-                vec_result
-            };
+            let vec_result: RuntimeResult<crate::retrieval::DocumentEmbeddingOutcome> =
+                if vec_inject {
+                    Err(RuntimeError::Internal(
+                        "injected vector failure".to_string(),
+                    ))
+                } else {
+                    vec_result
+                };
 
             let single_model_result: RuntimeResult<()> = match vec_result {
-                Ok(vector) => match self.vectors_for_model(token, model_name) {
-                    Ok(vs) => vs
-                        .insert(
-                            note.id,
-                            SubstrateKind::Note,
-                            ns,
-                            "note.content",
-                            vec![vector],
-                        )
-                        .await
-                        .map_err(RuntimeError::from),
-                    Err(e) => Err(e),
-                },
+                Ok(outcome) => {
+                    embedding_report.observe(&outcome);
+                    match self.vectors_for_model(token, model_name) {
+                        Ok(vs) => vs
+                            .insert(
+                                note.id,
+                                SubstrateKind::Note,
+                                ns,
+                                "note.content",
+                                vec![outcome.vector],
+                            )
+                            .await
+                            .map_err(RuntimeError::from),
+                        Err(e) => Err(e),
+                    }
+                }
                 Err(e) => Err(e),
             };
             if let Err(e) = single_model_result {
@@ -3245,7 +3327,7 @@ impl KhiveRuntime {
                 let ctx = usage_ctx.clone();
                 let token = (*token).clone();
                 join_set.spawn(async move {
-                    let fut = rt.embed_document_with_model_for_token(&token, &name, &text);
+                    let fut = rt.embed_document_with_model_outcome_for_token(&token, &name, &text);
                     let result = match ctx {
                         Some(ctx) => crate::usage::scope(ctx, fut).await,
                         None => fut.await,
@@ -3256,8 +3338,8 @@ impl KhiveRuntime {
             // The first failed or panicked handle aborts and detaches its
             // siblings. Embed usage is counted at dispatch, so a synchronous
             // provider winding down in the background cannot change it.
-            let vectors = match drain_embed_join_set(join_set, embed_model_names.len()).await {
-                Ok(vectors) => vectors,
+            let outcomes = match drain_embed_join_set(join_set, embed_model_names.len()).await {
+                Ok(outcomes) => outcomes,
                 Err(e) => {
                     // Compensate note row + FTS (no vectors inserted yet).
                     if let Ok(store) = self.notes(token) {
@@ -3271,7 +3353,8 @@ impl KhiveRuntime {
             };
             // TODO(P2): parallelize vector inserts
             let mut inserted_models: Vec<String> = Vec::with_capacity(embed_model_names.len());
-            for (model_name, vector) in embed_model_names.iter().zip(vectors) {
+            for (model_name, outcome) in embed_model_names.iter().zip(outcomes) {
+                embedding_report.observe(&outcome);
                 let insert_result = match self.vectors_for_model(token, model_name) {
                     Ok(vs) => vs
                         .insert(
@@ -3279,7 +3362,7 @@ impl KhiveRuntime {
                             SubstrateKind::Note,
                             ns,
                             "note.content",
-                            vec![vector],
+                            vec![outcome.vector],
                         )
                         .await
                         .map_err(RuntimeError::from),
@@ -3391,7 +3474,7 @@ impl KhiveRuntime {
             }
         }
 
-        Ok(note)
+        Ok((note, embedding_report))
     }
 
     /// List notes visible to the token, optionally filtered by kind.
@@ -5532,7 +5615,7 @@ mod tests {
     use crate::{ActorRef, Namespace};
     use async_trait::async_trait;
     use khive_storage::types::PathNode;
-    use lattice_embed::{EmbedError, EmbeddingModel, EmbeddingService};
+    use lattice_embed::{EmbedError, EmbeddingModel, EmbeddingService, MAX_TEXT_CHARS};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
 
@@ -14857,6 +14940,14 @@ mod tests {
             texts: &[String],
             _model: EmbeddingModel,
         ) -> std::result::Result<Vec<Vec<f32>>, EmbedError> {
+            for text in texts {
+                if text.len() > MAX_TEXT_CHARS {
+                    return Err(EmbedError::TextTooLong {
+                        length: text.len(),
+                        max: MAX_TEXT_CHARS,
+                    });
+                }
+            }
             self.captured.lock().unwrap().extend(texts.iter().cloned());
             Ok(texts.iter().map(|_| vec![1.0_f32; self.dims]).collect())
         }
@@ -14892,6 +14983,78 @@ mod tests {
                 captured: Arc::clone(&self.captured),
             }))
         }
+    }
+
+    #[tokio::test]
+    async fn create_bounds_embedding_input_without_truncating_stored_content() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+        rt.register_embedder(CapturingVecProvider {
+            provider_name: "strict-length-test".into(),
+            dims: 4,
+            captured: Arc::clone(&captured),
+        });
+
+        let content = format!("{}\u{1f980}tail", "a".repeat(MAX_TEXT_CHARS - 1));
+        let note = rt
+            .create_note(&tok, "observation", None, &content, None, None, vec![])
+            .await
+            .expect("over-length note create must succeed");
+        let fetched = rt
+            .notes(&tok)
+            .unwrap()
+            .get_note(note.id)
+            .await
+            .unwrap()
+            .expect("created note must be retrievable");
+        assert_eq!(fetched.content, content, "stored content must remain full");
+
+        let embedded = captured.lock().unwrap().clone();
+        assert_eq!(embedded.len(), 1);
+        assert_eq!(embedded[0].len(), MAX_TEXT_CHARS - 1);
+        assert!(embedded[0].is_char_boundary(embedded[0].len()));
+        assert!(!embedded[0].contains('\u{1f980}'));
+
+        let vector_info = rt
+            .vectors_for_model(&tok, "strict-length-test")
+            .expect("vector store")
+            .info()
+            .await
+            .expect("vector info");
+        assert_eq!(vector_info.dimensions, 4);
+        assert_eq!(vector_info.entry_count, 1);
+
+        captured.lock().unwrap().clear();
+        rt.reindex_note(&tok, &fetched)
+            .await
+            .expect("reindex must bound the same stored content");
+        assert_eq!(captured.lock().unwrap()[0].len(), MAX_TEXT_CHARS - 1);
+
+        captured.lock().unwrap().clear();
+        rt.embed_document_batch_with_model("strict-length-test", std::slice::from_ref(&content))
+            .await
+            .expect("batch reindex seam must bound stored content");
+        assert_eq!(captured.lock().unwrap()[0].len(), MAX_TEXT_CHARS - 1);
+
+        let normal = "normal byte-identical embedding input";
+        rt.create_note(&tok, "observation", None, normal, None, None, vec![])
+            .await
+            .expect("normal note create must succeed");
+        assert_eq!(captured.lock().unwrap().last().unwrap(), normal);
+
+        let long_description = format!("{}\u{1f980}tail", "b".repeat(MAX_TEXT_CHARS));
+        rt.create_entity(
+            &tok,
+            "concept",
+            None,
+            "entity",
+            Some(&long_description),
+            None,
+            vec![],
+        )
+        .await
+        .expect("over-length entity create must succeed");
     }
 
     #[tokio::test]
