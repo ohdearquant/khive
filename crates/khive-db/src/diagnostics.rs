@@ -4,7 +4,7 @@
 //! Answers "is a reader pinning the checkpoint / why is the WAL at 64MiB"
 //! without raw SQL against a production store.
 //!
-//! NOT read-only. [`checkpoint_probe`] issues a real
+//! NOT read-only. [`checkpoint_probe`](crate::diagnostics::checkpoint_probe) issues a real
 //! `PRAGMA wal_checkpoint(PASSIVE)`, and a PASSIVE checkpoint that succeeds
 //! BACKFILLS WAL frames into the main database — ordinary database-page
 //! writes, on the happy path. That I/O is the point: the busy/log_frames/
@@ -22,7 +22,8 @@
 //!
 //! Deliberate narrowings make those claims true rather than aspirational:
 //!
-//! 1. [`checkpoint_probe`] runs a single `PRAGMA wal_checkpoint(PASSIVE)` —
+//! 1. [`checkpoint_probe`](crate::diagnostics::checkpoint_probe) runs a
+//!    single `PRAGMA wal_checkpoint(PASSIVE)` —
 //!    which never blocks readers or writers — and does NOT route through
 //!    [`crate::checkpoint::checkpoint_once`]: that path mutates
 //!    `TruncateState`, may escalate to TRUNCATE, and double-counts the
@@ -46,8 +47,9 @@
 //!
 //! The counters are process-global statics inside this crate, so a report is
 //! only meaningful when built inside the process that owns the checkpoint
-//! task (the daemon). Every payload therefore carries [`BuildIdentity`], so a
-//! reading is self-labeling about which build's counters it describes.
+//! task (the daemon). Every payload therefore carries
+//! [`BuildIdentity`](crate::diagnostics::BuildIdentity), so a reading is
+//! self-labeling about which build's counters it describes.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
