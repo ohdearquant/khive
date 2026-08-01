@@ -3985,6 +3985,285 @@ async fn ensure_loaded_concurrent_same_namespace_is_safe() {
     );
 }
 
+#[tokio::test]
+async fn warm_pack_refreshes_profiles_and_bindings_written_by_peer() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let config = khive_runtime::RuntimeConfig {
+        db_path: Some(dir.path().join("cross-process-visibility.db")),
+        ..khive_runtime::RuntimeConfig::no_embeddings()
+    };
+    let writer_rt = KhiveRuntime::new(config.clone()).expect("writer runtime");
+    let reader_rt = KhiveRuntime::new(config).expect("reader runtime");
+    let writer = BrainPack::new(writer_rt.clone());
+    let reader = BrainPack::new(reader_rt.clone());
+    let registry = empty_registry();
+    let writer_token = writer_rt
+        .authorize(Namespace::local())
+        .expect("writer token");
+    let reader_token = reader_rt
+        .authorize(Namespace::local())
+        .expect("reader token");
+
+    let initial = reader
+        .dispatch("brain.profiles", json!({}), &registry, &reader_token)
+        .await
+        .expect("warm reader profile registry");
+    assert_eq!(initial["count"], json!(1u64));
+
+    writer
+        .dispatch(
+            "brain.create_profile",
+            json!({
+                "name": "peer-visible-profile",
+                "consumer_kind": "recall",
+            }),
+            &registry,
+            &writer_token,
+        )
+        .await
+        .expect("peer creates profile");
+
+    let refreshed = reader
+        .dispatch("brain.profiles", json!({}), &registry, &reader_token)
+        .await
+        .expect("warm reader refreshes profile registry");
+    assert!(
+        refreshed["profiles"]
+            .as_array()
+            .expect("profiles array")
+            .iter()
+            .any(|profile| profile["id"] == json!("peer-visible-profile")),
+        "a warm pack must observe a profile committed by another pack"
+    );
+
+    let target = create_test_entity(&writer_rt, &writer_token).await;
+    let feedback = reader
+        .dispatch(
+            "brain.feedback",
+            json!({
+                "target_id": target,
+                "signal": "useful",
+                "served_by_profile_id": "peer-visible-profile",
+            }),
+            &registry,
+            &reader_token,
+        )
+        .await
+        .expect("warm peer accepts feedback for newly visible profile");
+    assert_eq!(feedback["emitted"], json!(true));
+
+    let profile = writer
+        .dispatch(
+            "brain.profile",
+            json!({"profile_id": "peer-visible-profile"}),
+            &registry,
+            &writer_token,
+        )
+        .await
+        .expect("original writer refreshes peer feedback");
+    assert_eq!(profile["total_events"], json!(1u64));
+
+    writer
+        .dispatch(
+            "brain.bind",
+            json!({
+                "profile_id": "peer-visible-profile",
+                "actor": "peer-actor",
+                "namespace": "local",
+                "consumer_kind": "recall",
+            }),
+            &registry,
+            &writer_token,
+        )
+        .await
+        .expect("peer creates binding");
+
+    let bindings = reader
+        .dispatch(
+            "brain.bindings",
+            json!({"profile_id": "peer-visible-profile"}),
+            &registry,
+            &reader_token,
+        )
+        .await
+        .expect("warm reader refreshes bindings");
+    assert_eq!(bindings["count"], json!(1u64));
+    assert_eq!(bindings["bindings"][0]["actor"], json!("peer-actor"));
+}
+
+#[tokio::test]
+async fn stale_pack_mutation_rebases_on_durable_snapshot() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let config = khive_runtime::RuntimeConfig {
+        db_path: Some(dir.path().join("stale-writer.db")),
+        ..khive_runtime::RuntimeConfig::no_embeddings()
+    };
+    let first_rt = KhiveRuntime::new(config.clone()).expect("first runtime");
+    let stale_rt = KhiveRuntime::new(config.clone()).expect("stale runtime");
+    let observer_rt = KhiveRuntime::new(config).expect("observer runtime");
+    let first = BrainPack::new(first_rt.clone());
+    let stale = BrainPack::new(stale_rt.clone());
+    let observer = BrainPack::new(observer_rt.clone());
+    let registry = empty_registry();
+    let first_token = first_rt.authorize(Namespace::local()).expect("first token");
+    let stale_token = stale_rt.authorize(Namespace::local()).expect("stale token");
+    let observer_token = observer_rt
+        .authorize(Namespace::local())
+        .expect("observer token");
+
+    first
+        .dispatch("brain.profiles", json!({}), &registry, &first_token)
+        .await
+        .expect("warm first pack");
+    stale
+        .dispatch("brain.profiles", json!({}), &registry, &stale_token)
+        .await
+        .expect("warm stale pack before either write");
+
+    first
+        .handle_create_profile(
+            &first_token,
+            json!({"name": "first-process-profile", "consumer_kind": "recall"}),
+        )
+        .await
+        .expect("first process writes profile");
+
+    // Call the handler directly so this pack deliberately skips dispatch's
+    // freshness check. The persistence transaction itself must still read the
+    // latest durable snapshot before applying its mutation.
+    stale
+        .handle_create_profile(
+            &stale_token,
+            json!({"name": "stale-process-profile", "consumer_kind": "recall"}),
+        )
+        .await
+        .expect("stale process rebases its mutation");
+
+    let profiles = observer
+        .dispatch("brain.profiles", json!({}), &registry, &observer_token)
+        .await
+        .expect("fresh observer loads merged registry");
+    let ids: std::collections::HashSet<&str> = profiles["profiles"]
+        .as_array()
+        .expect("profiles array")
+        .iter()
+        .filter_map(|profile| profile["id"].as_str())
+        .collect();
+    assert!(ids.contains("first-process-profile"));
+    assert!(ids.contains("stale-process-profile"));
+}
+
+#[tokio::test]
+async fn matching_generation_reuses_local_snapshot_without_decoding_durable_json() {
+    use khive_storage::types::{SqlStatement, SqlValue};
+
+    let (pack, rt) = make_pack();
+    let registry = empty_registry();
+    let token = rt.authorize(Namespace::local()).expect("local token");
+
+    pack.dispatch(
+        "brain.create_profile",
+        json!({"name": "generation-reuse-seed", "consumer_kind": "recall"}),
+        &registry,
+        &token,
+    )
+    .await
+    .expect("seed durable snapshot and local generation");
+
+    // Poison only the durable JSON while preserving updated_at. This is a
+    // decode sentinel, not a supported external mutation: the next dispatch's
+    // generation check still matches the live local snapshot, so the mutation
+    // transaction must not fetch or deserialize this blob.
+    {
+        let mut writer = rt.sql().writer().await.expect("writer");
+        let changed = writer
+            .execute(SqlStatement {
+                sql: "UPDATE brain_profile_snapshots SET snapshot_json = ?1 \
+                      WHERE profile_id = ?2 AND namespace = ?3"
+                    .into(),
+                params: vec![
+                    SqlValue::Text("{decode-sentinel".to_string()),
+                    SqlValue::Text("__brain__".to_string()),
+                    SqlValue::Text(token.namespace().as_str().to_string()),
+                ],
+                label: Some("brain_test_poison_matching_snapshot".into()),
+            })
+            .await
+            .expect("install decode sentinel without advancing generation");
+        assert_eq!(changed, 1, "decode sentinel must replace the snapshot row");
+    }
+
+    pack.dispatch(
+        "brain.create_profile",
+        json!({"name": "generation-reuse-next", "consumer_kind": "recall"}),
+        &registry,
+        &token,
+    )
+    .await
+    .expect("matching generation must reuse local snapshot");
+
+    let (snapshot, _) = crate::persist::load_latest_snapshot(
+        rt.sql().as_ref(),
+        token.namespace().as_str(),
+        ENTITY_CACHE_CAPACITY,
+    )
+    .await
+    .expect("load replacement snapshot")
+    .expect("replacement snapshot exists");
+    assert!(snapshot.profiles.contains_key("generation-reuse-seed"));
+    assert!(snapshot.profiles.contains_key("generation-reuse-next"));
+}
+
+#[tokio::test]
+async fn mutation_timestamp_advances_past_existing_snapshot() {
+    let rt = KhiveRuntime::memory().expect("in-memory runtime");
+    let token = rt.authorize(Namespace::local()).expect("local token");
+    let namespace = token.namespace().as_str();
+    let future_updated_at = chrono::Utc::now().timestamp_micros() + 1_000_000;
+    let snapshot = khive_brain_core::BrainState::new(ENTITY_CACHE_CAPACITY).to_snapshot();
+    crate::persist::upsert_snapshot(rt.sql().as_ref(), namespace, &snapshot, future_updated_at)
+        .await
+        .expect("seed future-dated snapshot");
+
+    let tracker = std::sync::Mutex::new(crate::persist::PersistenceTracker::new());
+    let state = std::sync::Mutex::new(khive_brain_core::BrainState::new(ENTITY_CACHE_CAPACITY));
+    let event = khive_storage::event::Event::new(
+        namespace,
+        "brain.test_monotonic_timestamp",
+        khive_types::EventKind::Audit,
+        khive_types::SubstrateKind::Event,
+        "brain",
+    )
+    .with_payload(json!({"probe": true}));
+    crate::persist::persist_brain_state_mutation(
+        rt.sql().as_ref(),
+        &token,
+        &tracker,
+        &state,
+        crate::persist::BrainMutationEvent {
+            profile_id: "balanced-recall-v1".to_string(),
+            event_kind: event.verb.clone(),
+            payload: serde_json::to_value(event).expect("test event serializes"),
+        },
+        ENTITY_CACHE_CAPACITY,
+        |_state| Ok::<(), RuntimeError>(()),
+    )
+    .await
+    .expect("persist mutation after future-dated snapshot");
+
+    let (_, updated_at) =
+        crate::persist::load_latest_snapshot(rt.sql().as_ref(), namespace, ENTITY_CACHE_CAPACITY)
+            .await
+            .expect("load snapshot")
+            .expect("snapshot exists");
+    assert!(updated_at > future_updated_at);
+
+    let replay = crate::persist::load_events_since(rt.sql().as_ref(), namespace, future_updated_at)
+        .await
+        .expect("load post-snapshot events");
+    assert_eq!(replay.events.len(), 1);
+}
+
 /// Cross-namespace concurrent loads must not cause one namespace to save the
 /// wrong state under saved_states.  We alternate between two namespaces while
 /// mutating each, then verify each namespace sees only its own state.

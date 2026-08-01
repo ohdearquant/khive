@@ -663,9 +663,24 @@ lattice/LoRA rerank call site ships.
 This remains the right separation for a future consumer: durable state would stay in
 one transactional backend, while the portable format serves sharing, training import,
 and audit. Durable handler-owned mutations use the private `brain_event_log` and JSON
-snapshot path above. The best-effort `DispatchHook` mutates in-memory state only; it
-performs no event append or snapshot write and has no durability, cursor, or
-replay-atomicity guarantee.
+snapshot path above. A handler mutation acquires the SQLite write transaction first,
+reads the latest namespace generation inside that transaction, applies its mutation, and
+then appends the private event plus the replacement snapshot atomically. A process-local
+registry may supply the base only when its recorded generation exactly matches the durable
+row read inside the transaction; a mismatch loads and validates the durable snapshot payload
+before rebasing on it. This makes
+concurrent writers serialize as read-current → mutate → write-current instead of allowing a
+stale full-state blob to win last. The event and replacement snapshot use the same
+transaction timestamp, monotonically raised above the prior snapshot timestamp when
+necessary, so lock wait order cannot move the event-replay boundary backward.
+
+The snapshot row's monotonically-raised `updated_at` is the durable namespace generation.
+Every brain dispatch compares it with the generation represented by its in-memory state. An
+advance invalidates the warm copy and reloads the durable snapshot, so profiles and bindings
+committed by another process become visible without restart. The best-effort `DispatchHook`
+mutates in-memory state only; it performs no event append or snapshot write and has no
+durability, cursor, or replay-atomicity guarantee. A durable generation advance may therefore
+replace hook-only local state by design.
 
 #### 6.1 Versioned `ModuleName` enum
 

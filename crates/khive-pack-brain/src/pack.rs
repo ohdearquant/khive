@@ -51,7 +51,7 @@ pub struct BrainPack {
     pub(crate) runtime: KhiveRuntime,
     /// Profile registry + active balanced-recall state.
     pub(crate) state: Mutex<BrainState>,
-    /// Tracks which namespaces are loaded from DB and dirty event counts.
+    /// Tracks loaded namespaces, durable snapshot generations, and dirty counts.
     pub(crate) persistence: Mutex<persist::PersistenceTracker>,
     /// Serialises the (ensure_loaded → handler) pair so no namespace swap can
     /// occur between the two steps.  Must be a tokio async mutex because the

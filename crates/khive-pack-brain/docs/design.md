@@ -13,6 +13,13 @@ durability guarantee. Automatic shared-log catch-up and replay remain deferred b
 live inside each profile's own state, opaque to brain core. This means the brain pack has no
 knowledge of the internal structure of profile state — it stores opaque snapshots.
 
+**Cross-process coherence**: the namespace snapshot's monotonically-raised `updated_at` is its
+durable generation. Warm packs reload when that value advances, and durable mutations read the
+latest generation inside their SQLite write transaction before applying a full-state replacement,
+loading the durable snapshot payload only when the process-local generation differs.
+Concurrent processes therefore observe committed profiles/bindings and cannot silently
+overwrite a newer registry with a stale process-local blob.
+
 **Balanced-recall-v1 profile**: The built-in default profile uses three Beta posteriors:
 
 - `relevance_weight` — prior $\text{Beta}(7, 3)$: warm-starts expecting 70% retrieval relevance
