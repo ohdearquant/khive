@@ -92,8 +92,9 @@ local:
 	  exit 1; \
 	fi; \
 	echo "==> Verifying installed binary loads the full pack set..."; \
-	VERBS=$$(KHIVE_PACKS="$(FULL_PACKS)" "$$DEST" exec 'verbs()' 2>/dev/null \
-	  | python3 -c 'import json,sys; print(len(json.load(sys.stdin)["results"][0]["result"]["verbs"]))' 2>/dev/null || echo 0); \
+	VERBS=$$(KHIVE_NO_DAEMON=1 KHIVE_PACKS="$(FULL_PACKS)" \
+	  perl -e 'alarm 120; exec @ARGV or die' -- "$$DEST" exec --output-format json 'verbs()' 2>/dev/null \
+	  | python3 -c 'import json,sys; r=json.load(sys.stdin); e=r["results"][0]; v=e["result"]["verbs"]; assert e["ok"] is True and isinstance(v, list); print(len(v))' 2>/dev/null || echo 0); \
 	if [ "$$VERBS" -lt 80 ]; then \
 	  echo "==> ERROR: installed binary registered $$VERBS verbs (expected >= 80) — full pack set did not load"; \
 	  exit 1; \
