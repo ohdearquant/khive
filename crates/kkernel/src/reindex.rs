@@ -5,7 +5,7 @@
 //! FTS index. It is NOT a pack verb — it operates on the raw runtime stores
 //! regardless of which packs are loaded.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
@@ -16,6 +16,7 @@ use serde::Serialize;
 use uuid::Uuid;
 
 use khive_mcp::serve::{resolve_runtime_config, RuntimeConfigInputs};
+use khive_runtime::retrieval::EmbeddingTruncationReport;
 use khive_runtime::{entity_fts_document, note_fts_document, KhiveRuntime, Namespace};
 use khive_storage::entity::Entity;
 use khive_storage::error::StorageError;
@@ -23,8 +24,6 @@ use khive_storage::note::Note;
 use khive_storage::types::VectorRecord;
 use khive_storage::VectorStore;
 use khive_types::SubstrateKind;
-
-const MAX_EMBED_BYTES: usize = 32_768;
 
 // ─── progress bar ─────────────────────────────────────────────────────────────
 
@@ -215,6 +214,8 @@ struct ReindexReport {
     /// section embedding fails.
     knowledge_sections_failed: u64,
     models_used: Vec<String>,
+    /// Actual per-model input bounding observed at the embedding seam.
+    truncation_by_model: BTreeMap<String, EmbeddingTruncationReport>,
     elapsed_ms: u64,
     /// Entity/note vector inserts that failed across all engines.
     errors_skipped: u64,
@@ -275,6 +276,7 @@ async fn embed_and_store_batch(
     kind: SubstrateKind,
     field: &str,
     drop_existing: bool,
+    truncation_by_model: &mut BTreeMap<String, EmbeddingTruncationReport>,
 ) -> u64 {
     let mut errors: u64 = 0;
 
@@ -309,25 +311,28 @@ async fn embed_and_store_batch(
             continue;
         }
 
-        let budget = embed_budget(model_name);
-        let texts: Vec<String> = subset
-            .iter()
-            .map(|(_, t)| truncate_text(t, budget))
-            .collect();
-        match rt.embed_document_batch_with_model(model_name, &texts).await {
-            Ok(embeddings) if embeddings.len() == subset.len() => {
+        let texts: Vec<String> = subset.iter().map(|(_, t)| t.clone()).collect();
+        match rt
+            .embed_document_batch_with_model_outcomes(model_name, &texts)
+            .await
+        {
+            Ok(outcomes) if outcomes.len() == subset.len() => {
+                let model_report = truncation_by_model.entry(model_name.clone()).or_default();
+                for outcome in &outcomes {
+                    model_report.observe(outcome);
+                }
                 let expected = subset.len() as u64;
                 let now = chrono::Utc::now();
                 let records = subset
                     .iter()
-                    .zip(embeddings)
-                    .map(|((id, _), embedding)| VectorRecord {
+                    .zip(outcomes)
+                    .map(|((id, _), outcome)| VectorRecord {
                         subject_id: *id,
                         kind,
                         namespace: namespace.to_string(),
                         field: field.to_string(),
                         embedding_model: Some(model_name.clone()),
-                        vectors: vec![embedding],
+                        vectors: vec![outcome.vector],
                         updated_at: now,
                     })
                     .collect();
@@ -520,6 +525,7 @@ pub async fn run_reindex(args: ReindexArgs) -> Result<()> {
     let mut errors_skipped: u64 = 0;
     let mut entities_fts_failed: u64 = 0;
     let mut notes_fts_failed: u64 = 0;
+    let mut truncation_by_model = BTreeMap::new();
 
     let mut epoch_bump_failed = false;
 
@@ -565,6 +571,7 @@ pub async fn run_reindex(args: ReindexArgs) -> Result<()> {
                     SubstrateKind::Entity,
                     "entity.body",
                     drop_existing,
+                    &mut truncation_by_model,
                 )
                 .await;
                 entities_processed += staged.len() as u64;
@@ -618,6 +625,7 @@ pub async fn run_reindex(args: ReindexArgs) -> Result<()> {
                     SubstrateKind::Note,
                     "note.content",
                     drop_existing,
+                    &mut truncation_by_model,
                 )
                 .await;
                 notes_processed += staged.len() as u64;
@@ -705,6 +713,18 @@ pub async fn run_reindex(args: ReindexArgs) -> Result<()> {
         .await
         {
             Ok(v) => {
+                if let Some(per_model) = v.get("truncation_by_model").and_then(|v| v.as_object()) {
+                    for (model, value) in per_model {
+                        if let Ok(report) =
+                            serde_json::from_value::<EmbeddingTruncationReport>(value.clone())
+                        {
+                            truncation_by_model
+                                .entry(model.clone())
+                                .or_default()
+                                .merge(report);
+                        }
+                    }
+                }
                 if do_atoms {
                     knowledge_atoms_indexed =
                         Some(v.get("atoms_indexed").and_then(|n| n.as_u64()).unwrap_or(0));
@@ -752,6 +772,7 @@ pub async fn run_reindex(args: ReindexArgs) -> Result<()> {
         knowledge_ann_failed,
         knowledge_sections_failed,
         models_used: model_names,
+        truncation_by_model,
         elapsed_ms,
         errors_skipped,
         entities_fts_failed,
@@ -1150,90 +1171,80 @@ async fn count_notes(rt: &KhiveRuntime, ns: &str) -> u64 {
     }
 }
 
-// The embed service prepends the model's document instruction (e.g. "passage: "
-// for multilingual-e5) AFTER this truncation, and its input guard rejects the
-// combined length. Reserve the prefix bytes here or a text truncated exactly to
-// the cap fails the whole batch post-prefix.
-fn embed_budget(model_name: &str) -> usize {
-    let normalized = model_name.trim().to_ascii_lowercase().replace('_', "-");
-    let prefix_len = normalized
-        .parse::<lattice_embed::EmbeddingModel>()
-        .ok()
-        .and_then(|m| m.document_instruction())
-        .map_or(0, str::len);
-    MAX_EMBED_BYTES - prefix_len
-}
-
-fn truncate_text(t: &str, max_bytes: usize) -> String {
-    if t.len() <= max_bytes {
-        t.to_string()
+fn render_human_report(report: &ReindexReport) -> String {
+    let atoms = report
+        .knowledge_atoms_indexed
+        .map(|n| format!(", {n} knowledge atoms"))
+        .unwrap_or_default();
+    let sections = report
+        .knowledge_sections_indexed
+        .map(|n| format!(", {n} sections"))
+        .unwrap_or_default();
+    let status = if report.has_failures() {
+        "Reindex completed WITH FAILURES"
     } else {
-        let mut end = max_bytes;
-        while !t.is_char_boundary(end) {
-            end -= 1;
-        }
-        t[..end].to_string()
+        "Reindex complete"
+    };
+    let fts_errors = report.entities_fts_failed + report.notes_fts_failed;
+    let mut output = format!(
+        "{status}: {} entities, {} notes{}{} ({} vector errors, {} FTS errors) in {}ms\n",
+        report.entities_processed,
+        report.notes_processed,
+        atoms,
+        sections,
+        report.errors_skipped,
+        fts_errors,
+        report.elapsed_ms
+    );
+    if report.entities_fts_failed > 0 {
+        output.push_str(&format!(
+            "FTS backfill: {} entity upserts FAILED\n",
+            report.entities_fts_failed
+        ));
     }
+    if report.notes_fts_failed > 0 {
+        output.push_str(&format!(
+            "FTS backfill: {} note upserts FAILED\n",
+            report.notes_fts_failed
+        ));
+    }
+    if report.knowledge_pass_errored {
+        output.push_str("Knowledge pass: FAILED (did not run to completion)\n");
+    } else if report.knowledge_atoms_failed > 0 {
+        output.push_str(&format!(
+            "Knowledge pass: {} atom vector inserts FAILED\n",
+            report.knowledge_atoms_failed
+        ));
+    }
+    if report.knowledge_sections_failed > 0 {
+        output.push_str(&format!(
+            "Knowledge sections: {} section embed/write failures\n",
+            report.knowledge_sections_failed
+        ));
+    }
+    if report.knowledge_ann_failed {
+        output.push_str("Knowledge ANN: FAILED (snapshot not rebuilt/persisted)\n");
+    }
+    if !report.models_used.is_empty() {
+        output.push_str(&format!("Models: {}\n", report.models_used.join(", ")));
+    }
+    for (model, truncation) in &report.truncation_by_model {
+        let input_label = if truncation.truncated == 1 {
+            "input"
+        } else {
+            "inputs"
+        };
+        output.push_str(&format!(
+            "Embedding truncation ({model}): {} {input_label} truncated, {} bytes discarded\n",
+            truncation.truncated, truncation.discarded_bytes
+        ));
+    }
+    output
 }
 
 fn print_report(report: &ReindexReport, human: bool) {
     if human {
-        let atoms = report
-            .knowledge_atoms_indexed
-            .map(|n| format!(", {n} knowledge atoms"))
-            .unwrap_or_default();
-        let sections = report
-            .knowledge_sections_indexed
-            .map(|n| format!(", {n} sections"))
-            .unwrap_or_default();
-        let status = if report.has_failures() {
-            "Reindex completed WITH FAILURES"
-        } else {
-            "Reindex complete"
-        };
-        let fts_errors = report.entities_fts_failed + report.notes_fts_failed;
-        println!(
-            "{status}: {} entities, {} notes{}{} ({} vector errors, {} FTS errors) in {}ms",
-            report.entities_processed,
-            report.notes_processed,
-            atoms,
-            sections,
-            report.errors_skipped,
-            fts_errors,
-            report.elapsed_ms
-        );
-        if report.entities_fts_failed > 0 {
-            println!(
-                "FTS backfill: {} entity upserts FAILED",
-                report.entities_fts_failed
-            );
-        }
-        if report.notes_fts_failed > 0 {
-            println!(
-                "FTS backfill: {} note upserts FAILED",
-                report.notes_fts_failed
-            );
-        }
-        if report.knowledge_pass_errored {
-            println!("Knowledge pass: FAILED (did not run to completion)");
-        } else if report.knowledge_atoms_failed > 0 {
-            println!(
-                "Knowledge pass: {} atom vector inserts FAILED",
-                report.knowledge_atoms_failed
-            );
-        }
-        if report.knowledge_sections_failed > 0 {
-            println!(
-                "Knowledge sections: {} section embed/write failures",
-                report.knowledge_sections_failed
-            );
-        }
-        if report.knowledge_ann_failed {
-            println!("Knowledge ANN: FAILED (snapshot not rebuilt/persisted)");
-        }
-        if !report.models_used.is_empty() {
-            println!("Models: {}", report.models_used.join(", "));
-        }
+        print!("{}", render_human_report(report));
     } else {
         let json = serde_json::to_string(report).expect("serialize ReindexReport");
         println!("{json}");
@@ -1243,29 +1254,6 @@ fn print_report(report: &ReindexReport, human: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test]
-    fn embed_budget_reserves_document_prefix_bytes() {
-        // multilingual-e5 prepends "passage: " (9 bytes) after truncation; the
-        // budget must reserve it or exactly-at-cap texts fail the whole batch.
-        assert_eq!(embed_budget("multilingual-e5-base"), MAX_EMBED_BYTES - 9);
-        assert_eq!(embed_budget("multilingual_e5_small"), MAX_EMBED_BYTES - 9);
-        assert_eq!(embed_budget("all-minilm-l6-v2"), MAX_EMBED_BYTES);
-        assert_eq!(embed_budget("unknown-model"), MAX_EMBED_BYTES);
-    }
-
-    #[test]
-    fn truncate_text_respects_budget_and_char_boundaries() {
-        let long = "a".repeat(MAX_EMBED_BYTES + 100);
-        assert_eq!(
-            truncate_text(&long, MAX_EMBED_BYTES - 9).len(),
-            MAX_EMBED_BYTES - 9
-        );
-        let cjk = "\u{4e2d}".repeat(20_000); // 3 bytes each
-        let out = truncate_text(&cjk, 32_759);
-        assert!(out.len() <= 32_759);
-        assert!(out.chars().all(|c| c == '\u{4e2d}'));
-    }
-
     use crate::dbpath::resolve_db_override;
     use clap::Parser;
     use khive_storage::types::{SqlStatement, SqlValue};
@@ -1738,12 +1726,63 @@ mod tests {
             knowledge_ann_failed: false,
             knowledge_sections_failed: 0,
             models_used: vec![],
+            truncation_by_model: BTreeMap::new(),
             elapsed_ms: 0,
             errors_skipped: errors,
             entities_fts_failed: 0,
             notes_fts_failed: 0,
             epoch_bump_failed: false,
         }
+    }
+
+    #[test]
+    fn report_serializes_per_model_truncation_accounting() {
+        let mut report = report_with(0, 0, false);
+        report.truncation_by_model.insert(
+            "strict-model".to_string(),
+            EmbeddingTruncationReport {
+                truncated: 2,
+                discarded_bytes: 17,
+            },
+        );
+        let json = serde_json::to_value(report).expect("serialize report");
+        assert_eq!(json["truncation_by_model"]["strict-model"]["truncated"], 2);
+        assert_eq!(
+            json["truncation_by_model"]["strict-model"]["discarded_bytes"],
+            17
+        );
+    }
+
+    #[test]
+    fn human_report_renders_per_model_truncation_in_sorted_order() {
+        let mut report = report_with(0, 0, false);
+        report.truncation_by_model.insert(
+            "zeta-model".to_string(),
+            EmbeddingTruncationReport {
+                truncated: 3,
+                discarded_bytes: 29,
+            },
+        );
+        report.truncation_by_model.insert(
+            "alpha-model".to_string(),
+            EmbeddingTruncationReport {
+                truncated: 1,
+                discarded_bytes: 7,
+            },
+        );
+
+        let rendered = render_human_report(&report);
+        let truncation_lines: Vec<&str> = rendered
+            .lines()
+            .filter(|line| line.starts_with("Embedding truncation"))
+            .collect();
+        assert_eq!(
+            truncation_lines,
+            [
+                "Embedding truncation (alpha-model): 1 input truncated, 7 bytes discarded",
+                "Embedding truncation (zeta-model): 3 inputs truncated, 29 bytes discarded",
+            ]
+        );
     }
 
     #[test]
@@ -1775,6 +1814,7 @@ mod tests {
             knowledge_ann_failed: true,
             knowledge_sections_failed: 0,
             models_used: vec![],
+            truncation_by_model: BTreeMap::new(),
             elapsed_ms: 0,
             errors_skipped: 0,
             entities_fts_failed: 0,
@@ -1807,6 +1847,7 @@ mod tests {
             knowledge_ann_failed: false,
             knowledge_sections_failed: 3,
             models_used: vec![],
+            truncation_by_model: BTreeMap::new(),
             elapsed_ms: 0,
             errors_skipped: 0,
             entities_fts_failed: 0,
@@ -2085,6 +2126,7 @@ mod tests {
             SubstrateKind::Note,
             "note.content",
             true,
+            &mut BTreeMap::new(),
         )
         .await;
 
@@ -2141,6 +2183,7 @@ mod tests {
             knowledge_ann_failed: false,
             knowledge_sections_failed: 0,
             models_used: vec![],
+            truncation_by_model: BTreeMap::new(),
             elapsed_ms: 0,
             errors_skipped: 0,
             entities_fts_failed: 0,
@@ -2724,6 +2767,7 @@ mod tests {
             knowledge_ann_failed: false,
             knowledge_sections_failed: 0,
             models_used: vec![],
+            truncation_by_model: BTreeMap::new(),
             elapsed_ms: 0,
             errors_skipped: 0,
             entities_fts_failed: 1,

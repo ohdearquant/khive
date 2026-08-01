@@ -475,6 +475,11 @@ falls back to the conservative "assume nothing is embedded, re-embed everything"
 re-embed. In both modes the selected graph pass still backfills FTS. There is no
 `--embeds-only` mode.
 
+The default JSON report includes `truncation_by_model`. Each model entry reports `truncated`
+(the number of inputs that were bounded) and `discarded_bytes` (source bytes not sent to that
+embedder). These counters come from the embedding result itself; entity, note, atom, and section
+source text remains complete in SQL and FTS.
+
 **`--best-effort` vs. the fail-closed default**: `ReindexReport::has_failures()`
 (`reindex.rs`) is a single predicate covering eight categories: vector embed/insert
 errors, entity FTS failures, note FTS failures, knowledge atom failures, a knowledge pass that
@@ -492,8 +497,9 @@ exists: a bad `--namespace` value, a config resolution failure, a failed runtime
 **Engine fan-out**: omitting `--model` reindexes against `rt.registered_embedding_model_names()`,
 whatever engines the resolved runtime config actually registers, not a hardcoded list. If that
 list is empty (no embedder configured at all), a warning prints but FTS backfill for entities and
-notes still runs. The knowledge-corpus pass is **not** fanned out across this model list at all:
-it always uses the config's default embedder, independent of `--model`.
+notes still runs. Knowledge atoms use the default model for their primary success counters and
+fan out to secondary registered engines on a best-effort basis; knowledge sections use the
+default model. `--model` still restricts only the graph pass.
 
 **When to reindex** (genuine in-code rationale, not doc-comment fluff): after relabeling a
 namespace (vector rows would otherwise be stranded under the wrong namespace on next write,

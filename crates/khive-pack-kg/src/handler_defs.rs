@@ -1,4 +1,4 @@
-//! Static `KG_HANDLERS` table (19 `HandlerDef` entries) and the `verbs` introspection handler.
+//! Static `KG_HANDLERS` table (20 `HandlerDef` entries) and the `verbs` introspection handler.
 
 // Illocutionary classification (Searle 1976):
 //   Assertive  -- retrieves/presents state of affairs
@@ -14,7 +14,7 @@ use serde_json::Value;
 use khive_runtime::{RuntimeError, VerbRegistry};
 use khive_types::{HandlerDef, ParamDef, VerbCategory, Visibility};
 
-pub(crate) static KG_HANDLERS: [HandlerDef; 19] = [
+pub(crate) static KG_HANDLERS: [HandlerDef; 20] = [
     // Commissive: commits an entity or note to the namespace
     HandlerDef {
         name: "create",
@@ -629,9 +629,9 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 19] = [
     // Assertive: retrieves multi-hop traversal results
     HandlerDef {
         name: "traverse",
-        description: "Multi-hop BFS traversal. Can reach note nodes (e.g. via an \
-                      `annotates` edge) but only enriches entity nodes with name/kind; \
-                      note nodes come back with those fields absent.",
+        description: "Multi-hop BFS traversal returning one path per distinct root. \
+                      Entity and note nodes both include name/kind; note names use the \
+                      same fallback as `neighbors` when no explicit name is stored.",
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,
         params: &[
@@ -917,6 +917,20 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 19] = [
                       unattributed/anonymous fallback, the write namespace, and the \
                       read-visible namespace set. Never returns tokens or credentials — \
                       only labels the runtime already computed before dispatch.",
+        visibility: Visibility::Verb,
+        category: VerbCategory::Assertive,
+        params: &[],
+    },
+    // Assertive: read-only-by-intent WAL/checkpoint operator diagnostics (ADR-091)
+    HandlerDef {
+        name: "db_diagnostics",
+        description: "Report WAL/checkpoint diagnostics for the main database: build \
+                      identity, ADR-091 checkpoint counters, a PASSIVE checkpoint probe, \
+                      the -wal sidecar file size, and a WAL-pin holder census. The \
+                      checkpoint probe issues a real PRAGMA wal_checkpoint(PASSIVE), which \
+                      backfills WAL frames into the main database on the happy path — that \
+                      is ordinary checkpoint I/O, never a TRUNCATE escalation, and it never \
+                      creates a missing database file or perturbs the reported counters.",
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,
         params: &[],
