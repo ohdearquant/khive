@@ -317,10 +317,10 @@ high-cardinality profile deployments (ADR-032 §10).
 
 ### `served_by_profile_id` projection (forward-ref ADR-032)
 
-ADR-004 reserves `served_by_profile_id: Option<Uuid>` inside the event payload for
-events served by a brain profile. ADR-041 does NOT add a top-level EventFilter
-field for this; profile-scoped event queries use the existing payload-extraction
-path:
+ADR-004 reserves `served_by_profile_id: Option<String>` and the ADR-032 Amendment 2
+`serve_attribution` tri-state inside the event payload for profile-aware events. ADR-041
+does NOT add top-level EventFilter fields for these values;
+profile-scoped event queries use the existing payload-extraction path:
 
 ```rust
 EventFilter::default()

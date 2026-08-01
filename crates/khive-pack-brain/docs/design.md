@@ -114,7 +114,15 @@ $$\text{Beta}(\alpha_1 + \alpha_2 - \alpha_{\text{prior}},\; \beta_1 + \beta_2 -
   `served_by_profile_id` lifecycle before updating (must be non-archived). The authoritative
   lifecycle check runs against the rebased snapshot inside the write transaction before the
   public event, private event, fold-gate state, or replacement snapshot is written, so a peer
-  archive racing a warm preflight leaves no partial feedback trace (issue C4, R3-1).
+  archive racing a warm preflight leaves no partial feedback trace (issue C4, R3-1). This
+  authoritative re-check only runs when a profile was actually resolved; a serve stamped
+  `serve_attribution="unattributed"` never resolves a profile at all, so it bypasses both the
+  warm preflight and the rebased-snapshot check.
+- `serve_attribution="unattributed"` is explicit negative serve-time knowledge. Implicit
+  feedback is recorded through the forced-zero gate and skips every profile mutation; it
+  never re-resolves a binding/default. Omission remains the legacy fallback path (#1486).
+- Automatic recall signals carry the same tri-state and update the named profile-local
+  posterior. Only `unspecified`/legacy signals update the built-in default (#1475).
 - `brain.unbind` requires at least one filter (`profile_id`, `actor`, `namespace`, or
   `consumer_kind`) to prevent accidental wipe of all bindings (issue C2).
 - `brain.bind` rejects archived profiles to prevent creating unresolvable bindings (issue C3).

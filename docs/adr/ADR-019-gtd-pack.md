@@ -24,7 +24,7 @@ The system must satisfy:
 
 1. **No substrate fork.** Tasks ride on the existing notes table. No new storage
    trait or parallel CRUD path exists; the `properties` JSON column carries
-   GTD-specific fields. V15 adds invariant triggers without changing the task row
+   GTD-specific fields. V16 adds invariant triggers without changing the task row
    shape.
 2. **Five disjoint verbs.** No collision with the kg pack's shared CRUD. GTD's verbs
    express lifecycle intent (`assign`, `next`, `complete`, `tasks`, `transition`),
@@ -94,7 +94,7 @@ The `properties` JSON column carries every GTD field:
 
 The notes table's column shape is unchanged: `"task"` in `note.kind` and the JSON
 properties above carry task state. GTD separately owns the auxiliary lifecycle-audit
-table described below. Core migration V15 adds cycle-guard triggers to `notes` and
+table described below. Core migration V16 adds cycle-guard triggers to `notes` and
 `graph_edges`; it adds no task columns or parallel task table.
 
 ### GTD lifecycle
@@ -193,7 +193,7 @@ high duplicate fanout therefore cannot evade the edge budget through node dedupl
 Typed hooks are necessary for precise request errors but insufficient as the durable
 invariant: two processes can both validate against the same pre-write snapshot, and
 `kkernel exec --ops-file --atomic` prepares every operation before its single commit
-pass. Core migration V15 (`015-gtd-dependency-cycle-guards.sql`) therefore installs
+pass. Core migration V16 (`016-gtd-dependency-cycle-guards.sql`) therefore installs
 narrow `BEFORE INSERT`/`BEFORE UPDATE` triggers on `notes` and `graph_edges`. The trigger
 walk runs inside SQLite's serialized writer transaction, sees earlier writes in the
 same atomic unit, and rejects the later direction of an opposite-request race. It
@@ -632,7 +632,7 @@ minimal. Operators who want GTD configure it explicitly.
 - `crates/khive-pack-gtd/src/dependency.rs`:
   - Bounded property and edge reachability validation.
   - Read-time blocker classification for `next` and `tasks` task envelopes.
-- `crates/khive-db/sql/015-gtd-dependency-cycle-guards.sql`:
+- `crates/khive-db/sql/016-gtd-dependency-cycle-guards.sql`:
   - Transaction-time property/edge cycle backstops shared by every SQLite write path.
 - `crates/khive-pack-gtd/src/schema.rs`:
   - `gtd_lifecycle_audit` table DDL.

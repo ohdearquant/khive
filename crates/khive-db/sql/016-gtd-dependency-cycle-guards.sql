@@ -1,4 +1,4 @@
--- V15: Commit-time cycle guards for GTD task dependencies.
+-- V16: Commit-time cycle guards for GTD task dependencies.
 --
 -- The GTD pack performs typed, bounded reachability checks before canonical
 -- writes. These triggers are the transaction-time backstop shared by direct

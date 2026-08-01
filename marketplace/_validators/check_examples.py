@@ -40,7 +40,8 @@ BRAIN_VERBS = frozenset({
 })
 
 COMM_VERBS = frozenset({
-    "comm.send", "comm.inbox", "comm.read", "comm.reply", "comm.thread", "comm.health",
+    "comm.send", "comm.delivered", "comm.inbox", "comm.read", "comm.reply", "comm.thread",
+    "comm.health",
 })
 
 SCHEDULE_VERBS = frozenset({

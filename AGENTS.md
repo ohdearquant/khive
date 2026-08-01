@@ -162,18 +162,19 @@ Composite scores are always in [0,1]. Typical production floor: 0.3-0.7.
 `brain.auto_feedback(namespace=...)` writes and folds feedback only in that exact namespace;
 it does not train the default/live namespace's posterior state.
 
-### Comm pack — 8 verbs (`comm.` prefix)
+### Comm pack — 9 verbs (`comm.` prefix)
 
-| Verb          | What it does                                                                                                                 | When to use                                   |
-| ------------- | ---------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------- |
-| `comm.send`   | Send a message (optionally threaded)                                                                                         | Inter-agent or inter-namespace messaging      |
-| `comm.inbox`  | List inbound messages                                                                                                        | Check what's waiting                          |
-| `comm.unread` | Count-only view of unread inbound messages (no args, no payloads)                                                            | Cheap unread check without listing            |
-| `comm.read`   | Mark an **inbound** message as read (best-effort: check `read` in the response; `false` + `mark_error` means re-issue later) | Acknowledge receipt (recipient action)        |
-| `comm.reply`  | Reply to a message (threading linkage)                                                                                       | Respond in-thread                             |
-| `comm.thread` | Retrieve full conversation thread                                                                                            | Read the whole conversation                   |
-| `comm.health` | Per-channel health snapshot with nominal cadence and advisory staleness (no args)                                            | Check daemon channel-poll state               |
-| `comm.probe`  | Read-only poll for new inbound message metadata and stale unread count                                                       | Cheap wake-up check without a full inbox scan |
+| Verb             | What it does                                                                                           | When to use                                   |
+| ---------------- | ------------------------------------------------------------------------------------------------------ | --------------------------------------------- |
+| `comm.send`      | Send a message (optionally threaded)                                                                   | Inter-agent or inter-namespace messaging      |
+| `comm.delivered` | Confirm the internal inbound sibling for an outbound UUID                                              | Resolve an ambiguous atomic-write outcome     |
+| `comm.inbox`     | Page and filter inbound messages                                                                       | Check or triage what's waiting                |
+| `comm.unread`    | Count-only view of unread inbound messages (no args, no payloads)                                      | Cheap unread check without listing            |
+| `comm.read`      | Mark one or more **inbound** messages as read (best-effort: inspect each result's `read`/`mark_error`) | Acknowledge receipt (recipient action)        |
+| `comm.reply`     | Reply to a message (threading linkage)                                                                 | Respond in-thread                             |
+| `comm.thread`    | Retrieve full conversation thread                                                                      | Read the whole conversation                   |
+| `comm.health`    | Per-channel health snapshot with nominal cadence and advisory staleness (no args)                      | Check daemon channel-poll state               |
+| `comm.probe`     | Read-only poll for new inbound message metadata and stale unread count                                 | Cheap wake-up check without a full inbox scan |
 
 **Inbox shape (ADR-057).** `comm.inbox` is scannable: each entry carries top-level `from`, `to`,
 `subject`, `read`, `direction`, and a derived `preview` (whitespace-collapsed, truncated to 80
@@ -182,10 +183,21 @@ stamps `from_actor` from the server's configured actor and lands in `x`'s inbox,
 returns only messages addressed to you. Set that actor via `--actor` / `KHIVE_ACTOR`; an unset actor
 sends and reads as the shared `"local"` party line.
 
+Use `offset=<next_offset>` with otherwise-identical `comm.inbox` arguments until
+`next_offset` is null to enumerate a backlog larger than the 200-message page cap without
+changing read state. Filters include exact/prefix/excluded sender, inclusive `since`, exclusive
+`before`, and case-insensitive `subject_contains`/`content_contains`; time bounds use the
+response's top-level `created_at`.
+
 **`comm.read` is inbound-only.** It marks a received message as read; calling it on an outbound
 (sent) message returns `read: message <uuid> is outbound; only received (inbound) messages can be
 marked as read`. To confirm a sent message was received, read it from the recipient's `comm.inbox`
-or `comm.thread`.
+or `comm.thread`. Pass exactly one of `id` or `ids`; the latter accepts 1-500 IDs and returns
+per-item `read`/`mark_error` outcomes plus marked/failed counts. Bulk updates are not atomic across
+messages. If a send/reply returns an `ambiguous` error containing a full `outbound_id`, pass that
+UUID to `comm.delivered` before retrying. This checks the atomic pair's internal inbound sibling; it
+does not claim later SMTP delivery and cannot help when the whole MCP response is lost before the
+caller receives the server-generated UUID.
 
 ### Schedule pack — 4 verbs (`schedule.` prefix)
 
@@ -193,7 +205,7 @@ or `comm.thread`.
 | ------------------- | --------------------------------------------- | ------------------------------------------------------------- |
 | `schedule.remind`   | Deliver a reminder to your inbox at fire time | "Remind me to X at Y"                                         |
 | `schedule.schedule` | Schedule a future verb dispatch               | Deferred or cross-actor actions (action is a DSL verb string) |
-| `schedule.agenda`   | List upcoming scheduled events                | "What's on the calendar?"                                     |
+| `schedule.agenda`   | List upcoming events and ticker liveness      | "What's on the calendar, and is its ticker running?"          |
 | `schedule.cancel`   | Cancel a scheduled event                      | Remove a pending reminder/action                              |
 
 ### Knowledge pack — 19 verbs (`knowledge.` prefix)

@@ -23,7 +23,7 @@ An always-machine-readable copy of this page is at
 | `gtd`       | 5     | `KHIVE_PACKS=kg,gtd`                       | Yes                 |
 | `memory`    | 5     | `KHIVE_PACKS=kg,memory`                    | Yes                 |
 | `brain`     | 16    | `KHIVE_PACKS=kg,brain`                     | Yes                 |
-| `comm`      | 8     | `KHIVE_PACKS=kg,comm`                      | Yes                 |
+| `comm`      | 9     | `KHIVE_PACKS=kg,comm`                      | Yes                 |
 | `schedule`  | 4     | `KHIVE_PACKS=kg,schedule`                  | Yes                 |
 | `knowledge` | 19    | `KHIVE_PACKS=kg,knowledge`                 | Yes                 |
 | `session`   | 4     | `KHIVE_PACKS=kg,session`                   | Yes                 |
@@ -867,6 +867,11 @@ Recall memory notes with decay-aware hybrid ranking. Each hit carries resolved
 | `tag_mode`          | string  | no       | `any` (default, OR) or `all` (AND).                                       |
 | `namespace`         | string  | no       | Exact-match read scope; absent uses the caller's visible namespace set.   |
 
+Each result carries `serve_attribution` (`profile`, `unattributed`, or
+`unspecified`). `profile` also carries `served_by_profile_id`; `unattributed`
+means a selected profile record was unreadable and downstream feedback must not
+fall back to a current binding/default.
+
 ```
 request(ops="memory.recall(query=\"ADR-016 DSL grammar\", limit=5, min_score=0.3)")
 ```
@@ -1032,14 +1037,15 @@ request(ops="brain.reset(profile_id=\"implementer-recall-v1\")")
 
 Emit a `FeedbackExplicit` event into the shared log.
 
-| Param                  | Type   | Required | Notes                                                                                                      |
-| ---------------------- | ------ | -------- | ---------------------------------------------------------------------------------------------------------- |
-| `target_id`            | uuid   | yes      | Memory note or entity the feedback applies to.                                                             |
-| `signal`               | string | yes      | Same signal set as `memory.feedback`.                                                                      |
-| `served_by_profile_id` | string | no       | Profile that served the rated result.                                                                      |
-| `section_signals`      | object | no       | Per-section signals for `knowledge_compose` profiles: `{"section_name": "useful"\|"not_useful"\|"wrong"}`. |
-| `scorer_run_id`        | string | no       | ADR-081 scorer-pass id; must pair with `serve_ledger_id`.                                                  |
-| `serve_ledger_id`      | string | no       | ADR-081 `brain_serve_ledger` row id; must pair with `scorer_run_id`.                                       |
+| Param                  | Type   | Required | Notes                                                                                                                                              |
+| ---------------------- | ------ | -------- | -------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `target_id`            | uuid   | yes      | Memory note or entity the feedback applies to.                                                                                                     |
+| `signal`               | string | yes      | Same signal set as `memory.feedback`.                                                                                                              |
+| `served_by_profile_id` | string | no       | Profile that served the rated result.                                                                                                              |
+| `serve_attribution`    | string | no       | `profile`\|`unattributed`\|`unspecified`; unattributed implicit feedback is forced to zero weight, while explicit/correction feedback is rejected. |
+| `section_signals`      | object | no       | Per-section signals for `knowledge_compose` profiles: `{"section_name": "useful"\|"not_useful"\|"wrong"}`.                                         |
+| `scorer_run_id`        | string | no       | ADR-081 scorer-pass id; must pair with `serve_ledger_id`.                                                                                          |
+| `serve_ledger_id`      | string | no       | ADR-081 `brain_serve_ledger` row id; must pair with `scorer_run_id`.                                                                               |
 
 ```
 request(ops="brain.feedback(target_id=\"<uuid>\", signal=\"useful\")")
@@ -1056,9 +1062,14 @@ to call right after `memory.recall` instead of hand-building `brain.feedback`.
 | `results`              | array  | yes      | Recall result objects; the first object's `id` is credited.            |
 | `signal`               | string | no       | Defaults to `implicit_positive`.                                       |
 | `served_by_profile_id` | string | no       | Profile that served the recall.                                        |
+| `serve_attribution`    | string | no       | Serve-time tri-state; otherwise copied from the first result.          |
 | `scorer_run_id`        | string | no       | Forwarded verbatim to `brain.feedback`; pairs with `serve_ledger_id`.  |
 | `serve_ledger_id`      | string | no       | Forwarded verbatim to `brain.feedback`; pairs with `scorer_run_id`.    |
 | `namespace`            | string | no       | Exact namespace for the event and posterior fold; invalid values fail. |
+
+Top-level serve-attribution fields are one pair and take precedence over the first
+result's pair. If neither top-level field is supplied, both fields are copied from the
+first result together.
 
 ```
 request(ops="memory.recall(query=\"x\", limit=5) | brain.auto_feedback(query=\"x\", results=[{\"id\": \"$prev.items[0].id\"}])")
@@ -1161,7 +1172,7 @@ request(ops="brain.register_adapter(adapter_id=\"lora-v3\", content_hash=\"<sha2
 
 ---
 
-## `comm` pack — 8 verbs
+## `comm` pack — 9 verbs
 
 Actor-to-actor messaging with threading. Optional; load with `KHIVE_PACKS=kg,comm`.
 
@@ -1184,23 +1195,59 @@ embedding input is bounded, the successful response includes the standard `warni
 request(ops="comm.send(to=\"lambda:leo\", subject=\"PR ready\", content=\"#600 is open for review\")")
 ```
 
+### `comm.delivered` — Assertive
+
+Confirm the internal inbound sibling for a `comm.send` or `comm.reply`
+outbound UUID. This is a read-only exact correlation lookup; it does not infer
+delivery from content and does not report later SMTP or other external
+transport status. The matching inbound note must belong to the caller's
+namespace and carry the caller as `from_actor`.
+
+| Param | Type | Required | Notes                                                                                                                                                              |
+| ----- | ---- | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `id`  | uuid | yes      | Full `full_id` from a successful send/reply, or `outbound_id` surfaced by an ambiguous atomic-write error. Prefixes are rejected; the UUID is the correlation key. |
+
+Returns `{id, status, delivered, inbound_count}`. A successful lookup is
+conclusive: `status` is `delivered` when `inbound_count > 0`, otherwise
+`undelivered`. A lookup error leaves the delivery outcome uncertain.
+Ordinary atomic-write failures leave neither copy and do not require this
+lookup. Loss of the entire MCP response also loses the generated UUID and is
+outside this operation's contract.
+
+```
+request(ops="comm.delivered(id=\"<full-outbound-uuid>\")")
+```
+
 ### `comm.inbox` — Assertive
 
-List inbound messages for the caller.
+List and page through filtered inbound messages for the caller.
 
-| Param    | Type    | Required | Notes                              |
-| -------- | ------- | -------- | ---------------------------------- |
-| `limit`  | integer | no       | Default 20, max 200.               |
-| `status` | string  | no       | `unread` (default)\|`read`\|`all`. |
+| Param                | Type    | Required | Notes                                                                     |
+| -------------------- | ------- | -------- | ------------------------------------------------------------------------- |
+| `limit`              | integer | no       | Default 20, max 200.                                                      |
+| `offset`             | integer | no       | Default 0; offset after every supplied filter.                            |
+| `status`             | string  | no       | `unread` (default)\|`read`\|`all`.                                        |
+| `from_actor`         | string  | no       | Exact sender; mutually exclusive with `from_prefix`.                      |
+| `from_prefix`        | string  | no       | Sender prefix; mutually exclusive with `from_actor`.                      |
+| `exclude_from_actor` | string  | no       | Exclude an exact sender actor label.                                      |
+| `since`              | string  | no       | Inclusive RFC 3339 lower bound on top-level `created_at`.                 |
+| `before`             | string  | no       | Exclusive RFC 3339 upper bound on top-level `created_at`.                 |
+| `subject_contains`   | string  | no       | Case-insensitive non-empty subject substring; null subjects do not match. |
+| `content_contains`   | string  | no       | Case-insensitive non-empty content substring.                             |
 
 ```
 request(ops="comm.inbox(limit=10)")
+request(ops="comm.inbox(status=\"all\", content_contains=\"timeout\", offset=200)")
 ```
 
 Every returned message uses the hyphenated full UUID for `id`, so the value is
 always accepted unchanged by `comm.read`, `comm.reply`, or `comm.thread`, even
 when two messages share an eight-character prefix. `full_id` remains an alias
 for compatibility, while `short_id` is the compact display-only prefix.
+Responses also carry `offset`, `has_more`, and `next_offset`; repeat the same
+filtered call with each non-null `next_offset` to enumerate every match without
+marking it read. All filters are ANDed. Time bounds use response `created_at`,
+not optional transport `sent_at` metadata.
 
 ### `comm.unread` — Assertive
 
@@ -1213,19 +1260,26 @@ request(ops="comm.unread()")
 
 ### `comm.read` — Declaration
 
-Mark an inbound message as read. Outbound messages cannot be marked read. The mark-read
-write is best-effort: validation errors (not found, wrong kind, outbound direction, wrong
-addressee) remain fatal, but when the post-read mark write fails or finds no live row the
-call still succeeds with `read: false` and a `mark_error` field — inspect `read` and
-re-issue later if it is `false`.
+Mark one or more inbound messages as read. Outbound messages cannot be marked read. Mark writes
+are best-effort: validation errors (not found, wrong kind, outbound direction, wrong addressee)
+remain fatal, but a post-read mark failure returns `read: false` with `mark_error`. Inspect each
+single or bulk result and re-issue failures later.
 
-| Param | Type   | Required | Notes                                              |
-| ----- | ------ | -------- | -------------------------------------------------- |
-| `id`  | string | yes      | 8-char prefix or full UUID of the inbound message. |
+| Param | Type            | Required    | Notes                                                                   |
+| ----- | --------------- | ----------- | ----------------------------------------------------------------------- |
+| `id`  | string          | conditional | One 8-char prefix or full UUID; mutually exclusive with `ids`.          |
+| `ids` | array of string | conditional | 1-500 IDs; mutually exclusive with `id`. All targets validate up front. |
 
 ```
 request(ops="comm.read(id=\"<message-id>\")")
+request(ops="comm.read(ids=[\"<message-id-1>\", \"<message-id-2>\"])")
 ```
+
+Exactly one of `id` or `ids` is required. The bulk response contains ordered
+`results` plus `requested_count`, `unique_count`, `marked_count`, and
+`failed_count`. Bulk updates are not atomic across messages: validation errors
+reject the call before any write, while later storage errors appear in each
+item's `read` and optional `mark_error`.
 
 ### `comm.reply` — Commissive
 

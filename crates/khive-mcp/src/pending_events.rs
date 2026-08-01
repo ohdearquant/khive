@@ -24,9 +24,9 @@
 //! - **Daemon-resident tick** (ADR-106): [`schedule_tick_loop`] calls
 //!   [`run_pending_events_on`] against the daemon's own resolved `KhiveRuntime`
 //!   handle on a fixed interval for the lifetime of the warm `khived` daemon
-//!   process. Spawned only by the daemon role (mirrors the
-//!   `is_daemon_role` gate `khive-mcp::serve` already uses for the email
-//!   channel loops), never by a short-lived stdio client. Running both an
+//!   process. It runs as the ADR-119 `schedule-tick` component only in daemon
+//!   role, never from a short-lived stdio client, with tracked cancellation,
+//!   bounded restart, and component health. Running both an
 //!   external cron entry and the daemon tick at once is safe: the drain's
 //!   `pending -> firing` CAS claim (`claim_pending_event`) makes concurrent or
 //!   overlapping invocations harmless by construction — at most one caller
@@ -36,7 +36,13 @@
 //!
 //! Each event fires in its own namespace: the action is dispatched through the
 //! MCP server's registry with the event's namespace injected as the `namespace=`
-//! parameter, so all writes land in the event's namespace.
+//! parameter, so all writes land in the event's namespace. Replay derives its
+//! actor from an immutable, target-bound provenance event written by the
+//! schedule handler; `created_by_actor` note metadata is never an authorization
+//! source. Executable `scheduled_event` state is schedule-managed and rejects
+//! generic KG update/merge, so provenance cannot authorize rewritten intent. A
+//! generic legacy row without provenance fails closed instead of inheriting
+//! daemon authority.
 //!
 //! ## Repeat advancement
 //!
@@ -64,7 +70,8 @@
 //! (or a first boot against a store with a large stale backlog) marks the
 //! entire overdue backlog missed on its first tick and dispatches zero of
 //! them. See the ADR-106 amendment for the full rationale and the prior-art
-//! comparison.
+//! comparison. The creator-identity fence runs first for generic actions:
+//! an unattributed legacy row becomes `failed`, not `missed`, even when stale.
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Duration, FixedOffset, Months, Utc};
@@ -527,38 +534,58 @@ pub async fn run_pending_events_on(
                     .and_then(Value::as_str)
                     .unwrap_or("remind");
 
-                // The persisted `created_by_actor` is the sole trust anchor for
-                // replay identity (ADR-119): it is stamped at write time by
-                // `schedule.remind`/`schedule.schedule` from the caller's
-                // authenticated token, never from caller-supplied properties —
-                // generic `create`/`update` reject the `scheduled_event` kind
-                // outright (khive-pack-kg's create/update handlers), so no
-                // other path can set or alter it. A row with no stored creator
-                // (legacy data predating that provenance guarantee) has no
-                // verifiable identity and must fail closed rather than replay
-                // under the daemon's own identity.
-                let scheduled_actor =
-                    if !is_missed && (event_type == "remind" || event_type == "schedule") {
-                        properties
-                            .as_ref()
-                            .and_then(|p| p.get("created_by_actor"))
-                            .and_then(Value::as_str)
-                            .map(str::to_string)
-                    } else {
-                        None
-                    };
-                let missing_provenance = !is_missed
-                    && (event_type == "remind" || event_type == "schedule")
-                    && scheduled_actor.is_none();
-                if missing_provenance {
-                    tracing::warn!(
-                        scheduled_event_id = %id,
-                        event_type,
-                        "pending-events: scheduled event has no verifiable created_by_actor; \
-                         fail-closed, not dispatching under the daemon identity"
-                    );
-                }
-                let action_dsl: Option<String> = if is_missed || missing_provenance {
+                // Resolve replay/delivery authority only from the immutable
+                // pack-written provenance event. `created_by_actor` remains
+                // display metadata and never an authority source; the generic
+                // KG mutation fence separately prevents a valid provenance
+                // record from authorizing rewritten executable intent.
+                // Generic actions require provenance even on the missed path
+                // (legacy rows fail closed before any lifecycle transition);
+                // in-grace reminders use it for both recipient and dispatch
+                // identity. Missed reminders do not dispatch at all.
+                let creator = if event_type == "schedule" || !is_missed {
+                    match verified_creator_for_event(rt, ns_str, id, event_type).await {
+                        Ok(actor) => actor,
+                        Err(e) => {
+                            if verbose {
+                                eprintln!(
+                                    "[pending-events] creator provenance lookup failed for note \
+                                     {id}: {e}"
+                                );
+                            }
+                            summary.failed += 1;
+                            continue;
+                        }
+                    }
+                } else {
+                    None
+                };
+                let reminder_actor = if event_type == "remind" && !is_missed {
+                    match creator.as_ref() {
+                        Some(actor) => Some(actor.recipient_id.clone()),
+                        None => {
+                            // Compatibility for reminders written before
+                            // immutable provenance existed: deliver only to
+                            // the configured daemon owner. Never honor the
+                            // row's forgeable `created_by_actor` claim.
+                            let fallback = server
+                                .actor_id()
+                                .filter(|actor| !actor.trim().is_empty())
+                                .unwrap_or("local")
+                                .to_string();
+                            tracing::warn!(
+                                scheduled_event_id = %id,
+                                fallback_actor = %fallback,
+                                "pending-events: reminder lacks immutable creator provenance; \
+                                 ignoring note actor metadata and using the scheduler actor"
+                            );
+                            Some(fallback)
+                        }
+                    }
+                } else {
+                    None
+                };
+                let action_dsl: Option<String> = if is_missed {
                     None
                 } else if event_type == "schedule" {
                     properties
@@ -567,7 +594,7 @@ pub async fn run_pending_events_on(
                         .and_then(Value::as_str)
                         .map(str::to_string)
                 } else {
-                    scheduled_actor
+                    reminder_actor
                         .as_deref()
                         .map(|actor| reminder_delivery_action(actor, &content))
                 };
@@ -612,6 +639,49 @@ pub async fn run_pending_events_on(
                     summary.skipped_race += 1;
                     continue;
                 };
+
+                // Generic scheduled actions must replay as the creator from
+                // immutable pack provenance, never as the daemon and never
+                // from caller-editable note properties. Legacy/hand-written
+                // rows cannot satisfy that identity fence, so fail closed.
+                if event_type == "schedule" && creator.is_none() {
+                    let error = "scheduled action is missing immutable creator provenance; row cannot be replayed safely";
+                    tracing::error!(
+                        scheduled_event_id = %id,
+                        "pending-events: refusing unattributed scheduled action replay"
+                    );
+                    if verbose {
+                        eprintln!("[pending-events] dispatch refused for note {id}: {error}");
+                    }
+                    summary.failed += 1;
+                    let mut props = properties.clone().unwrap_or_else(|| json!({}));
+                    props["status"] = json!("failed");
+                    props["dispatch_error"] = json!(error);
+                    props["dispatch_failed_at"] = json!(Utc::now().to_rfc3339());
+                    let updated_at = Utc::now().timestamp_micros();
+                    match finalize_fired_event(
+                        rt,
+                        ns_str,
+                        id,
+                        &props,
+                        updated_at,
+                        claimed_firing_at,
+                    )
+                    .await
+                    {
+                        Ok(true) => {}
+                        Ok(false) => tracing::error!(
+                            scheduled_event_id = %id,
+                            "pending-events: failed-identity finalization lost its firing claim"
+                        ),
+                        Err(e) => tracing::error!(
+                            scheduled_event_id = %id,
+                            error = %e,
+                            "pending-events: failed-identity finalization failed"
+                        ),
+                    }
+                    continue;
+                }
 
                 if is_missed {
                     // ── Missed path: never dispatch. Mark terminally
@@ -679,16 +749,33 @@ pub async fn run_pending_events_on(
 
                 // ── Dispatch the action ──────────────────────────────────
                 let mut reminder_delivery_error = None;
-                let mut policy_error = None;
+                let mut scheduled_dispatch_error = None;
                 if let Some(dsl) = &action_dsl {
+                    let dispatch_actor = if event_type == "schedule" {
+                        creator.clone().expect("checked above").request_actor
+                    } else {
+                        // Provenanced reminders carry the typed creator. A
+                        // legacy reminder's safe daemon-owner fallback is
+                        // re-wrapped here only after the row actor was ignored.
+                        // An unconfigured server remains anonymous (`None`),
+                        // rather than becoming authenticated `actor:local`.
+                        match creator.clone() {
+                            Some(creator) => creator.request_actor,
+                            None => server.actor_id().and_then(|actor| {
+                                (!actor.trim().is_empty()).then(|| {
+                                    VerifiedActor::new(actor.to_string())
+                                        .expect("non-blank scheduler actor was prevalidated")
+                                })
+                            }),
+                        }
+                    };
                     let dispatch_result =
-                        dispatch_action(dsl, ns_str, server, scheduled_actor.as_deref(), verbose)
-                            .await;
+                        dispatch_action(dsl, ns_str, dispatch_actor, server, verbose).await;
                     if let Err(e) = dispatch_result {
                         tracing::error!(
                             scheduled_event_id = %id,
                             event_type,
-                            recipient_actor = scheduled_actor.as_deref(),
+                            recipient_actor = reminder_actor.as_deref(),
                             error = %e,
                             "pending-events: scheduled event delivery failed"
                         );
@@ -698,40 +785,25 @@ pub async fn run_pending_events_on(
                         summary.failed += 1;
                         if event_type == "remind" {
                             let error = e.to_string();
-                            append_scheduled_action_failure_event(
+                            append_reminder_delivery_failure_event(
                                 server,
                                 ns_str,
                                 id,
-                                scheduled_actor.as_deref().unwrap_or("local"),
+                                reminder_actor.as_deref().unwrap_or("local"),
                                 &error,
-                                event_type,
                             )
                             .await;
                             reminder_delivery_error = Some(error);
+                        } else {
+                            scheduled_dispatch_error = Some(e.to_string());
                         }
                         // Per-event failure does NOT abort the drain. Continue.
                         // Still mark as fired so the drain doesn't retry infinitely
                         // on a permanently broken action. The error is reported
                         // in the summary.
-                        // (Callers can inspect fired_at + a future dispatch_error
-                        // field to distinguish clean fires from error fires.)
+                        // Callers can inspect fired_at + dispatch_error to
+                        // distinguish clean fires from error fires.
                     }
-                } else if missing_provenance {
-                    summary.failed += 1;
-                    let error = "fail-closed: scheduled event has no verifiable \
-                                  created_by_actor; refusing to replay under the daemon identity"
-                        .to_string();
-                    tracing::error!(
-                        scheduled_event_id = %id,
-                        event_type,
-                        error = %error,
-                        "pending-events: scheduled event fail-closed: no verifiable creator provenance"
-                    );
-                    append_scheduled_action_failure_event(
-                        server, ns_str, id, "local", &error, event_type,
-                    )
-                    .await;
-                    policy_error = Some(error);
                 }
 
                 let fired_at_rfc = Utc::now().to_rfc3339();
@@ -744,20 +816,14 @@ pub async fn run_pending_events_on(
                         obj.remove("delivery_error");
                         obj.remove("delivery_failed_at");
                     }
-                }
-                // Fail-closed policy outcome (ADR-119): distinct from
-                // `delivery_error` above, which covers an attempted dispatch
-                // that failed. This covers a dispatch that was never
-                // attempted because the row's creator provenance could not
-                // be verified — a legacy-row case, not an execution error —
-                // and must remain visible on the row rather than reading as
-                // a clean `fired`/`pending` outcome.
-                if let Some(error) = policy_error {
-                    props["policy_error"] = json!(error);
-                    props["policy_error_at"] = json!(fired_at_rfc);
-                } else if let Some(obj) = props.as_object_mut() {
-                    obj.remove("policy_error");
-                    obj.remove("policy_error_at");
+                } else if event_type == "schedule" {
+                    if let Some(error) = scheduled_dispatch_error {
+                        props["dispatch_error"] = json!(error);
+                        props["dispatch_failed_at"] = json!(fired_at_rfc);
+                    } else if let Some(obj) = props.as_object_mut() {
+                        obj.remove("dispatch_error");
+                        obj.remove("dispatch_failed_at");
+                    }
                 }
                 let updated_at;
 
@@ -917,8 +983,9 @@ async fn reclaim_stale_firing_events(rt: &KhiveRuntime, stale_before_micros: i64
     Ok(rows)
 }
 
-/// CAS-persist the post-dispatch state of a claimed event: `firing -> {fired
-/// | pending}` (the latter for an advanced repeat). `claimed_firing_at` is
+/// CAS-persist the post-drain state of a claimed event: `firing -> {fired |
+/// pending | missed | failed}` (`pending` is an advanced repeat; `failed` is
+/// the unattributed-generic-action policy state). `claimed_firing_at` is
 /// the claim token from `claim_pending_event`; the CAS requires the row's
 /// CURRENT `firing_at` to still equal it, not merely `status='firing'`
 /// (issue #462). Clears `firing_at` on the terminal write. Returns
@@ -1055,31 +1122,19 @@ fn reminder_subject(content: &str) -> String {
     }
 }
 
-/// Append a durable audit event for a scheduled action that failed to fire —
-/// either an attempted dispatch that errored, or (ADR-119) a dispatch that
-/// was never attempted because the row's creator provenance could not be
-/// verified. The verb mirrors the fired-action's own verb family
-/// (`schedule.remind` / `schedule.schedule`) so it is queryable per event
-/// type, not just as an undifferentiated failure.
-async fn append_scheduled_action_failure_event(
+async fn append_reminder_delivery_failure_event(
     server: &KhiveMcpServer,
     namespace: &str,
     scheduled_event_id: uuid::Uuid,
     recipient_actor: &str,
     error: &str,
-    event_type: &str,
 ) {
     let Some(store) = server.event_store() else {
         return;
     };
-    let verb = if event_type == "remind" {
-        "schedule.remind.fire"
-    } else {
-        "schedule.schedule.fire"
-    };
     let event = khive_storage::Event::new(
         namespace,
-        verb,
+        "schedule.remind.fire",
         EventKind::Audit,
         SubstrateKind::Note,
         recipient_actor,
@@ -1095,8 +1150,101 @@ async fn append_scheduled_action_failure_event(
         tracing::error!(
             scheduled_event_id = %scheduled_event_id,
             error = %trace_error,
-            "pending-events: scheduled action failure event append failed"
+            "pending-events: reminder delivery failure event append failed"
         );
+    }
+}
+
+/// Resolve the actor bound to a scheduled-event note by the schedule pack's
+/// immutable provenance event.
+///
+/// The note's `properties.created_by_actor` field is intentionally ignored:
+/// generic note create can forge it, while schedule-managed rows reject generic
+/// update/merge. The `events` substrate is append-only and has no public create
+/// verb, so a target-bound event written by `schedule.remind`/`schedule.schedule`
+/// is the durable out-of-band proof from which the host constructs a verified
+/// replay identity. Zero matching rows means legacy or hand-written intent.
+/// More than one is corruption and fails the drain pass rather than choosing an
+/// identity nondeterministically.
+#[derive(Clone, Debug)]
+struct VerifiedCreator {
+    /// `None` deliberately represents the provenance-verified
+    /// `anonymous:local` actor. Request identity resolution must receive
+    /// `None`, not `Some("local")`, to preserve the actor kind.
+    request_actor: Option<VerifiedActor>,
+    recipient_id: String,
+}
+
+async fn verified_creator_for_event(
+    rt: &KhiveRuntime,
+    namespace: &str,
+    scheduled_event_id: uuid::Uuid,
+    event_type: &str,
+) -> Result<Option<VerifiedCreator>> {
+    let mut reader = rt
+        .sql()
+        .reader()
+        .await
+        .context("pending-events: open SQL reader for creator provenance")?;
+    let rows = reader
+        .query_all(SqlStatement {
+            sql: "SELECT actor FROM events \
+                  WHERE namespace = ?1 \
+                    AND verb = ?2 \
+                    AND target_id = ?3 \
+                    AND outcome = 'success' \
+                    AND json_extract(payload, '$.provenance') = ?4 \
+                    AND json_extract(payload, '$.event_type') = ?5 \
+                  ORDER BY created_at ASC, id ASC LIMIT 2"
+                .to_string(),
+            params: vec![
+                SqlValue::Text(namespace.to_string()),
+                SqlValue::Text(khive_pack_schedule::CREATOR_PROVENANCE_VERB.to_string()),
+                SqlValue::Text(scheduled_event_id.to_string()),
+                SqlValue::Text(khive_pack_schedule::CREATOR_PROVENANCE_MARKER_V1.to_string()),
+                SqlValue::Text(event_type.to_string()),
+            ],
+            label: Some("pending_events_creator_provenance".into()),
+        })
+        .await
+        .context("pending-events: query creator provenance")?;
+
+    match rows.as_slice() {
+        [] => Ok(None),
+        [row] => {
+            let actor = match row.get("actor") {
+                Some(SqlValue::Text(actor)) => actor,
+                other => {
+                    return Err(anyhow::anyhow!(
+                        "pending-events: creator provenance for {scheduled_event_id} has invalid \
+                         actor column: {other:?}"
+                    ));
+                }
+            };
+            if let Some(actor_id) = actor.strip_prefix("actor:") {
+                let verified = VerifiedActor::new(actor_id.to_string()).map_err(|e| {
+                    anyhow::anyhow!("pending-events: invalid creator provenance: {e}")
+                })?;
+                Ok(Some(VerifiedCreator {
+                    request_actor: Some(verified),
+                    recipient_id: actor_id.to_string(),
+                }))
+            } else if actor == "anonymous:local" {
+                Ok(Some(VerifiedCreator {
+                    request_actor: None,
+                    recipient_id: "local".to_string(),
+                }))
+            } else {
+                Err(anyhow::anyhow!(
+                    "pending-events: creator provenance for {scheduled_event_id} has \
+                     unsupported actor encoding {actor:?}"
+                ))
+            }
+        }
+        _ => Err(anyhow::anyhow!(
+            "pending-events: scheduled event {scheduled_event_id} has duplicate creator \
+             provenance rows"
+        )),
     }
 }
 
@@ -1104,13 +1252,16 @@ async fn append_scheduled_action_failure_event(
 ///
 /// The action is wrapped as a JSON-form batch with `namespace` injected into
 /// each op's args so the VerbRegistry mints a token scoped to the event's
-/// namespace. This preserves namespace isolation: all writes from the action
-/// land in the event's namespace, not in the server's default `local` namespace.
+/// namespace. Dispatch also uses the provenance-verified creator as the
+/// effective request identity and preserves public-surface visibility, so a
+/// delayed action cannot invoke an internal subhandler. Together these
+/// preserve the original authority boundary: writes land in the event's
+/// namespace and gate/audit decisions never inherit daemon authority.
 async fn dispatch_action(
     action_dsl: &str,
     namespace: &str,
+    creator_actor: Option<VerifiedActor>,
     server: &KhiveMcpServer,
-    acting_actor: Option<&str>,
     verbose: bool,
 ) -> Result<()> {
     // Parse the stored DSL to inject namespace into each op.
@@ -1151,29 +1302,22 @@ async fn dispatch_action(
         eprintln!("[pending-events] dispatch ns={namespace}: {ops_str}");
     }
 
-    let request = RequestParams {
-        ops: ops_str,
-        presentation: None,
-        presentation_per_op: None,
-        save_to: None,
-        format: None,
-        format_per_op: None,
-        request_id: None,
-    };
-    let result = match acting_actor {
-        Some(actor) => {
-            let actor = if actor == "local" {
-                None
-            } else {
-                Some(VerifiedActor::new(actor).map_err(|e| {
-                    anyhow::anyhow!("pending-events: invalid reminder actor {actor:?}: {e}")
-                })?)
-            };
-            server.dispatch_request_local_as(request, actor).await
-        }
-        None => server.dispatch_request_local(request).await,
-    }
-    .map_err(|e| anyhow::anyhow!("pending-events: dispatch error: {e}"))?;
+    let result = server
+        .dispatch_request_replay_as(
+            RequestParams {
+                ops: ops_str,
+                presentation: None,
+                presentation_per_op: None,
+                save_to: None,
+                format: None,
+                format_per_op: None,
+                request_id: None,
+            },
+            namespace,
+            creator_actor,
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("pending-events: dispatch error: {e}"))?;
 
     // The MCP response is a JSON string. Check for per-op failures.
     let parsed_result: Value = serde_json::from_str(&result).unwrap_or(Value::Null);
@@ -1312,24 +1456,31 @@ pub fn tick_interval_from_env() -> std::time::Duration {
 ///
 /// Runs [`run_pending_events_on`] on `interval` for as long as the daemon
 /// process lives; only the daemon role spawns this loop. `rt` MUST be the
-/// daemon's own already-resolved runtime handle for the `"schedule"` pack
-/// and `server` MUST be the daemon's own live [`KhiveMcpServer`] — never
-/// freshly reconstructed — or replayed actions can silently dispatch against
-/// the wrong backend (PR #782). Ticks on a fixed interval with
+/// daemon's own already-resolved runtime handle for the `"schedule"` pack.
+/// The host context carries the daemon's live [`KhiveMcpServer`] — never a
+/// freshly reconstructed server — or replayed actions can silently dispatch
+/// against the wrong backend (PR #782). Ticks on a fixed interval with
 /// `Skip`-missed-tick behavior so a long drain cannot make the loop drift
-/// behind. A per-tick failure is logged; the loop never stops.
+/// behind. Drain-level failures are retryable component failures; individual
+/// event failures remain part of a successful drain summary and do not spend
+/// the supervisor's restart budget.
 /// See `crates/khive-mcp/docs/api/pending-events.md` for the full rationale.
 pub async fn schedule_tick_loop(
     rt: KhiveRuntime,
-    server: KhiveMcpServer,
+    ctx: crate::components::HostContext,
     interval: std::time::Duration,
-) {
+) -> Result<(), crate::components::ComponentError> {
     let mut ticker = tokio::time::interval_at(tokio::time::Instant::now() + interval, interval);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
-        ticker.tick().await;
-        match run_pending_events_on(&rt, &server, false).await {
+        tokio::select! {
+            _ = ctx.cancellation().cancelled() => return Ok(()),
+            _ = ticker.tick() => {}
+        }
+        ctx.server().record_schedule_ticker_tick();
+        match run_pending_events_on(&rt, ctx.server(), false).await {
             Ok(summary) => {
+                ctx.heartbeat();
                 if summary.fired > 0
                     || summary.advanced > 0
                     || summary.failed > 0
@@ -1347,7 +1498,9 @@ pub async fn schedule_tick_loop(
                 }
             }
             Err(e) => {
-                tracing::warn!(error = %e, "schedule tick: drain pass failed");
+                return Err(crate::components::ComponentError::Retryable(format!(
+                    "schedule drain pass failed: {e}"
+                )));
             }
         }
     }
@@ -1362,6 +1515,7 @@ mod tests {
     use khive_storage::event::EventFilter;
     use khive_storage::types::PageRequest;
     use tempfile::NamedTempFile;
+    use tokio_util::sync::CancellationToken;
 
     #[derive(Debug)]
     struct DenyCommSendGate;
@@ -1378,24 +1532,51 @@ mod tests {
         }
     }
 
-    /// Denies by actor identity alone, regardless of verb — used to prove a
-    /// scheduled action replays under its creator's authenticated identity
-    /// (ADR-119), not the daemon's: the daemon actor stays allowed while the
-    /// creator actor is denied.
     #[derive(Debug)]
-    struct DenyActorGate {
-        denied_actor: String,
-    }
+    struct DenyCreatorCreateGate;
 
-    impl Gate for DenyActorGate {
+    impl Gate for DenyCreatorCreateGate {
         fn check(&self, request: &GateRequest) -> Result<GateDecision, GateError> {
-            if request.actor.id == self.denied_actor {
+            if request.verb == "create" && request.actor.id == "lambda:schedule-owner" {
                 Ok(GateDecision::deny(
-                    "actor denied by actor-aware policy-gate test",
+                    "creator is not authorized to replay create",
                 ))
             } else {
                 Ok(GateDecision::allow())
             }
+        }
+    }
+
+    #[derive(Debug)]
+    struct DenyAttackerCreateGate;
+
+    impl Gate for DenyAttackerCreateGate {
+        fn check(&self, request: &GateRequest) -> Result<GateDecision, GateError> {
+            if request.verb == "create" && request.actor.id == "lambda:schedule-attacker" {
+                Ok(GateDecision::deny(
+                    "attacker is not authorized to replay create",
+                ))
+            } else {
+                Ok(GateDecision::allow())
+            }
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct CaptureReplayIdentityGate {
+        creates: std::sync::Mutex<Vec<(String, String, String)>>,
+    }
+
+    impl Gate for CaptureReplayIdentityGate {
+        fn check(&self, request: &GateRequest) -> Result<GateDecision, GateError> {
+            if request.verb == "create" {
+                self.creates.lock().expect("capture lock").push((
+                    request.actor.kind.clone(),
+                    request.actor.id.clone(),
+                    request.namespace.as_str().to_string(),
+                ));
+            }
+            Ok(GateDecision::allow())
         }
     }
 
@@ -1472,6 +1653,111 @@ mod tests {
         run_pending_events_on(&rt, &server, false).await
     }
 
+    async fn agenda_ticker_last_tick_at(server: &KhiveMcpServer) -> Option<DateTime<Utc>> {
+        let response = server
+            .dispatch_request_local(RequestParams {
+                ops: "schedule.agenda()".to_string(),
+                presentation: Some("verbose".to_string()),
+                presentation_per_op: None,
+                save_to: None,
+                format: None,
+                format_per_op: None,
+                request_id: None,
+            })
+            .await
+            .expect("agenda dispatch");
+        let envelope: Value = serde_json::from_str(&response).expect("agenda response JSON");
+        assert_eq!(envelope["results"][0]["ok"], true, "{envelope:?}");
+        envelope["results"][0]["result"]["ticker"]["last_tick_at"]
+            .as_str()
+            .map(|timestamp| {
+                timestamp
+                    .parse::<DateTime<Utc>>()
+                    .expect("last_tick_at is RFC 3339")
+            })
+    }
+
+    async fn wait_for_agenda_tick_after(
+        server: &KhiveMcpServer,
+        after: Option<DateTime<Utc>>,
+    ) -> DateTime<Utc> {
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if let Some(tick) = agenda_ticker_last_tick_at(server).await {
+                    if after.as_ref().is_none_or(|prior| tick > *prior) {
+                        return tick;
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("schedule ticker heartbeat did not advance")
+    }
+
+    #[tokio::test]
+    async fn quiet_schedule_tick_loop_surfaces_an_advancing_then_stale_heartbeat() {
+        let (_file, db_path) = tmp_db();
+        let rt = make_rt(&db_path).await;
+        let server = KhiveMcpServer::new(rt.clone()).expect("server");
+        assert_eq!(agenda_ticker_last_tick_at(&server).await, None);
+
+        let interval = std::time::Duration::from_millis(15);
+        let cancellation = CancellationToken::new();
+        let health = crate::components::HealthReporter::default();
+        let ctx = crate::components::HostContext::new(
+            server.clone(),
+            cancellation.clone(),
+            "schedule-tick",
+            health.clone(),
+        );
+        let task = tokio::spawn(schedule_tick_loop(rt, ctx, interval));
+        let first = wait_for_agenda_tick_after(&server, None).await;
+        let second = wait_for_agenda_tick_after(&server, Some(first)).await;
+        assert!(second > first);
+        assert!(
+            health
+                .status("schedule-tick")
+                .and_then(|status| status.last_heartbeat)
+                .is_some(),
+            "a successful quiet drain must heartbeat through component health"
+        );
+
+        cancellation.cancel();
+        task.await
+            .expect("tick task joins")
+            .expect("cooperative cancellation is a clean stop");
+        let stopped_at = agenda_ticker_last_tick_at(&server)
+            .await
+            .expect("the loop recorded at least two ticks before stopping");
+        assert!(stopped_at >= second);
+        tokio::time::sleep(interval.saturating_mul(2)).await;
+        assert_eq!(
+            agenda_ticker_last_tick_at(&server).await,
+            Some(stopped_at),
+            "a stopped loop must leave a stale timestamp, not fabricate liveness"
+        );
+    }
+
+    #[tokio::test]
+    async fn schedule_ticker_heartbeat_is_process_local_and_missing_without_a_loop() {
+        let (_file, db_path) = tmp_db();
+        let rt = make_rt(&db_path).await;
+        let server = KhiveMcpServer::new(rt).expect("server");
+        assert_eq!(agenda_ticker_last_tick_at(&server).await, None);
+
+        server.record_schedule_ticker_tick();
+        assert!(agenda_ticker_last_tick_at(&server).await.is_some());
+
+        let replacement_rt = make_rt(&db_path).await;
+        let replacement = KhiveMcpServer::new(replacement_rt).expect("replacement server");
+        assert_eq!(
+            agenda_ticker_last_tick_at(&replacement).await,
+            None,
+            "a replacement process must not inherit its predecessor's heartbeat"
+        );
+    }
+
     /// Create a scheduled_event note directly via runtime.create_note, replicating
     /// the exact property schema used by handle_schedule / handle_remind in
     /// khive-pack-schedule.
@@ -1509,6 +1795,29 @@ mod tests {
             )
             .await
             .expect("create_note");
+
+        // Production schedule verbs append this immutable actor binding
+        // before activating a row. Most drain tests create fixtures directly
+        // through the runtime to target claim/finalize behavior, so mirror
+        // that provenance explicitly. Tests for legacy/forged rows construct
+        // their own notes and intentionally omit it.
+        let provenance = khive_storage::Event::new(
+            namespace,
+            khive_pack_schedule::CREATOR_PROVENANCE_VERB,
+            EventKind::Audit,
+            SubstrateKind::Note,
+            format!("{}:{}", token.actor().kind, token.actor().id),
+        )
+        .with_target(note.id)
+        .with_payload(json!({
+            "provenance": khive_pack_schedule::CREATOR_PROVENANCE_MARKER_V1,
+            "event_type": event_type,
+        }));
+        rt.events(&token)
+            .expect("events")
+            .append_event(provenance)
+            .await
+            .expect("append creator provenance");
 
         note.id
     }
@@ -1556,6 +1865,37 @@ mod tests {
                 (content, properties)
             })
             .collect()
+    }
+
+    async fn note_content_count_in_namespace(
+        rt: &KhiveRuntime,
+        namespace: &str,
+        kind: &str,
+        content: &str,
+    ) -> usize {
+        let token = rt
+            .authorize(Namespace::parse(namespace).expect("namespace"))
+            .expect("authorize");
+        rt.notes(&token)
+            .expect("notes")
+            .query_notes(
+                namespace,
+                Some(kind),
+                PageRequest {
+                    limit: 200,
+                    offset: 0,
+                },
+            )
+            .await
+            .expect("query notes")
+            .items
+            .into_iter()
+            .filter(|note| note.content == content)
+            .count()
+    }
+
+    async fn note_content_count(rt: &KhiveRuntime, kind: &str, content: &str) -> usize {
+        note_content_count_in_namespace(rt, "local", kind, content).await
     }
 
     async fn make_repeat_due_again(rt: &KhiveRuntime, id: uuid::Uuid) {
@@ -1641,7 +1981,6 @@ mod tests {
         );
         assert_eq!(messages[0].0, "test reminder");
         assert_eq!(messages[0].1["direction"], "inbound");
-        assert_eq!(messages[0].1["from_actor"], creator);
         assert_eq!(messages[0].1["to_actor"], creator);
         assert_eq!(messages[0].1["subject"], "[Reminder] test reminder");
         assert!(daemon_messages.is_empty());
@@ -1651,311 +1990,51 @@ mod tests {
         assert!(props["fired_at"].as_str().is_some());
     }
 
-    /// Security regression: the generic `create` verb must not be able to
-    /// forge a `scheduled_event`'s `created_by_actor` — that field is the
-    /// trust anchor the drain replays actions under, and `khive-pack-kg`'s
-    /// `create` handler must reject the kind outright rather than trust
-    /// caller-supplied properties.
     #[tokio::test]
-    async fn generic_create_cannot_forge_scheduled_event_creator() {
+    async fn unprovenanced_reminder_ignores_forged_actor_property() {
         let (_tmp, db_path) = tmp_db();
-        let rt = make_rt_with_actor(&db_path, Some("lambda:attacker")).await;
-        let server = KhiveMcpServer::new(rt.clone()).expect("server");
-
-        let ops = serde_json::to_string(&json!([{
-            "tool": "create",
-            "args": {
-                "kind": "note",
-                "note_kind": "scheduled_event",
-                "content": "forged reminder",
-                "properties": {
-                    "trigger_at": "2099-01-01T00:00:00Z",
-                    "status": "pending",
-                    "event_type": "remind",
-                    "created_by_actor": "lambda:victim"
-                }
-            }
-        }]))
-        .expect("serialize create op");
-        let result = server
-            .dispatch_request_local(RequestParams {
-                ops,
-                ..Default::default()
-            })
-            .await
-            .expect("dispatch_request_local must not error at the RPC layer");
-        let result: Value = serde_json::from_str(&result).expect("valid JSON");
-        let op = &result["results"][0];
-        assert_eq!(
-            op["ok"], false,
-            "generic create of a scheduled_event must be rejected: {result}"
-        );
-        let err = op["error"].as_str().unwrap_or("");
-        assert!(
-            err.contains("scheduled_event") && err.contains("not creatable"),
-            "expected a scheduled_event-specific rejection, got: {err}"
-        );
-    }
-
-    /// Security regression: the generic `update` verb must not be able to
-    /// alter a `scheduled_event`'s creator identity or action payload once
-    /// written, even for a legitimately-created row. Only `schedule.cancel`
-    /// remains a valid post-creation mutation.
-    #[tokio::test]
-    async fn generic_update_cannot_alter_scheduled_event_creator() {
-        let (_tmp, db_path) = tmp_db();
-        let creator = "lambda:reminder-owner-2";
-        let rt = make_rt_with_actor(&db_path, Some(creator)).await;
-        let server = KhiveMcpServer::new(rt.clone()).expect("server");
-
-        let remind_ops = serde_json::to_string(&json!([{
-            "tool": "schedule.remind",
-            "args": { "content": "test reminder", "at": "2099-01-01T00:00:00Z" }
-        }]))
-        .expect("serialize reminder op");
-        let result = server
-            .dispatch_request_local(RequestParams {
-                ops: remind_ops,
-                ..Default::default()
-            })
-            .await
-            .expect("create reminder through schedule.remind");
-        let result: Value = serde_json::from_str(&result).expect("reminder result JSON");
-        assert_eq!(result["results"][0]["ok"], true, "{result}");
-        let id_str = result["results"][0]["result"]["full_id"]
-            .as_str()
-            .expect("reminder full_id")
-            .to_string();
-        let id: uuid::Uuid = id_str.parse().expect("reminder UUID");
-
-        let update_ops = serde_json::to_string(&json!([{
-            "tool": "update",
-            "args": {
-                "id": id_str,
-                "properties": { "created_by_actor": "lambda:attacker" }
-            }
-        }]))
-        .expect("serialize update op");
-        let update_result = server
-            .dispatch_request_local_as(
-                RequestParams {
-                    ops: update_ops,
-                    ..Default::default()
-                },
-                Some(VerifiedActor::new("lambda:attacker").expect("verified actor")),
-            )
-            .await
-            .expect("dispatch_request_local_as must not error at the RPC layer");
-        let update_result: Value = serde_json::from_str(&update_result).expect("valid JSON");
-        let op = &update_result["results"][0];
-        assert_eq!(
-            op["ok"], false,
-            "generic update of a scheduled_event must be rejected: {update_result}"
-        );
-        let err = op["error"].as_str().unwrap_or("");
-        assert!(
-            err.contains("scheduled_event") && err.contains("not editable"),
-            "expected a scheduled_event-specific rejection, got: {err}"
-        );
-
-        let props = get_note_props(&rt, id).await;
-        assert_eq!(
-            props["created_by_actor"], creator,
-            "creator must remain unchanged after a rejected forgery attempt: {props}"
-        );
-    }
-
-    /// ADR-119: a generic `schedule.schedule` action must replay under its
-    /// creator's identity, not the daemon's, even when a different actor
-    /// owns the daemon process that drains it — mirroring the reminder
-    /// guarantee above (`fired_reminder_delivers_to_creator_after_daemon_actor_changes`).
-    #[tokio::test]
-    async fn scheduled_action_replays_as_creator_not_daemon() {
-        let (_tmp, db_path) = tmp_db();
-        let creator = "lambda:schedule-owner";
-        let daemon_actor = "lambda:replacement-daemon-2";
-
-        let creator_rt = make_rt_with_actor(&db_path, Some(creator)).await;
-        let action = format!(
-            "comm.send(to={creator:?}, subject=\"scheduled\", content=\"scheduled action fired\", self_send=true)"
-        );
-        let id = create_scheduled_event(
-            &creator_rt,
-            "local",
-            &due_rfc3339(),
-            Some(&action),
-            None,
-            "schedule",
-        )
-        .await;
-        let props = get_note_props(&creator_rt, id).await;
-        assert_eq!(props["created_by_actor"], creator, "{props}");
-
+        let daemon_actor = "lambda:daemon-owner";
+        let forged_victim = "lambda:forged-victim";
         let rt = make_rt_with_actor(&db_path, Some(daemon_actor)).await;
-        let server = KhiveMcpServer::new(rt.clone()).expect("replacement daemon server");
+        let server = KhiveMcpServer::new(rt.clone()).expect("server");
+        let token = rt
+            .authorize(Namespace::local())
+            .expect("authorize reminder fixture");
+        rt.create_note(
+            &token,
+            "scheduled_event",
+            None,
+            "unprovenanced reminder",
+            None,
+            Some(json!({
+                "trigger_at": due_rfc3339(),
+                "repeat": null,
+                "status": "pending",
+                "event_type": "remind",
+                "created_by_actor": forged_victim,
+                "payload": null,
+                "fired_at": null,
+                "cancelled_at": null,
+            })),
+            vec![],
+        )
+        .await
+        .expect("create hand-written reminder");
+
         let summary = run_pending_events_on(&rt, &server, false)
             .await
             .expect("drain");
         assert_eq!(summary.fired, 1);
         assert_eq!(summary.failed, 0);
-
-        let messages = inbound_reminder_messages(&rt, creator).await;
-        let daemon_messages = inbound_reminder_messages(&rt, daemon_actor).await;
-        assert_eq!(
-            messages.len(),
-            1,
-            "creator={creator}, daemon={daemon_actor}: daemon_messages={daemon_messages:?}"
-        );
-        assert_eq!(messages[0].1["from_actor"], creator);
-        assert!(daemon_messages.is_empty());
-    }
-
-    /// ADR-119 fail-closed requirement: a `scheduled_event` row with no
-    /// verifiable `created_by_actor` (legacy data predating this
-    /// provenance guarantee) must never replay under the daemon's own
-    /// identity — it must be counted as a failure and left undispatched.
-    #[tokio::test]
-    async fn scheduled_event_missing_provenance_fails_closed() {
-        let (_tmp, db_path) = tmp_db();
-        let daemon_actor = "lambda:daemon-legacy";
-        let rt = make_rt_with_actor(&db_path, Some(daemon_actor)).await;
-        let server = KhiveMcpServer::new(rt.clone()).expect("server");
-
-        let action =
-            "comm.send(to=\"lambda:daemon-legacy\", subject=\"x\", content=\"x\", self_send=true)";
-        let id =
-            create_scheduled_event(&rt, "local", &due_rfc3339(), Some(action), None, "schedule")
-                .await;
-
-        // Simulate a legacy row written before creator provenance was captured.
-        let mut writer = rt.sql().writer().await.expect("writer");
-        writer
-            .execute(SqlStatement {
-                sql: "UPDATE notes SET properties = json_remove(properties, \
-                      '$.created_by_actor') WHERE id = ?1"
-                    .to_string(),
-                params: vec![SqlValue::Text(id.to_string())],
-                label: Some("test_strip_provenance".into()),
-            })
-            .await
-            .expect("strip provenance");
-        drop(writer);
-
-        let summary = run_pending_events_on(&rt, &server, false)
-            .await
-            .expect("drain");
-        assert_eq!(
-            summary.failed, 1,
-            "missing provenance must fail closed, not silently succeed: {summary:?}"
+        assert!(
+            inbound_reminder_messages(&rt, forged_victim)
+                .await
+                .is_empty(),
+            "mutable created_by_actor metadata must not select a recipient"
         );
         let daemon_messages = inbound_reminder_messages(&rt, daemon_actor).await;
-        assert!(
-            daemon_messages.is_empty(),
-            "a fail-closed row must never dispatch under the daemon identity: {daemon_messages:?}"
-        );
-
-        // ADR-119: the row must carry a durable policy error, not read as a
-        // clean fire — an ephemeral drain counter alone hides action loss
-        // from anything reading the note row after the fact.
-        let props = get_note_props(&rt, id).await;
-        assert!(
-            props["policy_error"].as_str().is_some_and(
-                |error| error.contains("fail-closed") && error.contains("created_by_actor")
-            ),
-            "fail-closed row must persist a policy error distinguishing it from a clean fire: \
-             {props:?}"
-        );
-        assert!(
-            props["policy_error_at"].as_str().is_some(),
-            "fail-closed row must record when the policy error was recorded: {props:?}"
-        );
-
-        let token = rt.authorize(Namespace::local()).expect("authorize");
-        let events = rt
-            .events(&token)
-            .expect("event store")
-            .query_events(
-                EventFilter {
-                    verbs: vec!["schedule.schedule.fire".to_string()],
-                    ..Default::default()
-                },
-                PageRequest {
-                    limit: 10,
-                    offset: 0,
-                },
-            )
-            .await
-            .expect("query fail-closed policy events");
-        assert!(
-            events
-                .items
-                .iter()
-                .any(|event| event.outcome == EventOutcome::Error && event.target_id == Some(id)),
-            "fail-closed row must append an auditable policy-error event: {events:?}"
-        );
-    }
-
-    /// ADR-119 acceptance criterion 6: a caller must not be able to schedule
-    /// an action that is denied to them but allowed to the daemon. This gate
-    /// denies purely by actor identity (not verb), so the drain only passes
-    /// if it replays under the creator's persisted identity rather than the
-    /// daemon's — proving the `VerifiedActor` dispatch seam is actually
-    /// evaluated by the Gate, not just threaded through unused.
-    #[tokio::test]
-    async fn scheduled_action_denied_to_creator_is_not_permitted_via_daemon() {
-        let (_tmp, db_path) = tmp_db();
-        let creator = "lambda:gated-creator";
-        let daemon_actor = "lambda:gated-daemon";
-
-        let creator_rt = make_rt_with_actor(&db_path, Some(creator)).await;
-        let action = format!(
-            "comm.send(to={creator:?}, subject=\"scheduled\", content=\"scheduled action \
-             fired\", self_send=true)"
-        );
-        let id = create_scheduled_event(
-            &creator_rt,
-            "local",
-            &due_rfc3339(),
-            Some(&action),
-            None,
-            "schedule",
-        )
-        .await;
-        let props = get_note_props(&creator_rt, id).await;
-        assert_eq!(props["created_by_actor"], creator, "{props}");
-
-        let cfg = RuntimeConfig {
-            db_path: Some(std::path::PathBuf::from(&db_path)),
-            default_namespace: Namespace::parse("local").unwrap(),
-            embedding_model: None,
-            additional_embedding_models: vec![],
-            gate: std::sync::Arc::new(DenyActorGate {
-                denied_actor: creator.to_string(),
-            }),
-            actor_id: Some(daemon_actor.to_string()),
-            ..Default::default()
-        };
-        let rt = KhiveRuntime::new(cfg).expect("runtime");
-        let packs = vec!["kg".to_string(), "comm".to_string(), "schedule".to_string()];
-        let server = KhiveMcpServer::with_packs(rt.clone(), &packs)
-            .expect("server with required scheduled action delivery pack");
-
-        let summary = run_pending_events_on(&rt, &server, false)
-            .await
-            .expect("drain continues after gate denial");
-        assert_eq!(
-            summary.failed, 1,
-            "an action denied to its creator must be recorded as a failure, not run under the \
-             daemon's allowed identity: {summary:?}"
-        );
-
-        let creator_messages = inbound_reminder_messages(&rt, creator).await;
-        let daemon_messages = inbound_reminder_messages(&rt, daemon_actor).await;
-        assert!(
-            creator_messages.is_empty() && daemon_messages.is_empty(),
-            "a gate-denied action must have no side effect: creator={creator_messages:?}, \
-             daemon={daemon_messages:?}"
-        );
+        assert_eq!(daemon_messages.len(), 1);
+        assert_eq!(daemon_messages[0].0, "unprovenanced reminder");
     }
 
     #[tokio::test]
@@ -2497,6 +2576,156 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn concurrent_replay_preserves_each_events_actor_and_namespace() {
+        let (_tmp, db_path) = tmp_db();
+        let creator_runtime = |actor: &str| {
+            KhiveRuntime::new(RuntimeConfig {
+                db_path: Some(std::path::PathBuf::from(&db_path)),
+                default_namespace: Namespace::local(),
+                embedding_model: None,
+                additional_embedding_models: vec![],
+                actor_id: Some(actor.to_string()),
+                packs: vec!["kg".to_string(), "schedule".to_string()],
+                ..Default::default()
+            })
+            .expect("creator runtime")
+        };
+        let actor_a = "lambda:scheduled-a";
+        let actor_b = "lambda:scheduled-b";
+        let ns_a = "schedule-tenant-a";
+        let ns_b = "schedule-tenant-b";
+        let rt_a = creator_runtime(actor_a);
+        let rt_b = creator_runtime(actor_b);
+        create_scheduled_event(
+            &rt_a,
+            ns_a,
+            &due_rfc3339(),
+            Some("create(kind=\"observation\", content=\"isolated-a\")"),
+            None,
+            "schedule",
+        )
+        .await;
+        create_scheduled_event(
+            &rt_b,
+            ns_b,
+            &due_rfc3339(),
+            Some("create(kind=\"observation\", content=\"isolated-b\")"),
+            None,
+            "schedule",
+        )
+        .await;
+
+        let gate = std::sync::Arc::new(CaptureReplayIdentityGate::default());
+        let daemon_rt = KhiveRuntime::new(RuntimeConfig {
+            db_path: Some(std::path::PathBuf::from(&db_path)),
+            default_namespace: Namespace::local(),
+            embedding_model: None,
+            additional_embedding_models: vec![],
+            gate: gate.clone(),
+            actor_id: Some("lambda:daemon".to_string()),
+            packs: vec!["kg".to_string(), "schedule".to_string()],
+            ..Default::default()
+        })
+        .expect("daemon runtime");
+        let server = KhiveMcpServer::new(daemon_rt.clone()).expect("server");
+
+        let (drain_a, drain_b) = tokio::join!(
+            run_pending_events_on(&daemon_rt, &server, false),
+            run_pending_events_on(&daemon_rt, &server, false),
+        );
+        let drain_a = drain_a.expect("drain A");
+        let drain_b = drain_b.expect("drain B");
+        assert_eq!(
+            drain_a.failed + drain_b.failed,
+            0,
+            "{drain_a:?} {drain_b:?}"
+        );
+        assert_eq!(
+            drain_a.fired + drain_b.fired,
+            2,
+            "both isolated scheduled actions must fire exactly once"
+        );
+
+        let mut seen = gate.creates.lock().expect("capture lock").clone();
+        seen.sort();
+        let mut expected = vec![
+            ("actor".to_string(), actor_a.to_string(), ns_a.to_string()),
+            ("actor".to_string(), actor_b.to_string(), ns_b.to_string()),
+        ];
+        expected.sort();
+        assert_eq!(
+            seen, expected,
+            "concurrent replay must not swap actor or namespace identities"
+        );
+        assert_eq!(
+            note_content_count_in_namespace(&daemon_rt, ns_a, "observation", "isolated-a").await,
+            1
+        );
+        assert_eq!(
+            note_content_count_in_namespace(&daemon_rt, ns_b, "observation", "isolated-b").await,
+            1
+        );
+        assert_eq!(
+            note_content_count_in_namespace(&daemon_rt, ns_a, "observation", "isolated-b").await,
+            0,
+            "tenant B's action must not land in tenant A"
+        );
+        assert_eq!(
+            note_content_count_in_namespace(&daemon_rt, ns_b, "observation", "isolated-a").await,
+            0,
+            "tenant A's action must not land in tenant B"
+        );
+    }
+
+    #[tokio::test]
+    async fn anonymous_creator_replay_preserves_anonymous_actor_kind() {
+        let (_tmp, db_path) = tmp_db();
+        let creator_rt = make_rt(&db_path).await;
+        create_scheduled_event(
+            &creator_rt,
+            "local",
+            &due_rfc3339(),
+            Some("create(kind=\"observation\", content=\"anonymous replay marker\")"),
+            None,
+            "schedule",
+        )
+        .await;
+
+        let gate = std::sync::Arc::new(CaptureReplayIdentityGate::default());
+        let daemon_rt = KhiveRuntime::new(RuntimeConfig {
+            db_path: Some(std::path::PathBuf::from(&db_path)),
+            default_namespace: Namespace::local(),
+            embedding_model: None,
+            additional_embedding_models: vec![],
+            gate: gate.clone(),
+            actor_id: Some("lambda:daemon".to_string()),
+            packs: vec!["kg".to_string(), "schedule".to_string()],
+            ..Default::default()
+        })
+        .expect("daemon runtime");
+        let server = KhiveMcpServer::new(daemon_rt.clone()).expect("server");
+
+        let summary = run_pending_events_on(&daemon_rt, &server, false)
+            .await
+            .expect("drain");
+        assert_eq!(summary.fired, 1);
+        assert_eq!(summary.failed, 0);
+        assert_eq!(
+            gate.creates.lock().expect("capture lock").as_slice(),
+            &[(
+                "anonymous".to_string(),
+                "local".to_string(),
+                "local".to_string(),
+            )],
+            "verified anonymous provenance must not become authenticated actor:local"
+        );
+        assert_eq!(
+            note_content_count(&daemon_rt, "observation", "anonymous replay marker").await,
+            1
+        );
+    }
+
+    #[tokio::test]
     async fn dispatch_failure_does_not_abort_drain() {
         let (_tmp, db_path) = tmp_db();
         let rt = make_rt(&db_path).await;
@@ -2538,6 +2767,301 @@ mod tests {
         // The drain still ran to completion (no panic / early return).
         let props_bad2 = get_note_props(&rt, id_bad2).await;
         let _ = props_bad2["status"].as_str(); // just verify it's accessible
+    }
+
+    #[tokio::test]
+    async fn legacy_scheduled_action_without_creator_fails_closed() {
+        let (_tmp, db_path) = tmp_db();
+        let rt = make_rt_with_actor(&db_path, Some("lambda:daemon")).await;
+        let server = KhiveMcpServer::new(rt.clone()).expect("server");
+        let action = "create(kind=\"observation\", content=\"legacy action marker\")";
+        let token = rt
+            .authorize(Namespace::parse("local").expect("namespace"))
+            .expect("authorize");
+        let note = rt
+            .create_note(
+                &token,
+                "scheduled_event",
+                None,
+                action,
+                None,
+                Some(json!({
+                    "trigger_at": "2000-01-01T00:00:00Z",
+                    "repeat": null,
+                    "status": "pending",
+                    "event_type": "schedule",
+                    "payload": action,
+                    "fired_at": null,
+                    "cancelled_at": null,
+                })),
+                vec![],
+            )
+            .await
+            .expect("create legacy scheduled action");
+
+        let summary = run_pending_events_on(&rt, &server, false)
+            .await
+            .expect("drain");
+
+        assert_eq!(summary.failed, 1, "legacy row must report one failure");
+        assert_eq!(summary.fired, 0, "unsafe action must never count as fired");
+        assert_eq!(
+            note_content_count(&rt, "observation", "legacy action marker").await,
+            0,
+            "missing attribution must never inherit daemon authority"
+        );
+        let props = get_note_props(&rt, note.id).await;
+        assert_eq!(props["status"], "failed", "{props}");
+        assert!(
+            props["dispatch_error"]
+                .as_str()
+                .is_some_and(|error| error.contains("immutable creator provenance")),
+            "policy error must explain why replay was refused: {props}"
+        );
+        assert!(props["dispatch_failed_at"].as_str().is_some(), "{props}");
+    }
+
+    #[tokio::test]
+    async fn forged_created_by_actor_property_cannot_authorize_replay() {
+        let (_tmp, db_path) = tmp_db();
+        let rt = make_rt_with_actor(&db_path, Some("lambda:daemon")).await;
+        let server = KhiveMcpServer::new(rt.clone()).expect("server");
+        let action = "create(kind=\"observation\", content=\"forged actor marker\")";
+        let token = rt
+            .authorize(Namespace::parse("local").expect("namespace"))
+            .expect("authorize");
+        let note = rt
+            .create_note(
+                &token,
+                "scheduled_event",
+                None,
+                action,
+                None,
+                Some(json!({
+                    "trigger_at": due_rfc3339(),
+                    "repeat": null,
+                    "status": "pending",
+                    "event_type": "schedule",
+                    // Generic note properties are writable by the caller.
+                    // This claim has no pack-written provenance event.
+                    "created_by_actor": "lambda:privileged-victim",
+                    "payload": action,
+                    "fired_at": null,
+                    "cancelled_at": null,
+                })),
+                vec![],
+            )
+            .await
+            .expect("create forged scheduled action");
+
+        let summary = run_pending_events_on(&rt, &server, false)
+            .await
+            .expect("drain");
+
+        assert_eq!(summary.failed, 1);
+        assert_eq!(summary.fired, 0);
+        assert_eq!(
+            note_content_count(&rt, "observation", "forged actor marker").await,
+            0,
+            "caller-editable actor metadata must never become replay authority"
+        );
+        let props = get_note_props(&rt, note.id).await;
+        assert_eq!(props["status"], "failed", "{props}");
+        assert!(
+            props["dispatch_error"]
+                .as_str()
+                .is_some_and(|error| error.contains("immutable creator provenance")),
+            "{props}"
+        );
+    }
+
+    #[tokio::test]
+    async fn second_actor_cannot_rewrite_provenanced_schedule_intent() {
+        let (_tmp, db_path) = tmp_db();
+        let gate = std::sync::Arc::new(DenyAttackerCreateGate);
+        let owner = "lambda:schedule-owner";
+        let attacker = "lambda:schedule-attacker";
+        let original_action =
+            "create(kind=\"observation\", content=\"owner-approved schedule intent\")";
+        let forged_action =
+            "create(kind=\"observation\", content=\"attacker-selected schedule intent\")";
+
+        let owner_rt = KhiveRuntime::new(RuntimeConfig {
+            db_path: Some(std::path::PathBuf::from(&db_path)),
+            default_namespace: Namespace::local(),
+            embedding_model: None,
+            additional_embedding_models: vec![],
+            gate: gate.clone(),
+            actor_id: Some(owner.to_string()),
+            packs: vec!["kg".to_string(), "schedule".to_string()],
+            ..Default::default()
+        })
+        .expect("owner runtime");
+        let note_id = create_scheduled_event(
+            &owner_rt,
+            "local",
+            &due_rfc3339(),
+            Some(original_action),
+            None,
+            "schedule",
+        )
+        .await;
+
+        // Actor B is allowed to call generic `update`, but is denied the
+        // target `create` verb. Before the schedule-managed mutation fence,
+        // this patch replaced actor A's payload while retaining A's immutable
+        // provenance, so trigger-time Gate evaluation ran as A and allowed it.
+        let attacker_rt = KhiveRuntime::new(RuntimeConfig {
+            db_path: Some(std::path::PathBuf::from(&db_path)),
+            default_namespace: Namespace::local(),
+            embedding_model: None,
+            additional_embedding_models: vec![],
+            gate: gate.clone(),
+            actor_id: Some(attacker.to_string()),
+            packs: vec!["kg".to_string(), "schedule".to_string()],
+            ..Default::default()
+        })
+        .expect("attacker runtime");
+        let attacker_server = KhiveMcpServer::new(attacker_rt).expect("attacker server");
+        let update_ops = json!([{
+            "tool": "update",
+            "args": {
+                "id": note_id.to_string(),
+                "kind": "note",
+                "properties": {
+                    "payload": forged_action,
+                    "trigger_at": due_rfc3339(),
+                    "repeat": "daily",
+                    "status": "pending",
+                    "event_type": "schedule"
+                }
+            }
+        }])
+        .to_string();
+        let update_response = attacker_server
+            .dispatch_request_local(RequestParams {
+                ops: update_ops,
+                ..Default::default()
+            })
+            .await
+            .expect("generic update returns an operation envelope");
+        let update_response: Value =
+            serde_json::from_str(&update_response).expect("update response JSON");
+        assert_eq!(
+            update_response["results"][0]["ok"], false,
+            "{update_response}"
+        );
+        // Two layered defenses reject this: the KG update handler refuses the
+        // `scheduled_event` kind outright, and the runtime curation fence
+        // refuses schedule-managed notes. Whichever layer fires first, the
+        // rejection must name the scheduled-event trust boundary.
+        assert!(
+            update_response["results"][0]["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("schedule-managed")
+                    || error.contains("scheduled_event notes are not editable")),
+            "the generic mutation fence must reject executable schedule changes: \
+             {update_response}"
+        );
+
+        let unchanged = get_note_props(&owner_rt, note_id).await;
+        assert_eq!(unchanged["payload"], original_action, "{unchanged}");
+        assert_eq!(unchanged["repeat"], Value::Null, "{unchanged}");
+
+        let daemon_rt = KhiveRuntime::new(RuntimeConfig {
+            db_path: Some(std::path::PathBuf::from(&db_path)),
+            default_namespace: Namespace::local(),
+            embedding_model: None,
+            additional_embedding_models: vec![],
+            gate,
+            actor_id: Some("lambda:daemon".to_string()),
+            packs: vec!["kg".to_string(), "schedule".to_string()],
+            ..Default::default()
+        })
+        .expect("daemon runtime");
+        let daemon_server = KhiveMcpServer::new(daemon_rt.clone()).expect("daemon server");
+        let summary = run_pending_events_on(&daemon_rt, &daemon_server, false)
+            .await
+            .expect("drain");
+
+        assert_eq!(summary.failed, 0, "{summary:?}");
+        assert_eq!(summary.fired, 1, "{summary:?}");
+        assert_eq!(
+            note_content_count(&daemon_rt, "observation", "owner-approved schedule intent").await,
+            1
+        );
+        assert_eq!(
+            note_content_count(
+                &daemon_rt,
+                "observation",
+                "attacker-selected schedule intent"
+            )
+            .await,
+            0,
+            "actor B's rejected payload must never replay with actor A's authority"
+        );
+    }
+
+    #[tokio::test]
+    async fn scheduled_action_replay_uses_creator_not_daemon_identity() {
+        let (_tmp, db_path) = tmp_db();
+        let creator_cfg = RuntimeConfig {
+            db_path: Some(std::path::PathBuf::from(&db_path)),
+            default_namespace: Namespace::parse("local").unwrap(),
+            embedding_model: None,
+            additional_embedding_models: vec![],
+            gate: std::sync::Arc::new(DenyCreatorCreateGate),
+            actor_id: Some("lambda:schedule-owner".to_string()),
+            packs: vec!["kg".to_string(), "schedule".to_string()],
+            ..Default::default()
+        };
+        let creator_rt = KhiveRuntime::new(creator_cfg).expect("creator runtime");
+        let action = "create(kind=\"observation\", content=\"identity fence marker\")";
+        let note_id = create_scheduled_event(
+            &creator_rt,
+            "local",
+            &due_rfc3339(),
+            Some(action),
+            None,
+            "schedule",
+        )
+        .await;
+
+        let daemon_cfg = RuntimeConfig {
+            db_path: Some(std::path::PathBuf::from(&db_path)),
+            default_namespace: Namespace::parse("local").unwrap(),
+            embedding_model: None,
+            additional_embedding_models: vec![],
+            gate: std::sync::Arc::new(DenyCreatorCreateGate),
+            actor_id: Some("lambda:daemon".to_string()),
+            packs: vec!["kg".to_string(), "schedule".to_string()],
+            ..Default::default()
+        };
+        let rt = KhiveRuntime::new(daemon_cfg).expect("daemon runtime");
+        let server = KhiveMcpServer::new(rt.clone()).expect("server");
+
+        let summary = run_pending_events_on(&rt, &server, false)
+            .await
+            .expect("drain");
+
+        assert_eq!(summary.failed, 1, "creator gate denial must be visible");
+        assert_eq!(
+            note_content_count(&rt, "observation", "identity fence marker").await,
+            0,
+            "replay as the daemon would bypass the creator's denial"
+        );
+        let props = get_note_props(&rt, note_id).await;
+        assert_eq!(
+            props["status"], "fired",
+            "per-event failures do not retry forever"
+        );
+        assert!(
+            props["dispatch_error"]
+                .as_str()
+                .is_some_and(|error| error.contains("creator is not authorized")),
+            "dispatch failure must be persisted: {props}"
+        );
+        assert!(props["dispatch_failed_at"].as_str().is_some(), "{props}");
     }
 
     /// Issue #461: a `schedule.schedule` payload that write-time validation
@@ -2649,13 +3173,42 @@ mod tests {
         let rt = make_rt(&db_path).await;
         let server = KhiveMcpServer::new(rt.clone()).expect("server");
 
-        let err = dispatch_action("stats() | get(id=$prev.id)", "local", &server, None, false)
-            .await
-            .unwrap_err();
+        let err = dispatch_action(
+            "stats() | get(id=$prev.id)",
+            "local",
+            Some(VerifiedActor::new("lambda:test").expect("verified actor")),
+            &server,
+            false,
+        )
+        .await
+        .unwrap_err();
         let msg = err.to_string();
         assert!(
             msg.contains("not replayable"),
             "expected the specific non-literal-argument rejection message, got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn replay_defense_rejects_legacy_internal_subhandler_payload() {
+        let (_tmp, db_path) = tmp_db();
+        let rt = make_rt(&db_path).await;
+        let server = KhiveMcpServer::new(rt).expect("server");
+
+        let err = dispatch_action(
+            "comm.ingest(namespace=\"local\", from=\"email:a@example.com\", \
+             to=\"email:b@example.com\", content=\"forged inbound\")",
+            "local",
+            Some(VerifiedActor::new("lambda:scheduler").expect("verified actor")),
+            &server,
+            false,
+        )
+        .await
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("internal subhandler") && msg.contains("comm.ingest"),
+            "replay must preserve public-surface visibility for legacy/hand-written rows: {msg}"
         );
     }
 
@@ -2824,6 +3377,7 @@ mod tests {
                 "repeat": null,
                 "status": "firing",
                 "event_type": "schedule",
+                "created_by_actor": "local",
                 "payload": "stats()",
                 "fired_at": null,
                 "cancelled_at": null,

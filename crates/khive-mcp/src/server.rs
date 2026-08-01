@@ -11,7 +11,13 @@
 // as a unit. The module is the authoritative implementation of request
 // dispatch and is intentionally co-located.
 
-use std::{future::Future, sync::Arc};
+use std::{
+    future::Future,
+    sync::{
+        atomic::{AtomicI64, Ordering},
+        Arc,
+    },
+};
 
 use futures::{stream::FuturesUnordered, StreamExt};
 use rmcp::{
@@ -272,6 +278,11 @@ pub struct KhiveMcpServer {
     /// `KHIVE_OUTPUT_FORMAT` → builtin `json`. Per-request `format` fields
     /// override this at dispatch time.
     default_output_format: OutputFormat,
+    /// Last instant at which this process's daemon schedule loop began a tick.
+    /// Zero means this server instance has never observed the loop running.
+    /// Shared by server clones but never persisted, so a replacement process
+    /// cannot inherit a plausible-looking heartbeat from its predecessor.
+    schedule_ticker_last_tick_micros: Arc<AtomicI64>,
 }
 
 /// Failure reason inside a [`PackRegError`].
@@ -440,6 +451,7 @@ impl KhiveMcpServer {
             pool,
             secondary_pools: Vec::new(),
             default_output_format: OutputFormat::Json,
+            schedule_ticker_last_tick_micros: Arc::new(AtomicI64::new(0)),
         })
     }
 
@@ -461,6 +473,7 @@ impl KhiveMcpServer {
             pool: None,
             secondary_pools: Vec::new(),
             default_output_format: OutputFormat::Json,
+            schedule_ticker_last_tick_micros: Arc::new(AtomicI64::new(0)),
         }
     }
 
@@ -481,6 +494,7 @@ impl KhiveMcpServer {
             pool: None,
             secondary_pools: Vec::new(),
             default_output_format: OutputFormat::Json,
+            schedule_ticker_last_tick_micros: Arc::new(AtomicI64::new(0)),
         }
     }
 
@@ -618,6 +632,16 @@ impl KhiveMcpServer {
     /// construction by [`crate::serve::apply_env_output_format`].
     pub fn default_output_format(&self) -> OutputFormat {
         self.default_output_format
+    }
+
+    /// Record that this process's daemon schedule loop began a tick.
+    ///
+    /// The loop calls this before starting its drain pass, including passes
+    /// that find no due rows or return an error. A pass that wedges after this
+    /// point leaves a frozen timestamp for callers to classify as stale.
+    pub(crate) fn record_schedule_ticker_tick(&self) {
+        self.schedule_ticker_last_tick_micros
+            .store(chrono::Utc::now().timestamp_micros(), Ordering::Release);
     }
 
     /// Warm every pack's in-memory state. Called by the daemon in a background
@@ -824,7 +848,15 @@ impl KhiveMcpServer {
             .dispatch_with_identity(&tool, args_value, identity.cloned())
             .await
         {
-            Ok(result) => chain_ok_envelope_or_depth_error(tool, result),
+            Ok(result) => {
+                let result = decorate_schedule_agenda_with_ticker_health(
+                    &tool,
+                    is_help,
+                    result,
+                    self.schedule_ticker_last_tick_micros.as_ref(),
+                );
+                chain_ok_envelope_or_depth_error(tool, result)
+            }
             Err(RuntimeError::Khive(k)) => {
                 let error_payload = serde_json::to_value(&k)
                     .unwrap_or_else(|_| json!({ "kind": "internal", "message": k.to_string() }));
@@ -922,6 +954,8 @@ impl KhiveMcpServer {
 
                 // Clone coordinator and namespace for use in the per-op closures (ADR-029 D3/D4).
                 let coordinator: Option<Arc<dyn CoordinatorService>> = self.coordinator.clone();
+                let schedule_ticker_last_tick_micros =
+                    self.schedule_ticker_last_tick_micros.clone();
                 // ADR-096 Fork 1: a per-request identity overrides the default
                 // namespace for both the coordinator intercept and the registry
                 // dispatch below, so the two can't drift out of sync per op.
@@ -940,6 +974,8 @@ impl KhiveMcpServer {
 
                     let registry = self.registry.clone();
                     let coord = coordinator.clone();
+                    let schedule_ticker_last_tick_micros =
+                        schedule_ticker_last_tick_micros.clone();
                     let op_identity = identity_owned.clone();
                     let op_mode = mode_for_op(i);
                     let task_tool = op.tool.clone();
@@ -1046,12 +1082,20 @@ impl KhiveMcpServer {
                             .dispatch_with_identity(&tool, args_value, op_identity)
                             .await
                         {
-                            Ok(result) => present_ok_envelope_or_depth_error(
-                                tool,
-                                result,
-                                effective_mode,
-                                now_unix,
-                            ),
+                            Ok(result) => {
+                                let result = decorate_schedule_agenda_with_ticker_health(
+                                    &tool,
+                                    is_help,
+                                    result,
+                                    schedule_ticker_last_tick_micros.as_ref(),
+                                );
+                                present_ok_envelope_or_depth_error(
+                                    tool,
+                                    result,
+                                    effective_mode,
+                                    now_unix,
+                                )
+                            }
                             Err(RuntimeError::Khive(k)) => {
                                 let error_payload = serde_json::to_value(&k).unwrap_or_else(
                                     |_| json!({ "kind": "internal", "message": k.to_string() }),
@@ -1504,6 +1548,30 @@ fn stamp_usage(entry: &mut Value, ctx: &khive_runtime::usage::UsageContext) {
     }
 }
 
+/// Add host-owned ticker liveness to the schedule pack's canonical agenda
+/// payload. The pack owns scheduled intent; the MCP host owns the daemon loop,
+/// so this decoration stays at their dispatch boundary instead of persisting a
+/// process heartbeat in schedule data.
+fn decorate_schedule_agenda_with_ticker_health(
+    tool: &str,
+    is_help: bool,
+    mut result: Value,
+    last_tick_micros: &AtomicI64,
+) -> Value {
+    if tool != "schedule.agenda" || is_help {
+        return result;
+    }
+    let last_tick = last_tick_micros.load(Ordering::Acquire);
+    let last_tick_at = (last_tick > 0).then(|| khive_runtime::micros_to_iso(last_tick));
+    if let Some(result) = result.as_object_mut() {
+        result.insert(
+            "ticker".to_string(),
+            json!({ "last_tick_at": last_tick_at }),
+        );
+    }
+    result
+}
+
 /// Chain-mode (`dispatch_op`) success path: check the raw handler `result`
 /// against the depth guard before it is ever cloned into `$prev` context or
 /// wrapped in the response envelope. On violation returns a `result_too_deep`
@@ -1909,28 +1977,33 @@ impl KhiveMcpServer {
             .await
     }
 
-    /// Dispatch locally under an actor identity resolved outside the request DSL.
+    /// Replay one stored public-surface request under a host-verified actor.
     ///
-    /// The override applies only to this request; the server's construction-baked
-    /// actor and concurrent dispatches are unchanged. `None` explicitly selects
-    /// the anonymous/local actor rather than falling back to the baked actor.
-    pub(crate) async fn dispatch_request_local_as(
+    /// An attributed actor must come from an out-of-band provenance check,
+    /// never from a field inside the stored request. `None` is reserved for a
+    /// provenance-verified anonymous/local creator, preserving that actor kind.
+    /// Replay deliberately sets `from_wire=true`: scheduling delays a public
+    /// request; it does not upgrade that request into the operator-only local
+    /// surface where [`khive_runtime::Visibility::Subhandler`] verbs are callable.
+    pub(crate) async fn dispatch_request_replay_as(
         &self,
         p: RequestParams,
-        actor: Option<khive_runtime::VerifiedActor>,
+        namespace: &str,
+        verified_actor: Option<khive_runtime::VerifiedActor>,
     ) -> Result<String, McpError> {
         let identity = khive_runtime::RequestIdentity {
-            namespace: self.default_namespace.clone(),
-            actor_id: actor.map(|actor| actor.as_str().to_string()),
+            namespace: namespace.to_string(),
+            // `None` is the provenance-verified anonymous/local identity;
+            // spelling that identity as `Some("local")` would incorrectly
+            // reconstruct it as the distinct authenticated `actor:local`.
+            actor_id: verified_actor.map(|actor| actor.as_str().to_string()),
             process_ref: khive_runtime::process_ref_from_env(),
-            visible_namespaces: self
-                .visible_namespaces()
-                .iter()
-                .map(|ns| ns.as_str().to_string())
-                .collect(),
-            request_id: p.request_id,
+            // A scheduled action is scoped exactly to its event namespace;
+            // it never inherits the daemon's broader read visibility.
+            visible_namespaces: Vec::new(),
+            request_id: None,
         };
-        self.dispatch_request_inner(p, false, Some(identity), DispatchOrigin::Local)
+        self.dispatch_request_inner(p, true, Some(identity), DispatchOrigin::Local)
             .await
     }
 

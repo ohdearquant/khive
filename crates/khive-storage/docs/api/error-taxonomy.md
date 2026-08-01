@@ -26,9 +26,16 @@ The state reports what the task can prove about the individual request:
 
 A top-level operation has no enclosing transaction, so a panic is always
 `SideEffectsUnknown`. An unexpected loss of the typed reply for an accepted
-request is also classified conservatively as `SideEffectsUnknown`. A request
-buffered behind the terminal request, or a send attempted after the receiver
-closes, is `NotStarted`.
+request is also classified conservatively as `SideEffectsUnknown`. The same
+classification applies when `COMMIT` or the request operation fails and the
+writer cannot roll the enclosing transaction back, or when a transaction
+terminator returns without restoring autocommit mode. A request buffered
+behind the terminal request, or a send attempted after the receiver closes,
+is `NotStarted`.
+
+If rollback succeeds and restores autocommit mode, no terminal error is
+introduced: the caller receives the original operation error or the existing
+retryable `writer_task_commit` pool error, and the writer remains available.
 
 This error has no storage capability attribution (`capability()` returns
 `None`) and is not automatically retryable (`is_retryable()` returns `false`).

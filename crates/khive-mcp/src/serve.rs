@@ -66,8 +66,7 @@ pub async fn run(args: Args, registry: &TransportRegistry) -> anyhow::Result<()>
     spawn_email_channel_loops_if_daemon(&server, &args);
     #[cfg(feature = "channel-telegram")]
     spawn_telegram_channel_loops_if_daemon(&server, &args);
-    spawn_schedule_tick_loop_if_daemon(&args, &server, schedule_rt);
-    start_daemon_components_if_daemon(&args, &server);
+    start_daemon_components_if_daemon(&args, &server, schedule_rt);
 
     #[cfg(unix)]
     if args.daemon {
@@ -260,50 +259,17 @@ fn spawn_email_channel_loops_if_daemon(server: &KhiveMcpServer, args: &Args) {
 /// must not start components and stay byte-identical in behavior and output
 /// — the silent return keeps client runs unchanged. In daemon role the
 /// registry itself always logs the enumerated roster (names + count),
-/// including an empty one.
-fn start_daemon_components_if_daemon(args: &Args, server: &KhiveMcpServer) {
-    if !args.daemon {
-        return;
-    }
-    crate::components::start_daemon_components(server);
-}
-
-/// Spawn the daemon-resident schedule-event tick loop (ADR-106) iff `args`
-/// indicates this process is the daemon (mirrors the daemon-role gate
-/// pattern used by the (now-extracted) channel loops, #602). `schedule_rt`
-/// MUST be the daemon's own already-resolved `"schedule"`-pack runtime
-/// (never a fresh `RuntimeConfig`, PR #782); `None` means either this isn't
-/// the daemon role or the pack set has no `"schedule"`. `server` MUST be the
-/// daemon's own live `KhiveMcpServer`, cloned for action-dispatch only — a
-/// throwaway server built from `schedule_rt` alone would misroute replayed
-/// actions in a multi-backend deployment. See
-/// `crates/khive-mcp/docs/api/pending-events.md`.
-fn spawn_schedule_tick_loop_if_daemon(
+/// including an empty one. A resolved `schedule_rt` contributes the dynamic
+/// `schedule-tick` component; `None` leaves it out of the roster.
+fn start_daemon_components_if_daemon(
     args: &Args,
     server: &KhiveMcpServer,
     schedule_rt: Option<KhiveRuntime>,
-) {
+) -> usize {
     if !args.daemon {
-        tracing::info!("schedule tick loop: skipped (client role; daemon owns the tick)");
-        return;
+        return 0;
     }
-    let Some(rt) = schedule_rt else {
-        tracing::info!(
-            "schedule tick loop: skipped (\"schedule\" pack is not in this daemon's \
-             resolved pack set)"
-        );
-        return;
-    };
-    let interval = crate::pending_events::tick_interval_from_env();
-    tracing::info!(
-        interval_secs = interval.as_secs(),
-        "schedule tick loop: spawning (daemon role)"
-    );
-    tokio::spawn(crate::pending_events::schedule_tick_loop(
-        rt,
-        server.clone(),
-        interval,
-    ));
+    crate::components::start_daemon_components_with_schedule(server, schedule_rt)
 }
 
 /// Spawn the email channel polling + outbox loops if the `channel-email`
@@ -1496,7 +1462,7 @@ async fn telegram_outbox_loop(
 /// here. Pass `None` only if the caller could not acquire the lock.
 ///
 /// `schedule_rt` is the caller's resolved `"schedule"`-pack runtime handle
-/// (ADR-106) — see `spawn_schedule_tick_loop_if_daemon`. `kkernel`'s
+/// (ADR-106) — see `start_daemon_components_if_daemon`. `kkernel`'s
 /// coordinator-attached multi-backend boot path resolves this from the same
 /// `MultiBackendRegistry.per_pack_runtimes` map it uses to build `server`
 /// itself, so the tick drains the identical backend/actor/pack configuration
@@ -1519,8 +1485,7 @@ pub async fn serve_server(
     spawn_email_channel_loops_if_daemon(&server, args);
     #[cfg(feature = "channel-telegram")]
     spawn_telegram_channel_loops_if_daemon(&server, args);
-    spawn_schedule_tick_loop_if_daemon(args, &server, schedule_rt);
-    start_daemon_components_if_daemon(args, &server);
+    start_daemon_components_if_daemon(args, &server, schedule_rt);
 
     #[cfg(unix)]
     if args.daemon {
@@ -1947,7 +1912,7 @@ pub fn enforce_strict_actor_mode(
 ///
 /// Returns, alongside the server, the resolved [`KhiveRuntime`] handle the
 /// `"schedule"` pack is bound to — `None` when the resolved pack set does
-/// not include `"schedule"` — for `spawn_schedule_tick_loop_if_daemon` to
+/// not include `"schedule"` — for `start_daemon_components_if_daemon` to
 /// drain against (ADR-106). This is the SAME runtime the server itself
 /// dispatches through, never an independently re-resolved one (PR #782 —
 /// see `crates/khive-mcp/docs/api/pending-events.md`).
@@ -6647,6 +6612,28 @@ region = "us-east-1"
     }
 
     #[test]
+    fn client_role_never_starts_the_schedule_component() {
+        use clap::Parser;
+        let args = Args::parse_from(["mcp"]);
+        let cfg = RuntimeConfig {
+            db_path: None,
+            default_namespace: Namespace::parse("local").unwrap(),
+            embedding_model: None,
+            additional_embedding_models: vec![],
+            packs: vec!["kg".to_string(), "schedule".to_string()],
+            ..Default::default()
+        };
+        let rt = KhiveRuntime::new(cfg).expect("runtime");
+        let server = KhiveMcpServer::new(rt.clone()).expect("server");
+
+        assert_eq!(
+            start_daemon_components_if_daemon(&args, &server, Some(rt)),
+            0,
+            "stdio/client role must not own background schedule work"
+        );
+    }
+
+    #[test]
     #[serial]
     fn build_server_schedule_tick_runtime_satisfies_strict_actor_mode_like_the_live_server() {
         // Regression for the exact "strict actor mode can make every tick
@@ -6828,7 +6815,7 @@ backend = "schedule-backend"
     /// registers EVERY pack against the schedule backend alone. This test
     /// drives the drain through `run_pending_events_on(&rt, &server, ..)`
     /// with the daemon's REAL, fully-wired `server` (as
-    /// `spawn_schedule_tick_loop_if_daemon` now passes it) and asserts the
+    /// supervised schedule component now captures it) and asserts the
     /// replayed action's own write shows up only in `kg`'s declared backend.
     #[tokio::test]
     #[serial]
@@ -6903,17 +6890,36 @@ backend = "kg-backend"
         });
         let ns = Namespace::parse("local").expect("ns");
         let token = rt.authorize(ns).expect("authorize schedule runtime");
-        rt.create_note(
-            &token,
-            "scheduled_event",
-            None,
-            &action_dsl,
-            None,
-            Some(props),
-            vec![],
-        )
-        .await
-        .expect("create scheduled_event through the schedule runtime");
+        let scheduled = rt
+            .create_note(
+                &token,
+                "scheduled_event",
+                None,
+                &action_dsl,
+                None,
+                Some(props),
+                vec![],
+            )
+            .await
+            .expect("create scheduled_event through the schedule runtime");
+        rt.events(&token)
+            .expect("schedule event store")
+            .append_event(
+                khive_storage::Event::new(
+                    "local",
+                    khive_pack_schedule::CREATOR_PROVENANCE_VERB,
+                    khive_types::EventKind::Audit,
+                    khive_types::SubstrateKind::Note,
+                    format!("{}:{}", token.actor().kind, token.actor().id),
+                )
+                .with_target(scheduled.id)
+                .with_payload(serde_json::json!({
+                    "provenance": khive_pack_schedule::CREATOR_PROVENANCE_MARKER_V1,
+                    "event_type": "schedule",
+                })),
+            )
+            .await
+            .expect("append schedule creator provenance");
 
         let summary = crate::pending_events::run_pending_events_on(&rt, &server, false)
             .await

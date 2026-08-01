@@ -33,6 +33,10 @@ const SKIP_DIRS: &[&str] = &[
 #[derive(Debug, Clone)]
 pub(crate) struct ManifestProject {
     pub root: PathBuf,
+    /// The governing manifest file itself (`root` + the per-language
+    /// filename). Diagnostic labels must use this, never content-derived
+    /// names (#1594 quarantine reports).
+    pub manifest_path: PathBuf,
     pub name: String,
     pub language: &'static str,
     /// `(dependency_name, dependency_kind)`.
@@ -124,6 +128,7 @@ pub(crate) fn parse_cargo_toml(root: &Path, text: &str) -> Option<ManifestProjec
 
     Some(ManifestProject {
         root: root.to_path_buf(),
+        manifest_path: root.join("Cargo.toml"),
         name,
         language: "rust",
         dependencies,
@@ -178,6 +183,7 @@ pub(crate) fn parse_pyproject_toml(root: &Path, text: &str) -> Option<ManifestPr
 
     Some(ManifestProject {
         root: root.to_path_buf(),
+        manifest_path: root.join("pyproject.toml"),
         name,
         language: "python",
         dependencies,
@@ -205,6 +211,7 @@ pub(crate) fn parse_package_json(root: &Path, text: &str) -> Option<ManifestProj
 
     Some(ManifestProject {
         root: root.to_path_buf(),
+        manifest_path: root.join("package.json"),
         name,
         language: "typescript",
         dependencies,

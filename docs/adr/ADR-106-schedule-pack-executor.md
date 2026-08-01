@@ -2,11 +2,13 @@
 
 **Status**: Accepted
 **Date**: 2026-07-09
-**Amended**: 2026-07-12 (missed-event grace policy, Amendment A; implementation note,
-Amendment B; reminder delivery and failure observability, Amendment C)
+**Amended**: 2026-08-01 (missed-event grace policy, Amendment A; implementation note,
+Amendment B; reminder delivery and failure observability, Amendment C; process-local
+ticker liveness, Amendment D; ADR-119 supervision and creator-bound replay, Amendment E)
 **Depends on**: [ADR-040](ADR-040-communication-and-schedule-packs.md) (schedule pack
 verbs and `scheduled_event` note kind), [ADR-049](ADR-049-khived-daemon.md) (warm daemon
-process model), [ADR-016](ADR-016-request-dsl.md) (request DSL, replayed at fire time)
+process model), [ADR-016](ADR-016-request-dsl.md) (request DSL, replayed at fire time),
+[ADR-119](ADR-119-daemon-component-supervision.md) (host-owned lifecycle and identity fence)
 
 ## Context
 
@@ -774,14 +776,16 @@ this ADR has delivered so far.
 
 ## Amendment C: Reminder delivery and failure observability (2026-07-12)
 
-`schedule.remind` persists the creating actor's identity in the scheduled-event row as
-`created_by_actor`. When an in-grace reminder fires, the drain reads that stored value
-and dispatches `comm.send(to=<created_by_actor>, ...)`, producing an inbound message in
-the creator's actor-addressed inbox. Delivery therefore remains attributed to the
-creator across daemon restarts and changes in the daemon's own actor identity. Rows
-created before `created_by_actor` existed are the only exception: the drain logs a
-warning and falls back to the current server actor, then to `local` when the server has
-no configured actor.
+`schedule.remind` mirrors the creating actor in the scheduled-event row as
+`created_by_actor`, but the authoritative binding is a target-bound event appended from
+the dispatch token before the staged note becomes pending. When an in-grace reminder
+fires, the drain derives the recipient and dispatch actor from that immutable provenance
+and dispatches `comm.send`, producing an inbound message in the creator's actor-addressed
+inbox. Delivery therefore remains attributed to the creator across daemon restarts and
+changes in the daemon's own actor identity without trusting mutable note properties.
+Rows created before immutable provenance existed are the exception: the drain ignores
+any unprovenanced actor claim, logs a warning, and falls back to the current server actor,
+then to `local` when the server has no configured actor.
 
 A reminder-delivery failure is observable through the drain and persisted state. The
 drain logs the error, increments `DrainSummary.failed`, and persists `delivery_error` plus
@@ -800,3 +804,93 @@ rejects the call before persisting a note. The schedule pack itself still declar
 `REQUIRES = ["kg"]`, so `schedule.schedule`, `schedule.agenda`, and `schedule.cancel`
 remain available without `comm`. The per-event failure behavior above covers dispatch
 failures after a reminder has passed that creation-time capability check.
+
+## Amendment D: Process-local ticker liveness (2026-08-01)
+
+The daemon schedule loop MUST expose positive liveness even when an agenda is empty. The
+`KhiveMcpServer` instance owns a process-local `last_tick_at` heartbeat shared by its
+clones. `schedule_tick_loop` advances it immediately after the interval yields and before
+starting the drain attempt. Therefore quiet and failed drain passes both prove that the
+loop ran, while a drain that wedges after starting leaves a frozen timestamp for the
+caller to classify as stale.
+
+The MCP host decorates a successful `schedule.agenda` result with:
+
+```json
+{ "ticker": { "last_tick_at": "2026-08-01T12:34:56.123456Z" } }
+```
+
+`last_tick_at` is null until that server instance observes its first tick. The heartbeat
+is never written to SQLite or any other durable substrate: rebuilding the server over the
+same database starts at null, so a predecessor process cannot leave behind a recent-looking
+value that masquerades as current liveness. If the schedule pack is not resolved, the
+`schedule.agenda` verb itself is absent. The response deliberately carries no computed
+`healthy` boolean or fixed staleness threshold; callers compare the timestamp with their
+own expected cadence. Standard presentation rules still apply, so callers requiring the
+exact RFC 3339 value request verbose presentation.
+
+The schedule pack's direct registry handler remains responsible only for intent data. The
+decoration occurs at the MCP host boundary because that host owns the loop and is the only
+layer that can truthfully report whether this process is running it.
+
+## Amendment E: ADR-119 supervision and creator-bound replay (2026-08-01)
+
+ADR-119 supersedes the detached-task lifecycle described in this ADR's original Decision
+1/1a and closes the previously open tracked-shutdown gap. After configuration, actor,
+backend routing, and pack selection resolve, daemon-role startup adds a dynamic component
+named `schedule-tick` if and only if a schedule runtime exists. Its factory captures that
+exact runtime and receives the already-built live `KhiveMcpServer` through `HostContext`.
+The daemon roster contains one such component; client/stdio roles and pack-absent daemon
+configurations contain none. External `kkernel exec --pending-events` remains supported.
+
+The concrete process-lifetime policy is:
+
+| Field                      | Value                                                  |
+| -------------------------- | ------------------------------------------------------ |
+| Restart class              | `OnFailure`                                            |
+| Restart budget             | 5                                                      |
+| Initial backoff            | 1 second                                               |
+| Maximum backoff            | 60 seconds                                             |
+| Cooperative shutdown bound | 5 seconds (also clamped inside the daemon drain bound) |
+
+The loop selects between the interval and the component cancellation token. Each successful
+drain, including an empty agenda or a drain with absorbed per-event failures, records the
+ADR-119 component heartbeat. A drain-level error returns `ComponentError::Retryable`, so
+the supervisor records `Degraded`, backs off, and consumes one restart. Per-event action or
+reminder failures stay in `DrainSummary` and do not consume that budget. Panics, clean stop,
+budget exhaustion, and cancellation follow ADR-119's generic supervisor contract.
+
+Amendment D's agenda timestamp remains a separate, deliberately narrow signal: it records
+the tick attempt before the drain, so even a failed attempt is visible to callers. ADR-119's
+generic `HealthReporter` heartbeat records only successful cycles and remains process-local
+operator state; this amendment adds no generic component-health verb or wire schema.
+
+### Creator-bound replay and legacy policy
+
+`schedule.schedule`, like `schedule.remind`, mirrors `created_by_actor` for display but
+records authority in a target-bound, append-only creator-provenance event written from the
+dispatch token. Creation is ordered `provisioning note -> provenance event -> pending`, so
+no executable row exists before the immutable binding is durable. When a generic action
+fires, the drain reconstructs the exact verified actor kind from that event and supplies it
+with the event namespace to the live server. Attributed principals use `VerifiedActor`;
+`anonymous:local` remains anonymous. Token minting, gate checks, audit attribution, and writes
+therefore run as the creator, never as the daemon. Neither the stored DSL nor mutable note
+properties can override identity. Replay also retains the public visibility gate, so a
+scheduled payload cannot invoke a `Visibility::Subhandler`.
+
+Executable `scheduled_event` content and properties are schedule-managed. Generic KG
+`update` and note `merge` reject these rows (including either merge operand), so a caller
+cannot replace payload, trigger, cadence, or lifecycle state while retaining another
+actor's immutable provenance. `schedule.cancel` and the drain's CAS transitions remain the
+only executable-state mutation paths; generic deletion can still remove a row but cannot
+amend or reactivate it. Generic creation of an unprovenanced row still follows the
+fail-closed policy below.
+
+A generic scheduled-action row without immutable creator provenance fails closed: the payload is not
+dispatched, the claimed row becomes terminal `status="failed"`, and the drain persists
+`dispatch_error` plus `dispatch_failed_at`. This is the migration policy for rows written
+before creator attribution and deliberately differs from Amendment C's reminder-only legacy
+fallback: an unprovenanced reminder ignores its note actor claim and targets only the current
+server actor (then `local`). Other generic dispatch failures remain per-event and follow
+normal cadence finalization (`fired` or re-armed `pending`) while persisting those same error
+fields; a later successful repeat clears them.

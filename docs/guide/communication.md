@@ -47,17 +47,62 @@ A configured actor that addresses itself must opt in with `self_send=true`. If t
 target was meant to be a distinct parent or sub-agent, configure distinct actor identities
 instead of opting in; the rejection is intended to expose that identity collapse.
 
+### Confirm an uncertain internal delivery
+
+Rows, FTS documents, and vectors for a send/reply pair commit atomically.
+Ordinary failures leave neither copy. If the writer cannot establish whether
+an accepted request committed, the operation instead returns an `ambiguous`
+error containing `outbound_id=<full-uuid>`. Confirm the paired inbound write
+before retrying:
+
+```
+request(ops="comm.delivered(id=\"<full-outbound-uuid>\")")
+```
+
+A successful lookup returns `status="delivered"` and `delivered=true` when at
+least one live inbound note has `properties.outbound_ref` equal to that UUID.
+It returns `status="undelivered"`, `delivered=false`, and `inbound_count=0`
+when none does. The lookup does not require the outbound row to remain present
+and never compares message bodies. It is scoped to the caller's namespace and
+sender actor, so another actor cannot inspect a sender's outcome even if it
+learns the correlation UUID. If the lookup itself errors, the outcome is still
+uncertain.
+
+This operation confirms khive's internal inbound sibling only. It does not
+confirm asynchronous SMTP or another external transport; see
+[How outbound delivery works](#how-outbound-delivery-works) for that separate
+state machine.
+
+If the entire MCP response is lost, the caller receives neither the result nor
+the structured error and therefore does not know the server-generated UUID.
+`comm.delivered` cannot resolve that wider response-loss case.
+
 ### Inbox
 
-| Param    | Type    | Required | Notes                                        |
-| -------- | ------- | -------- | -------------------------------------------- |
-| `limit`  | integer | no       | Default 20, max 200.                         |
-| `status` | string  | no       | `"unread"` (default) \| `"read"` \| `"all"`. |
+| Param                | Type    | Required | Notes                                                                        |
+| -------------------- | ------- | -------- | ---------------------------------------------------------------------------- |
+| `limit`              | integer | no       | Default 20, max 200.                                                         |
+| `offset`             | integer | no       | Default 0; offset in the fully-filtered newest-first result set.             |
+| `status`             | string  | no       | `"unread"` (default) \| `"read"` \| `"all"`.                                 |
+| `from_actor`         | string  | no       | Exact sender; mutually exclusive with `from_prefix`.                         |
+| `from_prefix`        | string  | no       | Sender prefix; mutually exclusive with `from_actor`.                         |
+| `exclude_from_actor` | string  | no       | Exclude an exact sender actor label.                                         |
+| `since`              | string  | no       | Inclusive RFC 3339 lower bound on response `created_at`.                     |
+| `before`             | string  | no       | Exclusive RFC 3339 upper bound on response `created_at`.                     |
+| `subject_contains`   | string  | no       | Case-insensitive non-empty subject substring; missing subjects do not match. |
+| `content_contains`   | string  | no       | Case-insensitive non-empty body substring.                                   |
 
 ```
 request(ops="comm.inbox(limit=10)")
 request(ops="comm.inbox(status=\"all\")")
+request(ops="comm.inbox(status=\"all\", content_contains=\"timeout\", since=\"2026-07-31T00:00:00Z\")")
 ```
+
+Responses include `offset`, `has_more`, and `next_offset`. Repeat the same call
+with `offset=<next_offset>` until `next_offset` is null to enumerate every
+matching message without changing its read state. Filters are ANDed and offsets
+apply after all filters. Time bounds use the always-present top-level
+`created_at`, not optional transport `sent_at` metadata.
 
 ### Read
 
@@ -67,9 +112,16 @@ did not land — check `read` and re-issue later if needed.
 
 ```
 request(ops="comm.read(id=\"<message_id_or_prefix>\")")
+request(ops="comm.read(ids=[\"<message_id_1>\", \"<message_id_2>\"])")
 ```
 
-`id` accepts either a full UUID or a short 8-character hex prefix.
+Exactly one of `id` or `ids` is required. IDs accept either a full UUID or a
+short 8-character hex prefix; `ids` accepts 1-500 entries. The bulk form
+validates every target before mutating any and returns per-item results plus
+`requested_count`, `unique_count`, `marked_count`, and `failed_count`. Bulk
+updates are not transactional across messages: target-validation errors reject
+the call before any write, while later storage errors are reported in each
+result's `read` and optional `mark_error` fields.
 
 ### Reply
 

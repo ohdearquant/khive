@@ -118,7 +118,7 @@ fn fresh_db_migrates_to_latest() {
 }
 
 #[test]
-fn v15_fresh_start_installs_narrow_gtd_dependency_cycle_guards() {
+fn v16_fresh_start_installs_narrow_gtd_dependency_cycle_guards() {
     let mut conn = open_memory();
     run_migrations(&mut conn).expect("migrations should succeed");
 
@@ -137,7 +137,7 @@ fn v15_fresh_start_installs_narrow_gtd_dependency_cycle_guards() {
                 |row| row.get(0),
             )
             .expect("query trigger catalog");
-        assert!(exists, "V15 must install {trigger}");
+        assert!(exists, "V16 must install {trigger}");
     }
 
     insert_dependency_test_note(&conn, "task-a", "task", r#"{"status":"next"}"#, None);

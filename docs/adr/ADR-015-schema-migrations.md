@@ -142,7 +142,8 @@ above remains the historical pre-consolidation record.
 |     V12 | ADR-118            | ann_write_log_model_seq_index      | shipped |
 |     V13 | #1424 / #1462      | list_cursor_sequences              | shipped |
 |     V14 | #1424 / #1462      | graph_edges_id_unique              | shipped |
-|     V15 | ADR-019 / #1474    | gtd_dependency_cycle_guards        | shipped |
+|     V15 | #1597              | serve_ledger_attribution           | shipped |
+|     V16 | ADR-019 / #1474    | gtd_dependency_cycle_guards        | shipped |
 
 > **V9 record (2026-07-18)**: `entities_name_ci_index` (ADR-104) ships in the `MIGRATIONS`
 > array as `009-entities-name-ci-index.sql`; its status here was `claimed`, stale from ADR-104,

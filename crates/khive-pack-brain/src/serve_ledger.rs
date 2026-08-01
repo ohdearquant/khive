@@ -13,6 +13,7 @@ use khive_storage::types::{SqlStatement, SqlValue};
 use khive_storage::SqlAccess;
 
 pub use khive_brain_core::compute_query_class;
+use khive_brain_core::ServeAttribution;
 
 fn sql_err(context: &str, e: impl std::fmt::Display) -> RuntimeError {
     RuntimeError::Internal(format!("serve ledger {context}: {e}"))
@@ -33,6 +34,10 @@ pub struct ServeLedgerRow {
     /// read back here rather than recomputed, so a future change to the generated
     /// expression cannot silently diverge from what the fold gate reads.
     pub accounting_profile_id: Option<String>,
+    /// The tri-state marker stamped at serve time (ADR-081 amendment), or
+    /// `None` for a legacy row written before the column existed, or one
+    /// where the marker was unrecognized.
+    pub serve_attribution: Option<ServeAttribution>,
     #[allow(dead_code)]
     pub target_id: String,
     #[allow(dead_code)]
@@ -100,12 +105,13 @@ fn serve_ledger_insert_statement(
     query_class: &str,
     query_raw: &str,
     served_at: i64,
+    serve_attribution: Option<&str>,
 ) -> SqlStatement {
     SqlStatement {
         sql: "INSERT INTO brain_serve_ledger \
               (id, namespace, consumer_kind, served_by_profile_id, resolved_profile_id, \
-               resolved_at, target_id, query_class, query_raw, served_at) \
-              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10) \
+               resolved_at, target_id, query_class, query_raw, served_at, serve_attribution) \
+              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11) \
               ON CONFLICT(namespace, target_id, query_class, served_at) DO NOTHING"
             .into(),
         params: vec![
@@ -123,6 +129,9 @@ fn serve_ledger_insert_statement(
             SqlValue::Text(query_class.to_string()),
             SqlValue::Text(query_raw.to_string()),
             SqlValue::Integer(served_at),
+            serve_attribution
+                .map(|s| SqlValue::Text(s.to_string()))
+                .unwrap_or(SqlValue::Null),
         ],
         label: Some("brain_serve_ledger_insert".into()),
     }
@@ -140,6 +149,7 @@ pub(crate) async fn record_serves(
     query_class: &str,
     query_raw: &str,
     served_at: i64,
+    serve_attribution: Option<&str>,
 ) -> Result<ServeLedgerBatchSummary, RuntimeError> {
     if rows.is_empty() {
         return Ok(ServeLedgerBatchSummary::default());
@@ -158,6 +168,7 @@ pub(crate) async fn record_serves(
                 query_class,
                 query_raw,
                 served_at,
+                serve_attribution,
             )
         })
         .collect();
@@ -198,6 +209,7 @@ pub async fn record_serve(
     query_class: &str,
     query_raw: &str,
     served_at: i64,
+    serve_attribution: Option<&str>,
 ) -> Result<bool, RuntimeError> {
     let rows = [ServeLedgerInsert {
         id: id.to_string(),
@@ -214,6 +226,7 @@ pub async fn record_serve(
         query_class,
         query_raw,
         served_at,
+        serve_attribution,
     )
     .await?;
     Ok(summary.written == 1)
@@ -229,7 +242,8 @@ pub async fn get_serve_row(
         .query_row(SqlStatement {
             sql: "SELECT id, namespace, consumer_kind, served_by_profile_id, \
                   resolved_profile_id, resolved_at, accounting_profile_id, target_id, \
-                  query_class, query_raw, served_at, grade, graded_at, scorer_run_id \
+                  query_class, query_raw, served_at, grade, graded_at, scorer_run_id, \
+                  serve_attribution \
                   FROM brain_serve_ledger WHERE id = ?1"
                 .into(),
             params: vec![SqlValue::Text(id.to_string())],
@@ -250,6 +264,9 @@ pub async fn get_serve_row(
         resolved_profile_id: row_opt_text(&row, "resolved_profile_id"),
         resolved_at: row_opt_int(&row, "resolved_at"),
         accounting_profile_id: row_opt_text(&row, "accounting_profile_id"),
+        serve_attribution: ServeAttribution::from_column(
+            row_opt_text(&row, "serve_attribution").as_deref(),
+        ),
         target_id: row_text(&row, "target_id")?,
         query_class: row_text(&row, "query_class")?,
         query_raw: row_text(&row, "query_raw")?,
@@ -299,9 +316,12 @@ pub enum ServeLedgerResolution {
     AlreadyGraded,
     /// Row found and not yet graded by this `scorer_run_id`. Carries the
     /// accounting profile id to fold under, or `None` if unresolved (the
-    /// caller must force a zero-weight fold — ADR-081 §4 fail-safe).
+    /// caller must force a zero-weight fold — ADR-081 §4 fail-safe) — unless
+    /// `serve_attribution` is the stored `unspecified` marker, which keeps the
+    /// legacy binding/default fallback permitted instead of forcing zero.
     Proceed {
         accounting_profile_id: Option<String>,
+        serve_attribution: Option<ServeAttribution>,
     },
     /// No row exists for `serve_ledger_id`.
     NotFound,
@@ -321,6 +341,7 @@ pub async fn resolve(
     }
     Ok(ServeLedgerResolution::Proceed {
         accounting_profile_id: row.accounting_profile_id,
+        serve_attribution: row.serve_attribution,
     })
 }
 
@@ -449,6 +470,7 @@ mod tests {
             "class-a",
             "raw query",
             7,
+            None,
         )
         .await
         .expect("empty batch must succeed");
@@ -488,6 +510,7 @@ mod tests {
             "class-a",
             "Literal Raw Query",
             456,
+            Some("profile"),
         )
         .await
         .expect("captured batch must succeed");
@@ -530,6 +553,7 @@ mod tests {
                 statement.params.get(9),
                 Some(SqlValue::Integer(456))
             ));
+            assert_eq!(text_param(statement, 10), "profile");
         }
     }
 
@@ -563,6 +587,7 @@ mod tests {
             "preexisting-class",
             "preexisting query",
             1,
+            None,
         )
         .await
         .expect("precondition row must be inserted");
@@ -588,6 +613,7 @@ mod tests {
             "batch-class",
             "batch query",
             2,
+            None,
         )
         .await
         .expect_err("late primary-key collision must fail the whole batch");
@@ -690,6 +716,7 @@ mod tests {
                 "write-queue-routing-class",
                 "write queue routing test query",
                 1_700_000_000_000_000,
+                Some("profile"),
             )
             .await
         });

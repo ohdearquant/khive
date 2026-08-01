@@ -263,10 +263,11 @@ The canonical v1 set:
 | `created_at` | `Timestamp`     | ADR-004    | Weakly-monotonic event time                     |
 | `session_id` | `Option<Uuid>`  | ADR-041 §7 | Optional session grouping for implicit ordering |
 
-Profile-served events additionally carry `served_by_profile_id: Option<String>`
-inside `payload` (ADR-032 §3). Provenance observations linking an event to
-specific entities live in the sibling `event_observations` projection table
-(ADR-041 §2), NOT in the events row itself.
+Profile-aware events additionally carry `served_by_profile_id: Option<String>` and
+`serve_attribution` inside `payload` (ADR-032 §3 and Amendment 2). The tri-state marker
+distinguishes a successful profile serve from a failed profile read and legacy omission.
+Provenance observations linking an event to specific entities live in the sibling
+`event_observations` projection table (ADR-041 §2), NOT in the events row itself.
 
 ### Event vs Note boundary
 

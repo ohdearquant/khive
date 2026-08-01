@@ -36,11 +36,18 @@ when nobody is watching.
 ## `validate_replayable_single_action` — replay-safety gate (issue #461)
 
 The pending-events runner reparses the stored DSL at trigger time and dispatches it
-through the normal request surface. For that replay to succeed, the stored action
-must be:
+through the public-visibility request surface with the event namespace and a
+verified replay identity derived from the immutable, target-bound creator-provenance
+event; attributed principals use `VerifiedActor`, while `anonymous:local` remains
+anonymous. `created_by_actor` note metadata is not an authority source, and existing
+`scheduled_event` notes reject generic KG update/merge so another actor cannot rewrite
+the stored action while retaining the creator binding. A legacy generic row missing
+provenance fails closed. For replay to succeed, the stored action must be:
 
 - A single op against an exactly-registered handler name (not a bare shorthand
   resolved via a `schedule.{tool}` fallback).
+- Publicly callable (`Visibility::Verb`); registered internal subhandlers are rejected
+  both when intent is created and again by the replay dispatch boundary.
 - Built from literal argument values only (no `$prev` references — those are only
   meaningful inside a chain the replay path does not reconstruct).
 - Complete with respect to all required handler parameters.
@@ -54,7 +61,7 @@ the firing event's routing namespace into every op's args, and the registry pass
 it through unchanged whenever the handler declares `namespace`
 (`khive-runtime/src/pack.rs`). For handlers that treat `namespace` as a business
 param (e.g. `brain.bind`, `brain.resolve`), that silently changes the business value
-on replay — even when the *stored* action omitted `namespace` entirely (e.g.
+on replay — even when the _stored_ action omitted `namespace` entirely (e.g.
 `brain.bind` defaults an omitted `namespace` to the wildcard `"*"` at write time;
 replay would instead bind it to whatever namespace the event happens to fire from).
 Replay cannot yet carry routing-namespace and arg-namespace as separate concepts, so
@@ -135,7 +142,7 @@ subtype (e.g. git's `adr` Document subtype) is accepted at schedule time exactly
 when the real handler would accept it at trigger time.
 
 The kind-parse step is exactly what makes a pack-owned kind like `"resource"` reject
-*any* non-`None` `entity_type` outright: `resource` has no variant in the base
+_any_ non-`None` `entity_type` outright: `resource` has no variant in the base
 8-kind enum, so parsing `canonical_kind_name` fails before the subtype table is even
 consulted — the real handler has this same short-circuit
 (`khive-pack-kg/src/handlers/common.rs`, `validate_entity_type`), verified live via

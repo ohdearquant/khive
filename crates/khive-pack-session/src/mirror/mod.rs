@@ -1,4 +1,4 @@
-//! Background live-mirror service for Claude Code and Codex CLI session transcripts.
+//! Background live-mirror service for CLI transcripts and provider exports.
 //!
 //! Exposes the three sub-modules and re-exports the public surface used by
 //! `SessionPack::warm()` and tests.

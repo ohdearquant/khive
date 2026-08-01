@@ -3665,7 +3665,7 @@ backend = "sessions"
 
     /// #1474: the user-facing `--atomic` executor prepares every operation
     /// before its commit pass. Two individually acyclic task writes can
-    /// therefore form a cycle only inside the unit. The V15 commit-time
+    /// therefore form a cycle only inside the unit. The V16 commit-time
     /// guards must reject the later statement and roll the earlier one back
     /// for both authoritative dependency stores.
     #[tokio::test]

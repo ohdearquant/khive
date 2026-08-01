@@ -1,21 +1,22 @@
 # khive-pack-comm
 
-The communication pack for khive — inter-agent messaging (`send`, `inbox`,
-`read`, `unread`, `reply`, `thread`) over a dedicated `message` note kind, with
-dual-write, actor-addressed delivery, and channel polling observability.
+The communication pack for khive — inter-agent messaging over a dedicated
+`message` note kind, with dual-write, actor-addressed delivery, sender-side
+delivery confirmation, and channel polling observability.
 
 ## Verbs
 
-| Verb          | What it does                                                                                                                                                  |
-| ------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `comm.send`   | Send a message, optionally threaded                                                                                                                           |
-| `comm.inbox`  | List inbound messages for the caller (filter: unread / read / all)                                                                                            |
-| `comm.read`   | Mark an inbound message as read (best-effort: inspect `read`; `false` plus `mark_error` means re-issue later)                                                 |
-| `comm.unread` | Count the caller's unread inbound messages without message payloads                                                                                           |
-| `comm.reply`  | Reply to a message, preserving thread linkage                                                                                                                 |
-| `comm.thread` | Retrieve all messages in a conversation thread, chronologically                                                                                               |
-| `comm.health` | Read per-channel heartbeat state, nominal poll cadence, and nullable advisory schedule staleness                                                              |
-| `comm.probe`  | Read-only poll for new inbound message metadata and a stale unread count (takes an explicit `actor`; unlike `comm.inbox`, it is not inferred from the caller) |
+| Verb             | What it does                                                                                                                                                  |
+| ---------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `comm.send`      | Send a message, optionally threaded                                                                                                                           |
+| `comm.delivered` | Confirm the internal inbound sibling for an outbound UUID                                                                                                     |
+| `comm.inbox`     | Page and filter inbound messages for the caller                                                                                                               |
+| `comm.read`      | Mark one or up to 500 inbound messages as read (best-effort: inspect each result's `read`/`mark_error`)                                                       |
+| `comm.unread`    | Count the caller's unread inbound messages without message payloads                                                                                           |
+| `comm.reply`     | Reply to a message, preserving thread linkage                                                                                                                 |
+| `comm.thread`    | Retrieve all messages in a conversation thread, chronologically                                                                                               |
+| `comm.health`    | Read per-channel heartbeat state, nominal poll cadence, and nullable advisory schedule staleness                                                              |
+| `comm.probe`     | Read-only poll for new inbound message metadata and a stale unread count (takes an explicit `actor`; unlike `comm.inbox`, it is not inferred from the caller) |
 
 The internal `comm.ingest` handler is `Visibility::Subhandler` — it lets an
 out-of-band channel adapter (email, Telegram, etc.) write an inbound message
@@ -61,9 +62,26 @@ opaque so it can change again without a breaking rename.
 
 Every `comm.send` writes two `message` notes via `dual_write_message`
 (`src/message.rs`): an **outbound** copy (`direction=outbound`) and an
-**inbound** copy (`direction=inbound`), linked by `outbound_ref`. Both notes
-commit through one atomic writer transaction; a failure on either note rolls
-back the whole pair.
+**inbound** copy (`direction=inbound`), linked by `outbound_ref`. Rows, FTS
+documents, and vector rows for both copies commit in one atomic unit. An
+ordinary prepare or plan failure therefore leaves neither copy. If the writer
+seam reports `side_effects_unknown`, however, the caller cannot tell whether
+the complete pair committed. That error is surfaced as `ambiguous` with the
+pre-generated full `outbound_id`; pass the UUID to `comm.delivered` before
+deciding whether to retry.
+
+`comm.delivered(id=<full-outbound-uuid>)` performs one indexed, read-only
+lookup for a live inbound message whose `outbound_ref` is that UUID and whose
+`from_actor` is the caller. Its
+response is `{id, status, delivered, inbound_count}`, where `status` is
+`"delivered"` when at least one inbound sibling exists and `"undelivered"`
+otherwise. It does not require the outbound row to exist and never compares
+message bodies, so it also works for legacy/injected half-pairs and identical
+templated content. An operation error means the lookup itself is uncertain.
+This confirms only khive's internal inbound copy; it does not report later
+SMTP or other external-transport delivery. Loss of the entire MCP response is
+outside this contract: without the structured error, the caller never receives
+the server-generated UUID needed for confirmation.
 
 New comm-authored messages use the versioned
 [`properties` v1 contract](docs/api/message-properties.md). If `KHIVE_PROCESS_REF` is set for a
@@ -111,6 +129,17 @@ registry
 
 let inbox = registry.dispatch("comm.inbox", json!({"limit": 20})).await?;
 ```
+
+`comm.inbox` returns `has_more`/`next_offset`; pass the latter back as `offset`
+with otherwise-identical filters to enumerate the complete read-only result.
+Filters include sender exact/prefix/exclusion, inclusive `since`, exclusive
+`before`, and case-insensitive subject/content substring matching. Time bounds
+apply to top-level `created_at`.
+
+`comm.read(id=...)` keeps the single-message response. The additive
+`comm.read(ids=[...])` form validates 1-500 supplied IDs and returns per-item
+outcomes with marked/failed counts; inspect `read`/`mark_error` because bulk
+updates are not one cross-message transaction.
 
 Over MCP: `request(ops="comm.send(to=\"lambda:leo\", content=\"PR #372 is ready for review\")")`.
 

@@ -10,7 +10,7 @@ pub mod section_type;
 pub mod signal;
 pub mod tunable;
 
-pub use brain_signal::{entity_signal, is_recall_positive, BrainSignal};
+pub use brain_signal::{entity_signal, is_recall_positive, BrainSignal, ServeAttribution};
 pub use brain_state::{
     validate_brain_state_snapshot, validate_brain_state_snapshot_with_capacity, BrainState,
     BrainStateSnapshot,

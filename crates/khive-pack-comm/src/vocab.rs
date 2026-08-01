@@ -6,7 +6,7 @@ use khive_types::{HandlerDef, ParamDef, Visibility};
 /// crates/khive-pack-comm/docs/api/message-lifecycle.md#vocabrscomm_schema_plan_stmts for
 /// why they filter on `deleted_at IS NULL` rather than a literal `kind` value,
 /// and why `idx_comm_message_external_id` is deliberately absent from this list.
-pub(crate) static COMM_SCHEMA_PLAN_STMTS: [&str; 4] = [
+pub(crate) static COMM_SCHEMA_PLAN_STMTS: [&str; 5] = [
     "CREATE INDEX IF NOT EXISTS idx_comm_message_direction \
         ON notes(namespace, kind, json_extract(properties, '$.direction'), \
         json_extract(properties, '$.read'), created_at DESC) \
@@ -20,6 +20,11 @@ pub(crate) static COMM_SCHEMA_PLAN_STMTS: [&str; 4] = [
         json_extract(properties, '$.direction'), \
         json_extract(properties, '$.read'), \
         created_at DESC) \
+        WHERE deleted_at IS NULL",
+    "CREATE INDEX IF NOT EXISTS idx_comm_message_outbound_ref \
+        ON notes(namespace, kind, json_extract(properties, '$.direction'), \
+        json_extract(properties, '$.from_actor'), \
+        json_extract(properties, '$.outbound_ref')) \
         WHERE deleted_at IS NULL",
     COMM_CHANNEL_CURSOR_SCHEMA_STMT,
 ];
@@ -38,7 +43,7 @@ pub(crate) const COMM_CHANNEL_CURSOR_SCHEMA_STMT: &str =
     PRIMARY KEY (channel_kind, channel_slug)\
 )";
 
-pub(crate) static COMM_HANDLERS: [HandlerDef; 12] = [
+pub(crate) static COMM_HANDLERS: [HandlerDef; 13] = [
     HandlerDef {
         name: "comm.send",
         description: "Send a message, optionally threaded.",
@@ -84,8 +89,25 @@ pub(crate) static COMM_HANDLERS: [HandlerDef; 12] = [
         ],
     },
     HandlerDef {
+        name: "comm.delivered",
+        description: "Confirm whether the caller's internal inbound sibling exists for an \
+                      outbound comm.send/comm.reply UUID. This is a read-only sender-scoped \
+                      dual-write confirmation, not external transport (for example SMTP) \
+                      delivery status.",
+        visibility: Visibility::Verb,
+        category: khive_types::VerbCategory::Assertive,
+        params: &[ParamDef {
+            name: "id",
+            param_type: "uuid",
+            required: true,
+            description: "Full UUID returned as full_id by comm.send or comm.reply, or surfaced \
+                          as outbound_id in an ambiguous atomic-write error. A full UUID is \
+                          required because it is the exact correlation key.",
+        }],
+    },
+    HandlerDef {
         name: "comm.inbox",
-        description: "List inbound messages for the caller.",
+        description: "List and page through filtered inbound messages for the caller.",
         visibility: Visibility::Verb,
         category: khive_types::VerbCategory::Assertive,
         params: &[
@@ -94,6 +116,12 @@ pub(crate) static COMM_HANDLERS: [HandlerDef; 12] = [
                 param_type: "integer",
                 required: false,
                 description: "Max messages to return. Default 20, max 200.",
+            },
+            ParamDef {
+                name: "offset",
+                param_type: "integer",
+                required: false,
+                description: "Zero-based offset in the fully-filtered newest-first result set. Default 0. Follow `next_offset` until it is null to enumerate every match without changing read state.",
             },
             ParamDef {
                 name: "status",
@@ -113,19 +141,57 @@ pub(crate) static COMM_HANDLERS: [HandlerDef; 12] = [
                 required: false,
                 description: "Prefix match on the sender's actor label (e.g. `\"agent:khive:\"` selects all agents under one namespace). Mutually exclusive with `from_actor`.",
             },
+            ParamDef {
+                name: "exclude_from_actor",
+                param_type: "string",
+                required: false,
+                description: "Exclude messages whose sender actor label exactly matches this value.",
+            },
+            ParamDef {
+                name: "since",
+                param_type: "string",
+                required: false,
+                description: "Inclusive RFC 3339 lower bound on message `created_at`.",
+            },
+            ParamDef {
+                name: "before",
+                param_type: "string",
+                required: false,
+                description: "Exclusive RFC 3339 upper bound on message `created_at`.",
+            },
+            ParamDef {
+                name: "subject_contains",
+                param_type: "string",
+                required: false,
+                description: "Case-insensitive non-empty substring match on subject. Messages with no subject do not match.",
+            },
+            ParamDef {
+                name: "content_contains",
+                param_type: "string",
+                required: false,
+                description: "Case-insensitive non-empty substring match on message content.",
+            },
         ],
     },
     HandlerDef {
         name: "comm.read",
-        description: "Mark an inbound message as read. Best-effort: on a mark-write failure the response still succeeds with read=false and a mark_error field; re-issue later.",
+        description: "Mark one or up to 500 inbound messages as read. Mark writes are best-effort: inspect each result's read/mark_error fields and re-issue failures later.",
         visibility: Visibility::Verb,
         category: khive_types::VerbCategory::Declaration,
-        params: &[ParamDef {
-            name: "id",
-            param_type: "string",
-            required: true,
-            description: "Short 8-char prefix or full UUID of the inbound message to mark read. Outbound messages cannot be marked read.",
-        }],
+        params: &[
+            ParamDef {
+                name: "id",
+                param_type: "string",
+                required: false,
+                description: "Short 8-char prefix or full UUID of one inbound message to mark read. Mutually exclusive with `ids`.",
+            },
+            ParamDef {
+                name: "ids",
+                param_type: "array of string",
+                required: false,
+                description: "One to 500 inbound message ids to mark read in one operation. Mutually exclusive with `id`; all targets are validated before mutation and duplicate resolved ids are updated once.",
+            },
+        ],
     },
     HandlerDef {
         name: "comm.unread",

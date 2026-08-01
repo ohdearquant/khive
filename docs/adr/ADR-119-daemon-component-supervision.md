@@ -3,6 +3,7 @@
 **Status**: accepted (2026-07-19)\
 **Date**: 2026-07-19\
 **Scope**: daemon-resident work that is not a caller-invoked operation\
+**Amended**: 2026-08-01 (schedule reference migration delivered, Amendment 4)\
 **Amended by**: [ADR-122](ADR-122-email-outbound-delivery.md) (email Phase 2)
 
 ## Context
@@ -212,20 +213,23 @@ blesses is a confused-deputy seam. Generic scheduled actions (`schedule.schedule
 MUST replay under the creator's authenticated actor identity, not the daemon's own
 identity. Concretely:
 
-- The creator's authenticated actor MUST be persisted on the scheduled event at
-  schedule time.
-- Replay MUST dispatch with that persisted actor as the request identity, so any policy
-  gate evaluates the creator's authority, never the daemon's. A caller MUST NOT be able
-  to schedule an action the caller is denied but the daemon is allowed to perform.
-- Stored rows without a persisted creator identity MUST fail closed — the event
+- The creator actor from the dispatch-minted token MUST be persisted in an immutable,
+  target-bound provenance record at schedule time. A caller-editable note property is
+  not sufficient provenance.
+- Replay MUST derive a typed verified identity (including the original actor kind) from
+  that provenance and dispatch with it as the request identity, so any policy gate evaluates the creator's authority, never the
+  daemon's. Replay MUST retain public verb visibility; delayed execution cannot expose
+  internal subhandlers. A caller MUST NOT be able to schedule an action the caller is
+  denied but the daemon is allowed to perform.
+- Stored rows without immutable creator provenance MUST fail closed — the event
   transitions to its failure state with a policy error and is never dispatched under
   the daemon identity — unless a separate, explicit migration policy is adopted for
   them.
 
-The current replay path predates this ADR and does not carry a creator identity; that
-is a defect this ADR surfaces, not one it introduces. The registry migration MUST NOT
-ship with the identity gap intact: the identity contract is an acceptance criterion
-below.
+The replay path that predated this ADR did not carry a creator identity; that was a
+defect surfaced here, not one introduced by supervision. The registry migration was
+therefore required not to ship with the identity gap intact: the identity contract is
+an acceptance criterion below and is implemented by Amendment 4.
 
 Email, session-mirror, ANN, and checkpoint loops MAY migrate only after the schedule
 reference proves the registry contract. Their migrations MUST preserve their existing
@@ -367,10 +371,12 @@ In addition, ADR-119 is accepted only when:
    isolation.
 5. Golden compatibility tests prove identical `tools/list`, request parsing, and legacy
    stdio bytes.
-6. Generic scheduled-action replay dispatches under the persisted creator actor; a test
-   proves a caller cannot schedule an action the caller is denied but the daemon is
-   allowed to perform; stored rows without a creator identity fail closed or follow a
-   documented migration policy.
+6. Generic scheduled-action replay dispatches under the immutable, target-bound creator
+   provenance and retains public verb visibility; tests prove a caller cannot schedule
+   an action the caller is denied but the daemon is
+   allowed to perform, mutable note metadata cannot forge authority, internal subhandlers
+   remain denied, and rows without creator provenance fail closed or follow a documented
+   migration policy.
 
 ADR-079 Amendment 1's daemon-resource reference is corrected from issues #1126/#1127 to
 issues #1127/#1129 in the change that introduces this ADR; issue #1126 is cited here
@@ -393,8 +399,8 @@ solely as the email poison-message supervision incident.
   `tools/list`, or legacy stdio bytes.
 - Add an MCP resource, subscription, notification, event topic, or public health verb.
 - Treat restart as correctness recovery for work that has not committed durable state.
-- Dispatch a stored scheduled action under the daemon's own identity; replay carries the
-  persisted creator actor or fails closed.
+- Dispatch a stored scheduled action under the daemon's own identity or a mutable note
+  property; replay derives its actor from immutable creator provenance or fails closed.
 - Put blocking or unbounded work on async runtime workers.
 - Claim that supervision fixes issue #1127's scan complexity.
 - Claim complexity, memory, latency, or load benefits without measurement.
@@ -636,3 +642,85 @@ allowlist failure, transient retry/backoff, a fault between transport
 acceptance and durable stamp with same-Message-ID redelivery, and distinct
 supervisor health rows for `email-channel` and `email-outbound`. Static binary
 inspection or a roster-string match alone is not delivery evidence.
+
+---
+
+## Amendment 4: Schedule Reference Migration Delivered (2026-08-01)
+
+**Status**: accepted (2026-08-01)\
+**Trigger**: issue #1409 identified that the shipped schedule drain still used a detached
+task despite this ADR selecting it as the reference supervised component. Issue #1352
+also required positive quiet-agenda liveness without turning the internal generic health
+registry into a public component-inspection API.
+
+### Decision
+
+The reference migration is delivered as a host-owned dynamic registration named
+`schedule-tick`. It is dynamic, rather than an `inventory` submission, because the factory
+must capture the exact schedule-pack runtime produced by resolved backend routing. The host
+adds it after pack resolution only for daemon role and only when the schedule pack exists;
+client/stdio processes and schedule-absent daemons add none. Static externally linked
+registrations and this dynamic host registration enter the same supervisor and roster.
+
+The schedule registration fixes the following concrete policy:
+
+- restart class `OnFailure`, with five restarts over the daemon process lifetime;
+- exponential backoff with positive jitter from 1 second to a hard 60-second total-delay cap
+  (the jittered delay, not merely its base, is capped);
+- a 5-second cooperative shutdown bound, clamped inside the daemon drain window;
+- cancellation observed between ticks through `HostContext::cancellation()`;
+- component heartbeat after every successful drain, including an empty drain; and
+- drain-level errors returned as retryable component failures, while per-event failures
+  remain absorbed in `DrainSummary` and spend no restart budget.
+
+The supervisor task is registered through `track_background_task`; cancellation therefore
+runs before/concurrently with the daemon's bounded drain and the detached schedule task is
+removed from both serve entrypoints.
+
+### Identity fence and migration policy
+
+The accepted identity fence is delivered in the same migration. `schedule.schedule` stages
+its note, appends a target-bound creator-provenance event from the dispatch token, and only
+then activates the row as pending. `created_by_actor` remains display metadata, never an
+authority source. Replay reconstructs the exact actor kind from immutable provenance while
+retaining the row namespace and public verb-visibility boundary. Attributed principals use
+`VerifiedActor`; `anonymous:local` remains anonymous. Gate checks, audit records, and writes
+therefore execute as the creator rather than the daemon, and internal subhandlers remain
+unreachable. Policy tests deny `create` to the creator while allowing the daemon, reject a
+forged note property, and prove concurrent actor/namespace pairs do not cross.
+
+Executable `scheduled_event` content and properties are schedule-managed. Generic KG
+`update` and note `merge` reject these rows, including either merge operand, so immutable
+creator provenance cannot be reused as a bearer credential for attacker-selected payload,
+trigger, cadence, or lifecycle state. A two-actor policy regression permits the attacker to
+call `update`, denies that actor the target verb, and proves the mutation is rejected before
+the original creator's schedule is replayed unchanged.
+
+Generic legacy rows without immutable creator provenance fail closed and terminally: no dispatch
+occurs, `status` becomes `failed`, and `dispatch_error`/`dispatch_failed_at` record the
+policy failure. ADR-106 Amendment C's reminder-only fallback ignores any unprovenanced note
+actor claim and uses the current server actor (then `local`). Ordinary generic dispatch failures remain
+per-event, persist the same error fields, and follow normal cadence finalization.
+
+### Health compatibility
+
+The generic `HealthReporter` remains in-process operator state and gains no public verb,
+resource, notification, or schema. ADR-106 Amendment D separately authorizes the narrow
+host decoration `schedule.agenda.ticker.last_tick_at`: it is a schedule-loop attempt
+timestamp, not a serialization of component status. It advances before a drain attempt,
+whereas the generic component heartbeat advances only after a successful cycle. This
+preserves the public-health fence here while satisfying schedule's separate liveness
+contract.
+
+### Verification
+
+- Dynamic roster tests prove exactly one `schedule-tick` with a resolved schedule runtime
+  and none without it; the serve role gate proves client processes start zero components.
+- A supervised quiet-drain test proves heartbeat advancement and cooperative cancellation
+  to terminal `Stopped` without consuming restart budget.
+- Existing generic supervisor tests continue to cover retryable/permanent failure, polled-future
+  panic, synchronous factory-construction panic, budget exhaustion, cancellation,
+  timeout/abort, and independent progress.
+- Schedule drain tests prove creator-bound gate evaluation and legacy generic fail-closed
+  behavior; schedule-pack tests prove both creation verbs persist the creator.
+- Existing multi-backend and CAS regressions remain the routing and state-machine fences.

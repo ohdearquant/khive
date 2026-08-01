@@ -1,7 +1,8 @@
 # Message lifecycle
 
 Technical reference for the `comm` pack's message write, threading, and read path —
-`comm.send` / `comm.inbox` / `comm.read` / `comm.reply` / `comm.thread` / `comm.ingest` —
+`comm.send` / `comm.delivered` / `comm.inbox` / `comm.read` / `comm.reply` /
+`comm.thread` / `comm.ingest` —
 spanning `message.rs`, `handlers.rs`, `params.rs`, and the inbox/thread indexes in
 `vocab.rs`.
 
@@ -10,13 +11,27 @@ spanning `message.rs`, `handlers.rs`, `params.rs`, and the inbox/thread indexes 
 Accepts a 36-char hyphenated UUID or an 8+ hex-char short prefix. The prefix
 is resolved via `runtime.resolve_prefix` (namespace-scoped).
 
+## `message.rs::attach_outbound_id_to_ambiguous_write`
+
+Preserves ordinary `create_notes_atomic` failures unchanged. A
+`WriterTaskTerminated { request_state: SideEffectsUnknown }` error is different:
+the request was accepted, but the caller cannot establish whether the complete
+pair committed. The helper turns that case into a structured
+`RuntimeError::Khive(KhiveError)` (`kind=Conflict`) carrying the pre-generated
+full `outbound_id` as `details.outbound_id`, so an automated caller can read
+the correlation id back out of the MCP error object instead of parsing prose,
+and use it for an exact `comm.delivered` lookup before retry.
+
 ## `message.rs::dual_write_message`
 
 Writes an outbound copy (caller namespace) and an inbound copy (recipient
-namespace), rolling back the outbound note if the inbound write fails
-(atomicity guarantee). The recipient-namespace behavior applies to this
-generic cross-namespace path; the public actor-addressed `comm.send` keeps
-both copies in the caller namespace (see below).
+namespace) through `create_notes_atomic`. Both notes, their FTS documents, and
+all registered-model vector rows commit in one writer transaction. Ordinary
+prepare/plan failures leave neither copy; an ambiguous writer-reply failure can
+mean either the complete pair committed or neither did, never a durable
+half-pair. The recipient-namespace behavior applies to this generic
+cross-namespace path; the public actor-addressed `comm.send` keeps both copies
+in the caller namespace (see below).
 
 `subject`, `thread_id` are optional. `sent_at` is the RFC3339 timestamp for
 both copies. `from_actor` and `to_actor` are optional actor labels (ADR-057)
@@ -110,6 +125,21 @@ sessions that set `default_namespace` but not `actor_id`. Uses the shared
 actor-identity policy (#567) so this warning fires under exactly the same
 "unattributed" definition the gate and token minter use.
 
+## `handlers.rs::handle_delivered`
+
+Requires the full outbound UUID. It performs one indexed count of live inbound
+`message` notes in the caller's namespace whose `properties.from_actor` is the
+caller and whose `properties.outbound_ref` exactly matches that UUID. It
+deliberately does not fetch or resolve the outbound row first, because an
+undelivered or legacy/injected half-pair may have no outbound row available to
+resolve. The response carries
+`status` (`delivered` or `undelivered`), a matching boolean, and
+`inbound_count`; message content is irrelevant. This is internal paired-copy
+confirmation only, not external channel delivery status. If the caller loses
+the complete MCP response rather than receiving the structured ambiguous
+error, it also loses the server-generated outbound UUID; that case requires a
+future caller-supplied idempotency/correlation contract and is out of scope.
+
 ## `handlers.rs::handle_inbox`
 
 Lists inbound messages for the caller's actor label (ADR-057).
@@ -123,12 +153,22 @@ visible regardless (Q3: OR IS NULL).
 `from_actor`/`from_prefix` (#493) sender filters are mutually exclusive.
 Direction + read-status + `to_actor` filters are pushed into SQL so
 `idx_comm_message_direction`/`idx_comm_message_to_actor` are usable; the read
-filter uses `json_type` to match the old `as_bool().unwrap_or(false)`
-semantics — only JSON boolean `true` counts as read, missing/false/string/
-integer all count as unread. `from_prefix` has no SQL `FilterOp`, so when a
-sender filter is supplied, pages are scanned in Rust (same unbounded-page-loop
-shape `handle_thread` uses) until `limit` matches are collected or the store is
-exhausted.
+filter uses `json_type` to match the old `as_bool().unwrap_or(false)` semantics —
+only JSON boolean `true` counts as read, missing/false/string/integer all count as
+unread. Exact `from_actor` and inclusive `since` (`created_at >=`) also stay in
+SQL. `from_prefix`, `exclude_from_actor`, exclusive `before`, and case-insensitive
+`subject_contains`/`content_contains` have no corresponding `FilterOp`, so they
+are applied over an unbounded paged scan in Rust.
+
+`offset` is logical rather than a raw database offset: it skips rows only after
+every SQL and Rust filter has matched. The handler collects one extra logical
+match to return `has_more` and `next_offset`; following `next_offset` with the
+same filters enumerates a backlog larger than the 200-message page cap without
+marking anything read. The total order is `(created_at DESC, id ASC)`. `since`
+is inclusive and `before` is exclusive, both RFC 3339 and both evaluated against
+the top-level note `created_at` exposed in the response, not optional transport
+metadata in `properties.sent_at`. Empty substring filters are rejected, and a
+missing/non-string subject does not match `subject_contains`.
 
 ## `handlers.rs::handle_read`
 
@@ -136,11 +176,35 @@ Marks a message as read. Rejects `read()` on outbound messages — "read" is a
 recipient action; marking an outbound (sent) message as read corrupts the
 read/unread invariant and has no semantic meaning to the sender.
 
-Sets `read: true` through `NoteStore::set_note_property`, which lowers to one
-`UPDATE ... json_set(...)` statement. It never reads and replaces the whole
-properties document, so another writer setting a different key cannot be
-silently overwritten between those two steps (#1483). The operation also
-leaves every non-property column and the row's identity untouched (#780).
+Exactly one of `id` or `ids` is required. The single-ID form preserves its
+existing response. The bulk form accepts 1-500 IDs, resolves duplicates to one
+update, validates every target before the first mutation, and returns ordered
+per-target `results` with `requested_count`, `unique_count`, `marked_count`, and
+`failed_count`.
+Validation includes the same namespace, message-kind, direction, addressee, and
+legacy-message rules as the single-ID form. Updates are not a cross-message
+transaction: a validation failure rejects the call before any update, while an
+item-level storage failure returns `read=false` plus `mark_error` without rolling
+back an earlier successful item.
+
+Patches only the `read` key via `NoteStore::try_patch_note_property`, a
+storage-side `json_set`, not a caller-side merge-then-overwrite of the whole
+`properties` column: the write re-evaluates namespace, message kind, direction,
+and addressee against the row's *current* state in the same `UPDATE`, so a
+property written by another caller between validation and this call (the bulk
+form's window can span up to 500 targets) survives untouched, and an
+eligibility change in that window degrades the mark instead of silently
+landing on stale data. This also patches in place via a real `UPDATE`, never
+`upsert_note`'s `INSERT OR REPLACE` (the latter silently deletes and
+re-inserts the row on a primary-key conflict — #780). The `comm.probe` cursor
+is keyed on `notes_seq.seq`, which is fixed at first insert and survives such
+churn, so avoiding `upsert_note` here is defensive rather than load-bearing; a
+metadata patch should never rewrite the row regardless.
+
+`handle_reply`'s fold-in mark (see below) covers the single-original case and
+uses the simpler `NoteStore::set_note_property` — an unconditional atomic
+patch with no eligibility recheck — since a reply has only one target and no
+validate-then-mark window to race.
 
 The mark-read patch is best-effort: under multi-client burst traffic the
 sqlite writer pool can time out (`checkout_timeout`, 5s default), and the
@@ -151,13 +215,12 @@ been best-effort since its introduction. Three outcomes:
 
 - `Ok(true)` — the row was live and updated: `read: true`, `properties` is
   the patched value (including the new `read: true`).
-- `Ok(false)` — no live row was found to update (e.g. soft-deleted
-  mid-flight, between this handler's `get_note` and its
-  `set_note_property` call), or the stored properties value was not an
-  object: `read: false`, `mark_error: "no live row updated"`, `properties`
-  is the note's ORIGINAL stored value (a stored SQL-NULL properties column
-  round-trips as JSON `null`, never `{}`) — the response never claims a
-  write that did not land.
+- `Ok(false)` — no live row currently matches (soft-deleted mid-flight, or an
+  eligibility property — namespace, kind, direction, addressee — changed
+  since this handler's prior validation): `read: false`, `mark_error: "no
+  live row updated"`, `properties` is the note's ORIGINAL stored value (a
+  stored SQL-NULL properties column round-trips as JSON `null`, never `{}`)
+  — the response never claims a write that did not land.
 - `Err(e)` — the patch failed (writer timeout, pool exhaustion, etc.):
   logged via `tracing::warn!` with the full error detail, then `read:
   false`, `mark_error` is the error's `Display` string, `properties` is the
@@ -387,6 +450,9 @@ planner sees different predicates and falls back to a table scan.
 condition is always satisfied and the index is eligible. `kind` is included
 as an indexed column so the `kind = ?N` predicate is covered. Statements are
 idempotent (`CREATE INDEX IF NOT EXISTS`).
+
+`idx_comm_message_outbound_ref` covers the exact `comm.delivered` lookup by
+namespace, note kind, direction, sender actor, and `properties.outbound_ref`.
 
 The `idx_comm_message_external_id` UNIQUE index is NOT listed here; it is
 created by the V5 schema migration (`005-unique-comm-external-id.sql`), which

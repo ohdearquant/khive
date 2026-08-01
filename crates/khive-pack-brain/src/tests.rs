@@ -5,7 +5,7 @@ use khive_runtime::{
     VerbRegistryBuilder,
 };
 use khive_types::HandlerDef;
-use serde_json::json;
+use serde_json::{json, Value};
 
 struct TestConsumerPack;
 
@@ -1303,6 +1303,86 @@ async fn test_355_posteriors_update_after_dispatch_via_hook() {
     );
 }
 
+/// #1475/#1486: automatic recall evidence follows the profile that actually
+/// served, while explicit failed-read attribution never falls back to default.
+#[tokio::test]
+async fn recall_hook_routes_known_profile_and_drops_unattributed_signal() {
+    let (pack, rt) = make_pack();
+    let registry = empty_registry();
+    let token = rt.authorize(Namespace::local()).unwrap();
+
+    pack.dispatch(
+        "brain.create_profile",
+        json!({"name": "hook-custom-v1", "consumer_kind": "recall"}),
+        &registry,
+        &token,
+    )
+    .await
+    .expect("create custom profile");
+
+    let before = pack.snapshot();
+    let default_before = before.balanced_recall.clone();
+    let custom_before = before.profile_states["hook-custom-v1"].clone();
+
+    let target_id = uuid::Uuid::new_v4();
+    let mut attributed_event = khive_storage::event::Event::new(
+        "local",
+        "memory.recall",
+        khive_types::EventKind::Audit,
+        khive_types::SubstrateKind::Event,
+        "memory",
+    );
+    attributed_event.target_id = Some(target_id);
+    attributed_event.duration_us = 10_000;
+    attributed_event.payload = json!({
+        "served_by_profile_id": "hook-custom-v1",
+        "serve_attribution": "profile"
+    });
+    pack.on_dispatch(&khive_runtime::EventView {
+        event: attributed_event,
+        observations: Vec::new(),
+    })
+    .await;
+
+    let after_attributed = pack.snapshot();
+    assert_eq!(
+        after_attributed.balanced_recall, default_before,
+        "known custom-profile recall must not credit balanced-recall-v1"
+    );
+    let custom_after = after_attributed.profile_states["hook-custom-v1"].clone();
+    assert_eq!(custom_after.total_events, custom_before.total_events + 1);
+    assert_eq!(
+        custom_after.relevance.alpha(),
+        custom_before.relevance.alpha() + 1.0
+    );
+
+    let mut unattributed_event = khive_storage::event::Event::new(
+        "local",
+        "memory.recall",
+        khive_types::EventKind::Audit,
+        khive_types::SubstrateKind::Event,
+        "memory",
+    );
+    unattributed_event.target_id = Some(uuid::Uuid::new_v4());
+    unattributed_event.duration_us = 10_000;
+    unattributed_event.payload = json!({"serve_attribution": "unattributed"});
+    pack.on_dispatch(&khive_runtime::EventView {
+        event: unattributed_event,
+        observations: Vec::new(),
+    })
+    .await;
+
+    let after_unattributed = pack.snapshot();
+    assert_eq!(
+        after_unattributed.balanced_recall, default_before,
+        "failed-read recall must not fall back to balanced-recall-v1"
+    );
+    assert_eq!(
+        after_unattributed.profile_states["hook-custom-v1"], custom_after,
+        "failed-read recall must not credit the selected custom profile"
+    );
+}
+
 // ── Regression tests ──────────────────────────────────────────────────────
 
 // C2: brain.unbind with zero filters must be rejected.
@@ -2336,7 +2416,7 @@ fn make_pack_with_actor(actor_id: &str) -> (BrainPack, KhiveRuntime) {
 /// matching actor binding must attribute to the bound profile — not
 /// balanced-recall-v1 — and must leave the default profile's posteriors untouched.
 #[tokio::test]
-async fn feedback_697_unattributed_resolves_via_actor_binding() {
+async fn feedback_697_unspecified_resolves_via_actor_binding() {
     let (pack, rt) = make_pack_with_actor("test-actor");
     let registry = empty_registry();
     let token = rt.authorize(Namespace::local()).unwrap();
@@ -2410,7 +2490,7 @@ async fn feedback_697_unattributed_resolves_via_actor_binding() {
         .unwrap();
     assert_eq!(
         bound_after, 1,
-        "unattributed feedback with a matching actor binding must land on the bound profile"
+        "unspecified feedback with a matching actor binding must land on the bound profile"
     );
 
     let default_after = pack
@@ -2427,6 +2507,139 @@ async fn feedback_697_unattributed_resolves_via_actor_binding() {
     assert_eq!(
         default_after, default_before,
         "the default profile's posteriors must be untouched when a binding resolves the event elsewhere"
+    );
+}
+
+/// #1486: explicit failed-read attribution is not the same as omission. The
+/// first recall result carries the marker through auto_feedback, which records
+/// a forced-zero event without invoking the otherwise-matching actor binding.
+#[tokio::test]
+async fn auto_feedback_failed_read_marker_does_not_fall_back_to_binding() {
+    let (pack, rt) = make_pack_with_actor("failed-read-actor");
+    let registry = empty_registry();
+    let token = rt.authorize(Namespace::local()).unwrap();
+    let target = create_test_entity(&rt, &token).await;
+
+    pack.dispatch(
+        "brain.create_profile",
+        json!({"name": "failed-read-bound-v1", "consumer_kind": "recall"}),
+        &registry,
+        &token,
+    )
+    .await
+    .expect("create bound profile");
+    pack.dispatch(
+        "brain.bind",
+        json!({
+            "actor": "failed-read-actor",
+            "profile_id": "failed-read-bound-v1",
+            "consumer_kind": "recall"
+        }),
+        &registry,
+        &token,
+    )
+    .await
+    .expect("bind profile");
+
+    let before = pack.snapshot();
+    let default_before = before.balanced_recall.clone();
+    let bound_before = before.profile_states["failed-read-bound-v1"].clone();
+
+    let result = pack
+        .dispatch(
+            "brain.auto_feedback",
+            json!({
+                "query": "failed profile read",
+                "results": [{
+                    "id": target,
+                    "serve_attribution": "unattributed"
+                }]
+            }),
+            &registry,
+            &token,
+        )
+        .await
+        .expect("unattributed auto feedback is recorded at zero weight");
+
+    assert_eq!(result["emitted"], json!(true));
+    assert_eq!(result["serve_attribution"], json!("unattributed"));
+    assert_eq!(result["served_by_profile_id"], Value::Null);
+
+    let after = pack.snapshot();
+    assert_eq!(after.balanced_recall, default_before);
+    assert_eq!(
+        after.profile_states["failed-read-bound-v1"], bound_before,
+        "failed-read marker must bypass the matching binding entirely"
+    );
+
+    let store = rt.events(&token).expect("event store");
+    let page = store
+        .query_events(
+            khive_storage::event::EventFilter {
+                kinds: vec![khive_types::EventKind::FeedbackExplicit],
+                ..Default::default()
+            },
+            khive_storage::types::PageRequest {
+                limit: 10,
+                offset: 0,
+            },
+        )
+        .await
+        .expect("query feedback event");
+    let event = page.items.first().expect("forced-zero feedback event");
+    assert_eq!(event.payload["serve_attribution"], json!("unattributed"));
+    assert_eq!(event.payload["served_by_profile_id"], Value::Null);
+    assert_eq!(event.payload["gate"]["effective_weight"], json!(0.0));
+    assert_eq!(event.payload["gate"]["forced_zero_weight"], json!(true));
+}
+
+#[tokio::test]
+async fn auto_feedback_top_level_attribution_pair_wins_over_result_metadata() {
+    let (pack, rt) = make_pack();
+    let registry = empty_registry();
+    let token = rt.authorize(Namespace::local()).unwrap();
+    let target = create_test_entity(&rt, &token).await;
+
+    pack.dispatch(
+        "brain.create_profile",
+        json!({"name": "top-level-profile-v1", "consumer_kind": "recall"}),
+        &registry,
+        &token,
+    )
+    .await
+    .expect("create explicit profile");
+
+    let before = pack.snapshot();
+    let default_before = before.balanced_recall.clone();
+    let custom_before = before.profile_states["top-level-profile-v1"].total_events;
+
+    let result = pack
+        .dispatch(
+            "brain.auto_feedback",
+            json!({
+                "query": "explicit top-level attribution",
+                "served_by_profile_id": "top-level-profile-v1",
+                "results": [{
+                    "id": target,
+                    "serve_attribution": "unattributed"
+                }]
+            }),
+            &registry,
+            &token,
+        )
+        .await
+        .expect("top-level legacy profile id must override result attribution");
+
+    assert_eq!(
+        result["served_by_profile_id"],
+        json!("top-level-profile-v1")
+    );
+    assert_eq!(result["serve_attribution"], json!("profile"));
+    let after = pack.snapshot();
+    assert_eq!(after.balanced_recall, default_before);
+    assert_eq!(
+        after.profile_states["top-level-profile-v1"].total_events,
+        custom_before + 1
     );
 }
 
@@ -2649,14 +2862,14 @@ async fn feedback_anonymous_caller_does_not_match_explicit_actor_local_binding()
         .unwrap();
     assert_eq!(
         default_events, 1,
-        "anonymous unattributed feedback must fall through to the default profile"
+        "anonymous unspecified feedback must fall through to the default profile"
     );
 }
 
 /// #697 (b): feedback with neither an explicit profile nor any matching
 /// binding still defaults to balanced-recall-v1 — existing behavior preserved.
 #[tokio::test]
-async fn feedback_697_unattributed_no_binding_falls_back_to_default() {
+async fn feedback_697_unspecified_no_binding_falls_back_to_default() {
     let (pack, rt) = make_pack();
     let registry = empty_registry();
     let token = rt.authorize(Namespace::local()).unwrap();
@@ -6053,6 +6266,7 @@ mod adr081_retune_driver_tests {
             "class-1",
             "raw query",
             1_000,
+            None,
         )
         .await
         .expect("record_serve");
@@ -6133,6 +6347,7 @@ mod adr081_retune_driver_tests {
             "class-2",
             "raw query",
             1_000,
+            None,
         )
         .await
         .expect("record_serve");
@@ -6182,30 +6397,150 @@ mod adr081_retune_driver_tests {
             "class-3",
             "raw query",
             1_000,
+            None,
         )
         .await
         .expect("record_serve");
 
-        let sal_beta_before = pack.snapshot().balanced_recall.salience.beta();
+        let state_before = pack.snapshot().balanced_recall;
 
-        pack.dispatch(
-            "brain.feedback",
-            json!({
-                "target_id": target,
-                "signal": "implicit_positive",
-                "scorer_run_id": "scorer-run-3",
-                "serve_ledger_id": "ledger-row-3",
-            }),
-            &registry,
-            &token,
+        let result = pack
+            .dispatch(
+                "brain.feedback",
+                json!({
+                    "target_id": target,
+                    "signal": "implicit_positive",
+                    "scorer_run_id": "scorer-run-3",
+                    "serve_ledger_id": "ledger-row-3",
+                }),
+                &registry,
+                &token,
+            )
+            .await
+            .expect("unresolved profile must still succeed, just at zero weight");
+
+        let state_after = pack.snapshot().balanced_recall;
+        assert_eq!(
+            state_after, state_before,
+            "ADR-081 §4 fail-safe: unresolved accounting profile must not mutate any profile state"
+        );
+        assert_eq!(result["serve_attribution"], json!("unattributed"));
+        assert_eq!(result["served_by_profile_id"], Value::Null);
+    }
+
+    /// ADR-081 amendment regression: a serve row stamped with the tri-state
+    /// `unattributed` marker (a recall whose bound profile record could not be
+    /// read) must force zero weight exactly like the legacy no-marker row
+    /// above — the marker must not accidentally unlock crediting a guessed
+    /// profile.
+    #[tokio::test]
+    async fn serve_ledger_stored_unattributed_marker_forces_zero_weight_failsafe() {
+        let (pack, rt) = make_pack();
+        let registry = empty_registry();
+        let token = rt.authorize(Namespace::local()).unwrap();
+        let target = create_test_entity(&rt, &token).await;
+
+        crate::serve_ledger::record_serve(
+            rt.sql().as_ref(),
+            "ledger-row-unattributed",
+            "local",
+            "recall",
+            None,
+            None,
+            None,
+            &target,
+            "class-unattributed",
+            "raw query",
+            1_000,
+            Some("unattributed"),
         )
         .await
-        .expect("unresolved profile must still succeed, just at zero weight");
+        .expect("record_serve");
 
-        let sal_beta_after = pack.snapshot().balanced_recall.salience.beta();
+        let state_before = pack.snapshot().balanced_recall;
+
+        let result = pack
+            .dispatch(
+                "brain.feedback",
+                json!({
+                    "target_id": target,
+                    "signal": "implicit_positive",
+                    "scorer_run_id": "scorer-run-unattributed",
+                    "serve_ledger_id": "ledger-row-unattributed",
+                }),
+                &registry,
+                &token,
+            )
+            .await
+            .expect("stored-unattributed row must still succeed, just at zero weight");
+
+        let state_after = pack.snapshot().balanced_recall;
         assert_eq!(
-            sal_beta_after, sal_beta_before,
-            "ADR-081 §4 fail-safe: unresolved accounting profile must fold at zero weight"
+            state_after, state_before,
+            "a stored unattributed marker must force zero weight, same as a legacy null row"
+        );
+        assert_eq!(result["serve_attribution"], json!("unattributed"));
+        assert_eq!(result["served_by_profile_id"], Value::Null);
+    }
+
+    /// ADR-081 amendment regression, paired with the two forced-zero tests
+    /// above: a serve row stamped `unspecified` (no profile was ever selected
+    /// at serve time — never a failed read) must keep the legacy
+    /// binding/default resolution permitted, not collapse into the same
+    /// forced-zero state as `unattributed`.
+    #[tokio::test]
+    async fn serve_ledger_stored_unspecified_marker_permits_legacy_fallback() {
+        let (pack, rt) = make_pack();
+        let registry = empty_registry();
+        let token = rt.authorize(Namespace::local()).unwrap();
+        let target = create_test_entity(&rt, &token).await;
+
+        crate::serve_ledger::record_serve(
+            rt.sql().as_ref(),
+            "ledger-row-unspecified",
+            "local",
+            "recall",
+            None,
+            None,
+            None,
+            &target,
+            "class-unspecified",
+            "raw query",
+            1_000,
+            Some("unspecified"),
+        )
+        .await
+        .expect("record_serve");
+
+        let state_before = pack.snapshot().balanced_recall;
+
+        let result = pack
+            .dispatch(
+                "brain.feedback",
+                json!({
+                    "target_id": target,
+                    "signal": "implicit_positive",
+                    "scorer_run_id": "scorer-run-unspecified",
+                    "serve_ledger_id": "ledger-row-unspecified",
+                }),
+                &registry,
+                &token,
+            )
+            .await
+            .expect("stored-unspecified row must resolve via legacy binding/default fallback");
+
+        let state_after = pack.snapshot().balanced_recall;
+        assert_ne!(
+            state_after, state_before,
+            "a stored unspecified marker must keep the legacy binding/default \
+             fallback permitted — it must NOT be forced to zero weight like a \
+             genuine unattributed (failed profile read) row"
+        );
+        assert_eq!(result["serve_attribution"], json!("unspecified"));
+        assert_eq!(
+            result["served_by_profile_id"],
+            json!("balanced-recall-v1"),
+            "no explicit profile was supplied, so the default fallback profile must be credited"
         );
     }
 
@@ -6264,6 +6599,7 @@ mod adr081_retune_driver_tests {
             "dup-class",
             "raw query",
             42_000,
+            None,
         )
         .await
         .expect("first insert must succeed");
@@ -6281,6 +6617,7 @@ mod adr081_retune_driver_tests {
             "dup-class",
             "raw query",
             42_000,
+            None,
         )
         .await
         .expect("duplicate key must be tolerated, not errored");
@@ -6311,6 +6648,7 @@ mod adr081_retune_driver_tests {
             "class-a",
             "raw query a",
             1_000,
+            None,
         )
         .await
         .expect("first insert must succeed");
@@ -6329,6 +6667,7 @@ mod adr081_retune_driver_tests {
             "class-b",
             "raw query b",
             2_000,
+            None,
         )
         .await
         .expect_err("a PK collision with a mismatched natural key must not be tolerated");
