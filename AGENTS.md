@@ -136,7 +136,7 @@ false, id, full_id, from, to, note: "already in target status"}` — the task fi
 `memory.recall` supports `tags` and `tag_mode` ("any"|"all") for tag-based post-filtering.
 Composite scores are always in [0,1]. Typical production floor: 0.3-0.7.
 
-### Brain pack — 15 verbs (`brain.` prefix)
+### Brain pack — 16 verbs (`brain.` prefix)
 
 | Verb                     | What it does                                                                             | When to use                                                     |
 | ------------------------ | ---------------------------------------------------------------------------------------- | --------------------------------------------------------------- |
@@ -151,17 +151,19 @@ Composite scores are always in [0,1]. Typical production floor: 0.3-0.7.
 | `brain.reset`            | Reset posteriors to priors (preserves event history)                                     | Start tuning fresh                                              |
 | `brain.feedback`         | Emit explicit feedback event                                                             | Rate a recall result as useful/not_useful/wrong                 |
 | `brain.auto_feedback`    | Emit implicit feedback for recall results                                                | Convenience: agents call after memory.recall                    |
+| `brain.mark_turn`        | Emit a per-actor `actor_turn` work-unit marker (best-effort)                             | Once per wake/turn — denominator for discipline ratios          |
 | `brain.bind`             | Bind a profile to an actor + consumer                                                    | Route a specific caller to a specific profile                   |
 | `brain.unbind`           | Remove a binding                                                                         | Stop routing                                                    |
 | `brain.bindings`         | List binding rows                                                                        | Audit profile routing                                           |
 | `brain.register_adapter` | Register an adapter integrity record                                                     | Gate adapter composition to the active base-model revision      |
 
-### Comm pack — 7 verbs (`comm.` prefix)
+### Comm pack — 8 verbs (`comm.` prefix)
 
 | Verb          | What it does                                                                                                                 | When to use                                   |
 | ------------- | ---------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------- |
 | `comm.send`   | Send a message (optionally threaded)                                                                                         | Inter-agent or inter-namespace messaging      |
 | `comm.inbox`  | List inbound messages                                                                                                        | Check what's waiting                          |
+| `comm.unread` | Count-only view of unread inbound messages (no args, no payloads)                                                            | Cheap unread check without listing            |
 | `comm.read`   | Mark an **inbound** message as read (best-effort: check `read` in the response; `false` + `mark_error` means re-issue later) | Acknowledge receipt (recipient action)        |
 | `comm.reply`  | Reply to a message (threading linkage)                                                                                       | Respond in-thread                             |
 | `comm.thread` | Retrieve full conversation thread                                                                                            | Read the whole conversation                   |
