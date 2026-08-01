@@ -165,7 +165,7 @@ shipped semantic allowlist by speech act, which is this section's actual subject
 | `search`    | assertive   | Hybrid FTS + vector search                                                                                                                                                                                                                                                                                                                                                                      |
 | `link`      | commissive  | Create a typed directed edge                                                                                                                                                                                                                                                                                                                                                                    |
 | `neighbors` | assertive   | Immediate graph neighbors; optional `include_entity_type` param enriches each hit with its entity subtype                                                                                                                                                                                                                                                                                       |
-| `traverse`  | assertive   | Multi-hop BFS traversal; optional `include_properties` param enriches each path node with entity properties                                                                                                                                                                                                                                                                                     |
+| `traverse`  | assertive   | Bounded multi-hop BFS traversal: at most 100 roots, depth 10, 1,000 non-root results per root, and one shared 100,000-row/five-second storage-expansion budget; optional `include_properties` enriches entity path nodes (ADR-091 Amendment 4)                                                                                                                                                  |
 | `query`     | assertive   | GQL/SPARQL pattern matching                                                                                                                                                                                                                                                                                                                                                                     |
 | `merge`     | declaration | Deduplicate two entities                                                                                                                                                                                                                                                                                                                                                                        |
 | `propose`   | commissive  | Create a proposal for KG mutation; emits `ProposalCreated`.                                                                                                                                                                                                                                                                                                                                     |
@@ -636,3 +636,12 @@ the registered handlers, and the live surface is readable with
 `request(ops="verbs(pack=\"kg\")")`.
 
 The decision this ADR records is unchanged. Only the restatements of a number are removed.
+
+## Amendment: bounded traversal surface (2026-08-01)
+
+The `traverse` row above adopts ADR-091 Amendment 4's finite shape and execution
+bounds. The public handler rejects an oversized raw root list before resolution,
+defaults an omitted result limit to 100, and returns no partial paths when the
+shared work or deadline budget is exceeded. These are verb semantics, so they
+belong in the generated handler help and public API reference as well as the
+storage contract; they do not add a new verb or change its speech act.

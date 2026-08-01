@@ -1,6 +1,9 @@
 //! Graph edge types: edges, filters, traversal configuration, and path results.
 
 use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -10,6 +13,100 @@ use uuid::Uuid;
 use khive_types::EdgeRelation;
 
 use super::BatchWriteSummary;
+
+/// Maximum number of roots accepted by one public graph traversal.
+pub const MAX_TRAVERSAL_ROOTS: usize = 100;
+/// Maximum breadth-first depth accepted by graph traversal.
+pub const MAX_TRAVERSAL_DEPTH: usize = 10;
+/// Per-root non-root result cap used when the caller omits `limit`.
+pub const DEFAULT_TRAVERSAL_LIMIT: u32 = 100;
+/// Largest per-root non-root result cap accepted from a caller.
+pub const MAX_TRAVERSAL_LIMIT: u32 = 1_000;
+/// Maximum adjacency rows one public traversal may consume across backends.
+pub const MAX_TRAVERSAL_WORK: u64 = 100_000;
+/// Maximum wall-clock execution window for one public traversal.
+pub const MAX_TRAVERSAL_MILLIS: u64 = 5_000;
+
+/// Shared, one-shot execution budget carried by clones of a traversal request.
+///
+/// Runtime traversal fans one public request out over each visible namespace.
+/// Clones therefore share the same row counter and start instant so work and
+/// time limits apply to the whole public operation, rather than resetting for
+/// every backend. The field is skipped on the wire; callers control result
+/// shape through `limit`, while these hard ceilings remain server policy.
+#[derive(Clone, Debug)]
+pub struct TraversalExecutionBudget {
+    work_limit: u64,
+    remaining_work: Arc<AtomicU64>,
+    started_at: Instant,
+    max_duration: Duration,
+}
+
+impl Default for TraversalExecutionBudget {
+    fn default() -> Self {
+        Self::new(
+            MAX_TRAVERSAL_WORK,
+            Duration::from_millis(MAX_TRAVERSAL_MILLIS),
+        )
+    }
+}
+
+impl TraversalExecutionBudget {
+    /// Create a one-shot budget. Values below the public ceilings are useful
+    /// to internal callers and deterministic boundary tests.
+    pub fn new(work_limit: u64, max_duration: Duration) -> Self {
+        Self {
+            work_limit,
+            remaining_work: Arc::new(AtomicU64::new(work_limit)),
+            started_at: Instant::now(),
+            max_duration,
+        }
+    }
+
+    pub fn work_limit(&self) -> u64 {
+        self.work_limit
+    }
+
+    pub fn remaining_work(&self) -> u64 {
+        self.remaining_work.load(Ordering::Relaxed)
+    }
+
+    pub fn max_duration(&self) -> Duration {
+        self.max_duration
+    }
+
+    pub fn is_expired(&self) -> bool {
+        self.started_at.elapsed() >= self.max_duration
+    }
+
+    /// Consume one adjacency row. Returns `false` once the shared budget is
+    /// exhausted; the caller must fail the traversal rather than return a
+    /// partial path set.
+    pub fn try_consume_row(&self) -> bool {
+        self.remaining_work
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |remaining| {
+                remaining.checked_sub(1)
+            })
+            .is_ok()
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        if self.work_limit > MAX_TRAVERSAL_WORK {
+            return Err(format!(
+                "TraversalRequest: work_limit must be <= {MAX_TRAVERSAL_WORK}, got {}",
+                self.work_limit
+            ));
+        }
+        let max_duration = Duration::from_millis(MAX_TRAVERSAL_MILLIS);
+        if self.max_duration > max_duration {
+            return Err(format!(
+                "TraversalRequest: max_duration must be <= {MAX_TRAVERSAL_MILLIS}ms, got {}ms",
+                self.max_duration.as_millis()
+            ));
+        }
+        Ok(())
+    }
+}
 
 /// A type-safe link ID (wraps Uuid).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -337,11 +434,18 @@ impl TryFrom<TraversalOptionsRaw> for TraversalOptions {
                 ));
             }
         }
-        if raw.max_depth > i64::MAX as usize {
+        if raw.max_depth > MAX_TRAVERSAL_DEPTH {
             return Err(format!(
-                "TraversalOptions: max_depth must be <= i64::MAX, got {}",
+                "TraversalOptions: max_depth must be <= {MAX_TRAVERSAL_DEPTH}, got {}",
                 raw.max_depth
             ));
+        }
+        if let Some(limit) = raw.limit {
+            if limit > MAX_TRAVERSAL_LIMIT {
+                return Err(format!(
+                    "TraversalOptions: limit must be <= {MAX_TRAVERSAL_LIMIT}, got {limit}"
+                ));
+            }
         }
         Ok(Self {
             max_depth: raw.max_depth,
@@ -391,6 +495,44 @@ impl TraversalOptions {
         self.direction = d;
         self
     }
+
+    /// Finite per-root non-root result cap used by every traversal.
+    pub fn effective_limit(&self) -> u32 {
+        self.limit.unwrap_or(DEFAULT_TRAVERSAL_LIMIT)
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        if self.max_depth > MAX_TRAVERSAL_DEPTH {
+            return Err(format!(
+                "TraversalOptions: max_depth must be <= {MAX_TRAVERSAL_DEPTH}, got {}",
+                self.max_depth
+            ));
+        }
+        if let Some(limit) = self.limit {
+            if limit > MAX_TRAVERSAL_LIMIT {
+                return Err(format!(
+                    "TraversalOptions: limit must be <= {MAX_TRAVERSAL_LIMIT}, got {limit}"
+                ));
+            }
+        }
+        if let Some(relations) = &self.relations {
+            if relations.len() > EdgeRelation::ALL.len() {
+                return Err(format!(
+                    "TraversalOptions: relations must contain at most {} entries, got {}",
+                    EdgeRelation::ALL.len(),
+                    relations.len()
+                ));
+            }
+        }
+        if let Some(weight) = self.min_weight {
+            if !weight.is_finite() || !(0.0..=1.0).contains(&weight) {
+                return Err(format!(
+                    "TraversalOptions: min_weight must be finite and in [0.0, 1.0], got {weight}"
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Raw deserialization target for [`TraversalRequest`].
@@ -407,12 +549,15 @@ impl TryFrom<TraversalRequestRaw> for TraversalRequest {
     type Error = String;
 
     fn try_from(raw: TraversalRequestRaw) -> Result<Self, Self::Error> {
-        Ok(Self {
+        let request = Self {
             roots: raw.roots,
             options: TraversalOptions::try_from(raw.options)?,
             include_roots: raw.include_roots,
             include_properties: raw.include_properties,
-        })
+            execution_budget: TraversalExecutionBudget::default(),
+        };
+        request.validate()?;
+        Ok(request)
     }
 }
 
@@ -427,6 +572,23 @@ pub struct TraversalRequest {
     /// `PathNode`. Default `false`; the wire shape is unchanged when absent.
     #[serde(default)]
     pub include_properties: bool,
+    /// Shared by runtime clones so work/time ceilings cover all visible
+    /// namespaces. This is execution state, not part of the serialized API.
+    #[serde(skip)]
+    pub execution_budget: TraversalExecutionBudget,
+}
+
+impl TraversalRequest {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.roots.len() > MAX_TRAVERSAL_ROOTS {
+            return Err(format!(
+                "TraversalRequest: roots must contain at most {MAX_TRAVERSAL_ROOTS} entries, got {}",
+                self.roots.len()
+            ));
+        }
+        self.options.validate()?;
+        self.execution_budget.validate()
+    }
 }
 
 /// One node along a traversal path.
@@ -524,16 +686,16 @@ mod tests {
     #[test]
     fn traversal_options_default_max_depth_is_three() {
         assert_eq!(TraversalOptions::default().max_depth, 3);
+        assert_eq!(
+            TraversalOptions::default().effective_limit(),
+            DEFAULT_TRAVERSAL_LIMIT
+        );
     }
 
-    /// STORAGE-AUD-003 / #485: max_depth > i64::MAX must be rejected by serde
-    /// deserialization instead of silently narrowing to a negative i64 at the
-    /// SQLite traversal boundary.
     #[test]
-    #[cfg(target_pointer_width = "64")]
-    fn traverse_max_depth_over_i64max_rejected() {
+    fn traverse_max_depth_over_public_cap_rejected() {
         let raw = serde_json::json!({
-            "max_depth": (i64::MAX as u64) + 1,
+            "max_depth": MAX_TRAVERSAL_DEPTH + 1,
             "direction": "out",
             "relations": null,
             "min_weight": null,
@@ -542,21 +704,74 @@ mod tests {
         let result: Result<TraversalOptions, _> = serde_json::from_value(raw);
         assert!(
             result.is_err(),
-            "max_depth > i64::MAX must be rejected, got {result:?}"
+            "max_depth above the public cap must be rejected, got {result:?}"
         );
     }
 
     #[test]
-    #[cfg(target_pointer_width = "64")]
-    fn traverse_max_depth_at_i64max_accepted() {
+    fn traverse_depth_and_limit_boundaries_are_inclusive() {
         let raw = serde_json::json!({
-            "max_depth": i64::MAX as u64,
+            "max_depth": MAX_TRAVERSAL_DEPTH,
             "direction": "out",
             "relations": null,
             "min_weight": null,
-            "limit": null,
+            "limit": MAX_TRAVERSAL_LIMIT,
         });
         let result: Result<TraversalOptions, _> = serde_json::from_value(raw);
-        assert!(result.is_ok(), "max_depth == i64::MAX must be accepted");
+        assert!(result.is_ok(), "inclusive public maxima must be accepted");
+    }
+
+    #[test]
+    fn traverse_limit_over_public_cap_rejected() {
+        let raw = serde_json::json!({
+            "max_depth": 1,
+            "direction": "out",
+            "relations": null,
+            "min_weight": null,
+            "limit": MAX_TRAVERSAL_LIMIT + 1,
+        });
+        let result: Result<TraversalOptions, _> = serde_json::from_value(raw);
+        assert!(
+            result.is_err(),
+            "limit above the public cap must be rejected"
+        );
+    }
+
+    #[test]
+    fn traverse_root_cap_rejected_during_deserialization() {
+        let raw = serde_json::json!({
+            "roots": vec![Uuid::nil(); MAX_TRAVERSAL_ROOTS + 1],
+            "options": {
+                "max_depth": 1,
+                "direction": "out",
+                "relations": null,
+                "min_weight": null,
+                "limit": 1,
+            },
+            "include_roots": false,
+        });
+        let result: Result<TraversalRequest, _> = serde_json::from_value(raw);
+        assert!(
+            result.is_err(),
+            "root list above the public cap must be rejected"
+        );
+    }
+
+    #[test]
+    fn traversal_execution_budget_is_shared_but_not_serialized() {
+        let budget = TraversalExecutionBudget::new(2, Duration::from_secs(1));
+        let clone = budget.clone();
+        assert!(budget.try_consume_row());
+        assert_eq!(clone.remaining_work(), 1);
+
+        let request = TraversalRequest {
+            roots: vec![Uuid::nil()],
+            options: TraversalOptions::default(),
+            include_roots: true,
+            include_properties: false,
+            execution_budget: budget,
+        };
+        let value = serde_json::to_value(request).unwrap();
+        assert!(value.get("execution_budget").is_none());
     }
 }

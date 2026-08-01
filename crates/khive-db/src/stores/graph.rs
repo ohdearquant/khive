@@ -1,6 +1,6 @@
-//! SQL-backed `GraphStore`: edge CRUD, neighbor queries, and recursive CTE traversal.
+//! SQL-backed `GraphStore`: edge CRUD, neighbor queries, and bounded BFS traversal.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -12,7 +12,8 @@ use khive_storage::types::{
     BatchWriteSummary, DeleteMode, DirectedNeighborHit, Direction, Edge, EdgeFilter, EdgeSeekPage,
     EdgeSortField, GraphPath, GuardedBatchOutcome, GuardedBatchRefusal, GuardedWriteOutcome,
     MissingEndpoints, NeighborHit, NeighborQuery, Page, PageRequest, PathNode, SortDirection,
-    SortOrder, SqlStatement, SqlValue, TraversalRequest,
+    SortOrder, SqlStatement, SqlValue, TraversalExecutionBudget, TraversalOptions,
+    TraversalRequest,
 };
 use khive_storage::GraphStore;
 use khive_storage::LinkId;
@@ -1015,85 +1016,244 @@ fn batch_upsert_edges_guarded(
     })
 }
 
-/// Builds the recursive-member SQL for one chunk of `GraphStore::traverse`'s
-/// recursive CTE. `ns_param`/`depth_param` are the 1-based positional bind
-/// indices for this chunk's `?N` placeholders; `relation_cond`/`weight_cond`
-/// are the (already-indexed) optional filter fragments built by the caller.
-///
-/// `Out`/`In` each emit a single indexed-seek arm. `Both` emits two arms —
-/// one keyed on `e.source_id = t.node_id` (seekable via
-/// `idx_graph_edges_ns_src_rel`), one on `e.target_id = t.node_id` (seekable
-/// via `idx_graph_edges_ns_tgt_rel`) — UNION ALL'd inside the recursive
-/// member, mirroring the pattern already proven correct and fast for
-/// `batch_neighbors` (`build_inner_sql` above). A single
-/// `e.source_id = t.node_id OR e.target_id = t.node_id` predicate cannot be
-/// satisfied by one index seek: SQLite falls back to a full namespace scan
-/// per frontier row, degrading `Direction::Both` traversal from
-/// `O(frontier × avg_degree)` to `O(frontier × total_edges)` (#1229).
-fn traverse_recursive_member_sql(
+/// One index-seek adjacency statement used by bounded level-synchronous BFS.
+/// There is deliberately no `ORDER BY`: the public contract promises minimum
+/// depth, not a same-depth tie order, and sorting a high-degree node before a
+/// low `LIMIT` would reintroduce the unbounded SQL work fixed by #1444.
+fn traversal_neighbor_sql(
     direction: Direction,
-    ns_param: usize,
-    depth_param: usize,
-    relation_cond: &str,
-    weight_cond: &str,
+    relation_count: usize,
+    has_min_weight: bool,
 ) -> String {
-    match direction {
-        Direction::Out => format!(
-            "SELECT t.root_id, e.target_id, e.id, t.depth + 1, \
-                 t.path || ',' || e.target_id, t.total_weight + e.weight \
-             FROM traversal t CROSS JOIN graph_edges e \
-                 ON e.source_id = t.node_id \
-             WHERE e.namespace = ?{ns} \
-               AND e.deleted_at IS NULL \
-               AND t.depth < ?{depth} \
-               AND (',' || t.path || ',') NOT LIKE '%,' || e.target_id || ',%'\
-               {rel_cond}{wt_cond}",
-            ns = ns_param,
-            depth = depth_param,
-            rel_cond = relation_cond,
-            wt_cond = weight_cond,
-        ),
-        Direction::In => format!(
-            "SELECT t.root_id, e.source_id, e.id, t.depth + 1, \
-                 t.path || ',' || e.source_id, t.total_weight + e.weight \
-             FROM traversal t CROSS JOIN graph_edges e \
-                 ON e.target_id = t.node_id \
-             WHERE e.namespace = ?{ns} \
-               AND e.deleted_at IS NULL \
-               AND t.depth < ?{depth} \
-               AND (',' || t.path || ',') NOT LIKE '%,' || e.source_id || ',%'\
-               {rel_cond}{wt_cond}",
-            ns = ns_param,
-            depth = depth_param,
-            rel_cond = relation_cond,
-            wt_cond = weight_cond,
-        ),
-        Direction::Both => format!(
-            "SELECT t.root_id, e.target_id, e.id, t.depth + 1, \
-                 t.path || ',' || e.target_id, t.total_weight + e.weight \
-             FROM traversal t CROSS JOIN graph_edges e \
-                 ON e.source_id = t.node_id \
-             WHERE e.namespace = ?{ns} \
-               AND e.deleted_at IS NULL \
-               AND t.depth < ?{depth} \
-               AND (',' || t.path || ',') NOT LIKE '%,' || e.target_id || ',%'\
-               {rel_cond}{wt_cond} \
-             UNION ALL \
-             SELECT t.root_id, e.source_id, e.id, t.depth + 1, \
-                 t.path || ',' || e.source_id, t.total_weight + e.weight \
-             FROM traversal t CROSS JOIN graph_edges e \
-                 ON e.target_id = t.node_id \
-             WHERE e.namespace = ?{ns} \
-               AND e.deleted_at IS NULL \
-               AND t.depth < ?{depth} \
-               AND (',' || t.path || ',') NOT LIKE '%,' || e.source_id || ',%'\
-               {rel_cond}{wt_cond}",
-            ns = ns_param,
-            depth = depth_param,
-            rel_cond = relation_cond,
-            wt_cond = weight_cond,
+    let (node_column, endpoint_column, index) = match direction {
+        Direction::Out => ("target_id", "source_id", "idx_graph_edges_ns_src_rel"),
+        Direction::In => ("source_id", "target_id", "idx_graph_edges_ns_tgt_rel"),
+        Direction::Both => unreachable!("Direction::Both is split into indexed Out/In seeks"),
+    };
+    let mut sql = format!(
+        "SELECT {node_column}, id, weight \
+         FROM graph_edges INDEXED BY {index} \
+         WHERE namespace = ?1 AND {endpoint_column} = ?2 AND deleted_at IS NULL"
+    );
+    if relation_count > 0 {
+        let placeholders = (0..relation_count)
+            .map(|offset| format!("?{}", 4 + offset))
+            .collect::<Vec<_>>()
+            .join(",");
+        sql.push_str(&format!(" AND relation IN ({placeholders})"));
+    }
+    if has_min_weight {
+        sql.push_str(&format!(" AND weight >= ?{}", 4 + relation_count));
+    }
+    sql.push_str(" LIMIT ?3");
+    sql
+}
+
+fn traversal_timeout_error(budget: &TraversalExecutionBudget) -> StorageError {
+    StorageError::Timeout {
+        operation: format!(
+            "traverse ({}ms execution budget)",
+            budget.max_duration().as_millis()
+        )
+        .into(),
+    }
+}
+
+fn traversal_work_error(budget: &TraversalExecutionBudget) -> StorageError {
+    StorageError::InvalidInput {
+        capability: StorageCapability::Graph,
+        operation: "traverse".into(),
+        message: format!(
+            "traversal work budget exceeded after {} adjacency rows; \
+             narrow roots, depth, relations, or result limit",
+            budget.work_limit()
         ),
     }
+}
+
+#[derive(Clone, Copy)]
+struct TraversalFrontierNode {
+    node_id: Uuid,
+    depth: usize,
+    total_weight: f64,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_bounded_traversal(
+    conn: &rusqlite::Connection,
+    roots: Vec<Uuid>,
+    opts: TraversalOptions,
+    include_roots: bool,
+    namespace: String,
+    origin: khive_storage::tx_registry::TxOrigin,
+    budget: TraversalExecutionBudget,
+    counted_rows: &std::sync::atomic::AtomicU64,
+    counted_queries: &std::sync::atomic::AtomicU64,
+) -> Result<Vec<GraphPath>, StorageError> {
+    let progress_timed_out = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let callback_timed_out = Arc::clone(&progress_timed_out);
+    let callback_budget = budget.clone();
+    #[cfg(test)]
+    let progress_seam_root = roots.first().copied();
+    conn.progress_handler(
+        1_000,
+        Some(move || {
+            #[cfg(test)]
+            if tests::traverse_progress_seam::hook(progress_seam_root) {
+                callback_timed_out.store(true, std::sync::atomic::Ordering::Relaxed);
+                return true;
+            }
+            let expired = callback_budget.is_expired();
+            if expired {
+                callback_timed_out.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            expired
+        }),
+    );
+
+    let result = (|| {
+        let result_limit = opts.effective_limit() as usize;
+        let relation_count = opts.relations.as_ref().map_or(0, Vec::len);
+        let directions = match opts.direction {
+            Direction::Out => vec![Direction::Out],
+            Direction::In => vec![Direction::In],
+            Direction::Both => vec![Direction::Out, Direction::In],
+        };
+        let statements = directions
+            .into_iter()
+            .map(|direction| {
+                traversal_neighbor_sql(direction, relation_count, opts.min_weight.is_some())
+            })
+            .collect::<Vec<_>>();
+        let map_sql_error = |error| {
+            if progress_timed_out.load(std::sync::atomic::Ordering::Relaxed) {
+                traversal_timeout_error(&budget)
+            } else {
+                map_err(error, "traverse")
+            }
+        };
+
+        let mut all_paths = Vec::with_capacity(roots.len());
+        for root_id in roots {
+            let mut seen = HashSet::new();
+            seen.insert(root_id);
+            let mut frontier = VecDeque::from([TraversalFrontierNode {
+                node_id: root_id,
+                depth: 0,
+                total_weight: 0.0,
+            }]);
+            let mut nodes = Vec::with_capacity(result_limit + usize::from(include_roots));
+            if include_roots {
+                nodes.push(PathNode {
+                    node_id: root_id,
+                    via_edge: None,
+                    depth: 0,
+                    name: None,
+                    kind: None,
+                    properties: None,
+                    weight: 0.0,
+                });
+            }
+            let mut non_root_count = 0usize;
+
+            'root_walk: while non_root_count < result_limit {
+                let Some(current) = frontier.pop_front() else {
+                    break;
+                };
+                if current.depth >= opts.max_depth {
+                    continue;
+                }
+                if budget.is_expired() {
+                    return Err(traversal_timeout_error(&budget));
+                }
+
+                for sql in &statements {
+                    let row_cap = budget.remaining_work().saturating_add(1);
+                    let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = vec![
+                        Box::new(namespace.clone()),
+                        Box::new(current.node_id.to_string()),
+                        Box::new(row_cap as i64),
+                    ];
+                    if let Some(relations) = &opts.relations {
+                        params.extend(relations.iter().map(|relation| {
+                            Box::new(relation.to_string()) as Box<dyn rusqlite::types::ToSql>
+                        }));
+                    }
+                    if let Some(min_weight) = opts.min_weight {
+                        params.push(Box::new(min_weight));
+                    }
+                    let param_refs = params
+                        .iter()
+                        .map(|param| param.as_ref())
+                        .collect::<Vec<&dyn rusqlite::types::ToSql>>();
+
+                    let _snapshot = khive_storage::tx_registry::register_scoped(
+                        Some("graph_traverse_read".to_string()),
+                        origin.clone(),
+                    );
+                    let mut stmt = conn.prepare(sql).map_err(&map_sql_error)?;
+                    counted_queries.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let mut rows = stmt.query(param_refs.as_slice()).map_err(&map_sql_error)?;
+                    while let Some(row) = rows.next().map_err(&map_sql_error)? {
+                        // Test seam after `sqlite3_step` has produced a row:
+                        // the cursor's read snapshot is demonstrably live.
+                        #[cfg(test)]
+                        tests::traverse_snapshot_seam::hook(current.node_id);
+                        counted_rows.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if budget.is_expired() {
+                            return Err(traversal_timeout_error(&budget));
+                        }
+                        if !budget.try_consume_row() {
+                            return Err(traversal_work_error(&budget));
+                        }
+                        let node_str: String = row.get(0).map_err(&map_sql_error)?;
+                        let edge_str: String = row.get(1).map_err(&map_sql_error)?;
+                        let edge_weight: f64 = row.get(2).map_err(&map_sql_error)?;
+                        let node_id = parse_uuid(&node_str).map_err(&map_sql_error)?;
+                        if !seen.insert(node_id) {
+                            continue;
+                        }
+                        let via_edge = parse_uuid(&edge_str).map_err(&map_sql_error)?;
+                        let depth = current.depth + 1;
+                        let total_weight = current.total_weight + edge_weight;
+                        nodes.push(PathNode {
+                            node_id,
+                            via_edge: Some(via_edge),
+                            depth,
+                            name: None,
+                            kind: None,
+                            properties: None,
+                            weight: total_weight,
+                        });
+                        non_root_count += 1;
+                        if depth < opts.max_depth {
+                            frontier.push_back(TraversalFrontierNode {
+                                node_id,
+                                depth,
+                                total_weight,
+                            });
+                        }
+                        if non_root_count == result_limit {
+                            break 'root_walk;
+                        }
+                    }
+                }
+            }
+
+            if !nodes.is_empty() {
+                let total_weight = nodes.iter().map(|node| node.weight).fold(0.0_f64, f64::max);
+                all_paths.push(GraphPath {
+                    root_id,
+                    nodes,
+                    total_weight,
+                });
+            }
+        }
+        Ok(all_paths)
+    })();
+
+    conn.progress_handler(0, None::<fn() -> bool>);
+    result
 }
 
 #[async_trait]
@@ -2057,267 +2217,58 @@ impl GraphStore for SqlGraphStore {
     }
 
     async fn traverse(&self, request: TraversalRequest) -> Result<Vec<GraphPath>, StorageError> {
-        use std::collections::{HashMap, HashSet};
-
+        request
+            .validate()
+            .map_err(|message| StorageError::InvalidInput {
+                capability: StorageCapability::Graph,
+                operation: "traverse".into(),
+                message,
+            })?;
         if request.roots.is_empty() {
             return Ok(Vec::new());
         }
 
-        let roots = request.roots.clone();
-        let opts = request.options.clone();
+        let mut distinct_roots = HashSet::with_capacity(request.roots.len());
+        let roots = request
+            .roots
+            .iter()
+            .copied()
+            .filter(|root| distinct_roots.insert(*root))
+            .collect::<Vec<_>>();
+        let opts = request.options;
         let include_roots = request.include_roots;
         let namespace = self.namespace.clone();
-        let max_depth_i64 =
-            i64::try_from(opts.max_depth).map_err(|_| StorageError::InvalidInput {
-                capability: StorageCapability::Graph,
-                operation: "traverse".into(),
-                message: format!(
-                    "TraversalOptions: max_depth must be <= i64::MAX, got {}",
-                    opts.max_depth
-                ),
-            })?;
-
         let origin = self.pool.origin();
+        let budget = request.execution_budget;
         // Shared with the blocking closure so the counts survive an error.
         // `with_reader` runs the closure on a blocking thread where the
         // task-local usage context is invisible, so it cannot call
         // `usage::count` itself; returning the totals in the Ok value would
-        // lose every round trip already issued when a later chunk fails.
+        // lose every round trip already issued when a later statement fails.
         let counted_rows = Arc::new(std::sync::atomic::AtomicU64::new(0));
-        let counted_chunks = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let counted_queries = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let closure_rows = Arc::clone(&counted_rows);
-        let closure_chunks = Arc::clone(&counted_chunks);
+        let closure_queries = Arc::clone(&counted_queries);
         let result = self
             .with_reader("traverse", move |conn| {
-                // Two SQLite limits apply to the seed VALUES clause:
-                //
-                //   1. SQLITE_LIMIT_COMPOUND_SELECT (default 500): SQLite counts each row in a
-                //      VALUES list as one term in a compound SELECT.  Exceeding it gives
-                //      "too many terms in compound SELECT".
-                //
-                //   2. SQLITE_LIMIT_VARIABLE_NUMBER (default 999): each root binds one parameter
-                //      (referenced 3× in its seed row but counted once).  Fixed overhead —
-                //      namespace, depth, optional relation/weight params — adds ~20 at most.
-                //
-                // 400 rows stays safely below both: 400 < 500 (compound) and
-                // 400 + fixed << 999 (variables).
-                const CHUNK_ROOTS: usize = 400;
-
-                // Open a deferred read transaction so ALL chunk queries observe the same
-                // graph snapshot.  Without this, a writer committing between chunks could
-                // let roots 1..400 see the pre-commit graph and 401..800 see the post-commit
-                // graph.  One pool checkout, one snapshot for the full traverse.
-                //
-                // ADR-091 Plank 0: this is the most WAL-pin-relevant span in the store —
-                // it intentionally holds a read snapshot across chunked traversal work.
-                // Registered before the transaction is opened so the handle (declared
-                // first) drops after `tx`'s own Drop runs (locals drop in reverse
-                // declaration order within the same scope).
-                let _tx_handle = khive_storage::tx_registry::register_scoped(
-                    Some("graph_traverse_read".to_string()),
+                Ok(run_bounded_traversal(
+                    conn,
+                    roots,
+                    opts,
+                    include_roots,
+                    namespace,
                     origin,
-                );
-                let tx = conn.unchecked_transaction()?;
-
-                // Accumulate per-root state across all chunks: (nodes_with_path_weight, seen_set).
-                // Each entry carries the PathNode and its cumulative path weight from the SQL row,
-                // so the Rust-level per-root limit truncation can compute an accurate max_weight
-                // over the kept nodes.
-                let mut root_data: HashMap<Uuid, (Vec<(PathNode, f64)>, HashSet<Uuid>)> =
-                    HashMap::with_capacity(roots.len());
-                // Amendment 2 `graph_hops`: adjacency rows returned by the CTE,
-                // counted before first-visit de-duplication.
-                let raw_rows = &closure_rows;
-                // Amendment 2 `db_round_trips`: one per executed chunk query — a
-                // root set over CHUNK_ROOTS (400) splits into multiple SQL
-                // executions, each of which must count as its own round trip.
-                let chunks_executed = &closure_chunks;
-
-                // Pre-seed with root nodes when include_roots is set (done once for all roots).
-                for root_id in &roots {
-                    let (nodes, seen) = root_data.entry(*root_id).or_default();
-                    if include_roots {
-                        seen.insert(*root_id);
-                        nodes.push((
-                            PathNode {
-                                node_id: *root_id,
-                                via_edge: None,
-                                depth: 0,
-                                name: None,
-                                kind: None,
-                                properties: None,
-                                weight: 0.0,
-                            },
-                            0.0,
-                        ));
-                    }
-                }
-
-                for chunk in roots.chunks(CHUNK_ROOTS) {
-                    let n_chunk = chunk.len();
-
-                    // Param layout (per-chunk, not total):
-                    //   ?1 .. ?{n_chunk}     — root UUID strings (each used 3× in seed row)
-                    //   ?{n_chunk + 1}       — namespace
-                    //   ?{n_chunk + 2}       — max_depth
-                    //   ?{n_chunk + 3} ..    — optional relation / weight params
-                    let ns_param = n_chunk + 1;
-                    let depth_param = n_chunk + 2;
-                    let mut extra_param_idx = n_chunk + 3;
-
-                    let mut relation_cond = String::new();
-                    let mut extra_params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
-
-                    if let Some(ref rels) = opts.relations {
-                        if !rels.is_empty() {
-                            let placeholders: Vec<String> = rels
-                                .iter()
-                                .map(|r| {
-                                    extra_params.push(Box::new(r.to_string()));
-                                    let p = format!("?{extra_param_idx}");
-                                    extra_param_idx += 1;
-                                    p
-                                })
-                                .collect();
-                            relation_cond =
-                                format!(" AND e.relation IN ({})", placeholders.join(","));
-                        }
-                    }
-
-                    let mut weight_cond = String::new();
-                    if let Some(min_w) = opts.min_weight {
-                        extra_params.push(Box::new(min_w));
-                        weight_cond = format!(" AND e.weight >= ?{extra_param_idx}");
-                        // limit is applied in Rust (see below), so no SQL param needed.
-                    }
-
-                    // Seed rows: one per root in this chunk, each referencing its own
-                    // param 3× (root_id, node_id, and the initial path string).
-                    let seed_rows: Vec<String> = (1..=n_chunk)
-                        .map(|i| format!("(?{i}, ?{i}, NULL, 0, ?{i}, 0.0)"))
-                        .collect();
-                    let seeds = seed_rows.join(", ");
-
-                    // Recursive-member SQL for this chunk.  CROSS JOIN forces SQLite to
-                    // put the frontier (t) as the outer loop and seek graph_edges by
-                    // index, avoiding the O(edges × frontier) plan (#250, #251).
-                    // See `traverse_recursive_member_sql` for why `Both` is split
-                    // into two UNION ALL'd arms instead of one OR-predicate arm
-                    // (#1229).
-                    let recursive_member = traverse_recursive_member_sql(
-                        opts.direction.clone(),
-                        ns_param,
-                        depth_param,
-                        &relation_cond,
-                        &weight_cond,
-                    );
-
-                    let cte_sql = format!(
-                        "WITH RECURSIVE traversal(\
-                         root_id, node_id, edge_id, depth, path, total_weight\
-                     ) AS (\
-                         VALUES {seeds} \
-                         UNION ALL \
-                         {recursive_member} \
-                     ) \
-                     SELECT root_id, node_id, edge_id, depth, total_weight \
-                     FROM traversal WHERE depth > 0 \
-                     ORDER BY root_id, depth",
-                        seeds = seeds,
-                        recursive_member = recursive_member,
-                    );
-
-                    let mut all_params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
-                    for root_id in chunk {
-                        all_params.push(Box::new(root_id.to_string()));
-                    }
-                    all_params.push(Box::new(namespace.clone()));
-                    all_params.push(Box::new(max_depth_i64));
-                    all_params.extend(extra_params);
-
-                    let param_refs: Vec<&dyn rusqlite::types::ToSql> =
-                        all_params.iter().map(|p| p.as_ref()).collect();
-
-                    // Queries run on `conn`; reads are connection-level and participate
-                    // in the open `tx` deferred snapshot.
-                    let mut stmt = conn.prepare(&cte_sql)?;
-                    chunks_executed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    let rows_iter = stmt.query_map(param_refs.as_slice(), |row| {
-                        let root_str: String = row.get(0)?;
-                        let node_str: String = row.get(1)?;
-                        let edge_str: Option<String> = row.get(2)?;
-                        let depth: i64 = row.get(3)?;
-                        let total_weight: f64 = row.get(4)?;
-                        Ok((root_str, node_str, edge_str, depth, total_weight))
-                    })?;
-
-                    // The CTE is ordered by (root_id, depth), so the first occurrence of
-                    // each (root_id, node_id) pair is the shallowest — that is the one we
-                    // keep (BFS first-visit semantics, matching #285).
-                    for row in rows_iter {
-                        let (root_str, node_str, edge_str, depth, total_weight) = row?;
-                        raw_rows.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        let root_id = parse_uuid(&root_str)?;
-                        let node_id = parse_uuid(&node_str)?;
-                        let (nodes, seen) = root_data.entry(root_id).or_default();
-                        if !seen.insert(node_id) {
-                            continue;
-                        }
-                        let via_edge = edge_str.map(|s| parse_uuid(&s)).transpose()?;
-                        nodes.push((
-                            PathNode {
-                                node_id,
-                                via_edge,
-                                depth: depth as usize,
-                                name: None,
-                                kind: None,
-                                properties: None,
-                                weight: total_weight,
-                            },
-                            total_weight,
-                        ));
-                    }
-                }
-
-                tx.commit()?;
-
-                // Reconstruct Vec<GraphPath> in original root order.
-                // Per-root limit: counts only non-root nodes against the cap, matching
-                // the original per-root-CTE semantics where the SQL LIMIT applied only
-                // to depth > 0 rows.  Truncation is on the post-dedup list (BFS order),
-                // so the shallowest `limit` reachable nodes are kept per root.
-                let mut all_paths: Vec<GraphPath> = Vec::with_capacity(roots.len());
-                for root_id in &roots {
-                    if let Some((mut nw, _)) = root_data.remove(root_id) {
-                        if nw.is_empty() {
-                            continue;
-                        }
-                        if let Some(lim) = opts.limit {
-                            let root_count = usize::from(include_roots);
-                            nw.truncate(root_count + lim as usize);
-                        }
-                        // Post-truncation guard: a limit=0 + include_roots=false call
-                        // truncates to zero nodes; there is nothing to emit.
-                        if nw.is_empty() {
-                            continue;
-                        }
-                        let max_weight = nw.iter().map(|(_, w)| *w).fold(0.0_f64, f64::max);
-                        let nodes: Vec<PathNode> = nw.into_iter().map(|(n, _)| n).collect();
-                        all_paths.push(GraphPath {
-                            root_id: *root_id,
-                            nodes,
-                            total_weight: max_weight,
-                        });
-                    }
-                }
-
-                Ok(all_paths)
+                    budget,
+                    closure_rows.as_ref(),
+                    closure_queries.as_ref(),
+                ))
             })
-            .await;
+            .await
+            .and_then(|inner| inner);
 
         // Accounted on BOTH outcomes. `db_round_trips` counts round trips
         // *issued* and `graph_hops` counts adjacency rows storage *returned*,
-        // so work already done before a later chunk errors is real work and
+        // so work already done before a later statement errors is real work and
         // must appear. Reading the shared counters here rather than off the
         // Ok value is what makes that possible: the closure runs on a blocking
         // thread where the task-local usage context is not visible, so it
@@ -2325,7 +2276,7 @@ impl GraphStore for SqlGraphStore {
         // reports nothing at all when the traversal fails partway.
         khive_storage::usage::count(
             khive_storage::usage::UsageUnit::DbRoundTrips,
-            counted_chunks.load(std::sync::atomic::Ordering::Relaxed),
+            counted_queries.load(std::sync::atomic::Ordering::Relaxed),
         );
         khive_storage::usage::count(
             khive_storage::usage::UsageUnit::GraphHops,

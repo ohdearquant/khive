@@ -22,7 +22,7 @@ else, a different verb is a better fit:
 | Find records by topic or keyword, fuzzy or full-text                                        | `search(kind="entity", query="...")` — `kind="note"` works the same way                         |
 | Look up a known record by id                                                                | `get(id="...")`                                                                                 |
 | See immediate connections of a known node                                                   | `neighbors(node_id="...", direction="both")`                                                    |
-| Explore unbounded or loosely-bounded multi-hop paths                                        | `traverse(roots=["..."], max_depth=N)`                                                          |
+| Explore bounded multi-hop paths                                                             | `traverse(roots=["..."], max_depth=N)` — depth ≤10 with finite result/work/time budgets         |
 | Pull a budgeted, entity-anchored context bundle                                             | `context(query="...", hops=N, budget=N)` — or anchor with `entity_ids=[...]` instead of `query` |
 | Match a typed relation pattern, filter by property, or walk a _fixed-relation_ bounded path | `query(query="MATCH ...")` or `query(query="SELECT ...")`                                       |
 | Create, update, link, merge, or delete anything                                             | The corresponding KG verb — never `query`                                                       |

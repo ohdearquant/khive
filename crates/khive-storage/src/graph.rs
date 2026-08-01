@@ -225,7 +225,14 @@ pub trait GraphStore: Send + Sync + 'static {
         }
         Ok(out)
     }
-    /// Multi-hop BFS traversal from the given roots.
+    /// Bounded multi-hop BFS traversal from the given roots.
+    ///
+    /// Implementations must validate [`TraversalRequest::validate`], count
+    /// adjacency rows before first-visit de-duplication against the request's
+    /// shared execution budget, stop a root as soon as its effective result
+    /// limit is filled, and return an error rather than partial paths when the
+    /// work or time budget expires. Minimum-depth BFS selection is normative;
+    /// same-depth tie ordering is not.
     async fn traverse(&self, request: TraversalRequest) -> StorageResult<Vec<GraphPath>>;
     /// Hard-delete every incident edge (source or target) for `node_id`, regardless of soft-delete
     /// state. Used during endpoint hard-delete to prevent dangling `graph_edges` rows (ADR-002

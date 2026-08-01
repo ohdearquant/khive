@@ -123,10 +123,9 @@ The main backend's attribution view uses a filter matching
   site is threaded in the same change — the current inventory spans
   `pool.rs` (`WriterGuard::transaction`), `writer_task.rs` (the batch-writer
   span), `stores/graph.rs` (`graph_upsert_edges`, `graph_upsert_edge_guarded`,
-  the guarded-edge span, and `graph_traverse_read` — the long-lived deferred
-  read snapshot held across traversal chunks, which is precisely the span
-  class attribution exists for), and the daemon's own registration sites in
-  `khive-runtime`. The implementation PR gates completeness with a grep over
+  the guarded-edge span, and `graph_traverse_read` — a statement-scoped
+  traversal snapshot after ADR-091 Amendment 4), and the daemon's own
+  registration sites in `khive-runtime`. The implementation PR gates completeness with a grep over
   `tx_registry::register` — the list above is the audit baseline, not the
   contract; any site added later must register scoped or is a review defect.
 - **The session sweep** keeps its single task but fans out per backend: one
@@ -219,9 +218,10 @@ provides the same partitioning with an additive API.
 - Daemon-side tests: checkpoint attribution for pool X ignores a span registered
   against pool Y; with two file-backed backends, a WAL stall on the secondary is
   detected and its sidecar enumerated (per-backend ownership, not main-only).
-- Traversal coverage test: a `graph_traverse_read` deferred span on a secondary
-  backend appears in that backend's filtered view — the long-lived read snapshot
-  is the span class this design exists for and must not remain unscoped.
+- Traversal coverage test: a live `graph_traverse_read` statement span on a
+  secondary backend appears in that backend's filtered view and disappears
+  when the statement finishes. The snapshot is short-lived after ADR-091
+  Amendment 4, but it must still never remain unscoped.
 - Identity test: a non-UTF-8 database path (Unix) round-trips through
   `DbIdentity` without loss and matches its own sidecar directory key.
 

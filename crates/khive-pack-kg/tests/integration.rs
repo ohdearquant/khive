@@ -1513,11 +1513,8 @@ async fn traverse_from_root_with_depth_one_returns_linked_node() {
     );
 }
 
-/// STORAGE-AUD-003 / #485: an oversized max_depth (> i64::MAX) must reject at
-/// the storage boundary, not silently narrow to a negative i64 depth and
-/// return an empty or wrong traversal.
 #[tokio::test]
-async fn traverse_max_depth_over_i64max_rejected() {
+async fn traverse_max_depth_over_public_cap_rejected() {
     let pack = pack();
 
     let root = pack
@@ -1545,24 +1542,57 @@ async fn traverse_max_depth_over_i64max_rejected() {
     .await
     .expect("link must succeed");
 
-    let oversized_max_depth = (i64::MAX as u64) + 1;
     let err = pack
         .dispatch(
             "traverse",
             json!({
                 "roots": [root_id],
-                "max_depth": oversized_max_depth,
+                "max_depth": 11,
                 "direction": "out",
                 "include_roots": false
             }),
         )
         .await
-        .expect_err("traverse with max_depth > i64::MAX must not succeed");
+        .expect_err("traverse with max_depth > 10 must not succeed");
 
     match err {
-        RuntimeError::Storage(khive_storage::StorageError::InvalidInput { .. }) => {}
-        RuntimeError::InvalidInput(_) => {}
-        other => panic!("expected InvalidInput (directly or via Storage), got {other:?}"),
+        RuntimeError::InvalidInput(message) => assert!(message.contains("max_depth must be <= 10")),
+        other => panic!("expected handler InvalidInput, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn traverse_root_and_result_caps_reject_before_resolution() {
+    let pack = pack();
+
+    let roots = vec!["not-a-resolvable-root"; 101];
+    let root_error = pack
+        .dispatch("traverse", json!({"roots": roots, "max_depth": 1}))
+        .await
+        .expect_err("root cap+1 must fail");
+    match root_error {
+        RuntimeError::InvalidInput(message) => {
+            assert!(message.contains("roots must contain at most 100 entries"));
+            assert!(
+                !message.contains("UUID"),
+                "root count must be checked before root resolution"
+            );
+        }
+        other => panic!("expected root-cap InvalidInput, got {other:?}"),
+    }
+
+    let limit_error = pack
+        .dispatch(
+            "traverse",
+            json!({"roots": ["not-a-resolvable-root"], "max_depth": 1, "limit": 1001}),
+        )
+        .await
+        .expect_err("result cap+1 must fail");
+    match limit_error {
+        RuntimeError::InvalidInput(message) => {
+            assert!(message.contains("limit must be <= 1000"));
+        }
+        other => panic!("expected result-cap InvalidInput, got {other:?}"),
     }
 }
 

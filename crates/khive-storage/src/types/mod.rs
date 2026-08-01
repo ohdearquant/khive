@@ -15,8 +15,10 @@ pub type StorageResult<T> = Result<T, StorageError>;
 pub use graph::{
     DirectedNeighborHit, Direction, Edge, EdgeFilter, EdgeSeekPage, EdgeSortField, GraphPath,
     GuardedBatchOutcome, GuardedBatchRefusal, GuardedWriteOutcome, LinkId, MissingEndpoints,
-    NeighborHit, NeighborQuery, PathNode, SortDirection, SortOrder, TimeRange, TraversalOptions,
-    TraversalRequest,
+    NeighborHit, NeighborQuery, PathNode, SortDirection, SortOrder, TimeRange,
+    TraversalExecutionBudget, TraversalOptions, TraversalRequest, DEFAULT_TRAVERSAL_LIMIT,
+    MAX_TRAVERSAL_DEPTH, MAX_TRAVERSAL_LIMIT, MAX_TRAVERSAL_MILLIS, MAX_TRAVERSAL_ROOTS,
+    MAX_TRAVERSAL_WORK,
 };
 pub use pagination::{Page, PageRequest};
 pub use sparse::{
