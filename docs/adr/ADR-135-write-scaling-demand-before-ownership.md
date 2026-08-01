@@ -1,4 +1,4 @@
-# ADR-135 — Scale SQLite writes by reducing writer demand before changing ownership
+# ADR-135: Scale SQLite writes by reducing writer demand before changing ownership
 
 - **Status:** Proposed
 - **Date:** 2026-07-30
