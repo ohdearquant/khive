@@ -27,6 +27,8 @@ fn recall_hit(id: Uuid, latency_us: i64) -> BrainSignal {
     BrainSignal::RecallHit {
         target_id: id,
         latency_us,
+        served_by_profile_id: None,
+        serve_attribution: khive_brain_core::ServeAttribution::Unspecified,
     }
 }
 

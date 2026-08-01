@@ -10,7 +10,7 @@ pub mod tunable;
 mod event;
 mod pack;
 
-pub(crate) use pack::sync_balanced_recall_record;
+pub(crate) use pack::{apply_dispatch_signal, sync_balanced_recall_record};
 pub use pack::{BrainPack, ENTITY_CACHE_CAPACITY};
 
 use std::collections::HashMap;

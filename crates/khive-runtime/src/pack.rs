@@ -1713,17 +1713,44 @@ impl VerbRegistry {
 
                     // For recall verbs: extract the first result's id as
                     // target_id so the brain temporal posterior can observe
-                    // real hit/miss and latency.
+                    // real hit/miss and latency. Copy the serve-attribution
+                    // fields from that same hit so the hook credits the profile
+                    // that actually served instead of always crediting default.
                     if verb == "memory.recall" {
-                        let first_note_id = ok_val
-                            .as_array()
-                            .and_then(|arr| arr.first())
+                        let first_result =
+                            ok_val.as_array().and_then(|arr| arr.first()).or_else(|| {
+                                ok_val
+                                    .get("results")
+                                    .and_then(Value::as_array)
+                                    .and_then(|arr| arr.first())
+                            });
+                        let first_note_id = first_result
                             .and_then(|v| v.get("id"))
                             .and_then(|v| v.as_str())
                             .and_then(|s| s.parse::<uuid::Uuid>().ok());
                         if let Some(note_id) = first_note_id {
                             dispatch_event = dispatch_event.with_target(note_id);
                         }
+                        let mut payload = serde_json::Map::new();
+                        if let Some(profile_id) = first_result
+                            .and_then(|v| v.get("served_by_profile_id"))
+                            .and_then(Value::as_str)
+                        {
+                            payload.insert(
+                                "served_by_profile_id".to_string(),
+                                Value::String(profile_id.to_string()),
+                            );
+                        }
+                        if let Some(attribution) = first_result
+                            .and_then(|v| v.get("serve_attribution"))
+                            .and_then(Value::as_str)
+                        {
+                            payload.insert(
+                                "serve_attribution".to_string(),
+                                Value::String(attribution.to_string()),
+                            );
+                        }
+                        dispatch_event = dispatch_event.with_payload(Value::Object(payload));
                         // No first result → target_id stays None (RecallMiss
                         // in brain's event interpreter).
                     }
@@ -6333,6 +6360,67 @@ mod hook_tests {
         }
     }
 
+    struct RecallPack;
+
+    impl Pack for RecallPack {
+        const NAME: &'static str = "memory";
+        const NOTE_KINDS: &'static [&'static str] = &[];
+        const ENTITY_KINDS: &'static [&'static str] = &[];
+        const HANDLERS: &'static [HandlerDef] = &[HandlerDef {
+            name: "memory.recall",
+            description: "test recall",
+            visibility: Visibility::Verb,
+            category: VerbCategory::Assertive,
+            params: &[],
+        }];
+    }
+
+    #[async_trait]
+    impl PackRuntime for RecallPack {
+        fn name(&self) -> &str {
+            RecallPack::NAME
+        }
+        fn note_kinds(&self) -> &'static [&'static str] {
+            RecallPack::NOTE_KINDS
+        }
+        fn entity_kinds(&self) -> &'static [&'static str] {
+            RecallPack::ENTITY_KINDS
+        }
+        fn handlers(&self) -> &'static [HandlerDef] {
+            RecallPack::HANDLERS
+        }
+        async fn dispatch(
+            &self,
+            _verb: &str,
+            params: Value,
+            _registry: &VerbRegistry,
+            _token: &NamespaceToken,
+        ) -> Result<Value, RuntimeError> {
+            let hit = serde_json::json!({
+                "id": uuid::Uuid::new_v4().to_string(),
+                "served_by_profile_id": "custom-recall-v1",
+                "serve_attribution": "profile",
+            });
+            if params.get("verbose").and_then(Value::as_bool) == Some(true) {
+                Ok(serde_json::json!({"results": [hit]}))
+            } else {
+                Ok(serde_json::json!([hit]))
+            }
+        }
+    }
+
+    #[derive(Default)]
+    struct EventCapturingHook {
+        event: StdMutex<Option<Event>>,
+    }
+
+    #[async_trait]
+    impl DispatchHook for EventCapturingHook {
+        async fn on_dispatch(&self, view: &EventView) {
+            *self.event.lock().unwrap() = Some(view.event.clone());
+        }
+    }
+
     /// Hook that counts calls and records the last verb seen.
     #[derive(Default)]
     struct CountingHook {
@@ -6387,6 +6475,34 @@ mod hook_tests {
             3,
             "hook must fire once per successful dispatch"
         );
+    }
+
+    #[tokio::test]
+    async fn recall_hook_copies_serve_attribution_from_bare_and_verbose_results() {
+        let hook = Arc::new(EventCapturingHook::default());
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(RecallPack);
+        builder.with_dispatch_hook(hook.clone());
+        let reg = builder.build().expect("registry builds");
+
+        for params in [serde_json::json!({}), serde_json::json!({"verbose": true})] {
+            reg.dispatch("memory.recall", params)
+                .await
+                .expect("recall dispatch");
+            let event = hook.event.lock().unwrap().clone().expect("hook event");
+            assert!(
+                event.target_id.is_some(),
+                "first recall id must become target"
+            );
+            assert_eq!(
+                event.payload["served_by_profile_id"],
+                serde_json::json!("custom-recall-v1")
+            );
+            assert_eq!(
+                event.payload["serve_attribution"],
+                serde_json::json!("profile")
+            );
+        }
     }
 
     #[tokio::test]

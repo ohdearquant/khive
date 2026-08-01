@@ -6,7 +6,7 @@ use khive_storage::event::Event;
 use khive_types::EventOutcome;
 
 pub use khive_brain_core::BrainSignal;
-use khive_brain_core::{FeedbackEventKind, FeedbackSignal, SectionType};
+use khive_brain_core::{FeedbackEventKind, FeedbackSignal, SectionType, ServeAttribution};
 
 /// Extract a brain signal from a raw storage Event.
 ///
@@ -24,10 +24,26 @@ pub fn interpret(event: &Event) -> BrainSignal {
     match event.verb.as_str() {
         "memory.recall" | "recall" => match event.outcome {
             EventOutcome::Success => match event.target_id {
-                Some(tid) => BrainSignal::RecallHit {
-                    target_id: tid,
-                    latency_us: event.duration_us,
-                },
+                Some(tid) => {
+                    let served_by_profile_id = event
+                        .payload
+                        .get("served_by_profile_id")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_owned);
+                    let serve_attribution = ServeAttribution::from_wire(
+                        event
+                            .payload
+                            .get("serve_attribution")
+                            .and_then(|v| v.as_str()),
+                        served_by_profile_id.as_deref(),
+                    );
+                    BrainSignal::RecallHit {
+                        target_id: tid,
+                        latency_us: event.duration_us,
+                        served_by_profile_id,
+                        serve_attribution,
+                    }
+                }
                 None => BrainSignal::RecallMiss,
             },
             _ => BrainSignal::RecallMiss,
@@ -149,6 +165,45 @@ mod tests {
     }
 
     #[test]
+    fn recall_hit_decodes_serving_profile_attribution() {
+        let id = Uuid::new_v4();
+        let mut e = make_event("memory.recall", EventOutcome::Success, Some(id));
+        e.payload = serde_json::json!({
+            "served_by_profile_id": "custom-recall-v1",
+            "serve_attribution": "profile"
+        });
+        match interpret(&e) {
+            BrainSignal::RecallHit {
+                served_by_profile_id,
+                serve_attribution,
+                ..
+            } => {
+                assert_eq!(served_by_profile_id.as_deref(), Some("custom-recall-v1"));
+                assert_eq!(serve_attribution, ServeAttribution::Profile);
+            }
+            other => panic!("expected RecallHit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn recall_hit_decodes_explicit_unattributed_marker() {
+        let id = Uuid::new_v4();
+        let mut e = make_event("memory.recall", EventOutcome::Success, Some(id));
+        e.payload = serde_json::json!({"serve_attribution": "unattributed"});
+        match interpret(&e) {
+            BrainSignal::RecallHit {
+                served_by_profile_id,
+                serve_attribution,
+                ..
+            } => {
+                assert!(served_by_profile_id.is_none());
+                assert_eq!(serve_attribution, ServeAttribution::Unattributed);
+            }
+            other => panic!("expected RecallHit, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn recall_success_without_target_is_miss() {
         let e = make_event("recall", EventOutcome::Success, None);
         assert!(matches!(interpret(&e), BrainSignal::RecallMiss));
@@ -261,6 +316,8 @@ mod tests {
         let sig = BrainSignal::RecallHit {
             target_id: id,
             latency_us: 100,
+            served_by_profile_id: None,
+            serve_attribution: ServeAttribution::Unspecified,
         };
         assert_eq!(entity_signal(&sig), Some((id, true)));
     }
@@ -275,6 +332,8 @@ mod tests {
         let hit = BrainSignal::RecallHit {
             target_id: Uuid::new_v4(),
             latency_us: 0,
+            served_by_profile_id: None,
+            serve_attribution: ServeAttribution::Unspecified,
         };
         assert_eq!(is_recall_positive(&hit), Some(true));
         assert_eq!(is_recall_positive(&BrainSignal::RecallMiss), Some(false));

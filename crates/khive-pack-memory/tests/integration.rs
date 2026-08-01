@@ -3,7 +3,8 @@ use khive_brain_core::PackTunable;
 use khive_pack_kg::KgPack;
 use khive_pack_memory::MemoryPack;
 use khive_runtime::{
-    EmbedderProvider, FusionStrategy, KhiveRuntime, Namespace, RuntimeConfig, VerbRegistryBuilder,
+    EmbedderProvider, FusionStrategy, KhiveRuntime, Namespace, NamespaceToken, PackRuntime,
+    RuntimeConfig, RuntimeError, VerbRegistry, VerbRegistryBuilder,
 };
 use khive_storage::{SqlStatement, SqlValue};
 use khive_types::Pack;
@@ -27,6 +28,61 @@ fn make_registry(rt: KhiveRuntime) -> khive_runtime::VerbRegistry {
     builder.register(KgPack::new(rt.clone()));
     builder.register(MemoryPack::new(rt));
     builder.build().expect("registry builds")
+}
+
+/// Minimal readable brain profile surface whose snapshot is intentionally null.
+/// The profile record exists; null state means bootstrap from configured defaults.
+struct NullSnapshotBrainPack;
+
+impl Pack for NullSnapshotBrainPack {
+    const NAME: &'static str = "brain";
+    const NOTE_KINDS: &'static [&'static str] = &[];
+    const ENTITY_KINDS: &'static [&'static str] = &[];
+    const HANDLERS: &'static [khive_types::HandlerDef] = &[khive_types::HandlerDef {
+        name: "brain.profile",
+        description: "test readable null-snapshot profile",
+        visibility: khive_types::Visibility::Subhandler,
+        category: khive_types::VerbCategory::Assertive,
+        params: &[],
+    }];
+}
+
+#[async_trait]
+impl PackRuntime for NullSnapshotBrainPack {
+    fn name(&self) -> &str {
+        Self::NAME
+    }
+
+    fn note_kinds(&self) -> &'static [&'static str] {
+        Self::NOTE_KINDS
+    }
+
+    fn entity_kinds(&self) -> &'static [&'static str] {
+        Self::ENTITY_KINDS
+    }
+
+    fn handlers(&self) -> &'static [khive_types::HandlerDef] {
+        Self::HANDLERS
+    }
+
+    async fn dispatch(
+        &self,
+        verb: &str,
+        params: serde_json::Value,
+        _registry: &VerbRegistry,
+        _token: &NamespaceToken,
+    ) -> Result<serde_json::Value, RuntimeError> {
+        if verb != "brain.profile" {
+            return Err(RuntimeError::InvalidInput(format!(
+                "unexpected test verb {verb}"
+            )));
+        }
+        Ok(json!({
+            "id": params["profile_id"],
+            "state_snapshot": null,
+            "lifecycle": "active"
+        }))
+    }
 }
 
 /// Issue #396 regression: `memory.remember` dispatched through the real KG+memory
@@ -4861,6 +4917,11 @@ async fn test_unreadable_bound_profile_is_not_stamped_as_served_by() {
             hit.get("served_by_profile_id").is_none() || hit["served_by_profile_id"].is_null(),
             "unreadable bound profile must not be stamped as served_by; got: {hit:?}"
         );
+        assert_eq!(
+            hit["serve_attribution"],
+            json!("unattributed"),
+            "failed profile read must be wire-visible and distinct from omission"
+        );
     }
 
     // Explicit unknown profile_id remains a hard per-op error, unchanged.
@@ -4871,4 +4932,46 @@ async fn test_unreadable_bound_profile_is_not_stamped_as_served_by() {
         )
         .await;
     assert!(err.is_err(), "explicit unknown profile_id must error");
+}
+
+/// A readable profile record with a null state snapshot is the bootstrap case,
+/// not a failed read. It must remain positively attributed on the wire.
+#[tokio::test]
+async fn test_readable_null_snapshot_profile_still_stamps_as_serving() {
+    let rt = KhiveRuntime::new(RuntimeConfig {
+        db_path: None,
+        embedding_model: None,
+        additional_embedding_models: vec![],
+        brain_profile: Some("bootstrap-profile-v1".to_string()),
+        ..RuntimeConfig::default()
+    })
+    .expect("in-memory runtime");
+
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(KgPack::new(rt.clone()));
+    builder.register(MemoryPack::new(rt.clone()));
+    builder.register(NullSnapshotBrainPack);
+    let registry = builder.build().expect("registry builds");
+
+    registry
+        .dispatch(
+            "memory.remember",
+            json!({"content": "null snapshot bootstrap attribution fixture"}),
+        )
+        .await
+        .expect("remember fixture");
+    let result = registry
+        .dispatch(
+            "memory.recall",
+            json!({"query": "null snapshot bootstrap attribution fixture"}),
+        )
+        .await
+        .expect("readable null-snapshot profile must not fail recall");
+    let hits = result.as_array().expect("array of hits");
+    assert!(!hits.is_empty());
+    assert_eq!(
+        hits[0]["served_by_profile_id"],
+        json!("bootstrap-profile-v1")
+    );
+    assert_eq!(hits[0]["serve_attribution"], json!("profile"));
 }
