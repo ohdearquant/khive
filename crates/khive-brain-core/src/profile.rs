@@ -119,20 +119,19 @@ pub struct ProfileBinding {
 /// binding, or each pack's tier-3 (global tuning prior) would become
 /// unreachable.
 ///
-/// `actor` should be the caller's identity via `NamespaceToken::actor().binding_id()`
-/// so actor-scoped bindings can match; pass `None` for the anonymous caller or
-/// when the call site has no caller identity to thread through (wildcard
-/// `actor="*"` bindings still match in that case). Never pass the anonymous
-/// actor's raw `id` ("local") — it would let an anonymous caller match an
-/// explicit `actor="local"` binding that `None` never can.
+/// The authorized `token` supplies both the actor used for binding matching
+/// and the per-request identity used for the nested dispatch. Anonymous
+/// callers map to `actor: null`; their raw `id` ("local") must never match an
+/// explicit `actor="local"` binding. Reusing the token identity also prevents
+/// a warm registry's construction-baked principal from replacing the outer
+/// caller at the nested Gate boundary (ADR-096).
 ///
 /// Shared by the memory pack (`ConsumerKind::Recall`) and the knowledge pack
 /// (`ConsumerKind::KnowledgeCompose`) — ADR-058 amendment, #542; actor-aware
 /// resolution added by #697.
 pub async fn resolve_consumer_profile(
     registry: &khive_runtime::VerbRegistry,
-    actor: Option<&str>,
-    namespace: &str,
+    token: &khive_runtime::NamespaceToken,
     consumer_kind: ConsumerKind,
 ) -> Option<String> {
     // Without the brain pack loaded there is no binding table to consult;
@@ -141,12 +140,21 @@ pub async fn resolve_consumer_profile(
     if !registry.has_verb("brain.resolve") {
         return None;
     }
+    let actor = token.actor().binding_id();
+    let namespace = token.namespace().as_str();
     let resolve_params = serde_json::json!({
         "actor": actor,
         "namespace": namespace,
         "consumer_kind": consumer_kind.as_str(),
     });
-    match registry.dispatch("brain.resolve", resolve_params).await {
+    match registry
+        .dispatch_with_identity(
+            "brain.resolve",
+            resolve_params,
+            Some(khive_runtime::RequestIdentity::from_token(token)),
+        )
+        .await
+    {
         Ok(v) => {
             let matched_binding = v
                 .get("matched_binding")

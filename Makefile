@@ -1,3 +1,9 @@
+# The full pack set the installed daemon must serve. `make local` verifies the
+# INSTALLED binary registers the whole set by positive artifact (a verbs()
+# count from the binary itself) — a build that silently drops a pack's
+# inventory registration fails here instead of shipping.
+FULL_PACKS := kg,gtd,memory,comm,schedule,session,workspace,blob,git,knowledge,brain,code,formal
+
 .PHONY: check clippy test contract-test fmt fmt-check build clean ci docs-check publish publish-dry local check-fwd bench-1m bench-1m-ci
 
 check:
@@ -85,6 +91,19 @@ local:
 	  echo "==> ERROR: post-mv hash drift! staged=$$STAGED_HASH dest=$$DEST_HASH"; \
 	  exit 1; \
 	fi; \
-	echo "==> Installed: $$DEST ($$DEST_HASH, $$DEST_SIZE bytes, $$DEST_MTIME)"; \
+	echo "==> Verifying installed binary loads the full pack set..."; \
+	PROBE_OUT=$$(mktemp); \
+	if KHIVE_NO_DAEMON=1 KHIVE_PACKS="$(FULL_PACKS)" \
+	  perl -e 'alarm 120; exec @ARGV or die' -- "$$DEST" exec --output-format json 'verbs()' > "$$PROBE_OUT" 2>/dev/null; then \
+	  VERBS=$$(python3 -c 'import json,sys; r=json.load(sys.stdin); e=r["results"][0]; v=e["result"]["verbs"]; sys.exit(1) if (e.get("ok") is not True or not isinstance(v, list)) else print(len(v))' < "$$PROBE_OUT" 2>/dev/null || echo 0); \
+	else \
+	  VERBS=0; \
+	fi; \
+	rm -f "$$PROBE_OUT"; \
+	if [ "$$VERBS" -lt 80 ]; then \
+	  echo "==> ERROR: installed binary registered $$VERBS verbs (expected >= 80) — full pack set did not load"; \
+	  exit 1; \
+	fi; \
+	echo "==> Installed: $$DEST ($$DEST_HASH, $$DEST_SIZE bytes, $$DEST_MTIME, $$VERBS verbs)"; \
 	"$$DEST" --version
 	@echo "==> Done. Run /mcp in Claude Code to reconnect."

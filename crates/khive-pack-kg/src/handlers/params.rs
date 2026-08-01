@@ -99,6 +99,10 @@ pub(crate) struct StatsParams {}
 #[serde(deny_unknown_fields)]
 pub(crate) struct WhoamiParams {}
 
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct DbDiagnosticsParams {}
+
 /// ADR-099 B3: `pub` so kkernel's `--atomic` seam can deserialize through this same
 /// canonical struct, reproducing `deny_unknown_fields` rejection. Fields stay
 /// `pub(crate)` — the atomic seam only needs the `Result<_, _>` outcome.

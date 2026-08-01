@@ -608,6 +608,10 @@ throw away a successful read for a caller who cannot retry the fetch half.
 kind, outbound direction, wrong addressee) remain fatal and unchanged. The post-read
 mark-read patch itself is best-effort:
 
+The patch uses `NoteStore::set_note_property("read", true)`, an atomic storage-level JSON set.
+It does not replace the properties document, so a concurrent write to another key survives without
+a get/retry loop. This changes no `comm.read` response field or error/degradation rule.
+
 - On success, the response is as originally specified: `read: true`, `properties` is the
   updated envelope.
 - On a no-op (no live row updated, e.g. soft-deleted mid-flight) or a storage error, the

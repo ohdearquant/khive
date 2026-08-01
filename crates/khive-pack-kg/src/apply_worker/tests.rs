@@ -1,8 +1,48 @@
 use super::*;
-use khive_runtime::{KhiveRuntime, Namespace, VerbRegistryBuilder};
+use async_trait::async_trait;
+use khive_runtime::{EmbedderProvider, KhiveRuntime, Namespace, VerbRegistryBuilder};
 use khive_storage::types::{PageRequest, SqlStatement, SqlValue};
 use khive_types::{Id128, NoteDraft, ProposalChangeset, ProposalCreatedPayload};
+use lattice_embed::{EmbedError, EmbeddingModel, EmbeddingService, MAX_TEXT_CHARS};
 use uuid::Uuid;
+
+struct TruncationService;
+
+#[async_trait]
+impl EmbeddingService for TruncationService {
+    async fn embed(
+        &self,
+        texts: &[String],
+        _model: EmbeddingModel,
+    ) -> Result<Vec<Vec<f32>>, EmbedError> {
+        Ok(texts.iter().map(|_| vec![0.5]).collect())
+    }
+
+    fn supports_model(&self, _model: EmbeddingModel) -> bool {
+        true
+    }
+
+    fn name(&self) -> &'static str {
+        "proposal-truncation-test"
+    }
+}
+
+struct TruncationProvider;
+
+#[async_trait]
+impl EmbedderProvider for TruncationProvider {
+    fn name(&self) -> &str {
+        "proposal-truncation-test"
+    }
+
+    fn dimensions(&self) -> usize {
+        1
+    }
+
+    async fn build(&self) -> khive_runtime::RuntimeResult<std::sync::Arc<dyn EmbeddingService>> {
+        Ok(std::sync::Arc::new(TruncationService))
+    }
+}
 
 fn setup() -> (KhiveRuntime, NamespaceToken) {
     let rt = KhiveRuntime::memory().expect("in-memory runtime");
@@ -236,6 +276,46 @@ async fn apply_worker_atomic_update_preserves_explicit_description_clear() {
         .await
         .expect("get updated entity");
     assert_eq!(updated.description, None);
+}
+
+#[tokio::test]
+async fn apply_worker_returns_atomic_update_truncation_report() {
+    let (rt, tok) = setup();
+    rt.register_embedder(TruncationProvider);
+    ensure_schema(&rt).await;
+    let entity = rt
+        .create_entity(
+            &tok,
+            "concept",
+            None,
+            "ProposalTruncation",
+            None,
+            None,
+            vec![],
+        )
+        .await
+        .expect("create entity");
+    let proposal_id = Uuid::new_v4();
+    let changeset = ProposalChangeset::UpdateEntity {
+        id: Id128::from_u128(entity.id.as_u128()),
+        patch: khive_types::ProposalEntityPatch {
+            name: None,
+            description: Some(Some("x".repeat(MAX_TEXT_CHARS + 1))),
+            properties: None,
+            tags: None,
+        },
+    };
+    seed_proposal_created_event(&rt, &tok, proposal_id, changeset).await;
+    insert_projection_row(&rt, &tok, proposal_id, "approved").await;
+
+    let registry = build_registry(&rt);
+    let report = ProposalApplyWorker::new(rt)
+        .maybe_apply_with_report(&tok, proposal_id, &registry, None)
+        .await
+        .expect("apply proposal");
+
+    assert_eq!(report.truncated, 1);
+    assert!(report.discarded_bytes > 0);
 }
 
 #[tokio::test]

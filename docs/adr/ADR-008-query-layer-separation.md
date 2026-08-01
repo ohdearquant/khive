@@ -97,6 +97,23 @@ remains in `khive-runtime` (ADR-001, ADR-003). Query-time filtering by an unknow
 `entity_type` simply returns no rows unless the runtime normalizes the query before
 compilation.
 
+Granular node kinds follow the same read-time boundary. `khive-query` does not receive the
+`VerbRegistry` and must not copy its pack-owned note-kind or entity-kind vocabulary. A granular
+label such as `MATCH (m:message)` is compiled as a bound comparison against the shared `kind`
+column; a substrate label such as `note` is compiled against the union's `substrate_kind`
+discriminator. Consequently these GQL forms are equivalent for caller-visible comm rows:
+
+```text
+MATCH (m:message) RETURN m.id
+MATCH (m:note) WHERE m.kind = "message" RETURN m.id
+```
+
+Registration remains authoritative on the write path: comm registers `message`, the runtime
+admits message notes into the shared `notes` table, and the query compiler can then match the
+stored value without a registry dependency. `note_kind` is a verb-parameter name, not a GQL
+field; GQL uses `kind`. Namespace visibility is still injected by `CompileOptions`, so a query
+does not reveal message copies outside the caller's authorized scopes.
+
 ### Relation validation
 
 `khive-query` validates relation names by delegating to `EdgeRelation::from_str` from

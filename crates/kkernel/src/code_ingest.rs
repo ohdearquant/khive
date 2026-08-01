@@ -9,6 +9,7 @@
 //! `--dry-run` runs the same validation and existence checks but performs
 //! no writes.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -60,6 +61,9 @@ pub struct CodeIngestReport {
     pub notes_skipped_existing: u64,
     pub edges_created: u64,
     pub edges_skipped_existing: u64,
+    /// Actual embedding-input truncation grouped by the model that received
+    /// each bounded document. Empty for dry runs and no-embedder runs.
+    pub truncation_by_model: BTreeMap<String, khive_runtime::retrieval::EmbeddingTruncationReport>,
 }
 
 /// Run one `kkernel code-ingest` pass: resolve config, validate the
@@ -87,6 +91,16 @@ pub async fn run_code_ingest(args: CodeIngestArgs) -> Result<()> {
                 ""
             },
         );
+        if report
+            .truncation_by_model
+            .values()
+            .any(khive_runtime::retrieval::EmbeddingTruncationReport::any_truncated)
+        {
+            println!(
+                "embedding truncation: {}",
+                serde_json::to_string(&report.truncation_by_model)?
+            );
+        }
     } else {
         println!("{}", serde_json::to_string_pretty(&report)?);
     }
@@ -178,6 +192,11 @@ where
         .map_err(|e| anyhow::anyhow!("{e}"))
         .context("failed to authorize namespace")?;
 
+    // One immutable model-name snapshot governs this ingest pass. Each report
+    // below is still derived from the corresponding completed embed call, so a
+    // provider cannot appear in execution without also appearing in reporting.
+    let embedding_model_names = runtime.registered_embedding_model_names();
+
     let mut report = CodeIngestReport {
         dry_run: false,
         ..CodeIngestReport::default()
@@ -212,13 +231,18 @@ where
                 );
             }
         }
-        for model_name in runtime.registered_embedding_model_names() {
+        for model_name in &embedding_model_names {
             match runtime
-                .embed_document_with_model(&model_name, &embed_body)
+                .embed_document_with_model_outcome(model_name, &embed_body)
                 .await
             {
-                Ok(vector) => {
-                    if let Ok(vs) = runtime.vectors_for_model(&token, &model_name) {
+                Ok(outcome) => {
+                    report
+                        .truncation_by_model
+                        .entry(model_name.clone())
+                        .or_default()
+                        .observe(&outcome);
+                    if let Ok(vs) = runtime.vectors_for_model(&token, model_name) {
                         if let Err(e) = vs
                             .insert(
                                 entity.id,
@@ -230,7 +254,7 @@ where
                                 // provenance metadata agrees with every
                                 // other write path.
                                 "entity.body",
-                                vec![vector],
+                                vec![outcome.vector],
                             )
                             .await
                         {
@@ -278,20 +302,25 @@ where
                 );
             }
         }
-        for model_name in runtime.registered_embedding_model_names() {
+        for model_name in &embedding_model_names {
             match runtime
-                .embed_document_with_model(&model_name, &note.content)
+                .embed_document_with_model_outcome(model_name, &note.content)
                 .await
             {
-                Ok(vector) => {
-                    if let Ok(vs) = runtime.vectors_for_model(&token, &model_name) {
+                Ok(outcome) => {
+                    report
+                        .truncation_by_model
+                        .entry(model_name.clone())
+                        .or_default()
+                        .observe(&outcome);
+                    if let Ok(vs) = runtime.vectors_for_model(&token, model_name) {
                         if let Err(e) = vs
                             .insert(
                                 note.id,
                                 SubstrateKind::Note,
                                 token.namespace().as_str(),
                                 "note.content",
-                                vec![vector],
+                                vec![outcome.vector],
                             )
                             .await
                         {
@@ -494,7 +523,7 @@ mod tests {
 
     use async_trait::async_trait;
     use khive_runtime::{EmbedderProvider, RuntimeError};
-    use lattice_embed::{EmbedError, EmbeddingModel, EmbeddingService};
+    use lattice_embed::{EmbedError, EmbeddingModel, EmbeddingService, MAX_TEXT_CHARS};
     use serial_test::serial;
 
     use super::*;
@@ -986,6 +1015,51 @@ mod tests {
             }
         }
         assert!(saw_entity_row, "expected at least one entity vector row");
+    }
+
+    #[serial]
+    #[tokio::test]
+    async fn code_ingest_reports_actual_embedding_truncation_by_model() {
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let findings = write_valid_findings(tmp.path());
+        let db = tmp.path().join("scratch.db");
+
+        let mut document: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&findings).expect("read findings fixture"))
+                .expect("parse findings fixture");
+        // Finding-note embeddings use the canonical `title: impact` content,
+        // while evidence remains structured properties only.
+        document["findings"][0]["impact"] =
+            serde_json::Value::String("x".repeat(MAX_TEXT_CHARS + 1));
+        std::fs::write(
+            &findings,
+            serde_json::to_vec(&document).expect("serialize long findings fixture"),
+        )
+        .expect("write long findings fixture");
+
+        let report = code_ingest_batch_with_runtime_setup(base_args(findings, db), |runtime| {
+            for name in runtime.registered_embedding_model_names() {
+                let dimensions = runtime.resolve_embedding_model(Some(&name))?.dimensions();
+                runtime.register_embedder(FixedEmbeddingProvider { name, dimensions });
+            }
+            Ok(())
+        })
+        .await
+        .expect("ingest with bounded embedding input must succeed");
+
+        assert!(
+            !report.truncation_by_model.is_empty(),
+            "configured models that received embeddings must appear in the report"
+        );
+        assert!(
+            report
+                .truncation_by_model
+                .values()
+                .any(|truncation| { truncation.truncated > 0 && truncation.discarded_bytes > 0 }),
+            "the report must reflect the long finding content actually bounded by an embedder: \
+             {:?}",
+            report.truncation_by_model
+        );
     }
 
     /// Query the persisted `finding` note count for a scratch db, independent
