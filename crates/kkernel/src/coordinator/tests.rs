@@ -9,6 +9,7 @@ use khive_runtime::{
     BackendId, KhiveRuntime, PackRegistry, SearchHit, SearchSource, VerbRegistryBuilder,
 };
 use khive_score::DeterministicScore;
+use khive_storage::types::Direction;
 use khive_storage::EdgeRelation;
 use khive_types::namespace::Namespace;
 
@@ -634,6 +635,86 @@ async fn t2_cross_backend_link_stamps_target_backend() {
     );
     assert_eq!(edge.source_id, src.id, "T2: correct source_id");
     assert_eq!(edge.target_id, tgt.id, "T2: correct target_id");
+}
+
+// ---- T2b: Cross-backend link rejects an illegal entity pair without persisting ----
+
+/// T2b: An illegal cross-backend link (concept -> project, competes_with) is
+/// rejected through the coordinator's own resolved-endpoint validation path
+/// with the same "currently legal relations" diagnostic the same-backend
+/// validator produces, and leaves no edge written on either backend.
+#[tokio::test]
+async fn cross_backend_illegal_entity_pair_rejected_and_not_persisted() {
+    let rt_main = memory_runtime();
+    let rt_lore = memory_runtime();
+
+    let mut registry = BackendRegistry::new();
+    registry.register(BackendId::new("main"), Arc::clone(&rt_main));
+    registry.register(BackendId::new("lore"), Arc::clone(&rt_lore));
+    let coord = SubstrateCoordinator::new(registry);
+    let ns = Namespace::local();
+
+    // Create entity on "main".
+    let tok_main = rt_main.authorize(ns.clone()).unwrap();
+    let src = rt_main
+        .create_entity(
+            &tok_main,
+            "concept",
+            None,
+            "SourceConcept",
+            None,
+            None,
+            vec![],
+        )
+        .await
+        .expect("T2b: create source on main");
+
+    // Create entity on "lore".
+    let tok_lore = rt_lore.authorize(ns.clone()).unwrap();
+    let tgt = rt_lore
+        .create_entity(
+            &tok_lore,
+            "project",
+            None,
+            "TargetProject",
+            None,
+            None,
+            vec![],
+        )
+        .await
+        .expect("T2b: create target on lore");
+
+    // concept -> project competes_with is not in the base allowlist and no
+    // pack rules are installed on either backend, so this must be rejected.
+    let result = coord
+        .link_cross_backend(&ns, src.id, tgt.id, EdgeRelation::CompetesWith, 1.0, None)
+        .await;
+
+    let err = result.expect_err("T2b: illegal cross-backend link must be rejected");
+    assert!(
+        err.contains(
+            "currently legal relations for concept -> project under the loaded endpoint rules: none"
+        ),
+        "T2b: rejection must expose the exact loaded legal set; got: {err}"
+    );
+
+    // No edge must have been persisted on either backend.
+    let main_neighbors = rt_main
+        .neighbors(&tok_main, src.id, Direction::Out, None, None)
+        .await
+        .expect("T2b: main neighbors query");
+    assert!(
+        main_neighbors.is_empty(),
+        "T2b: no edge must be written on the source backend after rejection"
+    );
+    let lore_neighbors = rt_lore
+        .neighbors(&tok_lore, tgt.id, Direction::In, None, None)
+        .await
+        .expect("T2b: lore neighbors query");
+    assert!(
+        lore_neighbors.is_empty(),
+        "T2b: no edge must be written on the target backend after rejection"
+    );
 }
 
 // ---- T3: Fan-out merged from multiple backends ----
