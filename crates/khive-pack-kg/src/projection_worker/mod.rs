@@ -131,33 +131,43 @@ impl ProposalsProjectionWorker {
         Ok(rows == 1)
     }
 
-    /// Called after a `ProposalApplied` event is emitted.
-    pub async fn on_proposal_applied(
+    /// Atomically move `applying` to `applied` and publish `ProposalApplied`.
+    pub async fn applied_and_emit(
         &self,
         token: &NamespaceToken,
         proposal_id: Uuid,
+        event: Event,
     ) -> Result<bool, RuntimeError> {
         let now = chrono::Utc::now().timestamp_micros();
         let ns = token.namespace().as_str().to_owned();
+        let projection_stmt = SqlStatement {
+            sql: "UPDATE proposals_open \
+                  SET status = 'applied', updated_at = ?1 \
+                  WHERE proposal_id = ?2 AND namespace = ?3 \
+                    AND status = 'applying'"
+                .to_string(),
+            params: vec![
+                SqlValue::Integer(now),
+                SqlValue::Text(proposal_id.to_string()),
+                SqlValue::Text(ns),
+            ],
+            label: Some("projection_worker.applied_and_emit.cas".into()),
+        };
+        let event_stmt = build_conditional_event_insert(&event, "changes() = 1", vec![]);
+
         let sql = self.runtime.sql();
         let mut writer = sql.writer().await.map_err(RuntimeError::Storage)?;
-        let rows = writer
-            .execute(SqlStatement {
-                sql: "UPDATE proposals_open \
-                      SET status = 'applied', updated_at = ?1 \
-                      WHERE proposal_id = ?2 AND namespace = ?3 \
-                        AND status = 'applying'"
-                    .to_string(),
-                params: vec![
-                    SqlValue::Integer(now),
-                    SqlValue::Text(proposal_id.to_string()),
-                    SqlValue::Text(ns),
-                ],
-                label: Some("projection_worker.proposals_open.applied".into()),
-            })
+        let total_rows = writer
+            .execute_batch(vec![projection_stmt, event_stmt])
             .await
             .map_err(RuntimeError::Storage)?;
-        Ok(rows == 1)
+        let applied = total_rows == 2;
+        if applied {
+            // This atomic path deliberately bypasses EventStore::append_event,
+            // whose successful-append seam normally owns ADR-103 accounting.
+            khive_storage::usage::count(khive_storage::usage::UsageUnit::EventRows, 1);
+        }
+        Ok(applied)
     }
 
     /// Atomically move status `approved` → `applying` before KG mutation.
