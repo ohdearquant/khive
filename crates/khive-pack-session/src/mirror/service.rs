@@ -1,8 +1,8 @@
 //! Background live-mirror polling service.
 //!
 //! `run_mirror_service` is an infinite loop started by `SessionPack::warm()`.
-//! It discovers `*.jsonl` files under the Claude Code projects directory,
-//! tracks byte offsets, and tails new content every `poll_interval`.
+//! It discovers configured CLI transcripts and provider exports, tracks byte
+//! offsets, and ingests new content every `poll_interval`.
 //!
 //! Design principles:
 //! - Infallible: a per-file error is logged and skipped; the loop continues.
@@ -22,10 +22,10 @@ use super::ingest::{self, LineTailSource};
 
 /// How a discovered file should be ingested.
 ///
-/// `ChatGptExport` is a `MirrorSource` variant (ADR-080's closed mirror-source
-/// set) but deliberately not a `LineTailSource` variant: ChatGPT export
-/// ingestion is whole-file (`mirror_chatgpt_export_file`), not line-tail, so
-/// it does not belong in that narrower per-line dispatch enum.
+/// Provider exports are `MirrorSource` variants (ADR-080's closed
+/// mirror-source set) but deliberately not `LineTailSource` variants: export
+/// ingestion is whole-file, not line-tail, so it does not belong in that
+/// narrower per-line dispatch enum.
 enum DiscoveredKind {
     LineTail {
         source: LineTailSource,
@@ -33,6 +33,7 @@ enum DiscoveredKind {
         session_id: Option<String>,
     },
     ChatGptExport,
+    ClaudeAiExport,
 }
 
 /// A discovered file together with how it should be ingested.
@@ -65,6 +66,14 @@ pub struct MirrorConfig {
     ///
     /// Defaults to `$HOME/.chatgpt/exports`.
     pub chatgpt_exports_dir: PathBuf,
+    /// Whether the claude.ai export mirror is enabled (default: false — opt-in,
+    /// independent of the other source flags).
+    pub claude_ai_enabled: bool,
+    /// Root directory scanned (recursively) for claude.ai `conversations.json`
+    /// export files.
+    ///
+    /// Defaults to `$HOME/.claude/exports`.
+    pub claude_ai_exports_dir: PathBuf,
     /// How long to sleep between polling ticks (default: 2 seconds).
     pub poll_interval: Duration,
     /// When true (default), existing files are mirrored from byte offset 0.
@@ -118,6 +127,8 @@ impl MirrorConfig {
     /// | `KHIVE_MIRROR_CODEX_DIR`       | `$HOME/.codex/sessions`        |
     /// | `KHIVE_MIRROR_CHATGPT_ENABLED` | `false`                        |
     /// | `KHIVE_MIRROR_CHATGPT_DIR`     | `$HOME/.chatgpt/exports`       |
+    /// | `KHIVE_MIRROR_CLAUDE_AI_ENABLED` | `false`                      |
+    /// | `KHIVE_MIRROR_CLAUDE_AI_DIR`   | `$HOME/.claude/exports`        |
     /// | `KHIVE_MIRROR_POLL_SECS`       | `2`                            |
     /// | `KHIVE_MIRROR_BACKFILL`        | `true`                         |
     pub fn from_env() -> Self {
@@ -147,6 +158,14 @@ impl MirrorConfig {
             .map(PathBuf::from)
             .unwrap_or_else(|_| PathBuf::from(&home).join(".chatgpt").join("exports"));
 
+        let claude_ai_enabled = std::env::var("KHIVE_MIRROR_CLAUDE_AI_ENABLED")
+            .map(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "yes"))
+            .unwrap_or(false);
+
+        let claude_ai_exports_dir = std::env::var("KHIVE_MIRROR_CLAUDE_AI_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from(&home).join(".claude").join("exports"));
+
         let poll_raw = std::env::var("KHIVE_MIRROR_POLL_SECS").ok();
         let poll_secs = parse_mirror_poll_secs(poll_raw.as_deref());
 
@@ -161,6 +180,8 @@ impl MirrorConfig {
             codex_sessions_dir,
             chatgpt_enabled,
             chatgpt_exports_dir,
+            claude_ai_enabled,
+            claude_ai_exports_dir,
             poll_interval: Duration::from_secs(poll_secs),
             backfill,
         }
@@ -169,7 +190,7 @@ impl MirrorConfig {
 
 #[cfg(test)]
 mod config_tests {
-    use super::parse_mirror_poll_secs;
+    use super::{parse_mirror_poll_secs, scan_claude_ai_conversations_files, DiscoveredKind};
 
     /// Regression for PACKSESSION-AUD-002: `KHIVE_MIRROR_POLL_SECS=0` used to
     /// produce a hot polling loop via `Duration::from_secs(0)`. Explicit zero
@@ -203,6 +224,24 @@ mod config_tests {
             "valid nonzero value is honored"
         );
     }
+
+    #[test]
+    fn claude_ai_scanner_accepts_only_nested_conversations_json() {
+        let temp = tempfile::TempDir::new().expect("temp dir");
+        let nested = temp.path().join("download").join("claude-export");
+        std::fs::create_dir_all(&nested).expect("nested export dir");
+        let export = nested.join("conversations.json");
+        std::fs::write(&export, "[]").expect("export fixture");
+        std::fs::write(nested.join("conversations-copy.json"), "[]").expect("non-matching fixture");
+
+        let discovered = scan_claude_ai_conversations_files(temp.path());
+        assert_eq!(discovered.len(), 1);
+        assert_eq!(discovered[0].path, export);
+        assert!(matches!(
+            &discovered[0].kind,
+            DiscoveredKind::ClaudeAiExport
+        ));
+    }
 }
 
 /// Infinite background polling loop.  Returns only on a fatal setup error.
@@ -210,18 +249,22 @@ mod config_tests {
 /// Seed state from the `session_mirror_cursor` table at startup, then loop:
 /// stat each discovered file, tail any new bytes, sleep.
 ///
-/// Claude Code and Codex mirrors are independent: each is enabled by its own
-/// flag and scanned separately each tick.
+/// Every source is independent: each is enabled by its own flag and scanned
+/// separately each tick.
 ///
 /// Per-file errors are logged with `tracing::warn!` and do NOT stop the loop.
 pub async fn run_mirror_service(runtime: KhiveRuntime, config: MirrorConfig) {
     tracing::info!(
         projects_dir = %config.projects_dir.display(),
         codex_sessions_dir = %config.codex_sessions_dir.display(),
+        chatgpt_exports_dir = %config.chatgpt_exports_dir.display(),
+        claude_ai_exports_dir = %config.claude_ai_exports_dir.display(),
         poll_interval_ms = config.poll_interval.as_millis(),
         backfill = config.backfill,
         cc_enabled = config.enabled,
         codex_enabled = config.codex_enabled,
+        chatgpt_enabled = config.chatgpt_enabled,
+        claude_ai_enabled = config.claude_ai_enabled,
         "session mirror service starting"
     );
 
@@ -262,6 +305,12 @@ pub async fn run_mirror_service(runtime: KhiveRuntime, config: MirrorConfig) {
             }
         }
 
+        if config.claude_ai_enabled {
+            for item in scan_claude_ai_conversations_files(&config.claude_ai_exports_dir) {
+                discovered.push(item);
+            }
+        }
+
         let total_tracked = discovered.len();
         let mut files_mirrored: u64 = 0;
         let mut rows_inserted: u64 = 0;
@@ -292,7 +341,7 @@ pub async fn run_mirror_service(runtime: KhiveRuntime, config: MirrorConfig) {
                 continue;
             }
 
-            // Tail (line-tail sources) or whole-file re-read (ChatGPT export).
+            // Tail line sources or re-read provider exports whole.
             let result = match &item.kind {
                 DiscoveredKind::LineTail { source, session_id } => {
                     ingest::mirror_file(
@@ -306,6 +355,9 @@ pub async fn run_mirror_service(runtime: KhiveRuntime, config: MirrorConfig) {
                 }
                 DiscoveredKind::ChatGptExport => {
                     ingest::mirror_chatgpt_export_file(&runtime, &item.path, offset).await
+                }
+                DiscoveredKind::ClaudeAiExport => {
+                    ingest::mirror_claude_ai_export_file(&runtime, &item.path, offset).await
                 }
             };
 
@@ -493,6 +545,43 @@ fn scan_chatgpt_dir_recursive(dir: &std::path::Path, out: &mut Vec<DiscoveredFil
             out.push(DiscoveredFile {
                 path,
                 kind: DiscoveredKind::ChatGptExport,
+            });
+        }
+    }
+}
+
+/// Find `conversations.json` claude.ai export files under `path`.
+///
+/// The configured root is distinct from the ChatGPT export root because the
+/// two providers use the same filename for incompatible JSON shapes.
+fn scan_claude_ai_conversations_files(path: &std::path::Path) -> Vec<DiscoveredFile> {
+    let mut files = Vec::new();
+    if path.is_file() {
+        if path.file_name().and_then(|name| name.to_str()) == Some("conversations.json") {
+            files.push(DiscoveredFile {
+                path: path.to_path_buf(),
+                kind: DiscoveredKind::ClaudeAiExport,
+            });
+        }
+        return files;
+    }
+    scan_claude_ai_dir_recursive(path, &mut files);
+    files
+}
+
+fn scan_claude_ai_dir_recursive(dir: &std::path::Path, out: &mut Vec<DiscoveredFile>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            scan_claude_ai_dir_recursive(&path, out);
+        } else if path.file_name().and_then(|name| name.to_str()) == Some("conversations.json") {
+            out.push(DiscoveredFile {
+                path,
+                kind: DiscoveredKind::ClaudeAiExport,
             });
         }
     }

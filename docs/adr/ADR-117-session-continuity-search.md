@@ -59,12 +59,12 @@ split that [ADR-083](ADR-083-session-pack-t1-verbs.md) makes deliberately:
 
 1. **Caller-authored session notes.** The four T1 verbs (`session.store` / `list` / `resume` /
    `export`) read and write the shared `notes` table. These are records a caller explicitly stores.
-2. **Passively-mirrored transcript tables.** A background mirror tails Claude Code, Codex CLI, and
-   ChatGPT exports and writes three auxiliary tables — `sessions` (one row per transcript, carrying
-   `provider_session_id`, source, cwd, git_branch, timestamps), `session_messages` (the parsed
-   message text plus raw line), and `session_mirror_cursor` (a byte-offset cursor). ADR-083 keeps
-   these separate from the notes precisely because one is caller-authored and one is passive
-   ingestion.
+2. **Passively-mirrored transcript tables.** A background mirror ingests Claude Code, Codex CLI,
+   ChatGPT exports, and claude.ai exports and writes three auxiliary tables — `sessions` (one row
+   per transcript, carrying `provider_session_id`, source, cwd, git_branch, timestamps),
+   `session_messages` (the parsed message text plus raw source), and `session_mirror_cursor` (a
+   byte-offset cursor). ADR-083 keeps these separate from the notes precisely because one is
+   caller-authored and one is passive ingestion.
 
 Two facts about the mirror as it exists today shape every requirement below, and both were verified
 against source rather than assumed:
@@ -72,12 +72,12 @@ against source rather than assumed:
 - **The persistence identity is a bare global primary key.** `session_messages.id` and `sessions.id`
   are each `TEXT PRIMARY KEY` with no account or tenant component
   (`crates/khive-pack-session/src/vocab.rs`). `session_messages.id` is populated from
-  `ParsedEvent.uuid` — the Claude Code top-level `uuid`, the ChatGPT `message.id`, or the synthesized
-  `"{session_id}:{byte_offset}"` for Codex (`crates/khive-pack-session/src/mirror/parse.rs`). Those
-  are **provider event ids**, unique enough for the single-writer mirror's idempotency, but not
-  tenant-scoped: two accounts that produced the same provider event id would collide on one primary
-  key. The `namespace` column is nullable and is not part of any key. **The mirror is single-tenant
-  by construction.**
+  `ParsedEvent.uuid` — the Claude Code top-level `uuid`, the ChatGPT `message.id`, the claude.ai
+  `chat_messages[].uuid`, or the synthesized `"{session_id}:{byte_offset}"` for Codex
+  (`crates/khive-pack-session/src/mirror/parse.rs`). Those are **provider event ids**, unique enough
+  for the single-writer mirror's idempotency, but not tenant-scoped: two accounts that produced the
+  same provider event id would collide on one primary key. The `namespace` column is nullable and
+  is not part of any key. **The mirror is single-tenant by construction.**
 - **There is no search over message content.** `session.resume` fetches a single session by id;
   `session.list` is a recency browse. The transcript text sits in `session_messages` and is not
   indexed for retrieval.
