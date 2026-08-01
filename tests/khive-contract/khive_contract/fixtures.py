@@ -131,8 +131,8 @@ MEMORY_VERBS: frozenset[str] = frozenset(
 
 DISCOVERABLE_PRODUCT_VERBS: frozenset[str] = KG_VERBS | GTD_VERBS | MEMORY_VERBS
 
-# The play spec says "15 product verbs"; the baseline exposes 26
-# (KG:19 + GTD:5 + memory:2). DISCOVERABLE_PRODUCT_VERBS (26) subsumes
+# The play spec says "15 product verbs"; the baseline exposes 27
+# (KG:20 + GTD:5 + memory:2). DISCOVERABLE_PRODUCT_VERBS (27) subsumes
 # the stated minimum (15).
 PLAY_SPEC_MINIMUM_VERB_COUNT = 15
 

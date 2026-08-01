@@ -63,16 +63,17 @@ request(ops="[v1(...), v2(...), v3(...)]")             # parallel batch (max 100
 request(ops="[{\"tool\":\"v1\",\"args\":{...}}, ...]") # equivalent JSON form
 ```
 
-All 12 packs load by default, giving **86 verbs** out of the box (regenerate with
-`request(ops="verbs()")` before editing this table):
+All 12 packs load by default, giving **89 verbs** out of the box (regenerated from
+`request(ops="verbs()")` against this tree's binary, 2026-08-01; regenerate again
+before editing this table):
 
 | Pack          | Prefix       | Verbs | What it does                                                                                   |
 | ------------- | ------------ | ----- | ---------------------------------------------------------------------------------------------- |
-| **kg**        | _(bare)_     | 19    | Entities, edges, notes, graph queries, reference resolution, caller identity                   |
+| **kg**        | _(bare)_     | 20    | Entities, edges, notes, graph queries, reference resolution, caller identity, WAL diagnostics  |
 | **gtd**       | `gtd.`       | 5     | Task lifecycle (inbox → next → active → done)                                                  |
 | **memory**    | `memory.`    | 5     | Salience-weighted remember / decay-ranked recall                                               |
-| **brain**     | `brain.`     | 15    | Bayesian user profiles + feedback loop                                                         |
-| **comm**      | `comm.`      | 7     | Threaded messaging                                                                             |
+| **brain**     | `brain.`     | 16    | Bayesian user profiles + feedback loop                                                         |
+| **comm**      | `comm.`      | 8     | Threaded messaging                                                                             |
 | **schedule**  | `schedule.`  | 4     | Reminders and scheduled verb execution                                                         |
 | **knowledge** | `knowledge.` | 19    | Atom-based KB with embedding rerank search                                                     |
 | **session**   | `session.`   | 4     | Session record persistence (store/list/resume/export)                                          |

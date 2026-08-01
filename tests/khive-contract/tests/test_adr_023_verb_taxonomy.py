@@ -18,8 +18,8 @@ GTD_VERBS = ("gtd.assign", "gtd.next", "gtd.complete", "gtd.tasks", "gtd.transit
 MEMORY_VERBS = ("memory.remember", "memory.recall")
 
 # All 23 baseline product verbs (KG:16 + GTD:5 + memory:2). The 16 KG verbs
-# exercised below are of the pack's 19 (context/resolve/whoami are the
-# remaining KG verbs not exercised by this module's reachability walk).
+# exercised below are of the pack's 20 (context/resolve/whoami/db_diagnostics
+# are the remaining KG verbs not exercised by this module's reachability walk).
 # Written as a set literal so the manifest AST-introspector can parse it.
 VERBS_UNDER_TEST = {
     # KG substrate (16) — bare names; no pack prefix

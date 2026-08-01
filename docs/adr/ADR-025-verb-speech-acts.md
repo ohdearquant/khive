@@ -35,13 +35,13 @@ covered by the existing set.
 
 Following Searle's five categories (1976):
 
-| Category        | Illocutionary force                            | Verbs                                                                                                                                                     | What the verb DOES                              |
-| --------------- | ---------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------- |
-| **Assertive**   | Speaker represents a state of affairs          | `get`, `list`, `search`, `recall`, `neighbors`, `traverse`, `query`, `next`, `tasks`, `inbox`, `stats`, `verbs`, `context` (ADR-089), `resolve`, `whoami` | Retrieves and presents facts from the substrate |
-| **Directive**   | Speaker attempts to get hearer to do something | `assign`, `transition`                                                                                                                                    | Directs an actor or state machine to act        |
-| **Commissive**  | Speaker commits to a future course of action   | `create`, `remember`, `link`, `send`, `propose`, `withdraw` (ADR-046)                                                                                     | Commits the caller to a persistent change       |
-| **Declaration** | Speaker brings about a state of affairs        | `update`, `delete`, `merge`, `complete`, `review` (ADR-046)                                                                                               | Changes institutional status by fiat            |
-| **Expressive**  | Speaker expresses psychological state          | _(none)_                                                                                                                                                  | No verb currently — and this is correct         |
+| Category        | Illocutionary force                            | Verbs                                                                                                                                                                                 | What the verb DOES                              |
+| --------------- | ---------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------- |
+| **Assertive**   | Speaker represents a state of affairs          | `get`, `list`, `search`, `recall`, `neighbors`, `traverse`, `query`, `next`, `tasks`, `inbox`, `stats`, `verbs`, `context` (ADR-089), `resolve`, `whoami`, `db_diagnostics` (ADR-091) | Retrieves and presents facts from the substrate |
+| **Directive**   | Speaker attempts to get hearer to do something | `assign`, `transition`                                                                                                                                                                | Directs an actor or state machine to act        |
+| **Commissive**  | Speaker commits to a future course of action   | `create`, `remember`, `link`, `send`, `propose`, `withdraw` (ADR-046)                                                                                                                 | Commits the caller to a persistent change       |
+| **Declaration** | Speaker brings about a state of affairs        | `update`, `delete`, `merge`, `complete`, `review` (ADR-046)                                                                                                                           | Changes institutional status by fiat            |
+| **Expressive**  | Speaker expresses psychological state          | _(none)_                                                                                                                                                                              | No verb currently — and this is correct         |
 
 The `suggest` and `compose` verbs (internal lore service, not part of the standard
 product surface) would classify as assertives. Pack-internal handlers prefixed with a
@@ -133,7 +133,8 @@ The taxonomy is **only** for the verb-addition decision and for documentation/in
 "N verbs, closed" without an extension criterion is just "we have not needed to add one
 yet." (The product surface has grown: the kg pack has taken on `propose`,
 `review`, `withdraw` from ADR-046, `verbs` discovery from Wave 4, and the later assertive
-additions `stats`, `context` (ADR-089), `resolve`, and `whoami`; the full classified surface is
+additions `stats`, `context` (ADR-089), `resolve`, `whoami`, and `db_diagnostics`
+(ADR-091); the full classified surface is
 in the table above, and the enforced list is
 `KG_SUBSTRATE_VERBS` in `crates/kkernel/tests/verb_namespace_contract.rs`. No total is
 given here on purpose: the growth is the point being made, and a count restated in prose
