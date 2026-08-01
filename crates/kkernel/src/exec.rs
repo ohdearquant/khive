@@ -36,7 +36,8 @@ use khive_mcp::serve::resolve_runtime_config;
 use khive_mcp::serve::{
     apply_env_output_format, build_server_multi_backend_with_db_anchor, config_discovery_db_anchor,
     enforce_strict_actor_mode, install_resolved_blob_store,
-    normalize_redundant_db_override_with_source, RuntimeConfigInputs,
+    normalize_redundant_db_override_with_source, reject_conflicting_db_override_with_source,
+    RuntimeConfigInputs,
 };
 #[cfg(unix)]
 use khive_mcp::server::compute_config_id;
@@ -741,6 +742,19 @@ struct ExecDbContext {
     config: Option<PathBuf>,
 }
 
+fn load_exec_config(db_context: &ExecDbContext) -> Result<(KhiveConfig, Option<PathBuf>)> {
+    let db_path_for_config = config_discovery_db_anchor(db_context.raw.as_deref());
+    let loaded = KhiveConfig::load_with_home_fallback_and_source(
+        db_context.config.as_deref(),
+        db_path_for_config.as_deref(),
+    )
+    .map_err(|e| anyhow::anyhow!("config error: {e}"))?;
+    Ok(match loaded {
+        Some((config, source)) => (config, Some(source)),
+        None => (KhiveConfig::default(), None),
+    })
+}
+
 async fn run_exec_inline(
     ops: String,
     cfg: RuntimeConfig,
@@ -829,17 +843,7 @@ async fn run_exec_inline_with_forward(
     // diverged, so a correctly-configured client was rejected as a
     // `ConfigMismatch` and silently fell back to the cold in-process path on
     // every call.
-    let db_path_for_config = config_discovery_db_anchor(db_context.raw.as_deref());
-    let loaded_config = KhiveConfig::load_with_home_fallback_and_source(
-        db_context.config.as_deref(),
-        db_path_for_config.as_deref(),
-    )
-    .map_err(|e| anyhow::anyhow!("config error: {e}"))?;
-    let config_source = loaded_config.as_ref().map(|(_, source)| source.as_path());
-    let khive_cfg = loaded_config
-        .as_ref()
-        .map(|(config, _)| config.clone())
-        .unwrap_or_default();
+    let (khive_cfg, config_source) = load_exec_config(&db_context)?;
 
     // #1226: apply the same --db/[[backends]] conflict guard the in-process
     // fallback below applies, BEFORE the daemon fast-path — otherwise a warm
@@ -853,7 +857,7 @@ async fn run_exec_inline_with_forward(
             &mut cfg,
             db_context.raw.as_deref(),
             &khive_cfg.backends,
-            config_source,
+            config_source.as_deref(),
         )?;
         if matches!(db_context.raw.as_deref(), Some(path) if path != ":memory:") {
             db_context.anchor = cfg.db_path.clone();
@@ -972,10 +976,10 @@ fn build_local_fallback_server(
 #[allow(clippy::too_many_arguments)]
 async fn run_exec_ops_file(
     path: PathBuf,
-    mut cfg: RuntimeConfig,
+    cfg: RuntimeConfig,
     presentation: Option<String>,
     dry_run: bool,
-    mut db_context: ExecDbContext,
+    db_context: ExecDbContext,
     atomic: bool,
     atomic_max_ops: Option<usize>,
     strict: bool,
@@ -1011,28 +1015,18 @@ async fn run_exec_ops_file(
     // `[[backends]]` multi-backend topology exactly like the daemon-fallback
     // path — see `build_local_fallback_server`.
     enforce_strict_actor_mode(cfg.actor_id.as_deref(), &cfg.packs)?;
-    let db_path_for_config = config_discovery_db_anchor(db_context.raw.as_deref());
-    let loaded_config = KhiveConfig::load_with_home_fallback_and_source(
-        db_context.config.as_deref(),
-        db_path_for_config.as_deref(),
-    )
-    .map_err(|e| anyhow::anyhow!("config error: {e}"))?;
-    let config_source = loaded_config.as_ref().map(|(_, source)| source.as_path());
-    let khive_cfg = loaded_config
-        .as_ref()
-        .map(|(config, _)| config.clone())
-        .unwrap_or_default();
+    let (khive_cfg, config_source) = load_exec_config(&db_context)?;
 
     if !khive_cfg.backends.is_empty() {
-        normalize_redundant_db_override_with_source(
-            &mut cfg,
+        // Preserve the selected config path on a refusal, but leave accepted
+        // cases to their downstream owner: the non-atomic shared builder logs
+        // and normalizes them once, while `--atomic` rejects multi-backend
+        // topology before opening storage.
+        reject_conflicting_db_override_with_source(
             db_context.raw.as_deref(),
             &khive_cfg.backends,
-            config_source,
+            config_source.as_deref(),
         )?;
-        if matches!(db_context.raw.as_deref(), Some(path) if path != ":memory:") {
-            db_context.anchor = cfg.db_path.clone();
-        }
     }
 
     if atomic {
@@ -1249,33 +1243,32 @@ mod tests {
     }
 
     #[test]
-    fn config_flag_selects_explicit_config() {
-        let args = ExecArgs::parse_from([
+    #[serial]
+    fn config_flag_and_env_bind_with_flag_precedence() {
+        let previous = std::env::var_os("KHIVE_CONFIG");
+        std::env::set_var("KHIVE_CONFIG", "/tmp/kkernel-exec-env-config.toml");
+
+        let from_env = ExecArgs::parse_from(["exec", "stats()"]);
+        assert_eq!(
+            from_env.config.as_deref(),
+            Some(std::path::Path::new("/tmp/kkernel-exec-env-config.toml"))
+        );
+
+        let from_flag = ExecArgs::parse_from([
             "exec",
             "stats()",
             "--config",
-            "/tmp/kkernel-exec-config.toml",
+            "/tmp/kkernel-exec-flag-config.toml",
         ]);
         assert_eq!(
-            args.config.as_deref(),
-            Some(std::path::Path::new("/tmp/kkernel-exec-config.toml"))
+            from_flag.config.as_deref(),
+            Some(std::path::Path::new("/tmp/kkernel-exec-flag-config.toml"))
         );
-    }
 
-    #[test]
-    #[serial]
-    fn khive_config_env_binds_to_config_arg() {
-        let previous = std::env::var_os("KHIVE_CONFIG");
-        std::env::set_var("KHIVE_CONFIG", "/tmp/kkernel-exec-env-config.toml");
-        let args = ExecArgs::parse_from(["exec", "stats()"]);
         match previous {
             Some(value) => std::env::set_var("KHIVE_CONFIG", value),
             None => std::env::remove_var("KHIVE_CONFIG"),
         }
-        assert_eq!(
-            args.config.as_deref(),
-            Some(std::path::Path::new("/tmp/kkernel-exec-env-config.toml"))
-        );
     }
 
     #[test]

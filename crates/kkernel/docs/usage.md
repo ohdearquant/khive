@@ -86,7 +86,7 @@ kkernel exec 'knowledge.index(help=true)'                         # param schema
 kkernel exec 'knowledge.search(query="...", rerank=true)' --presentation verbose
 ```
 
-Flags: `--db`, `--config`, `--namespace`, `--actor`, `--expect-actor`,
+Flags: `--db`, `--config` (env `KHIVE_CONFIG`), `--namespace`, `--actor`, `--expect-actor`,
 `--presentation <agent|verbose|human>`, `--strict`.
 A request in which every op failed or aborted always exits nonzero after printing the full
 response. Without `--strict`, a _partially_ failed request (`status: "partial"` with at least
