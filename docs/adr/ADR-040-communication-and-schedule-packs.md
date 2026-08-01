@@ -98,10 +98,41 @@ caller's namespace) or `outbound` (message sent by the caller). This is set by `
 | Verb          | Speech act (ADR-025) | Args                                      | What it does                                                                                                                                                                                                                                                                              |
 | ------------- | -------------------- | ----------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `comm.send`   | commissive           | `to`, `subject?`, `content`, `thread_id?` | Create a message note in the recipient's namespace (`direction=inbound`) and an outbound copy in the caller's namespace (`direction=outbound`). `from` is set to the caller's identity. Both writes are atomic: if the inbound write fails, the outbound copy is rolled back.             |
-| `comm.inbox`  | assertive            | `limit?`, `status?`                       | List inbound messages (`direction=inbound`) for the caller. `status` filters on `read`: `unread` (default), `read`, or `all`. Uses a paginated scan so that inbound messages are never missed behind a deep outbound backlog.                                                             |
-| `comm.read`   | declaration          | `id`                                      | Set `properties.read = true` on an **inbound** message. Returns the updated message envelope. Outbound messages cannot be marked read; the verb returns an error if `direction=outbound`.                                                                                                 |
+| `comm.inbox`  | assertive            | `limit?`, `offset?`, filters              | List inbound messages (`direction=inbound`) for the caller. `status` filters on `read`: `unread` (default), `read`, or `all`. Offset pagination and sender/time/text filters apply without changing message state.                                                                        |
+| `comm.read`   | declaration          | `id?`, `ids?`                             | Set `properties.read = true` on one or more **inbound** messages. Exactly one of `id` or `ids` is required. Outbound messages cannot be marked read.                                                                                                                                      |
 | `comm.reply`  | commissive           | `id`, `content`                           | Fetch the target message's `thread_id` (or use the message's own UUID as the thread root). Create a new message with the same `thread_id`, `to` set to the other party, `subject` prefixed with `"Re: "` if not already. Uses dual-write for inbound delivery to the recipient.           |
 | `comm.thread` | assertive            | `id`, `limit?`                            | Validate the root message by UUID (must exist, must be `kind=message`), then return the root plus all messages whose `properties.thread_id` equals the root UUID, sorted by `created_at` ascending (chronological). Uses a paginated scan. `id` accepts 8-char short prefix or full UUID. |
+
+#### Inbox pagination, richer filters, and bulk read amendment (2026-08-01)
+
+`comm.inbox` accepts a zero-based `offset` (default 0) in addition to the existing `limit`
+(default 20, maximum 200). The offset is applied to the fully-filtered sequence ordered by
+`(created_at DESC, id ASC)`, including filters that must be evaluated after the indexed store
+query. The response adds `offset`, `has_more`, and `next_offset`; callers enumerate every match by
+passing each non-null `next_offset` into the next otherwise-identical call. Pagination never marks
+a message read.
+
+The additive inbox filters are:
+
+- `exclude_from_actor`: exclude an exact sender actor label;
+- `since`: inclusive RFC 3339 lower bound on the note's top-level `created_at`;
+- `before`: exclusive RFC 3339 upper bound on the note's top-level `created_at`;
+- `subject_contains`: case-insensitive, non-empty substring match on `properties.subject`;
+- `content_contains`: case-insensitive, non-empty substring match on the message body.
+
+All supplied filters are ANDed. `from_actor` remains mutually exclusive with `from_prefix`, while
+`exclude_from_actor` may be combined with either. A missing/non-string subject does not match
+`subject_contains`. Time filters intentionally use the always-present top-level `created_at` shown
+in inbox responses, not the optional transport-origin `properties.sent_at`.
+
+`comm.read` accepts exactly one of `id` or `ids`. `ids` contains 1-500 short prefixes or full
+UUIDs. Every target is resolved and checked for namespace, message kind, inbound direction, and
+addressee before the first write; duplicate resolved IDs are updated once. A bulk response returns
+ordered `results` plus `requested_count`, `unique_count`, `marked_count`, and `failed_count`. Each result uses the
+single-message response shape; an update failure carries `read=false` and `mark_error`. Bulk writes
+are not promised to be one transaction: any validation failure rejects the operation before writes,
+but a later storage failure does not roll back an earlier successful result. The single-`id`
+response remains unchanged.
 
 #### Message-filter scan cap
 

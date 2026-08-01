@@ -58,6 +58,16 @@ fn validate_actor_label(verb: &str, label: &str, field: &str) -> Result<(), Runt
     Ok(())
 }
 
+fn parse_inbox_timestamp(field: &str, raw: &str) -> Result<i64, RuntimeError> {
+    DateTime::parse_from_rfc3339(raw.trim())
+        .map(|dt| dt.with_timezone(&Utc).timestamp_micros())
+        .map_err(|e| {
+            RuntimeError::InvalidInput(format!(
+                "inbox: `{field}` must be a valid RFC 3339 timestamp, got {raw:?}: {e}"
+            ))
+        })
+}
+
 /// Parse a caller- or transport-supplied thread root and return the one wire
 /// spelling accepted by message-properties v1. `Uuid` deliberately accepts
 /// compact, braced, URN, and upper-hex input forms; normalizing here keeps
@@ -72,6 +82,59 @@ fn canonicalize_thread_id(verb: &str, raw: &str) -> Result<String, RuntimeError>
                 "{verb}: `thread_id` must be a valid UUID, got: {raw:?}"
             ))
         })
+}
+
+fn validate_inbox_substring(field: &str, value: Option<&str>) -> Result<(), RuntimeError> {
+    if value.is_some_and(|raw| raw.trim().is_empty()) {
+        return Err(RuntimeError::InvalidInput(format!(
+            "inbox: `{field}` must not be empty"
+        )));
+    }
+    Ok(())
+}
+
+fn inbox_note_matches(
+    note: &Note,
+    params: &InboxParams,
+    before_micros: Option<i64>,
+    subject_needle: Option<&str>,
+    content_needle: Option<&str>,
+) -> bool {
+    let props = note.properties.as_ref();
+    let sender = props
+        .and_then(|properties| properties.get("from_actor"))
+        .and_then(Value::as_str);
+
+    if params
+        .from_prefix
+        .as_deref()
+        .is_some_and(|prefix| !sender.is_some_and(|value| value.starts_with(prefix)))
+    {
+        return false;
+    }
+    if params
+        .exclude_from_actor
+        .as_deref()
+        .is_some_and(|excluded| sender == Some(excluded))
+    {
+        return false;
+    }
+    if before_micros.is_some_and(|before| note.created_at >= before) {
+        return false;
+    }
+    if subject_needle.is_some_and(|needle| {
+        !props
+            .and_then(|properties| properties.get("subject"))
+            .and_then(Value::as_str)
+            .is_some_and(|subject| subject.to_lowercase().contains(needle))
+    }) {
+        return false;
+    }
+    if content_needle.is_some_and(|needle| !note.content.to_lowercase().contains(needle)) {
+        return false;
+    }
+
+    true
 }
 
 /// Return the exact, indexable spellings a pre-v1 handler could have stored
@@ -224,11 +287,13 @@ pub(crate) async fn handle_inbox(
 ) -> Result<Value, RuntimeError> {
     let p: InboxParams = deser(params)?;
     let raw_limit = p.limit.unwrap_or(20);
-    if raw_limit == 0 {
-        let unread_count = count_unread_messages(runtime, token, &token.actor().id).await?;
-        return Ok(json!({ "messages": [], "count": 0, "unread_count": unread_count }));
+    let offset = p.offset.unwrap_or(0);
+    if offset > i64::MAX as u64 {
+        return Err(RuntimeError::InvalidInput(format!(
+            "inbox: `offset` must be <= {}, got {offset}",
+            i64::MAX
+        )));
     }
-    let limit = raw_limit.clamp(1, 200) as usize;
 
     // #493: from_actor / from_prefix sender filter — mutually exclusive.
     if p.from_actor.is_some() && p.from_prefix.is_some() {
@@ -245,6 +310,38 @@ pub(crate) async fn handle_inbox(
             )));
         }
     };
+
+    validate_inbox_substring("subject_contains", p.subject_contains.as_deref())?;
+    validate_inbox_substring("content_contains", p.content_contains.as_deref())?;
+
+    let since_micros = p
+        .since
+        .as_deref()
+        .map(|raw| parse_inbox_timestamp("since", raw))
+        .transpose()?;
+    let before_micros = p
+        .before
+        .as_deref()
+        .map(|raw| parse_inbox_timestamp("before", raw))
+        .transpose()?;
+    if matches!((since_micros, before_micros), (Some(since), Some(before)) if since >= before) {
+        return Err(RuntimeError::InvalidInput(
+            "inbox: `since` must be earlier than `before`".into(),
+        ));
+    }
+
+    if raw_limit == 0 {
+        let unread_count = count_unread_messages(runtime, token, &token.actor().id).await?;
+        return Ok(json!({
+            "messages": [],
+            "count": 0,
+            "unread_count": unread_count,
+            "offset": offset,
+            "next_offset": Value::Null,
+            "has_more": false,
+        }));
+    }
+    let limit = raw_limit.clamp(1, 200) as usize;
 
     let caller_actor = token.actor().id.clone();
 
@@ -276,21 +373,45 @@ pub(crate) async fn handle_inbox(
         op: FilterOp::EqOrMissing,
         value: SqlValue::Text(caller_actor.clone()),
     });
+    if let Some(from_actor) = p.from_actor.as_ref() {
+        property_filters.push(PropertyFilter {
+            json_path: "$.from_actor".to_string(),
+            op: FilterOp::Eq,
+            value: SqlValue::Text(from_actor.clone()),
+        });
+    }
 
     let filter = NoteFilter {
         kind: Some("message".to_string()),
         property_filters,
         order_by: None, // preserves existing created_at DESC ordering
+        min_created_at: since_micros,
         ..Default::default()
     };
     let store = runtime.notes(token)?;
 
-    // #493: `FilterOp` has no prefix-match op, so a sender filter is applied in Rust
-    // over paged results (see docs/api/message-lifecycle.md#handlersrshandle_inbox) instead of SQL.
-    let messages: Vec<Value> = if p.from_actor.is_some() || p.from_prefix.is_some() {
+    let subject_needle = p
+        .subject_contains
+        .as_ref()
+        .map(|value| value.to_lowercase());
+    let content_needle = p
+        .content_contains
+        .as_ref()
+        .map(|value| value.to_lowercase());
+    let has_post_filter = p.from_prefix.is_some()
+        || p.exclude_from_actor.is_some()
+        || before_micros.is_some()
+        || subject_needle.is_some()
+        || content_needle.is_some();
+
+    // Offset is defined over the fully-filtered sequence. When a filter cannot
+    // be represented by `NoteFilter`, scan the indexed base query and count only
+    // matching rows before collecting one lookahead item for `has_more`.
+    let mut messages: Vec<Value> = if has_post_filter {
         const PAGE_SIZE: u32 = 200;
         let mut collected: Vec<Value> = Vec::new();
-        let mut db_offset: u32 = 0;
+        let mut matched: u64 = 0;
+        let mut db_offset: u64 = 0;
         loop {
             let page = store
                 .query_notes_filtered(
@@ -298,33 +419,36 @@ pub(crate) async fn handle_inbox(
                     &filter,
                     PageRequest {
                         limit: PAGE_SIZE,
-                        offset: db_offset.into(),
+                        offset: db_offset,
                     },
                 )
                 .await?;
             let fetched = page.items.len() as u32;
             for n in &page.items {
-                let sender = n
-                    .properties
-                    .as_ref()
-                    .and_then(|props| props.get("from_actor"))
-                    .and_then(Value::as_str);
-                let matches = match (p.from_actor.as_deref(), p.from_prefix.as_deref()) {
-                    (Some(exact), None) => sender == Some(exact),
-                    (None, Some(prefix)) => sender.map(|s| s.starts_with(prefix)).unwrap_or(false),
-                    _ => unreachable!("mutual exclusion already validated above"),
-                };
-                if matches {
-                    collected.push(note_to_message_json(n));
-                    if collected.len() >= limit {
-                        break;
-                    }
+                if !inbox_note_matches(
+                    n,
+                    &p,
+                    before_micros,
+                    subject_needle.as_deref(),
+                    content_needle.as_deref(),
+                ) {
+                    continue;
+                }
+                if matched < offset {
+                    matched += 1;
+                    continue;
+                }
+                collected.push(note_to_message_json(n));
+                if collected.len() > limit {
+                    break;
                 }
             }
-            if collected.len() >= limit || fetched < PAGE_SIZE {
+            if collected.len() > limit || fetched < PAGE_SIZE {
                 break;
             }
-            db_offset += PAGE_SIZE;
+            db_offset = db_offset.checked_add(u64::from(PAGE_SIZE)).ok_or_else(|| {
+                RuntimeError::InvalidInput("inbox: pagination offset overflowed".into())
+            })?;
         }
         collected
     } else {
@@ -333,13 +457,18 @@ pub(crate) async fn handle_inbox(
                 token.namespace().as_str(),
                 &filter,
                 PageRequest {
-                    limit: limit as u32,
-                    offset: 0,
+                    limit: (limit + 1) as u32,
+                    offset,
                 },
             )
             .await?;
         page.items.iter().map(note_to_message_json).collect()
     };
+
+    let has_more = messages.len() > limit;
+    if has_more {
+        messages.truncate(limit);
+    }
     let count = messages.len();
     // #66: cheap derived stat over the page already fetched above — no extra
     // DB round-trip. For `status="unread"` every returned message is unread
@@ -350,7 +479,21 @@ pub(crate) async fn handle_inbox(
         .iter()
         .filter(|m| !m["read"].as_bool().unwrap_or(false))
         .count();
-    Ok(json!({ "messages": messages, "count": count, "unread_count": unread_count }))
+    let next_offset = if has_more {
+        Some(offset.checked_add(count as u64).ok_or_else(|| {
+            RuntimeError::InvalidInput("inbox: pagination offset overflowed".into())
+        })?)
+    } else {
+        None
+    };
+    Ok(json!({
+        "messages": messages,
+        "count": count,
+        "unread_count": unread_count,
+        "offset": offset,
+        "next_offset": next_offset,
+        "has_more": has_more,
+    }))
 }
 
 /// `unread` — count-only view of the caller's unread inbound messages (#66):
@@ -440,7 +583,80 @@ pub(crate) async fn handle_read(
     params: Value,
 ) -> Result<Value, RuntimeError> {
     let p: ReadParams = deser(params)?;
-    let id = resolve_id(runtime, token, &p.id, "read").await?;
+    match (p.id, p.ids) {
+        (Some(_), Some(_)) => Err(RuntimeError::InvalidInput(
+            "read: `id` and `ids` are mutually exclusive".into(),
+        )),
+        (None, None) => Err(RuntimeError::InvalidInput(
+            "read: exactly one of `id` or `ids` is required".into(),
+        )),
+        (Some(raw), None) => {
+            let (id, note) = validate_read_target(runtime, token, &raw).await?;
+            mark_read_target(runtime, token, id, note).await
+        }
+        (None, Some(raw_ids)) => {
+            const MAX_BULK_READ_IDS: usize = 500;
+            if raw_ids.is_empty() {
+                return Err(RuntimeError::InvalidInput(
+                    "read: `ids` must contain at least one message id".into(),
+                ));
+            }
+            if raw_ids.len() > MAX_BULK_READ_IDS {
+                return Err(RuntimeError::InvalidInput(format!(
+                    "read: `ids` accepts at most {MAX_BULK_READ_IDS} message ids, got {}",
+                    raw_ids.len()
+                )));
+            }
+
+            // Validate every target before the first mutation so malformed,
+            // outbound, or wrong-addressee input cannot produce a partial bulk read.
+            let requested_count = raw_ids.len();
+            let mut seen = HashSet::new();
+            let mut targets = Vec::with_capacity(requested_count);
+            for raw in raw_ids {
+                let (id, note) = validate_read_target(runtime, token, &raw).await?;
+                if seen.insert(id) {
+                    targets.push((id, note));
+                }
+            }
+
+            let mut results = Vec::with_capacity(targets.len());
+            for (id, note) in targets {
+                let original_properties = note.properties.clone();
+                match mark_read_target(runtime, token, id, note).await {
+                    Ok(result) => results.push(result),
+                    Err(error) => results.push(json!({
+                        "id": short_id(id),
+                        "full_id": id.as_hyphenated().to_string(),
+                        "read": false,
+                        "mark_error": error.to_string(),
+                        "properties": original_properties,
+                    })),
+                }
+            }
+            let marked_count = results
+                .iter()
+                .filter(|result| result["read"].as_bool() == Some(true))
+                .count();
+            let unique_count = results.len();
+            let failed_count = unique_count - marked_count;
+            Ok(json!({
+                "results": results,
+                "requested_count": requested_count,
+                "unique_count": unique_count,
+                "marked_count": marked_count,
+                "failed_count": failed_count,
+            }))
+        }
+    }
+}
+
+async fn validate_read_target(
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+    raw: &str,
+) -> Result<(Uuid, Note), RuntimeError> {
+    let id = resolve_id(runtime, token, raw, "read").await?;
 
     let store = runtime.notes(token)?;
     let note = store
@@ -513,42 +729,94 @@ pub(crate) async fn handle_read(
         );
     }
 
+    Ok((id, note))
+}
+
+async fn mark_read_target(
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+    id: Uuid,
+    note: Note,
+) -> Result<Value, RuntimeError> {
     // Patch via one atomic JSON-property `UPDATE`, not a get/replace cycle or
     // `upsert_note` (#1483, #780). See docs/api/message-lifecycle.md#handlersrshandle_read
-    //
+    let store = runtime.notes(token)?;
+
     // `orig_props` is kept as the stored `Option<Value>` (a SQL-NULL
     // properties column is a real, distinct state from `{}`) so a degraded
-    // response can report exactly what is stored; `props` is a
-    // separately-normalized object used only for the attempted patch.
+    // response can report exactly what is stored.
     let orig_props = note.properties.clone();
-    let mut props = orig_props.clone().unwrap_or_else(|| json!({}));
-    match props.as_object_mut() {
-        Some(object) => {
-            object.insert("read".to_string(), json!(true));
-        }
-        None => props = json!({ "read": true }),
-    }
     let updated_at = Utc::now().timestamp_micros();
+    let caller_actor = token.actor().id.as_str();
+
+    // Storage-side compare-and-swap: patches only the `$.read` key via
+    // `json_set` instead of overwriting the whole `properties` column with
+    // this call's snapshot (which bulk read's up-to-500-target
+    // validate-then-mark window can leave stale — a concurrent write to any
+    // other property between validation and this call must survive), and
+    // rechecks kind/direction/addressee against the row's *current* state in
+    // the same `UPDATE` — the same eligibility predicate
+    // `validate_read_target` already checked, re-evaluated at mutation time
+    // rather than trusted from an earlier read.
+    let recheck_filter = NoteFilter {
+        kind: Some("message".to_string()),
+        property_filters: vec![
+            PropertyFilter {
+                json_path: "$.direction".to_string(),
+                op: FilterOp::NotInOrMissing(vec![SqlValue::Text("outbound".to_string())]),
+                value: SqlValue::Null,
+            },
+            PropertyFilter {
+                json_path: "$.to_actor".to_string(),
+                op: FilterOp::EqOrMissing,
+                value: SqlValue::Text(caller_actor.to_string()),
+            },
+        ],
+        ..Default::default()
+    };
 
     // Best-effort: under multi-client writer contention the pool checkout can
     // time out. The read itself already succeeded above — failing the whole
     // call over a delivery-state patch would throw away a successful read for
     // a caller who cannot retry the fetch half. Mirrors handle_reply's
-    // fold-in mark-read: `Ok(false)` (no live row
-    // updated, e.g. soft-deleted mid-flight) and `Err` both degrade to
-    // `read: false` + `mark_error` instead of failing the response. A caller
-    // polling unread counts simply sees the message still unread and can
-    // re-issue `read` — self-healing, no retry loop needed here.
+    // fold-in mark-read: `Ok(false)` (no live row currently matches, e.g.
+    // soft-deleted or an eligibility property changed mid-flight) and `Err`
+    // both degrade to `read: false` + `mark_error` instead of failing the
+    // response. A caller polling unread counts simply sees the message still
+    // unread and can re-issue `read` — self-healing, no retry loop needed here.
     let patch_result = store
-        .set_note_property(id, "read", json!(true), updated_at)
+        .try_patch_note_property(
+            id,
+            token.namespace().as_str(),
+            &recheck_filter,
+            "$.read",
+            json!(true),
+            updated_at,
+        )
         .await;
+
+    // Only a successful patch needs the fresh row: `read_response`'s
+    // `Ok(false)`/`Err` arms report `orig_props` (what is still stored), not
+    // this value.
+    let patched_properties = if matches!(patch_result, Ok(true)) {
+        match store.get_note(id).await {
+            Ok(Some(fresh)) => fresh.properties.unwrap_or_else(|| json!({})),
+            _ => {
+                let mut fallback = orig_props.clone().unwrap_or_else(|| json!({}));
+                fallback["read"] = json!(true);
+                fallback
+            }
+        }
+    } else {
+        Value::Null
+    };
 
     Ok(read_response(
         short_id(id),
         id.as_hyphenated().to_string(),
         patch_result,
         orig_props,
-        props,
+        patched_properties,
     ))
 }
 
@@ -2267,8 +2535,9 @@ fn build_references_header(parent_chain: Option<&str>, parent_message_id: &str) 
 mod tests {
     use super::{
         add_embedding_truncation_warning, build_references_header, channel_stalled,
-        heartbeat_note_id, message_id_match_candidates, parent_references_chain,
-        parent_wire_message_id, read_response, sanitize_reference_token, wrap_message_id,
+        heartbeat_note_id, mark_read_target, message_id_match_candidates, parent_references_chain,
+        parent_wire_message_id, read_response, sanitize_reference_token, validate_read_target,
+        wrap_message_id,
     };
     use khive_storage::StorageError;
     use serde_json::{json, Value};
@@ -2730,5 +2999,205 @@ mod tests {
             "a stored SQL-NULL properties column must round-trip as JSON \
              null, never as {{}}; got {resp}"
         );
+    }
+
+    // Regression for the bulk-read lost-update: prevalidation (`validate_read_target`)
+    // snapshots a `Note`, but bulk read's validate-then-mark window can span up to
+    // 500 targets, during which another writer can change an unrelated property.
+    // `mark_read_target` must never write that stale snapshot's `properties` back —
+    // only the `read` key may change, and any property that landed after the
+    // snapshot but before the mark must survive.
+    #[tokio::test]
+    async fn mark_read_target_preserves_a_property_written_after_prevalidation() {
+        use khive_runtime::{AllowAllGate, BackendId, Namespace, RuntimeConfig};
+        use khive_storage::note::Note;
+        use uuid::Uuid;
+
+        let ns = format!("mark-read-cas-{}", Uuid::new_v4().simple());
+        let runtime = super::KhiveRuntime::new(RuntimeConfig {
+            git_write: Default::default(),
+            db_path: None,
+            default_namespace: Namespace::parse(&ns).unwrap(),
+            embedding_model: None,
+            additional_embedding_models: vec![],
+            gate: std::sync::Arc::new(AllowAllGate),
+            packs: vec!["kg".to_string(), "comm".to_string()],
+            backend_id: BackendId::main(),
+            brain_profile: None,
+            visible_namespaces: vec![],
+            allowed_outbound_namespaces: vec![],
+            actor_id: None,
+        })
+        .expect("in-memory runtime");
+        let token = runtime
+            .authorize(Namespace::parse(&ns).unwrap())
+            .expect("authorize");
+        let store = runtime.notes(&token).expect("notes store");
+
+        let id = Uuid::new_v4();
+        let created_at = chrono::Utc::now().timestamp_micros();
+        store
+            .upsert_note(Note {
+                id,
+                namespace: ns.clone(),
+                kind: "message".to_string(),
+                status: "active".to_string(),
+                name: None,
+                content: "concurrency regression".to_string(),
+                salience: None,
+                decay_factor: None,
+                expires_at: None,
+                properties: Some(json!({
+                    "direction": "inbound",
+                    // `actor_id: None` in the config below resolves to the
+                    // anonymous actor, whose id is always "local" regardless
+                    // of namespace — see `khive_runtime::actor_identity::resolve_actor`.
+                    "to_actor": "local",
+                    "read": false,
+                })),
+                created_at,
+                updated_at: created_at,
+                deleted_at: None,
+            })
+            .await
+            .expect("insert message");
+
+        // Prevalidation snapshot — this is what a bulk read's validate phase
+        // would have captured for this target before iterating the rest of a
+        // (possibly large) id list.
+        let (validated_id, stale_note) = validate_read_target(&runtime, &token, &id.to_string())
+            .await
+            .expect("prevalidation");
+        assert_eq!(validated_id, id);
+
+        // Simulate a concurrent write landing after prevalidation but before
+        // this target's mark step: another property changes, `read` stays false.
+        let concurrent_updated_at = created_at + 1;
+        store
+            .update_note_properties(
+                id,
+                Some(json!({
+                    "direction": "inbound",
+                    "to_actor": stale_note.properties.as_ref().unwrap()["to_actor"].clone(),
+                    "read": false,
+                    "flagged": true,
+                })),
+                concurrent_updated_at,
+            )
+            .await
+            .expect("concurrent property write");
+
+        // Mark using the now-stale snapshot, exactly as the bulk mark loop does.
+        let result = mark_read_target(&runtime, &token, id, stale_note)
+            .await
+            .expect("mark_read_target");
+        assert_eq!(result["read"], json!(true), "got {result}");
+
+        let stored = store
+            .get_note(id)
+            .await
+            .expect("get_note")
+            .expect("note still present");
+        let props = stored.properties.expect("properties present");
+        assert_eq!(
+            props["read"],
+            json!(true),
+            "the mark itself must still land; got {props}"
+        );
+        assert_eq!(
+            props["flagged"],
+            json!(true),
+            "a property written after prevalidation but before the mark must \
+             survive — the mark must never write back the stale snapshot; got {props}"
+        );
+    }
+
+    // Regression: a message whose stored `properties` document is not a JSON
+    // object (scalar or array) must never be reported as read. `json_set`
+    // silently leaves such a document unchanged while still returning it, so
+    // without a non-object guard the `UPDATE` would still match the row and
+    // `comm.read` would falsely report `read: true` for a patch that stored
+    // nothing.
+    #[tokio::test]
+    async fn mark_read_target_reports_unread_for_non_object_properties() {
+        use khive_runtime::{AllowAllGate, BackendId, Namespace, RuntimeConfig};
+        use khive_storage::note::Note;
+        use uuid::Uuid;
+
+        for (case, properties) in [
+            ("scalar", json!(1)),
+            ("array", json!(["not", "an", "object"])),
+        ] {
+            let ns = format!("mark-read-non-object-{case}-{}", Uuid::new_v4().simple());
+            let runtime = super::KhiveRuntime::new(RuntimeConfig {
+                git_write: Default::default(),
+                db_path: None,
+                default_namespace: Namespace::parse(&ns).unwrap(),
+                embedding_model: None,
+                additional_embedding_models: vec![],
+                gate: std::sync::Arc::new(AllowAllGate),
+                packs: vec!["kg".to_string(), "comm".to_string()],
+                backend_id: BackendId::main(),
+                brain_profile: None,
+                visible_namespaces: vec![],
+                allowed_outbound_namespaces: vec![],
+                actor_id: None,
+            })
+            .expect("in-memory runtime");
+            let token = runtime
+                .authorize(Namespace::parse(&ns).unwrap())
+                .expect("authorize");
+            let store = runtime.notes(&token).expect("notes store");
+
+            let id = Uuid::new_v4();
+            let created_at = chrono::Utc::now().timestamp_micros();
+            let note = Note {
+                id,
+                namespace: ns.clone(),
+                kind: "message".to_string(),
+                status: "active".to_string(),
+                name: None,
+                content: format!("{case} properties"),
+                salience: None,
+                decay_factor: None,
+                expires_at: None,
+                properties: Some(properties.clone()),
+                created_at,
+                updated_at: created_at,
+                deleted_at: None,
+            };
+            store
+                .upsert_note(note.clone())
+                .await
+                .expect("insert message");
+
+            let result = mark_read_target(&runtime, &token, id, note)
+                .await
+                .expect("mark_read_target");
+            assert_eq!(
+                result["read"],
+                json!(false),
+                "{case} properties document must not be reported as read; got {result}"
+            );
+            assert_eq!(
+                result["properties"], properties,
+                "{case} properties must round-trip unchanged; got {result}"
+            );
+
+            let stored = store
+                .get_note(id)
+                .await
+                .expect("get_note")
+                .expect("note still present");
+            assert_eq!(
+                stored.properties,
+                Some(properties),
+                "{case} properties must remain unchanged in storage"
+            );
+            assert_eq!(
+                stored.updated_at, created_at,
+                "{case} updated_at must not advance when the patch is refused"
+            );
+        }
     }
 }

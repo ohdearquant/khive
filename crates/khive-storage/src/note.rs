@@ -344,6 +344,36 @@ pub trait NoteStore: Send + Sync + 'static {
         value: Value,
         updated_at: i64,
     ) -> StorageResult<bool>;
+    /// Atomically patch a single `properties` JSON key on a note, but only
+    /// when the row's *current* state (re-evaluated inside this same
+    /// statement, not a snapshot the caller fetched earlier) still satisfies
+    /// `filter`'s namespace/kind/property_filters.
+    ///
+    /// Unlike `set_note_property` (which patches unconditionally once the row
+    /// is live) or `update_note_properties` (which replaces the whole
+    /// `properties` column with a value the caller already computed — safe
+    /// only when nothing else can have written to the row since the caller's
+    /// read), this also rechecks `filter` against the row's live state before
+    /// writing, so a target that stopped matching an eligibility predicate
+    /// between validation and this call is not mutated. Any other property
+    /// written concurrently between the caller's read and this call survives
+    /// untouched either way. A live row whose stored `properties` document is
+    /// a non-object (scalar, array, or otherwise) is not modified and returns
+    /// `false`, mirroring `set_note_property`. Returns `Ok(false)` — not an
+    /// error — when no live row currently matches `filter` (id not found,
+    /// soft-deleted, an eligibility property changed since the caller last
+    /// validated it, or the stored document is not a JSON object); the
+    /// caller degrades that the same way as `update_note_properties`'s
+    /// `Ok(false)`.
+    async fn try_patch_note_property(
+        &self,
+        id: Uuid,
+        namespace: &str,
+        filter: &NoteFilter,
+        json_path: &str,
+        value: Value,
+        updated_at: i64,
+    ) -> StorageResult<bool>;
     /// Query notes by namespace and optional kind with pagination.
     /// The returned total and page items must come from one consistent
     /// backend snapshot.
