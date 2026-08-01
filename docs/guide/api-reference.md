@@ -989,13 +989,13 @@ request(ops="memory.recall(query=\"x\", limit=5) | brain.auto_feedback(query=\"x
 
 Write a row in the profile resolution table.
 
-| Param           | Type    | Required | Notes                                        |
-| --------------- | ------- | -------- | -------------------------------------------- |
-| `profile_id`    | string  | yes      | Must exist.                                  |
-| `actor`         | string  | no       | Default `*` (all actors).                    |
-| `namespace`     | string  | no       | Default `*` (all namespaces).                |
-| `consumer_kind` | string  | no       | Default `*` (all kinds).                     |
-| `priority`      | integer | no       | Higher wins on multiple matches (default 0). |
+| Param           | Type    | Required | Notes                                                                                                                    |
+| --------------- | ------- | -------- | ------------------------------------------------------------------------------------------------------------------------ |
+| `profile_id`    | string  | yes      | Must exist.                                                                                                              |
+| `actor`         | string  | no       | Default `*` (all actors).                                                                                                |
+| `namespace`     | string  | no       | Default `*` (all namespaces).                                                                                            |
+| `consumer_kind` | string  | no       | Default `*`; specific values must be declared by a loaded consumer pack. Unknown values are rejected with the valid set. |
+| `priority`      | integer | no       | Higher wins on multiple matches (default 0).                                                                             |
 
 ```
 request(ops="brain.bind(profile_id=\"implementer-recall-v1\", actor=\"role:implementer\")")

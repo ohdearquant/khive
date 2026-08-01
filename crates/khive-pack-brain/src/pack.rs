@@ -67,6 +67,8 @@ impl Pack for BrainPack {
     const NAME: &'static str = "brain";
     const NOTE_KINDS: &'static [&'static str] = &[];
     const ENTITY_KINDS: &'static [&'static str] = &[];
+    const BRAIN_CONSUMER_KINDS: &'static [&'static str] =
+        &[khive_brain_core::ConsumerKind::Recall.as_str()];
     const HANDLERS: &'static [HandlerDef] = BRAIN_HANDLERS;
     const REQUIRES: &'static [&'static str] = &["kg"];
 }
@@ -164,6 +166,10 @@ impl khive_runtime::pack::PackRuntime for BrainPackRuntime {
 
     fn entity_kinds(&self) -> &'static [&'static str] {
         self.0.entity_kinds()
+    }
+
+    fn brain_consumer_kinds(&self) -> &'static [&'static str] {
+        self.0.brain_consumer_kinds()
     }
 
     fn handlers(&self) -> &'static [khive_runtime::HandlerDef] {

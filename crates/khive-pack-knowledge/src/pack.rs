@@ -35,6 +35,8 @@ impl Pack for KnowledgePack {
     const NAME: &'static str = "knowledge";
     const NOTE_KINDS: &'static [&'static str] = &[];
     const ENTITY_KINDS: &'static [&'static str] = &[];
+    const BRAIN_CONSUMER_KINDS: &'static [&'static str] =
+        &[khive_brain_core::ConsumerKind::KnowledgeCompose.as_str()];
     const HANDLERS: &'static [HandlerDef] = &KNOWLEDGE_HANDLERS;
     const REQUIRES: &'static [&'static str] = &["kg"];
 }
@@ -89,6 +91,10 @@ impl PackRuntime for KnowledgePack {
 
     fn entity_kinds(&self) -> &'static [&'static str] {
         <KnowledgePack as Pack>::ENTITY_KINDS
+    }
+
+    fn brain_consumer_kinds(&self) -> &'static [&'static str] {
+        <KnowledgePack as Pack>::BRAIN_CONSUMER_KINDS
     }
 
     fn handlers(&self) -> &'static [HandlerDef] {

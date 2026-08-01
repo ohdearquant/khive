@@ -7,6 +7,52 @@ use khive_runtime::{
 use khive_types::HandlerDef;
 use serde_json::json;
 
+struct TestConsumerPack;
+
+impl khive_types::Pack for TestConsumerPack {
+    const NAME: &'static str = "test-consumer";
+    const NOTE_KINDS: &'static [&'static str] = &[];
+    const ENTITY_KINDS: &'static [&'static str] = &[];
+    const BRAIN_CONSUMER_KINDS: &'static [&'static str] =
+        &["recall", "knowledge_compose", "search"];
+    const HANDLERS: &'static [HandlerDef] = &[];
+}
+
+#[async_trait::async_trait]
+impl PackRuntime for TestConsumerPack {
+    fn name(&self) -> &str {
+        <Self as khive_types::Pack>::NAME
+    }
+
+    fn note_kinds(&self) -> &'static [&'static str] {
+        <Self as khive_types::Pack>::NOTE_KINDS
+    }
+
+    fn entity_kinds(&self) -> &'static [&'static str] {
+        <Self as khive_types::Pack>::ENTITY_KINDS
+    }
+
+    fn brain_consumer_kinds(&self) -> &'static [&'static str] {
+        <Self as khive_types::Pack>::BRAIN_CONSUMER_KINDS
+    }
+
+    fn handlers(&self) -> &'static [HandlerDef] {
+        <Self as khive_types::Pack>::HANDLERS
+    }
+
+    async fn dispatch(
+        &self,
+        verb: &str,
+        _params: serde_json::Value,
+        _registry: &khive_runtime::VerbRegistry,
+        _token: &NamespaceToken,
+    ) -> Result<serde_json::Value, RuntimeError> {
+        Err(RuntimeError::InvalidInput(format!(
+            "test consumer pack does not handle verb {verb:?}"
+        )))
+    }
+}
+
 fn make_pack() -> (BrainPack, KhiveRuntime) {
     let rt = KhiveRuntime::memory().expect("in-memory runtime");
     let pack = BrainPack::new(rt.clone());
@@ -14,9 +60,11 @@ fn make_pack() -> (BrainPack, KhiveRuntime) {
 }
 
 fn empty_registry() -> khive_runtime::VerbRegistry {
-    VerbRegistryBuilder::new()
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(TestConsumerPack);
+    builder
         .build()
-        .expect("empty registry builds successfully")
+        .expect("handler-empty test registry builds successfully")
 }
 
 /// Create a real entity in the runtime and return its UUID string.
@@ -1604,6 +1652,43 @@ async fn w4_h2_bindings_lists_rows() {
     let rows = result2["bindings"].as_array().unwrap();
     assert_eq!(rows[0]["actor"], json!("agent-a"));
     assert_eq!(rows[0]["profile_id"], json!("balanced-recall-v1"));
+}
+
+#[tokio::test]
+async fn bind_rejects_unregistered_consumer_kind_with_valid_list() {
+    let (pack, rt) = make_pack();
+    let registry = empty_registry();
+    let token = rt.authorize(Namespace::local()).unwrap();
+
+    let err = pack
+        .dispatch(
+            "brain.bind",
+            json!({
+                "profile_id": "balanced-recall-v1",
+                "consumer_kind": "never_requested",
+            }),
+            &registry,
+            &token,
+        )
+        .await
+        .expect_err("an unregistered consumer kind must be rejected");
+
+    let RuntimeError::InvalidInput(message) = err else {
+        panic!("expected InvalidInput, got {err:?}");
+    };
+    assert!(message.contains("never_requested"), "{message}");
+    for valid in ["*", "knowledge_compose", "recall", "search"] {
+        assert!(
+            message.contains(valid),
+            "valid consumer kind {valid:?} missing from error: {message}"
+        );
+    }
+
+    let bindings = pack
+        .dispatch("brain.bindings", json!({}), &registry, &token)
+        .await
+        .expect("bindings remain readable after rejected bind");
+    assert_eq!(bindings["count"], json!(0u64));
 }
 
 // H2: brain.bindings supports filtering.
@@ -4189,6 +4274,7 @@ async fn dispatch_gate_race_is_observable_without_gate() {
             "namespace": "bare-ns-a",
             "consumer_kind": "recall",
         }),
+        &registry,
     )
     .await
     .expect("handle_bind for a");
