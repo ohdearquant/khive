@@ -31,7 +31,7 @@ use khive_storage::types::{
     TextQueryMode, TextSearchRequest, TraversalRequest,
 };
 use khive_storage::{Edge, EdgeRelation, Entity, EntityFilter, Event, EventFilter};
-use khive_types::{EdgeEndpointRule, EndpointKind, EventKind, SubstrateKind};
+use khive_types::{EdgeEndpointRule, EndpointKind, EventKind, KhiveError, SubstrateKind};
 
 use khive_db::stores::entity::{entity_hard_delete_statement, entity_upsert_statement};
 use khive_db::stores::graph::{edge_hard_delete_statement, purge_incident_edges_statement};
@@ -105,6 +105,12 @@ static FTS_FAIL_NS: std::sync::LazyLock<FaultArmSet> =
 // Vector insertion failures use the same namespace-keyed one-shot semantics.
 #[cfg(any(test, feature = "fault-injection"))]
 static VECTOR_FAIL_NS: std::sync::LazyLock<FaultArmSet> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+/// Entity-create compensation failure injection. The matching compensation
+/// skips only the entity-row delete; FTS/vector cleanup still runs so tests can
+/// inspect the exact residual state and combined error contract.
+#[cfg(any(test, feature = "fault-injection"))]
+static ENTITY_COMPENSATION_FAIL_NS: std::sync::LazyLock<FaultArmSet> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 /// FTS failure injection for `create_many` — separate from `FTS_FAIL_NS` so that
 /// create_note_inner and create_many tests cannot disarm each other. Namespace-keyed
@@ -249,6 +255,13 @@ pub fn arm_fts_search_fail(ns: &str) {
 #[cfg(any(test, feature = "fault-injection"))]
 pub fn arm_vector_fail_scoped(ns: &str) -> FaultInjectionArm {
     arm_fault(&VECTOR_FAIL_NS, ns, MAX_FAULT_ARMS)
+}
+
+/// Arm a one-shot entity-row cleanup failure for `create_entity`
+/// compensation in namespace `ns`.
+#[cfg(any(test, feature = "fault-injection"))]
+pub fn arm_entity_compensation_fail_scoped(ns: &str) -> FaultInjectionArm {
+    arm_fault(&ENTITY_COMPENSATION_FAIL_NS, ns, MAX_FAULT_ARMS)
 }
 
 /// Failure injection for `delete_note_row_first_for_compensation`'s post-row-removal
@@ -1075,7 +1088,83 @@ async fn drain_embed_join_set(
 impl KhiveRuntime {
     // ---- Entity operations ----
 
+    async fn compensate_entity_create(
+        &self,
+        token: &NamespaceToken,
+        entity_id: Uuid,
+        namespace: &str,
+        vector_models: &[String],
+    ) -> Vec<String> {
+        let mut cleanup_errors = Vec::new();
+
+        #[cfg(any(test, feature = "fault-injection"))]
+        let entity_delete_injected = consume_fault(&ENTITY_COMPENSATION_FAIL_NS, namespace);
+        #[cfg(not(any(test, feature = "fault-injection")))]
+        let entity_delete_injected = false;
+
+        if entity_delete_injected {
+            cleanup_errors.push("entity row delete: injected compensation failure".to_string());
+        } else {
+            match self.entities(token) {
+                Ok(store) => {
+                    if let Err(error) = store.delete_entity(entity_id, DeleteMode::Hard).await {
+                        cleanup_errors.push(format!("entity row delete: {error}"));
+                    }
+                }
+                Err(error) => cleanup_errors.push(format!("entity store access: {error}")),
+            }
+        }
+
+        match self.text(token) {
+            Ok(fts) => {
+                if let Err(error) = fts.delete_document(namespace, entity_id).await {
+                    cleanup_errors.push(format!("FTS document delete: {error}"));
+                }
+            }
+            Err(error) => cleanup_errors.push(format!("FTS store access: {error}")),
+        }
+
+        for model_name in vector_models {
+            match self.vectors_for_model(token, model_name) {
+                Ok(vectors) => {
+                    if let Err(error) = vectors.delete(entity_id).await {
+                        cleanup_errors
+                            .push(format!("vector delete for model {model_name}: {error}"));
+                    }
+                }
+                Err(error) => cleanup_errors.push(format!(
+                    "vector store access for model {model_name}: {error}"
+                )),
+            }
+        }
+
+        cleanup_errors
+    }
+
+    fn entity_create_failure(
+        entity_id: Uuid,
+        primary: RuntimeError,
+        cleanup_errors: Vec<String>,
+    ) -> RuntimeError {
+        if cleanup_errors.is_empty() {
+            primary
+        } else {
+            RuntimeError::Khive(KhiveError::internal(format!(
+                "create_entity indexing failed for record {entity_id}; primary failure: \
+                 {primary}; compensation failure(s): {}; partial persistence is possible; \
+                 inspect and reconcile this record before retrying",
+                cleanup_errors.join("; ")
+            )))
+        }
+    }
+
     /// Create and persist a new entity.
+    ///
+    /// Indexing failures trigger compensation across the entity row, FTS
+    /// document, and any vector models touched by this call. If compensation
+    /// also fails, the returned structured internal error identifies possible
+    /// partial persistence, includes both failure classes, and carries the
+    /// entity ID as a reconciliation handle.
     // REASON: entity creation requires kind, type, name, description, properties, tags, and
     // namespace token — refactoring into a builder would add indirection without reducing
     // caller complexity; this signature mirrors the MCP verb surface directly.
@@ -1131,16 +1220,10 @@ impl KhiveRuntime {
                 }
             };
             if let Err(e) = fts_result {
-                if let Ok(store) = self.entities(token) {
-                    if let Err(ce) = store.delete_entity(entity.id, DeleteMode::Hard).await {
-                        tracing::error!(
-                            error = %ce,
-                            id = %entity.id,
-                            "create_entity: failed to roll back entity row after FTS failure"
-                        );
-                    }
-                }
-                return Err(e);
+                let cleanup_errors = self
+                    .compensate_entity_create(token, entity.id, ns, &[])
+                    .await;
+                return Err(Self::entity_create_failure(entity.id, e, cleanup_errors));
             }
         }
 
@@ -1190,25 +1273,15 @@ impl KhiveRuntime {
                 Err(e) => Err(e),
             };
             if let Err(e) = single_result {
-                if let Ok(store) = self.entities(token) {
-                    if let Err(ce) = store.delete_entity(entity.id, DeleteMode::Hard).await {
-                        tracing::error!(
-                            error = %ce,
-                            id = %entity.id,
-                            "create_entity: failed to roll back entity row after vector failure"
-                        );
-                    }
-                }
-                if let Ok(fts) = self.text(token) {
-                    if let Err(ce) = fts.delete_document(ns, entity.id).await {
-                        tracing::error!(
-                            error = %ce,
-                            id = %entity.id,
-                            "create_entity: failed to roll back FTS document after vector failure"
-                        );
-                    }
-                }
-                return Err(e);
+                let cleanup_errors = self
+                    .compensate_entity_create(
+                        token,
+                        entity.id,
+                        ns,
+                        std::slice::from_ref(model_name),
+                    )
+                    .await;
+                return Err(Self::entity_create_failure(entity.id, e, cleanup_errors));
             }
         } else if !embed_model_names.is_empty() {
             // Multi-model path: embed with each model in parallel, then insert sequentially
@@ -1238,25 +1311,10 @@ impl KhiveRuntime {
             let vectors = match drain_embed_join_set(join_set, embed_model_names.len()).await {
                 Ok(vectors) => vectors,
                 Err(e) => {
-                    if let Ok(store) = self.entities(token) {
-                        if let Err(ce) = store.delete_entity(entity.id, DeleteMode::Hard).await {
-                            tracing::error!(
-                                error = %ce,
-                                id = %entity.id,
-                                "create_entity: failed to roll back entity row after embed failure"
-                            );
-                        }
-                    }
-                    if let Ok(fts) = self.text(token) {
-                        if let Err(ce) = fts.delete_document(ns, entity.id).await {
-                            tracing::error!(
-                                error = %ce,
-                                id = %entity.id,
-                                "create_entity: failed to roll back FTS document after embed failure"
-                            );
-                        }
-                    }
-                    return Err(e);
+                    let cleanup_errors = self
+                        .compensate_entity_create(token, entity.id, ns, &[])
+                        .await;
+                    return Err(Self::entity_create_failure(entity.id, e, cleanup_errors));
                 }
             };
             // TODO(P2): parallelize vector inserts
@@ -1298,38 +1356,14 @@ impl KhiveRuntime {
                     }
                 };
                 if let Err(e) = insert_result {
-                    // Compensate entity row + FTS + already-inserted vectors.
-                    if let Ok(store) = self.entities(token) {
-                        if let Err(ce) = store.delete_entity(entity.id, DeleteMode::Hard).await {
-                            tracing::error!(
-                                error = %ce,
-                                id = %entity.id,
-                                "create_entity: failed to roll back entity row after vector insert failure"
-                            );
-                        }
-                    }
-                    if let Ok(fts) = self.text(token) {
-                        if let Err(ce) = fts.delete_document(ns, entity.id).await {
-                            tracing::error!(
-                                error = %ce,
-                                id = %entity.id,
-                                "create_entity: failed to roll back FTS document after vector insert failure"
-                            );
-                        }
-                    }
-                    for m in &inserted_models {
-                        if let Ok(vs) = self.vectors_for_model(token, m) {
-                            if let Err(ce) = vs.delete(entity.id).await {
-                                tracing::error!(
-                                    error = %ce,
-                                    model = m,
-                                    id = %entity.id,
-                                    "create_entity: failed to roll back vector for model after insert failure"
-                                );
-                            }
-                        }
-                    }
-                    return Err(e);
+                    // Include the model whose INSERT returned an error: a backend
+                    // error does not prove the write had no side effects.
+                    let mut cleanup_models = inserted_models.clone();
+                    cleanup_models.push(model_name.clone());
+                    let cleanup_errors = self
+                        .compensate_entity_create(token, entity.id, ns, &cleanup_models)
+                        .await;
+                    return Err(Self::entity_create_failure(entity.id, e, cleanup_errors));
                 }
                 inserted_models.push(model_name.clone());
             }
@@ -12266,6 +12300,57 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn create_entity_fts_and_compensation_failures_report_partial_persistence() {
+        let rt = KhiveRuntime::memory().unwrap();
+        let ns = Namespace::parse("partial-persistence-fts").unwrap();
+        let tok = NamespaceToken::for_namespace(ns.clone());
+        let _fts_arm = arm_fts_fail_scoped(ns.as_str());
+        let _cleanup_arm = arm_entity_compensation_fail_scoped(ns.as_str());
+
+        let error = rt
+            .create_entity(
+                &tok,
+                "concept",
+                None,
+                "FTS partial persistence",
+                None,
+                None,
+                vec![],
+            )
+            .await
+            .expect_err("FTS and compensation failures must fail create_entity");
+        assert!(
+            matches!(&error, RuntimeError::Khive(_)),
+            "combined failures must use the structured wire error path"
+        );
+        let error_message = error.to_string();
+        assert!(error_message.contains("injected FTS failure"));
+        assert!(error_message.contains("injected compensation failure"));
+        assert!(error_message.contains("partial persistence is possible"));
+
+        let entities = rt.list_entities(&tok, None, None, 10, 0).await.unwrap();
+        assert_eq!(
+            entities.len(),
+            1,
+            "the failed row cleanup must leave residue"
+        );
+        let record_id = entities[0].id;
+        assert!(
+            error_message.contains(&record_id.to_string()),
+            "the error must identify the durable row that needs reconciliation"
+        );
+        assert!(
+            rt.text(&tok)
+                .unwrap()
+                .get_document(ns.as_str(), record_id)
+                .await
+                .unwrap()
+                .is_none(),
+            "FTS cleanup must run even when the FTS upsert reports failure"
+        );
+    }
+
     // Vector insert failure after entity row + FTS commit rolls back both.
     // Uses a unique namespace so only this test consumes its VECTOR_FAIL_NS entry.
     #[tokio::test]
@@ -12330,6 +12415,68 @@ mod tests {
         assert!(
             fts_hits.is_empty(),
             "compensation must remove FTS document after vector failure; got {fts_hits:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_entity_single_model_reports_primary_and_compensation_failures() {
+        const MODEL: &str = "partial-persistence-single";
+
+        let rt = KhiveRuntime::memory().unwrap();
+        let (provider, _counter) = ConstVecProvider::new(MODEL, 4);
+        rt.register_embedder(provider);
+
+        let ns = Namespace::parse("partial-persistence-single").unwrap();
+        let tok = NamespaceToken::for_namespace(ns.clone());
+        let _vector_arm = arm_vector_fail_scoped(ns.as_str());
+        let _cleanup_arm = arm_entity_compensation_fail_scoped(ns.as_str());
+
+        let error = rt
+            .create_entity(
+                &tok,
+                "concept",
+                None,
+                "single-model partial persistence",
+                Some("the FTS document lands before the injected vector failure"),
+                None,
+                vec![],
+            )
+            .await
+            .expect_err("vector and compensation failures must fail create_entity");
+
+        let error_message = error.to_string();
+        assert!(error_message.contains("injected vector failure"));
+        assert!(error_message.contains("injected compensation failure"));
+        assert!(error_message.contains("partial persistence is possible"));
+
+        let entities = rt.list_entities(&tok, None, None, 10, 0).await.unwrap();
+        assert_eq!(
+            entities.len(),
+            1,
+            "the failed row cleanup must leave residue"
+        );
+        let record_id = entities[0].id;
+        assert!(
+            error_message.contains(&record_id.to_string()),
+            "the caller-visible error must carry the recovery record ID"
+        );
+        assert!(
+            rt.text(&tok)
+                .unwrap()
+                .get_document(ns.as_str(), record_id)
+                .await
+                .unwrap()
+                .is_none(),
+            "independent FTS compensation must still complete"
+        );
+        assert_eq!(
+            rt.vectors_for_model(&tok, MODEL)
+                .unwrap()
+                .count()
+                .await
+                .unwrap(),
+            0,
+            "the failed model must be cleaned even though INSERT returned an error"
         );
     }
 
@@ -12419,6 +12566,70 @@ mod tests {
         assert!(
             hits_b.is_empty(),
             "model-b vector store must be empty after rollback; got {hits_b:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_entity_multi_model_reports_cleanup_failure_and_removes_all_vectors() {
+        let rt = KhiveRuntime::memory().unwrap();
+        let (provider_a, _ca) = ConstVecProvider::new("partial-multi-a", 4);
+        let (provider_b, _cb) = ConstVecProvider::new("partial-multi-b", 4);
+        rt.register_embedder(provider_a);
+        rt.register_embedder(provider_b);
+
+        let ns = Namespace::parse("partial-persistence-multi").unwrap();
+        let tok = NamespaceToken::for_namespace(ns.clone());
+        let _cleanup_arm = arm_entity_compensation_fail_scoped(ns.as_str());
+        arm_vector_fail_after(1);
+
+        let error = rt
+            .create_entity(
+                &tok,
+                "concept",
+                None,
+                "multi-model partial persistence",
+                Some("the second model fails after the first vector lands"),
+                None,
+                vec![],
+            )
+            .await
+            .expect_err("second vector and compensation failures must fail create_entity");
+
+        let error_message = error.to_string();
+        assert!(
+            error_message.contains("injected vector insert failure"),
+            "primary cause must be retained: {error_message}"
+        );
+        assert!(error_message.contains("injected compensation failure"));
+
+        let entities = rt.list_entities(&tok, None, None, 10, 0).await.unwrap();
+        assert_eq!(
+            entities.len(),
+            1,
+            "the failed row cleanup must leave residue"
+        );
+        let record_id = entities[0].id;
+        assert!(error_message.contains(&record_id.to_string()));
+
+        for model in ["partial-multi-a", "partial-multi-b"] {
+            assert_eq!(
+                rt.vectors_for_model(&tok, model)
+                    .unwrap()
+                    .count()
+                    .await
+                    .unwrap(),
+                0,
+                "compensation must clean both the successful and failed model ({model})"
+            );
+        }
+        assert!(
+            rt.text(&tok)
+                .unwrap()
+                .get_document(ns.as_str(), record_id)
+                .await
+                .unwrap()
+                .is_none(),
+            "FTS compensation must succeed even when row cleanup fails"
         );
     }
 
