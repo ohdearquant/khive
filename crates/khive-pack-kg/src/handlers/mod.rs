@@ -3,6 +3,7 @@
 mod common;
 mod context;
 mod create;
+mod db_diagnostics;
 mod get;
 mod graph;
 mod link;

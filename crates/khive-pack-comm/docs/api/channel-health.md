@@ -68,6 +68,10 @@ Read-modify-write against the existing row (if any) so that:
 - `consecutive_failures` resets to 0 on success and increments on failure,
   read from the prior row rather than any in-process counter, so it is
   correct even across a daemon restart.
+- `poll_interval_secs`, when supplied, records the writer's positive nominal
+  cadence. The shipped channel loop supplies `5` on every heartbeat. Omission
+  remains accepted for a mixed-version internal writer and preserves any
+  previously recorded cadence on that row.
 
 Heartbeat rows are an OPERATIONAL surface, not message data (#606). Persists
 under `token.namespace()` (khive #917) — the dispatch-authorized namespace
@@ -97,7 +101,8 @@ sees the poll loop's rows.
 Projects a persisted `channel_health` note into the `comm.health()` channel
 entry shape. Missing fields (a row written before a given property existed)
 default to `null`/`0` rather than panicking — forward-compatible with rows
-written by an older heartbeat writer.
+written by an older heartbeat writer. Invalid or missing cadence/timestamp
+facts produce `poll_interval_secs: null` and/or `stalled: null`.
 
 ## `handlers.rs::handle_health`
 
@@ -141,8 +146,24 @@ alongside `role: "client"` can tell "no daemon anywhere" (unscoped call,
 call, `namespace: "tenant-a"`) without khive silently falling back to `"local"`
 to paper over the difference.
 
-Never returns a computed `healthy: bool` (design review amendment: "report
-timestamps only") — staleness/alerting judgment belongs to the caller.
+Never returns a computed `healthy: bool`; overall health and alerting judgment
+still belong to the caller. Issue #1472 adds two narrower channel fields:
+
+- `poll_interval_secs` is the positive nominal/minimum poll cadence persisted
+  by the heartbeat writer. It is `null` for legacy or malformed rows.
+- `stalled` is an advisory schedule-staleness fact. For a row with zero
+  consecutive failures and valid cadence/timestamp facts, it is `true` only
+  when the shared response `as_of` is strictly more than three nominal
+  intervals after `last_poll_attempt_at`; otherwise it is `false`.
+  It is `null` for legacy/malformed rows and while a known failure is in
+  exponential backoff, because nominal cadence cannot classify that state.
+
+The three-interval grace avoids ordinary tick jitter, but `stalled` is not an
+authoritative task-liveness or supervisor verdict. Polls are sequential and
+transport operations can be slow, so `true` can also mean a long in-flight or
+delayed sweep. ADR-119's component supervisor remains authoritative for hung
+task detection and restart. All channel projections use the same captured
+`as_of`, so a multi-channel response has one consistent comparison instant.
 
 `resource` (ADR-103 Stage 1, issue #723 ask 2): a process-level self-report of
 this process's own cumulative CPU time and RSS (via `getrusage`,

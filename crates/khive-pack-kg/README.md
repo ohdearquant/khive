@@ -7,7 +7,7 @@ workspace declares it as a dependency.
 
 ## Verbs
 
-19 handlers, registered under [ADR-017](https://github.com/ohdearquant/khive/blob/main/docs/adr/ADR-017-pack-standard.md):
+20 handlers, registered under [ADR-017](https://github.com/ohdearquant/khive/blob/main/docs/adr/ADR-017-pack-standard.md):
 
 | Verb        | What it does                                                                    |
 | ----------- | ------------------------------------------------------------------------------- |
@@ -30,6 +30,7 @@ workspace declares it as a dependency.
 | `context`   | Entity-anchored graph context in one call (ADR-089)                             |
 | `resolve`   | Resolve natural-language references to record ids                               |
 | `whoami`    | Report the caller identity this request resolved to                             |
+| `db_diagnostics` | WAL/checkpoint diagnostics: counters, PASSIVE probe, WAL size, holder census (probe may backfill WAL frames; never TRUNCATE, never creates or deletes files) |
 
 `propose`/`review`/`withdraw` implement the event-sourced proposal lifecycle from
 [ADR-046](https://github.com/ohdearquant/khive/blob/main/docs/adr/ADR-046-event-sourced-proposals.md).

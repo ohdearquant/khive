@@ -4,12 +4,13 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use rusqlite::OptionalExtension;
 use uuid::Uuid;
 
 use khive_storage::entity::{Entity, EntityFilter};
 use khive_storage::error::StorageError;
 use khive_storage::types::{
-    BatchWriteSummary, DeleteMode, Page, PageRequest, SqlStatement, SqlValue,
+    BatchWriteSummary, DeleteMode, Page, PageRequest, SeekCursor, SeekPage, SqlStatement, SqlValue,
 };
 use khive_storage::EntityStore;
 use khive_storage::StorageCapability;
@@ -640,6 +641,19 @@ impl EntityStore for SqlEntityStore {
         .await
     }
 
+    async fn entity_sequence(&self, id: Uuid) -> Result<Option<i64>, StorageError> {
+        let id = id.to_string();
+        self.with_reader("entity_sequence", move |conn| {
+            conn.query_row(
+                "SELECT seq FROM entities_seq WHERE entity_id = ?1",
+                rusqlite::params![id],
+                |row| row.get(0),
+            )
+            .optional()
+        })
+        .await
+    }
+
     async fn delete_entity(&self, id: Uuid, mode: DeleteMode) -> Result<bool, StorageError> {
         match mode {
             DeleteMode::Soft => {
@@ -772,6 +786,71 @@ impl EntityStore for SqlEntityStore {
             }
 
             Ok(Page { items, total })
+        })
+        .await
+    }
+
+    async fn query_entities_after(
+        &self,
+        namespace: &str,
+        filter: EntityFilter,
+        after: Option<SeekCursor>,
+        limit: u32,
+    ) -> Result<SeekPage<Entity>, StorageError> {
+        if limit == 0 {
+            return Ok(SeekPage::default());
+        }
+        if !filter.names_ci.is_empty() {
+            return Err(StorageError::InvalidInput {
+                capability: StorageCapability::Entities,
+                operation: "query_entities_after".into(),
+                message: "names_ci candidate folding is not compatible with seek pagination".into(),
+            });
+        }
+
+        let namespace = namespace.to_string();
+        let limit_usize = limit as usize;
+        let probe_limit_i64 = i64::from(limit) + 1;
+        self.with_reader("query_entities_after", move |conn| {
+            let (mut where_sql, mut params) = build_entity_where(&namespace, &filter);
+            if let Some(cursor) = after {
+                params.push(Box::new(cursor.sequence));
+                where_sql.push_str(&format!(" AND entities_seq.seq > ?{}", params.len()));
+            }
+            params.push(Box::new(probe_limit_i64));
+            let limit_idx = params.len();
+
+            let columns = "id, namespace, kind, entity_type, name, description, properties, tags, \
+                           created_at, updated_at, deleted_at, merged_into, merge_event_id, content_ref";
+            // CROSS JOIN is load-bearing: SQLite must drive the query from the
+            // sequence INTEGER PRIMARY KEY range instead of scanning the
+            // namespace index and sorting all matches into a temp B-tree.
+            let sql = format!(
+                "SELECT {columns}, entities_seq.seq FROM entities_seq \
+                 CROSS JOIN entities ON entities.id = entities_seq.entity_id{where_sql} \
+                 ORDER BY entities_seq.seq ASC LIMIT ?{limit_idx}"
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+                params.iter().map(|param| param.as_ref()).collect();
+            let rows = stmt.query_map(param_refs.as_slice(), |row| {
+                Ok((read_entity(row)?, row.get::<_, i64>(14)?))
+            })?;
+            let mut entries = rows.collect::<Result<Vec<_>, _>>()?;
+            let has_more = entries.len() > limit_usize;
+            if has_more {
+                entries.truncate(limit_usize);
+            }
+            let next_after = if has_more {
+                entries.last().map(|(entity, sequence)| SeekCursor {
+                    sequence: *sequence,
+                    id: entity.id,
+                })
+            } else {
+                None
+            };
+            let items = entries.into_iter().map(|(entity, _)| entity).collect();
+            Ok(SeekPage { items, next_after })
         })
         .await
     }

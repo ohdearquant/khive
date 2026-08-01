@@ -239,20 +239,18 @@ to send instead: an object containing the keys the caller intends to set.
   `update` and `merge`.
 
 The second claim rests on there being no legitimate writer of those fields after creation, which
-holds at source. Comm's post-write property writes do not go through the `update` verb at all:
-they use the store-level `update_note_properties` at `khive-pack-comm/src/handlers.rs:450`
-(read-marking, writes `read`) and `:2371` (ADR-122 outbox delivery outcome, writing only
-`delivery`, `failed_at`, `last_error`, `delivery_attempts` and `next_attempt_at`,
-`handlers.rs:2320-2366`). No production path writes `from_actor`, `direction` or `sent_at` after
-creation; every other occurrence is a creation-site build (`message.rs:204,298`,
-`handlers.rs:141,681,1193`, `khive-component-email/src/lib.rs:556`) or a test fixture
-(`handlers.rs:2745-2760`).
+holds at source. Comm's post-write read bookkeeping does not go through the `update` verb: both
+`handle_read` and `handle_reply` call the store-level `set_note_property` with the literal key
+`read`. That single-key path prevents unrelated concurrent metadata from being lost, but it does
+not make identity mutation legitimate. No production path writes `from_actor`, `direction`, or
+`sent_at` after creation; every other occurrence is a creation-site build or a test fixture.
 
-The bound, stated so it is recognised rather than rediscovered: `update_note_properties` is a
-store-level path that bypasses the owned-field check entirely. It is safe today because it has no
-verb surface and writes only delivery and read bookkeeping. Giving it a caller-facing surface, or
-using it to write an identity field, reopens the hole this ADR closes; no check is added there
-now.
+The bound, stated so it is recognised rather than rediscovered: both
+`update_note_properties` (whole-document replacement) and `set_note_property` (one-key atomic set)
+are store-level paths that bypass the owned-field check entirely. They are safe only while they
+have no caller-facing verb surface and pack code limits them to its own mutable bookkeeping keys.
+Giving either a caller-facing surface, or using either to write an identity field, reopens the hole
+this ADR closes; no identity check belongs in the kind-agnostic storage layer.
 
 **4. A merge cannot rewrite who sent a message.**
 

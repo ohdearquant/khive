@@ -4,12 +4,13 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use rusqlite::OptionalExtension;
 use uuid::Uuid;
 
 use khive_storage::error::StorageError;
 use khive_storage::note::{FilterOp, Note, NoteFilter, SortDir};
 use khive_storage::types::{
-    BatchWriteSummary, DeleteMode, Page, PageRequest, SqlStatement, SqlValue,
+    BatchWriteSummary, DeleteMode, Page, PageRequest, SeekCursor, SeekPage, SqlStatement, SqlValue,
 };
 use khive_storage::NoteStore;
 use khive_storage::StorageCapability;
@@ -109,8 +110,8 @@ pub fn note_upsert_statement(note: &Note) -> SqlStatement {
 }
 
 /// The exact `properties`/`updated_at` `UPDATE` this store's
-/// `update_note_properties` issues. A real `UPDATE` never triggers SQLite's
-/// `INSERT OR REPLACE` delete+insert, so the row is patched in place (#780).
+/// `update_note_properties` issues. The row is patched in place without
+/// rewriting any other note column or its stable row identity (#780).
 /// The `comm.probe` cursor is keyed on `notes_seq.seq`, which is fixed at
 /// first insert and survives a delete+reinsert of the same note id, so this
 /// is defensive rather than load-bearing for cursor correctness; a metadata
@@ -137,6 +138,48 @@ pub fn note_update_properties_statement(
         ],
         label: Some("note-update-properties".to_string()),
     }
+}
+
+/// The atomic top-level JSON-property `UPDATE` issued by
+/// [`NoteStore::set_note_property`]. The key is encoded as one quoted JSON
+/// path segment, so punctuation is literal rather than interpreted as nested
+/// path syntax. `json(?2)` preserves the bound value's JSON type instead of
+/// storing objects, arrays, booleans, or numbers as JSON strings.
+///
+/// SQL-NULL documents start from `{}`. JSON arrays/scalars/null are not
+/// property objects and are left untouched; the caller receives `false`.
+pub fn note_set_property_statement(
+    id: Uuid,
+    key: &str,
+    value: &serde_json::Value,
+    updated_at: i64,
+) -> Result<SqlStatement, StorageError> {
+    // SQLite JSON-path object labels terminate at U+0000. Passing such a key
+    // through `json_set` can therefore select a shorter sibling key instead
+    // of the requested literal key, so reject it before constructing SQL.
+    if key.contains('\0') {
+        return Err(StorageError::InvalidInput {
+            capability: StorageCapability::Notes,
+            operation: "set_note_property".into(),
+            message: "property key must not contain U+0000".to_string(),
+        });
+    }
+    let path = format!("$.{}", serde_json::Value::String(key.to_string()));
+    Ok(SqlStatement {
+        sql: "UPDATE notes \
+              SET properties = json_set(COALESCE(properties, '{}'), ?1, json(?2)), \
+                  updated_at = ?3 \
+              WHERE id = ?4 AND deleted_at IS NULL \
+                AND (properties IS NULL OR json_type(properties) = 'object')"
+            .to_string(),
+        params: vec![
+            SqlValue::Text(path),
+            SqlValue::Text(value.to_string()),
+            SqlValue::Integer(updated_at),
+            SqlValue::Text(id.to_string()),
+        ],
+        label: Some("note-set-property".to_string()),
+    })
 }
 
 /// The exact soft-delete `UPDATE` this store's `delete_note(Soft)` issues.
@@ -218,12 +261,13 @@ impl SqlNoteStore {
     /// to the legacy pool-mutex path (ADR-067 Component A, Fork C slice 2).
     ///
     /// This is the routing point for single-statement `with_writer` callers
-    /// in this store (`update_note_properties`, `delete_note`). `f` must be
-    /// DML-only — on the flag-on path it runs inside the WriterTask's own
-    /// transaction, so a bare `BEGIN IMMEDIATE` would violate SQLite's
-    /// nested-transaction rule. `upsert_notes` (the batch method) does its
-    /// own flag check and returns early on `Some`, so its fallback call
-    /// into this helper only ever executes on the flag-off path
+    /// in this store (`update_note_properties`, `set_note_property`,
+    /// `delete_note`). `f` must be DML-only — on the flag-on path it runs
+    /// inside the WriterTask's own transaction, so a bare `BEGIN IMMEDIATE`
+    /// would violate SQLite's nested-transaction rule. `upsert_notes` (the
+    /// batch method) does its own flag check and returns early on `Some`, so
+    /// its fallback call into this helper only ever executes on the flag-off
+    /// path
     /// (`self.writer_task` is `None` by construction whenever that call is
     /// reached) — no double-routing. Callers whose `f` issues more than one
     /// DML statement that must land atomically together (`upsert_note`,
@@ -734,6 +778,22 @@ impl NoteStore for SqlNoteStore {
         .await
     }
 
+    async fn set_note_property(
+        &self,
+        id: Uuid,
+        key: &str,
+        value: serde_json::Value,
+        updated_at: i64,
+    ) -> Result<bool, StorageError> {
+        let statement = note_set_property_statement(id, key, &value, updated_at)?;
+        self.with_writer("set_note_property", move |conn| {
+            let mut stmt = conn.prepare(&statement.sql)?;
+            bind_params(&mut stmt, &statement.params)?;
+            Ok(stmt.raw_execute()? > 0)
+        })
+        .await
+    }
+
     async fn try_insert_note(&self, note: Note) -> Result<bool, StorageError> {
         let namespace = note.namespace.clone();
         let id_str = note.id.to_string();
@@ -871,6 +931,19 @@ impl NoteStore for SqlNoteStore {
                 Some(row) => Ok(Some(read_note(row)?)),
                 None => Ok(None),
             }
+        })
+        .await
+    }
+
+    async fn note_sequence(&self, id: Uuid) -> Result<Option<i64>, StorageError> {
+        let id = id.to_string();
+        self.with_reader("note_sequence", move |conn| {
+            conn.query_row(
+                "SELECT seq FROM notes_seq WHERE note_id = ?1",
+                rusqlite::params![id],
+                |row| row.get(0),
+            )
+            .optional()
         })
         .await
     }
@@ -1052,6 +1125,73 @@ impl NoteStore for SqlNoteStore {
                 &data_sql,
                 &data_params,
             )
+        })
+        .await
+    }
+
+    async fn query_notes_filtered_after(
+        &self,
+        namespace: &str,
+        filter: &NoteFilter,
+        after: Option<SeekCursor>,
+        limit: u32,
+    ) -> Result<SeekPage<Note>, StorageError> {
+        if limit == 0 {
+            return Ok(SeekPage::default());
+        }
+        if filter.order_by.is_some() {
+            return Err(StorageError::InvalidInput {
+                capability: StorageCapability::Notes,
+                operation: "query_notes_filtered_after".into(),
+                message: "custom order_by is not compatible with insertion-sequence pagination"
+                    .into(),
+            });
+        }
+        for property_filter in &filter.property_filters {
+            validate_json_path(&property_filter.json_path)?;
+        }
+
+        let namespace = namespace.to_string();
+        let filter = filter.clone();
+        let limit_usize = limit as usize;
+        let probe_limit_i64 = i64::from(limit) + 1;
+        self.with_reader("query_notes_filtered_after", move |conn| {
+            let (mut where_sql, mut params) = build_note_filter_where(&namespace, &filter)?;
+            if let Some(cursor) = after {
+                params.push(Box::new(cursor.sequence));
+                where_sql.push_str(&format!(" AND notes_seq.seq > ?{}", params.len()));
+            }
+            params.push(Box::new(probe_limit_i64));
+            let limit_idx = params.len();
+            // CROSS JOIN fixes the ledger as the outer loop, preserving an
+            // indexed `seq > boundary` scan with no full-match sort.
+            let sql = format!(
+                "SELECT id, namespace, kind, status, name, content, salience, decay_factor, \
+                 expires_at, properties, created_at, updated_at, deleted_at, notes_seq.seq \
+                 FROM notes_seq CROSS JOIN notes ON notes.id = notes_seq.note_id{where_sql} \
+                 ORDER BY notes_seq.seq ASC LIMIT ?{limit_idx}"
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+                params.iter().map(|param| param.as_ref()).collect();
+            let rows = stmt.query_map(param_refs.as_slice(), |row| {
+                Ok((read_note(row)?, row.get::<_, i64>(13)?))
+            })?;
+            let mut entries = rows.collect::<Result<Vec<_>, _>>()?;
+            let has_more = entries.len() > limit_usize;
+            if has_more {
+                entries.truncate(limit_usize);
+            }
+            let next_after = if has_more {
+                entries.last().map(|(note, sequence)| SeekCursor {
+                    sequence: *sequence,
+                    id: note.id,
+                })
+            } else {
+                None
+            };
+            let items = entries.into_iter().map(|(note, _)| note).collect();
+            Ok(SeekPage { items, next_after })
         })
         .await
     }

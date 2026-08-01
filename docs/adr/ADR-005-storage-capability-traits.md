@@ -44,6 +44,10 @@ pub trait NoteStore: Send + Sync + 'static {
     async fn upsert_notes(&self, notes: Vec<Note>) -> StorageResult<BatchWriteSummary>;
     async fn get_note(&self, id: Uuid) -> StorageResult<Option<Note>>;
     async fn delete_note(&self, id: Uuid, mode: DeleteMode) -> StorageResult<bool>;
+    async fn update_note_properties(&self, id: Uuid, properties: Option<Value>,
+                                    updated_at: i64) -> StorageResult<bool>;
+    async fn set_note_property(&self, id: Uuid, key: &str, value: Value,
+                               updated_at: i64) -> StorageResult<bool>;
     async fn query_notes(&self, namespace: &str, kind: Option<&str>,
                          filter: Page) -> StorageResult<Vec<Note>>;
     async fn count_notes(&self, namespace: &str, kind: Option<&str>) -> StorageResult<u64>;
@@ -156,6 +160,23 @@ is the backend's responsibility, not the trait's contract. Backends that support
 only single-vector records reject multi-vector inserts with `StorageError::Unsupported`.
 
 `EventStore` is append-only by construction. There is no `update_event` or `delete_event`.
+
+### Atomic note-property mutation
+
+`update_note_properties` remains the explicit whole-document replacement operation. Callers that
+own only one field must use `set_note_property`: it sets one literal top-level key and refreshes
+`updated_at` as one backend operation. A backend must not implement it as `get_note` followed by
+`update_note_properties`, because two writers setting different keys would still lose the earlier
+write. SQLite lowers the operation to one `UPDATE ... json_set(...)` statement.
+
+The value retains its JSON type, including explicit JSON `null`; this is set semantics, not JSON
+Merge Patch deletion semantics. A SQL-NULL document starts as `{}`. A live row whose stored
+properties value is an array, scalar, or JSON `null` is not an object and is left unchanged, with
+the method returning `false`. Missing and soft-deleted rows also return `false`. The method is a
+storage capability only: runtime/pack code still owns authorization, kind rules, secret checks,
+and reserved-field policy. Keys containing U+0000 are rejected with `InvalidInput`: SQLite's JSON
+path implementation cannot address an object label past that code point and could otherwise mutate
+a shorter sibling key instead of the requested literal key.
 
 ### Dispatch: `Arc<dyn Trait>`
 

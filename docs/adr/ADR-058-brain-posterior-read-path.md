@@ -712,6 +712,35 @@ must add `brain.serve_weights` to that table with:
 This item is the implementer checklist for the (separate) #542 implementation PR — no `.rs` files
 change in this spec-delta PR itself.
 
+### Amendment (2026-08-01): loaded-consumer validation for bindings
+
+The typed `ConsumerKind` enum above records the brain domains recognized by the Rust
+implementation, including deferred domains such as `rerank`. It does not prove that a consumer
+for every variant is present in a particular loaded pack set. A binding for a typed but dormant
+kind is just as unreachable as a misspelled kind.
+
+Issue #1467 closes that gap through the pack vocabulary contract in ADR-017:
+
+- a pack that requests profile resolution declares the exact wire values in
+  `Pack::BRAIN_CONSUMER_KINDS` and mirrors them through
+  `PackRuntime::brain_consumer_kinds()`;
+- `VerbRegistry::all_brain_consumer_kinds()` composes and deduplicates the loaded declarations;
+- `brain.bind` accepts the explicit `"*"` wildcard, but rejects any specific kind absent from
+  that aggregate and reports the valid loaded values;
+- the brain and memory packs declare `recall`, and the knowledge pack declares
+  `knowledge_compose`. `rerank` remains invalid until a loaded pack actually requests it.
+
+This validation applies at the binding write boundary. `brain.resolve` remains an honest read
+surface for inspection and still reports whether a binding matched. Existing stored rows are not
+rewritten: persistence remains historical, and a later consistency view can identify legacy
+rows whose kind is no longer registered.
+
+A per-occurrence event for every unbound fallback is deferred. `matched_binding=false` is the
+normal result when no explicit binding was intended, so emitting an error-like signal on every
+fallback would be noisy and cannot distinguish absence-by-design from a stale operator intent.
+The write-time validation prevents new unreachable bindings without changing the event contract;
+a future diagnostic should compare persisted bindings to the registry aggregate directly.
+
 ---
 
 ## Determinism and test plan

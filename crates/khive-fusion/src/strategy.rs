@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
-/// Default RRF constant k=60, standard in literature (Craswell et al., 2009).
+/// Default RRF constant k=60, standard in literature (Cormack et al., 2009).
 pub const DEFAULT_RRF_K: usize = 60;
 
 /// Error returned when a [`FusionStrategy`] fails invariant validation.

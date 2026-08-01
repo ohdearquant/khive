@@ -13,6 +13,13 @@ durability guarantee. Automatic shared-log catch-up and replay remain deferred b
 live inside each profile's own state, opaque to brain core. This means the brain pack has no
 knowledge of the internal structure of profile state — it stores opaque snapshots.
 
+**Cross-process coherence**: the namespace snapshot's monotonically-raised `updated_at` is its
+durable generation. Warm packs reload when that value advances, and durable mutations read the
+latest generation inside their SQLite write transaction before applying a full-state replacement,
+loading the durable snapshot payload only when the process-local generation differs.
+Concurrent processes therefore observe committed profiles/bindings and cannot silently
+overwrite a newer registry with a stale process-local blob.
+
 **Balanced-recall-v1 profile**: The built-in default profile uses three Beta posteriors:
 
 - `relevance_weight` — prior $\text{Beta}(7, 3)$: warm-starts expecting 70% retrieval relevance
@@ -37,7 +44,9 @@ must go through Inactive before archiving. `brain.reset` is only valid on non-ar
 **Profile resolution** (`brain.resolve`): Longest-match wins — actor + namespace + consumer_kind
 scores higher than actor + consumer_kind, which scores higher than consumer_kind alone.
 Archived profiles are filtered out before scoring. The `balanced-recall-v1` profile is the
-system-default fallback for `consumer_kind="recall"` when no explicit binding matches.
+system-default fallback for `consumer_kind="recall"` when no explicit binding matches. Specific
+`brain.bind` consumer kinds must appear in the loaded registry's composed
+`BRAIN_CONSUMER_KINDS`; `"*"` remains the explicit wildcard.
 
 **Event interpretation** (`event::interpret`): The `brain.feedback` verb is the
 `FeedbackExplicit` event emitter. `brain.emit` predates this design and its log entries are
@@ -102,10 +111,17 @@ $$\text{Beta}(\alpha_1 + \alpha_2 - \alpha_{\text{prior}},\; \beta_1 + \beta_2 -
 - Archived profiles are filtered out by `brain.resolve` before scoring so that stale bindings
   pointing at archived profiles do not block resolution of live lower-priority bindings (issue #357).
 - `brain.feedback` validates `target_id` existence against the KG before folding, and validates
-  `served_by_profile_id` lifecycle before updating (must be non-archived). Lifecycle check
-  precedes the event-log append so rejected calls leave no trace in the log (issue C4, R3-1).
+  `served_by_profile_id` lifecycle before updating (must be non-archived). The authoritative
+  lifecycle check runs against the rebased snapshot inside the write transaction before the
+  public event, private event, fold-gate state, or replacement snapshot is written, so a peer
+  archive racing a warm preflight leaves no partial feedback trace (issue C4, R3-1).
 - `brain.unbind` requires at least one filter (`profile_id`, `actor`, `namespace`, or
   `consumer_kind`) to prevent accidental wipe of all bindings (issue C2).
 - `brain.bind` rejects archived profiles to prevent creating unresolvable bindings (issue C3).
 - `brain.create_profile` enforces a profile-id grammar: alphanumeric + hyphens only, no dots,
   underscores, or wildcards; leading/trailing whitespace is trimmed (issue R3-3).
+- `brain.auto_feedback(namespace=...)` applies ADR-007's exact escape to both sides of the
+  mutation: the feedback event/fold-gate row and the selected namespace's live + durable
+  posterior state. Target IDs remain globally resolvable by ID. Direct `PackRuntime` calls must
+  present an authorized token whose namespace matches the parameter; the handler validates that
+  equality and never treats the business parameter itself as authority (issue #1505).

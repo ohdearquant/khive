@@ -12,6 +12,7 @@ use khive_runtime::{
     AllowAllGate, BackendId, KhiveRuntime, Namespace, NamespaceToken, RuntimeConfig, VerbRegistry,
     VerbRegistryBuilder,
 };
+use khive_storage::types::{SqlRow, SqlValue};
 use khive_types::Pack;
 
 fn build_registry() -> (VerbRegistry, KhiveRuntime) {
@@ -37,6 +38,62 @@ fn build_registry_for_ns(ns: &str) -> (VerbRegistry, KhiveRuntime) {
 #[test]
 fn comm_pack_declares_message_note_kind() {
     assert!(CommPack::NOTE_KINDS.contains(&"message"));
+}
+
+#[tokio::test]
+async fn pack_registered_message_notes_are_queryable_through_gql() {
+    let (registry, rt) = build_registry_for_ns("local");
+    assert!(
+        registry.all_note_kinds().contains(&"message"),
+        "the built registry must expose comm's message note kind"
+    );
+
+    registry
+        .dispatch(
+            "comm.send",
+            serde_json::json!({
+                "to": "local",
+                "content": "GQL pack-note regression"
+            }),
+        )
+        .await
+        .expect("self-send creates message notes");
+
+    let token = rt.authorize(Namespace::local()).expect("local token");
+    let by_granular_label = rt
+        .query(&token, "MATCH (m:message) RETURN m.id")
+        .await
+        .expect("pack-registered granular label compiles and executes");
+    let by_note_kind = rt
+        .query(
+            &token,
+            "MATCH (m:note) WHERE m.kind = 'message' RETURN m.id",
+        )
+        .await
+        .expect("note substrate plus kind predicate compiles and executes");
+
+    fn ids(rows: &[SqlRow]) -> Vec<String> {
+        let mut ids: Vec<String> = rows
+            .iter()
+            .map(|row| match row.get("m_id") {
+                Some(SqlValue::Text(id)) => id.clone(),
+                value => panic!("GQL m.id projection must be text; got {value:?}"),
+            })
+            .collect();
+        ids.sort();
+        ids
+    }
+
+    let granular_ids = ids(&by_granular_label);
+    assert!(
+        !granular_ids.is_empty(),
+        "MATCH (m:message) must return the message rows just written"
+    );
+    assert_eq!(
+        granular_ids,
+        ids(&by_note_kind),
+        "granular and substrate-plus-kind spellings must select the same message notes"
+    );
 }
 
 #[test]
@@ -975,9 +1032,9 @@ async fn test_reply_marks_directionless_legacy_original() {
     );
 }
 
-/// The read-patch must not clobber properties written between the original's
-/// fetch and the patch: reply re-reads current properties before setting
-/// `read`, since the store replaces the properties object wholesale.
+/// The read patch must not clobber an unrelated property. Both writes use the
+/// storage layer's one-statement JSON-property setter, so the invariant does
+/// not depend on a best-effort re-read immediately before replacement.
 #[tokio::test]
 async fn test_reply_read_patch_preserves_concurrent_properties() {
     use khive_storage::note::Note;
@@ -1009,15 +1066,15 @@ async fn test_reply_read_patch_preserves_concurrent_properties() {
         .await
         .expect("insert message");
 
-    // Stand in for another writer stamping metadata after the original was
-    // fetched: patch a new property directly, then reply.
-    let mut with_stamp = serde_json::json!({
-        "direction": "inbound", "from": "x", "to": "local", "read": false,
-        "delivery_stamp": "channel-email"
-    });
-    with_stamp["read"] = serde_json::json!(false);
+    // Stand in for another writer stamping metadata, then let reply perform
+    // its independent atomic `read` set.
     store
-        .update_note_properties(id, Some(with_stamp), now + 1)
+        .set_note_property(
+            id,
+            "delivery_stamp",
+            serde_json::json!("channel-email"),
+            now + 1,
+        )
         .await
         .expect("stamp applied");
 
@@ -5866,6 +5923,7 @@ async fn heartbeat_success_is_visible_via_health() {
                 "namespace": "local",
                 "channel_kind": "email",
                 "channel_slug": "recipient@example.com",
+                "poll_interval_secs": 5,
                 "outcome": "success",
             }),
         )
@@ -5884,11 +5942,163 @@ async fn heartbeat_success_is_visible_via_health() {
     let ch = &channels[0];
     assert_eq!(ch["channel_kind"].as_str(), Some("email"));
     assert_eq!(ch["channel_slug"].as_str(), Some("recipient@example.com"));
+    assert_eq!(ch["poll_interval_secs"].as_u64(), Some(5));
+    assert_eq!(ch["stalled"].as_bool(), Some(false));
     assert!(ch["last_success_at"].as_str().is_some());
     assert!(ch["last_poll_attempt_at"].as_str().is_some());
     assert!(ch["last_failure_at"].is_null());
     assert!(ch["last_error"].is_null());
     assert_eq!(ch["consecutive_failures"].as_u64(), Some(0));
+}
+
+/// #1472: a silently stopped poller must be distinguishable from a healthy,
+/// idle channel even when its persisted failure count is zero.
+#[tokio::test]
+async fn health_flags_stopped_poller_after_three_nominal_intervals() {
+    let (registry, _rt) = build_registry_for_ns("local");
+    let old_attempt = (chrono::Utc::now() - chrono::Duration::seconds(16)).to_rfc3339();
+
+    registry
+        .dispatch(
+            "comm.heartbeat",
+            serde_json::json!({
+                "namespace": "local",
+                "channel_kind": "email",
+                "channel_slug": "stopped@example.com",
+                "poll_interval_secs": 5,
+                "outcome": "success",
+                "at": old_attempt,
+            }),
+        )
+        .await
+        .expect("heartbeat succeeds");
+
+    let health = registry
+        .dispatch("comm.health", serde_json::json!({}))
+        .await
+        .expect("health succeeds");
+    let channel = &health["channels"][0];
+    assert_eq!(channel["consecutive_failures"].as_u64(), Some(0));
+    assert_eq!(channel["poll_interval_secs"].as_u64(), Some(5));
+    assert_eq!(channel["stalled"].as_bool(), Some(true));
+}
+
+/// Mixed-version rows lack cadence metadata. Their staleness is unknown, not
+/// false: `false` would misreport an old frozen row as current.
+#[tokio::test]
+async fn health_reports_null_stalled_for_legacy_heartbeat() {
+    let (registry, _rt) = build_registry_for_ns("local");
+
+    registry
+        .dispatch(
+            "comm.heartbeat",
+            serde_json::json!({
+                "namespace": "local",
+                "channel_kind": "email",
+                "channel_slug": "legacy@example.com",
+                "outcome": "success",
+                "at": "2020-01-01T00:00:00Z",
+            }),
+        )
+        .await
+        .expect("legacy heartbeat succeeds");
+
+    let health = registry
+        .dispatch("comm.health", serde_json::json!({}))
+        .await
+        .expect("health succeeds");
+    let channel = &health["channels"][0];
+    assert!(channel["poll_interval_secs"].is_null());
+    assert!(channel["stalled"].is_null());
+}
+
+/// A future attempt timestamp cannot support an elapsed-time judgment (for
+/// example under clock skew), so it must not be reported as current.
+#[tokio::test]
+async fn health_reports_null_stalled_for_future_attempt() {
+    let (registry, _rt) = build_registry_for_ns("local");
+    let future_attempt = (chrono::Utc::now() + chrono::Duration::seconds(60)).to_rfc3339();
+
+    registry
+        .dispatch(
+            "comm.heartbeat",
+            serde_json::json!({
+                "namespace": "local",
+                "channel_kind": "email",
+                "channel_slug": "future@example.com",
+                "poll_interval_secs": 5,
+                "outcome": "success",
+                "at": future_attempt,
+            }),
+        )
+        .await
+        .expect("heartbeat succeeds");
+
+    let health = registry
+        .dispatch("comm.health", serde_json::json!({}))
+        .await
+        .expect("health succeeds");
+    assert!(health["channels"][0]["stalled"].is_null());
+}
+
+/// Malformed persisted failure counters cannot safely distinguish a healthy
+/// idle channel from one in failure/backoff, so their staleness is unknown.
+#[tokio::test]
+async fn health_reports_null_stalled_for_malformed_or_missing_failure_count() {
+    use khive_storage::note::Note;
+
+    let (registry, rt) = build_registry_for_ns("local");
+    let token = rt
+        .authorize(khive_runtime::Namespace::local())
+        .expect("authorize local");
+    let store = rt.notes(&token).expect("notes store");
+    let old_attempt = (chrono::Utc::now() - chrono::Duration::seconds(60)).to_rfc3339();
+
+    for (slug, failure_count) in [
+        ("missing@example.com", None),
+        ("string@example.com", Some(serde_json::json!("1"))),
+        ("negative@example.com", Some(serde_json::json!(-1))),
+    ] {
+        let mut properties = serde_json::json!({
+            "channel_kind": "email",
+            "channel_slug": slug,
+            "poll_interval_secs": 5,
+            "last_poll_attempt_at": old_attempt,
+        });
+        if let Some(failure_count) = failure_count {
+            properties["consecutive_failures"] = failure_count;
+        }
+        let now = chrono::Utc::now().timestamp_micros();
+        store
+            .upsert_note(Note {
+                id: uuid::Uuid::new_v4(),
+                namespace: "local".to_string(),
+                kind: "channel_health".to_string(),
+                status: "active".to_string(),
+                name: Some(format!("email:{slug}")),
+                content: format!("channel heartbeat: email:{slug}"),
+                salience: None,
+                decay_factor: None,
+                expires_at: None,
+                properties: Some(properties),
+                created_at: now,
+                updated_at: now,
+                deleted_at: None,
+            })
+            .await
+            .expect("upsert malformed channel_health row");
+    }
+
+    let health = registry
+        .dispatch("comm.health", serde_json::json!({}))
+        .await
+        .expect("health succeeds");
+    let channels = health["channels"].as_array().expect("channels is array");
+    assert_eq!(channels.len(), 3);
+    assert!(
+        channels.iter().all(|channel| channel["stalled"].is_null()),
+        "malformed or missing failure counts must produce stalled: null: {channels:?}"
+    );
 }
 
 /// design review amendment 3: `last_error` is RETAINED after a subsequent success
@@ -5905,6 +6115,7 @@ async fn heartbeat_retains_last_error_after_success_but_resets_consecutive_failu
                 "namespace": "local",
                 "channel_kind": "email",
                 "channel_slug": "recipient@example.com",
+                "poll_interval_secs": 5,
                 "outcome": "failure",
                 "error_class": "auth",
                 "error_message": "XOAUTH2 handshake failed",
@@ -5919,6 +6130,7 @@ async fn heartbeat_retains_last_error_after_success_but_resets_consecutive_failu
                 "namespace": "local",
                 "channel_kind": "email",
                 "channel_slug": "recipient@example.com",
+                "poll_interval_secs": 5,
                 "outcome": "failure",
                 "error_class": "auth",
                 "error_message": "XOAUTH2 handshake failed",
@@ -5934,6 +6146,10 @@ async fn heartbeat_retains_last_error_after_success_but_resets_consecutive_failu
     let ch = &after_failures["channels"][0];
     assert_eq!(ch["consecutive_failures"].as_u64(), Some(2));
     assert_eq!(ch["last_error"]["class"].as_str(), Some("auth"));
+    assert!(
+        ch["stalled"].is_null(),
+        "known failure/backoff state has no nominal-cadence stall judgment"
+    );
 
     registry
         .dispatch(
@@ -5942,6 +6158,7 @@ async fn heartbeat_retains_last_error_after_success_but_resets_consecutive_failu
                 "namespace": "local",
                 "channel_kind": "email",
                 "channel_slug": "recipient@example.com",
+                "poll_interval_secs": 5,
                 "outcome": "success",
             }),
         )
@@ -5967,6 +6184,7 @@ async fn heartbeat_retains_last_error_after_success_but_resets_consecutive_failu
         ch["last_success_at"].as_str().is_some(),
         "last_success_at must be set"
     );
+    assert_eq!(ch["stalled"].as_bool(), Some(false));
 }
 
 /// design review amendment 2: rows are keyed by channel slug + kind, never kind
@@ -6070,6 +6288,29 @@ async fn heartbeat_requires_error_class_on_failure() {
         .expect_err("failure outcome without error_class must be rejected");
     assert!(
         err.to_string().contains("error_class"),
+        "unexpected error message: {err}"
+    );
+}
+
+#[tokio::test]
+async fn heartbeat_rejects_zero_poll_interval() {
+    let (registry, _rt) = build_registry_for_ns("local");
+
+    let err = registry
+        .dispatch(
+            "comm.heartbeat",
+            serde_json::json!({
+                "namespace": "local",
+                "channel_kind": "email",
+                "channel_slug": "recipient@example.com",
+                "poll_interval_secs": 0,
+                "outcome": "success",
+            }),
+        )
+        .await
+        .expect_err("zero poll interval must be rejected");
+    assert!(
+        err.to_string().contains("poll_interval_secs"),
         "unexpected error message: {err}"
     );
 }

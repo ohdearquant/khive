@@ -458,6 +458,145 @@ async fn test_note_status_field_roundtrip() {
     assert_eq!(fetched.status, "active");
 }
 
+#[tokio::test]
+async fn set_note_property_initializes_null_and_preserves_json_type() {
+    let store = setup_memory_store();
+    let note = make_note("default", "observation", "atomic property set");
+    let id = note.id;
+    let updated_at = note.updated_at + 1;
+    store.upsert_note(note).await.unwrap();
+
+    assert!(store
+        .set_note_property(
+            id,
+            "delivery.stamp",
+            serde_json::json!({ "channel": "email", "attempt": 1 }),
+            updated_at,
+        )
+        .await
+        .unwrap());
+    assert!(store
+        .set_note_property(id, "explicit_null", serde_json::Value::Null, updated_at + 1)
+        .await
+        .unwrap());
+
+    let fetched = store.get_note(id).await.unwrap().unwrap();
+    assert_eq!(
+        fetched.properties,
+        Some(serde_json::json!({
+            "delivery.stamp": { "channel": "email", "attempt": 1 },
+            "explicit_null": null
+        })),
+        "keys must be literal top-level segments and values must keep their JSON types"
+    );
+    assert_eq!(fetched.updated_at, updated_at + 1);
+}
+
+#[tokio::test]
+async fn concurrent_distinct_note_property_sets_both_survive() {
+    let store = Arc::new(setup_memory_store());
+    let note = make_note("default", "message", "concurrent atomic properties")
+        .with_properties(serde_json::json!({ "existing": "preserved" }));
+    let id = note.id;
+    let updated_at = note.updated_at;
+    store.upsert_note(note).await.unwrap();
+
+    let gate = Arc::new(tokio::sync::Barrier::new(3));
+    let left = {
+        let store = Arc::clone(&store);
+        let gate = Arc::clone(&gate);
+        tokio::spawn(async move {
+            gate.wait().await;
+            store
+                .set_note_property(
+                    id,
+                    "delivery_stamp",
+                    serde_json::json!("email"),
+                    updated_at + 1,
+                )
+                .await
+        })
+    };
+    let right = {
+        let store = Arc::clone(&store);
+        let gate = Arc::clone(&gate);
+        tokio::spawn(async move {
+            gate.wait().await;
+            store
+                .set_note_property(id, "ingest_marker", serde_json::json!(true), updated_at + 2)
+                .await
+        })
+    };
+
+    gate.wait().await;
+    assert!(left.await.unwrap().unwrap());
+    assert!(right.await.unwrap().unwrap());
+
+    let fetched = store.get_note(id).await.unwrap().unwrap();
+    assert_eq!(
+        fetched.properties,
+        Some(serde_json::json!({
+            "existing": "preserved",
+            "delivery_stamp": "email",
+            "ingest_marker": true
+        })),
+        "one-statement property sets must not lose a different concurrent key"
+    );
+}
+
+#[tokio::test]
+async fn set_note_property_refuses_non_object_document() {
+    let store = setup_memory_store();
+    let note = make_note("default", "observation", "scalar properties")
+        .with_properties(serde_json::json!(["not", "an", "object"]));
+    let id = note.id;
+    let original_updated_at = note.updated_at;
+    store.upsert_note(note).await.unwrap();
+
+    assert!(!store
+        .set_note_property(id, "read", serde_json::json!(true), original_updated_at + 1)
+        .await
+        .unwrap());
+    let fetched = store.get_note(id).await.unwrap().unwrap();
+    assert_eq!(
+        fetched.properties,
+        Some(serde_json::json!(["not", "an", "object"]))
+    );
+    assert_eq!(fetched.updated_at, original_updated_at);
+}
+
+#[tokio::test]
+async fn set_note_property_rejects_nul_key_without_mutation() {
+    let store = setup_memory_store();
+    let note = make_note("default", "observation", "nul property key").with_properties(
+        serde_json::json!({
+            "a": 0,
+            "a\u{0000}b": 9,
+        }),
+    );
+    let id = note.id;
+    let original_updated_at = note.updated_at;
+    let original_properties = note.properties.clone();
+    store.upsert_note(note).await.unwrap();
+
+    let result = store
+        .set_note_property(
+            id,
+            "a\u{0000}b",
+            serde_json::json!(1),
+            original_updated_at + 1,
+        )
+        .await;
+    assert!(
+        matches!(result, Err(StorageError::InvalidInput { .. })),
+        "expected InvalidInput, got {result:?}"
+    );
+
+    let fetched = store.get_note(id).await.unwrap().unwrap();
+    assert_eq!(fetched.properties, original_properties);
+    assert_eq!(fetched.updated_at, original_updated_at);
+}
+
 // -- query_notes_filtered tests --
 
 fn make_note_with_props(
@@ -884,11 +1023,15 @@ async fn test_try_insert_note_insert_and_seq_assignment_are_atomic() {
 /// failed `assign_note_seq` mid-batch) propagated via `?` straight out of
 /// the closure, skipping `ROLLBACK` and leaving `BEGIN IMMEDIATE` open on
 /// the shared pool-mutex connection. A `BEFORE INSERT` trigger fails the
-/// sequence assignment for the SECOND note in a two-note batch (the first
-/// note's insert and `assign_note_seq` must already have succeeded by the
-/// time this fires); the whole batch must roll back -- neither note must
-/// survive -- and the connection must not be left poisoned: a subsequent
-/// write through the same pool must still succeed.
+/// redundant explicit `assign_note_seq` safeguard for the SECOND note in a
+/// two-note batch, after V13's `AFTER INSERT ON notes` trigger has made the
+/// first, atomic sequence assignment. This keeps the injected error outside
+/// the per-row UPSERT error path (which intentionally reports partial
+/// success): the first note's insert and sequence assignment must already
+/// have succeeded by the time this fires. The whole batch must roll back --
+/// neither note nor sequence row may survive -- and the connection must not
+/// be left poisoned: a subsequent write through the same pool must still
+/// succeed.
 #[tokio::test]
 async fn test_upsert_notes_batch_rolls_back_fully_on_mid_batch_seq_failure() {
     let store = setup_memory_store();
@@ -901,6 +1044,7 @@ async fn test_upsert_notes_batch_rolls_back_fully_on_mid_batch_seq_failure() {
             .execute_batch(&format!(
                 "CREATE TRIGGER inject_seq_failure_batch BEFORE INSERT ON notes_seq \
                  WHEN NEW.note_id = '{fail_id}' \
+                   AND EXISTS (SELECT 1 FROM notes_seq WHERE note_id = NEW.note_id) \
                  BEGIN SELECT RAISE(ABORT, 'injected mid-batch failure for #827 test'); END;"
             ))
             .unwrap();

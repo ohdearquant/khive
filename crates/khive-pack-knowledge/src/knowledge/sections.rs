@@ -1,5 +1,7 @@
 //! Section handlers: edit, import, challenge, adjudicate; markdown parsing helpers.
 
+use std::collections::BTreeMap;
+
 use serde_json::{json, Value};
 use uuid::Uuid;
 
@@ -330,8 +332,10 @@ impl KnowledgeHandlers {
         // through the metadata-only UPDATE branch above and keep their existing vector.
         // The Vamana ANN snapshot rebuild is deferred (per-edit cost too high);
         // approximate ANN recall over new vectors lags until the next kkernel reindex.
-        // Missing embedder: embed_sections returns (0,0,0) immediately, so edit succeeds.
-        embed_sections(runtime, token, false, 32, None, Some(&atom_id)).await?;
+        // Missing embedder: embed_sections returns zero counters and an empty
+        // truncation report immediately, so edit succeeds.
+        let (_, _, _, section_truncation) =
+            embed_sections(runtime, token, false, 32, None, Some(&atom_id)).await?;
 
         // Refresh this atom's vector-store entry (knowledge.atom field) so atom-granularity
         // semantic recall is also fresh. rebuild_ann=false writes the vector immediately
@@ -339,7 +343,7 @@ impl KnowledgeHandlers {
         // taken for sections above.
         // Missing embedder: index early-returns {failed:0, reason:"no embedding model
         // configured"} — failed==0 but nothing was written, so check for reason too.
-        let atom_vector_refreshed = {
+        let (atom_vector_refreshed, mut truncation_by_model) = {
             let atom_params = serde_json::json!({
                 "ids": [atom_id],
                 "rebuild_ann": false,
@@ -353,18 +357,54 @@ impl KnowledgeHandlers {
                     atom_id = %atom_id,
                     failed = failed,
                     "knowledge.edit: atom vector refresh failed; \
-                     hybrid recall for this atom may be stale until next reindex"
+                    hybrid recall for this atom may be stale until next reindex"
                 );
             }
-            failed == 0 && !skipped_no_embedder
+            let truncation_by_model = match result.get("truncation_by_model") {
+                Some(value) => serde_json::from_value::<
+                    BTreeMap<String, khive_runtime::retrieval::EmbeddingTruncationReport>,
+                >(value.clone())
+                .map_err(|e| {
+                    RuntimeError::Internal(format!(
+                        "knowledge.edit: invalid knowledge.index truncation report: {e}"
+                    ))
+                })?,
+                None => BTreeMap::new(),
+            };
+            (failed == 0 && !skipped_no_embedder, truncation_by_model)
         };
 
-        Ok(json!({
+        // The section pass uses the default embedder. Merge its actual outcome
+        // into the atom pass's per-model report before deriving the advisory,
+        // so one response accounts for every embedding input this edit sent.
+        let default_model_name = runtime.default_embedder_name();
+        if !default_model_name.is_empty() {
+            truncation_by_model
+                .entry(default_model_name.to_string())
+                .or_default()
+                .merge(section_truncation);
+        }
+        let any_truncated = truncation_by_model
+            .values()
+            .any(khive_runtime::retrieval::EmbeddingTruncationReport::any_truncated);
+
+        let mut response = json!({
             "atom_id": atom_id,
             "upserted": upserted,
             "sections": section_results,
             "atom_vector_refreshed": atom_vector_refreshed,
-        }))
+            "truncation_by_model": truncation_by_model,
+        });
+        if any_truncated {
+            response
+                .as_object_mut()
+                .expect("edit response is an object")
+                .insert(
+                    "warnings".to_string(),
+                    json!([khive_runtime::retrieval::EMBEDDING_INPUT_TRUNCATED_WARNING]),
+                );
+        }
+        Ok(response)
     }
 
     pub(crate) async fn import(

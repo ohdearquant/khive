@@ -7,6 +7,18 @@ resolution before reaching a pack handler. Each section below is the extended te
 for one hook or dispatch-path function; the in-source doc-comment on each item carries only the
 concise standalone summary plus a pointer here.
 
+## brain_consumer_kinds
+
+Packs that request brain profile resolution declare their exact wire-level consumer values in
+`Pack::BRAIN_CONSUMER_KINDS` and return the same slice from
+`PackRuntime::brain_consumer_kinds`. `VerbRegistry::all_brain_consumer_kinds` composes the loaded
+declarations, deduplicating shared uses such as `recall` while preserving first-seen order.
+
+`brain.bind` validates specific values against that aggregate. The `"*"` wildcard is always legal
+at the binding boundary but is registry-owned and must not appear in a pack declaration. An enum
+variant or ADR mention alone does not make a kind bindable: a loaded pack must declare that it
+actually consumes the kind.
+
 ## register_embedders
 
 `PackRuntime::register_embedders` is called by the transport during pack initialisation, before

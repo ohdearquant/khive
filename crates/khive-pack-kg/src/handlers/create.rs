@@ -12,6 +12,18 @@ use super::common::{
 };
 use crate::KgPack;
 
+pub(super) fn add_embedding_truncation_warning(response: &mut Value, truncated: bool) {
+    if !truncated {
+        return;
+    }
+    if let Some(obj) = response.as_object_mut() {
+        obj.insert(
+            "warnings".to_string(),
+            json!([khive_runtime::retrieval::EMBEDDING_INPUT_TRUNCATED_WARNING]),
+        );
+    }
+}
+
 impl KgPack {
     pub(crate) async fn handle_create(
         &self,
@@ -314,7 +326,7 @@ impl KgPack {
             None
         };
 
-        let (mut response, new_id) = match p.kind.as_str() {
+        let (mut response, new_id, embedding_input_truncated) = match p.kind.as_str() {
             "entity" => {
                 if p.embedding_content.is_some() {
                     return Err(RuntimeError::InvalidInput(
@@ -331,9 +343,9 @@ impl KgPack {
                 let tags = p.tags.unwrap_or_default();
                 let validated_type =
                     validate_entity_type(&canonical, p.entity_type.as_deref(), registry)?;
-                let entity = self
+                let (entity, embedding_report) = self
                     .runtime
-                    .create_entity(
+                    .create_entity_with_embedding_report(
                         token,
                         &canonical,
                         validated_type.as_deref(),
@@ -344,7 +356,11 @@ impl KgPack {
                     )
                     .await?;
                 let id = entity.id;
-                (normalize_entity_timestamps(to_json(&entity)?), id)
+                (
+                    normalize_entity_timestamps(to_json(&entity)?),
+                    id,
+                    embedding_report.any_truncated(),
+                )
             }
             "note" => {
                 let canonical = sub_kind
@@ -358,9 +374,9 @@ impl KgPack {
                     annotates.push(resolve_uuid_unfiltered(&s, &self.runtime, token).await?);
                 }
                 let properties = super::common::merge_note_tags(p.properties, p.tags)?;
-                let note = self
+                let (note, embedding_report) = self
                     .runtime
-                    .create_note_with_embedding_content(
+                    .create_note_with_embedding_content_and_report(
                         token,
                         &canonical,
                         p.name.as_deref(),
@@ -375,6 +391,7 @@ impl KgPack {
                 (
                     remap_note_status(normalize_entity_timestamps(to_json(&note)?)),
                     id,
+                    embedding_report.any_truncated(),
                 )
             }
             other => {
@@ -383,6 +400,8 @@ impl KgPack {
                 )))
             }
         };
+
+        add_embedding_truncation_warning(&mut response, embedding_input_truncated);
 
         if let Some(ref h) = hook {
             if let Err(e) = h.after_create(&self.runtime, new_id, &params).await {

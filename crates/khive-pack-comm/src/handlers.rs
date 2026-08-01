@@ -20,6 +20,21 @@ use crate::params::{
     ProbeParams, ReadParams, ReplyParams, SendParams, ThreadParams, UnreadParams,
 };
 
+fn add_embedding_truncation_warning(
+    response: &mut Value,
+    report: &khive_runtime::retrieval::EmbeddingTruncationReport,
+) {
+    if !report.any_truncated() {
+        return;
+    }
+    if let Some(object) = response.as_object_mut() {
+        object.insert(
+            "warnings".to_string(),
+            json!([khive_runtime::retrieval::EMBEDDING_INPUT_TRUNCATED_WARNING]),
+        );
+    }
+}
+
 /// Validate an actor label: non-empty, no control characters, ≤255 bytes (ADR-057 Q1 loose).
 fn validate_actor_label(verb: &str, label: &str, field: &str) -> Result<(), RuntimeError> {
     if label.trim().is_empty() {
@@ -113,7 +128,7 @@ pub(crate) async fn handle_send(
     // Pass caller_ns as both `from` and `to` so `from == recipient_ns_str` in
     // dual_write_message, naturally bypassing the cross-namespace allowlist gate
     // (ADR-057 §"Interaction with ADR-040"). Actor labels are stored via from_actor/to_actor.
-    let outbound_note = dual_write_message(
+    let (outbound_note, embedding_truncation) = dual_write_message(
         runtime,
         token,
         &caller_ns,
@@ -130,14 +145,16 @@ pub(crate) async fn handle_send(
     )
     .await?;
 
-    Ok(json!({
+    let mut response = json!({
         "id": short_id(outbound_note.id),
         "full_id": outbound_note.id.as_hyphenated().to_string(),
         "from": from_actor,
         "to": p.to,
         "subject": p.subject,
         "sent_at": sent_at,
-    }))
+    });
+    add_embedding_truncation_warning(&mut response, &embedding_truncation);
+    Ok(response)
 }
 
 /// `inbox` — list inbound messages for the caller's actor label (ADR-057).
@@ -438,8 +455,8 @@ pub(crate) async fn handle_read(
         );
     }
 
-    // Patch via a real `UPDATE`, not `upsert_note`'s `INSERT OR REPLACE` (#780
-    // silently re-inserts the row on conflict). See docs/api/message-lifecycle.md#handlersrshandle_read
+    // Patch via one atomic JSON-property `UPDATE`, not a get/replace cycle or
+    // `upsert_note` (#1483, #780). See docs/api/message-lifecycle.md#handlersrshandle_read
     //
     // `orig_props` is kept as the stored `Option<Value>` (a SQL-NULL
     // properties column is a real, distinct state from `{}`) so a degraded
@@ -447,7 +464,12 @@ pub(crate) async fn handle_read(
     // separately-normalized object used only for the attempted patch.
     let orig_props = note.properties.clone();
     let mut props = orig_props.clone().unwrap_or_else(|| json!({}));
-    props["read"] = json!(true);
+    match props.as_object_mut() {
+        Some(object) => {
+            object.insert("read".to_string(), json!(true));
+        }
+        None => props = json!({ "read": true }),
+    }
     let updated_at = Utc::now().timestamp_micros();
 
     // Best-effort: under multi-client writer contention the pool checkout can
@@ -460,7 +482,7 @@ pub(crate) async fn handle_read(
     // polling unread counts simply sees the message still unread and can
     // re-issue `read` — self-healing, no retry loop needed here.
     let patch_result = store
-        .update_note_properties(id, Some(props.clone()), updated_at)
+        .set_note_property(id, "read", json!(true), updated_at)
         .await;
 
     Ok(read_response(
@@ -669,7 +691,7 @@ pub(crate) async fn handle_reply(
     // Pass caller_ns as both `from` and `to` so `from == recipient_ns_str` in
     // dual_write_message, naturally bypassing the cross-namespace allowlist gate
     // (ADR-057 §"Interaction with ADR-040"). Actor labels are stored via from_actor/to_actor.
-    let reply_note = dual_write_message(
+    let (reply_note, embedding_truncation) = dual_write_message(
         runtime,
         token,
         &caller_ns,
@@ -711,30 +733,20 @@ pub(crate) async fn handle_reply(
     let marked_read = if original_direction == "outbound" || !caller_is_addressee {
         None
     } else {
-        // Re-fetch: `orig_props` predates the dual write above, so writing it
-        // back wholesale would erase any property another writer set in that
-        // window (the store replaces `properties`, it does not merge).
-        let current = store
-            .get_note(id)
-            .await
-            .ok()
-            .flatten()
-            .and_then(|n| n.properties)
-            .unwrap_or_else(|| orig_props.clone());
-        let mut props = current;
-        props["read"] = json!(true);
         let updated_at = Utc::now().timestamp_micros();
         // `Ok(false)` means no live row was updated (e.g. the original was
-        // soft-deleted mid-flight) — that is not a successful mark.
+        // soft-deleted mid-flight, or its properties ceased to be an object)
+        // — that is not a successful mark. The one-statement property set
+        // preserves every unrelated key without a race window (#1483).
         Some(
             store
-                .update_note_properties(id, Some(props), updated_at)
+                .set_note_property(id, "read", json!(true), updated_at)
                 .await
                 .unwrap_or(false),
         )
     };
 
-    Ok(json!({
+    let mut response = json!({
         "id": short_id(reply_note.id),
         "full_id": reply_note.id.as_hyphenated().to_string(),
         "thread_id": thread_id,
@@ -743,7 +755,9 @@ pub(crate) async fn handle_reply(
         "subject": reply_subject,
         "sent_at": sent_at,
         "marked_read": marked_read,
-    }))
+    });
+    add_embedding_truncation_warning(&mut response, &embedding_truncation);
+    Ok(response)
 }
 
 /// `thread` — retrieve all messages in a conversation thread, ordered
@@ -1361,6 +1375,11 @@ pub(crate) async fn handle_heartbeat(
             "heartbeat: `channel_slug` must not be empty".into(),
         ));
     }
+    if p.poll_interval_secs == Some(0) {
+        return Err(RuntimeError::InvalidInput(
+            "heartbeat: `poll_interval_secs` must be greater than zero".into(),
+        ));
+    }
     let outcome = match p.outcome.as_str() {
         s @ ("success" | "failure") => s,
         other => {
@@ -1424,6 +1443,9 @@ pub(crate) async fn handle_heartbeat(
     props["channel_kind"] = json!(p.channel_kind);
     props["channel_slug"] = json!(p.channel_slug);
     props["last_poll_attempt_at"] = json!(at);
+    if let Some(poll_interval_secs) = p.poll_interval_secs {
+        props["poll_interval_secs"] = json!(poll_interval_secs);
+    }
 
     match outcome {
         "success" => {
@@ -1486,15 +1508,53 @@ pub(crate) async fn handle_heartbeat(
     }))
 }
 
+/// A channel is schedule-stale after three complete nominal poll intervals.
+/// The grace avoids flagging a live poller during ordinary tick and I/O jitter.
+const STALLED_AFTER_INTERVALS: u64 = 3;
+
+fn channel_stalled(props: &Value, as_of: &DateTime<Utc>) -> Option<bool> {
+    // A known failure enters intentional exponential backoff, so the nominal
+    // cadence cannot distinguish an overdue poll from a scheduled retry.
+    let consecutive_failures = props.get("consecutive_failures").and_then(Value::as_u64)?;
+    if consecutive_failures > 0 {
+        return None;
+    }
+    let poll_interval_secs = props.get("poll_interval_secs")?.as_u64()?;
+    if poll_interval_secs == 0 {
+        return None;
+    }
+    let stall_after_millis = poll_interval_secs
+        .checked_mul(STALLED_AFTER_INTERVALS)?
+        .checked_mul(1_000)?;
+    let last_poll_attempt =
+        DateTime::parse_from_rfc3339(props.get("last_poll_attempt_at")?.as_str()?)
+            .ok()?
+            .with_timezone(&Utc);
+    let elapsed_millis = u64::try_from(
+        as_of
+            .signed_duration_since(last_poll_attempt)
+            .num_milliseconds(),
+    )
+    .ok()?;
+    Some(elapsed_millis > stall_after_millis)
+}
+
 /// Project a persisted `channel_health` note into the `comm.health()` channel
-/// entry shape. Missing fields (a row written before a given property existed)
-/// default to `null`/`0` rather than panicking — forward-compatible with rows
-/// written by an older heartbeat writer.
-fn channel_health_to_json(note: &Note) -> Value {
+/// entry shape. Missing or malformed cadence/timestamp fields (including rows
+/// written before #1472) produce `stalled: null` rather than pretending the
+/// channel is current.
+fn channel_health_to_json(note: &Note, as_of: &DateTime<Utc>) -> Value {
     let props = note.properties.clone().unwrap_or_else(|| json!({}));
+    let poll_interval_secs = props
+        .get("poll_interval_secs")
+        .and_then(Value::as_u64)
+        .filter(|interval| *interval > 0);
+    let stalled = channel_stalled(&props, as_of);
     json!({
         "channel_kind": props.get("channel_kind").cloned().unwrap_or(Value::Null),
         "channel_slug": props.get("channel_slug").cloned().unwrap_or(Value::Null),
+        "poll_interval_secs": poll_interval_secs,
+        "stalled": stalled,
         "last_success_at": props.get("last_success_at").cloned().unwrap_or(Value::Null),
         "last_poll_attempt_at": props.get("last_poll_attempt_at").cloned().unwrap_or(Value::Null),
         "last_failure_at": props.get("last_failure_at").cloned().unwrap_or(Value::Null),
@@ -1505,8 +1565,9 @@ fn channel_health_to_json(note: &Note) -> Value {
 
 /// `health` — read-only per-channel health snapshot (khive #606). Reads
 /// `channel_health` rows from `token.namespace()` (khive #877 namespace
-/// scoping); never returns a computed `healthy: bool` — that judgment belongs
-/// to the caller. See crates/khive-pack-comm/docs/api/channel-health.md#handlersrshandle_health
+/// scoping). The additive `stalled` schedule fact is deliberately narrower
+/// than a computed `healthy: bool`; overall health judgment still belongs to
+/// the caller. See crates/khive-pack-comm/docs/api/channel-health.md#handlersrshandle_health
 /// for the `role`/`namespace`/`resource` field semantics (ADR-103 Stage 1).
 ///
 /// `resource` is a process-level self-report of this process's own CPU/RSS
@@ -1554,8 +1615,13 @@ pub(crate) async fn handle_health(
         );
     }
 
-    let channels: Vec<Value> = page.items.iter().map(channel_health_to_json).collect();
-    let as_of = Utc::now().to_rfc3339();
+    let now = Utc::now();
+    let channels: Vec<Value> = page
+        .items
+        .iter()
+        .map(|note| channel_health_to_json(note, &now))
+        .collect();
+    let as_of = now.to_rfc3339();
 
     let (role, source) = if channels.is_empty() {
         ("client", None::<&str>)
@@ -2109,12 +2175,64 @@ fn build_references_header(parent_chain: Option<&str>, parent_message_id: &str) 
 #[cfg(test)]
 mod tests {
     use super::{
-        build_references_header, heartbeat_note_id, message_id_match_candidates,
-        parent_references_chain, parent_wire_message_id, read_response, sanitize_reference_token,
-        wrap_message_id,
+        add_embedding_truncation_warning, build_references_header, channel_stalled,
+        heartbeat_note_id, message_id_match_candidates, parent_references_chain,
+        parent_wire_message_id, read_response, sanitize_reference_token, wrap_message_id,
     };
     use khive_storage::StorageError;
     use serde_json::{json, Value};
+
+    #[test]
+    fn channel_stalled_uses_strict_three_interval_threshold() {
+        let props = json!({
+            "poll_interval_secs": 5,
+            "last_poll_attempt_at": "2026-08-01T12:00:00Z",
+            "consecutive_failures": 0,
+        });
+        let at_threshold = chrono::DateTime::parse_from_rfc3339("2026-08-01T12:00:15Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let overdue = chrono::DateTime::parse_from_rfc3339("2026-08-01T12:00:15.001Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+
+        assert_eq!(channel_stalled(&props, &at_threshold), Some(false));
+        assert_eq!(channel_stalled(&props, &overdue), Some(true));
+    }
+
+    #[test]
+    fn channel_stalled_requires_valid_consecutive_failures() {
+        let as_of = chrono::DateTime::parse_from_rfc3339("2026-08-01T12:01:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let mut props = json!({
+            "poll_interval_secs": 5,
+            "last_poll_attempt_at": "2026-08-01T12:00:00Z",
+        });
+
+        assert_eq!(channel_stalled(&props, &as_of), None);
+
+        for malformed in [json!("1"), json!(-1)] {
+            props["consecutive_failures"] = malformed;
+            assert_eq!(channel_stalled(&props, &as_of), None);
+        }
+    }
+
+    #[test]
+    fn comm_write_response_reports_atomic_note_embedding_truncation() {
+        let mut response = json!({"id": "abc123"});
+        add_embedding_truncation_warning(
+            &mut response,
+            &khive_runtime::retrieval::EmbeddingTruncationReport {
+                truncated: 2,
+                discarded_bytes: 18,
+            },
+        );
+        assert_eq!(
+            response["warnings"],
+            json!([khive_runtime::retrieval::EMBEDDING_INPUT_TRUNCATED_WARNING])
+        );
+    }
 
     // #606: a delimiter-joined
     // `format!("...:{a}:{b}:{c}")` id encoding is not injective once
@@ -2402,7 +2520,7 @@ mod tests {
 
     // read_response's three arms are unit-tested directly because the
     // `Ok(false)` case (a live row vanishing between handle_read's `get_note`
-    // and its `update_note_properties` call) cannot be arranged honestly
+    // and its `set_note_property` call) cannot be arranged honestly
     // through the public dispatch path: the two calls are sequential within
     // one handler invocation with no seam to inject a concurrent delete.
 
@@ -2479,7 +2597,7 @@ mod tests {
         let original = json!({ "direction": "inbound", "read": false });
         let patched = json!({ "direction": "inbound", "read": true });
         let err = StorageError::Timeout {
-            operation: "update_note_properties".into(),
+            operation: "set_note_property".into(),
         };
         let err_text = err.to_string();
         let resp = read_response(
@@ -2503,7 +2621,7 @@ mod tests {
     fn read_response_err_preserves_stored_null_properties() {
         let patched = json!({ "read": true });
         let err = StorageError::Timeout {
-            operation: "update_note_properties".into(),
+            operation: "set_note_property".into(),
         };
         let resp = read_response(
             "abc123".to_string(),

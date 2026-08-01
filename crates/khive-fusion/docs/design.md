@@ -33,4 +33,4 @@
   documented in `docs/algorithm.md`. Weights are sanitized (non-finite → 0.0, negative → 0.0)
   before normalization; if all effective weights are zero, equal distribution is applied.
 - Per-source min-max normalization (issues #2496/#2639) ensures BM25 unbounded scores and cosine
-  similarity [0, 1] scores contribute proportionally to their configured weights after fusion.
+  similarity [-1, 1] scores contribute proportionally to their configured weights after fusion.
