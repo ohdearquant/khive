@@ -4,7 +4,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
-use khive_runtime::{NamespaceToken, RuntimeError, VerbRegistry};
+use khive_runtime::{NamespaceToken, RequestIdentity, RuntimeError, VerbRegistry};
 
 use crate::recall_feedback::on_explicit_feedback;
 use crate::MemoryPack;
@@ -85,7 +85,13 @@ async fn route_to_brain(
         "signal": signal,
         "served_by_profile_id": profile_id,
     });
-    registry.dispatch("brain.feedback", brain_params).await
+    registry
+        .dispatch_with_identity(
+            "brain.feedback",
+            brain_params,
+            Some(RequestIdentity::from_token(token)),
+        )
+        .await
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

@@ -220,31 +220,47 @@ impl KnowledgeHandlers {
             // rebuild insertion with the same generation check the warm path uses,
             // instead of the old presence-only `insert_ann_if_absent`.
             let build_generation = vamana::current_generation(ann, &ns);
+            let key = vamana::AnnKey::new(&ns, model_name);
+            let scan_authority = match vamana::prepare_full_corpus_scan(runtime, ann, &key).await {
+                Ok(authority) => Some(authority),
+                Err(e) => {
+                    tracing::error!(error = %e, "failed to establish Vamana full-scan authority");
+                    ann_failed = true;
+                    None
+                }
+            };
             // Build from the shared corpus scan (ORDER BY subject_id) so the persisted
             // v2 content_hash matches the warm-path live_content_hash. Building from
             // atom-iteration order persists a hash the warm path always reads as stale.
-            match vamana::load_and_build_from_vector_store(runtime, token, model_name).await {
-                Ok(Some(bridge)) => {
-                    let n = bridge.num_vectors();
-                    ann_count = Some(n);
-                    let key = vamana::AnnKey::new(&ns, model_name);
-                    vamana::checkpoint_raise_compact_readopt(
-                        runtime,
-                        ann,
-                        &key,
-                        &ns,
-                        model_name,
-                        bridge,
-                        build_generation,
-                    )
-                    .await;
-                    eprintln!("  Vamana ANN built ({n} vectors)");
-                }
-                Ok(None) => {}
-                Err(e) => {
-                    tracing::error!(error = %e, "failed to build Vamana ANN index");
-                    eprintln!("  Vamana ANN build failed: {e}");
-                    ann_failed = true;
+            if let Some(scan_authority) = scan_authority {
+                match vamana::load_and_build_from_vector_store(runtime, token, model_name).await {
+                    Ok(Some(bridge)) => {
+                        let n = bridge.num_vectors();
+                        ann_count = Some(n);
+                        let published = vamana::checkpoint_raise_compact_readopt(
+                            runtime,
+                            ann,
+                            &key,
+                            bridge,
+                            build_generation,
+                            scan_authority,
+                        )
+                        .await;
+                        if published {
+                            eprintln!("  Vamana ANN built ({n} vectors)");
+                        } else {
+                            tracing::warn!(
+                                "Vamana ANN publication was fenced; retrying on the next rebuild"
+                            );
+                            ann_failed = true;
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        tracing::error!(error = %e, "failed to build Vamana ANN index");
+                        eprintln!("  Vamana ANN build failed: {e}");
+                        ann_failed = true;
+                    }
                 }
             }
         }

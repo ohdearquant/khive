@@ -67,7 +67,8 @@
 
 # Brain profile id used by memory.feedback / knowledge.feedback and for recall-time
 # score boosting. Absent → the namespace-bound profile (brain.resolve) is tried,
-# then the global tuning prior. Mirrors --brain-profile / KHIVE_BRAIN_PROFILE.
+# then the pack-local tuning prior (knowledge keys it by effective namespace).
+# Mirrors --brain-profile / KHIVE_BRAIN_PROFILE.
 # brain_profile = "khive-default"
 
 # Default output serialization (ADR-078). One of:

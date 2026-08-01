@@ -64,6 +64,9 @@ The fields you triage on are surfaced at the **top level** — no digging into `
 
 Scan `from` + `subject` + `preview`, open `content` for the ones that matter, then
 `comm.read(id="<full_id>")` to clear them. Always pass a `limit` — active inboxes are large.
+The mark-read write is best-effort: a successful response can carry `read: false` plus a
+`mark_error` when the mark did not land (e.g. under writer contention). Check `read` in the
+response; if it is `false`, the message stays unread — re-issue `comm.read` later.
 
 ### 4. Reply to thread, don't start a new one
 

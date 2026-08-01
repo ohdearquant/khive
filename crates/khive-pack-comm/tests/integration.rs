@@ -12,6 +12,7 @@ use khive_runtime::{
     AllowAllGate, BackendId, KhiveRuntime, Namespace, NamespaceToken, RuntimeConfig, VerbRegistry,
     VerbRegistryBuilder,
 };
+use khive_storage::types::{SqlRow, SqlValue};
 use khive_types::Pack;
 
 fn build_registry() -> (VerbRegistry, KhiveRuntime) {
@@ -37,6 +38,62 @@ fn build_registry_for_ns(ns: &str) -> (VerbRegistry, KhiveRuntime) {
 #[test]
 fn comm_pack_declares_message_note_kind() {
     assert!(CommPack::NOTE_KINDS.contains(&"message"));
+}
+
+#[tokio::test]
+async fn pack_registered_message_notes_are_queryable_through_gql() {
+    let (registry, rt) = build_registry_for_ns("local");
+    assert!(
+        registry.all_note_kinds().contains(&"message"),
+        "the built registry must expose comm's message note kind"
+    );
+
+    registry
+        .dispatch(
+            "comm.send",
+            serde_json::json!({
+                "to": "local",
+                "content": "GQL pack-note regression"
+            }),
+        )
+        .await
+        .expect("self-send creates message notes");
+
+    let token = rt.authorize(Namespace::local()).expect("local token");
+    let by_granular_label = rt
+        .query(&token, "MATCH (m:message) RETURN m.id")
+        .await
+        .expect("pack-registered granular label compiles and executes");
+    let by_note_kind = rt
+        .query(
+            &token,
+            "MATCH (m:note) WHERE m.kind = 'message' RETURN m.id",
+        )
+        .await
+        .expect("note substrate plus kind predicate compiles and executes");
+
+    fn ids(rows: &[SqlRow]) -> Vec<String> {
+        let mut ids: Vec<String> = rows
+            .iter()
+            .map(|row| match row.get("m_id") {
+                Some(SqlValue::Text(id)) => id.clone(),
+                value => panic!("GQL m.id projection must be text; got {value:?}"),
+            })
+            .collect();
+        ids.sort();
+        ids
+    }
+
+    let granular_ids = ids(&by_granular_label);
+    assert!(
+        !granular_ids.is_empty(),
+        "MATCH (m:message) must return the message rows just written"
+    );
+    assert_eq!(
+        granular_ids,
+        ids(&by_note_kind),
+        "granular and substrate-plus-kind spellings must select the same message notes"
+    );
 }
 
 #[test]
@@ -975,9 +1032,9 @@ async fn test_reply_marks_directionless_legacy_original() {
     );
 }
 
-/// The read-patch must not clobber properties written between the original's
-/// fetch and the patch: reply re-reads current properties before setting
-/// `read`, since the store replaces the properties object wholesale.
+/// The read patch must not clobber an unrelated property. Both writes use the
+/// storage layer's one-statement JSON-property setter, so the invariant does
+/// not depend on a best-effort re-read immediately before replacement.
 #[tokio::test]
 async fn test_reply_read_patch_preserves_concurrent_properties() {
     use khive_storage::note::Note;
@@ -1009,15 +1066,15 @@ async fn test_reply_read_patch_preserves_concurrent_properties() {
         .await
         .expect("insert message");
 
-    // Stand in for another writer stamping metadata after the original was
-    // fetched: patch a new property directly, then reply.
-    let mut with_stamp = serde_json::json!({
-        "direction": "inbound", "from": "x", "to": "local", "read": false,
-        "delivery_stamp": "channel-email"
-    });
-    with_stamp["read"] = serde_json::json!(false);
+    // Stand in for another writer stamping metadata, then let reply perform
+    // its independent atomic `read` set.
     store
-        .update_note_properties(id, Some(with_stamp), now + 1)
+        .set_note_property(
+            id,
+            "delivery_stamp",
+            serde_json::json!("channel-email"),
+            now + 1,
+        )
         .await
         .expect("stamp applied");
 
@@ -8631,4 +8688,113 @@ async fn i66_inbox_limit_zero_carries_real_unread_count() {
         inbox["unread_count"], 1,
         "limit=0 must return the caller's real unread count"
     );
+}
+
+// ── send-single-txn: atomic dual-write coverage ────────────────────────────
+//
+// `dual_write_message` now commits both message copies (row + FTS + one
+// vector row per registered embedding model) through
+// `khive_runtime::create_notes_atomic` — ONE writer transaction for the
+// pair instead of one writer acquisition per row/FTS/vector write. This
+// test covers the multi-model vector fan-out count landing inside the
+// single atomic unit.
+
+/// A send must land the outbound + inbound note, an FTS document for each,
+/// and one vector row PER registered embedding model for EACH note, all
+/// inside the single atomic unit. Two stub models are registered: the
+/// vector-row count for each model must be exactly 2 (outbound + inbound).
+#[tokio::test]
+async fn send_lands_outbound_inbound_fts_and_vectors_with_multi_model_counts() {
+    use async_trait::async_trait;
+    use khive_runtime::EmbedderProvider;
+    use lattice_embed::{EmbedError, EmbeddingModel, EmbeddingService};
+
+    macro_rules! stub_model {
+        ($provider:ident, $service:ident, $name:literal, $dims:literal) => {
+            struct $service;
+            #[async_trait]
+            impl EmbeddingService for $service {
+                async fn embed(
+                    &self,
+                    texts: &[String],
+                    _model: EmbeddingModel,
+                ) -> std::result::Result<Vec<Vec<f32>>, EmbedError> {
+                    Ok(texts.iter().map(|_| vec![0.25_f32; $dims]).collect())
+                }
+                fn supports_model(&self, _model: EmbeddingModel) -> bool {
+                    true
+                }
+                fn name(&self) -> &'static str {
+                    $name
+                }
+            }
+            struct $provider;
+            #[async_trait]
+            impl EmbedderProvider for $provider {
+                fn name(&self) -> &str {
+                    $name
+                }
+                fn dimensions(&self) -> usize {
+                    $dims
+                }
+                async fn build(&self) -> khive_runtime::RuntimeResult<Arc<dyn EmbeddingService>> {
+                    Ok(Arc::new($service))
+                }
+            }
+        };
+    }
+    stub_model!(
+        SendCountsModelA,
+        SendCountsServiceA,
+        "send-counts-model-a",
+        4
+    );
+    stub_model!(
+        SendCountsModelB,
+        SendCountsServiceB,
+        "send-counts-model-b",
+        6
+    );
+
+    let (registry, rt) = build_registry_for_ns("agent:sender");
+    rt.register_embedder(SendCountsModelA);
+    rt.register_embedder(SendCountsModelB);
+
+    registry
+        .dispatch(
+            "comm.send",
+            serde_json::json!({ "to": "agent:sender", "content": "multi-model counts" }),
+        )
+        .await
+        .expect("send succeeds");
+
+    // Actor-addressed sends land both copies in "local".
+    let local_tok = rt.authorize(Namespace::parse("local").unwrap()).unwrap();
+    let notes = rt
+        .list_notes(&local_tok, Some("message"), 100, 0)
+        .await
+        .expect("list_notes");
+    let alive: Vec<_> = notes.iter().filter(|n| n.deleted_at.is_none()).collect();
+    assert_eq!(alive.len(), 2, "expected outbound + inbound; got {alive:?}");
+
+    let fts = rt.text_for_notes(&local_tok).expect("text store");
+    for note in &alive {
+        assert!(
+            fts.get_document("local", note.id)
+                .await
+                .expect("get_document")
+                .is_some(),
+            "FTS document must exist for note {}",
+            note.id
+        );
+    }
+
+    for model in ["send-counts-model-a", "send-counts-model-b"] {
+        let vs = rt.vectors_for_model(&local_tok, model).expect("vec store");
+        assert_eq!(
+            vs.count().await.expect("count"),
+            2,
+            "expected one vector row per note ({model}): outbound + inbound"
+        );
+    }
 }

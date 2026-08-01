@@ -807,6 +807,30 @@ pub struct RequestIdentity {
     pub request_id: Option<u64>,
 }
 
+impl RequestIdentity {
+    /// Reconstruct the effective principal and namespace scope carried by an
+    /// already-authorized token for a nested registry dispatch.
+    ///
+    /// Cross-pack calls must still pass through the registry Gate, but using
+    /// the registry's construction-baked identity would silently replace a
+    /// warm daemon request's actor and visibility (ADR-096). This projection
+    /// preserves the token's exact primary namespace, actor, and read-visible
+    /// namespaces. A `NamespaceToken` does not carry the ingress correlation
+    /// id, so nested calls intentionally use `request_id: None`.
+    pub fn from_token(token: &NamespaceToken) -> Self {
+        Self {
+            namespace: token.namespace().as_str().to_string(),
+            actor_id: token.actor().binding_id().map(str::to_string),
+            visible_namespaces: token
+                .visible_namespaces()
+                .iter()
+                .map(|namespace| namespace.as_str().to_string())
+                .collect(),
+            request_id: None,
+        }
+    }
+}
+
 /// A non-blank, out-of-band authenticated principal for [`VerbRegistry::dispatch_as`].
 ///
 /// Embedding hosts authenticate a principal through their own channel (not the

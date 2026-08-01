@@ -34,6 +34,7 @@ pub mod vector;
 #[doc(hidden)]
 #[allow(unused_imports)]
 mod _pack_links {
+    use khive_pack_blob::BlobPack as _;
     use khive_pack_brain::BrainPack as _;
     use khive_pack_code::CodePack as _;
     use khive_pack_comm::CommPack as _;
@@ -45,4 +46,5 @@ mod _pack_links {
     use khive_pack_memory::MemoryPack as _;
     use khive_pack_schedule::SchedulePack as _;
     use khive_pack_session::SessionPack as _;
+    use khive_pack_workspace::WorkspacePack as _;
 }

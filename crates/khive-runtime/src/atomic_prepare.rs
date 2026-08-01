@@ -41,6 +41,7 @@ use khive_db::stores::entity::{
     entity_hard_delete_statement, entity_soft_delete_statement, entity_upsert_statement,
 };
 use khive_db::stores::event::event_insert_statements;
+use khive_db::stores::event::hard_delete_lineage_warning_statements;
 use khive_db::stores::graph::{
     edge_hard_delete_statement, edge_insert_guarded_by_endpoints_statement,
     edge_soft_delete_statement, edge_symmetric_absorb_or_update_inplace_statement,
@@ -1015,6 +1016,7 @@ pub async fn prepare_delete(
     expected_kind: Option<AtomicDeleteKind>,
 ) -> RuntimeResult<AtomicOpPlan> {
     let id = require_uuid(args, "id")?;
+    let actor = format!("{}:{}", token.actor().kind, token.actor().id);
     let hard = obj(args)?
         .get("hard")
         .and_then(|v| v.as_bool())
@@ -1066,6 +1068,19 @@ pub async fn prepare_delete(
                 }]
             };
             if hard {
+                statements.extend(
+                    hard_delete_lineage_warning_statements(
+                        &namespace,
+                        &actor,
+                        id,
+                        SubstrateKind::Entity,
+                    )
+                    .into_iter()
+                    .map(|statement| PlanStatement {
+                        statement,
+                        guard: None,
+                    }),
+                );
                 // Same builder canonical `delete_entity`'s hard-delete
                 // cascade calls (`graph.purge_incident_edges`).
                 statements.push(PlanStatement {
@@ -1138,6 +1153,19 @@ pub async fn prepare_delete(
                 }]
             };
             if hard {
+                statements.extend(
+                    hard_delete_lineage_warning_statements(
+                        &namespace,
+                        &actor,
+                        id,
+                        SubstrateKind::Note,
+                    )
+                    .into_iter()
+                    .map(|statement| PlanStatement {
+                        statement,
+                        guard: None,
+                    }),
+                );
                 statements.push(PlanStatement {
                     statement: purge_incident_edges_statement(id),
                     guard: None,
@@ -1200,7 +1228,7 @@ pub async fn prepare_delete(
                     runtime.get_edge(token, id).await?
                 };
                 match edge {
-                    Some(edge) => prepare_delete_edge(id, edge, hard).await,
+                    Some(edge) => prepare_delete_edge(id, edge, hard, &actor).await,
                     None => Err(RuntimeError::NotFound(format!("entity/note/edge {id}"))),
                 }
             }
@@ -1220,11 +1248,20 @@ async fn prepare_delete_edge(
     id: Uuid,
     edge: khive_storage::types::Edge,
     hard: bool,
+    actor: &str,
 ) -> RuntimeResult<AtomicOpPlan> {
     let namespace = edge.namespace.clone();
     let mut statements: Vec<PlanStatement> = Vec::new();
 
     if hard {
+        statements.extend(
+            hard_delete_lineage_warning_statements(&namespace, actor, id, SubstrateKind::Entity)
+                .into_iter()
+                .map(|statement| PlanStatement {
+                    statement,
+                    guard: None,
+                }),
+        );
         // Mirrors `delete_edge`'s `graph.purge_incident_edges(edge_id)` —
         // unguarded: zero incident edges is a legitimate outcome, not a
         // failure (same reasoning as the entity/note cascade-edges
@@ -2769,6 +2806,63 @@ mod tests {
             );
             assert_eq!(events[0].payload["hard"], json!(hard));
         }
+    }
+
+    #[tokio::test]
+    async fn atomic_hard_delete_emits_lineage_warning_in_commit_unit() {
+        let runtime = scratch_runtime();
+        let token = NamespaceToken::mint_authorized(
+            Namespace::local(),
+            crate::ActorRef::new("agent", "atomic-lineage-deleter"),
+        );
+        let doomed = khive_storage::Entity::new("local", "document", "atomic-doomed");
+        let source = khive_storage::Entity::new("local", "artifact", "atomic-source");
+        let doomed_id = doomed.id;
+        runtime
+            .entities(&token)
+            .expect("entities store")
+            .upsert_entity(doomed)
+            .await
+            .expect("seed doomed entity");
+        runtime
+            .entities(&token)
+            .expect("entities store")
+            .upsert_entity(source.clone())
+            .await
+            .expect("seed source entity");
+        runtime
+            .link(
+                &token,
+                source.id,
+                doomed_id,
+                EdgeRelation::DerivedFrom,
+                1.0,
+                None,
+            )
+            .await
+            .expect("seed protected edge");
+
+        let plan = prepare_delete(
+            &runtime,
+            &token,
+            &json!({"id": doomed_id.to_string(), "hard": true}),
+            None,
+        )
+        .await
+        .expect("prepare hard delete");
+        let outcome = crate::atomic_runner::run_atomic_unit(runtime.sql().as_ref(), vec![plan])
+            .await
+            .expect("delete commit");
+        assert!(matches!(
+            outcome,
+            crate::atomic_runner::AtomicRunOutcome::Committed { .. }
+        ));
+
+        let warnings = events_for_target(&runtime, &token, doomed_id, EventKind::Audit).await;
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].actor, "agent:atomic-lineage-deleter");
+        assert_eq!(warnings[0].payload["relation"], "derived_from");
+        assert_eq!(warnings[0].payload["warning"], "provenance_loss");
     }
 
     /// Atomic soft and hard delete of a note must each append a

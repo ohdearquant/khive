@@ -12,8 +12,8 @@ use uuid::Uuid;
 use khive_brain_core::{compute_query_class, PackTunable};
 use khive_fusion::FusionStrategy;
 use khive_runtime::{
-    micros_to_iso, KhiveRuntime, Namespace, NamespaceToken, RuntimeError, SearchSource,
-    VerbRegistry,
+    micros_to_iso, KhiveRuntime, Namespace, NamespaceToken, RequestIdentity, RuntimeError,
+    SearchSource, VerbRegistry,
 };
 use khive_storage::types::{EdgeFilter, PageRequest};
 use khive_storage::EdgeRelation;
@@ -33,6 +33,23 @@ use super::common::{
     DEFAULT_SALIENCE_SEMANTIC, PROF_CID, RECALL_CALL_ID, RECALL_SLOW_THRESHOLD_MS,
 };
 
+async fn load_brain_profile(
+    registry: &VerbRegistry,
+    token: &NamespaceToken,
+    profile_id: &str,
+) -> Result<Value, RuntimeError> {
+    registry
+        .dispatch_with_identity(
+            "brain.profile",
+            json!({
+                "namespace": token.namespace().as_str(),
+                "profile_id": profile_id,
+            }),
+            Some(RequestIdentity::from_token(token)),
+        )
+        .await
+}
+
 impl MemoryPack {
     pub(crate) async fn handle_recall(
         &self,
@@ -45,13 +62,21 @@ impl MemoryPack {
         let recall_start = Instant::now();
         let p: RecallParams = deser(params)?;
 
-        // Re-derive dispatch's exact namespace as direct-call defense in depth; all later
-        // candidate, graph, and ledger operations use this shadowed token.
+        // Registry dispatch already supplies an exact token for an explicit
+        // namespace. Direct callers must present a token authorized for the
+        // same primary namespace before its visibility is narrowed to the
+        // requested arm; caller parameters may never elevate a token.
         let effective_token: NamespaceToken = match p.namespace.as_deref() {
             Some(ns_str) => {
                 let ns = Namespace::parse(ns_str).map_err(|e| {
                     RuntimeError::InvalidInput(format!("invalid namespace {ns_str:?}: {e}"))
                 })?;
+                if &ns != token.namespace() {
+                    return Err(RuntimeError::InvalidInput(
+                        "memory.recall namespace does not match authorized token namespace"
+                            .to_string(),
+                    ));
+                }
                 token.with_namespace(ns)
             }
             None => token.clone(),
@@ -145,8 +170,7 @@ impl MemoryPack {
         // Explicit unknown IDs error; unreadable bound state degrades to configured defaults.
         let mut profile_state: Option<khive_brain_core::BalancedRecallState> = None;
         let served_by_profile_id: Option<String> = if let Some(ref pid) = p.profile_id {
-            let resp = registry
-                .dispatch("brain.profile", json!({ "profile_id": pid }))
+            let resp = load_brain_profile(registry, token, pid)
                 .await
                 .map_err(|e| {
                     RuntimeError::InvalidInput(format!(
@@ -159,10 +183,7 @@ impl MemoryPack {
             let mut resolved =
                 super::common::resolve_serving_profile(&self.brain_profile, token, registry).await;
             if let Some(ref profile_id) = resolved {
-                match registry
-                    .dispatch("brain.profile", json!({ "profile_id": profile_id }))
-                    .await
-                {
+                match load_brain_profile(registry, token, profile_id).await {
                     Ok(resp) => {
                         profile_state =
                             super::common::balanced_recall_state_from_profile_response(&resp);
@@ -877,7 +898,14 @@ impl MemoryPack {
                 if let Some(ref profile_id) = served_by_profile_id {
                     ledger_params["served_by_profile_id"] = json!(profile_id);
                 }
-                if let Err(error) = registry.dispatch("brain.record_serve", ledger_params).await {
+                if let Err(error) = registry
+                    .dispatch_with_identity(
+                        "brain.record_serve",
+                        ledger_params,
+                        Some(RequestIdentity::from_token(&token)),
+                    )
+                    .await
+                {
                     tracing::warn!(
                         error = %error,
                         "serve ledger dispatch failed; recall result is unaffected"
@@ -2955,6 +2983,90 @@ mod tests {
         );
     }
 
+    /// #1505: an explicit profile override is resolved in recall's effective
+    /// namespace, not the registry's baked/default namespace. The arm-only
+    /// profile is also applied to scoring, proving this is more than a stamp.
+    #[tokio::test]
+    #[serial(background_tasks)]
+    async fn namespaced_recall_loads_arm_profile_and_applies_its_state() {
+        use khive_pack_brain::BrainPack;
+
+        let rt = build_full_rt_with_brain();
+        let arm_ns = Namespace::parse("bench-arm-a").expect("arm namespace");
+        let arm_token = rt.authorize(arm_ns.clone()).expect("arm token");
+        let note = rt
+            .create_note(
+                &arm_token,
+                "memory",
+                None,
+                "bench arm isolated profile recall note",
+                Some(0.7),
+                None,
+                vec![],
+            )
+            .await
+            .expect("create arm note");
+
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(KgPack::new(rt.clone()));
+        builder.register(MemoryPack::new(rt.clone()));
+        builder.register(BrainPack::new(rt.clone()));
+        let registry = builder.build().expect("registry");
+
+        registry
+            .dispatch(
+                "brain.create_profile",
+                serde_json::json!({
+                    "namespace": arm_ns.as_str(),
+                    "name": "bench-arm-a-recall-v1",
+                    "consumer_kind": "recall",
+                }),
+            )
+            .await
+            .expect("create arm-only profile");
+        for _ in 0..12 {
+            registry
+                .dispatch(
+                    "brain.feedback",
+                    serde_json::json!({
+                        "namespace": arm_ns.as_str(),
+                        "target_id": note.id.to_string(),
+                        "signal": "useful",
+                        "served_by_profile_id": "bench-arm-a-recall-v1",
+                    }),
+                )
+                .await
+                .expect("tune arm profile");
+        }
+
+        let result = registry
+            .dispatch(
+                "memory.recall",
+                serde_json::json!({
+                    "namespace": arm_ns.as_str(),
+                    "query": "bench arm isolated profile recall note",
+                    "profile_id": "bench-arm-a-recall-v1",
+                    "include_breakdown": true,
+                    "limit": 10,
+                }),
+            )
+            .await
+            .expect("namespaced recall must load the arm-only profile");
+        let hits = result.as_array().expect("bare array result");
+        assert!(!hits.is_empty(), "arm note must be recalled");
+        assert_eq!(
+            hits[0]["served_by_profile_id"],
+            serde_json::json!("bench-arm-a-recall-v1")
+        );
+        let component = hits[0]["breakdown"]["profile_component"]
+            .as_f64()
+            .expect("profile component");
+        assert!(
+            (component - 1.0).abs() > 1e-6,
+            "arm profile feedback must affect scoring, got neutral component {component}"
+        );
+    }
+
     /// Breakdown reports neutral/default profile state and learned entity posterior state.
     #[tokio::test]
     #[serial(background_tasks)]
@@ -3919,6 +4031,32 @@ mod tests {
             HashSet::from([bench_id]),
             "namespace=\"bench-a\" must return exactly the bench-a memory and \
              neither local memory: {hits:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn direct_recall_rejects_namespace_token_mismatch() {
+        let rt = KhiveRuntime::memory().expect("in-memory runtime");
+        let pack = MemoryPack::new(rt.clone());
+        let token = rt.authorize(Namespace::local()).expect("local token");
+        let registry = VerbRegistryBuilder::new()
+            .build()
+            .expect("empty registry builds");
+
+        let err = pack
+            .handle_recall(
+                &token,
+                serde_json::json!({
+                    "namespace": "bench-arm-a",
+                    "query": "direct mismatch regression",
+                }),
+                &registry,
+            )
+            .await
+            .expect_err("a local token must not elevate into a measurement arm");
+        assert!(
+            matches!(err, RuntimeError::InvalidInput(ref msg) if msg.contains("does not match authorized token namespace")),
+            "unexpected error: {err:?}"
         );
     }
 
