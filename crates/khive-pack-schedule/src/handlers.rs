@@ -225,9 +225,11 @@ fn validate_replayable_single_action(
 /// note visible to the agenda/drain by transitioning it to `pending`.
 ///
 /// `created_by_actor` in note properties is deliberately only a display
-/// mirror: generic KG `create`/`update` can write arbitrary note properties,
-/// whereas no public verb can append an event. The runner therefore derives
-/// replay authority from this event's actor column and never from the note.
+/// mirror: generic KG `create` can forge arbitrary note properties, whereas
+/// no public verb can append an event. Existing `scheduled_event` notes are
+/// schedule-managed and generic KG update/merge rejects them, so the immutable
+/// actor binding cannot become a bearer credential for rewritten intent. The
+/// runner still derives replay authority from the event and never from the note.
 /// Creating the note as `provisioning` closes the crash window: a failure
 /// before provenance and activation can leave an inert diagnostic row, never
 /// executable unprovenanced work.

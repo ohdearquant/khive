@@ -46,12 +46,13 @@ the creating actor's inbox) from `schedule` (stores a serialized verb+args
 payload for replay). Both event types mirror the creator in `created_by_actor`
 for display, but authority comes only from a target-bound, append-only
 `schedule.creator_provenance` event written from the dispatch token. Generic KG
-CRUD can forge note properties but cannot append that event. The note is staged
-as `provisioning` and becomes `pending` only after provenance is durable.
+create can forge an unprovenanced row, but existing `scheduled_event` notes reject
+generic update and merge. The note is staged as `provisioning` and becomes `pending`
+only after provenance is durable.
 Replay reconstructs the exact verified actor kind from the event (including
 preserving `anonymous:local`), preserves public verb visibility, and therefore
-cannot inherit daemon authority or invoke an internal subhandler; legacy generic
-rows without provenance fail closed.
+cannot inherit daemon authority, authorize rewritten executable intent, or invoke an
+internal subhandler; legacy generic rows without provenance fail closed.
 `payload` is null for reminders and a JSON-encoded verb call string for scheduled
 dispatch. Reminder delivery uses the same dual-write path as `comm.send`. Use
 `schedule.schedule(action="comm.send(...)")` for delivery to an actor other than

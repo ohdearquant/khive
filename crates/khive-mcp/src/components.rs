@@ -481,10 +481,35 @@ async fn supervise(
             "daemon component: starting"
         );
         let ctx = HostContext::new(server.clone(), token.clone(), reg.name, health.clone());
-        // A separate task per run isolates panics at the task boundary: a
-        // panicking component surfaces as a JoinError here instead of
-        // unwinding through the supervisor.
-        let mut handle = tokio::spawn((reg.start)(ctx));
+        // Invoke the factory behind an unwind boundary before spawning its
+        // returned future. Argument evaluation happens before `tokio::spawn`,
+        // so putting `(reg.start)(ctx)` directly in that call would let a
+        // synchronous construction panic unwind the supervisor itself and
+        // strand a false `Running` health row. ADR-119 makes construction
+        // failure terminal rather than restartable.
+        let component =
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (reg.start)(ctx))) {
+                Ok(component) => component,
+                Err(payload) => {
+                    let detail = payload
+                        .downcast_ref::<&str>()
+                        .map(|message| (*message).to_string())
+                        .or_else(|| payload.downcast_ref::<String>().cloned())
+                        .unwrap_or_else(|| "non-string panic payload".to_string());
+                    let error = format!("component construction panicked: {detail}");
+                    health.record_state(reg.name, ComponentState::Unhealthy, Some(error.clone()));
+                    tracing::error!(
+                        component = reg.name,
+                        error = %error,
+                        "daemon component: construction failed; terminally unhealthy"
+                    );
+                    return;
+                }
+            };
+        // A separate task per run isolates panics raised while polling the
+        // returned component future: they surface as JoinError here instead
+        // of unwinding through the supervisor.
+        let mut handle = tokio::spawn(component);
 
         let joined = tokio::select! {
             r = &mut handle => Some(r),
@@ -1104,7 +1129,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failed_component_is_isolated_from_independent_sibling() {
+    async fn synchronous_factory_panic_is_terminal_and_sibling_survives() {
         let healthy_cycles = Arc::new(AtomicU32::new(0));
         let healthy_cycles_for_start = healthy_cycles.clone();
         let healthy = ComponentRegistration {
@@ -1137,9 +1162,7 @@ mod tests {
             backoff_max_ms: 2,
             shutdown_timeout_ms: 100,
             start: Arc::new(|_ctx: HostContext| -> ComponentFuture {
-                Box::pin(async move {
-                    panic!("isolated sibling panic");
-                })
+                panic!("synchronous component construction panic");
             }),
         };
         let (_f, db) = tmp_db();
@@ -1156,7 +1179,19 @@ mod tests {
             2
         );
 
-        wait_for_state(&health, "test-isolated-failing", ComponentState::Unhealthy).await;
+        let failed =
+            wait_for_state(&health, "test-isolated-failing", ComponentState::Unhealthy).await;
+        assert_eq!(
+            failed.restart_count, 0,
+            "construction failures are terminal and must not spend restart budget"
+        );
+        assert!(
+            failed
+                .last_error
+                .as_deref()
+                .is_some_and(|error| error.contains("construction panicked")),
+            "construction panic must be named in terminal health: {failed:?}"
+        );
         for _ in 0..400 {
             if healthy_cycles.load(Ordering::SeqCst) >= 2 {
                 break;
@@ -1165,7 +1200,7 @@ mod tests {
         }
         assert!(
             healthy_cycles.load(Ordering::SeqCst) >= 2,
-            "one component's panic must not cancel or starve an independent sibling"
+            "one component's construction panic must not cancel or starve an independent sibling"
         );
         assert_eq!(
             health

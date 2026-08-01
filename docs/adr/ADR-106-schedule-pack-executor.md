@@ -878,6 +878,14 @@ therefore run as the creator, never as the daemon. Neither the stored DSL nor mu
 properties can override identity. Replay also retains the public visibility gate, so a
 scheduled payload cannot invoke a `Visibility::Subhandler`.
 
+Executable `scheduled_event` content and properties are schedule-managed. Generic KG
+`update` and note `merge` reject these rows (including either merge operand), so a caller
+cannot replace payload, trigger, cadence, or lifecycle state while retaining another
+actor's immutable provenance. `schedule.cancel` and the drain's CAS transitions remain the
+only executable-state mutation paths; generic deletion can still remove a row but cannot
+amend or reactivate it. Generic creation of an unprovenanced row still follows the
+fail-closed policy below.
+
 A generic scheduled-action row without immutable creator provenance fails closed: the payload is not
 dispatched, the claimed row becomes terminal `status="failed"`, and the drain persists
 `dispatch_error` plus `dispatch_failed_at`. This is the migration policy for rows written

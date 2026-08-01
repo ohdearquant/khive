@@ -1128,6 +1128,8 @@ impl KhiveRuntime {
             .await?
             .ok_or_else(|| RuntimeError::NotFound(format!("note {id}")))?;
 
+        reject_pack_managed_schedule_mutation(&note, "update")?;
+
         let mut text_changed = false;
 
         if let Some(name_patch) = patch.name {
@@ -1289,6 +1291,9 @@ impl KhiveRuntime {
             .ok_or_else(|| RuntimeError::NotFound("not found in this namespace".into()))?;
         Self::ensure_namespace(&from_note.namespace, &ns)?;
 
+        reject_pack_managed_schedule_mutation(&into_note, "merge")?;
+        reject_pack_managed_schedule_mutation(&from_note, "merge")?;
+
         let _ = self.graph(token)?;
         let _ = self.text_for_notes(token)?;
         for model_name in embedding_plan.model_names() {
@@ -1393,6 +1398,26 @@ impl KhiveRuntime {
 
         Ok(summary)
     }
+}
+
+/// Keep executable schedule intent behind the schedule pack's state-machine verbs.
+///
+/// `scheduled_event` notes carry both replay payloads and lifecycle state. Allowing
+/// generic note update/merge to rewrite either would turn the immutable creator event
+/// into a bearer credential for attacker-selected work: replay would attribute the
+/// changed row to its original creator. Schedule's own transitions use its private
+/// note-store CAS helpers and therefore do not pass through this generic curation seam.
+fn reject_pack_managed_schedule_mutation(
+    note: &khive_storage::note::Note,
+    operation: &str,
+) -> RuntimeResult<()> {
+    if note.kind == "scheduled_event" {
+        return Err(RuntimeError::InvalidInput(format!(
+            "cannot {operation} a schedule-managed `scheduled_event` note through generic KG \
+             mutation; use schedule.cancel or create a replacement schedule"
+        )));
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -4460,6 +4485,99 @@ mod tests {
             Some(into.id.to_string().as_str()),
             "merged_into must point to into_id"
         );
+    }
+
+    #[tokio::test]
+    async fn generic_update_and_merge_reject_schedule_managed_notes() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let schedule_a = rt
+            .create_note(
+                &tok,
+                "scheduled_event",
+                None,
+                "stats()",
+                None,
+                Some(serde_json::json!({
+                    "event_type": "schedule",
+                    "payload": "stats()",
+                    "status": "pending",
+                    "trigger_at": "2099-01-01T00:00:00Z"
+                })),
+                vec![],
+            )
+            .await
+            .unwrap();
+        let schedule_b = rt
+            .create_note(
+                &tok,
+                "scheduled_event",
+                None,
+                "stats()",
+                None,
+                Some(serde_json::json!({
+                    "event_type": "schedule",
+                    "payload": "stats()",
+                    "status": "pending",
+                    "trigger_at": "2099-01-02T00:00:00Z"
+                })),
+                vec![],
+            )
+            .await
+            .unwrap();
+
+        let update_error = rt
+            .update_note(
+                &tok,
+                schedule_a.id,
+                NotePatch::new(
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(serde_json::json!({ "payload": "delete(id=\"victim\")" })),
+                ),
+            )
+            .await
+            .expect_err("schedule-managed note update must fail");
+        assert!(
+            update_error.to_string().contains("schedule-managed"),
+            "{update_error}"
+        );
+
+        for (into_id, from_id) in [
+            (schedule_a.id, schedule_b.id),
+            (schedule_b.id, schedule_a.id),
+        ] {
+            let merge_error = rt
+                .merge_note(
+                    &tok,
+                    into_id,
+                    from_id,
+                    EntityDedupMergePolicy::PreferFrom,
+                    ContentMergeStrategy::PreferFrom,
+                    false,
+                )
+                .await
+                .expect_err("either schedule-managed merge operand must fail");
+            assert!(
+                merge_error.to_string().contains("schedule-managed"),
+                "{merge_error}"
+            );
+        }
+
+        let store = rt.notes(&tok).unwrap();
+        for (id, trigger_at) in [
+            (schedule_a.id, "2099-01-01T00:00:00Z"),
+            (schedule_b.id, "2099-01-02T00:00:00Z"),
+        ] {
+            let note = store
+                .get_note(id)
+                .await
+                .unwrap()
+                .expect("rejected generic mutation leaves the schedule intact");
+            assert_eq!(note.properties.as_ref().unwrap()["trigger_at"], trigger_at);
+        }
     }
 
     #[tokio::test]

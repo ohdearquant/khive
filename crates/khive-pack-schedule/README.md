@@ -28,8 +28,10 @@ content to the creating actor's inbox through the same dual-write path as
 is a different actor. Both creation verbs mirror `created_by_actor` for display and
 write an immutable, target-bound creator-provenance event before activating the note.
 Generic actions replay under the actor derived from that event for gate checks, audit
-attribution, and writes; mutable note properties cannot grant authority and replay
-cannot invoke internal subhandlers. A legacy generic row without provenance fails
+attribution, and writes. Existing `scheduled_event` notes are schedule-managed: generic
+KG `update` and note `merge` reject them, preventing payload, trigger, cadence, or lifecycle
+rewrites from reusing the immutable actor binding. Replay cannot invoke internal
+subhandlers. A legacy generic row without provenance fails
 closed instead of being dispatched. `schedule.schedule`'s
 `action` parameter
 is a full verb-dispatch string (e.g.

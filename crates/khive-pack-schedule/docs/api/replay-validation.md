@@ -39,8 +39,10 @@ The pending-events runner reparses the stored DSL at trigger time and dispatches
 through the public-visibility request surface with the event namespace and a
 verified replay identity derived from the immutable, target-bound creator-provenance
 event; attributed principals use `VerifiedActor`, while `anonymous:local` remains
-anonymous. The caller-editable `created_by_actor` note property is not an authority source. A legacy
-generic row missing provenance fails closed. For replay to succeed, the stored action must be:
+anonymous. `created_by_actor` note metadata is not an authority source, and existing
+`scheduled_event` notes reject generic KG update/merge so another actor cannot rewrite
+the stored action while retaining the creator binding. A legacy generic row missing
+provenance fails closed. For replay to succeed, the stored action must be:
 
 - A single op against an exactly-registered handler name (not a bare shorthand
   resolved via a `schedule.{tool}` fallback).

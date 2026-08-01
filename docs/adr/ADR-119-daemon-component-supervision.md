@@ -683,6 +683,13 @@ therefore execute as the creator rather than the daemon, and internal subhandler
 unreachable. Policy tests deny `create` to the creator while allowing the daemon, reject a
 forged note property, and prove concurrent actor/namespace pairs do not cross.
 
+Executable `scheduled_event` content and properties are schedule-managed. Generic KG
+`update` and note `merge` reject these rows, including either merge operand, so immutable
+creator provenance cannot be reused as a bearer credential for attacker-selected payload,
+trigger, cadence, or lifecycle state. A two-actor policy regression permits the attacker to
+call `update`, denies that actor the target verb, and proves the mutation is rejected before
+the original creator's schedule is replayed unchanged.
+
 Generic legacy rows without immutable creator provenance fail closed and terminally: no dispatch
 occurs, `status` becomes `failed`, and `dispatch_error`/`dispatch_failed_at` record the
 policy failure. ADR-106 Amendment C's reminder-only fallback ignores any unprovenanced note
@@ -705,8 +712,9 @@ contract.
   and none without it; the serve role gate proves client processes start zero components.
 - A supervised quiet-drain test proves heartbeat advancement and cooperative cancellation
   to terminal `Stopped` without consuming restart budget.
-- Existing generic supervisor tests continue to cover retryable/permanent failure, panic,
-  budget exhaustion, cancellation, timeout/abort, and independent progress.
+- Existing generic supervisor tests continue to cover retryable/permanent failure, polled-future
+  panic, synchronous factory-construction panic, budget exhaustion, cancellation,
+  timeout/abort, and independent progress.
 - Schedule drain tests prove creator-bound gate evaluation and legacy generic fail-closed
   behavior; schedule-pack tests prove both creation verbs persist the creator.
 - Existing multi-backend and CAS regressions remain the routing and state-machine fences.

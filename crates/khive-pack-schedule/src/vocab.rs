@@ -99,9 +99,7 @@ pub(crate) static SCHEDULE_HANDLERS: [HandlerDef; 4] = [
     },
     HandlerDef {
         name: "schedule.agenda",
-        description: "List upcoming scheduled events. On the MCP surface, the host also \
-                      reports process-local daemon ticker liveness as `ticker.last_tick_at`; \
-                      null before this server instance observes its first tick.",
+        description: "List upcoming scheduled events.",
         visibility: Visibility::Verb,
         category: khive_types::VerbCategory::Assertive,
         params: &[

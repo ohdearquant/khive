@@ -230,14 +230,19 @@ The schedule pack's note kind is **`scheduled_event`** — a user-authored, futu
 record. The name is deliberately distinct from the substrate `Event` type to prevent
 confusion between the two mechanisms:
 
-| Concept         | Kind / Type              | Author       | Mutability | Purpose               |
-| --------------- | ------------------------ | ------------ | ---------- | --------------------- |
-| Substrate event | `Event` (not a note)     | Runtime      | Immutable  | Audit / observability |
-| Schedule intent | `scheduled_event` (note) | Agent / user | Updateable | Future trigger intent |
+| Concept         | Kind / Type              | Author       | Mutability       | Purpose               |
+| --------------- | ------------------------ | ------------ | ---------------- | --------------------- |
+| Substrate event | `Event` (not a note)     | Runtime      | Immutable        | Audit / observability |
+| Schedule intent | `scheduled_event` (note) | Agent / user | Schedule-managed | Future trigger intent |
 
 Callers create `scheduled_event` notes by calling `remind` or `schedule`. The runtime or an
 external scheduler reads these notes, evaluates the trigger time, dispatches the stored
-payload, and updates the note's status.
+payload, and updates the note's status. ADR-119 Amendment 4 tightens the original
+"updateable" description: generic KG update/merge cannot mutate executable schedule rows,
+because retaining immutable creator provenance while changing payload or lifecycle state
+would create a confused deputy. `schedule.cancel` and the executor's state-machine
+transitions are the supported executable-state mutation paths; generic deletion remains
+record removal rather than schedule amendment.
 
 #### Pack identity
 
@@ -544,10 +549,11 @@ standard `delete(id)` path.
    the sent message's ID. Whether the recipient namespace actually exists is a separate check
    that may or may not be surfaced to the sender.
 
-2. **Scheduled event fired status**: After trigger evaluation, the execution environment
-   updates `properties.status = "fired"` and `properties.fired_at`. This write must use
-   `update(id, properties={...})`. Should the pack register a `fire` verb owned by the
-   runtime/daemon, or is `update` sufficient?
+2. **Scheduled event fired status (resolved by ADR-106/ADR-119)**: After trigger evaluation,
+   the execution environment updates `properties.status = "fired"` and
+   `properties.fired_at` through the schedule executor's conditional state-machine write.
+   Generic `update` is not sufficient because it would expose executable intent and creator
+   authority to confused-deputy substitution.
 
 3. **Repeat semantics after firing**: For recurring events, the execution environment
    calculates the next `trigger_at` from the `repeat` rule and creates a new `scheduled_event`
@@ -582,8 +588,8 @@ standard `delete(id)` path.
   `scheduled_event` note kind defined here.
 - ADR-013: Note Kind Taxonomy — adds `message` and `scheduled_event` as pack-extensible
   kinds.
-- ADR-014: Curation Operations — standard `delete` for message removal; `update` for
-  status mutation on scheduled events.
+- ADR-014: Curation Operations — standard `delete` for message removal; ADR-119 Amendment 4
+  supersedes generic `update` for schedule status mutation with schedule-owned transitions.
 - ADR-015: Schema Migrations — pack-auxiliary DDL uses idempotent `CREATE ... IF NOT EXISTS`.
 - ADR-016: Request DSL — verb dispatch surface that routes to both packs; `action` payload
   in `schedule` is a DSL string.

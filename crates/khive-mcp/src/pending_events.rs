@@ -38,9 +38,11 @@
 //! MCP server's registry with the event's namespace injected as the `namespace=`
 //! parameter, so all writes land in the event's namespace. Replay derives its
 //! actor from an immutable, target-bound provenance event written by the
-//! schedule handler; the caller-editable `created_by_actor` note property is
-//! never an authorization source. A generic legacy row without provenance
-//! fails closed instead of inheriting daemon authority.
+//! schedule handler; `created_by_actor` note metadata is never an authorization
+//! source. Executable `scheduled_event` state is schedule-managed and rejects
+//! generic KG update/merge, so provenance cannot authorize rewritten intent. A
+//! generic legacy row without provenance fails closed instead of inheriting
+//! daemon authority.
 //!
 //! ## Repeat advancement
 //!
@@ -533,9 +535,10 @@ pub async fn run_pending_events_on(
                     .unwrap_or("remind");
 
                 // Resolve replay/delivery authority only from the immutable
-                // pack-written provenance event. `created_by_actor` in note
-                // properties is caller-editable through generic KG CRUD and
-                // is therefore display metadata, never an authority source.
+                // pack-written provenance event. `created_by_actor` remains
+                // display metadata and never an authority source; the generic
+                // KG mutation fence separately prevents a valid provenance
+                // record from authorizing rewritten executable intent.
                 // Generic actions require provenance even on the missed path
                 // (legacy rows fail closed before any lifecycle transition);
                 // in-grace reminders use it for both recipient and dispatch
@@ -1156,12 +1159,13 @@ async fn append_reminder_delivery_failure_event(
 /// immutable provenance event.
 ///
 /// The note's `properties.created_by_actor` field is intentionally ignored:
-/// generic note CRUD can create or overwrite it. The `events` substrate is
-/// append-only and has no public create verb, so a target-bound event written
-/// by `schedule.remind`/`schedule.schedule` is the durable out-of-band proof
-/// from which the host constructs a verified replay identity. Zero matching
-/// rows means legacy or hand-written intent. More than one is corruption and
-/// fails the drain pass rather than choosing an identity nondeterministically.
+/// generic note create can forge it, while schedule-managed rows reject generic
+/// update/merge. The `events` substrate is append-only and has no public create
+/// verb, so a target-bound event written by `schedule.remind`/`schedule.schedule`
+/// is the durable out-of-band proof from which the host constructs a verified
+/// replay identity. Zero matching rows means legacy or hand-written intent.
+/// More than one is corruption and fails the drain pass rather than choosing an
+/// identity nondeterministically.
 #[derive(Clone, Debug)]
 struct VerifiedCreator {
     /// `None` deliberately represents the provenance-verified
@@ -1536,6 +1540,21 @@ mod tests {
             if request.verb == "create" && request.actor.id == "lambda:schedule-owner" {
                 Ok(GateDecision::deny(
                     "creator is not authorized to replay create",
+                ))
+            } else {
+                Ok(GateDecision::allow())
+            }
+        }
+    }
+
+    #[derive(Debug)]
+    struct DenyAttackerCreateGate;
+
+    impl Gate for DenyAttackerCreateGate {
+        fn check(&self, request: &GateRequest) -> Result<GateDecision, GateError> {
+            if request.verb == "create" && request.actor.id == "lambda:schedule-attacker" {
+                Ok(GateDecision::deny(
+                    "attacker is not authorized to replay create",
                 ))
             } else {
                 Ok(GateDecision::allow())
@@ -2853,6 +2872,128 @@ mod tests {
                 .as_str()
                 .is_some_and(|error| error.contains("immutable creator provenance")),
             "{props}"
+        );
+    }
+
+    #[tokio::test]
+    async fn second_actor_cannot_rewrite_provenanced_schedule_intent() {
+        let (_tmp, db_path) = tmp_db();
+        let gate = std::sync::Arc::new(DenyAttackerCreateGate);
+        let owner = "lambda:schedule-owner";
+        let attacker = "lambda:schedule-attacker";
+        let original_action =
+            "create(kind=\"observation\", content=\"owner-approved schedule intent\")";
+        let forged_action =
+            "create(kind=\"observation\", content=\"attacker-selected schedule intent\")";
+
+        let owner_rt = KhiveRuntime::new(RuntimeConfig {
+            db_path: Some(std::path::PathBuf::from(&db_path)),
+            default_namespace: Namespace::local(),
+            embedding_model: None,
+            additional_embedding_models: vec![],
+            gate: gate.clone(),
+            actor_id: Some(owner.to_string()),
+            packs: vec!["kg".to_string(), "schedule".to_string()],
+            ..Default::default()
+        })
+        .expect("owner runtime");
+        let note_id = create_scheduled_event(
+            &owner_rt,
+            "local",
+            &due_rfc3339(),
+            Some(original_action),
+            None,
+            "schedule",
+        )
+        .await;
+
+        // Actor B is allowed to call generic `update`, but is denied the
+        // target `create` verb. Before the schedule-managed mutation fence,
+        // this patch replaced actor A's payload while retaining A's immutable
+        // provenance, so trigger-time Gate evaluation ran as A and allowed it.
+        let attacker_rt = KhiveRuntime::new(RuntimeConfig {
+            db_path: Some(std::path::PathBuf::from(&db_path)),
+            default_namespace: Namespace::local(),
+            embedding_model: None,
+            additional_embedding_models: vec![],
+            gate: gate.clone(),
+            actor_id: Some(attacker.to_string()),
+            packs: vec!["kg".to_string(), "schedule".to_string()],
+            ..Default::default()
+        })
+        .expect("attacker runtime");
+        let attacker_server = KhiveMcpServer::new(attacker_rt).expect("attacker server");
+        let update_ops = json!([{
+            "tool": "update",
+            "args": {
+                "id": note_id.to_string(),
+                "kind": "note",
+                "properties": {
+                    "payload": forged_action,
+                    "trigger_at": due_rfc3339(),
+                    "repeat": "daily",
+                    "status": "pending",
+                    "event_type": "schedule"
+                }
+            }
+        }])
+        .to_string();
+        let update_response = attacker_server
+            .dispatch_request_local(RequestParams {
+                ops: update_ops,
+                ..Default::default()
+            })
+            .await
+            .expect("generic update returns an operation envelope");
+        let update_response: Value =
+            serde_json::from_str(&update_response).expect("update response JSON");
+        assert_eq!(
+            update_response["results"][0]["ok"], false,
+            "{update_response}"
+        );
+        assert!(
+            update_response["results"][0]["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("schedule-managed")),
+            "the generic mutation fence must reject executable schedule changes: \
+             {update_response}"
+        );
+
+        let unchanged = get_note_props(&owner_rt, note_id).await;
+        assert_eq!(unchanged["payload"], original_action, "{unchanged}");
+        assert_eq!(unchanged["repeat"], Value::Null, "{unchanged}");
+
+        let daemon_rt = KhiveRuntime::new(RuntimeConfig {
+            db_path: Some(std::path::PathBuf::from(&db_path)),
+            default_namespace: Namespace::local(),
+            embedding_model: None,
+            additional_embedding_models: vec![],
+            gate,
+            actor_id: Some("lambda:daemon".to_string()),
+            packs: vec!["kg".to_string(), "schedule".to_string()],
+            ..Default::default()
+        })
+        .expect("daemon runtime");
+        let daemon_server = KhiveMcpServer::new(daemon_rt.clone()).expect("daemon server");
+        let summary = run_pending_events_on(&daemon_rt, &daemon_server, false)
+            .await
+            .expect("drain");
+
+        assert_eq!(summary.failed, 0, "{summary:?}");
+        assert_eq!(summary.fired, 1, "{summary:?}");
+        assert_eq!(
+            note_content_count(&daemon_rt, "observation", "owner-approved schedule intent").await,
+            1
+        );
+        assert_eq!(
+            note_content_count(
+                &daemon_rt,
+                "observation",
+                "attacker-selected schedule intent"
+            )
+            .await,
+            0,
+            "actor B's rejected payload must never replay with actor A's authority"
         );
     }
 
