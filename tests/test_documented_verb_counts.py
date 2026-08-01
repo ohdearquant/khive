@@ -55,6 +55,18 @@ The server config loads all three (`kg`, `comm`, `workspace`).
         self.assertIn(("pack_verbs", "kg", 20), {(c.kind, c.pack, c.value) for c in claims})
         self.assertIn(("pack_verbs", "workspace", 0), {(c.kind, c.pack, c.value) for c in claims})
 
+    def test_scanner_covers_status_cells_and_line_wrapped_pack_counts(self) -> None:
+        claims = scan_document(
+            "README.md",
+            "| **28 verbs, 3 packs** | all load by default |\n"
+            "A 28-verb runtime across 3\n"
+            "packs, ready for use.\n",
+            PACK_COUNTS,
+        )
+        values = [(claim.kind, claim.value) for claim in claims]
+        self.assertEqual(values.count(("total_verbs", 28)), 2)
+        self.assertEqual(values.count(("total_packs", 3)), 2)
+
     def test_pack_path_supplies_named_window(self) -> None:
         claims = scan_document(
             "marketplace/khive/skills/comm/SKILL.md",
@@ -62,6 +74,32 @@ The server config loads all three (`kg`, `comm`, `workspace`).
             PACK_COUNTS,
         )
         self.assertEqual([(c.pack, c.value) for c in claims], [("comm", 8)])
+
+        claims = scan_document(
+            "crates/khive-pack-comm/src/lib.rs",
+            "//! Adds the `message` note kind and eight verbs.\n",
+            PACK_COUNTS,
+        )
+        self.assertEqual([(c.pack, c.value) for c in claims], [("comm", 8)])
+
+        claims = scan_document(
+            "crates/khive-pack-kg/README.md",
+            "## Verbs\n\n20 handlers, registered under ADR-017.\n",
+            PACK_COUNTS,
+        )
+        self.assertEqual([(c.pack, c.value) for c in claims], [("kg", 20)])
+
+    def test_context_resolves_registered_pack_and_pack_filter(self) -> None:
+        claims = scan_document(
+            "docs/guide/api-reference.md",
+            "`comm` registers the message kind; its eight verbs are public.\n"
+            '`request(ops="verbs(pack=\\"comm\\")")` lists the eight public verbs.\n',
+            PACK_COUNTS,
+        )
+        self.assertEqual(
+            [(c.pack, c.value) for c in claims if c.kind == "pack_verbs"],
+            [("comm", 8), ("comm", 8)],
+        )
 
         claims = scan_document(
             "crates/khive-pack-comm/docs/design.md",

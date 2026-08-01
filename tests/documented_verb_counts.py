@@ -67,6 +67,10 @@ HANDLER_ENTRY_RE = re.compile(
     rf"\b(?P<count>{COUNT_TOKEN})\s+(?:public\s+verbs?\s+)?entries\b",
     re.IGNORECASE,
 )
+HANDLER_COUNT_RE = re.compile(
+    rf"\b(?P<count>{COUNT_TOKEN})\s+(?:public\s+)?handlers?(?![-\w])",
+    re.IGNORECASE,
+)
 
 
 @dataclass(frozen=True)
@@ -157,9 +161,12 @@ def _context_pack(context: str, pack_names: set[str]) -> str | None:
     for pack in pack_names:
         marker = re.compile(
             rf"(?:khive-pack-{re.escape(pack)}\b|"
-            rf"(?<![\w.-]){re.escape(pack)}(?![\w.-])\s+pack\b|"
-            rf"(?<![\w.-]){re.escape(pack)}(?![\w.-])\s+"
-            rf"(?:contributes?|provides?|implements?|dispatches?|ships?|exposes?))",
+            rf"(?<![\w.-]){re.escape(pack)}(?![\w.-])"
+            rf"(?:\s*\([^)]*\))?\s+pack\b|"
+            rf"(?<![\w.-]){re.escape(pack)}(?![\w.-])"
+            rf"(?:\s*\([^)]*\))?\s+"
+            rf"(?:adds?|contributes?|dispatches?|exposes?|implements?|provides?|registers?|ships?)|"
+            rf"\bpack\s*=\s*\\?[\"']?{re.escape(pack)}\\?[\"']?)",
             re.IGNORECASE,
         )
         for match in marker.finditer(plain):
@@ -181,7 +188,10 @@ def _is_pack_total_context(plain: str, match: re.Match[str]) -> bool:
         return False
     if re.search(r"\b(?:surface|pack|handlers?|catalog|descriptors?|all)\b", lowered):
         return True
-    if re.search(r"\b(?:contribut|provid|implement|dispatch|ship|expos)\w*\b", lowered):
+    if re.search(
+        r"\b(?:add|contribut|provid|implement|dispatch|register|ship|expos)\w*\b",
+        lowered,
+    ):
         return True
     suffix = plain[match.end() : match.end() + 4]
     return ":" in suffix or "-" in suffix
@@ -191,7 +201,7 @@ def _is_aggregate_verb_context(plain: str, match: re.Match[str]) -> bool:
     if match.re is INVERTED_VERB_COUNT_RE:
         return True
     lowered = plain.lower()
-    return any(
+    if any(
         cue in lowered
         for cue in (
             "across",
@@ -201,6 +211,11 @@ def _is_aggregate_verb_context(plain: str, match: re.Match[str]) -> bool:
             "out of the box",
             "aggregate",
         )
+    ):
+        return True
+    return PACK_COUNT_RE.search(plain) is not None and any(
+        cue in lowered
+        for cue in ("default", "load by default", "loaded by default", "production")
     )
 
 
@@ -252,8 +267,19 @@ def scan_document(path: str, text: str, pack_names: Iterable[str]) -> list[Count
         stripped = raw.strip()
         if path.endswith(".rs") and not stripped.startswith(("//!", "///", "#[doc")):
             continue
-        plain = _plain(raw)
+        next_raw = lines[line_number] if line_number < len(lines) else ""
+        if path.endswith(".rs") and not next_raw.strip().startswith(("//!", "///", "#[doc")):
+            next_raw = ""
+        raw_window = f"{raw} {next_raw}" if next_raw else raw
+        plain = _plain(raw_window)
+        current_line_end = len(_plain(raw))
         context = "\n".join(lines[max(0, line_number - 3) : line_number])
+
+        def starts_on_current_line(match: re.Match[str]) -> bool:
+            return match.start() <= current_line_end
+
+        def claim_text(match: re.Match[str]) -> str:
+            return raw_window if match.end() > current_line_end else raw
 
         if stripped.startswith("|"):
             cells = [re.sub(r"[`*_]", "", cell).strip() for cell in stripped.strip("|").split("|")]
@@ -281,6 +307,8 @@ def scan_document(path: str, text: str, pack_names: Iterable[str]) -> list[Count
             )
             verb_matches.extend(named_count_re.finditer(plain))
         for match in verb_matches:
+            if not starts_on_current_line(match):
+                continue
             if match.span() in matched_spans:
                 continue
             if _is_reference_count(plain, match):
@@ -288,20 +316,48 @@ def scan_document(path: str, text: str, pack_names: Iterable[str]) -> list[Count
             matched_spans.add(match.span())
             value = _number(match.group("count"))
             pack = path_pack or _context_pack(context, names)
-            pack_context = plain if path_pack is not None else _plain(context)
+            pack_context = (
+                _plain(claim_text(match)) if path_pack is not None else _plain(context)
+            )
             if pack is not None and _is_pack_total_context(pack_context, match):
                 claims.append(
-                    _claim(path, line_number, "pack_verbs", value, raw, "per-pack-window", pack)
+                    _claim(
+                        path,
+                        line_number,
+                        "pack_verbs",
+                        value,
+                        claim_text(match),
+                        "per-pack-window",
+                        pack,
+                    )
                 )
             elif _is_aggregate_verb_context(plain, match):
                 form = "inverted" if match.re is INVERTED_VERB_COUNT_RE else (
                     "hyphenated" if "-" in match.group(0) else "spaced"
                 )
-                claims.append(_claim(path, line_number, "total_verbs", value, raw, form))
+                claims.append(
+                    _claim(
+                        path,
+                        line_number,
+                        "total_verbs",
+                        value,
+                        claim_text(match),
+                        form,
+                    )
+                )
 
         if path_pack is not None and "handlers" in plain.lower():
-            for match in HANDLER_ENTRY_RE.finditer(plain):
+            handler_matches = list(HANDLER_ENTRY_RE.finditer(plain)) + list(
+                HANDLER_COUNT_RE.finditer(plain)
+            )
+            for match in handler_matches:
+                if not starts_on_current_line(match):
+                    continue
                 if _is_reference_count(plain, match):
+                    continue
+                if match.re is HANDLER_COUNT_RE and not _is_pack_total_context(
+                    _plain(context), match
+                ):
                     continue
                 claims.append(
                     _claim(
@@ -309,7 +365,7 @@ def scan_document(path: str, text: str, pack_names: Iterable[str]) -> list[Count
                         line_number,
                         "pack_verbs",
                         _number(match.group("count")),
-                        raw,
+                        claim_text(match),
                         "per-pack-window",
                         path_pack,
                     )
@@ -319,6 +375,8 @@ def scan_document(path: str, text: str, pack_names: Iterable[str]) -> list[Count
             INVERTED_PACK_COUNT_RE.finditer(plain)
         ) + list(BEYOND_LOADED_RE.finditer(plain))
         for match in pack_matches:
+            if not starts_on_current_line(match):
+                continue
             if _is_reference_count(plain, match) or not _is_aggregate_pack_context(plain, match):
                 continue
             if "--packs" in plain and "production" not in plain.lower():
@@ -327,10 +385,19 @@ def scan_document(path: str, text: str, pack_names: Iterable[str]) -> list[Count
                 "hyphenated" if "-" in match.group(0) else "spaced"
             )
             claims.append(
-                _claim(path, line_number, "total_packs", _number(match.group("count")), raw, form)
+                _claim(
+                    path,
+                    line_number,
+                    "total_packs",
+                    _number(match.group("count")),
+                    claim_text(match),
+                    form,
+                )
             )
 
         for match in LOADS_ALL_RE.finditer(plain):
+            if not starts_on_current_line(match):
+                continue
             if any(existing.line == line_number and existing.kind == "total_packs" for existing in claims):
                 continue
             context = plain.lower()
@@ -341,7 +408,7 @@ def scan_document(path: str, text: str, pack_names: Iterable[str]) -> list[Count
                         line_number,
                         "total_packs",
                         _number(match.group("count")),
-                        raw,
+                        claim_text(match),
                         "spelled",
                     )
                 )
