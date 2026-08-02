@@ -1480,7 +1480,10 @@ impl CheckpointConnection {
 ///
 /// Issues `PRAGMA wal_checkpoint(PASSIVE)` every tick on the task's dedicated
 /// [`CheckpointConnection`] — never the pool's writer mutex, so a concurrent
-/// writer cannot block (or be blocked by) a checkpoint tick. A tick is
+/// `pool.writer()` checkout can never queue behind a checkpoint tick. That
+/// guarantee is admission-only: an armed TRUNCATE still takes SQLite's writer
+/// lock and can block new write transactions, on any connection, for up to
+/// `truncate_busy_timeout` (see [`CheckpointConnection`]'s contract). A tick is
 /// `Skipped` only when that dedicated connection is itself unavailable. A
 /// WARNING fires once per below→above threshold crossing, not every tick.
 ///
