@@ -1804,6 +1804,14 @@ diagnostic names the attempted `verb`, the provenance `record_kind` and natural
 Because a digest continues after a per-record refusal, callers that require a clean run
 should assert `writes_refused == 0` in addition to waiting for `done == true`.
 
+`gh_available` reports only whether the `gh --version` presence probe succeeds.
+Inspect the separate `issues` and `pull_requests` objects for source coverage. Each reports
+`state` (`ingested`, `skipped`, or `failed`), a machine-readable `reason`, and the
+number of records successfully handled. Skip reasons are `not_requested`,
+`gh_cli_absent`, `remote_not_github`, and `budget_exhausted`; command failures use
+`gh_error`. A successful empty query is `ingested` with count 0. The top-level `done`
+field remains a cursor/budget signal, not a coverage claim.
+
 ### `git.commit` / `git.branch` / `git.push` — Commissive (ADR-108)
 
 Thin write verbs that shell to system git (`std::process::Command::args`, no shell

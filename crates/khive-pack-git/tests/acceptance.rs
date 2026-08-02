@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 
 use async_trait::async_trait;
-use khive_pack_git::ingest::{run_ingest, IngestOptions};
+use khive_pack_git::ingest::{run_ingest, IngestOptions, IngestSourceReason, IngestSourceState};
 use khive_pack_git::GitPack;
 use khive_pack_kg::KgPack;
 use khive_runtime::{
@@ -2069,6 +2069,49 @@ async fn issue_and_pr_idempotency_is_scoped_per_project() {
 
 // ── gh boundary contract + per-record warning aggregation ───────────────────
 
+#[tokio::test]
+async fn gh_command_failure_has_a_structured_source_outcome() {
+    let _guard = ENV_MUTEX.lock().await;
+    let (rt, token, registry) = fixture().await;
+    let project_id = create(
+        &registry,
+        json!({"kind": "project", "name": "gh-failure-repo"}),
+    )
+    .await;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path().join("repo");
+    std::fs::create_dir_all(&repo).expect("mk repo dir");
+    init_repo(&repo);
+    let bin_dir = dir.path().join("bin");
+    std::fs::create_dir_all(&bin_dir).expect("mk bin dir");
+    let log_dir = dir.path().join("log");
+    std::fs::create_dir_all(&log_dir).expect("mk log dir");
+    write_fake_gh(&bin_dir, &log_dir, "not-json", "[]");
+    let _path_guard = PathGuard::install(&bin_dir);
+
+    let mut opts = IngestOptions::unbounded(repo, project_id.to_string());
+    opts.include.commits = false;
+    opts.include.issues = false;
+    let report = run_ingest(&rt, &token, &registry, opts)
+        .await
+        .expect("a gh source failure stays in-band");
+
+    assert!(report.gh_available, "the fake CLI probe succeeded");
+    assert_eq!(report.pull_requests.state, IngestSourceState::Failed);
+    assert_eq!(
+        report.pull_requests.reason,
+        Some(IngestSourceReason::GhError)
+    );
+    assert_eq!(report.pull_requests.count, 0);
+    assert_eq!(report.issues.state, IngestSourceState::Skipped);
+    assert_eq!(report.issues.reason, Some(IngestSourceReason::NotRequested));
+    assert!(report
+        .warnings
+        .iter()
+        .any(|warning| warning.contains("gh pr list failed")));
+}
+
 /// End-to-end over a PATH-shadowing fake `gh`: locks the four demo-found
 /// regression classes ((a) no `-C`, correct cwd; (b) empty `stateReason`
 /// omitted; (c) uppercase enum values lowercased; (d) all four governed
@@ -2145,10 +2188,16 @@ async fn gh_boundary_contract_and_partial_ingest_failure() {
         "fake gh must be found on PATH: {report:?}"
     );
     assert_eq!(report.prs_ingested, 1, "{report:?}");
+    assert_eq!(report.pull_requests.state, IngestSourceState::Ingested);
+    assert_eq!(report.pull_requests.reason, None);
+    assert_eq!(report.pull_requests.count, 1);
     assert_eq!(
         report.issues_ingested, 5,
         "5 of 6 issues land, #3 warns-and-skips: {report:?}"
     );
+    assert_eq!(report.issues.state, IngestSourceState::Ingested);
+    assert_eq!(report.issues.reason, None);
+    assert_eq!(report.issues.count, 5);
     assert_eq!(
         report
             .warnings
@@ -2990,6 +3039,72 @@ async fn pr_ingest_retries_tie_at_cursor_timestamp() {
 
 // ── `git.digest` verb (ADR-088 Amendment 1) ─────────────────────────────────
 
+#[tokio::test]
+async fn digest_verb_reports_non_github_source_skips_even_when_gh_is_installed() {
+    let _guard = ENV_MUTEX.lock().await;
+    let (_rt, _token, registry) = fixture().await;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path().join("repo");
+    std::fs::create_dir_all(&repo).expect("mk repo dir");
+    init_repo(&repo);
+    git(
+        &repo,
+        &[
+            "remote",
+            "add",
+            "origin",
+            "https://gitlab.com/example/non-github-repo.git",
+        ],
+    );
+
+    let bin_dir = dir.path().join("bin");
+    std::fs::create_dir_all(&bin_dir).expect("mk bin dir");
+    let log_dir = dir.path().join("log");
+    std::fs::create_dir_all(&log_dir).expect("mk log dir");
+    write_fake_gh(&bin_dir, &log_dir, "[]", "[]");
+    let _path_guard = PathGuard::install(&bin_dir);
+
+    let result = registry
+        .dispatch(
+            "git.digest",
+            json!({
+                "source": repo.to_str().expect("utf-8 repo path"),
+                "max_items": 10,
+                "include": ["issues", "pull_requests"]
+            }),
+        )
+        .await
+        .expect("non-GitHub degradation stays in-band");
+
+    assert_eq!(result["gh_available"], true, "the fake gh CLI is present");
+    assert_eq!(
+        result["issues"],
+        json!({"state": "skipped", "reason": "remote_not_github", "count": 0})
+    );
+    assert_eq!(
+        result["pull_requests"],
+        json!({"state": "skipped", "reason": "remote_not_github", "count": 0})
+    );
+    assert_eq!(result["done"], true, "done remains a cursor/budget signal");
+    assert!(result["warnings"]
+        .as_array()
+        .expect("warnings array")
+        .iter()
+        .any(|warning| warning
+            .as_str()
+            .is_some_and(|text| text.contains("no github.com remote"))));
+
+    let args_log = std::fs::read_to_string(log_dir.join("args.log")).expect("read args log");
+    assert!(args_log.lines().any(|line| line == "--version"));
+    assert!(
+        !args_log
+            .lines()
+            .any(|line| line.starts_with("pr ") || line.starts_with("issue ")),
+        "remote-not-GitHub must skip source commands: {args_log}"
+    );
+}
+
 /// End-to-end over the `git.digest` verb itself (not `run_ingest` directly):
 /// no `project` argument auto-creates the repo-anchor entity (reported via
 /// `project_created`), a `Closes #N` commit message materializes an
@@ -3161,6 +3276,15 @@ async fn digest_verb_counts_and_describes_partial_secret_gate_refusals() {
     let repo: PathBuf = dir.path().join("repo");
     std::fs::create_dir_all(&repo).expect("mk repo dir");
     init_repo(&repo);
+    git(
+        &repo,
+        &[
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/example/refusal-accounting-repo.git",
+        ],
+    );
 
     let bin_dir = dir.path().join("bin");
     std::fs::create_dir_all(&bin_dir).expect("mk bin dir");

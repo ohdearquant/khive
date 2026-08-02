@@ -17,11 +17,11 @@ use khive_storage::types::{SqlStatement, SqlValue};
 use crate::cache::{self, CacheError};
 use crate::ingest::{
     resolve_project_id, run_ingest, run_ingest_with_commit_recovery, CacheRepairStrategy,
-    GitLogError, IngestInclude, IngestOptions, RecoveredRepo,
+    GitLogError, GithubRemoteCapability, IngestInclude, IngestOptions, RecoveredRepo,
 };
 use crate::source::{
-    parse_source, redact_repo_url, remote_url_to_slug, repo_basename, repo_identity, DigestSource,
-    REPO_SLUG_PROPERTY,
+    github_remote_usable, parse_source, redact_repo_url, remote_url_to_slug, repo_basename,
+    repo_identity, DigestSource, REPO_SLUG_PROPERTY,
 };
 use crate::GitPack;
 
@@ -132,12 +132,17 @@ impl GitPack {
             Some(v) => parse_include(v)?,
         };
 
-        let mut warnings: Vec<String> = Vec::new();
-
         // Resolve a local repo path -- remote sources clone/fetch into the
         // scratch cache first (ADR-088 Amendment 1 §Remote-URL mode).
-        let (repo_path, gh_capable) = match &source {
-            DigestSource::Local(p) => (p.clone(), true),
+        let (repo_path, github_remote) = match &source {
+            DigestSource::Local(p) => {
+                let capability = if github_remote_usable(&source).await {
+                    GithubRemoteCapability::Usable
+                } else {
+                    GithubRemoteCapability::Unavailable
+                };
+                (p.clone(), capability)
+            }
             DigestSource::Remote { canonical, gh_slug } => {
                 let cloned = cache::ensure_clone(canonical).map_err(|e| {
                     RuntimeError::InvalidInput(format!(
@@ -145,14 +150,12 @@ impl GitPack {
                         redact_repo_url(canonical)
                     ))
                 })?;
-                if gh_slug.is_none() {
-                    warnings.push(format!(
-                        "host for {:?} is not github.com; issue/pull_request \
-                         ingestion is skipped (commits-only degradation, ADR-088 Amendment 1)",
-                        redact_repo_url(canonical)
-                    ));
-                }
-                (cloned, gh_slug.is_some())
+                let capability = if gh_slug.is_some() {
+                    GithubRemoteCapability::Usable
+                } else {
+                    GithubRemoteCapability::Unavailable
+                };
+                (cloned, capability)
             }
         };
 
@@ -179,17 +182,12 @@ impl GitPack {
         let project_id = resolution.id;
         let project_created = resolution.created;
 
-        let effective_include = IngestInclude {
-            commits: include.commits,
-            issues: include.issues && gh_capable,
-            pull_requests: include.pull_requests && gh_capable,
-        };
-
         let opts = IngestOptions {
             repo: repo_path,
             project: project_id.to_string(),
             max_items: Some(max_items),
-            include: effective_include,
+            include,
+            github_remote,
         };
 
         // Only a remote-URL source has a disposable cache to repair (ADR-088
@@ -207,7 +205,6 @@ impl GitPack {
         }
         .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?;
 
-        report.warnings.extend(warnings);
         if !resolution.slug_duplicates.is_empty() {
             report.warnings.push(format!(
                 "multiple live project anchors match the same repo identity; selected oldest {}; duplicates: {}",

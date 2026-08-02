@@ -352,6 +352,25 @@ async fn local_origin_remote_url(canonical_repo_path: &Path) -> Option<String> {
     .flatten()
 }
 
+/// Whether `source` names a repository that the `gh` CLI can serve.
+///
+/// Remote URL sources carry this fact from `parse_source`. Local sources
+/// derive it from their configured `origin`, accepting every Git remote
+/// spelling that `remote_url_to_slug` normalizes. CLI presence is a separate
+/// capability reported by the ingester.
+pub async fn github_remote_usable(source: &DigestSource) -> bool {
+    match source {
+        DigestSource::Remote { gh_slug, .. } => gh_slug.is_some(),
+        DigestSource::Local(path) => {
+            let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.clone());
+            local_origin_remote_url(&canonical)
+                .await
+                .and_then(|origin| remote_url_to_slug(&origin))
+                .is_some_and(|slug| slug.split('/').next() == Some("github.com"))
+        }
+    }
+}
+
 /// Resolve the canonical repo-anchor identity (issue #1173) for a digest
 /// source -- the value stored in `properties.repo_slug` and matched on by
 /// `resolve_or_create_project`.
@@ -704,6 +723,31 @@ mod tests {
                 .expect("spawn git");
             assert!(status.success(), "git {args:?} failed");
         }
+    }
+
+    #[tokio::test]
+    async fn github_remote_capability_uses_local_origin_host() {
+        let github = tempfile::tempdir().expect("github tempdir");
+        init_repo_with_origin(github.path(), "git@github.com:org/repo.git");
+        assert!(github_remote_usable(&DigestSource::Local(github.path().to_path_buf())).await);
+
+        let gitlab = tempfile::tempdir().expect("gitlab tempdir");
+        init_repo_with_origin(gitlab.path(), "https://gitlab.com/org/repo.git");
+        assert!(!github_remote_usable(&DigestSource::Local(gitlab.path().to_path_buf())).await);
+    }
+
+    #[tokio::test]
+    async fn github_remote_capability_is_false_without_origin() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(dir.path())
+            .args(["init", "-q"])
+            .status()
+            .expect("spawn git init");
+        assert!(status.success());
+
+        assert!(!github_remote_usable(&DigestSource::Local(dir.path().to_path_buf())).await);
     }
 
     #[tokio::test]

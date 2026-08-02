@@ -19,3 +19,13 @@ classified `GitLogError` (the caller has already verified
 operate on the cache slot for `canonical_url`, which is the same path
 `_repo` already names (`crate::cache`'s slot layout is keyed by URL, not
 passed through).
+
+## GitHub source capability
+
+Before constructing `IngestOptions`, the `git.digest` handler resolves whether the
+selected source has a usable GitHub remote. Remote-URL sources reuse their parsed
+`gh_slug`; local sources inspect the configured `origin` through the same URL
+normalization rules. The original `include` selection is preserved when GitHub is
+unavailable so `run_ingest` can emit machine-readable `remote_not_github` outcomes
+for requested issue and pull-request sources. This source fact is independent of
+`gh_available`, which reports only whether the `gh` CLI probe succeeded.

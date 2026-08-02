@@ -40,6 +40,20 @@ impl Default for IngestInclude {
     }
 }
 
+/// What the caller knows about whether the repository has a GitHub remote.
+///
+/// `Unknown` preserves the shared ingester's historical behavior: invoke
+/// `gh` and let that command report whether the current repository is usable.
+/// The `git.digest` handler resolves local and remote sources before calling
+/// the ingester, so its agent-facing report always uses `Usable` or
+/// `Unavailable` instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GithubRemoteCapability {
+    Unknown,
+    Usable,
+    Unavailable,
+}
+
 /// Options for one ingest pass.
 #[derive(Debug, Clone)]
 pub struct IngestOptions {
@@ -53,6 +67,8 @@ pub struct IngestOptions {
     pub max_items: Option<u64>,
     /// Which record kinds to ingest this pass.
     pub include: IngestInclude,
+    /// Whether the repository has a remote the `gh` CLI can serve.
+    pub github_remote: GithubRemoteCapability,
 }
 
 impl IngestOptions {
@@ -64,6 +80,7 @@ impl IngestOptions {
             project,
             max_items: None,
             include: IngestInclude::default(),
+            github_remote: GithubRemoteCapability::Unknown,
         }
     }
 }
@@ -114,6 +131,70 @@ pub struct IngestWriteRefusal {
     pub masked: String,
 }
 
+/// Machine-readable coverage state for one optional GitHub source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IngestSourceState {
+    Ingested,
+    Skipped,
+    Failed,
+}
+
+/// Why an optional GitHub source was skipped or failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IngestSourceReason {
+    NotRequested,
+    GhCliAbsent,
+    RemoteNotGithub,
+    GhError,
+    BudgetExhausted,
+}
+
+/// Outcome for one issue/PR source in this ingest pass.
+///
+/// `count` is the number of records successfully handled as either newly
+/// ingested or already present. A successful empty query is therefore
+/// `ingested` with count zero, distinct from every skip/failure state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct IngestSourceOutcome {
+    pub state: IngestSourceState,
+    pub reason: Option<IngestSourceReason>,
+    pub count: u64,
+}
+
+impl IngestSourceOutcome {
+    fn ingested(count: u64) -> Self {
+        Self {
+            state: IngestSourceState::Ingested,
+            reason: None,
+            count,
+        }
+    }
+
+    fn skipped(reason: IngestSourceReason) -> Self {
+        Self {
+            state: IngestSourceState::Skipped,
+            reason: Some(reason),
+            count: 0,
+        }
+    }
+
+    fn failed(reason: IngestSourceReason, count: u64) -> Self {
+        Self {
+            state: IngestSourceState::Failed,
+            reason: Some(reason),
+            count,
+        }
+    }
+}
+
+impl Default for IngestSourceOutcome {
+    fn default() -> Self {
+        Self::skipped(IngestSourceReason::NotRequested)
+    }
+}
+
 /// Outcome of one ingest pass. Serializable so CLI callers can emit it as JSON.
 #[derive(Debug, Default, Serialize)]
 pub struct IngestReport {
@@ -123,9 +204,14 @@ pub struct IngestReport {
     pub issues_skipped_existing: u64,
     pub prs_ingested: u64,
     pub prs_skipped_existing: u64,
-    /// `false` when the `gh` CLI was not found on PATH — issues/PRs were
-    /// skipped but commits still ingested (ADR-088 §5 graceful-absence rule).
+    /// Whether the `gh --version` CLI-presence probe succeeded. This says
+    /// nothing about remote usability or per-source success; inspect
+    /// `issues` and `pull_requests` for those outcomes.
     pub gh_available: bool,
+    /// Machine-readable issue-source coverage for this pass.
+    pub issues: IngestSourceOutcome,
+    /// Machine-readable pull-request-source coverage for this pass.
+    pub pull_requests: IngestSourceOutcome,
     pub warnings: Vec<String>,
     /// Number of per-record content writes refused by the runtime secret gate
     /// during this pass. Callers can assert this is zero independently of
@@ -245,6 +331,7 @@ pub(crate) async fn run_ingest_with_commit_recovery(
         done: true,
         ..IngestReport::default()
     };
+    report.gh_available = gh_cli_available(&opts.repo);
 
     let project_id = resolve_id(runtime, token, &opts.project)
         .await?
@@ -258,59 +345,103 @@ pub(crate) async fn run_ingest_with_commit_recovery(
     };
     let mut new_records: Vec<NewRecordForRef> = Vec::new();
 
-    // Graceful degradation covers both "gh is not on PATH" and "gh is present
-    // but this repo has no usable GitHub remote" (e.g. a synthetic/local-only
-    // repo) — either way, issues/PRs are skipped with a warning and commits
-    // still ingest (ADR-088 §5). A hard `gh` failure must never abort the
-    // whole pass.
+    // Graceful degradation keeps issue/PR source coverage explicit while
+    // commits continue. `done` remains solely the budget/cursor contract;
+    // callers inspect these source outcomes for remote coverage (#1617).
     if opts.include.issues || opts.include.pull_requests {
-        if gh_available(&opts.repo) {
-            report.gh_available = true;
-            if opts.include.pull_requests && !budget.exhausted() {
-                match ingest_prs(
-                    runtime,
-                    token,
-                    registry,
-                    &opts.repo,
-                    project_id,
-                    &mut report,
-                    &mut merge_sha_to_pr,
-                    &mut number_to_pr,
-                    &mut budget,
-                    &mut new_records,
-                )
-                .await
-                {
-                    Ok(()) => {}
-                    Err(e) => report
-                        .warnings
-                        .push(format!("gh pr list failed, skipping pull requests: {e}")),
-                }
+        if opts.github_remote == GithubRemoteCapability::Unavailable {
+            if opts.include.pull_requests {
+                report.pull_requests =
+                    IngestSourceOutcome::skipped(IngestSourceReason::RemoteNotGithub);
             }
-            if opts.include.issues && !budget.exhausted() {
-                if let Err(e) = ingest_issues(
-                    runtime,
-                    token,
-                    registry,
-                    &opts.repo,
-                    project_id,
-                    &mut report,
-                    &mut budget,
-                    &mut new_records,
-                )
-                .await
-                {
-                    report
-                        .warnings
-                        .push(format!("gh issue list failed, skipping issues: {e}"));
-                }
+            if opts.include.issues {
+                report.issues = IngestSourceOutcome::skipped(IngestSourceReason::RemoteNotGithub);
             }
-        } else {
-            report.gh_available = false;
             report.warnings.push(
-                "gh CLI not found on PATH; skipped issues and pull requests — commits still ingest"
+                "repository has no github.com remote usable by gh; skipped requested issues and pull requests — commits still ingest"
                     .to_string(),
             );
+        } else if !report.gh_available {
+            if opts.include.pull_requests {
+                report.pull_requests =
+                    IngestSourceOutcome::skipped(IngestSourceReason::GhCliAbsent);
+            }
+            if opts.include.issues {
+                report.issues = IngestSourceOutcome::skipped(IngestSourceReason::GhCliAbsent);
+            }
+            report.warnings.push(
+                "gh CLI not found on PATH; skipped requested issues and pull requests — commits still ingest"
+                    .to_string(),
+            );
+        } else {
+            if opts.include.pull_requests {
+                if budget.exhausted() {
+                    report.pull_requests =
+                        IngestSourceOutcome::skipped(IngestSourceReason::BudgetExhausted);
+                } else {
+                    let outcome = ingest_prs(
+                        runtime,
+                        token,
+                        registry,
+                        &opts.repo,
+                        project_id,
+                        &mut report,
+                        &mut merge_sha_to_pr,
+                        &mut number_to_pr,
+                        &mut budget,
+                        &mut new_records,
+                    )
+                    .await;
+                    let count = report
+                        .prs_ingested
+                        .saturating_add(report.prs_skipped_existing);
+                    match outcome {
+                        Ok(()) => {
+                            report.pull_requests = IngestSourceOutcome::ingested(count);
+                        }
+                        Err(e) => {
+                            report.pull_requests =
+                                IngestSourceOutcome::failed(IngestSourceReason::GhError, count);
+                            report
+                                .warnings
+                                .push(format!("gh pr list failed, skipping pull requests: {e}"));
+                        }
+                    }
+                }
+            }
+            if opts.include.issues {
+                if budget.exhausted() {
+                    report.issues =
+                        IngestSourceOutcome::skipped(IngestSourceReason::BudgetExhausted);
+                } else {
+                    let outcome = ingest_issues(
+                        runtime,
+                        token,
+                        registry,
+                        &opts.repo,
+                        project_id,
+                        &mut report,
+                        &mut budget,
+                        &mut new_records,
+                    )
+                    .await;
+                    let count = report
+                        .issues_ingested
+                        .saturating_add(report.issues_skipped_existing);
+                    match outcome {
+                        Ok(()) => {
+                            report.issues = IngestSourceOutcome::ingested(count);
+                        }
+                        Err(e) => {
+                            report.issues =
+                                IngestSourceOutcome::failed(IngestSourceReason::GhError, count);
+                            report
+                                .warnings
+                                .push(format!("gh issue list failed, skipping issues: {e}"));
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -460,8 +591,9 @@ async fn link_references(
     }
 }
 
-/// `true` when `gh` is on PATH and can run inside `repo`.
-fn gh_available(repo: &Path) -> bool {
+/// `true` when the `gh` executable is present and its version probe succeeds.
+/// Remote usability is reported separately through per-source outcomes.
+fn gh_cli_available(repo: &Path) -> bool {
     Command::new("gh")
         .arg("--version")
         .current_dir(repo)

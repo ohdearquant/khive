@@ -3,9 +3,10 @@
 Long-form rationale extracted from `crates/khive-pack-git/src/ingest.rs`
 doc-comments. Everything documented here is a non-public (private or
 `pub(crate)`) item — internal notes, not the published API reference (the
-crate's public surface — `IngestInclude`, `IngestOptions`, `IngestReport`,
-`run_ingest`, `resolve_project_id` — keeps its complete doc-comments in the
-source file itself).
+crate's public surface — `GithubRemoteCapability`, `IngestInclude`,
+`IngestOptions`, `IngestReport`, `IngestSourceOutcome`,
+`IngestSourceReason`, `IngestSourceState`, `run_ingest`, and
+`resolve_project_id` — keeps its complete doc-comments in the source file itself).
 
 ## Module overview
 
@@ -40,11 +41,37 @@ excerpt. It never includes the rejected content. Accounting is per ingest call r
 than process-global daemon telemetry, so a caller can reliably assert
 `writes_refused == 0` even when other digests run concurrently.
 
+## GitHub source coverage
+
+`IngestReport::gh_available` is narrowly the result of the `gh --version`
+CLI-presence probe. Repository capability and query execution are reported
+separately through `IngestReport::issues` and
+`IngestReport::pull_requests`, each an `IngestSourceOutcome` containing
+`state`, `reason`, and `count`.
+
+`state=ingested` has `reason=null`; its count includes records newly ingested
+or already present. `state=skipped` always names `not_requested`,
+`gh_cli_absent`, `remote_not_github`, or `budget_exhausted`.
+`state=failed` names `gh_error` and retains the count successfully handled
+before the failure. This makes an empty successful query (`ingested`, count
+zero) distinct from a source that was never reached.
+
+`IngestOptions::github_remote` carries a source resolver's knowledge into the
+shared ingest core. `git.digest` always supplies `Usable` or `Unavailable`:
+remote URLs already carry `gh_slug`, while local paths inspect their
+configured `origin` through `source::github_remote_usable`. The public
+`IngestOptions::unbounded` constructor uses `Unknown` for historical direct
+callers, which lets the `gh` command itself determine usability and reports a
+command failure as `gh_error`.
+
+The human-readable warnings remain, and `IngestReport::done` remains strictly
+the budget/cursor completion signal. It is not a coverage indicator.
+
 ## `NewRecordForRef`
 
 A newly created note this pass, retained so the post-ingestion
 reference-extraction sweep (`link_references`) can resolve cross-references
-between records created in the *same* pass regardless of ingestion order
+between records created in the _same_ pass regardless of ingestion order
 (PRs and issues are ingested before commits) without re-reading them from
 storage.
 
@@ -80,7 +107,7 @@ namespace (matches the by-ID resolution contract used by `get`/`update`).
 ## `link_references`
 
 Post-ingestion sweep (ADR-088 Amendment 1 ingest enrichment): extracts
-GitHub reference-grammar mentions from every note created *this pass*
+GitHub reference-grammar mentions from every note created _this pass_
 (commits, issues, PRs — order-independent, since all three are already in
 `new_records` by the time this runs) and materializes `annotates` edges to
 the referenced issue/PR note, carrying `ref_kind` ("closes" | "mentions")
@@ -169,7 +196,7 @@ available), and any other error (including an unclassified `GitLogError` or
 a non-`GitLogError` failure) is returned immediately without ever calling
 `recover`. A later repair attempt's strategy replaces the pending warning
 rather than accumulating one per attempt, so exactly one success warning is
-ever returned — describing the *last* repair that was needed, not every
+ever returned — describing the _last_ repair that was needed, not every
 one tried.
 
 ## Masking boundaries (`MaskedCommitFields`, `MaskedIssueFields`, `MaskedPrFields`)

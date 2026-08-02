@@ -208,6 +208,7 @@ fn commits_only_opts(
             issues: false,
             pull_requests: false,
         },
+        github_remote: crate::ingest::GithubRemoteCapability::Unknown,
     }
 }
 

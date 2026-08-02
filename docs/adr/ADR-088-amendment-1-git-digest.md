@@ -63,6 +63,30 @@ copies the rejected content. Per-record refusal remains non-fatal so the pass ca
 all affected records and ingest clean siblings, but a caller requiring a clean run must
 assert `writes_refused == 0` as well as loop until `done == true`.
 
+### Per-source coverage amendment (issue #1617, 2026-08-01)
+
+`gh_available` reports only whether the `gh --version` CLI-presence probe succeeded. It
+does not claim that the repository has a GitHub remote or that either GitHub query ran.
+The report adds `issues` and `pull_requests` outcome objects with this stable shape:
+
+```json
+{ "state": "ingested|skipped|failed", "reason": null, "count": 0 }
+```
+
+- `ingested` means the source query ran; `reason` is null. `count` is the number of
+  records successfully handled as newly ingested or already present, so a successful
+  empty repository is mechanically distinct from an unreached source.
+- `skipped` always carries one of `not_requested`, `gh_cli_absent`,
+  `remote_not_github`, or `budget_exhausted`.
+- `failed` carries `gh_error`; its count preserves records successfully handled before
+  the source failure.
+
+For a local path, GitHub capability is derived from the configured `origin` using the
+same normalized remote grammar as repo-anchor identity. A non-GitHub or missing origin
+therefore degrades requested issue/PR sources to `remote_not_github` even when `gh` is
+installed. Human-readable warnings remain additive. `done` is unchanged: it reports
+budget/cursor exhaustion only and must not be interpreted as source coverage.
+
 ### Remote-URL mode
 
 1. Clone to a daemon-owned scratch directory (`~/.khive/scratch/git-digest/<hash>/`),
