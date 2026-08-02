@@ -213,6 +213,9 @@ jobs:
       - name: Channel-email feature tests
         if: env.CI_SUITE == 'full' && matrix.shard == 1
         run: ../scripts/ci.sh channel-email
+      - name: Daemon recovery flake gate
+        if: matrix.shard == 1
+        run: ../scripts/ci.sh daemon-recovery-flake
       - name: No-default-features check
         if: env.CI_SUITE == 'full' && matrix.shard == 1
         run: ../scripts/ci.sh no-default-features

@@ -198,6 +198,26 @@ phase_channel_email() {
     cargo test -p khive-mcp --features channel-email
 }
 
+run_daemon_recovery_repeats() {
+    # #539/#544: both tests mutate the process-global daemon rendezvous and
+    # intentionally create maximal recovery contention. Run them serially
+    # inside each process, but repeat the paired scenario enough times on every
+    # supported CI OS to expose scheduler-sensitive ownership leaks.
+    repeat=1
+    while [ "$repeat" -le 25 ]; do
+        echo "daemon recovery repeat ${repeat}/25"
+        cargo test -p khive-mcp --lib 'daemon::tests::parallel_' -- --test-threads=1
+        repeat=$((repeat + 1))
+    done
+}
+
+phase_daemon_recovery_flake() {
+    echo "=== Daemon Recovery Flake Gate (25 repeats) ==="
+    # One guard around the complete repeat batch detects any default-store
+    # mutation without re-hashing a potentially large operator store 50 times.
+    run_with_store_sentinel run_daemon_recovery_repeats
+}
+
 phase_no_default_features() {
     echo "=== No-Default-Features Check ==="
     cargo check --workspace --no-default-features
@@ -269,6 +289,7 @@ run_phase() {
         tests) phase_tests ;;
         tests-doc) phase_tests_doc ;;
         channel-email) phase_channel_email ;;
+        daemon-recovery-flake) phase_daemon_recovery_flake ;;
         no-default-features) phase_no_default_features ;;
         release) phase_release ;;
         contract-tests) phase_contract_tests ;;
@@ -280,7 +301,7 @@ run_phase() {
         macos-pr-tests) phase_macos_pr_tests ;;
         *)
             echo "Unknown CI phase: $1" >&2
-            echo "Valid phases: no-stubs-scan lockfile forward-deployed lint no-stubs clippy docs tests tests-doc channel-email no-default-features release contract-tests deno-tests smoke-tests vector-smoke contract-suite macos-pr-check macos-pr-tests" >&2
+            echo "Valid phases: no-stubs-scan lockfile forward-deployed lint no-stubs clippy docs tests tests-doc channel-email daemon-recovery-flake no-default-features release contract-tests deno-tests smoke-tests vector-smoke contract-suite macos-pr-check macos-pr-tests" >&2
             exit 2
             ;;
     esac
@@ -297,6 +318,7 @@ run_all() {
         docs \
         tests \
         channel-email \
+        daemon-recovery-flake \
         no-default-features \
         release \
         contract-tests \

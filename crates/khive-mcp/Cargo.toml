@@ -65,6 +65,7 @@ channel-telegram = ["khive-channel", "khive-channel-telegram"]
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
+khive-runtime = { version = "0.7.0", path = "../khive-runtime", features = ["fault-injection"] }
 rmcp = { workspace = true, features = ["server", "transport-io", "client"] }
 async-trait = { workspace = true }
 serial_test = { workspace = true }
