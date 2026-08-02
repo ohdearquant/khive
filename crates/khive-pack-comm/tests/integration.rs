@@ -390,6 +390,10 @@ async fn delivered_rejects_short_or_malformed_ids() {
             error.to_string().contains("full outbound UUID"),
             "error must explain the stable correlation requirement: {error}"
         );
+        assert!(
+            error.to_string().contains("scoped resolution"),
+            "error must explain why a display prefix is insufficient: {error}"
+        );
     }
 }
 
@@ -3076,6 +3080,22 @@ async fn send_rejects_malformed_thread_id() {
     );
 }
 
+#[tokio::test]
+async fn send_rejects_thread_prefix_with_resolution_consequence() {
+    let (registry, _rt) = build_registry_for_ns("local");
+    let err = registry
+        .dispatch(
+            "comm.send",
+            serde_json::json!({ "to": "local", "content": "hi", "thread_id": "deadbeef" }),
+        )
+        .await
+        .expect_err("thread prefixes are not stable roots");
+    let message = err.to_string();
+
+    assert!(message.contains("scoped resolution"), "{message}");
+    assert!(message.contains("explicit stable reference"), "{message}");
+}
+
 /// `send` accepts UUID parser variants but stores only the v1 hyphenated form,
 /// so later exact-string thread queries cannot split the conversation.
 #[tokio::test]
@@ -4884,6 +4904,54 @@ async fn ingest_and_get_props(
         .expect("get_note ok")
         .expect("note exists");
     note.properties.expect("note has properties")
+}
+
+#[tokio::test]
+async fn ingest_dedup_returns_existing_canonical_thread_id() {
+    let (registry, _rt) = build_registry_for_ns("local");
+    let original_thread = uuid::Uuid::new_v4();
+    let competing_thread = uuid::Uuid::new_v4();
+    let external_id = format!("roundtrip-dedup-{original_thread}");
+
+    let first = registry
+        .dispatch(
+            "comm.ingest",
+            serde_json::json!({
+                "from": "external:sender",
+                "to": "local",
+                "content": "first delivery",
+                "external_id": external_id,
+                "thread_id": original_thread.simple().to_string(),
+            }),
+        )
+        .await
+        .expect("first ingest");
+    assert_eq!(
+        first["thread_id"],
+        original_thread.as_hyphenated().to_string()
+    );
+
+    let duplicate = registry
+        .dispatch(
+            "comm.ingest",
+            serde_json::json!({
+                "from": "external:sender",
+                "to": "local",
+                "content": "retry with a different proposed root",
+                "external_id": external_id,
+                "thread_id": competing_thread,
+            }),
+        )
+        .await
+        .expect("duplicate ingest is an acknowledged no-op");
+
+    assert_eq!(duplicate["deduplicated"], true);
+    assert_eq!(
+        duplicate["thread_id"],
+        original_thread.as_hyphenated().to_string(),
+        "the acknowledgement must identify the persisted thread, not the retry's proposed root"
+    );
+    assert_eq!(duplicate["thread_id"].as_str().unwrap().len(), 36);
 }
 
 /// (a) Reply with correlation matching an outbound note whose from_actor=lambda:khive

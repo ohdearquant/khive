@@ -101,8 +101,14 @@ impl KgPack {
         khive_runtime::secret_gate::check_tags(&p.reviewers)?;
         khive_runtime::secret_gate::check_json(&p.changeset)?;
 
-        let changeset: ProposalChangeset = serde_json::from_value(p.changeset.clone())
-            .map_err(|e| RuntimeError::InvalidInput(format!("invalid changeset: {e}")))?;
+        let changeset: ProposalChangeset =
+            serde_json::from_value(p.changeset.clone()).map_err(|e| {
+                RuntimeError::InvalidInput(format!(
+                    "invalid changeset: {e}; every changeset identifier must be a full UUID \
+                     because resolving a short prefix could miss, be ambiguous, or change the \
+                     proposal's stable intent"
+                ))
+            })?;
         if has_multi_step_compound(&changeset) {
             return Err(RuntimeError::InvalidInput(
                 "multi-step Compound proposals are not supported until atomic proposal apply is available"
@@ -119,11 +125,18 @@ impl KgPack {
             .as_deref()
             .map(|s| -> Result<khive_types::Id128, RuntimeError> {
                 let parent_uuid = Uuid::from_str(s).map_err(|e| {
-                    RuntimeError::InvalidInput(format!("invalid parent_id {s:?}: {e}"))
+                    RuntimeError::InvalidInput(format!(
+                        "parent_id must be a full UUID because a short prefix would require \
+                         proposal-namespace resolution and ancestry is an explicit stable \
+                         reference; got {s:?}: {e}"
+                    ))
                 })?;
                 Ok(khive_types::Id128::from_u128(parent_uuid.as_u128()))
             })
             .transpose()?;
+        let response_parent_id = validated_parent_id
+            .as_ref()
+            .map(|id| Uuid::from_u128(id.to_u128()).as_hyphenated().to_string());
 
         if let Some(ref parent_id128) = validated_parent_id {
             let parent_uuid = Uuid::from_u128(parent_id128.to_u128());
@@ -189,6 +202,8 @@ impl KgPack {
 
         to_json(&serde_json::json!({
             "id": proposal_id.to_string(),
+            "full_id": proposal_id.to_string(),
+            "parent_id": response_parent_id,
             "status": "open",
             "proposer": actor,
             "title": p.title,

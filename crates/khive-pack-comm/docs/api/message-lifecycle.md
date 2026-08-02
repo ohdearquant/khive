@@ -96,6 +96,12 @@ Message properties follow the versioned
 origin set `KHIVE_PROCESS_REF`, its exact Unicode value is copied to
 `sent_by_process` on both delivery copies as attribution-only metadata.
 
+The response includes the canonical full `thread_id` persisted on both copies.
+For a root send it is the outbound message's full UUID; for a continuation it
+is the canonicalized caller-supplied root. Because `comm.send(thread_id=...)`
+requires a full UUID, Agent presentation preserves this field so it can be
+submitted to a later send unchanged.
+
 ### Self-send collapse guard (#820)
 
 A resolved target that equals the sender's own actor identity is, outside the
@@ -139,6 +145,8 @@ confirmation only, not external channel delivery status. If the caller loses
 the complete MCP response rather than receiving the structured ambiguous
 error, it also loses the server-generated outbound UUID; that case requires a
 future caller-supplied idempotency/correlation contract and is out of scope.
+Agent presentation keeps this response's `id` canonical, so the returned exact
+correlation key can be submitted to `comm.delivered` again unchanged.
 
 ## `handlers.rs::handle_inbox`
 
@@ -378,6 +386,9 @@ Deduplication: when `external_id` is supplied, `try_create_note` uses a
 verify-after-insert check on the durable unique index on `external_id`. A
 confirmed duplicate returns `Ok(None)` without error; only an external_id
 collision is treated as dedup, other constraint violations surface as errors.
+The acknowledgement returns the canonical 36-character `thread_id` read from
+the existing row (falling back to that row's UUID for pre-v1 data), never the
+new root proposed by the duplicate delivery.
 
 Generic transport-layer metadata passthrough (issue #448, `IngestParams::metadata`):
 merged additively so it can never clobber a key already present. Names in the

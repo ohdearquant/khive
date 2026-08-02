@@ -79,7 +79,9 @@ fn canonicalize_thread_id(verb: &str, raw: &str) -> Result<String, RuntimeError>
         .map(|id| id.as_hyphenated().to_string())
         .map_err(|_| {
             RuntimeError::InvalidInput(format!(
-                "{verb}: `thread_id` must be a valid UUID, got: {raw:?}"
+                "{verb}: `thread_id` must be a full UUID because a short prefix would require \
+                 scoped resolution and a thread root is an explicit stable reference; got \
+                 {raw:?}"
             ))
         })
 }
@@ -266,9 +268,21 @@ pub(crate) async fn handle_send(
     )
     .await?;
 
+    // `thread_id` is a strict full-UUID input on a later send. Surface the
+    // canonical value persisted by `dual_write_message` so this response can
+    // start or continue a thread without fetching the message first (#1482).
+    let response_thread_id = outbound_note
+        .properties
+        .as_ref()
+        .and_then(|properties| properties.get("thread_id"))
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .unwrap_or_else(|| outbound_note.id.as_hyphenated().to_string());
+
     let mut response = json!({
         "id": short_id(outbound_note.id),
         "full_id": outbound_note.id.as_hyphenated().to_string(),
+        "thread_id": response_thread_id,
         "from": from_actor,
         "to": p.to,
         "subject": p.subject,
@@ -295,9 +309,10 @@ pub(crate) async fn handle_delivered(
     let p: DeliveredParams = deser(params)?;
     let outbound_id = Uuid::parse_str(p.id.trim()).map_err(|_| {
         RuntimeError::InvalidInput(
-            "delivered: `id` must be the full outbound UUID returned as `full_id` by \
-             comm.send or comm.reply, or surfaced as `outbound_id` in an ambiguous \
-             atomic-write error"
+            "delivered: a short prefix would require scoped resolution and cannot prove an \
+             exact delivery correlation; `id` must be the full outbound UUID returned as \
+             `full_id` by comm.send or comm.reply, or surfaced as `outbound_id` in an \
+             ambiguous atomic-write error"
                 .into(),
         )
     })?;
@@ -1738,10 +1753,49 @@ pub(crate) async fn handle_ingest(
                 external_id = ?p.external_id,
                 "comm.ingest: duplicate message skipped"
             );
+            let external_id = p.external_id.as_deref().ok_or_else(|| {
+                RuntimeError::Internal(
+                    "comm.ingest: storage reported a duplicate without an external_id".into(),
+                )
+            })?;
+            let duplicate_filter = NoteFilter {
+                kind: Some("message".to_string()),
+                property_filters: vec![PropertyFilter {
+                    json_path: "$.external_id".to_string(),
+                    op: FilterOp::Eq,
+                    value: SqlValue::Text(external_id.to_string()),
+                }],
+                ..Default::default()
+            };
+            let duplicate_page = store
+                .query_notes_filtered(
+                    ns,
+                    &duplicate_filter,
+                    PageRequest {
+                        limit: 1,
+                        offset: 0,
+                    },
+                )
+                .await?;
+            let duplicate = duplicate_page.items.first().ok_or_else(|| {
+                RuntimeError::Internal(format!(
+                    "comm.ingest: duplicate external_id {external_id:?} has no existing row"
+                ))
+            })?;
+            let existing_thread_id = duplicate
+                .properties
+                .as_ref()
+                .and_then(|properties| properties.get("thread_id"))
+                .and_then(Value::as_str)
+                .and_then(|raw| raw.parse::<Uuid>().ok())
+                .unwrap_or(duplicate.id)
+                .as_hyphenated()
+                .to_string();
             return Ok(json!({
                 "ok": true,
                 "deduplicated": true,
                 "external_id": p.external_id,
+                "thread_id": existing_thread_id,
             }));
         }
     };

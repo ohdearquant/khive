@@ -214,25 +214,28 @@ annotation discovery is namespace-agnostic under ADR-007, matching the fetched e
 
 List records with optional filtering.
 
-| Param                        | Type                     | Required | Notes                                                                         |
-| ---------------------------- | ------------------------ | -------- | ----------------------------------------------------------------------------- |
-| `kind`                       | string                   | yes      | `entity`\|`note`\|`edge`\|`event`\|`proposal`\|`message`, or a granular kind. |
-| `limit`                      | integer                  | no       | Default 20.                                                                   |
-| `offset`                     | integer                  | no       | Default 0; mutually exclusive with `after`.                                   |
-| `after`                      | string                   | no       | Entity/note/edge cursor UUID, or `""` to begin cursor mode.                   |
-| `entity_kind`                | string                   | no       | Filter when `kind="entity"`.                                                  |
-| `entity_type`                | string                   | no       | Filter by type field when `kind="entity"`.                                    |
-| `note_kind`                  | string                   | no       | Filter when `kind="note"`.                                                    |
-| `tags`                       | array\<string\>          | no       | OR-match, `kind="entity"` only.                                               |
-| `source_id` / `target_id`    | uuid                     | no       | Edge endpoint filters, `kind="edge"` only.                                    |
-| `relations`                  | array\<string\>          | no       | Edge relation filter, `kind="edge"` only.                                     |
-| `min_weight` / `max_weight`  | number                   | no       | Edge weight bounds, `kind="edge"` only.                                       |
-| `event_kind` / `event_kinds` | string / array\<string\> | no       | `kind="event"` only; additive.                                                |
-| `thread_id`                  | string                   | no       | `kind="message"` only; full UUID or 8-char prefix.                            |
-| `direction`                  | string                   | no       | `kind="message"` only: `inbound`\|`outbound`.                                 |
-| `from` / `to`                | string                   | no       | `kind="message"` only, sender/recipient filter.                               |
-| `read`                       | bool                     | no       | `kind="message"` only.                                                        |
-| `delivered`                  | bool                     | no       | `kind="message"` only.                                                        |
+| Param                        | Type                     | Required | Notes                                                                                                                                                                                |
+| ---------------------------- | ------------------------ | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `kind`                       | string                   | yes      | `entity`\|`note`\|`edge`\|`event`\|`proposal`\|`message`, or a granular kind.                                                                                                        |
+| `limit`                      | integer                  | no       | Default 20.                                                                                                                                                                          |
+| `offset`                     | integer                  | no       | Default 0; mutually exclusive with `after`.                                                                                                                                          |
+| `after`                      | string                   | no       | Exact full entity/note/edge cursor UUID returned as `next_after`, or `""` to begin cursor mode. Prefixes are rejected because keyset pagination needs the stable insertion boundary. |
+| `entity_kind`                | string                   | no       | Filter when `kind="entity"`.                                                                                                                                                         |
+| `entity_type`                | string                   | no       | Filter by type field when `kind="entity"`.                                                                                                                                           |
+| `note_kind`                  | string                   | no       | Filter when `kind="note"`.                                                                                                                                                           |
+| `tags`                       | array\<string\>          | no       | OR-match, `kind="entity"` only.                                                                                                                                                      |
+| `source_id` / `target_id`    | uuid                     | no       | Edge endpoint filters, `kind="edge"` only.                                                                                                                                           |
+| `relations`                  | array\<string\>          | no       | Edge relation filter, `kind="edge"` only.                                                                                                                                            |
+| `min_weight` / `max_weight`  | number                   | no       | Edge weight bounds, `kind="edge"` only.                                                                                                                                              |
+| `event_kind` / `event_kinds` | string / array\<string\> | no       | `kind="event"` only; additive.                                                                                                                                                       |
+| `session_id`                 | uuid                     | no       | `kind="event"` only; exact full session UUID. Prefixes are rejected because the filter needs one stable record.                                                                      |
+| `observed`                   | array\<uuid\>            | no       | `kind="event"` only; exact full observed-record UUIDs. Prefixes are rejected.                                                                                                        |
+| `selected`                   | array\<uuid\>            | no       | `kind="event"` only; exact full selected-record UUIDs. Prefixes are rejected.                                                                                                        |
+| `thread_id`                  | string                   | no       | `kind="message"` only; complete UUID or unique 8+ hex prefix resolved across stored thread roots in the caller's primary namespace. Missing or ambiguous prefixes fail explicitly.   |
+| `direction`                  | string                   | no       | `kind="message"` only: `inbound`\|`outbound`.                                                                                                                                        |
+| `from` / `to`                | string                   | no       | `kind="message"` only, sender/recipient filter.                                                                                                                                      |
+| `read`                       | bool                     | no       | `kind="message"` only.                                                                                                                                                               |
+| `delivered`                  | bool                     | no       | `kind="message"` only.                                                                                                                                                               |
 
 ```
 request(ops="list(kind=\"entity\", entity_kind=\"concept\", limit=20)")
@@ -621,18 +624,21 @@ request(ops="query(query=\"MATCH (c:concept)-[:extends]->(d:concept) RETURN c, d
 
 ### `propose` — Commissive
 
-Create an event-sourced change proposal. Returns `{id, status, proposer, title}` —
-chain with `$prev.id`, not `$prev.proposal_id`. The `changeset` field has nested
-objects and cannot be expressed in function-call DSL form; use JSON form.
+Create an event-sourced change proposal. Returns `{id, full_id, parent_id, status, proposer, title}`.
+`full_id` and a non-null `parent_id` remain canonical 36-character UUIDs in Agent mode so
+ancestry can be submitted again unchanged; `id` may be the ordinary 8-character Agent form.
+Reuse the returned `full_id` as `parent_id` in a subsequent proposal request. The `changeset`
+field has nested objects and cannot be expressed in function-call DSL form; use JSON form (whose
+operations do not support `$prev`).
 
-| Param         | Type            | Required | Notes                                                                                                                                              |
-| ------------- | --------------- | -------- | -------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `title`       | string          | yes      | Non-empty short title.                                                                                                                             |
-| `description` | string          | yes      | Non-empty full description.                                                                                                                        |
-| `changeset`   | object          | yes      | Discriminated by `kind`: `add_entity`, `update_entity`, `add_edge`, `add_note`, `merge_entities`, `supersede_entity`, `compound` (nested `steps`). |
-| `reviewers`   | array\<string\> | no       | Actor IDs requested as reviewers.                                                                                                                  |
-| `expiry`      | integer         | no       | Expiry timestamp, microseconds since epoch.                                                                                                        |
-| `parent_id`   | uuid            | no       | Parent proposal this supersedes or extends.                                                                                                        |
+| Param         | Type            | Required | Notes                                                                                                                                                                                                                                                                                           |
+| ------------- | --------------- | -------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `title`       | string          | yes      | Non-empty short title.                                                                                                                                                                                                                                                                          |
+| `description` | string          | yes      | Non-empty full description.                                                                                                                                                                                                                                                                     |
+| `changeset`   | object          | yes      | Discriminated by `kind`: `add_entity`, `update_entity`, `add_edge`, `add_note`, `merge_entities`, `supersede_entity`, `compound` (nested `steps`). Every nested identifier is a full UUID; prefixes are rejected because resolution could miss, be ambiguous, or change stable proposal intent. |
+| `reviewers`   | array\<string\> | no       | Actor IDs requested as reviewers.                                                                                                                                                                                                                                                               |
+| `expiry`      | integer         | no       | Expiry timestamp, microseconds since epoch.                                                                                                                                                                                                                                                     |
+| `parent_id`   | uuid            | no       | Full UUID of the parent proposal. Prefixes are rejected because ancestry is an explicit stable reference; responses preserve it canonically.                                                                                                                                                    |
 
 ```
 request(ops="[{\"tool\":\"propose\",\"args\":{\"title\":\"Add GQE\",\"description\":\"Register the GQE concept\",\"changeset\":{\"kind\":\"add_entity\",\"entity\":{\"kind\":\"concept\",\"name\":\"GQE\"}}}}]")
@@ -746,8 +752,8 @@ Create a GTD task (note with `kind=task`).
 | `priority`          | string          | no       | `p0`\|`p1`\|`p2`\|`p3` (default `p2`).                                                                                                                               |
 | `assignee`          | string          | no       | Assignee identifier.                                                                                                                                                 |
 | `due`               | string          | no       | ISO-8601 due date.                                                                                                                                                   |
-| `depends_on`        | array\<uuid\>   | no       | Blocking task UUIDs.                                                                                                                                                 |
-| `context_entity_id` | uuid            | no       | Full UUID of a related KG entity.                                                                                                                                    |
+| `depends_on`        | array\<uuid\>   | no       | Blocking task complete UUIDs or unique 8+ hex prefixes resolved in the caller's primary namespace.                                                                   |
+| `context_entity_id` | uuid            | no       | Full UUID of a related KG entity. Prefixes are rejected because the stored relationship is an explicit stable reference; Agent responses preserve it canonically.    |
 | `tags`              | array\<string\> | no       | Tag list.                                                                                                                                                            |
 
 ```
@@ -880,10 +886,10 @@ request(ops="memory.recall(query=\"ADR-016 DSL grammar\", limit=5, min_score=0.3
 
 Emit explicit feedback on a recalled entity; updates recall-domain posteriors.
 
-| Param       | Type   | Required | Notes                                                                                                                              |
-| ----------- | ------ | -------- | ---------------------------------------------------------------------------------------------------------------------------------- |
-| `target_id` | string | yes      | UUID of the recalled entity or memory.                                                                                             |
-| `signal`    | string | yes      | `useful`\|`not_useful`\|`wrong`\|`explicit_positive`\|`explicit_negative`\|`implicit_positive`\|`implicit_negative`\|`correction`. |
+| Param       | Type   | Required | Notes                                                                                                                                                                           |
+| ----------- | ------ | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `target_id` | string | yes      | Full UUID of the recalled entity or memory. Prefixes are rejected because feedback must identify one exact record. The acknowledgement returns canonical `target_id` for reuse. |
+| `signal`    | string | yes      | `useful`\|`not_useful`\|`wrong`\|`explicit_positive`\|`explicit_negative`\|`implicit_positive`\|`implicit_negative`\|`correction`.                                              |
 
 ```
 request(ops="memory.feedback(target_id=\"<uuid>\", signal=\"useful\")")
@@ -1188,12 +1194,15 @@ embedding input is bounded, the successful response includes the standard `warni
 | `to`        | string | yes      | Actor label, e.g. `"lambda:leo"`. Both copies land in the caller's namespace; no cross-namespace write occurs.                                                                                  |
 | `content`   | string | yes      | Non-empty message body.                                                                                                                                                                         |
 | `subject`   | string | no       | Optional subject line.                                                                                                                                                                          |
-| `thread_id` | uuid   | no       | Groups the message into an existing thread.                                                                                                                                                     |
+| `thread_id` | uuid   | no       | Optional full thread UUID. Prefixes are rejected because a thread root is an explicit stable reference. Accepted complete spellings normalize to canonical lowercase dashed form.               |
 | `self_send` | bool   | no       | Default false. Required when `to` matches the configured sender actor; otherwise the send is rejected. The anonymous `local` fallback is exempt. Use true only for an intentional note to self. |
 
 ```
 request(ops="comm.send(to=\"lambda:leo\", subject=\"PR ready\", content=\"#600 is open for review\")")
 ```
+
+Returns `{id, full_id, thread_id, ...}`. `full_id` and `thread_id` remain canonical
+36-character UUIDs in Agent mode; pass the returned `thread_id` unchanged to a later send.
 
 ### `comm.delivered` — Assertive
 
@@ -1406,9 +1415,9 @@ request(ops="schedule.agenda(limit=10)")
 
 Cancel a scheduled event.
 
-| Param | Type   | Required | Notes                             |
-| ----- | ------ | -------- | --------------------------------- |
-| `id`  | string | yes      | Full UUID of the scheduled event. |
+| Param | Type   | Required | Notes                                                                                                                    |
+| ----- | ------ | -------- | ------------------------------------------------------------------------------------------------------------------------ |
+| `id`  | string | yes      | Complete UUID or unique 8+ hex prefix of the scheduled event. Prefix resolution searches the caller's primary namespace. |
 
 ```
 request(ops="schedule.cancel(id=\"<event-id>\")")

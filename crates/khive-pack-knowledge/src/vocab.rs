@@ -528,13 +528,17 @@ pub(crate) static KNOWLEDGE_HANDLERS: [HandlerDef; 19] = [
                 name: "concept_id",
                 param_type: "uuid",
                 required: true,
-                description: "Concept entity ID",
+                description: "Concept entity complete UUID or unique 8+ hex prefix. Prefix \
+                              resolution searches the caller's primary namespace.",
             },
             ParamDef {
                 name: "source_id",
                 param_type: "uuid",
                 required: true,
-                description: "Source entity ID; must be kind=document, kind=person, or kind=org (introduced_by edge rule)",
+                description: "Source entity complete UUID or unique 8+ hex prefix; prefix \
+                              resolution searches the caller's primary namespace. The source \
+                              must be kind=document, kind=person, or kind=org (introduced_by \
+                              edge rule).",
             },
             ParamDef {
                 name: "weight",

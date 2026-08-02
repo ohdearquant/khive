@@ -31,10 +31,13 @@ impl MemoryPack {
 
         let target_id = p.target_id.parse::<Uuid>().map_err(|_| {
             RuntimeError::InvalidInput(format!(
-                "memory.feedback: target_id {:?} is not a valid UUID",
+                "memory.feedback: target_id must be a full UUID because a short-prefix \
+                 resolution can miss or be ambiguous, while feedback must identify one exact \
+                 recalled record; got {:?}",
                 p.target_id
             ))
         })?;
+        let canonical_target_id = target_id.as_hyphenated().to_string();
 
         // Tiers 1-2: explicit config profile, then namespace-bound profile via
         // brain.resolve(consumer_kind="recall") — shared with memory.recall's
@@ -42,7 +45,14 @@ impl MemoryPack {
         if let Some(profile_id) =
             super::common::resolve_serving_profile(&self.brain_profile, token, registry).await
         {
-            return route_to_brain(registry, token, &p.target_id, &p.signal, &profile_id).await;
+            return route_to_brain(
+                registry,
+                token,
+                &canonical_target_id,
+                &p.signal,
+                &profile_id,
+            )
+            .await;
         }
 
         // Tier 3: global tuning prior (original behavior).
@@ -50,7 +60,11 @@ impl MemoryPack {
             on_explicit_feedback(&mut state, target_id, &p.signal);
         }
 
-        Ok(json!({ "ok": true, "target_id": p.target_id, "signal": p.signal }))
+        Ok(json!({
+            "ok": true,
+            "target_id": canonical_target_id,
+            "signal": p.signal,
+        }))
     }
 }
 
@@ -120,6 +134,29 @@ mod tests {
         .expect("runtime")
     }
 
+    #[tokio::test]
+    async fn feedback_rejects_target_prefix_with_resolution_consequence() {
+        let rt = build_memory_rt(None);
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(KgPack::new(rt.clone()));
+        builder.register(crate::MemoryPack::new(rt));
+        let registry = builder.build().expect("registry");
+
+        let error = registry
+            .dispatch(
+                "memory.feedback",
+                serde_json::json!({
+                    "target_id": "deadbeef",
+                    "signal": "useful",
+                }),
+            )
+            .await
+            .expect_err("a feedback target prefix is not an exact record id");
+        let message = error.to_string();
+        assert!(message.contains("can miss or be ambiguous"), "{message}");
+        assert!(message.contains("one exact recalled record"), "{message}");
+    }
+
     /// Tier-3: when no brain pack is loaded and no profile is configured, feedback
     /// updates the global prior without error.
     #[tokio::test]
@@ -162,7 +199,53 @@ mod tests {
         assert!(result.is_ok(), "feedback must not error: {:?}", result);
         let v = result.unwrap();
         assert_eq!(v["ok"], true);
+        assert_eq!(v["target_id"], note_id.id.as_hyphenated().to_string());
         assert_eq!(v["signal"], "useful");
+    }
+
+    #[tokio::test]
+    async fn feedback_canonicalizes_complete_uuid_spelling() {
+        let rt = build_memory_rt(None);
+        let ns = Namespace::parse("local").expect("ns");
+        let token = rt.authorize(ns.clone()).expect("token");
+
+        let note_id = rt
+            .create_note_with_decay_for_embedding_model(
+                &token,
+                "memory",
+                None,
+                "canonical feedback target",
+                Some(0.7),
+                0.01,
+                None,
+                vec![],
+                None,
+            )
+            .await
+            .expect("create note");
+
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(KgPack::new(rt.clone()));
+        builder.register(crate::MemoryPack::new(rt));
+        let registry = builder.build().expect("registry");
+
+        let result = registry
+            .dispatch(
+                "memory.feedback",
+                serde_json::json!({
+                    "namespace": ns.as_str(),
+                    "target_id": format!("{{{}}}", note_id.id),
+                    "signal": "useful",
+                }),
+            )
+            .await
+            .expect("feedback ok");
+
+        assert_eq!(
+            result["target_id"],
+            note_id.id.as_hyphenated().to_string(),
+            "strict identifier acknowledgements use canonical lowercase dashed UUIDs"
+        );
     }
 
     /// Tier-3: not_useful signal flows through global prior path correctly.

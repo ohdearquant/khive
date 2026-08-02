@@ -1043,12 +1043,69 @@ async fn ensure_note_kind_rejects_foreign_note_before_kind_check() {
     }
 }
 
+#[tokio::test]
+async fn list_thread_filter_distinguishes_full_uuid_and_rejects_ambiguous_prefix() {
+    use crate::KgPack;
+    use khive_runtime::{KhiveRuntime, Namespace, VerbRegistryBuilder};
+
+    let rt = KhiveRuntime::memory().expect("in-memory runtime");
+    let token = rt.authorize(Namespace::local()).unwrap();
+    let first_thread = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+    let second_thread = "aaaaaaaa-cccc-dddd-eeee-ffffffffffff";
+
+    for (content, thread_id) in [
+        ("first shared-prefix thread", first_thread),
+        ("second shared-prefix thread", second_thread),
+    ] {
+        rt.create_note(
+            &token,
+            "observation",
+            None,
+            content,
+            None,
+            Some(serde_json::json!({"thread_id": thread_id})),
+            vec![],
+        )
+        .await
+        .expect("create threaded note");
+    }
+
+    let pack = KgPack::new(rt.clone());
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(KgPack::new(rt));
+    let registry = builder.build().expect("registry build");
+
+    let exact = pack
+        .handle_list(
+            &token,
+            serde_json::json!({"kind": "note", "thread_id": first_thread}),
+            &registry,
+        )
+        .await
+        .expect("full thread UUID filter");
+    let exact = exact.as_array().expect("list result array");
+    assert_eq!(exact.len(), 1, "full UUID must identify only one thread");
+    assert_eq!(exact[0]["properties"]["thread_id"], first_thread);
+
+    let error = pack
+        .handle_list(
+            &token,
+            serde_json::json!({"kind": "note", "thread_id": "aaaaaaaa"}),
+            &registry,
+        )
+        .await
+        .expect_err("shared prefix must be ambiguous");
+    let message = error.to_string();
+    assert!(message.contains("ambiguous thread_id prefix"), "{message}");
+    assert!(message.contains("one exact thread"), "{message}");
+}
+
 // Regression: list(kind=note, thread_id=<filter>) must not panic when a stored
 // thread_id contains a multi-byte UTF-8 character whose second byte falls at
 // byte index 8. The old code used `stored[..8]` (a byte-index slice) which
-// panics when byte 8 is not a char boundary. The fix uses `str::get(..8)`
-// which returns None for invalid boundaries, converting the panic into a safe
-// no-match result while leaving ASCII (UUID) thread_ids unaffected.
+// panics when byte 8 is not a char boundary. Non-UUID legacy labels now take
+// exact-match-only behavior, so the malformed stored value safely cannot match
+// an unrelated filter.
 #[tokio::test]
 async fn list_note_thread_filter_non_ascii_stored_no_panic() {
     use crate::KgPack;
@@ -1079,13 +1136,13 @@ async fn list_note_thread_filter_non_ascii_stored_no_panic() {
     builder.register(KgPack::new(rt.clone()));
     let registry = builder.build().expect("registry build");
 
-    // Filter with a different 8-byte ASCII string so exact equality fails and
-    // the prefix branch is reached.  On the old code, stored[..8] on
-    // "1234567α" panics; with the fix it safely returns no match.
+    // Filter with a different non-UUID string so exact equality fails. On the
+    // old code, stored[..8] on "1234567α" panicked; now it safely returns no
+    // match without entering UUID-prefix logic.
     let result = pack
         .handle_list(
             &token,
-            serde_json::json!({"kind": "note", "thread_id": "12345678"}),
+            serde_json::json!({"kind": "note", "thread_id": "1234567z"}),
             &registry,
         )
         .await;
@@ -1100,7 +1157,7 @@ async fn list_note_thread_filter_non_ascii_stored_no_panic() {
         arr.as_array()
             .expect("list result must be a JSON array")
             .is_empty(),
-        "no note should match a non-overlapping thread_id prefix"
+        "no note should match an unrelated legacy thread label"
     );
 }
 

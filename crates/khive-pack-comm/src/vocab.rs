@@ -72,7 +72,7 @@ pub(crate) static COMM_HANDLERS: [HandlerDef; 13] = [
                 name: "thread_id",
                 param_type: "uuid",
                 required: false,
-                description: "Optional UUID to group messages into a thread.",
+                description: "Optional full UUID to group messages into a thread. A short prefix would require scoped resolution and is rejected because the thread root is an explicit stable reference.",
             },
             ParamDef {
                 name: "tags",
@@ -298,7 +298,7 @@ pub(crate) static COMM_HANDLERS: [HandlerDef; 13] = [
                 name: "thread_id",
                 param_type: "uuid",
                 required: false,
-                description: "Optional internal thread UUID. When absent, a new thread root is created.",
+                description: "Optional full internal thread UUID. A short prefix would require scoped resolution and is rejected because the thread root is an explicit stable reference. When absent, a new thread root is created.",
             },
             ParamDef {
                 name: "channel_kind",

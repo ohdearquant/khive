@@ -3042,8 +3042,10 @@ Params:
 The handler writes exactly one `message` note with `direction=inbound` into the namespace from
 the `namespace` param. Deduplication is atomic: the handler calls `try_create_note`, which uses
 `INSERT OR IGNORE` against the durable unique index `idx_comm_message_external_id` (see §11).
-A duplicate `external_id` results in zero rows written and a `{"ok": true, "deduplicated": true}`
-response; no error is returned.
+A duplicate `external_id` results in zero rows written and a
+`{"ok": true, "deduplicated": true, "thread_id": "<canonical full UUID>"}` response;
+the thread identifier is read from the existing row rather than the duplicate attempt, and no
+error is returned.
 
 Thread resolution: when `correlation_external_id` is supplied, the handler queries for an
 existing message note whose `external_id` matches that value, reads its `thread_id`, and
@@ -3216,7 +3218,8 @@ Two layers, applied in order:
 zero rows are written, the storage layer verifies whether the suppressed insert was caused by
 an `external_id` collision (a live note in the same namespace and kind with the same non-empty
 `external_id` already exists). If confirmed, the handler returns
-`{"ok": true, "deduplicated": true}` without error. Any other ignored constraint surfaces as a
+`{"ok": true, "deduplicated": true, "thread_id": "<canonical full UUID>"}` without error. The
+thread identifier comes from the existing row. Any other ignored constraint surfaces as a
 `StorageError` so it is not misreported as deduplication. No note body is ever lost. This check
 is DB-backed and survives restarts; any re-delivered message is rejected at the storage layer.
 

@@ -167,7 +167,8 @@ types for proposals, events, and namespace isolation.
 - `VerbPresentationPolicy` controls whether a verb's response can be trimmed by
   agent-mode transforms.
 - `AlwaysVerbose` verbs bypass agent-mode transforms entirely. The current set:
-  `get`, `link`, `query`, `traverse`, `neighbors`, `brain.feedback`.
+  `get`, `link`, `query`, `traverse`, `neighbors`, `brain.feedback`,
+  `memory.feedback`, `comm.delivered`.
 - `link` is `AlwaysVerbose` because the returned edge ID is the only handle for
   follow-up graph traversal calls. At scale (~65K edges), two edges can share
   the same 8-character prefix, so shortening the edge ID breaks downstream
@@ -175,6 +176,10 @@ types for proposals, events, and namespace isolation.
 - `brain.feedback` is `AlwaysVerbose` because callers chain `target_id` from
   the response into subsequent feedback or profile queries; an 8-char prefix is
   ambiguous.
+- `memory.feedback` is `AlwaysVerbose` because it requires one exact recalled
+  record and returns that same strict `target_id` acknowledgement.
+- `comm.delivered` is `AlwaysVerbose` because its `id` is an exact outbound
+  correlation key; prefix resolution cannot prove which write it confirms.
 
 ### Proposal Lifecycle (ADR-046)
 

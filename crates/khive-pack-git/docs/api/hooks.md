@@ -18,7 +18,10 @@ GitHub issue/PR numbers are repository-scoped, not globally unique — two
 different `project` entities in the same namespace can each have a `#1`.
 `properties.project_id` is the natural-key scoping field the ingester's
 `find_by_number` lookup filters on, so it is required and validated as a
-UUID here rather than left to the caller's discipline.
+full UUID here rather than left to the caller's discipline. A short-prefix
+resolution can miss or be ambiguous while provenance must identify one exact
+project, so prefixes are rejected. Accepted complete spellings are normalized
+to canonical lowercase dashed form before the note is stored and returned.
 
 `ISSUE_STATE_REASONS` is `pub(crate)` so `ingest::MaskedIssueFields` can
 classify against the same set at the masking boundary, before an ungoverned

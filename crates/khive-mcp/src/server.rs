@@ -2189,9 +2189,9 @@ fn parse_output_format(s: Option<&str>) -> Result<Option<OutputFormat>, String> 
 ///   per-op presentation (presentation_per_op[i] → batch presentation, then the
 ///   verb's AlwaysVerbose policy forces Verbose), apply `render_format` to the
 ///   `result` payload with the effective presentation so that both
-///   `presentation_per_op=["verbose"]` and AlwaysVerbose verbs (get/link/query/
-///   traverse/neighbors/brain.feedback) correctly skip the redundancy-drop
-///   pre-pass (ADR-078 §7 + §8.4; mirrors `run_parsed`).
+///   `presentation_per_op=["verbose"]` and AlwaysVerbose verbs (including
+///   strict feedback and delivery-correlation acknowledgements) correctly skip
+///   the redundancy-drop pre-pass (ADR-078 §7 + §8.4; mirrors `run_parsed`).
 ///
 /// The outer envelope (`{results:[...], summary:{...}}`) is always compact JSON (§8.4).
 /// Daemon-served responses are rendered before fitting. If the rendered envelope

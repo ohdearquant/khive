@@ -115,7 +115,7 @@ pub enum VerbPresentationPolicy {
     /// Always use `Verbose` output regardless of the caller's mode.
     ///
     /// Declared verbs: `get`, `link`, `query`, `traverse`, `neighbors`,
-    /// `brain.feedback`.
+    /// `brain.feedback`, `memory.feedback`, `comm.delivered`.
     ///
     /// `link` is included because the returned edge ID is the only handle for
     /// follow-up `neighbors`/`traverse` calls; short-form IDs risk prefix
@@ -124,6 +124,10 @@ pub enum VerbPresentationPolicy {
     /// `brain.feedback` is included because callers chain `target_id` from the
     /// response back into subsequent feedback or profile queries; an 8-char
     /// prefix is ambiguous and defeats the acknowledged-ID contract (#545).
+    /// `memory.feedback` has the same exact-target contract and rejects prefix
+    /// resolution, so its acknowledged `target_id` must remain canonical.
+    /// `comm.delivered` is included because its `id` is an exact correlation
+    /// key and the verb deliberately rejects prefix resolution (#1482).
     AlwaysVerbose,
 }
 
@@ -138,9 +142,8 @@ impl HandlerDef {
     /// list means `Standard` applies.
     pub fn presentation_policy(&self) -> VerbPresentationPolicy {
         match self.name {
-            "get" | "link" | "query" | "traverse" | "neighbors" | "brain.feedback" => {
-                VerbPresentationPolicy::AlwaysVerbose
-            }
+            "get" | "link" | "query" | "traverse" | "neighbors" | "brain.feedback"
+            | "memory.feedback" | "comm.delivered" => VerbPresentationPolicy::AlwaysVerbose,
             _ => VerbPresentationPolicy::Standard,
         }
     }
@@ -539,7 +542,7 @@ mod tests {
         );
     }
 
-    // AlwaysVerbose set regression: ensure get/query/traverse/neighbors/brain.feedback remain.
+    // AlwaysVerbose set regression: ensure strict chaining/correlation verbs remain.
     #[test]
     fn always_verbose_set_contains_expected_verbs() {
         let always_verbose = [
@@ -549,6 +552,8 @@ mod tests {
             "traverse",
             "neighbors",
             "brain.feedback",
+            "memory.feedback",
+            "comm.delivered",
         ];
         for name in always_verbose {
             let h = HandlerDef {

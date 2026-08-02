@@ -131,9 +131,10 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 20] = [
                 name: "id",
                 param_type: "uuid",
                 required: true,
-                description: "UUID of the entity, note, edge, event, or proposal to fetch. \
-                               Short hex prefix accepted (minimum 8 hex characters); \
-                               shorter prefixes are not resolved and will be treated as a name lookup.",
+                description: "Complete UUID or globally unique 8+ hex prefix of the entity, \
+                              note, edge, event, or proposal to fetch. UUID and prefix lookup \
+                              are namespace-unfiltered under ADR-007; other input falls back \
+                              to primary-namespace entity-name lookup.",
             },
             ParamDef {
                 name: "include_deleted",
@@ -186,7 +187,7 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 20] = [
                 name: "after",
                 param_type: "string",
                 required: false,
-                description: "Insertion-sequence cursor for entity, note, and edge lists: the id from \
+                description: "Insertion-sequence cursor for entity, note, and edge lists: the full UUID from \
                               the prior page's next_after, or \"\" to start cursor mode. A new id is \
                               assigned a durable database sequence, so later inserts cannot fall behind \
                               an issued boundary even when timestamps tie. This is a live walk, not an \
@@ -194,7 +195,9 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 20] = [
                               page require a new walk. Responses are {\"entities\": [...]}, \
                               {\"notes\": [...]}, or {\"edges\": [...]}, plus next_after. Reuse the \
                               same filters throughout a walk. A missing, hard-deleted, or out-of-scope \
-                              cursor fails explicitly. Mutually exclusive with offset.",
+                              cursor fails explicitly. Short prefixes are rejected because they can miss \
+                              or be ambiguous while keyset pagination needs the exact stable insertion \
+                              boundary. Mutually exclusive with offset.",
             },
             ParamDef {
                 name: "entity_kind",
@@ -224,13 +227,17 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 20] = [
                 name: "source_id",
                 param_type: "uuid",
                 required: false,
-                description: "Filter edges by source node UUID (kind=\"edge\" only).",
+                description: "Filter edges by source node complete UUID, unique 8+ hex prefix, \
+                              or entity name (kind=\"edge\" only). Prefix and name resolution \
+                              search the caller's primary namespace.",
             },
             ParamDef {
                 name: "target_id",
                 param_type: "uuid",
                 required: false,
-                description: "Filter edges by target node UUID (kind=\"edge\" only).",
+                description: "Filter edges by target node complete UUID, unique 8+ hex prefix, \
+                              or entity name (kind=\"edge\" only). Prefix and name resolution \
+                              search the caller's primary namespace.",
             },
             ParamDef {
                 name: "relations",
@@ -263,10 +270,31 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 20] = [
                 description: "Filter events to multiple EventKinds (kind=\"event\" only). Additive with event_kind.",
             },
             ParamDef {
+                name: "session_id",
+                param_type: "uuid",
+                required: false,
+                description: "Filter events by an exact full session UUID (kind=\"event\" only). A short-prefix resolution can miss or be ambiguous, so it is rejected for this stable record filter.",
+            },
+            ParamDef {
+                name: "observed",
+                param_type: "array of uuid",
+                required: false,
+                description: "Filter events that observed every listed exact full UUID (kind=\"event\" only). Short-prefix resolution can miss or be ambiguous, so prefixes are rejected for these stable record filters.",
+            },
+            ParamDef {
+                name: "selected",
+                param_type: "array of uuid",
+                required: false,
+                description: "Filter events that selected every listed exact full UUID (kind=\"event\" only). Short-prefix resolution can miss or be ambiguous, so prefixes are rejected for these stable record filters.",
+            },
+            ParamDef {
                 name: "thread_id",
                 param_type: "string",
                 required: false,
-                description: "Filter messages by thread ID (kind=\"message\" only). Accepts full UUID or 8-char prefix.",
+                description: "Filter messages by thread ID (kind=\"message\" only). Accepts a \
+                              complete UUID or a unique 8+ hex prefix resolved across stored \
+                              thread roots in the caller's primary namespace; missing or \
+                              ambiguous prefixes fail explicitly.",
             },
             ParamDef {
                 name: "direction",
@@ -323,7 +351,9 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 20] = [
                 name: "id",
                 param_type: "uuid",
                 required: true,
-                description: "UUID of the entity, note, or edge to patch.",
+                description: "Complete UUID or globally unique 8+ hex prefix of the entity, note, \
+                              or edge to patch. UUID and prefix lookup are namespace-unfiltered \
+                              under ADR-007; entity-name fallback uses the primary namespace.",
             },
             ParamDef {
                 name: "kind",
@@ -398,7 +428,9 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 20] = [
                 name: "id",
                 param_type: "uuid",
                 required: true,
-                description: "UUID of the record to delete.",
+                description: "Complete UUID or globally unique 8+ hex prefix of the record to \
+                              delete. UUID and prefix lookup are namespace-unfiltered under \
+                              ADR-007; entity-name fallback uses the primary namespace.",
             },
             ParamDef {
                 name: "kind",
@@ -426,13 +458,17 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 20] = [
                 name: "into_id",
                 param_type: "uuid",
                 required: true,
-                description: "The entity or note that survives the merge (canonical).",
+                description: "Complete UUID or globally unique 8+ hex prefix of the entity or \
+                              note that survives. UUID and prefix lookup are namespace-unfiltered \
+                              under ADR-007; entity-name fallback uses the primary namespace.",
             },
             ParamDef {
                 name: "from_id",
                 param_type: "uuid",
                 required: true,
-                description: "The entity or note to merge from (will be soft-deleted after merge).",
+                description: "Complete UUID or globally unique 8+ hex prefix of the entity or \
+                              note to merge from. UUID and prefix lookup are namespace-unfiltered \
+                              under ADR-007; entity-name fallback uses the primary namespace.",
             },
             ParamDef {
                 name: "kind",
@@ -552,13 +588,17 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 20] = [
                 name: "source_id",
                 param_type: "uuid",
                 required: true,
-                description: "UUID of the source node.",
+                description: "Source node complete UUID or globally unique 8+ hex prefix. UUID \
+                              and prefix lookup are namespace-unfiltered under ADR-007; \
+                              entity-name fallback uses the primary namespace.",
             },
             ParamDef {
                 name: "target_id",
                 param_type: "uuid",
                 required: true,
-                description: "UUID of the target node.",
+                description: "Target node complete UUID or globally unique 8+ hex prefix. UUID \
+                              and prefix lookup are namespace-unfiltered under ADR-007; \
+                              entity-name fallback uses the primary namespace.",
             },
             ParamDef {
                 name: "relation",
@@ -604,7 +644,9 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 20] = [
                 name: "node_id",
                 param_type: "uuid",
                 required: true,
-                description: "UUID of the node whose neighbors to return.",
+                description: "Complete UUID, unique 8+ hex prefix, or entity name of the node \
+                              whose neighbors to return. Prefix and name resolution search the \
+                              caller's primary namespace.",
             },
             ParamDef {
                 name: "direction",
@@ -642,7 +684,10 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 20] = [
                 name: "roots",
                 param_type: "array of uuid",
                 required: true,
-                description: "Starting node UUIDs for the traversal (maximum 100; aliases resolving to the same UUID are de-duplicated).",
+                description: "Starting node complete UUIDs, unique 8+ hex prefixes, or entity \
+                              names (maximum 100; aliases resolving to the same UUID are \
+                              de-duplicated). Prefix and name resolution search the caller's \
+                              primary namespace.",
             },
             ParamDef {
                 name: "max_depth",
@@ -785,8 +830,9 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 20] = [
     // Commissive: commits a proposal to the namespace event log
     HandlerDef {
         name: "propose",
-        description: "Create an event-sourced change proposal. Returns {id, status, proposer, title}; \
-                       chain with $prev.id (not $prev.proposal_id). \
+        description: "Create an event-sourced change proposal. Returns {id, full_id, parent_id, status, proposer, title}; \
+                       chain review/withdraw with $prev.id (not $prev.proposal_id), and reuse \
+                       $prev.full_id as parent_id in a subsequent proposal request. \
                        Note: the changeset field contains nested objects and cannot be expressed in \
                        function-call DSL form — use JSON form instead: \
                        request(ops=\"[{\\\"tool\\\":\\\"propose\\\",\\\"args\\\":{...}}]\").",
@@ -810,13 +856,14 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 20] = [
                 param_type: "object",
                 required: true,
                 description: "Proposed changes. Discriminated by 'kind' field. \
+                    Every identifier below must be a full UUID; short prefixes are rejected because resolution could miss, be ambiguous, or change the proposal's stable intent. \
                     Variants (all fields are structured objects, not JSON strings): \
                     add_entity — {kind: \"add_entity\", entity: {kind: <entity-kind>, name: <string>, description?: <string>, properties?: <object>, tags?: [<string>]}}; \
                     update_entity — {kind: \"update_entity\", id: <full UUID>, patch: {name?: <string>, description?: <string|null>, properties?: <object>, tags?: [<string>]}}; \
-                    add_edge — {kind: \"add_edge\", source: <UUID>, target: <UUID>, relation: <EdgeRelation>, weight?: <float>}; \
+                    add_edge — {kind: \"add_edge\", source: <full UUID>, target: <full UUID>, relation: <EdgeRelation>, weight?: <float>}; \
                     add_note — {kind: \"add_note\", note: {kind: <note-kind>, content: <string>, name?: <string>, properties?: <object>}}; \
-                    merge_entities — {kind: \"merge_entities\", into: <UUID>, from: <UUID>}; \
-                    supersede_entity — {kind: \"supersede_entity\", old: <UUID>, new: <UUID>}; \
+                    merge_entities — {kind: \"merge_entities\", into: <full UUID>, from: <full UUID>}; \
+                    supersede_entity — {kind: \"supersede_entity\", old: <full UUID>, new: <full UUID>}; \
                     compound — {kind: \"compound\", steps: [<changeset>, ...]}.",
             },
             ParamDef {
@@ -835,7 +882,7 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 20] = [
                 name: "parent_id",
                 param_type: "uuid",
                 required: false,
-                description: "UUID of a parent proposal this supersedes or extends.",
+                description: "Full UUID of a parent proposal this supersedes or extends. A short prefix would require proposal-namespace resolution and is rejected because ancestry is an explicit stable reference.",
             },
         ],
     },
@@ -850,7 +897,9 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 20] = [
                 name: "id",
                 param_type: "uuid",
                 required: true,
-                description: "Full UUID or 8-char short ID of the proposal to review.",
+                description: "Complete UUID or unique 8+ hex prefix of the proposal to review. \
+                              Prefix resolution searches open proposals in the caller's primary \
+                              namespace.",
             },
             ParamDef {
                 name: "decision",
@@ -877,7 +926,9 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 20] = [
                 name: "id",
                 param_type: "uuid",
                 required: true,
-                description: "Full UUID or 8-char short ID of the open proposal to withdraw.",
+                description: "Complete UUID or unique 8+ hex prefix of the open proposal to \
+                              withdraw. Prefix resolution searches open proposals in the caller's \
+                              primary namespace.",
             },
             ParamDef {
                 name: "rationale",

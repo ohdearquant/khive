@@ -32,6 +32,27 @@ pub use khive_types::VerbDef;
 
 use crate::validation::ValidationRule;
 
+const FULL_UUID_IDENTIFIER_HELP: &str = "A complete UUID spelling accepted by the consuming \
+    parameter directly names one globally unique record; direct UUID lookup is not a namespace \
+    search. Strict identifier responses use canonical lowercase dashed UUIDs.";
+const SHORT_PREFIX_IDENTIFIER_HELP: &str = "A short UUID prefix is at least 8 hexadecimal \
+    characters without dashes that do not parse as a complete UUID. It is a resolution, not a \
+    direct identifier; a 32-character compact UUID is complete input instead. Its lookup scope belongs to the consuming parameter: \
+    operations governed by ADR-007's by-ID contract resolve without a namespace filter, while \
+    other resolvers may search only the caller's primary namespace. A prefix can be missing or \
+    ambiguous.";
+const IDENTIFIER_PARAMETER_HELP: &str = "A parameter that requires a full UUID rejects prefixes \
+    and explains the resolution consequence. Its corresponding response field remains a \
+    canonical full UUID so the value can be submitted again.";
+
+fn identifier_resolution_help() -> Value {
+    serde_json::json!({
+        "full_uuid": FULL_UUID_IDENTIFIER_HELP,
+        "short_prefix": SHORT_PREFIX_IDENTIFIER_HELP,
+        "parameter_rule": IDENTIFIER_PARAMETER_HELP,
+    })
+}
+
 /// Pack-auxiliary schema plan.
 ///
 /// Declares `CREATE TABLE IF NOT EXISTS` statements for pack-owned tables that
@@ -1123,6 +1144,7 @@ impl VerbRegistry {
     ///
     /// Walks registered packs for the first matching `HandlerDef` and returns a
     /// structured JSON envelope. Subhandlers carry `callable_via_mcp: false`.
+    /// Every envelope carries the shared `identifier_resolution` contract.
     /// `link`'s envelope additionally carries `endpoint_rules` — the composed
     /// per-relation source/target allowlist (issue #964) — so batch callers can
     /// defer to the kernel's own table instead of re-implementing it locally.
@@ -1156,6 +1178,7 @@ impl VerbRegistry {
                             "description": handler.description,
                             "category": category,
                             "params": params_arr,
+                            "identifier_resolution": identifier_resolution_help(),
                             "visibility": "internal",
                             "callable_via_mcp": false,
                             "note": "This is an internal subhandler. Calling it via the MCP \
@@ -1169,6 +1192,7 @@ impl VerbRegistry {
                         "description": handler.description,
                         "category": category,
                         "params": params_arr,
+                        "identifier_resolution": identifier_resolution_help(),
                     });
                     if verb == "link" {
                         envelope["endpoint_rules"] = Value::Array(edge_endpoint_table(&self.packs));
@@ -6869,6 +6893,19 @@ mod help_tests {
             "'kind' must be required"
         );
         assert_eq!(kind_param["type"], "string", "'kind' type must be 'string'");
+
+        let identifier_help = result["identifier_resolution"]
+            .as_object()
+            .expect("help=true must include the shared identifier contract");
+        assert!(identifier_help["full_uuid"]
+            .as_str()
+            .is_some_and(|text| text.contains("globally unique")));
+        assert!(identifier_help["short_prefix"]
+            .as_str()
+            .is_some_and(|text| text.contains("lookup scope belongs to the consuming parameter")));
+        assert!(identifier_help["parameter_rule"]
+            .as_str()
+            .is_some_and(|text| text.contains("submitted again")));
     }
 
     /// help=true on `recall` returns a schema envelope including the `query` param.
