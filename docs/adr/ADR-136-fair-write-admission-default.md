@@ -87,14 +87,20 @@ requires, and schedules the remaining work plus the A/B that F2's own flip claus
 
 Read at source on the deployed revision:
 
-- `SqlBridge` write dispatches now route through the `WriterTask` when the flag is on
-  (`crates/khive-db/src/sql_bridge.rs`: apply-changeset, execute-batch, and single-write
-  paths all check the queue handle first); remaining unmigrated dispatches fall back to a
-  standalone connection and are enumerable.
-- Exactly **three** unconditional `with_writer_unmanaged` call sites remain, all
+- The migrated `SqlBridge` execution methods prefer a captured `WriterTask` handle when
+  one exists (`crates/khive-db/src/sql_bridge.rs`: the execute, execute-batch, and
+  transactional dispatch sites), but the factory itself is **not queue-first**:
+  `SqlBridge::writer()` opens a standalone connection before the handle lookup, and a
+  failed lookup silently degrades to the standalone path. That is precisely the ordering
+  ADR-135 F2 names as a strict-routing condition; it is still unmet and is D1 work.
+- Exactly **three** direct `with_writer_unmanaged` call sites remain, all
   transaction-owning maintenance operations: `vec_delete_subjects` and `orphan_sweep`
   (`stores/vectors.rs`), `fts_rename_namespace` (`stores/text.rs`). The hot request path
-  (`with_writer`) already prefers the queue.
+  (`with_writer`) already prefers the queue. Enumeration method: search for
+  `self.with_writer_unmanaged(` across `crates/khive-db/src/stores/`, with the managed
+  `self.with_writer(` call sites (four per store) as the must-match control on the same
+  invocation; the helper-internal fallback lines are excluded because they execute only
+  when no queue handle exists — the flag-off path, not an unconditional bypass.
 - The `database is locked` sink row above is the measured cost of the remaining
   standalone-writer traffic coexisting with the pool writer today — the flip is not what
   introduces that class; strict routing is what retires it.
@@ -108,30 +114,46 @@ baseline, not against a post-ADR-133 load profile.
 
 ## Decision
 
-### D1 — Complete ADR-135 F2's strict-routing preconditions
+### D1 — Complete ADR-135 F2's strict-routing preconditions, in full
 
-The enumerated bypass work becomes scheduled implementation, tracked under #1654:
+The bypass work becomes scheduled implementation, tracked under #1654. The gate list
+reproduces F2's conditions without weakening them:
 
-1. Migrate the three remaining `with_writer_unmanaged` transaction-owning closures onto
-   the `WriterTask` transactional dispatch (or classify them explicitly as non-request
-   maintenance writers with a documented conflict story), and remove the helper from
-   request-reachable code.
-2. Migrate or explicitly classify the remaining `SqlBridge` standalone-connection
-   dispatches.
-3. Queue spawn failure with the flag on is fail-closed (writes error; no silent fallback
-   to the mutex path), and any direct-writer acquisition while the queue is enabled is
-   observable in the admission-timeout sink's process ledger.
+1. `SqlBridge::writer()` checks and routes through the queue **before** opening a
+   standalone connection; a failed handle lookup in strict mode is an error, not a silent
+   degrade to the standalone path.
+2. The three remaining `with_writer_unmanaged` call sites are migrated onto the
+   `WriterTask` transactional dispatch or replaced with owner-executed top-level
+   operations, and the helper is removed from runtime request paths.
+3. Queue **spawn or runtime** failure fails closed for writes in strict mode (writes
+   error; no silent fallback to the mutex path).
+4. Every direct-writer violation is observable **and test-failing**: a fixture asserts
+   that any acquisition bypassing the queue while it is enabled fails the test suite, not
+   only that it is logged.
+5. Startup, migrations, checkpointing, recovery, and top-level maintenance writers are
+   classified explicitly rather than left as implicit exceptions.
+6. Telemetry closes the instrument gaps this record found at source: the admission sink
+   gains durable, distinguishable rows for queue-saturation results (today
+   `StorageError::WriteQueueFull` returns to the caller with no sink emission), for
+   writer-task terminal retirement (today emitted only through `tracing` before the queue
+   closes), and for direct-route violations. Without these, D4's rollback triggers cannot
+   be observed by the named instrument.
+
+Per F2, `KHIVE_WRITE_ROUTING=strict` exercises the completed routing without changing
+absent-variable behavior before any default moves.
 
 ### D2 — A/B under the measured load shape, then flip under F2's clause
 
 Before the code default changes, the queue runs flag-enabled on the deployed server in a
 declared window, with the sink recording both arms. The load model is the measured
 baseline above — concurrent multi-client messaging with embed-carrying writes, the shape
-that produced the cross-client collision — not synthetic-only load. The flip executes when
-F2's condition is met: queue-on materially lowers caller errors (the five-second-cadence
-burst class disappears) without hidden fallbacks, and a route audit confirms accepted
-writes retain their result semantics. Then `write_queue_enabled` defaults to `true` for
-file-backed pools.
+that produced the cross-client collision — not synthetic-only load. The flip is contingent
+on **all** of D1's gates, including the test-failing violation fixture and the telemetry
+additions, and executes when F2's condition is met: queue-on materially lowers caller
+errors (the five-second-cadence burst class disappears) without hidden fallbacks, a route
+audit confirms accepted writes retain their result semantics, and one release of
+production-representative evidence shows no direct-writer violations. Then
+`write_queue_enabled` defaults to `true` for file-backed pools.
 
 ### D3 — Internal maintenance writers follow the dedicated-connection precedent
 
@@ -143,16 +165,22 @@ on the same measurement discipline as D4.
 
 ### D4 — Acceptance is measured, and the rollback switch has a named trigger
 
-The admission-timeout sink (one NDJSON file per process) is the acceptance instrument. The
+The admission sink (one NDJSON file per process), extended per D1 item 6, is the
+acceptance instrument. The A/B comparison combines, per arm: sink timeout rows, sink
+queue-saturation rows, sink retirement rows, and caller-visible error results. The
 criterion: under load equivalent to the measured baseline, the five-second-cadence burst
 class disappears from the sink, and no new failure class appears in its place.
 
 The environment opt-out (`KHIVE_WRITE_QUEUE=0`) remains after the default flips. The named
-observables that trigger pulling the default back: (a) queue-saturation results appearing
-in the sink at a rate exceeding the baseline's timeout rate under equivalent load, (b) any
-writer-task retirement (unclean-connection shutdown) in production, or (c) `database is
-locked` rows rising rather than falling after strict routing lands. Any one of these
-reverts the default pending diagnosis; the sink rows are the evidence either way.
+observables that trigger pulling the default back, each with its emitting source: (a)
+queue-saturation rows (added by D1 item 6; today only the caller-visible
+`StorageError::WriteQueueFull` result exists) appearing at a rate exceeding the baseline's
+timeout rate under equivalent load, (b) any writer-task retirement row (added by D1
+item 6; today observable only via `tracing` and terminal caller errors) in production, or
+(c) `database is locked` rows with standalone-site attribution (already emitted; the
+measured instance in the baseline series) rising rather than falling after strict routing
+lands. Any one of these reverts the default pending diagnosis; the sink rows are the
+evidence either way.
 
 ## Alternatives considered
 
