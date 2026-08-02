@@ -442,7 +442,7 @@ pub async fn create_notes_atomic_with_report(
 mod tests {
     use super::*;
     use async_trait::async_trait;
-    use lattice_embed::{EmbedError, EmbeddingModel, EmbeddingService, MAX_TEXT_CHARS};
+    use lattice_embed::{EmbedError, EmbeddingModel, EmbeddingService, MAX_TEXT_BYTES};
 
     use khive_types::Namespace;
 
@@ -626,7 +626,7 @@ mod tests {
         let token = runtime
             .authorize(Namespace::parse("atomic-message-truncation-test").unwrap())
             .expect("authorize");
-        let content = "x".repeat(MAX_TEXT_CHARS);
+        let content = "x".repeat(MAX_TEXT_BYTES);
 
         let (notes, report) = create_notes_atomic_with_report(
             &runtime,

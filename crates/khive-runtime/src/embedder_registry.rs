@@ -12,7 +12,7 @@ use std::sync::{Arc, OnceLock};
 use async_trait::async_trait;
 use lattice_embed::{
     CachedEmbeddingService, EmbeddingModel, EmbeddingService, NativeEmbeddingService,
-    DEFAULT_MAX_BATCH_SIZE, MAX_TEXT_CHARS,
+    DEFAULT_MAX_BATCH_SIZE, MAX_TEXT_BYTES,
 };
 use tokio::sync::OnceCell;
 
@@ -26,9 +26,9 @@ enum EmbeddingCall {
 }
 
 const EMBEDDING_QUEUE_CAPACITY: usize = 32;
-const EMBEDDING_MAX_JOB_BYTES: usize = DEFAULT_MAX_BATCH_SIZE * MAX_TEXT_CHARS;
+const EMBEDDING_MAX_JOB_BYTES: usize = DEFAULT_MAX_BATCH_SIZE * MAX_TEXT_BYTES;
 // 32 queue slots × the normal 128-text batch × 32 KiB/text = 128 MiB in flight.
-const EMBEDDING_QUEUE_BYTE_BUDGET: usize = EMBEDDING_QUEUE_CAPACITY * 128 * MAX_TEXT_CHARS;
+const EMBEDDING_QUEUE_BYTE_BUDGET: usize = EMBEDDING_QUEUE_CAPACITY * 128 * MAX_TEXT_BYTES;
 
 struct InFlightBytes {
     counter: Arc<AtomicUsize>,
@@ -132,10 +132,10 @@ impl<S: EmbeddingService + 'static> BlockingEmbeddingService<S> {
                 texts.len()
             )));
         }
-        if let Some(text) = texts.iter().find(|text| text.len() > MAX_TEXT_CHARS) {
+        if let Some(text) = texts.iter().find(|text| text.len() > MAX_TEXT_BYTES) {
             return Err(lattice_embed::EmbedError::TextTooLong {
                 length: text.len(),
-                max: MAX_TEXT_CHARS,
+                max: MAX_TEXT_BYTES,
             });
         }
         Ok(input_bytes)
@@ -795,7 +795,7 @@ mod tests {
     async fn blocking_adapter_rejects_oversized_job_before_enqueue() {
         let service = BlockingEmbeddingService::new(Arc::new(ConstVecService { dims: 1 }));
         let oversized =
-            "x".repeat(lattice_embed::DEFAULT_MAX_BATCH_SIZE * lattice_embed::MAX_TEXT_CHARS + 1);
+            "x".repeat(lattice_embed::DEFAULT_MAX_BATCH_SIZE * lattice_embed::MAX_TEXT_BYTES + 1);
 
         let error = service
             .embed(&[oversized], EmbeddingModel::default())
@@ -822,7 +822,7 @@ mod tests {
             byte_budget,
         ));
         let max_texts = Arc::new(vec![
-            "x".repeat(lattice_embed::MAX_TEXT_CHARS);
+            "x".repeat(lattice_embed::MAX_TEXT_BYTES);
             lattice_embed::DEFAULT_MAX_BATCH_SIZE
         ]);
         let mut admitted = Vec::with_capacity(ADMITTED_JOBS);

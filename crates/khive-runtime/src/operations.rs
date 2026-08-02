@@ -5862,7 +5862,7 @@ mod tests {
     use crate::{ActorRef, Namespace};
     use async_trait::async_trait;
     use khive_storage::types::PathNode;
-    use lattice_embed::{EmbedError, EmbeddingModel, EmbeddingService, MAX_TEXT_CHARS};
+    use lattice_embed::{EmbedError, EmbeddingModel, EmbeddingService, MAX_TEXT_BYTES};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
 
@@ -15644,10 +15644,10 @@ mod tests {
             _model: EmbeddingModel,
         ) -> std::result::Result<Vec<Vec<f32>>, EmbedError> {
             for text in texts {
-                if text.len() > MAX_TEXT_CHARS {
+                if text.len() > MAX_TEXT_BYTES {
                     return Err(EmbedError::TextTooLong {
                         length: text.len(),
-                        max: MAX_TEXT_CHARS,
+                        max: MAX_TEXT_BYTES,
                     });
                 }
             }
@@ -15699,7 +15699,7 @@ mod tests {
             captured: Arc::clone(&captured),
         });
 
-        let content = format!("{}\u{1f980}tail", "a".repeat(MAX_TEXT_CHARS - 1));
+        let content = format!("{}\u{1f980}tail", "a".repeat(MAX_TEXT_BYTES - 1));
         let note = rt
             .create_note(&tok, "observation", None, &content, None, None, vec![])
             .await
@@ -15715,7 +15715,7 @@ mod tests {
 
         let embedded = captured.lock().unwrap().clone();
         assert_eq!(embedded.len(), 1);
-        assert_eq!(embedded[0].len(), MAX_TEXT_CHARS - 1);
+        assert_eq!(embedded[0].len(), MAX_TEXT_BYTES - 1);
         assert!(embedded[0].is_char_boundary(embedded[0].len()));
         assert!(!embedded[0].contains('\u{1f980}'));
 
@@ -15732,13 +15732,13 @@ mod tests {
         rt.reindex_note(&tok, &fetched)
             .await
             .expect("reindex must bound the same stored content");
-        assert_eq!(captured.lock().unwrap()[0].len(), MAX_TEXT_CHARS - 1);
+        assert_eq!(captured.lock().unwrap()[0].len(), MAX_TEXT_BYTES - 1);
 
         captured.lock().unwrap().clear();
         rt.embed_document_batch_with_model("strict-length-test", std::slice::from_ref(&content))
             .await
             .expect("batch reindex seam must bound stored content");
-        assert_eq!(captured.lock().unwrap()[0].len(), MAX_TEXT_CHARS - 1);
+        assert_eq!(captured.lock().unwrap()[0].len(), MAX_TEXT_BYTES - 1);
 
         let normal = "normal byte-identical embedding input";
         rt.create_note(&tok, "observation", None, normal, None, None, vec![])
@@ -15746,7 +15746,7 @@ mod tests {
             .expect("normal note create must succeed");
         assert_eq!(captured.lock().unwrap().last().unwrap(), normal);
 
-        let long_description = format!("{}\u{1f980}tail", "b".repeat(MAX_TEXT_CHARS));
+        let long_description = format!("{}\u{1f980}tail", "b".repeat(MAX_TEXT_BYTES));
         rt.create_entity(
             &tok,
             "concept",

@@ -1578,7 +1578,7 @@ mod tests {
     use super::*;
 
     use async_trait::async_trait;
-    use lattice_embed::{EmbedError, EmbeddingModel, EmbeddingService, MAX_TEXT_CHARS};
+    use lattice_embed::{EmbedError, EmbeddingModel, EmbeddingService, MAX_TEXT_BYTES};
     use serde_json::json;
 
     use khive_types::Namespace;
@@ -1782,7 +1782,7 @@ mod tests {
             .expect("vec store");
         assert_eq!(vec_store.count().await.expect("count before"), 0);
 
-        let updated_content = format!("freshly-updated-content-xyz{}", "x".repeat(MAX_TEXT_CHARS));
+        let updated_content = format!("freshly-updated-content-xyz{}", "x".repeat(MAX_TEXT_BYTES));
         let plan = prepare_update(
             &runtime,
             &token,
