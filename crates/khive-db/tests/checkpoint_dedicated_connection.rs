@@ -3,11 +3,16 @@
 //! caller's `pool.writer()` admission.
 //!
 //! Pre-fix, `checkpoint_once` acquired the pool's writer mutex
-//! (`try_writer_nowait`) and held it across `PRAGMA wal_checkpoint(PASSIVE)`
-//! for the whole tick. Over a large WAL that pragma can run for seconds, so
-//! every concurrent `pool.writer()` caller timed out at `checkout_timeout`
-//! (production evidence: 22 caller-side admission timeouts on 2026-08-02
-//! across the fleet, sustained bursts, against a persistent 64MiB WAL).
+//! (`try_writer_nowait`) and held it across the whole tick: the PASSIVE pass
+//! AND, when armed, the TRUNCATE escalation — which busy-waits up to
+//! `truncate_busy_timeout` (seconds) on any live read snapshot pinning the
+//! WAL. That bounded busy-wait under the pool's writer mutex is the
+//! multi-second hold this test reproduces; a PASSIVE pass alone over tens of
+//! MiB completes in tens of milliseconds on modern SSDs and does not
+//! contend measurably (measured while building this fixture). Production
+//! evidence: 22+ caller-side admission timeouts on 2026-08-02 across the
+//! fleet, sustained bursts, against a persistent 64MiB WAL pinned by
+//! long-lived readers.
 //! `PRAGMA wal_checkpoint(PASSIVE)` takes SQLite's CKPT lock, not the WRITE
 //! lock — a writer can commit concurrently with a passive checkpoint: the
 //! pool-mutex serialization was an application-level constraint SQLite
@@ -19,6 +24,17 @@ use khive_db::{CheckpointConfig, ConnectionPool, PoolConfig};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+/// How long the TRUNCATE escalation busy-waits on the pinning reader below.
+/// This is the reproduced hold: a PASSIVE pass alone over a 32MiB WAL
+/// completes in tens of milliseconds on modern SSDs (measured — too fast to
+/// contend with a 250ms admission timeout), but a TRUNCATE armed against a
+/// WAL pinned by a live read snapshot busy-waits for this entire duration,
+/// and on the pre-fix design it did so while holding the pool's writer
+/// mutex. That bounded multi-second hold is the production failure shape
+/// (persistent 64MiB WAL pinned by long-lived readers, admission timeouts in
+/// bursts).
+const TRUNCATE_BUSY: Duration = Duration::from_secs(2);
 
 /// Fixture floor: the `-wal` file must reach at least this size before the
 /// test proceeds, so a vacuous pass (WAL never actually grew, PASSIVE
@@ -111,6 +127,31 @@ fn checkpoint_once_does_not_block_a_concurrent_pool_writer_admission() {
          a genuinely fat WAL for checkpoint_once to churn through"
     );
 
+    // A live read snapshot pinning the WAL: TRUNCATE must wait for readers
+    // whose snapshot predates the WAL's end, so with this transaction open
+    // the armed TRUNCATE below busy-waits for the full TRUNCATE_BUSY bound.
+    // (Any standalone connection works; BEGIN + a SELECT materializes the
+    // snapshot.)
+    let pinning_reader = pool
+        .open_standalone_writer()
+        .expect("open the pinning-reader connection");
+    pinning_reader
+        .execute_batch("BEGIN")
+        .expect("open the pinning read transaction");
+    let _pin: i64 = pinning_reader
+        .query_row("SELECT COUNT(*) FROM blobs", [], |r| r.get(0))
+        .expect("materialize the read snapshot");
+
+    // TRUNCATE armed deterministically: threshold trivially crossed, no
+    // interval gate, and a busy bound long enough for thread B to land
+    // inside the hold window with wide margins.
+    let config = CheckpointConfig {
+        truncate_high_water_pages: 1,
+        truncate_min_interval: Duration::ZERO,
+        truncate_busy_timeout: TRUNCATE_BUSY,
+        ..CheckpointConfig::default()
+    };
+
     // The checkpoint task's dedicated connection, opened exactly the way
     // `run_checkpoint_task` opens its own (`CheckpointConnection::ensure_open`
     // -> `ConnectionPool::open_standalone_writer`).
@@ -119,20 +160,22 @@ fn checkpoint_once_does_not_block_a_concurrent_pool_writer_admission() {
         .open_standalone_writer()
         .expect("open dedicated checkpoint connection");
 
-    // Thread A: run the real `checkpoint_once` once, against the fat WAL.
+    // Thread A: run the real `checkpoint_once` once — PASSIVE over the fat
+    // WAL, then the armed TRUNCATE busy-waiting ~TRUNCATE_BUSY on the
+    // pinning reader.
     let thread_a = std::thread::spawn(move || {
         checkpoint_once(
             &checkpoint_pool,
             &dedicated_conn,
-            &CheckpointConfig::default(),
+            &config,
             &mut TruncateState::default(),
         )
     });
 
-    // Thread B starts ~50ms after A — enough head start for A to have
-    // entered the PASSIVE pragma on a pre-fix build, where it would be
-    // holding the pool's writer mutex for the whole multi-second pass.
-    std::thread::sleep(Duration::from_millis(50));
+    // Thread B starts 500ms after A — safely inside A's TRUNCATE busy-wait
+    // window ([~tens of ms, ~2s]) on a pre-fix build, where that whole wait
+    // happened under the pool's writer mutex.
+    std::thread::sleep(Duration::from_millis(500));
 
     let writer_pool = Arc::clone(&pool);
     let start = Instant::now();
