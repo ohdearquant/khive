@@ -877,6 +877,140 @@ async fn link_invalid_relation_error_suggests_valid_relations() {
     );
 }
 
+fn configured_kg_endpoint_test_surface() -> (
+    khive_runtime::KhiveRuntime,
+    khive_runtime::NamespaceToken,
+    crate::KgPack,
+    khive_runtime::VerbRegistry,
+) {
+    use crate::KgPack;
+    use khive_runtime::{KhiveRuntime, Namespace, VerbRegistryBuilder};
+
+    let rt = KhiveRuntime::memory().expect("in-memory runtime");
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(KgPack::new(rt.clone()));
+    let registry = builder.build().expect("kg registry builds");
+    rt.install_edge_rules(registry.all_edge_rules());
+    let token = rt.authorize(Namespace::local()).expect("authorize local");
+    let pack = KgPack::new(rt.clone());
+    (rt, token, pack, registry)
+}
+
+async fn seed_entity_with_id(
+    rt: &khive_runtime::KhiveRuntime,
+    token: &khive_runtime::NamespaceToken,
+    id: uuid::Uuid,
+    kind: &str,
+    name: &str,
+) {
+    let mut entity = khive_storage::Entity::new(token.namespace().as_str(), kind, name);
+    entity.id = id;
+    rt.entities(token)
+        .expect("entity store")
+        .upsert_entity(entity)
+        .await
+        .expect("seed fixed-id entity");
+}
+
+// #1606: symmetric relations use canonical UUID order for persistence and bulk
+// duplicate detection, but validation diagnostics must retain caller order. The
+// fixed IDs force target < source, which exposed both bulk modes reporting the
+// reverse project->concept legal set before this regression fix.
+#[tokio::test]
+async fn bulk_link_symmetric_rejection_preserves_requested_pair_in_both_modes() {
+    let (rt, token, pack, _registry) = configured_kg_endpoint_test_surface();
+    let concept_id =
+        uuid::Uuid::parse_str("ffffffff-ffff-ffff-ffff-ffffffffffff").expect("high UUID");
+    let project_id = uuid::Uuid::nil();
+    assert!(project_id < concept_id, "test must exercise UUID reversal");
+    seed_entity_with_id(&rt, &token, concept_id, "concept", "Concept source").await;
+    seed_entity_with_id(&rt, &token, project_id, "project", "Project target").await;
+
+    for atomic in [true, false] {
+        let params = json!({
+            "links": [{
+                "source_id": concept_id.to_string(),
+                "target_id": project_id.to_string(),
+                "relation": "competes_with",
+            }],
+            "atomic": atomic,
+        });
+        let message = if atomic {
+            pack.handle_link(&token, params)
+                .await
+                .expect_err("atomic bulk must reject concept competes_with project")
+                .to_string()
+        } else {
+            let response = pack
+                .handle_link(&token, params)
+                .await
+                .expect("non-atomic bulk reports entry failures in-band");
+            response["errors"][0]["error"]
+                .as_str()
+                .expect("entry error string")
+                .to_string()
+        };
+
+        assert!(
+            message.contains(
+                "currently legal relations for concept -> project under the loaded endpoint rules: none"
+            ),
+            "atomic={atomic} must diagnose the caller-ordered pair; got: {message}"
+        );
+        assert!(
+            !message.contains("currently legal relations for project -> concept"),
+            "atomic={atomic} must not diagnose the UUID-canonical reverse pair; got: {message}"
+        );
+    }
+}
+
+// #1606: attached edges always originate at the newly-created entity. A nil
+// target UUID deterministically sorts before every v4 create UUID, proving that
+// persistence canonicalization cannot reverse the pair used in the error.
+#[tokio::test]
+async fn create_attached_symmetric_edge_rejection_preserves_new_entity_as_source() {
+    let (rt, token, pack, registry) = configured_kg_endpoint_test_surface();
+    let project_id = uuid::Uuid::nil();
+    seed_entity_with_id(&rt, &token, project_id, "project", "Project target").await;
+
+    let response = pack
+        .handle_create(
+            &token,
+            json!({
+                "kind": "concept",
+                "name": "Concept source",
+                "skip_dedup_check": true,
+                "edges": [{
+                    "target_id": project_id.to_string(),
+                    "relation": "competes_with",
+                }],
+            }),
+            &registry,
+        )
+        .await
+        .expect("entity creation succeeds with attached-edge failure reported in-band");
+
+    let created_id = uuid::Uuid::parse_str(response["id"].as_str().expect("created entity id"))
+        .expect("created entity UUID");
+    assert!(
+        project_id < created_id,
+        "test must exercise persistence canonicalization"
+    );
+    let message = response["edge_errors"][0]["error"]
+        .as_str()
+        .expect("attached-edge error string");
+    assert!(
+        message.contains(
+            "currently legal relations for concept -> project under the loaded endpoint rules: none"
+        ),
+        "attached-edge error must diagnose new entity -> requested target; got: {message}"
+    );
+    assert!(
+        !message.contains("currently legal relations for project -> concept"),
+        "attached-edge error must not diagnose the UUID-canonical reverse pair; got: {message}"
+    );
+}
+
 // ── #567 regression: ensure_note_kind must not disclose foreign note metadata ──
 
 #[tokio::test]
