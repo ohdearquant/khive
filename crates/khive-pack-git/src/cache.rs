@@ -770,7 +770,11 @@ mod tests {
             .args(args)
             .status()
             .expect("spawn git");
-        assert!(status.success(), "git {args:?} failed in {}", repo.display());
+        assert!(
+            status.success(),
+            "git {args:?} failed in {}",
+            repo.display()
+        );
     }
 
     fn test_head_sha(repo: &Path) -> String {
@@ -780,7 +784,11 @@ mod tests {
             .args(["rev-parse", "HEAD"])
             .output()
             .expect("rev-parse");
-        assert!(out.status.success(), "rev-parse failed in {}", repo.display());
+        assert!(
+            out.status.success(),
+            "rev-parse failed in {}",
+            repo.display()
+        );
         String::from_utf8_lossy(&out.stdout).trim().to_string()
     }
 
