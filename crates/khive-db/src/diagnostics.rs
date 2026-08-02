@@ -18,6 +18,7 @@
 //! * never creates a missing database file,
 //! * never escalates to TRUNCATE,
 //! * never perturbs the counters it reports,
+//! * never increments write-traffic acquisition counters,
 //! * never deletes a walpin sidecar entry.
 //!
 //! Deliberate narrowings make those claims true rather than aspirational:
@@ -30,7 +31,7 @@
 //!    ADR-091 process-global counters. A verb that reports state must not
 //!    perturb the state it reports.
 //! 2. The probe's connection comes from
-//!    `ConnectionPool::open_standalone_writer`, opened without
+//!    `ConnectionPool::open_standalone_writer_untracked`, opened without
 //!    `SQLITE_OPEN_CREATE`. A missing database yields `checkpoint_probe:
 //!    null` plus a `checkpoint_probe_error`, never a freshly created file.
 //! 3. The WAL-pin sidecar directory in this crate is enumerated only through
@@ -407,15 +408,24 @@ pub fn wal_pin_attribution(_db_path: &Path, _sweep_interval: Duration) -> WalPin
 
 /// One typed snapshot of writer-contention signals.
 ///
-/// `writer_acquisitions` and `writer_acquisition_timeouts` are scoped to the
-/// main pool's finite-wait mutex checkout. `audit_append_failures` is supplied
-/// by the runtime because the audit store lives above `khive-db`; direct
-/// `khive-db` callers receive `None` plus an explicit reason instead of a
-/// fabricated zero.
+/// `writer_acquisitions` is the aggregate of the three explicit connection
+/// classes below. `writer_acquisition_timeouts` remains specific to the
+/// finite-wait pool-mutex stage; standalone SQLite failures and writer-task
+/// `BEGIN` failures have different ADR-135 F6 stages and are not mislabeled as
+/// pool checkout timeouts. `audit_append_failures` is supplied by the runtime
+/// because the audit store lives above `khive-db`; direct `khive-db` callers
+/// receive `None` plus an explicit reason instead of a fabricated zero.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct WriterContentionDiagnostics {
-    /// Successful finite-wait writer checkouts through the main pool.
+    /// Successful acquisitions across pooled, standalone, and writer-task
+    /// connection classes.
     pub writer_acquisitions: u64,
+    /// Successful finite-wait main-pool mutex checkouts.
+    pub pooled_writer_acquisitions: u64,
+    /// Successful per-operation file-backed standalone writer opens.
+    pub standalone_writer_acquisitions: u64,
+    /// Successful writer-task ownership acquisitions.
+    pub writer_task_acquisitions: u64,
     /// Main-pool writer checkouts that exhausted their finite deadline.
     pub writer_acquisition_timeouts: u64,
     /// Process-wide audit appends whose errors were logged and swallowed.
@@ -429,6 +439,9 @@ impl WriterContentionDiagnostics {
         let writer = pool.writer_acquisition_snapshot();
         Self {
             writer_acquisitions: writer.acquisitions,
+            pooled_writer_acquisitions: writer.pooled_acquisitions,
+            standalone_writer_acquisitions: writer.standalone_acquisitions,
+            writer_task_acquisitions: writer.writer_task_acquisitions,
             writer_acquisition_timeouts: writer.timeouts,
             audit_append_failures,
             audit_append_failures_unavailable_reason: audit_append_failures.is_none().then(|| {
@@ -462,12 +475,12 @@ pub struct DbDiagnostics {
 /// process-global), but every file-backed section degrades to an explicit
 /// "unavailable" with a reason rather than being silently omitted.
 ///
-/// The PASSIVE probe goes through `ConnectionPool::open_standalone_writer`,
-/// opened WITHOUT `SQLITE_OPEN_CREATE`, so a diagnostic request against a
-/// missing file returns `checkpoint_probe: null` with a
-/// `checkpoint_probe_error` instead of creating a database. Running on a
-/// standalone connection also keeps checkpoint I/O off the pooled writer
-/// mutex.
+/// The PASSIVE probe goes through the infrastructure-only untracked
+/// standalone open, WITHOUT `SQLITE_OPEN_CREATE`, so a diagnostic request
+/// against a missing file returns `checkpoint_probe: null` with a
+/// `checkpoint_probe_error` instead of creating a database or incrementing
+/// the write-traffic acquisition total. Running on a standalone connection
+/// also keeps checkpoint I/O off the pooled writer mutex.
 pub fn collect(
     pool: &ConnectionPool,
     build: BuildIdentity,
@@ -537,7 +550,7 @@ fn collect_inner(
 /// `checkpoint_probe_error`. Nothing here can create a file.
 fn probe_pool(pool: &ConnectionPool) -> Result<CheckpointProbe, String> {
     let conn = pool
-        .open_standalone_writer()
+        .open_standalone_writer_untracked()
         .map_err(|e| format!("guarded standalone open refused: {e}"))?;
     checkpoint_probe(&conn).map_err(|e| format!("PRAGMA wal_checkpoint(PASSIVE) failed: {e}"))
 }
@@ -573,7 +586,9 @@ mod tests {
     fn checkpoint_probe_returns_a_well_formed_triple_on_a_file_backed_db() {
         let dir = tempfile::tempdir().expect("tempdir");
         let (pool, _path) = seeded_pool(&dir);
-        let conn = pool.open_standalone_writer().expect("standalone");
+        let conn = pool
+            .open_standalone_writer_untracked()
+            .expect("standalone probe connection");
 
         let probe = checkpoint_probe(&conn).expect("probe must succeed on a WAL database");
 
@@ -607,7 +622,9 @@ mod tests {
         crate::checkpoint::reset_checkpoint_metrics_for_tests();
         let dir = tempfile::tempdir().expect("tempdir");
         let (pool, _path) = seeded_pool(&dir);
-        let conn = pool.open_standalone_writer().expect("standalone");
+        let conn = pool
+            .open_standalone_writer_untracked()
+            .expect("standalone probe connection");
 
         let before = checkpoint_counters();
         for _ in 0..3 {
@@ -692,6 +709,9 @@ mod tests {
             report.writer_contention.writer_acquisitions, 1,
             "the seed write checked the finite-wait pooled writer out once"
         );
+        assert_eq!(report.writer_contention.pooled_writer_acquisitions, 1);
+        assert_eq!(report.writer_contention.standalone_writer_acquisitions, 0);
+        assert_eq!(report.writer_contention.writer_task_acquisitions, 0);
         assert_eq!(report.writer_contention.writer_acquisition_timeouts, 0);
         assert!(report.writer_contention.audit_append_failures.is_none());
         assert!(
@@ -700,6 +720,40 @@ mod tests {
                 .audit_append_failures_unavailable_reason
                 .is_some(),
             "a direct khive-db snapshot must not fabricate a runtime audit count"
+        );
+    }
+
+    #[test]
+    fn diagnostics_composes_file_backed_standalone_acquisitions_without_counting_its_probe() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (pool, _path) = seeded_pool(&dir);
+
+        drop(
+            pool.open_standalone_writer()
+                .expect("write-traffic standalone connection"),
+        );
+
+        let report = collect_with_audit_append_failures(
+            &pool,
+            BuildIdentity::from_env("9.9.9", None),
+            Duration::from_secs(30),
+            0,
+        );
+        assert_eq!(report.writer_contention.writer_acquisitions, 2);
+        assert_eq!(report.writer_contention.pooled_writer_acquisitions, 1);
+        assert_eq!(report.writer_contention.standalone_writer_acquisitions, 1);
+        assert_eq!(report.writer_contention.writer_task_acquisitions, 0);
+        assert_eq!(report.writer_contention.writer_acquisition_timeouts, 0);
+
+        let second = collect_with_audit_append_failures(
+            &pool,
+            BuildIdentity::from_env("9.9.9", None),
+            Duration::from_secs(30),
+            0,
+        );
+        assert_eq!(
+            second.writer_contention, report.writer_contention,
+            "the diagnostics PASSIVE probe must not inflate write-traffic counters"
         );
     }
 
@@ -749,6 +803,9 @@ mod tests {
             0,
         );
         assert_eq!(report.writer_contention.writer_acquisitions, 1);
+        assert_eq!(report.writer_contention.pooled_writer_acquisitions, 1);
+        assert_eq!(report.writer_contention.standalone_writer_acquisitions, 0);
+        assert_eq!(report.writer_contention.writer_task_acquisitions, 0);
         assert_eq!(report.writer_contention.writer_acquisition_timeouts, 1);
     }
 
@@ -770,8 +827,8 @@ mod tests {
     }
 
     /// A missing configured path must never be created by a diagnostic
-    /// request. `open_standalone_writer` opens without `SQLITE_OPEN_CREATE`,
-    /// so the probe degrades to an error and the file stays absent.
+    /// request. The untracked standalone open omits `SQLITE_OPEN_CREATE`, so
+    /// the probe degrades to an error and the file stays absent.
     #[test]
     fn probe_refuses_a_missing_configured_path_without_creating_it() {
         let dir = tempfile::tempdir().expect("tempdir");

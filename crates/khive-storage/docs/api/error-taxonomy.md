@@ -43,9 +43,9 @@ In particular, callers must not blindly retry `SideEffectsUnknown`: the first
 attempt may have committed a side effect. Retry decisions belong to the
 operation's idempotency contract.
 
-Neither `StorageError` nor `WriterTaskRequestState` has a serialized wire
-representation. Runtime and MCP error envelopes continue to flatten storage
-errors through `Display`; the rendered form is
+Neither `WriterTaskTerminated` nor `WriterTaskRequestState` has a serialized
+wire representation. Runtime and MCP error envelopes continue to flatten this
+storage error through `Display`; the rendered form is
 `writer task terminated (request_state=<state>)`, where `<state>` is one of
 `not_started`, `transaction_rolled_back`, or `side_effects_unknown`. This adds
 typed in-process information without changing the enclosing runtime/MCP error
@@ -53,6 +53,17 @@ schema. `StorageError` is a public enum without `#[non_exhaustive]`, so adding
 this variant is nevertheless a Rust source-compatibility change for downstream
 code that exhaustively matches every variant; those matches must add a
 `WriterTaskTerminated` arm.
+
+## Typed writer-pool checkout timeout source
+
+`khive-db` retains `SqliteError::WriterPoolCheckoutTimeout` as the typed source
+inside `StorageError::Driver`. Runtime downcasts that source without inspecting
+its message, preserving the wrapping capability and operation. MCP is the one
+intentional exception to the default flat `Display` wire form: it emits stable
+`code` and `stage` fields of `writer_pool_checkout_timeout`, `timeout_ms`, and
+the wrapper's `capability`/`operation`. Its `message` field keeps the historical
+rendering for compatibility. This timeout occurs before SQLite executes and
+must not be classified as `SQLITE_BUSY` or checkpoint starvation.
 
 ## `is_fts5_syntax_error`
 

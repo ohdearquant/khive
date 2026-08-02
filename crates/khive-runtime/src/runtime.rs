@@ -1077,6 +1077,15 @@ mod tests {
             report.writer_contention.writer_acquisitions >= 1,
             "runtime construction runs migrations through the finite-wait pooled writer"
         );
+        assert_eq!(
+            report.writer_contention.writer_acquisitions,
+            report
+                .writer_contention
+                .pooled_writer_acquisitions
+                .saturating_add(report.writer_contention.standalone_writer_acquisitions)
+                .saturating_add(report.writer_contention.writer_task_acquisitions),
+            "the public aggregate must equal the class-specific snapshot"
+        );
         assert!(
             report.writer_contention.audit_append_failures.is_some(),
             "the runtime path must supply its process-wide swallowed-audit counter"

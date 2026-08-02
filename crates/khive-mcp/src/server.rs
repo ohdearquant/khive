@@ -33,10 +33,10 @@ use khive_request::{parse_request, ArgValue, DslError, ExecutionMode, ParsedOp, 
 use khive_runtime::{
     present, render_format, KhiveRuntime, OutputFormat, PackLoadError, PackRegistry,
     PresentationMode, RuntimeConfig, RuntimeError, VerbPresentationPolicy, VerbRegistry,
-    VerbRegistryBuilder,
+    VerbRegistryBuilder, WRITER_POOL_CHECKOUT_TIMEOUT_STAGE,
 };
 
-use khive_storage::EdgeRelation;
+use khive_storage::{EdgeRelation, StorageCapability};
 
 use crate::coordinator::CoordinatorService;
 use crate::tools::request::RequestParams;
@@ -857,12 +857,7 @@ impl KhiveMcpServer {
                 );
                 chain_ok_envelope_or_depth_error(tool, result)
             }
-            Err(RuntimeError::Khive(k)) => {
-                let error_payload = serde_json::to_value(&k)
-                    .unwrap_or_else(|_| json!({ "kind": "internal", "message": k.to_string() }));
-                Err((tool, error_payload))
-            }
-            Err(e) => Err((tool, json!(e.to_string()))),
+            Err(error) => Err((tool, runtime_error_value(error))),
         }
     }
 
@@ -1096,13 +1091,10 @@ impl KhiveMcpServer {
                                     now_unix,
                                 )
                             }
-                            Err(RuntimeError::Khive(k)) => {
-                                let error_payload = serde_json::to_value(&k).unwrap_or_else(
-                                    |_| json!({ "kind": "internal", "message": k.to_string() }),
-                                );
+                            Err(error) => {
+                                let error_payload = runtime_error_value(error);
                                 json!({ "ok": false, "tool": tool, "error": error_payload })
                             }
-                            Err(e) => json!({ "ok": false, "tool": tool, "error": e.to_string() }),
                         }
                         })
                         .await;
@@ -1434,13 +1426,46 @@ async fn dispatch_via_coordinator_inner(
 }
 
 fn runtime_error_payload(tool: &str, error: RuntimeError) -> (String, Value) {
+    (tool.to_string(), runtime_error_value(error))
+}
+
+/// Preserve the established flat-string payload for ordinary runtime errors,
+/// while carrying the ADR-135 F6 writer-pool stage structurally through every
+/// MCP execution mode.
+fn runtime_error_value(error: RuntimeError) -> Value {
     match error {
-        RuntimeError::Khive(k) => {
-            let error_payload = serde_json::to_value(&k)
-                .unwrap_or_else(|_| json!({"kind": "internal", "message": k.to_string()}));
-            (tool.to_string(), error_payload)
+        RuntimeError::Khive(k) => serde_json::to_value(&k)
+            .unwrap_or_else(|_| json!({"kind": "internal", "message": k.to_string()})),
+        other => {
+            let Some(context) = other.writer_pool_checkout_timeout_context() else {
+                return json!(other.to_string());
+            };
+            let timeout_ms = u64::try_from(context.timeout.as_millis()).unwrap_or(u64::MAX);
+            let capability = context.capability.map(storage_capability_wire_name);
+            json!({
+                "kind": "unavailable",
+                "code": WRITER_POOL_CHECKOUT_TIMEOUT_STAGE,
+                "stage": WRITER_POOL_CHECKOUT_TIMEOUT_STAGE,
+                "message": other.to_string(),
+                "timeout_ms": timeout_ms,
+                "capability": capability,
+                "operation": context.operation,
+            })
         }
-        other => (tool.to_string(), json!(other.to_string())),
+    }
+}
+
+fn storage_capability_wire_name(capability: StorageCapability) -> &'static str {
+    match capability {
+        StorageCapability::Sql => "sql",
+        StorageCapability::Notes => "notes",
+        StorageCapability::Entities => "entities",
+        StorageCapability::Graph => "graph",
+        StorageCapability::Events => "events",
+        StorageCapability::Vectors => "vectors",
+        StorageCapability::Sparse => "sparse",
+        StorageCapability::Text => "text",
+        StorageCapability::Blob => "blob",
     }
 }
 

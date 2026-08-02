@@ -958,10 +958,11 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 20] = [
     HandlerDef {
         name: "db_diagnostics",
         description: "Report writer-contention and WAL/checkpoint diagnostics for the main \
-                      database: finite-wait pooled writer acquisitions/timeouts, swallowed \
-                      best-effort audit append failures, build identity, ADR-091 checkpoint \
-                      counters, a PASSIVE checkpoint probe, the -wal sidecar file size, and \
-                      an explicitly qualified WAL-pin holder census. The \
+                      database: aggregate and class-specific pooled/standalone/writer-task \
+                      acquisitions, finite-wait pool timeouts, swallowed best-effort audit \
+                      append failures, build identity, ADR-091 checkpoint counters, a PASSIVE \
+                      checkpoint probe, the -wal sidecar file size, and an explicitly qualified \
+                      WAL-pin holder census. The \
                       checkpoint probe issues a real PRAGMA wal_checkpoint(PASSIVE), which \
                       backfills WAL frames into the main database on the happy path — that \
                       is ordinary checkpoint I/O, never a TRUNCATE escalation, and it never \

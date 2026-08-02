@@ -40,12 +40,13 @@
 
 use rusqlite::Connection;
 use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
 
 use khive_storage::error::{StorageError, WriterTaskRequestState};
 
 use crate::error::SqliteError;
-use crate::pool::ConnectionPool;
+use crate::pool::{ConnectionPool, WriterAcquisitionCounters};
 
 /// Closure signature for a write operation executed against the writer
 /// task's dedicated connection.
@@ -516,12 +517,13 @@ impl WriterTaskHandle {
 /// Spawn the write-owner task (ADR-067 Component A) on the current Tokio
 /// runtime.
 ///
-/// Opens a dedicated standalone writer connection
-/// ([`ConnectionPool::open_standalone_writer`]), independent of the pool's
-/// Mutex-guarded `writer()` connection used by unmigrated paths. Returns the
-/// cloneable [`WriterTaskHandle`] sender half. The task normally runs until
-/// every handle clone is dropped and the channel closes; a request panic,
-/// failed rollback, or poisoned connection puts it into the permanent
+/// Opens a dedicated standalone writer connection independent of the pool's
+/// Mutex-guarded `writer()` connection used by unmigrated paths. That one-time
+/// infrastructure open is uncounted; every dequeued top-level request or
+/// successful `BEGIN IMMEDIATE` increments the writer-task acquisition class.
+/// Returns the cloneable [`WriterTaskHandle`] sender half. The task normally
+/// runs until every handle clone is dropped and the channel closes; a request
+/// panic, failed rollback, or poisoned connection puts it into the permanent
 /// terminal state documented below.
 ///
 /// `capacity` bounds the channel (`PoolConfig::write_queue_capacity` /
@@ -534,11 +536,21 @@ impl WriterTaskHandle {
 /// support). See `crates/khive-db/docs/api/writer-task.md` for the
 /// migration-slice scope this commits per `BEGIN IMMEDIATE`.
 pub fn spawn(pool: &ConnectionPool, capacity: usize) -> Result<WriterTaskHandle, SqliteError> {
-    let conn = pool.open_standalone_writer()?;
+    // The lifetime connection is infrastructure, not one acquisition per
+    // write. Each dequeued request is counted below at the task's actual
+    // ownership boundary instead.
+    let conn = pool.open_standalone_writer_untracked()?;
+    let acquisition_counters = pool.writer_acquisition_counters();
     let origin = pool.origin();
     let db = crate::timeout_sink::db_label(pool);
     let (tx, rx) = mpsc::channel(capacity.max(1));
-    tokio::spawn(run_writer_task(conn, rx, origin, db.clone()));
+    tokio::spawn(run_writer_task(
+        conn,
+        rx,
+        origin,
+        db.clone(),
+        acquisition_counters,
+    ));
     Ok(WriterTaskHandle {
         tx,
         db,
@@ -578,9 +590,11 @@ async fn run_writer_task(
     mut rx: mpsc::Receiver<Box<dyn AnyWriteRequest + Send>>,
     origin: khive_storage::tx_registry::TxOrigin,
     db: String,
+    acquisition_counters: Arc<WriterAcquisitionCounters>,
 ) {
     while let Some(request) = rx.recv().await {
         let origin = origin.clone();
+        let acquisition_counters = Arc::clone(&acquisition_counters);
         let outcome = tokio::task::spawn_blocking(move || {
             // A top-level request deliberately skips BEGIN, so it would
             // silently join any transaction leaked by an earlier request.
@@ -604,6 +618,7 @@ async fn run_writer_task(
                 // connection and still serialized one-request-at-a-time by
                 // this same drain loop, so the single-writer guarantee
                 // holds; only the transaction wrap is skipped.
+                acquisition_counters.record_writer_task_acquisition();
                 sealed::Sealed::execute_and_reply_top_level_reporting_terminal(request, &conn)
             } else {
                 let _tx_handle = khive_storage::tx_registry::register_scoped(
@@ -611,7 +626,10 @@ async fn run_writer_task(
                     origin,
                 );
                 match conn.execute_batch("BEGIN IMMEDIATE") {
-                    Ok(()) => sealed::Sealed::execute_and_reply_reporting_terminal(request, &conn),
+                    Ok(()) => {
+                        acquisition_counters.record_writer_task_acquisition();
+                        sealed::Sealed::execute_and_reply_reporting_terminal(request, &conn)
+                    }
                     Err(e) => {
                         // Do NOT run the request's operation: `conn` never
                         // entered a transaction, so executing the op's DML
@@ -846,12 +864,19 @@ mod tests {
             .query_row("SELECT v FROM t WHERE id = 1", [], |row| row.get(0))
             .expect("row must be committed and visible to a reader");
         assert_eq!(v, "hello");
+
+        let counters = pool.writer_acquisition_snapshot();
+        assert_eq!(counters.acquisitions, 2);
+        assert_eq!(counters.pooled_acquisitions, 1);
+        assert_eq!(counters.standalone_acquisitions, 0);
+        assert_eq!(counters.writer_task_acquisitions, 1);
+        assert_eq!(counters.timeouts, 0);
     }
 
     #[test]
     fn spawn_fails_on_in_memory_pool() {
         // In-memory pools have no standalone-connection support
-        // (`ConnectionPool::open_standalone_writer`) — `spawn` must surface
+        // (the infrastructure-only standalone open) — `spawn` must surface
         // that as an error rather than panicking. Deliberately a plain
         // `#[test]` (no Tokio runtime): `spawn` fails before it ever reaches
         // `tokio::spawn`, so no runtime is required for this path.

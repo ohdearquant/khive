@@ -239,13 +239,11 @@ fn canonicalize_deepest_existing(path: &Path) -> Result<PathBuf, SqliteError> {
 /// writer connection.
 pub struct ConnectionPool {
     writer: Arc<Mutex<Connection>>,
-    /// Monotonic successful finite-wait checkouts through `writer()` /
-    /// `try_writer()`. Zero-wait maintenance probes and standalone
-    /// connections are separate stages and deliberately do not contribute.
-    writer_acquisitions: AtomicU64,
-    /// Monotonic finite-wait pool-mutex checkout timeouts. A failed
-    /// `try_writer_nowait()` is a maintenance skip, not a timeout.
-    writer_acquisition_timeouts: AtomicU64,
+    /// Process-local writer acquisition counters shared with the pool's
+    /// lifetime-owned writer task. Keeping the counters at the actual
+    /// acquisition boundaries means new verbs inherit instrumentation without
+    /// per-verb classification (ADR-133 D8 / issue #1389).
+    writer_acquisition_counters: Arc<WriterAcquisitionCounters>,
     readers: ArrayQueue<Connection>,
     max_readers: usize,
     config: PoolConfig,
@@ -332,19 +330,61 @@ pub struct WriterGuard<'pool> {
     origin: TxOrigin,
 }
 
-/// One non-resetting snapshot of the main pool's finite-wait writer checkout
-/// counters.
+/// Process-local monotonic counters for every instrumented writer acquisition
+/// boundary owned by one [`ConnectionPool`].
 ///
-/// These counters identify the Rust pool-mutex stage before SQLite executes.
-/// They intentionally exclude standalone connections and zero-wait
-/// maintenance probes, whose failures have different retry and incident
-/// semantics (ADR-135 F6).
+/// The aggregate `acquisitions` is the saturating sum of its three explicit
+/// connection classes. Infrastructure-only opens (the diagnostics PASSIVE
+/// probe and the writer task's one-time lifetime connection) are excluded;
+/// zero-wait maintenance probes also remain outside these request-traffic
+/// counters.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct WriterAcquisitionSnapshot {
-    /// Successful finite-wait pool writer checkouts.
+    /// Successful acquisitions across pooled, standalone, and writer-task
+    /// connection classes.
     pub acquisitions: u64,
+    /// Successful finite-wait pool-mutex writer checkouts.
+    pub pooled_acquisitions: u64,
+    /// Successful per-operation standalone writer connection opens.
+    pub standalone_acquisitions: u64,
+    /// Successful writer-task ownership acquisitions (one per dequeued
+    /// top-level request or successful `BEGIN IMMEDIATE`).
+    pub writer_task_acquisitions: u64,
     /// Finite-wait pool writer checkouts that exhausted their deadline.
     pub timeouts: u64,
+}
+
+/// Atomics backing [`WriterAcquisitionSnapshot`]. The writer task retains an
+/// `Arc` after spawn so its per-request acquisition site can update the same
+/// pool-scoped snapshot without retaining the whole pool.
+#[derive(Debug, Default)]
+pub(crate) struct WriterAcquisitionCounters {
+    pooled_acquisitions: AtomicU64,
+    standalone_acquisitions: AtomicU64,
+    writer_task_acquisitions: AtomicU64,
+    pooled_timeouts: AtomicU64,
+}
+
+impl WriterAcquisitionCounters {
+    pub(crate) fn record_writer_task_acquisition(&self) {
+        self.writer_task_acquisitions
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> WriterAcquisitionSnapshot {
+        let pooled_acquisitions = self.pooled_acquisitions.load(Ordering::Relaxed);
+        let standalone_acquisitions = self.standalone_acquisitions.load(Ordering::Relaxed);
+        let writer_task_acquisitions = self.writer_task_acquisitions.load(Ordering::Relaxed);
+        WriterAcquisitionSnapshot {
+            acquisitions: pooled_acquisitions
+                .saturating_add(standalone_acquisitions)
+                .saturating_add(writer_task_acquisitions),
+            pooled_acquisitions,
+            standalone_acquisitions,
+            writer_task_acquisitions,
+            timeouts: self.pooled_timeouts.load(Ordering::Relaxed),
+        }
+    }
 }
 
 impl<'pool> WriterGuard<'pool> {
@@ -427,8 +467,7 @@ impl ConnectionPool {
 
         let pool = Self {
             writer: Arc::new(Mutex::new(writer)),
-            writer_acquisitions: AtomicU64::new(0),
-            writer_acquisition_timeouts: AtomicU64::new(0),
+            writer_acquisition_counters: Arc::new(WriterAcquisitionCounters::default()),
             readers,
             max_readers,
             config,
@@ -524,7 +563,8 @@ impl ConnectionPool {
     /// exceeded.
     pub fn writer(&self) -> Result<WriterGuard<'_>, SqliteError> {
         let Some(guard) = self.writer.try_lock_for(self.config.checkout_timeout) else {
-            self.writer_acquisition_timeouts
+            self.writer_acquisition_counters
+                .pooled_timeouts
                 .fetch_add(1, Ordering::Relaxed);
             let message = format!(
                 "timed out after {:?} waiting for sqlite writer connection",
@@ -545,7 +585,9 @@ impl ConnectionPool {
                 timeout: self.config.checkout_timeout,
             });
         };
-        self.writer_acquisitions.fetch_add(1, Ordering::Relaxed);
+        self.writer_acquisition_counters
+            .pooled_acquisitions
+            .fetch_add(1, Ordering::Relaxed);
         Ok(WriterGuard {
             guard,
             origin: self.origin(),
@@ -580,13 +622,15 @@ impl ConnectionPool {
         })
     }
 
-    /// Snapshot finite-wait pooled writer checkout outcomes since this pool
+    /// Snapshot all instrumented writer acquisition outcomes since this pool
     /// was constructed.
     pub fn writer_acquisition_snapshot(&self) -> WriterAcquisitionSnapshot {
-        WriterAcquisitionSnapshot {
-            acquisitions: self.writer_acquisitions.load(Ordering::Relaxed),
-            timeouts: self.writer_acquisition_timeouts.load(Ordering::Relaxed),
-        }
+        self.writer_acquisition_counters.snapshot()
+    }
+
+    /// Clone the pool-scoped counter set for the lifetime-owned writer task.
+    pub(crate) fn writer_acquisition_counters(&self) -> Arc<WriterAcquisitionCounters> {
+        Arc::clone(&self.writer_acquisition_counters)
     }
 
     /// Get the current number of available reader connections.
@@ -717,8 +761,23 @@ impl ConnectionPool {
     /// must still honor `PoolConfig::read_only`: opening
     /// `SQLITE_OPEN_READ_WRITE` unconditionally here would let a read-only
     /// backend's graph/event/text stores bypass the flag that the pooled
-    /// writer enforces via `query_only`.
+    /// writer enforces via `query_only`. A fully configured successful open
+    /// increments the standalone acquisition class exactly once.
     pub fn open_standalone_writer(&self) -> Result<Connection, SqliteError> {
+        let conn = self.open_standalone_writer_untracked()?;
+        self.writer_acquisition_counters
+            .standalone_acquisitions
+            .fetch_add(1, Ordering::Relaxed);
+        Ok(conn)
+    }
+
+    /// Open an infrastructure-owned standalone writer connection without
+    /// counting it as one write-operation acquisition.
+    ///
+    /// Restricted to the diagnostics PASSIVE probe and the writer task's
+    /// one-time lifetime connection. Actual file-backed write paths must call
+    /// [`Self::open_standalone_writer`] so their acquisitions are observable.
+    pub(crate) fn open_standalone_writer_untracked(&self) -> Result<Connection, SqliteError> {
         let path = self.config.path.as_ref().ok_or_else(|| {
             SqliteError::InvalidData(
                 "in-memory databases do not support standalone connections".to_string(),
@@ -1326,6 +1385,33 @@ mod tests {
     }
 
     #[test]
+    fn standalone_writer_open_counts_its_connection_class_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("standalone_writer_counter.db");
+        let pool = ConnectionPool::new(PoolConfig {
+            path: Some(path),
+            ..PoolConfig::default()
+        })
+        .expect("file-backed pool");
+
+        let _standalone = pool
+            .open_standalone_writer()
+            .expect("standalone writer opens");
+
+        assert_eq!(
+            pool.writer_acquisition_snapshot(),
+            WriterAcquisitionSnapshot {
+                acquisitions: 1,
+                pooled_acquisitions: 0,
+                standalone_acquisitions: 1,
+                writer_task_acquisitions: 0,
+                timeouts: 0,
+            },
+            "the public standalone boundary must contribute to the aggregate exactly once"
+        );
+    }
+
+    #[test]
     fn in_memory_pool_degrades_to_single_connection() {
         let cfg = PoolConfig {
             path: None,
@@ -1382,6 +1468,9 @@ mod tests {
             pool.writer_acquisition_snapshot(),
             WriterAcquisitionSnapshot {
                 acquisitions: 1,
+                pooled_acquisitions: 1,
+                standalone_acquisitions: 0,
+                writer_task_acquisitions: 0,
                 timeouts: 1,
             }
         );
@@ -1392,6 +1481,9 @@ mod tests {
             pool.writer_acquisition_snapshot(),
             WriterAcquisitionSnapshot {
                 acquisitions: 2,
+                pooled_acquisitions: 2,
+                standalone_acquisitions: 0,
+                writer_task_acquisitions: 0,
                 timeouts: 1,
             }
         );

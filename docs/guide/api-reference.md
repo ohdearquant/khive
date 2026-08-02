@@ -704,10 +704,35 @@ the checkpoint counters, a single PASSIVE checkpoint probe, the `-wal` sidecar f
 WAL-pin holder census. Takes no parameters.
 
 `writer_contention` contains monotonic counters captured once per request:
-`writer_acquisitions` and `writer_acquisition_timeouts` cover finite-wait main-pool mutex
-checkouts before SQLite executes, while `audit_append_failures` counts process-wide best-effort
-audit appends whose storage error was logged and swallowed. Zero-wait checkpoint skips and
-standalone connections are different stages and are not mislabeled as pool checkout timeouts.
+`writer_acquisitions` is the total of `pooled_writer_acquisitions`,
+`standalone_writer_acquisitions`, and `writer_task_acquisitions`. The first counts successful
+finite-wait main-pool mutex checkouts, the second counts successful per-operation file-backed
+standalone writer opens, and the third counts dequeued writer-task requests that acquired its
+dedicated connection (or successfully completed `BEGIN IMMEDIATE`).
+`writer_acquisition_timeouts` remains specific to the finite-wait main-pool mutex before SQLite
+executes; SQLite `BEGIN`/statement failures are separate stages. `audit_append_failures` counts
+process-wide best-effort audit appends whose storage error was logged and swallowed. Zero-wait
+checkpoint skips, the diagnostics probe connection, and the writer task's one-time lifetime
+connection do not inflate the write-traffic acquisition total.
+
+A finite-wait pooled checkout failure retains its compatibility display text in `message`, but
+the MCP error is a stable object rather than a string:
+
+```json
+{
+  "kind": "unavailable",
+  "code": "writer_pool_checkout_timeout",
+  "stage": "writer_pool_checkout_timeout",
+  "message": "storage: ... timed out ... waiting for sqlite writer connection",
+  "timeout_ms": 5000,
+  "capability": "notes",
+  "operation": "append_note"
+}
+```
+
+`capability` and `operation` are `null` when the typed SQLite error reaches runtime directly
+rather than through a storage capability wrapper. Callers should branch on `code` or `stage`,
+never on `message`.
 
 The PASSIVE probe may backfill WAL frames into the database — that is normal checkpoint
 I/O and is what the reported `checkpointed_frames` counts. It never changes logical
