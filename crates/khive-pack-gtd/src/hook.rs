@@ -9,7 +9,8 @@ use async_trait::async_trait;
 use serde_json::Value;
 use uuid::Uuid;
 
-use khive_runtime::{KhiveRuntime, KindHook, Namespace, RuntimeError};
+use khive_runtime::{KhiveRuntime, KindHook, LinkSpec, Namespace, NamespaceToken, RuntimeError};
+use khive_storage::Note;
 
 use crate::task_create::{link_depends_on_edges, prepare_task_create, TaskCreateInput};
 
@@ -62,5 +63,24 @@ impl KindHook for TaskHook {
         }
 
         Ok(())
+    }
+
+    async fn validate_note_update(
+        &self,
+        runtime: &KhiveRuntime,
+        token: &NamespaceToken,
+        note: &Note,
+        properties: Option<&Value>,
+    ) -> Result<(), RuntimeError> {
+        crate::dependency::validate_property_update(runtime, token, note, properties).await
+    }
+
+    async fn validate_links(
+        &self,
+        runtime: &KhiveRuntime,
+        token: &NamespaceToken,
+        links: &[LinkSpec],
+    ) -> Result<(), RuntimeError> {
+        crate::dependency::validate_dependency_links(runtime, token, links).await
     }
 }

@@ -756,12 +756,14 @@ request(ops="gtd.assign(title=\"Ship API reference\", priority=\"p1\", assignee=
 
 ### `gtd.next` — Assertive
 
-List actionable tasks (status `next` or `active`) by priority.
+List actionable tasks (status `next` or `active`) by priority. By default, tasks with
+unfinished or structurally broken dependencies are omitted.
 
-| Param      | Type    | Required | Notes                    |
-| ---------- | ------- | -------- | ------------------------ |
-| `limit`    | integer | no       | Default 10.              |
-| `assignee` | string  | no       | Filter to this assignee. |
+| Param             | Type    | Required | Notes                                                                             |
+| ----------------- | ------- | -------- | --------------------------------------------------------------------------------- |
+| `limit`           | integer | no       | Default 10.                                                                       |
+| `assignee`        | string  | no       | Filter to this assignee.                                                          |
+| `include_blocked` | boolean | no       | Include blocked/broken candidates after ready work for diagnosis (default false). |
 
 ```
 request(ops="gtd.next(assignee=\"agent:docs\", limit=10)")
@@ -784,6 +786,10 @@ request(ops="gtd.complete(id=\"<task-id>\", result=\"shipped in PR #600\")")
 ### `gtd.tasks` — Assertive
 
 List tasks filtered by status, assignee, priority.
+
+Each task reports `dependency_state` (`ready`, `blocked`, or `broken`), `actionable`,
+and a `blocked_by` array whose entries carry a `state` of `pending`, `cancelled`,
+`soft_deleted`, `missing`, `invalid`, `different_namespace`, or `wrong_kind`.
 
 | Param      | Type    | Required | Notes                                                                                              |
 | ---------- | ------- | -------- | -------------------------------------------------------------------------------------------------- |

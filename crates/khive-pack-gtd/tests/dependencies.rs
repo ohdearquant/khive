@@ -125,6 +125,21 @@ async fn scenario_gtd_c2_next_excludes_tasks_with_incomplete_deps() {
     .await;
     let dep_id = dependent["full_id"].as_str().unwrap().to_string();
 
+    let diagnostic = pack
+        .dispatch("gtd.tasks", json!({"status": "next"}))
+        .await
+        .expect("diagnostic task listing");
+    let dependent_diagnostic = diagnostic
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|task| task["full_id"].as_str() == Some(dep_id.as_str()))
+        .expect("dependent task diagnostic");
+    assert_eq!(dependent_diagnostic["dependency_state"], "blocked");
+    assert_eq!(dependent_diagnostic["actionable"], false);
+    assert_eq!(dependent_diagnostic["blocked_by"][0]["state"], "pending");
+    assert_eq!(dependent_diagnostic["blocked_by"][0]["status"], "inbox");
+
     let result = pack.dispatch("gtd.next", json!({})).await.unwrap();
     let titles: Vec<&str> = result
         .as_array()
@@ -740,6 +755,411 @@ async fn create_task_rejects_nested_depends_on_non_task_without_persisting() {
             .filter_map(|n| n.name.clone())
             .collect::<Vec<_>>()
     );
+}
+
+#[tokio::test]
+async fn dependency_diagnostics_surface_cancelled_soft_deleted_and_missing_blockers() {
+    let fixture = pack(rt());
+
+    let cancelled = assign(
+        &fixture,
+        json!({"title": "cancelled blocker", "status": "inbox"}),
+    )
+    .await;
+    let soft_deleted = assign(
+        &fixture,
+        json!({"title": "soft-deleted blocker", "status": "inbox"}),
+    )
+    .await;
+    let hard_deleted = assign(
+        &fixture,
+        json!({"title": "hard-deleted blocker", "status": "inbox"}),
+    )
+    .await;
+
+    for (title, blocker) in [
+        ("blocked by cancelled", &cancelled),
+        ("blocked by soft delete", &soft_deleted),
+        ("blocked by hard delete", &hard_deleted),
+    ] {
+        assign(
+            &fixture,
+            json!({
+                "title": title,
+                "status": "next",
+                "depends_on": [blocker["full_id"].as_str().unwrap()]
+            }),
+        )
+        .await;
+    }
+
+    fixture
+        .dispatch(
+            "gtd.transition",
+            json!({"id": cancelled["full_id"], "status": "cancelled"}),
+        )
+        .await
+        .expect("cancel blocker");
+    fixture
+        .dispatch("delete", json!({"id": soft_deleted["full_id"]}))
+        .await
+        .expect("soft-delete blocker");
+    fixture
+        .dispatch(
+            "delete",
+            json!({"id": hard_deleted["full_id"], "hard": true}),
+        )
+        .await
+        .expect("hard-delete blocker");
+
+    let tasks = fixture
+        .dispatch("gtd.tasks", json!({"status": "next"}))
+        .await
+        .expect("diagnostic task listing");
+    let tasks = tasks.as_array().expect("tasks array");
+    for (title, blocker_state) in [
+        ("blocked by cancelled", "cancelled"),
+        ("blocked by soft delete", "soft_deleted"),
+        ("blocked by hard delete", "missing"),
+    ] {
+        let task = tasks
+            .iter()
+            .find(|task| task["title"].as_str() == Some(title))
+            .unwrap_or_else(|| panic!("missing diagnostic task {title:?}: {tasks:?}"));
+        assert_eq!(task["dependency_state"], "broken");
+        assert_eq!(task["actionable"], false);
+        assert_eq!(task["blocked_by"][0]["state"], blocker_state);
+    }
+
+    let default_next = fixture
+        .dispatch("gtd.next", json!({}))
+        .await
+        .expect("default next");
+    assert!(default_next.as_array().unwrap().is_empty());
+
+    let diagnostic_next = fixture
+        .dispatch("gtd.next", json!({"include_blocked": true}))
+        .await
+        .expect("diagnostic next");
+    assert_eq!(diagnostic_next.as_array().unwrap().len(), 3);
+    assert!(diagnostic_next
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|task| { task["dependency_state"] == "broken" && task["actionable"] == false }));
+}
+
+#[tokio::test]
+async fn dependency_diagnostics_surface_invalid_different_namespace_and_wrong_kind_blockers() {
+    let rt = rt();
+    let fixture = pack(rt.clone());
+    let token = rt.authorize(khive_runtime::Namespace::local()).unwrap();
+    let store = rt.notes(&token).expect("note store");
+
+    let wrong_kind_blocker = assign(
+        &fixture,
+        json!({"title": "wrong-kind blocker", "status": "inbox"}),
+    )
+    .await;
+    let namespace_blocker = assign(
+        &fixture,
+        json!({"title": "namespace blocker", "status": "inbox"}),
+    )
+    .await;
+
+    for (title, blocker) in [
+        ("blocked by wrong kind", &wrong_kind_blocker),
+        ("blocked by different namespace", &namespace_blocker),
+    ] {
+        assign(
+            &fixture,
+            json!({
+                "title": title,
+                "status": "next",
+                "depends_on": [blocker["full_id"].as_str().unwrap()]
+            }),
+        )
+        .await;
+    }
+
+    let invalid_dependent = assign(
+        &fixture,
+        json!({"title": "blocked by invalid entry", "status": "next"}),
+    )
+    .await;
+
+    // Corrupt each blocker's stored row directly through the note store,
+    // bypassing the pack-level write-time validation that would otherwise
+    // reject these shapes — read-time diagnostics must still catch them.
+    let wrong_kind_id =
+        uuid::Uuid::parse_str(wrong_kind_blocker["full_id"].as_str().unwrap()).unwrap();
+    let mut corrupted_kind = store
+        .get_note(wrong_kind_id)
+        .await
+        .expect("fetch blocker")
+        .expect("blocker exists");
+    corrupted_kind.kind = "observation".to_string();
+    store
+        .upsert_note(corrupted_kind)
+        .await
+        .expect("corrupt blocker kind");
+
+    let namespace_id =
+        uuid::Uuid::parse_str(namespace_blocker["full_id"].as_str().unwrap()).unwrap();
+    let mut corrupted_namespace = store
+        .get_note(namespace_id)
+        .await
+        .expect("fetch blocker")
+        .expect("blocker exists");
+    corrupted_namespace.namespace = "other".to_string();
+    store
+        .upsert_note(corrupted_namespace)
+        .await
+        .expect("corrupt blocker namespace");
+
+    let invalid_id = uuid::Uuid::parse_str(invalid_dependent["full_id"].as_str().unwrap()).unwrap();
+    store
+        .set_note_property(
+            invalid_id,
+            "depends_on",
+            json!(["not-a-uuid"]),
+            chrono::Utc::now().timestamp_micros(),
+        )
+        .await
+        .expect("corrupt dependent depends_on");
+
+    let tasks = fixture
+        .dispatch("gtd.tasks", json!({"status": "next"}))
+        .await
+        .expect("diagnostic task listing");
+    let tasks = tasks.as_array().expect("tasks array");
+    for (title, blocker_state) in [
+        ("blocked by wrong kind", "wrong_kind"),
+        ("blocked by different namespace", "different_namespace"),
+        ("blocked by invalid entry", "invalid"),
+    ] {
+        let task = tasks
+            .iter()
+            .find(|task| task["title"].as_str() == Some(title))
+            .unwrap_or_else(|| panic!("missing diagnostic task {title:?}: {tasks:?}"));
+        assert_eq!(task["dependency_state"], "broken");
+        assert_eq!(task["actionable"], false);
+        assert_eq!(task["blocked_by"][0]["state"], blocker_state);
+    }
+}
+
+#[tokio::test]
+async fn generic_update_rejects_direct_and_multihop_property_cycles() {
+    let fixture = pack(rt());
+    let a = assign(&fixture, json!({"title": "cycle A"})).await;
+    let b = assign(&fixture, json!({"title": "cycle B"})).await;
+    let c = assign(&fixture, json!({"title": "cycle C"})).await;
+    let a_id = a["full_id"].as_str().unwrap();
+    let b_id = b["full_id"].as_str().unwrap();
+    let c_id = c["full_id"].as_str().unwrap();
+
+    let direct = fixture
+        .dispatch(
+            "update",
+            json!({"id": a_id, "properties": {"depends_on": [a_id]}}),
+        )
+        .await
+        .expect_err("direct property cycle must fail");
+    assert!(direct.to_string().contains("dependency cycle"));
+
+    fixture
+        .dispatch(
+            "update",
+            json!({"id": a_id, "properties": {"depends_on": [b_id]}}),
+        )
+        .await
+        .expect("A depends on B");
+    fixture
+        .dispatch(
+            "update",
+            json!({"id": b_id, "properties": {"depends_on": [c_id]}}),
+        )
+        .await
+        .expect("B depends on C");
+    let multihop = fixture
+        .dispatch(
+            "update",
+            json!({"id": c_id, "properties": {"depends_on": [a_id]}}),
+        )
+        .await
+        .expect_err("C -> A must not close A -> B -> C");
+    assert!(multihop.to_string().contains("dependency cycle"));
+
+    let persisted_c = fixture
+        .dispatch("get", json!({"id": c_id}))
+        .await
+        .expect("load C after rejected update");
+    assert!(persisted_c["properties"].get("depends_on").is_none());
+}
+
+#[tokio::test]
+async fn generic_update_rejects_noncanonical_dependency_uuid_without_persisting() {
+    let fixture = pack(rt());
+    let task = assign(&fixture, json!({"title": "canonical dependency source"})).await;
+    let blocker = assign(&fixture, json!({"title": "canonical dependency target"})).await;
+    let task_id = task["full_id"].as_str().unwrap();
+    let blocker_id = blocker["full_id"].as_str().unwrap();
+    let compact_blocker_id = blocker_id.replace('-', "");
+
+    let error = fixture
+        .dispatch(
+            "update",
+            json!({
+                "id": task_id,
+                "properties": {"depends_on": [compact_blocker_id]}
+            }),
+        )
+        .await
+        .expect_err("ordinary update must reject an alternate UUID spelling");
+    assert!(
+        error
+            .to_string()
+            .contains("canonical lowercase hyphenated UUID"),
+        "unexpected canonical UUID validation error: {error}"
+    );
+
+    let persisted = fixture
+        .dispatch("get", json!({"id": task_id}))
+        .await
+        .expect("load task after rejected alternate UUID spelling");
+    assert!(persisted["properties"].get("depends_on").is_none());
+}
+
+#[tokio::test]
+async fn generic_update_rejects_duplicate_dependency_walk_over_edge_budget() {
+    let runtime = rt();
+    let fixture = pack(runtime.clone());
+    let token = runtime
+        .authorize(khive_runtime::Namespace::local())
+        .expect("authorize local namespace");
+    let leaf = assign(&fixture, json!({"title": "fanout leaf"})).await;
+    let leaf_id = leaf["full_id"].as_str().unwrap();
+    let repeated_edges = vec![leaf_id.to_string(); 20_001];
+    let fanout = runtime
+        .create_note(
+            &token,
+            "task",
+            Some("duplicate dependency fanout"),
+            "duplicate dependency fanout",
+            Some(0.5),
+            Some(json!({"status": "next", "depends_on": repeated_edges})),
+            vec![],
+        )
+        .await
+        .expect("create legacy task above the typed traversal edge budget");
+    let source = assign(&fixture, json!({"title": "bounded traversal source"})).await;
+
+    let error = fixture
+        .dispatch(
+            "update",
+            json!({
+                "id": source["full_id"],
+                "properties": {"depends_on": [fanout.id.as_hyphenated().to_string()]}
+            }),
+        )
+        .await
+        .expect_err("duplicate dependency entries must consume the edge budget");
+    assert!(
+        error.to_string().contains("20000-edge safety bound"),
+        "unexpected bounded-walk error: {error}"
+    );
+}
+
+#[tokio::test]
+async fn link_rejects_multihop_and_same_batch_dependency_cycles() {
+    let fixture = pack(rt());
+    let a = assign(&fixture, json!({"title": "edge cycle A"})).await;
+    let b = assign(&fixture, json!({"title": "edge cycle B"})).await;
+    let c = assign(&fixture, json!({"title": "edge cycle C"})).await;
+    let a_id = a["full_id"].as_str().unwrap();
+    let b_id = b["full_id"].as_str().unwrap();
+    let c_id = c["full_id"].as_str().unwrap();
+
+    for (source_id, target_id) in [(a_id, b_id), (b_id, c_id)] {
+        fixture
+            .dispatch(
+                "link",
+                json!({
+                    "source_id": source_id,
+                    "target_id": target_id,
+                    "relation": "depends_on"
+                }),
+            )
+            .await
+            .expect("acyclic dependency link");
+    }
+    let multihop = fixture
+        .dispatch(
+            "link",
+            json!({
+                "source_id": c_id,
+                "target_id": a_id,
+                "relation": "depends_on"
+            }),
+        )
+        .await
+        .expect_err("C -> A must not close A -> B -> C");
+    assert!(multihop.to_string().contains("dependency cycle"));
+
+    let x = assign(&fixture, json!({"title": "batch cycle X"})).await;
+    let y = assign(&fixture, json!({"title": "batch cycle Y"})).await;
+    let same_batch = fixture
+        .dispatch(
+            "link",
+            json!({
+                "links": [
+                    {"source_id": x["full_id"], "target_id": y["full_id"], "relation": "depends_on"},
+                    {"source_id": y["full_id"], "target_id": x["full_id"], "relation": "depends_on"}
+                ]
+            }),
+        )
+        .await
+        .expect_err("atomic batch cycle must fail before either edge is written");
+    assert!(same_batch.to_string().contains("dependency cycle"));
+}
+
+#[tokio::test]
+async fn link_cycle_walk_ignores_paths_through_soft_deleted_tasks() {
+    let fixture = pack(rt());
+    let a = assign(&fixture, json!({"title": "live edge path A"})).await;
+    let tombstone = assign(&fixture, json!({"title": "deleted edge path B"})).await;
+    let c = assign(&fixture, json!({"title": "live edge path C"})).await;
+
+    for (source, target) in [(&a, &tombstone), (&tombstone, &c)] {
+        fixture
+            .dispatch(
+                "link",
+                json!({
+                    "source_id": source["full_id"],
+                    "target_id": target["full_id"],
+                    "relation": "depends_on"
+                }),
+            )
+            .await
+            .expect("seed acyclic dependency path");
+    }
+
+    fixture
+        .dispatch("delete", json!({"id": tombstone["full_id"]}))
+        .await
+        .expect("soft-delete intermediate task");
+
+    fixture
+        .dispatch(
+            "link",
+            json!({
+                "source_id": c["full_id"],
+                "target_id": a["full_id"],
+                "relation": "depends_on"
+            }),
+        )
+        .await
+        .expect("a path through a soft-deleted task is not a live dependency cycle");
 }
 
 // ---- depends_on and context_entity_id must be primary-only -------------------

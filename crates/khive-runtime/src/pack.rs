@@ -14,6 +14,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::Instant;
 
+use crate::operations::{LinkSpec, Resolved};
 use crate::runtime::NamespaceToken;
 use async_trait::async_trait;
 use khive_gate::{AllowAllGate, AuditEvent, GateDecision, GateRef, GateRequest};
@@ -257,13 +258,15 @@ pub trait PackRuntime: Send + Sync {
 /// - **Defaults** filled into create args (e.g. `status="inbox"` for tasks)
 /// - **Derived properties** computed from args (e.g. salience from priority)
 /// - **Side-effect writes** after the storage commit (e.g. `depends_on` edges)
+/// - **Cross-pack validation** before shared CRUD mutates an owned kind
 ///
 /// Hooks are stateless from the framework's perspective — they receive the
-/// runtime as a method parameter and operate on the args `Value` directly.
-/// The pack registers them via [`PackRuntime::kind_hook`].
+/// runtime and the current mutation inputs as method parameters. The pack
+/// registers them via [`PackRuntime::kind_hook`].
 ///
 /// Lifecycle verbs (e.g. gtd's `complete`, `transition`) remain pack-owned
-/// verbs and do not flow through this trait — only the create path does.
+/// verbs. Shared `create`, note `update`, and `link` calls flow through this
+/// trait when an endpoint kind has an owning pack hook.
 #[async_trait]
 pub trait KindHook: Send + Sync + std::fmt::Debug {
     /// Mutate args before the storage write. Fill defaults, normalize values,
@@ -291,6 +294,34 @@ pub trait KindHook: Send + Sync + std::fmt::Debug {
         id: uuid::Uuid,
         args: &Value,
     ) -> Result<(), RuntimeError>;
+
+    /// Validate a shared note-property update before storage is mutated.
+    ///
+    /// The default accepts the update. Kind-owning packs override this when a
+    /// property has invariants that generic CRUD cannot know about (for
+    /// example, GTD task dependency acyclicity).
+    async fn validate_note_update(
+        &self,
+        _runtime: &KhiveRuntime,
+        _token: &NamespaceToken,
+        _note: &khive_storage::Note,
+        _properties: Option<&Value>,
+    ) -> Result<(), RuntimeError> {
+        Ok(())
+    }
+
+    /// Validate one or more shared graph links before any edge is written.
+    ///
+    /// A batch is supplied as a unit so a hook can reject a cycle formed only
+    /// by the proposed edges. The default accepts every link.
+    async fn validate_links(
+        &self,
+        _runtime: &KhiveRuntime,
+        _token: &NamespaceToken,
+        _links: &[crate::LinkSpec],
+    ) -> Result<(), RuntimeError> {
+        Ok(())
+    }
 }
 
 /// Optional sub-trait for packs that own private SQL tables and issue UUIDs
@@ -1899,6 +1930,55 @@ impl VerbRegistry {
             }
         }
         None
+    }
+
+    /// Run the owning kind's shared-note-update validator, if it declares one.
+    ///
+    /// Both canonical KG dispatch and user-facing atomic preparation call this
+    /// seam so pack-specific property invariants cannot drift between them.
+    pub async fn validate_note_update_hook(
+        &self,
+        runtime: &KhiveRuntime,
+        token: &NamespaceToken,
+        note: &khive_storage::Note,
+        properties: Option<&Value>,
+    ) -> Result<(), RuntimeError> {
+        if let Some(hook) = self.find_kind_hook(&note.kind) {
+            hook.validate_note_update(runtime, token, note, properties)
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Run shared-link validators grouped by the owning source-note kind.
+    ///
+    /// Supplying the whole proposed batch lets a kind hook reject an invariant
+    /// violation formed only by multiple entries in that batch. Sources that
+    /// are not live notes, or whose kind has no hook, remain the canonical
+    /// endpoint validator's responsibility.
+    pub async fn validate_link_hooks(
+        &self,
+        runtime: &KhiveRuntime,
+        token: &NamespaceToken,
+        specs: &[LinkSpec],
+    ) -> Result<(), RuntimeError> {
+        let mut specs_by_kind: HashMap<String, Vec<LinkSpec>> = HashMap::new();
+        for spec in specs {
+            let Some(Resolved::Note(source)) = runtime.resolve_by_id(token, spec.source_id).await?
+            else {
+                continue;
+            };
+            specs_by_kind
+                .entry(source.kind)
+                .or_default()
+                .push(spec.clone());
+        }
+        for (kind, kind_specs) in specs_by_kind {
+            if let Some(hook) = self.find_kind_hook(&kind) {
+                hook.validate_links(runtime, token, &kind_specs).await?;
+            }
+        }
+        Ok(())
     }
 
     /// Whether any registered pack declares a handler with this verb name.
