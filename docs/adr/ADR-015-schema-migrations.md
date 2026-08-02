@@ -160,11 +160,11 @@ above remains the historical pre-consolidation record.
 > and edge list cursors. V14 adds the graph-edge identifier compatibility guard.
 > These entries align the live ledger with `MIGRATIONS`.
 
-> **V15 record (2026-08-01, ADR-019 / #1474)**:
+> **V16 record (2026-08-01, ADR-019 / #1474)**:
 > `gtd_dependency_cycle_guards` installs narrowly predicated transaction-time triggers on
 > the core `notes` and `graph_edges` tables. They reject only live task property cycles and
 > live task-to-task `depends_on` edge cycles. Pack `KindHook` validation remains the typed,
-> bounded early-error path; V15 is the cross-process race-safe backstop shared by canonical,
+> bounded early-error path; V16 is the cross-process race-safe backstop shared by canonical,
 > direct-storage, and atomic-unit writers. The migration does not rewrite or reject existing
 > rows while installing the triggers.
 
@@ -203,7 +203,7 @@ exception is narrow: it applies only to evolving a table's shape that a core mig
 never to introducing a wholly new pack-auxiliary table through the core lane, which remains the pack's
 own boot-time declaration to make.
 
-**The core-row invariant-trigger exception.** V15
+**The core-row invariant-trigger exception.** V16
 (`gtd_dependency_cycle_guards`, ADR-019 / #1474) records a second narrow case: a
 pack-owned invariant may use a versioned trigger on a core table when correctness requires
 validation in the same SQLite writer transaction as every mutation. An async pack hook alone
