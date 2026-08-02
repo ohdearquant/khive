@@ -2728,15 +2728,16 @@ mod tests {
                 .expect("seed writes");
         }
 
-        let tick = khive_db::checkpoint_once(
+        let dedicated_conn = pool
+            .open_standalone_writer()
+            .expect("open dedicated checkpoint connection");
+        khive_db::checkpoint_once(
             &pool,
+            &dedicated_conn,
             &CheckpointConfig::default(),
             &mut khive_db::checkpoint::TruncateState::default(),
-        );
-        assert!(
-            matches!(tick, khive_db::CheckpointTick::Observed(_)),
-            "checkpoint_once on a freshly-writer-held pool must observe, not skip: {tick:?}"
-        );
+        )
+        .expect("checkpoint_once must observe on a healthy dedicated connection");
 
         let dispatcher = MockDispatch {
             namespace: "local".to_string(),

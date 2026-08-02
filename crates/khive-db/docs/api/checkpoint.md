@@ -3,10 +3,12 @@
 The checkpoint task (`crates/khive-db/src/checkpoint.rs`) is a periodic
 background `tokio::spawn` that keeps the SQLite WAL file from growing
 unbounded and surfaces pressure/staleness signals to operators (ADR-091: WAL
-checkpoint pressure telemetry + TRUNCATE escalation + tx-age sweep). Public
-item contracts stay complete in their doc-comments; this file is the
-function-specific technical reference for the private helpers, metrics
-surface, and the test suite that pins down each guarantee.
+checkpoint pressure telemetry + TRUNCATE escalation + tx-age sweep;
+dedicated-checkpoint-connection amendment, 2026-08-02 — see the ADR's own
+amendment section for the full rationale). Public item contracts stay
+complete in their doc-comments; this file is the function-specific technical
+reference for the private helpers, metrics surface, and the test suite that
+pins down each guarantee.
 
 ## Module overview (ADR-091 Planks 0/1/2)
 
@@ -15,39 +17,60 @@ See `crates/khive-db/src/checkpoint.rs` module doc.
 The periodic task issues `PRAGMA wal_checkpoint(PASSIVE)` on every tick,
 including when the WAL page count exceeds the high-water mark. Ordinary
 ticks stay PASSIVE-only and non-blocking; a rare, separately-gated escalation
-may additionally run `PRAGMA wal_checkpoint(TRUNCATE)` under the same writer
-guard with a shortened busy timeout (Plank 2, below).
+may additionally run `PRAGMA wal_checkpoint(TRUNCATE)` on the same dedicated
+connection with a shortened busy timeout (Plank 2, below).
 
-**Non-contending design**: `checkpoint_once` uses `try_writer_nowait`
-(zero-wait `try_lock`) so a tick is skipped immediately when any writer holds
-the mutex, rather than blocking for up to `checkout_timeout`. The checkpoint
-task must never stall active write traffic — a skipped tick is always
-preferable.
+**Non-contending design (2026-08-02 amendment — supersedes the original
+`try_writer_nowait` design below).** The task opens its own dedicated,
+long-lived standalone connection (`CheckpointConnection`, opened once at
+task startup via `ConnectionPool::open_standalone_writer`) and runs PASSIVE
+(and, when armed, TRUNCATE) on it every tick — `checkpoint_once` never
+checks out the pool's writer mutex at all. `PRAGMA wal_checkpoint` takes
+SQLite's CKPT lock, not the WRITE lock, so a concurrent pool writer can
+commit while a checkpoint tick runs; serializing the two through one
+application-level mutex, as the original design did, imposed contention
+SQLite itself never required. Production evidence for the original design's
+cost: 22 caller-side `pool.writer()` admission timeouts on 2026-08-02 across
+the fleet, sustained bursts, against a persistent 64MiB WAL — a PASSIVE pass
+over a WAL that large ran long enough to starve every concurrent writer for
+the tick's duration. A tick is `Skipped` only when the dedicated connection
+itself is unavailable (never opened yet, e.g. an in-memory or read-only
+pool, or dropped after a prior tick's connection-level pragma failure, which
+`CheckpointConnection::ensure_open` lazily reopens on the next tick) — a busy
+pool writer no longer produces a Skipped tick at all; PASSIVE now runs
+unconditionally on every tick regardless of concurrent write traffic.
+
+_Original design (superseded above, kept for history):_ `checkpoint_once`
+used `try_writer_nowait` (zero-wait `try_lock`) so a tick was skipped
+immediately when any writer held the pool's writer mutex, rather than
+blocking for up to `checkout_timeout`.
 
 **Why TRUNCATE is excluded from every ordinary tick**: TRUNCATE inherits
 RESTART semantics — it waits for active readers to release their WAL
 snapshots and invokes the busy handler before acquiring the exclusive lock
-needed to reset the WAL file. With `PoolConfig`'s 30s `busy_timeout`, blindly
-running it every tick could sit inside SQLite holding the sole writer
-connection for up to 30s, stalling all normal write traffic. PASSIVE never
-waits for readers; it checkpoints as many frames as currently possible and
-returns promptly. When WAL pressure is sustained (`high_water_pages`
-exceeded), the task emits a WARNING; once WAL pressure reaches the much
-higher `truncate_high_water_pages` mark, the rare Plank 2 escalation may
+needed to reset the WAL file. Blindly running it every tick could sit inside
+SQLite holding the dedicated checkpoint connection for the length of its
+(shortened) `truncate_busy_timeout`. PASSIVE never waits for readers; it
+checkpoints as many frames as currently possible and returns promptly. When
+WAL pressure is sustained (`high_water_pages` exceeded), the task emits a
+WARNING; once WAL pressure reaches the much higher
+`truncate_high_water_pages` mark, the rare Plank 2 escalation may
 additionally attempt a bounded, rate-limited TRUNCATE under a deliberately
 shortened busy timeout — replacing what used to be a purely
-operator-scheduled manual step.
+operator-scheduled manual step. Because TRUNCATE also now runs on the
+dedicated connection rather than the pool writer, its bounded busy-wait cost
+falls on that connection alone, never on a concurrent `pool.writer()` caller.
 
 **Threshold-crossing WARN semantics**: both the `warn_pages` and
 `high_water_pages` warnings fire at most once per below→above crossing.
-Skipped ticks (writer busy) leave the crossing state unchanged so that a
-skip cannot spuriously re-arm the rate limit while WAL pressure is still
-elevated. The ADR-091 Plank 0 open-transaction-registry WARNs (oldest-entry
-escalation and the high-water snapshot enumeration) ride the SAME crossing
-gates — they are not independently rate-limited, so they never repeat on
-consecutive ticks that remain above a threshold. Only the per-tick `debug!`
-trace of the oldest open entry, and the Plank 1 age sweep, run
-unconditionally on every tick — including a Skipped one; the sweep's own
+Skipped ticks (dedicated connection unavailable) leave the crossing state
+unchanged so that a skip cannot spuriously re-arm the rate limit while WAL
+pressure is still elevated. The ADR-091 Plank 0 open-transaction-registry
+WARNs (oldest-entry escalation and the high-water snapshot enumeration) ride
+the SAME crossing gates — they are not independently rate-limited, so they
+never repeat on consecutive ticks that remain above a threshold. Only the
+per-tick `debug!` trace of the oldest open entry, and the Plank 1 age sweep,
+run unconditionally on every tick — including a Skipped one; the sweep's own
 emissions stay edge-triggered per rung via `TxAgeSweepState`.
 
 ### Plank 2: rare TRUNCATE escalation
@@ -58,19 +81,19 @@ wal_checkpoint(TRUNCATE)` once the WAL has grown past
 `truncate_high_water_pages` and at least `truncate_min_interval` has elapsed
 since the last TRUNCATE _attempt_ (not the last successful reclaim).
 
-This is a **single writer checkout per tick**: PASSIVE and any due TRUNCATE
-both run under the one guard `checkpoint_once` already holds — there is
-never a second concurrent checkout for TRUNCATE. If the writer mutex is
-busy, both PASSIVE and any due TRUNCATE are skipped for that tick, and
-`last_truncate_attempt` is left untouched so the next tick where the writer
-is free is immediately eligible rather than waiting out the full interval
-again. `last_truncate_attempt` only advances on a tick that actually
-attempted TRUNCATE (writer held, threshold crossed, interval elapsed) —
-never on a skip for any reason (writer busy, below threshold, interval not
-yet up).
+This runs on the **same dedicated connection** `checkpoint_once` already
+holds — there is never a second connection or a pool checkout for TRUNCATE.
+If the dedicated connection is unavailable, both PASSIVE and any due
+TRUNCATE are skipped for that tick, and `last_truncate_attempt` is left
+untouched so the next tick where the connection is available is immediately
+eligible rather than waiting out the full interval again.
+`last_truncate_attempt` only advances on a tick that actually attempted
+TRUNCATE (connection available, threshold crossed, interval elapsed) — never
+on a skip for any reason (connection unavailable, below threshold, interval
+not yet up).
 
 TRUNCATE runs under a temporarily shortened `busy_timeout`
-(`truncate_busy_timeout`), restored on the writer connection immediately
+(`truncate_busy_timeout`), restored on the dedicated connection immediately
 after the attempt, win or lose. No transaction is ever killed or aborted
 here — the tx_registry is only read for diagnostics; Plank 1 owns the
 registry's own bound.
@@ -88,9 +111,9 @@ delivered for writes by a later ADR.
 
 What ships here instead is the part of Plank 1 that still applies to every
 registered span regardless of which mechanism created it: on EVERY tick —
-Skipped as well as Observed, since a registered `WriterGuard::transaction`
-span holds the writer mutex for its whole lifetime and would otherwise make
-the busiest, most relevant tick invisible to this sweep — `TxAgeSweepState`
+Skipped as well as Observed, since the sweep must not go blind for the
+duration of a Skipped outage (dedicated connection unavailable) any more
+than for an ordinary busy tick — `TxAgeSweepState`
 checks `khive_storage::tx_registry::oldest()`'s age against
 `tx_warn_secs`/`tx_max_age_secs` and escalates to `warn!`/`error!` on each
 below→above crossing (same debounce idiom as the WAL-pressure ladder — a
@@ -172,12 +195,14 @@ below→above crossing (`warn_pages` / `high_water_pages` respectively, via
 
 See `crates/khive-db/src/checkpoint.rs` — private fn `maybe_truncate`.
 
-Runs under the writer guard the caller already holds — never performs its
-own checkout. No-ops unless BOTH `wal_pages >= truncate_high_water_pages`
-AND no prior attempt or `truncate_min_interval` has elapsed since the last
-one. `truncate_state.last_attempt` is stamped ONLY immediately before the
-TRUNCATE pragma itself runs (writer held, threshold crossed, interval
-elapsed, AND the temporary busy_timeout override successfully applied) —
+Runs on the same dedicated checkpoint connection the caller already holds —
+never performs its own checkout, and never touches the pool's writer mutex.
+No-ops unless BOTH `wal_pages >= truncate_high_water_pages` AND no prior
+attempt or `truncate_min_interval` has elapsed since the last one.
+`truncate_state.last_attempt` is stamped ONLY immediately before the
+TRUNCATE pragma itself runs (connection available, threshold crossed,
+interval elapsed, AND the temporary busy_timeout override successfully
+applied) —
 every earlier return is a skip, not an attempt, and never touches it,
 matching the ADR's "skip must not stamp" requirement. The oldest-pinning
 snapshot is logged (reusing Plank 0's `tx_registry`) before the attempt.
@@ -278,6 +303,50 @@ TRUNCATE regression blocks for ~2000ms — a 4x safety margin on both sides.
 An idle reader connection (no `BEGIN`) does NOT pin frames and would not
 cause TRUNCATE to wait — an actual open read transaction is required for
 the isomorphism to hold.
+
+### `checkpoint_once_proceeds_and_can_attempt_truncate_while_pool_writer_held` (dedicated-connection fix, 2026-08-02)
+
+The fix this module exists to prove, at the unit level: holding the POOL's
+writer mutex (`pool.try_writer()`) must NOT cause `checkpoint_once` to skip
+or block — PASSIVE (and, if armed, TRUNCATE) run on the task's own dedicated
+connection, which never contends with the pool writer at all. Before the
+fix, this exact setup made `checkpoint_once` return `Skipped` via
+`try_writer_nowait()`. Replaces the old `busy_writer_skips_both_passive_and_truncate`
+test, whose entire premise (a busy pool writer causes a skip) is no longer
+true.
+
+See `crates/khive-db/tests/checkpoint_dedicated_connection.rs` for the
+integration-level companion: a real `checkpoint_once` call against a
+genuinely fat (≥32MiB) WAL, run concurrently with a `pool.writer()`
+admission attempt, proving the converse direction — the writer is never
+blocked behind the checkpoint either.
+
+### `open_standalone_writer_fails_on_in_memory_pool`
+
+An in-memory pool has no on-disk file for `ConnectionPool::open_standalone_writer`
+to open a second connection against. This is exactly the precondition that
+makes `CheckpointConnection::ensure_open` return `None` and
+`run_checkpoint_task` report `Skipped` — `checkpoint_once` itself is never
+even called for an in-memory pool. Replaces the old
+`checkpoint_once_is_noop_on_in_memory_pool` test, which called
+`checkpoint_once` directly against an in-memory pool — no longer possible
+once `checkpoint_once` takes an already-open dedicated connection as an
+argument rather than acquiring one itself.
+
+### `checkpoint_task_sweeps_stale_entry_even_when_dedicated_connection_is_unavailable_every_tick`
+
+Renamed and re-mechanized from
+`checkpoint_task_sweeps_stale_entry_even_when_writer_is_busy_every_tick`:
+since the dedicated-connection fix, holding the pool's writer mutex no
+longer produces a Skipped tick at all, so the original mechanism (hold
+`pool.try_writer()` for the task's whole run) can no longer drive the
+Skipped path this regression exists to cover. Drives Skipped the way it
+actually happens now instead: a read-only pool, on which
+`ConnectionPool::open_standalone_writer` always fails, so
+`CheckpointConnection::ensure_open` can never open a dedicated connection.
+The underlying regression this test guards — the Plank 1 age sweep must
+still run and escalate on a Skipped tick, not just an Observed one — is
+unchanged; only the mechanism that produces the Skipped tick moved.
 
 ### `checkpoint_config_rejects_reversed_tx_thresholds`
 

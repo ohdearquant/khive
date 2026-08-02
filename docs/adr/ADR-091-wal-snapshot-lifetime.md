@@ -1087,3 +1087,67 @@ public ceiling and the over-budget sentinel, and snapshot tests must prove a
 live statement is attributed while no registry entry survives the statement.
 Changing any numeric ceiling, partial-result rule, traversal ordering guarantee,
 or snapshot consistency model requires another ADR amendment.
+
+### 2026-08-02 amendment (Amendment 5): dedicated checkpoint connection — supersedes `try_writer_nowait`
+
+**Motivation.** Production evidence (2026-08-02): 22 caller-side `pool.writer()`
+admission timeouts across the fleet, sustained bursts, against a persistent
+64MiB WAL. `checkpoint_once` acquired the pool's writer mutex via
+`try_writer_nowait` (Plank 2, above) and held that same guard across `PRAGMA
+wal_checkpoint(PASSIVE)` — and, when armed, the TRUNCATE escalation — for the
+whole tick. Over a large WAL a PASSIVE pass can run long enough that every
+concurrent `pool.writer()` caller times out at `checkout_timeout`. This was an
+unforced application-level constraint, not a SQLite requirement: `PRAGMA
+wal_checkpoint` takes SQLite's CKPT lock, not the WRITE lock, so a writer can
+commit concurrently with a passive checkpoint. Serializing checkpoint and
+writers through one mutex imposed contention SQLite itself never required.
+
+**This amendment supersedes, and directly contradicts, several statements
+made earlier in this document** (Plank 2's own section, above, and the
+Non-goals section's "does not redesign writer serialization" — that statement
+was true of the pool's general-purpose write path, which this amendment does
+not touch, but was never meant to bless serializing the checkpoint task's own
+pragmas behind that same mutex). Both are corrected by this amendment; the
+earlier text is left in place, unedited, as the historical record of the
+original (now-superseded) design, per this document's own convention for
+prior amendments.
+
+**Design.** The checkpoint task now owns a dedicated, long-lived standalone
+connection to the same database file (`CheckpointConnection` in
+`checkpoint.rs`), opened once at task startup via the crate's existing
+standalone-connection open path (`ConnectionPool::open_standalone_writer` —
+same pragmas as any other standalone connection, including `busy_timeout`
+from the pool config). `checkpoint_once` runs PASSIVE — and, when armed,
+`maybe_truncate`'s TRUNCATE escalation, on the SAME dedicated connection,
+never a second checkout — on this connection and never checks out the pool's
+writer mutex at all. `try_writer_nowait` is no longer used anywhere on this
+path.
+
+**Skip semantics changed.** Previously a busy pool writer caused
+`checkpoint_once` to return `CheckpointTick::Skipped` for that tick (a busy
+writer skip). That mechanism is gone: PASSIVE now runs unconditionally on
+every tick regardless of concurrent write traffic, because it no longer
+contends with that traffic at all. `CheckpointTick::Skipped` still exists, but
+is now produced only when the dedicated connection itself is unavailable —
+never opened yet (an in-memory or read-only pool has no on-disk file, or no
+write permission, for `open_standalone_writer` to open a second connection
+against), or dropped after a prior tick's connection-level pragma failure.
+`CheckpointConnection::ensure_open` lazily reopens on the next tick in that
+case; a dropped connection never crashes the task.
+
+**TRUNCATE's bounded blocking cost is unaffected in kind, only in which
+connection pays it.** TRUNCATE still inherits RESTART semantics and can block
+for up to `truncate_busy_timeout` waiting on active readers — that accepted,
+bounded cost (already governed by `truncate_busy_timeout` and the
+`truncate_min_interval` gate) now falls on the dedicated connection alone,
+never on a concurrent `pool.writer()` caller.
+
+**What did not change.** Every counter, WARN-once threshold-crossing
+semantic, the tx-registry age sweep (Plank 1, including its running on a
+Skipped tick — the reason changed, from "writer busy" to "dedicated
+connection unavailable," but the invariant that the sweep must not go blind
+during a Skipped streak did not), the severity ladder (Plank 0), and the
+walpin sidecar heartbeat (Amendment 2 Plank B) are behavior-neutral under
+this amendment — only which connection/lock a checkpoint tick runs on
+changed. `run_checkpoint_task`'s public signature, and every other daemon
+call site, are also unchanged.
