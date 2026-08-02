@@ -918,7 +918,7 @@ async fn seed_entity_with_id(
 // reverse project->concept legal set before this regression fix.
 #[tokio::test]
 async fn bulk_link_symmetric_rejection_preserves_requested_pair_in_both_modes() {
-    let (rt, token, pack, _registry) = configured_kg_endpoint_test_surface();
+    let (rt, token, pack, registry) = configured_kg_endpoint_test_surface();
     let concept_id =
         uuid::Uuid::parse_str("ffffffff-ffff-ffff-ffff-ffffffffffff").expect("high UUID");
     let project_id = uuid::Uuid::nil();
@@ -936,13 +936,13 @@ async fn bulk_link_symmetric_rejection_preserves_requested_pair_in_both_modes() 
             "atomic": atomic,
         });
         let message = if atomic {
-            pack.handle_link(&token, params)
+            pack.handle_link(&token, params, &registry)
                 .await
                 .expect_err("atomic bulk must reject concept competes_with project")
                 .to_string()
         } else {
             let response = pack
-                .handle_link(&token, params)
+                .handle_link(&token, params, &registry)
                 .await
                 .expect("non-atomic bulk reports entry failures in-band");
             response["errors"][0]["error"]
