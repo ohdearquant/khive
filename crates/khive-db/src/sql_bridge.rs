@@ -239,6 +239,10 @@ struct SqliteWriter {
     /// The origin (ADR-091 backend-scoped attribution) of the pool this
     /// standalone connection was opened against.
     origin: khive_storage::tx_registry::TxOrigin,
+    /// This connection's pool's writer-timeout sink identity (`db_label`),
+    /// captured at construction so the standalone-path busy/locked mapping
+    /// below doesn't need a `&ConnectionPool` reference to report against.
+    db: String,
 }
 
 #[async_trait]
@@ -343,7 +347,14 @@ impl khive_storage::SqlWriter for SqliteWriter {
         .await
         .map_err(|e| StorageError::driver(StorageCapability::Sql, "execute", e))?;
         self.conn = Some(conn);
-        let affected = result.map_err(|e| map_rusqlite_err(e, "execute"))?;
+        let affected = result.map_err(|e| {
+            crate::timeout_sink::maybe_emit_busy(
+                &self.db,
+                crate::timeout_sink::Site::StandaloneSqlBridge,
+                &e,
+            );
+            map_rusqlite_err(e, "execute")
+        })?;
         Ok(affected as u64)
     }
 
@@ -416,7 +427,14 @@ impl khive_storage::SqlWriter for SqliteWriter {
         .await
         .map_err(|e| StorageError::driver(StorageCapability::Sql, "execute_batch", e))?;
         self.conn = Some(conn);
-        result.map_err(|e| map_rusqlite_err(e, "execute_batch"))
+        result.map_err(|e| {
+            crate::timeout_sink::maybe_emit_busy(
+                &self.db,
+                crate::timeout_sink::Site::StandaloneSqlBridge,
+                &e,
+            );
+            map_rusqlite_err(e, "execute_batch")
+        })
     }
 
     async fn execute_script(&mut self, script: String) -> khive_storage::types::StorageResult<()> {
@@ -449,7 +467,14 @@ impl khive_storage::SqlWriter for SqliteWriter {
         .await
         .map_err(|e| StorageError::driver(StorageCapability::Sql, "execute_script", e))?;
         self.conn = Some(conn);
-        result.map_err(|e| map_rusqlite_err(e, "execute_script"))
+        result.map_err(|e| {
+            crate::timeout_sink::maybe_emit_busy(
+                &self.db,
+                crate::timeout_sink::Site::StandaloneSqlBridge,
+                &e,
+            );
+            map_rusqlite_err(e, "execute_script")
+        })
     }
 
     async fn execute_script_top_level(
@@ -486,7 +511,14 @@ impl khive_storage::SqlWriter for SqliteWriter {
         .await
         .map_err(|e| StorageError::driver(StorageCapability::Sql, "execute_script_top_level", e))?;
         self.conn = Some(conn);
-        result.map_err(|e| map_rusqlite_err(e, "execute_script_top_level"))
+        result.map_err(|e| {
+            crate::timeout_sink::maybe_emit_busy(
+                &self.db,
+                crate::timeout_sink::Site::StandaloneSqlBridge,
+                &e,
+            );
+            map_rusqlite_err(e, "execute_script_top_level")
+        })
     }
 }
 
@@ -991,6 +1023,7 @@ impl khive_storage::SqlAccess for SqlBridge {
                 conn: Some(conn),
                 writer_task,
                 origin: self.pool.origin(),
+                db: crate::timeout_sink::db_label(&self.pool),
             }))
         } else {
             Ok(Box::new(PoolBackedWriter {
@@ -1058,6 +1091,7 @@ impl khive_storage::SqlAccess for SqlBridge {
                 conn: Some(conn),
                 writer_task: None,
                 origin: self.pool.origin(),
+                db: crate::timeout_sink::db_label(&self.pool),
             };
             run_manual_atomic_unit(&mut writer, op, self.pool.origin()).await
         } else {
