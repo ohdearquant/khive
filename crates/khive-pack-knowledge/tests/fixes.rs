@@ -3102,7 +3102,7 @@ mod edit_inline_reembed {
     use async_trait::async_trait;
     use khive_runtime::{AllowAllGate, BackendId, EmbedderProvider, RuntimeConfig};
     use khive_types::Namespace;
-    use lattice_embed::{EmbedError, EmbeddingModel, EmbeddingService, MAX_TEXT_CHARS};
+    use lattice_embed::{EmbedError, EmbeddingModel, EmbeddingService, MAX_TEXT_BYTES};
     use std::sync::Arc;
 
     const MODEL_KEY: &str = "all-minilm-l6-v2";
@@ -3351,7 +3351,7 @@ mod edit_inline_reembed {
                     "id": "edit-truncation-report",
                     "sections": [{
                         "section_type": "overview",
-                        "content": format!("{}tail", "x".repeat(MAX_TEXT_CHARS + 1))
+                        "content": format!("{}tail", "x".repeat(MAX_TEXT_BYTES + 1))
                     }]
                 }),
             )
