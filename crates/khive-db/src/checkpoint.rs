@@ -63,7 +63,7 @@ static TRUNCATE_ATTEMPTS: AtomicU64 = AtomicU64::new(0);
 static TRUNCATE_CONSECUTIVE_FAILURES: AtomicU64 = AtomicU64::new(0);
 
 /// Count of checkpoint ticks skipped because the task's dedicated
-/// [`CheckpointConnection`] was unavailable that tick (never opened yet, or
+/// `CheckpointConnection` was unavailable that tick (never opened yet, or
 /// dropped after a prior connection-level pragma failure — ADR-091
 /// checkpoint-pressure telemetry), across this process's lifetime. Never
 /// reset outside `#[cfg(test)]`.
@@ -151,7 +151,7 @@ pub(crate) fn reset_checkpoint_metrics_for_tests() {
 
 /// Outcome of a single checkpoint attempt.
 ///
-/// `Skipped` is returned when the task's dedicated [`CheckpointConnection`]
+/// `Skipped` is returned when the task's dedicated `CheckpointConnection`
 /// is unavailable that tick (the tick is a no-op) — never because a
 /// concurrent pool writer was busy; a checkpoint tick no longer checks out
 /// the pool's writer mutex at all. `Observed` carries the WAL page count read
@@ -1479,11 +1479,11 @@ impl CheckpointConnection {
 /// makes that check unreachable (issue #774).
 ///
 /// Issues `PRAGMA wal_checkpoint(PASSIVE)` every tick on the task's dedicated
-/// [`CheckpointConnection`] — never the pool's writer mutex, so a concurrent
+/// `CheckpointConnection` — never the pool's writer mutex, so a concurrent
 /// `pool.writer()` checkout can never queue behind a checkpoint tick. That
 /// guarantee is admission-only: an armed TRUNCATE still takes SQLite's writer
 /// lock and can block new write transactions, on any connection, for up to
-/// `truncate_busy_timeout` (see [`CheckpointConnection`]'s contract). A tick is
+/// `truncate_busy_timeout` (see `CheckpointConnection`'s contract). A tick is
 /// `Skipped` only when that dedicated connection is itself unavailable. A
 /// WARNING fires once per below→above threshold crossing, not every tick.
 ///
@@ -1773,7 +1773,7 @@ fn log_tx_registry_snapshot_warn(wal_pages: u64) {
 }
 
 /// Issue one checkpoint cycle against the task's dedicated checkpoint
-/// connection (`conn` — see [`CheckpointConnection`]; NEVER the pool's writer
+/// connection (`conn` — see `CheckpointConnection`; NEVER the pool's writer
 /// mutex).
 ///
 /// Returns the observed WAL page count on success. Returns `Err` only for a

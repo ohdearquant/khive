@@ -1142,7 +1142,7 @@ queues behind a checkpoint tick, because that tick no longer holds the pool's
 writer mutex at all. SQLite-level lock semantics are otherwise unchanged by
 this amendment: PASSIVE takes only the CKPT lock and never blocks writers, at
 the SQLite level, on any connection. TRUNCATE inherits RESTART semantics and
-*additionally* acquires SQLite's writer lock, blocking new write transactions
+_additionally_ acquires SQLite's writer lock, blocking new write transactions
 on ALL connections — this process or any other, pool-checked-out or
 standalone — while it waits on pinning readers, bounded by
 `truncate_busy_timeout` (see
