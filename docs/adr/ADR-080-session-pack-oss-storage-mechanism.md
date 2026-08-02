@@ -2,7 +2,7 @@
 
 **Status**: accepted
 **Date**: 2026-06-28
-**Amended**: 2026-07-02 — shipped-surface record (§3), session mirror (§6), scope revision (Context); 2026-08-01 — claude.ai export source (§6)
+**Amended**: 2026-07-02 — shipped-surface record (§3), session mirror (§6), scope revision (Context); 2026-08-01 — claude.ai export source (§6); 2026-08-02 — delta-proportional mirror polling (§6)
 **Superseded by**: [ADR-083](ADR-083-session-pack-t1-verbs.md) for §3 only; ADR-083 is
 the current authority for the public session verb surface, while the rest of this record
 remains in force.
@@ -243,7 +243,40 @@ ChatGPT and claude.ai both name this file `conversations.json`, while the cursor
 file path. Each export parser therefore rejects a document containing the other provider's
 recognizable conversation shape, and a mixed-provider array is unsupported. This leaves the
 cursor untouched instead of allowing a misconfigured overlapping root to let the wrong source
-consume that path first.
+consume that path first. Candidate dispatch claims the path only when a pass advances its
+cursor; a no-progress success such as one provider's lower whole-file size ceiling falls
+through to the next configured provider candidate.
+
+#### Delta-proportional polling (Amendment, 2026-08-02)
+
+The service performs one full discovery pass at startup, then keeps an in-memory directory
+and file index. Steady-state polling does not re-walk every transcript tree or stat every
+completed transcript:
+
+- Known directories are checked round-robin, at most 64 metadata probes per tick. A directory
+  is listed only when its `(mtime, length)` fingerprint changes, or after 30 unchanged probes
+  as a bounded fallback for coarse or unreliable filesystem timestamps. A changed directory
+  puts its directly contained cold transcripts at the front of the bounded probe schedule;
+  newly discovered transcripts enter the active set immediately.
+- A file remains active while it is growing, while ingest is catching up to its cursor, or
+  while a per-file error requires retry. Once its cursor is caught up, two unchanged probes
+  and an mtime at least five minutes old make it cold. Filesystems that do not report mtime
+  use 30 unchanged probes instead.
+- Cold files are sampled through a round-robin queue capped at 256 metadata probes per tick.
+  This is a correctness fallback because appending to a file does not update its parent
+  directory mtime on every supported filesystem. Consequently a resumed cold transcript is
+  noticed within the priority sweep started by a parent-directory change, or within one
+  complete bounded cold-file sweep even without that change.
+
+Once the historical corpus is cold, a quiet tick performs at most 64 directory metadata probes,
+256 cold-file metadata probes, and one metadata probe per active file; those fixed terms do not
+grow with the cold-file count. Work may still scale with the actual delta: startup discovery, a
+directory whose entry set changed, backfill, and simultaneously growing files are processed
+rather than silently dropped. Persisted cursor semantics, source selection, per-file ingest
+limits, idempotency, and the rule that errors do not advance cursors are unchanged. Configured
+roots that do not exist at startup remain in the directory schedule so later creation is
+discovered. The same pinned identity applies to a configured root nested below another source
+root: removing and recreating the ancestor cannot discard the nested root's source kinds.
 
 #### Auxiliary schema
 
