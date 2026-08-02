@@ -382,6 +382,160 @@ fn vector_only_fusion_unions_hits_across_every_engine() {
     );
 }
 
+// ── Two-arm positional contract (ADR-033 §6.3): VectorOnly/KeywordOnly must
+// preserve both `[vector, keyword]` slots even with zero registered vector
+// models, rather than collapsing to a single source. ────────────────────────
+
+#[test]
+fn vector_only_with_zero_vector_models_never_leaks_text_hits() {
+    use khive_storage::types::TextSearchHit;
+    use std::collections::HashSet;
+    use uuid::Uuid;
+
+    let id_text_only = Uuid::from_u128(0x3333);
+    let text_hits = vec![TextSearchHit {
+        subject_id: id_text_only,
+        score: 0.9_f64.into(),
+        rank: 1,
+        title: None,
+        snippet: None,
+    }];
+    let memory_ids: HashSet<Uuid> = [id_text_only].into_iter().collect();
+
+    let candidates = RecallCandidateSet {
+        namespace: "local".to_string(),
+        text_hits,
+        vector_hits_per_model: vec![],
+        visible_namespaces: vec!["local".to_string()],
+        ann_degraded: false,
+    };
+    let cfg = RecallConfig {
+        fuse_strategy: FusionStrategy::VectorOnly,
+        ..RecallConfig::default()
+    };
+
+    let results = fuse_candidates(&candidates, &memory_ids, &cfg, 10);
+
+    assert!(
+        results.is_empty(),
+        "VectorOnly with zero registered vector models must return no hits, \
+         even though text hits are present — the keyword slot must stay a \
+         distinct, empty position rather than being read as the vector arm; \
+         got {:?}",
+        results.iter().map(|h| h.entity_id).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn keyword_only_with_zero_vector_models_still_returns_text_hits() {
+    use khive_storage::types::TextSearchHit;
+    use std::collections::HashSet;
+    use uuid::Uuid;
+
+    let id_a = Uuid::from_u128(0x4444);
+    let id_b = Uuid::from_u128(0x5555);
+    let text_hits = vec![
+        TextSearchHit {
+            subject_id: id_a,
+            score: 0.9_f64.into(),
+            rank: 1,
+            title: None,
+            snippet: None,
+        },
+        TextSearchHit {
+            subject_id: id_b,
+            score: 0.5_f64.into(),
+            rank: 2,
+            title: None,
+            snippet: None,
+        },
+    ];
+    let memory_ids: HashSet<Uuid> = [id_a, id_b].into_iter().collect();
+
+    let candidates = RecallCandidateSet {
+        namespace: "local".to_string(),
+        text_hits,
+        vector_hits_per_model: vec![],
+        visible_namespaces: vec!["local".to_string()],
+        ann_degraded: false,
+    };
+    let cfg = RecallConfig {
+        fuse_strategy: FusionStrategy::KeywordOnly,
+        ..RecallConfig::default()
+    };
+
+    let results = fuse_candidates(&candidates, &memory_ids, &cfg, 10);
+    let ids: Vec<Uuid> = results.iter().map(|h| h.entity_id).collect();
+
+    assert_eq!(
+        ids,
+        vec![id_a, id_b],
+        "KeywordOnly with zero registered vector models must still serve the \
+         text arm from its dedicated keyword slot, in score order; got {ids:?}"
+    );
+}
+
+#[test]
+fn multi_engine_rrf_gives_each_engine_a_separate_rank_contribution() {
+    use khive_storage::types::VectorSearchHit;
+    use std::collections::HashSet;
+    use uuid::Uuid;
+
+    // id_dual appears in both engines (rank 2 in A, rank 1 in B) and so must
+    // accumulate two RRF rank contributions. id_solo appears only in engine A
+    // at rank 1. If per-model vector hits were unioned into one source before
+    // RRF (max score per ID) instead of staying separate, id_solo's higher
+    // raw score (0.90) would put it ahead of id_dual (0.50) in the unioned
+    // ranking — the opposite of the outcome asserted below.
+    let id_dual = Uuid::from_u128(0x6666);
+    let id_solo = Uuid::from_u128(0x7777);
+
+    let hits_engine_a = vec![
+        VectorSearchHit {
+            subject_id: id_solo,
+            score: 0.90_f64.into(),
+            rank: 1,
+        },
+        VectorSearchHit {
+            subject_id: id_dual,
+            score: 0.50_f64.into(),
+            rank: 2,
+        },
+    ];
+    let hits_engine_b = vec![VectorSearchHit {
+        subject_id: id_dual,
+        score: 0.50_f64.into(),
+        rank: 1,
+    }];
+    let memory_ids: HashSet<Uuid> = [id_dual, id_solo].into_iter().collect();
+
+    let candidates = RecallCandidateSet {
+        namespace: "local".to_string(),
+        text_hits: vec![],
+        vector_hits_per_model: vec![
+            ("engine-a".to_string(), hits_engine_a),
+            ("engine-b".to_string(), hits_engine_b),
+        ],
+        visible_namespaces: vec!["local".to_string()],
+        ann_degraded: false,
+    };
+    let cfg = RecallConfig {
+        fuse_strategy: FusionStrategy::Rrf { k: 60 },
+        ..RecallConfig::default()
+    };
+
+    let results = fuse_candidates(&candidates, &memory_ids, &cfg, 10);
+    let ids: Vec<Uuid> = results.iter().map(|h| h.entity_id).collect();
+
+    assert_eq!(
+        ids.first(),
+        Some(&id_dual),
+        "multi-engine RRF must keep each engine as a separate source so a \
+         note present in both engines outranks a single-engine hit with a \
+         higher raw score, not the pre-union collapse; got {ids:?}"
+    );
+}
+
 #[test]
 fn compute_score_weighted_strategy_formula() {
     let cfg = RecallConfig {

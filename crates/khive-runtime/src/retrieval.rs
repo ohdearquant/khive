@@ -754,10 +754,12 @@ impl KhiveRuntime {
             vector_hits.retain(|hit| hit.score >= score_floor);
         }
 
-        // Keep the full candidate pool (untruncated) through the alive/kind/tag/property
-        // filter below, so matching hits ranked below `limit` in the raw fusion aren't
-        // lost when higher-ranked candidates get excluded by a filter.
-        let mut fused = rrf_fuse(text_hits, vector_hits, candidates as usize, query_text);
+        // Each arm fetched `candidates` independently, so their union can contain
+        // twice that many distinct IDs. Keep the complete fetched pool through
+        // ranking and the alive/kind/tag/property filters below; reusing one arm's
+        // cap here lets stale or filtered hits hide live candidates from the other.
+        let fusion_limit = text_hits.len().saturating_add(vector_hits.len());
+        let mut fused = rrf_fuse(text_hits, vector_hits, fusion_limit, query_text);
 
         // tags_any has a SQL column and is pushed into query_entities; properties
         // filtering has no SQL column and is applied in Rust below on the fetched records.
@@ -777,7 +779,7 @@ impl KhiveRuntime {
                     },
                     PageRequest {
                         offset: 0,
-                        limit: fused.len() as u32,
+                        limit: u32::try_from(fused.len()).unwrap_or(u32::MAX),
                     },
                 )
                 .await?;
