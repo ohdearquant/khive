@@ -124,7 +124,11 @@ object_store = { version = "=0.14.1", default-features = false, features = ["aws
 opt-level = 3
 lto = "thin"
 codegen-units = 1
-strip = "symbols"
+# Keep function symbol names so production profilers (sample/atos) can resolve
+# frames on release binaries; drop only the DWARF debug sections. With
+# strip = "symbols" a live-process sample yields anonymous offsets, which makes
+# post-hoc analysis of a stall or contention window impossible.
+strip = "debuginfo"
 
 # lattice 0.3.0 published — use crates.io directly. Restore [patch.crates-io]
 # block below to point at local lattice when iterating on lattice-side fixes.
