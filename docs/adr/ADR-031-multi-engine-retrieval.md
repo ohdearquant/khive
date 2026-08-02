@@ -18,12 +18,13 @@ SparseStore + memory.recall_* verbs)\
 - ADR-029 (SubstrateCoordinator) — backend-level unweighted RRF is distinct from the engine-level weighted RRF here
 - ADR-033 (Recall Pipeline) — memory recall consumes the pack fan-out pattern specified here
 - ADR-035 (CLI Config) — project-vs-user TOML override semantics extended by this ADR
+- ADR-051 (Knowledge Section Embeddings) — knowledge uses only its searchable default model
 
 ## Context
 
-An earlier implementation delivered multi-engine embedding: N peer models run concurrently, each with
-its own HNSW index, every write embedding with all N models, every query fusing per-engine
-rankings via weighted RRF. `deploy/engine.toml` was the canonical config; per-engine
+An earlier implementation delivered multi-engine embedding: N peer models run concurrently, each
+with its own HNSW index, with participating writes embedding in all N models and corresponding
+queries fusing per-engine rankings via weighted RRF. `deploy/engine.toml` was the canonical config; per-engine
 normalization parameters (`noise_floor`, `max_similarity`, `threshold`) were tuned during the
 2026-03-26 Chinese-blindspot crisis (mE5 migration). That crisis confirmed empirically that
 no single embedding model dominates across languages and corpus types — multilingual and
@@ -50,16 +51,27 @@ peer after HNSW namespace split." The current release erased this without an ADR
 ### What "multi-engine" means
 
 Distinct from multi-actor namespace isolation (per ADR-007) and distinct from model migration
-(single model, swap atomically). Multi-engine means:
+(single model, swap atomically). For a substrate with a multi-engine read path, multi-engine means:
 
 - N peer embedding services run concurrently in the same process
 - Each service may be a different provider (lattice-embed native, OpenAI API, custom)
 - Each service has its own vector index — one `vec_*` table per (model_id, dim)
-- Every write embeds with all N services and stores in all N indices
-- Every query embeds with all N services, searches all N indices in parallel, then fuses
+- Every participating write embeds with all N services and stores in all N indices
+- Every corresponding query embeds with all N services, searches all N indices in parallel, then fuses
 - Results merge via weighted RRF using per-engine weight
 - Per-engine score normalization (noise_floor, max_similarity, threshold) calibrates
   cross-engine comparability
+
+### Amendment 1 (2026-08-01): readable-model symmetry for knowledge
+
+The fan-out contract is write/read symmetric, not permission to create vectors no serving path
+can consume. Entity, note, and memory paths retain multi-engine write and read fan-out. Knowledge
+search, ANN warming, fresh-tail fusion, and compose currently select only the default embedder and
+expose no model selector or cross-model fusion, so `knowledge.index` writes only that default
+model. ADR-051 Amendment 1 records the same knowledge-specific decision. Multi-model knowledge
+indexing must land together with a model-aware or fused knowledge read path; until then secondary
+knowledge vectors are dead embedding and storage work. This supersedes Phase C's unqualified
+"pack handlers fan out" wording and Open Question 2's deferral for this specific substrate.
 
 ### Why "engine" not "model"
 
@@ -736,7 +748,8 @@ preserved — the single engine is now the built-in default, passed explicitly b
 handler rather than owned by the runtime.
 
 **Phase C — Multi-engine config + pack fan-out (D3 full, D5, D6)**. `[[engines]]` TOML
-schema activated; pack handlers fan out across all configured engines. `SparseStore` trait
+schema activated; handlers with multi-engine reads fan out across all configured engines.
+`SparseStore` trait
 added. `memory.recall_*` dotted verbs added. New deployments get multi-engine by declaring the array;
 existing single-engine deployments see no behavior change.
 
@@ -745,9 +758,10 @@ existing single-engine deployments see no behavior change.
 1. **`MultiEngineSearcher` helper extraction.** Defer until three or more packs need
    identical fan-out code. Pack handlers copy the pattern; extract when the duplication
    threshold is reached.
-2. **Multi-engine write policy.** Default: every engine embeds every write. A future
-   `write_engines` allowlist on `EngineConfig` (or `PackConfig`) would allow a pack to store
-   writes in a subset of engines, reading from all. Deferred to v2.
+2. **Multi-engine write policy.** Default for a multi-engine read path: every engine embeds every
+   write. A future `write_engines` allowlist on `EngineConfig` (or `PackConfig`) would allow a pack
+   to store writes in a subset of engines while reading from all. Deferred to v2. Knowledge's
+   default-only policy is a different case: it writes exactly the one engine it can read.
 3. **Remote-API engine config.** A `[[engines]] provider = "openai"` shape needs `api_key_env`
    / `endpoint` / `timeout` fields on `EngineConfig`. The `Embedder` trait supports it; the
    TOML schema is lattice-shaped for v1. Future ADR when a concrete remote-API provider ships.
