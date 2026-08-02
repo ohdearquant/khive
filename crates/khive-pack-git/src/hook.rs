@@ -15,6 +15,19 @@ fn is_40_hex(s: &str) -> bool {
     s.len() == 40 && s.chars().all(|c| c.is_ascii_hexdigit())
 }
 
+fn is_repo_relative_path(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    let windows_absolute =
+        bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && bytes[2] == b'/';
+    !path.is_empty()
+        && !path.starts_with('/')
+        && !windows_absolute
+        && !path.contains('\0')
+        && path
+            .split('/')
+            .all(|component| !component.is_empty() && component != "." && component != "..")
+}
+
 fn properties_obj(args: &Value) -> Result<&serde_json::Map<String, Value>, RuntimeError> {
     args.get("properties")
         .and_then(Value::as_object)
@@ -28,8 +41,9 @@ fn properties_obj(args: &Value) -> Result<&serde_json::Map<String, Value>, Runti
 /// `KindHook` for the immutable `commit` note kind.
 ///
 /// Validates `properties.sha` (required, 40-hex) and, when present,
-/// `properties.parents` (array of 40-hex strings). Commits have no lifecycle
-/// and no `after_create` edge work.
+/// `properties.parents` (array of 40-hex strings) and `properties.changed_paths`
+/// (array of repository-relative path strings). Commits have no lifecycle and
+/// no `after_create` edge work.
 #[derive(Debug, Default)]
 pub struct CommitHook;
 
@@ -75,6 +89,34 @@ impl KindHook for CommitHook {
                 return Err(RuntimeError::InvalidInput(format!(
                     "commit properties.short_sha {short:?} must be a non-empty prefix of sha {sha:?}"
                 )));
+            }
+        }
+
+        if let Some(paths) = props.get("changed_paths") {
+            let arr = paths.as_array().ok_or_else(|| {
+                RuntimeError::InvalidInput(
+                    "commit properties.changed_paths must be an array".into(),
+                )
+            })?;
+            let mut previous: Option<&str> = None;
+            for (idx, path) in arr.iter().enumerate() {
+                let Some(path) = path.as_str() else {
+                    return Err(RuntimeError::InvalidInput(format!(
+                        "commit properties.changed_paths[{idx}] must be a string"
+                    )));
+                };
+                if !is_repo_relative_path(path) {
+                    return Err(RuntimeError::InvalidInput(format!(
+                        "commit properties.changed_paths[{idx}] must be a non-empty \
+                         repository-relative '/'-separated path without '.' or '..' components"
+                    )));
+                }
+                if previous.is_some_and(|prior| path <= prior) {
+                    return Err(RuntimeError::InvalidInput(
+                        "commit properties.changed_paths must be sorted and deduplicated".into(),
+                    ));
+                }
+                previous = Some(path);
             }
         }
 

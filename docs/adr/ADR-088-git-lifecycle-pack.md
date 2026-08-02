@@ -60,8 +60,10 @@ New pack crate `khive-pack-git`, `REQUIRES = ["kg"]`, following `khive-pack-form
    CLAUDE.md's "Scope = secrets only, not general PII" rule; no masking required),
    `committed_at`, `parents` (array of parent SHA strings — a plain property, not a graph
    edge; see Alternatives A2 for why commit-to-commit lineage is deliberately not an edge
-   in v1). No lifecycle — commits are immutable once created, so `commit` carries no
-   `kind_status`.
+   in v1), and optional `changed_paths` (a sorted, deduplicated array of non-empty,
+   repository-relative `/`-separated path strings; the git ingester always supplies it,
+   including an empty array for an empty commit). No lifecycle — commits are immutable
+   once created, so `commit` carries no `kind_status`.
 
 3. **`issue` properties**: `number`, `title`, `author`, `created_at`, `closed_at`
    (optional), `labels` (array), `state_reason` (optional: `completed` / `not_planned` / `reopened` / `duplicate` — the GitHub `stateReason` enum, normalized to lowercase).
@@ -262,3 +264,17 @@ Decision text.
    unmasked secret patterns. The ingester calls the same masking helper the gate uses
    before submitting commit-message and issue/PR-body content, so ingested provenance text
    is redacted rather than rejected outright.
+
+6. **Commit path facts and code-map annotations.** The ingester stores paths read from
+   `git log -z --name-only --diff-merges=first-parent` in
+   `commit.properties.changed_paths`. NUL framing preserves raw path boundaries; bytes use
+   ADR-085's lossy UTF-8 filesystem-path normalization, and a merge's one path set is its
+   first-parent diff. When the same namespace contains live ADR-085 `concept/module`
+   entities, a module is eligible only when its `source_revision` equals the repository
+   snapshot HEAD and its `source_path` equals the changed path. The module index is read
+   once per commit-ingest phase. Exactly one matching row adds that module to the commit's
+   existing `annotates` targets; zero or multiple rows are a best-effort skip, preventing
+   same-path modules from another repository snapshot from being selected or
+   cross-annotated. No code entity or new relation is created. This enrichment depends on
+   ADR-085 Amendment 5's path-and-revision contract and supports module churn and
+   cross-project co-change queries directly over the graph.

@@ -4,7 +4,7 @@
 //! the standard `create` verb. See crates/khive-pack-git/docs/api/ingest.md for
 //! the full module overview.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -589,6 +589,52 @@ async fn find_document_for_path(
     Ok(row.and_then(|r| row_uuid(&r)))
 }
 
+/// Load the live code-map module index for the exact repository snapshot
+/// being digested. ADR-085's `source_path` is relative to a repository root,
+/// so path alone is not a safe cross-repository join key. Requiring the
+/// module's `source_revision` to equal the snapshot HEAD keeps unrelated maps
+/// out; a path with more than one matching live row remains ambiguous and is
+/// deliberately represented by `None` rather than selecting or annotating an
+/// arbitrary candidate.
+async fn load_code_modules_by_snapshot_path(
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+    source_revision: &str,
+) -> Result<HashMap<String, Option<Uuid>>> {
+    let sql = runtime.sql();
+    let mut r = sql.reader().await.map_err(|e| anyhow!("{e}"))?;
+    let rows = r
+        .query_all(SqlStatement {
+            sql: "SELECT id, json_extract(properties,'$.source_path') AS source_path \
+                  FROM entities WHERE kind='concept' AND entity_type='module' \
+                  AND namespace=?1 AND deleted_at IS NULL \
+                  AND json_type(properties,'$.source_path')='text' \
+                  AND json_extract(properties,'$.source_revision')=?2 \
+                  ORDER BY source_path, id"
+                .into(),
+            params: vec![
+                SqlValue::Text(token.namespace().as_str().to_string()),
+                SqlValue::Text(source_revision.to_string()),
+            ],
+            label: Some("git_ingest_load_code_modules_by_snapshot_path".into()),
+        })
+        .await
+        .map_err(|e| anyhow!("{e}"))?;
+
+    let mut modules: HashMap<String, Option<Uuid>> = HashMap::new();
+    for row in rows {
+        let Some(id) = row_uuid(&row) else { continue };
+        let Some(SqlValue::Text(path)) = row.get("source_path") else {
+            continue;
+        };
+        modules
+            .entry(path.clone())
+            .and_modify(|candidate| *candidate = None)
+            .or_insert(Some(id));
+    }
+    Ok(modules)
+}
+
 /// Read the last-ingested cursor value for `(project_id, kind)`, if any.
 async fn read_cursor(
     runtime: &KhiveRuntime,
@@ -650,6 +696,7 @@ async fn write_cursor(
 
 const RECORD_SEP: char = '\u{1e}';
 const FIELD_SEP: char = '\u{1f}';
+const TOUCHED_HEADER_PREFIX: &[u8] = b"/\x1e";
 
 struct RawCommit {
     sha: String,
@@ -767,14 +814,22 @@ fn walk_commits(repo: &Path, since_sha: Option<&str>) -> Result<Vec<RawCommit>> 
 }
 
 /// `sha -> \[touched paths\]` for every commit in `repo`'s history, via a
-/// separate `--name-only` pass.
+/// separate NUL-delimited `--name-only` pass. Merge commits use their
+/// first-parent diff as the one canonical path set. The resulting paths drive
+/// document/module annotations and the durable
+/// `commit.properties.changed_paths` fact.
 fn touched_files(repo: &Path) -> Result<HashMap<String, Vec<String>>> {
     let output = Command::new("git")
         .arg("-C")
         .arg(repo)
         .arg("log")
+        .arg("-z")
         .arg("--name-only")
-        .arg(format!("--pretty=format:{RECORD_SEP}%H"))
+        .arg("--diff-merges=first-parent")
+        // Git paths are always repository-relative, so no tracked path token
+        // can start with `/`. This absolute-looking prefix is therefore an
+        // unambiguous header sentinel in the NUL-delimited token stream.
+        .arg(format!("--pretty=format:/{RECORD_SEP}%H"))
         .output()
         .context("spawning git log --name-only")?;
     if !output.status.success() {
@@ -783,15 +838,82 @@ fn touched_files(repo: &Path) -> Result<HashMap<String, Vec<String>>> {
             stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
         }));
     }
-    let text = String::from_utf8_lossy(&output.stdout);
+    Ok(parse_touched_files(&output.stdout))
+}
+
+fn parse_touched_files(bytes: &[u8]) -> HashMap<String, Vec<String>> {
     let mut map: HashMap<String, Vec<String>> = HashMap::new();
-    for block in text.split(RECORD_SEP) {
-        let mut lines = block.lines().filter(|l| !l.trim().is_empty());
-        let Some(sha) = lines.next() else { continue };
-        let files: Vec<String> = lines.map(str::to_string).collect();
-        map.insert(sha.trim().to_string(), files);
+    // With `-z`, git emits paths verbatim and NUL-terminates each one. Git
+    // may place either one or two NULs between adjacent commit sections, so
+    // parse individual tokens and recognize only the impossible-path header
+    // prefix above. The header and its first path share a token, separated by
+    // one newline; removing exactly that one byte preserves a filename whose
+    // own first byte is a newline.
+    let mut current_sha: Option<String> = None;
+    for token in bytes.split(|byte| *byte == 0) {
+        if token.is_empty() {
+            continue;
+        }
+        if let Some(header) = token.strip_prefix(TOUCHED_HEADER_PREFIX) {
+            if header.len() < 40 || !header[..40].iter().all(u8::is_ascii_hexdigit) {
+                current_sha = None;
+                continue;
+            }
+            let sha = String::from_utf8_lossy(&header[..40]).into_owned();
+            let files = map.entry(sha.clone()).or_default();
+            if let Some(first_path) = header[40..].strip_prefix(b"\n") {
+                if !first_path.is_empty() {
+                    files.push(String::from_utf8_lossy(first_path).into_owned());
+                }
+            }
+            current_sha = Some(sha);
+            continue;
+        }
+        if let Some(sha) = &current_sha {
+            map.get_mut(sha)
+                .expect("current SHA was inserted with its header")
+                .push(String::from_utf8_lossy(token).into_owned());
+        }
     }
-    Ok(map)
+    map
+}
+
+#[cfg(test)]
+mod touched_file_parser_tests {
+    use super::parse_touched_files;
+
+    #[test]
+    fn accepts_single_or_double_nul_commit_boundaries() {
+        let sha_a = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let sha_b = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let sha_c = "cccccccccccccccccccccccccccccccccccccccc";
+        let raw =
+            format!("/\x1e{sha_a}\nfirst.rs\0second.rs\0/\x1e{sha_b}\nthird.rs\0\0/\x1e{sha_c}\0");
+
+        let parsed = parse_touched_files(raw.as_bytes());
+        assert_eq!(
+            parsed[sha_a],
+            vec!["first.rs".to_string(), "second.rs".to_string()]
+        );
+        assert_eq!(parsed[sha_b], vec!["third.rs".to_string()]);
+        assert!(parsed[sha_c].is_empty());
+    }
+
+    #[test]
+    fn preserves_delimiters_and_uses_lossy_utf8_path_normalization() {
+        let sha = "dddddddddddddddddddddddddddddddddddddddd";
+        let mut raw = format!("/\x1e{sha}\n").into_bytes();
+        raw.extend_from_slice(b"src/caf\xc3\xa9\t\"quoted\"\\leaf\nline.rs\0bad-\xff.rs\0");
+
+        let parsed = parse_touched_files(&raw);
+        assert_eq!(
+            parsed[sha],
+            vec![
+                "src/café\t\"quoted\"\\leaf\nline.rs".to_string(),
+                "bad-�.rs".to_string(),
+            ]
+        );
+    }
 }
 
 /// The two `git log` passes a commit-ingest phase needs, loaded together so
@@ -978,6 +1100,17 @@ async fn ingest_commits(
         return Ok(());
     }
 
+    // `walk_commits` is oldest-first and includes HEAD whenever this phase
+    // has work, so the last record is the exact repository snapshot against
+    // which ADR-085 `source_revision` must bind.
+    let snapshot_head = commits
+        .last()
+        .expect("non-empty commit snapshot checked above")
+        .sha
+        .clone();
+    let code_modules_by_source_path =
+        load_code_modules_by_snapshot_path(runtime, token, &snapshot_head).await?;
+
     // `cursor_stalled` freezes `last_sha` at the last contiguous successfully
     // processed commit: once a record fails to create, later records in this
     // same pass are still attempted (so a run surfaces every failure it can,
@@ -1015,15 +1148,23 @@ async fn ingest_commits(
             format!("{}\n\n{}", masked.subject, masked.body)
         };
 
-        let mut annotates = vec![project_id.to_string()];
+        let changed_paths: Vec<String> = files_by_sha
+            .get(&c.sha)
+            .into_iter()
+            .flatten()
+            .map(|path| secret_gate::mask_secrets(path).into_owned())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        let mut annotates = BTreeSet::from([project_id.to_string()]);
 
-        if let Some(paths) = files_by_sha.get(&c.sha) {
-            for p in paths {
-                if !p.starts_with("docs/adr/") {
-                    continue;
-                }
-                if let Some(doc_id) = find_document_for_path(runtime, token, p).await? {
-                    annotates.push(doc_id.to_string());
+        for path in &changed_paths {
+            if let Some(Some(module_id)) = code_modules_by_source_path.get(path) {
+                annotates.insert(module_id.to_string());
+            }
+            if path.starts_with("docs/adr/") {
+                if let Some(doc_id) = find_document_for_path(runtime, token, path).await? {
+                    annotates.insert(doc_id.to_string());
                 }
             }
         }
@@ -1044,7 +1185,7 @@ async fn ingest_commits(
             },
         };
         if let Some(pr_id) = pr_id {
-            annotates.push(pr_id.to_string());
+            annotates.insert(pr_id.to_string());
         }
 
         let properties = json!({
@@ -1054,6 +1195,7 @@ async fn ingest_commits(
             "author_email": masked.author_email,
             "committed_at": masked.committed_at,
             "parents": masked.parents,
+            "changed_paths": changed_paths,
         });
 
         let name = refs::truncate_chars(
@@ -1067,7 +1209,7 @@ async fn ingest_commits(
             "name": name,
             "content": content,
             "properties": properties,
-            "annotates": annotates,
+            "annotates": annotates.into_iter().collect::<Vec<_>>(),
         });
         if let Some(head) = embedding_head {
             create_request["embedding_content"] = json!(head);

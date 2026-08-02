@@ -44,7 +44,7 @@ than process-global daemon telemetry, so a caller can reliably assert
 
 A newly created note this pass, retained so the post-ingestion
 reference-extraction sweep (`link_references`) can resolve cross-references
-between records created in the *same* pass regardless of ingestion order
+between records created in the _same_ pass regardless of ingestion order
 (PRs and issues are ingested before commits) without re-reading them from
 storage.
 
@@ -80,7 +80,7 @@ namespace (matches the by-ID resolution contract used by `get`/`update`).
 ## `link_references`
 
 Post-ingestion sweep (ADR-088 Amendment 1 ingest enrichment): extracts
-GitHub reference-grammar mentions from every note created *this pass*
+GitHub reference-grammar mentions from every note created _this pass_
 (commits, issues, PRs — order-independent, since all three are already in
 `new_records` by the time this runs) and materializes `annotates` edges to
 the referenced issue/PR note, carrying `ref_kind` ("closes" | "mentions")
@@ -169,7 +169,7 @@ available), and any other error (including an unclassified `GitLogError` or
 a non-`GitLogError` failure) is returned immediately without ever calling
 `recover`. A later repair attempt's strategy replaces the pending warning
 rather than accumulating one per attempt, so exactly one success warning is
-ever returned — describing the *last* repair that was needed, not every
+ever returned — describing the _last_ repair that was needed, not every
 one tried.
 
 ## Masking boundaries (`MaskedCommitFields`, `MaskedIssueFields`, `MaskedPrFields`)
@@ -309,3 +309,28 @@ not a complete signal.
   Resolution now happens in one query/snapshot: both candidates are
   visible to the same `SELECT`, and the `ORDER BY` — not read ordering —
   decides the exact match wins.
+
+## Changed paths and code-module annotations
+
+The commit snapshot's `git log -z --name-only
+--diff-merges=first-parent` pass is the authority for
+`commit.properties.changed_paths`. NUL-delimited paths bypass Git's quoted
+display encoding and are decoded with the same lossy UTF-8 normalization as
+ADR-085's filesystem path producer. Tabs, newlines, quotes, backslashes, and
+non-ASCII text therefore retain their path identity. A merge commit carries
+one canonical path set: its diff against the first parent. Paths are
+secret-masked, sorted, and deduplicated before storage. Every ingested commit
+carries the array, including an empty array for a genuinely empty commit.
+
+Before walking commits, the ingester loads the same-namespace live ADR-085
+module index once for the repository snapshot HEAD. A module is eligible only
+when both `properties.source_revision` equals that HEAD and
+`properties.source_path` exactly equals the changed path. Requiring the
+revision prevents an identically named path in another repository snapshot
+from receiving a fabricated annotation. If more than one live module still
+has the same `(source_revision, source_path)`, the binding is ambiguous and no
+candidate is annotated. There is no suffix match, inferred rename, entity
+creation, or arbitrary winner. This makes module churn and repeated
+cross-project co-change derivable from incoming `annotates` graph reads while
+retaining `changed_paths` as a durable path fact when no matching code map
+exists.
