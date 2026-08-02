@@ -699,16 +699,25 @@ request(ops="whoami()")
 
 ### `db_diagnostics` — Assertive
 
-Report WAL/checkpoint diagnostics for the main database: build identity, the checkpoint
-counters, a single PASSIVE checkpoint probe, the `-wal` sidecar file size, and a WAL-pin
-holder census. Takes no parameters.
+Report writer-contention and WAL/checkpoint diagnostics for the main database: build identity,
+the checkpoint counters, a single PASSIVE checkpoint probe, the `-wal` sidecar file size, and a
+WAL-pin holder census. Takes no parameters.
+
+`writer_contention` contains monotonic counters captured once per request:
+`writer_acquisitions` and `writer_acquisition_timeouts` cover finite-wait main-pool mutex
+checkouts before SQLite executes, while `audit_append_failures` counts process-wide best-effort
+audit appends whose storage error was logged and swallowed. Zero-wait checkpoint skips and
+standalone connections are different stages and are not mislabeled as pool checkout timeouts.
 
 The PASSIVE probe may backfill WAL frames into the database — that is normal checkpoint
 I/O and is what the reported `checkpointed_frames` counts. It never changes logical
 state, never escalates to TRUNCATE, never creates a missing database file, and never
-deletes WAL-pin sidecar evidence. Sections that cannot be collected (in-memory backend,
-missing file, unsupported platform) carry explicit `unavailable_reason` strings rather
-than being silently omitted.
+deletes WAL-pin sidecar evidence. `wal_pin.status` reports `complete`, `degraded`, or
+`unavailable`; its tagged `census.status` is independently `complete`, `incomplete`, or
+`unavailable`. An incomplete OS walk retains partial PID evidence but states why additional
+holders cannot be ruled out. The legacy sibling booleans and PID arrays remain for compatibility.
+Sections that cannot be collected (in-memory backend, missing file, unsupported platform) carry
+explicit reasons rather than being silently omitted.
 
 ```
 request(ops="db_diagnostics()")

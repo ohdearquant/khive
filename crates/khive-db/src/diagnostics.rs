@@ -195,10 +195,17 @@ fn wal_sidecar_path(db_path: &Path) -> PathBuf {
 /// ported from, so external consumers parsing this payload keep working.
 /// This tree's `khive-db` lacks a read-only sidecar enumeration primitive
 /// (see the module docs), so the sidecar-derived fields below are always
-/// empty here; `available`/`unavailable_reason` say so explicitly rather
-/// than silently reporting an incomplete answer as complete.
+/// empty here. `status`, `status_reasons`, and the tagged `census` field are
+/// the authoritative completeness contract. The older sibling booleans and
+/// PID arrays remain as a compatibility projection.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct WalPinAttribution {
+    /// Authoritative quality of the complete attribution answer.
+    pub status: WalPinAttributionStatus,
+    /// Machine-adjacent reasons why the answer is degraded or unavailable.
+    pub status_reasons: Vec<String>,
+    /// Authoritative tagged result of the OS holder census.
+    pub census: WalPinCensus,
     /// `false` plus an `unavailable_reason` whenever the OS census failed,
     /// or when only a partial (census-only) answer is available.
     pub available: bool,
@@ -225,6 +232,55 @@ pub struct WalPinAttribution {
     pub sidecar_entries_cleanup_would_reap: usize,
 }
 
+/// Overall quality of the WAL-pin attribution answer.
+///
+/// The current non-mutating diagnostics path can return `degraded` with a
+/// useful OS census, but cannot claim `complete` while sidecar reconciliation
+/// would require the mutating cleanup enumerator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WalPinAttributionStatus {
+    /// Holder census and sidecar reconciliation both completed.
+    Complete,
+    /// Some useful evidence is present, but full attribution is impossible.
+    Degraded,
+    /// No holder-census evidence could be collected.
+    Unavailable,
+}
+
+/// Tagged OS holder-census result.
+///
+/// An incomplete scan retains the partial holder evidence, but its wire shape
+/// cannot be mistaken for a complete census without ignoring the explicit
+/// `status` tag. This is the fail-loud direction required by ADR-091: a
+/// truncated walk or an uninspectable PID is inconclusive, never evidence
+/// that no additional holder exists.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum WalPinCensus {
+    /// Every visible process was inspected and the walk was not truncated.
+    Complete {
+        /// PIDs confirmed to hold the database file open.
+        holder_pids: Vec<u32>,
+    },
+    /// Partial evidence from an inconclusive process walk.
+    Incomplete {
+        /// PIDs confirmed to hold the database file open.
+        holder_pids: Vec<u32>,
+        /// PIDs for which inspection failed outright.
+        uninspectable_pids: Vec<u32>,
+        /// Whether process enumeration had positive evidence of truncation.
+        truncated: bool,
+        /// Why additional holders cannot be ruled out.
+        reason: String,
+    },
+    /// The platform or census operation supplied no holder evidence.
+    Unavailable {
+        /// Why the census could not run.
+        reason: String,
+    },
+}
+
 /// One PID's heartbeat as reported to an operator. Retained for shape
 /// compatibility with the reference payload; this port never populates it
 /// (see [`WalPinAttribution`] docs).
@@ -239,9 +295,15 @@ pub struct WalPinHolder {
 
 impl WalPinAttribution {
     fn unavailable(reason: impl Into<String>) -> Self {
+        let reason = reason.into();
         Self {
+            status: WalPinAttributionStatus::Unavailable,
+            status_reasons: vec![reason.clone()],
+            census: WalPinCensus::Unavailable {
+                reason: reason.clone(),
+            },
             available: false,
-            unavailable_reason: Some(reason.into()),
+            unavailable_reason: Some(reason),
             census_holder_pids: Vec::new(),
             census_uninspectable_pids: Vec::new(),
             census_truncated: false,
@@ -258,6 +320,71 @@ impl WalPinAttribution {
     }
 }
 
+#[cfg(unix)]
+fn wal_pin_attribution_from_census(census: crate::walpin::CensusResult) -> WalPinAttribution {
+    const SIDECAR_REASON: &str = "sidecar-to-holder reconciliation not available: this tree's \
+        khive-db exposes sidecar enumeration only via walpin::enumerate_live, which deletes \
+        stale/malformed entries as part of its cleanup pass; a diagnostics probe must not \
+        delete forensic sidecar evidence, so only the OS holder census below was collected";
+
+    let census_is_complete = census.is_complete();
+    let mut census_holder_pids: Vec<u32> = census.holders.iter().copied().collect();
+    census_holder_pids.sort_unstable();
+    let mut census_uninspectable_pids = census.uninspectable_pids;
+    census_uninspectable_pids.sort_unstable();
+    census_uninspectable_pids.dedup();
+    let census_truncated = census.truncated;
+
+    let mut status_reasons = vec![SIDECAR_REASON.to_string()];
+    let census = if census_is_complete {
+        WalPinCensus::Complete {
+            holder_pids: census_holder_pids.clone(),
+        }
+    } else {
+        let mut causes = Vec::new();
+        if census_truncated {
+            causes.push("the OS process walk was truncated".to_string());
+        }
+        if !census_uninspectable_pids.is_empty() {
+            causes.push(format!(
+                "{} PID(s) could not be inspected",
+                census_uninspectable_pids.len()
+            ));
+        }
+        let reason = format!(
+            "OS holder census is incomplete: {}; additional database holders cannot be ruled out",
+            causes.join("; ")
+        );
+        status_reasons.push(reason.clone());
+        WalPinCensus::Incomplete {
+            holder_pids: census_holder_pids.clone(),
+            uninspectable_pids: census_uninspectable_pids.clone(),
+            truncated: census_truncated,
+            reason,
+        }
+    };
+
+    WalPinAttribution {
+        status: WalPinAttributionStatus::Degraded,
+        unavailable_reason: Some(status_reasons.join("; ")),
+        status_reasons,
+        census,
+        available: false,
+        census_holder_pids,
+        census_uninspectable_pids,
+        census_truncated,
+        census_is_complete,
+        reporting: Vec::new(),
+        registered_silent_pids: Vec::new(),
+        unknown_pids: Vec::new(),
+        census_pids_without_attribution: Vec::new(),
+        fully_attributed: false,
+        sidecar_entries: Vec::new(),
+        sidecar_listing_truncated: false,
+        sidecar_entries_cleanup_would_reap: 0,
+    }
+}
+
 /// Build the WAL-pin attribution for `db_path`.
 ///
 /// Unix-only: the OS census requires it. Everywhere else this degrades to
@@ -270,37 +397,45 @@ pub fn wal_pin_attribution(db_path: &Path, _sweep_interval: Duration) -> WalPinA
         Ok(c) => c,
         Err(e) => return WalPinAttribution::unavailable(format!("census_holders failed: {e}")),
     };
-
-    let mut census_holder_pids: Vec<u32> = census.holders.iter().copied().collect();
-    census_holder_pids.sort_unstable();
-
-    WalPinAttribution {
-        available: false,
-        unavailable_reason: Some(
-            "sidecar-to-holder reconciliation not available: this tree's khive-db exposes \
-             sidecar enumeration only via walpin::enumerate_live, which deletes stale/malformed \
-             entries as part of its cleanup pass; a diagnostics probe must not delete forensic \
-             sidecar evidence, so only the OS holder census below was collected"
-                .to_string(),
-        ),
-        census_holder_pids,
-        census_uninspectable_pids: census.uninspectable_pids.clone(),
-        census_truncated: census.truncated,
-        census_is_complete: census.is_complete(),
-        reporting: Vec::new(),
-        registered_silent_pids: Vec::new(),
-        unknown_pids: Vec::new(),
-        census_pids_without_attribution: Vec::new(),
-        fully_attributed: false,
-        sidecar_entries: Vec::new(),
-        sidecar_listing_truncated: false,
-        sidecar_entries_cleanup_would_reap: 0,
-    }
+    wal_pin_attribution_from_census(census)
 }
 
 #[cfg(not(unix))]
 pub fn wal_pin_attribution(_db_path: &Path, _sweep_interval: Duration) -> WalPinAttribution {
     WalPinAttribution::unavailable("WAL-pin attribution requires a Unix platform")
+}
+
+/// One typed snapshot of writer-contention signals.
+///
+/// `writer_acquisitions` and `writer_acquisition_timeouts` are scoped to the
+/// main pool's finite-wait mutex checkout. `audit_append_failures` is supplied
+/// by the runtime because the audit store lives above `khive-db`; direct
+/// `khive-db` callers receive `None` plus an explicit reason instead of a
+/// fabricated zero.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct WriterContentionDiagnostics {
+    /// Successful finite-wait writer checkouts through the main pool.
+    pub writer_acquisitions: u64,
+    /// Main-pool writer checkouts that exhausted their finite deadline.
+    pub writer_acquisition_timeouts: u64,
+    /// Process-wide audit appends whose errors were logged and swallowed.
+    pub audit_append_failures: Option<u64>,
+    /// Why `audit_append_failures` is unavailable to this caller.
+    pub audit_append_failures_unavailable_reason: Option<String>,
+}
+
+impl WriterContentionDiagnostics {
+    fn snapshot(pool: &ConnectionPool, audit_append_failures: Option<u64>) -> Self {
+        let writer = pool.writer_acquisition_snapshot();
+        Self {
+            writer_acquisitions: writer.acquisitions,
+            writer_acquisition_timeouts: writer.timeouts,
+            audit_append_failures,
+            audit_append_failures_unavailable_reason: audit_append_failures.is_none().then(|| {
+                "runtime audit instrumentation was not supplied to khive-db diagnostics".to_string()
+            }),
+        }
+    }
 }
 
 /// The full diagnostics payload.
@@ -314,6 +449,8 @@ pub struct DbDiagnostics {
     pub checkpoint_counters: CheckpointCounters,
     pub checkpoint_probe: Option<CheckpointProbe>,
     pub checkpoint_probe_error: Option<String>,
+    /// Writer-pool and best-effort audit persistence signals.
+    pub writer_contention: WriterContentionDiagnostics,
     pub wal_pin: WalPinAttribution,
 }
 
@@ -336,7 +473,28 @@ pub fn collect(
     build: BuildIdentity,
     sweep_interval: Duration,
 ) -> DbDiagnostics {
+    collect_inner(pool, build, sweep_interval, None)
+}
+
+/// Assemble the report with the runtime's process-wide count of swallowed
+/// best-effort audit append failures.
+pub fn collect_with_audit_append_failures(
+    pool: &ConnectionPool,
+    build: BuildIdentity,
+    sweep_interval: Duration,
+    audit_append_failures: u64,
+) -> DbDiagnostics {
+    collect_inner(pool, build, sweep_interval, Some(audit_append_failures))
+}
+
+fn collect_inner(
+    pool: &ConnectionPool,
+    build: BuildIdentity,
+    sweep_interval: Duration,
+    audit_append_failures: Option<u64>,
+) -> DbDiagnostics {
     let counters = checkpoint_counters();
+    let writer_contention = WriterContentionDiagnostics::snapshot(pool, audit_append_failures);
 
     let Some(path) = pool.config().path.clone() else {
         return DbDiagnostics {
@@ -348,6 +506,7 @@ pub fn collect(
             checkpoint_probe_error: Some(
                 "in-memory database: no WAL file and no checkpoint to probe".to_string(),
             ),
+            writer_contention,
             wal_pin: WalPinAttribution::unavailable(
                 "in-memory database: no file for the OS holder census",
             ),
@@ -366,6 +525,7 @@ pub fn collect(
         checkpoint_counters: counters,
         checkpoint_probe: probe,
         checkpoint_probe_error: probe_error,
+        writer_contention,
         wal_pin: wal_pin_attribution(&path, sweep_interval),
     }
 }
@@ -528,6 +688,68 @@ mod tests {
         ] {
             assert!(counters.get(key).is_some(), "counter {key} must be present");
         }
+        assert_eq!(
+            report.writer_contention.writer_acquisitions, 1,
+            "the seed write checked the finite-wait pooled writer out once"
+        );
+        assert_eq!(report.writer_contention.writer_acquisition_timeouts, 0);
+        assert!(report.writer_contention.audit_append_failures.is_none());
+        assert!(
+            report
+                .writer_contention
+                .audit_append_failures_unavailable_reason
+                .is_some(),
+            "a direct khive-db snapshot must not fabricate a runtime audit count"
+        );
+    }
+
+    #[test]
+    fn runtime_aware_collect_exposes_the_supplied_audit_failure_counter() {
+        let pool = ConnectionPool::new(PoolConfig::default()).expect("in-memory pool");
+
+        let report = collect_with_audit_append_failures(
+            &pool,
+            BuildIdentity::from_env("9.9.9", None),
+            Duration::from_secs(30),
+            17,
+        );
+
+        assert_eq!(report.writer_contention.audit_append_failures, Some(17));
+        assert!(
+            report
+                .writer_contention
+                .audit_append_failures_unavailable_reason
+                .is_none(),
+            "a supplied runtime counter must not carry an unavailable reason"
+        );
+    }
+
+    #[test]
+    fn diagnostics_exposes_an_induced_writer_checkout_timeout() {
+        let pool = ConnectionPool::new(PoolConfig {
+            checkout_timeout: Duration::from_millis(1),
+            ..PoolConfig::default()
+        })
+        .expect("in-memory pool");
+
+        let held = pool.writer().expect("first writer checkout succeeds");
+        assert!(
+            matches!(
+                pool.writer(),
+                Err(crate::SqliteError::WriterPoolCheckoutTimeout { .. })
+            ),
+            "holding the sole writer must exercise the typed timeout path"
+        );
+        drop(held);
+
+        let report = collect_with_audit_append_failures(
+            &pool,
+            BuildIdentity::from_env("9.9.9", None),
+            Duration::from_secs(30),
+            0,
+        );
+        assert_eq!(report.writer_contention.writer_acquisitions, 1);
+        assert_eq!(report.writer_contention.writer_acquisition_timeouts, 1);
     }
 
     /// The `u64::MAX` never-observed sentinel must serialize as `null`, never
@@ -602,6 +824,77 @@ mod tests {
         );
         assert!(!report.wal_pin.available);
         assert!(report.wal_pin.unavailable_reason.is_some());
+        assert_eq!(report.wal_pin.status, WalPinAttributionStatus::Unavailable);
+        assert!(matches!(
+            report.wal_pin.census,
+            WalPinCensus::Unavailable { .. }
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn incomplete_holder_census_is_a_tagged_degraded_result() {
+        let census = crate::walpin::CensusResult {
+            holders: std::collections::HashSet::from([41, 7]),
+            uninspectable_pids: vec![99, 99],
+            truncated: true,
+        };
+
+        let pin = wal_pin_attribution_from_census(census);
+
+        assert_eq!(pin.status, WalPinAttributionStatus::Degraded);
+        assert!(!pin.available);
+        assert!(!pin.census_is_complete);
+        assert_eq!(pin.census_holder_pids, vec![7, 41]);
+        assert_eq!(pin.census_uninspectable_pids, vec![99]);
+        assert!(
+            pin.unavailable_reason.as_deref().is_some_and(
+                |reason| reason.contains("additional database holders cannot be ruled out")
+            ),
+            "the legacy reason must also fail loud for old consumers: {pin:?}"
+        );
+        match &pin.census {
+            WalPinCensus::Incomplete {
+                holder_pids,
+                uninspectable_pids,
+                truncated,
+                reason,
+            } => {
+                assert_eq!(holder_pids, &vec![7, 41]);
+                assert_eq!(uninspectable_pids, &vec![99]);
+                assert!(*truncated);
+                assert!(reason.contains("additional database holders cannot be ruled out"));
+            }
+            other => panic!("incomplete scan must serialize as incomplete, got {other:?}"),
+        }
+
+        let json = serde_json::to_value(&pin).expect("serializes");
+        assert_eq!(json["status"], "degraded");
+        assert_eq!(json["census"]["status"], "incomplete");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn complete_holder_census_stays_explicit_while_attribution_is_degraded() {
+        let census = crate::walpin::CensusResult {
+            holders: std::collections::HashSet::from([7]),
+            uninspectable_pids: Vec::new(),
+            truncated: false,
+        };
+
+        let pin = wal_pin_attribution_from_census(census);
+
+        assert_eq!(pin.status, WalPinAttributionStatus::Degraded);
+        assert!(pin.census_is_complete);
+        assert!(matches!(
+            pin.census,
+            WalPinCensus::Complete { ref holder_pids } if holder_pids == &vec![7]
+        ));
+        assert_eq!(
+            pin.status_reasons.len(),
+            1,
+            "only missing sidecar reconciliation degrades a complete OS census"
+        );
     }
 
     /// This port's WAL-pin attribution never claims full reconciliation —
@@ -625,5 +918,10 @@ mod tests {
         );
         assert!(pin.sidecar_entries.is_empty());
         assert!(pin.reporting.is_empty());
+        assert_eq!(pin.status, WalPinAttributionStatus::Degraded);
+        assert!(matches!(
+            pin.census,
+            WalPinCensus::Complete { .. } | WalPinCensus::Incomplete { .. }
+        ));
     }
 }

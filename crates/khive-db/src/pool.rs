@@ -5,6 +5,7 @@ use rusqlite::{Connection, OpenFlags};
 use std::fs;
 use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -238,6 +239,13 @@ fn canonicalize_deepest_existing(path: &Path) -> Result<PathBuf, SqliteError> {
 /// writer connection.
 pub struct ConnectionPool {
     writer: Arc<Mutex<Connection>>,
+    /// Monotonic successful finite-wait checkouts through `writer()` /
+    /// `try_writer()`. Zero-wait maintenance probes and standalone
+    /// connections are separate stages and deliberately do not contribute.
+    writer_acquisitions: AtomicU64,
+    /// Monotonic finite-wait pool-mutex checkout timeouts. A failed
+    /// `try_writer_nowait()` is a maintenance skip, not a timeout.
+    writer_acquisition_timeouts: AtomicU64,
     readers: ArrayQueue<Connection>,
     max_readers: usize,
     config: PoolConfig,
@@ -324,6 +332,21 @@ pub struct WriterGuard<'pool> {
     origin: TxOrigin,
 }
 
+/// One non-resetting snapshot of the main pool's finite-wait writer checkout
+/// counters.
+///
+/// These counters identify the Rust pool-mutex stage before SQLite executes.
+/// They intentionally exclude standalone connections and zero-wait
+/// maintenance probes, whose failures have different retry and incident
+/// semantics (ADR-135 F6).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WriterAcquisitionSnapshot {
+    /// Successful finite-wait pool writer checkouts.
+    pub acquisitions: u64,
+    /// Finite-wait pool writer checkouts that exhausted their deadline.
+    pub timeouts: u64,
+}
+
 impl<'pool> WriterGuard<'pool> {
     /// Returns a shared reference to the underlying connection.
     pub fn conn(&self) -> &Connection {
@@ -404,6 +427,8 @@ impl ConnectionPool {
 
         let pool = Self {
             writer: Arc::new(Mutex::new(writer)),
+            writer_acquisitions: AtomicU64::new(0),
+            writer_acquisition_timeouts: AtomicU64::new(0),
             readers,
             max_readers,
             config,
@@ -495,29 +520,32 @@ impl ConnectionPool {
     /// Check out the writer connection.
     ///
     /// Waits up to `checkout_timeout` for the writer Mutex and returns
-    /// `Err(SqliteError::InvalidData)` if the timeout is exceeded.
+    /// `Err(SqliteError::WriterPoolCheckoutTimeout)` if the timeout is
+    /// exceeded.
     pub fn writer(&self) -> Result<WriterGuard<'_>, SqliteError> {
-        let guard = self
-            .writer
-            .try_lock_for(self.config.checkout_timeout)
-            .ok_or_else(|| {
-                let message = format!(
-                    "timed out after {:?} waiting for sqlite writer connection",
-                    self.config.checkout_timeout
-                );
-                crate::timeout_sink::emit_timeout(
-                    &crate::timeout_sink::db_label(self),
-                    crate::timeout_sink::Site::PoolAdmission,
-                    &message,
-                    Some(
-                        self.config
-                            .checkout_timeout
-                            .as_millis()
-                            .min(u128::from(u64::MAX)) as u64,
-                    ),
-                );
-                SqliteError::InvalidData(message)
-            })?;
+        let Some(guard) = self.writer.try_lock_for(self.config.checkout_timeout) else {
+            self.writer_acquisition_timeouts
+                .fetch_add(1, Ordering::Relaxed);
+            let message = format!(
+                "timed out after {:?} waiting for sqlite writer connection",
+                self.config.checkout_timeout
+            );
+            crate::timeout_sink::emit_timeout(
+                &crate::timeout_sink::db_label(self),
+                crate::timeout_sink::Site::PoolAdmission,
+                &message,
+                Some(
+                    self.config
+                        .checkout_timeout
+                        .as_millis()
+                        .min(u128::from(u64::MAX)) as u64,
+                ),
+            );
+            return Err(SqliteError::WriterPoolCheckoutTimeout {
+                timeout: self.config.checkout_timeout,
+            });
+        };
+        self.writer_acquisitions.fetch_add(1, Ordering::Relaxed);
         Ok(WriterGuard {
             guard,
             origin: self.origin(),
@@ -550,6 +578,15 @@ impl ConnectionPool {
             guard,
             origin: self.origin(),
         })
+    }
+
+    /// Snapshot finite-wait pooled writer checkout outcomes since this pool
+    /// was constructed.
+    pub fn writer_acquisition_snapshot(&self) -> WriterAcquisitionSnapshot {
+        WriterAcquisitionSnapshot {
+            acquisitions: self.writer_acquisitions.load(Ordering::Relaxed),
+            timeouts: self.writer_acquisition_timeouts.load(Ordering::Relaxed),
+        }
     }
 
     /// Get the current number of available reader connections.
@@ -1312,6 +1349,71 @@ mod tests {
         let _writer2 = pool
             .writer()
             .expect("second writer checkout should succeed");
+    }
+
+    #[test]
+    fn writer_checkout_snapshot_counts_successes_and_timeouts_at_the_pool_boundary() {
+        let cfg = PoolConfig {
+            path: None,
+            checkout_timeout: Duration::from_millis(1),
+            ..PoolConfig::default()
+        };
+        let pool = ConnectionPool::new(cfg).unwrap();
+
+        assert_eq!(
+            pool.writer_acquisition_snapshot(),
+            WriterAcquisitionSnapshot::default()
+        );
+
+        let held = pool.writer().expect("first checkout succeeds");
+        let error = match pool.writer() {
+            Ok(_) => panic!("the held pool mutex must force a finite-wait timeout"),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(
+                &error,
+                SqliteError::WriterPoolCheckoutTimeout { timeout }
+                    if *timeout == Duration::from_millis(1)
+            ),
+            "timeout must have a stable, structurally matchable stage: {error}"
+        );
+        assert_eq!(
+            pool.writer_acquisition_snapshot(),
+            WriterAcquisitionSnapshot {
+                acquisitions: 1,
+                timeouts: 1,
+            }
+        );
+
+        drop(held);
+        let _reacquired = pool.writer().expect("checkout succeeds after release");
+        assert_eq!(
+            pool.writer_acquisition_snapshot(),
+            WriterAcquisitionSnapshot {
+                acquisitions: 2,
+                timeouts: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn zero_wait_maintenance_skip_is_not_reported_as_a_checkout_timeout() {
+        let pool = ConnectionPool::new(PoolConfig::default()).unwrap();
+        let held = pool.writer().expect("finite-wait checkout succeeds");
+        let before = pool.writer_acquisition_snapshot();
+
+        assert!(
+            pool.try_writer_nowait().is_err(),
+            "zero-wait maintenance checkout must skip while held"
+        );
+
+        assert_eq!(
+            pool.writer_acquisition_snapshot(),
+            before,
+            "a checkpoint-style zero-wait skip is not a finite-wait checkout timeout"
+        );
+        drop(held);
     }
 
     /// ADR-091 Plank 0: `WriterGuard::transaction` registers/deregisters a
