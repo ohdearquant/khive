@@ -25,7 +25,13 @@ fn in_memory_pool_first_then_file_backed_pool_second_carries_file_backed_identit
     let memory_pool =
         Arc::new(ConnectionPool::new(memory_cfg).expect("in-memory pool should open"));
 
-    let ndjson_path = sink_dir.path().join("writer_timeouts.ndjson");
+    // The sink names its file after this process's own pid (see the module
+    // docs' "FILES ARE PER-PROCESS" section); this test binary and the sink
+    // it's exercising share a process, so this names the exact file the
+    // file-backed pool below will open.
+    let ndjson_path = sink_dir
+        .path()
+        .join(format!("writer_timeouts.{}.ndjson", std::process::id()));
     assert!(
         !ndjson_path.exists(),
         "an in-memory pool must never create the sink's NDJSON file"

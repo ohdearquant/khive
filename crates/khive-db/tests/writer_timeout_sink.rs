@@ -53,8 +53,12 @@ fn ensure_sink_dir() -> &'static Path {
     dir.path()
 }
 
+/// The sink names its file after this process's own pid (see the module
+/// docs' "FILES ARE PER-PROCESS" section) — this test binary and the sink
+/// it's exercising share a process, so `std::process::id()` here names the
+/// exact same file the sink itself just opened.
 fn read_sink_ndjson() -> String {
-    let path = ensure_sink_dir().join("writer_timeouts.ndjson");
+    let path = ensure_sink_dir().join(format!("writer_timeouts.{}.ndjson", std::process::id()));
     std::fs::read_to_string(&path).unwrap_or_else(|e| {
         panic!("expected the sink's NDJSON file to exist and be readable at {path:?}: {e}")
     })

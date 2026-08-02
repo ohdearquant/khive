@@ -36,6 +36,36 @@
 //! (not a short write) is recoverable — the writer thread lazily retries
 //! opening the file on its next wakeup, so a transiently unwritable log
 //! directory heals without operator intervention.
+//!
+//! FILES ARE PER-PROCESS: each process writes `writer_timeouts.<pid>.ndjson`
+//! in the resolved log directory, never a single shared file. This makes the
+//! short-write-poisons-forever contract correct in the face of multiple
+//! processes sharing a log directory (a daemon restart, or a short-lived CLI
+//! invocation running alongside a long-lived daemon) — poisoning is scoped to
+//! the one process whose write actually landed short, never silently
+//! blocking a sibling process's otherwise-healthy stream. A READER of this
+//! sink must glob `writer_timeouts.*.ndjson` across the directory and merge
+//! by `ts_utc`; it must also treat a file whose last line is not valid JSON
+//! (an unterminated fragment left by a process that was killed mid-write) as
+//! truncated at the last complete line, not as a parse failure for the whole
+//! file.
+//!
+//! EVENT LOSS AT PROCESS EXIT IS EXPECTED AND SCOPED: an event that has been
+//! enqueued but not yet drained and written by the background writer thread
+//! is lost if the process exits before the next drain — there is no
+//! `atexit`/`Drop`-driven flush. This is deliberate: a flush on exit would
+//! have to run synchronously on an exiting thread, is not reliably reachable
+//! from every process-exit path (`SIGKILL`, `abort`, a panic that unwinds
+//! past the point where any such hook would run), and — if implemented as a
+//! blocking drain — would reintroduce exactly the caller-path-latency defect
+//! this module exists to avoid, just relocated to shutdown instead of to a
+//! write. Consequently, the "zero writer-admission timeouts" acceptance
+//! claim this sink exists to support is only sound for LONG-LIVED daemon
+//! processes, whose continuous heartbeat rows are what makes "no timeout rows
+//! appeared" mean "the daemon was up and reporting, and truly saw none" — a
+//! short-lived CLI process (a single `kkernel` invocation that exits after
+//! one operation) contributes best-effort rows only: a timeout event it hits
+//! right before exit may never make it to disk.
 
 use std::fs::{File, OpenOptions};
 use std::io::Write;
@@ -65,7 +95,28 @@ const QUEUE_CAPACITY: usize = 1024;
 /// the queue or the NDJSON line size.
 const MAX_ERROR_BYTES: usize = 512;
 
-const NDJSON_FILE_NAME: &str = "writer_timeouts.ndjson";
+/// Upper bound on how many queued events the writer thread drains in a
+/// single wakeup before yielding back to its own loop (which re-checks the
+/// heartbeat deadline and lets `recv_timeout` immediately pick the drain back
+/// up if the channel is still non-empty). Bounds one wakeup's worst-case
+/// latency to ~256 writes instead of however deep the queue happens to be —
+/// under sustained load the heartbeat still fires on schedule because it is
+/// checked after every single write, not just after a whole batch.
+const DRAIN_BATCH_CAP: usize = 256;
+
+/// Test-only escape hatch: sleep this many milliseconds before each write
+/// attempt the writer thread makes. Not gated by `#[cfg(test)]` — like
+/// [`HEARTBEAT_MS_OVERRIDE_ENV`], integration tests link the compiled crate
+/// as an ordinary dependency (no `--cfg test`), so a `cfg(test)`-only hook
+/// would be invisible to them. The check is one env var read, cached for the
+/// writer thread's lifetime at startup, and a no-op when unset.
+const WRITE_DELAY_MS_OVERRIDE_ENV: &str = "KHIVE_WRITER_TIMEOUT_SINK_WRITE_DELAY_MS";
+
+/// Per-process NDJSON file name — see the module docs' "FILES ARE
+/// PER-PROCESS" section for why this is not a single shared file.
+fn ndjson_file_name() -> String {
+    format!("writer_timeouts.{}.ndjson", std::process::id())
+}
 
 /// Fallback log subdirectory, rooted at the database file's parent
 /// directory, used only when the primary `<HOME>/.khive/logs` resolution
@@ -249,6 +300,9 @@ fn enqueue(sender: &SyncSender<QueuedEvent>, dropped: &AtomicU64, event: QueuedE
 struct AppendSink<W> {
     target: Option<W>,
     poisoned: bool,
+    /// Test-only: sleep this long before every write attempt. `Duration::ZERO`
+    /// (the default) means no delay — the ordinary production path.
+    write_delay: Duration,
 }
 
 impl<W: Write> AppendSink<W> {
@@ -256,7 +310,16 @@ impl<W: Write> AppendSink<W> {
         Self {
             target: None,
             poisoned: false,
+            write_delay: Duration::ZERO,
         }
+    }
+
+    /// Test-only: arm an artificial per-write delay, so an integration test
+    /// can prove the caller path never reaches this writer even when it is
+    /// genuinely slow (as opposed to merely absent, which the unwritable-
+    /// directory test already covers).
+    fn set_write_delay(&mut self, delay: Duration) {
+        self.write_delay = delay;
     }
 
     fn is_open(&self) -> bool {
@@ -289,6 +352,9 @@ impl<W: Write> AppendSink<W> {
         let Some(target) = self.target.as_mut() else {
             return false;
         };
+        if !self.write_delay.is_zero() {
+            thread::sleep(self.write_delay);
+        }
         match target.write(line.as_bytes()) {
             Ok(n) if n == line.len() => true,
             Ok(_) => {
@@ -310,7 +376,7 @@ impl<W: Write> AppendSink<W> {
 }
 
 impl AppendSink<File> {
-    /// Open (creating parent directories as needed) `<dir>/writer_timeouts.ndjson`
+    /// Open (creating parent directories as needed) `<dir>/writer_timeouts.<pid>.ndjson`
     /// for append. A no-op if already open or poisoned; on failure the
     /// target simply stays `None` so a later call can retry — this is what
     /// makes a transiently-unwritable directory recoverable rather than a
@@ -319,7 +385,7 @@ impl AppendSink<File> {
         if self.poisoned || self.target.is_some() {
             return;
         }
-        let path = dir.join(NDJSON_FILE_NAME);
+        let path = dir.join(ndjson_file_name());
         let opened = std::fs::create_dir_all(dir)
             .and_then(|_| OpenOptions::new().create(true).append(true).open(&path))
             .ok();
@@ -353,6 +419,84 @@ fn retry_open_if_healthy(sink: &mut AppendSink<File>, dir: &Path) {
 /// they arrive (fsync'd — see module docs on why timeouts alone pay that
 /// cost), and emits a `heartbeat` row (plus, if anything has been dropped
 /// since the last one, a `sink_error_summary` row) every `heartbeat_interval`.
+fn write_event(sink: &mut AppendSink<File>, dropped: &AtomicU64, event: QueuedEvent) {
+    if !sink.is_open() {
+        dropped.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
+    let line = build_line(
+        event.ts_utc,
+        "timeout",
+        &event.db,
+        Some(event.site),
+        Some(&event.error),
+        event.timeout_ms,
+        None,
+        None,
+    );
+    if sink.write_line(&line) {
+        sink.sync();
+    } else {
+        dropped.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Emit a `heartbeat` row (plus, if anything has been dropped since the last
+/// one, a `sink_error_summary` row) if `heartbeat_interval` has elapsed since
+/// `last_heartbeat`. Called both between individual writes inside the drain
+/// loop and once per outer-loop iteration, so a full channel — up to
+/// [`DRAIN_BATCH_CAP`] events deep — can never starve heartbeat cadence: the
+/// deadline is checked after every single write, not just after a whole
+/// batch.
+fn maybe_emit_heartbeat(
+    sink: &mut AppendSink<File>,
+    dir: &Path,
+    db_identity: &str,
+    dropped: &AtomicU64,
+    last_heartbeat: &mut Instant,
+    last_summary_dropped: &mut u64,
+    heartbeat_interval: Duration,
+) {
+    if last_heartbeat.elapsed() < heartbeat_interval {
+        return;
+    }
+    *last_heartbeat = Instant::now();
+    sink.ensure_open(dir);
+    if !sink.is_open() {
+        return;
+    }
+    let hb = build_line_now(
+        "heartbeat",
+        db_identity,
+        None,
+        None,
+        None,
+        Some(std::process::id()),
+        Some(env!("CARGO_PKG_VERSION")),
+    );
+    sink.write_line(&hb);
+
+    let current_dropped = dropped.load(Ordering::Relaxed);
+    if current_dropped > *last_summary_dropped {
+        let message = format!(
+            "sink drops since last summary: {}",
+            current_dropped - *last_summary_dropped
+        );
+        let summary = build_line_now(
+            "sink_error_summary",
+            "-",
+            None,
+            Some(&message),
+            None,
+            None,
+            None,
+        );
+        if sink.write_line(&summary) {
+            *last_summary_dropped = current_dropped;
+        }
+    }
+}
+
 fn writer_thread_loop(
     receiver: Receiver<QueuedEvent>,
     dir: PathBuf,
@@ -361,6 +505,7 @@ fn writer_thread_loop(
     heartbeat_interval: Duration,
 ) {
     let mut sink = AppendSink::<File>::new();
+    sink.set_write_delay(write_delay_from_env());
     let mut last_heartbeat = Instant::now();
     let mut last_summary_dropped = 0u64;
 
@@ -381,30 +526,45 @@ fn writer_thread_loop(
     loop {
         match receiver.recv_timeout(DRAIN_INTERVAL) {
             Ok(first) => {
-                let mut batch = vec![first];
-                while let Ok(more) = receiver.try_recv() {
-                    batch.push(more);
-                }
                 retry_open_if_healthy(&mut sink, &dir);
-                for event in batch {
-                    if !sink.is_open() {
-                        dropped.fetch_add(1, Ordering::Relaxed);
-                        continue;
-                    }
-                    let line = build_line(
-                        event.ts_utc,
-                        "timeout",
-                        &event.db,
-                        Some(event.site),
-                        Some(&event.error),
-                        event.timeout_ms,
-                        None,
-                        None,
-                    );
-                    if sink.write_line(&line) {
-                        sink.sync();
-                    } else {
-                        dropped.fetch_add(1, Ordering::Relaxed);
+                write_event(&mut sink, &dropped, first);
+                maybe_emit_heartbeat(
+                    &mut sink,
+                    &dir,
+                    &db_identity,
+                    &dropped,
+                    &mut last_heartbeat,
+                    &mut last_summary_dropped,
+                    heartbeat_interval,
+                );
+
+                // Drain the rest of this wakeup's backlog incrementally
+                // (recv one, write one) rather than collecting an unbounded
+                // `Vec` up front — a producer-side burst must not force this
+                // thread to hold arbitrarily many events in memory before it
+                // writes any of them, and the heartbeat deadline is
+                // re-checked after every single write below so a full
+                // channel can never starve it. Capped at `DRAIN_BATCH_CAP`
+                // per wakeup; anything past the cap stays queued and is
+                // picked up on the very next loop iteration (`recv_timeout`
+                // returns immediately since the channel is still non-empty).
+                let mut drained_this_wakeup = 1usize;
+                while drained_this_wakeup < DRAIN_BATCH_CAP {
+                    match receiver.try_recv() {
+                        Ok(event) => {
+                            write_event(&mut sink, &dropped, event);
+                            drained_this_wakeup += 1;
+                            maybe_emit_heartbeat(
+                                &mut sink,
+                                &dir,
+                                &db_identity,
+                                &dropped,
+                                &mut last_heartbeat,
+                                &mut last_summary_dropped,
+                                heartbeat_interval,
+                            );
+                        }
+                        Err(_) => break,
                     }
                 }
             }
@@ -414,42 +574,15 @@ fn writer_thread_loop(
             Err(RecvTimeoutError::Disconnected) => break,
         }
 
-        if last_heartbeat.elapsed() >= heartbeat_interval {
-            last_heartbeat = Instant::now();
-            sink.ensure_open(&dir);
-            if sink.is_open() {
-                let hb = build_line_now(
-                    "heartbeat",
-                    &db_identity,
-                    None,
-                    None,
-                    None,
-                    Some(std::process::id()),
-                    Some(env!("CARGO_PKG_VERSION")),
-                );
-                sink.write_line(&hb);
-
-                let current_dropped = dropped.load(Ordering::Relaxed);
-                if current_dropped > last_summary_dropped {
-                    let message = format!(
-                        "sink drops since last summary: {}",
-                        current_dropped - last_summary_dropped
-                    );
-                    let summary = build_line_now(
-                        "sink_error_summary",
-                        "-",
-                        None,
-                        Some(&message),
-                        None,
-                        None,
-                        None,
-                    );
-                    if sink.write_line(&summary) {
-                        last_summary_dropped = current_dropped;
-                    }
-                }
-            }
-        }
+        maybe_emit_heartbeat(
+            &mut sink,
+            &dir,
+            &db_identity,
+            &dropped,
+            &mut last_heartbeat,
+            &mut last_summary_dropped,
+            heartbeat_interval,
+        );
     }
 }
 
@@ -488,6 +621,18 @@ fn heartbeat_interval_from_env() -> Duration {
         .unwrap_or(HEARTBEAT_INTERVAL)
 }
 
+/// Test-only: read [`WRITE_DELAY_MS_OVERRIDE_ENV`] once at writer-thread
+/// startup. Unset (the production case) resolves to `Duration::ZERO`, which
+/// [`AppendSink::write_line`] treats as "no delay" — a no-op check on every
+/// write, not a behavior change.
+fn write_delay_from_env() -> Duration {
+    std::env::var(WRITE_DELAY_MS_OVERRIDE_ENV)
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(Duration::from_millis)
+        .unwrap_or(Duration::ZERO)
+}
+
 /// Initialize the process-global sink on first call from a file-backed
 /// pool; every later call (from another pool booting in the same process)
 /// is a cheap no-op once a sink is in place. Does no filesystem I/O itself —
@@ -516,22 +661,39 @@ pub(crate) fn init(db_parent: Option<&Path>, db_identity: &str) {
     let heartbeat_interval = heartbeat_interval_from_env();
     let (sender, receiver) = mpsc::sync_channel::<QueuedEvent>(QUEUE_CAPACITY);
     let dropped = Arc::new(AtomicU64::new(0));
-    let handle = SinkHandle {
-        sender,
-        dropped: Arc::clone(&dropped),
-    };
+    let thread_dropped = Arc::clone(&dropped);
+    let db_identity = db_identity.to_string();
 
-    if SINK.set(handle).is_ok() {
-        let db_identity = db_identity.to_string();
-        let _ = thread::Builder::new()
-            .name("khive-writer-timeout-sink".to_string())
-            .spawn(move || {
-                writer_thread_loop(receiver, dir, db_identity, dropped, heartbeat_interval)
-            });
+    // Spawn the writer thread FIRST, before publishing anything through the
+    // process-global `OnceLock`. `Builder::spawn` fails when the OS can't
+    // create a new thread (resource exhaustion — the process is already at
+    // its thread-count or memory limit); if that happens here, the slot
+    // must stay unclaimed rather than get permanently wedged into "sink
+    // present, but its writer thread never actually started" — a later
+    // pool booting in the same process (by which point the transient
+    // exhaustion may have cleared) gets to retry `init` from scratch instead
+    // of inheriting a dead claim.
+    let spawn_result = thread::Builder::new()
+        .name("khive-writer-timeout-sink".to_string())
+        .spawn(move || {
+            writer_thread_loop(
+                receiver,
+                dir,
+                db_identity,
+                thread_dropped,
+                heartbeat_interval,
+            )
+        });
+
+    if spawn_result.is_ok() {
+        let handle = SinkHandle { sender, dropped };
+        // On a lost `OnceLock` race (another pool's `init` call published
+        // first), `handle` — and with it `sender` — is simply dropped here.
+        // The thread spawned above sees its `receiver` disconnect on its
+        // next `recv_timeout` and exits; the pool that won the race already
+        // has its own thread running.
+        let _ = SINK.set(handle);
     }
-    // On a lost `OnceLock` race, `receiver`/`dropped` are simply dropped here —
-    // no thread is spawned for this call, and the pool that won the race
-    // already has its own thread running.
 }
 
 /// This pool's identity string for the sink's `db` field: its canonical
@@ -805,7 +967,7 @@ mod tests {
         );
         assert!(sink.write_line("recovered\n"));
 
-        let contents = std::fs::read_to_string(bogus_dir.join(NDJSON_FILE_NAME)).unwrap();
+        let contents = std::fs::read_to_string(bogus_dir.join(ndjson_file_name())).unwrap();
         assert!(contents.contains("recovered"));
     }
 
