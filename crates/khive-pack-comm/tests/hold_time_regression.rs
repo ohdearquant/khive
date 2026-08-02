@@ -11,8 +11,12 @@
 //! calibrated bound, rather than only reporting a number.
 //!
 //! Shapes covered (the two `dual_write_message` callers — #1565):
-//! - `comm.send` to a new root (outbound write + thread_id patch + inbound write)
-//! - `comm.reply` (outbound write + inbound write, no thread_id patch)
+//! - `comm.send` to a new root (outbound + inbound copies committed in one
+//!   atomic writer transaction; the canonical thread_id is generated before
+//!   either write, not patched in afterwards)
+//! - `comm.reply` (same one-transaction dual write, plus the reply path's
+//!   parent `get_note` read and header-threading computation, which run
+//!   before the dispatch call returns and are part of this shape's cost)
 //!
 //! # Methodology
 //!
@@ -72,13 +76,16 @@ const SAFETY_FACTOR: f64 = 10.0;
 const SEND_MEDIAN_BOUND: Duration = Duration::from_micros(850);
 const SEND_P95_BOUND: Duration = Duration::from_micros(1_100);
 
-/// Calibrated 2026-08-01, same method: comm.reply observed median
-/// 1.68-1.84ms, p95 1.9-2.15ms across 4 runs (reply costs more than send
-/// here — the reply path's extra `get_note` read plus header-threading
-/// computation run before the timed dispatch call returns, unlike send's
-/// leaner param path). Base calibration: median 1.9ms, p95 2.2ms.
-const REPLY_MEDIAN_BOUND: Duration = Duration::from_micros(1_900);
-const REPLY_P95_BOUND: Duration = Duration::from_micros(2_200);
+/// Calibrated 2026-08-02, same method, after the timed closure was reduced
+/// to exactly one `comm.reply` dispatch (the root fixture moved outside the
+/// timer): observed median 733-936us, p95 950us-1.22ms across 4 runs under
+/// a machine-wide bench-window lock (1-min load average 15-17, disclosed
+/// per fleet bench discipline). Reply sits slightly above send: the reply
+/// path's extra parent `get_note` read plus header-threading computation
+/// run inside the timed dispatch. Base calibration rounds the observed max
+/// up: median 950us, p95 1.25ms.
+const REPLY_MEDIAN_BOUND: Duration = Duration::from_micros(950);
+const REPLY_P95_BOUND: Duration = Duration::from_micros(1_250);
 
 fn build_registry() -> (VerbRegistry, KhiveRuntime) {
     let runtime = KhiveRuntime::memory().expect("in-memory runtime");
@@ -89,7 +96,9 @@ fn build_registry() -> (VerbRegistry, KhiveRuntime) {
     (registry, runtime)
 }
 
-/// Median and p95 (nearest-rank) over `durations`. Panics on an empty slice
+/// Nearest-rank median (p50) and p95 over `durations`: rank
+/// `ceil(n * q) - 1` after sorting, for both quantiles — for 40 samples
+/// that is index 19 (median) and index 37 (p95). Panics on an empty slice
 /// — callers must assert `durations.len() == SAMPLES` first so a short
 /// collection fails on that explicit assertion, not silently here.
 fn median_and_p95(durations: &mut [Duration]) -> (Duration, Duration) {
@@ -98,10 +107,11 @@ fn median_and_p95(durations: &mut [Duration]) -> (Duration, Duration) {
         "median_and_p95: no samples collected"
     );
     durations.sort_unstable();
-    let median = durations[durations.len() / 2];
-    let p95_index = ((durations.len() as f64) * 0.95).ceil() as usize - 1;
-    let p95 = durations[p95_index.min(durations.len() - 1)];
-    (median, p95)
+    let nearest_rank = |q: f64| {
+        let index = ((durations.len() as f64) * q).ceil() as usize - 1;
+        durations[index.min(durations.len() - 1)]
+    };
+    (nearest_rank(0.50), nearest_rank(0.95))
 }
 
 fn scale_bound(bound: Duration, factor: f64) -> Duration {
@@ -181,22 +191,26 @@ async fn hold_time_regression_comm_send_new_root() {
 async fn hold_time_regression_comm_reply() {
     let (registry, _rt) = build_registry();
 
+    // Seed one root OUTSIDE the timed region: the timed closure below must
+    // dispatch exactly one comm.reply and nothing else, so the reply shape's
+    // calibration is not coupled to comm.send performance.
+    let root = registry
+        .dispatch(
+            "comm.send",
+            json!({ "to": "local", "content": "hold-time gate reply root" }),
+        )
+        .await
+        .expect("comm.send (reply root fixture) succeeds");
+    let root_id = root
+        .get("full_id")
+        .and_then(|v| v.as_str())
+        .expect("comm.send returns full_id")
+        .to_string();
+
     let mut durations = sample_shape(|| {
         let registry = &registry;
+        let root_id = root_id.clone();
         async move {
-            let root = registry
-                .dispatch(
-                    "comm.send",
-                    json!({ "to": "local", "content": "hold-time gate reply root" }),
-                )
-                .await
-                .expect("comm.send (reply root) succeeds");
-            let root_id = root
-                .get("full_id")
-                .and_then(|v| v.as_str())
-                .expect("comm.send returns full_id")
-                .to_string();
-
             registry
                 .dispatch(
                     "comm.reply",
