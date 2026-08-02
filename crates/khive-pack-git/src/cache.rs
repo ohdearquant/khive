@@ -232,6 +232,7 @@ fn ensure_clone_locked(root: &Path, canonical_url: &str) -> Result<PathBuf, Cach
             return Err(CacheError::UnsafeToReplace(repo_dir));
         }
         fetch(&repo_dir)?;
+        advance_to_fetched_tip(&repo_dir)?;
         // `repo_dir` was just fetched into and its ownership already
         // confirmed above; it vanishing here is a real problem (`slot_lock`
         // excludes a concurrent `ensure_clone`/`refetch_clone`/`reclone` on
@@ -280,6 +281,7 @@ fn refetch_clone_locked(root: &Path, canonical_url: &str) -> Result<PathBuf, Cac
     }
 
     fetch_refetch(&repo_dir)?;
+    advance_to_fetched_tip(&repo_dir)?;
 
     let cap = clone_max_bytes();
     let size = dir_size(&repo_dir)?;
@@ -411,6 +413,45 @@ fn clone(url: &str, dest: &Path) -> Result<(), CacheError> {
         return Err(CacheError::Git(format!(
             "git clone {:?} failed (exit {status})",
             redact_repo_url(url)
+        )));
+    }
+    Ok(())
+}
+
+/// Advance the cache clone's checked-out HEAD to the tip `fetch` just
+/// brought in. `git fetch` updates remote-tracking refs only; without this
+/// step the clone's HEAD stays wherever the original `git clone` (or the
+/// last reclone) left it, and every walk of `HEAD` silently covers stale
+/// history (issue #1644 — measured: a slot whose FETCH_HEAD was minutes old
+/// walked a HEAD three weeks behind and reported a clean empty pass). The
+/// clone is a disposable cache entry this crate owns outright and nothing
+/// ever writes into its worktree, so a hard reset to the fetched default
+/// branch is safe by construction. Failing to advance is a hard error, not
+/// a warning: proceeding would reintroduce the stale-walk defect silently.
+fn advance_to_fetched_tip(repo: &Path) -> Result<(), CacheError> {
+    // `origin/HEAD` is created by `git clone`; repair it first in case an
+    // older slot predates it or the remote's default branch moved. Best
+    // effort — the reset below is the step that must succeed.
+    let _ = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["remote", "set-head", "origin", "--auto"])
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .status();
+    let status = Command::new("git")
+        .arg("-c")
+        .arg("core.hooksPath=/dev/null")
+        .arg("-C")
+        .arg(repo)
+        .args(["reset", "--hard", "refs/remotes/origin/HEAD", "--"])
+        .status()
+        .map_err(|e| CacheError::Git(format!("spawning git reset: {e}")))?;
+    if !status.success() {
+        return Err(CacheError::Git(format!(
+            "advancing {} to the fetched tip failed (exit {status}); a stale \
+             checkout would walk stale history, so this pass refuses to \
+             proceed",
+            repo.display()
         )));
     }
     Ok(())
@@ -717,6 +758,73 @@ mod tests {
         assert!(
             leftovers.is_empty(),
             "a failed clone must not leave .staging-* directories behind: {leftovers:?}"
+        );
+
+        std::env::remove_var("KHIVE_GIT_DIGEST_SCRATCH_ROOT");
+    }
+
+    fn test_git(repo: &Path, args: &[&str]) {
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .status()
+            .expect("spawn git");
+        assert!(status.success(), "git {args:?} failed in {}", repo.display());
+    }
+
+    fn test_head_sha(repo: &Path) -> String {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .expect("rev-parse");
+        assert!(out.status.success(), "rev-parse failed in {}", repo.display());
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// Issue #1644: `git fetch --prune` updates `refs/remotes/origin/*` but
+    /// never advances the slot's checked-out HEAD, so every walk after the
+    /// first ran against the HEAD frozen at clone time — an empty
+    /// `{cursor}..HEAD` range that read as a clean completion. A re-`ensure`
+    /// of an existing slot must leave the checkout AT the fetched tip.
+    #[test]
+    fn reensure_advances_checkout_to_fetched_tip() {
+        let _guard = ENV_MUTEX.blocking_lock();
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::env::set_var("KHIVE_GIT_DIGEST_SCRATCH_ROOT", dir.path());
+
+        let upstream = dir.path().join("upstream");
+        std::fs::create_dir_all(&upstream).unwrap();
+        test_git(&upstream, &["init", "-q"]);
+        test_git(&upstream, &["config", "user.email", "t@example.com"]);
+        test_git(&upstream, &["config", "user.name", "T"]);
+        std::fs::write(upstream.join("a.md"), "a\n").unwrap();
+        test_git(&upstream, &["add", "a.md"]);
+        test_git(&upstream, &["commit", "-q", "-m", "commit A"]);
+
+        let url = upstream.to_str().expect("utf8 path");
+        let slot = ensure_clone(url).expect("initial clone");
+        assert_eq!(
+            test_head_sha(&slot),
+            test_head_sha(&upstream),
+            "fresh clone starts at upstream HEAD"
+        );
+
+        // Upstream advances after the clone.
+        std::fs::write(upstream.join("b.md"), "b\n").unwrap();
+        test_git(&upstream, &["add", "b.md"]);
+        test_git(&upstream, &["commit", "-q", "-m", "commit B"]);
+        let upstream_tip = test_head_sha(&upstream);
+
+        let slot2 = ensure_clone(url).expect("re-ensure existing slot");
+        assert_eq!(slot2, slot, "same cache slot");
+        assert_eq!(
+            test_head_sha(&slot2),
+            upstream_tip,
+            "re-ensure must advance the checkout to the fetched tip \
+             (issue #1644): a stale HEAD walks stale history"
         );
 
         std::env::remove_var("KHIVE_GIT_DIGEST_SCRATCH_ROOT");
