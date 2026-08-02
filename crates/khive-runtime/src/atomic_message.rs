@@ -35,6 +35,8 @@
 //! version of `dual_write_message` used to document is closed by
 //! construction.
 
+use std::sync::Arc;
+
 use serde_json::Value;
 use uuid::Uuid;
 
@@ -149,13 +151,15 @@ fn maybe_inject_vector_failure(_namespace: &str, _label: &str) -> Option<PlanSta
     None
 }
 
-/// DELETE-then-INSERT-then-log statements for one (note, model) vector row,
-/// replaying `khive-db::stores::vectors::replace_vector_row_dml`'s DML shape
-/// as plain [`PlanStatement`]s rather than a live `rusqlite::Connection`
-/// call — the same technique `atomic_prepare::push_index_purge_statements`
-/// uses for delete. Unguarded: same convention as the FTS-insert statement
-/// in `atomic_prepare::prepare_add_note` (the row's existence guard is
-/// carried by the plan's primary note-row statement, applied first).
+/// DELETE-then-INSERT-then-log statements for one (note, model) vector row.
+/// This static atomic plan cannot branch on an identity-constrained DELETE's
+/// affected-row count, so it retains the general delete-log scan used before
+/// `khive-db::stores::vectors::replace_vector_row_dml` gained its live-
+/// connection fast path. It uses the same plain-[`PlanStatement`] technique
+/// as `atomic_prepare::push_index_purge_statements`. Unguarded: same
+/// convention as the FTS-insert statement in
+/// `atomic_prepare::prepare_add_note` (the row's existence guard is carried by
+/// the plan's primary note-row statement, applied first).
 #[allow(clippy::too_many_arguments)]
 fn vector_insert_statements(
     table: &str,
@@ -307,15 +311,21 @@ pub async fn create_notes_atomic_with_report(
         let usage_ctx = crate::usage::current();
         let mut join_set = tokio::task::JoinSet::new();
         for (note_idx, (spec, note)) in specs.iter().zip(notes.iter()).enumerate() {
-            let text = crate::curation::note_embedding_text(note);
+            // Spawned tasks need owned text; share one content allocation across
+            // every model instead of cloning the note body per task.
+            let text: Arc<str> = Arc::from(crate::curation::note_embedding_text_ref(note));
             for (model_idx, model_name) in embed_model_names.iter().enumerate() {
                 let rt = runtime.clone();
                 let token = spec.token.clone();
                 let name = model_name.clone();
-                let text = text.clone();
+                let text = Arc::clone(&text);
                 let ctx = usage_ctx.clone();
                 join_set.spawn(async move {
-                    let fut = rt.embed_document_with_model_outcome_for_token(&token, &name, &text);
+                    let fut = rt.embed_document_with_model_outcome_for_token(
+                        &token,
+                        &name,
+                        text.as_ref(),
+                    );
                     let result = match ctx {
                         Some(ctx) => crate::usage::scope(ctx, fut).await,
                         None => fut.await,

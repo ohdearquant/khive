@@ -1183,7 +1183,7 @@ impl KhiveRuntime {
                 .embed_document_with_model_outcome_for_token(
                     token,
                     model_name,
-                    &note_embedding_text(note),
+                    note_embedding_text_ref(note),
                 )
                 .await
             {
@@ -1564,7 +1564,13 @@ pub fn entity_embedding_text(entity: &Entity) -> String {
 /// Build the canonical text embedded for a note when no explicit bounded
 /// embedding prefix was supplied at creation time.
 pub fn note_embedding_text(note: &Note) -> String {
-    note.content.clone()
+    note_embedding_text_ref(note).to_owned()
+}
+
+/// Borrow the canonical note embedding text for runtime paths that do not
+/// require ownership.
+pub(crate) fn note_embedding_text_ref(note: &Note) -> &str {
+    &note.content
 }
 
 /// Build the `TextDocument` for an entity. This is the single source of truth for
@@ -2842,6 +2848,20 @@ mod tests {
             .map(|index| char::from(ALPHANUMERIC[(index * 17 + 11) % ALPHANUMERIC.len()]))
             .collect();
         format!("secret value: {candidate}")
+    }
+
+    #[test]
+    fn note_embedding_text_ref_borrows_stored_content() {
+        let note = Note::new("embedding-borrow", "observation", "borrow this content");
+        let text = note_embedding_text_ref(&note);
+
+        assert_eq!(text, note.content.as_str());
+        assert!(
+            std::ptr::eq(text, note.content.as_str()),
+            "internal canonical note text must borrow instead of cloning"
+        );
+        let owned: String = note_embedding_text(&note);
+        assert_eq!(owned.as_str(), note.content.as_str());
     }
 
     async fn restore_edge_preimage(

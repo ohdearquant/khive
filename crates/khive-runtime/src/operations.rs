@@ -45,7 +45,7 @@ use crate::atomic_plan::{
     AddEntityPlan, AffectedRowGuard, DeletePlan, PlanStatement, PostCommitEffect,
 };
 use crate::atomic_runner::{run_atomic_unit, AtomicOpFailure, AtomicOpPlan, AtomicRunOutcome};
-use crate::curation::{entity_fts_document, note_embedding_text, note_fts_document};
+use crate::curation::{entity_fts_document, note_embedding_text_ref, note_fts_document};
 use crate::error::{GuardedWriteFailure, RuntimeError, RuntimeResult};
 use crate::runtime::{KhiveRuntime, NamespaceToken};
 
@@ -3199,7 +3199,7 @@ impl KhiveRuntime {
                 .embed_document_with_model_outcome_for_token(
                     token,
                     model_name,
-                    &note_embedding_text(&note),
+                    note_embedding_text_ref(&note),
                 )
                 .await
             {
@@ -3405,8 +3405,8 @@ impl KhiveRuntime {
         // capped override when present, otherwise the full stored content.
         // FTS indexing above always used the full `note.content` — this cap
         // affects only the vector-embedding input.
-        let canonical_embed_text = note_embedding_text(&note);
-        let embed_text: &str = embedding_content.unwrap_or(&canonical_embed_text);
+        let canonical_embed_text = note_embedding_text_ref(&note);
+        let embed_text = embedding_content.unwrap_or(canonical_embed_text);
 
         let mut embedding_report = crate::retrieval::EmbeddingTruncationReport::default();
         if embed_model_names.len() == 1 {
@@ -3485,17 +3485,23 @@ impl KhiveRuntime {
             // Multi-model path: embed with each model in parallel via spawned tasks,
             // then insert one VectorRecord per model.
             let rt_clone = self.clone();
-            let content_owned = embed_text.to_string();
+            // JoinSet tasks require owned text; an Arc keeps this to one
+            // content-sized allocation rather than one clone per model.
+            let content_owned: std::sync::Arc<str> = std::sync::Arc::from(embed_text);
             let usage_ctx = crate::usage::current();
             let mut join_set = tokio::task::JoinSet::new();
             for (idx, model_name) in embed_model_names.iter().enumerate() {
                 let rt = rt_clone.clone();
-                let text = content_owned.clone();
+                let text = std::sync::Arc::clone(&content_owned);
                 let name = model_name.clone();
                 let ctx = usage_ctx.clone();
                 let token = (*token).clone();
                 join_set.spawn(async move {
-                    let fut = rt.embed_document_with_model_outcome_for_token(&token, &name, &text);
+                    let fut = rt.embed_document_with_model_outcome_for_token(
+                        &token,
+                        &name,
+                        text.as_ref(),
+                    );
                     let result = match ctx {
                         Some(ctx) => crate::usage::scope(ctx, fut).await,
                         None => fut.await,
