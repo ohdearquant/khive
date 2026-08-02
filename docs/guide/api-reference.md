@@ -1875,6 +1875,34 @@ becomes known.
 request(ops="code.ingest(path=\"/repo/crates/my-crate\")")
 ```
 
+The success report includes `fts_indexed`, the number of entity documents written to the map's
+full-text index. Entity and FTS writes are a single success postcondition for this verb: an FTS
+failure makes the ingest fail rather than returning a structurally populated but unsearchable map.
+
+The map database uses the ordinary khive schema. To explore it with the generic KG read verbs,
+select it as a backend in a dedicated config:
+
+```toml
+[[backends]]
+name = "main"
+kind = "sqlite"
+path = "/absolute/path/to/code-map.db"
+```
+
+```sh
+kkernel exec --config /absolute/path/to/code-map.toml \
+  'search(kind="entity", query="my-crate")'
+kkernel exec --config /absolute/path/to/code-map.toml \
+  'resolve(refs=["my-crate"])'
+```
+
+Use `--config` without `--db` for this read path. With `[[backends]]` configured, a conflicting
+concrete `--db` override is refused; `:memory:` remains an explicit ephemeral override, and a path
+that canonically matches the declared `main` backend is normalized as a no-op. A warning that a
+daemon has a different configuration and local fallback is required is expected and prevents
+accidentally serving the production database. `kkernel code-audit` is the distinct policy-driven
+reporting surface over a code-map database.
+
 ---
 
 ## `blob` pack — 3 verbs

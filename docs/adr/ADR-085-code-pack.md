@@ -661,6 +661,17 @@ symbols and modules an agent's work has actually referenced, into the shared
 production database is a separate, explicit curation or import path, distinct
 from and never performed by `code.ingest`.
 
+The dedicated target uses the ordinary khive graph and text-search substrates. Each entity upsert
+in L1/L1.5 is paired with `entity_fts_document` in the map's text store; a successful
+`code.ingest` response therefore means generic KG `search` and query-anchored `context` can read
+the entities it reports. An FTS write failure fails the ingest and is repaired by an idempotent
+retry, rather than returning an unqualified success for a graph whose empty search results would
+look authoritative. The report exposes the number of completed document writes as `fts_indexed`.
+Interactive reads select the map with a dedicated `[[backends]]` config and `--config`. The
+multi-backend safety contract refuses a conflicting concrete `--db` override, while permitting
+`:memory:` and normalizing a path that canonically matches the declared `main` backend. The
+policy-derived `kkernel code-audit` admin command remains a separate, documented read surface.
+
 ### B8: Acceptance
 
 An implementation of this amendment is acceptance-tested against three
