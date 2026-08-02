@@ -820,6 +820,27 @@ pub struct VerbRegistry {
     reference_ring: Arc<crate::reference_ring::ReferenceRing>,
 }
 
+/// Result of an operation handled outside normal pack dispatch, paired with
+/// typed transport metadata that must survive the gate/audit boundary.
+///
+/// The canonical `result` remains the value used for audit accounting. The
+/// metadata is returned to the intercepting transport without being smuggled
+/// through a mutex side channel or folded into the verb's public result shape.
+#[derive(Debug, Clone, PartialEq)]
+pub struct InterceptedDispatchResult<M> {
+    /// Canonical verb result used for audit and resource accounting.
+    pub result: Value,
+    /// Transport-owned metadata that must accompany the canonical result.
+    pub metadata: M,
+}
+
+impl<M> InterceptedDispatchResult<M> {
+    /// Pair a canonical result with its typed transport metadata.
+    pub fn new(result: Value, metadata: M) -> Self {
+        Self { result, metadata }
+    }
+}
+
 /// Per-request identity context that overrides a [`VerbRegistry`]'s
 /// construction-baked `default_namespace` / `actor_id` / `visible_namespaces`
 /// for exactly one [`VerbRegistry::dispatch_with_identity`] call (ADR-096
@@ -1228,6 +1249,37 @@ impl VerbRegistry {
         F: FnOnce(Namespace) -> Fut,
         Fut: std::future::Future<Output = Result<Value, RuntimeError>>,
     {
+        self.dispatch_intercepted_with_metadata_with_identity(
+            verb,
+            params,
+            identity,
+            |namespace| async move {
+                dispatch(namespace)
+                    .await
+                    .map(|result| InterceptedDispatchResult::new(result, ()))
+            },
+        )
+        .await
+        .map(|outcome| outcome.result)
+    }
+
+    /// Gate and execute an intercepted operation whose transport needs typed
+    /// metadata in addition to the canonical verb result.
+    ///
+    /// Audit accounting always receives `outcome.result`; `outcome.metadata`
+    /// crosses the dispatch seam unchanged for the transport to place beside
+    /// that result in its own envelope.
+    pub async fn dispatch_intercepted_with_metadata_with_identity<M, F, Fut>(
+        &self,
+        verb: &str,
+        params: &Value,
+        identity: Option<&RequestIdentity>,
+        dispatch: F,
+    ) -> Result<InterceptedDispatchResult<M>, RuntimeError>
+    where
+        F: FnOnce(Namespace) -> Fut,
+        Fut: std::future::Future<Output = Result<InterceptedDispatchResult<M>, RuntimeError>>,
+    {
         let request_id = identity.and_then(|id| id.request_id);
         let gate_req = self.gate_request_with_identity(verb, params, identity)?;
         let deferred_audit = match self.gate.check(&gate_req) {
@@ -1269,7 +1321,7 @@ impl VerbRegistry {
                 verb,
                 &gate_req,
                 audit,
-                &result,
+                result.as_ref().map(|outcome| &outcome.result),
                 duration_us,
                 request_id,
             )
@@ -1283,7 +1335,7 @@ impl VerbRegistry {
         verb: &str,
         gate_req: &GateRequest,
         audit: AuditEvent,
-        result: &Result<Value, RuntimeError>,
+        result: Result<&Value, &RuntimeError>,
         duration_us: i64,
         request_id: Option<u64>,
     ) {

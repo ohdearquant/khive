@@ -2,7 +2,7 @@
 //! trait defined in `khive-mcp`. Wraps `SubstrateCoordinator` and adapts its types
 //! to the trait interface used by `KhiveMcpServer`.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use async_trait::async_trait;
 use uuid::Uuid;
@@ -11,6 +11,7 @@ use khive_mcp::coordinator::{
     BackendSearchResult as CoordBackendResult, CoordError, CoordLinkResult, CoordSearchResult,
     CoordinatorService,
 };
+use khive_pack_kg::handlers::ValidatedSearchRequest;
 use khive_runtime::BackendId;
 use khive_runtime::Namespace;
 use khive_storage::EdgeRelation;
@@ -24,34 +25,18 @@ use super::dispatch::SubstrateCoordinator;
 /// for single-backend deployments (zero-change invariant).
 pub struct SubstrateCoordinatorService {
     inner: SubstrateCoordinator,
-    /// Merged note-kind vocabulary from every pack loaded onto the multi-backend
-    /// `VerbRegistry` (see `khive_runtime::pack::VerbRegistry::all_note_kinds`).
-    /// Drives `fan_out_search`'s note-vs-entity substrate classification so a
-    /// granular kind registered by any loaded pack (e.g. `session`) routes to
-    /// note FTS instead of falling through to a hardcoded list.
-    note_kinds: HashSet<String>,
 }
 
 impl SubstrateCoordinatorService {
-    /// Wrap an existing [`SubstrateCoordinator`], classifying granular search
-    /// kinds against `note_kinds` (the merged pack/runtime note-kind registry).
-    pub fn new(coordinator: SubstrateCoordinator, note_kinds: HashSet<String>) -> Self {
-        Self {
-            inner: coordinator,
-            note_kinds,
-        }
+    /// Wrap an existing [`SubstrateCoordinator`]. Search substrate and filter
+    /// reconciliation are already captured by [`ValidatedSearchRequest`].
+    pub fn new(coordinator: SubstrateCoordinator) -> Self {
+        Self { inner: coordinator }
     }
 
     /// The primary backend id, if any.
     pub fn primary_backend_id_inner(&self) -> Option<BackendId> {
         self.inner.primary_runtime().map(|_| BackendId::main())
-    }
-
-    /// Classify `kind` as note-substrate vs entity-substrate for fan-out
-    /// routing. `"note"` is always note-substrate; any other kind is
-    /// note-substrate iff it is a member of the merged pack note-kind registry.
-    fn is_note_substrate(&self, kind: &str) -> bool {
-        kind == "note" || self.note_kinds.contains(kind)
     }
 }
 
@@ -110,27 +95,11 @@ impl CoordinatorService for SubstrateCoordinatorService {
 
     async fn fan_out_search(
         &self,
-        kind: &str,
-        query: &str,
+        request: &ValidatedSearchRequest,
         namespace: &Namespace,
-        limit: u32,
-        kind_filter: Option<&str>,
-        props_filter: Option<&serde_json::Value>,
-        tags: &[String],
     ) -> CoordSearchResult {
-        let search_notes = self.is_note_substrate(kind);
-        let (entity_hits, note_hits, per_backend) = self
-            .inner
-            .fan_out_search(
-                query,
-                namespace,
-                limit,
-                search_notes,
-                kind_filter,
-                props_filter,
-                tags,
-            )
-            .await;
+        let (entity_hits, note_hits, per_backend) =
+            self.inner.fan_out_search(request, namespace).await;
 
         let partial = per_backend.iter().any(|r| r.error.is_some());
 

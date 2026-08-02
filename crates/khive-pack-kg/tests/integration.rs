@@ -1026,6 +1026,27 @@ async fn search_nameless_note_name_is_null() {
     );
 }
 
+#[tokio::test]
+async fn search_rejects_filters_that_do_not_apply_to_the_resolved_substrate() {
+    let pack = pack();
+    for params in [
+        json!({"kind": "entity", "query": "x", "note_kind": "observation"}),
+        json!({"kind": "entity", "query": "x", "include_superseded": true}),
+        json!({"kind": "note", "query": "x", "entity_kind": "concept"}),
+        json!({"kind": "note", "query": "x", "entity_type": "theorem"}),
+        json!({"kind": "entity", "query": "x", "properties": ["not", "an", "object"]}),
+    ] {
+        let error = pack
+            .dispatch("search", params)
+            .await
+            .expect_err("an inapplicable or malformed filter must not be ignored");
+        assert!(
+            is_invalid_input(&error),
+            "search validation must return InvalidInput, got {error:?}"
+        );
+    }
+}
+
 /// Regression for #163: `search` accepts a `properties` filter that restricts
 /// results to entities whose properties contain the given key=value pairs.
 #[tokio::test]

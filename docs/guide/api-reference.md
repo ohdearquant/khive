@@ -389,10 +389,10 @@ Hybrid FTS + vector search with RRF fusion.
 | `kind`               | string  | yes      | Substrate or granular kind to search.                                                                                                  |
 | `query`              | string  | yes      | Free-text query.                                                                                                                       |
 | `limit`              | integer | no       | Default 10.                                                                                                                            |
-| `entity_kind`        | string  | no       | `kind="entity"` only.                                                                                                                  |
-| `entity_type`        | string  | no       | `kind="entity"` only.                                                                                                                  |
-| `note_kind`          | string  | no       | `kind="note"` only.                                                                                                                    |
-| `include_superseded` | bool    | no       | `kind="note"` only; default false excludes notes targeted by a `supersedes` edge.                                                      |
+| `entity_kind`        | string  | no       | Entity-substrate searches only.                                                                                                         |
+| `entity_type`        | string  | no       | Entity-substrate searches only.                                                                                                         |
+| `note_kind`          | string  | no       | Note-substrate searches only.                                                                                                           |
+| `include_superseded` | bool    | no       | Note-substrate searches only; default false excludes notes targeted by a `supersedes` edge.                                             |
 | `properties`         | object  | no       | Match records whose properties contain all listed key=value pairs, applied before result truncation inside a bounded candidate window. |
 | `tags`               | array   | no       | OR-match against tags; entity tags matched at the SQL level, note tags read from `properties.tags`.                                    |
 | `min_score`          | number  | no       | Score floor 0.0–1.0. No server default; RRF rank-1 scores on small corpora are typically 0.013–0.033.                                  |
@@ -400,6 +400,20 @@ Hybrid FTS + vector search with RRF fusion.
 ```
 request(ops="search(kind=\"entity\", query=\"knowledge graph runtime\", limit=10)")
 ```
+
+`entity_kind` and `note_kind` are compatibility filters for the corresponding
+substrate-level `kind`. A granular discriminator such as `kind="concept"` or
+`kind="observation"` may be paired with the same compatibility value, but a
+contradiction is rejected. Entity-only fields on a note search and note-only
+fields on an entity search are also rejected explicitly; they are never
+ignored. `properties` must be an object and `tags` must be an array of strings.
+The same validated request is used for single- and multi-backend execution.
+
+In multi-backend mode a backend failure yields the successful hits from the
+remaining backends and adds `partial: true` plus `missing_backends` to that
+operation's request envelope. These fields sit beside `result` rather than
+inside the search result array, and remain present through presentation and
+response-frame compaction.
 
 Response shape (`kind="entity"` rows, `presentation="verbose"`):
 

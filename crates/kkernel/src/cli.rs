@@ -286,8 +286,7 @@ pub async fn cli_main() -> Result<()> {
                 // and finish server assembly through the shared #603 constructor
                 // (`build_multi_backend_server_with_coordinator`) — this branch
                 // contains no server-assembly logic of its own beyond building
-                // the coordinator inputs (BackendRegistry + note_kinds) and
-                // attaching it.
+                // the coordinator's BackendRegistry and attaching it.
                 let (cli_ns_explicit, cli_ns) = khive_mcp::args::resolve_cli_namespace(&a)
                     .map_err(|e| anyhow::anyhow!("{e}"))?;
 
@@ -460,14 +459,7 @@ fn build_multi_backend_server_with_coordinator_and_db_anchor(
         backend_reg.register(backend_id, Arc::clone(rt));
     }
 
-    let note_kinds: std::collections::HashSet<String> = multi
-        .registry
-        .all_note_kinds()
-        .into_iter()
-        .map(str::to_string)
-        .collect();
-    let coord =
-        SubstrateCoordinatorService::new(SubstrateCoordinator::new(backend_reg), note_kinds);
+    let coord = SubstrateCoordinatorService::new(SubstrateCoordinator::new(backend_reg));
 
     let server = khive_mcp::serve::build_server_from_multi_backend_registry(
         multi,

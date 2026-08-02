@@ -7,6 +7,7 @@ use std::time::Duration;
 use tokio::task::JoinError;
 use uuid::Uuid;
 
+use khive_pack_kg::handlers::{SearchSubstrate, ValidatedSearchRequest};
 use khive_runtime::{
     BackendId, EdgeEndpointKind, KhiveRuntime, NoteSearchHit, Resolved, SearchHit, SearchSource,
 };
@@ -49,6 +50,8 @@ pub struct SubstrateCoordinator {
     locator: Arc<LocatorCache>,
     #[cfg(test)]
     pub(super) fail_backend_id: Option<String>,
+    #[cfg(test)]
+    pub(super) panic_backend_id: Option<String>,
 }
 
 impl SubstrateCoordinator {
@@ -59,6 +62,8 @@ impl SubstrateCoordinator {
             locator: Arc::new(LocatorCache::new()),
             #[cfg(test)]
             fail_backend_id: None,
+            #[cfg(test)]
+            panic_backend_id: None,
         }
     }
 
@@ -69,6 +74,8 @@ impl SubstrateCoordinator {
             locator: Arc::new(LocatorCache::with_ttl(ttl)),
             #[cfg(test)]
             fail_backend_id: None,
+            #[cfg(test)]
+            panic_backend_id: None,
         }
     }
 
@@ -81,6 +88,8 @@ impl SubstrateCoordinator {
             locator: Arc::new(LocatorCache::new()),
             #[cfg(test)]
             fail_backend_id: None,
+            #[cfg(test)]
+            panic_backend_id: None,
         }
     }
 
@@ -88,6 +97,13 @@ impl SubstrateCoordinator {
     #[cfg(test)]
     pub fn with_failing_backend(mut self, backend_id: &str) -> Self {
         self.fail_backend_id = Some(backend_id.to_string());
+        self
+    }
+
+    /// Test-only: force a named backend's fan-out task to panic.
+    #[cfg(test)]
+    pub fn with_panicking_backend(mut self, backend_id: &str) -> Self {
+        self.panic_backend_id = Some(backend_id.to_string());
         self
     }
 
@@ -373,48 +389,25 @@ impl SubstrateCoordinator {
 
     // ---- D4: Fan-out search ----
 
-    /// Broadcast `query` to all registered backends in parallel and merge results via RRF (k=60).
-    ///
-    /// `search_notes` controls which substrate to search:
-    /// - `false` → entity fan-out via `hybrid_search`
-    /// - `true`  → note fan-out via `search_notes`
-    ///
-    /// `kind_filter` is passed as the storage-level kind filter:
-    /// - entity substrate: `entity_kind` parameter of `hybrid_search`
-    /// - note substrate: `note_kind` parameter of `search_notes`
-    ///
-    /// `props_filter` and `tags` are forwarded to each backend's `hybrid_search` when
-    /// `search_notes` is false. When either is active the per-backend candidate window is
-    /// widened (up to 500) so that sparse matches ranked below the bare `limit` are not
-    /// cut off before the filter is applied inside `hybrid_search`. Both parameters are
-    /// ignored for note-substrate searches.
-    ///
-    /// Pass `None`/`&[]` for substrate-level searches without filters.
+    /// Broadcast a validated KG search request to all registered backends in
+    /// parallel and merge results via RRF (k=60). Every filter in the request
+    /// reaches the matching runtime search method on every backend.
     ///
     /// Per-backend errors are captured in [`BackendSearchResult::error`] — a single
     /// failing backend does NOT abort the fan-out.
-    #[allow(clippy::too_many_arguments)]
     pub async fn fan_out_search(
         &self,
-        query: &str,
+        request: &ValidatedSearchRequest,
         namespace: &Namespace,
-        limit: u32,
-        search_notes: bool,
-        kind_filter: Option<&str>,
-        props_filter: Option<&serde_json::Value>,
-        tags: &[String],
     ) -> (Vec<SearchHit>, Vec<NoteSearchHit>, Vec<BackendSearchResult>) {
-        // Widen the per-backend candidate window when entity filters are active so
-        // that sparse matches ranked below the bare `limit` survive inside each
-        // backend's hybrid_search before being filtered (mirrors search.rs behaviour).
-        let search_limit = if !search_notes && (props_filter.is_some() || !tags.is_empty()) {
-            limit.saturating_mul(50).min(500)
-        } else {
-            limit
-        };
-
-        let props_filter_owned: Option<serde_json::Value> = props_filter.cloned();
-        let tags_owned: Vec<String> = tags.to_vec();
+        let search_notes = request.substrate() == SearchSubstrate::Note;
+        let search_limit = request.candidate_limit();
+        let limit = request.limit();
+        let props_filter_owned = request.properties().cloned();
+        let tags_owned = request.tags().to_vec();
+        let kind_filter_owned = request.kind_filter().map(str::to_string);
+        let entity_type_owned = request.entity_type().map(str::to_string);
+        let include_superseded = request.include_superseded();
 
         let entries: Vec<(BackendId, Arc<KhiveRuntime>)> = self
             .registry
@@ -443,10 +436,21 @@ impl SubstrateCoordinator {
             };
             if search_notes {
                 match runtime
-                    .search_notes(&token, query, None, limit, kind_filter, false, &[], None)
+                    .search_notes(
+                        &token,
+                        request.query(),
+                        None,
+                        search_limit,
+                        request.kind_filter(),
+                        include_superseded,
+                        &tags_owned,
+                        props_filter_owned.as_ref(),
+                    )
                     .await
                 {
                     Ok(note_hits) => {
+                        let note_hits: Vec<NoteSearchHit> =
+                            note_hits.into_iter().take(limit as usize).collect();
                         let backend_result = BackendSearchResult {
                             backend_id: backend_id.clone(),
                             hits: vec![],
@@ -469,11 +473,11 @@ impl SubstrateCoordinator {
                 match runtime
                     .hybrid_search(
                         &token,
-                        query,
+                        request.query(),
                         None,
                         search_limit,
-                        kind_filter,
-                        None,
+                        request.kind_filter(),
+                        request.entity_type(),
                         &tags_owned,
                         props_filter_owned.as_ref(),
                     )
@@ -502,20 +506,24 @@ impl SubstrateCoordinator {
             }
         }
 
-        let query = query.to_string();
+        let query = request.query().to_string();
         let ns = namespace.clone();
-        let kind_filter_owned: Option<String> = kind_filter.map(|s| s.to_string());
 
         #[cfg(test)]
         let fail_id: Option<String> = self.fail_backend_id.clone();
         #[cfg(not(test))]
         let fail_id: Option<String> = None;
+        #[cfg(test)]
+        let panic_id: Option<String> = self.panic_backend_id.clone();
+        #[cfg(not(test))]
+        let panic_id: Option<String> = None;
 
         let mut handles = Vec::with_capacity(entries.len());
         for (backend_id, runtime) in entries {
             let q = query.clone();
             let ns = ns.clone();
             let kf = kind_filter_owned.clone();
+            let et = entity_type_owned.clone();
             let pf = props_filter_owned.clone();
             let tg = tags_owned.clone();
             let sl = search_limit;
@@ -524,7 +532,15 @@ impl SubstrateCoordinator {
                 .as_deref()
                 .map(|id| id == backend_id.as_str())
                 .unwrap_or(false);
+            let should_panic = panic_id
+                .as_deref()
+                .map(|id| id == backend_id.as_str())
+                .unwrap_or(false);
+            let joined_backend_id = backend_id.clone();
             let handle = tokio::spawn(async move {
+                if should_panic {
+                    panic!("injected backend search panic");
+                }
                 if should_fail {
                     return (
                         backend_id,
@@ -543,15 +559,37 @@ impl SubstrateCoordinator {
                 };
                 if search_notes {
                     let result = runtime
-                        .search_notes(&token, &q, None, lim, kf.as_deref(), false, &[], None)
+                        .search_notes(
+                            &token,
+                            &q,
+                            None,
+                            sl,
+                            kf.as_deref(),
+                            include_superseded,
+                            &tg,
+                            pf.as_ref(),
+                        )
                         .await;
                     match result {
-                        Ok(note_hits) => (backend_id, Ok(vec![]), Some(note_hits)),
+                        Ok(note_hits) => {
+                            let note_hits: Vec<NoteSearchHit> =
+                                note_hits.into_iter().take(lim as usize).collect();
+                            (backend_id, Ok(vec![]), Some(note_hits))
+                        }
                         Err(e) => (backend_id, Err(e), None),
                     }
                 } else {
                     let result = runtime
-                        .hybrid_search(&token, &q, None, sl, kf.as_deref(), None, &tg, pf.as_ref())
+                        .hybrid_search(
+                            &token,
+                            &q,
+                            None,
+                            sl,
+                            kf.as_deref(),
+                            et.as_deref(),
+                            &tg,
+                            pf.as_ref(),
+                        )
                         .await;
                     match result {
                         Ok(hits) => {
@@ -566,23 +604,15 @@ impl SubstrateCoordinator {
                     }
                 }
             });
-            handles.push(handle);
+            handles.push((joined_backend_id, handle));
         }
-
-        type BackendOutcome = (
-            BackendId,
-            Result<Vec<SearchHit>, khive_runtime::RuntimeError>,
-            Option<Vec<NoteSearchHit>>,
-        );
-        let join_results: Vec<Result<BackendOutcome, JoinError>> =
-            futures_util::future::join_all(handles).await;
 
         let mut per_backend: Vec<BackendSearchResult> = Vec::new();
         let mut entity_ranked_lists: Vec<Vec<SearchHit>> = Vec::new();
         let mut note_ranked_lists: Vec<Vec<NoteSearchHit>> = Vec::new();
 
-        for join_result in join_results {
-            match join_result {
+        for (joined_backend_id, handle) in handles {
+            match handle.await {
                 Ok((backend_id, Ok(hits), note_hits_opt)) => {
                     let note_hits = note_hits_opt.unwrap_or_default();
                     if !hits.is_empty() {
@@ -607,7 +637,16 @@ impl SubstrateCoordinator {
                     });
                 }
                 Err(join_err) => {
-                    tracing::warn!(error = %join_err, "backend search task failed");
+                    let error = khive_runtime::RuntimeError::Internal(format!(
+                        "backend search task join failed: {join_err}"
+                    ));
+                    tracing::warn!(backend = %joined_backend_id, error = %error, "backend search task failed");
+                    per_backend.push(BackendSearchResult {
+                        backend_id: joined_backend_id,
+                        hits: vec![],
+                        note_hits: vec![],
+                        error: Some(error.to_string()),
+                    });
                 }
             }
         }

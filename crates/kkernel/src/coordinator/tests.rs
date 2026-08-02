@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use uuid::Uuid;
 
+use khive_pack_kg::handlers::ValidatedSearchRequest;
 use khive_runtime::Namespace as RuntimeNamespace;
 use khive_runtime::{
     BackendId, KhiveRuntime, PackRegistry, SearchHit, SearchSource, VerbRegistryBuilder,
@@ -44,6 +45,60 @@ fn packs_registry(runtime: Arc<KhiveRuntime>, pack_names: &[&str]) -> khive_runt
     let registry = builder.build().expect("build registry");
     runtime.install_edge_rules(registry.all_edge_rules());
     registry
+}
+
+/// Parse the same strict search request the KG handler and MCP coordinator use.
+///
+/// Direct coordinator tests intentionally go through this boundary instead of
+/// constructing an internal approximation of the wire contract.
+fn validated_kg_search(params: serde_json::Value) -> ValidatedSearchRequest {
+    let registry = packs_registry(memory_runtime(), &["kg"]);
+    ValidatedSearchRequest::from_value(params, &registry).expect("valid KG search request")
+}
+
+#[test]
+fn validated_search_reconciles_compatible_granular_kind_fields() {
+    let entity = validated_kg_search(serde_json::json!({
+        "kind": "concept",
+        "query": "typed request",
+        "entity_kind": "concept",
+        "entity_type": "algorithm",
+    }));
+    assert_eq!(entity.kind_filter(), Some("concept"));
+    assert_eq!(entity.entity_type(), Some("algorithm"));
+
+    let note = validated_kg_search(serde_json::json!({
+        "kind": "observation",
+        "query": "typed request",
+        "note_kind": "observation",
+        "include_superseded": true,
+    }));
+    assert_eq!(note.kind_filter(), Some("observation"));
+    assert!(note.include_superseded());
+}
+
+#[test]
+fn validated_search_rejects_contradictory_compatibility_kind_fields() {
+    let registry = packs_registry(memory_runtime(), &["kg"]);
+    for params in [
+        serde_json::json!({
+            "kind": "concept",
+            "query": "typed request",
+            "entity_kind": "document",
+        }),
+        serde_json::json!({
+            "kind": "observation",
+            "query": "typed request",
+            "note_kind": "decision",
+        }),
+    ] {
+        let error = ValidatedSearchRequest::from_value(params, &registry)
+            .expect_err("contradictory compatibility kinds must reject");
+        assert!(
+            error.to_string().contains("contradicts"),
+            "validation error must identify the contradiction: {error}"
+        );
+    }
 }
 
 // ---- Existing tests (D1 infrastructure) ----
@@ -232,9 +287,12 @@ async fn fan_out_search_single_backend_returns_hits() {
         .await
         .expect("create entity");
 
-    let (hits, _note_hits, per_backend) = coord
-        .fan_out_search("FlashAttention", &ns, 10, false, None, None, &[])
-        .await;
+    let request = validated_kg_search(serde_json::json!({
+        "kind": "entity",
+        "query": "FlashAttention",
+        "limit": 10,
+    }));
+    let (hits, _note_hits, per_backend) = coord.fan_out_search(&request, &ns).await;
 
     assert!(!hits.is_empty(), "should find the entity");
     assert_eq!(per_backend.len(), 1, "single backend report");
@@ -281,9 +339,12 @@ async fn fan_out_search_two_backends_merged() {
         .expect("create on lore");
 
     // Fan-out search for "LoRA" — both backends should contribute.
-    let (merged_hits, _note_hits, per_backend) = coord
-        .fan_out_search("LoRA", &ns, 10, false, None, None, &[])
-        .await;
+    let request = validated_kg_search(serde_json::json!({
+        "kind": "entity",
+        "query": "LoRA",
+        "limit": 10,
+    }));
+    let (merged_hits, _note_hits, per_backend) = coord.fan_out_search(&request, &ns).await;
 
     assert_eq!(per_backend.len(), 2, "both backends in report");
     // Merged set should contain at least one hit from the combined results.
@@ -341,9 +402,12 @@ fn cross_backend_entity_merge_preserves_retrieval_leg_membership() {
 async fn fan_out_search_empty_registry_returns_empty() {
     let coord = SubstrateCoordinator::new(BackendRegistry::new());
     let ns = Namespace::local();
-    let (hits, note_hits, per_backend) = coord
-        .fan_out_search("anything", &ns, 10, false, None, None, &[])
-        .await;
+    let request = validated_kg_search(serde_json::json!({
+        "kind": "entity",
+        "query": "anything",
+        "limit": 10,
+    }));
+    let (hits, note_hits, per_backend) = coord.fan_out_search(&request, &ns).await;
     assert!(hits.is_empty());
     assert!(note_hits.is_empty());
     assert!(per_backend.is_empty());
@@ -383,9 +447,12 @@ async fn fan_out_partial_failure_preserves_working_backend_hits() {
     // Force "main" to error; "lore" should still return hits.
     let coord = SubstrateCoordinator::new(registry).with_failing_backend("main");
 
-    let (merged_hits, _note_hits, per_backend) = coord
-        .fan_out_search("PartialFailureProbe", &ns, 10, false, None, None, &[])
-        .await;
+    let request = validated_kg_search(serde_json::json!({
+        "kind": "entity",
+        "query": "PartialFailureProbe",
+        "limit": 10,
+    }));
+    let (merged_hits, _note_hits, per_backend) = coord.fan_out_search(&request, &ns).await;
 
     // Both backends must be reported.
     assert_eq!(
@@ -422,6 +489,68 @@ async fn fan_out_partial_failure_preserves_working_backend_hits() {
     assert!(
         !merged_hits.is_empty(),
         "merged hits must include results from the working backend"
+    );
+}
+
+/// A backend task panic is a partial failure, not an omitted contribution.
+/// The backend id and join error must remain visible beside healthy hits.
+#[tokio::test]
+async fn fan_out_panicked_backend_is_explicit_in_per_backend() {
+    let rt_main = memory_runtime();
+    let rt_lore = memory_runtime();
+    let ns = Namespace::local();
+
+    let tok_lore = rt_lore.authorize(ns.clone()).unwrap();
+    rt_lore
+        .create_entity(
+            &tok_lore,
+            "concept",
+            None,
+            "PanickedBackendProbe",
+            Some("healthy backend result retained when its sibling task panics"),
+            None,
+            vec![],
+        )
+        .await
+        .expect("create entity on healthy backend");
+
+    let mut registry = BackendRegistry::new();
+    registry.register(BackendId::new("main"), rt_main);
+    registry.register(BackendId::new("lore"), rt_lore);
+    let coord = SubstrateCoordinator::new(registry).with_panicking_backend("main");
+    let request = validated_kg_search(serde_json::json!({
+        "kind": "concept",
+        "query": "PanickedBackendProbe",
+        "limit": 10,
+    }));
+
+    let (merged_hits, _note_hits, per_backend) = coord.fan_out_search(&request, &ns).await;
+    assert_eq!(per_backend.len(), 2, "every spawned backend is reported");
+
+    let panicked = per_backend
+        .iter()
+        .find(|result| result.backend_id.as_str() == "main")
+        .expect("panicked backend remains identified");
+    let error = panicked
+        .error
+        .as_deref()
+        .expect("panicked backend carries an explicit error");
+    assert!(
+        error.contains("join failed") && error.contains("panic"),
+        "join error should identify the task panic, got {error:?}"
+    );
+
+    let healthy = per_backend
+        .iter()
+        .find(|result| result.backend_id.as_str() == "lore")
+        .expect("healthy backend is reported");
+    assert!(
+        healthy.error.is_none(),
+        "healthy backend must remain successful"
+    );
+    assert!(
+        !merged_hits.is_empty(),
+        "healthy backend hits survive a sibling task panic"
     );
 }
 
@@ -556,9 +685,12 @@ async fn t1_single_backend_zero_change_invariant() {
     );
 
     // fan_out_search returns results equivalent to a single runtime search.
-    let (hits, _note_hits, per_backend) = coord
-        .fan_out_search("T1Entity", &ns, 10, false, None, None, &[])
-        .await;
+    let request = validated_kg_search(serde_json::json!({
+        "kind": "entity",
+        "query": "T1Entity",
+        "limit": 10,
+    }));
+    let (hits, _note_hits, per_backend) = coord.fan_out_search(&request, &ns).await;
     assert!(
         !hits.is_empty(),
         "T1: fan-out on single backend must return hits"
@@ -758,9 +890,12 @@ async fn t3_fan_out_search_merged_from_two_backends() {
     .expect("T3: create on beta");
 
     // Search "Entity" — should match both AlphaEntity and BetaEntity.
-    let (merged, _note_hits, per_backend) = coord
-        .fan_out_search("Entity", &ns, 20, false, None, None, &[])
-        .await;
+    let request = validated_kg_search(serde_json::json!({
+        "kind": "entity",
+        "query": "Entity",
+        "limit": 20,
+    }));
+    let (merged, _note_hits, per_backend) = coord.fan_out_search(&request, &ns).await;
 
     assert_eq!(per_backend.len(), 2, "T3: both backends in report");
     assert!(
@@ -890,10 +1025,12 @@ async fn fan_out_note_search_two_backends() {
     .await
     .expect("create note on lore");
 
-    // Note fan-out (search_notes=true).
-    let (_entity_hits, note_hits, per_backend) = coord
-        .fan_out_search("observation", &ns, 10, true, None, None, &[])
-        .await;
+    let request = validated_kg_search(serde_json::json!({
+        "kind": "note",
+        "query": "observation",
+        "limit": 10,
+    }));
+    let (_entity_hits, note_hits, per_backend) = coord.fan_out_search(&request, &ns).await;
 
     assert_eq!(per_backend.len(), 2, "both backends in report");
     assert!(per_backend.iter().all(|r| r.error.is_none()), "no errors");
@@ -956,10 +1093,13 @@ async fn fan_out_search_props_filter_drops_non_matching() {
     registry.register(BackendId::new("lore"), rt_lore);
     let coord = SubstrateCoordinator::new(registry);
 
-    let props = serde_json::json!({"status": "keep"});
-    let (hits, _note_hits, _per_backend) = coord
-        .fan_out_search("propsfiltertest", &ns, 10, false, None, Some(&props), &[])
-        .await;
+    let request = validated_kg_search(serde_json::json!({
+        "kind": "entity",
+        "query": "propsfiltertest",
+        "limit": 10,
+        "properties": {"status": "keep"},
+    }));
+    let (hits, _note_hits, _per_backend) = coord.fan_out_search(&request, &ns).await;
 
     let hit_ids: Vec<uuid::Uuid> = hits.iter().map(|h| h.entity_id).collect();
     assert!(
@@ -1018,10 +1158,13 @@ async fn fan_out_search_props_filter_before_truncation_semantics() {
 
     let coord = SubstrateCoordinator::single(rt);
 
-    let props = serde_json::json!({"keep": true});
-    let (hits, _note_hits, _per_backend) = coord
-        .fan_out_search("truncsemtest", &ns, 1, false, None, Some(&props), &[])
-        .await;
+    let request = validated_kg_search(serde_json::json!({
+        "kind": "entity",
+        "query": "truncsemtest",
+        "limit": 1,
+        "properties": {"keep": true},
+    }));
+    let (hits, _note_hits, _per_backend) = coord.fan_out_search(&request, &ns).await;
 
     let hit_ids: Vec<uuid::Uuid> = hits.iter().map(|h| h.entity_id).collect();
     assert_eq!(
@@ -1080,17 +1223,13 @@ async fn fan_out_search_tags_filter_drops_non_matching() {
     registry.register(BackendId::new("lore"), rt_lore);
     let coord = SubstrateCoordinator::new(registry);
 
-    let (hits, _note_hits, _per_backend) = coord
-        .fan_out_search(
-            "tagsfiltertest",
-            &ns,
-            10,
-            false,
-            None,
-            None,
-            &["target-tag".to_string()],
-        )
-        .await;
+    let request = validated_kg_search(serde_json::json!({
+        "kind": "entity",
+        "query": "tagsfiltertest",
+        "limit": 10,
+        "tags": ["target-tag"],
+    }));
+    let (hits, _note_hits, _per_backend) = coord.fan_out_search(&request, &ns).await;
 
     let hit_ids: Vec<uuid::Uuid> = hits.iter().map(|h| h.entity_id).collect();
     assert!(
@@ -1102,6 +1241,222 @@ async fn fan_out_search_tags_filter_drops_non_matching() {
         hit_ids.iter().all(|id| *id == tagged.id),
         "only the tagged entity should be returned; got {:?}",
         hit_ids
+    );
+}
+
+/// The validated entity request must preserve every supported entity filter
+/// through multi-backend fan-out. Each decoy violates exactly one filter.
+#[tokio::test]
+async fn fan_out_search_preserves_full_entity_filter_contract() {
+    let rt_main = memory_runtime();
+    let rt_lore = memory_runtime();
+    let ns = Namespace::local();
+    let tok_main = rt_main.authorize(ns.clone()).unwrap();
+    let tok_lore = rt_lore.authorize(ns.clone()).unwrap();
+
+    rt_main
+        .create_entity(
+            &tok_main,
+            "concept",
+            Some("algorithm"),
+            "FullEntityFilterWrongTag",
+            Some("fullentityfilter contract probe"),
+            Some(serde_json::json!({"scope": "keep"})),
+            vec!["other-tag".to_string()],
+        )
+        .await
+        .expect("create tag decoy");
+    rt_main
+        .create_entity(
+            &tok_main,
+            "concept",
+            Some("technique"),
+            "FullEntityFilterWrongType",
+            Some("fullentityfilter contract probe"),
+            Some(serde_json::json!({"scope": "keep"})),
+            vec!["entity-target".to_string()],
+        )
+        .await
+        .expect("create entity-type decoy");
+    rt_main
+        .create_entity(
+            &tok_main,
+            "document",
+            Some("paper"),
+            "FullEntityFilterWrongKind",
+            Some("fullentityfilter contract probe"),
+            Some(serde_json::json!({"scope": "keep"})),
+            vec!["entity-target".to_string()],
+        )
+        .await
+        .expect("create kind decoy");
+    rt_lore
+        .create_entity(
+            &tok_lore,
+            "concept",
+            Some("algorithm"),
+            "FullEntityFilterWrongProperties",
+            Some("fullentityfilter contract probe"),
+            Some(serde_json::json!({"scope": "drop"})),
+            vec!["entity-target".to_string()],
+        )
+        .await
+        .expect("create properties decoy");
+    let target = rt_lore
+        .create_entity(
+            &tok_lore,
+            "concept",
+            Some("algorithm"),
+            "FullEntityFilterTarget",
+            Some("fullentityfilter contract probe"),
+            Some(serde_json::json!({"scope": "keep", "extra": true})),
+            vec!["entity-target".to_string()],
+        )
+        .await
+        .expect("create matching entity");
+
+    let mut registry = BackendRegistry::new();
+    registry.register(BackendId::new("main"), rt_main);
+    registry.register(BackendId::new("lore"), rt_lore);
+    let coord = SubstrateCoordinator::new(registry);
+    let request = validated_kg_search(serde_json::json!({
+        "kind": "concept",
+        "query": "fullentityfilter",
+        "limit": 20,
+        "entity_kind": "concept",
+        "entity_type": "algorithm",
+        "properties": {"scope": "keep"},
+        "tags": ["entity-target"],
+    }));
+
+    let (hits, note_hits, per_backend) = coord.fan_out_search(&request, &ns).await;
+    let hit_ids: Vec<Uuid> = hits.iter().map(|hit| hit.entity_id).collect();
+    assert!(
+        note_hits.is_empty(),
+        "entity request cannot return note hits"
+    );
+    assert!(
+        per_backend.iter().all(|result| result.error.is_none()),
+        "both backends should search successfully: {per_backend:?}"
+    );
+    assert_eq!(
+        hit_ids,
+        vec![target.id],
+        "all entity filters must be applied before merge"
+    );
+}
+
+/// Note fan-out preserves granular/legacy kind reconciliation, supersession,
+/// properties, and tags as one canonical request across every backend.
+#[tokio::test]
+async fn fan_out_search_preserves_full_note_filter_contract() {
+    let rt_main = memory_runtime();
+    let rt_lore = memory_runtime();
+    let ns = Namespace::local();
+    let tok_main = rt_main.authorize(ns.clone()).unwrap();
+    let tok_lore = rt_lore.authorize(ns.clone()).unwrap();
+
+    rt_main
+        .create_note(
+            &tok_main,
+            "decision",
+            Some("wrong kind"),
+            "fullnotefilter contract probe",
+            Some(0.8),
+            Some(serde_json::json!({
+                "scope": "keep",
+                "tags": ["note-target"],
+            })),
+            vec![],
+        )
+        .await
+        .expect("create note-kind decoy");
+    let superseded = rt_lore
+        .create_note(
+            &tok_lore,
+            "observation",
+            Some("superseded target"),
+            "fullnotefilter contract probe",
+            Some(0.8),
+            Some(serde_json::json!({
+                "scope": "keep",
+                "tags": ["note-target"],
+                "extra": true,
+            })),
+            vec![],
+        )
+        .await
+        .expect("create superseded target note");
+    let replacement = rt_lore
+        .create_note(
+            &tok_lore,
+            "observation",
+            Some("replacement decoy"),
+            "fullnotefilter contract probe",
+            Some(0.8),
+            Some(serde_json::json!({
+                "scope": "drop",
+                "tags": ["other-tag"],
+            })),
+            vec![],
+        )
+        .await
+        .expect("create replacement note");
+    rt_lore
+        .link(
+            &tok_lore,
+            replacement.id,
+            superseded.id,
+            EdgeRelation::Supersedes,
+            1.0,
+            None,
+        )
+        .await
+        .expect("mark target note superseded");
+
+    let mut registry = BackendRegistry::new();
+    registry.register(BackendId::new("main"), rt_main);
+    registry.register(BackendId::new("lore"), rt_lore);
+    let coord = SubstrateCoordinator::new(registry);
+    let include_request = validated_kg_search(serde_json::json!({
+        "kind": "observation",
+        "query": "fullnotefilter",
+        "limit": 20,
+        "note_kind": "observation",
+        "include_superseded": true,
+        "properties": {"scope": "keep"},
+        "tags": ["note-target"],
+    }));
+
+    let (entity_hits, note_hits, per_backend) = coord.fan_out_search(&include_request, &ns).await;
+    let note_ids: Vec<Uuid> = note_hits.iter().map(|hit| hit.note_id).collect();
+    assert!(
+        entity_hits.is_empty(),
+        "note request cannot return entity hits"
+    );
+    assert!(
+        per_backend.iter().all(|result| result.error.is_none()),
+        "both backends should search successfully: {per_backend:?}"
+    );
+    assert_eq!(
+        note_ids,
+        vec![superseded.id],
+        "all note filters, including include_superseded, must reach fan-out"
+    );
+
+    let exclude_request = validated_kg_search(serde_json::json!({
+        "kind": "observation",
+        "query": "fullnotefilter",
+        "limit": 20,
+        "note_kind": "observation",
+        "include_superseded": false,
+        "properties": {"scope": "keep"},
+        "tags": ["note-target"],
+    }));
+    let (_entity_hits, note_hits, _per_backend) = coord.fan_out_search(&exclude_request, &ns).await;
+    assert!(
+        note_hits.is_empty(),
+        "the only matching note must be hidden when superseded notes are excluded"
     );
 }
 
@@ -1127,9 +1482,9 @@ fn two_backend_server(
     two_backend_server_with_packs(rt_a, rt_b, &["kg"])
 }
 
-/// Helper: build a two-backend server whose `VerbRegistry` (and the
-/// coordinator's note-kind substrate classification, #439) includes the given
-/// packs.
+/// Helper: build a two-backend server whose `VerbRegistry` includes the given
+/// packs. The validated request derives substrate classification from this
+/// same registry before it reaches the coordinator.
 fn two_backend_server_with_packs(
     rt_a: Arc<KhiveRuntime>,
     rt_b: Arc<KhiveRuntime>,
@@ -1137,18 +1492,11 @@ fn two_backend_server_with_packs(
 ) -> khive_mcp::server::KhiveMcpServer {
     // Build the VerbRegistry from rt_a (single runtime, given packs).
     let registry = packs_registry(Arc::clone(&rt_a), pack_names);
-    let note_kinds: std::collections::HashSet<String> = registry
-        .all_note_kinds()
-        .into_iter()
-        .map(str::to_string)
-        .collect();
-
     // Build a two-backend coordinator.
     let mut backend_reg = BackendRegistry::new();
     backend_reg.register(BackendId::new("alpha"), Arc::clone(&rt_a));
     backend_reg.register(BackendId::new("beta"), Arc::clone(&rt_b));
-    let coordinator =
-        SubstrateCoordinatorService::new(SubstrateCoordinator::new(backend_reg), note_kinds);
+    let coordinator = SubstrateCoordinatorService::new(SubstrateCoordinator::new(backend_reg));
 
     khive_mcp::server::KhiveMcpServer::from_registry_with_meta(
         registry,
@@ -1382,12 +1730,9 @@ async fn t7c_multi_backend_search_min_score_applied() {
 /// T7d (#439): multi-backend search for the `session` note kind must route to
 /// note FTS through the coordinator, not fall through to entity search.
 ///
-/// RED before fix: `is_note_substrate` was a hardcoded list omitting `session`,
-/// so `search(kind="session")` searched entity FTS with an entity-kind filter
-/// and never found the seeded session note.
-/// GREEN after fix: substrate classification is driven by the merged
-/// `VerbRegistry` note-kind set (installed on `SubstrateCoordinatorService`),
-/// so `session` (registered by `khive-pack-session`) routes to note FTS.
+/// The validated request resolves substrate classification against the merged
+/// `VerbRegistry`, so `session` (registered by `khive-pack-session`) reaches the
+/// coordinator as a note request and routes to note FTS.
 #[tokio::test]
 async fn t7d_multi_backend_search_session_kind_routes_to_note_substrate() {
     let rt_a = memory_runtime();
