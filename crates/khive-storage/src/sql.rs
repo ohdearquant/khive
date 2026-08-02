@@ -6,7 +6,7 @@ use std::pin::Pin;
 
 use async_trait::async_trait;
 
-use crate::types::{SqlRow, SqlStatement, SqlValue, StorageResult};
+use crate::types::{PageRequest, SqlRow, SqlStatement, SqlValue, StorageResult};
 
 /// A boxed future, borrowing from the `&mut dyn SqlWriter` an
 /// [`AtomicUnitOp`] is called with (see [`SqlAccess::atomic_unit`]).
@@ -32,9 +32,30 @@ pub type AtomicUnitOp = Box<
 #[async_trait]
 pub trait SqlReader: Send + 'static {
     /// Execute `statement` and return the first row, or `None` if the result set is empty.
+    /// Implementations must not convert later matching rows into owned values.
     async fn query_row(&mut self, statement: SqlStatement) -> StorageResult<Option<SqlRow>>;
     /// Execute `statement` and return all rows.
+    ///
+    /// This compatibility primitive has no result-size bound. Callers that do
+    /// not already constrain their SQL should use [`Self::query_page`].
     async fn query_all(&mut self, statement: SqlStatement) -> StorageResult<Vec<SqlRow>>;
+    /// Execute `statement` and return only the requested offset page.
+    ///
+    /// The default preserves source compatibility for alternate backends by
+    /// slicing [`Self::query_all`]. Backends should override this method when
+    /// they can stop row conversion at `page.limit`; khive-db's SQLite bridge
+    /// does so, bounding owned result materialization without rewriting the
+    /// caller's SQL.
+    async fn query_page(
+        &mut self,
+        statement: SqlStatement,
+        page: PageRequest,
+    ) -> StorageResult<Vec<SqlRow>> {
+        let rows = self.query_all(statement).await?;
+        let offset = usize::try_from(page.offset).unwrap_or(usize::MAX);
+        let limit = usize::try_from(page.limit).unwrap_or(usize::MAX);
+        Ok(rows.into_iter().skip(offset).take(limit).collect())
+    }
     /// Execute `statement` and return the first column of the first row as a scalar.
     async fn query_scalar(&mut self, statement: SqlStatement) -> StorageResult<Option<SqlValue>>;
     /// Run `EXPLAIN QUERY PLAN` for `statement` and return the plan rows.

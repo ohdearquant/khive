@@ -1,7 +1,7 @@
 //! SqlAccess bridge: connects `ConnectionPool` to `khive_storage::SqlAccess`.
 //!
 //! Two modes:
-//! - **File-backed**: Opens standalone connections per reader/writer call (high concurrency).
+//! - **File-backed**: Opens standalone connections per reader/writer handle under pool-wide caps.
 //!   Cross-statement atomicity goes through `atomic_unit`, which drives a single
 //!   registered raw transaction span rather than a caller-held per-tx connection.
 //! - **Memory**: Uses pool-backed approach (acquire pool connection per-query inside `spawn_blocking`).
@@ -12,8 +12,9 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use khive_storage::error::StorageError;
-use khive_storage::types::{SqlColumn, SqlRow, SqlStatement, SqlValue};
+use khive_storage::types::{PageRequest, SqlColumn, SqlRow, SqlStatement, SqlValue};
 use khive_storage::{AtomicUnitOp, StorageCapability};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::error::SqliteError;
 use crate::pool::ConnectionPool;
@@ -24,6 +25,9 @@ use crate::pool::ConnectionPool;
 
 /// Convert a rusqlite `Row` into an owned `SqlRow`.
 fn row_to_sql_row(row: &rusqlite::Row<'_>, col_count: usize, col_names: &[String]) -> SqlRow {
+    #[cfg(test)]
+    ROW_CONVERSIONS.with(|count| count.set(count.get() + 1));
+
     let mut columns = Vec::with_capacity(col_count);
     for i in 0..col_count {
         let value = match row.get_ref(i) {
@@ -42,6 +46,11 @@ fn row_to_sql_row(row: &rusqlite::Row<'_>, col_count: usize, col_names: &[String
         });
     }
     SqlRow { columns }
+}
+
+#[cfg(test)]
+thread_local! {
+    static ROW_CONVERSIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Bind `SqlValue` parameters to a rusqlite statement.
@@ -97,9 +106,74 @@ fn execute_query(
     Ok(rows)
 }
 
+fn execute_query_row(
+    conn: &rusqlite::Connection,
+    statement: &SqlStatement,
+) -> Result<Option<SqlRow>, rusqlite::Error> {
+    let mut stmt = conn.prepare(&statement.sql)?;
+    bind_params(&mut stmt, &statement.params)?;
+
+    let col_count = stmt.column_count();
+    let col_names: Vec<String> = (0..col_count)
+        .map(|i| stmt.column_name(i).unwrap_or("").to_string())
+        .collect();
+
+    let mut raw_rows = stmt.raw_query();
+    Ok(raw_rows
+        .next()?
+        .map(|row| row_to_sql_row(row, col_count, &col_names)))
+}
+
+fn execute_query_page(
+    conn: &rusqlite::Connection,
+    statement: &SqlStatement,
+    page: &PageRequest,
+) -> Result<Vec<SqlRow>, rusqlite::Error> {
+    let mut stmt = conn.prepare(&statement.sql)?;
+    bind_params(&mut stmt, &statement.params)?;
+
+    let col_count = stmt.column_count();
+    let col_names: Vec<String> = (0..col_count)
+        .map(|i| stmt.column_name(i).unwrap_or("").to_string())
+        .collect();
+
+    let mut rows = Vec::new();
+    let mut offset = page.offset;
+    let mut remaining = u64::from(page.limit);
+    let mut raw_rows = stmt.raw_query();
+    while remaining > 0 {
+        let Some(row) = raw_rows.next()? else {
+            break;
+        };
+        if offset > 0 {
+            offset -= 1;
+            continue;
+        }
+        rows.push(row_to_sql_row(row, col_count, &col_names));
+        remaining -= 1;
+    }
+    Ok(rows)
+}
+
 /// Map a rusqlite error to `StorageError`.
 fn map_rusqlite_err(e: rusqlite::Error, op: &'static str) -> StorageError {
     StorageError::driver(StorageCapability::Sql, op, e)
+}
+
+async fn acquire_handle_slot(
+    slots: Arc<Semaphore>,
+    timeout: std::time::Duration,
+    operation: &'static str,
+) -> Result<OwnedSemaphorePermit, StorageError> {
+    tokio::time::timeout(timeout, slots.acquire_owned())
+        .await
+        .map_err(|_| StorageError::Timeout {
+            operation: operation.into(),
+        })?
+        .map_err(|error| StorageError::Pool {
+            operation: operation.into(),
+            message: error.to_string(),
+        })
 }
 
 // =============================================================================
@@ -160,8 +234,15 @@ fn open_standalone_writer(pool: &ConnectionPool) -> Result<rusqlite::Connection,
 // File-backed: SqliteReader (standalone connection)
 // =============================================================================
 
+struct StandaloneHandle {
+    conn: rusqlite::Connection,
+    /// Travels into every blocking closure with `conn`, so cancelling the
+    /// awaiting task cannot release the cap while SQLite is still running.
+    _slot: OwnedSemaphorePermit,
+}
+
 struct SqliteReader {
-    conn: Option<rusqlite::Connection>,
+    handle: Option<StandaloneHandle>,
 }
 
 #[async_trait]
@@ -170,37 +251,55 @@ impl khive_storage::SqlReader for SqliteReader {
         &mut self,
         statement: SqlStatement,
     ) -> khive_storage::types::StorageResult<Option<SqlRow>> {
-        let conn = self.conn.take().ok_or_else(|| StorageError::Pool {
+        let handle = self.handle.take().ok_or_else(|| StorageError::Pool {
             operation: "query_row".into(),
             message: "connection already consumed".into(),
         })?;
-        let (conn, result) = tokio::task::spawn_blocking(move || {
-            let res = execute_query(&conn, &statement);
-            (conn, res)
+        let (handle, result) = tokio::task::spawn_blocking(move || {
+            let res = execute_query_row(&handle.conn, &statement);
+            (handle, res)
         })
         .await
         .map_err(|e| StorageError::driver(StorageCapability::Sql, "query_row", e))?;
-        self.conn = Some(conn);
-        let rows = result.map_err(|e| map_rusqlite_err(e, "query_row"))?;
-        Ok(rows.into_iter().next())
+        self.handle = Some(handle);
+        result.map_err(|e| map_rusqlite_err(e, "query_row"))
     }
 
     async fn query_all(
         &mut self,
         statement: SqlStatement,
     ) -> khive_storage::types::StorageResult<Vec<SqlRow>> {
-        let conn = self.conn.take().ok_or_else(|| StorageError::Pool {
+        let handle = self.handle.take().ok_or_else(|| StorageError::Pool {
             operation: "query_all".into(),
             message: "connection already consumed".into(),
         })?;
-        let (conn, result) = tokio::task::spawn_blocking(move || {
-            let res = execute_query(&conn, &statement);
-            (conn, res)
+        let (handle, result) = tokio::task::spawn_blocking(move || {
+            let res = execute_query(&handle.conn, &statement);
+            (handle, res)
         })
         .await
         .map_err(|e| StorageError::driver(StorageCapability::Sql, "query_all", e))?;
-        self.conn = Some(conn);
+        self.handle = Some(handle);
         result.map_err(|e| map_rusqlite_err(e, "query_all"))
+    }
+
+    async fn query_page(
+        &mut self,
+        statement: SqlStatement,
+        page: PageRequest,
+    ) -> khive_storage::types::StorageResult<Vec<SqlRow>> {
+        let handle = self.handle.take().ok_or_else(|| StorageError::Pool {
+            operation: "query_page".into(),
+            message: "connection already consumed".into(),
+        })?;
+        let (handle, result) = tokio::task::spawn_blocking(move || {
+            let res = execute_query_page(&handle.conn, &statement, &page);
+            (handle, res)
+        })
+        .await
+        .map_err(|e| StorageError::driver(StorageCapability::Sql, "query_page", e))?;
+        self.handle = Some(handle);
+        result.map_err(|e| map_rusqlite_err(e, "query_page"))
     }
 
     async fn query_scalar(
@@ -229,7 +328,9 @@ impl khive_storage::SqlReader for SqliteReader {
 // =============================================================================
 
 struct SqliteWriter {
-    conn: Option<rusqlite::Connection>,
+    /// Taken into every standalone blocking closure as one resource;
+    /// writer-task calls leave it resident because they use the task's connection.
+    handle: Option<StandaloneHandle>,
     /// ADR-067 Component A: when the write queue is enabled, `execute_batch`
     /// routes the whole caller-supplied statement list through the
     /// single-writer task instead of opening its own `BEGIN IMMEDIATE` on
@@ -247,37 +348,55 @@ impl khive_storage::SqlReader for SqliteWriter {
         &mut self,
         statement: SqlStatement,
     ) -> khive_storage::types::StorageResult<Option<SqlRow>> {
-        let conn = self.conn.take().ok_or_else(|| StorageError::Pool {
+        let handle = self.handle.take().ok_or_else(|| StorageError::Pool {
             operation: "writer.query_row".into(),
             message: "connection already consumed".into(),
         })?;
-        let (conn, result) = tokio::task::spawn_blocking(move || {
-            let res = execute_query(&conn, &statement);
-            (conn, res)
+        let (handle, result) = tokio::task::spawn_blocking(move || {
+            let res = execute_query_row(&handle.conn, &statement);
+            (handle, res)
         })
         .await
         .map_err(|e| StorageError::driver(StorageCapability::Sql, "writer.query_row", e))?;
-        self.conn = Some(conn);
-        let rows = result.map_err(|e| map_rusqlite_err(e, "writer.query_row"))?;
-        Ok(rows.into_iter().next())
+        self.handle = Some(handle);
+        result.map_err(|e| map_rusqlite_err(e, "writer.query_row"))
     }
 
     async fn query_all(
         &mut self,
         statement: SqlStatement,
     ) -> khive_storage::types::StorageResult<Vec<SqlRow>> {
-        let conn = self.conn.take().ok_or_else(|| StorageError::Pool {
+        let handle = self.handle.take().ok_or_else(|| StorageError::Pool {
             operation: "writer.query_all".into(),
             message: "connection already consumed".into(),
         })?;
-        let (conn, result) = tokio::task::spawn_blocking(move || {
-            let res = execute_query(&conn, &statement);
-            (conn, res)
+        let (handle, result) = tokio::task::spawn_blocking(move || {
+            let res = execute_query(&handle.conn, &statement);
+            (handle, res)
         })
         .await
         .map_err(|e| StorageError::driver(StorageCapability::Sql, "writer.query_all", e))?;
-        self.conn = Some(conn);
+        self.handle = Some(handle);
         result.map_err(|e| map_rusqlite_err(e, "writer.query_all"))
+    }
+
+    async fn query_page(
+        &mut self,
+        statement: SqlStatement,
+        page: PageRequest,
+    ) -> khive_storage::types::StorageResult<Vec<SqlRow>> {
+        let handle = self.handle.take().ok_or_else(|| StorageError::Pool {
+            operation: "writer.query_page".into(),
+            message: "connection already consumed".into(),
+        })?;
+        let (handle, result) = tokio::task::spawn_blocking(move || {
+            let res = execute_query_page(&handle.conn, &statement, &page);
+            (handle, res)
+        })
+        .await
+        .map_err(|e| StorageError::driver(StorageCapability::Sql, "writer.query_page", e))?;
+        self.handle = Some(handle);
+        result.map_err(|e| map_rusqlite_err(e, "writer.query_page"))
     }
 
     async fn query_scalar(
@@ -309,7 +428,7 @@ impl khive_storage::SqlWriter for SqliteWriter {
     ) -> khive_storage::types::StorageResult<u64> {
         // ADR-067 Component A (Fork C slice 2): a single statement is
         // self-contained, just like `execute_batch`'s full statement list —
-        // route it through the writer task when available. `self.conn` is
+        // route it through the writer task when available. `self.handle` is
         // left untouched so a subsequent `execute`/`execute_script` call on
         // this same handle still works over the standalone connection.
         if let Some(writer_task) = self.writer_task.clone() {
@@ -328,21 +447,21 @@ impl khive_storage::SqlWriter for SqliteWriter {
                 .await;
         }
 
-        let conn = self.conn.take().ok_or_else(|| StorageError::Pool {
+        let handle = self.handle.take().ok_or_else(|| StorageError::Pool {
             operation: "execute".into(),
             message: "connection already consumed".into(),
         })?;
-        let (conn, result) = tokio::task::spawn_blocking(move || {
+        let (handle, result) = tokio::task::spawn_blocking(move || {
             let res = (|| -> Result<usize, rusqlite::Error> {
-                let mut stmt = conn.prepare_cached(&statement.sql)?;
+                let mut stmt = handle.conn.prepare_cached(&statement.sql)?;
                 bind_params(&mut stmt, &statement.params)?;
                 stmt.raw_execute()
             })();
-            (conn, res)
+            (handle, res)
         })
         .await
         .map_err(|e| StorageError::driver(StorageCapability::Sql, "execute", e))?;
-        self.conn = Some(conn);
+        self.handle = Some(handle);
         let affected = result.map_err(|e| map_rusqlite_err(e, "execute"))?;
         Ok(affected as u64)
     }
@@ -355,7 +474,7 @@ impl khive_storage::SqlWriter for SqliteWriter {
         // list is supplied up front and the whole thing commits or rolls back
         // as one unit) — unlike `writer()`'s live incrementally-driven handle,
         // it maps cleanly onto a single `WriteRequest`. Route it through the
-        // writer task when available; `self.conn` is left untouched so a
+        // writer task when available; `self.handle` is left untouched so a
         // subsequent `execute`/`execute_script` call on this same handle still
         // works over the standalone connection (that dispatch is unmigrated —
         // see `SqlBridge::writer()`).
@@ -379,14 +498,14 @@ impl khive_storage::SqlWriter for SqliteWriter {
                 .await;
         }
 
-        let conn = self.conn.take().ok_or_else(|| StorageError::Pool {
+        let handle = self.handle.take().ok_or_else(|| StorageError::Pool {
             operation: "execute_batch".into(),
             message: "connection already consumed".into(),
         })?;
         let origin = self.origin.clone();
-        let (conn, result) = tokio::task::spawn_blocking(move || {
-            if let Err(e) = conn.execute_batch("BEGIN IMMEDIATE") {
-                return (conn, Err(e));
+        let (handle, result) = tokio::task::spawn_blocking(move || {
+            if let Err(e) = handle.conn.execute_batch("BEGIN IMMEDIATE") {
+                return (handle, Err(e));
             }
             // Registered only after BEGIN succeeds, so an unopened transaction is
             // never counted. The handle is declared here — enclosing both the
@@ -400,22 +519,22 @@ impl khive_storage::SqlWriter for SqliteWriter {
             let result = (|| -> Result<u64, rusqlite::Error> {
                 let mut total: u64 = 0;
                 for statement in &statements {
-                    let mut stmt = conn.prepare(&statement.sql)?;
+                    let mut stmt = handle.conn.prepare(&statement.sql)?;
                     bind_params(&mut stmt, &statement.params)?;
                     total += stmt.raw_execute()? as u64;
                 }
-                conn.execute_batch("COMMIT")?;
+                handle.conn.execute_batch("COMMIT")?;
                 Ok(total)
             })();
             if result.is_err() {
-                let _ = conn.execute_batch("ROLLBACK");
+                let _ = handle.conn.execute_batch("ROLLBACK");
             }
             // `_tx_handle` drops here, after ROLLBACK (or COMMIT) has already run.
-            (conn, result)
+            (handle, result)
         })
         .await
         .map_err(|e| StorageError::driver(StorageCapability::Sql, "execute_batch", e))?;
-        self.conn = Some(conn);
+        self.handle = Some(handle);
         result.map_err(|e| map_rusqlite_err(e, "execute_batch"))
     }
 
@@ -423,7 +542,7 @@ impl khive_storage::SqlWriter for SqliteWriter {
         // ADR-067 Component A (Fork C slice 2): the script text is
         // self-contained (supplied up front, runs as one unit), just like
         // `execute_batch` — route it through the writer task when
-        // available. `self.conn` is left untouched so a subsequent
+        // available. `self.handle` is left untouched so a subsequent
         // `execute`/`execute_script` call on this same handle still works
         // over the standalone connection. Callers must supply a DML-only
         // script (no bare `BEGIN`/`COMMIT`/`ROLLBACK`) on the flag-on path,
@@ -438,17 +557,17 @@ impl khive_storage::SqlWriter for SqliteWriter {
                 .await;
         }
 
-        let conn = self.conn.take().ok_or_else(|| StorageError::Pool {
+        let handle = self.handle.take().ok_or_else(|| StorageError::Pool {
             operation: "execute_script".into(),
             message: "connection already consumed".into(),
         })?;
-        let (conn, result) = tokio::task::spawn_blocking(move || {
-            let res = conn.execute_batch(&script);
-            (conn, res)
+        let (handle, result) = tokio::task::spawn_blocking(move || {
+            let res = handle.conn.execute_batch(&script);
+            (handle, res)
         })
         .await
         .map_err(|e| StorageError::driver(StorageCapability::Sql, "execute_script", e))?;
-        self.conn = Some(conn);
+        self.handle = Some(handle);
         result.map_err(|e| map_rusqlite_err(e, "execute_script"))
     }
 
@@ -475,17 +594,17 @@ impl khive_storage::SqlWriter for SqliteWriter {
         // Flag off / no writer task: identical to `execute_script`'s own
         // flag-off path — a bare `execute_batch` on the standalone
         // connection, already transaction-free.
-        let conn = self.conn.take().ok_or_else(|| StorageError::Pool {
+        let handle = self.handle.take().ok_or_else(|| StorageError::Pool {
             operation: "execute_script_top_level".into(),
             message: "connection already consumed".into(),
         })?;
-        let (conn, result) = tokio::task::spawn_blocking(move || {
-            let res = conn.execute_batch(&script);
-            (conn, res)
+        let (handle, result) = tokio::task::spawn_blocking(move || {
+            let res = handle.conn.execute_batch(&script);
+            (handle, res)
         })
         .await
         .map_err(|e| StorageError::driver(StorageCapability::Sql, "execute_script_top_level", e))?;
-        self.conn = Some(conn);
+        self.handle = Some(handle);
         result.map_err(|e| map_rusqlite_err(e, "execute_script_top_level"))
     }
 }
@@ -509,9 +628,8 @@ impl khive_storage::SqlReader for PoolBackedReader {
             let guard = pool
                 .reader()
                 .map_err(|e| StorageError::driver(StorageCapability::Sql, "pool_reader", e))?;
-            let rows = execute_query(&guard, &statement)
-                .map_err(|e| map_rusqlite_err(e, "pool_reader.query_row"))?;
-            Ok(rows.into_iter().next())
+            execute_query_row(&guard, &statement)
+                .map_err(|e| map_rusqlite_err(e, "pool_reader.query_row"))
         })
         .await
         .map_err(|e| StorageError::driver(StorageCapability::Sql, "pool_reader.query_row", e))?
@@ -531,6 +649,23 @@ impl khive_storage::SqlReader for PoolBackedReader {
         })
         .await
         .map_err(|e| StorageError::driver(StorageCapability::Sql, "pool_reader.query_all", e))?
+    }
+
+    async fn query_page(
+        &mut self,
+        statement: SqlStatement,
+        page: PageRequest,
+    ) -> khive_storage::types::StorageResult<Vec<SqlRow>> {
+        let pool = Arc::clone(&self.pool);
+        tokio::task::spawn_blocking(move || {
+            let guard = pool
+                .reader()
+                .map_err(|e| StorageError::driver(StorageCapability::Sql, "pool_reader", e))?;
+            execute_query_page(&guard, &statement, &page)
+                .map_err(|e| map_rusqlite_err(e, "pool_reader.query_page"))
+        })
+        .await
+        .map_err(|e| StorageError::driver(StorageCapability::Sql, "pool_reader.query_page", e))?
     }
 
     async fn query_scalar(
@@ -569,9 +704,8 @@ impl khive_storage::SqlReader for PoolBackedWriter {
             let guard = pool.try_writer().map_err(|e: SqliteError| {
                 StorageError::driver(StorageCapability::Sql, "pool_writer.query_row", e)
             })?;
-            let rows = execute_query(&guard, &statement)
-                .map_err(|e| map_rusqlite_err(e, "pool_writer.query_row"))?;
-            Ok(rows.into_iter().next())
+            execute_query_row(&guard, &statement)
+                .map_err(|e| map_rusqlite_err(e, "pool_writer.query_row"))
         })
         .await
         .map_err(|e| StorageError::driver(StorageCapability::Sql, "pool_writer.query_row", e))?
@@ -591,6 +725,23 @@ impl khive_storage::SqlReader for PoolBackedWriter {
         })
         .await
         .map_err(|e| StorageError::driver(StorageCapability::Sql, "pool_writer.query_all", e))?
+    }
+
+    async fn query_page(
+        &mut self,
+        statement: SqlStatement,
+        page: PageRequest,
+    ) -> khive_storage::types::StorageResult<Vec<SqlRow>> {
+        let pool = Arc::clone(&self.pool);
+        tokio::task::spawn_blocking(move || {
+            let guard = pool.try_writer().map_err(|e: SqliteError| {
+                StorageError::driver(StorageCapability::Sql, "pool_writer.query_page", e)
+            })?;
+            execute_query_page(&guard, &statement, &page)
+                .map_err(|e| map_rusqlite_err(e, "pool_writer.query_page"))
+        })
+        .await
+        .map_err(|e| StorageError::driver(StorageCapability::Sql, "pool_writer.query_page", e))?
     }
 
     async fn query_scalar(
@@ -758,9 +909,8 @@ impl khive_storage::SqlReader for InlineWriter {
         &mut self,
         statement: SqlStatement,
     ) -> khive_storage::types::StorageResult<Option<SqlRow>> {
-        let rows = execute_query(self.conn(), &statement)
-            .map_err(|e| map_rusqlite_err(e, "inline.query_row"))?;
-        Ok(rows.into_iter().next())
+        execute_query_row(self.conn(), &statement)
+            .map_err(|e| map_rusqlite_err(e, "inline.query_row"))
     }
 
     async fn query_all(
@@ -768,6 +918,15 @@ impl khive_storage::SqlReader for InlineWriter {
         statement: SqlStatement,
     ) -> khive_storage::types::StorageResult<Vec<SqlRow>> {
         execute_query(self.conn(), &statement).map_err(|e| map_rusqlite_err(e, "inline.query_all"))
+    }
+
+    async fn query_page(
+        &mut self,
+        statement: SqlStatement,
+        page: PageRequest,
+    ) -> khive_storage::types::StorageResult<Vec<SqlRow>> {
+        execute_query_page(self.conn(), &statement, &page)
+            .map_err(|e| map_rusqlite_err(e, "inline.query_page"))
     }
 
     async fn query_scalar(
@@ -938,9 +1097,10 @@ async fn run_manual_atomic_unit(
 /// Bridges `ConnectionPool` to `khive_storage::SqlAccess`.
 ///
 /// Dispatches based on whether the pool is file-backed or in-memory:
-/// - File-backed: standalone connections per reader/writer call (high
-///   concurrency); atomic units drive a single registered raw transaction
-///   span instead of a caller-held per-tx connection.
+/// - File-backed: standalone connections per reader/writer handle, capped per
+///   pool at the effective reader count and one writer; atomic units drive a
+///   single registered raw transaction span instead of a caller-held per-tx
+///   connection.
 /// - In-memory: pool-backed connections per query (single shared connection).
 pub struct SqlBridge {
     pool: Arc<ConnectionPool>,
@@ -963,8 +1123,19 @@ impl khive_storage::SqlAccess for SqlBridge {
         &self,
     ) -> khive_storage::types::StorageResult<Box<dyn khive_storage::SqlReader>> {
         if self.is_file_backed {
+            let handle_slot = acquire_handle_slot(
+                self.pool.sql_bridge_reader_slots(),
+                self.pool.config().checkout_timeout,
+                "sql_bridge.reader_handle",
+            )
+            .await?;
             let conn = open_standalone_reader(&self.pool)?;
-            Ok(Box::new(SqliteReader { conn: Some(conn) }))
+            Ok(Box::new(SqliteReader {
+                handle: Some(StandaloneHandle {
+                    conn,
+                    _slot: handle_slot,
+                }),
+            }))
         } else {
             Ok(Box::new(PoolBackedReader {
                 pool: Arc::clone(&self.pool),
@@ -982,13 +1153,22 @@ impl khive_storage::SqlAccess for SqlBridge {
                     message: "backend is read-only".into(),
                 });
             }
+            let handle_slot = acquire_handle_slot(
+                self.pool.sql_bridge_writer_slots(),
+                self.pool.config().checkout_timeout,
+                "sql_bridge.writer_handle",
+            )
+            .await?;
             let conn = open_standalone_writer(&self.pool)?;
             // Best-effort: a lookup failure (no runtime context) degrades to the
             // standalone-connection path in `execute_batch` rather than failing
             // handle construction (mirrors every other migrated store).
             let writer_task = self.pool.writer_task_handle().ok().flatten();
             Ok(Box::new(SqliteWriter {
-                conn: Some(conn),
+                handle: Some(StandaloneHandle {
+                    conn,
+                    _slot: handle_slot,
+                }),
                 writer_task,
                 origin: self.pool.origin(),
             }))
@@ -1053,9 +1233,18 @@ impl khive_storage::SqlAccess for SqlBridge {
             // Flag-off (or no writer task available): manual
             // BEGIN IMMEDIATE/COMMIT/ROLLBACK on a standalone writer —
             // byte-for-byte the pre-ADR-067 shape.
+            let handle_slot = acquire_handle_slot(
+                self.pool.sql_bridge_writer_slots(),
+                self.pool.config().checkout_timeout,
+                "sql_bridge.atomic_unit_handle",
+            )
+            .await?;
             let conn = open_standalone_writer(&self.pool)?;
             let mut writer = SqliteWriter {
-                conn: Some(conn),
+                handle: Some(StandaloneHandle {
+                    conn,
+                    _slot: handle_slot,
+                }),
                 writer_task: None,
                 origin: self.pool.origin(),
             };
@@ -1077,7 +1266,279 @@ mod tests {
     use super::*;
     use crate::pool::PoolConfig;
     use khive_storage::types::{SqlStatement, SqlValue};
-    use khive_storage::SqlAccess as _;
+    use khive_storage::{SqlAccess as _, SqlReader as _};
+
+    struct NotifyOnDrop(Arc<tokio::sync::Notify>);
+
+    impl Drop for NotifyOnDrop {
+        fn drop(&mut self) {
+            self.0.notify_one();
+        }
+    }
+
+    fn blocking_progress_gate(
+        conn: &rusqlite::Connection,
+    ) -> (
+        Arc<tokio::sync::Notify>,
+        Arc<std::sync::Barrier>,
+        Arc<tokio::sync::Notify>,
+    ) {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let callback_entered = Arc::clone(&entered);
+        let release = Arc::new(std::sync::Barrier::new(2));
+        let callback_release = Arc::clone(&release);
+        let completed = Arc::new(tokio::sync::Notify::new());
+        let notify_on_drop = NotifyOnDrop(Arc::clone(&completed));
+        let blocked_once = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let callback_blocked_once = Arc::clone(&blocked_once);
+        conn.progress_handler(
+            1,
+            Some(move || {
+                let _keep_until_connection_drop = &notify_on_drop;
+                if !callback_blocked_once.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                    callback_entered.notify_one();
+                    callback_release.wait();
+                    return true;
+                }
+                false
+            }),
+        )
+        .unwrap();
+        (entered, release, completed)
+    }
+
+    fn progress_gate_statement() -> SqlStatement {
+        SqlStatement {
+            sql: "WITH RECURSIVE rows(value) AS (\
+                  SELECT 0 UNION ALL SELECT value + 1 FROM rows WHERE value < 999\
+                  ) SELECT SUM(value) FROM rows"
+                .into(),
+            params: vec![],
+            label: None,
+        }
+    }
+
+    #[test]
+    fn query_row_converts_only_the_first_matching_row() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        let statement = SqlStatement {
+            sql: "WITH RECURSIVE rows(value) AS (\
+                  SELECT 0 UNION ALL SELECT value + 1 FROM rows WHERE value < 99\
+                  ) SELECT value FROM rows ORDER BY value"
+                .into(),
+            params: vec![],
+            label: None,
+        };
+
+        ROW_CONVERSIONS.with(|count| count.set(0));
+        let row = execute_query_row(&conn, &statement).unwrap().unwrap();
+
+        assert!(matches!(row.get("value"), Some(SqlValue::Integer(0))));
+        ROW_CONVERSIONS.with(|count| assert_eq!(count.get(), 1));
+    }
+
+    #[test]
+    fn query_page_bounds_owned_rows_before_full_materialization() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        let statement = SqlStatement {
+            sql: "WITH RECURSIVE rows(value) AS (\
+                  SELECT 0 UNION ALL SELECT value + 1 FROM rows WHERE value < 99\
+                  ) SELECT value FROM rows ORDER BY value"
+                .into(),
+            params: vec![],
+            label: None,
+        };
+
+        ROW_CONVERSIONS.with(|count| count.set(0));
+        let rows = execute_query_page(
+            &conn,
+            &statement,
+            &PageRequest {
+                offset: 40,
+                limit: 3,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(rows.len(), 3);
+        assert!(matches!(rows[0].get("value"), Some(SqlValue::Integer(40))));
+        assert!(matches!(rows[2].get("value"), Some(SqlValue::Integer(42))));
+        ROW_CONVERSIONS.with(|count| assert_eq!(count.get(), 3));
+    }
+
+    #[tokio::test]
+    async fn file_bridge_caps_live_reader_and_writer_handles_per_pool() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = PoolConfig {
+            path: Some(dir.path().join("sql_bridge_handle_cap.db")),
+            max_readers: 2,
+            checkout_timeout: std::time::Duration::from_millis(20),
+            ..PoolConfig::default()
+        };
+        let pool = Arc::new(ConnectionPool::new(config).unwrap());
+        let bridge = SqlBridge::new(Arc::clone(&pool), true);
+        let second_bridge = SqlBridge::new(Arc::clone(&pool), true);
+
+        let reader_a = bridge.reader().await.unwrap();
+        let reader_b = second_bridge.reader().await.unwrap();
+        let reader_error = match second_bridge.reader().await {
+            Ok(_) => panic!("a third live reader handle exceeded the configured cap"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            reader_error,
+            StorageError::Timeout { ref operation }
+                if operation.as_ref() == "sql_bridge.reader_handle"
+        ));
+        drop((reader_a, reader_b));
+        let mut reader_after_release = bridge.reader().await.unwrap();
+        let page = reader_after_release
+            .query_page(
+                SqlStatement {
+                    sql: "WITH RECURSIVE rows(value) AS (\
+                          SELECT 0 UNION ALL SELECT value + 1 FROM rows WHERE value < 9\
+                          ) SELECT value FROM rows ORDER BY value"
+                        .into(),
+                    params: vec![],
+                    label: None,
+                },
+                PageRequest {
+                    offset: 7,
+                    limit: 2,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(page.len(), 2);
+        assert!(matches!(page[0].get("value"), Some(SqlValue::Integer(7))));
+        assert!(matches!(page[1].get("value"), Some(SqlValue::Integer(8))));
+        drop(reader_after_release);
+
+        let writer = bridge.writer().await.unwrap();
+        let writer_error = match second_bridge.writer().await {
+            Ok(_) => panic!("a second live writer handle exceeded the one-handle cap"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            writer_error,
+            StorageError::Timeout { ref operation }
+                if operation.as_ref() == "sql_bridge.writer_handle"
+        ));
+        drop(writer);
+        let writer_after_release = bridge.writer().await.unwrap();
+        drop(writer_after_release);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_reader_query_retains_slot_until_blocking_work_finishes() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = PoolConfig {
+            path: Some(dir.path().join("sql_bridge_cancelled_reader.db")),
+            max_readers: 1,
+            checkout_timeout: std::time::Duration::from_millis(250),
+            ..PoolConfig::default()
+        };
+        let pool = Arc::new(ConnectionPool::new(config).unwrap());
+        let bridge = SqlBridge::new(Arc::clone(&pool), true);
+
+        let handle_slot = pool
+            .sql_bridge_reader_slots()
+            .acquire_owned()
+            .await
+            .unwrap();
+        let conn = open_standalone_reader(&pool).unwrap();
+        let (entered, release, completed) = blocking_progress_gate(&conn);
+        let mut reader = SqliteReader {
+            handle: Some(StandaloneHandle {
+                conn,
+                _slot: handle_slot,
+            }),
+        };
+        let query = tokio::spawn(async move { reader.query_all(progress_gate_statement()).await });
+
+        entered.notified().await;
+        query.abort();
+        let cancelled = matches!(query.await, Err(error) if error.is_cancelled());
+
+        let contender = bridge.reader().await;
+        let retained_slot = matches!(
+            &contender,
+            Err(StorageError::Timeout { operation })
+                if operation.as_ref() == "sql_bridge.reader_handle"
+        );
+        drop(contender);
+
+        tokio::task::spawn_blocking(move || release.wait())
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), completed.notified())
+            .await
+            .expect("cancelled reader's detached SQLite call did not finish");
+        assert!(cancelled, "reader query task did not report cancellation");
+        assert!(
+            retained_slot,
+            "cancellation released the reader slot before SQLite stopped"
+        );
+        let reader_after_completion = bridge.reader().await.unwrap();
+        drop(reader_after_completion);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_writer_query_retains_slot_until_blocking_work_finishes() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = PoolConfig {
+            path: Some(dir.path().join("sql_bridge_cancelled_writer.db")),
+            checkout_timeout: std::time::Duration::from_millis(250),
+            ..PoolConfig::default()
+        };
+        let pool = Arc::new(ConnectionPool::new(config).unwrap());
+        let bridge = SqlBridge::new(Arc::clone(&pool), true);
+
+        let handle_slot = pool
+            .sql_bridge_writer_slots()
+            .acquire_owned()
+            .await
+            .unwrap();
+        let conn = open_standalone_writer(&pool).unwrap();
+        let (entered, release, completed) = blocking_progress_gate(&conn);
+        let mut writer = SqliteWriter {
+            handle: Some(StandaloneHandle {
+                conn,
+                _slot: handle_slot,
+            }),
+            writer_task: None,
+            origin: pool.origin(),
+        };
+        let query = tokio::spawn(async move {
+            khive_storage::SqlReader::query_all(&mut writer, progress_gate_statement()).await
+        });
+
+        entered.notified().await;
+        query.abort();
+        let cancelled = matches!(query.await, Err(error) if error.is_cancelled());
+
+        let contender = bridge.writer().await;
+        let retained_slot = matches!(
+            &contender,
+            Err(StorageError::Timeout { operation })
+                if operation.as_ref() == "sql_bridge.writer_handle"
+        );
+        drop(contender);
+
+        tokio::task::spawn_blocking(move || release.wait())
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), completed.notified())
+            .await
+            .expect("cancelled writer's detached SQLite call did not finish");
+        assert!(cancelled, "writer query task did not report cancellation");
+        assert!(
+            retained_slot,
+            "cancellation released the writer slot before SQLite stopped"
+        );
+        let writer_after_completion = bridge.writer().await.unwrap();
+        drop(writer_after_completion);
+    }
 
     /// ADR-067 Component A entry 10: with `KHIVE_WRITE_QUEUE=1`,
     /// `SqliteWriter::execute_batch` (reached via `SqlBridge::writer()`)

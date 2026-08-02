@@ -36,6 +36,24 @@ another test's entry being reported as "oldest", but it still shares the
 same `tx_registry` serial group as `checkpoint.rs`'s and `sql_bridge.rs`'s
 registry tests for defense-in-depth against cross-test interference.
 
+## Raw SQL bridge handle budget
+
+File-backed `SqlBridge` handles keep their standalone connection for the
+handle lifetime, preserving connection-local behavior across calls. The pool
+therefore owns two shared permit sets across every bridge constructed over it:
+reader handles are capped at the effective `max_readers` (with a minimum of
+one in degraded mode), and writer handles are capped at one. Acquisition waits
+only for `checkout_timeout` and then returns `StorageError::Timeout`. Dropping
+an idle boxed handle releases its permit. Once an operation has entered
+`spawn_blocking`, its connection and permit travel together; cancelling the
+awaiting task retains both until SQLite finishes and drops the resource, so a
+detached blocking call cannot escape the cap.
+
+The optional writer task owns its separate, fixed connection and is not a
+caller-held SQL bridge handle. Store-specific standalone connections are also
+outside this raw-SQL handle budget; their write ownership remains governed by
+ADR-067 and ADR-135.
+
 ### `writer_task_handle_fails_loud_without_tokio_runtime`
 
 ADR-067 Component A runtime-handle guard: `write_queue_enabled` is set but
