@@ -1,6 +1,6 @@
 # ADR-136: Fair write admission — execute the queue default-on pathway with production evidence
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date:** 2026-08-02
 - **Relates to:** ADR-135 (write scaling: demand before ownership — this record executes its
   F2 flip pathway), ADR-131 (admission control; Amendment 1 in ADR-135 defers its Decision 1
