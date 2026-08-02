@@ -201,6 +201,18 @@ impl Fts5TextSearch {
         if let Err(err) = &result {
             let msg = err.to_string();
             if msg.contains("locked") || msg.contains("busy") {
+                if self.is_file_backed {
+                    // Only the standalone-connection path: the pool-mutex
+                    // (`try_writer`) path's own timeout is already recorded
+                    // at `Site::PoolAdmission` inside `ConnectionPool::writer`
+                    // — emitting here too would double-count the same event.
+                    crate::timeout_sink::emit_timeout(
+                        &crate::timeout_sink::db_label(&self.pool),
+                        crate::timeout_sink::Site::StandaloneText,
+                        &msg,
+                        None,
+                    );
+                }
                 let open: Vec<String> = khive_storage::tx_registry::snapshot()
                     .into_iter()
                     .map(|(age, label)| {

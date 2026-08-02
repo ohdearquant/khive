@@ -22,7 +22,7 @@ const DEFAULT_WAL_AUTOCHECKPOINT_PAGES: u32 = 4000;
 const DEFAULT_JOURNAL_SIZE_LIMIT_BYTES: i64 = 67_108_864; // 64 MiB
 const DEFAULT_WRITE_QUEUE_CAPACITY: usize = 256;
 
-const TEST_HARNESS_ENV: &str = "KHIVE_TEST_HARNESS";
+pub(crate) const TEST_HARNESS_ENV: &str = "KHIVE_TEST_HARNESS";
 
 /// Configuration for the connection pool.
 #[derive(Clone, Debug)]
@@ -408,6 +408,15 @@ impl ConnectionPool {
                 .expect("reader queue must have capacity during pool initialization");
         }
 
+        // Best-effort, process-global: the first pool to boot in this
+        // process resolves the writer-timeout sink's log directory and
+        // spawns its heartbeat thread; every later pool's call here is a
+        // cheap no-op. See `crate::timeout_sink` module docs.
+        crate::timeout_sink::init(
+            pool.canonical_path().and_then(Path::parent),
+            &crate::timeout_sink::db_label(&pool),
+        );
+
         Ok(pool)
     }
 
@@ -479,10 +488,22 @@ impl ConnectionPool {
             .writer
             .try_lock_for(self.config.checkout_timeout)
             .ok_or_else(|| {
-                SqliteError::InvalidData(format!(
+                let message = format!(
                     "timed out after {:?} waiting for sqlite writer connection",
                     self.config.checkout_timeout
-                ))
+                );
+                crate::timeout_sink::emit_timeout(
+                    &crate::timeout_sink::db_label(self),
+                    crate::timeout_sink::Site::PoolAdmission,
+                    &message,
+                    Some(
+                        self.config
+                            .checkout_timeout
+                            .as_millis()
+                            .min(u128::from(u64::MAX)) as u64,
+                    ),
+                );
+                SqliteError::InvalidData(message)
             })?;
         Ok(WriterGuard {
             guard,
