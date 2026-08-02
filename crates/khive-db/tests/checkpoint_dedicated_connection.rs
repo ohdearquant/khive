@@ -1,6 +1,8 @@
 //! Reproducer for the checkpoint-isolation fix: `checkpoint_once` must run
-//! on its own dedicated connection and never contend with a concurrent
-//! caller's `pool.writer()` admission.
+//! on its own dedicated connection and a concurrent caller's `pool.writer()`
+//! ADMISSION must never queue behind it — even during an armed TRUNCATE.
+//! This is an admission guarantee, not a claim that TRUNCATE's own
+//! SQLite-level write-blocking window disappeared; see below.
 //!
 //! Pre-fix, `checkpoint_once` acquired the pool's writer mutex
 //! (`try_writer_nowait`) and held it across the whole tick: the PASSIVE pass
@@ -13,11 +15,21 @@
 //! evidence: 22+ caller-side admission timeouts on 2026-08-02 across the
 //! fleet, sustained bursts, against a persistent 64MiB WAL pinned by
 //! long-lived readers.
-//! `PRAGMA wal_checkpoint(PASSIVE)` takes SQLite's CKPT lock, not the WRITE
-//! lock — a writer can commit concurrently with a passive checkpoint: the
-//! pool-mutex serialization was an application-level constraint SQLite
-//! itself never required. This test proves the fixed design no longer
-//! imposes it.
+//!
+//! `PRAGMA wal_checkpoint(PASSIVE)` takes only SQLite's CKPT lock, not the
+//! WRITE lock — a writer can commit concurrently with a passive checkpoint.
+//! TRUNCATE additionally acquires SQLite's writer lock and still blocks new
+//! write transactions, on any connection, for up to `truncate_busy_timeout`
+//! while it waits on a pinning reader — that SQLite-level cost is unchanged
+//! by this fix. What the pre-fix design added on top was an
+//! application-level constraint SQLite itself never required: serializing
+//! checkpoint ADMISSION behind the pool's writer mutex, so a caller could not
+//! even be admitted to attempt its own write until the checkpoint tick
+//! (PASSIVE, or a busy-waiting TRUNCATE) released that mutex. This test
+//! arms TRUNCATE deliberately (see `TRUNCATE_BUSY` below) and asserts that
+//! `pool.writer()` is still admitted promptly during its busy-wait — proving
+//! the fixed design no longer imposes that admission-path constraint, not
+//! that TRUNCATE stopped blocking writes at the SQLite level.
 
 use khive_db::checkpoint::{checkpoint_once, TruncateState};
 use khive_db::{CheckpointConfig, ConnectionPool, PoolConfig};
@@ -172,10 +184,52 @@ fn checkpoint_once_does_not_block_a_concurrent_pool_writer_admission() {
         )
     });
 
-    // Thread B starts 500ms after A — safely inside A's TRUNCATE busy-wait
-    // window ([~tens of ms, ~2s]) on a pre-fix build, where that whole wait
-    // happened under the pool's writer mutex.
-    std::thread::sleep(Duration::from_millis(500));
+    // Observe, rather than time-guess, the moment thread A's TRUNCATE actually
+    // arms and starts holding SQLite's writer lock: a separate probe
+    // connection with `busy_timeout=0` attempts `BEGIN IMMEDIATE` in a tight
+    // poll. While no writer lock is held, the probe's own `BEGIN IMMEDIATE`
+    // succeeds immediately (and is rolled back to release it before the next
+    // attempt); the instant it instead fails with `SQLITE_BUSY`, that failure
+    // *is* the observation that thread A now holds the writer lock — not an
+    // inference from elapsed wall-clock time. Bounded by a 5s deadline so a
+    // TRUNCATE that never arms (a fixture regression) fails loudly instead of
+    // this test passing vacuously.
+    let probe = pool
+        .open_standalone_writer()
+        .expect("open the TRUNCATE-arming probe connection");
+    probe
+        .busy_timeout(Duration::ZERO)
+        .expect("set zero busy_timeout on the probe connection");
+
+    let handshake_deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match probe.execute_batch("BEGIN IMMEDIATE") {
+            Ok(()) => {
+                probe
+                    .execute_batch("ROLLBACK")
+                    .expect("release the probe's own BEGIN IMMEDIATE");
+            }
+            Err(rusqlite::Error::SqliteFailure(e, _))
+                if e.code == rusqlite::ErrorCode::DatabaseBusy =>
+            {
+                break;
+            }
+            Err(err) => panic!(
+                "probe's BEGIN IMMEDIATE failed with an unexpected error (expected \
+                 SQLITE_BUSY): {err:?}"
+            ),
+        }
+        if Instant::now() >= handshake_deadline {
+            panic!(
+                "fixture INVALID: TRUNCATE never armed within 5s — the probe's BEGIN \
+                 IMMEDIATE kept succeeding the whole time, meaning thread A's \
+                 checkpoint_once never held SQLite's writer lock; this test would \
+                 otherwise pass vacuously without ever observing the hold it exists to \
+                 reproduce"
+            );
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
 
     let writer_pool = Arc::clone(&pool);
     let start = Instant::now();

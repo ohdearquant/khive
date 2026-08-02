@@ -569,10 +569,10 @@ pub struct MetricsSnapshot {
     /// bring the WAL back below `warn_pages`; resets to 0 the next time an
     /// attempt clears it.
     pub wal_truncate_consecutive_failures: u64,
-    /// Total checkpoint ticks skipped because the writer mutex was busy
-    /// (ADR-091 checkpoint-pressure telemetry), across this process's
-    /// lifetime. `#[serde(default)]` so an older client decoding a newer
-    /// daemon's snapshot (or vice versa) does not fail.
+    /// Total checkpoint ticks skipped because the dedicated checkpoint
+    /// connection was unavailable (ADR-091 checkpoint-pressure telemetry),
+    /// across this process's lifetime. `#[serde(default)]` so an older client
+    /// decoding a newer daemon's snapshot (or vice versa) does not fail.
     #[serde(default)]
     pub wal_checkpoint_skipped_ticks: u64,
     /// Current consecutive-skip run length; 0 once the next tick is observed.

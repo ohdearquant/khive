@@ -8,10 +8,15 @@
 //! the last attempt (Plank 2); both run on the task's own dedicated
 //! standalone connection (`CheckpointConnection`), opened once at task
 //! startup and reused for every tick — `checkpoint_once` never checks out the
-//! pool's writer mutex at all, so a concurrent pool writer can never be
-//! blocked behind (or block) a checkpoint tick. `PRAGMA wal_checkpoint`
-//! itself takes SQLite's CKPT lock, not the WRITE lock, so this reflects
-//! actual SQLite lock semantics rather than an application-level convenience.
+//! pool's writer mutex at all, so a concurrent `pool.writer()` checkout can
+//! never queue behind a checkpoint tick's ADMISSION. That guarantee is
+//! admission-only: PASSIVE takes SQLite's CKPT lock, not the WRITE lock, so
+//! it never blocks writers at the SQLite level either — but TRUNCATE
+//! additionally acquires SQLite's writer lock and can still block a
+//! concurrent write transaction, on any connection, for up to
+//! `truncate_busy_timeout` while it waits on a pinning reader, exactly as
+//! before this connection split.
+//!
 //! If the dedicated connection is unavailable (never opened yet, or dropped
 //! after a prior tick's connection-level pragma failure), the tick reports
 //! `CheckpointTick::Skipped` and the next tick lazily reopens it — this is
@@ -1364,10 +1369,21 @@ impl Drop for CheckpointLifecycleEmitter {
 /// The checkpoint task's dedicated, long-lived standalone connection to the
 /// same database file — opened once at task startup and reused for every
 /// tick's PASSIVE (and, when armed, TRUNCATE) pragma. NEVER the pool's writer
-/// mutex: `PRAGMA wal_checkpoint` takes SQLite's CKPT lock, not the WRITE
-/// lock, so a concurrent pool writer can commit while a checkpoint runs on
-/// this connection — serializing the two through an application-level mutex
-/// (the pre-fix design) imposed contention SQLite itself does not require.
+/// mutex, which is what removes the pool-mutex ADMISSION path: a concurrent
+/// `pool.writer()` checkout no longer queues behind a checkpoint tick.
+///
+/// That removal is scoped to admission, not to SQLite-level blocking in
+/// general. `PRAGMA wal_checkpoint(PASSIVE)` takes only SQLite's CKPT lock,
+/// not the WRITE lock, so a concurrent writer can commit while a PASSIVE pass
+/// runs on this connection — true of PASSIVE specifically, not of TRUNCATE.
+/// TRUNCATE inherits RESTART semantics and additionally acquires SQLite's
+/// writer lock, so it can still block a concurrent write transaction, on any
+/// connection, for up to `truncate_busy_timeout` while it waits on a pinning
+/// reader — the same bounded cost that existed pre-fix, now paid on this
+/// dedicated connection instead of the pool writer. Serializing checkpoint
+/// admission behind the pool's writer mutex (the pre-fix design) imposed
+/// contention SQLite itself does not require; TRUNCATE's own SQLite-level
+/// write-blocking window is unaffected by that removal.
 ///
 /// `None` between ticks means the connection is unavailable (never opened
 /// yet, or dropped after a prior tick's connection-level pragma failure) —
@@ -1375,11 +1391,22 @@ impl Drop for CheckpointLifecycleEmitter {
 /// one. This is now the ONLY source of a `Skipped` tick.
 struct CheckpointConnection {
     conn: Option<rusqlite::Connection>,
+    /// Consecutive failed `open_standalone_writer` attempts since the last
+    /// successful open (or since task startup). Drives the WARN-once /
+    /// debug-thereafter log rate-limiting in `ensure_open`: a file-backed
+    /// pool that transiently loses its dedicated connection would otherwise
+    /// log a WARN on every tick (default 500ms) for as long as the outage
+    /// lasts, which for a read-only or in-memory pool — where the open can
+    /// never succeed — means permanent per-tick WARN spam.
+    consecutive_open_failures: u32,
 }
 
 impl CheckpointConnection {
     fn new() -> Self {
-        Self { conn: None }
+        Self {
+            conn: None,
+            consecutive_open_failures: 0,
+        }
     }
 
     /// Ensure a usable connection is open, lazily (re)opening from `pool`
@@ -1388,20 +1415,45 @@ impl CheckpointConnection {
     /// which applies the same pragmas (including `busy_timeout` from the pool
     /// config) as any other standalone connection. Returns `None` if opening
     /// fails — an in-memory pool (no on-disk file to open a second connection
-    /// against), a read-only pool, or a transient filesystem error — logging
-    /// once per failed attempt rather than every tick would require extra
-    /// state for no operational benefit at this cadence, so this logs each
-    /// time.
+    /// against), a read-only pool, or a transient filesystem error.
+    ///
+    /// Logging is rate-limited across a failure streak: the FIRST failure of
+    /// a streak logs at `warn!`, every subsequent identical failure (while
+    /// still failing) logs at `debug!` instead, and a successful open that
+    /// ends a streak logs one `info!` recovery line. Without this, a
+    /// permanently-unopenable pool (read-only or in-memory, selected by
+    /// `checkpoint_pool_for`) would WARN on every tick forever.
     fn ensure_open(&mut self, pool: &ConnectionPool) -> Option<&rusqlite::Connection> {
         if self.conn.is_none() {
             match pool.open_standalone_writer() {
-                Ok(conn) => self.conn = Some(conn),
+                Ok(conn) => {
+                    if self.consecutive_open_failures > 0 {
+                        tracing::info!(
+                            prior_consecutive_failures = self.consecutive_open_failures,
+                            "dedicated checkpoint connection opened successfully, ending a \
+                             failure streak"
+                        );
+                    }
+                    self.consecutive_open_failures = 0;
+                    self.conn = Some(conn);
+                }
                 Err(e) => {
-                    tracing::warn!(
-                        error = %e,
-                        "failed to open the dedicated checkpoint connection; \
-                         this tick is skipped and the open retried next tick"
-                    );
+                    if self.consecutive_open_failures == 0 {
+                        tracing::warn!(
+                            error = %e,
+                            "failed to open the dedicated checkpoint connection; \
+                             this tick is skipped and the open retried next tick"
+                        );
+                    } else {
+                        tracing::debug!(
+                            error = %e,
+                            consecutive_failures = self.consecutive_open_failures,
+                            "dedicated checkpoint connection still unavailable; \
+                             this tick is skipped and the open retried next tick"
+                        );
+                    }
+                    self.consecutive_open_failures =
+                        self.consecutive_open_failures.saturating_add(1);
                     return None;
                 }
             }

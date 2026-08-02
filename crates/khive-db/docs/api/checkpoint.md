@@ -58,8 +58,15 @@ WARNING; once WAL pressure reaches the much higher
 additionally attempt a bounded, rate-limited TRUNCATE under a deliberately
 shortened busy timeout — replacing what used to be a purely
 operator-scheduled manual step. Because TRUNCATE also now runs on the
-dedicated connection rather than the pool writer, its bounded busy-wait cost
-falls on that connection alone, never on a concurrent `pool.writer()` caller.
+dedicated connection rather than the pool writer, a concurrent
+`pool.writer()` checkout is no longer queued behind it — that is an
+ADMISSION-only guarantee. At the SQLite level TRUNCATE still additionally
+acquires SQLite's writer lock (RESTART semantics plus TRUNCATE's own
+exclusive step) and blocks new write transactions on every connection, this
+process or any other, for up to `truncate_busy_timeout` while it waits on a
+pinning reader — that bounded blocking window is unchanged by this
+connection split; see the ADR-091 Amendment 5 dedicated-connection section
+for the full admission-vs-SQLite-lock distinction.
 
 **Threshold-crossing WARN semantics**: both the `warn_pages` and
 `high_water_pages` warnings fire at most once per below→above crossing.

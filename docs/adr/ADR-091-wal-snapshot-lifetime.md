@@ -1135,12 +1135,26 @@ against), or dropped after a prior tick's connection-level pragma failure.
 `CheckpointConnection::ensure_open` lazily reopens on the next tick in that
 case; a dropped connection never crashes the task.
 
-**TRUNCATE's bounded blocking cost is unaffected in kind, only in which
-connection pays it.** TRUNCATE still inherits RESTART semantics and can block
-for up to `truncate_busy_timeout` waiting on active readers — that accepted,
-bounded cost (already governed by `truncate_busy_timeout` and the
-`truncate_min_interval` gate) now falls on the dedicated connection alone,
-never on a concurrent `pool.writer()` caller.
+**What actually changed is admission, not SQLite-level blocking — this
+distinction matters and must not be flattened.** The dedicated connection
+removes the pool-mutex ADMISSION path: a `pool.writer()` checkout no longer
+queues behind a checkpoint tick, because that tick no longer holds the pool's
+writer mutex at all. SQLite-level lock semantics are otherwise unchanged by
+this amendment: PASSIVE takes only the CKPT lock and never blocks writers, at
+the SQLite level, on any connection. TRUNCATE inherits RESTART semantics and
+*additionally* acquires SQLite's writer lock, blocking new write transactions
+on ALL connections — this process or any other, pool-checked-out or
+standalone — while it waits on pinning readers, bounded by
+`truncate_busy_timeout` (see
+[`sqlite3_wal_checkpoint_v2`](https://www.sqlite.org/c3ref/wal_checkpoint_v2.html)).
+So during an armed TRUNCATE, a concurrent caller is still ADMITTED promptly —
+that is what the reproducer in
+`crates/khive-db/tests/checkpoint_dedicated_connection.rs` asserts — but a
+write transaction it then attempts can still wait, at the SQLite level, for
+the bounded TRUNCATE window, exactly as before this amendment. "Never falls on
+a concurrent `pool.writer()` caller" is true of admission only; it must not be
+read, here or anywhere else in this document or the accompanying source, as a
+claim that TRUNCATE's SQLite-level write-blocking window disappeared.
 
 **What did not change.** Every counter, WARN-once threshold-crossing
 semantic, the tx-registry age sweep (Plank 1, including its running on a
