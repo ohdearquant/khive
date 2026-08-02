@@ -73,11 +73,17 @@ queue default to on.
 **ADR-135 (accepted) deferred that default** via its Amendment 1 to ADR-131: at its
 routing census, `SqlBridge` writes opened standalone connections without consulting the
 queue, and `with_writer_unmanaged` bypassed the queue unconditionally, so a default-on
-queue would have asserted a single-admission property the code did not have. F2 names the
-conditions under which the recommendation flips: strict routing (no request-path bypass),
-observable direct-writer violations, fail-closed queue spawn, explicit classification of
-non-request writers, and an A/B control on production-representative load showing queue-on
-lowers caller errors without hidden fallbacks.
+queue would have asserted a single-admission property the code did not have. F2 defers the
+flip until queue-enabled mode is strict, through five gates: queue-first
+`SqlBridge::writer` routing; removal or replacement of `with_writer_unmanaged` on runtime
+request paths; fail-closed behavior on queue **spawn or runtime** failure; direct-writer
+violations that are observable **and test-failing**; and explicit classification of
+startup, migrations, checkpointing, recovery, and maintenance writers. Default enablement
+additionally requires one release of production-representative evidence showing no
+direct-writer violations and no completion or recovery regression. F2's flip clause: an
+A/B control shows queue-on materially lowers caller errors without hidden fallbacks, while
+a route audit **and fault injection** prove that all accepted writes retain their result
+semantics.
 
 This ADR does not contradict that deferral. It records that the two triggering conditions
 have materially narrowed since the census, contributes the production failure evidence F2
@@ -151,9 +157,9 @@ that produced the cross-client collision — not synthetic-only load. The flip i
 on **all** of D1's gates, including the test-failing violation fixture and the telemetry
 additions, and executes when F2's condition is met: queue-on materially lowers caller
 errors (the five-second-cadence burst class disappears) without hidden fallbacks, a route
-audit confirms accepted writes retain their result semantics, and one release of
-production-representative evidence shows no direct-writer violations. Then
-`write_queue_enabled` defaults to `true` for file-backed pools.
+audit **and fault injection** prove that all accepted writes retain their result
+semantics, and one release of production-representative evidence shows no direct-writer
+violations. Then `write_queue_enabled` defaults to `true` for file-backed pools.
 
 ### D3 — Internal maintenance writers follow the dedicated-connection precedent
 
