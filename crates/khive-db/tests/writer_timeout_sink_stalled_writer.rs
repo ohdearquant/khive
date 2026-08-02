@@ -8,6 +8,13 @@
 //! `OnceLock` must still be unclaimed when this file's first pool boots, and
 //! this scenario needs its own process-wide `KHIVE_WRITER_TIMEOUT_SINK_WRITE_DELAY_MS`
 //! setting that would otherwise collide with any other test's sink config.
+//!
+//! This test is implementation-anchored: it exercises this specific
+//! design's heartbeat-vs-write timing using a delay knob only this
+//! implementation exposes. `writer_timeout_sink_stalled_fifo.rs` covers the
+//! same latency-bound claim with a design-agnostic fixture (a FIFO with no
+//! reader) that any implementation touching the sink file on a caller path
+//! would fail, not just this one.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};

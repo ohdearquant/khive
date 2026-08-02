@@ -50,6 +50,21 @@
 //! truncated at the last complete line, not as a parse failure for the whole
 //! file.
 //!
+//! A malformed trailing line is always the last line OF ITS FILE — that
+//! contract holds not just within one file-open lifetime but across process
+//! epochs too, because of one more rule: the writer thread never appends to
+//! a pre-existing regular file at its predictable path. On every open
+//! attempt it first checks whether something is already there; if it's a
+//! regular file (a poisoned fragment left by an earlier epoch of this same
+//! pid, e.g. after pid reuse, or by this process's own prior poisoned
+//! attempt) it is rotated out of the way to `writer_timeouts.<pid>.r<epoch
+//! millis>.ndjson` before a fresh file is created at the original path. A
+//! rotated file still matches the reader glob below and keeps its own
+//! terminal-fragment property; it just stops being the file this epoch
+//! writes to. Something at the path that is NOT a regular file (a FIFO,
+//! symlink, or device — an operator or test construct) is left untouched
+//! and opened as-is, never rotated.
+//!
 //! EVENT LOSS AT PROCESS EXIT IS EXPECTED AND SCOPED: an event that has been
 //! enqueued but not yet drained and written by the background writer thread
 //! is lost if the process exits before the next drain — there is no
@@ -116,6 +131,48 @@ const WRITE_DELAY_MS_OVERRIDE_ENV: &str = "KHIVE_WRITER_TIMEOUT_SINK_WRITE_DELAY
 /// PER-PROCESS" section for why this is not a single shared file.
 fn ndjson_file_name() -> String {
     format!("writer_timeouts.{}.ndjson", std::process::id())
+}
+
+/// Upper bound on rename-collision retries when rotating a pre-existing
+/// regular file out of the way (bumping the millisecond component each
+/// time) — bounded so a pathological run of same-millisecond collisions
+/// can't spin forever.
+const ROTATE_COLLISION_RETRIES: u32 = 16;
+
+/// If `path` currently names a regular file, rename it to
+/// `writer_timeouts.<pid>.r<epoch millis>.ndjson` in `dir` so a fresh file
+/// can be created at `path` without appending to whatever was already
+/// there — see the module docs' note on why a malformed line must stay the
+/// last line of its own file across process epochs, not just within one
+/// file-open lifetime. A no-op (`Ok`) if nothing is at `path`, or if
+/// something is there but is not a regular file (FIFO, symlink, device —
+/// an operator/test construct, deliberately left untouched and opened
+/// as-is by the caller). `Err` only on a real rename failure, which the
+/// caller treats as recoverable: skip opening this wakeup, retry the next.
+fn rotate_if_regular_file(path: &Path, dir: &Path) -> Result<(), ()> {
+    let is_regular_file = std::fs::symlink_metadata(path)
+        .map(|meta| meta.is_file())
+        .unwrap_or(false);
+    if !is_regular_file {
+        return Ok(());
+    }
+
+    let mut millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    for _ in 0..ROTATE_COLLISION_RETRIES {
+        let candidate = dir.join(format!(
+            "writer_timeouts.{}.r{millis}.ndjson",
+            std::process::id()
+        ));
+        if candidate.exists() {
+            millis += 1;
+            continue;
+        }
+        return std::fs::rename(path, &candidate).map_err(|_| ());
+    }
+    Err(())
 }
 
 /// Fallback log subdirectory, rooted at the database file's parent
@@ -386,6 +443,19 @@ impl AppendSink<File> {
             return;
         }
         let path = dir.join(ndjson_file_name());
+        // Never append to a file this process did not create in this
+        // epoch. A regular file already at this predictable path is a
+        // poisoned fragment from an earlier epoch (pid reuse, or this same
+        // process's own prior poisoned attempt) and must be rotated away
+        // first. A FIFO/symlink/device at this path is a deliberate
+        // operator or test construct (the stalled-writer FIFO fixture
+        // relies on exactly this: it is opened as-is, never rotated) and
+        // is left alone. A rotation failure is recoverable, same policy as
+        // an open failure: skip this wakeup, retry the next one — never
+        // fall through to appending the pre-existing file.
+        if rotate_if_regular_file(&path, dir).is_err() {
+            return;
+        }
         let opened = std::fs::create_dir_all(dir)
             .and_then(|_| OpenOptions::new().create(true).append(true).open(&path))
             .ok();
@@ -397,6 +467,48 @@ impl AppendSink<File> {
     fn sync(&self) {
         if let Some(file) = self.target.as_ref() {
             let _ = file.sync_data();
+        }
+    }
+}
+
+/// Best-effort retention window for `writer_timeouts.*.ndjson` files (both
+/// live per-process files and rotated `.rNNN.` fragments). Deliberately
+/// generous relative to the sink's own 24h "zero timeouts" acceptance
+/// window — this is headroom for slow-to-notice operational issues, not a
+/// long-term retention promise. A reader that needs history past this
+/// window must copy the files out before it elapses.
+const RETENTION_MAX_AGE: Duration = Duration::from_secs(14 * 24 * 60 * 60);
+
+/// One best-effort pass over `dir`, removing `writer_timeouts.*.ndjson`
+/// entries whose mtime is older than [`RETENTION_MAX_AGE`]. Owned entirely
+/// by the writer thread, run once at startup, so no database caller path
+/// and no other process ever pays for a directory scan. Per-entry errors
+/// (unreadable metadata, a file removed by a concurrent pruning run of
+/// another process) are ignored — a single bad entry must not abort the
+/// rest of the pass.
+fn prune_expired_sink_files(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let now = std::time::SystemTime::now();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !name.starts_with("writer_timeouts.") || !name.ends_with(".ndjson") {
+            continue;
+        }
+        let Ok(age) = entry
+            .metadata()
+            .and_then(|meta| meta.modified())
+            .and_then(|modified| {
+                now.duration_since(modified)
+                    .map_err(|e| std::io::Error::other(e.to_string()))
+            })
+        else {
+            continue;
+        };
+        if age > RETENTION_MAX_AGE {
+            let _ = std::fs::remove_file(entry.path());
         }
     }
 }
@@ -498,12 +610,27 @@ fn maybe_emit_heartbeat(
 }
 
 fn writer_thread_loop(
+    go: Receiver<()>,
     receiver: Receiver<QueuedEvent>,
     dir: PathBuf,
     db_identity: String,
     dropped: Arc<AtomicU64>,
     heartbeat_interval: Duration,
 ) {
+    // No filesystem effect without a published handle: `init` only sends
+    // this token after `SINK.set` confirms this thread's handle won the
+    // `OnceLock` race. On a lost race the sender is dropped without ever
+    // sending, this `recv` returns `Err`, and the thread exits having
+    // touched nothing on disk.
+    if go.recv().is_err() {
+        return;
+    }
+
+    // Retention is owned by the writer thread, run once per process
+    // lifetime, after the publication gate above and before the first
+    // file open — see `prune_expired_sink_files` and the module docs.
+    prune_expired_sink_files(&dir);
+
     let mut sink = AppendSink::<File>::new();
     sink.set_write_delay(write_delay_from_env());
     let mut last_heartbeat = Instant::now();
@@ -660,6 +787,7 @@ pub(crate) fn init(db_parent: Option<&Path>, db_identity: &str) {
 
     let heartbeat_interval = heartbeat_interval_from_env();
     let (sender, receiver) = mpsc::sync_channel::<QueuedEvent>(QUEUE_CAPACITY);
+    let (go_sender, go_receiver) = mpsc::sync_channel::<()>(1);
     let dropped = Arc::new(AtomicU64::new(0));
     let thread_dropped = Arc::clone(&dropped);
     let db_identity = db_identity.to_string();
@@ -672,11 +800,15 @@ pub(crate) fn init(db_parent: Option<&Path>, db_identity: &str) {
     // present, but its writer thread never actually started" — a later
     // pool booting in the same process (by which point the transient
     // exhaustion may have cleared) gets to retry `init` from scratch instead
-    // of inheriting a dead claim.
+    // of inheriting a dead claim. The spawned thread does no filesystem
+    // work of its own accord: it blocks on `go_receiver` until this
+    // function sends the go token below, so spawning it here has no
+    // observable effect until publication succeeds.
     let spawn_result = thread::Builder::new()
         .name("khive-writer-timeout-sink".to_string())
         .spawn(move || {
             writer_thread_loop(
+                go_receiver,
                 receiver,
                 dir,
                 db_identity,
@@ -688,11 +820,14 @@ pub(crate) fn init(db_parent: Option<&Path>, db_identity: &str) {
     if spawn_result.is_ok() {
         let handle = SinkHandle { sender, dropped };
         // On a lost `OnceLock` race (another pool's `init` call published
-        // first), `handle` — and with it `sender` — is simply dropped here.
-        // The thread spawned above sees its `receiver` disconnect on its
-        // next `recv_timeout` and exits; the pool that won the race already
-        // has its own thread running.
-        let _ = SINK.set(handle);
+        // first), `handle` — and with it `sender` — is simply dropped here,
+        // and `go_sender` below is never sent, only dropped. The thread
+        // spawned above sees its `go_receiver` error on its blocking `recv`
+        // and exits immediately, having done no filesystem work; the pool
+        // that won the race already has its own thread running.
+        if SINK.set(handle).is_ok() {
+            let _ = go_sender.send(());
+        }
     }
 }
 
