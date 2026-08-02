@@ -756,12 +756,14 @@ request(ops="gtd.assign(title=\"Ship API reference\", priority=\"p1\", assignee=
 
 ### `gtd.next` — Assertive
 
-List actionable tasks (status `next` or `active`) by priority.
+List actionable tasks (status `next` or `active`) by priority. By default, tasks with
+unfinished or structurally broken dependencies are omitted.
 
-| Param      | Type    | Required | Notes                    |
-| ---------- | ------- | -------- | ------------------------ |
-| `limit`    | integer | no       | Default 10.              |
-| `assignee` | string  | no       | Filter to this assignee. |
+| Param             | Type    | Required | Notes                                                                             |
+| ----------------- | ------- | -------- | --------------------------------------------------------------------------------- |
+| `limit`           | integer | no       | Default 10.                                                                       |
+| `assignee`        | string  | no       | Filter to this assignee.                                                          |
+| `include_blocked` | boolean | no       | Include blocked/broken candidates after ready work for diagnosis (default false). |
 
 ```
 request(ops="gtd.next(assignee=\"agent:docs\", limit=10)")
@@ -784,6 +786,10 @@ request(ops="gtd.complete(id=\"<task-id>\", result=\"shipped in PR #600\")")
 ### `gtd.tasks` — Assertive
 
 List tasks filtered by status, assignee, priority.
+
+Each task reports `dependency_state` (`ready`, `blocked`, or `broken`), `actionable`,
+and a `blocked_by` array whose entries carry a `state` of `pending`, `cancelled`,
+`soft_deleted`, `missing`, `invalid`, `different_namespace`, or `wrong_kind`.
 
 | Param      | Type    | Required | Notes                                                                                              |
 | ---------- | ------- | -------- | -------------------------------------------------------------------------------------------------- |
@@ -860,6 +866,11 @@ Recall memory notes with decay-aware hybrid ranking. Each hit carries resolved
 | `tags`              | array   | no       | Filter by `properties.tags`.                                              |
 | `tag_mode`          | string  | no       | `any` (default, OR) or `all` (AND).                                       |
 | `namespace`         | string  | no       | Exact-match read scope; absent uses the caller's visible namespace set.   |
+
+Each result carries `serve_attribution` (`profile`, `unattributed`, or
+`unspecified`). `profile` also carries `served_by_profile_id`; `unattributed`
+means a selected profile record was unreadable and downstream feedback must not
+fall back to a current binding/default.
 
 ```
 request(ops="memory.recall(query=\"ADR-016 DSL grammar\", limit=5, min_score=0.3)")
@@ -1026,14 +1037,15 @@ request(ops="brain.reset(profile_id=\"implementer-recall-v1\")")
 
 Emit a `FeedbackExplicit` event into the shared log.
 
-| Param                  | Type   | Required | Notes                                                                                                      |
-| ---------------------- | ------ | -------- | ---------------------------------------------------------------------------------------------------------- |
-| `target_id`            | uuid   | yes      | Memory note or entity the feedback applies to.                                                             |
-| `signal`               | string | yes      | Same signal set as `memory.feedback`.                                                                      |
-| `served_by_profile_id` | string | no       | Profile that served the rated result.                                                                      |
-| `section_signals`      | object | no       | Per-section signals for `knowledge_compose` profiles: `{"section_name": "useful"\|"not_useful"\|"wrong"}`. |
-| `scorer_run_id`        | string | no       | ADR-081 scorer-pass id; must pair with `serve_ledger_id`.                                                  |
-| `serve_ledger_id`      | string | no       | ADR-081 `brain_serve_ledger` row id; must pair with `scorer_run_id`.                                       |
+| Param                  | Type   | Required | Notes                                                                                                                                              |
+| ---------------------- | ------ | -------- | -------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `target_id`            | uuid   | yes      | Memory note or entity the feedback applies to.                                                                                                     |
+| `signal`               | string | yes      | Same signal set as `memory.feedback`.                                                                                                              |
+| `served_by_profile_id` | string | no       | Profile that served the rated result.                                                                                                              |
+| `serve_attribution`    | string | no       | `profile`\|`unattributed`\|`unspecified`; unattributed implicit feedback is forced to zero weight, while explicit/correction feedback is rejected. |
+| `section_signals`      | object | no       | Per-section signals for `knowledge_compose` profiles: `{"section_name": "useful"\|"not_useful"\|"wrong"}`.                                         |
+| `scorer_run_id`        | string | no       | ADR-081 scorer-pass id; must pair with `serve_ledger_id`.                                                                                          |
+| `serve_ledger_id`      | string | no       | ADR-081 `brain_serve_ledger` row id; must pair with `scorer_run_id`.                                                                               |
 
 ```
 request(ops="brain.feedback(target_id=\"<uuid>\", signal=\"useful\")")
@@ -1050,9 +1062,14 @@ to call right after `memory.recall` instead of hand-building `brain.feedback`.
 | `results`              | array  | yes      | Recall result objects; the first object's `id` is credited.            |
 | `signal`               | string | no       | Defaults to `implicit_positive`.                                       |
 | `served_by_profile_id` | string | no       | Profile that served the recall.                                        |
+| `serve_attribution`    | string | no       | Serve-time tri-state; otherwise copied from the first result.          |
 | `scorer_run_id`        | string | no       | Forwarded verbatim to `brain.feedback`; pairs with `serve_ledger_id`.  |
 | `serve_ledger_id`      | string | no       | Forwarded verbatim to `brain.feedback`; pairs with `scorer_run_id`.    |
 | `namespace`            | string | no       | Exact namespace for the event and posterior fold; invalid values fail. |
+
+Top-level serve-attribution fields are one pair and take precedence over the first
+result's pair. If neither top-level field is supplied, both fields are copied from the
+first result together.
 
 ```
 request(ops="memory.recall(query=\"x\", limit=5) | brain.auto_feedback(query=\"x\", results=[{\"id\": \"$prev.items[0].id\"}])")

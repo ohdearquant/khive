@@ -11,7 +11,7 @@ Does not cover storage, embedding, or retrieval engine internals.
 
 **Benchmarks:** `benches/fusion_bench.rs` — see `docs/benchmarks.md` for the ledger and run command
 
-**Last reviewed:** 2026-06-06
+**Last reviewed:** 2026-08-01
 
 ---
 
@@ -21,8 +21,8 @@ Does not cover storage, embedding, or retrieval engine internals.
   to score distribution differences between retrieval sources.
 - **Weighted**: Linear combination of per-source min-max normalized scores with configurable weights.
 - **Union**: Takes the maximum score per ID across all sources.
-- **VectorOnly**: Passes through vector search results without fusion (exactly one source required).
-- **KeywordOnly**: Passes through keyword search results without fusion (exactly one source required).
+- **VectorOnly**: Passes through source slot 0 without fusion; a lone source is authoritative.
+- **KeywordOnly**: Passes through source slot 1 without fusion; a lone source is authoritative.
 
 ---
 
@@ -104,18 +104,19 @@ any retriever, without rank-based aggregation.
 
 ## VectorOnly / KeywordOnly
 
-Passthrough strategies: exactly one source must be supplied. Supplying multiple sources is
-a wiring error; `fuse()` returns an empty vector in both debug and release builds so the
-error is detectable without panicking on caller input.
+Passthrough strategies select a positional source without changing its scores or order.
+With multiple sources, `VectorOnly` selects slot 0 and `KeywordOnly` selects slot 1.
+Two-arm hybrid callers therefore supply `[vector, keyword]`; other callers own and document
+their positional meaning. When only one source is supplied, it is authoritative for either
+passthrough strategy so a one-arm query does not disappear.
 
 ---
 
 ## `fuse()` dispatcher
 
 `fuse()` in `src/fuse.rs` is the main entry point. It accepts any `FusionStrategy`, delegates
-to the appropriate algorithm, then applies `top_k` truncation using a partial sort
-(`select_nth_unstable_by`) that is O(n) for partitioning and O(k log k) for the final sort.
-This avoids a full O(n log n) sort when `top_k << n`.
+to the appropriate algorithm, then takes the first `top_k` results from that algorithm's
+deterministically sorted output. Passthrough modes preserve the selected source's input order.
 
 Individual algorithm functions (`reciprocal_rank_fusion`, `weighted_fusion`, `union_fusion`)
 do not apply `top_k` truncation — they return the full fused list.
@@ -128,7 +129,8 @@ do not apply `top_k` truncation — they return the full fused list.
 | -------------------------------------------- | ------------------------------------------------------------- |
 | Empty sources                                | Returns empty vec                                             |
 | `top_k == 0`                                 | Returns empty vec                                             |
-| VectorOnly/KeywordOnly with multiple sources | Returns empty vec (wiring error)                              |
+| VectorOnly/KeywordOnly with multiple sources | Selects slot 0/slot 1, respectively                           |
+| VectorOnly/KeywordOnly with one source       | Returns that authoritative source unchanged                   |
 | All-zero or all-negative weights             | Falls back to equal weight distribution                       |
 | Non-finite weights in `weighted_fusion`      | Treated as 0.0 (lossy); use `try_normalize_weights` to reject |
 
@@ -158,7 +160,7 @@ let fused = fuse(
     vec![vector_results, keyword_results],
     &FusionStrategy::Rrf { k: 60 },
     5,
-);
+).unwrap();
 
 // doc_b appears in both sources → highest RRF score
 assert_eq!(fused[0].0, "doc_b");

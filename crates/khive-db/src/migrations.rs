@@ -129,6 +129,10 @@ const V13_UP: &str = include_str!("../sql/013-list-cursor-sequences.sql");
 
 const V14_UP: &str = include_str!("../sql/014-graph-edges-id-unique.sql");
 
+const V15_UP: &str = include_str!("../sql/015-serve-ledger-attribution.sql");
+
+const V16_UP: &str = include_str!("../sql/016-gtd-dependency-cycle-guards.sql");
+
 /// DDL for the `ann_write_log` delta table.
 ///
 /// Shared between migration V11 and the belt-and-suspenders creation in
@@ -222,6 +226,16 @@ pub const MIGRATIONS: &[VersionedMigration] = &[
         version: 14,
         name: "graph_edges_id_unique",
         up: V14_UP,
+    },
+    VersionedMigration {
+        version: 15,
+        name: "serve_ledger_attribution",
+        up: V15_UP,
+    },
+    VersionedMigration {
+        version: 16,
+        name: "gtd_dependency_cycle_guards",
+        up: V16_UP,
     },
 ];
 

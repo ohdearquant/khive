@@ -22,7 +22,7 @@ use khive_brain_core::derive_deterministic_weights;
 use khive_brain_core::BetaPosterior;
 use khive_brain_core::{
     ConsumerKind, FeedbackEventKind, ProfileBinding, ProfileLifecycle, ProfileRecord,
-    SectionPosteriorState, SectionType, DEFAULT_ESS_CAP,
+    SectionPosteriorState, SectionType, ServeAttribution, DEFAULT_ESS_CAP,
 };
 
 // ── Adapter revision sentinel ─────────────────────────────────────────────────
@@ -268,6 +268,12 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
                 description: "Profile ID that served the result being rated. Recorded in the event payload.",
             },
             khive_types::ParamDef {
+                name: "serve_attribution",
+                param_type: "string",
+                required: false,
+                description: "Serve-time attribution state: \"profile\" | \"unattributed\" | \"unspecified\". Unattributed implicit feedback is forced to zero weight; explicit/correction feedback is rejected. It never falls back to a binding/default profile.",
+            },
+            khive_types::ParamDef {
                 name: "section_signals",
                 param_type: "object",
                 required: false,
@@ -318,6 +324,12 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
                 param_type: "string",
                 required: false,
                 description: "Profile ID that served the recall. Defaults like brain.feedback.",
+            },
+            khive_types::ParamDef {
+                name: "serve_attribution",
+                param_type: "string",
+                required: false,
+                description: "Serve-time attribution state. Top-level attribution fields form one pair; when neither is supplied, both are copied from the first recall result.",
             },
             khive_types::ParamDef {
                 name: "scorer_run_id",
@@ -1384,6 +1396,7 @@ impl BrainPack {
             target_id: String,
             signal: String,
             served_by_profile_id: Option<String>,
+            serve_attribution: Option<ServeAttribution>,
             section_signals: Option<serde_json::Value>,
             // ADR-081 §6: scorer provenance, additive and optional. Must be
             // supplied together (validated just below) — one without the other
@@ -1433,6 +1446,10 @@ impl BrainPack {
                 )))
             }
         };
+        let is_gated_implicit = matches!(
+            FeedbackEventKind::from_signal_str(signal),
+            Some(FeedbackEventKind::ImplicitPositive) | Some(FeedbackEventKind::ImplicitNegative)
+        );
 
         // Resolve the target by UUID with no namespace filter (ADR-007 Rule 2 /
         // PR-A1: by-ID ops are namespace-agnostic; authorization is the Gate's,
@@ -1459,15 +1476,58 @@ impl BrainPack {
             }
         };
 
+        // Preserve the serve-time distinction between omitted attribution and
+        // explicit negative knowledge. Only the former may use the historical
+        // binding/default resolver. Legacy callers that send only a profile id
+        // remain attributed without needing the new marker.
+        let mut serve_attribution = p.serve_attribution.unwrap_or_else(|| {
+            if p.served_by_profile_id.is_some() {
+                ServeAttribution::Profile
+            } else {
+                ServeAttribution::Unspecified
+            }
+        });
+        match (serve_attribution, p.served_by_profile_id.as_deref()) {
+            (ServeAttribution::Profile, None) => {
+                return Err(RuntimeError::InvalidInput(
+                    "serve_attribution=\"profile\" requires served_by_profile_id".to_string(),
+                ));
+            }
+            (ServeAttribution::Unattributed | ServeAttribution::Unspecified, Some(_)) => {
+                return Err(RuntimeError::InvalidInput(format!(
+                    "serve_attribution=\"{}\" cannot include served_by_profile_id",
+                    serve_attribution.as_str()
+                )));
+            }
+            _ => {}
+        }
+
         // Compute the effective serving profile (explicit, else a matching
-        // actor+namespace binding, else the system default — #697), then
-        // perform a warm-state fast-path check that it exists and is not
-        // Archived. The persistence transaction repeats this against the
-        // authoritative rebased snapshot before writing any side effect.
-        let (effective_profile, profile_resolution) =
-            self.resolve_effective_feedback_profile(token, p.served_by_profile_id.as_deref());
-        let effective_profile = effective_profile.as_str();
-        {
+        // actor+namespace binding, else the system default — #697), unless the
+        // serve was explicitly unattributed, in which case there is no profile
+        // to resolve at all. Then perform a warm-state fast-path check that it
+        // exists and is not Archived; the persistence transaction repeats this
+        // against the authoritative rebased snapshot before writing any side
+        // effect on every path where a profile was actually resolved.
+        let (mut effective_profile, mut profile_resolution) =
+            if serve_attribution == ServeAttribution::Unattributed {
+                (None, "serve_unattributed")
+            } else {
+                let (profile_id, resolution) = self
+                    .resolve_effective_feedback_profile(token, p.served_by_profile_id.as_deref());
+                (Some(profile_id), resolution)
+            };
+
+        // Validate section_signals up front using the shared validator.
+        // Malformed input is rejected here rather than silently dropped during replay.
+        if let Some(ref ss) = p.section_signals {
+            crate::validate_section_signals(ss)?;
+        }
+
+        // Validate every profile selected by the normal resolver before any
+        // ledger fast path. A later null accounting profile may suppress its
+        // mutation, but must not turn an invalid explicit id into a valid call.
+        if let Some(effective_profile) = effective_profile.as_deref() {
             let state = self.state.lock().unwrap();
             match state.profiles.get(effective_profile) {
                 None => {
@@ -1486,19 +1546,13 @@ impl BrainPack {
             }
         }
 
-        // Validate section_signals up front using the shared validator.
-        // Malformed input is rejected here rather than silently dropped during replay.
-        if let Some(ref ss) = p.section_signals {
-            crate::validate_section_signals(ss)?;
-        }
-
         let sql = self.runtime.sql();
         let now_us = Utc::now().timestamp_micros();
 
         // ADR-081 §6: when both scorer_run_id and serve_ledger_id are supplied,
         // resolve dedup + the accounting_profile_id fail-safe against the serve
         // ledger before the fold gate runs.
-        let mut forced_zero_weight = false;
+        let mut forced_zero_weight = effective_profile.is_none();
         if let (Some(scorer_run_id), Some(serve_ledger_id)) =
             (p.scorer_run_id.as_deref(), p.serve_ledger_id.as_deref())
         {
@@ -1513,6 +1567,8 @@ impl BrainPack {
                         "target_id": target.to_string(),
                         "serve_ledger_id": serve_ledger_id,
                         "scorer_run_id": scorer_run_id,
+                        "served_by_profile_id": effective_profile.as_deref(),
+                        "serve_attribution": serve_attribution,
                     }));
                 }
                 crate::serve_ledger::ServeLedgerResolution::NotFound => {
@@ -1523,15 +1579,34 @@ impl BrainPack {
                 }
                 crate::serve_ledger::ServeLedgerResolution::Proceed {
                     accounting_profile_id,
+                    serve_attribution: ledger_attribution,
                 } => {
                     // ADR-081 §4 fail-safe: an implicit event whose serve row has
                     // no resolvable profile is recorded at zero weight — never
-                    // folded under a guessed profile.
-                    if accounting_profile_id.is_none() {
+                    // folded under a guessed profile. The stored tri-state marker
+                    // preserves the one exception: a row stamped `unspecified`
+                    // (no profile was ever selected at serve time) keeps the
+                    // legacy binding/default fallback already resolved above,
+                    // instead of being forced to zero like a genuine
+                    // `unattributed` (failed profile read) or a legacy row with
+                    // no stored marker at all.
+                    if accounting_profile_id.is_none()
+                        && ledger_attribution != Some(ServeAttribution::Unspecified)
+                    {
                         forced_zero_weight = true;
+                        effective_profile = None;
+                        profile_resolution = "serve_ledger_unattributed";
+                        serve_attribution = ServeAttribution::Unattributed;
                     }
                 }
             }
+        }
+
+        if effective_profile.is_none() && !is_gated_implicit {
+            return Err(RuntimeError::InvalidInput(
+                "unattributed serve feedback must use implicit_positive or implicit_negative; no profile can receive explicit credit"
+                    .to_string(),
+            ));
         }
 
         // ADR-081 §2/§6: when both scorer fields are present, the dedup claim
@@ -1557,7 +1632,8 @@ impl BrainPack {
         // marker records how it was resolved.
         let mut base_data = json!({
             "signal": signal,
-            "served_by_profile_id": effective_profile,
+            "served_by_profile_id": effective_profile.as_deref(),
+            "serve_attribution": serve_attribution,
             "profile_resolution": profile_resolution,
         });
         if let Some(ref ss) = p.section_signals {
@@ -1584,11 +1660,6 @@ impl BrainPack {
         // ADR-081 §2: the bounded-mass fold gate applies only to implicit
         // signals. Explicit/correction signals are never gated (they are the
         // clamp's own comparator, ADR-081 §1).
-        let is_gated_implicit = matches!(
-            FeedbackEventKind::from_signal_str(signal),
-            Some(FeedbackEventKind::ImplicitPositive) | Some(FeedbackEventKind::ImplicitNegative)
-        );
-
         let duration_us = feedback_start.elapsed().as_micros().max(1) as i64;
         let event = Event::new(
             token.namespace().as_str().to_string(),
@@ -1621,101 +1692,192 @@ impl BrainPack {
             crate::persist::FeedbackEventWrite::Direct(event)
         };
 
-        let serving_profile_owned = effective_profile.to_string();
-        #[cfg(test)]
-        crate::pack::run_feedback_precommit_hook(effective_profile).await;
-        let event = crate::persist::persist_feedback_state_mutation(
-            self.runtime.sql().as_ref(),
-            token,
-            &self.persistence,
-            &self.state,
-            serving_profile_owned.clone(),
-            event_write,
-            ENTITY_CACHE_CAPACITY,
-            {
-                let serving_profile_owned = serving_profile_owned.clone();
-                move |state: &mut khive_brain_core::BrainState, brain_signal| {
-                    let serving_profile = serving_profile_owned.as_str();
+        let event: Event = if let Some(serving_profile_owned) = effective_profile.clone() {
+            // #1592: profile existence/lifecycle was already fast-path-checked
+            // above under the warm-state lock; `persist_feedback_state_mutation`
+            // repeats that check against the authoritative rebased snapshot
+            // inside the same atomic unit that appends the event and mutates
+            // the posterior, so a profile archived/deleted between the two
+            // checks is still caught.
+            #[cfg(test)]
+            crate::pack::run_feedback_precommit_hook(serving_profile_owned.as_str()).await;
+            let event = crate::persist::persist_feedback_state_mutation(
+                self.runtime.sql().as_ref(),
+                token,
+                &self.persistence,
+                &self.state,
+                serving_profile_owned.clone(),
+                event_write,
+                ENTITY_CACHE_CAPACITY,
+                {
+                    let serving_profile_owned = serving_profile_owned.clone();
+                    move |state: &mut khive_brain_core::BrainState, brain_signal| {
+                        let serving_profile = serving_profile_owned.as_str();
 
-                    if serving_profile == "balanced-recall-v1" {
-                        state.balanced_recall.apply_signal(brain_signal);
-                        sync_balanced_recall_record(state);
-                    } else if state.profile_states.contains_key(serving_profile) {
-                        let ps = state
-                            .profile_states
-                            .get_mut(serving_profile)
-                            .expect("key checked above");
-                        ps.apply_signal(brain_signal);
-                        let snap = serde_json::to_value(ps.to_snapshot()).ok();
-                        let total = ps.total_events;
-                        if let Some(record) = state.profiles.get_mut(serving_profile) {
-                            record.total_events = total;
-                            record.state_snapshot = snap;
+                        if serving_profile == "balanced-recall-v1" {
+                            state.balanced_recall.apply_signal(brain_signal);
+                            sync_balanced_recall_record(state);
+                        } else if state.profile_states.contains_key(serving_profile) {
+                            let ps = state
+                                .profile_states
+                                .get_mut(serving_profile)
+                                .expect("key checked above");
+                            ps.apply_signal(brain_signal);
+                            let snap = serde_json::to_value(ps.to_snapshot()).ok();
+                            let total = ps.total_events;
+                            if let Some(record) = state.profiles.get_mut(serving_profile) {
+                                record.total_events = total;
+                                record.state_snapshot = snap;
+                            }
+                        } else {
+                            state.balanced_recall.apply_signal(brain_signal);
+                            sync_balanced_recall_record(state);
                         }
-                    } else {
-                        state.balanced_recall.apply_signal(brain_signal);
-                        sync_balanced_recall_record(state);
+
+                        let section_state = crate::ensure_section_state_seeded(
+                            &mut state.section_states,
+                            &serving_profile_owned,
+                        );
+                        section_state.apply_signal(brain_signal);
                     }
-
-                    let section_state = crate::ensure_section_state_seeded(
-                        &mut state.section_states,
-                        &serving_profile_owned,
-                    );
-                    section_state.apply_signal(brain_signal);
-                }
-            },
-        )
-        .await?;
-        let Some(event) = event else {
-            return Ok(json!({
-                "emitted": false,
-                "deduped": true,
-                "verb": "brain.feedback",
-                "signal": signal,
-                "target_id": target.to_string(),
-                "serve_ledger_id": p.serve_ledger_id,
-                "scorer_run_id": p.scorer_run_id,
-            }));
-        };
-        khive_storage::usage::count(khive_storage::usage::UsageUnit::EventRows, 1);
-
-        // lattice-router: build the context vector from the now-published live
-        // state and forward through the fann network. This is a best-effort
-        // routing computation independent of durability, so it reads from
-        // `self.state` only after the mutation above has durably committed.
-        // Consumption of routed weights lands with the engine route() seam (#343) and the
-        // compose value-gate (#346); no per-event stdout/stderr spam.
-        #[cfg(feature = "lattice-router")]
-        {
-            let state = self.state.lock().unwrap();
-            let serving_profile = serving_profile_owned.as_str();
-            let (rel, sal, temp) = if serving_profile == "balanced-recall-v1" {
-                (
-                    state.balanced_recall.relevance.clone(),
-                    state.balanced_recall.salience.clone(),
-                    state.balanced_recall.temporal.clone(),
-                )
-            } else if let Some(ps) = state.profile_states.get(serving_profile) {
-                (
-                    ps.relevance.clone(),
-                    ps.salience.clone(),
-                    ps.temporal.clone(),
-                )
-            } else {
-                (
-                    state.balanced_recall.relevance.clone(),
-                    state.balanced_recall.salience.clone(),
-                    state.balanced_recall.temporal.clone(),
-                )
+                },
+            )
+            .await?;
+            let Some(event) = event else {
+                return Ok(json!({
+                    "emitted": false,
+                    "deduped": true,
+                    "verb": "brain.feedback",
+                    "signal": signal,
+                    "target_id": target.to_string(),
+                    "serve_ledger_id": p.serve_ledger_id,
+                    "scorer_run_id": p.scorer_run_id,
+                    "served_by_profile_id": effective_profile.as_deref(),
+                    "serve_attribution": serve_attribution,
+                }));
             };
-            let sec = state
-                .section_states
-                .get(serving_profile)
-                .map(|ss| ss.posteriors.clone());
-            drop(state);
-            let ctx = build_context_vector(&rel, &sal, &temp, sec.as_ref());
-            let _routed = route_via_fann(&ctx);
-        }
+            khive_storage::usage::count(khive_storage::usage::UsageUnit::EventRows, 1);
+
+            // lattice-router: build the context vector from the now-published live
+            // state and forward through the fann network. This is a best-effort
+            // routing computation independent of durability, so it reads from
+            // `self.state` only after the mutation above has durably committed.
+            // Consumption of routed weights lands with the engine route() seam (#343) and the
+            // compose value-gate (#346); no per-event stdout/stderr spam.
+            #[cfg(feature = "lattice-router")]
+            {
+                let state = self.state.lock().unwrap();
+                let serving_profile = serving_profile_owned.as_str();
+                let (rel, sal, temp) = if serving_profile == "balanced-recall-v1" {
+                    (
+                        state.balanced_recall.relevance.clone(),
+                        state.balanced_recall.salience.clone(),
+                        state.balanced_recall.temporal.clone(),
+                    )
+                } else if let Some(ps) = state.profile_states.get(serving_profile) {
+                    (
+                        ps.relevance.clone(),
+                        ps.salience.clone(),
+                        ps.temporal.clone(),
+                    )
+                } else {
+                    (
+                        state.balanced_recall.relevance.clone(),
+                        state.balanced_recall.salience.clone(),
+                        state.balanced_recall.temporal.clone(),
+                    )
+                };
+                let sec = state
+                    .section_states
+                    .get(serving_profile)
+                    .map(|ss| ss.posteriors.clone());
+                drop(state);
+                let ctx = build_context_vector(&rel, &sal, &temp, sec.as_ref());
+                let _routed = route_via_fann(&ctx);
+            }
+
+            event
+        } else {
+            // ADR-081 §4 fail-safe: no profile was resolved at all (an explicit
+            // serve-time `unattributed` marker, or a ledger row whose accounting
+            // profile could not be resolved and was not `unspecified`). The
+            // guard above already rejected this case unless `is_gated_implicit`,
+            // so `event_write` is always `Gated` here. There is no posterior to
+            // mutate and no profile to validate against the registry, so this
+            // bypasses `persist_feedback_state_mutation` (and its #1592
+            // authoritative re-check, which only applies where a profile was
+            // actually resolved) and appends the audit event directly through
+            // the fold gate's own atomic unit instead.
+            let crate::persist::FeedbackEventWrite::Gated {
+                event,
+                target_id,
+                gate_mode,
+                gate_now_us,
+                dedup_key,
+            } = event_write
+            else {
+                unreachable!(
+                    "effective_profile=None implies is_gated_implicit, so event_write is always Gated"
+                );
+            };
+            let dedup_ref = dedup_key
+                .as_ref()
+                .map(|(scorer, ledger)| (scorer.as_str(), ledger.as_str()));
+            let namespace = token.namespace().as_str().to_string();
+            // Forced-zero unattributed events do not touch the mass table, so
+            // this sentinel is an atomic-unit routing key only and can never be
+            // mistaken for a registered serving profile.
+            let outcome = crate::fold_gate::apply_fold_gate_and_append_event(
+                sql.as_ref(),
+                &namespace,
+                "__unattributed__",
+                &target_id,
+                gate_mode,
+                gate_now_us,
+                dedup_ref,
+                move |fold_outcome, forced_zero| {
+                    let mut event = event;
+                    let (effective_weight, mass_before, mass_after) = match fold_outcome {
+                        Some(o) => (o.effective_weight, o.mass_before, o.mass_after),
+                        None => (0.0, 0.0, 0.0),
+                    };
+                    event.payload["gate"] = json!({
+                        "effective_weight": effective_weight,
+                        "mass_before": mass_before,
+                        "mass_after": mass_after,
+                        "forced_zero_weight": forced_zero,
+                    });
+                    event
+                },
+            )
+            .await?;
+
+            match outcome {
+                // This is now the ONLY place a scorer-tagged
+                // implicit call returns `deduped` — reached only when the
+                // atomic unit's claim conflicted, meaning either a prior call
+                // already committed claim+fold+event together, or (never)
+                // a partially-failed prior attempt, since a failed attempt
+                // rolls back its claim too.
+                crate::fold_gate::GateAndAppendOutcome::Deduped => {
+                    return Ok(json!({
+                        "emitted": false,
+                        "deduped": true,
+                        "verb": "brain.feedback",
+                        "signal": signal,
+                        "target_id": target.to_string(),
+                        "serve_ledger_id": p.serve_ledger_id,
+                        "scorer_run_id": p.scorer_run_id,
+                        "served_by_profile_id": effective_profile.as_deref(),
+                        "serve_attribution": serve_attribution,
+                    }));
+                }
+                crate::fold_gate::GateAndAppendOutcome::Applied(result) => {
+                    khive_storage::usage::count(khive_storage::usage::UsageUnit::EventRows, 1);
+                    result.event
+                }
+            }
+        };
 
         // ADR-081 §6: "the fold... backfills the ledger row's grade." Runs after
         // the fold itself so a ledger-write failure never blocks the feedback
@@ -1743,6 +1905,8 @@ impl BrainPack {
             "verb": "brain.feedback",
             "signal": signal,
             "target_id": target.to_string(),
+            "served_by_profile_id": effective_profile,
+            "serve_attribution": serve_attribution,
         }))
     }
 
@@ -1761,6 +1925,7 @@ impl BrainPack {
             results: Vec<AutoFeedbackResult>,
             signal: Option<String>,
             served_by_profile_id: Option<String>,
+            serve_attribution: Option<ServeAttribution>,
             // ADR-081 §6: forwarded verbatim to brain.feedback, which owns the
             // together-or-rejected validation and the dedup/fold-gate logic.
             scorer_run_id: Option<String>,
@@ -1774,6 +1939,8 @@ impl BrainPack {
         #[derive(Deserialize)]
         struct AutoFeedbackResult {
             id: String,
+            served_by_profile_id: Option<String>,
+            serve_attribution: Option<ServeAttribution>,
         }
 
         let p: AutoFeedbackParams = serde_json::from_value(params)
@@ -1814,8 +1981,20 @@ impl BrainPack {
             "target_id": target.to_string(),
             "signal": p.signal.as_deref().unwrap_or("implicit_positive"),
         });
-        if let Some(ref profile_id) = p.served_by_profile_id {
+        // Prefer explicit top-level attribution, otherwise carry it directly
+        // from the first recall result. This makes passing the recall result
+        // objects sufficient to preserve the serve-time tri-state.
+        let (served_by_profile_id, serve_attribution) =
+            if p.served_by_profile_id.is_some() || p.serve_attribution.is_some() {
+                (p.served_by_profile_id.as_ref(), p.serve_attribution)
+            } else {
+                (first.served_by_profile_id.as_ref(), first.serve_attribution)
+            };
+        if let Some(profile_id) = served_by_profile_id {
             feedback_params["served_by_profile_id"] = json!(profile_id);
+        }
+        if let Some(attribution) = serve_attribution {
+            feedback_params["serve_attribution"] = json!(attribution);
         }
         if let Some(ref scorer_run_id) = p.scorer_run_id {
             feedback_params["scorer_run_id"] = json!(scorer_run_id);
@@ -1852,6 +2031,8 @@ impl BrainPack {
         struct RecordServeParams {
             consumer_kind: String,
             served_by_profile_id: Option<String>,
+            #[serde(default)]
+            serve_attribution: Option<ServeAttribution>,
             target_ids: Vec<String>,
             query_raw: String,
             served_at: Option<i64>,
@@ -1892,6 +2073,7 @@ impl BrainPack {
             &query_class,
             &p.query_raw,
             served_at,
+            p.serve_attribution.map(ServeAttribution::as_str),
         )
         .await
         {
@@ -2840,9 +3022,9 @@ impl DispatchHook for BrainPack {
         let signal = interpret(&view.event);
 
         // Route the signal to the state bucket that owns view.event.namespace.
-        // No event is silently dropped: cold and saved namespaces are updated
-        // inside PersistenceTracker; only when the namespace is the active slot
-        // do we need to apply to the shared BrainState.
+        // Namespace residency never loses an otherwise-applicable signal: cold
+        // and saved namespaces are handled inside PersistenceTracker; only the
+        // active slot is applied through the shared BrainState here.
         let target = {
             let mut tracker = self.persistence.lock().unwrap();
             tracker.route_signal(&view.event.namespace, &signal, ENTITY_CACHE_CAPACITY)
@@ -2850,8 +3032,7 @@ impl DispatchHook for BrainPack {
 
         if matches!(target, crate::persist::ApplyTarget::ActiveSlot) {
             let mut state = self.state.lock().unwrap();
-            state.balanced_recall.apply_signal(&signal);
-            sync_balanced_recall_record(&mut state);
+            crate::apply_dispatch_signal(&mut state, &signal);
         }
     }
 }

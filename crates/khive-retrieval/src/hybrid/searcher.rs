@@ -65,31 +65,27 @@ pub trait Reranker<Id: Send + Sync + 'static>: Send + Sync {
 ///
 /// This can be used by implementors of [`HybridSearcher`] to fuse results
 /// from their [`VectorSearch`] and [`KeywordSearch`] implementations.
+/// Two-arm vector/text callers use the positional order `[vector, keyword]`.
+/// Keep empty arms in that order so positional weighted strategies cannot
+/// rebind a keyword-only result set to the vector weight (or vice versa).
+/// Generic RRF and Union callers may supply N sources in a caller-defined,
+/// documented order.
 ///
 /// `Ord` is required for deterministic tie-breaking when scores are equal.
 ///
 /// # Weighted strategy validation
 ///
 /// When `config.fusion_strategy` is `Weighted`, this function validates that
-/// exactly 2 sources are provided in all builds. If the source count does not
-/// match the weight vector length, the function falls back to RRF to prevent
-/// silent data corruption. Use [`fuse_search_results_checked`] if you need an
-/// explicit error instead of a fallback.
+/// exactly 2 vector/text source slots are provided in all builds. A missing
+/// arm is represented by an empty slot; any other source count falls back to
+/// RRF to prevent silent positional rebinding. Use
+/// [`fuse_search_results_checked`] if you need an explicit error instead.
 pub fn fuse_search_results<Id: Eq + Hash + Clone + Ord>(
     sources: Vec<Vec<(Id, DeterministicScore)>>,
     config: &HybridConfig,
 ) -> Vec<(Id, DeterministicScore)> {
     if sources.is_empty() {
         return Vec::new();
-    }
-
-    if sources.len() == 1 {
-        let mut results = sources.into_iter().next().unwrap();
-        if let Some(min_score) = config.min_score {
-            results.retain(|(_, score)| *score >= min_score);
-        }
-        results.truncate(config.top_k);
-        return results;
     }
 
     // Determine fusion strategy — Custom falls back to RRF (same as Weighted
@@ -120,7 +116,7 @@ pub fn fuse_search_results<Id: Eq + Hash + Clone + Ord>(
 }
 
 /// Like [`fuse_search_results`] but returns `Err` when `Weighted` fusion is
-/// configured with a source count that doesn't match the expected 2 weights.
+/// configured without exactly two vector/text source slots.
 ///
 /// Use this in code paths that should not silently fall back to RRF.
 pub fn fuse_search_results_checked<Id: Eq + Hash + Clone + Ord>(
@@ -167,6 +163,8 @@ mod tests {
 
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].0, "a");
+        assert_eq!(results[0].1, khive_score::rrf_score(1, 60));
+        assert_eq!(results[1].1, khive_score::rrf_score(2, 60));
     }
 
     #[test]
@@ -189,6 +187,20 @@ mod tests {
     }
 
     #[test]
+    fn weighted_sources_use_vector_then_keyword_order() {
+        let vector = vec![("vector".to_string(), DeterministicScore::from_f64(0.9))];
+        let keyword = vec![("keyword".to_string(), DeterministicScore::from_f64(0.9))];
+        let config = HybridConfig::new(10)
+            .with_fusion_strategy(FusionStrategy::weighted(vec![0.7, 0.3]))
+            .with_weights(0.7, 0.3);
+
+        let results = fuse_search_results(vec![vector, keyword], &config);
+
+        assert_eq!(results[0].0, "vector");
+        assert!(results[0].1 > results[1].1);
+    }
+
+    #[test]
     fn test_fuse_with_min_score() {
         let sources = vec![vec![
             ("a".to_string(), DeterministicScore::from_f64(0.9)),
@@ -198,9 +210,10 @@ mod tests {
         let config = HybridConfig::new(10).with_min_score(DeterministicScore::from_f64(0.5));
         let results = fuse_search_results(sources, &config);
 
-        // b should be filtered out (RRF score ~0.016 < 0.5)
-        // Actually RRF scores are very small, let's use a lower threshold
-        assert!(!results.is_empty());
+        assert!(
+            results.is_empty(),
+            "the one-arm RRF transform must run before the fused-domain score floor"
+        );
     }
 
     #[test]
@@ -269,5 +282,20 @@ mod tests {
         let result = fuse_search_results_checked(vec![source1, source2], &config);
         assert!(result.is_ok(), "2-source Weighted must succeed");
         assert_eq!(result.unwrap().len(), 2);
+    }
+
+    #[test]
+    fn test_fuse_search_results_checked_weighted_empty_arm_keeps_slot() {
+        let config = HybridConfig::new(10)
+            .with_fusion_strategy(FusionStrategy::weighted(vec![0.7, 0.3]))
+            .with_weights(0.7, 0.3);
+        let keyword = vec![("keyword".to_string(), DeterministicScore::from_f64(0.8))];
+
+        let result = fuse_search_results_checked(vec![Vec::new(), keyword], &config)
+            .expect("an empty vector arm still occupies its canonical slot");
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].0, "keyword");
+        assert!((result[0].1.to_f64() - 0.3).abs() < 1e-9);
     }
 }

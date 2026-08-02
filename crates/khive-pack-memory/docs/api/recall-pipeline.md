@@ -48,17 +48,21 @@ When no installed graph is available after the readiness attempt — except when
 
 ## Fusion
 
-Retrieval sources are labeled `text`, `vector`, or `both`. Per-model vector lists are unioned by UUID before cross-source fusion, retaining the best vector score for duplicates.
+Retrieval sources are labeled `text`, `vector`, or `both`. How per-model vector lists reach fusion depends on the configured strategy:
+
+- `rrf` and `union` keep each embedding model's vector hits as a separate source, in `vector_hits_per_model` order, followed by the text source. A note ranking in more than one model's results gets one rank contribution per model instead of being collapsed to its best raw score.
+- `weighted` first unions all per-model vector hits into one combined vector source by UUID (retaining the best score per duplicate), then fuses `[combined_vector, text]` under the configured vector/keyword weights.
+- `vector_only` and `keyword_only` union per-model vector hits the same way as `weighted` and route only the relevant arm; the unused arm is passed as an explicit empty source so the two-arm `[vector, keyword]` positions stay stable rather than being rebound.
 
 Supported strategies are:
 
-| Request value | Behavior |
-| --- | --- |
-| `rrf` | Reciprocal-rank fusion with `k = 60`. |
-| `weighted` | Weighted text/vector fusion; configured pack weights govern values. |
-| `union` | Union candidate sets. |
-| `vector_only` | Ignore text candidates. |
-| `keyword_only` | Ignore vector candidates. |
+| Request value  | Behavior                                                            |
+| -------------- | ------------------------------------------------------------------- |
+| `rrf`          | Reciprocal-rank fusion with `k = 60`.                               |
+| `weighted`     | Weighted text/vector fusion; configured pack weights govern values. |
+| `union`        | Union candidate sets.                                               |
+| `vector_only`  | Ignore text candidates.                                             |
+| `keyword_only` | Ignore vector candidates.                                           |
 
 Unknown strategy names return `InvalidInput`. Candidate count defaults to `max(limit * candidate_multiplier, 40)` unless `candidate_limit` is explicit.
 
@@ -66,7 +70,7 @@ Unknown strategy names return `InvalidInput`. Candidate count defaults to `max(l
 
 Profile resolution happens before candidate scoring. An explicit `profile_id` wins; otherwise recall resolves an actor-plus-namespace binding for consumer kind `recall`. An explicit unknown ID is an error. An absent or malformed optional profile snapshot degrades to configured defaults rather than failing recall.
 
-The response is stamped with `served_by_profile_id` only when a profile actually served it. The resolved `BalancedRecallState` projects posterior means into request-local recall weights. The configured pack state is not mutated by serving another profile.
+Every result carries `serve_attribution`: `profile` with `served_by_profile_id` when a readable profile actually served it, `unattributed` when a selected profile record could not be read, or `unspecified` when no profile resolved. The latter two omit the profile id; only `unspecified` permits later binding/default fallback. The resolved `BalancedRecallState` projects posterior means into request-local recall weights. The configured pack state is not mutated by serving another profile.
 
 Per-entity posterior lookup is bounded to a 10,000-entry reconstructed LRU. The entity term is neutral for candidates without a learned posterior and is clamped to a ±15% multiplier; details are in `crates/khive-pack-memory/docs/api/scoring.md`.
 

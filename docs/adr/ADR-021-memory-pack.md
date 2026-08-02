@@ -220,8 +220,23 @@ memory.recall(query, …):
   2. weights = P.config_overrides (RRF / salience / temporal weights — §5)
   3. candidates = recall_embed → recall_candidates (multi-engine if ADR-031 loaded)
   4. fused = recall_fuse(candidates, weights)
-  5. emit RecallExecuted event with payload.served_by_profile_id = Some(P.id)
+  5. stamp each result and RecallExecuted with the serve-attribution state
 ```
+
+The serve-attribution state is wire-visible and has three values:
+
+| `serve_attribution` | `served_by_profile_id` | Meaning                                                                                             |
+| ------------------- | ---------------------- | --------------------------------------------------------------------------------------------------- |
+| `"profile"`         | profile id             | the profile record was readable and its state served the request                                    |
+| `"unattributed"`    | absent / null          | profile resolution selected a profile, but its record could not be read; configured defaults served |
+| `"unspecified"`     | absent / null          | no profile was supplied or resolved                                                                 |
+
+The distinction between `unattributed` and `unspecified` is load-bearing. Downstream
+feedback may retain the historical binding/default fallback only for `unspecified` (and
+legacy calls that omit the marker). `unattributed` is explicit negative knowledge and
+must never be re-resolved to a profile. A readable profile record whose state snapshot is
+null remains `profile`: the configured-default bootstrap state is still a successful
+profile serve.
 
 The §5 scoring formula's `0.70 / 0.20 / 0.10` weights are the **defaults**; brain's
 resolved profile may override them per `(actor, namespace, consumer_kind)` binding

@@ -197,7 +197,9 @@ impl PersistenceTracker {
     ///   drained by `ensure_loaded` *after* snapshot restore and event replay, so
     ///   the ordering guarantee is: snapshot → replayed events → queued signals.
     ///
-    /// No event is silently dropped regardless of which slot is currently active.
+    /// Namespace residency never drops an otherwise-applicable signal; the
+    /// attribution policy may still intentionally reject an unattributed or
+    /// unavailable-profile signal after it reaches the owning state bucket.
     pub(crate) fn route_signal(
         &mut self,
         namespace: &str,
@@ -212,8 +214,7 @@ impl PersistenceTracker {
             // Namespace has been loaded from the DB but is currently saved off.
             // Apply directly to its saved BrainState.
             if let Some(state) = self.saved_states.get_mut(namespace) {
-                state.balanced_recall.apply_signal(signal);
-                crate::sync_balanced_recall_record(state);
+                crate::apply_dispatch_signal(state, signal);
             }
             return ApplyTarget::Done;
         }
@@ -1164,10 +1165,7 @@ pub async fn ensure_loaded(
         let pending = t.drain_pending_signals(&namespace);
         let mut final_state = new_state;
         for sig in &pending {
-            final_state.balanced_recall.apply_signal(sig);
-        }
-        if !pending.is_empty() {
-            crate::sync_balanced_recall_record(&mut final_state);
+            crate::apply_dispatch_signal(&mut final_state, sig);
         }
 
         // Write the new state while the tracker lock is still held.

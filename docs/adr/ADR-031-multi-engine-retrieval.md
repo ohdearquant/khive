@@ -435,13 +435,14 @@ async fn handle_recall(args):
         per_engine_hits.push(filtered)
 
     # Step 3 — weighted RRF across engines
+    # Both arrays preserve registry declaration order: [engine_0, ..., engine_n].
     weights      = registry.engines().iter().map(|e| e.config.weight as f64).collect()
     vector_fused = khive_fusion::fuse(
         per_engine_hits, FusionStrategy::Weighted { weights }, candidate_pool_size)
 
     # Step 4 — layer FTS5 keyword path and final fusion
     text_hits = self.runtime.text(args.namespace).search(...)
-    fused     = fuse(vector_fused, text_hits, args.fusion_strategy, args.limit)
+    fused     = fuse([vector_fused, text_hits], args.fusion_strategy, args.limit)
 
     # Step 5 — pack-specific scoring
     return apply_pack_scoring(fused, args)
@@ -472,6 +473,12 @@ per-corpus retuning is operator responsibility.
 corpus. BGE's English semantic strength, mE5's multilingual coverage, Qwen3's instruction-
 tuned recall — operators set weights from empirical retrieval quality. `FusionStrategy::Weighted`
 already exists in `khive-fusion`; pack handlers wire `EngineConfig.weight` into it.
+
+The positional contract at this stage is N-engine registry order: the source at
+index `i` is weighted by the config at index `i`. The later two-arm hybrid stage
+uses `[combined_vector, text]` (the runtime/retrieval `[vector, keyword]`
+contract). Neither rule changes the dual-index migration router's independent
+`[primary, legacy]` contract.
 
 **This is engine-level weighted RRF — distinct from the backend-level unweighted RRF in
 ADR-029 §D4.** ADR-029's D4 fuses ranked lists across backends at the substrate-search layer,

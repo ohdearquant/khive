@@ -14,6 +14,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::Instant;
 
+use crate::operations::{LinkSpec, Resolved};
 use crate::runtime::NamespaceToken;
 use async_trait::async_trait;
 use khive_gate::{AllowAllGate, AuditEvent, GateDecision, GateRef, GateRequest};
@@ -257,13 +258,15 @@ pub trait PackRuntime: Send + Sync {
 /// - **Defaults** filled into create args (e.g. `status="inbox"` for tasks)
 /// - **Derived properties** computed from args (e.g. salience from priority)
 /// - **Side-effect writes** after the storage commit (e.g. `depends_on` edges)
+/// - **Cross-pack validation** before shared CRUD mutates an owned kind
 ///
 /// Hooks are stateless from the framework's perspective — they receive the
-/// runtime as a method parameter and operate on the args `Value` directly.
-/// The pack registers them via [`PackRuntime::kind_hook`].
+/// runtime and the current mutation inputs as method parameters. The pack
+/// registers them via [`PackRuntime::kind_hook`].
 ///
 /// Lifecycle verbs (e.g. gtd's `complete`, `transition`) remain pack-owned
-/// verbs and do not flow through this trait — only the create path does.
+/// verbs. Shared `create`, note `update`, and `link` calls flow through this
+/// trait when an endpoint kind has an owning pack hook.
 #[async_trait]
 pub trait KindHook: Send + Sync + std::fmt::Debug {
     /// Mutate args before the storage write. Fill defaults, normalize values,
@@ -291,6 +294,34 @@ pub trait KindHook: Send + Sync + std::fmt::Debug {
         id: uuid::Uuid,
         args: &Value,
     ) -> Result<(), RuntimeError>;
+
+    /// Validate a shared note-property update before storage is mutated.
+    ///
+    /// The default accepts the update. Kind-owning packs override this when a
+    /// property has invariants that generic CRUD cannot know about (for
+    /// example, GTD task dependency acyclicity).
+    async fn validate_note_update(
+        &self,
+        _runtime: &KhiveRuntime,
+        _token: &NamespaceToken,
+        _note: &khive_storage::Note,
+        _properties: Option<&Value>,
+    ) -> Result<(), RuntimeError> {
+        Ok(())
+    }
+
+    /// Validate one or more shared graph links before any edge is written.
+    ///
+    /// A batch is supplied as a unit so a hook can reject a cycle formed only
+    /// by the proposed edges. The default accepts every link.
+    async fn validate_links(
+        &self,
+        _runtime: &KhiveRuntime,
+        _token: &NamespaceToken,
+        _links: &[crate::LinkSpec],
+    ) -> Result<(), RuntimeError> {
+        Ok(())
+    }
 }
 
 /// Optional sub-trait for packs that own private SQL tables and issue UUIDs
@@ -1713,17 +1744,44 @@ impl VerbRegistry {
 
                     // For recall verbs: extract the first result's id as
                     // target_id so the brain temporal posterior can observe
-                    // real hit/miss and latency.
+                    // real hit/miss and latency. Copy the serve-attribution
+                    // fields from that same hit so the hook credits the profile
+                    // that actually served instead of always crediting default.
                     if verb == "memory.recall" {
-                        let first_note_id = ok_val
-                            .as_array()
-                            .and_then(|arr| arr.first())
+                        let first_result =
+                            ok_val.as_array().and_then(|arr| arr.first()).or_else(|| {
+                                ok_val
+                                    .get("results")
+                                    .and_then(Value::as_array)
+                                    .and_then(|arr| arr.first())
+                            });
+                        let first_note_id = first_result
                             .and_then(|v| v.get("id"))
                             .and_then(|v| v.as_str())
                             .and_then(|s| s.parse::<uuid::Uuid>().ok());
                         if let Some(note_id) = first_note_id {
                             dispatch_event = dispatch_event.with_target(note_id);
                         }
+                        let mut payload = serde_json::Map::new();
+                        if let Some(profile_id) = first_result
+                            .and_then(|v| v.get("served_by_profile_id"))
+                            .and_then(Value::as_str)
+                        {
+                            payload.insert(
+                                "served_by_profile_id".to_string(),
+                                Value::String(profile_id.to_string()),
+                            );
+                        }
+                        if let Some(attribution) = first_result
+                            .and_then(|v| v.get("serve_attribution"))
+                            .and_then(Value::as_str)
+                        {
+                            payload.insert(
+                                "serve_attribution".to_string(),
+                                Value::String(attribution.to_string()),
+                            );
+                        }
+                        dispatch_event = dispatch_event.with_payload(Value::Object(payload));
                         // No first result → target_id stays None (RecallMiss
                         // in brain's event interpreter).
                     }
@@ -1872,6 +1930,55 @@ impl VerbRegistry {
             }
         }
         None
+    }
+
+    /// Run the owning kind's shared-note-update validator, if it declares one.
+    ///
+    /// Both canonical KG dispatch and user-facing atomic preparation call this
+    /// seam so pack-specific property invariants cannot drift between them.
+    pub async fn validate_note_update_hook(
+        &self,
+        runtime: &KhiveRuntime,
+        token: &NamespaceToken,
+        note: &khive_storage::Note,
+        properties: Option<&Value>,
+    ) -> Result<(), RuntimeError> {
+        if let Some(hook) = self.find_kind_hook(&note.kind) {
+            hook.validate_note_update(runtime, token, note, properties)
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Run shared-link validators grouped by the owning source-note kind.
+    ///
+    /// Supplying the whole proposed batch lets a kind hook reject an invariant
+    /// violation formed only by multiple entries in that batch. Sources that
+    /// are not live notes, or whose kind has no hook, remain the canonical
+    /// endpoint validator's responsibility.
+    pub async fn validate_link_hooks(
+        &self,
+        runtime: &KhiveRuntime,
+        token: &NamespaceToken,
+        specs: &[LinkSpec],
+    ) -> Result<(), RuntimeError> {
+        let mut specs_by_kind: HashMap<String, Vec<LinkSpec>> = HashMap::new();
+        for spec in specs {
+            let Some(Resolved::Note(source)) = runtime.resolve_by_id(token, spec.source_id).await?
+            else {
+                continue;
+            };
+            specs_by_kind
+                .entry(source.kind)
+                .or_default()
+                .push(spec.clone());
+        }
+        for (kind, kind_specs) in specs_by_kind {
+            if let Some(hook) = self.find_kind_hook(&kind) {
+                hook.validate_links(runtime, token, &kind_specs).await?;
+            }
+        }
+        Ok(())
     }
 
     /// Whether any registered pack declares a handler with this verb name.
@@ -6333,6 +6440,67 @@ mod hook_tests {
         }
     }
 
+    struct RecallPack;
+
+    impl Pack for RecallPack {
+        const NAME: &'static str = "memory";
+        const NOTE_KINDS: &'static [&'static str] = &[];
+        const ENTITY_KINDS: &'static [&'static str] = &[];
+        const HANDLERS: &'static [HandlerDef] = &[HandlerDef {
+            name: "memory.recall",
+            description: "test recall",
+            visibility: Visibility::Verb,
+            category: VerbCategory::Assertive,
+            params: &[],
+        }];
+    }
+
+    #[async_trait]
+    impl PackRuntime for RecallPack {
+        fn name(&self) -> &str {
+            RecallPack::NAME
+        }
+        fn note_kinds(&self) -> &'static [&'static str] {
+            RecallPack::NOTE_KINDS
+        }
+        fn entity_kinds(&self) -> &'static [&'static str] {
+            RecallPack::ENTITY_KINDS
+        }
+        fn handlers(&self) -> &'static [HandlerDef] {
+            RecallPack::HANDLERS
+        }
+        async fn dispatch(
+            &self,
+            _verb: &str,
+            params: Value,
+            _registry: &VerbRegistry,
+            _token: &NamespaceToken,
+        ) -> Result<Value, RuntimeError> {
+            let hit = serde_json::json!({
+                "id": uuid::Uuid::new_v4().to_string(),
+                "served_by_profile_id": "custom-recall-v1",
+                "serve_attribution": "profile",
+            });
+            if params.get("verbose").and_then(Value::as_bool) == Some(true) {
+                Ok(serde_json::json!({"results": [hit]}))
+            } else {
+                Ok(serde_json::json!([hit]))
+            }
+        }
+    }
+
+    #[derive(Default)]
+    struct EventCapturingHook {
+        event: StdMutex<Option<Event>>,
+    }
+
+    #[async_trait]
+    impl DispatchHook for EventCapturingHook {
+        async fn on_dispatch(&self, view: &EventView) {
+            *self.event.lock().unwrap() = Some(view.event.clone());
+        }
+    }
+
     /// Hook that counts calls and records the last verb seen.
     #[derive(Default)]
     struct CountingHook {
@@ -6387,6 +6555,34 @@ mod hook_tests {
             3,
             "hook must fire once per successful dispatch"
         );
+    }
+
+    #[tokio::test]
+    async fn recall_hook_copies_serve_attribution_from_bare_and_verbose_results() {
+        let hook = Arc::new(EventCapturingHook::default());
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(RecallPack);
+        builder.with_dispatch_hook(hook.clone());
+        let reg = builder.build().expect("registry builds");
+
+        for params in [serde_json::json!({}), serde_json::json!({"verbose": true})] {
+            reg.dispatch("memory.recall", params)
+                .await
+                .expect("recall dispatch");
+            let event = hook.event.lock().unwrap().clone().expect("hook event");
+            assert!(
+                event.target_id.is_some(),
+                "first recall id must become target"
+            );
+            assert_eq!(
+                event.payload["served_by_profile_id"],
+                serde_json::json!("custom-recall-v1")
+            );
+            assert_eq!(
+                event.payload["serve_attribution"],
+                serde_json::json!("profile")
+            );
+        }
     }
 
     #[tokio::test]

@@ -5,7 +5,7 @@ use std::sync::Mutex;
 use khive_runtime::{KhiveRuntime, NamespaceToken, RuntimeError};
 use khive_types::{HandlerDef, Pack};
 
-use khive_brain_core::BrainState;
+use khive_brain_core::{BrainSignal, BrainState, ServeAttribution};
 
 use crate::handlers::BRAIN_HANDLERS;
 use crate::persist;
@@ -83,6 +83,53 @@ pub(crate) fn sync_balanced_recall_record(state: &mut BrainState) {
     if let Some(record) = state.profiles.get_mut("balanced-recall-v1") {
         record.total_events = total_ev;
         record.state_snapshot = snap_val;
+    }
+}
+
+/// Apply an automatic dispatch-hook signal to the profile that served it.
+///
+/// Legacy/unspecified signals retain the historical default-profile behavior.
+/// Explicitly unattributed signals are dropped, because a failed profile read
+/// proves that no profile served. A named profile that is absent from the
+/// namespace state also fails closed instead of miscrediting the default.
+pub(crate) fn apply_dispatch_signal(state: &mut BrainState, signal: &BrainSignal) {
+    let serving_profile = match signal {
+        BrainSignal::RecallHit {
+            served_by_profile_id,
+            serve_attribution,
+            ..
+        } => match serve_attribution {
+            ServeAttribution::Unattributed => return,
+            ServeAttribution::Profile => match served_by_profile_id.as_deref() {
+                Some(profile_id) => Some(profile_id),
+                None => return,
+            },
+            ServeAttribution::Unspecified => None,
+        },
+        _ => None,
+    };
+
+    match serving_profile {
+        None | Some("balanced-recall-v1") => {
+            state.balanced_recall.apply_signal(signal);
+            sync_balanced_recall_record(state);
+        }
+        Some(profile_id) => {
+            let Some(profile_state) = state.profile_states.get_mut(profile_id) else {
+                tracing::warn!(
+                    profile_id,
+                    "automatic brain signal named an unavailable serving profile; signal was not applied"
+                );
+                return;
+            };
+            profile_state.apply_signal(signal);
+            let total_events = profile_state.total_events;
+            let state_snapshot = serde_json::to_value(profile_state.to_snapshot()).ok();
+            if let Some(record) = state.profiles.get_mut(profile_id) {
+                record.total_events = total_events;
+                record.state_snapshot = state_snapshot;
+            }
+        }
     }
 }
 

@@ -118,6 +118,8 @@ pub enum FusionStrategy {
     Union,
     /// Drop non-vector hits; return vector hits only.
     VectorOnly,
+    /// Drop non-keyword hits; return keyword hits only.
+    KeywordOnly,
     /// Pack-defined or user-defined custom strategy, dispatched by name.
     Custom {
         name: String,
@@ -125,6 +127,15 @@ pub enum FusionStrategy {
     },
 }
 ```
+
+The two-arm vector/text hybrid APIs use one positional order:
+`[vector, keyword]`. Both positions remain present when an arm is empty; deleting
+an empty arm would rebind the surviving source to the wrong positional weight.
+RRF, weighted, and union transforms still run when only one arm has results, so
+post-fusion score floors operate in the same score domain for one-arm and
+two-arm queries. This order is not a global rule for the generic fusion
+primitive: N-engine fusion preserves engine-registry order (ADR-031), while
+dual-index migration uses `[primary, legacy]`.
 
 `Custom` is the openness mechanism. khive's memory pack registers a `decay_weighted`
 strategy that weights candidates by salience and time decay. A brain pack may register
@@ -254,18 +265,20 @@ IS NOT NULL) and superseded notes must not appear in retrieval results. The aliv
 is a single batch query against `EntityStore` or `NoteStore` after fusion:
 
 ```rust
-// After fusion produces candidate IDs (namespace derived from NamespaceToken)
+// Fuse up to the sum of all fetched arm lengths, then alive-check before top-k.
 let alive_set = entities.query_entities(
     token.namespace(),
     EntityFilter { ids: candidate_ids, ..Default::default() },
     PageRequest { offset: 0, limit: candidates.len() as u32 },
 ).await?;
 fused.retain(|h| alive_set.contains(&h.entity_id));
+fused.truncate(limit);
 ```
 
 This is the right layer for the check. Storage filters by `deleted_at IS NULL`; the
-runtime composes the check after fusion so the candidate pool stays large enough that
-filtering doesn't deplete top-K.
+runtime composes the check after fusion ranking but before final top-K truncation,
+so a stale high-ranked candidate cannot consume a returned slot while live
+candidates remain in the over-fetched pool.
 
 ### Cross-substrate retrieval
 
@@ -349,20 +362,33 @@ retrieval paths.
 
 **What v1 ships:**
 
-| Capability                                                                | Where it lives                                                 |
-| ------------------------------------------------------------------------- | -------------------------------------------------------------- |
-| RRF fusion (k configurable, default 60)                                   | `khive_score::rrf_score`, `khive-runtime::retrieval::rrf_fuse` |
-| Weighted linear fusion (min-max normalized)                               | `khive-runtime::fusion::fuse_with_strategy`                    |
-| `FusionStrategy` enum: `Rrf`, `Weighted`, `Union`, `VectorOnly`, `Custom` | `khive-runtime::fusion`                                        |
-| Custom strategy registration                                              | `khive-runtime::FusionRegistry`                                |
-| Hybrid search composition (vector + text)                                 | `khive-runtime::retrieval::hybrid_search`                      |
-| Strategy-parameterized hybrid search                                      | `khive-runtime::fusion::hybrid_search_with_strategy`           |
-| Graph BFS (depth-bounded, direction + relation filters)                   | `khive-runtime::graph_traversal::bfs_traverse`                 |
-| Bidirectional shortest-path                                               | `khive-runtime::graph_traversal::shortest_path`                |
-| Exact KNN                                                                 | `khive-runtime::retrieval::knn`                                |
-| Candidate-set rerank                                                      | `khive-runtime::retrieval::rerank`                             |
-| Cross-substrate search                                                    | `khive-runtime::retrieval::search_mixed`                       |
-| Alive-check after fusion                                                  | `khive-runtime::retrieval` (mandatory in every fusion path)    |
+| Capability                                                                               | Where it lives                                                    |
+| ---------------------------------------------------------------------------------------- | ----------------------------------------------------------------- |
+| Generic RRF fusion (k configurable, default 60)                                          | `khive_score::rrf_score`, `khive-fusion`, `khive-runtime::fusion` |
+| Weighted linear fusion (min-max normalized)                                              | `khive-runtime::fusion::fuse_with_strategy`                       |
+| `FusionStrategy` enum: `Rrf`, `Weighted`, `Union`, `VectorOnly`, `KeywordOnly`, `Custom` | `khive-runtime::fusion`                                           |
+| Custom strategy registration                                                             | `khive-runtime::FusionRegistry`                                   |
+| Hybrid search composition (vector + text)                                                | `khive-runtime::retrieval::hybrid_search`                         |
+| Strategy-parameterized hybrid search                                                     | `khive-runtime::fusion::hybrid_search_with_strategy`              |
+| Graph BFS (depth-bounded, direction + relation filters)                                  | `khive-runtime::graph_traversal::bfs_traverse`                    |
+| Bidirectional shortest-path                                                              | `khive-runtime::graph_traversal::shortest_path`                   |
+| Exact KNN                                                                                | `khive-runtime::retrieval::knn`                                   |
+| Candidate-set rerank                                                                     | `khive-runtime::retrieval::rerank`                                |
+| Cross-substrate search                                                                   | `khive-runtime::retrieval::search_mixed`                          |
+| Alive-check after fusion                                                                 | `khive-runtime::retrieval` (mandatory in every fusion path)       |
+
+The older entity-oriented `KhiveRuntime::hybrid_search` path is an explicit
+method-local exception to the generic RRF default: it uses fixed `k=10`, a 4×
+candidate pool, and a `0.5` exact-title boost so exact entity names dominate its
+small RRF score range. `hybrid_search_with_strategy` uses the caller's strategy
+(whose default RRF value is `k=60`) and a 4× pool. Reusable
+`khive-retrieval::HybridConfig` defaults to a 5× pool, while its higher-level
+balanced `SearchConfig`/query-IR preset uses 3×. These pool sizes are
+API-specific latency/quality policies rather than `FusionStrategy` semantics;
+all paths must retain the complete fetched pool through post-fusion alive/filter
+checks before applying the final requested limit. When two arms each fetch a
+pool, the fusion cap must admit their combined lengths rather than reusing one
+arm's pool size.
 
 **What v1 deliberately defers:**
 
@@ -424,8 +450,10 @@ becomes a natural composition, not a special-case feature.
 
 If the alive-check happens before fusion, the candidate pool may be depleted before
 ranking — top-K from a 200-candidate pool that's been pre-filtered to 50 candidates
-returns lower-quality results. Filtering after fusion preserves the candidate pool
-through ranking.
+returns lower-quality results. Fusion therefore ranks the complete over-fetched
+pool first. The alive-check then filters that ranked pool, and only afterward does
+the runtime truncate to top-K; truncating before the alive-check would underfill
+the response whenever a stale hit occupied a leading slot.
 
 The cost is one extra batch query per search. Acceptable for the quality gain.
 
