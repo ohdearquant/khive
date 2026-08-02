@@ -51,7 +51,7 @@ the serving profile so scoring weights don't drift mid-measurement.
    part of the measurement:
 
    ```text
-   brain.auto_feedback(query="...", results=[{"id":"..."}], namespace="bench-arm-a")
+   brain.auto_feedback(query="...", results=[{"id":"..."}], target_id="...", signal="implicit_positive", namespace="bench-arm-a")
    knowledge.compose(query="...", atom_ids=["..."], namespace="bench-arm-a")
    ```
 
