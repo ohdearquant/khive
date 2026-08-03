@@ -317,6 +317,12 @@ pub struct WriterTaskHandle {
     /// report a `queue_saturation` sink row (ADR-136 D1 gate 6a) without
     /// needing a `&ConnectionPool` reference.
     db: String,
+    /// Slow-write latency bound (`timeout_sink::slow_write_threshold`),
+    /// resolved once at spawn. `None` disables slow-write rows. Captured
+    /// here rather than read per send so the caller path pays no env lookup
+    /// and tests get a deterministic value by setting the override before
+    /// spawning their own writer task.
+    slow_write_threshold: Option<std::time::Duration>,
 }
 
 impl WriterTaskHandle {
@@ -382,10 +388,13 @@ impl WriterTaskHandle {
         R: Send + 'static,
         F: FnOnce(&Connection) -> Result<R, StorageError> + Send + 'static,
     {
+        let observation = self.begin_latency_observation();
         let reply_rx = self.enqueue(op).await?;
-        reply_rx
+        let result = reply_rx
             .await
-            .map_err(|_| writer_task_terminated(WriterTaskRequestState::SideEffectsUnknown))?
+            .map_err(|_| writer_task_terminated(WriterTaskRequestState::SideEffectsUnknown))?;
+        self.finish_latency_observation(observation);
+        result
     }
 
     /// Like [`Self::send`], but bounds the wait for the bounded channel to
@@ -411,6 +420,7 @@ impl WriterTaskHandle {
         R: Send + 'static,
         F: FnOnce(&Connection) -> Result<R, StorageError> + Send + 'static,
     {
+        let observation = self.begin_latency_observation();
         let reply_rx = match tokio::time::timeout(timeout, self.enqueue(op)).await {
             Ok(Ok(reply_rx)) => reply_rx,
             Ok(Err(e)) => return Err(e),
@@ -421,9 +431,11 @@ impl WriterTaskHandle {
             }
         };
 
-        reply_rx
+        let result = reply_rx
             .await
-            .map_err(|_| writer_task_terminated(WriterTaskRequestState::SideEffectsUnknown))?
+            .map_err(|_| writer_task_terminated(WriterTaskRequestState::SideEffectsUnknown))?;
+        self.finish_latency_observation(observation);
+        result
     }
 
     /// Send a write operation that MUST run outside any open transaction
@@ -442,10 +454,44 @@ impl WriterTaskHandle {
         R: Send + 'static,
         F: FnOnce(&Connection) -> Result<R, StorageError> + Send + 'static,
     {
+        let observation = self.begin_latency_observation();
         let reply_rx = self.enqueue_inner(op, true).await?;
-        reply_rx
+        let result = reply_rx
             .await
-            .map_err(|_| writer_task_terminated(WriterTaskRequestState::SideEffectsUnknown))?
+            .map_err(|_| writer_task_terminated(WriterTaskRequestState::SideEffectsUnknown))?;
+        self.finish_latency_observation(observation);
+        result
+    }
+
+    /// Snapshot the start instant and the queue backlog for one send, if
+    /// slow-write observation is enabled for this handle. The depth is
+    /// captured at send START — after completion the drain loop has already
+    /// consumed this request, so a completion-time read would systematically
+    /// understate the backlog the caller actually waited behind.
+    fn begin_latency_observation(&self) -> Option<(std::time::Instant, usize)> {
+        self.slow_write_threshold
+            .map(|_| (std::time::Instant::now(), self.queue_depth()))
+    }
+
+    /// Emit a `slow_write` sink row if this send's whole span met the
+    /// threshold. Called on the reply path — success or typed error alike,
+    /// since the caller experienced the latency either way. Never called
+    /// when the reply channel itself is severed (writer-task terminated),
+    /// which is reported through its own retirement row.
+    fn finish_latency_observation(&self, observation: Option<(std::time::Instant, usize)>) {
+        let (Some(threshold), Some((start, depth_at_entry))) =
+            (self.slow_write_threshold, observation)
+        else {
+            return;
+        };
+        let elapsed = start.elapsed();
+        if elapsed >= threshold {
+            crate::timeout_sink::emit_slow_write(
+                &self.db,
+                elapsed.as_millis() as u64,
+                depth_at_entry,
+            );
+        }
     }
 
     /// Current write-queue backlog depth: requests enqueued but not yet
@@ -493,7 +539,11 @@ pub fn spawn(pool: &ConnectionPool, capacity: usize) -> Result<WriterTaskHandle,
     let db = crate::timeout_sink::db_label(pool);
     let (tx, rx) = mpsc::channel(capacity.max(1));
     tokio::spawn(run_writer_task(conn, rx, origin, db.clone()));
-    Ok(WriterTaskHandle { tx, db })
+    Ok(WriterTaskHandle {
+        tx,
+        db,
+        slow_write_threshold: crate::timeout_sink::slow_write_threshold(),
+    })
 }
 
 /// Permanently close admission, then reply to every request that was already
@@ -827,6 +877,7 @@ mod tests {
         let handle = WriterTaskHandle {
             tx,
             db: "test".to_string(),
+            slow_write_threshold: None,
         };
 
         // First send fills the sole channel slot. Its reply never arrives
@@ -864,6 +915,7 @@ mod tests {
         let handle = WriterTaskHandle {
             tx,
             db: "test".to_string(),
+            slow_write_threshold: None,
         };
 
         let first = tokio::spawn({
@@ -1588,6 +1640,7 @@ mod tests {
         let handle = WriterTaskHandle {
             tx,
             db: "test".to_string(),
+            slow_write_threshold: None,
         };
         let send_result = handle.send(|_conn| Ok::<(), StorageError>(())).await;
         assert_writer_task_terminal_state(send_result, WriterTaskRequestState::NotStarted);
@@ -1612,6 +1665,7 @@ mod tests {
         let handle = WriterTaskHandle {
             tx,
             db: "test".to_string(),
+            slow_write_threshold: None,
         };
         let request_ran = Arc::new(AtomicBool::new(false));
         let request_ran_in_op = Arc::clone(&request_ran);

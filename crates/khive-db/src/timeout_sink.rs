@@ -127,6 +127,37 @@ const DRAIN_BATCH_CAP: usize = 256;
 /// writer thread's lifetime at startup, and a no-op when unset.
 const WRITE_DELAY_MS_OVERRIDE_ENV: &str = "KHIVE_WRITER_TIMEOUT_SINK_WRITE_DELAY_MS";
 
+/// Caller-experienced write latency at or above this bound produces a
+/// `slow_write` sink row. Exists because the ADR-136 write queue converts
+/// what used to be a caller-visible admission FAILURE (a `timeout` row) into
+/// caller-visible WAITING: under burst, contention now presents as latency,
+/// which the failure-shaped rows are structurally unable to record — a
+/// quiet sink no longer means an uncontended writer. The bound is on the
+/// whole send-to-reply span (enqueue wait + queue depth + execution), i.e.
+/// the quantity a blocked caller actually experiences.
+const SLOW_WRITE_THRESHOLD: Duration = Duration::from_secs(1);
+
+/// Override for [`SLOW_WRITE_THRESHOLD`], in milliseconds. `0` disables
+/// slow-write rows entirely. Read once per spawned `WriterTask` handle (at
+/// spawn, not per write), so tests get a deterministic value by setting it
+/// before spawning their own writer task.
+const SLOW_WRITE_THRESHOLD_MS_OVERRIDE_ENV: &str = "KHIVE_SLOW_WRITE_THRESHOLD_MS";
+
+/// Resolve the slow-write latency bound: env override if parseable, else
+/// [`SLOW_WRITE_THRESHOLD`]. `Some(0)` from the override resolves to `None`
+/// (disabled) — a zero bound would stamp every write and turn the sink into
+/// a write log, which it is not.
+pub(crate) fn slow_write_threshold() -> Option<Duration> {
+    match std::env::var(SLOW_WRITE_THRESHOLD_MS_OVERRIDE_ENV) {
+        Ok(v) => match v.parse::<u64>() {
+            Ok(0) => None,
+            Ok(ms) => Some(Duration::from_millis(ms)),
+            Err(_) => Some(SLOW_WRITE_THRESHOLD),
+        },
+        Err(_) => Some(SLOW_WRITE_THRESHOLD),
+    }
+}
+
 /// Per-process NDJSON file name — see the module docs' "FILES ARE
 /// PER-PROCESS" section for why this is not a single shared file.
 fn ndjson_file_name() -> String {
@@ -254,13 +285,15 @@ impl Site {
 /// bounded channel — this is the only thing a database caller path ever
 /// does. `error` is already truncated to [`MAX_ERROR_BYTES`] where present.
 ///
-/// `kind` distinguishes the four durable row shapes this sink emits:
+/// `kind` distinguishes the five durable row shapes this sink emits:
 /// `"timeout"` (a writer-admission or busy/locked timeout, carries `site` +
 /// `error`), `"queue_saturation"` (a caller-visible `WriteQueueFull`, carries
 /// `timeout_ms`), `"writer_task_retirement"` (a `WriterTask` terminal
-/// retirement, carries `error` as the retirement reason), and
+/// retirement, carries `error` as the retirement reason),
 /// `"direct_route_violation"` (a direct writer acquisition bypassing an
-/// enabled queue, carries `site`).
+/// enabled queue, carries `site`), and `"slow_write"` (a queued write whose
+/// send-to-reply span met [`SLOW_WRITE_THRESHOLD`], carries `elapsed_ms` +
+/// `queue_depth`).
 struct QueuedEvent {
     ts_utc: String,
     kind: &'static str,
@@ -268,6 +301,8 @@ struct QueuedEvent {
     site: Option<&'static str>,
     error: Option<String>,
     timeout_ms: Option<u64>,
+    elapsed_ms: Option<u64>,
+    queue_depth: Option<u64>,
 }
 
 /// Process-global handle to the writer thread's inbox. Set at most once per
@@ -299,6 +334,10 @@ struct EventRecord<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     timeout_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    elapsed_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    queue_depth: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pid: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     version: Option<&'a str>,
@@ -312,6 +351,8 @@ fn build_line(
     site: Option<&str>,
     error: Option<&str>,
     timeout_ms: Option<u64>,
+    elapsed_ms: Option<u64>,
+    queue_depth: Option<u64>,
     pid: Option<u32>,
     version: Option<&str>,
 ) -> String {
@@ -322,6 +363,8 @@ fn build_line(
         site,
         error,
         timeout_ms,
+        elapsed_ms,
+        queue_depth,
         pid,
         version,
     };
@@ -350,6 +393,8 @@ fn build_line_now(
         site,
         error,
         timeout_ms,
+        None,
+        None,
         pid,
         version,
     )
@@ -582,6 +627,8 @@ fn write_event(sink: &mut AppendSink<File>, dropped: &AtomicU64, event: QueuedEv
         event.site,
         event.error.as_deref(),
         event.timeout_ms,
+        event.elapsed_ms,
+        event.queue_depth,
         None,
         None,
     );
@@ -894,6 +941,8 @@ pub(crate) fn emit_timeout(db: &str, site: Site, error: &str, timeout_ms: Option
         site: Some(site.as_str()),
         error: Some(truncate_error(error, MAX_ERROR_BYTES)),
         timeout_ms,
+        elapsed_ms: None,
+        queue_depth: None,
     };
     enqueue(&handle.sender, &handle.dropped, event);
 }
@@ -914,6 +963,8 @@ pub(crate) fn emit_queue_saturation(db: &str, timeout_ms: u64) {
         site: None,
         error: None,
         timeout_ms: Some(timeout_ms),
+        elapsed_ms: None,
+        queue_depth: None,
     };
     enqueue(&handle.sender, &handle.dropped, event);
 }
@@ -933,6 +984,8 @@ pub(crate) fn emit_writer_task_retirement(db: &str, reason: &str) {
         site: None,
         error: Some(truncate_error(reason, MAX_ERROR_BYTES)),
         timeout_ms: None,
+        elapsed_ms: None,
+        queue_depth: None,
     };
     enqueue(&handle.sender, &handle.dropped, event);
 }
@@ -955,6 +1008,31 @@ pub(crate) fn emit_direct_route_violation(db: &str, site: Site) {
         site: Some(site.as_str()),
         error: None,
         timeout_ms: None,
+        elapsed_ms: None,
+        queue_depth: None,
+    };
+    enqueue(&handle.sender, &handle.dropped, event);
+}
+
+/// Record a `slow_write` event: a queued write whose whole send-to-reply
+/// span (enqueue wait + queue depth + execution) met the slow-write
+/// threshold. Emitted by `WriterTaskHandle`'s send paths on completion —
+/// success or error alike, since the caller experienced the latency either
+/// way. `queue_depth` is the backlog snapshot taken when the send STARTED,
+/// so a reader can separate "queue was deep" from "one op was slow".
+pub(crate) fn emit_slow_write(db: &str, elapsed_ms: u64, queue_depth: usize) {
+    let Some(handle) = SINK.get() else {
+        return;
+    };
+    let event = QueuedEvent {
+        ts_utc: now_rfc3339(),
+        kind: "slow_write",
+        db: db.to_string(),
+        site: None,
+        error: None,
+        timeout_ms: None,
+        elapsed_ms: Some(elapsed_ms),
+        queue_depth: Some(queue_depth as u64),
     };
     enqueue(&handle.sender, &handle.dropped, event);
 }
@@ -1015,6 +1093,49 @@ mod tests {
     }
 
     #[test]
+    fn slow_write_threshold_env_override_and_zero_disable() {
+        std::env::remove_var(SLOW_WRITE_THRESHOLD_MS_OVERRIDE_ENV);
+        assert_eq!(slow_write_threshold(), Some(SLOW_WRITE_THRESHOLD));
+
+        std::env::set_var(SLOW_WRITE_THRESHOLD_MS_OVERRIDE_ENV, "250");
+        assert_eq!(slow_write_threshold(), Some(Duration::from_millis(250)));
+
+        // 0 = disabled entirely, never "emit every write".
+        std::env::set_var(SLOW_WRITE_THRESHOLD_MS_OVERRIDE_ENV, "0");
+        assert_eq!(slow_write_threshold(), None);
+
+        // Unparseable falls back to the default, never to disabled — a typo
+        // in the override must not silently turn the instrument off.
+        std::env::set_var(SLOW_WRITE_THRESHOLD_MS_OVERRIDE_ENV, "not-a-number");
+        assert_eq!(slow_write_threshold(), Some(SLOW_WRITE_THRESHOLD));
+        std::env::remove_var(SLOW_WRITE_THRESHOLD_MS_OVERRIDE_ENV);
+    }
+
+    #[test]
+    fn slow_write_line_carries_elapsed_and_depth_and_omits_inapplicable_fields() {
+        let line = build_line(
+            now_rfc3339(),
+            "slow_write",
+            "test-db",
+            None,
+            None,
+            None,
+            Some(1234),
+            Some(7),
+            None,
+            None,
+        );
+        let parsed: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+        assert_eq!(parsed["kind"], "slow_write");
+        assert_eq!(parsed["elapsed_ms"], 1234);
+        assert_eq!(parsed["queue_depth"], 7);
+        // Inapplicable fields are omitted, not null (existing sink contract).
+        assert!(parsed.get("site").is_none());
+        assert!(parsed.get("error").is_none());
+        assert!(parsed.get("timeout_ms").is_none());
+    }
+
+    #[test]
     fn truncate_error_leaves_short_strings_untouched() {
         let short = "database is locked";
         assert_eq!(truncate_error(short, MAX_ERROR_BYTES), short);
@@ -1055,6 +1176,8 @@ mod tests {
             site: Some(Site::PoolAdmission.as_str()),
             error: Some("boom".to_string()),
             timeout_ms: Some(5),
+            elapsed_ms: None,
+            queue_depth: None,
         };
 
         enqueue(&sender, &dropped, make_event());
@@ -1232,6 +1355,8 @@ mod tests {
                         site: Some(Site::StandaloneGraph.as_str()),
                         error: Some(format!("contention-{i}")),
                         timeout_ms: Some(i as u64),
+                        elapsed_ms: None,
+                        queue_depth: None,
                     };
                     enqueue(&sender, &dropped, event);
                 })
@@ -1253,6 +1378,8 @@ mod tests {
                 event.site,
                 event.error.as_deref(),
                 event.timeout_ms,
+                event.elapsed_ms,
+                event.queue_depth,
                 None,
                 None,
             );

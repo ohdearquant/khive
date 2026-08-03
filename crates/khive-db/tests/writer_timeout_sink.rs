@@ -39,6 +39,12 @@ const EVENTS_DDL: &str = include_str!("../sql/events-ddl.sql");
 static SINK_DIR: OnceLock<tempfile::TempDir> = OnceLock::new();
 static SET_ENV: Once = Once::new();
 
+/// Serializes the two slow-write tests' env-override + writer-task-spawn
+/// windows: the threshold env var is process-global and read at spawn, so
+/// concurrent set/spawn from both tests would let one test's value leak
+/// into the other's handle.
+static SLOW_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Point the sink at a directory this process controls and keeps alive for
 /// its whole lifetime, instead of letting it resolve against whichever
 /// test's own (eventually-dropped) tempdir happens to boot the first pool.
@@ -402,5 +408,113 @@ async fn text_busy_standalone_writer_emits_ndjson_row() {
     assert!(
         matched,
         "expected a standalone:text busy row naming {db_marker}, got: {contents}"
+    );
+}
+
+/// A queued write whose send-to-reply span meets the slow-write threshold
+/// must produce a `"kind":"slow_write"` row carrying `elapsed_ms` and
+/// `queue_depth`, naming this pool's own database path. Threshold is forced
+/// to 1ms (env override, read at writer-task spawn) and the op itself
+/// sleeps 50ms, so the span is guaranteed over-threshold without depending
+/// on scheduler timing.
+#[tokio::test]
+async fn slow_queued_write_emits_slow_write_row() {
+    ensure_sink_dir();
+
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("slow_write_sink_test.db");
+    let handle = {
+        let _guard = SLOW_ENV_LOCK.lock().unwrap();
+        std::env::set_var("KHIVE_SLOW_WRITE_THRESHOLD_MS", "1");
+        let cfg = PoolConfig {
+            path: Some(db_path.clone()),
+            write_queue_enabled: true,
+            ..PoolConfig::default()
+        };
+        let pool = ConnectionPool::new(cfg).expect("file-backed pool should open");
+        let handle = pool
+            .writer_task_handle()
+            .expect("runtime is present")
+            .expect("write queue enabled must spawn a writer task");
+        std::env::remove_var("KHIVE_SLOW_WRITE_THRESHOLD_MS");
+        handle
+    };
+
+    let value = handle
+        .send(|_conn| {
+            std::thread::sleep(Duration::from_millis(50));
+            Ok(42u8)
+        })
+        .await
+        .expect("queued write should succeed");
+    assert_eq!(value, 42);
+
+    let canonical_db: PathBuf = db_path.canonicalize().unwrap_or(db_path);
+    let db_marker = canonical_db.display().to_string();
+    let is_slow_row = |line: &str| {
+        line.contains("\"kind\":\"slow_write\"")
+            && line.contains("\"elapsed_ms\":")
+            && line.contains("\"queue_depth\":")
+            && line.contains(&db_marker)
+    };
+    let contents = wait_for_ndjson_line(is_slow_row, Duration::from_secs(5));
+    assert!(
+        contents.lines().any(is_slow_row),
+        "expected a slow_write row naming {db_marker}, got: {contents}"
+    );
+}
+
+/// The disable arm: threshold override `0` must spawn a handle that never
+/// emits `slow_write`, even for an over-any-threshold op. Uses its own pool
+/// and db path so the assertion ("no slow_write row for THIS db") cannot
+/// collide with the positive test's rows in the shared sink file.
+#[tokio::test]
+async fn slow_write_disabled_by_zero_threshold_emits_nothing() {
+    ensure_sink_dir();
+
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("slow_write_disabled_test.db");
+
+    // Race note: the positive test sets this var to "1" concurrently. Spawn
+    // the writer task inside a scope that forces "0", then restore. The env
+    // is process-global, so serialize the two tests' spawn windows with a
+    // lock rather than hoping for ordering.
+    let handle = {
+        let _guard = SLOW_ENV_LOCK.lock().unwrap();
+        std::env::set_var("KHIVE_SLOW_WRITE_THRESHOLD_MS", "0");
+        let cfg = PoolConfig {
+            path: Some(db_path.clone()),
+            write_queue_enabled: true,
+            ..PoolConfig::default()
+        };
+        let pool = ConnectionPool::new(cfg).expect("file-backed pool should open");
+        let handle = pool
+            .writer_task_handle()
+            .expect("runtime is present")
+            .expect("write queue enabled must spawn a writer task");
+        std::env::remove_var("KHIVE_SLOW_WRITE_THRESHOLD_MS");
+        handle
+    };
+
+    handle
+        .send(|_conn| {
+            std::thread::sleep(Duration::from_millis(50));
+            Ok(())
+        })
+        .await
+        .expect("queued write should succeed");
+
+    // Give the sink's writer thread a real chance to drain anything the
+    // handle might (wrongly) have emitted before asserting absence — an
+    // instant read would pass even against a buggy emit still in flight.
+    std::thread::sleep(Duration::from_millis(300));
+    let canonical_db: PathBuf = db_path.canonicalize().unwrap_or(db_path);
+    let db_marker = canonical_db.display().to_string();
+    let contents = read_sink_ndjson();
+    assert!(
+        !contents
+            .lines()
+            .any(|l| l.contains("\"kind\":\"slow_write\"") && l.contains(&db_marker)),
+        "threshold 0 must disable slow_write rows for this db, got: {contents}"
     );
 }
