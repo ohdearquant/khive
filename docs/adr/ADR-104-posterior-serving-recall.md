@@ -597,8 +597,14 @@ caller always states a signal, so it never had this defect.
 A new wire signal value, `unjudged`, records that a serve happened and no judgment was
 available. Callers that structurally cannot judge — prefetch hooks, session-boot
 recalls, any instrument that fires before a consumer sees the results — pass
-`signal="unjudged"`. Callers that can judge but did not are rejected under Change 1;
-they never silently degrade into `unjudged`.
+`signal="unjudged"`. The enforceable rule on this surface is precisely: omission is
+rejected (Change 1), and a caller that sends `unjudged` asserts that no judgment was
+available. The wire cannot verify that assertion — the request carries no producer
+class or capability from which "structurally unable" could be checked, and this
+amendment adds none. What the rule removes is the silent path: before it, an
+undecided caller was converted into an endorsement by default; after it, recording
+non-judgment requires stating non-judgment, which is an honest claim under the
+caller's own name rather than a fabricated positive under nobody's.
 
 **`unjudged` is wire vocabulary, not evidence.** It is not a member of
 `EvidenceFeedbackSignal`, it does not appear in the Amendment 2 mass table, and it
@@ -660,10 +666,14 @@ No serving-path component may manufacture a judgment the caller did not state. T
 rule is not new: Amendment 1's Stage D accrual rule already excludes both `RecallHit`
 and `NoteAccessed` from per-entity evidence, and its gate already requires that a
 `RecallHit` leave per-entity evidence unchanged and a `NoteAccessed` leave every
-posterior unchanged. The shipped reducer still applies both per-entity arms, so
-Stage D's accrual rule is accepted but not yet satisfied by the code. This change
-supersedes nothing in Amendment 1 — it schedules the implementation that satisfies
-it, and enumerates the affected paths explicitly:
+posterior unchanged. Amendment 1 is itself still Proposed; this amendment does not
+ratify it wholesale. It adopts exactly two of its clauses as normative for this
+change — the Stage D per-entity exclusion of `RecallHit` and of `NoteAccessed`, with
+`RecallHit`'s entity-blind global updates retained — and takes no position on the
+rest of that rider. The shipped reducer still applies both per-entity arms, so those
+clauses are specified but not yet satisfied by the code. This change supersedes
+nothing in Amendment 1 — it schedules the implementation that satisfies the two
+adopted clauses, and enumerates the affected paths explicitly:
 
 1. The `brain.auto_feedback` omitted-signal default — deleted (Change 1).
 2. The memory pack's post-recall hook, which awards a per-entity posterior success to
