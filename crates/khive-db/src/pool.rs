@@ -335,9 +335,9 @@ pub struct WriterGuard<'pool> {
 ///
 /// The aggregate `acquisitions` is the saturating sum of its three explicit
 /// connection classes. Infrastructure-only opens (the diagnostics PASSIVE
-/// probe and the writer task's one-time lifetime connection) are excluded;
-/// zero-wait maintenance probes also remain outside these request-traffic
-/// counters.
+/// probe, the writer task's one-time lifetime connection, and the checkpoint
+/// task's dedicated long-lived connection) are excluded; zero-wait
+/// maintenance probes also remain outside these request-traffic counters.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct WriterAcquisitionSnapshot {
     /// Successful acquisitions across pooled, standalone, and writer-task
@@ -774,9 +774,12 @@ impl ConnectionPool {
     /// Open an infrastructure-owned standalone writer connection without
     /// counting it as one write-operation acquisition.
     ///
-    /// Restricted to the diagnostics PASSIVE probe and the writer task's
-    /// one-time lifetime connection. Actual file-backed write paths must call
-    /// [`Self::open_standalone_writer`] so their acquisitions are observable.
+    /// Restricted to the diagnostics PASSIVE probe, the writer task's
+    /// one-time lifetime connection, and the checkpoint task's dedicated
+    /// long-lived connection (opened once at startup and reused across
+    /// ticks — see `CheckpointConnection::ensure_open`). Actual file-backed
+    /// write paths must call [`Self::open_standalone_writer`] so their
+    /// acquisitions are observable.
     pub(crate) fn open_standalone_writer_untracked(&self) -> Result<Connection, SqliteError> {
         let path = self.config.path.as_ref().ok_or_else(|| {
             SqliteError::InvalidData(

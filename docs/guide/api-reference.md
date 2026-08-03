@@ -712,8 +712,9 @@ dedicated connection (or successfully completed `BEGIN IMMEDIATE`).
 `writer_acquisition_timeouts` remains specific to the finite-wait main-pool mutex before SQLite
 executes; SQLite `BEGIN`/statement failures are separate stages. `audit_append_failures` counts
 process-wide best-effort audit appends whose storage error was logged and swallowed. Zero-wait
-checkpoint skips, the diagnostics probe connection, and the writer task's one-time lifetime
-connection do not inflate the write-traffic acquisition total.
+checkpoint skips, the diagnostics probe connection, the writer task's one-time lifetime
+connection, and the checkpoint task's dedicated long-lived connection (opened once at startup
+and reused across ticks) do not inflate the write-traffic acquisition total.
 
 A finite-wait pooled checkout failure retains its compatibility display text in `message`, but
 the MCP error is a stable object rather than a string:
