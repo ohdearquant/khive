@@ -135,6 +135,7 @@ Architecture Decision Records (ADRs) for khive v1. These are **desired-state spe
 | [ADR-134](ADR-134-store-durability-posture.md)                          | Store durability posture, and the obligation it carries for accounting records                             |
 | [ADR-135](ADR-135-write-scaling-demand-before-ownership.md)             | Scale SQLite writes by reducing writer demand before changing ownership                                    |
 | [ADR-136](ADR-136-fair-write-admission-default.md)                      | Fair write admission — execute the queue default-on pathway with production evidence                       |
+| [ADR-140](ADR-140-context-graph-payload.md)                             | Add a bounded graph payload to context responses                                                           |
 
 <!-- END GENERATED ADR CATALOG -->
 
