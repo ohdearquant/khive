@@ -67,7 +67,10 @@ pub use engine_config::{
     config_from_env, BackendConfig, BackendKind, BlobConfig, ConfigError, EngineConfig,
     GitWriteEntryConfig, GitWriteSectionConfig, KhiveConfig, PackConfig, StorageSectionConfig,
 };
-pub use error::{fts_text_leg_or_err, GuardedWriteFailure, RuntimeError, RuntimeResult};
+pub use error::{
+    fts_text_leg_or_err, GuardedWriteFailure, RuntimeError, RuntimeResult,
+    WriterPoolCheckoutTimeoutContext, WRITER_POOL_CHECKOUT_TIMEOUT_STAGE,
+};
 pub use fusion::FusionStrategy;
 pub use graph_traversal::PathNode;
 pub use khive_db::{

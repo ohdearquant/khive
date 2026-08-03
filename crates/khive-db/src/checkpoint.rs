@@ -1416,12 +1416,13 @@ impl CheckpointConnection {
     }
 
     /// Ensure a usable connection is open, lazily (re)opening from `pool`
-    /// when the current one is absent. Reuses the crate's existing
-    /// standalone-connection open path (`ConnectionPool::open_standalone_writer`),
+    /// when the current one is absent. Reuses the crate's existing untracked
+    /// standalone-connection open path (`ConnectionPool::open_standalone_writer_untracked`),
     /// which applies the same pragmas (including `busy_timeout` from the pool
-    /// config) as any other standalone connection. Returns `None` if opening
-    /// fails — an in-memory pool (no on-disk file to open a second connection
-    /// against), a read-only pool, or a transient filesystem error.
+    /// config) as any other standalone connection, without counting this
+    /// infrastructure connection as write-operation traffic. Returns `None` if
+    /// opening fails — an in-memory pool (no on-disk file to open a second
+    /// connection against), a read-only pool, or a transient filesystem error.
     ///
     /// Logging is rate-limited across a failure streak: the FIRST failure of
     /// a streak logs at `warn!`, every subsequent identical failure (while
@@ -1431,7 +1432,7 @@ impl CheckpointConnection {
     /// `checkpoint_pool_for`) would WARN on every tick forever.
     fn ensure_open(&mut self, pool: &ConnectionPool) -> Option<&rusqlite::Connection> {
         if self.conn.is_none() {
-            match pool.open_standalone_writer() {
+            match pool.open_standalone_writer_untracked() {
                 Ok(conn) => {
                     if self.consecutive_open_failures > 0 {
                         tracing::info!(
@@ -2708,6 +2709,40 @@ mod tests {
         assert!(
             pool.open_standalone_writer().is_err(),
             "an in-memory pool must not be able to open a dedicated checkpoint connection"
+        );
+    }
+
+    /// `CheckpointConnection::ensure_open` must open its dedicated connection
+    /// through the untracked standalone boundary, both on the initial open
+    /// and on a reopen after the connection is dropped — the checkpoint task
+    /// is exempt infrastructure, not a request-traffic writer acquisition
+    /// (ADR-136 D1 gate 5).
+    #[test]
+    fn ensure_open_does_not_move_writer_acquisition_counters() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("checkpoint_ensure_open.db");
+        let pool = file_pool(&path);
+
+        let before_first_open = pool.writer_acquisition_snapshot();
+        let mut checkpoint_conn = CheckpointConnection::new();
+        checkpoint_conn
+            .ensure_open(&pool)
+            .expect("dedicated checkpoint connection must open against a file-backed pool");
+        assert_eq!(
+            pool.writer_acquisition_snapshot(),
+            before_first_open,
+            "the checkpoint connection's initial open must not count as a writer acquisition"
+        );
+
+        checkpoint_conn.conn = None;
+        let before_reopen = pool.writer_acquisition_snapshot();
+        checkpoint_conn
+            .ensure_open(&pool)
+            .expect("dedicated checkpoint connection must reopen after invalidation");
+        assert_eq!(
+            pool.writer_acquisition_snapshot(),
+            before_reopen,
+            "reopening the checkpoint connection must not count as a writer acquisition either"
         );
     }
 

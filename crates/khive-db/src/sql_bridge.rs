@@ -133,18 +133,9 @@ fn open_standalone_reader(pool: &ConnectionPool) -> Result<rusqlite::Connection,
 
 fn open_standalone_writer(pool: &ConnectionPool) -> Result<rusqlite::Connection, StorageError> {
     let config = pool.config();
-    let path = config.path.as_ref().ok_or_else(|| StorageError::Pool {
-        operation: "writer".into(),
-        message: "in-memory databases do not support standalone writer; use pool-backed".into(),
-    })?;
-
-    let conn = rusqlite::Connection::open_with_flags(
-        path,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
-            | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX
-            | rusqlite::OpenFlags::SQLITE_OPEN_URI,
-    )
-    .map_err(|e| map_rusqlite_err(e, "open_writer"))?;
+    let conn = pool
+        .open_standalone_writer()
+        .map_err(|e| StorageError::driver(StorageCapability::Sql, "open_writer", e))?;
 
     conn.busy_timeout(config.busy_timeout)
         .map_err(|e| map_rusqlite_err(e, "open_writer"))?;
@@ -1864,5 +1855,52 @@ mod tests {
                 "mark row {i} must reflect the persisted UPDATE after release; got {val:?}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn file_backed_bridge_counts_writer_and_flag_off_atomic_unit_acquisitions() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = PoolConfig {
+            path: Some(dir.path().join("bridge_writer_acquisitions.db")),
+            write_queue_enabled: false,
+            ..PoolConfig::default()
+        };
+        let pool = Arc::new(ConnectionPool::new(config).unwrap());
+        let bridge = SqlBridge::new(Arc::clone(&pool), true);
+
+        let before = pool.writer_acquisition_snapshot();
+
+        drop(bridge.writer().await.unwrap());
+        let after_writer = pool.writer_acquisition_snapshot();
+        assert_eq!(
+            after_writer.standalone_acquisitions,
+            before.standalone_acquisitions + 1
+        );
+        assert_eq!(after_writer.acquisitions, before.acquisitions + 1);
+        assert_eq!(after_writer.pooled_acquisitions, before.pooled_acquisitions);
+        assert_eq!(
+            after_writer.writer_task_acquisitions,
+            before.writer_task_acquisitions
+        );
+
+        let op: AtomicUnitOp = Box::new(|_writer| {
+            Box::pin(async { Ok(Box::new(()) as Box<dyn std::any::Any + Send>) })
+        });
+        bridge.atomic_unit(op).await.unwrap();
+
+        let after_atomic_unit = pool.writer_acquisition_snapshot();
+        assert_eq!(
+            after_atomic_unit.standalone_acquisitions,
+            before.standalone_acquisitions + 2
+        );
+        assert_eq!(after_atomic_unit.acquisitions, before.acquisitions + 2);
+        assert_eq!(
+            after_atomic_unit.pooled_acquisitions,
+            before.pooled_acquisitions
+        );
+        assert_eq!(
+            after_atomic_unit.writer_task_acquisitions,
+            before.writer_task_acquisitions
+        );
     }
 }

@@ -325,13 +325,14 @@ impl KhiveRuntime {
         self.backend.ann_root()
     }
 
-    /// WAL/checkpoint diagnostics (ADR-091 operator surface): build identity,
-    /// checkpoint counters, a PASSIVE checkpoint probe, WAL file size, and
-    /// WAL-pin census. Not write-free: the PASSIVE probe may backfill WAL
-    /// frames into the database (normal checkpoint I/O). It never changes
-    /// logical state, escalates to TRUNCATE, creates a missing database file,
-    /// or deletes sidecar evidence — see `khive_db::diagnostics` for the
-    /// narrowings that make those claims hold.
+    /// Writer-contention plus WAL/checkpoint diagnostics (ADR-091/ADR-135
+    /// operator surface): pooled writer and audit-failure counters, build
+    /// identity, checkpoint counters, a PASSIVE checkpoint probe, WAL file
+    /// size, and explicitly qualified WAL-pin census. Not write-free: the
+    /// PASSIVE probe may backfill WAL frames into the database (normal
+    /// checkpoint I/O). It never changes logical state, escalates to TRUNCATE,
+    /// creates a missing database file, or deletes sidecar evidence — see
+    /// `khive_db::diagnostics` for the narrowings that make those claims hold.
     ///
     /// Always targets the *main* backend via [`Self::core`], regardless of
     /// which backend this runtime handle is bound to, so a report never
@@ -345,11 +346,16 @@ impl KhiveRuntime {
         let build =
             khive_db::diagnostics::BuildIdentity::from_env(env!("CARGO_PKG_VERSION"), build_hash);
 
-        tokio::task::spawn_blocking(move || khive_db::diagnostics::collect(&pool, build, interval))
-            .await
-            .map_err(|e| {
-                RuntimeError::Internal(format!("db_diagnostics: spawn_blocking join: {e}"))
-            })
+        tokio::task::spawn_blocking(move || {
+            khive_db::diagnostics::collect_with_audit_append_failures(
+                &pool,
+                build,
+                interval,
+                crate::pack::audit_append_failure_count(),
+            )
+        })
+        .await
+        .map_err(|e| RuntimeError::Internal(format!("db_diagnostics: spawn_blocking join: {e}")))
     }
 
     // ---- Store accessors (token-scoped) ----
@@ -1059,6 +1065,35 @@ mod tests {
     fn memory_runtime_creates_successfully() {
         let rt = KhiveRuntime::memory().expect("memory runtime should create");
         assert!(rt.config().db_path.is_none());
+    }
+
+    #[tokio::test]
+    async fn runtime_db_diagnostics_supplies_both_contention_counter_sources() {
+        let rt = KhiveRuntime::memory().expect("memory runtime should create");
+
+        let report = rt.db_diagnostics().await.expect("diagnostics succeed");
+
+        assert!(
+            report.writer_contention.writer_acquisitions >= 1,
+            "runtime construction runs migrations through the finite-wait pooled writer"
+        );
+        assert_eq!(
+            report.writer_contention.writer_acquisitions,
+            report
+                .writer_contention
+                .pooled_writer_acquisitions
+                .saturating_add(report.writer_contention.standalone_writer_acquisitions)
+                .saturating_add(report.writer_contention.writer_task_acquisitions),
+            "the public aggregate must equal the class-specific snapshot"
+        );
+        assert!(
+            report.writer_contention.audit_append_failures.is_some(),
+            "the runtime path must supply its process-wide swallowed-audit counter"
+        );
+        assert!(report
+            .writer_contention
+            .audit_append_failures_unavailable_reason
+            .is_none());
     }
 
     #[test]

@@ -2641,12 +2641,20 @@ fn build_audit_storage_event(
     storage_event
 }
 
+static AUDIT_APPEND_FAILURES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub(crate) fn audit_append_failure_count() -> u64 {
+    AUDIT_APPEND_FAILURES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Append an audit event, logging and swallowing store failures.
 ///
 /// Audit persistence is best-effort everywhere in the dispatch path: a store
-/// write failure must never fail the verb call it is auditing.
+/// write failure must never fail the verb call it is auditing. Every swallowed
+/// failure increments the process-wide diagnostics counter above.
 async fn append_audit_event_best_effort(store: &Arc<dyn EventStore>, event: Event, verb: &str) {
     if let Err(store_err) = store.append_event(event).await {
+        AUDIT_APPEND_FAILURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         tracing::warn!(
             verb,
             error = %store_err,
@@ -4277,11 +4285,17 @@ mod tests {
     #[derive(Default, Debug)]
     struct MemoryEventStore {
         events: std::sync::Mutex<Vec<Event>>,
+        fail_appends: bool,
     }
 
     #[async_trait]
     impl EventStore for MemoryEventStore {
         async fn append_event(&self, event: Event) -> khive_storage::StorageResult<()> {
+            if self.fail_appends {
+                return Err(khive_storage::StorageError::Internal(
+                    "injected audit append failure".to_string(),
+                ));
+            }
             self.events.lock().unwrap().push(event);
             Ok(())
         }
@@ -4446,6 +4460,46 @@ mod tests {
         assert_eq!(ev.namespace, "test-ns");
         assert_eq!(ev.substrate, SubstrateKind::Event);
         assert_eq!(ev.outcome, EventOutcome::Success);
+    }
+
+    #[tokio::test]
+    #[serial(audit_append_failures)]
+    async fn swallowed_audit_append_failure_is_counted_without_failing_dispatch() {
+        let before = audit_append_failure_count();
+
+        let successful_store = Arc::new(MemoryEventStore::default());
+        let mut successful_builder = VerbRegistryBuilder::new();
+        successful_builder.register(AlphaPack);
+        successful_builder.with_event_store(successful_store);
+        let successful_registry = successful_builder.build().expect("registry builds");
+        successful_registry
+            .dispatch("list", Value::Null)
+            .await
+            .expect("successful audit append must not affect dispatch");
+        assert_eq!(
+            audit_append_failure_count(),
+            before,
+            "successful audit appends must not increment the failure counter"
+        );
+
+        let failing_store = Arc::new(MemoryEventStore {
+            fail_appends: true,
+            ..MemoryEventStore::default()
+        });
+        let mut failing_builder = VerbRegistryBuilder::new();
+        failing_builder.register(AlphaPack);
+        failing_builder.with_event_store(failing_store);
+        let failing_registry = failing_builder.build().expect("registry builds");
+        failing_registry
+            .dispatch("list", Value::Null)
+            .await
+            .expect("best-effort audit failure must preserve dispatch success");
+
+        assert_eq!(
+            audit_append_failure_count(),
+            before + 1,
+            "the swallowed append failure must remain visible to diagnostics"
+        );
     }
 
     #[tokio::test]
