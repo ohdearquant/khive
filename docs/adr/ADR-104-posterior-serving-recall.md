@@ -576,7 +576,9 @@ evidence, it is the absence of evidence. Converting it into a positive event mak
 retriever's own ranking its training data — a rank-position feedback loop in which the
 first result is credited for having been first. Serving paths that structurally cannot
 judge (pre-serving prefetch, session-boot recall) are today indistinguishable from
-endorsements.
+endorsements. The same rank-position credit also exists below the feedback surface:
+the recall path itself awards a per-entity posterior success to the top result of
+every recall (see Change 3).
 
 ### Change 1 — `signal` is required
 
@@ -592,59 +594,125 @@ caller always states a signal, so it never had this defect.
 
 ### Change 2 — `unjudged`: telemetry without endorsement
 
-A new signal value records that a serve happened and no judgment was available:
+A new wire signal value, `unjudged`, records that a serve happened and no judgment was
+available. Callers that structurally cannot judge — prefetch hooks, session-boot
+recalls, any instrument that fires before a consumer sees the results — pass
+`signal="unjudged"`. Callers that can judge but did not are rejected under Change 1;
+they never silently degrade into `unjudged`.
 
-| Signal     | Polarity | Evidence mass          |
-| ---------- | -------- | ---------------------- |
-| `unjudged` | none     | 0 (excluded from fold) |
+**`unjudged` is wire vocabulary, not evidence.** It is not a member of
+`EvidenceFeedbackSignal`, it does not appear in the Amendment 2 mass table, and it
+never constructs an evidence row. Amendment 2's closed eight-member enum, its
+every-row-exactly-once rule, and the migration validator's strictly-positive-mass
+requirement are all unchanged by this amendment. The wire vocabulary of
+`brain.auto_feedback` and the evidence vocabulary are distinct sets by design: a
+signal that carries no evidence must not be representable in the evidence type.
 
-`unjudged` rows are persisted with full serve attribution (they remain serving
-telemetry and still resolve profiles, ledger ids, and candidate lists) but the
-posterior fold excludes them entirely — zero mass, no polarity, no clamp interaction.
-This row is additive to the Amendment 2 table and is a policy-version bump per that
-table's own versioning rule.
+**Event kind.** `unjudged` acceptances persist under a new event kind,
+`feedback_unjudged`, rather than under `feedback_explicit`:
 
-**Event kind: `unjudged` gets its own kind, `feedback_unjudged`, rather than riding
-`feedback_explicit`.** The decision is forced by how the existing consumers read:
-
-- The posterior fold selects its inputs by emitting verb and event kind — the
-  `brain.feedback` route in the brain pack's event classifier — and its shared signal
-  validator quarantines out-of-contract signal values. A separate kind is therefore
-  excluded from training by the absence of a subscription, not by a filter every
-  present and future consumer must remember to apply. Riding `feedback_explicit`
-  would invert that: correctness would depend on each consumer opting out.
 - `feedback_explicit` flat counts are consumed as judgment counts (including as a
   discipline-ratio numerator against `actor_turn`). A non-judgment row inside that
   kind would silently inflate every such read; the kind's own name would misdescribe
-  its contents. With a separate kind, those counts stay judgment-only with zero
+  its contents. With a separate kind those counts stay judgment-only with zero
   consumer changes.
 - The event-count surface groups by kind generically, so `feedback_unjudged` appears
   as its own row in existing kind breakdowns with no migration.
+- The event-kind enum is closed and compile-time; adding `feedback_unjudged` updates
+  the enum, its ALL list and count, canonical name, valid-name list, and parser
+  together, following the same pattern as every prior kind addition.
 
-The event-kind enum is closed and compile-time; `feedback_unjudged` is one additive
-variant plus its canonical string, following the same pattern as every prior kind
-addition.
+**Fold boundary, stated against the implementation as it is.** The brain event
+interpreter today dispatches on the emitting verb alone, and an unknown top-level
+signal value degrades to an ignored no-op rather than being quarantined (only invalid
+`section_signals` maps are quarantined on replay). Incidental ignorance is not a
+contract: it would hold only until the signal parsers are next extended. This
+amendment therefore makes the exclusion normative and explicit — the fold boundary is
+the pair (emitting verb, event kind), and the interpreter gains an explicit
+`feedback_unjudged` arm that classifies the row as irrelevant-to-training _before_
+signal parsing. A valid `feedback_unjudged` row is persisted, never quarantined: it is
+correct telemetry, not a malformed input.
 
-Callers that structurally cannot judge — prefetch hooks, session-boot recalls, any
-instrument that fires before a consumer sees the results — pass `signal="unjudged"`.
-This composes with the existing unattributed-serve invariant (no profile receives
-explicit credit from an unattributed serve): `unjudged` grants no credit, so it is
-legal from both attributed and unattributed serves.
+**Persistence route for unattributed serves.** The current handler permits
+profile-less events only through the implicit-mass gate, and rejects every other
+profile-less signal. Neither route fits `unjudged`: it must not create an
+implicit-mass row, and it must not be rejected. This amendment specifies a third
+route: `feedback_unjudged` events append atomically to the event log with full serve
+attribution when available (profile id, serve attribution, scorer run, serve-ledger
+id, query, candidate ids) and with no profile mutation, no posterior touch, and no
+fold-gate row — from attributed and unattributed serves alike. This composes with the
+existing invariant that no profile receives explicit credit from an unattributed
+serve: `unjudged` grants no credit from any serve. An `unjudged` event carrying
+serve-ledger provenance does **not** consume the ledger's grade slot or its
+deduplication budget: a later genuine judgment for the same serve must still be
+recordable exactly once.
 
 ### Change 3 — no synthesized judgments anywhere in the serving path
 
-The clause generalizes beyond the one default: no serving-path component may
-manufacture a judgment the caller did not state. Any internal auto-crediting of recall
-results (the first-result implicit-positive crediting described in ADR-058's recall
-integration) is removed under this amendment. A serve with no subsequent judgment
-leaves a serve-ledger row and, at most, an `unjudged` event — never a positive.
+No serving-path component may manufacture a judgment the caller did not state. This
+amendment supersedes Amendment 1's retention of the shipped `RecallHit` per-entity
+credit, and enumerates the affected paths explicitly:
 
-### Sequencing and acceptance
+1. The `brain.auto_feedback` omitted-signal default — deleted (Change 1).
+2. The memory pack's post-recall hook, which awards a per-entity posterior success to
+   the top result of every non-empty recall — the per-entity arm is removed. The
+   entity-blind arms of the same hook (recall availability, latency-bucketed temporal
+   state) are measurements of the serving function, not judgments of a result, and
+   are retained.
+3. The brain core's per-entity signal extraction, which maps a recall hit to a
+   positive per-entity update — the recall-hit arm stops yielding a per-entity
+   signal. The entity-blind global recall parameter (hit/miss) and the temporal
+   posterior remain driven by recall events, unchanged.
 
-Origin-verb stamping (so each feedback event names whether `brain.feedback` or
-`brain.auto_feedback` emitted it) lands first or in the same change; without it the
-acceptance window cannot attribute residual implicit rows to a path. Acceptance: an
-observation window under normal agent load shows zero newly-emitted
+Note-access crediting (a positive per-entity signal when a record is directly
+accessed) is grounded in a caller action on a specific record rather than in rank
+position, and is out of scope for this amendment; any change to it takes its own
+record.
+
+After this change, a serve with no subsequent judgment leaves a serve-ledger row and,
+at most, a `feedback_unjudged` event — never a positive update of any per-entity or
+per-profile evidence state.
+
+### Origin stamping: wire contract
+
+Every feedback event written after this amendment carries a required payload field
+`originating_verb`, with the closed value set `brain.feedback` |
+`brain.auto_feedback` | `brain.emit` (the last for the deprecated legacy path). The
+stored event verb remains `brain.feedback` for replay and historical-query stability;
+the forwarding path stamps `originating_verb` before delegating, so the stored verb
+and the originating surface are separately queryable. Historical rows lack the field;
+absence means pre-amendment, and no backfill is performed. The acceptance queries
+below filter on this field; without it, residual implicit rows cannot be attributed
+to an emitting surface.
+
+### Acceptance arms — executed, not claimed
+
+Each arm is a test that must exist and pass with the implementing change:
+
+1. **Rejection with absence assertion.** A signal-less `brain.auto_feedback` call
+   returns invalid input, and the event store is asserted to contain zero new rows
+   from the call — the rejection writes nothing.
+2. **Wire survival.** A `signal="unjudged"` call writes a `feedback_unjudged` row
+   that survives ingestion and is readable back through the event-count surface's
+   kind breakdown with serve attribution intact. The two surfaces where a validator
+   could silently eat the row are named as test targets: the closed event-kind
+   valid-name list and parser in the types crate, and the closed signal-string match
+   in the brain handlers — both must accept the new values, and the test exercises
+   the full write-then-read path rather than the validators in isolation.
+3. **Training exclusion, live and replayed.** Folding a stream containing
+   `feedback_unjudged` rows produces posterior state identical to folding the same
+   stream without them — asserted over global, per-profile, per-section, and
+   implicit-mass state, in both the live-write path and the replay path.
+4. **No synthesized credit.** A recall returning results, followed by no caller
+   judgment, leaves every per-entity posterior unchanged in both the memory-pack
+   recall state and the brain-core profile state; only the entity-blind availability
+   and temporal arms may move.
+
+### Sequencing and acceptance window
+
+The origin-stamping contract above lands first or in the same change as Changes 1–3;
+without it the acceptance window cannot attribute residual implicit rows to a path.
+Acceptance: an observation window under normal agent load shows zero newly-emitted
 `implicit_positive` events from serving-profile traffic — every event is either a
-stated judgment or a typed `unjudged` row. Historical events are untouched; this
-amendment changes what may be written, never what was written.
+stated judgment or a typed `feedback_unjudged` row. Historical events are untouched;
+this amendment changes what may be written, never what was written.
