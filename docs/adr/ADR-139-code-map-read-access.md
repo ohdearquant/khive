@@ -25,7 +25,15 @@ The code pack SHALL add `code.list`, `code.search`, and `code.deps` as read-only
 
 The three verbs SHALL NOT accept a database path, URI, connection string, file descriptor, or other caller-controlled location. [Source: ADR-085, Amendment 4, E7; ADR-018]
 
-The `map` argument SHALL resolve only through an operator-maintained code-map registry loaded with daemon configuration. [Source: ADR-028, §1 and §8]
+The `map` argument SHALL resolve only through an operator-maintained code-map registry, defined by this ADR and loaded from daemon configuration. [Source: ADR-018; ADR-028, §1 and §8]
+
+### Registry configuration contract
+
+The registry's source of truth is a `[[code_maps]]` array in the daemon's configuration file, defined by this ADR: each entry declares the registered `name` (string, unique across entries), the absolute `path` of the map database file, and the operator-declared absolute `source_root` the map's contents describe. The shipped configuration parser reads only engine and actor settings and ignores unknown keys, so implementing this ADR includes adding this key to the parser; until then the registry is empty and every read verb fails closed at map resolution. [Source: ADR-028, §1 and "Deferred" list]
+
+The registry loads at exactly two points — daemon startup and an explicit operator-initiated configuration reload — and no runtime verb, request, or map content can create, alter, or remove an entry. Registration is a configuration edit followed by a reload or restart; deregistration is removal of the entry followed by the same, and it removes the map from the read surface without deleting or changing the database file. A reload takes effect for every request admitted after it; an in-flight request holds its already-opened handle at most until its short read transaction ends. [Source: ADR-018; ADR-028, §8]
+
+Validation is per entry, at load time, fail closed: an entry failing any check in "Registered map lifecycle" below SHALL NOT be registered, and the loader SHALL log that entry's name and the failing check for the operator. A rejected entry aborts neither daemon startup nor the reload nor the loading of other entries — an unregistered map is simply unreadable, which is this surface's intended failure direction. A read request naming an unknown `map` receives one per-op validation error that does not distinguish never-configured from rejected-at-load; that distinction is operator-facing, in the load log, never caller-facing. [Source: ADR-018]
 
 ### Registered map lifecycle
 
@@ -47,6 +55,10 @@ Deregistering a map SHALL remove it from the public read surface without deletin
 
 After registry resolution, a read verb SHALL open only the registered file through a read-only SQLite constructor that neither creates a missing file nor runs migrations. [Source: ADR-085, Amendment 4, E7]
 
+Registry resolution replaces caller path selection and nothing else; it SHALL NOT weaken any per-open protection of ADR-085 Amendment 4 E7, all of which apply to every open of a registered map: the open SHALL go through a no-follow VFS for the main database file and for every SQLite companion file the connection touches (`-journal`, `-wal`, `-shm`); after open and before any row is read, the opened descriptor's `(device, inode)` identity SHALL be compared against the map's registered identity and checked against the shared production database's identity set, main file and companions alike; and a writable companion whose link count exceeds one SHALL be rejected. Any failed check SHALL close the handle and fail the request, fail closed. [Source: ADR-085, Amendment 4, E7]
+
+The implementation SHALL carry a post-registration companion-swap acceptance test: register a valid map, then replace one of its companion files with a symlink to — or a hard link sharing identity with — a production companion, and assert that the next read of that map fails closed without reading through the link. A registry check at load time cannot observe a swap that happens after load; only the per-open fence can, which is why registration does not retire it. [Source: ADR-085, Amendment 4, E7]
+
 The read path SHALL use a short read transaction and SHALL close the map handle before returning a response. [Source: ADR-085, Amendment 4, E3-E4]
 
 The implementation SHALL treat the registry as the authorization boundary for map selection; map data cannot grant access to another database. [Source: ADR-018; ADR-028, §1]
@@ -55,11 +67,13 @@ The implementation SHALL treat the registry as the authorization boundary for ma
 
 `code.list(map, entity_type?, project_id?, cursor?, limit?)` SHALL return a stable, cursor-paginated list of live code entities from the selected map. [Source: ADR-085, D2-D3 and Amendment 4, E1]
 
-`entity_type`, when supplied to `code.list`, SHALL be one of `module`, `function`, `datatype`, or `interface`; `project_id`, when supplied, SHALL be a map-local project identifier. [Source: ADR-085, D2-D3]
+`entity_type`, when supplied to `code.list`, SHALL be one of `project`, `module`, `function`, `datatype`, or `interface` — the five entity kinds a map contains; `project_id`, when supplied, SHALL be a map-local project identifier. [Source: ADR-085, D2-D3 and Amendment 2; Context]
+
+The same five-kind set governs responses, filtered or not: L1 and L1.5 maps contain `project` entities and project-to-project `depends_on` edges (Context), and the read surface SHALL represent every kind the map holds rather than silently omit rows an unfiltered request matched. A row whose `entity_type` is `project` SHALL carry `project_id: null`; a code-subtype row's `project_id` names its containing project. [Source: ADR-085, Amendment 2; `crates/khive-pack-code/src/source_ingest.rs:296-312` at commit `9442ec2c52290120c5bf4a4c8a1dc771102658dd`]
 
 `code.search(map, query, entity_type?, project_id?, cursor?, limit?)` SHALL return a bounded, ranked list of live code entities from the selected map and SHALL scope every lookup to that map. [Source: ADR-085, D2-D3 and Amendment 4, E1]
 
-`code.deps(map, id, direction?, max_depth?, limit?)` SHALL traverse live `depends_on` edges from a map-local entity identifier and SHALL return a bounded subgraph from the selected map only. [Source: ADR-085, D3 and Amendment 2, B8]
+`code.deps(map, id, direction?, max_depth?, limit?)` SHALL traverse live `depends_on` edges from a map-local entity identifier and SHALL return a bounded subgraph from the selected map only. `id` MAY name a `project` entity, and project-to-project `depends_on` edges traverse exactly as code-subtype edges do. [Source: ADR-085, D3 and Amendment 2, B8]
 
 `direction`, when supplied, SHALL be the closed set `outgoing`, `incoming`, or `both`; when omitted, `direction` SHALL default to `both`. `max_depth` and `limit` SHALL have explicit documented maxima and SHALL reject invalid values before the map is opened. [Source: ADR-085, Amendment 4, E8]
 
@@ -84,66 +98,72 @@ Every bounded numeric or cursor-adjacent parameter below is validated before the
 
 Every parameter below is typed and validated before the map is opened; an omitted optional parameter behaves per its Default column, never per an implementation-chosen convention.
 
-| Verb          | Parameter             | Type                                                         | Required | Default                                                                                                   |
-| ------------- | --------------------- | ------------------------------------------------------------ | -------- | --------------------------------------------------------------------------------------------------------- |
-| `code.list`   | `map`                 | string (registered map name)                                 | yes      | —                                                                                                         |
-| `code.list`   | `entity_type`         | string, one of `module`, `function`, `datatype`, `interface` | no       | none (no filter applied)                                                                                  |
-| `code.list`   | `project_id`          | string (map-local identifier)                                | no       | none (no filter applied)                                                                                  |
-| `code.list`   | `cursor`              | string (opaque token)                                        | no       | none (first page)                                                                                         |
-| `code.list`   | `limit`               | integer                                                      | no       | 100                                                                                                       |
-| `code.search` | `map`                 | string (registered map name)                                 | yes      | —                                                                                                         |
-| `code.search` | `query`               | string, non-empty                                            | yes      | —                                                                                                         |
-| `code.search` | `entity_type`         | string, one of `module`, `function`, `datatype`, `interface` | no       | none (no filter applied)                                                                                  |
-| `code.search` | `project_id`          | string (map-local identifier)                                | no       | none (no filter applied)                                                                                  |
-| `code.search` | `cursor`              | string (opaque token)                                        | no       | none (first page); valid only when replayed against an identical `query`, `entity_type`, and `project_id` |
-| `code.search` | `limit`               | integer                                                      | no       | 20                                                                                                        |
-| `code.deps`   | `map`                 | string (registered map name)                                 | yes      | —                                                                                                         |
-| `code.deps`   | `id`                  | string (map-local entity identifier)                         | yes      | —                                                                                                         |
-| `code.deps`   | `direction`           | string, one of `outgoing`, `incoming`, `both`                | no       | `both`                                                                                                    |
-| `code.deps`   | `max_depth`           | integer                                                      | no       | 2                                                                                                         |
-| `code.deps`   | `limit` (total nodes) | integer                                                      | no       | 200                                                                                                       |
+| Verb          | Parameter             | Type                                                                    | Required | Default                                       |
+| ------------- | --------------------- | ----------------------------------------------------------------------- | -------- | --------------------------------------------- |
+| `code.list`   | `map`                 | string (registered map name)                                            | yes      | —                                             |
+| `code.list`   | `entity_type`         | string, one of `project`, `module`, `function`, `datatype`, `interface` | no       | none (no filter applied)                      |
+| `code.list`   | `project_id`          | string (map-local identifier)                                           | no       | none (no filter applied)                      |
+| `code.list`   | `cursor`              | string (opaque token)                                                   | no       | none (first page)                             |
+| `code.list`   | `limit`               | integer                                                                 | no       | 100                                           |
+| `code.search` | `map`                 | string (registered map name)                                            | yes      | —                                             |
+| `code.search` | `query`               | string, non-empty                                                       | yes      | —                                             |
+| `code.search` | `entity_type`         | string, one of `project`, `module`, `function`, `datatype`, `interface` | no       | none (no filter applied)                      |
+| `code.search` | `project_id`          | string (map-local identifier)                                           | no       | none (no filter applied)                      |
+| `code.search` | `cursor`              | string (opaque token)                                                   | no       | none (first page); bound per "Cursor binding" |
+| `code.search` | `limit`               | integer                                                                 | no       | 20                                            |
+| `code.deps`   | `map`                 | string (registered map name)                                            | yes      | —                                             |
+| `code.deps`   | `id`                  | string (map-local entity identifier)                                    | yes      | —                                             |
+| `code.deps`   | `direction`           | string, one of `outgoing`, `incoming`, `both`                           | no       | `both`                                        |
+| `code.deps`   | `max_depth`           | integer                                                                 | no       | 2                                             |
+| `code.deps`   | `limit` (total nodes) | integer                                                                 | no       | 200                                           |
 
 #### Response field types
 
 Every response field below is typed; a field marked nullable returns JSON `null` rather than an absent key.
 
-| Verb          | Field                 | Type                                                         | Nullable                 |
-| ------------- | --------------------- | ------------------------------------------------------------ | ------------------------ |
-| `code.list`   | `map`                 | string                                                       | no                       |
-| `code.list`   | `items[].id`          | string                                                       | no                       |
-| `code.list`   | `items[].entity_type` | string, one of `module`, `function`, `datatype`, `interface` | no                       |
-| `code.list`   | `items[].name`        | string                                                       | no                       |
-| `code.list`   | `items[].project_id`  | string                                                       | yes                      |
-| `code.list`   | `next_cursor`         | string (opaque token)                                        | yes (`null` = last page) |
-| `code.search` | `map`                 | string                                                       | no                       |
-| `code.search` | `items[].id`          | string                                                       | no                       |
-| `code.search` | `items[].entity_type` | string, one of `module`, `function`, `datatype`, `interface` | no                       |
-| `code.search` | `items[].name`        | string                                                       | no                       |
-| `code.search` | `items[].project_id`  | string                                                       | yes                      |
-| `code.search` | `items[].score`       | number (floating point, higher ranks first)                  | no                       |
-| `code.search` | `next_cursor`         | string (opaque token)                                        | yes (`null` = last page) |
-| `code.deps`   | `map`                 | string                                                       | no                       |
-| `code.deps`   | `root`                | string                                                       | no                       |
-| `code.deps`   | `nodes[].id`          | string                                                       | no                       |
-| `code.deps`   | `nodes[].entity_type` | string, one of `module`, `function`, `datatype`, `interface` | no                       |
-| `code.deps`   | `nodes[].name`        | string                                                       | no                       |
-| `code.deps`   | `edges[].source`      | string (an `id` present in `nodes`)                          | no                       |
-| `code.deps`   | `edges[].target`      | string (an `id` present in `nodes`)                          | no                       |
-| `code.deps`   | `truncated`           | boolean                                                      | no                       |
+| Verb          | Field                 | Type                                                                    | Nullable                 |
+| ------------- | --------------------- | ----------------------------------------------------------------------- | ------------------------ |
+| `code.list`   | `map`                 | string                                                                  | no                       |
+| `code.list`   | `items[].id`          | string                                                                  | no                       |
+| `code.list`   | `items[].entity_type` | string, one of `project`, `module`, `function`, `datatype`, `interface` | no                       |
+| `code.list`   | `items[].name`        | string                                                                  | no                       |
+| `code.list`   | `items[].project_id`  | string                                                                  | yes                      |
+| `code.list`   | `next_cursor`         | string (opaque token)                                                   | yes (`null` = last page) |
+| `code.search` | `map`                 | string                                                                  | no                       |
+| `code.search` | `items[].id`          | string                                                                  | no                       |
+| `code.search` | `items[].entity_type` | string, one of `project`, `module`, `function`, `datatype`, `interface` | no                       |
+| `code.search` | `items[].name`        | string                                                                  | no                       |
+| `code.search` | `items[].project_id`  | string                                                                  | yes                      |
+| `code.search` | `items[].score`       | number (floating point, higher ranks first)                             | no                       |
+| `code.search` | `next_cursor`         | string (opaque token)                                                   | yes (`null` = last page) |
+| `code.deps`   | `map`                 | string                                                                  | no                       |
+| `code.deps`   | `root`                | string                                                                  | no                       |
+| `code.deps`   | `nodes[].id`          | string                                                                  | no                       |
+| `code.deps`   | `nodes[].entity_type` | string, one of `project`, `module`, `function`, `datatype`, `interface` | no                       |
+| `code.deps`   | `nodes[].name`        | string                                                                  | no                       |
+| `code.deps`   | `edges[].source`      | string (an `id` present in `nodes`)                                     | no                       |
+| `code.deps`   | `edges[].target`      | string (an `id` present in `nodes`)                                     | no                       |
+| `code.deps`   | `truncated`           | boolean                                                                 | no                       |
 
 #### `code.list` response
 
 The success value is `{ "map": <resolved map name>, "items": [ { "id", "entity_type", "name", "project_id" } ], "next_cursor": <string> | null }`. Rows order by `name` ascending, ties broken by `id` ascending — a total order, so two identical calls against an unchanged map return rows in the same sequence. [Source: ADR-085, Amendment 4, E2 and E9, applying the same total-order pattern used for `code.coupling`.]
 
-`cursor` is an opaque token encoding the `(name, id)` of the last row returned on the prior page; a `cursor` that does not decode to that shape, or that does not correspond to a value the selected map could have produced, SHALL be rejected with a validation error rather than treated as "start of list."
+`cursor` is an opaque token encoding the `(name, id)` of the last row returned on the prior page, under the bindings in "Cursor binding" below; a `cursor` that does not decode to that shape, or that does not correspond to a value the selected map could have produced, SHALL be rejected with a validation error rather than treated as "start of list."
 
 #### `code.search` response
 
-The success value is `{ "map": <resolved map name>, "items": [ { "id", "entity_type", "name", "project_id", "score" } ], "next_cursor": <string> | null }`. Rows order by `score` descending, ties broken by `id` ascending. `cursor` encodes the `(score, id)` of the last row returned; it is valid only when replayed against an identical `query`, `entity_type`, and `project_id` — a cursor replayed against a different query SHALL be rejected with a validation error, because ranked order is not guaranteed stable across distinct queries.
+The success value is `{ "map": <resolved map name>, "items": [ { "id", "entity_type", "name", "project_id", "score" } ], "next_cursor": <string> | null }`. Rows order by `score` descending, ties broken by `id` ascending. `cursor` encodes the `(score, id)` of the last row returned, under the bindings in "Cursor binding" below — ranked order is not guaranteed stable across distinct queries, which is why the query is a bound value.
+
+The search contract is deliberately minimal and deterministic. The indexed field is the entity `name`; `query` is a literal string with no operator grammar, and a `query` that is empty or entirely whitespace SHALL be rejected before the map is opened. Matching is case-insensitive: a row is returned only when `query` matches its `name` exactly, as a prefix, or as an interior substring. `score` is a floating-point number whose scale is implementation-defined; its ordering is not: an exact name match SHALL rank strictly above every prefix match, and a prefix match strictly above every interior-substring match, with ties inside a band broken by `id` ascending. A consumer SHALL rely only on the ordering and band guarantees, never on score values or their differences. The implementation SHALL carry a fixture map whose entity names exercise all three match bands plus a non-matching control, asserting the relative order — the fixture is this contract's executable form, and a richer query grammar would be a superseding amendment, not an implementation liberty. [Source: ADR-085, Amendment 4, E2 and E9]
 
 #### `code.deps` response
 
 The success value is `{ "map": <resolved map name>, "root": <id>, "nodes": [ { "id", "entity_type", "name" } ], "edges": [ { "source", "target" } ], "truncated": <bool> }`. Traversal SHALL proceed breadth-first from `root`, ordering nodes by depth ascending and, within a depth, by `id` ascending — a total order over the traversal itself, independent of `limit`. When the `limit` bound on total returned nodes is reached before traversal completes, the response SHALL set `truncated: true` and stop expanding rather than silently omit edges among already-returned nodes. `id` values not resolvable in the selected map SHALL produce a distinct not-found validation error before any traversal begins.
+
+#### Cursor binding
+
+Every cursor token binds the full context that produced it: the resolved map name, the map's registered opened-file identity as recorded at registration, and every result-affecting parameter of the issuing request — for `code.list`, `entity_type` and `project_id`; for `code.search`, `query`, `entity_type`, and `project_id`. Replaying a cursor with any bound value differing from the replaying request SHALL be rejected with a per-op validation error naming the cursor as stale, never treated as "start of list" and never silently applied to the new context. Deregistering a map, or re-registering it — even at the same path over a rebuilt file — changes the registered identity and therefore invalidates every outstanding cursor for that map; the caller restarts from the first page. A cursor is short-lived pagination state, not a durable bookmark. [Source: ADR-085, Amendment 4, E2]
 
 ### Relationship to the existing map-analysis design
 
