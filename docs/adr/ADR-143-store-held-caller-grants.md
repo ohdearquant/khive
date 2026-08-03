@@ -90,11 +90,22 @@ capability plus ADR-127's grant fields — in durable form.
   verified before the capability is treated as authority; a seal that fails
   verification is a refusal, and one that cannot be verified is unavailable —
   which is also a refusal, never a pass.
-- **Revocation is transitive through the recorded lineage.** The substrate's
-  revocation walks the delegation children; because every store-held record
-  names its parent, that walk reaches durable children across processes.
-  Revoking a grant revokes everything delegated from it, effective no later
-  than the next gate consultation, without a process restart.
+- **Revocation is transitive, and the authoritative mechanism is gate-time
+  ancestor validation.** A store-held record contributes to effective
+  authority only if its complete recorded ancestor chain — every record from
+  it up to a boot-minted root — is live (unrevoked) and seal-valid at the
+  same consultation, evaluated from the store. Persisting a parent id does
+  not rebuild any process's in-memory children index, and no process is
+  required to rebuild one: a non-minting process materializes nothing ahead
+  of time — at consultation it loads and seal-verifies the record and each
+  recorded ancestor, and any missing, revoked, or seal-invalid ancestor makes
+  the grant contribute nothing. Revoking a grant therefore denies everything
+  delegated from it at every process's next consultation, without restart and
+  without cross-process coordination. The substrate's in-process
+  children-index revocation walk remains a valid optimization inside the
+  minting process; it is not the contract. Chains are shallow by
+  construction: §2 forbids subactors as grantors, so lineage passes only
+  through top-level principals.
 - **Check-time view.** A principal's effective authority is computed at gate
   consultation as a view over its live (unrevoked, seal-valid) grant records.
   There is no boot-time snapshot of caller authority to go stale. This is the
@@ -126,13 +137,25 @@ one gate instance, minted at the boot seam, no outside-gate constructor.
   Write there. After boot the two rights are independent — holding a right
   does not imply administering it, and administering a pair does not grant the
   ordinary right; a principal that needs both holds both.
-- **The surface is gated under Amendment 1's pseudo-verb invariant.** Creating
-  or revoking a grant is checked against the full authority the resulting
-  record carries: every `(namespace, right)` pair in the request requires the
-  caller hold `GrantAdmin` for that pair (clause 1 — the check is on what the
-  result grants), and a request covering several pairs is checked on every one
-  of them, any failure denying the whole request with no partial record
-  (clause 2).
+- **The surface is gated under Amendment 1's pseudo-verb invariant, and the
+  right-selection rule is stated so only one implementation is admissible.**
+  Creating a grant for a `(namespace, right)` pair requires the caller hold
+  BOTH: a live, seal-valid ordinary capability of its own covering that pair —
+  and that capability, not one selected by the surface, is the `delegate_cap`
+  parent of the minted grant — AND `GrantAdmin` for the same pair. This
+  satisfies Amendment 1 clause 1 literally: the caller is checked against the
+  full ordinary authority the result grants, because it must hold that
+  authority to serve as the delegation parent. An admin-only principal —
+  `GrantAdmin` without the ordinary right — can mint nothing; administration
+  is permission to delegate what you hold, never a source of authority. A
+  request covering several pairs is checked on every one of them, any failure
+  denying the whole request with no partial record (clause 2). **Revocation**
+  is checked against `GrantAdmin` for every pair in the target's complete
+  pre-revocation record set — the pair set is derived by enumerating the
+  target records at request time, never taken from the request text — and a
+  request whose caller lacks `GrantAdmin` on any derived pair is denied
+  whole. Revocation does not require the ordinary right: it removes authority
+  and grants none.
 - **Administration is self-administering, which closes the delegation
   regress.** Delegating `GrantAdmin(namespace, right)` requires holding
   `GrantAdmin(namespace, right)`. There is no higher administrative right, so
@@ -206,20 +229,43 @@ Gate consultations continue to audit per ADR-018. Mutations of grant state get
 their own record class, because a consultation event cannot carry the history
 the Context section promises:
 
-- **A grant-change record** is durable, immutable, and queryable per ADR-022.
-  It carries: the change kind (`grant`, `revoke`, or `import`); the id of
-  every grant record created or revoked; the grantee's full structural
-  identity; the complete set of `(namespace, rights)` covered; the grantor's
-  or revoker's full structural identity; a required free-text rationale; the
-  timestamp; and a correlation to the gate decision that authorized the
-  mutation. A multi-pair action produces one record naming all its pairs.
-- **The record is written in the same transaction as the mutation it
-  describes.** If the record cannot be written, the mutation does not happen.
-  This is a stated exemption from ADR-018's optional-audit posture, and the
-  reason is the difference in role: a consultation event observes a decision
-  that stands on its own, while a grant-change record IS the attributable
-  history this amendment exists to create — grant state with no history is
-  the configuration file again, one layer down.
+- **Shape: one grant-change record per grant record affected.** A grant
+  record covers one grantee and one namespace (§1), and its grant-change
+  record does the same — this fits the substrate's single-namespace Event
+  envelope rather than fighting it. An action that creates or revokes several
+  grant records (a multi-pair grant, a multi-record revoke, the import)
+  produces one grant-change record per affected grant record, all carrying
+  the same **action id** — a fresh identifier minted once per surface request
+  (for the import, the epoch marker's id). The whole action is reconstructed
+  by querying the action id; no single record claims to describe more than
+  the one grant record it names.
+- **Envelope and payload.** Each grant-change record is an Event of kind
+  `grant_change`, written to the namespace of the grant record it describes,
+  with a payload carrying: the action id; the change kind (`grant`,
+  `revoke`, or `import`); the grant record id; the grantee's full structural
+  identity (leg form); the rights set; the acting principal's full structural
+  identity; a required rationale; and the authorization snapshot below.
+  Visibility follows ADR-022 unchanged: the record is readable by callers
+  whose read scope covers that namespace — which is exactly the namespace
+  whose authority the change moved.
+- **Authorization is embedded, not referenced.** ADR-018 defines no stable
+  decision identifier and its consultation-event persistence is optional and
+  non-transactional, so a reference to a gate decision would point at an
+  object this contract cannot guarantee exists. Each grant-change record
+  therefore embeds an immutable authorization snapshot: the checked pairs,
+  the decision, the gate implementation name, the request's actor and verb,
+  and the check timestamp. For the import — which no caller requested — the
+  snapshot is the synthetic boot authorization: the boot principal, the epoch
+  marker id, the configuration source, and the fixed rationale
+  `configuration import at first boot`.
+- **The records are written in the same transaction as the mutation they
+  describe.** If any grant-change record of the action cannot be written, the
+  whole action does not happen. This is a stated exemption from ADR-018's
+  optional-audit posture, and the reason is the difference in role: a
+  consultation event observes a decision that stands on its own, while
+  grant-change records ARE the attributable history this amendment exists to
+  create — grant state with no history is the configuration file again, one
+  layer down.
 - Refused requests produce ADR-018 consultation denials only; grant-change
   records exist exclusively for mutations that happened.
 
@@ -235,13 +281,16 @@ afterward.
   attempt the import; the uniqueness constraint admits one transaction, the
   loser's transaction fails whole, and the loser proceeds by reading the
   winner's records — no duplicates, no union of divergent lists.
-- **Import content.** For each caller in the deduplicated `granted_actors`
-  list: one grant record per namespace of the Stage 1c normalized enumeration
-  (the §1 record shape), attributed to the boot principal, delegated from the
-  boot-minted root. If `grant_unattributed = true`, the anonymous principal is
-  imported the same way. One `import`-kind grant-change record (§4a) names the
-  entire imported set. An empty or absent list writes the marker with an empty
-  set: the epoch records that import ran and imported nothing.
+- **Import content.** The imported principal set is the union of the
+  deduplicated `granted_actors` list and — when `grant_unattributed = true` —
+  the anonymous principal; the flag's contribution is independent of whether
+  the list is empty. For each principal in that union: one grant record per
+  namespace of the Stage 1c normalized enumeration (the §1 record shape),
+  attributed to the boot principal, delegated from the boot-minted root, with
+  `import`-kind grant-change records per §4a sharing the epoch marker's id as
+  their action id. The empty-set case — the marker recording that import ran
+  and imported nothing — occurs only when BOTH the list is empty or absent
+  AND `grant_unattributed` is false.
 - **After the epoch both keys are inert.** A later boot that observes a
   non-empty `granted_actors` list, or a `grant_unattributed` value whose
   effect differs from live store state, changes no records and logs a
@@ -267,12 +316,20 @@ All conditions are executed tests, not review assertions:
    namespaces — are observed to differ at the same consultation point: each
    serves where its records reach and is denied where only the other's do. A
    uniform-grant implementation must fail this arm.
-3. **Attenuation, both signs.** A caller lacking `GrantAdmin` on a
-   `(namespace, right)` pair cannot create a grant covering it; a multi-pair
-   request with one uncovered pair is denied whole, and no partial record
-   exists afterward. A principal whose enumeration is Read-only on a namespace
-   mints Read there (positive control) and is denied minting Write there
-   (the boot-admin-never-exceeds-authority arm).
+3. **Attenuation, both signs and both requirements.** A caller lacking
+   `GrantAdmin` on a `(namespace, right)` pair cannot create a grant covering
+   it; a multi-pair request with one uncovered pair is denied whole, and no
+   partial record exists afterward. A principal whose enumeration is
+   Read-only on a namespace mints Read there (positive control) and is denied
+   minting Write there (the boot-admin-never-exceeds-authority arm).
+   **Admin-only arm:** a principal holding `GrantAdmin(namespace, right)` but
+   no ordinary capability for that pair is denied minting it — administration
+   alone is never a source of authority. **Ordinary-source arm:** a minted
+   grant's delegation parent is verified to be the grantor's own ordinary
+   capability, not a root selected by the surface. **Multi-pair revoke arm:**
+   a revoke whose derived target pair set includes one pair the revoker lacks
+   `GrantAdmin` for is denied whole, with the pair set enumerated from the
+   pre-revocation records rather than the request text.
 4. **Subactor bounds.** A leg serves only where its parent currently serves;
    revoking the parent denies the leg at the next consultation with no
    restart; a leg label violating the grammar is refused at intake; a
@@ -290,14 +347,27 @@ All conditions are executed tests, not review assertions:
    union. A first boot with an empty list writes the marker; a second boot
    after the list is edited imports nothing and logs the divergence. An
    anonymous grant revoked at runtime stays revoked across a restart with
-   `grant_unattributed = true`.
-7. **Grant-change history.** A grant and a revoke each produce one queryable
-   grant-change record carrying grantee, pairs, actor, and rationale; a
-   multi-pair action produces one record naming all pairs; a simulated
-   failure to write the record aborts the mutation (fail-closed arm); a
-   refused request produces no grant-change record. **Transitive revocation
-   arm:** with a delegation chain root → A → B, revoking A's grant removes
-   B's derived authority at the next consultation.
+   `grant_unattributed = true`. **Combined-input arm:** a first boot with
+   `granted_actors = []` and `grant_unattributed = true` imports the
+   anonymous principal — the empty-set clause must not suppress the flag.
+7. **Grant-change history.** A single-pair grant and a revoke each produce
+   one queryable grant-change record carrying grantee, rights, actor,
+   rationale, and the embedded authorization snapshot; a multi-pair action
+   produces one record per affected grant record, all sharing one action id,
+   and querying that action id reconstructs the whole action; each record is
+   an Event in the namespace of the grant record it describes and is readable
+   under ADR-022's caller-namespace scoping by a caller scoped to that
+   namespace (multi-namespace visibility arm); import records resolve their
+   synthetic boot authorization (boot principal, epoch marker id,
+   configuration source, fixed rationale); a simulated failure to write any
+   record of an action aborts the whole action (fail-closed arm); a refused
+   request produces no grant-change record.
+8. **Cross-process transitive revocation.** With a delegation chain
+   root → A → B and two serving processes over one store: revoke A's grant in
+   the first process; the second process — which did not mint any of the
+   chain and holds no in-memory state for it (cold load) — denies B at its
+   next consultation, without restart. The same test repeated with the root
+   revoked denies both A and B.
 
 ## Consequences
 
@@ -307,9 +377,11 @@ All conditions are executed tests, not review assertions:
   only after verification, per ADR-127.
 - The gate's consultation path gains a read dependency on live grant state.
   Whatever caching an implementation adds is bounded by acceptance conditions
-  1, 4, and 7 — a cache that can serve a revoked principal, or a revoked
+  1, 4, and 8 — a cache that can serve a revoked principal, or a revoked
   delegation chain, past the next consultation is a defect, not a tuning
-  choice.
+  choice. The gate-time ancestor validation in §1 makes chain depth a
+  consultation cost; the no-subactor-grantor rule keeps that depth to
+  top-level delegation chains only.
 - The grant surface is a new authorization-bearing API and inherits no safety
   from having been built for safety: it is reviewed adversarially as an
   authorization surface in its own right, and its acceptance arms include the
