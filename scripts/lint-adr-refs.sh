@@ -18,8 +18,9 @@ self_test() {
 
     mkdir -p "$tmp/case-fail/docs/adr" "$tmp/case-fail/crates/fixture-crate/docs"
     mkdir -p "$tmp/case-pass/docs/adr" "$tmp/case-pass/crates/fixture-crate/docs"
+    mkdir -p "$tmp/case-uncataloged/docs/adr"
 
-    for case in case-fail case-pass; do
+    for case in case-fail case-pass case-uncataloged; do
         cat > "$tmp/$case/docs/adr/ADR-030-retrieval-stack-port.md" <<'FIXTURE'
 # ADR-030: Retrieval Stack Port — khive-retrieval
 
@@ -30,8 +31,17 @@ FIXTURE
 
 | ADR | Title |
 | --- | --- |
+| [ADR-030](ADR-030-retrieval-stack-port.md) | Retrieval Stack Port — khive-retrieval |
 FIXTURE
     done
+
+    # Regression case 3 (must-FAIL control for the catalog-coverage arm): the
+    # same tree with the ADR-030 row deleted from the index must go red. The
+    # arm was added because a merged ADR landed with no catalog row and the
+    # lint passed; an assertion that has never been observed failing is not
+    # yet a check, so this case IS that observation, kept permanent.
+    grep -v '^| \[ADR-030\]' "$tmp/case-uncataloged/docs/adr/README.md" > "$tmp/case-uncataloged/README.tmp"
+    mv "$tmp/case-uncataloged/README.tmp" "$tmp/case-uncataloged/docs/adr/README.md"
 
     cat > "$tmp/case-fail/crates/fixture-crate/docs/design.md" <<'FIXTURE'
 # fixture-crate Design
@@ -69,6 +79,18 @@ FIXTURE
         status=1
     else
         echo "self-test OK: bare ADR reference does not false-positive"
+    fi
+
+    if sh "$SCRIPT_DIR/lint-adr-refs.sh" "$tmp/case-uncataloged" > "$tmp/uncataloged.log" 2>&1; then
+        echo "self-test FAILED: ADR file with no index catalog row was not caught"
+        cat "$tmp/uncataloged.log"
+        status=1
+    elif ! grep -q "ADR-030 (ADR-030-retrieval-stack-port.md) has no index catalog row" "$tmp/uncataloged.log"; then
+        echo "self-test FAILED: uncataloged lint failed, but not for the expected reason:"
+        cat "$tmp/uncataloged.log"
+        status=1
+    else
+        echo "self-test OK: uncataloged ADR caught"
     fi
 
     return "$status"
@@ -249,12 +271,14 @@ for path in sorted(adr_dir.glob("ADR-*.md")):
     titles[file_number] = (heading_match.group("title"), path)
 
 index_path = adr_dir / "README.md"
+cataloged_numbers: set[str] = set()
 with index_path.open(encoding="utf-8") as handle:
     for line_number, line in enumerate(handle, 1):
         match = index_row_re.match(line.rstrip("\n"))
         if match is None:
             continue
         number = match.group("number")
+        cataloged_numbers.add(number)
         relative = index_path.relative_to(root)
         canonical = titles.get(number)
         if canonical is None:
@@ -273,6 +297,18 @@ with index_path.open(encoding="utf-8") as handle:
                 f'{relative}:{line_number}: ADR-{number} index title mismatch; '
                 f'expected "{expected}", found "{found}"'
             )
+
+# Catalog coverage: every authoritative ADR file must have an index row.
+# The index and the tree can otherwise drift silently -- a merged ADR with no
+# catalog row passes every per-reference check above because no reference to
+# it exists to check.
+index_relative = index_path.relative_to(root)
+for number in sorted(titles):
+    if number not in cataloged_numbers:
+        missing_name = titles[number][1].name
+        errors.append(
+            f"{index_relative}: ADR-{number} ({missing_name}) has no index catalog row"
+        )
 
 scan_paths = set((root / "docs").glob("**/*.md"))
 scan_paths.update((root / "crates").glob("**/docs/**/*.md"))
