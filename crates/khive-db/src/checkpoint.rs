@@ -1389,6 +1389,12 @@ impl Drop for CheckpointLifecycleEmitter {
 /// yet, or dropped after a prior tick's connection-level pragma failure) —
 /// the caller must report that tick `Skipped` and retry the open on the next
 /// one. This is now the ONLY source of a `Skipped` tick.
+///
+/// ADR-136 D1 gate 5 classification: **checkpoint writer**. Explicitly
+/// exempt from `WriterTask`/queue routing by design (see the admission-path
+/// note above), never `SqlAccess`-reachable, never counted as a
+/// `direct_route_violation` — see the classification table in
+/// `writer_task`'s module doc.
 struct CheckpointConnection {
     conn: Option<rusqlite::Connection>,
     /// Consecutive failed `open_standalone_writer` attempts since the last

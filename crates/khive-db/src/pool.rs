@@ -79,6 +79,16 @@ pub struct PoolConfig {
     /// Overridable via `KHIVE_WRITE_QUEUE_CAPACITY`. Default: 256 pending
     /// operations (ADR-067 Component A recommended default).
     pub write_queue_capacity: usize,
+    /// ADR-136 D1: when `true`, every write path that would otherwise
+    /// silently degrade to the legacy pool-mutex/standalone-connection path
+    /// on a missing or failed `WriterTask` handle instead returns an error.
+    /// Exercises the completed routing (ADR-135 F2's strict-routing
+    /// precondition) without changing behavior for callers that never set
+    /// the env var.
+    ///
+    /// Overridable via `KHIVE_WRITE_ROUTING` (value `"strict"`,
+    /// case-insensitive; anything else, or unset, leaves this `false`).
+    pub write_routing_strict: bool,
 }
 
 impl Default for PoolConfig {
@@ -119,6 +129,9 @@ impl Default for PoolConfig {
                 .and_then(|v| v.parse::<usize>().ok())
                 .filter(|&n| n > 0)
                 .unwrap_or(DEFAULT_WRITE_QUEUE_CAPACITY),
+            write_routing_strict: std::env::var("KHIVE_WRITE_ROUTING")
+                .map(|v| v.eq_ignore_ascii_case("strict"))
+                .unwrap_or(false),
         }
     }
 }
@@ -1047,13 +1060,14 @@ mod tests {
         }
     }
 
-    const POOL_ENV_VARS: [&str; 6] = [
+    const POOL_ENV_VARS: [&str; 7] = [
         "KHIVE_BUSY_TIMEOUT_SECS",
         "KHIVE_CHECKOUT_TIMEOUT_SECS",
         "KHIVE_WAL_AUTOCHECKPOINT_PAGES",
         "KHIVE_JOURNAL_SIZE_LIMIT_BYTES",
         "KHIVE_WRITE_QUEUE",
         "KHIVE_WRITE_QUEUE_CAPACITY",
+        "KHIVE_WRITE_ROUTING",
     ];
 
     struct PoolEnvGuard {
@@ -1188,6 +1202,41 @@ mod tests {
         let cfg = PoolConfig::default();
         std::env::remove_var("KHIVE_WRITE_QUEUE");
         assert!(cfg.write_queue_enabled);
+    }
+
+    #[test]
+    #[serial]
+    fn pool_config_write_routing_strict_defaults_off() {
+        let _pool_env = clear_pool_env();
+        let cfg = PoolConfig::default();
+        assert!(!cfg.write_routing_strict);
+    }
+
+    #[test]
+    #[serial]
+    fn pool_config_env_override_write_routing_strict() {
+        std::env::set_var("KHIVE_WRITE_ROUTING", "strict");
+        let cfg = PoolConfig::default();
+        std::env::remove_var("KHIVE_WRITE_ROUTING");
+        assert!(cfg.write_routing_strict);
+    }
+
+    #[test]
+    #[serial]
+    fn pool_config_env_override_write_routing_strict_case_insensitive() {
+        std::env::set_var("KHIVE_WRITE_ROUTING", "STRICT");
+        let cfg = PoolConfig::default();
+        std::env::remove_var("KHIVE_WRITE_ROUTING");
+        assert!(cfg.write_routing_strict);
+    }
+
+    #[test]
+    #[serial]
+    fn pool_config_env_write_routing_ignores_unrecognized_value() {
+        std::env::set_var("KHIVE_WRITE_ROUTING", "eventual");
+        let cfg = PoolConfig::default();
+        std::env::remove_var("KHIVE_WRITE_ROUTING");
+        assert!(!cfg.write_routing_strict);
     }
 
     #[test]
