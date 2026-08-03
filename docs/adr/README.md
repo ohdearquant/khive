@@ -8,6 +8,8 @@ An ADR merges in whatever state its ratification had reached at merge time; the 
 
 A `Proposed` ADR becomes `accepted` only through an explicit ratification event, recorded by a dedicated status-flip PR. That PR's body must cite the ratifying artifact by identifier and must assert that the ratification postdates the merge commit of the final ADR text it ratifies — a sign-off issued against an earlier revision, followed by further edits, ratifies nothing. Contract-level ADRs scoped to one subsystem may be ratified by maintainer design review; cross-cutting or strategic ADRs require a project-owner decision. A conformant implementation landing is the usual trigger for seeking ratification.
 
+The same head-binding governs review: a verdict authorizes only the exact commit it names, and a PR that edits the ADR catalog is guaranteed to have its head move whenever a sibling catalog row merges first. Catalog-touching PRs therefore serialize — bring the branch up to the current base, take one narrow review at the final head, and merge before the next catalog row lands. A verdict at a superseded head carries no authority at the new one.
+
 ## ADR catalog
 
 <!-- BEGIN GENERATED ADR CATALOG -->
