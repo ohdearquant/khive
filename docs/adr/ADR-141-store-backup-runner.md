@@ -1,0 +1,220 @@
+# ADR-141: Executable store backup runner
+
+- **Status:** Proposed
+- **Date:** 2026-08-03
+
+## Context
+
+ADR-100 selects scheduled `sqlite3_rsync` for tiers 1 and 2, `VACUUM INTO` for tier 3, and a host scheduler independent of the daemon and orchestration stack. [ADR-100:124-126]
+
+ADR-100 defines the required tier cadences as 15 minutes for a local replica, one hour for an SSH replica, and one week for a dated archive. [ADR-100:130-139]
+
+The current `kkernel` command table has no backup variant, and an inspection measured on a development deployment did not identify an executable backup invocation. [crates/kkernel/src/cli.rs:53-103](https://github.com/ohdearquant/khive/blob/main/crates/kkernel/src/cli.rs#L53-L103); `rg -n --glob '!docs/**' --glob '!CHANGELOG.md' 'sqlite3_rsync|sqlite-rsync|VACUUM INTO' .`
+
+ADR-100 requires each failed run to have a concrete failure log and a nonzero supervisor-visible exit status, including preflight, version, timeout, and SSH failures. [ADR-100:145-154]
+
+`db_diagnostics()` reports WAL and checkpoint state for the main database, but it does not report replica or archive freshness. [docs/guide/api-reference.md:700-715](https://github.com/ohdearquant/khive/blob/main/docs/guide/api-reference.md#L700-L715)
+
+## Decision
+
+The deployment SHALL use a host-supervised job as the scheduling and restart boundary, with `kkernel backup run` as the one-shot executable payload. [ADR-100:124-126]
+
+The host supervisor SHALL invoke one named job per scheduled group of `(database, tier)` pairs and retain the job's exit status. The payload form is `kkernel backup run --tier <tier> --database <id> [--database <id> ...] --config <path>`: the repeatable `--database` argument names exactly the databases the job covers, and the runner SHALL execute exactly the named `(database, tier)` pairs — one per-database lock and one result record each — and no unnamed database. An invocation with no `--database` argument is a validation error, never an implicit "all databases": independent per-database cadences [ADR-100:70-75] are implementable only when each host job's work set is explicit, so a 15-minute job cannot sweep a database configured hourly. A named `(database, tier)` pair whose tier is not enabled for that database (see "Configuration and exclusion") is likewise a validation error, distinct from a failed backup. [ADR-100:145-153]
+
+The host-supervised form is selected because ADR-100 requires the backup lane to survive a daemon or orchestration-stack failure. [ADR-100:145-146]
+
+`kkernel backup run` SHALL be a finite process and SHALL neither daemonize nor implement its own persistent scheduler. [ADR-100:145-146]
+
+### Configuration and exclusion
+
+The configuration SHALL identify each database by a stable identifier, an origin path, an explicit enabled-tier set, a tier-1 replica path, an SSH target for tier 2 where tier 2 is enabled, archive roots for tier 3 where tier 3 is enabled, per-tier cadences, retention counts, timeout budgets, local and remote `sqlite3_rsync` paths, two absolute sink paths — `run_result_sink` and `failure_sink`, defined under "Results, failures, and freshness" — a per-tier successful-sync-duration bound, and a failure-detection lag. [ADR-100:38-48]; [ADR-100:70-75]; [ADR-100:269-274]
+
+**Tier enablement — a narrow amendment to ADR-100.** Tier 1 is mandatory: a configuration declaring a database without tier 1 in its enabled-tier set is invalid and rejected at configuration load, before any run. Tiers 2 and 3 are per-database opt-in. To the extent ADR-100's tier table reads as requiring all three tiers for every backed-up database, this ADR amends that reading: a deployment MAY declare a database with a subset of tiers, and every consequence of doing so is explicit rather than inferred — the database's RPO and freshness claims extend only to its enabled tiers; `backup.status` reports a disabled tier as `enabled: false` with no freshness computation (never as a failure, never as current — see the field table below); a run naming a disabled `(database, tier)` pair is a validation error distinct from a failed backup; and drills select a mode rather than a tier, with the tier-2-disabled fallback specified under "Restore drill". ADR-100's cadences, mechanisms, and failure-visibility rules are unchanged for every enabled tier. [ADR-100:70-75]
+
+The successful-sync-duration bound is the configured worst-case wall-clock time a successful run of that tier is expected to take; the failure-detection lag is the configured worst-case delay between a run becoming overdue and the supervisor or a `backup.status()` reader noticing. Both default to the tier's timeout budget when not explicitly configured, and both are RPO inputs per ADR-100's `RPO = cadence + maximum successful sync duration + failure-detection lag` accounting. [ADR-100:38-48]
+
+The runner SHALL not download or select a platform package at run time, because executable availability and version parity are deployment preconditions verified by the preflight. [ADR-100:102-105]
+
+The runner SHALL acquire one per-database lock before preflight and release it only after it writes a terminal result record, so tier 1, tier 2, tier 3, and a restore drill cannot overlap for that database. [ADR-100:166-172]
+
+An occupied lock SHALL produce an explicit terminal result and a nonzero exit: a run invocation appends its `kind: "backup_run"` record with `outcome: "overlap"` (a member of the closed failure-code list under "Results, failures, and freshness"), and a drill invocation appends its `kind: "backup_restore_drill"` record with `outcome: "overlap"`. `"overlap"` is the canonical serialized value in every record and status field; "skipped overlap" is prose for the same outcome, never a distinct code. A supervisor-declared intentional no-op is the one exception, and it SHALL be implemented by not invoking the runner at all — no record is written and no exit status exists. An `overlap` outcome is a suppressed attempt, not evidence about replica state: it SHALL NOT trigger the failure-after-success freshness rule under "Results, failures, and freshness" — an overlap never makes a tier non-current by itself — while the staleness bound there still catches a persistently suppressed cadence. [ADR-100:45-48]
+
+### Tier execution and preflight
+
+For tier 1, the runner SHALL execute `sqlite3_rsync <origin> <local-replica-path>` on the configured cadence. [ADR-100:130-133]
+
+For tier 2, the runner SHALL execute `sqlite3_rsync <origin> <user>@<host>:<replica-path>` over SSH on the configured cadence without suppressing a failure to reach the remote host. [ADR-100:133-135]
+
+For tier 3, the runner SHALL create a dated archive with `VACUUM INTO`, transfer only the completed cold archive, and apply the configured local and off-host retention counts. [ADR-100:136-143]
+
+Before tiers 1 and 2, the runner SHALL resolve `sqlite3_rsync` locally, collect its raw version output and a documented normalized release identifier, and reject an absent or unidentifiable executable. [ADR-100:94-105]
+
+Before tier 2, the runner SHALL resolve the executable through the same non-interactive SSH invocation that will run the transfer, collect the remote raw output and normalized release identifier, and reject versions below 3.50.1 or any local-to-remote identifier mismatch. [ADR-100:102-105]
+
+The runner SHALL enforce a per-run timeout, record the timeout as a failure, and terminate the child process before releasing the per-database lock. [ADR-100:43-48]; [ADR-100:158-172]
+
+The runner SHALL preflight target free space for the database, WAL, and temporary-file headroom before every sync or archive. [ADR-100:278-285]
+
+The runner SHALL not copy a hot main database, WAL, or SHM file with a general file-copy tool. [ADR-100:177-183]
+
+### Failure atomicity
+
+The implementation SHALL establish, by test, whether a `sqlite3_rsync` run killed mid-transfer (by timeout, signal, or process death) leaves the destination path's previous replica state recoverable. [ADR-100:278-285]
+
+If that test does not establish that the previous replica survives an interrupted run, tiers 1 and 2 SHALL instead sync into a staged path distinct from the destination and promote the staged result to the destination only after the sync completes successfully; a killed or failed run under this mode SHALL leave the previous destination replica untouched. [ADR-100:278-285]
+
+"Promote" SHALL mean an atomic same-filesystem replacement of the destination path by the staged path (an atomic rename or an equivalent single-syscall atomic replace); the staged path SHALL reside on the same filesystem as the destination specifically so that promotion is not a copy, and SHALL NOT be satisfied by a copy-then-delete or delete-then-move sequence, because either sequence can itself fail after partially overwriting the destination. Before promotion, the runner SHALL fsync the staged file's contents; after promotion, the runner SHALL fsync the destination's containing directory where the platform requires a directory fsync for the rename to be crash-durable. The interruption test required above SHALL include an interruption injected during promotion itself, not only during sync, and SHALL confirm the result is always either the complete prior destination content or the complete new content, never a partially written destination. [ADR-100:278-285]
+
+A timeout, signal termination, or process failure during any tier SHALL never leave the destination replica in a partially written state; the runner's terminal result record for that run states which of the two atomicity mechanisms (proven-recoverable-in-place, or staged promotion) was active for the invocation. [ADR-100:145-154]; [ADR-100:278-285]
+
+### Results, failures, and freshness
+
+Two durable JSON Lines sinks exist, each at its own configured absolute path, and `backup.status` locates both through the same configuration record the runner uses. The `run_result_sink` receives every `kind: "backup_run"` record and every `kind: "backup_restore_drill"` record. The `failure_sink` receives every `kind: "backup_failure"` record. No record kind is written to the other sink. [ADR-100:145-154]
+
+Every invocation SHALL append one durable record to the `run_result_sink` with `kind: "backup_run"`, a unique `run_id`, `database_id`, `tier`, `outcome`, `scheduled_at`, `snapshot_started_at`, `completed_at`, duration, destination identity, local and remote tool release identifiers when applicable, and an error code when unsuccessful. [ADR-100:43-48]; [ADR-100:145-154]
+
+Every unsuccessful invocation SHALL additionally append a `kind: "backup_failure"` record with the same `run_id` to the `failure_sink`, preserve stderr in the per-database job log, and exit nonzero. [ADR-100:145-154]
+
+If either durable sink cannot be written, the runner SHALL emit an unbuffered `backup_failure` JSON record to stderr and exit nonzero, so the host supervisor retains a visible failure signal. [ADR-100:145-154]
+
+The defined failure codes SHALL include `overlap`, `preflight_space`, `tool_missing`, `version_parse`, `version_floor`, `version_mismatch`, `ssh_unreachable`, `timeout`, `sync_failed`, `archive_failed`, `transfer_failed`, `retention_failed`, and `result_sink_failed`. [ADR-100:145-154]; [ADR-100:278-285]
+
+The implementation SHALL register `backup.status` as a read-only, Assertive verb in a new `backup` pack, following the single-pack-prefix rule every non-kg-substrate verb uses, rather than overloading `db_diagnostics()`. [ADR-023, lines 149-223]; [docs/guide/api-reference.md:700-715](https://github.com/ohdearquant/khive/blob/main/docs/guide/api-reference.md#L700-L715)
+
+`backup.status(database_id?)` SHALL return one entry for every configured database (or only the named `database_id` when supplied), each carrying exactly one `tiers` entry for each of the closed tiers `1`, `2`, and `3` — a tier absent from the database's enabled-tier set appears as `enabled: false` under the field table's nullability rules, so a reader can always distinguish a disabled tier from a missing or truncated response — and exactly one `restore_drills` entry per drill mode. An unknown `database_id` SHALL produce a validation error before any result-sink read. The verb-specific success value is returned as the `result` field of the request DSL's per-op envelope (`ok`/`tool`/`result` — ADR-016, lines 376-390). A complete, valid example:
+
+```json
+{
+  "databases": [
+    {
+      "database_id": "main",
+      "tiers": [
+        {
+          "tier": 1,
+          "enabled": true,
+          "current": true,
+          "current_reason": null,
+          "latest_run": {
+            "run_id": "r-01983f2",
+            "outcome": "success",
+            "completed_at": "2026-08-03T19:45:00.000Z"
+          },
+          "last_success_at": "2026-08-03T19:45:00.000Z",
+          "last_failure_at": "2026-08-02T11:15:00.000Z",
+          "consecutive_failures": 0,
+          "cadence_ms": 900000,
+          "timeout_budget_ms": 300000,
+          "successful_sync_duration_bound_ms": 300000,
+          "failure_detection_lag_ms": 300000,
+          "observed_duration_ms": 8451
+        },
+        {
+          "tier": 2,
+          "enabled": false,
+          "current": null,
+          "current_reason": null,
+          "latest_run": null,
+          "last_success_at": null,
+          "last_failure_at": null,
+          "consecutive_failures": 0,
+          "cadence_ms": null,
+          "timeout_budget_ms": null,
+          "successful_sync_duration_bound_ms": null,
+          "failure_detection_lag_ms": null,
+          "observed_duration_ms": null
+        },
+        {
+          "tier": 3,
+          "enabled": false,
+          "current": null,
+          "current_reason": null,
+          "latest_run": null,
+          "last_success_at": null,
+          "last_failure_at": null,
+          "consecutive_failures": 0,
+          "cadence_ms": null,
+          "timeout_budget_ms": null,
+          "successful_sync_duration_bound_ms": null,
+          "failure_detection_lag_ms": null,
+          "observed_duration_ms": null
+        }
+      ],
+      "restore_drills": [
+        {
+          "mode": "replica_capture",
+          "outcome": "success",
+          "completed_at": "2026-08-03T06:00:00.000Z",
+          "measured_rto_ms": 41250
+        },
+        { "mode": "origin_exact", "outcome": null, "completed_at": null, "measured_rto_ms": null }
+      ]
+    }
+  ]
+}
+```
+
+The normative field table:
+
+| Field                                                                                              | Type and format                                                                                                                                                                                                                          | Nullability rule                                                                                                                                              |
+| -------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `database_id`                                                                                      | string, the configured stable identifier                                                                                                                                                                                                 | never null                                                                                                                                                    |
+| `tier`                                                                                             | integer, closed set `1`, `2`, `3`                                                                                                                                                                                                        | never null; exactly one `tiers` entry per tier value per database                                                                                             |
+| `enabled`                                                                                          | boolean, from the database's configured enabled-tier set                                                                                                                                                                                 | never null                                                                                                                                                    |
+| `current`                                                                                          | boolean or null                                                                                                                                                                                                                          | `null` exactly when `enabled` is `false`; boolean otherwise                                                                                                   |
+| `current_reason`                                                                                   | string or null, closed set `"never_succeeded"`, `"stale"`, `"failure_after_success"`                                                                                                                                                     | non-null exactly when `current` is `false`; a tier with no successful run ever reports `current: false`, `current_reason: "never_succeeded"`                  |
+| `latest_run`                                                                                       | object (`run_id`, `outcome`, `completed_at`) or null                                                                                                                                                                                     | `null` until the tier's first terminal run; `outcome` is `"success"` or a defined failure code from the closed failure-code list above                        |
+| `last_success_at`, `last_failure_at`                                                               | RFC 3339 UTC millisecond-precision string or null                                                                                                                                                                                        | `null` until the first success or first failure respectively                                                                                                  |
+| `consecutive_failures`                                                                             | non-negative integer                                                                                                                                                                                                                     | never null; `0` when the latest terminal run succeeded or no run exists                                                                                       |
+| `cadence_ms`, `timeout_budget_ms`, `successful_sync_duration_bound_ms`, `failure_detection_lag_ms` | non-negative integer milliseconds                                                                                                                                                                                                        | `null` exactly when `enabled` is `false`; configured values otherwise                                                                                         |
+| `observed_duration_ms`                                                                             | non-negative integer milliseconds or null                                                                                                                                                                                                | `null` until the tier's first successful run; thereafter the most recent successful run's duration                                                            |
+| `restore_drills[].mode`                                                                            | string, closed set `"replica_capture"`, `"origin_exact"`                                                                                                                                                                                 | never null; exactly one entry per mode per database                                                                                                           |
+| `restore_drills[].outcome`                                                                         | string or null, closed set `"success"`, `"integrity_check_failed"`, `"marker_missing"`, `"manifest_mismatch"`, `"runtime_boot_failed"`, `"drill_failed"`, `"overlap"` (`"overlap"`: the attempt was suppressed by the per-database lock) | `null` when no drill of that mode has ever terminated for the database, never a synthesized placeholder; otherwise the latest terminal drill record's outcome |
+| `restore_drills[].completed_at`                                                                    | RFC 3339 UTC millisecond-precision string or null                                                                                                                                                                                        | `null` exactly when `outcome` is `null`                                                                                                                       |
+| `restore_drills[].measured_rto_ms`                                                                 | non-negative integer milliseconds or null                                                                                                                                                                                                | `null` unless the drill of that mode completed with `outcome: "success"`                                                                                      |
+
+All timestamps in this contract are RFC 3339 UTC strings with millisecond precision; all durations are integer milliseconds. [ADR-100:38-48]
+
+For an enabled tier (a disabled tier's `current` is `null` and carries no freshness claim), `current` SHALL be false whenever either condition holds: (a) the latest terminal run for that tier is a failure other than `overlap` newer than the last success, or (b) the last success's `completed_at` is older than `now - (cadence + successful_sync_duration_bound + failure_detection_lag)`. Three examples fix the boundary: a success completed within the last cadence window is `current: true`; a success older than the window by more than the combined bound is `current: false` even with no recorded failure (a wedged or silently-stopped scheduler); and any failure other than `overlap` recorded after the last success is `current: false` immediately, regardless of how recent that last success was — an `overlap` after that success leaves `current` and `current_reason` unchanged, and only condition (b)'s staleness bound can later retire it. [ADR-100:38-48]
+
+Consumers SHALL determine that a backup is current only by reading `backup.status()` and observing `current: true` for each enabled tier of that database, rather than inferring freshness from a process exit status or a WAL diagnostic; a disabled tier contributes nothing to that determination, and the deployment's RPO claim for the database is correspondingly scoped to its enabled tiers. [ADR-100:38-48]; [docs/guide/api-reference.md:700-715](https://github.com/ohdearquant/khive/blob/main/docs/guide/api-reference.md#L700-L715)
+
+`db_diagnostics()` remains the diagnostic surface for WAL size, checkpoint progress, and reader-pin evidence during a backup investigation. [docs/guide/api-reference.md:700-715](https://github.com/ohdearquant/khive/blob/main/docs/guide/api-reference.md#L700-L715)
+
+### Restore drill
+
+The implementation SHALL provide a mode-selectable drill command, `kkernel backup restore-drill --database <id> --mode <replica-capture|origin-exact> --scratch <path>`. Every drill invocation SHALL append one `kind: "backup_restore_drill"` record to the `run_result_sink` carrying, at minimum: a unique `run_id`; `database_id`; `mode` in its canonical serialized spelling; `outcome` from the closed drill-outcome set in the status field table; `started_at` and `completed_at` as RFC 3339 UTC millisecond-precision strings; `measured_rto_ms` as integer milliseconds, `null` unless `outcome` is `"success"`; and an error detail string when unsuccessful. These records are the sole durable source for the per-mode drill fields `backup.status` returns, including after a process restart; no side state participates. Mode spelling is normalized once and totally: the CLI accepts the hyphenated forms `replica-capture` and `origin-exact`, every record and every status field uses the canonical underscore forms `replica_capture` and `origin_exact`, and no other spelling is valid anywhere. An unsuccessful drill SHALL additionally append a `kind: "backup_failure"` record with the same `run_id`, the `database_id`, the canonical mode, and an `error_code` equal to the drill's non-success `outcome` value, and SHALL exit nonzero — the run failure-code list above and the drill-outcome set are two separate closed code sets, and a failure record's code set is determined by the record kind it reports on. The two modes are ADR-100's two accepted drill routines, and this ADR adopts them rather than redefining them. [ADR-100:184-215]; [ADR-100:233-265]
+
+- **`replica-capture`** is the standing routine, scheduled on its own recurring cadence like any other host job. It writes the marker row to the origin through the normal write path, executes the designated tier-1 sync, captures the validation manifest from the tier-1 replica that sync just produced, restores that replica to the scratch path, runs `PRAGMA integrity_check`, verifies the marker round-trip, and compares the restored copy's manifest with the recorded replica manifest exactly. [ADR-100:233-258]
+- **`origin-exact`** is the maintenance-window routine: ADR-100's original drill, run on a store held quiescent for the window, executed against the tier-2 replica where tier 2 is enabled, with the manifest captured from the origin in the same read transaction as the marker write. It is not part of the standing cadence on a live store. For a database whose tier 2 is disabled, the origin-exact drill runs against the tier-1 replica instead; the mode is defined by where the manifest is captured, not by which replica is restored. [ADR-100:184-215]; [ADR-100:260-265]
+
+In both modes the drill SHALL boot a runtime against the restored copy, serve the specified live verbs, rebuild the ANN index, serve a vector-backed query, and record measured RTO. [ADR-100:208-215]
+
+The supervisor configuration SHALL schedule the `replica-capture` drill on its configured recurring cadence for every backed-up database, and SHALL run the `origin-exact` drill after every schema-migration release; `backup.status()` SHALL expose the latest outcome and completion time per drill mode, as specified in the status contract above. [ADR-100:184-186]; [ADR-100:286-288]
+
+## Consequences
+
+The deployment gains an executable boundary for the accepted tier policy, a supervisor-visible failure signal, and a queryable definition of backup freshness. [ADR-100:124-154]
+
+The implementation adds a host-supervisor definition, a `kkernel backup` command family, persistent result sinks, and the `backup.status()` read surface. [ADR-100:145-154]; [ADR-100:269-274]
+
+The backup process can delay WAL checkpoint progress only for its bounded snapshot lifetime, so timeout, exclusion, and WAL measurements are acceptance requirements. [ADR-100:156-175]
+
+The deployment must install and maintain compatible `sqlite3_rsync` executables on each endpoint because tier 2 refuses unavailable, below-floor, or mismatched versions. [ADR-100:102-105]; [ADR-100:307-308]
+
+## Alternatives considered
+
+### A `kkernel` process that schedules and supervises itself
+
+Rejected because ADR-100 assigns scheduling to the host specifically so the backup lane survives failure of the daemon and orchestration stack. [ADR-100:145-146]
+
+### A daemon-native backup loop
+
+Rejected for this amendment because ADR-100 permits a daemon-native administrative surface only as a later product path, while the accepted v1 mechanism remains host scheduled. [ADR-100:269-274]
+
+### `db_diagnostics()` as the freshness surface
+
+Rejected because `db_diagnostics()` exposes WAL and checkpoint observations for the main database, not tier execution, replica age, archive age, or restore-drill outcome. [docs/guide/api-reference.md:700-715](https://github.com/ohdearquant/khive/blob/main/docs/guide/api-reference.md#L700-L715)
+
+### Litestream or raw file copying
+
+Rejected because ADR-100 rejects Litestream's checkpoint-control conflict and prohibits raw copying of a hot WAL-mode database. [ADR-100:84-105]; [ADR-100:177-183]
