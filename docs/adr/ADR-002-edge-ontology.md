@@ -194,9 +194,9 @@ Physical canonical direction is never exposed as semantic direction.
 
 ### Reciprocal pairs, self-loops, and repricing (2026-08-03 amendment)
 
-The base contract above addresses inverse *relations* (`contains` vs `part_of`) and
+The base contract above addresses inverse _relations_ (`contains` vs `part_of`) and
 symmetric canonicalization, but never stated whether two live opposite-direction edges of
-the *same* non-symmetric relation between one pair of nodes is a legal state, nor what a
+the _same_ non-symmetric relation between one pair of nodes is a legal state, nor what a
 delete-then-relink workflow may assume. Issue #1667 forced the question: the edge natural
 key `(namespace, source_id, target_id, relation)` is direction-sensitive for non-symmetric
 relations (canonicalization applies only to `competes_with`/`composed_with`), so a
@@ -222,10 +222,10 @@ non-symmetric — is legal at the storage layer for every relation. Three reason
 semantically coherent. For curation and validation-pipeline use (advisory — never
 write-time enforcement):
 
-| Class | Relations | Reciprocal pair means |
-| --- | --- | --- |
-| Order-like — reciprocal pair INCOHERENT | `contains`, `part_of`, `instance_of`, `extends`, `variant_of`, `introduced_by`, `supersedes`, `derived_from`, `precedes`, `implements` | The two edges contradict: each claims a directional subordination or ordering the other denies. Surface as curation-review candidates. |
-| State-like — reciprocal pair COHERENT | `depends_on`, `enables`, `supports`, `refutes` | The two edges are independent assertions that can both hold (mutual dependency, mutual enablement, claims that each support or refute the other). Not findings. |
+| Class                                   | Relations                                                                                                                              | Reciprocal pair means                                                                                                                                           |
+| --------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Order-like — reciprocal pair INCOHERENT | `contains`, `part_of`, `instance_of`, `extends`, `variant_of`, `introduced_by`, `supersedes`, `derived_from`, `precedes`, `implements` | The two edges contradict: each claims a directional subordination or ordering the other denies. Surface as curation-review candidates.                          |
+| State-like — reciprocal pair COHERENT   | `depends_on`, `enables`, `supports`, `refutes`                                                                                         | The two edges are independent assertions that can both hold (mutual dependency, mutual enablement, claims that each support or refute the other). Not findings. |
 
 `annotates` is note-sourced, so it cannot form an entity-endpoint reciprocal pair and
 sits outside the entity census below. Note→note reciprocal `annotates` pairs (note A
@@ -271,21 +271,21 @@ cannot see — inferred from the endpoint contract, not sampled. Note-endpoint r
 pairs are therefore **not counted below**; the SQL queries that follow are
 substrate-blind and settle them for store operators.
 
-| Relation | Reciprocal pairs | Class | Residual rows outside census |
-| --- | --- | --- | --- |
-| `precedes` | 66 | order-like — review | 0 |
-| `enables` | 15 | state-like — keep | 16 |
-| `depends_on` | 11 | state-like — keep | 11 |
-| `extends` | 3 | order-like — review | 17 |
-| `instance_of` | 2 | order-like — review | 0 |
-| `introduced_by` | 2 | order-like — review | 37 |
-| `variant_of` | 1 | order-like — review | 0 |
-| `supersedes` | 1 | order-like — review | 56 |
-| `contains` | 0 | order-like — review | 10 |
-| `part_of` | 0 | order-like — review | 5 |
-| `implements` | 0 | order-like — review | 10 |
-| `supports` | 0 | state-like — keep | 1 |
-| `derived_from`, `refutes` | 0 | — | 0 |
+| Relation                  | Reciprocal pairs | Class               | Residual rows outside census |
+| ------------------------- | ---------------- | ------------------- | ---------------------------- |
+| `precedes`                | 66               | order-like — review | 0                            |
+| `enables`                 | 15               | state-like — keep   | 16                           |
+| `depends_on`              | 11               | state-like — keep   | 11                           |
+| `extends`                 | 3                | order-like — review | 17                           |
+| `instance_of`             | 2                | order-like — review | 0                            |
+| `introduced_by`           | 2                | order-like — review | 37                           |
+| `variant_of`              | 1                | order-like — review | 0                            |
+| `supersedes`              | 1                | order-like — review | 56                           |
+| `contains`                | 0                | order-like — review | 10                           |
+| `part_of`                 | 0                | order-like — review | 5                            |
+| `implements`              | 0                | order-like — review | 10                           |
+| `supports`                | 0                | state-like — keep   | 1                            |
+| `derived_from`, `refutes` | 0                | —                   | 0                            |
 
 Total: 101 reciprocal pairs (75 order-like review candidates, 26 state-like keeps).
 Self-loops: 1 (`instance_of`, predating the seam rejection) — curation candidate.
