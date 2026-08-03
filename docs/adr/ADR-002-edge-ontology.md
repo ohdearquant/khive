@@ -227,8 +227,12 @@ write-time enforcement):
 | Order-like — reciprocal pair INCOHERENT | `contains`, `part_of`, `instance_of`, `extends`, `variant_of`, `introduced_by`, `supersedes`, `derived_from`, `precedes`, `implements` | The two edges contradict: each claims a directional subordination or ordering the other denies. Surface as curation-review candidates. |
 | State-like — reciprocal pair COHERENT | `depends_on`, `enables`, `supports`, `refutes` | The two edges are independent assertions that can both hold (mutual dependency, mutual enablement, claims that each support or refute the other). Not findings. |
 
-`annotates` is note-sourced and cannot form a reciprocal pair under the endpoint
-contract; symmetric relations cannot by canonicalization.
+`annotates` is note-sourced, so it cannot form an entity-endpoint reciprocal pair and
+sits outside the entity census below. Note→note reciprocal `annotates` pairs (note A
+annotates note B and note B annotates note A) are endpoint-legal — the contract admits
+any substrate UUID as target — and are classified state-like: two annotations are
+independent assertions, not findings. Symmetric relations cannot form reciprocal pairs
+by canonicalization.
 
 **Self-loops.** `source_id == target_id` is rejected at the endpoint-validation seam
 (`validate_edge_relation_endpoints`) for every relation — this amendment records an
@@ -237,14 +241,18 @@ verb surface; writers below the seam (pack-private map databases, direct store a
 are outside it by construction, and ADR-034's `no-self-loops` pipeline is the audit that
 catches legacy or below-seam rows.
 
-**Delete-then-relink direction rule (normative for callers).** Repricing an edge means:
-`get(edge_id)` → read the stored `source_id`/`target_id` → `delete` → `link` in the SAME
-stored direction. The re-link revives the original row — same id, `created_at` preserved
-as first-assertion provenance, `updated_at` carrying the act date. A direction-flipped
-`link` is a NEW assertion, never a reprice: while the reversed row sits soft-deleted on
-its own natural key, the flip forks a second live edge instead of reviving the first.
-Callers must not infer stored direction from adjacency output (`neighbors` echoes the
-traversal origin, issue #1670); `get(edge_id)` is the supported direction read.
+**Delete-then-relink direction rule (normative for callers; non-symmetric relations).**
+Repricing an edge means: `get(edge_id)` → read the stored `source_id`/`target_id` →
+`delete` → `link` in the SAME stored direction. The re-link revives the original row —
+same id, `created_at` preserved as first-assertion provenance, `updated_at` carrying the
+act date. A direction-flipped `link` is a NEW assertion, never a reprice: the flip
+addresses the other direction's natural key, so it creates (or revives) that key's row
+while the deleted original stays deleted — one live edge after the sequence, not two.
+Two live rows exist only once both directional natural keys have been linked live. For
+symmetric relations the question does not arise: either endpoint order canonicalizes to
+the same natural key, so a re-link in either order revives the same row. Callers must
+not infer stored direction from adjacency output (`neighbors` echoes the traversal
+origin, issue #1670); `get(edge_id)` is the supported direction read.
 
 **Migration consequence.** The legality ruling strands no existing rows. Reciprocal
 pairs in state-like relations stay as-is. Reciprocal pairs in order-like relations and
@@ -315,7 +323,16 @@ note-substrate endpoints, so a residual short of `stats()` is expected on relati
 carrying such rows and must be diagnosed (fetch the residual edge ids, inspect their
 endpoints) rather than assumed benign. Second, `list`-verb offset pagination is not a
 sound enumeration substitute: page ordering is non-deterministic, so paged sweeps both
-duplicate and miss rows (issue #1671).
+duplicate and miss rows (issue #1671). The edge list surface also carries a keyset
+cursor (`after`/`next_after`) that reads raw edge rows — substrate-blind, so it covers
+the note-endpoint and soft-deleted-endpoint edges the entity pattern misses. Where a
+deployment supports it end-to-end, per-relation cursor traversal (until the cursor is
+exhausted) followed by client-side pairing is the preferred MCP census path. Measured
+caveats on the reference deployment: traversal fails loudly on edges created before the
+cursor's insertion-sequence ledger, and an empty-string starting cursor returned no
+cursor envelope at all — verify the first page round-trips (rows plus `next_after`)
+before relying on the cursor, and otherwise fall back to the SQL queries above as the
+reliable substrate-blind census.
 
 ## Endpoint Validation
 
