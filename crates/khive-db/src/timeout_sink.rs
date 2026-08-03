@@ -205,6 +205,21 @@ pub(crate) enum Site {
     StandaloneText,
     /// A standalone writer connection opened by `sql_bridge`.
     StandaloneSqlBridge,
+    /// `SqlBridge::writer()`'s standalone-connection fallback, taken while
+    /// the write queue is enabled (ADR-136 D1 gate 6c).
+    DirectRouteSqlBridgeWriter,
+    /// `SqlBridge::atomic_unit()`'s flag-off manual-transaction fallback,
+    /// taken while the write queue is enabled (ADR-136 D1 gate 6c).
+    DirectRouteAtomicUnit,
+    /// `stores::vectors::vec_delete_subjects`'s `with_writer_unmanaged`
+    /// fallback, taken while the write queue is enabled.
+    DirectRouteVecDeleteSubjects,
+    /// `stores::vectors::orphan_sweep`'s `with_writer_unmanaged` fallback,
+    /// taken while the write queue is enabled.
+    DirectRouteOrphanSweep,
+    /// `stores::text::rename_namespace`'s `with_writer_unmanaged` fallback,
+    /// taken while the write queue is enabled.
+    DirectRouteFtsRenameNamespace,
 }
 
 impl Site {
@@ -215,19 +230,33 @@ impl Site {
             Site::StandaloneEvent => "standalone:event",
             Site::StandaloneText => "standalone:text",
             Site::StandaloneSqlBridge => "standalone:sql_bridge",
+            Site::DirectRouteSqlBridgeWriter => "direct_route:sql_bridge_writer",
+            Site::DirectRouteAtomicUnit => "direct_route:atomic_unit",
+            Site::DirectRouteVecDeleteSubjects => "direct_route:vec_delete_subjects",
+            Site::DirectRouteOrphanSweep => "direct_route:orphan_sweep",
+            Site::DirectRouteFtsRenameNamespace => "direct_route:fts_rename_namespace",
         }
     }
 }
 
-/// A fully-formatted timeout event, ready to hand off to the writer thread.
+/// A fully-formatted sink event, ready to hand off to the writer thread.
 /// Built entirely on the caller's thread (no I/O) and pushed through a
 /// bounded channel — this is the only thing a database caller path ever
-/// does. `error` is already truncated to [`MAX_ERROR_BYTES`].
+/// does. `error` is already truncated to [`MAX_ERROR_BYTES`] where present.
+///
+/// `kind` distinguishes the four durable row shapes this sink emits:
+/// `"timeout"` (a writer-admission or busy/locked timeout, carries `site` +
+/// `error`), `"queue_saturation"` (a caller-visible `WriteQueueFull`, carries
+/// `timeout_ms`), `"writer_task_retirement"` (a `WriterTask` terminal
+/// retirement, carries `error` as the retirement reason), and
+/// `"direct_route_violation"` (a direct writer acquisition bypassing an
+/// enabled queue, carries `site`).
 struct QueuedEvent {
     ts_utc: String,
+    kind: &'static str,
     db: String,
-    site: &'static str,
-    error: String,
+    site: Option<&'static str>,
+    error: Option<String>,
     timeout_ms: Option<u64>,
 }
 
@@ -538,10 +567,10 @@ fn write_event(sink: &mut AppendSink<File>, dropped: &AtomicU64, event: QueuedEv
     }
     let line = build_line(
         event.ts_utc,
-        "timeout",
+        event.kind,
         &event.db,
-        Some(event.site),
-        Some(&event.error),
+        event.site,
+        event.error.as_deref(),
         event.timeout_ms,
         None,
         None,
@@ -850,10 +879,72 @@ pub(crate) fn emit_timeout(db: &str, site: Site, error: &str, timeout_ms: Option
     };
     let event = QueuedEvent {
         ts_utc: now_rfc3339(),
+        kind: "timeout",
         db: db.to_string(),
-        site: site.as_str(),
-        error: truncate_error(error, MAX_ERROR_BYTES),
+        site: Some(site.as_str()),
+        error: Some(truncate_error(error, MAX_ERROR_BYTES)),
         timeout_ms,
+    };
+    enqueue(&handle.sender, &handle.dropped, event);
+}
+
+/// Record a `queue_saturation` event: a caller-visible
+/// `StorageError::WriteQueueFull` — the bounded `WriterTask` channel was
+/// full for the caller's whole `send_with_timeout` deadline and the request
+/// was never accepted (ADR-136 D1 gate 6a). Before this, `WriteQueueFull`
+/// reached the caller with no sink emission at all.
+pub(crate) fn emit_queue_saturation(db: &str, timeout_ms: u64) {
+    let Some(handle) = SINK.get() else {
+        return;
+    };
+    let event = QueuedEvent {
+        ts_utc: now_rfc3339(),
+        kind: "queue_saturation",
+        db: db.to_string(),
+        site: None,
+        error: None,
+        timeout_ms: Some(timeout_ms),
+    };
+    enqueue(&handle.sender, &handle.dropped, event);
+}
+
+/// Record a `writer_task_retirement` event: the `WriterTask` drain loop
+/// reached a terminal request or connection state and is closing admission
+/// permanently (ADR-136 D1 gate 6b). Before this, retirement was observable
+/// only through a `tracing::error!` line before the queue closed.
+pub(crate) fn emit_writer_task_retirement(db: &str, reason: &str) {
+    let Some(handle) = SINK.get() else {
+        return;
+    };
+    let event = QueuedEvent {
+        ts_utc: now_rfc3339(),
+        kind: "writer_task_retirement",
+        db: db.to_string(),
+        site: None,
+        error: Some(truncate_error(reason, MAX_ERROR_BYTES)),
+        timeout_ms: None,
+    };
+    enqueue(&handle.sender, &handle.dropped, event);
+}
+
+/// Record a `direct_route_violation` event: a write path acquired a writer
+/// connection directly (standalone connection or pool mutex), bypassing the
+/// `WriterTask` queue, while `PoolConfig::write_queue_enabled` was `true`
+/// (ADR-136 D1 gate 6c). Emitted on the degrade path itself — never gated on
+/// `write_routing_strict`, since strict mode turns the same condition into a
+/// caller-visible error instead of a degrade, so there is no bypass left to
+/// report there.
+pub(crate) fn emit_direct_route_violation(db: &str, site: Site) {
+    let Some(handle) = SINK.get() else {
+        return;
+    };
+    let event = QueuedEvent {
+        ts_utc: now_rfc3339(),
+        kind: "direct_route_violation",
+        db: db.to_string(),
+        site: Some(site.as_str()),
+        error: None,
+        timeout_ms: None,
     };
     enqueue(&handle.sender, &handle.dropped, event);
 }
@@ -949,9 +1040,10 @@ mod tests {
         let dropped = AtomicU64::new(0);
         let make_event = || QueuedEvent {
             ts_utc: now_rfc3339(),
+            kind: "timeout",
             db: "test-db".to_string(),
-            site: Site::PoolAdmission.as_str(),
-            error: "boom".to_string(),
+            site: Some(Site::PoolAdmission.as_str()),
+            error: Some("boom".to_string()),
             timeout_ms: Some(5),
         };
 
@@ -1125,9 +1217,10 @@ mod tests {
                 thread::spawn(move || {
                     let event = QueuedEvent {
                         ts_utc: now_rfc3339(),
+                        kind: "timeout",
                         db: "concurrent-test".to_string(),
-                        site: Site::StandaloneGraph.as_str(),
-                        error: format!("contention-{i}"),
+                        site: Some(Site::StandaloneGraph.as_str()),
+                        error: Some(format!("contention-{i}")),
                         timeout_ms: Some(i as u64),
                     };
                     enqueue(&sender, &dropped, event);
@@ -1145,10 +1238,10 @@ mod tests {
         while let Ok(event) = receiver.try_recv() {
             let line = build_line(
                 event.ts_utc,
-                "timeout",
+                event.kind,
                 &event.db,
-                Some(event.site),
-                Some(&event.error),
+                event.site,
+                event.error.as_deref(),
                 event.timeout_ms,
                 None,
                 None,
