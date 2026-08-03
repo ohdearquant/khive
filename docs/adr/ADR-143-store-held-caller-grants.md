@@ -122,7 +122,11 @@ capability plus ADR-127's grant fields — in durable form.
   of the anchor's own boot principal, performed through the grant surface
   and recorded per §4a — denies every chain terminating at it at every
   process's next consultation; this is also how a decommissioned process's
-  outstanding delegations are extinguished. Cross-process seal verification
+  outstanding delegations are extinguished. Retirement's authorization rule
+  is identity, not administration: the surface authorizes it solely by
+  structural equality between the caller and the anchor's boot principal —
+  no `GrantAdmin` is involved, and under Amendment 1 the classification is
+  trivial because the result grants nothing. Cross-process seal verification
   itself presupposes the deployment provisions seal-key material per
   ADR-127's durable-grant deployment obligation; this record consumes that
   obligation and adds only the anchor and its terminal rule, redefining no
@@ -144,8 +148,12 @@ capability plus ADR-127's grant fields — in durable form.
 ### 2. One authorized grant surface
 
 Amendment 2's invariant "no runtime registration API" is superseded by exactly
-one: the grant surface. The rest of the invariant is carried forward unchanged —
-one gate instance, minted at the boot seam, no outside-gate constructor.
+one: the grant surface. Its mutation operations — grant, revoke, and anchor
+retirement (§1) — are the only runtime writers of caller authority; the
+surface additionally carries its own scope-bounded read for grant-change
+reconstruction (§4a), which registers nothing. The rest of the invariant is
+carried forward unchanged — one gate instance, minted at the boot seam, no
+outside-gate constructor.
 
 - **Grant administration is a distinct, pair-scoped right, and this is an
   explicit amendment to Stage 1c.** `GrantAdmin(namespace, right)` is held per
