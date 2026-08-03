@@ -608,6 +608,13 @@ requirement are all unchanged by this amendment. The wire vocabulary of
 `brain.auto_feedback` and the evidence vocabulary are distinct sets by design: a
 signal that carries no evidence must not be representable in the evidence type.
 
+One Amendment 2 sentence is narrowed to make that split well-formed. Amendment 2
+states that "every signal accepted by the feedback surface appears" in the normative
+mass mapping; that sentence is henceforth scoped to every **evidence-bearing** signal
+accepted by the `brain.feedback` evidence surface. Wire-only values — today exactly
+`unjudged` — are excluded from the table by design, not by omission. The eight-row
+table, its row set, and its positive-mass invariant are unchanged.
+
 **Event kind.** `unjudged` acceptances persist under a new event kind,
 `feedback_unjudged`, rather than under `feedback_explicit`:
 
@@ -650,8 +657,13 @@ recordable exactly once.
 ### Change 3 — no synthesized judgments anywhere in the serving path
 
 No serving-path component may manufacture a judgment the caller did not state. This
-amendment supersedes Amendment 1's retention of the shipped `RecallHit` per-entity
-credit, and enumerates the affected paths explicitly:
+rule is not new: Amendment 1's Stage D accrual rule already excludes both `RecallHit`
+and `NoteAccessed` from per-entity evidence, and its gate already requires that a
+`RecallHit` leave per-entity evidence unchanged and a `NoteAccessed` leave every
+posterior unchanged. The shipped reducer still applies both per-entity arms, so
+Stage D's accrual rule is accepted but not yet satisfied by the code. This change
+supersedes nothing in Amendment 1 — it schedules the implementation that satisfies
+it, and enumerates the affected paths explicitly:
 
 1. The `brain.auto_feedback` omitted-signal default — deleted (Change 1).
 2. The memory pack's post-recall hook, which awards a per-entity posterior success to
@@ -662,16 +674,30 @@ credit, and enumerates the affected paths explicitly:
 3. The brain core's per-entity signal extraction, which maps a recall hit to a
    positive per-entity update — the recall-hit arm stops yielding a per-entity
    signal. The entity-blind global recall parameter (hit/miss) and the temporal
-   posterior remain driven by recall events, unchanged.
+   posterior remain driven by recall events, exactly as Amendment 1 retains them.
+4. The same extraction's note-access arm, which maps a direct record access
+   (`get`/`remember`) to a positive per-entity update — removed under Amendment 1's
+   existing exclusion, whose gate already requires a `NoteAccessed` to leave every
+   posterior unchanged. Nothing here re-decides that rule; the arm is listed so the
+   implementing change cannot satisfy the recall arms while leaving this one live.
 
-Note-access crediting (a positive per-entity signal when a record is directly
-accessed) is grounded in a caller action on a specific record rather than in rank
-position, and is out of scope for this amendment; any change to it takes its own
-record.
+**Normative rule for consumers.** Per-entity evidence state originates exclusively
+from judgment-bearing feedback events. No fold or serving consumer may derive
+per-entity state from recall, access, or serve events, whatever fields those events
+carry. Recall events retain their `target_id` provenance deliberately: event-level
+provenance is the audit instrument that exposed the implicit-positive loop this
+amendment corrects, and deleting the audit surface to prove loop-absence would blind
+the detector. The acceptance arms below are the point-in-time witness that the
+shipped stacks obey this rule at amendment time; this clause, not those tests,
+governs every future consumer.
 
-After this change, a serve with no subsequent judgment leaves a serve-ledger row and,
-at most, a `feedback_unjudged` event — never a positive update of any per-entity or
-per-profile evidence state.
+After this change, a serve with no subsequent judgment leaves, at most, a
+serve-ledger row (the existing best-effort serve ledger is retained as-is; this
+amendment does not make it durable) and a `feedback_unjudged` event — never a
+positive update of any per-entity or per-profile evidence state. The
+later-judgment and deduplication rule in Change 2 applies when serve-ledger
+provenance is available; when the best-effort ledger recorded nothing, an `unjudged`
+event still persists on its own.
 
 ### Origin stamping: wire contract
 
@@ -681,9 +707,20 @@ Every feedback event written after this amendment carries a required payload fie
 stored event verb remains `brain.feedback` for replay and historical-query stability;
 the forwarding path stamps `originating_verb` before delegating, so the stored verb
 and the originating surface are separately queryable. Historical rows lack the field;
-absence means pre-amendment, and no backfill is performed. The acceptance queries
-below filter on this field; without it, residual implicit rows cannot be attributed
-to an emitting surface.
+absence means pre-amendment, and no backfill is performed.
+
+**Executable read contract.** Origin and attribution are read through the generic
+event list, not through the aggregate count surface: the acceptance query is
+`list(kind="event", event_kind="feedback_unjudged")` (and the same list filtered to
+the feedback kinds for judgment rows), with the payload predicate applied
+client-side — each returned row's payload is asserted to carry `originating_verb`
+with a value from the closed set above, and serve attribution
+(`served_by_profile_id`, serve-ledger id when available) intact. The aggregate
+count surface groups by kind generically and inspects payload fields for no kind
+except explicit judgments, so its kind breakdown serves as a volume check only;
+it is not the instrument that verifies attribution or origin survival. Without
+this field and this query, residual implicit rows cannot be attributed to an
+emitting surface.
 
 ### Acceptance arms — executed, not claimed
 
@@ -693,8 +730,11 @@ Each arm is a test that must exist and pass with the implementing change:
    returns invalid input, and the event store is asserted to contain zero new rows
    from the call — the rejection writes nothing.
 2. **Wire survival.** A `signal="unjudged"` call writes a `feedback_unjudged` row
-   that survives ingestion and is readable back through the event-count surface's
-   kind breakdown with serve attribution intact. The two surfaces where a validator
+   that survives ingestion and is read back through the acceptance query defined
+   above — `list(kind="event", event_kind="feedback_unjudged")` — with the
+   client-side payload predicate asserting both `originating_verb` and serve
+   attribution on the returned row; the event-count kind breakdown is additionally
+   asserted to show the row as a volume check. The two surfaces where a validator
    could silently eat the row are named as test targets: the closed event-kind
    valid-name list and parser in the types crate, and the closed signal-string match
    in the brain handlers — both must accept the new values, and the test exercises
