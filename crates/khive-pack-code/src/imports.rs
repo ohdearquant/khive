@@ -133,10 +133,11 @@ pub(crate) fn classify_import(
     raw: &str,
     current_module_path: &str,
     project_name: &str,
+    is_package: bool,
 ) -> Resolved {
     match language {
         "rust" => classify_rust(raw, current_module_path, project_name),
-        "python" => classify_python(raw, current_module_path, project_name),
+        "python" => classify_python(raw, current_module_path, project_name, is_package),
         "typescript" => classify_typescript(raw),
         _ => Resolved::Skip,
     }
@@ -179,7 +180,12 @@ fn module_or_skip(module_path: &str) -> Resolved {
     }
 }
 
-fn classify_python(raw: &str, current_module_path: &str, project_name: &str) -> Resolved {
+fn classify_python(
+    raw: &str,
+    current_module_path: &str,
+    project_name: &str,
+    is_package: bool,
+) -> Resolved {
     if let Some(stripped) = raw.strip_prefix('.') {
         let mut level = 1usize;
         let mut rest = stripped;
@@ -188,19 +194,33 @@ fn classify_python(raw: &str, current_module_path: &str, project_name: &str) -> 
             rest = s;
         }
         let mut base: Vec<&str> = current_module_path.split('.').collect();
-        // The declaring module's own containing package is one level up
-        // from itself; a single leading dot means "this package".
-        base.pop();
+        // A single leading dot means "the containing package". For a regular
+        // module that is one level up from its own path; for a package
+        // (`__init__.py`) it is the module path itself, because
+        // `module_path_for_file` already collapsed `pkg/__init__.py` to
+        // `pkg` — popping again would resolve into the parent package.
+        if !is_package {
+            base.pop();
+        }
         for _ in 1..level {
             base.pop();
         }
-        if rest.is_empty() {
-            return module_or_skip(&base.join("."));
-        }
+        // A relative import that climbs to or above the scanner's project
+        // root cannot be attributed — Python itself rejects relative imports
+        // beyond the top-level package — so never record a root-level guess
+        // that a later same-name module would silently satisfy.
         if base.is_empty() {
-            return Resolved::IntraModule(rest.to_string());
+            return Resolved::Skip;
         }
-        return Resolved::IntraModule(format!("{}.{}", base.join("."), rest));
+        let target = if rest.is_empty() {
+            base.join(".")
+        } else {
+            format!("{}.{}", base.join("."), rest)
+        };
+        if target == current_module_path {
+            return Resolved::Skip;
+        }
+        return module_or_skip(&target);
     }
     if raw.is_empty() {
         return Resolved::Skip;
@@ -346,15 +366,21 @@ mod tests {
     #[test]
     fn rust_classify_external_vs_intra() {
         assert_eq!(
-            classify_import("rust", "serde::Serialize", "crate", "mycrate"),
+            classify_import("rust", "serde::Serialize", "crate", "mycrate", false),
             Resolved::ExternalProject("serde".to_string())
         );
         assert_eq!(
-            classify_import("rust", "mycrate::foo::Bar", "crate", "mycrate"),
+            classify_import("rust", "mycrate::foo::Bar", "crate", "mycrate", false),
             Resolved::IntraModule("foo::Bar".to_string())
         );
         assert_eq!(
-            classify_import("rust", "std::collections::HashMap", "crate", "mycrate"),
+            classify_import(
+                "rust",
+                "std::collections::HashMap",
+                "crate",
+                "mycrate",
+                false
+            ),
             Resolved::Skip
         );
     }
@@ -362,23 +388,82 @@ mod tests {
     #[test]
     fn python_classify_relative_import() {
         assert_eq!(
-            classify_import("python", ".sibling", "pkg.mod", "pkg"),
+            classify_import("python", ".sibling", "pkg.mod", "pkg", false),
             Resolved::IntraModule("pkg.sibling".to_string())
         );
         assert_eq!(
-            classify_import("python", "requests", "pkg.mod", "pkg"),
+            classify_import("python", "requests", "pkg.mod", "pkg", false),
             Resolved::ExternalProject("requests".to_string())
+        );
+    }
+
+    #[test]
+    fn python_relative_import_from_package_init_stays_in_package() {
+        // `from .x import A` in `pkg/x/__init__.py` (module path `pkg.x`):
+        // the leading dot refers to `pkg.x` itself, so the target is the
+        // same-name submodule `pkg.x.x`, never a self-loop on `pkg.x`.
+        assert_eq!(
+            classify_import("python", ".x", "pkg.x", "pkg", true),
+            Resolved::IntraModule("pkg.x.x".to_string())
+        );
+        // `from .y import B` in `pkg/x/__init__.py` -> `pkg.x.y`.
+        assert_eq!(
+            classify_import("python", ".y", "pkg.x", "pkg", true),
+            Resolved::IntraModule("pkg.x.y".to_string())
+        );
+        // Regular-module behavior unchanged: `from .y import C` in
+        // `pkg/x/z.py` -> `pkg.x.y`.
+        assert_eq!(
+            classify_import("python", ".y", "pkg.x.z", "pkg", false),
+            Resolved::IntraModule("pkg.x.y".to_string())
+        );
+        // Each additional dot climbs one package from the declarer's own
+        // package: `from ..a import D` in `pkg/x/__init__.py` -> `pkg.a`.
+        assert_eq!(
+            classify_import("python", "..a", "pkg.x", "pkg", true),
+            Resolved::IntraModule("pkg.a".to_string())
+        );
+        // `from . import x` in `pkg/x/__init__.py` resolves to the package
+        // itself — a self-reference, skipped rather than recorded as a
+        // self-loop edge.
+        assert_eq!(
+            classify_import("python", ".", "pkg.x", "pkg", true),
+            Resolved::Skip
+        );
+    }
+
+    #[test]
+    fn python_relative_import_above_project_root_is_skipped() {
+        // Climbing to or above the scanner's project root is unattributable
+        // (Python rejects relative imports beyond the top-level package) —
+        // never a root-level intra-project target. Both declarer shapes.
+        assert_eq!(
+            classify_import("python", "..outside", "pkg", "pkg", true),
+            Resolved::Skip
+        );
+        assert_eq!(
+            classify_import("python", "..outside", "pkg.mod", "pkg", false),
+            Resolved::Skip
+        );
+        assert_eq!(
+            classify_import("python", "...outside", "pkg.x", "pkg", true),
+            Resolved::Skip
+        );
+        // One level short of the root still resolves normally.
+        assert_eq!(
+            classify_import("python", "..a", "pkg.x.y", "pkg", false),
+            Resolved::IntraModule("pkg.a".to_string())
         );
     }
 
     #[test]
     fn typescript_classify_relative_vs_package() {
         assert_eq!(
-            classify_import("typescript", "./util", "", ""),
+            classify_import("typescript", "./util", "", "", false),
             Resolved::IntraModule("./util".to_string())
         );
         assert_eq!(
-            classify_import("typescript", "left-pad", "", ""),
+            classify_import("typescript", "left-pad", "", "", false),
             Resolved::ExternalProject("left-pad".to_string())
         );
     }

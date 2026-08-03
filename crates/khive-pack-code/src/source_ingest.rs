@@ -900,12 +900,13 @@ async fn run_import_scan(
             report.edges_updated += 1;
         }
 
+        let is_package = file.file_name().is_some_and(|name| name == "__init__.py");
         for raw in imports::extract_raw_imports(language, &content) {
             let resolved = if language == "typescript" && raw.starts_with('.') {
                 let rel_dir = file_dir.strip_prefix(&proj_root).unwrap_or(Path::new(""));
                 Resolved::IntraModule(imports::resolve_relative_ts_module(rel_dir, &raw))
             } else {
-                imports::classify_import(language, &raw, &module_path, &proj_name)
+                imports::classify_import(language, &raw, &module_path, &proj_name, is_package)
             };
             match resolved {
                 Resolved::Skip => {}

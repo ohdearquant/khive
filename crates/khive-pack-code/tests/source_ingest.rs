@@ -325,6 +325,72 @@ async fn rust_item_import_resolves_to_containing_module_after_reingest() {
     );
 }
 
+/// Relative imports declared in a package `__init__.py` must resolve inside
+/// that package, not its parent (#1662): `module_path_for_file` collapses
+/// `pkg/x/__init__.py` to `pkg.x`, so the single leading dot already names
+/// the package itself. Before the fix, `from .x import A` in
+/// `pkg/x/__init__.py` resolved to `pkg.x` — a self-loop — and every other
+/// `__init__` relative import landed one package too high.
+fn write_python_init_reexport_fixture(root: &Path) {
+    let pkg_x = root.join("pkg/x");
+    std::fs::create_dir_all(&pkg_x).unwrap();
+    std::fs::write(
+        root.join("pyproject.toml"),
+        "[project]\nname = \"pyproj\"\n",
+    )
+    .unwrap();
+    std::fs::write(root.join("pkg/__init__.py"), "").unwrap();
+    std::fs::write(
+        pkg_x.join("__init__.py"),
+        "from .x import A\nfrom .y import B\n",
+    )
+    .unwrap();
+    std::fs::write(pkg_x.join("x.py"), "A = 1\n").unwrap();
+    std::fs::write(pkg_x.join("y.py"), "B = 2\n").unwrap();
+    std::fs::write(pkg_x.join("z.py"), "from .y import B\n").unwrap();
+}
+
+#[tokio::test]
+async fn python_init_reexport_resolves_in_package_without_self_loop() {
+    let root = TempDir::new().expect("tempdir");
+    write_python_init_reexport_fixture(root.path());
+    let db = root.path().join("init_reexport.db");
+    let rt = rt_at(&db);
+    let token = rt.authorize(Namespace::local()).expect("token");
+
+    let opts = || CodeSourceIngestOptions {
+        path: root.path(),
+        languages: all_languages(),
+        sweep_time: Utc::now(),
+    };
+    run_code_ingest(&rt, &token, opts())
+        .await
+        .expect("first ingest succeeds");
+    run_code_ingest(&rt, &token, opts())
+        .await
+        .expect("second ingest succeeds");
+
+    let edges = edge_fingerprints(&rt).await;
+    for (src, tgt) in [
+        ("pkg.x", "pkg.x.x"),
+        ("pkg.x", "pkg.x.y"),
+        ("pkg.x.z", "pkg.x.y"),
+    ] {
+        assert!(
+            edges.iter().any(|(rel, s, t, kinds)| rel == "depends_on"
+                && s == src
+                && t == tgt
+                && kinds == "import"),
+            "expected {src} -> {tgt} depends_on import edge, got: {edges:?}"
+        );
+    }
+    let self_loops: Vec<_> = edges.iter().filter(|(_, s, t, _)| s == t).collect();
+    assert!(
+        self_loops.is_empty(),
+        "same-name submodule re-export must not produce self-loop edges, got: {self_loops:?}"
+    );
+}
+
 /// A manifestless folder (no `Cargo.toml`/`pyproject.toml`/`package.json`
 /// anywhere above its source files) must still produce project/module
 /// entities and import edges under the basename-fallback identity rule
