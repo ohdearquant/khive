@@ -151,6 +151,11 @@ impl KgPack {
                             "entity_kind": entity_kind,
                             "name": h.title,
                             "score": h.score.to_f64(),
+                            // This path always serves one backend's own fused relevance
+                            // score. The multi-backend daemon path can instead serve a
+                            // rank-derived fusion value, which is not comparable to this
+                            // one, so every search row states which it carries.
+                            "score_kind": "backend",
                             "source": h.source.as_str(),
                             "title": h.title,
                             "snippet": h.snippet,
@@ -268,6 +273,7 @@ impl KgPack {
                             "note_kind": note_kind,
                             "name": name,
                             "score": h.score.to_f64(),
+                            "score_kind": "backend",
                             "source": h.source.as_str(),
                             "title": h.title,
                             "snippet": h.snippet,

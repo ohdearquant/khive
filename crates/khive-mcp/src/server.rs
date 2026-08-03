@@ -1374,12 +1374,41 @@ async fn dispatch_via_coordinator_inner(
                             )
                             .await;
 
-                        // Shape result to match the kg search handler's output fields exactly.
-                        // Entity hits: [{id, entity_kind, score, title, snippet}]
+                        // Shape result to match the kg search handler's output fields.
+                        // Entity hits: [{id, entity_kind, score, score_kind, title, snippet}]
                         //   - entity_kind: real kind string fetched from the owning backend
-                        //   - score: RRF-merged, subject to min_score floor
-                        // Note hits:   [{id, note_kind, score, title, snippet}]
+                        //   - score: subject to min_score floor; see score_kind
+                        // Note hits:   [{id, note_kind, score, score_kind, title, snippet}]
                         //   - note_kind: real kind string fetched from the owning backend
+                        //
+                        // `score` is not one quantity. When a single backend contributed
+                        // hits they pass through carrying that backend's own fused
+                        // relevance score; when two or more contributed, the merge emits a
+                        // Reciprocal Rank Fusion value derived from ranks alone, which is
+                        // not comparable to a relevance score and cannot be thresholded
+                        // like one. `score_kind` says which of the two a caller is reading.
+                        let entity_score_kind = if coord_result
+                            .per_backend
+                            .iter()
+                            .filter(|r| !r.entity_hits.is_empty())
+                            .count()
+                            > 1
+                        {
+                            "fused_rank"
+                        } else {
+                            "backend"
+                        };
+                        let note_score_kind = if coord_result
+                            .per_backend
+                            .iter()
+                            .filter(|r| !r.note_hits.is_empty())
+                            .count()
+                            > 1
+                        {
+                            "fused_rank"
+                        } else {
+                            "backend"
+                        };
                         let result_val = if !coord_result.note_hits.is_empty()
                             || (coord_result.entity_hits.is_empty()
                                 && coord_result.note_hits.is_empty())
@@ -1395,6 +1424,7 @@ async fn dispatch_via_coordinator_inner(
                                         "id": h.note_id.to_string(),
                                         "note_kind": note_kind,
                                         "score": h.score.to_f64(),
+                                        "score_kind": note_score_kind,
                                         "source": h.source.as_str(),
                                         "title": h.title,
                                         "snippet": h.snippet,
@@ -1414,6 +1444,7 @@ async fn dispatch_via_coordinator_inner(
                                         "id": h.entity_id.to_string(),
                                         "entity_kind": entity_kind,
                                         "score": h.score.to_f64(),
+                                        "score_kind": entity_score_kind,
                                         "source": h.source.as_str(),
                                         "title": h.title,
                                         "snippet": h.snippet,

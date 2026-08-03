@@ -6,7 +6,8 @@ use uuid::Uuid;
 
 use khive_runtime::Namespace as RuntimeNamespace;
 use khive_runtime::{
-    BackendId, KhiveRuntime, PackRegistry, SearchHit, SearchSource, VerbRegistryBuilder,
+    BackendId, KhiveRuntime, NoteSearchHit, PackRegistry, SearchHit, SearchSource,
+    VerbRegistryBuilder,
 };
 use khive_score::DeterministicScore;
 use khive_storage::types::Direction;
@@ -335,6 +336,123 @@ fn cross_backend_entity_merge_preserves_retrieval_leg_membership() {
     assert_eq!(sources[&text_on_both], SearchSource::Text);
     assert_eq!(sources[&vector_on_both], SearchSource::Vector);
     assert_eq!(sources[&both_and_vector], SearchSource::Both);
+}
+
+fn scored_hit(entity_id: Uuid, source: SearchSource, score: f64) -> SearchHit {
+    SearchHit {
+        entity_id,
+        score: DeterministicScore::from_f64(score),
+        source,
+        title: None,
+        snippet: None,
+    }
+}
+
+fn scored_note_hit(note_id: Uuid, source: SearchSource, score: f64) -> NoteSearchHit {
+    NoteSearchHit {
+        note_id,
+        score: DeterministicScore::from_f64(score),
+        source,
+        title: None,
+        snippet: None,
+    }
+}
+
+/// One contributing backend means there is nothing to fuse. Running RRF anyway
+/// replaced every backend score with `1/(60 + position)`, so an exact-title hit
+/// and an unrelated one at the next position scored 0.016393 and 0.016129 — a
+/// rank artifact in the field callers threshold on. The passthrough must preserve
+/// the backend's own scores exactly.
+#[test]
+fn single_contributing_backend_passes_backend_scores_through() {
+    let exact = Uuid::new_v4();
+    let partial = Uuid::new_v4();
+
+    // 0.681818… is what the entity fusion path emits for an exact title match
+    // (two arms at rank 1 with k=10, plus the exact-match boost).
+    let merged = super::dispatch::rrf_merge_entity_hits(
+        vec![vec![
+            scored_hit(exact, SearchSource::Both, 0.681_818_181_818),
+            scored_hit(partial, SearchSource::Vector, 0.083_333_333_333),
+        ]],
+        10,
+    );
+
+    assert_eq!(merged.len(), 2);
+    assert_eq!(merged[0].entity_id, exact);
+    assert_eq!(merged[1].entity_id, partial);
+    assert_eq!(
+        merged[0].score,
+        DeterministicScore::from_f64(0.681_818_181_818),
+        "single-contributor passthrough must keep the backend score"
+    );
+    assert_eq!(
+        merged[1].score,
+        DeterministicScore::from_f64(0.083_333_333_333)
+    );
+    // The defect this guards against is positional: both scores collapsing onto
+    // 1/(60 + position) regardless of what retrieval found.
+    let positional_first = DeterministicScore::from_f64(1.0 / 61.0);
+    assert_ne!(
+        merged[0].score, positional_first,
+        "a rank artifact must not be served as a relevance score"
+    );
+}
+
+#[test]
+fn single_contributing_backend_passthrough_respects_limit() {
+    let hits: Vec<SearchHit> = (0..5)
+        .map(|i| scored_hit(Uuid::new_v4(), SearchSource::Text, 1.0 - f64::from(i) * 0.1))
+        .collect();
+    let merged = super::dispatch::rrf_merge_entity_hits(vec![hits], 2);
+    assert_eq!(merged.len(), 2);
+}
+
+#[test]
+fn single_contributing_backend_note_passthrough_keeps_scores() {
+    let note = Uuid::new_v4();
+    let merged = super::dispatch::rrf_merge_note_hits(
+        vec![vec![scored_note_hit(note, SearchSource::Both, 0.42)]],
+        10,
+    );
+    assert_eq!(merged.len(), 1);
+    assert_eq!(merged[0].score, DeterministicScore::from_f64(0.42));
+}
+
+/// Two contributing backends genuinely need rank fusion — scores from different
+/// backends are not comparable. This pins the RRF math so the passthrough above
+/// cannot be widened into "never fuse".
+#[test]
+fn two_contributing_backends_still_fuse_by_rank() {
+    let on_both = Uuid::new_v4();
+    let on_one = Uuid::new_v4();
+
+    let merged = super::dispatch::rrf_merge_entity_hits(
+        vec![
+            vec![
+                scored_hit(on_both, SearchSource::Text, 0.9),
+                scored_hit(on_one, SearchSource::Text, 0.8),
+            ],
+            vec![scored_hit(on_both, SearchSource::Vector, 0.1)],
+        ],
+        10,
+    );
+
+    assert_eq!(merged.len(), 2);
+    assert_eq!(merged[0].entity_id, on_both, "rank-1 in both lists wins");
+    assert_eq!(
+        merged[0].score,
+        DeterministicScore::from_f64(1.0 / 61.0 + 1.0 / 61.0),
+        "fused score sums the per-list RRF contributions"
+    );
+    assert_eq!(
+        merged[1].score,
+        DeterministicScore::from_f64(1.0 / 62.0),
+        "rank-2 in one list only"
+    );
+    // The backend scores must NOT survive a real fusion: 0.9 is not comparable
+    // to 0.1 across backends, which is the reason RRF is used here at all.
+    assert_ne!(merged[0].score, DeterministicScore::from_f64(0.9));
 }
 
 #[tokio::test]

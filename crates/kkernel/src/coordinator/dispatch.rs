@@ -629,8 +629,20 @@ struct RrfMergeBucket {
 }
 
 /// Merge multiple ranked entity hit lists via Reciprocal Rank Fusion (k=60).
+///
+/// Fusion runs only when two or more backends actually CONTRIBUTED hits. With a
+/// single contributing list there is nothing to fuse, and running RRF anyway would
+/// replace each backend score with `1/(60 + position)` — a rank artifact emitted
+/// into the field callers read as relevance. The single-contributor list is
+/// therefore passed through with its backend scores intact.
 pub(super) fn rrf_merge_entity_hits(lists: Vec<Vec<SearchHit>>, limit: usize) -> Vec<SearchHit> {
     const K: f64 = 60.0;
+
+    if lists.len() == 1 {
+        let mut only = lists.into_iter().next().unwrap_or_default();
+        only.truncate(limit);
+        return only;
+    }
 
     let mut scores: HashMap<Uuid, RrfMergeBucket> = HashMap::new();
 
@@ -673,8 +685,20 @@ pub(super) fn rrf_merge_entity_hits(lists: Vec<Vec<SearchHit>>, limit: usize) ->
 }
 
 /// Merge multiple ranked note hit lists via Reciprocal Rank Fusion (k=60).
-fn rrf_merge_note_hits(lists: Vec<Vec<NoteSearchHit>>, limit: usize) -> Vec<NoteSearchHit> {
+///
+/// Single-contributor passthrough applies here for the same reason as the entity
+/// merge above.
+pub(super) fn rrf_merge_note_hits(
+    lists: Vec<Vec<NoteSearchHit>>,
+    limit: usize,
+) -> Vec<NoteSearchHit> {
     const K: f64 = 60.0;
+
+    if lists.len() == 1 {
+        let mut only = lists.into_iter().next().unwrap_or_default();
+        only.truncate(limit);
+        return only;
+    }
 
     let mut scores: HashMap<Uuid, RrfMergeBucket> = HashMap::new();
 
