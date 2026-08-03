@@ -137,6 +137,7 @@ Architecture Decision Records (ADRs) for khive v1. These are **desired-state spe
 | [ADR-136](ADR-136-fair-write-admission-default.md)                      | Fair write admission — execute the queue default-on pathway with production evidence                       |
 | [ADR-137](ADR-137-tailnet-wire-transport.md)                            | Tailnet Wire Transport for the khive Frame Protocol                                                        |
 | [ADR-138](ADR-138-blob-enumeration.md)                                  | Add read-only blob enumeration to the blob-store contract                                                  |
+| [ADR-139](ADR-139-code-map-read-access.md)                              | Read access to registered code map databases                                                               |
 | [ADR-141](ADR-141-store-backup-runner.md)                               | Executable store backup runner                                                                             |
 | [ADR-142](ADR-142-agentic-process-runtime.md)                           | Agentic Process Runtime                                                                                    |
 | [ADR-143](ADR-143-store-held-caller-grants.md)                          | Store-held caller grants and hierarchical subactor identity                                                |
