@@ -229,6 +229,12 @@ impl khive_storage::SqlReader for SqliteReader {
 // =============================================================================
 
 struct SqliteWriter {
+    /// `None` at construction when a `WriterTaskHandle` was obtained (ADR-136
+    /// D1 gate 1: queue-first `writer()` skips the standalone open in that
+    /// case). Lazily opened by [`SqliteWriter::ensure_conn`] on first read
+    /// (`query_row`/`query_all`) — no production caller reads via a
+    /// `writer()` handle today, but the `SqlReader` supertrait still
+    /// requires the capability.
     conn: Option<rusqlite::Connection>,
     /// ADR-067 Component A: when the write queue is enabled, `execute_batch`
     /// routes the whole caller-supplied statement list through the
@@ -243,6 +249,18 @@ struct SqliteWriter {
     /// captured at construction so the standalone-path busy/locked mapping
     /// below doesn't need a `&ConnectionPool` reference to report against.
     db: String,
+    /// Needed only for [`Self::ensure_conn`]'s lazy standalone-connection
+    /// open when `conn` was skipped at construction (`writer_task` present).
+    pool: Arc<ConnectionPool>,
+}
+
+impl SqliteWriter {
+    /// Return `conn` if already open, else open a standalone writer
+    /// connection now. See the `conn` field doc comment for when this lazy
+    /// path is reached.
+    fn ensure_conn(&self) -> khive_storage::types::StorageResult<rusqlite::Connection> {
+        open_standalone_writer(&self.pool)
+    }
 }
 
 #[async_trait]
@@ -251,10 +269,16 @@ impl khive_storage::SqlReader for SqliteWriter {
         &mut self,
         statement: SqlStatement,
     ) -> khive_storage::types::StorageResult<Option<SqlRow>> {
-        let conn = self.conn.take().ok_or_else(|| StorageError::Pool {
-            operation: "writer.query_row".into(),
-            message: "connection already consumed".into(),
-        })?;
+        let conn = match self.conn.take() {
+            Some(conn) => conn,
+            None if self.writer_task.is_some() => self.ensure_conn()?,
+            None => {
+                return Err(StorageError::Pool {
+                    operation: "writer.query_row".into(),
+                    message: "connection already consumed".into(),
+                })
+            }
+        };
         let (conn, result) = tokio::task::spawn_blocking(move || {
             let res = execute_query(&conn, &statement);
             (conn, res)
@@ -270,10 +294,16 @@ impl khive_storage::SqlReader for SqliteWriter {
         &mut self,
         statement: SqlStatement,
     ) -> khive_storage::types::StorageResult<Vec<SqlRow>> {
-        let conn = self.conn.take().ok_or_else(|| StorageError::Pool {
-            operation: "writer.query_all".into(),
-            message: "connection already consumed".into(),
-        })?;
+        let conn = match self.conn.take() {
+            Some(conn) => conn,
+            None if self.writer_task.is_some() => self.ensure_conn()?,
+            None => {
+                return Err(StorageError::Pool {
+                    operation: "writer.query_all".into(),
+                    message: "connection already consumed".into(),
+                })
+            }
+        };
         let (conn, result) = tokio::task::spawn_blocking(move || {
             let res = execute_query(&conn, &statement);
             (conn, res)
@@ -1014,16 +1044,59 @@ impl khive_storage::SqlAccess for SqlBridge {
                     message: "backend is read-only".into(),
                 });
             }
-            let conn = open_standalone_writer(&self.pool)?;
-            // Best-effort: a lookup failure (no runtime context) degrades to the
-            // standalone-connection path in `execute_batch` rather than failing
-            // handle construction (mirrors every other migrated store).
-            let writer_task = self.pool.writer_task_handle().ok().flatten();
+            let db = crate::timeout_sink::db_label(&self.pool);
+            // ADR-136 D1 gate 1: queue-first. The handle lookup runs BEFORE
+            // any standalone connection is opened, and a lookup failure is
+            // propagated (never silently degraded) when strict routing is
+            // on. Only the flag-off/degraded case still opens a standalone
+            // connection.
+            let writer_task = match self.pool.writer_task_handle() {
+                Ok(handle) => handle,
+                Err(e) => {
+                    if self.pool.config().write_routing_strict {
+                        return Err(e);
+                    }
+                    tracing::warn!(
+                        error = %e,
+                        "KHIVE_WRITE_ROUTING is not strict; writer() degrades to the \
+                         standalone-connection path"
+                    );
+                    None
+                }
+            };
+            if writer_task.is_none() && self.pool.config().write_routing_strict {
+                return Err(StorageError::Pool {
+                    operation: "writer".into(),
+                    message: "KHIVE_WRITE_ROUTING=strict but no writer-task handle is \
+                              available; refusing to fall back to a direct connection"
+                        .into(),
+                });
+            }
+            if writer_task.is_none() && self.pool.config().write_queue_enabled {
+                // The queue is enabled but this call didn't get a handle
+                // (spawn/runtime degrade) — a direct-route violation in the
+                // making once this writer's execute*/query* methods run.
+                crate::timeout_sink::emit_direct_route_violation(
+                    &db,
+                    crate::timeout_sink::Site::DirectRouteSqlBridgeWriter,
+                );
+            }
+            // A standalone connection is opened only when there is no queue
+            // handle to route writes through — `SqliteWriter`'s `SqlReader`
+            // methods (`query_row`/`query_all`) lazily open one on first use
+            // in the handle-present case (no production caller reads via a
+            // `writer()` handle today; see `SqliteWriter::ensure_conn`).
+            let conn = if writer_task.is_none() {
+                Some(open_standalone_writer(&self.pool)?)
+            } else {
+                None
+            };
             Ok(Box::new(SqliteWriter {
-                conn: Some(conn),
+                conn,
                 writer_task,
                 origin: self.pool.origin(),
-                db: crate::timeout_sink::db_label(&self.pool),
+                db,
+                pool: Arc::clone(&self.pool),
             }))
         } else {
             Ok(Box::new(PoolBackedWriter {
@@ -1055,8 +1128,25 @@ impl khive_storage::SqlAccess for SqlBridge {
             }
             // Best-effort, same guard `writer()` uses: `Ok(None)` on flag-off;
             // `Err(WriterTaskNoRuntime)` propagates loud rather than silently
-            // falling back to a competing connection from a sync caller.
-            if let Some(writer_task) = self.pool.writer_task_handle()? {
+            // falling back to a competing connection from a sync caller. ADR-136
+            // D1 gate 3: `Ok(None)` under strict routing is ALSO a fail-closed
+            // error (queue was requested but unavailable), not just a degrade.
+            let handle = self.pool.writer_task_handle()?;
+            if handle.is_none() && self.pool.config().write_routing_strict {
+                return Err(StorageError::Pool {
+                    operation: "atomic_unit".into(),
+                    message: "KHIVE_WRITE_ROUTING=strict but no writer-task handle is \
+                              available; refusing to fall back to a direct connection"
+                        .into(),
+                });
+            }
+            if handle.is_none() && self.pool.config().write_queue_enabled {
+                crate::timeout_sink::emit_direct_route_violation(
+                    &crate::timeout_sink::db_label(&self.pool),
+                    crate::timeout_sink::Site::DirectRouteAtomicUnit,
+                );
+            }
+            if let Some(writer_task) = handle {
                 // Flag-on: ONE queued WriteRequest. `run_writer_task` already
                 // has an open `BEGIN IMMEDIATE` on its dedicated connection
                 // before this closure runs and issues `COMMIT`/`ROLLBACK`
@@ -1092,6 +1182,7 @@ impl khive_storage::SqlAccess for SqlBridge {
                 writer_task: None,
                 origin: self.pool.origin(),
                 db: crate::timeout_sink::db_label(&self.pool),
+                pool: Arc::clone(&self.pool),
             };
             run_manual_atomic_unit(&mut writer, op, self.pool.origin()).await
         } else {
@@ -1355,6 +1446,188 @@ mod tests {
             matches!(count, Some(SqlValue::Integer(1))),
             "the well-behaved atomic_unit call after the Pending misuse must \
              have actually committed its write; got {count:?}"
+        );
+    }
+
+    /// ADR-136 D1 gate 1/3: with `KHIVE_WRITE_ROUTING=strict` and no writer
+    /// task available, `SqlBridge::writer()` must error instead of silently
+    /// degrading to a standalone connection — even when the reason no handle
+    /// exists is simply that the queue itself was never enabled. Strict
+    /// routing without an enabled queue is a caller misconfiguration this
+    /// gate refuses rather than silently no-ops: an operator who set
+    /// `KHIVE_WRITE_ROUTING=strict` believing every write is single-admission
+    /// must be told loudly if `KHIVE_WRITE_QUEUE` was never turned on, not
+    /// left thinking strict routing is in effect when it is not.
+    #[tokio::test]
+    async fn writer_strict_routing_fails_closed_without_writer_task() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("strict_writer.db");
+        let config = PoolConfig {
+            path: Some(path),
+            write_queue_enabled: false,
+            write_routing_strict: true,
+            ..PoolConfig::default()
+        };
+        let pool = Arc::new(ConnectionPool::new(config).unwrap());
+        let bridge = SqlBridge::new(Arc::clone(&pool), true);
+
+        let result = bridge.writer().await;
+        let err = match result {
+            Ok(_) => panic!(
+                "KHIVE_WRITE_ROUTING=strict with no writer task must fail closed, not \
+                 silently degrade to a standalone connection"
+            ),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string().contains("strict"),
+            "error must name strict routing, got: {err}"
+        );
+    }
+
+    /// ADR-136 D1 gate 3/4: with `KHIVE_WRITE_ROUTING=strict` and no writer
+    /// task available, `SqlBridge::atomic_unit` must error instead of
+    /// silently falling back to a manual `BEGIN IMMEDIATE` on a standalone
+    /// connection.
+    #[tokio::test]
+    async fn atomic_unit_strict_routing_fails_closed_without_writer_task() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("strict_atomic_unit.db");
+        let config = PoolConfig {
+            path: Some(path),
+            write_queue_enabled: false,
+            write_routing_strict: true,
+            ..PoolConfig::default()
+        };
+        let pool = Arc::new(ConnectionPool::new(config).unwrap());
+        let bridge = SqlBridge::new(Arc::clone(&pool), true);
+
+        let op: AtomicUnitOp = Box::new(|_writer| {
+            Box::pin(async move { Ok(Box::new(()) as Box<dyn std::any::Any + Send>) })
+        });
+        let result = bridge.atomic_unit(op).await;
+        assert!(
+            result.is_err(),
+            "KHIVE_WRITE_ROUTING=strict but the queue is off (no writer task handle) must \
+             fail closed instead of falling back to a manual BEGIN IMMEDIATE; got {result:?}"
+        );
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("strict"),
+            "error must name strict routing, got: {msg}"
+        );
+    }
+
+    /// ADR-136 D1 acceptance arm: a 5-op batch shaped like
+    /// `[send, read, read, read, read]` at the storage layer, issued while 3
+    /// concurrent writers contend the write path, must complete every op —
+    /// no checkout timeout — once routing is strict and the queue is on.
+    /// Mirrors the measured production failure ADR-136's Context section
+    /// documents (middle ops of a batch starving while a sibling write wins
+    /// under the legacy fixed-deadline pool mutex).
+    #[tokio::test]
+    async fn acceptance_five_op_batch_completes_under_concurrent_write_contention() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("acceptance_batch.db");
+        let config = PoolConfig {
+            path: Some(path),
+            write_queue_enabled: true,
+            write_routing_strict: true,
+            ..PoolConfig::default()
+        };
+        let pool = Arc::new(ConnectionPool::new(config).unwrap());
+        {
+            let guard = pool.writer().unwrap();
+            guard
+                .conn()
+                .execute_batch(
+                    "CREATE TABLE IF NOT EXISTS acceptance_batch \
+                     (id INTEGER PRIMARY KEY, val TEXT NOT NULL)",
+                )
+                .unwrap();
+        }
+
+        let bridge = Arc::new(SqlBridge::new(Arc::clone(&pool), true));
+
+        // 3 concurrent writers contending the write path — each a
+        // self-contained `execute()` through `SqlBridge::writer()`, matching
+        // the "several short acquisitions" shape ADR-136's Context section
+        // measures (a logical write is many short holds, not one long one).
+        let contenders: Vec<_> = (0..3)
+            .map(|i| {
+                let bridge = Arc::clone(&bridge);
+                tokio::spawn(async move {
+                    let mut writer = bridge.writer().await?;
+                    writer
+                        .execute(SqlStatement {
+                            sql: "INSERT INTO acceptance_batch (id, val) VALUES (?1, ?2)".into(),
+                            params: vec![
+                                SqlValue::Integer(100 + i),
+                                SqlValue::Text(format!("contender-{i}")),
+                            ],
+                            label: None,
+                        })
+                        .await
+                })
+            })
+            .collect();
+
+        // The 5-op batch: [send, read, read, read, read].
+        let send = {
+            let bridge = Arc::clone(&bridge);
+            tokio::spawn(async move {
+                let mut writer = bridge.writer().await?;
+                writer
+                    .execute(SqlStatement {
+                        sql: "INSERT INTO acceptance_batch (id, val) VALUES (?1, ?2)".into(),
+                        params: vec![SqlValue::Integer(1), SqlValue::Text("send".into())],
+                        label: None,
+                    })
+                    .await
+            })
+        };
+        let reads: Vec<_> = (0..4)
+            .map(|_| {
+                let bridge = Arc::clone(&bridge);
+                tokio::spawn(async move {
+                    let mut reader = bridge.reader().await?;
+                    reader
+                        .query_scalar(SqlStatement {
+                            sql: "SELECT COUNT(*) FROM acceptance_batch".into(),
+                            params: vec![],
+                            label: None,
+                        })
+                        .await
+                })
+            })
+            .collect();
+
+        for c in contenders {
+            c.await
+                .expect("contender task must not panic")
+                .expect("contender write must complete without a checkout timeout");
+        }
+        send.await
+            .expect("send task must not panic")
+            .expect("send op must complete without a checkout timeout");
+        for r in reads {
+            r.await
+                .expect("read task must not panic")
+                .expect("read op must complete without a checkout timeout — no starvation");
+        }
+
+        let mut reader = bridge.reader().await.unwrap();
+        let count = reader
+            .query_scalar(SqlStatement {
+                sql: "SELECT COUNT(*) FROM acceptance_batch".into(),
+                params: vec![],
+                label: None,
+            })
+            .await
+            .unwrap();
+        assert!(
+            matches!(count, Some(SqlValue::Integer(4))),
+            "all 3 contenders plus the batch's own send must have committed; got {count:?}"
         );
     }
 }
