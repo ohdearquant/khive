@@ -558,3 +558,93 @@ The Stage D gate gains these assertions:
   `BalancedRecallState` after profile creation, policy migration, reload, and replay;
   each assertion also verifies that `ProfileRecord.state_snapshot` is the regenerated
   mirror of that live state.
+
+## Amendment 3 (2026-08-03): Required judgment on the automatic feedback surface
+
+### Problem, measured
+
+`brain.auto_feedback` defaults an omitted `signal` to `implicit_positive` and credits
+the first recall result. On a production deployment this default dominated the event
+history: 6,278 of 7,414 feedback events were `implicit_positive`, several serving
+profiles had accumulated zero negative events ever, and a six-hour window showed
+individual profiles at 16/16 and 19/22 implicit-positive despite caller-side
+instructions requiring an explicit judgment. Instruction-level enforcement is
+measured-insufficient; the emitting surface is the lever.
+
+The defect is structural, not volumetric: an omitted judgment is not weak positive
+evidence, it is the absence of evidence. Converting it into a positive event makes the
+retriever's own ranking its training data — a rank-position feedback loop in which the
+first result is credited for having been first. Serving paths that structurally cannot
+judge (pre-serving prefetch, session-boot recall) are today indistinguishable from
+endorsements.
+
+### Change 1 — `signal` is required
+
+`brain.auto_feedback` rejects a call without `signal` as invalid input (the error
+enumerates the accepted values); no event is emitted. The serving-path default is
+deleted. The accepted values on this surface are `useful`, `not_useful`, `wrong`, and
+`unjudged`. The implicit rows remain in the historical store and in the Amendment 2
+table for interpreting that history; they are no longer emittable through
+`brain.auto_feedback`.
+
+`brain.feedback` (the manual, explicitly-parameterized surface) is unchanged: its
+caller always states a signal, so it never had this defect.
+
+### Change 2 — `unjudged`: telemetry without endorsement
+
+A new signal value records that a serve happened and no judgment was available:
+
+| Signal     | Polarity | Evidence mass          |
+| ---------- | -------- | ---------------------- |
+| `unjudged` | none     | 0 (excluded from fold) |
+
+`unjudged` rows are persisted with full serve attribution (they remain serving
+telemetry and still resolve profiles, ledger ids, and candidate lists) but the
+posterior fold excludes them entirely — zero mass, no polarity, no clamp interaction.
+This row is additive to the Amendment 2 table and is a policy-version bump per that
+table's own versioning rule.
+
+**Event kind: `unjudged` gets its own kind, `feedback_unjudged`, rather than riding
+`feedback_explicit`.** The decision is forced by how the existing consumers read:
+
+- The posterior fold selects its inputs by emitting verb and event kind — the
+  `brain.feedback` route in the brain pack's event classifier — and its shared signal
+  validator quarantines out-of-contract signal values. A separate kind is therefore
+  excluded from training by the absence of a subscription, not by a filter every
+  present and future consumer must remember to apply. Riding `feedback_explicit`
+  would invert that: correctness would depend on each consumer opting out.
+- `feedback_explicit` flat counts are consumed as judgment counts (including as a
+  discipline-ratio numerator against `actor_turn`). A non-judgment row inside that
+  kind would silently inflate every such read; the kind's own name would misdescribe
+  its contents. With a separate kind, those counts stay judgment-only with zero
+  consumer changes.
+- The event-count surface groups by kind generically, so `feedback_unjudged` appears
+  as its own row in existing kind breakdowns with no migration.
+
+The event-kind enum is closed and compile-time; `feedback_unjudged` is one additive
+variant plus its canonical string, following the same pattern as every prior kind
+addition.
+
+Callers that structurally cannot judge — prefetch hooks, session-boot recalls, any
+instrument that fires before a consumer sees the results — pass `signal="unjudged"`.
+This composes with the existing unattributed-serve invariant (no profile receives
+explicit credit from an unattributed serve): `unjudged` grants no credit, so it is
+legal from both attributed and unattributed serves.
+
+### Change 3 — no synthesized judgments anywhere in the serving path
+
+The clause generalizes beyond the one default: no serving-path component may
+manufacture a judgment the caller did not state. Any internal auto-crediting of recall
+results (the first-result implicit-positive crediting described in ADR-058's recall
+integration) is removed under this amendment. A serve with no subsequent judgment
+leaves a serve-ledger row and, at most, an `unjudged` event — never a positive.
+
+### Sequencing and acceptance
+
+Origin-verb stamping (so each feedback event names whether `brain.feedback` or
+`brain.auto_feedback` emitted it) lands first or in the same change; without it the
+acceptance window cannot attribute residual implicit rows to a path. Acceptance: an
+observation window under normal agent load shows zero newly-emitted
+`implicit_positive` events from serving-profile traffic — every event is either a
+stated judgment or a typed `unjudged` row. Historical events are untouched; this
+amendment changes what may be written, never what was written.
