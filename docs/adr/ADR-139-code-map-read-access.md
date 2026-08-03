@@ -5,23 +5,23 @@
 
 ## Context
 
-The code pack writes L1 manifest and L1.5 import-scan output to a dedicated map database rather than the shared production graph, and its default target is `<path>/.khive/code-map.db`. [Source: `crates/khive-pack-code/src/vocab.rs:9-40` at `origin/main`]
+The code pack writes L1 manifest and L1.5 import-scan output to a dedicated map database rather than the shared production graph, and its default target is `<path>/.khive/code-map.db`. [Source: `crates/khive-pack-code/src/vocab.rs:9-40` at commit `9442ec2c52290120c5bf4a4c8a1dc771102658dd`]
 
-The current code-pack handler table contains one handler, `code.ingest`; its dispatch implementation accepts that verb only. [Source: `crates/khive-pack-code/src/vocab.rs:9-40` and `crates/khive-pack-code/src/pack.rs:106-120` at `origin/main`]
-
-On a development deployment, the code-pack verb listing exposed `code.ingest` and no code-map read verb. [Source: measured on a development deployment; corroborated by `crates/khive-pack-code/src/vocab.rs:9-40` at `origin/main`]
+The current code-pack handler table contains one handler, `code.ingest`; its dispatch implementation accepts that verb only, so no code-map read verb exists on the public surface. [Source: `crates/khive-pack-code/src/vocab.rs:9-40` and `crates/khive-pack-code/src/pack.rs:106-120` at commit `9442ec2c52290120c5bf4a4c8a1dc771102658dd`]
 
 The code-pack's granularity fence keeps exhaustive symbol and call graphs in dedicated map databases rather than `khive.db`. [Source: ADR-085, D6.1 and Amendment 2, B7]
 
 ADR-085 Amendment 4 specifies analysis operations with a caller-supplied `db` parameter and a substantial path and file-identity fence. [Source: ADR-085, Amendment 4, E1-E9]
 
-ADR-028 defines a pack-scoped backend as an operator-declared named SQLite file, assigns each pack instance exactly one backend, and marks the multi-backend configuration and boot path as deferred in the shipped runtime. [Source: ADR-028, §§1, 2, and 4]
+ADR-028 defines a pack-scoped backend as an operator-declared named SQLite file, assigns each pack instance exactly one backend, and marks the multi-backend configuration and boot path as deferred in the shipped runtime; the shipped configuration parser reads only engine and actor settings and ignores unknown keys. ADR-028 is rationale for this ADR's design shape, not a prerequisite contract: nothing below depends on the deferred multi-backend mechanism, and the configuration record this ADR requires is defined by this ADR itself. [Source: ADR-028, §§1, 2, and 4, and "Deferred" list]
+
+L1 and L1.5 maps contain `project` entities and project-to-project `depends_on` edges alongside the four code subtypes. [Source: ADR-085, Amendment 2 (L1 manifest edges, L1.5 import-scan edges); `crates/khive-pack-code/src/source_ingest.rs:296-312` at commit `9442ec2c52290120c5bf4a4c8a1dc771102658dd`]
 
 This ADR addresses read access to code maps without changing the storage placement established by ADR-085. [Source: ADR-085, D6.1 and Amendment 2, B7]
 
 ## Decision
 
-The code pack SHALL add `code.list`, `code.search`, and `code.deps` as read-only verbs over a required opaque `map` name. [Source: ADR-085, D6.1 and Amendment 2, B7; `crates/khive-pack-code/src/vocab.rs:9-40` at `origin/main`]
+The code pack SHALL add `code.list`, `code.search`, and `code.deps` as read-only verbs over a required opaque `map` name. [Source: ADR-085, D6.1 and Amendment 2, B7; `crates/khive-pack-code/src/vocab.rs:9-40` at commit `9442ec2c52290120c5bf4a4c8a1dc771102658dd`]
 
 The three verbs SHALL NOT accept a database path, URI, connection string, file descriptor, or other caller-controlled location. [Source: ADR-085, Amendment 4, E7; ADR-018]
 
@@ -35,7 +35,7 @@ The registry loader SHALL reject an entry whose opened-file identity matches the
 
 The loader SHALL canonicalize each accepted entry, record its opened-file identity, and accept it only when its canonical path is within an operator-configured code-map root. [Source: ADR-028, §8; ADR-085, Amendment 4, E7]
 
-`code.ingest` MAY create or update a dedicated map database, but it SHALL NOT make that database readable through the public read surface. [Source: `crates/khive-pack-code/src/handlers.rs:62-94` and `crates/khive-pack-code/src/db_target.rs:58-105` at `origin/main`]
+`code.ingest` MAY create or update a dedicated map database, but it SHALL NOT make that database readable through the public read surface. [Source: `crates/khive-pack-code/src/handlers.rs:62-94` and `crates/khive-pack-code/src/db_target.rs:58-105` at commit `9442ec2c52290120c5bf4a4c8a1dc771102658dd`]
 
 An operator SHALL register a map through configuration and a normal configuration reload or restart after the map database exists. [Source: ADR-028, §1 and §8]
 
@@ -149,7 +149,7 @@ The success value is `{ "map": <resolved map name>, "root": <id>, "nodes": [ { "
 
 This ADR supersedes the caller-facing `db` parameter in ADR-085 Amendment 4 for `code.coupling`, `code.health`, and `code.cycles`; those verbs SHALL take the same registered `map` argument when implemented. [Source: ADR-085, Amendment 4, E2-E4 and E7]
 
-This ADR does not change `code.ingest`'s write-target contract. [Source: `crates/khive-pack-code/src/vocab.rs:9-40` and `crates/khive-pack-code/src/db_target.rs:58-105` at `origin/main`]
+This ADR does not change `code.ingest`'s write-target contract. [Source: `crates/khive-pack-code/src/vocab.rs:9-40` and `crates/khive-pack-code/src/db_target.rs:58-105` at commit `9442ec2c52290120c5bf4a4c8a1dc771102658dd`]
 
 ## Consequences
 
@@ -157,7 +157,7 @@ The public read surface can select several independently built code maps without
 
 Map availability becomes an explicit operator lifecycle with registration, reload, revalidation, and deregistration steps. [Source: ADR-028, §1 and §8]
 
-An ingested map is not automatically queryable, so operators must register a map before clients can use the new read verbs. [Source: `crates/khive-pack-code/src/handlers.rs:62-94` at `origin/main`; ADR-028, §1]
+An ingested map is not automatically queryable, so operators must register a map before clients can use the new read verbs. [Source: `crates/khive-pack-code/src/handlers.rs:62-94` at commit `9442ec2c52290120c5bf4a4c8a1dc771102658dd`; ADR-028, §1]
 
 Replacing or relocating a map requires registry revalidation or re-registration before it can be read again. [Source: ADR-085, Amendment 4, E7]
 
@@ -187,14 +187,15 @@ The registry also creates an explicit map lifecycle and prevents a new read endp
 
 This alternative is rejected because ADR-085 reserves exhaustive code-map data for dedicated map databases rather than the shared production graph. [Source: ADR-085, D6.1 and Amendment 2, B7]
 
-On a development deployment, the generic code subtype filters returned no code-map rows from the main daemon. [Source: measured on a development deployment; `crates/khive-pack-code/src/handlers.rs:62-94` at `origin/main`]
+The generic code subtype filters read the shared production database, while `code.ingest` writes to a dedicated map database that the daemon does not attach, so code-map rows are structurally unreachable through those filters. [Source: ADR-085, D6.1; `crates/khive-pack-code/src/db_target.rs:58-105` and `crates/khive-pack-code/src/handlers.rs:62-94` at commit `9442ec2c52290120c5bf4a4c8a1dc771102658dd`]
 
 ## References
 
 - ADR-018: Authorization Gate.
 - ADR-028: Pack-Scoped Backends and Per-Pack Schema Declaration.
 - ADR-085: Code Pack, including Amendments 2 and 4.
-- `crates/khive-pack-code/src/vocab.rs:9-40` at `origin/main`.
-- `crates/khive-pack-code/src/handlers.rs:62-94` at `origin/main`.
-- `crates/khive-pack-code/src/db_target.rs:58-105` at `origin/main`.
-- `crates/khive-pack-code/src/pack.rs:106-120` at `origin/main`.
+- `crates/khive-pack-code/src/vocab.rs:9-40` at commit `9442ec2c52290120c5bf4a4c8a1dc771102658dd`.
+- `crates/khive-pack-code/src/handlers.rs:62-94` at commit `9442ec2c52290120c5bf4a4c8a1dc771102658dd`.
+- `crates/khive-pack-code/src/db_target.rs:58-105` at commit `9442ec2c52290120c5bf4a4c8a1dc771102658dd`.
+- `crates/khive-pack-code/src/pack.rs:106-120` at commit `9442ec2c52290120c5bf4a4c8a1dc771102658dd`.
+- `crates/khive-pack-code/src/source_ingest.rs:296-312` at commit `9442ec2c52290120c5bf4a4c8a1dc771102658dd`.
