@@ -11,6 +11,8 @@
   named places: `ActorRef` gains an optional `leg` field (additive), and the
   grant-change history defined here is exempted from ADR-018's optional-audit
   posture (it is transactional, and the exemption is stated where it is made).
+  Also amends [ADR-004](ADR-004-substrate-observables.md): the closed
+  substrate event-kind taxonomy gains one variant, `GrantChange` (§4a).
 - Depends on: [ADR-018](ADR-018-authorization-gate.md) (gate contract and audit
   shape), ADR-127 (authenticated actor and grant primitive — the capability,
   delegation, sealing, and transitive-revocation substrate this record builds
@@ -106,6 +108,25 @@ capability plus ADR-127's grant fields — in durable form.
   minting process; it is not the contract. Chains are shallow by
   construction: §2 forbids subactors as grantors, so lineage passes only
   through top-level principals.
+- **The chain's terminal is a durable root anchor.** The in-process boot root
+  stays exactly what ADR-127 makes it: an in-memory, raw-inserted bootstrap
+  capability that never leaves its process. A cold process therefore cannot
+  validate a chain against it, so the boot mint additionally writes a **root
+  anchor** to the store: a record carrying the boot principal's structural
+  identity, a root-anchor id, creation time, and liveness state. The anchor
+  is not a capability and carries no rights; it is the store-side
+  registration that a given boot root exists and is live. Every durable
+  grant's recorded lineage terminates at a root-anchor id, and gate-time
+  chain validation requires every intermediate record live and seal-valid
+  AND the terminal anchor live. Retiring an anchor — an administrative act
+  of the anchor's own boot principal, performed through the grant surface
+  and recorded per §4a — denies every chain terminating at it at every
+  process's next consultation; this is also how a decommissioned process's
+  outstanding delegations are extinguished. Cross-process seal verification
+  itself presupposes the deployment provisions seal-key material per
+  ADR-127's durable-grant deployment obligation; this record consumes that
+  obligation and adds only the anchor and its terminal rule, redefining no
+  key management.
 - **Check-time view.** A principal's effective authority is computed at gate
   consultation as a view over its live (unrevoked, seal-valid) grant records.
   There is no boot-time snapshot of caller authority to go stale. This is the
@@ -239,15 +260,32 @@ the Context section promises:
   (for the import, the epoch marker's id). The whole action is reconstructed
   by querying the action id; no single record claims to describe more than
   the one grant record it names.
-- **Envelope and payload.** Each grant-change record is an Event of kind
-  `grant_change`, written to the namespace of the grant record it describes,
-  with a payload carrying: the action id; the change kind (`grant`,
-  `revoke`, or `import`); the grant record id; the grantee's full structural
-  identity (leg form); the rights set; the acting principal's full structural
-  identity; a required rationale; and the authorization snapshot below.
-  Visibility follows ADR-022 unchanged: the record is readable by callers
-  whose read scope covers that namespace — which is exactly the namespace
+- **Envelope and payload, completely.** Each grant-change record is a
+  substrate Event whose envelope is fully specified: `kind` is
+  **`GrantChange`**, a new variant added to the closed substrate event-kind
+  taxonomy — a closed-taxonomy addition named in this record's Amends header
+  (ADR-004), not an informal string; `verb` is the surface operation
+  (`grant`, `revoke`, or `import`); `actor` is the acting principal's full
+  structural identity (leg form); `substrate` is the grant store; `outcome`
+  is success — records exist only for mutations that happened; and
+  `namespace` is the namespace of the grant record described. The payload is
+  versioned (`payload_version: 1`) and carries: the action id; the grant
+  record id; the grantee's full structural identity (leg form); the rights
+  set; a required rationale; and the authorization snapshot below.
+  Per-record visibility follows ADR-022 unchanged: a record is readable by
+  callers whose read scope covers its namespace — exactly the namespace
   whose authority the change moved.
+- **Whole-action reconstruction is a grant-surface read, not an ADR-022
+  query.** ADR-022's filter set (kind, verb, outcome, actor, substrate,
+  time) gains no payload predicate from this record, and its
+  caller-namespace scoping is not weakened. Instead: the action id is an
+  **indexed field of the grant-change store**, never payload-only, and the
+  grant surface itself exposes the lookup — given an action id, it returns
+  the grant-change records whose namespace falls within the caller's read
+  scope. A caller whose read scope covers every affected namespace
+  reconstructs the whole action; any other caller sees exactly the lawful
+  per-namespace subset. Reconstruction is scope-bounded by design, not a
+  visibility bypass.
 - **Authorization is embedded, not referenced.** ADR-018 defines no stable
   decision identifier and its consultation-event persistence is optional and
   non-transactional, so a reference to a gate decision would point at an
@@ -351,23 +389,30 @@ All conditions are executed tests, not review assertions:
    `granted_actors = []` and `grant_unattributed = true` imports the
    anonymous principal — the empty-set clause must not suppress the flag.
 7. **Grant-change history.** A single-pair grant and a revoke each produce
-   one queryable grant-change record carrying grantee, rights, actor,
+   one queryable `GrantChange` Event carrying grantee, rights, actor,
    rationale, and the embedded authorization snapshot; a multi-pair action
-   produces one record per affected grant record, all sharing one action id,
-   and querying that action id reconstructs the whole action; each record is
-   an Event in the namespace of the grant record it describes and is readable
-   under ADR-022's caller-namespace scoping by a caller scoped to that
-   namespace (multi-namespace visibility arm); import records resolve their
+   produces one record per affected grant record, all sharing one action id.
+   **Reconstruction arms:** the grant surface's action-id lookup returns the
+   whole action to a caller whose read scope covers every affected namespace,
+   and returns exactly the one lawful record to a caller scoped to a single
+   affected namespace (scope-bounded arm); the lookup resolves through the
+   indexed action-id field, demonstrated by reconstructing an action whose
+   records span at least two namespaces. Import records resolve their
    synthetic boot authorization (boot principal, epoch marker id,
    configuration source, fixed rationale); a simulated failure to write any
    record of an action aborts the whole action (fail-closed arm); a refused
    request produces no grant-change record.
-8. **Cross-process transitive revocation.** With a delegation chain
-   root → A → B and two serving processes over one store: revoke A's grant in
-   the first process; the second process — which did not mint any of the
-   chain and holds no in-memory state for it (cold load) — denies B at its
-   next consultation, without restart. The same test repeated with the root
-   revoked denies both A and B.
+8. **Cross-process transitive revocation, with a cold-load positive
+   control.** With a delegation chain root → A → B and two serving processes
+   over one store: FIRST, the second process — which minted none of the
+   chain and holds no in-memory state for it — serves B at its next
+   consultation while the chain is fully live, proving the cold-load path
+   validates a healthy chain end to end including the terminal root anchor.
+   THEN revoke A's grant in the first process: the second process denies B
+   at its next consultation, without restart. THEN, on a fresh chain, the
+   first process's boot principal retires its root anchor: the second
+   process denies both A and B. A test suite containing only the revocation
+   arms does not satisfy this condition.
 
 ## Consequences
 
