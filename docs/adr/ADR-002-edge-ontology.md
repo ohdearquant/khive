@@ -19,6 +19,10 @@ publication copy of a document points at the canonical source it was produced fr
 "Base endpoint contract" below and "Why the 2026-07-27 provenance amendment?" in Rationale.
 **Amended 2026-07-31**: hard-delete cascade warnings use the existing `audit` event kind and
 carry a relation-specific payload atomically with the delete, as specified in "Cascade Behavior."
+**Amended 2026-08-03**: specifies reciprocal same-relation pairs (legal at the substrate,
+with a per-relation coherence classification for curation), records the existing self-loop
+rejection, and states the delete-then-relink direction rule. See "Reciprocal pairs,
+self-loops, and repricing" below. Motivated by issue #1667.
 
 ## Context
 
@@ -187,6 +191,131 @@ unique for symmetric relations.
 
 **Query behavior**: `direction` is ignored for symmetric relations and treated as `both`.
 Physical canonical direction is never exposed as semantic direction.
+
+### Reciprocal pairs, self-loops, and repricing (2026-08-03 amendment)
+
+The base contract above addresses inverse *relations* (`contains` vs `part_of`) and
+symmetric canonicalization, but never stated whether two live opposite-direction edges of
+the *same* non-symmetric relation between one pair of nodes is a legal state, nor what a
+delete-then-relink workflow may assume. Issue #1667 forced the question: the edge natural
+key `(namespace, source_id, target_id, relation)` is direction-sensitive for non-symmetric
+relations (canonicalization applies only to `competes_with`/`composed_with`), so a
+same-direction re-link revives a soft-deleted row (id and `created_at` preserved) while a
+direction-flipped re-link inserts a fresh row — and both rows can then be live at once,
+reading as two independent assertions.
+
+**Substrate legality.** A reciprocal pair — `A -[r]-> B` and `B -[r]-> A` both live, `r`
+non-symmetric — is legal at the storage layer for every relation. Three reasons:
+
+1. For dependency-category relations a reciprocal pair records a real state: mutual
+   dependency and mutual enablement occur in practice, and the reference production store
+   carries live `depends_on` reciprocal pairs that are factually correct.
+2. A write-time pair rejection would be a length-2 special case of cycle prevention. A
+   `supersedes` cycle of length 3 is exactly as incoherent as a reciprocal pair, and no
+   pair check can see it. Enforcing only the length-2 case is arbitrary enforcement, not a
+   contract; whole-graph coherence is an audit concern (ADR-034 validation pipelines), not
+   a per-write concern.
+3. Data records assertions; coherence between assertions is judged at the curation layer
+   (ADR-014). Refusing the write would conflate the two layers.
+
+**Per-relation coherence classification.** Legal-to-store is not the same as
+semantically coherent. For curation and validation-pipeline use (advisory — never
+write-time enforcement):
+
+| Class | Relations | Reciprocal pair means |
+| --- | --- | --- |
+| Order-like — reciprocal pair INCOHERENT | `contains`, `part_of`, `instance_of`, `extends`, `variant_of`, `introduced_by`, `supersedes`, `derived_from`, `precedes`, `implements` | The two edges contradict: each claims a directional subordination or ordering the other denies. Surface as curation-review candidates. |
+| State-like — reciprocal pair COHERENT | `depends_on`, `enables`, `supports`, `refutes` | The two edges are independent assertions that can both hold (mutual dependency, mutual enablement, claims that each support or refute the other). Not findings. |
+
+`annotates` is note-sourced and cannot form a reciprocal pair under the endpoint
+contract; symmetric relations cannot by canonicalization.
+
+**Self-loops.** `source_id == target_id` is rejected at the endpoint-validation seam
+(`validate_edge_relation_endpoints`) for every relation — this amendment records an
+existing behavior in the contract rather than introducing it. The rejection covers the
+verb surface; writers below the seam (pack-private map databases, direct store accessors)
+are outside it by construction, and ADR-034's `no-self-loops` pipeline is the audit that
+catches legacy or below-seam rows.
+
+**Delete-then-relink direction rule (normative for callers).** Repricing an edge means:
+`get(edge_id)` → read the stored `source_id`/`target_id` → `delete` → `link` in the SAME
+stored direction. The re-link revives the original row — same id, `created_at` preserved
+as first-assertion provenance, `updated_at` carrying the act date. A direction-flipped
+`link` is a NEW assertion, never a reprice: while the reversed row sits soft-deleted on
+its own natural key, the flip forks a second live edge instead of reviving the first.
+Callers must not infer stored direction from adjacency output (`neighbors` echoes the
+traversal origin, issue #1670); `get(edge_id)` is the supported direction read.
+
+**Migration consequence.** The legality ruling strands no existing rows. Reciprocal
+pairs in state-like relations stay as-is. Reciprocal pairs in order-like relations and
+any surviving self-loop rows become curation-review candidates, resolved one by one with
+ADR-014 verbs (typically: delete the direction that the pair's history shows was an
+accidental flip, or supersede one side) — never mass-deleted. Measured on the reference
+production store (2026-08-03), over **entity-endpoint edges**: for 5 of 14 non-symmetric
+relations the enumeration's distinct edge-id count equals the `stats()` row count
+exactly (including `precedes`, the largest at 9,379 rows); the other 9 relations carry
+a residual of 163 edge rows total that entity-pattern matching cannot see. Sampled
+diagnosis of the `contains` residual: edges whose endpoint entities are soft-deleted
+(edges retained by design, view-filtered). For relations whose contract permits
+note-substrate endpoints (`supersedes`, `supports`, `refutes` note→note; pack-extended
+`contains`→note), live note-endpoint edges are a second cause the entity-pattern census
+cannot see — inferred from the endpoint contract, not sampled. Note-endpoint reciprocal
+pairs are therefore **not counted below**; the SQL queries that follow are
+substrate-blind and settle them for store operators.
+
+| Relation | Reciprocal pairs | Class | Residual rows outside census |
+| --- | --- | --- | --- |
+| `precedes` | 66 | order-like — review | 0 |
+| `enables` | 15 | state-like — keep | 16 |
+| `depends_on` | 11 | state-like — keep | 11 |
+| `extends` | 3 | order-like — review | 17 |
+| `instance_of` | 2 | order-like — review | 0 |
+| `introduced_by` | 2 | order-like — review | 37 |
+| `variant_of` | 1 | order-like — review | 0 |
+| `supersedes` | 1 | order-like — review | 56 |
+| `contains` | 0 | order-like — review | 10 |
+| `part_of` | 0 | order-like — review | 5 |
+| `implements` | 0 | order-like — review | 10 |
+| `supports` | 0 | state-like — keep | 1 |
+| `derived_from`, `refutes` | 0 | — | 0 |
+
+Total: 101 reciprocal pairs (75 order-like review candidates, 26 state-like keeps).
+Self-loops: 1 (`instance_of`, predating the seam rejection) — curation candidate.
+
+**Count queries.** For store operators with SQL access, read-only:
+
+```sql
+-- Reciprocal pairs per relation (each pair counted once per direction; halve)
+SELECT e1.relation, COUNT(*) / 2 AS reciprocal_pairs
+FROM graph_edges e1
+JOIN graph_edges e2
+  ON e2.namespace = e1.namespace
+ AND e2.relation  = e1.relation
+ AND e2.source_id = e1.target_id
+ AND e2.target_id = e1.source_id
+WHERE e1.deleted_at IS NULL AND e2.deleted_at IS NULL
+  AND e1.source_id <> e1.target_id
+  AND e1.relation NOT IN ('competes_with', 'composed_with')
+GROUP BY e1.relation;
+
+-- Self-loops per relation
+SELECT relation, COUNT(*) AS self_loops
+FROM graph_edges
+WHERE deleted_at IS NULL AND source_id = target_id
+GROUP BY relation;
+```
+
+On the MCP surface the same census is expressible with per-relation edge enumeration
+(`query` GQL `MATCH (a)-[e:REL]->(b) RETURN a.id, b.id, e.id`, partitioned by id prefix
+under the 500-row result cap) followed by client-side pairing — with two caveats.
+First, completeness is checked against `stats()` per relation, but exact parity is only
+reachable when every edge row has two live entity endpoints: `stats()` counts raw live
+edge rows, while entity-pattern matching excludes edges with soft-deleted or
+note-substrate endpoints, so a residual short of `stats()` is expected on relations
+carrying such rows and must be diagnosed (fetch the residual edge ids, inspect their
+endpoints) rather than assumed benign. Second, `list`-verb offset pagination is not a
+sound enumeration substitute: page ordering is non-deterministic, so paged sweeps both
+duplicate and miss rows (issue #1671).
 
 ## Endpoint Validation
 
