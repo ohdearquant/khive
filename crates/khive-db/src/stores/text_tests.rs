@@ -2644,3 +2644,115 @@ async fn rename_namespace_strict_routing_fails_closed_without_writer_task() {
         "error must name strict routing, got: {err}"
     );
 }
+
+/// ADR-136 D1 gate 3 amendment: a store built on a thread with no ambient
+/// Tokio runtime caches `writer_task: None` at construction — the pool
+/// returns `Err(WriterTaskNoRuntime)`, which `Fts5TextSearch::new` collapses
+/// via `.ok().flatten()` (a documented, deliberate best-effort degrade). The
+/// bug this guards against: without `with_writer`'s write-time re-lookup
+/// (`current_writer_task`), that construction-time `None` would stick
+/// forever, so a *normal* FTS write (`upsert_document`, routed through the
+/// general `with_writer` helper, not a maintenance path) issued later inside
+/// a real runtime would silently bypass the queue via the direct-connection
+/// path instead of routing through the shared `WriterTask` like every other
+/// write on this pool. Same occupier / `queue_depth()` discriminator as
+/// `rename_namespace_routes_through_writer_task_when_flag_enabled` above,
+/// proving genuine queue routing rather than a `writer_task_spawn_count() ==
+/// 1` false positive.
+///
+/// Deliberately `#[test]`, not `#[tokio::test]`: construction must happen
+/// with no ambient runtime, which a `#[tokio::test]` function body would
+/// not give it (the whole test body already runs on a Tokio worker thread).
+/// Red-proof: reverting `with_writer`'s `self.current_writer_task()` check
+/// back to `&self.writer_task` makes `saw_enqueued` stay `false` and this
+/// test fail — the write takes the direct-connection path immediately
+/// instead of ever appearing in the writer task's channel.
+#[test]
+fn general_write_routes_through_writer_task_when_store_built_outside_runtime() {
+    let table_key = "general_write_no_runtime_construction";
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("general_write_no_runtime_construction.db");
+    let pool_cfg = PoolConfig {
+        path: Some(path.clone()),
+        write_queue_enabled: true,
+        ..PoolConfig::default()
+    };
+    let pool = Arc::new(ConnectionPool::new(pool_cfg).unwrap());
+    {
+        let writer = pool.writer().unwrap();
+        ensure_fts5_schema(writer.conn(), table_key).unwrap();
+    }
+
+    assert!(
+        tokio::runtime::Handle::try_current().is_err(),
+        "sanity: this test body must not already be running inside a Tokio runtime"
+    );
+    // Construction happens here, outside any runtime — reproduces the
+    // permanent-`None`-cache scenario `writer_task_handle()`'s doc comment
+    // describes.
+    let store = Fts5TextSearch::new(Arc::clone(&pool), true, table_key.to_string());
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async move {
+        let writer_task = pool
+            .writer_task_handle()
+            .unwrap()
+            .expect("writer task must be available now that a runtime exists");
+
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel::<()>();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let occupier = {
+            let writer_task = writer_task.clone();
+            tokio::spawn(async move {
+                writer_task
+                    .send(move |_conn| {
+                        let _ = started_tx.send(());
+                        let _ = release_rx.blocking_recv();
+                        Ok::<(), StorageError>(())
+                    })
+                    .await
+            })
+        };
+        started_rx
+            .await
+            .expect("occupier must signal it has started running inside the writer task");
+        assert_eq!(
+            writer_task.queue_depth(),
+            0,
+            "channel must start empty once the occupier has been dequeued and is running"
+        );
+
+        let write_task = tokio::spawn(async move {
+            store
+                .upsert_document(make_document(Uuid::new_v4(), "outside-runtime", "body"))
+                .await
+        });
+
+        let mut saw_enqueued = false;
+        for _ in 0..100 {
+            if writer_task.queue_depth() >= 1 {
+                saw_enqueued = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(
+            saw_enqueued,
+            "upsert_document's write request never appeared in the writer task's channel \
+             while the occupier held the single drain slot — a store built outside a \
+             runtime is not re-checking writer-task availability at write time"
+        );
+
+        release_tx
+            .send(())
+            .expect("occupier must still be waiting on the release signal");
+        occupier
+            .await
+            .expect("occupier task must not panic")
+            .expect("occupier write must succeed");
+        write_task
+            .await
+            .expect("write task must not panic")
+            .expect("upsert_document must succeed once unblocked");
+    });
+}

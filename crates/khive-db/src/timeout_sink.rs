@@ -220,6 +220,14 @@ pub(crate) enum Site {
     /// `stores::text::rename_namespace`'s `with_writer_unmanaged` fallback,
     /// taken while the write queue is enabled.
     DirectRouteFtsRenameNamespace,
+    /// `stores::text::Fts5TextSearch::with_writer`'s general-helper
+    /// `with_writer_unmanaged` fallback, taken while the write queue is
+    /// enabled (ADR-136 D1 gate 3 amendment — the general FTS write path).
+    DirectRouteFtsGeneralWrite,
+    /// `stores::vectors::SqliteVecStore::with_writer`'s general-helper
+    /// `with_writer_unmanaged` fallback, taken while the write queue is
+    /// enabled (ADR-136 D1 gate 3 amendment — the general vector write path).
+    DirectRouteVecGeneralWrite,
 }
 
 impl Site {
@@ -235,6 +243,8 @@ impl Site {
             Site::DirectRouteVecDeleteSubjects => "direct_route:vec_delete_subjects",
             Site::DirectRouteOrphanSweep => "direct_route:orphan_sweep",
             Site::DirectRouteFtsRenameNamespace => "direct_route:fts_rename_namespace",
+            Site::DirectRouteFtsGeneralWrite => "direct_route:fts_general_write",
+            Site::DirectRouteVecGeneralWrite => "direct_route:vec_general_write",
         }
     }
 }

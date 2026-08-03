@@ -181,6 +181,21 @@ impl Fts5TextSearch {
             .map_err(|e| map_sqlite_err(e, "open_fts_reader"))
     }
 
+    /// Re-derive writer-task availability at write time instead of trusting
+    /// only the field cached at construction (ADR-136 D1 gate 3 amendment).
+    /// `self.writer_task` permanently caches `None` when this store was
+    /// constructed outside a Tokio runtime (`writer_task_handle()` returns
+    /// `Err(WriterTaskNoRuntime)`, which construction collapses via
+    /// `.ok().flatten()`) — every later write, even ones running inside a
+    /// runtime, would otherwise silently keep bypassing an enabled queue.
+    /// `ConnectionPool::writer_task_handle()` is a cheap `OnceCell` read once
+    /// resolved, so re-checking here costs nothing on the hot path.
+    fn current_writer_task(&self) -> Option<WriterTaskHandle> {
+        self.writer_task
+            .clone()
+            .or_else(|| self.pool.writer_task_handle().ok().flatten())
+    }
+
     /// Route a single-row write through the pool-wide `WriterTask` when
     /// `KHIVE_WRITE_QUEUE=1` and a handle is available; otherwise fall back
     /// to the legacy standalone-connection / pool-mutex path (ADR-067
@@ -192,12 +207,17 @@ impl Fts5TextSearch {
         F: FnOnce(&rusqlite::Connection) -> Result<R, rusqlite::Error> + Send + 'static,
         R: Send + 'static,
     {
-        if let Some(writer_task) = &self.writer_task {
+        if let Some(writer_task) = self.current_writer_task() {
             return writer_task
                 .send(move |conn| f(conn).map_err(|e| map_err(e, op)))
                 .await;
         }
 
+        refuse_direct_route_if_strict(
+            &self.pool,
+            crate::timeout_sink::Site::DirectRouteFtsGeneralWrite,
+            op,
+        )?;
         self.with_writer_unmanaged(op, f).await
     }
 
@@ -777,8 +797,13 @@ impl TextSearch for Fts5TextSearch {
         // ADR-067 Component A: when the write queue is enabled, route
         // through the pool-wide WriterTask. DML-only closure — no BEGIN
         // IMMEDIATE/COMMIT/ROLLBACK here, since the WriterTask's run loop
-        // owns the transaction.
-        if let Some(writer_task) = &self.writer_task {
+        // owns the transaction. `current_writer_task()` (ADR-136 D1 gate 3
+        // amendment) re-checks past a construction-time `None` cache so a
+        // handle that only became available later is still used here rather
+        // than falling to `with_writer`'s BEGIN-IMMEDIATE-wrapped closure
+        // below (that closure is not safe to send through the queue, which
+        // already wraps its own transaction).
+        if let Some(writer_task) = self.current_writer_task() {
             let table2 = table.clone();
             return writer_task
                 .send(move |conn| {
@@ -820,8 +845,10 @@ impl TextSearch for Fts5TextSearch {
         // through the pool-wide WriterTask. DML-only closure (the per-row
         // `SAVEPOINT fts_upsert_doc` is preserved unchanged — only the OUTER
         // BEGIN IMMEDIATE/COMMIT is removed, since the WriterTask's run loop
-        // owns the enclosing transaction).
-        if let Some(writer_task) = &self.writer_task {
+        // owns the enclosing transaction). `current_writer_task()` re-checks
+        // past a construction-time `None` cache — see `upsert_document`'s
+        // matching note.
+        if let Some(writer_task) = self.current_writer_task() {
             let table2 = table.clone();
             return writer_task
                 .send(move |conn| {

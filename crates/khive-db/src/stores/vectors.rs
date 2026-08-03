@@ -363,6 +363,21 @@ impl SqliteVecStore {
         Ok(conn)
     }
 
+    /// Re-derive writer-task availability at write time instead of trusting
+    /// only the field cached at construction (ADR-136 D1 gate 3 amendment).
+    /// `self.writer_task` permanently caches `None` when this store was
+    /// constructed outside a Tokio runtime (`writer_task_handle()` returns
+    /// `Err(WriterTaskNoRuntime)`, which construction collapses via
+    /// `.ok().flatten()`) — every later write, even ones running inside a
+    /// runtime, would otherwise silently keep bypassing an enabled queue.
+    /// `ConnectionPool::writer_task_handle()` is a cheap `OnceCell` read once
+    /// resolved, so re-checking here costs nothing on the hot path.
+    fn current_writer_task(&self) -> Option<crate::writer_task::WriterTaskHandle> {
+        self.writer_task
+            .clone()
+            .or_else(|| self.pool.writer_task_handle().ok().flatten())
+    }
+
     /// Route a single-row DML-only write through the pool-wide `WriterTask`
     /// when available, else fall back to `with_writer_unmanaged`. See
     /// crates/khive-db/docs/api/vectors.md#with_writer--with_writer_unmanaged--writertask-routing-adr-067-component-a-fork-c-slice-2
@@ -371,12 +386,17 @@ impl SqliteVecStore {
         F: FnOnce(&rusqlite::Connection) -> Result<R, rusqlite::Error> + Send + 'static,
         R: Send + 'static,
     {
-        if let Some(writer_task) = &self.writer_task {
+        if let Some(writer_task) = self.current_writer_task() {
             return writer_task
                 .send(move |conn| f(conn).map_err(|e| map_err(e, op)))
                 .await;
         }
 
+        refuse_direct_route_if_strict(
+            &self.pool,
+            crate::timeout_sink::Site::DirectRouteVecGeneralWrite,
+            op,
+        )?;
         self.with_writer_unmanaged(op, f).await
     }
 
@@ -908,7 +928,7 @@ impl VectorStore for SqliteVecStore {
         // named SAVEPOINT rather than `conn.unchecked_transaction()`,
         // which would attempt a nested `BEGIN` and fail under the
         // WriterTask's already-open transaction.
-        if let Some(writer_task) = &self.writer_task {
+        if let Some(writer_task) = self.current_writer_task() {
             let table2 = table.clone();
             let namespace2 = namespace.clone();
             let field2 = field.clone();
@@ -992,7 +1012,7 @@ impl VectorStore for SqliteVecStore {
         // `SAVEPOINT vec_batch_record` is preserved unchanged — only the
         // OUTER BEGIN IMMEDIATE/COMMIT is removed, since the WriterTask's
         // run loop owns the enclosing transaction).
-        if let Some(writer_task) = &self.writer_task {
+        if let Some(writer_task) = self.current_writer_task() {
             let table2 = table.clone();
             let store_embedding_model2 = store_embedding_model.clone();
             return writer_task
@@ -1078,7 +1098,7 @@ impl VectorStore for SqliteVecStore {
         // named SAVEPOINT rather than `conn.unchecked_transaction()`,
         // which would attempt a nested `BEGIN` and fail under the
         // WriterTask's already-open transaction.
-        if let Some(writer_task) = &self.writer_task {
+        if let Some(writer_task) = self.current_writer_task() {
             let table2 = table.clone();
             let namespace2 = namespace.clone();
             let field2 = field.clone();
@@ -4892,5 +4912,136 @@ mod write_queue_tests {
             err.to_string().contains("strict"),
             "error must name strict routing, got: {err}"
         );
+    }
+
+    /// ADR-136 D1 gate 3 amendment: a store built on a thread with no
+    /// ambient Tokio runtime caches `writer_task: None` at construction —
+    /// the pool returns `Err(WriterTaskNoRuntime)`, which `SqliteVecStore::
+    /// new` collapses via `.ok().flatten()` (a documented, deliberate
+    /// best-effort degrade). The bug this guards against: without
+    /// `with_writer`'s write-time re-lookup (`current_writer_task`), that
+    /// construction-time `None` would stick forever, so a *normal* vector
+    /// write (`insert`, routed through the general `with_writer` helper, not
+    /// a maintenance path) issued later inside a real runtime would silently
+    /// bypass the queue via the direct-connection path instead of routing
+    /// through the shared `WriterTask` like every other write on this pool.
+    /// Same occupier / `queue_depth()` discriminator as
+    /// `vec_delete_subjects_routes_through_writer_task_when_flag_enabled`
+    /// above, proving genuine queue routing rather than a
+    /// `writer_task_spawn_count() == 1` false positive.
+    ///
+    /// Deliberately `#[test]`, not `#[tokio::test]`: construction must
+    /// happen with no ambient runtime, which a `#[tokio::test]` function
+    /// body would not give it (the whole test body already runs on a Tokio
+    /// worker thread). Red-proof: reverting `with_writer`'s
+    /// `self.current_writer_task()` check back to `&self.writer_task` makes
+    /// `saw_enqueued` stay `false` and this test fail — the write takes the
+    /// direct-connection path immediately instead of ever appearing in the
+    /// writer task's channel.
+    #[test]
+    fn general_write_routes_through_writer_task_when_store_built_outside_runtime() {
+        crate::extension::ensure_extensions_loaded();
+
+        let model_key = "general_write_no_runtime_construction";
+        let dims = 4usize;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("general_write_no_runtime_construction.db");
+        let pool = Arc::new(
+            ConnectionPool::new(PoolConfig {
+                path: Some(path),
+                write_queue_enabled: true,
+                ..PoolConfig::default()
+            })
+            .expect("file-backed pool"),
+        );
+        create_vec_table(&pool, model_key, dims);
+
+        assert!(
+            tokio::runtime::Handle::try_current().is_err(),
+            "sanity: this test body must not already be running inside a Tokio runtime"
+        );
+        // Construction happens here, outside any runtime — reproduces the
+        // permanent-`None`-cache scenario `writer_task_handle()`'s doc
+        // comment describes.
+        let store = SqliteVecStore::new(
+            Arc::clone(&pool),
+            true,
+            model_key.to_string(),
+            model_key.to_string(),
+            dims,
+            "ns:test".to_string(),
+        )
+        .expect("SqliteVecStore::new");
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async move {
+            let writer_task = pool
+                .writer_task_handle()
+                .unwrap()
+                .expect("writer task must be available now that a runtime exists");
+
+            let (started_tx, started_rx) = tokio::sync::oneshot::channel::<()>();
+            let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+            let occupier = {
+                let writer_task = writer_task.clone();
+                tokio::spawn(async move {
+                    writer_task
+                        .send(move |_conn| {
+                            let _ = started_tx.send(());
+                            let _ = release_rx.blocking_recv();
+                            Ok::<(), StorageError>(())
+                        })
+                        .await
+                })
+            };
+            started_rx
+                .await
+                .expect("occupier must signal it has started running inside the writer task");
+            assert_eq!(
+                writer_task.queue_depth(),
+                0,
+                "channel must start empty once the occupier has been dequeued and is running"
+            );
+
+            let id = Uuid::new_v4();
+            let write_task = tokio::spawn(async move {
+                store
+                    .insert(
+                        id,
+                        SubstrateKind::Entity,
+                        "ns:test",
+                        "body",
+                        vec![vec![0.1, 0.2, 0.3, 0.4]],
+                    )
+                    .await
+            });
+
+            let mut saw_enqueued = false;
+            for _ in 0..100 {
+                if writer_task.queue_depth() >= 1 {
+                    saw_enqueued = true;
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            assert!(
+                saw_enqueued,
+                "insert's write request never appeared in the writer task's channel while \
+                 the occupier held the single drain slot — a store built outside a runtime \
+                 is not re-checking writer-task availability at write time"
+            );
+
+            release_tx
+                .send(())
+                .expect("occupier must still be waiting on the release signal");
+            occupier
+                .await
+                .expect("occupier task must not panic")
+                .expect("occupier write must succeed");
+            write_task
+                .await
+                .expect("write task must not panic")
+                .expect("insert must succeed once unblocked");
+        });
     }
 }

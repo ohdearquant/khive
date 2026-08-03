@@ -232,9 +232,10 @@ struct SqliteWriter {
     /// `None` at construction when a `WriterTaskHandle` was obtained (ADR-136
     /// D1 gate 1: queue-first `writer()` skips the standalone open in that
     /// case). Lazily opened by [`SqliteWriter::ensure_conn`] on first read
-    /// (`query_row`/`query_all`) — no production caller reads via a
-    /// `writer()` handle today, but the `SqlReader` supertrait still
-    /// requires the capability.
+    /// (`query_row`/`query_all`) — production callers do read through a
+    /// `writer()` handle (e.g. `khive-pack-comm` and `khive-pack-gtd`), so
+    /// the `SqlReader` supertrait's lazy-open path is live, not just a
+    /// capability formality.
     conn: Option<rusqlite::Connection>,
     /// ADR-067 Component A: when the write queue is enabled, `execute_batch`
     /// routes the whole caller-supplied statement list through the
@@ -255,11 +256,22 @@ struct SqliteWriter {
 }
 
 impl SqliteWriter {
-    /// Return `conn` if already open, else open a standalone writer
-    /// connection now. See the `conn` field doc comment for when this lazy
-    /// path is reached.
+    /// Return `conn` if already open, else lazily open a standalone
+    /// **read-only** connection now. See the `conn` field doc comment for
+    /// when this lazy path is reached — it is only reached from the
+    /// `SqlReader` methods (`query_row`/`query_all`), never from a
+    /// `SqlWriter` method: every `SqlWriter` method on this type either
+    /// routes through `writer_task` (when present, the same condition that
+    /// causes `conn` to start `None`) or uses the writer connection opened
+    /// eagerly at construction (when `writer_task` is absent). Opening a
+    /// read-only connection here (ADR-136 D1 gate 3 amendment) closes the
+    /// gap where a caller holding a queue-backed writer handle could issue
+    /// an `INSERT ... RETURNING` (or any other DML) through `query_row` /
+    /// `query_all` and have it execute on an untracked read-write
+    /// connection, outside the `WriterTask` — SQLite rejects DML against a
+    /// read-only connection instead.
     fn ensure_conn(&self) -> khive_storage::types::StorageResult<rusqlite::Connection> {
-        open_standalone_writer(&self.pool)
+        open_standalone_reader(&self.pool)
     }
 }
 
@@ -1081,11 +1093,12 @@ impl khive_storage::SqlAccess for SqlBridge {
                     crate::timeout_sink::Site::DirectRouteSqlBridgeWriter,
                 );
             }
-            // A standalone connection is opened only when there is no queue
-            // handle to route writes through — `SqliteWriter`'s `SqlReader`
-            // methods (`query_row`/`query_all`) lazily open one on first use
-            // in the handle-present case (no production caller reads via a
-            // `writer()` handle today; see `SqliteWriter::ensure_conn`).
+            // A standalone read-write connection is opened only when there is
+            // no queue handle to route writes through — `SqliteWriter`'s
+            // `SqlReader` methods (`query_row`/`query_all`) lazily open a
+            // read-only one on first use in the handle-present case;
+            // production callers do read through a `writer()` handle, so
+            // this lazy path is live (see `SqliteWriter::ensure_conn`).
             let conn = if writer_task.is_none() {
                 Some(open_standalone_writer(&self.pool)?)
             } else {
@@ -1518,13 +1531,149 @@ mod tests {
         );
     }
 
-    /// ADR-136 D1 acceptance arm: a 5-op batch shaped like
-    /// `[send, read, read, read, read]` at the storage layer, issued while 3
-    /// concurrent writers contend the write path, must complete every op —
-    /// no checkout timeout — once routing is strict and the queue is on.
+    /// ADR-136 D1 gate 3 amendment: production DOES read through a
+    /// queue-backed `writer()` handle — `khive-pack-comm`'s handlers obtain
+    /// a writer then call `w.query_row(...)` cursor-style, and
+    /// `khive-pack-gtd`'s bootstrap calls `w.query_all("PRAGMA
+    /// table_info...")` on one. Exercise that exact shape under a strict,
+    /// queue-enabled pool: write through the handle, then read the same row
+    /// back through it before it is dropped.
+    #[tokio::test]
+    async fn writer_handle_supports_read_after_write_under_strict_queue() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("writer_read_after_write.db");
+        let config = PoolConfig {
+            path: Some(path),
+            write_queue_enabled: true,
+            write_routing_strict: true,
+            ..PoolConfig::default()
+        };
+        let pool = Arc::new(ConnectionPool::new(config).unwrap());
+        {
+            let guard = pool.writer().unwrap();
+            guard
+                .conn()
+                .execute_batch(
+                    "CREATE TABLE IF NOT EXISTS writer_cursor_test \
+                     (id INTEGER PRIMARY KEY, val TEXT NOT NULL)",
+                )
+                .unwrap();
+        }
+
+        let bridge = SqlBridge::new(Arc::clone(&pool), true);
+
+        let mut w = bridge.writer().await.unwrap();
+        w.execute(SqlStatement {
+            sql: "INSERT INTO writer_cursor_test (id, val) VALUES (?1, ?2)".into(),
+            params: vec![SqlValue::Integer(1), SqlValue::Text("via-writer".into())],
+            label: None,
+        })
+        .await
+        .unwrap();
+
+        let row = w
+            .query_row(SqlStatement {
+                sql: "SELECT val FROM writer_cursor_test WHERE id = ?1".into(),
+                params: vec![SqlValue::Integer(1)],
+                label: None,
+            })
+            .await
+            .unwrap()
+            .expect("row inserted through the same writer handle must be visible to it");
+        assert!(
+            matches!(&row.columns[0].value, SqlValue::Text(v) if v == "via-writer"),
+            "query_row through a queue-backed writer handle must see its own \
+             committed write; got {:?}",
+            row.columns[0].value
+        );
+    }
+
+    /// ADR-136 D1 gate 3 amendment: `SqlWriter::query_row`/`query_all` carry
+    /// no read-only restriction at the trait level — a caller could hand a
+    /// DML-with-RETURNING statement to `query_row` expecting it to behave
+    /// like any other query. Under a queue-backed handle, the standalone
+    /// connection `SqliteWriter::ensure_conn` lazily opens must be
+    /// read-only, so SQLite rejects the statement outright instead of
+    /// quietly mutating the row on an untracked connection outside the
+    /// `WriterTask`. Red-proof: reverting `ensure_conn` to
+    /// `open_standalone_writer` makes this test fail (the UPDATE succeeds
+    /// and mutates the row).
+    #[tokio::test]
+    async fn writer_query_row_rejects_dml_with_returning_on_queue_backed_handle() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("writer_readonly_returning.db");
+        let config = PoolConfig {
+            path: Some(path),
+            write_queue_enabled: true,
+            write_routing_strict: true,
+            ..PoolConfig::default()
+        };
+        let pool = Arc::new(ConnectionPool::new(config).unwrap());
+        {
+            let guard = pool.writer().unwrap();
+            guard
+                .conn()
+                .execute_batch(
+                    "CREATE TABLE IF NOT EXISTS writer_returning_test \
+                     (id INTEGER PRIMARY KEY, val TEXT NOT NULL);
+                     INSERT INTO writer_returning_test (id, val) VALUES (1, 'original');",
+                )
+                .unwrap();
+        }
+
+        let bridge = SqlBridge::new(Arc::clone(&pool), true);
+
+        let mut w = bridge.writer().await.unwrap();
+        let result = w
+            .query_row(SqlStatement {
+                sql: "UPDATE writer_returning_test SET val = 'mutated' \
+                      WHERE id = ?1 RETURNING val"
+                    .into(),
+                params: vec![SqlValue::Integer(1)],
+                label: None,
+            })
+            .await;
+        assert!(
+            result.is_err(),
+            "a DML-with-RETURNING statement through query_row on a \
+             queue-backed writer handle must be rejected, not executed on \
+             an untracked read-write connection; got {result:?}"
+        );
+
+        let mut reader = bridge.reader().await.unwrap();
+        let val = reader
+            .query_scalar(SqlStatement {
+                sql: "SELECT val FROM writer_returning_test WHERE id = ?1".into(),
+                params: vec![SqlValue::Integer(1)],
+                label: None,
+            })
+            .await
+            .unwrap();
+        assert!(
+            matches!(&val, Some(SqlValue::Text(v)) if v == "original"),
+            "the rejected UPDATE...RETURNING must not have altered the row; got {val:?}"
+        );
+    }
+
+    /// ADR-136 D1 acceptance arm: a 5-op batch shaped like `[send, mark,
+    /// mark, mark, mark]` at the storage layer — every "mark" op is a real
+    /// `UPDATE` against its own pre-seeded row, so (like `send`) it routes
+    /// through the writer task rather than bypassing it as a `SELECT` would
+    /// — issued while 3 concurrent writers contend the write path, must
+    /// complete every op — no checkout timeout — once routing is strict and
+    /// the queue is on. An occupier holds the writer task's single drain
+    /// slot until all 8 requests (3 contenders + send + 4 marks) are
+    /// provably enqueued behind it (`queue_depth() >= 8`, the same
+    /// occupier/`queue_depth()` discriminator the migrated-call-site tests
+    /// use), so this proves genuine contention instead of a scheduler that
+    /// happens to drain the tiny writes before the others even enqueue.
     /// Mirrors the measured production failure ADR-136's Context section
     /// documents (middle ops of a batch starving while a sibling write wins
-    /// under the legacy fixed-deadline pool mutex).
+    /// under the legacy fixed-deadline pool mutex). Red-proofed: reverting
+    /// the marks back to `bridge.reader()` `SELECT`s (the pre-fix shape)
+    /// makes the `queue_depth() >= 8` wait time out and fail, since a read
+    /// never reaches the writer task's channel — confirming this version
+    /// actually requires all four marks to be real writes.
     #[tokio::test]
     async fn acceptance_five_op_batch_completes_under_concurrent_write_contention() {
         let dir = tempfile::tempdir().unwrap();
@@ -1542,12 +1691,47 @@ mod tests {
                 .conn()
                 .execute_batch(
                     "CREATE TABLE IF NOT EXISTS acceptance_batch \
-                     (id INTEGER PRIMARY KEY, val TEXT NOT NULL)",
+                     (id INTEGER PRIMARY KEY, val TEXT NOT NULL);
+                     INSERT INTO acceptance_batch (id, val) VALUES \
+                     (200, 'seed-0'), (201, 'seed-1'), (202, 'seed-2'), (203, 'seed-3');",
                 )
                 .unwrap();
         }
 
         let bridge = Arc::new(SqlBridge::new(Arc::clone(&pool), true));
+
+        let writer_task = pool
+            .writer_task_handle()
+            .unwrap()
+            .expect("writer task must be spawned for a file-backed pool with the flag on");
+
+        // Occupier: holds the single writer-task drain slot until released,
+        // so every op below is provably queued behind it rather than racing
+        // to finish before the others even enqueue (same technique as
+        // `rename_namespace_routes_through_writer_task_when_flag_enabled` in
+        // `stores::text_tests`).
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel::<()>();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let occupier = {
+            let writer_task = writer_task.clone();
+            tokio::spawn(async move {
+                writer_task
+                    .send(move |_conn| {
+                        let _ = started_tx.send(());
+                        let _ = release_rx.blocking_recv();
+                        Ok::<(), StorageError>(())
+                    })
+                    .await
+            })
+        };
+        started_rx
+            .await
+            .expect("occupier must signal it has started running inside the writer task");
+        assert_eq!(
+            writer_task.queue_depth(),
+            0,
+            "channel must start empty once the occupier has been dequeued and is running"
+        );
 
         // 3 concurrent writers contending the write path — each a
         // self-contained `execute()` through `SqlBridge::writer()`, matching
@@ -1572,7 +1756,7 @@ mod tests {
             })
             .collect();
 
-        // The 5-op batch: [send, read, read, read, read].
+        // The 5-op batch: [send, mark, mark, mark, mark].
         let send = {
             let bridge = Arc::clone(&bridge);
             tokio::spawn(async move {
@@ -1586,21 +1770,50 @@ mod tests {
                     .await
             })
         };
-        let reads: Vec<_> = (0..4)
-            .map(|_| {
+        let marks: Vec<_> = (0..4)
+            .map(|i| {
                 let bridge = Arc::clone(&bridge);
                 tokio::spawn(async move {
-                    let mut reader = bridge.reader().await?;
-                    reader
-                        .query_scalar(SqlStatement {
-                            sql: "SELECT COUNT(*) FROM acceptance_batch".into(),
-                            params: vec![],
+                    let mut writer = bridge.writer().await?;
+                    writer
+                        .execute(SqlStatement {
+                            sql: "UPDATE acceptance_batch SET val = ?2 WHERE id = ?1".into(),
+                            params: vec![
+                                SqlValue::Integer(200 + i),
+                                SqlValue::Text(format!("marked-{i}")),
+                            ],
                             label: None,
                         })
                         .await
                 })
             })
             .collect();
+
+        // All 8 requests must actually reach the writer task's channel
+        // while the occupier still holds the single drain slot.
+        let mut saw_all_enqueued = false;
+        for _ in 0..200 {
+            if writer_task.queue_depth() >= 8 {
+                saw_all_enqueued = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(
+            saw_all_enqueued,
+            "not all 8 contending writes (3 contenders + send + 4 marks) reached \
+             the writer task's channel while the occupier held the single drain \
+             slot — got depth {}",
+            writer_task.queue_depth()
+        );
+
+        release_tx
+            .send(())
+            .expect("occupier must still be waiting on the release signal");
+        occupier
+            .await
+            .expect("occupier task must not panic")
+            .expect("occupier write must succeed");
 
         for c in contenders {
             c.await
@@ -1610,10 +1823,15 @@ mod tests {
         send.await
             .expect("send task must not panic")
             .expect("send op must complete without a checkout timeout");
-        for r in reads {
-            r.await
-                .expect("read task must not panic")
-                .expect("read op must complete without a checkout timeout — no starvation");
+        for (i, m) in marks.into_iter().enumerate() {
+            let affected = m
+                .await
+                .expect("mark task must not panic")
+                .expect("mark op must complete without a checkout timeout — no starvation");
+            assert_eq!(
+                affected, 1,
+                "mark {i} must have updated exactly its own row"
+            );
         }
 
         let mut reader = bridge.reader().await.unwrap();
@@ -1626,8 +1844,25 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            matches!(count, Some(SqlValue::Integer(4))),
-            "all 3 contenders plus the batch's own send must have committed; got {count:?}"
+            matches!(count, Some(SqlValue::Integer(8))),
+            "the 4 seeded mark rows plus 3 contenders plus the batch's own send \
+             must all be present; got {count:?}"
         );
+
+        for i in 0..4i64 {
+            let mut reader = bridge.reader().await.unwrap();
+            let val = reader
+                .query_scalar(SqlStatement {
+                    sql: "SELECT val FROM acceptance_batch WHERE id = ?1".into(),
+                    params: vec![SqlValue::Integer(200 + i)],
+                    label: None,
+                })
+                .await
+                .unwrap();
+            assert!(
+                matches!(&val, Some(SqlValue::Text(v)) if *v == format!("marked-{i}")),
+                "mark row {i} must reflect the persisted UPDATE after release; got {val:?}"
+            );
+        }
     }
 }
