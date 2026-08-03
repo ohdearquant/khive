@@ -11,8 +11,14 @@
   named places: `ActorRef` gains an optional `leg` field (additive), and the
   grant-change history defined here is exempted from ADR-018's optional-audit
   posture (it is transactional, and the exemption is stated where it is made).
-  Also amends [ADR-004](ADR-004-substrate-observables.md): the closed
-  substrate event-kind taxonomy gains one variant, `GrantChange` (§4a).
+  Also amends [ADR-094](ADR-094-lifecycle-telemetry-events.md)'s event-kind
+  taxonomy: the closed `EventKind` enum gains one variant, `GrantChange`, added
+  through ADR-094's additive-variant mechanism — the variant joins
+  `EventKind::ALL` and the `FromStr`/`Display` round-trip coverage that
+  mechanism requires (§4a). ADR-004 is NOT amended: the substrate set is
+  unchanged, and `GrantChange` events use the existing `Event` substrate,
+  following ADR-094's own precedent for operation-audit events whose subject
+  is neither a note nor an entity.
 - Depends on: [ADR-018](ADR-018-authorization-gate.md) (gate contract and audit
   shape), ADR-127 (authenticated actor and grant primitive — the capability,
   delegation, sealing, and transitive-revocation substrate this record builds
@@ -115,7 +121,10 @@ capability plus ADR-127's grant fields — in durable form.
   anchor** to the store: a record carrying the boot principal's structural
   identity, a root-anchor id, creation time, and liveness state. The anchor
   is not a capability and carries no rights; it is the store-side
-  registration that a given boot root exists and is live. Every durable
+  registration that a given boot root exists and is live. Like every store
+  write, the registration carries a namespace under ADR-007 attribution —
+  the booting process's own write attribution, not a new configuration
+  knob — and that namespace is where the anchor's §4a history lands. Every durable
   grant's recorded lineage terminates at a root-anchor id, and gate-time
   chain validation requires every intermediate record live and seal-valid
   AND the terminal anchor live. Retiring an anchor — an administrative act
@@ -258,31 +267,52 @@ Gate consultations continue to audit per ADR-018. Mutations of grant state get
 their own record class, because a consultation event cannot carry the history
 the Context section promises:
 
-- **Shape: one grant-change record per grant record affected.** A grant
-  record covers one grantee and one namespace (§1), and its grant-change
-  record does the same — this fits the substrate's single-namespace Event
-  envelope rather than fighting it. An action that creates or revokes several
-  grant records (a multi-pair grant, a multi-record revoke, the import)
-  produces one grant-change record per affected grant record, all carrying
-  the same **action id** — a fresh identifier minted once per surface request
-  (for the import, the epoch marker's id). The whole action is reconstructed
-  by querying the action id; no single record claims to describe more than
-  the one grant record it names.
-- **Envelope and payload, completely.** Each grant-change record is a
-  substrate Event whose envelope is fully specified: `kind` is
-  **`GrantChange`**, a new variant added to the closed substrate event-kind
-  taxonomy — a closed-taxonomy addition named in this record's Amends header
-  (ADR-004), not an informal string; `verb` is the surface operation
-  (`grant`, `revoke`, or `import`); `actor` is the acting principal's full
-  structural identity (leg form); `substrate` is the grant store; `outcome`
-  is success — records exist only for mutations that happened; and
-  `namespace` is the namespace of the grant record described. The payload is
-  versioned (`payload_version: 1`) and carries: the action id; the grant
-  record id; the grantee's full structural identity (leg form); the rights
-  set; a required rationale; and the authorization snapshot below.
-  Per-record visibility follows ADR-022 unchanged: a record is readable by
-  callers whose read scope covers its namespace — exactly the namespace
-  whose authority the change moved.
+- **Shape: one grant-change record per affected record.** The affected
+  record is a grant record for `grant`, `revoke`, and `import`, and the
+  anchor registration record for `retire_anchor` (§1). A grant record covers
+  one grantee and one namespace (§1), and its grant-change record does the
+  same — this fits the substrate's single-namespace Event envelope rather
+  than fighting it; a retirement affects exactly one anchor registration and
+  produces exactly one record, in that registration's namespace. An action
+  that touches several records (a multi-pair grant, a multi-record revoke,
+  the import) produces one grant-change record per affected record, all
+  carrying the same **action id** — a fresh identifier minted once per
+  surface request (for the import, the epoch marker's id). The whole action
+  is reconstructed by querying the action id; no single record claims to
+  describe more than the one record it names.
+- **Envelope and payload, completely — within the existing Event struct.**
+  Each grant-change record is a substrate Event whose envelope uses only
+  fields the Event contract already has: `kind` is **`GrantChange`**, a new
+  variant on the closed `EventKind` enum — the ADR-094-mechanism addition
+  named in this record's Amends header, carrying `EventKind::ALL` and
+  `FromStr`/`Display` round-trip coverage, not an informal string; `verb` is
+  the surface operation (`grant`, `revoke`, `import`, or `retire_anchor`);
+  `substrate` is `Event` — ADR-094's own precedent for operation-audit
+  records whose subject is neither a note nor an entity; the substrate set
+  is unchanged and no fourth value is invented. The envelope's `actor` field
+  is a string by contract, and §3 (via Stage 1b) is explicit that flattened
+  principal renderings are not injective — so the envelope string is the
+  Stage 1b display rendering and is display-only, while the **authoritative
+  acting-principal identity lives in the payload in §3's three-field audit
+  form** (`kind`, `id`, and the optional leg label as separate structured
+  members). No consumer parses the envelope string; a consumer needing
+  identity reads the structured payload members, which is exactly the rule
+  §3 already sets for audit records.
+  `outcome` is success — records exist only for mutations that happened —
+  and `namespace` is the namespace of the record described. Versioning is
+  the envelope's existing `payload_schema_version` field, set to 1; there is
+  no separate payload version member. The payload carries, for grant-record
+  changes: the action id; the grant record id; the grantee's structural
+  identity; the rights set; a required rationale; and the authorization
+  snapshot below. For `retire_anchor`: the action id; the root-anchor id;
+  the anchor's boot principal structural identity; the liveness transition
+  (live to retired); a required rationale; and the authorization snapshot in
+  its retirement form (defined with the snapshot below). Per-record visibility follows
+  ADR-022 unchanged: a record is readable by callers whose read scope covers
+  its namespace — for grant records, exactly the namespace whose authority
+  the change moved; for a retirement, the anchor registration's attribution
+  namespace (§1). Gate-time liveness never depends on history visibility:
+  the validator reads the anchor's liveness state directly.
 - **Whole-action reconstruction is a grant-surface read, not an ADR-022
   query.** ADR-022's filter set (kind, verb, outcome, actor, substrate,
   time) gains no payload predicate from this record, and its
@@ -303,7 +333,11 @@ the Context section promises:
   and the check timestamp. For the import — which no caller requested — the
   snapshot is the synthetic boot authorization: the boot principal, the epoch
   marker id, the configuration source, and the fixed rationale
-  `configuration import at first boot`.
+  `configuration import at first boot`. For `retire_anchor` — whose
+  authorization is identity, not pairs (§1) — the snapshot records the
+  identity rule instead: the caller's structural identity, the
+  structural-equality check against the anchor's boot principal, and the
+  check timestamp.
 - **The records are written in the same transaction as the mutation they
   describe.** If any grant-change record of the action cannot be written, the
   whole action does not happen. This is a stated exemption from ADR-018's
@@ -409,7 +443,12 @@ All conditions are executed tests, not review assertions:
    synthetic boot authorization (boot principal, epoch marker id,
    configuration source, fixed rationale); a simulated failure to write any
    record of an action aborts the whole action (fail-closed arm); a refused
-   request produces no grant-change record.
+   request produces no grant-change record. **Retirement arm:** an anchor
+   retirement produces one `retire_anchor` record in the anchor
+   registration's namespace, resolvable through the action-id lookup,
+   carrying the liveness transition and the identity-rule authorization
+   snapshot; a simulated failure to write that record aborts the retirement
+   and the anchor stays live.
 8. **Cross-process transitive revocation, with a cold-load positive
    control.** With a delegation chain root → A → B and two serving processes
    over one store: FIRST, the second process — which minted none of the
