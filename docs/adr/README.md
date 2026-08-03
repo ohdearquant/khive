@@ -2,6 +2,12 @@
 
 Architecture Decision Records (ADRs) for khive v1. These are **desired-state specifications** — the contract that code must implement. ADRs use closed taxonomies and bear normative weight; changes require explicit ADR amendments.
 
+## ADR lifecycle
+
+An ADR merges in whatever state its ratification had reached at merge time; the merge itself never changes the status field. `Proposed` is a legitimate resting state on `main`: it means the record is awaiting either a conformant implementation or an explicit adoption decision. A record ratified before its merge lands already reading `accepted`, carrying its ratification date in the header.
+
+A `Proposed` ADR becomes `accepted` only through an explicit ratification event, recorded by a dedicated status-flip PR. That PR's body must cite the ratifying artifact by identifier and must assert that the ratification postdates the merge commit of the final ADR text it ratifies — a sign-off issued against an earlier revision, followed by further edits, ratifies nothing. Contract-level ADRs scoped to one subsystem may be ratified by maintainer design review; cross-cutting or strategic ADRs require a project-owner decision. A conformant implementation landing is the usual trigger for seeking ratification.
+
 ## ADR catalog
 
 <!-- BEGIN GENERATED ADR CATALOG -->
