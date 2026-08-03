@@ -139,6 +139,7 @@ Architecture Decision Records (ADRs) for khive v1. These are **desired-state spe
 | [ADR-138](ADR-138-blob-enumeration.md)                                  | Add read-only blob enumeration to the blob-store contract                                                  |
 | [ADR-141](ADR-141-store-backup-runner.md)                               | Executable store backup runner                                                                             |
 | [ADR-142](ADR-142-agentic-process-runtime.md)                           | Agentic Process Runtime                                                                                    |
+| [ADR-143](ADR-143-store-held-caller-grants.md)                          | Store-held caller grants and hierarchical subactor identity                                                |
 
 <!-- END GENERATED ADR CATALOG -->
 
