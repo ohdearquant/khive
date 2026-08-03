@@ -2519,3 +2519,128 @@ async fn test_search_rank_within_cap_counts_two_fts_passes() {
 
     assert_eq!(ctx.snapshot()["fts_passes"], 2);
 }
+
+/// ADR-136 D1 gate 2/4: `rename_namespace`'s flag-on path must route through
+/// the pool-wide `WriterTask`, not `with_writer_unmanaged`'s
+/// standalone-connection path, when the write queue is enabled — same
+/// occupier / `queue_depth()` technique as
+/// `upsert_documents_routes_through_writer_task_when_flag_enabled` above (a
+/// `writer_task_spawn_count() == 1` assertion alone is a false positive:
+/// `upsert_document` setup calls already spawn/use the task). Red-proof:
+/// reverting the `if let Some(writer_task) = &self.writer_task` branch in
+/// `rename_namespace` (forcing every call through `with_writer_unmanaged`)
+/// makes `saw_enqueued` stay `false` and this test fail — see the impl
+/// report for the exact revert/run/restore transcript.
+#[tokio::test]
+async fn rename_namespace_routes_through_writer_task_when_flag_enabled() {
+    let table_key = "write_queue_rename_namespace";
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("write_queue_rename_namespace.db");
+    let pool_cfg = PoolConfig {
+        path: Some(path.clone()),
+        write_queue_enabled: true,
+        ..PoolConfig::default()
+    };
+    let pool = Arc::new(ConnectionPool::new(pool_cfg).unwrap());
+    {
+        let writer = pool.writer().unwrap();
+        ensure_fts5_schema(writer.conn(), table_key).unwrap();
+    }
+
+    let store = Fts5TextSearch::new(Arc::clone(&pool), true, table_key.to_string());
+
+    let subject = Uuid::new_v4();
+    let mut doc = make_document(subject, "Doc A", "body a");
+    doc.namespace = "old_ns".to_string();
+    store.upsert_document(doc).await.unwrap();
+
+    let writer_task = pool
+        .writer_task_handle()
+        .unwrap()
+        .expect("writer task must be spawned for a file-backed pool with the flag on");
+
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel::<()>();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+    let occupier = {
+        let writer_task = writer_task.clone();
+        tokio::spawn(async move {
+            writer_task
+                .send(move |_conn| {
+                    let _ = started_tx.send(());
+                    let _ = release_rx.blocking_recv();
+                    Ok::<(), StorageError>(())
+                })
+                .await
+        })
+    };
+
+    started_rx
+        .await
+        .expect("occupier must signal it has started running inside the writer task");
+    assert_eq!(
+        writer_task.queue_depth(),
+        0,
+        "channel must start empty once the occupier has been dequeued and is running"
+    );
+
+    let rename_task = tokio::spawn(async move { store.rename_namespace("old_ns", "new_ns").await });
+
+    let mut saw_enqueued = false;
+    for _ in 0..100 {
+        if writer_task.queue_depth() >= 1 {
+            saw_enqueued = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert!(
+        saw_enqueued,
+        "rename_namespace's write request never appeared in the writer task's channel \
+         while the occupier held the single drain slot — rename_namespace is not routing \
+         through the shared writer task"
+    );
+
+    release_tx
+        .send(())
+        .expect("occupier must still be waiting on the release signal");
+    occupier
+        .await
+        .expect("occupier task must not panic")
+        .expect("occupier write must succeed");
+    let moved = rename_task
+        .await
+        .expect("rename task must not panic")
+        .expect("rename_namespace must succeed once unblocked");
+    assert_eq!(moved, 1);
+}
+
+/// ADR-136 D1 gate 3/4: with `KHIVE_WRITE_ROUTING=strict` and no writer task
+/// available, `rename_namespace` must error instead of silently falling back
+/// to `with_writer_unmanaged`'s standalone-connection path.
+#[tokio::test]
+async fn rename_namespace_strict_routing_fails_closed_without_writer_task() {
+    let table_key = "strict_rename_namespace";
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("strict_rename_namespace.db");
+    let pool_cfg = PoolConfig {
+        path: Some(path.clone()),
+        write_queue_enabled: false,
+        write_routing_strict: true,
+        ..PoolConfig::default()
+    };
+    let pool = Arc::new(ConnectionPool::new(pool_cfg).unwrap());
+    {
+        let writer = pool.writer().unwrap();
+        ensure_fts5_schema(writer.conn(), table_key).unwrap();
+    }
+
+    let store = Fts5TextSearch::new(Arc::clone(&pool), true, table_key.to_string());
+    let err = store.rename_namespace("old_ns", "new_ns").await.expect_err(
+        "KHIVE_WRITE_ROUTING=strict with no writer task must fail closed, not silently \
+             fall back to with_writer_unmanaged",
+    );
+    assert!(
+        err.to_string().contains("strict"),
+        "error must name strict routing, got: {err}"
+    );
+}

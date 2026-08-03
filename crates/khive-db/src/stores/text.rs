@@ -23,6 +23,36 @@ use crate::pool::ConnectionPool;
 use crate::sql_bridge::bind_params;
 use crate::writer_task::WriterTaskHandle;
 
+/// ADR-136 D1 gate 3: called immediately before a `with_writer_unmanaged`
+/// fallback so this store's one remaining direct-writer call site
+/// (`rename_namespace`) fails closed under strict routing instead of
+/// silently bypassing an enabled queue. Under non-strict routing this is a
+/// no-op except for a `direct_route_violation` sink row when the queue is
+/// enabled (ADR-136 D1 gate 6c) — observable, but not yet fatal. Mirrors
+/// `stores::vectors::refuse_direct_route_if_strict`; kept as a separate copy
+/// rather than a shared export to avoid coupling the two stores' internals.
+fn refuse_direct_route_if_strict(
+    pool: &ConnectionPool,
+    site: crate::timeout_sink::Site,
+    op: &'static str,
+) -> Result<(), StorageError> {
+    if pool.config().write_routing_strict {
+        return Err(StorageError::Pool {
+            operation: op.into(),
+            message: "KHIVE_WRITE_ROUTING=strict but no writer-task handle is available; \
+                      refusing to fall back to a direct connection"
+                .into(),
+        });
+    }
+    if pool.config().write_queue_enabled {
+        crate::timeout_sink::emit_direct_route_violation(
+            &crate::timeout_sink::db_label(pool),
+            site,
+        );
+    }
+    Ok(())
+}
+
 /// The exact `DELETE` this store's `delete_document` issues, for a given
 /// FTS table (ADR-099 B3 r6 structural cut — see `entity.rs`'s sibling
 /// block). `table` must already be a trusted, sanitized table name (this
@@ -1416,84 +1446,128 @@ impl Fts5TextSearch {
         let old_ns = old_namespace.to_string();
         let new_ns = new_namespace.to_string();
 
+        // ADR-136 D1 gate 2: queue-first, DML-only closure. `run_writer_task`
+        // already owns the enclosing `BEGIN IMMEDIATE`/`COMMIT`/`ROLLBACK` for
+        // this request, so the SELECT enumerating rows-to-move runs INSIDE
+        // that same transaction as the DELETE+INSERT that consumes it —
+        // closing the TOCTOU window the pre-migration path had (its SELECT
+        // ran before its own `BEGIN IMMEDIATE`, so a writer landing between
+        // the two could resurrect a stale row or lose one mid-rename).
+        if let Some(writer_task) = &self.writer_task {
+            let table2 = table.clone();
+            return writer_task
+                .send(move |conn| {
+                    rename_namespace_dml(conn, &table2, &old_ns, &new_ns)
+                        .map_err(|e| map_err(e, "fts_rename_namespace"))
+                })
+                .await;
+        }
+
+        refuse_direct_route_if_strict(
+            &self.pool,
+            crate::timeout_sink::Site::DirectRouteFtsRenameNamespace,
+            "fts_rename_namespace",
+        )?;
+
         let origin = self.pool.origin();
         self.with_writer_unmanaged("fts_rename_namespace", move |conn| {
-            let sel_sql = format!(
-                "SELECT subject_id, kind, title, body, tags, metadata, updated_at \
-                 FROM {} WHERE namespace = ?1",
-                table
-            );
-            struct Row {
-                subject_id: String,
-                kind: String,
-                title: String,
-                body: String,
-                tags: String,
-                metadata: Option<String>,
-                updated_at: i64,
-            }
-            let rows: Vec<Row> = {
-                let mut stmt = conn.prepare(&sel_sql)?;
-                let iter = stmt.query_map(rusqlite::params![&old_ns], |row| {
-                    Ok(Row {
-                        subject_id: row.get(0)?,
-                        kind: row.get(1)?,
-                        title: row.get(2)?,
-                        body: row.get(3)?,
-                        tags: row.get(4)?,
-                        metadata: row.get(5)?,
-                        updated_at: row.get(6)?,
-                    })
-                })?;
-                iter.collect::<Result<Vec<_>, _>>()?
-            };
-            let moved = rows.len() as u64;
-            if moved == 0 {
-                return Ok(0u64);
-            }
-
             conn.execute_batch("BEGIN IMMEDIATE")?;
             let _tx_handle = khive_storage::tx_registry::register_scoped(
                 Some("text_rename_namespace".to_string()),
                 origin,
             );
-
-            let del_sql = format!("DELETE FROM {} WHERE namespace = ?1", table);
-            if let Err(e) = conn.execute(&del_sql, rusqlite::params![&old_ns]) {
-                let _ = conn.execute_batch("ROLLBACK");
-                return Err(e);
-            }
-
-            let ins_sql = format!(
-                "INSERT INTO {} \
-                 (subject_id, kind, title, body, tags, namespace, metadata, updated_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-                table
-            );
-            for row in &rows {
-                if let Err(e) = conn.execute(
-                    &ins_sql,
-                    rusqlite::params![
-                        row.subject_id,
-                        row.kind,
-                        row.title,
-                        row.body,
-                        row.tags,
-                        &new_ns,
-                        row.metadata,
-                        row.updated_at,
-                    ],
-                ) {
+            // The SELECT now runs inside this same `BEGIN IMMEDIATE` — same
+            // TOCTOU fix as the queue path above, applied to the legacy
+            // standalone-connection path too.
+            match rename_namespace_dml(conn, &table, &old_ns, &new_ns) {
+                Ok(moved) => {
+                    conn.execute_batch("COMMIT")?;
+                    Ok(moved)
+                }
+                Err(e) => {
                     let _ = conn.execute_batch("ROLLBACK");
-                    return Err(e);
+                    Err(e)
                 }
             }
-
-            conn.execute_batch("COMMIT")?;
-            Ok(moved)
         })
         .await
     }
+}
+
+struct FtsRenameRow {
+    subject_id: String,
+    kind: String,
+    title: String,
+    body: String,
+    tags: String,
+    metadata: Option<String>,
+    updated_at: i64,
+}
+
+/// Move every FTS5 document row from `old_ns` to `new_ns` in `table`.
+/// DML-only — issues no `BEGIN`/`COMMIT`/`ROLLBACK` of its own, so it is safe
+/// to call both inside an already-open transaction (the `WriterTask` queue
+/// path) and wrapped by a caller-managed one (the legacy standalone path).
+/// The `SELECT` enumerating rows-to-move and the `DELETE`+`INSERT` that
+/// consumes it always run inside the SAME transaction the caller opened —
+/// see `Fts5TextSearch::rename_namespace`'s TOCTOU note.
+fn rename_namespace_dml(
+    conn: &rusqlite::Connection,
+    table: &str,
+    old_ns: &str,
+    new_ns: &str,
+) -> Result<u64, rusqlite::Error> {
+    let sel_sql = format!(
+        "SELECT subject_id, kind, title, body, tags, metadata, updated_at \
+         FROM {} WHERE namespace = ?1",
+        table
+    );
+    let rows: Vec<FtsRenameRow> = {
+        let mut stmt = conn.prepare(&sel_sql)?;
+        let iter = stmt.query_map(rusqlite::params![old_ns], |row| {
+            Ok(FtsRenameRow {
+                subject_id: row.get(0)?,
+                kind: row.get(1)?,
+                title: row.get(2)?,
+                body: row.get(3)?,
+                tags: row.get(4)?,
+                metadata: row.get(5)?,
+                updated_at: row.get(6)?,
+            })
+        })?;
+        iter.collect::<Result<Vec<_>, _>>()?
+    };
+    let moved = rows.len() as u64;
+    if moved == 0 {
+        return Ok(0);
+    }
+
+    let del_sql = format!("DELETE FROM {} WHERE namespace = ?1", table);
+    conn.execute(&del_sql, rusqlite::params![old_ns])?;
+
+    let ins_sql = format!(
+        "INSERT INTO {} \
+         (subject_id, kind, title, body, tags, namespace, metadata, updated_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        table
+    );
+    for row in &rows {
+        conn.execute(
+            &ins_sql,
+            rusqlite::params![
+                row.subject_id,
+                row.kind,
+                row.title,
+                row.body,
+                row.tags,
+                new_ns,
+                row.metadata,
+                row.updated_at,
+            ],
+        )?;
+    }
+
+    Ok(moved)
 }
 
 #[cfg(test)]
