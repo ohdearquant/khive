@@ -205,10 +205,15 @@ fn classify_python(
         for _ in 1..level {
             base.pop();
         }
+        // A relative import that climbs to or above the scanner's project
+        // root cannot be attributed — Python itself rejects relative imports
+        // beyond the top-level package — so never record a root-level guess
+        // that a later same-name module would silently satisfy.
+        if base.is_empty() {
+            return Resolved::Skip;
+        }
         let target = if rest.is_empty() {
             base.join(".")
-        } else if base.is_empty() {
-            rest.to_string()
         } else {
             format!("{}.{}", base.join("."), rest)
         };
@@ -424,6 +429,30 @@ mod tests {
         assert_eq!(
             classify_import("python", ".", "pkg.x", "pkg", true),
             Resolved::Skip
+        );
+    }
+
+    #[test]
+    fn python_relative_import_above_project_root_is_skipped() {
+        // Climbing to or above the scanner's project root is unattributable
+        // (Python rejects relative imports beyond the top-level package) —
+        // never a root-level intra-project target. Both declarer shapes.
+        assert_eq!(
+            classify_import("python", "..outside", "pkg", "pkg", true),
+            Resolved::Skip
+        );
+        assert_eq!(
+            classify_import("python", "..outside", "pkg.mod", "pkg", false),
+            Resolved::Skip
+        );
+        assert_eq!(
+            classify_import("python", "...outside", "pkg.x", "pkg", true),
+            Resolved::Skip
+        );
+        // One level short of the root still resolves normally.
+        assert_eq!(
+            classify_import("python", "..a", "pkg.x.y", "pkg", false),
+            Resolved::IntraModule("pkg.a".to_string())
         );
     }
 
