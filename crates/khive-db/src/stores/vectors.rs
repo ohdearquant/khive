@@ -22,6 +22,34 @@ use crate::error::SqliteError;
 use crate::pool::ConnectionPool;
 use crate::sql_bridge::bind_params;
 
+/// ADR-136 D1 gate 3: called immediately before a `with_writer_unmanaged`
+/// fallback so this store's two remaining direct-writer call sites
+/// (`vec_delete_subjects`, `orphan_sweep`) fail closed under strict routing
+/// instead of silently bypassing an enabled queue. Under non-strict routing
+/// this is a no-op except for a `direct_route_violation` sink row when the
+/// queue is enabled (ADR-136 D1 gate 6c) — observable, but not yet fatal.
+fn refuse_direct_route_if_strict(
+    pool: &ConnectionPool,
+    site: crate::timeout_sink::Site,
+    op: &'static str,
+) -> Result<(), StorageError> {
+    if pool.config().write_routing_strict {
+        return Err(StorageError::Pool {
+            operation: op.into(),
+            message: "KHIVE_WRITE_ROUTING=strict but no writer-task handle is available; \
+                      refusing to fall back to a direct connection"
+                .into(),
+        });
+    }
+    if pool.config().write_queue_enabled {
+        crate::timeout_sink::emit_direct_route_violation(
+            &crate::timeout_sink::db_label(pool),
+            site,
+        );
+    }
+    Ok(())
+}
+
 /// The exact `DELETE` this store's `delete` issues, for a given vector table
 /// (ADR-099 B3 r6 structural cut — see `stores::entity`'s sibling block).
 /// `table` must already be a trusted, sanitized table name (mirrors
@@ -1332,6 +1360,11 @@ impl VectorStore for SqliteVecStore {
         // outermost SAVEPOINT. `Transaction` rolls back on early DML errors and
         // also when COMMIT fails while SQLite leaves the transaction open,
         // preventing a poisoned transaction from returning to the pool.
+        refuse_direct_route_if_strict(
+            &self.pool,
+            crate::timeout_sink::Site::DirectRouteVecDeleteSubjects,
+            "vec_delete_subjects",
+        )?;
         let table_for_error = table.clone();
         let origin = self.pool.origin();
         self.with_writer_unmanaged("vec_delete_subjects", move |conn| {
@@ -1469,6 +1502,11 @@ impl VectorStore for SqliteVecStore {
         // Flag-off (default) path: byte-for-byte unchanged from pre-ADR-067
         // behavior — the closure owns its own transaction via
         // `Transaction::new_unchecked`.
+        refuse_direct_route_if_strict(
+            &self.pool,
+            crate::timeout_sink::Site::DirectRouteOrphanSweep,
+            "orphan_sweep",
+        )?;
         let origin = self.pool.origin();
         self.with_writer_unmanaged("orphan_sweep", move |conn| {
             // `Transaction::new_unchecked` issues `BEGIN IMMEDIATE` and RAII-manages
@@ -4647,6 +4685,212 @@ mod write_queue_tests {
             msg.contains("cannot start a transaction within a transaction"),
             "expected the deterministic nested-transaction failure (SQLite's own message \
              for a second BEGIN issued inside an already-open transaction), got: {msg}"
+        );
+    }
+
+    /// ADR-136 D1 gate 2/4: `vec_delete_subjects`'s flag-on path must route
+    /// through the pool-wide `WriterTask`, not `with_writer_unmanaged`'s
+    /// pool-mutex path, when the write queue is enabled — same occupier /
+    /// `queue_depth()` technique as
+    /// `orphan_sweep_routes_through_writer_task_when_flag_enabled` above (a
+    /// `writer_task_spawn_count() == 1` assertion alone is a false positive:
+    /// `SqliteVecStore::new` and the setup insert already spawn/use the
+    /// task). Red-proof: reverting the `if let Some(writer_task) =
+    /// &self.writer_task` branch in `vec_delete_subjects` (forcing every
+    /// call through `with_writer_unmanaged`) makes `saw_enqueued` stay
+    /// `false` and this test fail — see the impl report for the exact
+    /// revert/run/restore transcript.
+    #[tokio::test]
+    async fn vec_delete_subjects_routes_through_writer_task_when_flag_enabled() {
+        crate::extension::ensure_extensions_loaded();
+
+        let model_key = "write_queue_vec_delete_subjects";
+        let dims = 4usize;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("write_queue_vec_delete_subjects.db");
+        let pool = Arc::new(
+            ConnectionPool::new(PoolConfig {
+                path: Some(path),
+                write_queue_enabled: true,
+                ..PoolConfig::default()
+            })
+            .expect("file-backed pool"),
+        );
+        create_vec_table(&pool, model_key, dims);
+
+        let store = SqliteVecStore::new(
+            Arc::clone(&pool),
+            true,
+            model_key.to_string(),
+            model_key.to_string(),
+            dims,
+            "ns:test".to_string(),
+        )
+        .expect("SqliteVecStore::new");
+
+        let id = Uuid::new_v4();
+        store
+            .insert(
+                id,
+                SubstrateKind::Entity,
+                "ns:test",
+                "body",
+                vec![vec![0.1, 0.2, 0.3, 0.4]],
+            )
+            .await
+            .expect("insert vector");
+
+        let writer_task = pool
+            .writer_task_handle()
+            .expect("writer task handle")
+            .expect("writer task must be spawned for a file-backed pool with the flag on");
+
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel::<()>();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let occupier = {
+            let writer_task = writer_task.clone();
+            tokio::spawn(async move {
+                writer_task
+                    .send(move |_conn| {
+                        let _ = started_tx.send(());
+                        let _ = release_rx.blocking_recv();
+                        Ok::<(), StorageError>(())
+                    })
+                    .await
+            })
+        };
+
+        started_rx
+            .await
+            .expect("occupier must signal it has started running inside the writer task");
+        assert_eq!(
+            writer_task.queue_depth(),
+            0,
+            "channel must start empty once the occupier has been dequeued and is running"
+        );
+
+        let delete_task = tokio::spawn(async move { store.delete_subjects(&[id]).await });
+
+        let mut saw_enqueued = false;
+        for _ in 0..100 {
+            if writer_task.queue_depth() >= 1 {
+                saw_enqueued = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(
+            saw_enqueued,
+            "vec_delete_subjects's write request never appeared in the writer task's channel \
+             while the occupier held the single drain slot — vec_delete_subjects is not \
+             routing through the shared writer task"
+        );
+
+        release_tx
+            .send(())
+            .expect("occupier must still be waiting on the release signal");
+        occupier
+            .await
+            .expect("occupier task must not panic")
+            .expect("occupier write must succeed");
+        let deleted = delete_task
+            .await
+            .expect("delete task must not panic")
+            .expect("vec_delete_subjects must succeed once unblocked");
+        assert_eq!(deleted, 1);
+    }
+
+    /// ADR-136 D1 gate 3/4: with `KHIVE_WRITE_ROUTING=strict` and no writer
+    /// task available, `vec_delete_subjects` must error instead of silently
+    /// falling back to `with_writer_unmanaged`'s pool-mutex path.
+    #[tokio::test]
+    async fn vec_delete_subjects_strict_routing_fails_closed_without_writer_task() {
+        crate::extension::ensure_extensions_loaded();
+
+        let model_key = "strict_vec_delete_subjects";
+        let dims = 4usize;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("strict_vec_delete_subjects.db");
+        let pool = Arc::new(
+            ConnectionPool::new(PoolConfig {
+                path: Some(path),
+                write_queue_enabled: false,
+                write_routing_strict: true,
+                ..PoolConfig::default()
+            })
+            .expect("file-backed pool"),
+        );
+        create_vec_table(&pool, model_key, dims);
+
+        let store = SqliteVecStore::new(
+            Arc::clone(&pool),
+            true,
+            model_key.to_string(),
+            model_key.to_string(),
+            dims,
+            "ns:test".to_string(),
+        )
+        .expect("SqliteVecStore::new");
+
+        let id = Uuid::new_v4();
+        let err = store.delete_subjects(&[id]).await.expect_err(
+            "KHIVE_WRITE_ROUTING=strict with no writer task must fail closed, not silently \
+             fall back to with_writer_unmanaged",
+        );
+        assert!(
+            err.to_string().contains("strict"),
+            "error must name strict routing, got: {err}"
+        );
+    }
+
+    /// ADR-136 D1 gate 3/4: same fail-closed contract as
+    /// `vec_delete_subjects_strict_routing_fails_closed_without_writer_task`,
+    /// for `orphan_sweep`'s own `with_writer_unmanaged` fallback.
+    #[tokio::test]
+    async fn orphan_sweep_strict_routing_fails_closed_without_writer_task() {
+        crate::extension::ensure_extensions_loaded();
+
+        let model_key = "strict_orphan_sweep";
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("strict_orphan_sweep.db");
+        let pool = Arc::new(
+            ConnectionPool::new(PoolConfig {
+                path: Some(path),
+                write_queue_enabled: false,
+                write_routing_strict: true,
+                ..PoolConfig::default()
+            })
+            .expect("file-backed pool"),
+        );
+        create_substrate_tables(&pool);
+        create_vec_table(&pool, model_key, 4);
+
+        let store = SqliteVecStore::new(
+            Arc::clone(&pool),
+            true,
+            model_key.to_string(),
+            model_key.to_string(),
+            4,
+            "ns:test".to_string(),
+        )
+        .expect("SqliteVecStore::new");
+
+        let err = store
+            .orphan_sweep(&OrphanSweepConfig {
+                subject_id_allowlist: None,
+                namespaces: vec![],
+                substrate_kinds: vec![],
+                max_delete: 100,
+                dry_run: true,
+            })
+            .await
+            .expect_err(
+                "KHIVE_WRITE_ROUTING=strict with no writer task must fail closed, not \
+                 silently fall back to with_writer_unmanaged",
+            );
+        assert!(
+            err.to_string().contains("strict"),
+            "error must name strict routing, got: {err}"
         );
     }
 }
