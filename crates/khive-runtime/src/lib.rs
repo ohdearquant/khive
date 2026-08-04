@@ -3,6 +3,7 @@
 //! Wraps `StorageBackend` and query compilation into a single Rust API surface.
 
 pub mod actor_identity;
+pub mod agent_lifecycle;
 pub mod atomic_message;
 pub mod atomic_plan;
 pub mod atomic_prepare;
@@ -36,6 +37,10 @@ pub use khive_storage::usage;
 pub mod validation;
 
 pub use actor_identity::{actor_is_unattributed, resolve_actor, should_warn_unattributed_actor};
+pub use agent_lifecycle::{
+    apply_transition, spawn_fingerprint, AgentRecord, AgentState, IllegalTransition,
+    TerminalReason, Transition, Trigger,
+};
 pub use atomic_message::{create_notes_atomic, create_notes_atomic_with_report, AtomicNoteSpec};
 pub use atomic_plan::{
     AddEntityPlan, AddNotePlan, AffectedRowGuard, DeletePlan, GovernanceOp, GovernancePlan,
