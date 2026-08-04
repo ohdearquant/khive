@@ -90,7 +90,7 @@ FIXTURE
 <!-- END GENERATED ADR CATALOG -->
 FIXTURE
 
-    # Regression case 6 (must-FAIL control, inert catalog rows): the only index row for the
+    # Regression case 6 (must-FAIL control, row not counted as coverage): the only index row for the
     # ADR sits inside an HTML comment spanning multiple lines -- a stale
     # example kept for reference, not a live catalog entry. Must go red.
     mkdir -p "$tmp/case-comment-row/docs/adr"
@@ -113,7 +113,7 @@ FIXTURE
 <!-- END GENERATED ADR CATALOG -->
 FIXTURE
 
-    # Regression case 7 (must-FAIL control, inert catalog rows): the only index row for the
+    # Regression case 7 (must-FAIL control, row not counted as coverage): the only index row for the
     # ADR sits inside a fenced code block. Must go red.
     mkdir -p "$tmp/case-fenced-row/docs/adr"
     cat > "$tmp/case-fenced-row/docs/adr/ADR-202-fixture-fenced-row.md" <<'FIXTURE'
@@ -217,11 +217,14 @@ FIXTURE
 - follows the suffix convention (ADR-117a: Fixture Letter Suffix).
 FIXTURE
 
-    # Regression case 11 (must-FAIL control, inert END in a fence): the catalog
-    # never really closes, but a quoted END marker sits inside a code fence.
-    # Testing the delimiter before resolving fence state let that quoted text
-    # satisfy the end-marker assertion, so an unclosed catalog passed again by
-    # a different route than case 8.
+    # Regression case 11 (must-FAIL control): a quoted END marker sits inside a
+    # code fence below the real rows. The marker is NOT inert -- it starts at
+    # column zero, so it matches and closes the catalog early. What makes this
+    # go red is that the region it closes then contains the surrounding prose
+    # and fence lines, which the catalog grammar rejects. Naming the mechanism
+    # matters: the guarantee here is "this README is rejected", not "a quoted
+    # marker is ignored", and the script deliberately does not implement the
+    # latter.
     mkdir -p "$tmp/case-fenced-end/docs/adr"
     cat > "$tmp/case-fenced-end/docs/adr/ADR-204-fixture-fenced-end.md" <<'FIXTURE'
 # ADR-204: Fixture Fenced End
@@ -244,9 +247,10 @@ The catalog is delimited like this:
 ```
 FIXTURE
 
-    # Regression case 12 (must-FAIL control, inert END in a comment): the same
-    # defect reached through the multi-line HTML-comment state instead of the
-    # fence state.
+    # Regression case 12 (must-FAIL control): the same shape as case 11 reached
+    # through a multi-line HTML comment instead of a fence. The quoted END again
+    # matches and closes the catalog; the comment opener left inside the closed
+    # region is what the grammar rejects.
     mkdir -p "$tmp/case-commented-end/docs/adr"
     cat > "$tmp/case-commented-end/docs/adr/ADR-205-fixture-commented-end.md" <<'FIXTURE'
 # ADR-205: Fixture Commented End
@@ -267,11 +271,15 @@ FIXTURE
 -->
 FIXTURE
 
-    # Regression case 13 (must-FAIL control, inert BEGIN): the mirror of cases
-    # 11 and 12 on the opening delimiter. A quoted BEGIN inside a multi-line
-    # HTML comment, above the real catalog, opened the scan early, so a stale
-    # row sitting between the quoted marker and the real one counted as live
-    # coverage for an ADR the real catalog omits.
+    # Regression case 13 (must-FAIL control): the mirror of cases 11 and 12 on
+    # the opening delimiter. A quoted BEGIN inside a multi-line HTML comment,
+    # above the real catalog, opened the scan early, so a stale row sitting
+    # between the quoted marker and the real one counted as live coverage for
+    # an ADR the real catalog omits. This fixture trips two independent
+    # rejections -- the BEGIN count reaches two, AND the stale row fails to
+    # provide coverage -- so the assertion below pins the COVERAGE message
+    # specifically. Accepting either message would let this arm stay green
+    # after the coverage rule it exists to protect had been removed.
     #
     # The quoted marker is inside a COMMENT rather than a fence deliberately.
     # A fenced variant of this fixture goes red either way: the fence's own
@@ -331,8 +339,10 @@ FIXTURE
 
     # Regression case 15 (must-FAIL control, short closing fence): a fence
     # closes only on a run at least as long as the one that opened it, so a
-    # three-backtick line does not close a four-backtick fence and the END
-    # quoted after it stays inert.
+    # three-backtick line does not close a four-backtick fence. Under a
+    # Markdown-modelling scanner the END quoted after it would be inert; this
+    # script does not model Markdown, so the END matches, closes the catalog,
+    # and the fence lines left inside the closed region are what go red.
     mkdir -p "$tmp/case-short-fence/docs/adr"
     cat > "$tmp/case-short-fence/docs/adr/ADR-208-fixture-short-fence.md" <<'FIXTURE'
 # ADR-208: Fixture Short Fence
@@ -640,7 +650,7 @@ FIXTURE
         echo "self-test FAILED: catalog opened but never closed was accepted, and a row past the intended boundary counted as coverage"
         cat "$tmp/unclosed.log"
         status=1
-    elif ! grep -qE 'expected exactly one "<!-- END GENERATED ADR CATALOG -->" marker|unexpected line inside the generated catalog' "$tmp/unclosed.log"; then
+    elif ! grep -q 'expected exactly one "<!-- END GENERATED ADR CATALOG -->" marker at the start of a line, found 0' "$tmp/unclosed.log"; then
         echo "self-test FAILED: unclosed-catalog lint failed, but not for the expected reason:"
         cat "$tmp/unclosed.log"
         status=1
@@ -669,27 +679,27 @@ FIXTURE
     fi
 
     if sh "$SCRIPT_DIR/lint-adr-refs.sh" "$tmp/case-fenced-end" > "$tmp/fenced-end.log" 2>&1; then
-        echo "self-test FAILED: an END marker quoted inside a code fence satisfied the end-marker assertion"
+        echo "self-test FAILED: a README with an END quoted inside a code fence was accepted"
         cat "$tmp/fenced-end.log"
         status=1
-    elif ! grep -qE 'expected exactly one "<!-- END GENERATED ADR CATALOG -->" marker|unexpected line inside the generated catalog' "$tmp/fenced-end.log"; then
+    elif ! grep -q 'unexpected line inside the generated catalog' "$tmp/fenced-end.log"; then
         echo "self-test FAILED: fenced-end lint failed, but not for the expected reason:"
         cat "$tmp/fenced-end.log"
         status=1
     else
-        echo "self-test OK: END marker quoted inside a code fence does not close the catalog"
+        echo "self-test OK: an END quoted inside a code fence closes the catalog early onto a region the grammar rejects"
     fi
 
     if sh "$SCRIPT_DIR/lint-adr-refs.sh" "$tmp/case-commented-end" > "$tmp/commented-end.log" 2>&1; then
-        echo "self-test FAILED: an END marker inside a multi-line HTML comment satisfied the end-marker assertion"
+        echo "self-test FAILED: a README with an END quoted inside a multi-line HTML comment was accepted"
         cat "$tmp/commented-end.log"
         status=1
-    elif ! grep -qE 'expected exactly one "<!-- END GENERATED ADR CATALOG -->" marker|unexpected line inside the generated catalog' "$tmp/commented-end.log"; then
+    elif ! grep -q 'unexpected line inside the generated catalog' "$tmp/commented-end.log"; then
         echo "self-test FAILED: commented-end lint failed, but not for the expected reason:"
         cat "$tmp/commented-end.log"
         status=1
     else
-        echo "self-test OK: END marker inside an HTML comment does not close the catalog"
+        echo "self-test OK: an END quoted inside an HTML comment closes the catalog early onto a region the grammar rejects"
     fi
 
     if sh "$SCRIPT_DIR/lint-adr-refs.sh" "$tmp/case-quoted-begin" > "$tmp/quoted-begin.log" 2>&1; then
@@ -701,7 +711,7 @@ FIXTURE
         cat "$tmp/quoted-begin.log"
         status=1
     else
-        echo "self-test OK: BEGIN marker quoted inside an HTML comment does not open the catalog"
+        echo "self-test OK: a BEGIN quoted above the real catalog does not turn a stale row into coverage"
     fi
 
     for case in mixed-fence short-fence chained-comment; do
@@ -711,15 +721,15 @@ FIXTURE
             chained-comment) why="an END quoted inside a comment reopened on the same line that closed the previous one" ;;
         esac
         if sh "$SCRIPT_DIR/lint-adr-refs.sh" "$tmp/case-$case" > "$tmp/$case.log" 2>&1; then
-            echo "self-test FAILED: $why closed the catalog"
+            echo "self-test FAILED: a README where $why was accepted"
             cat "$tmp/$case.log"
             status=1
-        elif ! grep -qE 'expected exactly one "<!-- END GENERATED ADR CATALOG -->" marker|unexpected line inside the generated catalog' "$tmp/$case.log"; then
+        elif ! grep -q 'unexpected line inside the generated catalog' "$tmp/$case.log"; then
             echo "self-test FAILED: $case lint failed, but not for the expected reason:"
             cat "$tmp/$case.log"
             status=1
         else
-            echo "self-test OK: $why does not close the catalog"
+            echo "self-test OK: $why leaves a region the catalog grammar rejects"
         fi
     done
 
@@ -731,9 +741,12 @@ FIXTURE
         echo "self-test OK: trailing whitespace on a marker does not hide it"
     fi
 
-    # Cases 17-22: the catalog grammar rejects every one of these outright, so
-    # each asserts a rejection rather than a particular repair. Their value is
-    # that none of them needs Markdown state to be recognised as inert.
+    # Cases 17-22: each asserts a rejection rather than a particular repair.
+    # These are the arms where a marker genuinely IS inert -- leading
+    # whitespace survives rstrip, so an indented marker never matches at all
+    # (case 17 reports "found 0") -- plus the duplicate and out-of-order
+    # arms, which are marker-count and marker-order rejections. Unlike cases
+    # 11-16, none of these needs the grammar loop to go red.
     for case in indented-end continuation-indent-end tab-end duplicate-begin marker-order list-fence-end; do
         case "$case" in
             indented-end) why="a four-space indented END" ;;
