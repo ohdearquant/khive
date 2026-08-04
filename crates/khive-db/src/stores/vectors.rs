@@ -469,25 +469,32 @@ fn replace_vector_row_dml(
         ));
     }
 
-    // Vector tables use subject_id as their primary key. Replace by that same
-    // identity so a successful write also repairs stale namespace metadata.
+    // Vector tables use subject_id as their primary key. Delete the common
+    // same-identity row directly; its incoming upsert log is sufficient. Only
+    // the metadata-repair path needs to discover and log the old ANN identity.
     // The caller's transaction/savepoint restores the prior row on failure.
     let subject_id = row.subject_id.to_string();
-    log_vector_deletes(
-        conn,
-        table,
-        "subject_id = ?1 AND NOT (namespace = ?2 AND embedding_model = ?3 \
-         AND kind = ?4 AND field = ?5)",
-        &[
+    let delete_same_identity_sql = format!(
+        "DELETE FROM {table} WHERE subject_id = ?1 AND namespace = ?2 \
+         AND embedding_model = ?3 AND kind = ?4 AND field = ?5"
+    );
+    let deleted_same_identity = conn.execute(
+        &delete_same_identity_sql,
+        rusqlite::params![
             &subject_id,
-            &row.namespace,
-            &row.embedding_model,
-            &row.kind,
-            &row.field,
+            row.namespace,
+            row.embedding_model,
+            row.kind,
+            row.field
         ],
     )?;
-    let del_sql = format!("DELETE FROM {table} WHERE subject_id = ?1");
-    conn.execute(&del_sql, rusqlite::params![subject_id])?;
+    if deleted_same_identity == 0 {
+        let logged = log_vector_deletes(conn, table, "subject_id = ?1", &[&subject_id])?;
+        if logged > 0 {
+            let delete_prior_identity_sql = format!("DELETE FROM {table} WHERE subject_id = ?1");
+            conn.execute(&delete_prior_identity_sql, rusqlite::params![&subject_id])?;
+        }
+    }
 
     // Failpoint: fires only in cfg(test) when the guard is active. DELETE has
     // already run; if the caller's rollback (transaction or SAVEPOINT) is
@@ -511,7 +518,7 @@ fn replace_vector_row_dml(
     conn.execute(
         &ins_sql,
         rusqlite::params![
-            row.subject_id.to_string(),
+            &subject_id,
             row.namespace,
             row.kind,
             row.field,
@@ -530,7 +537,7 @@ fn replace_vector_row_dml(
             row.embedding_model,
             row.kind,
             row.field,
-            row.subject_id.to_string()
+            &subject_id
         ],
     )?;
 
@@ -540,20 +547,20 @@ fn replace_vector_row_dml(
 /// Log `'delete'` rows into `ann_write_log` for every vector row in `table`
 /// matching `where_clause` (a predicate over the vec0 table's own columns).
 /// Must run in the same transaction as — and before — the corresponding
-/// `DELETE`, so the logged set is exactly the deleted set.
+/// `DELETE`, so the logged set is exactly the deleted set. Returns the number
+/// of identities logged.
 fn log_vector_deletes(
     conn: &rusqlite::Connection,
     table: &str,
     where_clause: &str,
     params: &[&dyn rusqlite::ToSql],
-) -> Result<(), rusqlite::Error> {
+) -> Result<usize, rusqlite::Error> {
     let sql = format!(
         "INSERT INTO ann_write_log (namespace, embedding_model, kind, field, subject_id, op) \
          SELECT namespace, embedding_model, kind, field, subject_id, 'delete' \
          FROM {table} WHERE {where_clause}"
     );
-    conn.execute(&sql, params)?;
-    Ok(())
+    conn.execute(&sql, params)
 }
 
 /// DML-only multi-chunk subject deletion shared by both the legacy
@@ -2790,11 +2797,13 @@ mod delete_subjects_atomic_tests {
 
 #[cfg(all(test, feature = "vectors"))]
 mod atomic_replace_tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
     use khive_storage::types::VectorRecord;
     use khive_storage::VectorStore;
     use khive_types::SubstrateKind;
+    use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
     use uuid::Uuid;
 
     use super::*;
@@ -3334,6 +3343,26 @@ mod atomic_replace_tests {
             .expect("initial insert");
         clear_ann_write_log(&pool);
 
+        let prepared_log_inserts = Arc::new(AtomicUsize::new(0));
+        {
+            let prepared_log_inserts = Arc::clone(&prepared_log_inserts);
+            pool.try_writer()
+                .expect("pool writer")
+                .conn()
+                .authorizer(Some(move |context: AuthContext<'_>| {
+                    if matches!(
+                        context.action,
+                        AuthAction::Insert {
+                            table_name: "ann_write_log"
+                        }
+                    ) {
+                        prepared_log_inserts.fetch_add(1, Ordering::SeqCst);
+                    }
+                    Authorization::Allow
+                }))
+                .expect("install statement authorizer");
+        }
+
         store
             .update(
                 id,
@@ -3350,6 +3379,16 @@ mod atomic_replace_tests {
             vec![ann_write_log_row(ns, model_key, "upsert")],
             "same-identity replacement must not emit delete/upsert churn"
         );
+        assert_eq!(
+            prepared_log_inserts.load(Ordering::SeqCst),
+            1,
+            "the common replacement path must prepare only the required upsert log statement"
+        );
+        pool.try_writer()
+            .expect("pool writer")
+            .conn()
+            .authorizer(None::<fn(AuthContext<'_>) -> Authorization>)
+            .expect("remove statement authorizer");
     }
 
     // True ROLLBACK TO SAVEPOINT sentinels (failpoint-driven) — see
