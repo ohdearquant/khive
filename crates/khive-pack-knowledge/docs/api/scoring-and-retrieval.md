@@ -44,6 +44,10 @@ where $\alpha$ = `rerank_alpha` (default 0.7, TF-IDF dominant) and $\hat{s}_{\te
 is the TF-IDF score normalized to $[0, 1]$ by dividing by the maximum TF-IDF score in the
 candidate set.
 
+Knowledge retrieval uses the default embedder for both query and atom vectors. Accordingly,
+`knowledge.index` writes only default-model atom vectors; additional registered models are not
+indexed until a knowledge read path can select or fuse them.
+
 ### Vamana ANN Signal
 
 In parallel with TF-IDF, if a Vamana ANN index is warm (populated via `knowledge.index
