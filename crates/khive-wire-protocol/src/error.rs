@@ -134,3 +134,30 @@ impl std::fmt::Display for WireErrorCode {
         f.write_str(self.as_str())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unrecognized_code_falls_back_to_internal() {
+        // ADR-137: a code this client does not recognize must decode as
+        // `internal` — request-terminal — rather than failing to decode.
+        let code: WireErrorCode = serde_json::from_str(r#""bogus""#).unwrap();
+        assert_eq!(code, WireErrorCode::Internal);
+        assert_eq!(code.terminal_scope(), TerminalScope::Request);
+    }
+
+    #[test]
+    fn unrecognized_code_inside_an_error_frame_falls_back_to_internal() {
+        let payload = br#"{"kind":"error","code":"bogus","message":"future code"}"#;
+        let frame = crate::codec::decode_payload(payload).unwrap();
+        match frame {
+            crate::frame::Frame::Error { id, code, .. } => {
+                assert_eq!(code, WireErrorCode::Internal);
+                assert!(id.is_none());
+            }
+            other => panic!("expected an error frame, got {other:?}"),
+        }
+    }
+}

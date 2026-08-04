@@ -98,6 +98,25 @@ fn error() {
 }
 
 #[test]
+fn connection_terminal_error_carries_no_id() {
+    // A connection-terminal error (e.g. a rejected handshake) omits `id`
+    // entirely; it must round-trip byte-exactly without the field.
+    let frame = Frame::Error {
+        id: None,
+        code: WireErrorCode::UnsupportedVersion,
+        message: "unsupported protocol version 9999; server supports [1, 1]".to_string(),
+    };
+    let wire = encode_frame(&frame).unwrap();
+    let payload = br#"{"kind":"error","code":"unsupported_version","message":"unsupported protocol version 9999; server supports [1, 1]"}"#;
+    assert_eq!(&wire[4..], payload.as_slice());
+    assert_eq!(decode_frame(&wire, wire.len()).unwrap(), frame);
+
+    // Decoding a raw payload that lacks the `id` field yields `id: None`.
+    let decoded = khive_wire_protocol::codec::decode_payload(payload).unwrap();
+    assert_eq!(decoded, frame);
+}
+
+#[test]
 fn cancel() {
     assert_golden(
         "cancel",
@@ -221,5 +240,102 @@ fn malformed_missing_required_field() {
             assert!(detail.contains("topic"), "detail was: {detail}");
         }
         other => panic!("expected InvalidFields, got {other:?}"),
+    }
+}
+
+#[test]
+fn trailing_bytes_beyond_the_first_frame_are_ignored() {
+    // The documented contract: `decode_frame` consumes exactly one frame
+    // and ignores any bytes beyond it; slicing a stream into frames is the
+    // transport's job.
+    let first = fixture("cancel");
+    let second = fixture("handshake");
+    let mut buf = first.clone();
+    buf.extend_from_slice(&second);
+    let decoded = decode_frame(&buf, khive_wire_protocol::DEFAULT_MAX_FRAME_BYTES).unwrap();
+    assert_eq!(
+        decoded,
+        Frame::Cancel {
+            id: OperationId::from("op-1"),
+        }
+    );
+}
+
+#[test]
+fn frame_kinds_matches_the_frame_enum() {
+    // `FRAME_KINDS` must cover every `Frame` variant exactly; otherwise the
+    // codec's closed-set check would reject (or admit) the wrong kinds.
+    let variants = [
+        Frame::Handshake {
+            version: ProtocolVersion::new(1),
+        },
+        Frame::HandshakeAck {
+            version: ProtocolVersion::new(1),
+        },
+        Frame::Request {
+            id: OperationId::from("op-1"),
+            ops: "stats()".to_string(),
+            deadline_ms: None,
+            namespace: None,
+            actor_id: None,
+            visible_namespaces: None,
+        },
+        Frame::Response {
+            id: OperationId::from("op-1"),
+            result: serde_json::json!({}),
+        },
+        Frame::Error {
+            id: None,
+            code: WireErrorCode::Internal,
+            message: String::new(),
+        },
+        Frame::Cancel {
+            id: OperationId::from("op-1"),
+        },
+        Frame::Subscribe {
+            id: OperationId::from("op-1"),
+            topic: "domain.event".to_string(),
+            resume_cursor: None,
+        },
+        Frame::SubscribeAck {
+            id: OperationId::from("op-1"),
+            topic: "domain.event".to_string(),
+            start_cursor: 0,
+        },
+        Frame::Unsubscribe {
+            id: OperationId::from("op-1"),
+            topic: "domain.event".to_string(),
+        },
+        Frame::UnsubscribeAck {
+            id: OperationId::from("op-1"),
+            topic: "domain.event".to_string(),
+        },
+        Frame::Event {
+            topic: "domain.event".to_string(),
+            cursor: 0,
+            occurred_at: "2026-08-04T11:00:00Z".to_string(),
+            payload: serde_json::json!({}),
+        },
+    ];
+    assert_eq!(
+        variants.len(),
+        khive_wire_protocol::FRAME_KINDS.len(),
+        "FRAME_KINDS and the Frame enum have drifted"
+    );
+    for variant in &variants {
+        let kind = variant.kind();
+        assert!(
+            khive_wire_protocol::FRAME_KINDS.contains(&kind),
+            "FRAME_KINDS is missing {kind:?}"
+        );
+        // Each kind must actually decode through the closed-set check.
+        let wire = encode_frame(variant).unwrap();
+        decode_frame(&wire, khive_wire_protocol::DEFAULT_MAX_FRAME_BYTES).unwrap();
+    }
+    for &kind in khive_wire_protocol::FRAME_KINDS {
+        assert!(
+            variants.iter().any(|v| v.kind() == kind),
+            "FRAME_KINDS entry {kind:?} has no Frame variant"
+        );
     }
 }

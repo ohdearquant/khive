@@ -133,6 +133,16 @@ pub fn encode_frame_with_max(frame: &Frame, max_frame_bytes: usize) -> Result<Ve
             max: max_frame_bytes,
         });
     }
+    // The 4-byte length prefix is a `u32`; without this guard a caller who
+    // configured `max_frame_bytes > u32::MAX` could admit a payload whose
+    // length would silently truncate in the cast below, writing a prefix
+    // that does not match the payload.
+    if payload.len() > u32::MAX as usize {
+        return Err(CodecError::FrameTooLarge {
+            declared: payload.len(),
+            max: u32::MAX as usize,
+        });
+    }
     let mut buf = Vec::with_capacity(LENGTH_PREFIX_BYTES + payload.len());
     buf.extend_from_slice(&(payload.len() as u32).to_be_bytes());
     buf.extend_from_slice(&payload);
@@ -255,6 +265,15 @@ mod tests {
     }
 
     #[test]
+    fn rejects_zero_length_payload() {
+        let codec = FrameCodec::default();
+        match codec.decode(&0u32.to_be_bytes()).unwrap_err() {
+            CodecError::InvalidJson(_) => {}
+            other => panic!("expected InvalidJson, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn rejects_missing_required_field() {
         let payload = br#"{"kind":"cancel"}"#;
         match decode_payload(payload).unwrap_err() {
@@ -303,5 +322,20 @@ mod configured_max_tests {
     fn free_function_encode_still_uses_the_default_maximum() {
         let wire = encode_frame(&oversized_frame()).expect("well under 8 MiB");
         assert!(wire.len() > 4096);
+    }
+
+    #[test]
+    fn encode_never_exceeds_the_u32_prefix_capacity() {
+        // A codec may be configured above `u32::MAX`; the length prefix can
+        // still only name `u32::MAX` payload bytes, so encode must reject a
+        // payload beyond that rather than write a truncated prefix. The
+        // pre-size guard is what makes this testable without serializing a
+        // 4 GiB payload.
+        assert!(encode_frame_with_max(&oversized_frame(), usize::MAX).is_ok());
+        let err = encode_frame_with_max(&oversized_frame(), 16).unwrap_err();
+        match err {
+            CodecError::FrameTooLarge { max, .. } => assert_eq!(max, 16),
+            other => panic!("expected FrameTooLarge, got {other:?}"),
+        }
     }
 }

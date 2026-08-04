@@ -105,11 +105,10 @@ impl HandshakeGate {
     ///   (`Err(`[`HandshakeSequenceError`]`)`) — the caller must never have
     ///   dispatched it to `request`/`subscribe`/etc. handling; this call is
     ///   what makes that guarantee enforceable rather than conventional.
-    /// - After completion, every frame (including a stray second
-    ///   `handshake`) is a sequence violation except frames the caller
-    ///   routes elsewhere; a second `Handshake` frame specifically is
-    ///   rejected here too, since the ADR fixes the handshake to "the first
-    ///   application frame".
+    /// - After completion, ordinary frames are admitted
+    ///   ([`HandshakeOutcome::Admitted`]); only a stray second `handshake`
+    ///   is a sequence violation, since the ADR fixes the handshake to "the
+    ///   first application frame".
     pub fn admit(&mut self, frame: &Frame) -> Result<HandshakeOutcome, HandshakeSequenceError> {
         match (&self.state, frame) {
             (State::AwaitingHandshake, Frame::Handshake { version }) => {
