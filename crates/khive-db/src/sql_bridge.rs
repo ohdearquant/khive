@@ -540,7 +540,21 @@ impl khive_storage::SqlWriter for SqliteWriter {
                 Ok(total)
             })();
             if result.is_err() {
-                let _ = handle.conn.execute_batch("ROLLBACK");
+                if let Err(error) = &result {
+                    if let Err(rollback_error) = handle.conn.execute_batch("ROLLBACK") {
+                        // A failed ROLLBACK means the connection the handle is
+                        // about to reuse may be left in an unknown transaction
+                        // state. The caller still sees the ORIGINAL statement
+                        // error (never masked by the rollback failure), but the
+                        // unknown state must at least be observable.
+                        tracing::warn!(
+                            %error,
+                            %rollback_error,
+                            "execute_batch: ROLLBACK after statement failure failed; \
+                             the standalone connection may be in an unknown transaction state"
+                        );
+                    }
+                }
             }
             // `_tx_handle` drops here, after ROLLBACK (or COMMIT) has already run.
             (handle, result)
@@ -1801,6 +1815,168 @@ mod tests {
         );
         let writer_after_completion = bridge.writer().await.unwrap();
         drop(writer_after_completion);
+    }
+
+    /// Cancelling an in-flight call permanently invalidates the boxed handle:
+    /// the call took the handle's connection into the detached blocking task,
+    /// so every subsequent call on the SAME handle fails loudly with
+    /// "connection already consumed" instead of silently operating on a
+    /// connection that may still be running the cancelled statement.
+    /// Callers that cancel or time out a bridge call must drop the handle and
+    /// acquire a fresh one.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_call_invalidates_handle_reuse_fails_loud() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = PoolConfig {
+            path: Some(dir.path().join("sql_bridge_cancelled_reuse.db")),
+            checkout_timeout: std::time::Duration::from_millis(250),
+            ..PoolConfig::default()
+        };
+        let pool = Arc::new(ConnectionPool::new(config).unwrap());
+
+        let handle_slot = acquire_handle_slot(
+            pool.sql_bridge_writer_slots(),
+            pool.config().checkout_timeout,
+            "sql_bridge.writer_handle",
+        )
+        .await
+        .unwrap();
+        let conn = open_standalone_writer(&pool).unwrap();
+        let (entered, release, completed) = blocking_progress_gate(&conn);
+        let writer = Arc::new(tokio::sync::Mutex::new(SqliteWriter {
+            handle: Some(StandaloneHandle {
+                conn,
+                _slot: handle_slot,
+            }),
+            writer_task: None,
+            origin: pool.origin(),
+        }));
+        let writer_clone = Arc::clone(&writer);
+        let query = tokio::spawn(async move {
+            khive_storage::SqlWriter::execute_batch(
+                &mut *writer_clone.lock().await,
+                vec![progress_gate_statement()],
+            )
+            .await
+        });
+
+        entered.notified().await;
+        query.abort();
+        let cancelled = matches!(query.await, Err(error) if error.is_cancelled());
+
+        let reuse = khive_storage::SqlWriter::execute(
+            &mut *writer.lock().await,
+            SqlStatement {
+                sql: "CREATE TABLE cancelled_reuse_probe (id INTEGER PRIMARY KEY)".into(),
+                params: vec![],
+                label: None,
+            },
+        )
+        .await;
+        let message = match reuse {
+            Err(StorageError::Pool { message, .. }) => message,
+            other => panic!(
+                "reusing a cancelled writer handle must fail loudly with \
+                 'connection already consumed'; got {other:?}"
+            ),
+        };
+        assert!(
+            message.contains("connection already consumed"),
+            "expected the cancelled handle's reuse error to name the pinned \
+             failure; got {message:?}"
+        );
+
+        tokio::task::spawn_blocking(move || release.wait())
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), completed.notified())
+            .await
+            .expect("cancelled writer's detached SQLite call did not finish");
+        assert!(cancelled, "writer batch task did not report cancellation");
+    }
+
+    /// The manual `atomic_unit` path (write queue off) shares the pool's
+    /// one-permit writer-handle budget with `writer()`: while a boxed writer
+    /// handle is live, `atomic_unit` times out; after the handle drops, the
+    /// next `atomic_unit` succeeds on the same pool.
+    #[tokio::test]
+    async fn manual_atomic_unit_shares_writer_permit_budget_with_writer_handle() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = PoolConfig {
+            path: Some(dir.path().join("sql_bridge_atomic_unit_budget.db")),
+            checkout_timeout: std::time::Duration::from_millis(50),
+            write_queue_enabled: false,
+            ..PoolConfig::default()
+        };
+        let pool = Arc::new(ConnectionPool::new(config).unwrap());
+        let bridge = SqlBridge::new(Arc::clone(&pool), true);
+        {
+            let guard = pool.writer().unwrap();
+            guard
+                .conn()
+                .execute_batch(
+                    "CREATE TABLE IF NOT EXISTS atomic_unit_budget_test \
+                     (id INTEGER PRIMARY KEY, val INTEGER NOT NULL)",
+                )
+                .unwrap();
+        }
+
+        fn insert_op(id: i64) -> AtomicUnitOp {
+            Box::new(move |writer| {
+                Box::pin(async move {
+                    writer
+                        .execute(SqlStatement {
+                            sql: "INSERT INTO atomic_unit_budget_test (id, val) VALUES (?1, ?2)"
+                                .into(),
+                            params: vec![SqlValue::Integer(id), SqlValue::Integer(id)],
+                            label: None,
+                        })
+                        .await
+                        .map_err(|e| {
+                            khive_storage::StorageError::driver(
+                                StorageCapability::Sql,
+                                "atomic_unit_budget_test_insert",
+                                e,
+                            )
+                        })?;
+                    Ok(Box::new(()) as Box<dyn std::any::Any + Send>)
+                })
+            })
+        }
+
+        let writer_handle = bridge.writer().await.unwrap();
+        let blocked = bridge.atomic_unit(insert_op(1)).await;
+        assert!(
+            matches!(
+                &blocked,
+                Err(StorageError::Timeout { operation })
+                    if operation.as_ref() == "sql_bridge.atomic_unit_handle"
+            ),
+            "atomic_unit must time out on the shared writer permit while a \
+             writer handle is live; got {blocked:?}"
+        );
+
+        drop(writer_handle);
+        let unblocked = bridge.atomic_unit(insert_op(2)).await;
+        assert!(
+            unblocked.is_ok(),
+            "atomic_unit must succeed once the writer handle releases the \
+             shared writer permit; got {unblocked:?}"
+        );
+
+        let mut reader = bridge.reader().await.unwrap();
+        let count = reader
+            .query_scalar(SqlStatement {
+                sql: "SELECT COUNT(*) FROM atomic_unit_budget_test".into(),
+                params: vec![],
+                label: None,
+            })
+            .await
+            .unwrap();
+        assert!(
+            matches!(count, Some(SqlValue::Integer(1))),
+            "only the post-drop atomic_unit call may have committed; got {count:?}"
+        );
     }
 
     /// ADR-067 Component A entry 10: with `KHIVE_WRITE_QUEUE=1`,

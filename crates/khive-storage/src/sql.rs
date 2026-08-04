@@ -33,6 +33,9 @@ pub type AtomicUnitOp = Box<
 pub trait SqlReader: Send + 'static {
     /// Execute `statement` and return the first row, or `None` if the result set is empty.
     /// Implementations must not convert later matching rows into owned values.
+    /// Implementations may stop stepping the statement early, so statements with
+    /// side effects (e.g. DML with `RETURNING`) must not be issued through this
+    /// method; use [`SqlWriter::execute`] or [`SqlWriter::execute_batch`] for writes.
     async fn query_row(&mut self, statement: SqlStatement) -> StorageResult<Option<SqlRow>>;
     /// Execute `statement` and return all rows.
     ///
@@ -52,6 +55,10 @@ pub trait SqlReader: Send + 'static {
     /// unconstrained SQL must not rely on the default to keep memory
     /// proportional to `page.limit` — that bound holds only on backends that
     /// override this method.
+    ///
+    /// Implementations may stop stepping the statement early, so statements with
+    /// side effects (e.g. DML with `RETURNING`) must not be issued through this
+    /// method; use [`SqlWriter::execute`] or [`SqlWriter::execute_batch`] for writes.
     async fn query_page(
         &mut self,
         statement: SqlStatement,
