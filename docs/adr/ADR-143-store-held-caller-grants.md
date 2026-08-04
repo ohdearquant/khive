@@ -249,7 +249,11 @@ outside-gate constructor.
   live-intersection rule, but this record's standard is that only one
   implementation is admissible, so the parent-only rule is stated rather than
   left to inference. Acceptance 3 gains an arm: a non-parent principal holding
-  the target right cannot mint to another principal's leg.
+  everything §2 requires of a grantor — the ordinary capability AND
+  `GrantAdmin` — still cannot mint to another principal's leg, paired with a
+  positive control that the parent can. Both prerequisites are named because a
+  negative principal missing either one is already denied by the admin-only
+  rule, and such an arm would pass with this rule unimplemented.
 - **Attribution.** Audit records for a subactor carry the full structural
   identity. The parent is recoverable from every record its legs produce.
 
@@ -420,9 +424,15 @@ All conditions are executed tests, not review assertions:
    a revoke whose derived target pair set includes one pair the revoker lacks
    `GrantAdmin` for is denied whole, with the pair set enumerated from the
    pre-revocation records rather than the request text. **Parent-only-grantee
-   arm:** a non-parent principal that itself holds `GrantAdmin` on a pair is
-   still denied minting a grant whose grantee is another principal's `(P, leg)`
-   subactor; only `P` may mint to `P`'s legs.
+   arm:** a non-parent principal `Q` holding everything §2 requires of a
+   grantor — a live ordinary capability AND `GrantAdmin`, on every requested
+   pair — is still denied minting a grant whose grantee is another principal's
+   `(P, leg)` subactor. `Q` must be denied for the parent mismatch itself: an
+   arm whose negative principal lacks either prerequisite is satisfied by the
+   admin-only denial above and passes whether or not the parent-only rule is
+   implemented. Paired positive control: `P`, holding those same two
+   prerequisites, does mint to `(P, leg)`, so an implementation that refuses
+   every subactor grantee fails this arm rather than passing it.
 4. **Subactor bounds.** A leg serves only where its parent currently serves;
    revoking the parent denies the leg at the next consultation with no
    restart; a leg label violating the grammar is refused at intake; a
