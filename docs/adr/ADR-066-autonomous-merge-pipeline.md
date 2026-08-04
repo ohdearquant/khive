@@ -4,7 +4,7 @@
 **Date**: 2026-06-23 (revised; original 2026-06-22)
 **Supersedes**: ADR-066 draft dated 2026-06-22 (two-lane model with CODEOWNERS hold)
 **Relates to**: CI workflow (`.github/workflows/ci.yml`, `.github/workflows/release.yml`),
-`scripts/apply-autonomous-merge.sh`, repository ruleset 17362266
+repository ruleset 17362266
 
 ---
 
@@ -49,10 +49,13 @@ A non-automatable floor (section 4) is never delegated to automation.
 
 ### 1. Required gate wall (required status checks)
 
-Branch protection on `main` (ruleset 17362266) requires all of the following status contexts.
-Context strings are matched by exact name; the canonical list lives in
-`scripts/apply-autonomous-merge.sh`, which is the source of truth for the exact strings and
-must be kept in sync with this ADR.
+Branch protection on `main` (ruleset 17362266) is what makes the gates below blocking. Context
+strings are matched by exact name, and the ruleset itself is the source of truth for them: read
+it with `gh api repos/<owner>/<repo>/rulesets/17362266`. The ruleset requires two contexts,
+`Secret scan (gitleaks)` and `CI gate`. `CI gate` is an aggregate job defined in
+`.github/workflows/ci.yml`; it runs `if: always()` over a `needs` list covering the other jobs,
+so it is skip-aware and a skipped dependency cannot silently satisfy protection. The individual
+gates named below are those dependencies rather than separately required contexts.
 
 Each gate in the wall replaces a category of defect that a human reviewer would otherwise be
 responsible for catching.
@@ -106,9 +109,10 @@ actually bumps and the check is green-able: the release gate (section 3).
   where they run. The `ann-ci-gate` job re-runs post-merge on every push to `main` as defense
   in depth.
 
-The full, authoritative context list and the exact strings used in the ruleset are maintained in
-`scripts/apply-autonomous-merge.sh`. When a new gate is introduced and its context name is
-established, that script is updated first, and this ADR's prose is updated to match.
+The authoritative list is the ruleset itself for the required context strings, and the `needs`
+list of the `CI gate` job in `.github/workflows/ci.yml` for the gates behind the aggregate. When
+a new gate is introduced it is added to that `needs` list, and this ADR's prose is updated to
+match; the required context set changes only if the new gate is also to be required directly.
 
 ### 2. Auto-merge mechanics
 
