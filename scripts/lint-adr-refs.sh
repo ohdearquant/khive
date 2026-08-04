@@ -463,8 +463,10 @@ FIXTURE
     # kept verbatim as it was originally reported). Recorded because it is the
     # reported defect, NOT because it isolates one mechanism: it is rejected
     # twice over, by the indented END failing the marker comparison AND by the
-    # fence line being an unexpected line inside the catalog region. Case 18
-    # is the arm that isolates the marker comparison.
+    # coverage rule, since a catalog that never closes leaves its ADR uncovered.
+    # It is NOT rejected by the catalog grammar: with no END marker there is no
+    # bounded region, so that loop never runs for this fixture. Case 18 is the
+    # arm that isolates the marker comparison.
     mkdir -p "$tmp/case-list-fence-end/docs/adr"
     cat > "$tmp/case-list-fence-end/docs/adr/ADR-215-fixture-list-fence.md" <<'FIXTURE'
 # ADR-215: Fixture List Fence
@@ -747,21 +749,27 @@ FIXTURE
     # (case 17 reports "found 0") -- plus the duplicate and out-of-order
     # arms, which are marker-count and marker-order rejections. Unlike cases
     # 11-16, none of these needs the grammar loop to go red.
+    # Every fixture here emits TWO messages: its marker error, and a coverage
+    # error, because a catalog that fails to delimit leaves its ADR uncovered.
+    # A shared assertion that accepted either one would let the whole marker
+    # mechanism break while all six arms stayed green on the coverage message.
+    # So each arm pins the marker message it was measured to produce.
     for case in indented-end continuation-indent-end tab-end duplicate-begin marker-order list-fence-end; do
+        end_missing='expected exactly one "<!-- END GENERATED ADR CATALOG -->" marker at the start of a line, found 0'
         case "$case" in
-            indented-end) why="a four-space indented END" ;;
-            continuation-indent-end) why="a two-space indented END" ;;
-            list-fence-end) why="an END inside a fence in a list item" ;;
-            tab-end) why="a tab-indented END" ;;
-            duplicate-begin) why="a second BEGIN marker" ;;
-            marker-order) why="an END marker above the BEGIN" ;;
+            indented-end) why="a four-space indented END"; expect="$end_missing" ;;
+            continuation-indent-end) why="a two-space indented END"; expect="$end_missing" ;;
+            list-fence-end) why="an END inside a fence in a list item"; expect="$end_missing" ;;
+            tab-end) why="a tab-indented END"; expect="$end_missing" ;;
+            duplicate-begin) why="a second BEGIN marker"; expect='expected exactly one "<!-- BEGIN GENERATED ADR CATALOG -->" marker at the start of a line, found 2' ;;
+            marker-order) why="an END marker above the BEGIN"; expect='"<!-- END GENERATED ADR CATALOG -->" appears before "<!-- BEGIN GENERATED ADR CATALOG -->"' ;;
         esac
         if sh "$SCRIPT_DIR/lint-adr-refs.sh" "$tmp/case-$case" > "$tmp/$case.log" 2>&1; then
             echo "self-test FAILED: $why was accepted"
             cat "$tmp/$case.log"
             status=1
-        elif ! grep -qE 'expected exactly one|appears before|unexpected line inside the generated catalog|has no index catalog row' "$tmp/$case.log"; then
-            echo "self-test FAILED: $case lint failed, but not for the expected reason:"
+        elif ! grep -qF "$expect" "$tmp/$case.log"; then
+            echo "self-test FAILED: $case was rejected, but not by the marker rule this arm names:"
             cat "$tmp/$case.log"
             status=1
         else
