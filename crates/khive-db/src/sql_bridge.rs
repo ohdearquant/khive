@@ -518,7 +518,7 @@ impl khive_storage::SqlWriter for SqliteWriter {
         let origin = self.origin.clone();
         let (handle, result) = tokio::task::spawn_blocking(move || {
             if let Err(e) = handle.conn.execute_batch("BEGIN IMMEDIATE") {
-                return (handle, Err(e));
+                return (Some(handle), Err(e));
             }
             // Registered only after BEGIN succeeds, so an unopened transaction is
             // never counted. The handle is declared here — enclosing both the
@@ -539,29 +539,34 @@ impl khive_storage::SqlWriter for SqliteWriter {
                 handle.conn.execute_batch("COMMIT")?;
                 Ok(total)
             })();
-            if result.is_err() {
-                if let Err(error) = &result {
-                    if let Err(rollback_error) = handle.conn.execute_batch("ROLLBACK") {
-                        // A failed ROLLBACK means the connection the handle is
-                        // about to reuse may be left in an unknown transaction
-                        // state. The caller still sees the ORIGINAL statement
-                        // error (never masked by the rollback failure), but the
-                        // unknown state must at least be observable.
-                        tracing::warn!(
-                            %error,
-                            %rollback_error,
-                            "execute_batch: ROLLBACK after statement failure failed; \
-                             the standalone connection may be in an unknown transaction state"
-                        );
-                    }
+            let retained = if let Err(error) = &result {
+                if let Err(rollback_error) = handle.conn.execute_batch("ROLLBACK") {
+                    // A failed ROLLBACK leaves the connection in an unknown
+                    // transaction state, so it must never be reused: the handle
+                    // is poisoned (dropped instead of restored) and every
+                    // subsequent call on this bridge fails with "connection
+                    // already consumed". The caller still sees the ORIGINAL
+                    // statement error (never masked by the rollback failure).
+                    tracing::warn!(
+                        %error,
+                        %rollback_error,
+                        "execute_batch: ROLLBACK after statement failure failed; \
+                         poisoning the standalone connection — the handle is \
+                         dropped and must be re-acquired"
+                    );
+                    None
+                } else {
+                    Some(handle)
                 }
-            }
+            } else {
+                Some(handle)
+            };
             // `_tx_handle` drops here, after ROLLBACK (or COMMIT) has already run.
-            (handle, result)
+            (retained, result)
         })
         .await
         .map_err(|e| StorageError::driver(StorageCapability::Sql, "execute_batch", e))?;
-        self.handle = Some(handle);
+        self.handle = handle;
         result.map_err(|e| map_rusqlite_err(e, "execute_batch"))
     }
 
@@ -1893,6 +1898,90 @@ mod tests {
             .await
             .expect("cancelled writer's detached SQLite call did not finish");
         assert!(cancelled, "writer batch task did not report cancellation");
+    }
+
+    /// A failed ROLLBACK after a statement failure poisons the handle: the
+    /// connection may be in an unknown transaction state, so it is dropped
+    /// instead of restored, and every subsequent call on the same handle
+    /// fails loudly with "connection already consumed". The caller still
+    /// sees the ORIGINAL statement error, never the rollback failure.
+    ///
+    /// Forcing the arm: the first statement is a bare `COMMIT`, which ends
+    /// the batch's own `BEGIN IMMEDIATE` transaction; the second statement
+    /// fails at prepare, so the error path's `ROLLBACK` runs with no active
+    /// transaction and itself fails.
+    #[tokio::test]
+    async fn failed_rollback_poisons_handle_reuse_fails_loud() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = PoolConfig {
+            path: Some(dir.path().join("sql_bridge_rollback_poison.db")),
+            checkout_timeout: std::time::Duration::from_millis(250),
+            ..PoolConfig::default()
+        };
+        let pool = Arc::new(ConnectionPool::new(config).unwrap());
+
+        let handle_slot = acquire_handle_slot(
+            pool.sql_bridge_writer_slots(),
+            pool.config().checkout_timeout,
+            "sql_bridge.writer_handle",
+        )
+        .await
+        .unwrap();
+        let conn = open_standalone_writer(&pool).unwrap();
+        let mut writer = SqliteWriter {
+            handle: Some(StandaloneHandle {
+                conn,
+                _slot: handle_slot,
+            }),
+            writer_task: None,
+            origin: pool.origin(),
+        };
+
+        let batch = khive_storage::SqlWriter::execute_batch(
+            &mut writer,
+            vec![
+                SqlStatement {
+                    sql: "COMMIT".into(),
+                    params: vec![],
+                    label: None,
+                },
+                SqlStatement {
+                    sql: "SELECT FROM WHERE".into(),
+                    params: vec![],
+                    label: None,
+                },
+            ],
+        )
+        .await;
+        let batch_error = batch.expect_err("invalid second statement must fail the batch");
+        let batch_message = batch_error.to_string();
+        assert!(
+            !batch_message.contains("cannot rollback"),
+            "the caller must see the original statement error, not the \
+             rollback failure; got {batch_message:?}"
+        );
+
+        let reuse = khive_storage::SqlWriter::execute(
+            &mut writer,
+            SqlStatement {
+                sql: "CREATE TABLE rollback_poison_probe (id INTEGER PRIMARY KEY)".into(),
+                params: vec![],
+                label: None,
+            },
+        )
+        .await;
+        let message = match reuse {
+            Err(StorageError::Pool { message, .. }) => message,
+            other => panic!(
+                "reusing a poisoned writer handle must fail loudly with \
+                 'connection already consumed'; got {other:?}"
+            ),
+        };
+        assert!(
+            message.contains("connection already consumed"),
+            "expected the poisoned handle's reuse error to name the pinned \
+             failure; got {message:?}"
+        );
     }
 
     /// The manual `atomic_unit` path (write queue off) shares the pool's
