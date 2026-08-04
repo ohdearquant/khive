@@ -252,8 +252,10 @@ outside-gate constructor.
   everything §2 requires of a grantor — the ordinary capability AND
   `GrantAdmin` — still cannot mint to another principal's leg, paired with a
   positive control that the parent can. Both prerequisites are named because a
-  negative principal missing either one is already denied by the admin-only
-  rule, and such an arm would pass with this rule unimplemented.
+  negative principal missing either one is already denied by an existing
+  attenuation check — the admin-only rule when it lacks the ordinary
+  capability, the lack-`GrantAdmin` rule when it lacks `GrantAdmin` — so such
+  an arm would pass with this rule unimplemented.
 - **Attribution.** Audit records for a subactor carry the full structural
   identity. The parent is recoverable from every record its legs produce.
 
@@ -428,9 +430,11 @@ All conditions are executed tests, not review assertions:
    grantor — a live ordinary capability AND `GrantAdmin`, on every requested
    pair — is still denied minting a grant whose grantee is another principal's
    `(P, leg)` subactor. `Q` must be denied for the parent mismatch itself: an
-   arm whose negative principal lacks either prerequisite is satisfied by the
-   admin-only denial above and passes whether or not the parent-only rule is
-   implemented. Paired positive control: `P`, holding those same two
+   arm whose negative principal lacks the ordinary capability is satisfied by
+   the admin-only denial above, and one lacking `GrantAdmin` by the
+   lack-`GrantAdmin` denial at the head of this condition; either way the arm
+   passes whether or not the parent-only rule is implemented. Paired positive
+   control: `P`, holding those same two
    prerequisites, does mint to `(P, leg)`, so an implementation that refuses
    every subactor grantee fails this arm rather than passing it.
 4. **Subactor bounds.** A leg serves only where its parent currently serves;
