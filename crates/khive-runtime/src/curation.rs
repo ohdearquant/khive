@@ -2790,11 +2790,19 @@ pub(crate) fn merge_string_field(
 /// Naming one of these in a caller-supplied `properties` patch is refused by
 /// `update` on a pack-owned kind (see [`owner_established_property_named_in`]).
 ///
+/// `to_actor` belongs here alongside `from_actor`: comm establishes it at
+/// send time from the `to=` param, and `comm.read` trusts a present string
+/// value to decide whether the caller is the addressee, failing open only
+/// when the key is absent or non-string. A caller must not be able to
+/// retarget a delivered message's addressee via a patch that names no other
+/// currently-protected key.
+///
 /// Membership here governs writes to an EXISTING record only. Introducing one
 /// of these keys at create time is a separate question and is not addressed
 /// by this constant.
 pub(crate) const OWNER_ESTABLISHED_PROPERTIES: &[&str] = &[
     "from_actor",
+    "to_actor",
     "direction",
     "sent_at",
     "outbound_ref",

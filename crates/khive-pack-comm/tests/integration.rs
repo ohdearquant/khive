@@ -9637,6 +9637,15 @@ fn build_registry_with_owned_kinds() -> (VerbRegistry, KhiveRuntime) {
 /// `from_actor` on a `message` note. This is the central regression test —
 /// send a message, forge via update, assert the forgery is refused and the
 /// stored value is unchanged.
+///
+/// Table-driven over every key in `OWNER_ESTABLISHED_PROPERTIES`
+/// (khive-runtime's `curation.rs`, kept in sync by hand here since the
+/// const is crate-private and this is a different crate) so a future key
+/// added there without a matching arm here is caught by a length mismatch
+/// rather than silently under-covered. For each key, a complete snapshot of
+/// the note's stored `properties` is compared before and after the refused
+/// attempt — not just a handful of named fields — so a forgery that lands
+/// on any untested field is still caught.
 #[tokio::test]
 async fn update_refuses_to_forge_owner_established_properties_on_message_note() {
     let (registry, _rt) = build_registry_with_owned_kinds();
@@ -9654,18 +9663,23 @@ async fn update_refuses_to_forge_owner_established_properties_on_message_note() 
         .expect("send must return full_id")
         .to_string();
 
-    let before = registry
-        .dispatch("get", serde_json::json!({"id": full_id}))
-        .await
-        .expect("get must succeed");
-    let original_from_actor = before["properties"]["from_actor"].clone();
-
     for (key, forged_value) in [
         ("from_actor", "lambda:leo"),
+        ("to_actor", "lambda:leo"),
         ("direction", "inbound"),
         ("sent_at", "1970-01-01T00:00:00Z"),
+        ("outbound_ref", "00000000-0000-0000-0000-000000000000"),
         ("thread_id", "forged-thread"),
+        ("subject", "forged-subject"),
+        ("wire_message_id", "<forged@example.com>"),
+        ("external_id", "<forged-external@example.com>"),
     ] {
+        let before = registry
+            .dispatch("get", serde_json::json!({"id": full_id}))
+            .await
+            .expect("get must succeed");
+        let before_props = before["properties"].clone();
+
         let err = registry
             .dispatch(
                 "update",
@@ -9685,24 +9699,19 @@ async fn update_refuses_to_forge_owner_established_properties_on_message_note() 
             "refusal error must never echo the attempted value `{forged_value}` \
              (secret-gate discipline applies to error strings); got: {msg}"
         );
-    }
 
-    let after = registry
-        .dispatch("get", serde_json::json!({"id": full_id}))
-        .await
-        .expect("get must succeed");
-    assert_eq!(
-        after["properties"]["from_actor"], original_from_actor,
-        "stored from_actor must be unchanged after every refused forgery attempt"
-    );
-    assert_eq!(
-        after["properties"]["direction"],
-        before["properties"]["direction"]
-    );
-    assert_eq!(
-        after["properties"]["sent_at"],
-        before["properties"]["sent_at"]
-    );
+        let after = registry
+            .dispatch("get", serde_json::json!({"id": full_id}))
+            .await
+            .expect("get must succeed");
+        assert_eq!(
+            after["properties"],
+            before_props,
+            "refused update naming `{key}` must leave the ENTIRE stored properties \
+             object unchanged; got before={before_props} after={after}",
+            after = after["properties"]
+        );
+    }
 }
 
 /// Positive arm: a non-owned property update on the same `message` note must

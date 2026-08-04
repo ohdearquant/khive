@@ -1811,6 +1811,22 @@ fn build_registry_for_multi_backend_inner(
     // update/delete verbs notify caching packs even though there is no
     // crate-level dependency between them.
     registry.call_register_note_mutation_hooks(&default_runtime);
+    // Note-write identity: the pack-owned kind set drives `update`'s
+    // properties refusal so a pack-owned note's identity properties cannot
+    // be overwritten by a caller-supplied `properties` patch. Each per-pack
+    // runtime is constructed independently in the multi-backend boot path
+    // (unlike the single-backend `KhiveMcpServer::with_packs` path), so the
+    // registry must be installed on every runtime that could actually serve
+    // a generic `update` for a pack-owned kind, not just `default_runtime`.
+    let owned_note_kinds: Vec<String> = registry
+        .pack_owned_note_kinds()
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    default_runtime.install_pack_owned_note_kinds(owned_note_kinds.clone());
+    for rt in per_pack_runtimes_local.values() {
+        rt.install_pack_owned_note_kinds(owned_note_kinds.clone());
+    }
 
     let backend_for_pack: HashMap<&str, &StorageBackend> = per_pack_runtimes_local
         .iter()
@@ -3990,6 +4006,135 @@ id = "lambda:project-actor"
             first_comm_ok,
             Some(true),
             "comm.send must succeed; response: {comm_resp}"
+        );
+    }
+
+    /// ADR-124 note-write identity guard: the pack-owned note kind set must
+    /// be installed on the multi-backend boot path, not only on
+    /// `KhiveMcpServer::with_packs` (single-backend). Routes `kg` and `comm`
+    /// to the same "main" backend through the real `build_server_multi_backend`
+    /// builder — no manual `install_pack_owned_note_kinds` call, unlike
+    /// `build_registry_with_owned_kinds` in the `khive-pack-comm` integration
+    /// tests — so this test exercises the actual boot wiring rather than a
+    /// hand-simulated one. Without the install this fix added in `serve.rs`
+    /// (alongside the edge-rules/note-mutation-hook installs), a generic
+    /// `update(properties={from_actor: ...})` on an inbound message note
+    /// would silently succeed on a served multi-backend instance. Verified by
+    /// temporarily reverting the `install_pack_owned_note_kinds` calls in
+    /// `build_registry_for_multi_backend_inner` and re-running this test: it
+    /// fails (`from_actor` forgery succeeds) without the fix and passes with
+    /// it restored.
+    #[tokio::test]
+    #[serial]
+    async fn multi_backend_boot_installs_owned_note_kinds_so_update_is_refused() {
+        use crate::tools::request::RequestParams;
+
+        let khive_cfg = KhiveConfig {
+            backends: vec![BackendConfig {
+                name: "main".to_string(),
+                kind: BackendKind::Memory,
+                path: None,
+                cache_mb: None,
+                journal_mode: None,
+                read_only: false,
+            }],
+            ..KhiveConfig::default()
+        };
+
+        let base_cfg = base_runtime_config_for_multi_backend();
+
+        let server = build_server_multi_backend(base_cfg, &khive_cfg, None)
+            .expect("multi-backend boot must succeed");
+
+        let send_resp = server
+            .dispatch_request_local(RequestParams {
+                ops: r#"comm.send(to="local", content="adr-124 multi-backend boot probe")"#
+                    .to_string(),
+                presentation: None,
+                presentation_per_op: None,
+                save_to: None,
+                format: None,
+                format_per_op: None,
+                request_id: None,
+            })
+            .await
+            .expect("comm.send dispatch must not error");
+        let send_json: serde_json::Value =
+            serde_json::from_str(&send_resp).expect("send response is valid JSON");
+        assert_eq!(
+            send_json["results"][0]["ok"].as_bool(),
+            Some(true),
+            "comm.send must succeed; response: {send_resp}"
+        );
+        let full_id = send_json["results"][0]["result"]["full_id"]
+            .as_str()
+            .expect("send must return full_id")
+            .to_string();
+
+        let get_before_resp = server
+            .dispatch_request_local(RequestParams {
+                ops: format!(r#"get(id="{full_id}")"#),
+                presentation: None,
+                presentation_per_op: None,
+                save_to: None,
+                format: None,
+                format_per_op: None,
+                request_id: None,
+            })
+            .await
+            .expect("get dispatch must not error");
+        let get_before_json: serde_json::Value =
+            serde_json::from_str(&get_before_resp).expect("get response is valid JSON");
+        let original_from_actor =
+            get_before_json["results"][0]["result"]["properties"]["from_actor"].clone();
+
+        let update_resp = server
+            .dispatch_request_local(RequestParams {
+                ops: format!(
+                    r#"update(id="{full_id}", properties={{"from_actor": "forged-actor"}})"#
+                ),
+                presentation: None,
+                presentation_per_op: None,
+                save_to: None,
+                format: None,
+                format_per_op: None,
+                request_id: None,
+            })
+            .await
+            .expect("update dispatch must not error");
+        let update_json: serde_json::Value =
+            serde_json::from_str(&update_resp).expect("update response is valid JSON");
+        assert_eq!(
+            update_json["results"][0]["ok"].as_bool(),
+            Some(false),
+            "update forging `from_actor` on a message note must be refused on a served \
+             multi-backend instance; response: {update_resp}"
+        );
+        let error_msg = update_json["results"][0]["error"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(
+            error_msg.contains("from_actor"),
+            "refusal error must name `from_actor`; got: {error_msg}"
+        );
+
+        let get_after_resp = server
+            .dispatch_request_local(RequestParams {
+                ops: format!(r#"get(id="{full_id}")"#),
+                presentation: None,
+                presentation_per_op: None,
+                save_to: None,
+                format: None,
+                format_per_op: None,
+                request_id: None,
+            })
+            .await
+            .expect("get dispatch must not error");
+        let get_after_json: serde_json::Value =
+            serde_json::from_str(&get_after_resp).expect("get response is valid JSON");
+        assert_eq!(
+            get_after_json["results"][0]["result"]["properties"]["from_actor"], original_from_actor,
+            "stored from_actor must be unchanged after the refused forgery attempt"
         );
     }
 
