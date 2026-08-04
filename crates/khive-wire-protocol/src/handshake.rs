@@ -43,14 +43,16 @@ pub enum HandshakeOutcome {
     /// Send the returned `error` frame (`unsupported_version`), then close
     /// the connection.
     Rejected { error: Frame },
-    /// The connection already completed its handshake; this frame was not
-    /// a handshake attempt and is admitted for ordinary dispatch.
+    /// The connection already completed its handshake, this frame was not
+    /// a handshake attempt, and its kind is one a client may send to the
+    /// server; it is admitted for ordinary dispatch.
     Admitted,
 }
 
 /// A protocol violation the gate detected outside the handshake itself:
-/// a non-`handshake` frame arriving before handshake completion, or a
-/// second `handshake` frame arriving after completion.
+/// a non-`handshake` frame arriving before handshake completion, a second
+/// `handshake` frame arriving after completion, or a server→client-only
+/// frame kind arriving on the server's INBOUND gate after completion.
 ///
 /// ADR-137 does not name a specific wire error code for either violation;
 /// this crate maps both to [`WireErrorCode::MalformedFrame`] (connection
@@ -105,10 +107,15 @@ impl HandshakeGate {
     ///   (`Err(`[`HandshakeSequenceError`]`)`) — the caller must never have
     ///   dispatched it to `request`/`subscribe`/etc. handling; this call is
     ///   what makes that guarantee enforceable rather than conventional.
-    /// - After completion, ordinary frames are admitted
-    ///   ([`HandshakeOutcome::Admitted`]); only a stray second `handshake`
-    ///   is a sequence violation, since the ADR fixes the handshake to "the
-    ///   first application frame".
+    /// - After completion, client→server frames
+    ///   ([`crate::frame::CLIENT_TO_SERVER_KINDS`] minus `handshake`) are
+    ///   admitted ([`HandshakeOutcome::Admitted`]). A stray second
+    ///   `handshake` is a sequence violation (the ADR fixes the handshake
+    ///   to "the first application frame"), and a server→client-only kind
+    ///   (`response`, `handshake_ack`, `subscribe_ack`, `unsubscribe_ack`,
+    ///   `event`) is a direction violation — it can never be a legal
+    ///   inbound frame on this gate — and closes the gate like any other
+    ///   protocol violation.
     pub fn admit(&mut self, frame: &Frame) -> Result<HandshakeOutcome, HandshakeSequenceError> {
         match (&self.state, frame) {
             (State::AwaitingHandshake, Frame::Handshake { version }) => {
@@ -156,7 +163,27 @@ impl HandshakeGate {
                     }),
                 })
             }
-            (State::Completed(_), _) => Ok(HandshakeOutcome::Admitted),
+            (State::Completed(_), _) => {
+                // The gate is the server-side inbound admission point, so a
+                // frame whose kind is only ever sent server→client is a
+                // direction violation (frame grammar) no matter when it
+                // arrives: reject it like any other grammar violation.
+                if crate::frame::CLIENT_TO_SERVER_KINDS.contains(&frame.kind()) {
+                    Ok(HandshakeOutcome::Admitted)
+                } else {
+                    self.state = State::Closed;
+                    Err(HandshakeSequenceError {
+                        error: Box::new(Frame::Error {
+                            id: None,
+                            code: WireErrorCode::MalformedFrame,
+                            message: format!(
+                                "frame kind {:?} is server-to-client only; a server never accepts it as an inbound frame",
+                                frame.kind()
+                            ),
+                        }),
+                    })
+                }
+            }
             (State::Closed, _) => Err(HandshakeSequenceError {
                 error: Box::new(Frame::Error {
                     id: None,
@@ -244,5 +271,168 @@ mod tests {
             version: CURRENT_VERSION,
         });
         assert!(result.is_err());
+    }
+
+    fn completed_gate() -> HandshakeGate {
+        let mut gate = HandshakeGate::default();
+        gate.admit(&Frame::Handshake {
+            version: CURRENT_VERSION,
+        })
+        .unwrap();
+        gate
+    }
+
+    #[test]
+    fn rejects_server_only_kinds_on_the_inbound_gate() {
+        // After handshake completion the gate must not admit kinds that are
+        // only ever sent server→client; every client→server kind stays
+        // admitted (checked in the next test).
+        let server_only_frames = [
+            Frame::HandshakeAck {
+                version: CURRENT_VERSION,
+            },
+            Frame::Response {
+                id: crate::frame::OperationId::from("op-1"),
+                result: serde_json::json!({}),
+            },
+            Frame::Error {
+                id: None,
+                code: WireErrorCode::Internal,
+                message: "x".to_string(),
+            },
+            Frame::SubscribeAck {
+                id: crate::frame::OperationId::from("op-2"),
+                topic: "a.b".to_string(),
+                start_cursor: 1,
+            },
+            Frame::UnsubscribeAck {
+                id: crate::frame::OperationId::from("op-3"),
+                topic: "a.b".to_string(),
+            },
+            Frame::Event {
+                topic: "a.b".to_string(),
+                cursor: 1,
+                occurred_at: "2026-08-04T11:00:00Z".to_string(),
+                payload: serde_json::json!({}),
+            },
+        ];
+        for frame in server_only_frames {
+            let mut gate = completed_gate();
+            assert!(
+                gate.admit(&frame).is_err(),
+                "server-only kind {:?} must be rejected on the inbound gate",
+                frame.kind()
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_a_server_only_kind_with_the_gates_rejection_shape() {
+        let mut gate = completed_gate();
+        let response = Frame::Response {
+            id: crate::frame::OperationId::from("op-1"),
+            result: serde_json::json!({}),
+        };
+        let err = gate.admit(&response).unwrap_err();
+        match err.error.as_ref() {
+            Frame::Error { id, code, message } => {
+                assert_eq!(id, &None);
+                assert_eq!(*code, WireErrorCode::MalformedFrame);
+                assert!(message.contains("server-to-client"), "message: {message}");
+            }
+            other => panic!("expected an error frame, got {other:?}"),
+        }
+        // The direction violation closes the gate like any other protocol
+        // violation: subsequent frames are rejected too.
+        let err = gate
+            .admit(&Frame::Cancel {
+                id: crate::frame::OperationId::from("op-1"),
+            })
+            .unwrap_err();
+        match err.error.as_ref() {
+            Frame::Error { code, .. } => assert_eq!(*code, WireErrorCode::MalformedFrame),
+            other => panic!("expected an error frame, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn admits_every_client_kind_after_handshake() {
+        // Direction-gate control arm: every kind a client may send stays
+        // admitted after the handshake (a repeat `handshake` keeps its
+        // existing rejection handling and is checked separately).
+        let client_frames = [
+            Frame::Request {
+                id: crate::frame::OperationId::from("op-1"),
+                ops: "stats()".to_string(),
+                deadline_ms: None,
+                namespace: None,
+                actor_id: None,
+                visible_namespaces: None,
+            },
+            Frame::Cancel {
+                id: crate::frame::OperationId::from("op-1"),
+            },
+            Frame::Subscribe {
+                id: crate::frame::OperationId::from("op-2"),
+                topic: "a.b".to_string(),
+                resume_cursor: None,
+            },
+            Frame::Unsubscribe {
+                id: crate::frame::OperationId::from("op-3"),
+                topic: "a.b".to_string(),
+            },
+        ];
+        for frame in client_frames {
+            let mut gate = completed_gate();
+            let outcome = gate
+                .admit(&frame)
+                .unwrap_or_else(|_| panic!("kind {:?} should be admitted", frame.kind()));
+            assert_eq!(
+                outcome,
+                HandshakeOutcome::Admitted,
+                "kind {:?}",
+                frame.kind()
+            );
+        }
+    }
+
+    #[test]
+    fn stays_closed_after_a_rejected_handshake() {
+        // A rejected handshake produces a connection-terminal
+        // `unsupported_version` error; the gate must stay closed to every
+        // later frame, reporting the sequence-violation code.
+        let mut gate = HandshakeGate::default();
+        let outcome = gate
+            .admit(&Frame::Handshake {
+                version: ProtocolVersion::new(9999),
+            })
+            .unwrap();
+        assert!(matches!(outcome, HandshakeOutcome::Rejected { .. }));
+
+        for frame in [
+            Frame::Handshake {
+                version: CURRENT_VERSION,
+            },
+            Frame::Request {
+                id: crate::frame::OperationId::from("op-1"),
+                ops: "stats()".to_string(),
+                deadline_ms: None,
+                namespace: None,
+                actor_id: None,
+                visible_namespaces: None,
+            },
+        ] {
+            let err = gate.admit(&frame).unwrap_err();
+            match err.error.as_ref() {
+                Frame::Error { code, message, .. } => {
+                    assert_eq!(*code, WireErrorCode::MalformedFrame);
+                    assert!(
+                        message.contains("closed by a prior handshake failure"),
+                        "message: {message}"
+                    );
+                }
+                other => panic!("expected an error frame, got {other:?}"),
+            }
+        }
     }
 }

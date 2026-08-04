@@ -78,6 +78,55 @@
 //! `"kind"` value outside this table rejects the frame
 //! ([`codec::CodecError::UnknownFrameKind`]) rather than skipping it.
 //!
+//! ## Strict field rejection (closed grammar)
+//!
+//! The grammar is closed in both dimensions — kinds AND fields. Every
+//! payload is parsed by its kind's payload struct
+//! ([`frame::HandshakePayload`], [`frame::RequestPayload`], ...), each of
+//! which carries `#[serde(deny_unknown_fields)]`: a payload carrying any
+//! field its kind does not declare is rejected with
+//! [`codec::CodecError::InvalidFields`], never silently ignored. Unknown
+//! fields are rejected within a protocol version; forward compatibility is
+//! carried by the version handshake ([`version::ProtocolVersion`]), not by
+//! field tolerance — new fields arrive by bumping the protocol version and
+//! teaching the new version's grammar about them. This is the fail-closed
+//! posture ADR-137 requires: a decoder never guesses that an unrecognized
+//! field is ignorable.
+//!
+//! The strictness covers the fields each frame KIND declares. The two
+//! opaque JSON values — `response.result` and `event.payload` — are data,
+//! not grammar: keys inside them are preserved, and their field-by-field
+//! shape is owned by the verb result surface (ADR-016) and the per-topic
+//! event catalog respectively, not by this crate.
+//!
+//! ## Opaque payload fidelity
+//!
+//! `response.result` and `event.payload` are preserved as JSON VALUES —
+//! semantic equality, not byte-for-byte. Decoding and re-encoding yields a
+//! payload semantically equal to the original under the JSON data model,
+//! but the wire bytes may differ in two documented ways, both consequences
+//! of this workspace's `serde_json` feature set (default features only —
+//! no `preserve_order`, no `arbitrary_precision`):
+//!
+//! - **Object key order is not preserved.** Decoded objects use
+//!   `serde_json`'s `BTreeMap`-backed map and re-encode with keys in
+//!   sorted order. Consumers must treat key order as insignificant.
+//! - **Integers outside the u64/i64 range lose precision.** Integers
+//!   within u64/i64 range — including values above 2^53 — parse and
+//!   re-encode exactly; anything outside that range parses as `f64` and
+//!   may lose precision.
+//!
+//! The codec's `opaque_payloads_are_preserved_semantically_not_byte_for_byte`
+//! test pins exactly this behavior.
+//!
+//! ## Server-produced fields
+//!
+//! `event.occurred_at` (RFC 3339) and `event.topic` are SERVER-PRODUCED
+//! fields: the server validates them when it produces an event, and the
+//! codec accepts them as plain strings without parsing. This crate
+//! deliberately takes no timestamp-parsing dependency for decode-side
+//! validation of server-produced data.
+//!
 //! ## Handshake sequence
 //!
 //! 1. The client opens the transport connection (Unix-domain socket or
@@ -131,7 +180,15 @@
 //!
 //! A **connection-terminal** error is followed by connection close and
 //! carries no operation id. A **request-terminal** error terminates only
-//! the operation id it echoes; the connection stays usable. The set is
+//! the operation id it echoes; the connection stays usable. The codec
+//! enforces that pairing at decode time
+//! ([`codec::CodecError::InconsistentErrorScope`]): an `error` frame whose
+//! id presence contradicts its code's terminal scope is rejected, never
+//! represented. The check covers the codes in the closed set
+//! ([`error::WIRE_ERROR_CODES`]); an unrecognized code falls back to
+//! `internal` and is processed per the fallback rule above (its true scope
+//! is unknown to this version, so the pairing is not enforced for it).
+//! The set is
 //! closed within a protocol version: adding a code requires a version bump,
 //! and a client that decodes a code it does not recognize treats it as
 //! `internal` (request-terminal) rather than inventing semantics for it —
@@ -167,7 +224,7 @@ pub use codec::{
     decode_frame, encode_frame, encode_frame_with_max, CodecError, FrameCodec,
     DEFAULT_MAX_FRAME_BYTES,
 };
-pub use error::{TerminalScope, WireErrorCode};
-pub use frame::{Cursor, Frame, OperationId, FRAME_KINDS};
+pub use error::{TerminalScope, WireErrorCode, WIRE_ERROR_CODES};
+pub use frame::{Cursor, Frame, OperationId, CLIENT_TO_SERVER_KINDS, FRAME_KINDS};
 pub use handshake::{HandshakeGate, HandshakeOutcome, HandshakeSequenceError};
 pub use version::{ProtocolVersion, SupportedVersions, CURRENT_VERSION};

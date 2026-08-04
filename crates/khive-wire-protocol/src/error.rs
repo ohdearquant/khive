@@ -34,6 +34,33 @@ pub enum TerminalScope {
 /// older client talking to a server that has gained a new code under a later
 /// protocol version degrades to this documented behavior instead of a decode
 /// failure.
+/// The wire (`snake_case`) names of every code in the closed set for
+/// protocol version 1, in ADR-137's "Wire error taxonomy" table order.
+///
+/// The codec's decode-time error-scope check applies only to codes in this
+/// set: their terminal scopes are fixed by the table. A code outside the
+/// set fell back to [`WireErrorCode::Internal`] via `#[serde(other)]`; its
+/// true scope is unknown to this protocol version, and ADR-137 directs the
+/// client to treat it as `internal` rather than reject the frame.
+pub const WIRE_ERROR_CODES: &[&str] = &[
+    "unsupported_version",
+    "identity_rejected",
+    "malformed_frame",
+    "frame_too_large",
+    "subscriber_overflow",
+    "subscription_revoked",
+    "context_rejected",
+    "peer_class_denied",
+    "subscription_denied",
+    "already_subscribed",
+    "cursor_expired",
+    "in_flight_limit_exceeded",
+    "deadline_exceeded",
+    "cancelled",
+    "shutting_down",
+    "internal",
+];
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WireErrorCode {

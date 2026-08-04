@@ -109,7 +109,11 @@ fn connection_terminal_error_carries_no_id() {
     let wire = encode_frame(&frame).unwrap();
     let payload = br#"{"kind":"error","code":"unsupported_version","message":"unsupported protocol version 9999; server supports [1, 1]"}"#;
     assert_eq!(&wire[4..], payload.as_slice());
-    assert_eq!(decode_frame(&wire, wire.len()).unwrap(), frame);
+    // `max_frame_bytes` is payload-only by definition: pass the payload
+    // length, not the total wire length (which would admit payloads 4
+    // bytes over the bound).
+    let payload_len = wire.len() - khive_wire_protocol::codec::LENGTH_PREFIX_BYTES;
+    assert_eq!(decode_frame(&wire, payload_len).unwrap(), frame);
 
     // Decoding a raw payload that lacks the `id` field yields `id: None`.
     let decoded = khive_wire_protocol::codec::decode_payload(payload).unwrap();
@@ -284,9 +288,12 @@ fn frame_kinds_matches_the_frame_enum() {
             id: OperationId::from("op-1"),
             result: serde_json::json!({}),
         },
+        // A connection-terminal code with no id: a scope-consistent
+        // pairing the decode-time check accepts (request-terminal codes
+        // must echo an id; see `codec::InconsistentErrorScope`).
         Frame::Error {
             id: None,
-            code: WireErrorCode::Internal,
+            code: WireErrorCode::MalformedFrame,
             message: String::new(),
         },
         Frame::Cancel {
