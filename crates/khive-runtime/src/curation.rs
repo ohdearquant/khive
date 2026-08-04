@@ -2848,8 +2848,9 @@ pub(crate) fn owner_established_property_named_in(patch: &Value) -> Option<&'sta
 }
 
 /// Restore the into-note's [`OWNER_ESTABLISHED_PROPERTIES`] into `merged`
-/// after a property fold, and return how many of them the fold had taken from
-/// the from-note (so the caller can correct its merged-field count).
+/// after a property fold, and return how many of the fold's counted
+/// `from`-contributed keys this restoration took back out (so the caller can
+/// correct its merged-field count).
 ///
 /// A key absent on the into-note is removed from `merged` rather than left as
 /// the from-note's value: a record that carried no owner-established value
@@ -2857,13 +2858,29 @@ pub(crate) fn owner_established_property_named_in(patch: &Value) -> Option<&'sta
 /// as to attribution — a note with no `thread_id` must not join a conversation
 /// because another note was folded into it.
 ///
+/// The returned count only covers that removal case. `merge_json`'s fold only
+/// counts a key as "added" when it was absent from `into` — a key already
+/// present on `into` is never counted, even when the fold's chosen strategy
+/// (e.g. `PreferFrom`) overwrote its value with the from-note's. Restoring
+/// such a key's original value here (the `Some` arm below) therefore reverts
+/// a change the fold never counted in the first place, and must not be
+/// subtracted from `properties_merged` — doing so double-counts and can drive
+/// the reported total below the number of non-owned keys that genuinely
+/// survived the merge.
+///
 /// A fold can also yield a value that is not an object at all: `merge_json`
 /// applies a non-object `from` directly under `PreferFrom`, replacing the
 /// into-note's whole object with a scalar. A scalar cannot carry the
 /// owner-established keys, so there is nothing to restore them into and they
 /// would be erased. The into-note's properties are kept instead — the scalar
 /// contributes no key that could coexist with them, so nothing the fold
-/// intended is lost.
+/// intended is lost. That branch returns the number of owner-established keys
+/// found on the into-note, which is not itself a fold count: the fold scores a
+/// scalar `PreferFrom` replace as exactly 1 regardless of how many keys the
+/// into-note carried. The two agree only after the caller's `saturating_sub`,
+/// which clamps to the correct answer of zero merged properties whenever the
+/// replace is undone. Returning the key count rather than 1 is therefore safe
+/// here but is not a value any other caller should read as a fold count.
 pub(crate) fn preserve_owner_established_properties(
     into: &Option<Value>,
     merged: &mut Option<Value>,
@@ -2888,24 +2905,26 @@ pub(crate) fn preserve_owner_established_properties(
         Some(Value::Object(m)) => Some(m),
         _ => None,
     };
-    let mut reverted = 0usize;
+    let mut reverted_from_fold = 0usize;
     for key in OWNER_ESTABLISHED_PROPERTIES {
         let original = into_map.and_then(|m| m.get(*key));
         match original {
             Some(value) => {
-                let replaced = merged_map.insert((*key).to_string(), value.clone());
-                if replaced.as_ref() != Some(value) {
-                    reverted += 1;
-                }
+                // Already present on `into` — the fold never counted an
+                // overwrite of this key, so restoring it is not a reversal of
+                // any counted addition.
+                merged_map.insert((*key).to_string(), value.clone());
             }
             None => {
+                // Absent from `into` — any value the fold placed here came
+                // from `from` and WAS counted as an added property.
                 if merged_map.remove(*key).is_some() {
-                    reverted += 1;
+                    reverted_from_fold += 1;
                 }
             }
         }
     }
-    reverted
+    reverted_from_fold
 }
 
 /// Merge two property objects. Returns (merged, count_of_fields_from_from_that_were_added).
