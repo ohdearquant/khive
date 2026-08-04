@@ -146,6 +146,7 @@ The same head-binding governs review: a verdict authorizes only the exact commit
 | [ADR-137](ADR-137-tailnet-wire-transport.md)                            | Tailnet Wire Transport for the khive Frame Protocol                                                        |
 | [ADR-138](ADR-138-blob-enumeration.md)                                  | Add read-only blob enumeration to the blob-store contract                                                  |
 | [ADR-139](ADR-139-code-map-read-access.md)                              | Read access to registered code map databases                                                               |
+| [ADR-140](ADR-140-context-graph-payload.md)                             | Add a bounded graph payload to context responses                                                           |
 | [ADR-141](ADR-141-store-backup-runner.md)                               | Executable store backup runner                                                                             |
 | [ADR-142](ADR-142-agentic-process-runtime.md)                           | Agentic Process Runtime                                                                                    |
 
