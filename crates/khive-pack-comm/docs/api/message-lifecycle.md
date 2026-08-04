@@ -57,6 +57,16 @@ When `thread_id` is already supplied, the handler first parses it and serializes
 the UUID in full-hyphenated form, then forwards that canonical value unchanged
 to both copies.
 
+A supplied `thread_id` must also resolve to an existing thread (issue #1673):
+at least one live `message` note in the caller's namespace must carry that
+`thread_id`, checked against the same spelling set `comm.thread` probes. Shape
+validation alone would accept any UUID-shaped value, and a send onto a root no
+note carries would succeed silently while no reader could ever reconstruct the
+thread — the failure would degrade the shared artifact (a reply missing from
+its conversation) rather than the caller's state. An unresolvable `thread_id`
+is therefore rejected with an invalid-input error naming the id, and no
+message row is persisted. Omit `thread_id` to start a new thread.
+
 `in_reply_to_message_id` is the parent's wire Message-ID (angle-bracketed),
 when this write is a reply to a message with a known one (issue #403). It is
 stored verbatim on both copies as `in_reply_to_message_id`; the outbox

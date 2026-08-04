@@ -1588,22 +1588,33 @@ async fn test_inbox_returns_self_send_as_inbound() {
 async fn test_list_message_thread_id_filter() {
     let (send_registry, rt) = build_registry_for_ns("lambda:khive");
 
-    // Send two messages — one with a thread_id, one without.
-    let msg1 = send_registry
+    // Establish a real thread root, then send one message onto it and one
+    // outside it (a fabricated thread_id is rejected at the send boundary,
+    // so the filter fixture must thread onto an existing root).
+    let root = send_registry
+        .dispatch(
+            "comm.send",
+            serde_json::json!({ "to": "lambda:khive", "content": "thread root" }),
+        )
+        .await
+        .expect("send root succeeds");
+    let thread_id = root
+        .get("full_id")
+        .and_then(|v| v.as_str())
+        .expect("root full_id")
+        .to_string();
+
+    send_registry
         .dispatch(
             "comm.send",
             serde_json::json!({
                 "to": "lambda:khive",
                 "content": "threaded message",
-                "thread_id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+                "thread_id": thread_id
             }),
         )
         .await
-        .expect("send msg1 succeeds");
-    let _thread_id = msg1
-        .get("full_id")
-        .and_then(|v| v.as_str())
-        .expect("msg1 full_id");
+        .expect("send threaded message succeeds");
 
     send_registry
         .dispatch(
@@ -1625,14 +1636,19 @@ async fn test_list_message_thread_id_filter() {
             "list",
             serde_json::json!({
                 "kind": "message",
-                "thread_id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+                "thread_id": thread_id
             }),
         )
         .await
         .expect("list with thread_id filter succeeds");
 
     let items = result.as_array().expect("list returns an array");
-    // Every returned message must have the requested thread_id.
+    // The filter must actually select rows (a vacuously empty pass proves
+    // nothing) and every returned message must carry the requested thread_id.
+    assert!(
+        !items.is_empty(),
+        "CC-2 C1 regression: list(thread_id=X) returned no rows for a thread with a live message"
+    );
     for item in items {
         let stored_thread = item
             .get("properties")
@@ -1640,7 +1656,7 @@ async fn test_list_message_thread_id_filter() {
             .and_then(|v| v.as_str())
             .unwrap_or("");
         assert_eq!(
-            stored_thread, "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+            stored_thread, thread_id,
             "CC-2 C1 regression: list(thread_id=X) must only return messages in that thread; got {item}"
         );
     }
@@ -3073,6 +3089,119 @@ async fn send_rejects_malformed_thread_id() {
     assert!(
         err.is_err(),
         "send with malformed thread_id must fail; got: {err:?}"
+    );
+}
+
+/// send with a UUID-shaped but unresolvable thread_id must fail closed (issue
+/// #1673): the error names the unresolvable id and no message row is persisted.
+#[tokio::test]
+async fn send_rejects_unresolvable_thread_id() {
+    use khive_storage::note::{FilterOp, NoteFilter, PropertyFilter};
+    use khive_storage::types::PageRequest;
+
+    let (registry, rt) = build_registry_for_ns("local");
+
+    let phantom_thread_id = uuid::Uuid::new_v4().as_hyphenated().to_string();
+    let err = registry
+        .dispatch(
+            "comm.send",
+            serde_json::json!({
+                "to": "local",
+                "content": "stranded reply",
+                "thread_id": phantom_thread_id,
+            }),
+        )
+        .await
+        .expect_err("send with a thread_id no message carries must fail");
+    let err_text = format!("{err:?}");
+    assert!(
+        err_text.contains(&phantom_thread_id),
+        "the error must name the unresolvable thread_id {phantom_thread_id:?}; got {err_text}"
+    );
+
+    let token = rt.authorize(Namespace::local()).expect("local token");
+    let store = rt.notes(&token).expect("note store");
+    let stranded_filter = NoteFilter {
+        kind: Some("message".to_string()),
+        property_filters: vec![PropertyFilter {
+            json_path: "$.thread_id".to_string(),
+            op: FilterOp::Eq,
+            value: SqlValue::Text(phantom_thread_id.clone()),
+        }],
+        ..Default::default()
+    };
+    let stranded = store
+        .query_notes_filtered("local", &stranded_filter, PageRequest::default())
+        .await
+        .expect("filtered query");
+    assert!(
+        stranded.items.is_empty(),
+        "a rejected send must leave no message row behind; got {:?}",
+        stranded
+            .items
+            .iter()
+            .map(|n| &n.content)
+            .collect::<Vec<_>>()
+    );
+    let all = rt
+        .list_notes(&token, Some("message"), 100, 0)
+        .await
+        .expect("list messages");
+    assert!(
+        all.is_empty(),
+        "a rejected send must persist nothing at all; got {:?}",
+        all.iter().map(|n| &n.content).collect::<Vec<_>>()
+    );
+}
+
+/// send with a thread_id that resolves to an existing thread must still
+/// thread correctly (issue #1673 must not regress legitimate threading).
+#[tokio::test]
+async fn send_accepts_resolvable_thread_id() {
+    let (registry, _rt) = build_registry_for_ns("local");
+
+    let root = registry
+        .dispatch(
+            "comm.send",
+            serde_json::json!({ "to": "local", "content": "root message" }),
+        )
+        .await
+        .expect("root send succeeds");
+    let root_id = root
+        .get("full_id")
+        .and_then(|v| v.as_str())
+        .expect("full_id present")
+        .to_string();
+
+    registry
+        .dispatch(
+            "comm.send",
+            serde_json::json!({
+                "to": "local",
+                "content": "threaded follow-up",
+                "thread_id": root_id,
+            }),
+        )
+        .await
+        .expect("send threaded onto an existing root must succeed");
+
+    let thread = registry
+        .dispatch("comm.thread", serde_json::json!({ "id": root_id }))
+        .await
+        .expect("thread lookup succeeds");
+    let messages = thread["messages"].as_array().expect("messages array");
+    for expected_content in ["root message", "threaded follow-up"] {
+        assert!(
+            messages
+                .iter()
+                .any(|message| message["content"].as_str() == Some(expected_content)),
+            "thread must contain {expected_content:?}; got {thread}"
+        );
+    }
+    assert_eq!(
+        thread["thread_id"].as_str(),
+        Some(root_id.as_str()),
+        "the follow-up must land on the supplied root thread; got {thread}"
     );
 }
 
