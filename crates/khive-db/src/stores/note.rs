@@ -1163,7 +1163,7 @@ impl NoteStore for SqlNoteStore {
                         json_extract_expr(path)
                     )
                 }
-                None => " ORDER BY created_at DESC, id DESC".to_string(),
+                None => " ORDER BY created_at DESC, id ASC".to_string(),
             };
 
             let limit_idx = data_params.len() - 1;

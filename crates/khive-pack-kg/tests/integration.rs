@@ -12512,19 +12512,53 @@ async fn list_proposal_limit_over_cap_reports_effective_limit() {
 /// boundaries — even when proposals share `updated_at` timestamps.
 #[tokio::test]
 async fn list_proposals_offset_sweep_covers_all_exactly_once() {
-    let f = pack_with_events();
+    let rt = KhiveRuntime::memory().expect("in-memory runtime must succeed");
+    let tok = rt.authorize(Namespace::local()).unwrap();
+    let event_store = rt.events(&tok).expect("event store must be available");
+    let mut builder = VerbRegistryBuilder::new();
+    builder.with_event_store(event_store);
+    builder.register(KgPack::new(rt.clone()));
+    let f = Fixture {
+        registry: builder.build().expect("registry build must succeed"),
+    };
+    let mut created_ids = Vec::new();
     for i in 0..61 {
-        f.dispatch(
-            "propose",
-            json!({
-                "title": format!("sweep-{i:03}"),
-                "description": "offset sweep coverage",
-                "changeset": changeset_add_entity(),
-            }),
-        )
-        .await
-        .expect("propose must succeed");
+        let response = f
+            .dispatch(
+                "propose",
+                json!({
+                    "title": format!("sweep-{i:03}"),
+                    "description": "offset sweep coverage",
+                    "changeset": changeset_add_entity(),
+                }),
+            )
+            .await
+            .expect("propose must succeed");
+        created_ids.push(response["id"].as_str().expect("proposal id").to_string());
     }
+
+    // Force every proposal onto one shared `updated_at` so the sweep exercises
+    // the tiebreak path; otherwise unique microsecond timestamps would let the
+    // test pass even without the `proposal_id` tiebreak.
+    let shared_updated_at = 1_750_000_000_000_000_i64;
+    {
+        let sql = rt.sql();
+        let mut writer = sql.writer().await.expect("sql writer must open");
+        for id in &created_ids {
+            writer
+                .execute(SqlStatement {
+                    sql: "UPDATE proposals_open SET updated_at = ?1 WHERE proposal_id = ?2".into(),
+                    params: vec![
+                        SqlValue::Integer(shared_updated_at),
+                        SqlValue::Text(id.clone()),
+                    ],
+                    label: None,
+                })
+                .await
+                .expect("force shared updated_at");
+        }
+    }
+    created_ids.sort_unstable_by(|a, b| b.cmp(a));
 
     let mut seen = std::collections::HashSet::new();
     let mut offset = 0_u64;
@@ -12551,6 +12585,12 @@ async fn list_proposals_offset_sweep_covers_all_exactly_once() {
         seen.len(),
         61,
         "sweep must cover every proposal exactly once"
+    );
+    let mut seen_sorted: Vec<String> = seen.into_iter().collect();
+    seen_sorted.sort_unstable_by(|a, b| b.cmp(a));
+    assert_eq!(
+        seen_sorted, created_ids,
+        "sweep must return exactly the proposals that were created"
     );
 }
 

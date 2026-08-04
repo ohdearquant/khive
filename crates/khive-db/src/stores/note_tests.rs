@@ -786,7 +786,7 @@ async fn filtered_default_order_is_stable_across_equal_timestamp_pages() {
         expected_ids.push(note.id);
         store.upsert_note(note).await.unwrap();
     }
-    expected_ids.sort_unstable_by(|a, b| b.cmp(a));
+    expected_ids.sort_unstable();
 
     let mut actual_ids = Vec::new();
     let page_size = 29_u32;

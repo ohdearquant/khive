@@ -3443,6 +3443,58 @@ async fn query_edges_offset_sweep_covers_equal_created_at_exactly_once() {
         asc_ids, expected_asc,
         "ASC sweep must cover every edge exactly once in id ASC order"
     );
+
+    // Multi-field custom sort: every edge has the same created_at and weight
+    // (1.0), so only the appended `id` tiebreak — following the last sort key's
+    // direction — makes these pages a deterministic total order.
+    for (directions, expected) in [
+        (vec![SortDirection::Desc, SortDirection::Asc], {
+            // expected_ids is id DESC; the appended tiebreak follows the last
+            // sort key's direction, so [Desc, Asc] pages in id ASC order.
+            let mut reversed = expected_ids.clone();
+            reversed.reverse();
+            reversed
+        }),
+        (
+            vec![SortDirection::Asc, SortDirection::Desc],
+            expected_ids.clone(),
+        ),
+    ] {
+        let sort = vec![
+            SortOrder {
+                field: EdgeSortField::CreatedAt,
+                direction: directions[0].clone(),
+            },
+            SortOrder {
+                field: EdgeSortField::Weight,
+                direction: directions[1].clone(),
+            },
+        ];
+        let mut actual = Vec::new();
+        let mut offset = 0_u64;
+        loop {
+            let page = store
+                .query_edges(
+                    EdgeFilter::default(),
+                    sort.clone(),
+                    PageRequest {
+                        offset,
+                        limit: page_size,
+                    },
+                )
+                .await
+                .unwrap();
+            if page.items.is_empty() {
+                break;
+            }
+            offset += page.items.len() as u64;
+            actual.extend(page.items.into_iter().map(|edge| edge.id));
+        }
+        assert_eq!(
+            actual, expected,
+            "multi-field sweep with directions {directions:?} must cover every edge exactly once"
+        );
+    }
 }
 
 #[tokio::test]

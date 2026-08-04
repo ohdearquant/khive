@@ -987,6 +987,53 @@ async fn query_entities_offset_sweep_covers_equal_created_at_exactly_once() {
     );
 }
 
+/// #1671: the name-prefix branch ranks exact matches first, then orders by
+/// `created_at DESC` — that branch needs the same `id` tiebreak so offset
+/// pages over equal `created_at` rows are a deterministic total order.
+#[tokio::test]
+async fn query_entities_name_prefix_offset_sweep_covers_equal_created_at_exactly_once() {
+    let store = setup_memory_store_ns("ns1");
+    let created_at = 1_750_000_000_000_000_i64;
+    let mut expected_ids = Vec::new();
+    for index in 0..113 {
+        let mut entity = make_entity("ns1", "concept", &format!("Alpha-{index:03}"));
+        entity.created_at = created_at;
+        expected_ids.push(entity.id);
+        store.upsert_entity(entity).await.unwrap();
+    }
+    expected_ids.sort_unstable_by(|a, b| b.cmp(a));
+
+    let mut actual_ids = Vec::new();
+    let page_size = 23_u32;
+    let mut offset = 0_u64;
+    loop {
+        let page = store
+            .query_entities(
+                "ns1",
+                EntityFilter {
+                    name_prefix: Some("Alpha".to_string()),
+                    ..Default::default()
+                },
+                PageRequest {
+                    offset,
+                    limit: page_size,
+                },
+            )
+            .await
+            .unwrap();
+        if page.items.is_empty() {
+            break;
+        }
+        offset += page.items.len() as u64;
+        actual_ids.extend(page.items.into_iter().map(|entity| entity.id));
+    }
+
+    assert_eq!(
+        actual_ids, expected_ids,
+        "name-prefix sweep must cover every entity exactly once"
+    );
+}
+
 // =============================================================================
 // ADR-067 slice 1: WriterTask-routed `upsert_entities` (KHIVE_WRITE_QUEUE=1)
 // =============================================================================

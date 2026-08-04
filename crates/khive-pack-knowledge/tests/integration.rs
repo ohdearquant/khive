@@ -14,6 +14,7 @@ use khive_runtime::{
     Gate, GateDecision, GateError, GateRequest, KhiveRuntime, PackRegistry, RequestIdentity,
     RuntimeError, VerbRegistry, VerbRegistryBuilder,
 };
+use khive_storage::{SqlStatement, SqlValue};
 use serde_json::{json, Value};
 use std::sync::{Arc, Mutex};
 
@@ -1327,11 +1328,12 @@ async fn list_respects_limit_and_offset() {
 
 /// #1671: a full offset sweep over `knowledge.list` must enumerate every atom
 /// exactly once — no duplicates, no misses across page boundaries — even when
-/// many atoms land on the same `created_at` second (the column the primary
-/// sort key uses).
+/// all atoms share one `created_at` value (the column the primary sort key
+/// uses), which this test forces via a direct SQL update.
 #[tokio::test]
 async fn list_offset_sweep_covers_all_atoms_exactly_once() {
-    let f = pack(rt());
+    let rt = rt();
+    let f = pack(rt.clone());
     let content = "dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity";
     for chunk in 0..7 {
         let atoms: Vec<Value> = (0..17)
@@ -1343,6 +1345,23 @@ async fn list_offset_sweep_covers_all_atoms_exactly_once() {
         f.dispatch("knowledge.upsert_atoms", json!({ "atoms": atoms }))
             .await
             .expect("upsert");
+    }
+
+    // Force every atom onto one shared `created_at` so the sweep exercises the
+    // tiebreak path; otherwise unique microsecond timestamps would let the
+    // test pass even without the `id` tiebreak.
+    let shared_created_at = 1_750_000_000_000_000_i64;
+    {
+        let sql = rt.sql();
+        let mut writer = sql.writer().await.expect("sql writer must open");
+        writer
+            .execute(SqlStatement {
+                sql: "UPDATE knowledge_atoms SET created_at = ?1".into(),
+                params: vec![SqlValue::Integer(shared_created_at)],
+                label: None,
+            })
+            .await
+            .expect("force shared created_at");
     }
 
     let mut seen = std::collections::HashSet::new();
