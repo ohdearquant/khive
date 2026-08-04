@@ -17,11 +17,14 @@ fn is_40_hex(s: &str) -> bool {
 
 fn is_repo_relative_path(path: &str) -> bool {
     let bytes = path.as_bytes();
-    let windows_absolute =
-        bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && bytes[2] == b'/';
+    let windows_drive_absolute = bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && (bytes[2] == b'/' || bytes[2] == b'\\');
     !path.is_empty()
         && !path.starts_with('/')
-        && !windows_absolute
+        && !path.starts_with('\\')
+        && !windows_drive_absolute
         && !path.contains('\0')
         && path
             .split('/')

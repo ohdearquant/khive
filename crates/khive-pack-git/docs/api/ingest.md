@@ -312,15 +312,23 @@ not a complete signal.
 
 ## Changed paths and code-module annotations
 
-The commit snapshot's `git log -z --name-only
+The commit snapshot's `git log -z --name-only --no-renames
 --diff-merges=first-parent` pass is the authority for
 `commit.properties.changed_paths`. NUL-delimited paths bypass Git's quoted
 display encoding and are decoded with the same lossy UTF-8 normalization as
 ADR-085's filesystem path producer. Tabs, newlines, quotes, backslashes, and
-non-ASCII text therefore retain their path identity. A merge commit carries
-one canonical path set: its diff against the first parent. Paths are
-secret-masked, sorted, and deduplicated before storage. Every ingested commit
-carries the array, including an empty array for a genuinely empty commit.
+non-ASCII text therefore retain their path identity. Rename detection is
+pinned off (`--no-renames`) so a rename always surfaces as the delete + add
+pair `--name-only` reports without it; because Git does not mark which entry
+is the rename source, leaving detection on could silently swap one side of
+the pair away from the exact path facts that join against ADR-085 modules.
+A merge commit carries one canonical path set: its diff against the first
+parent. Paths are secret-masked, sorted, and deduplicated before storage.
+Every ingested commit carries the array, including an empty array for a
+genuinely empty commit — and only for one: a malformed `--name-only` token
+stream fails the phase (retried on the next pass via the cursor contract),
+and a walked commit with no recorded path set is skipped with a warning and
+a stalled cursor rather than stored with a fabricated `[]`.
 
 Before walking commits, the ingester loads the same-namespace live ADR-085
 module index once for the repository snapshot HEAD. A module is eligible only
@@ -330,7 +338,10 @@ revision prevents an identically named path in another repository snapshot
 from receiving a fabricated annotation. If more than one live module still
 has the same `(source_revision, source_path)`, the binding is ambiguous and no
 candidate is annotated. There is no suffix match, inferred rename, entity
-creation, or arbitrary winner. This makes module churn and repeated
+creation, or arbitrary winner. A failure to load the module index degrades
+the pass to no module annotation with a warning instead of aborting it,
+because the annotation is best-effort enrichment while `changed_paths` is
+the durable fact. This makes module churn and repeated
 cross-project co-change derivable from incoming `annotates` graph reads while
 retaining `changed_paths` as a durable path fact when no matching code map
 exists.

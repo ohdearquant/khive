@@ -761,6 +761,105 @@ async fn ingest_records_first_parent_paths_for_merge_commits() {
     );
 }
 
+/// Issue #1604: `[]` is the canonical shape for a genuinely empty commit
+/// (ADR-088: "the git ingester always supplies it, including an empty array
+/// for an empty commit"). Exercise the `--allow-empty` path end to end so
+/// the contract cannot silently rot.
+#[tokio::test]
+async fn ingest_records_empty_changed_paths_for_empty_commits() {
+    let _guard = ENV_MUTEX.lock().await;
+    let (rt, token, registry) = fixture().await;
+    let project_id = create(
+        &registry,
+        json!({"kind": "project", "name": "empty-commit-repo"}),
+    )
+    .await;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_repo(repo);
+    write(repo, "base.rs", "pub fn base() {}\n");
+    commit(repo, &["base.rs"], "Base");
+    git(
+        repo,
+        &["commit", "-q", "--allow-empty", "-m", "Empty marker"],
+    );
+    let empty_sha = head_sha(repo);
+
+    let report = run_ingest(
+        &rt,
+        &token,
+        &registry,
+        IngestOptions::unbounded(repo.to_path_buf(), project_id.to_string()),
+    )
+    .await
+    .expect("ingest ok");
+    assert_eq!(report.commits_ingested, 2, "{report:?}");
+
+    let commits = registry
+        .dispatch("list", json!({"kind": "commit", "limit": 10}))
+        .await
+        .expect("list commits");
+    let empty = commits
+        .as_array()
+        .expect("commit array")
+        .iter()
+        .find(|note| note["properties"]["sha"] == empty_sha)
+        .expect("empty commit");
+    assert_eq!(
+        empty["properties"]["changed_paths"],
+        json!([]),
+        "an empty commit carries an empty changed-path array"
+    );
+}
+
+/// Issue #1604: rename detection is pinned off, so a rename surfaces as the
+/// delete + add path pair that keeps `changed_paths` an exact join key for
+/// ADR-085's filesystem-derived `source_path`. Without the pin, whether the
+/// old path appears in `--name-only` output would depend on the rename
+/// detection settings of whatever git build runs the ingest.
+#[tokio::test]
+async fn ingest_records_both_sides_of_a_rename() {
+    let _guard = ENV_MUTEX.lock().await;
+    let (rt, token, registry) = fixture().await;
+    let project_id = create(&registry, json!({"kind": "project", "name": "rename-repo"})).await;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_repo(repo);
+    write(repo, "old.rs", "pub fn renamed() {}\n");
+    commit(repo, &["old.rs"], "Add old.rs");
+    git(repo, &["mv", "old.rs", "new.rs"]);
+    git(repo, &["commit", "-q", "-m", "Rename old.rs to new.rs"]);
+    let rename_sha = head_sha(repo);
+
+    let report = run_ingest(
+        &rt,
+        &token,
+        &registry,
+        IngestOptions::unbounded(repo.to_path_buf(), project_id.to_string()),
+    )
+    .await
+    .expect("ingest ok");
+    assert_eq!(report.commits_ingested, 2, "{report:?}");
+
+    let commits = registry
+        .dispatch("list", json!({"kind": "commit", "limit": 10}))
+        .await
+        .expect("list commits");
+    let rename = commits
+        .as_array()
+        .expect("commit array")
+        .iter()
+        .find(|note| note["properties"]["sha"] == rename_sha)
+        .expect("rename commit");
+    assert_eq!(
+        rename["properties"]["changed_paths"],
+        json!(["new.rs", "old.rs"]),
+        "a rename records both the deleted and the added path"
+    );
+}
+
 /// Coordinator addendum requirement: a commit message containing a
 /// credential-shaped token must be masked before it is stored.
 #[tokio::test]
@@ -2360,6 +2459,8 @@ async fn commit_hook_rejects_invalid_changed_path_shapes() {
         json!("src/lib.rs"),
         json!(["/absolute.rs"]),
         json!(["C:/absolute.rs"]),
+        json!(["C:\\absolute.rs"]),
+        json!(["\\\\server\\share\\file.rs"]),
         json!(["src/../secret.rs"]),
         json!([7]),
         json!(["z.rs", "a.rs"]),
@@ -2381,6 +2482,28 @@ async fn commit_hook_rejects_invalid_changed_path_shapes() {
             .expect_err("invalid changed_paths must be rejected");
         assert!(format!("{err}").contains("changed_paths"), "{err}");
     }
+}
+
+/// The contract's canonical shape for a genuinely empty commit is `[]`;
+/// the hook must accept it (a missing or null `changed_paths` is likewise
+/// optional for manually created commit notes).
+#[tokio::test]
+async fn commit_hook_accepts_empty_changed_paths() {
+    let (_rt, _token, registry) = fixture().await;
+    registry
+        .dispatch(
+            "create",
+            json!({
+                "kind": "commit",
+                "content": "empty commit fixture",
+                "properties": {
+                    "sha": "0000000000000000000000000000000000000000",
+                    "changed_paths": []
+                }
+            }),
+        )
+        .await
+        .expect("an empty changed_paths array is the canonical empty-commit shape");
 }
 
 // ── project-scoped idempotency ──────────────────────────────────────────

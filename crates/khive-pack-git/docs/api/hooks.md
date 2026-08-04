@@ -19,7 +19,9 @@ In addition to the governed SHA, parent, and short-SHA shapes,
 validated when present. It must be an array of non-empty, repository-relative
 `/`-separated strings without empty, `.` or `..` components, and the array
 must already be sorted and deduplicated. The git ingester always supplies that
-canonical shape, including `[]` for an empty commit.
+canonical shape, including `[]` for an empty commit. POSIX-absolute paths and
+the Windows absolute shapes (drive-letter with either separator, `\\`-prefixed
+UNC) are rejected.
 
 ## `IssueLikeHook`
 

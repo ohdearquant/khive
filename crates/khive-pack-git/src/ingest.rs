@@ -596,13 +596,17 @@ async fn find_document_for_path(
 /// out; a path with more than one matching live row remains ambiguous and is
 /// deliberately represented by `None` rather than selecting or annotating an
 /// arbitrary candidate.
+///
+/// A load failure returns `None` instead of aborting the pass: module
+/// annotation is best-effort enrichment (ADR-088 Amendment 1), while the
+/// durable `changed_paths` fact must still be recorded.
 async fn load_code_modules_by_snapshot_path(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
     source_revision: &str,
-) -> Result<HashMap<String, Option<Uuid>>> {
+) -> Option<HashMap<String, Option<Uuid>>> {
     let sql = runtime.sql();
-    let mut r = sql.reader().await.map_err(|e| anyhow!("{e}"))?;
+    let mut r = sql.reader().await.map_err(|e| anyhow!("{e}")).ok()?;
     let rows = r
         .query_all(SqlStatement {
             sql: "SELECT id, json_extract(properties,'$.source_path') AS source_path \
@@ -619,7 +623,8 @@ async fn load_code_modules_by_snapshot_path(
             label: Some("git_ingest_load_code_modules_by_snapshot_path".into()),
         })
         .await
-        .map_err(|e| anyhow!("{e}"))?;
+        .map_err(|e| anyhow!("{e}"))
+        .ok()?;
 
     let mut modules: HashMap<String, Option<Uuid>> = HashMap::new();
     for row in rows {
@@ -632,7 +637,7 @@ async fn load_code_modules_by_snapshot_path(
             .and_modify(|candidate| *candidate = None)
             .or_insert(Some(id));
     }
-    Ok(modules)
+    Some(modules)
 }
 
 /// Read the last-ingested cursor value for `(project_id, kind)`, if any.
@@ -817,7 +822,11 @@ fn walk_commits(repo: &Path, since_sha: Option<&str>) -> Result<Vec<RawCommit>> 
 /// separate NUL-delimited `--name-only` pass. Merge commits use their
 /// first-parent diff as the one canonical path set. The resulting paths drive
 /// document/module annotations and the durable
-/// `commit.properties.changed_paths` fact.
+/// `commit.properties.changed_paths` fact. Rename detection is pinned off so
+/// a rename always surfaces as the delete + add pair `--name-only` reports
+/// without it: those exact path facts are the ADR-085 module join keys, and
+/// Git does not mark which entry is the rename source, so an inferred rename
+/// could otherwise silently swap one side of the pair away.
 fn touched_files(repo: &Path) -> Result<HashMap<String, Vec<String>>> {
     let output = Command::new("git")
         .arg("-C")
@@ -825,6 +834,7 @@ fn touched_files(repo: &Path) -> Result<HashMap<String, Vec<String>>> {
         .arg("log")
         .arg("-z")
         .arg("--name-only")
+        .arg("--no-renames")
         .arg("--diff-merges=first-parent")
         // Git paths are always repository-relative, so no tracked path token
         // can start with `/`. This absolute-looking prefix is therefore an
@@ -838,10 +848,17 @@ fn touched_files(repo: &Path) -> Result<HashMap<String, Vec<String>>> {
             stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
         }));
     }
-    Ok(parse_touched_files(&output.stdout))
+    parse_touched_files(&output.stdout)
 }
 
-fn parse_touched_files(bytes: &[u8]) -> HashMap<String, Vec<String>> {
+/// Decode the `-z --name-only` stream [`touched_files`] produces. The stream
+/// is unambiguous only when every token is either a `/\x1e<40-hex-sha>`
+/// header (optionally followed by one newline and the commit's first path)
+/// or a path belonging to the most recent header; anything else fails the
+/// phase rather than storing a silently partial path set. A bare `[]` is
+/// therefore meaningful: it is a genuinely empty commit, never the residue
+/// of a parser/git-output mismatch.
+fn parse_touched_files(bytes: &[u8]) -> Result<HashMap<String, Vec<String>>> {
     let mut map: HashMap<String, Vec<String>> = HashMap::new();
     // With `-z`, git emits paths verbatim and NUL-terminates each one. Git
     // may place either one or two NULs between adjacent commit sections, so
@@ -856,8 +873,10 @@ fn parse_touched_files(bytes: &[u8]) -> HashMap<String, Vec<String>> {
         }
         if let Some(header) = token.strip_prefix(TOUCHED_HEADER_PREFIX) {
             if header.len() < 40 || !header[..40].iter().all(u8::is_ascii_hexdigit) {
-                current_sha = None;
-                continue;
+                return Err(anyhow!(
+                    "git log --name-only output contains a malformed commit header {:?}",
+                    String::from_utf8_lossy(&header[..header.len().min(80)])
+                ));
             }
             let sha = String::from_utf8_lossy(&header[..40]).into_owned();
             let files = map.entry(sha.clone()).or_default();
@@ -865,17 +884,30 @@ fn parse_touched_files(bytes: &[u8]) -> HashMap<String, Vec<String>> {
                 if !first_path.is_empty() {
                     files.push(String::from_utf8_lossy(first_path).into_owned());
                 }
+            } else if !header[40..].is_empty() {
+                // Anything after the SHA that does not start with the one
+                // newline separator is a shape git never emits; guessing at
+                // it could drop or fabricate a first path.
+                return Err(anyhow!(
+                    "git log --name-only header for commit {sha} carries a \
+                     malformed first-path separator"
+                ));
             }
             current_sha = Some(sha);
             continue;
         }
-        if let Some(sha) = &current_sha {
-            map.get_mut(sha)
-                .expect("current SHA was inserted with its header")
-                .push(String::from_utf8_lossy(token).into_owned());
-        }
+        let Some(sha) = &current_sha else {
+            return Err(anyhow!(
+                "git log --name-only output contains a path token before any \
+                 commit header: {:?}",
+                String::from_utf8_lossy(&token[..token.len().min(80)])
+            ));
+        };
+        map.get_mut(sha)
+            .expect("current SHA was inserted with its header")
+            .push(String::from_utf8_lossy(token).into_owned());
     }
-    map
+    Ok(map)
 }
 
 #[cfg(test)]
@@ -890,7 +922,7 @@ mod touched_file_parser_tests {
         let raw =
             format!("/\x1e{sha_a}\nfirst.rs\0second.rs\0/\x1e{sha_b}\nthird.rs\0\0/\x1e{sha_c}\0");
 
-        let parsed = parse_touched_files(raw.as_bytes());
+        let parsed = parse_touched_files(raw.as_bytes()).expect("well-formed stream");
         assert_eq!(
             parsed[sha_a],
             vec!["first.rs".to_string(), "second.rs".to_string()]
@@ -905,7 +937,7 @@ mod touched_file_parser_tests {
         let mut raw = format!("/\x1e{sha}\n").into_bytes();
         raw.extend_from_slice(b"src/caf\xc3\xa9\t\"quoted\"\\leaf\nline.rs\0bad-\xff.rs\0");
 
-        let parsed = parse_touched_files(&raw);
+        let parsed = parse_touched_files(&raw).expect("well-formed stream");
         assert_eq!(
             parsed[sha],
             vec![
@@ -913,6 +945,43 @@ mod touched_file_parser_tests {
                 "bad-�.rs".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn rejects_a_path_token_before_any_header() {
+        // Silently dropping this token could store `[]` for a commit that
+        // touched files; failing the phase preserves the retry contract.
+        let sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let raw = format!("orphan.rs\0/\x1e{sha}\nfirst.rs\0");
+
+        let err = parse_touched_files(raw.as_bytes()).expect_err("orphan path must fail");
+        assert!(
+            format!("{err}").contains("before any commit header"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn rejects_a_malformed_header_sha() {
+        let raw = "/\x1enot-hex-at-all\nfirst.rs\0second.rs\0";
+
+        let err = parse_touched_files(raw.as_bytes()).expect_err("bad header must fail");
+        assert!(
+            format!("{err}").contains("malformed commit header"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn rejects_a_header_remainder_without_the_newline_separator() {
+        // A header remainder that does not start with exactly one newline is
+        // a shape git never emits; silently discarding it could lose the
+        // first path or misread it as a leading-newline path.
+        let sha = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let raw = format!("/\x1e{sha}XXfirst.rs\0");
+
+        let err = parse_touched_files(raw.as_bytes()).expect_err("bad separator must fail");
+        assert!(format!("{err}").contains("first-path separator"), "{err}");
     }
 }
 
@@ -1108,8 +1177,20 @@ async fn ingest_commits(
         .expect("non-empty commit snapshot checked above")
         .sha
         .clone();
+    // Module annotation is best-effort enrichment: a failed index load
+    // degrades to no module annotation with a warning rather than aborting
+    // the pass that records the durable `changed_paths` facts.
     let code_modules_by_source_path =
-        load_code_modules_by_snapshot_path(runtime, token, &snapshot_head).await?;
+        match load_code_modules_by_snapshot_path(runtime, token, &snapshot_head).await {
+            Some(modules) => modules,
+            None => {
+                report.warnings.push(format!(
+                    "code module index load failed for snapshot {snapshot_head}; \
+                     commits ingest without code-module annotation"
+                ));
+                HashMap::new()
+            }
+        };
 
     // `cursor_stalled` freezes `last_sha` at the last contiguous successfully
     // processed commit: once a record fails to create, later records in this
@@ -1148,10 +1229,21 @@ async fn ingest_commits(
             format!("{}\n\n{}", masked.subject, masked.body)
         };
 
-        let changed_paths: Vec<String> = files_by_sha
-            .get(&c.sha)
-            .into_iter()
-            .flatten()
+        // Both `git log` passes walk the same history, so every walked
+        // commit should have a path-set entry. A missing entry means the two
+        // passes disagree; surface it instead of silently storing the `[]`
+        // the contract reserves for a genuinely empty commit.
+        let Some(touched_paths) = files_by_sha.get(&c.sha) else {
+            cursor_stalled = true;
+            report.warnings.push(format!(
+                "create commit {}: no touched-path set recorded by the \
+                 --name-only pass; not ingested",
+                c.sha
+            ));
+            continue;
+        };
+        let changed_paths: Vec<String> = touched_paths
+            .iter()
             .map(|path| secret_gate::mask_secrets(path).into_owned())
             .collect::<BTreeSet<_>>()
             .into_iter()
