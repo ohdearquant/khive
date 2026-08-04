@@ -264,11 +264,18 @@ pub async fn create_notes_atomic_with_report(
     let mut notes: Vec<Note> = Vec::with_capacity(specs.len());
     for spec in &specs {
         runtime.validate_note_kind(spec.kind)?;
+        // Same owned-identity derivation every other note-write site runs
+        // (`operations.rs`'s create funnel, `atomic_prepare::prepare_add_note`):
+        // derive from the token BEFORE the secret scan and note construction,
+        // so a caller-supplied `from_actor`/`thread_id`/etc. in `spec.properties`
+        // never reaches storage verbatim on this writer either.
+        let properties =
+            runtime.derive_note_write_properties(spec.kind, spec.token, spec.properties.clone())?;
         crate::secret_gate::check(spec.content)?;
         if let Some(n) = spec.name {
             crate::secret_gate::check(n)?;
         }
-        if let Some(ref p) = spec.properties {
+        if let Some(ref p) = properties {
             crate::secret_gate::check_json(p)?;
         }
 
@@ -280,7 +287,7 @@ pub async fn create_notes_atomic_with_report(
         if let Some(n) = spec.name {
             note = note.with_name(n);
         }
-        if let Some(p) = spec.properties.clone() {
+        if let Some(p) = properties {
             note = note.with_properties(p);
         }
         notes.push(note);
@@ -517,6 +524,26 @@ mod tests {
         }
     }
 
+    /// A minimal note-write validator standing in for a pack's real one (e.g.
+    /// `khive-pack-comm`'s `derive_message_identity`): unconditionally stamps
+    /// `from_actor` with the caller's token-derived actor id, discarding
+    /// whatever the caller's own `properties` named for that key.
+    fn stamp_from_actor(
+        _kind: &str,
+        actor_id: &str,
+        properties: Option<Value>,
+    ) -> RuntimeResult<Option<Value>> {
+        let mut props = match properties {
+            Some(Value::Object(map)) => map,
+            _ => serde_json::Map::new(),
+        };
+        props.insert(
+            "from_actor".to_string(),
+            Value::String(actor_id.to_string()),
+        );
+        Ok(Some(Value::Object(props)))
+    }
+
     async fn fts_row_count(runtime: &KhiveRuntime, namespace: &str) -> i64 {
         let mut reader = runtime.sql().reader().await.expect("sql reader");
         match reader
@@ -708,6 +735,56 @@ mod tests {
             doc.body.contains("second content"),
             "the surviving FTS document must reflect the latest content; got {:?}",
             doc.body
+        );
+    }
+
+    /// ADR-124 regression: `create_notes_atomic_with_report` must run
+    /// `derive_note_write_properties` per spec, the same as every other
+    /// note-write site (`operations.rs`'s create funnel,
+    /// `atomic_prepare::prepare_add_note`). A caller holding a valid token
+    /// for one actor must not be able to plant an arbitrary `from_actor` (or
+    /// any other owner-established property) via `AtomicNoteSpec::properties`
+    /// — the installed validator's derived value must win.
+    ///
+    /// This test fails if the `derive_note_write_properties` call in
+    /// `create_notes_atomic_with_report`'s spec loop is removed: verified by
+    /// deleting that call in a scratch copy of this file and re-running —
+    /// the assertion below turns red because the stored `from_actor` reverts
+    /// to the forged `"forged-actor"` value instead of the token's actor id.
+    #[tokio::test]
+    async fn create_notes_atomic_derives_from_actor_overwriting_a_forged_value() {
+        let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+        runtime.install_note_write_validator(std::sync::Arc::new(stamp_from_actor));
+        let ns = "atomic-message-identity-guard-test";
+        let token = runtime
+            .authorize(Namespace::parse(ns).unwrap())
+            .expect("authorize");
+        let true_actor = token.actor().id.clone();
+
+        let notes = create_notes_atomic(
+            &runtime,
+            vec![AtomicNoteSpec {
+                token: &token,
+                id: None,
+                kind: "observation",
+                name: None,
+                content: "atomic writer identity guard probe",
+                properties: Some(serde_json::json!({"from_actor": "forged-actor"})),
+            }],
+        )
+        .await
+        .expect("atomic note write must succeed — the guard derives, it does not refuse");
+
+        assert_eq!(notes.len(), 1);
+        assert_eq!(
+            notes[0]
+                .properties
+                .as_ref()
+                .and_then(|p| p.get("from_actor"))
+                .and_then(|v| v.as_str()),
+            Some(true_actor.as_str()),
+            "the atomic writer must store the token-derived from_actor, not the \
+             caller-supplied forged value"
         );
     }
 }

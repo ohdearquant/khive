@@ -9,8 +9,8 @@ use std::sync::Arc;
 
 use khive_pack_comm::CommPack;
 use khive_runtime::{
-    AllowAllGate, BackendId, KhiveRuntime, Namespace, NamespaceToken, RuntimeConfig, VerbRegistry,
-    VerbRegistryBuilder,
+    AllowAllGate, BackendId, KhiveRuntime, Namespace, NamespaceToken, RequestIdentity,
+    RuntimeConfig, VerbRegistry, VerbRegistryBuilder,
 };
 use khive_storage::types::{SqlRow, SqlValue};
 use khive_types::Pack;
@@ -9632,6 +9632,18 @@ fn build_registry_with_owned_kinds() -> (VerbRegistry, KhiveRuntime) {
     (registry, rt)
 }
 
+/// Build a registry the same way as [`build_registry_with_owned_kinds`] but
+/// also install the pack-owned note-write validator, mirroring both
+/// `khive-mcp` boot paths. A test exercising the CREATE- or MERGE-path guard
+/// against a registry that skips this call proves nothing: the derive/preserve
+/// step is inert on an unwired runtime exactly like the update-path refusal
+/// was inert before `install_pack_owned_note_kinds` existed.
+fn build_registry_with_owned_kinds_and_validator() -> (VerbRegistry, KhiveRuntime) {
+    let (registry, rt) = build_registry_with_owned_kinds();
+    registry.call_register_note_write_validators(&rt);
+    (registry, rt)
+}
+
 /// The confirmed hole, reproduced as a test: a generic `update(properties=
 /// {from_actor: ...})` must no longer be able to forge the handler-stamped
 /// `from_actor` on a `message` note. This is the central regression test —
@@ -9822,5 +9834,653 @@ async fn update_refuses_non_object_properties_patch_on_message_note() {
     assert!(
         msg.contains("object"),
         "refusal error must explain the object requirement; got: {msg}"
+    );
+}
+
+// ---- ADR-124 note-write identity guard: CREATE-path derivation ----
+
+/// FORGE arm: a generic `create(kind="message", properties={from_actor:
+/// "forged"})` call under an authenticated token for actor X must store
+/// `from_actor == X` — the true caller — not the forged value. This is not a
+/// refusal: the create succeeds and the identity property is silently
+/// corrected to the value the authorization token actually names.
+#[tokio::test]
+async fn create_derives_from_actor_overwriting_a_forged_value() {
+    let (registry, _rt) = build_registry_with_owned_kinds_and_validator();
+    let true_actor = "lambda:true-caller";
+
+    let created = registry
+        .dispatch_with_identity(
+            "create",
+            serde_json::json!({
+                "kind": "message",
+                "content": "create-path forgery probe",
+                "properties": {"from_actor": "forged"},
+            }),
+            Some(RequestIdentity {
+                namespace: "local".to_string(),
+                actor_id: Some(true_actor.to_string()),
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect("create must succeed — the guard derives, it does not refuse");
+
+    assert_eq!(
+        created["properties"]["from_actor"], true_actor,
+        "the stored from_actor must be the authenticated caller, not the forged value"
+    );
+}
+
+/// LEGITIMATE-NO-KEY arm: a `create(kind="message", content=...)` with no
+/// `from_actor` in properties at all must still come out stamped with the
+/// authenticated caller.
+#[tokio::test]
+async fn create_stamps_from_actor_when_caller_supplies_no_identity_key() {
+    let (registry, _rt) = build_registry_with_owned_kinds_and_validator();
+    let true_actor = "lambda:no-key-caller";
+
+    let created = registry
+        .dispatch_with_identity(
+            "create",
+            serde_json::json!({
+                "kind": "message",
+                "content": "create-path no-key probe",
+            }),
+            Some(RequestIdentity {
+                namespace: "local".to_string(),
+                actor_id: Some(true_actor.to_string()),
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect("create with no properties key must succeed");
+
+    assert_eq!(
+        created["properties"]["from_actor"], true_actor,
+        "an absent from_actor key must be stamped with the authenticated caller"
+    );
+}
+
+/// DAEMON-STAMP arm: the real `comm.send` writer path must still stamp
+/// `from_actor` correctly and succeed once the validator is installed. A
+/// guard that broke the writer that is supposed to set `from_actor` would
+/// fail closed into an outage — prove it does not.
+///
+/// MECHANISM SENSITIVITY: this arm stays green even with the atomic
+/// multi-note writer's own derivation call removed entirely, because
+/// `comm.send`'s handler (`crates/khive-pack-comm/src/handlers.rs`) derives
+/// and stamps `from_actor` onto the message spec BEFORE it ever reaches
+/// `khive-runtime`'s `create_notes_atomic_with_report`. A failure here means
+/// the send handler itself, or the ordinary (non-atomic) write path, broke —
+/// it says nothing about the atomic writer's own guard. That coverage lives
+/// in `khive-runtime`'s
+/// `atomic_message::tests::create_notes_atomic_derives_from_actor_overwriting_a_forged_value`,
+/// which calls the atomic writer directly with a forged property and would
+/// fail if this arm alone were relied on.
+#[tokio::test]
+async fn comm_send_still_stamps_from_actor_with_validator_installed() {
+    let (registry, _rt) = build_registry_with_owned_kinds_and_validator();
+    let true_actor = "lambda:sender";
+
+    let sent = registry
+        .dispatch_with_identity(
+            "comm.send",
+            serde_json::json!({"to": "local", "content": "validator does not break comm.send"}),
+            Some(RequestIdentity {
+                namespace: "local".to_string(),
+                actor_id: Some(true_actor.to_string()),
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect("comm.send must still succeed with the validator installed");
+
+    let full_id = sent
+        .get("full_id")
+        .and_then(serde_json::Value::as_str)
+        .expect("send must return full_id")
+        .to_string();
+    let after = registry
+        .dispatch("get", serde_json::json!({"id": full_id}))
+        .await
+        .expect("get must succeed");
+    assert_eq!(
+        after["properties"]["from_actor"], true_actor,
+        "comm.send's own from_actor stamp must still be the sending actor"
+    );
+}
+
+/// GENERIC-KIND arm: the validator is single-occupancy across all packs, so
+/// a `create` on a kind comm does not own (`observation`, owned by kg) must
+/// pass its properties through untouched.
+///
+/// MECHANISM SENSITIVITY: the foreign-kind passthrough assertion alone would
+/// stay green even if the validator were never installed at all — with no
+/// validator, every kind's properties pass through untouched, so that
+/// assertion by itself cannot tell "validator installed and correctly scoped
+/// to `message`" apart from "no validator at all". The paired `message`
+/// assertion below closes that gap: it only passes if a validator is
+/// installed AND correctly scoped, so this arm fails if the validator is
+/// missing, not just if it is mis-scoped.
+#[tokio::test]
+async fn create_leaves_generic_kind_properties_untouched() {
+    let (registry, _rt) = build_registry_with_owned_kinds_and_validator();
+
+    let created = registry
+        .dispatch_with_identity(
+            "create",
+            serde_json::json!({
+                "kind": "observation",
+                "content": "generic-kind create arm",
+                "properties": {"from_actor": "x"},
+            }),
+            Some(RequestIdentity {
+                namespace: "local".to_string(),
+                actor_id: Some("lambda:someone-else".to_string()),
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect("create observation must succeed");
+
+    assert_eq!(
+        created["properties"]["from_actor"], "x",
+        "a foreign (non-message) kind's properties must pass through the validator unchanged"
+    );
+
+    let message_created = registry
+        .dispatch_with_identity(
+            "create",
+            serde_json::json!({
+                "kind": "message",
+                "content": "same-fixture message arm — validator must be scoped, not absent",
+                "properties": {"from_actor": "forged"},
+            }),
+            Some(RequestIdentity {
+                namespace: "local".to_string(),
+                actor_id: Some("lambda:someone-else".to_string()),
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect("create message must succeed");
+
+    assert_eq!(
+        message_created["properties"]["from_actor"], "lambda:someone-else",
+        "on the SAME registry, a `message` create must still be derived — proving \
+         the validator is installed and merely scoped away from `observation`, \
+         not absent entirely"
+    );
+}
+
+// ---- ADR-124 note-write identity guard: MERGE-path preservation ----
+
+async fn send_message_as(registry: &VerbRegistry, actor: &str, content: &str) -> String {
+    let sent = registry
+        .dispatch_with_identity(
+            "comm.send",
+            serde_json::json!({"to": "local", "content": content}),
+            Some(RequestIdentity {
+                namespace: "local".to_string(),
+                actor_id: Some(actor.to_string()),
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect("self-send must succeed");
+    sent.get("full_id")
+        .and_then(serde_json::Value::as_str)
+        .expect("send must return full_id")
+        .to_string()
+}
+
+/// FORGERY-BLOCKED arm: merging a `message` note authored by Y into one
+/// authored by X with `strategy="prefer_from"` — the attack this guard
+/// exists for — must leave the surviving note's `from_actor` as X, not Y.
+#[tokio::test]
+async fn merge_preserves_into_note_from_actor_under_prefer_from() {
+    let (registry, _rt) = build_registry_with_owned_kinds_and_validator();
+
+    let into_id = send_message_as(&registry, "lambda:x", "into-note, authored by X").await;
+    let from_id = send_message_as(&registry, "lambda:y", "from-note, authored by Y").await;
+
+    registry
+        .dispatch(
+            "merge",
+            serde_json::json!({
+                "kind": "message",
+                "into_id": into_id,
+                "from_id": from_id,
+                "strategy": "prefer_from",
+            }),
+        )
+        .await
+        .expect("merge must succeed");
+
+    let after = registry
+        .dispatch("get", serde_json::json!({"id": into_id}))
+        .await
+        .expect("get must succeed");
+    assert_eq!(
+        after["properties"]["from_actor"], "lambda:x",
+        "prefer_from must not be able to transfer attribution from the absorbed note"
+    );
+}
+
+/// CONTROL arm: the same merge under `strategy="prefer_into"` must also
+/// leave `from_actor` as X.
+///
+/// Honesty note (khive-oss PR #1690 round 3): this arm is NOT sensitive to
+/// the preservation step being removed. `PreferInto`'s fold
+/// (`merge_json` in `khive-runtime`'s `curation.rs`) only ever inserts a
+/// `from`-note key that is absent on `into` — `from_actor` is already
+/// present on X's into-note before the merge runs, so the fold itself never
+/// touches it. This arm stays green with `preserve_owner_established_properties`
+/// deleted entirely; it is a legitimate control (it proves the merge doesn't
+/// silently overwrite under this strategy) but it is NOT evidence the guard
+/// works. `merge_preserves_into_note_from_actor_under_prefer_from` above is
+/// the arm carrying the security-relevant assertion: `PreferFrom`'s fold
+/// does overwrite `from_actor` with Y's value, so that arm only passes
+/// because the preserve step reverts it.
+#[tokio::test]
+async fn merge_preserves_into_note_from_actor_under_prefer_into() {
+    let (registry, _rt) = build_registry_with_owned_kinds_and_validator();
+
+    let into_id = send_message_as(&registry, "lambda:x", "into-note, control arm").await;
+    let from_id = send_message_as(&registry, "lambda:y", "from-note, control arm").await;
+
+    registry
+        .dispatch(
+            "merge",
+            serde_json::json!({
+                "kind": "message",
+                "into_id": into_id,
+                "from_id": from_id,
+                "strategy": "prefer_into",
+            }),
+        )
+        .await
+        .expect("merge must succeed");
+
+    let after = registry
+        .dispatch("get", serde_json::json!({"id": into_id}))
+        .await
+        .expect("get must succeed");
+    assert_eq!(after["properties"]["from_actor"], "lambda:x");
+}
+
+/// NON-IDENTITY-KEY arm: a non-owned property that differs between the two
+/// notes still folds by strategy — `prefer_from` takes the from-note's
+/// value — proving the preserve step pins only the owner-established keys,
+/// not the whole property object.
+#[tokio::test]
+async fn merge_still_folds_non_owned_properties_by_strategy() {
+    let (registry, _rt) = build_registry_with_owned_kinds_and_validator();
+
+    let into_id = send_message_as(&registry, "lambda:x", "into-note, non-identity arm").await;
+    let from_id = send_message_as(&registry, "lambda:y", "from-note, non-identity arm").await;
+
+    registry
+        .dispatch(
+            "update",
+            serde_json::json!({"id": into_id, "properties": {"tag": "into-tag"}}),
+        )
+        .await
+        .expect("update must succeed");
+    registry
+        .dispatch(
+            "update",
+            serde_json::json!({"id": from_id, "properties": {"tag": "from-tag"}}),
+        )
+        .await
+        .expect("update must succeed");
+
+    registry
+        .dispatch(
+            "merge",
+            serde_json::json!({
+                "kind": "message",
+                "into_id": into_id,
+                "from_id": from_id,
+                "strategy": "prefer_from",
+            }),
+        )
+        .await
+        .expect("merge must succeed");
+
+    let after = registry
+        .dispatch("get", serde_json::json!({"id": into_id}))
+        .await
+        .expect("get must succeed");
+    assert_eq!(
+        after["properties"]["tag"], "from-tag",
+        "a non-owned key must still fold by strategy — only owner-established keys are pinned"
+    );
+    assert_eq!(
+        after["properties"]["from_actor"], "lambda:x",
+        "the owner-established key must remain pinned to the into-note in the same merge"
+    );
+}
+
+/// GENERIC-KIND arm: merging two `observation` notes (a kind comm does not
+/// own) under `prefer_from` must let a `from_actor`-named property overwrite
+/// normally — the preservation guard fires only on pack-owned kinds.
+#[tokio::test]
+async fn merge_overwrites_from_actor_on_generic_kind_under_prefer_from() {
+    let (registry, _rt) = build_registry_with_owned_kinds_and_validator();
+
+    let into_created = registry
+        .dispatch(
+            "create",
+            serde_json::json!({
+                "kind": "observation",
+                "content": "into observation",
+                "properties": {"from_actor": "x"},
+            }),
+        )
+        .await
+        .expect("create must succeed");
+    let into_id = into_created["id"]
+        .as_str()
+        .expect("create must return id")
+        .to_string();
+
+    let from_created = registry
+        .dispatch(
+            "create",
+            serde_json::json!({
+                "kind": "observation",
+                "content": "from observation",
+                "properties": {"from_actor": "y"},
+            }),
+        )
+        .await
+        .expect("create must succeed");
+    let from_id = from_created["id"]
+        .as_str()
+        .expect("create must return id")
+        .to_string();
+
+    registry
+        .dispatch(
+            "merge",
+            serde_json::json!({
+                "kind": "observation",
+                "into_id": into_id,
+                "from_id": from_id,
+                "strategy": "prefer_from",
+            }),
+        )
+        .await
+        .expect("merge must succeed");
+
+    let after = registry
+        .dispatch("get", serde_json::json!({"id": into_id}))
+        .await
+        .expect("get must succeed");
+    assert_eq!(
+        after["properties"]["from_actor"], "y",
+        "on a non-pack-owned kind, prefer_from must overwrite from_actor normally"
+    );
+}
+
+/// PROPERTIES-MERGED-ACCURACY arm: restoring an owner-established key that
+/// was already present on the into-note (here `to_actor`) must not be
+/// double-counted against `properties_merged` — the fold never counted that
+/// key as "added" in the first place, because `to_actor` already existed on
+/// the into-note before the merge. Only the genuinely new non-owned key
+/// (`added`) contributed to the fold, so `properties_merged` must report 1,
+/// not 0, and the non-owned key must actually survive on the merged note.
+#[tokio::test]
+async fn merge_reports_properties_merged_for_key_that_actually_survives() {
+    let (registry, _rt) = build_registry_with_owned_kinds_and_validator();
+
+    let into_created = registry
+        .dispatch(
+            "create",
+            serde_json::json!({
+                "kind": "message",
+                "content": "into note, properties_merged accuracy arm",
+                "properties": {"to_actor": "into", "base": "i"},
+            }),
+        )
+        .await
+        .expect("create must succeed");
+    let into_id = into_created["id"]
+        .as_str()
+        .expect("create must return id")
+        .to_string();
+
+    let from_created = registry
+        .dispatch(
+            "create",
+            serde_json::json!({
+                "kind": "message",
+                "content": "from note, properties_merged accuracy arm",
+                "properties": {"to_actor": "from", "added": "x"},
+            }),
+        )
+        .await
+        .expect("create must succeed");
+    let from_id = from_created["id"]
+        .as_str()
+        .expect("create must return id")
+        .to_string();
+
+    let merged = registry
+        .dispatch(
+            "merge",
+            serde_json::json!({
+                "kind": "message",
+                "into_id": into_id,
+                "from_id": from_id,
+                "strategy": "prefer_from",
+            }),
+        )
+        .await
+        .expect("merge must succeed");
+
+    assert_eq!(
+        merged["properties_merged"], 1,
+        "exactly one non-owned key (`added`) genuinely survived the merge; got {merged}"
+    );
+
+    let after = registry
+        .dispatch("get", serde_json::json!({"id": into_id}))
+        .await
+        .expect("get must succeed");
+    assert_eq!(
+        after["properties"]["added"], "x",
+        "the newly introduced non-owned key must survive on the merged note"
+    );
+    assert_eq!(
+        after["properties"]["base"], "i",
+        "the into-note's own pre-existing non-owned key must survive too"
+    );
+    assert_eq!(
+        after["properties"]["to_actor"], "into",
+        "the owner-established key must remain pinned to the into-note, not \
+         the from-note's value"
+    );
+}
+
+/// NESTED-UNION arm: an owner-established key that holds an OBJECT
+/// (`thread_id`) merged under `strategy="union"` must not be double-counted
+/// either. The round-2 fix above corrected the flat case
+/// (`merge_reports_properties_merged_for_key_that_actually_survives`); this
+/// is the nested case that fix left uncorrected. Under `union` the fold
+/// recurses into `thread_id` and counts the absorbed note's nested key as a
+/// merged contribution, but restoration then reverts `thread_id` wholesale
+/// back to the into-note's pre-merge value — so nothing the fold counted
+/// actually survived, and `properties_merged` must report 0.
+#[tokio::test]
+async fn merge_reports_zero_properties_merged_for_nested_union_reversion() {
+    let (registry, _rt) = build_registry_with_owned_kinds_and_validator();
+
+    let identity = RequestIdentity {
+        namespace: "local".to_string(),
+        actor_id: Some("lambda:z".to_string()),
+        ..Default::default()
+    };
+
+    let into_created = registry
+        .dispatch_with_identity(
+            "create",
+            serde_json::json!({
+                "kind": "message",
+                "content": "into note, nested-union accuracy arm",
+                "properties": {"thread_id": {"keep": 1}},
+            }),
+            Some(identity.clone()),
+        )
+        .await
+        .expect("create must succeed");
+    let into_id = into_created["id"]
+        .as_str()
+        .expect("create must return id")
+        .to_string();
+
+    let from_created = registry
+        .dispatch_with_identity(
+            "create",
+            serde_json::json!({
+                "kind": "message",
+                "content": "from note, nested-union accuracy arm",
+                "properties": {"thread_id": {"discarded": 2}},
+            }),
+            Some(identity),
+        )
+        .await
+        .expect("create must succeed");
+    let from_id = from_created["id"]
+        .as_str()
+        .expect("create must return id")
+        .to_string();
+
+    let merged = registry
+        .dispatch(
+            "merge",
+            serde_json::json!({
+                "kind": "message",
+                "into_id": into_id,
+                "from_id": from_id,
+                "strategy": "union",
+            }),
+        )
+        .await
+        .expect("merge must succeed");
+
+    let after = registry
+        .dispatch("get", serde_json::json!({"id": into_id}))
+        .await
+        .expect("get must succeed");
+    assert_eq!(
+        after["properties"]["thread_id"],
+        serde_json::json!({"keep": 1}),
+        "the absorbed note's nested contribution must not survive restoration"
+    );
+    assert_eq!(
+        merged["properties_merged"], 0,
+        "nothing from the absorbed note actually survived restoration, so \
+         properties_merged must report 0, not the nested fold's raw count; \
+         got {merged}"
+    );
+}
+
+/// ROUTE-LEVEL RESTORATION arm: the whole scenario driven through the pack's
+/// actual `comm.send`/`create` + `merge` verbs (not `count_new_property_keys`
+/// called directly — that unit-level coverage already lives in
+/// `khive-runtime`'s `curation.rs` tests), on a pack-owned `message` note.
+///
+/// `external_id` is an `OWNER_ESTABLISHED_PROPERTIES` key `comm.send` never
+/// sets, so the into-note's property map genuinely lacks the key entirely
+/// (unlike `subject`, which `comm.send` always writes, even as `null` — a
+/// present-but-null key would already be "in" the into-note's map and
+/// wouldn't exercise the "absent from into" removal path). The from-note is
+/// built with `create` so `properties` can name `external_id` directly.
+///
+/// Under `prefer_from` the fold treats `external_id` as a genuinely new key
+/// — the into-note's property map does not have it — and counts it as one
+/// contribution. Restoration then reverts it: `external_id` is absent on the
+/// into-note, so it is removed from the merged result rather than kept.
+/// Nothing the fold counted actually survives, so `properties_merged` must
+/// report 0, and the into-note's owner-established properties (here
+/// `from_actor`) must still read as the into-note's own, not the absorbed
+/// note's.
+#[tokio::test]
+async fn merge_reports_zero_properties_merged_when_restoration_reverts_the_only_new_key_through_the_route(
+) {
+    let (registry, _rt) = build_registry_with_owned_kinds_and_validator();
+
+    let into_id = send_message_as(
+        &registry,
+        "lambda:x",
+        "into note, route-level restoration arm — no external_id",
+    )
+    .await;
+
+    let from_created = registry
+        .dispatch_with_identity(
+            "create",
+            serde_json::json!({
+                "kind": "message",
+                "content": "from note, route-level restoration arm — has an external_id",
+                "properties": {"external_id": "wire-abc-123"},
+            }),
+            Some(RequestIdentity {
+                namespace: "local".to_string(),
+                actor_id: Some("lambda:y".to_string()),
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect("create must succeed");
+    let from_id = from_created["id"]
+        .as_str()
+        .expect("create must return id")
+        .to_string();
+
+    let before = registry
+        .dispatch("get", serde_json::json!({"id": into_id}))
+        .await
+        .expect("get must succeed");
+    assert!(
+        before["properties"].get("external_id").is_none(),
+        "fixture invariant: the into-note must not already carry an \
+         `external_id`; got {before}"
+    );
+
+    let merged = registry
+        .dispatch(
+            "merge",
+            serde_json::json!({
+                "kind": "message",
+                "into_id": into_id,
+                "from_id": from_id,
+                "strategy": "prefer_from",
+            }),
+        )
+        .await
+        .expect("merge must succeed");
+
+    let after = registry
+        .dispatch("get", serde_json::json!({"id": into_id}))
+        .await
+        .expect("get must succeed");
+    assert!(
+        after["properties"].get("external_id").is_none(),
+        "restoration must strip the absorbed note's `external_id`, since the \
+         into-note never had one — got {after}"
+    );
+    assert_eq!(
+        after["properties"]["from_actor"], "lambda:x",
+        "the into-note's owner-established `from_actor` must survive the merge \
+         unchanged"
+    );
+    assert_eq!(
+        merged["properties_merged"], 0,
+        "the only key the fold counted as new (`external_id`) was reverted by \
+         restoration, so nothing genuinely survived; got {merged}"
     );
 }

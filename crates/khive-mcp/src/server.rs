@@ -433,8 +433,8 @@ impl KhiveMcpServer {
         // crate-level dependency between them.
         registry.call_register_note_mutation_hooks(&runtime);
         // Note-write identity: the pack-owned kind set drives `update`'s
-        // properties refusal so a pack-owned note's identity properties
-        // cannot be overwritten by a caller-supplied `properties` patch.
+        // properties refusal and `merge`'s identity preservation; the
+        // validator derives owned identity properties at every note-write.
         runtime.install_pack_owned_note_kinds(
             registry
                 .pack_owned_note_kinds()
@@ -442,6 +442,7 @@ impl KhiveMcpServer {
                 .map(str::to_string)
                 .collect(),
         );
+        registry.call_register_note_write_validators(&runtime);
         // Apply pack-auxiliary schema plans at startup so pack tables are
         // present before any handler runs. Errors are logged but not propagated
         // so a single pack's schema failure cannot abort startup.
@@ -3107,6 +3108,69 @@ mod tests {
             total_events > 0,
             "dispatch hook must update the same BrainPack instance the registry \
              dispatches brain.* verbs to; got snapshot {state:?}"
+        );
+    }
+
+    /// ADR-124 boot-occupancy regression: `has_note_write_validator` exists
+    /// specifically so a transport's own tests can assert, per boot path,
+    /// that the documented startup sequence actually filled the slot — but
+    /// nothing called it. Every prior ADR-124 test built its registry by
+    /// hand (`registry.call_register_note_write_validators(&rt)` in
+    /// `khive-pack-comm`'s integration tests), which proves the validator
+    /// works but proves nothing about whether `with_packs` — the single-
+    /// backend production boot path — installs it. Asserts occupancy
+    /// directly through the real builder, then proves the slot is not just
+    /// occupied but functioning: a generic `create` naming a forged
+    /// `from_actor` on a `message` note must come back derived to the
+    /// dispatching token's actor. Sensitivity verified by temporarily
+    /// commenting out the `registry.call_register_note_write_validators(&runtime);`
+    /// line in `KhiveMcpServer::with_packs` and re-running: both assertions
+    /// fail without it (occupancy false; forged value survives) and pass
+    /// with it restored.
+    #[tokio::test]
+    async fn single_runtime_boot_installs_note_write_validator() {
+        let config = RuntimeConfig {
+            db_path: None,
+            default_namespace: Namespace::local(),
+            embedding_model: None,
+            additional_embedding_models: vec![],
+            packs: vec!["kg".to_string(), "comm".to_string()],
+            ..RuntimeConfig::default()
+        };
+        let runtime = KhiveRuntime::new(config).expect("in-memory runtime");
+        let runtime_probe = runtime.clone();
+        let server = KhiveMcpServer::with_packs(runtime, &["kg".to_string(), "comm".to_string()])
+            .expect("server builds with kg + comm");
+
+        assert!(
+            runtime_probe.has_note_write_validator(),
+            "with_packs (single-backend boot) must install the note-write \
+             validator on the runtime it serves writes through"
+        );
+
+        let identity = khive_runtime::RequestIdentity {
+            namespace: "local".to_string(),
+            actor_id: Some("lambda:probe".to_string()),
+            ..Default::default()
+        };
+        let created = server
+            .registry
+            .dispatch_with_identity(
+                "create",
+                serde_json::json!({
+                    "kind": "message",
+                    "content": "single-runtime boot occupancy probe",
+                    "properties": {"from_actor": "forged-actor"},
+                }),
+                Some(identity),
+            )
+            .await
+            .expect("create must succeed");
+        assert_eq!(
+            created["properties"]["from_actor"], "lambda:probe",
+            "a forged from_actor on a generic create must come back derived to \
+             the dispatching token's actor, proving the installed validator is \
+             not just present but wired into the write path; got {created:?}"
         );
     }
 

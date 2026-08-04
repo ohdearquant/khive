@@ -43,6 +43,23 @@ pub type NoteMutationHookFn = Arc<
         + Sync,
 >;
 
+/// Callback type for a pack-installed note-write validator.
+///
+/// The pack that owns a note kind carrying derivable identity installs one so
+/// that the identity is a function of the authorization token rather than of
+/// caller input, on every write path including direct callers that bypass the
+/// handler layer — same rationale as [`EntityTypeValidatorFn`], which exists
+/// for exactly that reason on the entity side.
+///
+/// Kinds the installing pack does not own must be returned unchanged: the slot
+/// is single-occupancy (like `note_mutation_hook`), so a validator that
+/// rewrote foreign kinds would silently govern every other pack's notes.
+pub type NoteWriteValidatorFn = Arc<
+    dyn Fn(&str, &str, Option<serde_json::Value>) -> Result<Option<serde_json::Value>, RuntimeError>
+        + Send
+        + Sync,
+>;
+
 pub use crate::config::{
     assert_captured_db_anchor_consistent, assert_db_anchor_consistent, expand_tilde,
     parse_pack_list, resolve_db_anchor, resolve_project_actor_id, runtime_config_from_khive_config,
@@ -103,12 +120,21 @@ pub struct KhiveRuntime {
     /// no pack cares about note-mutation notifications) — the call becomes a
     /// no-op check of an `Option`.
     note_mutation_hook: Arc<RwLock<Option<NoteMutationHookFn>>>,
+    /// Pack-installed note-write validator.
+    ///
+    /// When `Some`, every runtime note-materialisation site that accepts
+    /// caller-supplied `properties` routes them through this function before
+    /// the `Note` is built, so a pack-owned identity property is derived from
+    /// the authorization token instead of trusted from caller input. `None`
+    /// on a bare runtime (no packs) — the properties pass through unchanged.
+    note_write_validator: Arc<RwLock<Option<NoteWriteValidatorFn>>>,
     /// Pack-owned note kinds — every note kind declared by a pack other than
     /// the generic-CRUD pack, installed by the transport from the registry
     /// (see `VerbRegistry::pack_owned_note_kinds`). Records of these kinds are
     /// maintained by their owning pack's own verbs, so `update`'s `properties`
-    /// patch is refused on them at the runtime layer. Empty until installed
-    /// (bare runtime), which leaves the rule inert.
+    /// patch is refused on them at the runtime layer and their owned identity
+    /// properties survive a `merge` unchanged. Empty until installed (bare
+    /// runtime), which leaves both rules inert.
     pack_owned_note_kinds: Arc<RwLock<Vec<String>>>,
     /// The config-resolved `BlobStore` (ADR-111 Amendment 2), installed by
     /// the boot path (`khive-mcp`'s single- and multi-backend startup paths)
@@ -156,6 +182,7 @@ impl KhiveRuntime {
             valid_note_kinds: Arc::new(RwLock::new(Vec::new())),
             entity_type_validator: Arc::new(RwLock::new(None)),
             note_mutation_hook: Arc::new(RwLock::new(None)),
+            note_write_validator: Arc::new(RwLock::new(None)),
             pack_owned_note_kinds: Arc::new(RwLock::new(Vec::new())),
             blob_store: Arc::new(RwLock::new(None)),
         })
@@ -187,6 +214,7 @@ impl KhiveRuntime {
             valid_note_kinds: Arc::new(RwLock::new(Vec::new())),
             entity_type_validator: Arc::new(RwLock::new(None)),
             note_mutation_hook: Arc::new(RwLock::new(None)),
+            note_write_validator: Arc::new(RwLock::new(None)),
             pack_owned_note_kinds: Arc::new(RwLock::new(Vec::new())),
             blob_store: Arc::new(RwLock::new(None)),
         })
@@ -217,6 +245,7 @@ impl KhiveRuntime {
             valid_note_kinds: Arc::new(RwLock::new(Vec::new())),
             entity_type_validator: Arc::new(RwLock::new(None)),
             note_mutation_hook: Arc::new(RwLock::new(None)),
+            note_write_validator: Arc::new(RwLock::new(None)),
             pack_owned_note_kinds: Arc::new(RwLock::new(Vec::new())),
             blob_store: Arc::new(RwLock::new(None)),
         }
@@ -276,6 +305,7 @@ impl KhiveRuntime {
                     valid_note_kinds: self.valid_note_kinds.clone(),
                     entity_type_validator: self.entity_type_validator.clone(),
                     note_mutation_hook: self.note_mutation_hook.clone(),
+                    note_write_validator: self.note_write_validator.clone(),
                     pack_owned_note_kinds: self.pack_owned_note_kinds.clone(),
                     blob_store: self.blob_store.clone(),
                 }
@@ -778,6 +808,77 @@ impl KhiveRuntime {
     pub fn install_note_mutation_hook(&self, f: NoteMutationHookFn) {
         if let Ok(mut guard) = self.note_mutation_hook.write() {
             *guard = Some(f);
+        }
+    }
+
+    /// Install a pack-owned note-write validator.
+    ///
+    /// Called during pack registration (`PackRuntime::register_note_write_validator`)
+    /// so that the covered note-write sites carrying caller-supplied
+    /// `properties` derive the owning pack's identity properties from the
+    /// authorization token, closing the gap where a direct Rust caller, the
+    /// generic `create` verb, or the proposal-apply path (which dispatches no
+    /// pack hooks) writes them unchecked. Single-slot semantics, same as
+    /// [`install_note_mutation_hook`](Self::install_note_mutation_hook): a
+    /// second installing pack overwrites the first, so a validator must return
+    /// kinds it does not own unchanged.
+    ///
+    /// Covered sites — each calls `derive_note_write_properties`
+    /// before the write: `create_note_inner` (`operations.rs`, the generic
+    /// `create` verb funnel and every other public `create_note*` variant),
+    /// `atomic_prepare::prepare_add_note` (the proposal-apply add-note path),
+    /// and `atomic_message::create_notes_atomic_with_report` (the atomic
+    /// multi-note writer).
+    ///
+    /// NOT covered: `try_create_note` (`operations.rs`), and the raw
+    /// `try_insert_note` / `upsert_note` methods on the [`NoteStore`] returned
+    /// by [`notes`](Self::notes). `try_create_note` is deliberately excluded —
+    /// its only caller path is `comm.ingest`, where `properties.from_actor` is
+    /// the external transport sender named by the `from` parameter, not the
+    /// authenticated caller; deriving it from the token here would stamp
+    /// every inbound message as the ingesting daemon and destroy inbound
+    /// attribution. The `NoteStore` accessors are a lower-level storage
+    /// escape hatch with no properties-derivation contract of their own; a
+    /// caller reaching storage directly is expected to have already decided
+    /// what `properties` to write.
+    pub fn install_note_write_validator(&self, f: NoteWriteValidatorFn) {
+        if let Ok(mut guard) = self.note_write_validator.write() {
+            *guard = Some(f);
+        }
+    }
+
+    /// Whether a note-write validator is installed on this runtime.
+    ///
+    /// Exists so a transport's own tests can assert, per boot path, that the
+    /// documented startup sequence actually filled the slot. A missing install
+    /// fails open and silently — an empty slot passes caller-supplied
+    /// properties straight through, which no write site can distinguish from a
+    /// validator that approved them — so occupancy is asserted, never assumed.
+    pub fn has_note_write_validator(&self) -> bool {
+        self.note_write_validator
+            .read()
+            .map(|g| g.is_some())
+            .unwrap_or(false)
+    }
+
+    /// Run caller-supplied note `properties` through the installed note-write
+    /// validator, returning the properties to store.
+    ///
+    /// Returns them unchanged when no validator is installed (bare runtime).
+    pub(crate) fn derive_note_write_properties(
+        &self,
+        kind: &str,
+        token: &NamespaceToken,
+        properties: Option<serde_json::Value>,
+    ) -> RuntimeResult<Option<serde_json::Value>> {
+        let validator = self
+            .note_write_validator
+            .read()
+            .map_err(|_| RuntimeError::Internal("note write validator lock poisoned".into()))?
+            .clone();
+        match validator {
+            None => Ok(properties),
+            Some(validate) => validate(kind, &token.actor().id, properties),
         }
     }
 

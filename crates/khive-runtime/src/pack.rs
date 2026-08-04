@@ -233,6 +233,18 @@ pub trait PackRuntime: Send + Sync {
     /// See `docs/api/pack.md#register_note_mutation_hook` for cross-pack notification rationale.
     fn register_note_mutation_hook(&self, _runtime: &KhiveRuntime) {}
 
+    /// Install a note-write validator on the runtime, called at pack
+    /// initialisation with the same timing as `register_note_mutation_hook`.
+    ///
+    /// A pack owning a note kind whose properties carry identity that the
+    /// runtime can derive from the authorization token implements this and
+    /// calls `KhiveRuntime::install_note_write_validator`, so the identity is
+    /// derived at every note-write site rather than trusted from caller input
+    /// on the write paths that reach no pack verb. Default no-op leaves the
+    /// slot absent. The slot holds one validator, so an implementation must
+    /// return properties for kinds it does not own unchanged.
+    fn register_note_write_validator(&self, _runtime: &KhiveRuntime) {}
+
     /// Warm up any in-memory state from persisted snapshots (optional). Called after
     /// all packs are registered but before serving the first request. Must be
     /// idempotent and infallible — errors are logged internally, never propagated.
@@ -2252,6 +2264,19 @@ impl VerbRegistry {
     pub fn call_register_note_mutation_hooks(&self, runtime: &KhiveRuntime) {
         for pack in self.packs.iter() {
             pack.register_note_mutation_hook(runtime);
+        }
+    }
+
+    /// Invoke `PackRuntime::register_note_write_validator` on every registered pack.
+    ///
+    /// Called by the transport during startup with the same timing as
+    /// `call_register_note_mutation_hooks`, so note-write validation is active
+    /// at the runtime layer for every write path — the generic `create` verb,
+    /// direct Rust callers, and proposal apply, none of which dispatch a pack
+    /// hook of their own on the note-write.
+    pub fn call_register_note_write_validators(&self, runtime: &KhiveRuntime) {
+        for pack in self.packs.iter() {
+            pack.register_note_write_validator(runtime);
         }
     }
 

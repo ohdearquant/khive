@@ -3265,6 +3265,12 @@ impl KhiveRuntime {
         embedding_model: Option<&str>,
     ) -> RuntimeResult<(Note, crate::retrieval::EmbeddingTruncationReport)> {
         self.validate_note_kind(kind)?;
+        // Owned identity properties are derived from the authorization token
+        // before anything else touches them, so every caller of this function —
+        // the generic `create` verb and direct Rust callers alike — stores the
+        // same derived values. Runs before the secret gate so the gate scans
+        // exactly what will be written.
+        let properties = self.derive_note_write_properties(kind, token, properties)?;
         // Secret gate: scan content, optional name, and structured properties.
         crate::secret_gate::check(content)?;
         if let Some(n) = name {
