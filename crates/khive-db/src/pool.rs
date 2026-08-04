@@ -712,6 +712,16 @@ impl ConnectionPool {
     /// fail loud on a genuine misconfiguration (write queue requested but no
     /// runtime to run it on) can propagate the `Err` directly.
     pub fn writer_task_handle(&self) -> Result<Option<WriterTaskHandle>, StorageError> {
+        // Pinned invariant: `ConnectionPool::new` resolves `None` ("no
+        // preference") to a concrete `Some(..)` once `path` is known, so by
+        // the time any reader sees this config it is resolved. A `None` here
+        // would mean a future construction path skipped that resolution and
+        // would silently read as disabled — trip loudly in debug instead.
+        debug_assert!(
+            self.config.write_queue_enabled.is_some(),
+            "write_queue_enabled must be resolved to Some(..) by ConnectionPool::new \
+             before any writer_task_handle read"
+        );
         if !self.config.write_queue_enabled.unwrap_or(false) {
             return Ok(None);
         }
@@ -762,13 +772,24 @@ impl ConnectionPool {
     /// once, by [`crate::writer_task::spawn`], immediately after spawning —
     /// the same `writer_task` OnceLock init that makes spawn at-most-once
     /// per pool makes this write at-most-once per pool.
+    ///
+    /// First-wins: if a handle is already stored, the existing handle is
+    /// kept and the new one is dropped (dropping a `JoinHandle` detaches
+    /// its task without cancelling it). A second store violates the
+    /// at-most-once contract and trips the debug_assert in debug builds;
+    /// release builds keep the first handle rather than silently swapping
+    /// the drain owner out from under whichever caller already took it.
     pub(crate) fn set_writer_task_join(&self, join: tokio::task::JoinHandle<()>) {
-        let prev = self.writer_task_join.lock().replace(join);
+        let mut slot = self.writer_task_join.lock();
+        let first_store = slot.is_none();
         debug_assert!(
-            prev.is_none(),
+            first_store,
             "writer task JoinHandle stored twice; the writer_task OnceLock is \
              supposed to make spawn at-most-once per pool"
         );
+        if first_store {
+            *slot = Some(join);
+        }
     }
 
     /// Take the writer task's JoinHandle, if a writer task was spawned and
@@ -779,9 +800,15 @@ impl ConnectionPool {
     /// the task's exit before treating the database file as settled: the
     /// task's connection close fires SQLite's close-time WAL checkpoint, so
     /// until the task exits the file bytes can still move after the caller's
-    /// last write returned. `None` means either the write queue never
-    /// spawned (disabled, or spawn degraded) or another caller already took
-    /// the handle — in both cases there is nothing further to await here.
+    /// last write returned.
+    ///
+    /// One-shot: `None` means either the write queue never spawned
+    /// (disabled, or spawn degraded) or another caller already took the
+    /// handle — in both cases there is nothing further to await here.
+    /// Exactly one subsystem may own the drain: the single caller that
+    /// receives `Some(_)` is the sole owner of the task-exit await (and of
+    /// the close-time WAL checkpoint that settles the database file); every
+    /// later caller receives `None` and must not arrange its own await.
     pub fn take_writer_task_join(&self) -> Option<tokio::task::JoinHandle<()>> {
         self.writer_task_join.lock().take()
     }
@@ -1364,6 +1391,18 @@ mod tests {
 
     #[test]
     #[serial]
+    fn pool_config_env_override_write_queue_invalid_value_is_explicit_off() {
+        // Documented contract (`write_queue_enabled` docs): `"1"`/`"true"`
+        // (case-insensitive) set `Some(true)`; any other value — garbage
+        // included — sets `Some(false)`, never `None`.
+        std::env::set_var("KHIVE_WRITE_QUEUE", "banana");
+        let cfg = PoolConfig::default();
+        std::env::remove_var("KHIVE_WRITE_QUEUE");
+        assert_eq!(cfg.write_queue_enabled, Some(false));
+    }
+
+    #[test]
+    #[serial]
     fn pool_config_write_routing_strict_defaults_off() {
         let _pool_env = clear_pool_env();
         let cfg = PoolConfig::default();
@@ -1505,9 +1544,9 @@ mod tests {
         assert_eq!(pool.config().write_queue_enabled, Some(false));
     }
 
-    #[test]
+    #[tokio::test]
     #[serial]
-    fn explicit_true_stays_on_for_memory_backed_pool() {
+    async fn explicit_true_stays_on_for_memory_backed_pool() {
         let _pool_env = clear_pool_env();
         let pool = ConnectionPool::new(PoolConfig {
             path: None,
@@ -1516,6 +1555,26 @@ mod tests {
         })
         .expect("in-memory pool should open");
         assert_eq!(pool.config().write_queue_enabled, Some(true));
+        // Pinned behavioral contract: the explicit-on preference survives in
+        // the stored config, but an in-memory pool cannot host a writer
+        // task — `writer_task::spawn` fails its standalone-connection open
+        // and degrades to no writer task, so callers fall back to the
+        // legacy pool-mutex write path and there is no JoinHandle to drain.
+        assert!(
+            pool.writer_task_handle()
+                .expect("spawn degrade must resolve without error")
+                .is_none(),
+            "explicit-on in-memory pool must degrade to no writer task"
+        );
+        assert_eq!(
+            pool.writer_task_spawn_count(),
+            1,
+            "the spawn attempt must happen exactly once and degrade, not retry"
+        );
+        assert!(
+            pool.take_writer_task_join().is_none(),
+            "a degraded spawn stores no JoinHandle to drain"
+        );
     }
 
     #[test]
@@ -1701,6 +1760,93 @@ mod tests {
             pool.writer_task_spawn_count(),
             0,
             "the guard must reject before ever attempting tokio::spawn"
+        );
+    }
+
+    /// Join-handle lifecycle: a spawn-configured pool stores exactly one
+    /// JoinHandle — the first `take_writer_task_join` after spawn returns
+    /// it, and every later take returns `None` (the one-shot contract that
+    /// lets exactly one subsystem own the drain).
+    #[tokio::test]
+    async fn take_writer_task_join_returns_some_once_then_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("join_lifecycle.db");
+        let pool = ConnectionPool::new(PoolConfig {
+            path: Some(path),
+            write_queue_enabled: Some(true),
+            ..PoolConfig::default()
+        })
+        .expect("file-backed pool should open");
+
+        // Spawning is lazy: nothing to take before the first
+        // `writer_task_handle()` call actually spawns the task.
+        assert!(
+            pool.take_writer_task_join().is_none(),
+            "before spawn there is no JoinHandle to take"
+        );
+        pool.writer_task_handle()
+            .expect("runtime is present")
+            .expect("write queue enabled must spawn a writer task");
+
+        assert!(
+            pool.take_writer_task_join().is_some(),
+            "the first take must return the spawned task's JoinHandle"
+        );
+        assert!(
+            pool.take_writer_task_join().is_none(),
+            "the second take must return None — the handle is one-shot"
+        );
+    }
+
+    /// Debug half of the first-wins contract: a second
+    /// `set_writer_task_join` call is a construction bug, and debug builds
+    /// trip the method's debug_assert loudly instead of carrying on.
+    #[cfg(debug_assertions)]
+    #[tokio::test]
+    #[should_panic(expected = "writer task JoinHandle stored twice")]
+    async fn set_writer_task_join_second_store_trips_debug_assert() {
+        let pool = ConnectionPool::new(PoolConfig::default()).expect("in-memory pool should open");
+        pool.set_writer_task_join(tokio::spawn(async {}));
+        pool.set_writer_task_join(tokio::spawn(async {}));
+    }
+
+    /// Release half of the first-wins contract: with the debug_assert
+    /// compiled out, a second `set_writer_task_join` call keeps the
+    /// EXISTING handle and drops the new one. The stored handle is
+    /// therefore the first task's, so awaiting the taken handle completes
+    /// the FIRST task's observable effect.
+    #[cfg(not(debug_assertions))]
+    #[tokio::test]
+    async fn set_writer_task_join_first_wins_keeps_existing_handle() {
+        let pool = ConnectionPool::new(PoolConfig::default()).expect("in-memory pool should open");
+
+        // First task: completes promptly and signals completion — the
+        // observable effect the bounded await below asserts on.
+        let (first_done_tx, first_done_rx) = tokio::sync::oneshot::channel::<()>();
+        let first = tokio::spawn(async move {
+            let _ = first_done_tx.send(());
+        });
+        // Second task: parks on a receiver nobody sends to, so it never
+        // completes on its own. If first-wins failed and this task's handle
+        // were the stored one, the bounded await below would time out.
+        let (_never_sent, never_rx) = tokio::sync::oneshot::channel::<()>();
+        let second = tokio::spawn(async move {
+            let _ = never_rx.await;
+        });
+
+        pool.set_writer_task_join(first);
+        pool.set_writer_task_join(second);
+
+        let taken = pool
+            .take_writer_task_join()
+            .expect("the first handle must still be stored");
+        tokio::time::timeout(Duration::from_secs(5), taken)
+            .await
+            .expect("stored handle must be the first task's; the second never completes")
+            .expect("the first task must not panic");
+        assert!(
+            first_done_rx.await.is_ok(),
+            "completing the taken handle must mean the FIRST task ran to completion"
         );
     }
 

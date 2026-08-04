@@ -365,6 +365,13 @@ async fn event_busy_standalone_writer_emits_ndjson_row() {
 /// standalone-writer path so this test keeps exercising the
 /// `standalone:text` busy site regardless of the file-backed write-queue
 /// default.
+///
+/// Env restore ordering is safe as written: `StorageBackend::sqlite` reads
+/// `PoolConfig::default()` off the env and `ConnectionPool::new` resolves the
+/// `None` preference synchronously before that constructor returns
+/// (crates/khive-db/src/backend.rs:38-45, crates/khive-db/src/pool.rs:465-473),
+/// so the pool's resolved `Some(false)` config is already baked in by the
+/// time the variables are restored below.
 #[tokio::test]
 #[serial_test::serial(writer_timeout_sink_busy_env)]
 async fn text_busy_standalone_writer_emits_ndjson_row() {

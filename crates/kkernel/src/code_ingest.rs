@@ -833,7 +833,10 @@ mod tests {
         // resolves the write queue ON, so this test exercises the writer-task
         // drain rather than silently passing through the queue-off path an
         // ambient KHIVE_WRITE_QUEUE=0 would select. (#[serial] guards the
-        // env mutation.)
+        // env mutation.) Save the prior value so the restore at the end of
+        // the test leaves the process environment exactly as this test
+        // found it.
+        let previous_write_queue = std::env::var_os("KHIVE_WRITE_QUEUE");
         std::env::remove_var("KHIVE_WRITE_QUEUE");
         let tmp = tempfile::TempDir::new().expect("temp dir");
         let findings = write_valid_findings(tmp.path());
@@ -870,6 +873,11 @@ mod tests {
             bytes_at_return, bytes_later,
             "no byte of the database may move after code_ingest_batch has returned"
         );
+
+        match previous_write_queue {
+            Some(v) => std::env::set_var("KHIVE_WRITE_QUEUE", v),
+            None => std::env::remove_var("KHIVE_WRITE_QUEUE"),
+        }
     }
 
     /// The `-shm` sidecar path SQLite uses alongside a WAL-mode database file.
