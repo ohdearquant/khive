@@ -39,6 +39,10 @@ pub const DB_OVERRIDE_CONFLICT_CODE: &str = "database_override_conflict";
 
 /// Invocation-level refusal raised before any verb is dispatched when a
 /// concrete `--db`/`KHIVE_DB` value would collapse declared backends.
+///
+/// The `config_source` the envelope reports is the canonicalized selected
+/// file path (`diagnostic_config_path`): under symlinks it can diverge from
+/// the path the operator typed.
 #[derive(Debug)]
 pub struct DatabaseOverrideConflict {
     db_override: String,
@@ -3336,13 +3340,16 @@ brain_profile = "project-profile"
     fn cli_actor_flag_populates_actor_id() {
         std::env::remove_var("KHIVE_ACTOR");
 
-        // ADR-096 Fork 2: an explicit nonexistent config path (rather than `None`)
+        // ADR-096 Fork 2: an explicit EMPTY config file (rather than `None`)
         // keeps this test hermetic against whatever the real `$HOME/.khive/config.toml`
         // on the machine running the suite happens to contain — the project-actor
         // tier (`resolve_project_actor_id`) now runs unconditionally and would
         // otherwise pick up a real machine's global `[actor]`, if one is set.
-        let missing_config =
-            std::path::PathBuf::from("/nonexistent/khive-cli-actor-test/config.toml");
+        // (The explicit tier fails loud on a MISSING file — ADR-035 — so the
+        // hermeticity trick must be a real, empty file.)
+        let empty_config_dir = tempfile::tempdir().expect("empty config tempdir");
+        let missing_config = empty_config_dir.path().join("config.toml");
+        std::fs::write(&missing_config, "").expect("write empty config");
 
         let resolved = resolve_runtime_config(RuntimeConfigInputs {
             db: Some(":memory:"),
@@ -3413,8 +3420,9 @@ brain_profile = "project-profile"
         std::env::remove_var("KHIVE_ACTOR");
 
         // See the hermeticity note in `cli_actor_flag_populates_actor_id` above.
-        let missing_config =
-            std::path::PathBuf::from("/nonexistent/khive-cli-actor-local-test/config.toml");
+        let empty_config_dir = tempfile::tempdir().expect("empty config tempdir");
+        let missing_config = empty_config_dir.path().join("config.toml");
+        std::fs::write(&missing_config, "").expect("write empty config");
 
         let resolved = resolve_runtime_config(RuntimeConfigInputs {
             db: Some(":memory:"),
@@ -3696,11 +3704,15 @@ id = "lambda:project-actor"
         })
         .expect("resolve config with project actor");
 
-        let missing_config =
-            std::path::PathBuf::from("/nonexistent/khive-project-vs-env-test/config.toml");
+        // A real, EMPTY file stands in for "no project config": the explicit
+        // tier fails loud on a missing file (ADR-035), so the hermeticity
+        // trick cannot be a nonexistent path.
+        let empty_config_dir = tempfile::tempdir().expect("empty config tempdir");
+        let empty_config = empty_config_dir.path().join("config.toml");
+        std::fs::write(&empty_config, "").expect("write empty config");
         let without_project_config = resolve_runtime_config(RuntimeConfigInputs {
             db: Some(":memory:"),
-            config: Some(&missing_config),
+            config: Some(&empty_config),
             namespace: Namespace::parse("local").expect("ns"),
             namespace_explicit: false,
             actor_explicit: false,

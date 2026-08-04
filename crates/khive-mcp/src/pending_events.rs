@@ -4288,6 +4288,49 @@ mod tests {
         );
     }
 
+    /// Sibling regression for the explicit-tier half of the same seam: an
+    /// explicit `--config` naming a MISSING file must fail loud, not run the
+    /// drain with defaults. The loader enforces the explicit tier
+    /// (`KhiveConfig::load_with_home_fallback_and_source` returns
+    /// `ExplicitConfigMissing`), and the error surfaces wrapped in the
+    /// generic build context — it is NOT a `DatabaseOverrideConflict`.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn run_pending_events_fails_loud_for_missing_explicit_config() {
+        std::env::remove_var("KHIVE_DB");
+        std::env::remove_var("KHIVE_PACKS");
+        std::env::remove_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR");
+
+        let seat_dir = tempfile::tempdir().expect("seat tempdir");
+        let _seat_env = SeatEnv::enter(seat_dir.path());
+        let config_dir = tempfile::tempdir().expect("config tempdir");
+        let missing_config = config_dir.path().join("does-not-exist.toml");
+
+        let error = run_pending_events_with_config(None, Some(&missing_config), "local", false)
+            .await
+            .expect_err("a missing explicit config must fail loud, not run with defaults");
+
+        assert!(
+            error
+                .downcast_ref::<crate::serve::DatabaseOverrideConflict>()
+                .is_none(),
+            "not a database-override conflict: {error:?}"
+        );
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains("pending-events: build server"),
+            "non-conflict build failures keep the generic provenance: {rendered}"
+        );
+        assert!(
+            rendered.contains("does not exist"),
+            "the underlying missing-file failure must name the selected path: {rendered}"
+        );
+        assert!(
+            rendered.contains("does-not-exist.toml"),
+            "the error must name the missing file the operator selected: {rendered}"
+        );
+    }
+
     /// The wrapper seam (`build_server_with_explicit_namespace`, called by
     /// `run_pending_events` with `namespace_explicit: true, actor_explicit:
     /// false`) must let a `"local"`-resolved default namespace fall through

@@ -285,28 +285,21 @@ pub async fn cli_main() -> Result<()> {
             // instead of the project, silently skipping a project-local
             // `.khive/config.toml`).
             let db_path_hint = khive_mcp::serve::config_discovery_db_anchor(a.db.as_deref());
-            // An explicit `--config`/`KHIVE_CONFIG` that fails to load must
-            // fail loud — silently defaulting would boot against a config
-            // the operator did not select (ADR-035). The automatic-discovery
-            // tiers keep the historical tolerant default: the CLI-level
-            // topology check is advisory, and a malformed discovered file is
-            // still reported by the builder's own load further down.
+            // An explicit `--config`/`KHIVE_CONFIG` that fails to load — a
+            // malformed file OR a missing one — must fail loud: silently
+            // defaulting would boot against a config the operator did not
+            // select (ADR-035). The loader itself enforces the explicit tier
+            // (`load_with_home_fallback_and_source` returns
+            // `ConfigError::ExplicitConfigMissing` for a missing explicit
+            // path), so every entry point inherits the refusal; the
+            // automatic-discovery tiers keep the historical tolerant
+            // default: the CLI-level topology check is advisory, and a
+            // malformed discovered file is still reported by the builder's
+            // own load further down.
             let loaded_config = match KhiveConfig::load_with_home_fallback_and_source(
                 a.config.as_deref(),
                 db_path_hint.as_deref(),
             ) {
-                // An explicit selection that resolves to a MISSING file is the
-                // same operator error as a malformed one (a mistyped path
-                // would otherwise boot silently with defaults): the explicit
-                // tier never falls through to discovery, so `Ok(None)` here
-                // with an explicit path means the named file does not exist.
-                Ok(None) if a.config.is_some() => {
-                    let selected = a.config.as_deref().expect("guard: a.config.is_some()");
-                    anyhow::bail!(
-                        "the explicitly selected config file {} does not exist",
-                        selected.display()
-                    );
-                }
                 Ok(loaded) => loaded,
                 Err(load_error) => {
                     if a.config.is_some() {
@@ -903,32 +896,39 @@ mod tests {
         );
     }
 
-    // An explicit `--config` naming a nonexistent file must not silently fall
-    // through to the discovery tiers. The loader's contract is that with an
-    // explicit selection, `Ok(None)` means exactly "the named file does not
-    // exist" — never "fell back to a discovered config" — which is the
-    // property the `Command::Mcp` branch relies on to convert that case into
-    // a loud failure instead of booting with defaults.
+    // An explicit `--config` naming a nonexistent file must fail loud at the
+    // loader — never silently fall through to the discovery tiers (ADR-035).
+    // The `Command::Mcp` branch's `Err` arm ("failed to load the explicitly
+    // selected config file") carries this case now that the explicit tier is
+    // enforced inside `load_with_home_fallback_and_source` itself.
     #[tokio::test]
     async fn mcp_explicit_missing_config_does_not_fall_through_to_discovery() {
         let tmp = TempDir::new().expect("temp dir");
         // Plant a discoverable config in the db-anchored tier
-        // (`<db_dir>/.khive/config.toml`). If the explicit tier fell through,
-        // discovery would pick this file up and `Ok(Some(...))` would come
-        // back instead of `Ok(None)`.
+        // (`<db_dir>/.khive/config.toml`). It is the CONTROL proving discovery
+        // was NOT consulted: if the explicit tier fell through, discovery
+        // would pick this file up and `Ok(Some(...))` would come back instead
+        // of the loud missing-file error.
         let anchor_dir = tmp.path().join(".khive");
         std::fs::create_dir_all(&anchor_dir).expect("create discovery anchor dir");
         std::fs::write(anchor_dir.join("config.toml"), "").expect("write discoverable config");
         let missing = tmp.path().join("does-not-exist.toml");
         let db_hint = tmp.path().join("khive.db");
 
-        let loaded =
-            KhiveConfig::load_with_home_fallback_and_source(Some(&missing), Some(&db_hint))
-                .expect("a missing explicit config is not a parse error");
+        let error = KhiveConfig::load_with_home_fallback_and_source(Some(&missing), Some(&db_hint))
+            .expect_err("an explicit selection naming a missing file must fail loud");
         assert!(
-            loaded.is_none(),
-            "the explicit tier must report a missing file as None, never fall \
-             through to a discovered config: {loaded:?}"
+            matches!(
+                error,
+                khive_runtime::engine_config::ConfigError::ExplicitConfigMissing { .. }
+            ),
+            "the explicit tier must fail with ExplicitConfigMissing, never fall \
+             through to the planted discoverable config: {error:?}"
+        );
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains("does-not-exist.toml"),
+            "the error must name the missing file the operator selected: {rendered}"
         );
     }
 

@@ -757,16 +757,28 @@ fn spawn_daemon_with_exe_and_config(
     if let Some(path) = config {
         cmd.arg("--config").arg(path);
     }
-    // Only `:memory:` is forwarded. It is the one override a newly spawned
-    // daemon can honor byte-identically to the client (ephemeral by
-    // definition), and without it the fresh daemon would bind the config's
-    // declared persistent backend files instead — the opposite of what the
-    // operator requested. A concrete redundant-main override needs no
-    // forwarding: the spawned daemon's config-declared path IS that
-    // override's target, and the client's `config_id` has already been
-    // normalized to the no-override anchor so the match is exact.
-    if db == Some(":memory:") {
-        cmd.arg("--db").arg(":memory:");
+    // Forward whatever override the caller hands over — the caller owns the
+    // decision of WHICH override a spawned daemon must be constructed with
+    // (`run_exec_inline_with_forward` in `crates/kkernel/src/exec.rs`):
+    //
+    // - `:memory:` always forwards: it is the one override a newly spawned
+    //   daemon can honor byte-identically to the client (ephemeral by
+    //   definition), and without it the fresh daemon would bind the config's
+    //   declared persistent backend files instead — the opposite of what the
+    //   operator requested.
+    // - A CONCRETE path forwards in the single-backend case (no
+    //   `[[backends]]` declared): the spawned daemon has no config-declared
+    //   database path to default to, so without the override it would bind
+    //   `$HOME/.khive/khive.db` and its `config_id` would never match the
+    //   client's override-anchored frame.
+    // - A redundant concrete override (multi-backend, proven to name the
+    //   declared `main` backend) is deliberately NOT passed here by the
+    //   caller: the spawned daemon's config-declared path IS that override's
+    //   target, and the client's `config_id` has already been normalized to
+    //   the no-override anchor — forwarding it would desync the child's
+    //   fingerprint from the normalized frame.
+    if let Some(db) = db {
+        cmd.arg("--db").arg(db);
     }
     cmd.stdin(Stdio::null()).stdout(Stdio::null());
     // The daemon's tracing (including WAL/checkpoint telemetry) goes to
@@ -3081,14 +3093,19 @@ mod tests {
         );
     }
 
-    /// A concrete (non-`:memory:`) override is deliberately NOT forwarded:
-    /// by the time the frame is built, a legal concrete override has already
-    /// been proven to name the declared `main` backend and normalized to the
-    /// no-override anchor (`normalize_redundant_db_override_with_source` in
-    /// `crates/kkernel/src/exec.rs`), so the spawned daemon's
-    /// config-declared path IS the override's target.
+    /// A concrete override handed to the spawn seam must reach the spawned
+    /// daemon's command line: this is the single-backend case (no
+    /// `[[backends]]` declared), where the fresh daemon has no
+    /// config-declared database path and would otherwise bind
+    /// `$HOME/.khive/khive.db` instead of the operator's override — a
+    /// `config_id` mismatch against the client's override-anchored frame.
+    /// The redundant-concrete multi-backend case never reaches this
+    /// function: the caller (`run_exec_inline_with_forward` in
+    /// `crates/kkernel/src/exec.rs`) withholds the override there because
+    /// the frame's fingerprint has already been normalized to the
+    /// no-override anchor (`normalize_redundant_db_override_with_source`).
     #[test]
-    fn spawn_daemon_with_exe_and_config_omits_concrete_db_flag_from_command_line() {
+    fn spawn_daemon_with_exe_and_config_forwards_concrete_db_flag_to_command_line() {
         let dir = tempfile::tempdir().expect("tempdir");
         let record = dir.path().join("argv.txt");
         let exe = daemon_script_fixture(
@@ -3105,8 +3122,8 @@ mod tests {
         let recorded = std::fs::read_to_string(&record).expect("read recorded argv");
         assert_eq!(
             recorded.trim_end(),
-            "mcp --daemon",
-            "a concrete override must not be forwarded to the daemon command line"
+            "mcp --daemon --db /tmp/main.db",
+            "the concrete override handed to the spawn seam must reach the daemon command line"
         );
     }
 

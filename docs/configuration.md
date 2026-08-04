@@ -144,7 +144,10 @@ Three cases:
   `:memory:` (and an explicit `--config`) to a warm daemon it spawns, so the
   daemon it binds is just as ephemeral; it never reuses a daemon already
   bound to the persistent files, because `:memory:` produces a distinct
-  `config_id` that no persistent-storage daemon can match.
+  `config_id` that no persistent-storage daemon can match. A concrete `--db`
+  override on a single-backend invocation (no `[[backends]]` declared) is
+  likewise forwarded to the spawned daemon, so the child binds the operator's
+  file instead of the default database.
 
 - **A concrete path equal to the declared `main` backend path**: accepted as
   a redundant no-op after canonical path comparison. It does not collapse or
@@ -182,7 +185,8 @@ Three cases:
   The process remains nonzero, but automation can distinguish a no-run
   configuration refusal from a dispatched batch whose operations all failed.
   MCP startup keeps stdout protocol-clean and reports the actionable message on
-  stderr only.
+  stderr only. The reported `config_path` is the canonicalized selected file
+  path; under symlinks it can differ from the path you typed.
 
 **Why this fails loud instead of silently applying `--db` to `main` only, or
 to every backend:** with two or more distinct declared backend files, a

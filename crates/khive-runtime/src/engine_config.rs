@@ -72,6 +72,9 @@ pub enum ConfigError {
 
     #[error("[[git_write.allowed]] entry {repo:?}: {reason}")]
     InvalidGitWriteEntry { repo: String, reason: String },
+
+    #[error("the explicitly selected config file does not exist: {path}")]
+    ExplicitConfigMissing { path: PathBuf },
 }
 
 // ---- Config structs ----
@@ -479,6 +482,14 @@ impl KhiveConfig {
     /// Parse errors are propagated immediately — a malformed config is always
     /// an error regardless of which tier it came from.
     ///
+    /// The explicit tier (1) is stricter than the discovery tiers: a `path`
+    /// that names a file which does not exist returns
+    /// [`ConfigError::ExplicitConfigMissing`] instead of falling through to
+    /// tiers 2-4 — an operator-selected config that is missing is the same
+    /// class of mistake as one that is malformed, and silently discovering a
+    /// different file would boot against a config the operator did not select
+    /// (ADR-035).
+    ///
     /// `db_path` should be the same database path the caller is about to open
     /// (or has already resolved). Passing it makes tier 3 resolve identically
     /// for any two processes that target the same database, regardless of
@@ -504,8 +515,19 @@ impl KhiveConfig {
         path: Option<&Path>,
         db_path: Option<&Path>,
     ) -> Result<Option<(Self, PathBuf)>, ConfigError> {
-        // Tier 1: explicit path (highest priority).
+        // Tier 1: explicit path (highest priority). An explicit selection
+        // naming a MISSING file fails loud here — once, at the loader, for
+        // every entry point — instead of silently falling through to the
+        // discovery tiers: a mistyped path would otherwise boot against a
+        // config the operator did not select (ADR-035: an entry point must
+        // not document an explicit tier while silently falling back to
+        // discovery). Tiers 2-4 keep their tolerant contract.
         if let Some(p) = path {
+            if !p.exists() {
+                return Err(ConfigError::ExplicitConfigMissing {
+                    path: p.to_path_buf(),
+                });
+            }
             return Ok(Self::load(Some(p))?.map(|config| (config, Self::diagnostic_config_path(p))));
         }
 
