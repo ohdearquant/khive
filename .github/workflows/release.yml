@@ -5,7 +5,7 @@ name: Release
 # SemVer gate predates #216, so tag-triggered publishing is an ungated path. Making
 # main-dispatch the sole publisher means "the workflow that publishes" always equals
 # "the gate-carrying workflow on main". The `publish` environment's ref allowlist is
-# restricted to `main` (scripts/apply-autonomous-merge.sh), so even if an old tag's
+# restricted to `main` (repository ruleset 17362266), so even if an old tag's
 # old workflow runs, its publish job cannot deploy.
 #
 # Builds Rust binaries per-platform, publishes each khive-kernel-{platform}
@@ -192,7 +192,7 @@ jobs:
     # moves from per-PR to per-release. This job publishes to npm; the
     # 'publish' environment carries a required reviewer (Ocean), so even an
     # automated or accidental tag pauses here until a human authorizes the
-    # deployment. The environment is created by scripts/apply-autonomous-merge.sh
+    # deployment. The environment is configured on the repository, not in this tree.
     # (STEP=release-gate). Until that runs, the gate is dormant (the environment
     # auto-creates unprotected on first use) — apply the release gate before
     # flipping the ruleset to zero approvals.
