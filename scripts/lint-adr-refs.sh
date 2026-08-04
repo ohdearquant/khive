@@ -380,6 +380,144 @@ FIXTURE
 -->
 FIXTURE
 
+    # Regression case 17 (must-FAIL control, indented END): four spaces make a
+    # line an indented code block in Markdown, so the marker is inert text. A
+    # scanner that stripped the line before comparing accepted it as the real
+    # delimiter; exact whole-line matching cannot.
+    mkdir -p "$tmp/case-indented-end/docs/adr"
+    cat > "$tmp/case-indented-end/docs/adr/ADR-210-fixture-indented-end.md" <<'FIXTURE'
+# ADR-210: Fixture Indented End
+
+**Status**: accepted
+FIXTURE
+    printf '%s\n' \
+        '# ADR Index' \
+        '' \
+        '<!-- BEGIN GENERATED ADR CATALOG -->' \
+        '' \
+        '| ADR | Title |' \
+        '| --- | --- |' \
+        '| [ADR-210](ADR-210-fixture-indented-end.md) | Fixture Indented End |' \
+        '' \
+        '    <!-- END GENERATED ADR CATALOG -->' \
+        > "$tmp/case-indented-end/docs/adr/README.md"
+
+    # Regression case 18 (must-FAIL control, two-space indented END): the
+    # continuation indentation a list container would give a nested marker,
+    # isolated from the fence itself so that only the exact whole-line marker
+    # comparison can reject it. Two spaces are neither an indented code block
+    # nor a tab, so this arm is not a weaker restatement of case 17 or 19.
+    mkdir -p "$tmp/case-continuation-indent-end/docs/adr"
+    cat > "$tmp/case-continuation-indent-end/docs/adr/ADR-211-fixture-continuation-indent.md" <<'FIXTURE'
+# ADR-211: Fixture Continuation Indent
+
+**Status**: accepted
+FIXTURE
+    printf '%s\n' \
+        '# ADR Index' \
+        '' \
+        '<!-- BEGIN GENERATED ADR CATALOG -->' \
+        '' \
+        '| ADR | Title |' \
+        '| --- | --- |' \
+        '| [ADR-211](ADR-211-fixture-continuation-indent.md) | Fixture Continuation Indent |' \
+        '' \
+        '  <!-- END GENERATED ADR CATALOG -->' \
+        > "$tmp/case-continuation-indent-end/docs/adr/README.md"
+
+    # Regression case 22 (must-FAIL control, the Round-5 list-item fence
+    # reproducer verbatim). Recorded because it is the reported defect, NOT
+    # because it isolates one mechanism: under this grammar it is rejected
+    # twice over, by the indented END failing the marker comparison AND by the
+    # fence line being an unexpected line inside the catalog region. Case 18
+    # is the arm that isolates the marker comparison.
+    mkdir -p "$tmp/case-list-fence-end/docs/adr"
+    cat > "$tmp/case-list-fence-end/docs/adr/ADR-215-fixture-list-fence.md" <<'FIXTURE'
+# ADR-215: Fixture List Fence
+
+**Status**: accepted
+FIXTURE
+    printf '%s\n' \
+        '# ADR Index' \
+        '' \
+        '<!-- BEGIN GENERATED ADR CATALOG -->' \
+        '' \
+        '| ADR | Title |' \
+        '| --- | --- |' \
+        '| [ADR-215](ADR-215-fixture-list-fence.md) | Fixture List Fence |' \
+        '' \
+        '- ```' \
+        '  <!-- END GENERATED ADR CATALOG -->' \
+        '  ```' \
+        > "$tmp/case-list-fence-end/docs/adr/README.md"
+
+    # Regression case 19 (must-FAIL control, tab-indented END): a tab expands to
+    # an indented-code prefix in Markdown but counts as one character to a
+    # `\s{0,3}` prefix test, which is how a tab could close a real fence early.
+    mkdir -p "$tmp/case-tab-end/docs/adr"
+    cat > "$tmp/case-tab-end/docs/adr/ADR-212-fixture-tab-end.md" <<'FIXTURE'
+# ADR-212: Fixture Tab End
+
+**Status**: accepted
+FIXTURE
+    printf '%s\n' \
+        '# ADR Index' \
+        '' \
+        '<!-- BEGIN GENERATED ADR CATALOG -->' \
+        '' \
+        '| ADR | Title |' \
+        '| --- | --- |' \
+        '| [ADR-212](ADR-212-fixture-tab-end.md) | Fixture Tab End |' \
+        '' \
+        '	<!-- END GENERATED ADR CATALOG -->' \
+        > "$tmp/case-tab-end/docs/adr/README.md"
+
+    # Regression case 20 (must-FAIL control, duplicate BEGIN): marker cardinality
+    # was previously unspecified -- the first BEGIN won and any later one was
+    # ignored, so a second catalog region could exist unnoticed. Exactly one of
+    # each is now required.
+    mkdir -p "$tmp/case-duplicate-begin/docs/adr"
+    cat > "$tmp/case-duplicate-begin/docs/adr/ADR-213-fixture-duplicate-begin.md" <<'FIXTURE'
+# ADR-213: Fixture Duplicate Begin
+
+**Status**: accepted
+FIXTURE
+    cat > "$tmp/case-duplicate-begin/docs/adr/README.md" <<'FIXTURE'
+# ADR Index
+
+<!-- BEGIN GENERATED ADR CATALOG -->
+
+| ADR | Title |
+| --- | --- |
+| [ADR-213](ADR-213-fixture-duplicate-begin.md) | Fixture Duplicate Begin |
+
+<!-- BEGIN GENERATED ADR CATALOG -->
+
+<!-- END GENERATED ADR CATALOG -->
+FIXTURE
+
+    # Regression case 21 (must-FAIL control, markers out of order): an END above
+    # the BEGIN previously left the scan looking for a later END that the file
+    # did not have, which happened to fail but for the wrong reason. Order is
+    # now checked directly.
+    mkdir -p "$tmp/case-marker-order/docs/adr"
+    cat > "$tmp/case-marker-order/docs/adr/ADR-214-fixture-marker-order.md" <<'FIXTURE'
+# ADR-214: Fixture Marker Order
+
+**Status**: accepted
+FIXTURE
+    cat > "$tmp/case-marker-order/docs/adr/README.md" <<'FIXTURE'
+# ADR Index
+
+<!-- END GENERATED ADR CATALOG -->
+
+| ADR | Title |
+| --- | --- |
+| [ADR-214](ADR-214-fixture-marker-order.md) | Fixture Marker Order |
+
+<!-- BEGIN GENERATED ADR CATALOG -->
+FIXTURE
+
     cat > "$tmp/case-fail/crates/fixture-crate/docs/design.md" <<'FIXTURE'
 # fixture-crate Design
 
@@ -454,7 +592,7 @@ FIXTURE
         echo "self-test FAILED: index row hidden inside an HTML comment was counted as catalog coverage"
         cat "$tmp/comment-row.log"
         status=1
-    elif ! grep -q "ADR-201 (ADR-201-fixture-comment-row.md) has no index catalog row" "$tmp/comment-row.log"; then
+    elif ! grep -q "unexpected line inside the generated catalog" "$tmp/comment-row.log"; then
         echo "self-test FAILED: comment-row lint failed, but not for the expected reason:"
         cat "$tmp/comment-row.log"
         status=1
@@ -466,7 +604,7 @@ FIXTURE
         echo "self-test FAILED: index row hidden inside a fenced code block was counted as catalog coverage"
         cat "$tmp/fenced-row.log"
         status=1
-    elif ! grep -q "ADR-202 (ADR-202-fixture-fenced-row.md) has no index catalog row" "$tmp/fenced-row.log"; then
+    elif ! grep -q "unexpected line inside the generated catalog" "$tmp/fenced-row.log"; then
         echo "self-test FAILED: fenced-row lint failed, but not for the expected reason:"
         cat "$tmp/fenced-row.log"
         status=1
@@ -478,7 +616,7 @@ FIXTURE
         echo "self-test FAILED: catalog opened but never closed was accepted, and a row past the intended boundary counted as coverage"
         cat "$tmp/unclosed.log"
         status=1
-    elif ! grep -q 'missing "<!-- END GENERATED ADR CATALOG -->" marker' "$tmp/unclosed.log"; then
+    elif ! grep -qE 'expected exactly one "<!-- END GENERATED ADR CATALOG -->" marker|unexpected line inside the generated catalog' "$tmp/unclosed.log"; then
         echo "self-test FAILED: unclosed-catalog lint failed, but not for the expected reason:"
         cat "$tmp/unclosed.log"
         status=1
@@ -510,7 +648,7 @@ FIXTURE
         echo "self-test FAILED: an END marker quoted inside a code fence satisfied the end-marker assertion"
         cat "$tmp/fenced-end.log"
         status=1
-    elif ! grep -q 'missing "<!-- END GENERATED ADR CATALOG -->" marker' "$tmp/fenced-end.log"; then
+    elif ! grep -qE 'expected exactly one "<!-- END GENERATED ADR CATALOG -->" marker|unexpected line inside the generated catalog' "$tmp/fenced-end.log"; then
         echo "self-test FAILED: fenced-end lint failed, but not for the expected reason:"
         cat "$tmp/fenced-end.log"
         status=1
@@ -522,7 +660,7 @@ FIXTURE
         echo "self-test FAILED: an END marker inside a multi-line HTML comment satisfied the end-marker assertion"
         cat "$tmp/commented-end.log"
         status=1
-    elif ! grep -q 'missing "<!-- END GENERATED ADR CATALOG -->" marker' "$tmp/commented-end.log"; then
+    elif ! grep -qE 'expected exactly one "<!-- END GENERATED ADR CATALOG -->" marker|unexpected line inside the generated catalog' "$tmp/commented-end.log"; then
         echo "self-test FAILED: commented-end lint failed, but not for the expected reason:"
         cat "$tmp/commented-end.log"
         status=1
@@ -552,12 +690,37 @@ FIXTURE
             echo "self-test FAILED: $why closed the catalog"
             cat "$tmp/$case.log"
             status=1
-        elif ! grep -q 'missing "<!-- END GENERATED ADR CATALOG -->" marker' "$tmp/$case.log"; then
+        elif ! grep -qE 'expected exactly one "<!-- END GENERATED ADR CATALOG -->" marker|unexpected line inside the generated catalog' "$tmp/$case.log"; then
             echo "self-test FAILED: $case lint failed, but not for the expected reason:"
             cat "$tmp/$case.log"
             status=1
         else
             echo "self-test OK: $why does not close the catalog"
+        fi
+    done
+
+    # Cases 17-22: the catalog grammar rejects every one of these outright, so
+    # each asserts a rejection rather than a particular repair. Their value is
+    # that none of them needs Markdown state to be recognised as inert.
+    for case in indented-end continuation-indent-end tab-end duplicate-begin marker-order list-fence-end; do
+        case "$case" in
+            indented-end) why="a four-space indented END" ;;
+            continuation-indent-end) why="a two-space indented END" ;;
+            list-fence-end) why="an END inside a fence in a list item" ;;
+            tab-end) why="a tab-indented END" ;;
+            duplicate-begin) why="a second BEGIN marker" ;;
+            marker-order) why="an END marker above the BEGIN" ;;
+        esac
+        if sh "$SCRIPT_DIR/lint-adr-refs.sh" "$tmp/case-$case" > "$tmp/$case.log" 2>&1; then
+            echo "self-test FAILED: $why was accepted"
+            cat "$tmp/$case.log"
+            status=1
+        elif ! grep -qE 'expected exactly one|appears before|unexpected line inside the generated catalog|has no index catalog row' "$tmp/$case.log"; then
+            echo "self-test FAILED: $case lint failed, but not for the expected reason:"
+            cat "$tmp/$case.log"
+            status=1
+        else
+            echo "self-test OK: $why is rejected"
         fi
     done
 
@@ -747,128 +910,90 @@ for path in sorted(adr_dir.glob("ADR-*.md")):
 
 index_path = adr_dir / "README.md"
 relative = index_path.relative_to(root)
-# Scoped to the generated catalog table's own markers rather than the whole
-# file: a prose table elsewhere in README.md, or a row sitting inside an HTML
-# comment or fenced block *within* the marked region (e.g. a stale example
-# kept for reference), must never count as catalog coverage.
+# The catalog is a GENERATED block, so it is validated against a closed grammar
+# rather than by modelling the Markdown around it. Four review rounds of a
+# hand-rolled fence and comment scanner each closed one way a quoted marker
+# could act as a real delimiter and left another -- mismatched fence
+# characters, short closers, comments reopened on one line, four-space indented
+# code, fences inside list items, tab expansion. Those are structural
+# CommonMark concepts, and a line-at-a-time model in this script will keep
+# missing them.
+#
+# The grammar removes the problem instead of chasing it. Markers are matched by
+# exact equality on the whole raw line, so an indented or quoted marker is
+# simply not a marker and needs no state to recognise as inert. Exactly one of
+# each is required, in order. Between them only four line shapes are legal:
+# blank, the header row, its separator, and an index row. A fence or a comment
+# inside the region is not skipped -- it is rejected by name, because a
+# generated block has no business containing either.
 catalog_begin = "<!-- BEGIN GENERATED ADR CATALOG -->"
 catalog_end = "<!-- END GENERATED ADR CATALOG -->"
+catalog_header_re = re.compile(r"^\|\s*ADR\s*\|\s*Title\s*\|$")
+catalog_separator_re = re.compile(r"^\|\s*-{3,}\s*\|\s*-{3,}\s*\|$")
 cataloged_numbers: set[str] = set()
-in_catalog = False
-saw_catalog_end = False
-open_fence: tuple[str, int] | None = None
-in_comment = False
 
-fence_re = re.compile(r"^\s{0,3}(?P<marker>`{3,}|~{3,})(?P<info>.*)$")
+index_lines = index_path.read_text(encoding="utf-8").split("\n")
+begin_positions = [i for i, line in enumerate(index_lines) if line == catalog_begin]
+end_positions = [i for i, line in enumerate(index_lines) if line == catalog_end]
 
 
-def advance_comment_state(text: str, inside: bool) -> bool:
-    """Comment nesting state after consuming one line.
-
-    A single pass looking only for the first `-->` is not enough: `--> <!--`
-    both closes a comment and opens the next one on the same line, and a
-    scanner that stops at the close treats everything after it as live text.
-    Alternating the search keeps the state correct however many delimiters a
-    line carries.
-    """
-    index = 0
-    while True:
-        if inside:
-            close = text.find("-->", index)
-            if close < 0:
-                return True
-            index = close + 3
-            inside = False
-        else:
-            opening = text.find("<!--", index)
-            if opening < 0:
-                return False
-            index = opening + 4
-            inside = True
+def describe(count: int, marker: str) -> str:
+    return f'{relative}: expected exactly one "{marker}" marker at the start of a line, found {count}'
 
 
-with index_path.open(encoding="utf-8") as handle:
-    for line_number, raw_line in enumerate(handle, 1):
-        line = raw_line.rstrip("\n")
-        # Fence and comment state is resolved BEFORE either delimiter is
-        # tested, and for every line rather than only inside the catalog. A
-        # marker quoted in a code fence or inside a comment is illustrative
-        # text, not a delimiter: testing the delimiters first let an inert END
-        # satisfy the end-marker assertion, and let an inert BEGIN open the
-        # scan early so stale rows above the real catalog counted as coverage.
-        #
-        # The fence state carries the opening character and run length rather
-        # than a single flag. A flag treats any fence line as a toggle, so a
-        # backtick line inside a tilde fence -- ordinary text, in Markdown --
-        # closed the fence and exposed whatever followed. A fence closes only
-        # on the same character, at a run at least as long, with nothing after
-        # it.
-        fence_match = fence_re.match(line)
-        if open_fence is None:
-            if fence_match is not None and not in_comment:
-                marker = fence_match.group("marker")
-                open_fence = (marker[0], len(marker))
+if len(begin_positions) != 1:
+    errors.append(describe(len(begin_positions), catalog_begin))
+if len(end_positions) != 1:
+    errors.append(describe(len(end_positions), catalog_end))
+if len(begin_positions) == 1 and len(end_positions) == 1:
+    if end_positions[0] < begin_positions[0]:
+        errors.append(
+            f'{relative}:{end_positions[0] + 1}: "{catalog_end}" appears before '
+            f'"{catalog_begin}"'
+        )
+    else:
+        for offset, line in enumerate(
+            index_lines[begin_positions[0] + 1 : end_positions[0]]
+        ):
+            line_number = begin_positions[0] + offset + 2
+            if not line.strip():
                 continue
-        else:
-            fence_char, fence_len = open_fence
-            if (
-                fence_match is not None
-                and fence_match.group("marker")[0] == fence_char
-                and len(fence_match.group("marker")) >= fence_len
-                and not fence_match.group("info").strip()
-            ):
-                open_fence = None
-            continue
-        entered_in_comment = in_comment
-        if not entered_in_comment:
-            if not in_catalog:
-                if line.strip() == catalog_begin:
-                    in_catalog = True
-                    in_comment = advance_comment_state(line, in_comment)
-                    continue
-            elif line.strip() == catalog_end:
-                saw_catalog_end = True
-                break
-        in_comment = advance_comment_state(line, in_comment)
-        if entered_in_comment or in_comment:
-            continue
-        if not in_catalog:
-            continue
-        match = index_row_re.match(line)
-        if match is None:
-            continue
-        number = match.group("number").lower()
-        cataloged_numbers.add(number)
-        canonical = titles.get(number)
-        if canonical is None:
-            errors.append(f"{relative}:{line_number}: ADR-{number} index entry has no authoritative file")
-            continue
-        expected, expected_path = canonical
-        target_path = (adr_dir / match.group("target")).resolve()
-        if target_path != expected_path.resolve():
-            errors.append(
-                f"{relative}:{line_number}: ADR-{number} index target mismatch; "
-                f'expected "{expected_path.name}", found "{match.group("target")}"'
-            )
-        found = match.group("title")
-        if normalize(found) != normalize(expected):
-            errors.append(
-                f'{relative}:{line_number}: ADR-{number} index title mismatch; '
-                f'expected "{expected}", found "{found}"'
-            )
-if not in_catalog:
-    errors.append(
-        f'{relative}: missing "{catalog_begin}" marker; catalog-coverage scan did not run'
-    )
-elif not saw_catalog_end:
-    # Reaching EOF still inside the catalog means the scan silently consumed
-    # every line after the intended boundary. Any later Markdown table row --
-    # a stale example, a prose table -- then counts as live coverage, so an
-    # unclosed catalog can read as fully covered. The boundary is only a
-    # boundary if both ends are asserted.
-    errors.append(
-        f'{relative}: missing "{catalog_end}" marker; catalog-coverage scan read to end of file'
-    )
+            if catalog_header_re.match(line) or catalog_separator_re.match(line):
+                continue
+            match = index_row_re.match(line)
+            if match is None:
+                errors.append(
+                    f"{relative}:{line_number}: unexpected line inside the generated "
+                    f"catalog; only the header, its separator, and index rows are "
+                    f"allowed: {line.strip()!r}"
+                )
+                continue
+            number = match.group("number").lower()
+            if number in cataloged_numbers:
+                errors.append(
+                    f"{relative}:{line_number}: duplicate catalog row for ADR-{number}"
+                )
+                continue
+            cataloged_numbers.add(number)
+            canonical = titles.get(number)
+            if canonical is None:
+                errors.append(
+                    f"{relative}:{line_number}: ADR-{number} index entry has no authoritative file"
+                )
+                continue
+            expected, expected_path = canonical
+            target_path = (adr_dir / match.group("target")).resolve()
+            if target_path != expected_path.resolve():
+                errors.append(
+                    f"{relative}:{line_number}: ADR-{number} index target mismatch; "
+                    f'expected "{expected_path.name}", found "{match.group("target")}"'
+                )
+            found = match.group("title")
+            if normalize(found) != normalize(expected):
+                errors.append(
+                    f'{relative}:{line_number}: ADR-{number} index title mismatch; '
+                    f'expected "{expected}", found "{found}"'
+                )
 
 # Catalog coverage: every authoritative ADR file must have an index row.
 # The index and the tree can otherwise drift silently -- a merged ADR with no
