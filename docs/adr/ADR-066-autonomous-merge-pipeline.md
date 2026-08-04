@@ -147,6 +147,24 @@ The gate-defining path routing in section 3 documents this risk and the structur
 
 Merging to `main` is not a release. Publishing is a separate step, gated on human approval.
 
+> **Implementation status (2026-08-04): this gate is not in force.** The `publish` environment
+> exists but carries no protection rules and no deployment-branch policy. Read it with
+> `gh api repos/<owner>/<repo>/environments/publish --jq '{protection_rules, deployment_branch_policy}'`;
+> it returns an empty rule list and a null policy. The environment auto-created unprotected on
+> first use, and step 2 of the activation order below, which adds the required reviewer and
+> validates that the gate fires, was never completed.
+>
+> Everything in this section describing a required reviewer, a pinned deployment-branch policy,
+> or a human approving each deployment describes the intended design, not the current state.
+> The same applies to the backstop claim later in this section and to the publishing bullet
+> under Consequences.
+>
+> What is actually true today: `release.yml` triggers only on `workflow_dispatch`, so there is
+> no tag-push publish path, and the reachable exposure is that an actor with write access can
+> publish from any ref without a second person approving. Whether to activate the gate or to
+> amend this record to match how releases are actually run is an open decision; this note states
+> the measured state and does not settle it.
+
 `release.yml` triggers only on `workflow_dispatch` (the `v*` tag-push trigger was removed in
 #222). It builds platform binaries and publishes the npm packages; the crates.io library publish is the separate
 `scripts/publish.sh` (`make publish`) path. The npm publish job (`publish-all`) runs in a GitHub
@@ -230,8 +248,9 @@ These properties are enforced at all times and are never relaxed:
   change after a dependent change has landed can break the build. The dependency chain is
   foundation to platform to features. Post-merge monitoring and fast revert discipline are the
   operational backstops.
-- Publishing stays human-gated. The npm release is held by the `publish` environment's required
-  reviewer (section 3); the crates.io library publish is a maintainer-run `make publish` with no
+- Publishing is intended to stay human-gated, held by the `publish` environment's required
+  reviewer (section 3). That protection is not currently configured; see the implementation-status
+  note in section 3. the crates.io library publish is a maintainer-run `make publish` with no
   autonomous CI path. A published version cannot be unpublished after the registry retains it.
 
 ## Activation order
