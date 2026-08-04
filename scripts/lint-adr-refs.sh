@@ -47,7 +47,7 @@ FIXTURE
     grep -v '^| \[ADR-030\]' "$tmp/case-uncataloged/docs/adr/README.md" > "$tmp/case-uncataloged/README.tmp"
     mv "$tmp/case-uncataloged/README.tmp" "$tmp/case-uncataloged/docs/adr/README.md"
 
-    # Regression case 4 (must-FAIL control, H1): a letter-suffixed ADR id
+    # Regression case 4 (must-FAIL control, letter-suffixed ids): a letter-suffixed ADR id
     # (the real "ADR-117a" shape) is invisible to the old \d{3}-only file
     # pattern on both sides of the join -- neither added to the authoritative
     # set nor checked against the index -- so it silently passed uncatalogued.
@@ -69,7 +69,7 @@ FIXTURE
 <!-- END GENERATED ADR CATALOG -->
 FIXTURE
 
-    # Regression case 5 (must-PASS control, H1): the same letter-suffixed ADR
+    # Regression case 5 (must-PASS control, letter-suffixed ids): the same letter-suffixed ADR
     # correctly catalogued must not be flagged -- proves the fix admits the
     # id rather than merely rejecting it everywhere.
     mkdir -p "$tmp/case-letter-cataloged/docs/adr"
@@ -90,7 +90,7 @@ FIXTURE
 <!-- END GENERATED ADR CATALOG -->
 FIXTURE
 
-    # Regression case 6 (must-FAIL control, H2): the only index row for the
+    # Regression case 6 (must-FAIL control, inert catalog rows): the only index row for the
     # ADR sits inside an HTML comment spanning multiple lines -- a stale
     # example kept for reference, not a live catalog entry. Must go red.
     mkdir -p "$tmp/case-comment-row/docs/adr"
@@ -113,7 +113,7 @@ FIXTURE
 <!-- END GENERATED ADR CATALOG -->
 FIXTURE
 
-    # Regression case 7 (must-FAIL control, H2): the only index row for the
+    # Regression case 7 (must-FAIL control, inert catalog rows): the only index row for the
     # ADR sits inside a fenced code block. Must go red.
     mkdir -p "$tmp/case-fenced-row/docs/adr"
     cat > "$tmp/case-fenced-row/docs/adr/ADR-202-fixture-fenced-row.md" <<'FIXTURE'
@@ -133,6 +133,88 @@ FIXTURE
 ```
 
 <!-- END GENERATED ADR CATALOG -->
+FIXTURE
+
+    # Regression case 8 (must-FAIL control, catalog boundary): the catalog
+    # opens but never closes, and a valid-looking row sits in the trailing
+    # prose past the intended boundary. Without an end-of-marker assertion the
+    # scan runs to EOF and adopts that row as live coverage, so the file reads
+    # as fully catalogued.
+    mkdir -p "$tmp/case-unclosed-catalog/docs/adr"
+    cat > "$tmp/case-unclosed-catalog/docs/adr/ADR-203-fixture-unclosed.md" <<'FIXTURE'
+# ADR-203: Fixture Unclosed Catalog
+
+**Status**: accepted
+FIXTURE
+    cat > "$tmp/case-unclosed-catalog/docs/adr/README.md" <<'FIXTURE'
+# ADR Index
+
+<!-- BEGIN GENERATED ADR CATALOG -->
+
+| ADR | Title |
+| --- | --- |
+
+## Superseded entries kept for reference
+
+| [ADR-203](ADR-203-fixture-unclosed.md) | Fixture Unclosed Catalog |
+FIXTURE
+
+    # Regression case 9 (must-FAIL control, titled reference): a titled prose
+    # citation of a letter-suffixed ADR carrying the wrong title. The coverage
+    # grammar admitted such ids before the reference recognizers did, so an
+    # ADR-117a citation could restate any title at all and never be compared
+    # against the authoritative H1.
+    mkdir -p "$tmp/case-letter-ref/docs/adr" "$tmp/case-letter-ref/crates/fixture-crate/docs"
+    cat > "$tmp/case-letter-ref/docs/adr/ADR-117a-fixture-letter-suffix.md" <<'FIXTURE'
+# ADR-117a: Fixture Letter Suffix
+
+**Status**: accepted
+FIXTURE
+    cat > "$tmp/case-letter-ref/docs/adr/README.md" <<'FIXTURE'
+# ADR Index
+
+<!-- BEGIN GENERATED ADR CATALOG -->
+
+| ADR | Title |
+| --- | --- |
+| [ADR-117a](ADR-117a-fixture-letter-suffix.md) | Fixture Letter Suffix |
+
+<!-- END GENERATED ADR CATALOG -->
+FIXTURE
+    cat > "$tmp/case-letter-ref/crates/fixture-crate/docs/design.md" <<'FIXTURE'
+# fixture-crate Design
+
+## ADR Compliance
+
+- follows the suffix convention (ADR-117a: Deliberately Wrong Title).
+FIXTURE
+
+    # Regression case 10 (must-PASS control, titled reference): the same
+    # citation restating the real title must stay green -- proves case 9 fails
+    # on the title comparison rather than on the widened id shape itself.
+    mkdir -p "$tmp/case-letter-ref-ok/docs/adr" "$tmp/case-letter-ref-ok/crates/fixture-crate/docs"
+    cat > "$tmp/case-letter-ref-ok/docs/adr/ADR-117a-fixture-letter-suffix.md" <<'FIXTURE'
+# ADR-117a: Fixture Letter Suffix
+
+**Status**: accepted
+FIXTURE
+    cat > "$tmp/case-letter-ref-ok/docs/adr/README.md" <<'FIXTURE'
+# ADR Index
+
+<!-- BEGIN GENERATED ADR CATALOG -->
+
+| ADR | Title |
+| --- | --- |
+| [ADR-117a](ADR-117a-fixture-letter-suffix.md) | Fixture Letter Suffix |
+
+<!-- END GENERATED ADR CATALOG -->
+FIXTURE
+    cat > "$tmp/case-letter-ref-ok/crates/fixture-crate/docs/design.md" <<'FIXTURE'
+# fixture-crate Design
+
+## ADR Compliance
+
+- follows the suffix convention (ADR-117a: Fixture Letter Suffix).
 FIXTURE
 
     cat > "$tmp/case-fail/crates/fixture-crate/docs/design.md" <<'FIXTURE'
@@ -229,6 +311,38 @@ FIXTURE
         echo "self-test OK: index row hidden inside a fenced code block does not count as coverage"
     fi
 
+    if sh "$SCRIPT_DIR/lint-adr-refs.sh" "$tmp/case-unclosed-catalog" > "$tmp/unclosed.log" 2>&1; then
+        echo "self-test FAILED: catalog opened but never closed was accepted, and a row past the intended boundary counted as coverage"
+        cat "$tmp/unclosed.log"
+        status=1
+    elif ! grep -q 'missing "<!-- END GENERATED ADR CATALOG -->" marker' "$tmp/unclosed.log"; then
+        echo "self-test FAILED: unclosed-catalog lint failed, but not for the expected reason:"
+        cat "$tmp/unclosed.log"
+        status=1
+    else
+        echo "self-test OK: catalog with no end marker caught"
+    fi
+
+    if sh "$SCRIPT_DIR/lint-adr-refs.sh" "$tmp/case-letter-ref" > "$tmp/letter-ref.log" 2>&1; then
+        echo "self-test FAILED: titled citation of letter-suffixed ADR-117a restating a wrong title was not caught"
+        cat "$tmp/letter-ref.log"
+        status=1
+    elif ! grep -q "ADR-117a title mismatch" "$tmp/letter-ref.log"; then
+        echo "self-test FAILED: letter-suffixed reference lint failed, but not for the expected reason:"
+        cat "$tmp/letter-ref.log"
+        status=1
+    else
+        echo "self-test OK: wrong-titled citation of a letter-suffixed ADR caught"
+    fi
+
+    if ! sh "$SCRIPT_DIR/lint-adr-refs.sh" "$tmp/case-letter-ref-ok" > "$tmp/letter-ref-ok.log" 2>&1; then
+        echo "self-test FAILED: correctly titled citation of letter-suffixed ADR-117a should not trip the lint"
+        cat "$tmp/letter-ref-ok.log"
+        status=1
+    else
+        echo "self-test OK: correctly titled citation of a letter-suffixed ADR does not false-positive"
+    fi
+
     return "$status"
 }
 
@@ -260,12 +374,14 @@ h1_re = re.compile(
     rf"^#\s+ADR-(?P<number>{ADR_NUMBER})(?:\s+Rev\s+\d+)?\s*:\s*(?P<title>.+?)\s*#*\s*$",
     re.IGNORECASE,
 )
-colon_ref_re = re.compile(r"\bADR-(?P<number>\d{3})\s*:\s*", re.IGNORECASE)
-paren_ref_re = re.compile(r"\bADR-(?P<number>\d{3})\s+\(", re.IGNORECASE)
-dash_ref_re = re.compile(r"\bADR-(?P<number>\d{3})\s+(?:--?|–|—)\s+", re.IGNORECASE)
+colon_ref_re = re.compile(rf"\bADR-(?P<number>{ADR_NUMBER})\s*:\s*", re.IGNORECASE)
+paren_ref_re = re.compile(rf"\bADR-(?P<number>{ADR_NUMBER})\s+\(", re.IGNORECASE)
+dash_ref_re = re.compile(
+    rf"\bADR-(?P<number>{ADR_NUMBER})\s+(?:--?|–|—)\s+", re.IGNORECASE
+)
 heading_re = re.compile(r"^\s{0,3}#{1,6}\s+(?P<body>.+?)\s*#*\s*$")
 link_re = re.compile(r"\[(?P<label>[^]\n]+)\]\((?P<target>[^\n)]+)\)")
-adr_led_re = re.compile(r"^(?:\[)?ADR-\d{3}\b", re.IGNORECASE)
+adr_led_re = re.compile(rf"^(?:\[)?ADR-{ADR_NUMBER}\b", re.IGNORECASE)
 index_row_re = re.compile(
     rf"^\|\s*\[ADR-(?P<number>{ADR_NUMBER})\]\((?P<target>[^)]+)\)\s*"
     r"\|\s*(?P<title>.*?)\s*\|\s*$",
@@ -350,20 +466,20 @@ def prose_parenthetical_references(line: str) -> list[tuple[str, str]]:
                 # Empty capture, or a section/line locator like "ADR-017:451-480"
                 # rather than a titled reference.
                 continue
-            references.append((inner_match.group("number"), title))
+            references.append((inner_match.group("number").lower(), title))
     return references
 
 
 def titled_references(label: str) -> list[tuple[str, str]]:
     references: list[tuple[str, str]] = []
     for match in colon_ref_re.finditer(label):
-        references.append((match.group("number"), label[match.end() :]))
+        references.append((match.group("number").lower(), label[match.end() :]))
     for match in paren_ref_re.finditer(label):
         title = parenthesized_title(label, match)
         if title is not None:
-            references.append((match.group("number"), title))
+            references.append((match.group("number").lower(), title))
     for match in dash_ref_re.finditer(label):
-        references.append((match.group("number"), label[match.end() :]))
+        references.append((match.group("number").lower(), label[match.end() :]))
     return references
 
 
@@ -421,6 +537,7 @@ catalog_begin = "<!-- BEGIN GENERATED ADR CATALOG -->"
 catalog_end = "<!-- END GENERATED ADR CATALOG -->"
 cataloged_numbers: set[str] = set()
 in_catalog = False
+saw_catalog_end = False
 in_fence = False
 in_comment = False
 with index_path.open(encoding="utf-8") as handle:
@@ -431,6 +548,7 @@ with index_path.open(encoding="utf-8") as handle:
                 in_catalog = True
             continue
         if line.strip() == catalog_end:
+            saw_catalog_end = True
             break
         if re.match(r"^\s*(```|~~~)", line):
             in_fence = not in_fence
@@ -470,6 +588,15 @@ with index_path.open(encoding="utf-8") as handle:
 if not in_catalog:
     errors.append(
         f'{relative}: missing "{catalog_begin}" marker; catalog-coverage scan did not run'
+    )
+elif not saw_catalog_end:
+    # Reaching EOF still inside the catalog means the scan silently consumed
+    # every line after the intended boundary. Any later Markdown table row --
+    # a stale example, a prose table -- then counts as live coverage, so an
+    # unclosed catalog can read as fully covered. The boundary is only a
+    # boundary if both ends are asserted.
+    errors.append(
+        f'{relative}: missing "{catalog_end}" marker; catalog-coverage scan read to end of file'
     )
 
 # Catalog coverage: every authoritative ADR file must have an index row.
