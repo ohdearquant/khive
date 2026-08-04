@@ -494,6 +494,49 @@ async fn inbox_long_poll_wakes_after_concurrent_ingest() {
     assert!(inbox["next_offset"].is_null());
 }
 
+#[tokio::test]
+async fn inbox_long_poll_wakes_after_concurrent_send() {
+    let (registry, _rt) = build_registry_for_ns("local");
+    let waiter_registry = registry.clone();
+    let mut waiter = tokio::spawn(async move {
+        waiter_registry
+            .dispatch(
+                "comm.inbox",
+                serde_json::json!({ "status": "all", "wait_ms": 5_000 }),
+            )
+            .await
+    });
+
+    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    assert!(
+        !waiter.is_finished(),
+        "empty inbox must remain blocked before a matching send"
+    );
+
+    registry
+        .dispatch(
+            "comm.send",
+            serde_json::json!({ "to": "local", "content": "send wakes the inbox" }),
+        )
+        .await
+        .expect("concurrent send succeeds");
+
+    let inbox = match tokio::time::timeout(std::time::Duration::from_secs(1), &mut waiter).await {
+        Ok(joined) => joined
+            .expect("long-poll task must not panic")
+            .expect("long-poll inbox succeeds"),
+        Err(_) => {
+            waiter.abort();
+            panic!("long-poll inbox did not wake within one second of send");
+        }
+    };
+    assert_eq!(inbox["count"].as_u64(), Some(1));
+    assert_eq!(
+        inbox["messages"][0]["content"].as_str(),
+        Some("send wakes the inbox")
+    );
+}
+
 #[tokio::test(start_paused = true)]
 async fn inbox_long_poll_stops_at_requested_budget() {
     let (registry, _rt) = build_registry_for_ns("local");
@@ -526,6 +569,65 @@ async fn inbox_rejects_wait_budget_above_thirty_seconds() {
     assert!(
         err.to_string().contains("wait_ms") && err.to_string().contains("30000"),
         "error must name wait_ms and its maximum: {err}"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn inbox_count_only_never_waits() {
+    let (registry, _rt) = build_registry_for_ns("local");
+    let started = tokio::time::Instant::now();
+
+    let inbox = registry
+        .dispatch(
+            "comm.inbox",
+            serde_json::json!({ "limit": 0, "wait_ms": 5_000 }),
+        )
+        .await
+        .expect("count-only inbox succeeds");
+
+    assert_eq!(inbox["count"].as_u64(), Some(0));
+    assert!(
+        inbox["messages"]
+            .as_array()
+            .is_some_and(|rows| rows.is_empty()),
+        "count-only inbox returns no message payloads: {inbox}"
+    );
+    assert_eq!(
+        tokio::time::Instant::now().duration_since(started),
+        std::time::Duration::ZERO,
+        "limit=0 must return immediately even with a positive wait_ms"
+    );
+}
+
+#[tokio::test]
+async fn inbox_long_poll_returns_immediately_when_matches_exist() {
+    let (registry, _rt) = build_registry_for_ns("local");
+
+    registry
+        .dispatch(
+            "comm.send",
+            serde_json::json!({ "to": "local", "content": "already waiting" }),
+        )
+        .await
+        .expect("send succeeds");
+
+    let started = std::time::Instant::now();
+    let inbox = registry
+        .dispatch(
+            "comm.inbox",
+            serde_json::json!({ "status": "all", "wait_ms": 5_000 }),
+        )
+        .await
+        .expect("long poll over a non-empty inbox succeeds");
+
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(1),
+        "an initial query with matches must return without waiting out the budget"
+    );
+    assert_eq!(inbox["count"].as_u64(), Some(1));
+    assert_eq!(
+        inbox["messages"][0]["content"].as_str(),
+        Some("already waiting")
     );
 }
 
