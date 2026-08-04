@@ -9640,9 +9640,10 @@ fn build_registry_with_owned_kinds() -> (VerbRegistry, KhiveRuntime) {
 ///
 /// Table-driven over every key in `OWNER_ESTABLISHED_PROPERTIES`
 /// (khive-runtime's `curation.rs`, kept in sync by hand here since the
-/// const is crate-private and this is a different crate) so a future key
-/// added there without a matching arm here is caught by a length mismatch
-/// rather than silently under-covered. For each key, a complete snapshot of
+/// const is crate-private and this is a different crate). Nothing here
+/// detects that drift: a key added to the const without an arm added below
+/// leaves this test green and that key uncovered, so a change that protects
+/// a new key adds its arm here in the same change. For each key, a complete snapshot of
 /// the note's stored `properties` is compared before and after the refused
 /// attempt — not just a handful of named fields — so a forgery that lands
 /// on any untested field is still caught.
