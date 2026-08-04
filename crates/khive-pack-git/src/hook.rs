@@ -15,7 +15,12 @@ fn is_40_hex(s: &str) -> bool {
     s.len() == 40 && s.chars().all(|c| c.is_ascii_hexdigit())
 }
 
-fn is_repo_relative_path(path: &str) -> bool {
+/// The canonical `changed_paths` element shape. `pub(crate)` so the ingester
+/// filters the raw `git log -z --name-only` stream against exactly the rule
+/// this hook enforces, instead of handing the hook paths it must reject
+/// (a Unix filename may legitimately contain `\` or start `X:`; those can
+/// never round-trip through `changed_paths`).
+pub(crate) fn is_repo_relative_path(path: &str) -> bool {
     let bytes = path.as_bytes();
     // Any `X:` prefix is a Windows drive reference — absolute (`C:/...`) or
     // drive-relative (`C:foo`). The canonical shape is `/`-separated

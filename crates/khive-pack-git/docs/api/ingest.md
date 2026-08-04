@@ -316,8 +316,17 @@ The commit snapshot's `git log -z --name-only --no-renames
 --diff-merges=first-parent` pass is the authority for
 `commit.properties.changed_paths`. NUL-delimited paths bypass Git's quoted
 display encoding and are decoded with the same lossy UTF-8 normalization as
-ADR-085's filesystem path producer. Tabs, newlines, quotes, backslashes, and
-non-ASCII text therefore retain their path identity. Rename detection is
+ADR-085's filesystem path producer. At this parse stage tabs, newlines,
+quotes, backslashes, and non-ASCII text retain their path identity — but
+parsing identity is not storage identity. `changed_paths` storage is
+governed by `CommitHook`'s canonical repo-relative shape (see
+docs/api/hooks.md): a valid Unix filename containing a `\` byte or starting
+with an `X:` drive prefix can never round-trip through it. Before create,
+the ingester filters exactly those elements out of the array (the same
+predicate the hook enforces), keeps the canonical remainder, stores the
+commit, and counts the dropped paths in
+`IngestReport.changed_paths_filtered_noncanonical` with one bounded warning
+per run. Rename detection is
 pinned off (`--no-renames`) so a rename always surfaces as the delete + add
 pair `--name-only` reports without it; because Git does not mark which entry
 is the rename source, leaving detection on could silently swap one side of
@@ -337,7 +346,9 @@ when both `properties.source_revision` equals that HEAD and
 revision prevents an identically named path in another repository snapshot
 from receiving a fabricated annotation. If more than one live module still
 has the same `(source_revision, source_path)`, the binding is ambiguous and no
-candidate is annotated. There is no suffix match, inferred rename, entity
+candidate is annotated; each such skipped binding is counted in
+`IngestReport.code_module_ambiguous_path_skips` so the deliberate skip is
+visible per run. There is no suffix match, inferred rename, entity
 creation, or arbitrary winner. A failure to load the module index degrades
 the pass to no module annotation with a warning instead of aborting it,
 because the annotation is best-effort enrichment while `changed_paths` is

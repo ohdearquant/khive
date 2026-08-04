@@ -189,6 +189,18 @@ pub struct IngestReport {
     /// to compare directly against an independent source of truth (e.g.
     /// `git rev-list --count <ref>`).
     pub commits_total_in_db: u64,
+    /// Touched paths the `--name-only` pass recorded but `changed_paths`
+    /// storage cannot carry: valid Unix filenames that violate the hook's
+    /// canonical shape (a `\` byte, an `X:` drive prefix, a leading `/`,
+    /// or an empty/`.`/`..` component). Dropped before create rather than
+    /// failing the whole commit — see
+    /// crates/khive-pack-git/docs/api/ingest.md#changed-paths-and-code-module-annotations.
+    pub changed_paths_filtered_noncanonical: u64,
+    /// Changed paths whose `(source_revision, source_path)` module binding
+    /// was ambiguous (more than one live row) and therefore received no
+    /// code-module annotation — counted once per skipped binding so the
+    /// skip is visible without an unbounded per-path log.
+    pub code_module_ambiguous_path_skips: u64,
 }
 
 fn record_write_failure(
@@ -604,11 +616,15 @@ async fn find_document_for_path(
 /// it rather than aborting the pass: module annotation is best-effort
 /// enrichment (ADR-088 Amendment 1), while the durable `changed_paths` fact
 /// must still be recorded.
+///
+/// The returned count is the number of paths whose binding is ambiguous
+/// (mapped to `None`) — surfaced in the ingest report so the deliberate
+/// skip is visible per run.
 async fn load_code_modules_by_snapshot_path(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
     source_revision: &str,
-) -> Result<HashMap<String, Option<Uuid>>> {
+) -> Result<(HashMap<String, Option<Uuid>>, u64)> {
     let sql = runtime.sql();
     let mut r = sql.reader().await.map_err(|e| anyhow!("{e}"))?;
     let rows = r
@@ -644,7 +660,11 @@ async fn load_code_modules_by_snapshot_path(
             .and_modify(|candidate| *candidate = None)
             .or_insert(id);
     }
-    Ok(modules)
+    let ambiguous = modules
+        .values()
+        .filter(|candidate| candidate.is_none())
+        .count() as u64;
+    Ok((modules, ambiguous))
 }
 
 /// Read the last-ingested cursor value for `(project_id, kind)`, if any.
@@ -1190,7 +1210,10 @@ async fn ingest_commits(
     // `changed_paths` facts.
     let code_modules_by_source_path =
         match load_code_modules_by_snapshot_path(runtime, token, &snapshot_head).await {
-            Ok(modules) => modules,
+            Ok((modules, ambiguous)) => {
+                report.code_module_ambiguous_path_skips += ambiguous;
+                modules
+            }
             Err(e) => {
                 report.warnings.push(format!(
                     "code module index load failed for snapshot {snapshot_head}: {e}; \
@@ -1250,12 +1273,21 @@ async fn ingest_commits(
             ));
             continue;
         };
+        // The `-z` stream is verbatim: a Unix filename may legitimately
+        // contain `\` or start `X:`, and the hook's canonical
+        // `changed_paths` shape can never carry those (CommitHook rejects
+        // them, which would fail the whole commit create and stall the
+        // cursor on every pass). Filter them here, against the same
+        // predicate the hook enforces, and surface the per-run count below.
         let changed_paths: Vec<String> = touched_paths
             .iter()
             .map(|path| secret_gate::mask_secrets(path).into_owned())
+            .filter(|path| hook::is_repo_relative_path(path))
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect();
+        let noncanonical = touched_paths.len() as u64 - changed_paths.len() as u64;
+        report.changed_paths_filtered_noncanonical += noncanonical;
         let mut annotates = BTreeSet::from([project_id.to_string()]);
 
         for path in &changed_paths {
@@ -1379,6 +1411,18 @@ async fn ingest_commits(
 
     if let Some(sha) = last_sha {
         write_cursor(runtime, project_id, "commits", &sha).await?;
+    }
+    // One bounded line per run (never one per path): filenames are
+    // attacker/repo-controlled and may be long, so the count alone is
+    // surfaced; the paths themselves remain recoverable from the raw
+    // `git log -z --name-only` stream if an operator needs them.
+    if report.changed_paths_filtered_noncanonical > 0 {
+        report.warnings.push(format!(
+            "{} touched path(s) dropped from changed_paths: outside the \
+             canonical repo-relative shape (backslash, `X:` drive prefix, \
+             leading `/`, or empty/`.`/`..` component)",
+            report.changed_paths_filtered_noncanonical
+        ));
     }
     if let Some(warning) = recovery_warning {
         report.warnings.push(warning);
@@ -2555,10 +2599,11 @@ mod module_index_loader_tests {
         let (rt, token) = rt_and_token();
         let id = create_module(&rt, &token, "solo_module", AMBIGUOUS_PATH).await;
 
-        let index = load_code_modules_by_snapshot_path(&rt, &token, REVISION)
+        let (index, ambiguous) = load_code_modules_by_snapshot_path(&rt, &token, REVISION)
             .await
             .unwrap();
         assert_eq!(index.get(AMBIGUOUS_PATH), Some(&Some(id)));
+        assert_eq!(ambiguous, 0);
     }
 
     /// Contract: more than one live module with the same
@@ -2571,7 +2616,7 @@ mod module_index_loader_tests {
         let valid_id = create_module(&rt, &token, "valid_module", AMBIGUOUS_PATH).await;
         insert_unparsable_module_row(&rt, &token, "malformed_module", AMBIGUOUS_PATH).await;
 
-        let index = load_code_modules_by_snapshot_path(&rt, &token, REVISION)
+        let (index, ambiguous) = load_code_modules_by_snapshot_path(&rt, &token, REVISION)
             .await
             .unwrap();
         assert_eq!(
@@ -2580,6 +2625,7 @@ mod module_index_loader_tests {
             "a malformed row is evidence of a second live module for \
              {AMBIGUOUS_PATH}; the valid row {valid_id} must not be selected"
         );
+        assert_eq!(ambiguous, 1, "the ambiguous key is counted for the report");
     }
 
     #[tokio::test]
@@ -2587,7 +2633,7 @@ mod module_index_loader_tests {
         let (rt, token) = rt_and_token();
         insert_unparsable_module_row(&rt, &token, "lonely_malformed", AMBIGUOUS_PATH).await;
 
-        let index = load_code_modules_by_snapshot_path(&rt, &token, REVISION)
+        let (index, ambiguous) = load_code_modules_by_snapshot_path(&rt, &token, REVISION)
             .await
             .unwrap();
         assert_eq!(
@@ -2595,6 +2641,7 @@ mod module_index_loader_tests {
             Some(&None),
             "an unparsable id can never serve as an annotation target"
         );
+        assert_eq!(ambiguous, 1);
     }
 
     /// A failed index load must surface its cause: the caller includes this
