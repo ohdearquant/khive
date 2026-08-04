@@ -11001,3 +11001,84 @@ async fn i1471_local_sent_box_includes_legacy_rows_only() {
         "rows attributed to another actor must not leak; got {contents:?}"
     );
 }
+
+/// An ATTRIBUTED caller's sent box requires an exact `from_actor` match:
+/// legacy outbound rows without `from_actor` are never inherited (fail
+/// closed), even when they live in the namespace the caller's query scans.
+/// Only the anonymous `"local"` actor gets the EqOrMissing fallback.
+#[tokio::test]
+async fn i1471_attributed_sent_box_excludes_legacy_rows() {
+    let backend = shared_backend();
+    let (registry_a, rt_a) = build_actor_registry(backend, "lambda:a");
+
+    registry_a
+        .dispatch(
+            "comm.send",
+            serde_json::json!({ "to": "lambda:b", "content": "attributed outbound" }),
+        )
+        .await
+        .expect("attributed actor sends");
+
+    let tok = rt_a
+        .authorize(Namespace::local())
+        .expect("authorize fixture namespace");
+    rt_a.create_note(
+        &tok,
+        "message",
+        None,
+        "legacy outbound, no from_actor",
+        None,
+        Some(serde_json::json!({
+            "to": "lambda:b",
+            "direction": "outbound",
+        })),
+        vec![],
+    )
+    .await
+    .expect("legacy from_actor-less outbound fixture");
+    // In-scope control: an identically created note that DOES carry the
+    // caller's `from_actor` must be visible, proving the exclusion above is
+    // the actor predicate and not namespace scoping making the legacy row
+    // unreachable.
+    rt_a.create_note(
+        &tok,
+        "message",
+        None,
+        "attributed fixture, from_actor present",
+        None,
+        Some(serde_json::json!({
+            "from_actor": "lambda:a",
+            "to": "lambda:b",
+            "direction": "outbound",
+        })),
+        vec![],
+    )
+    .await
+    .expect("attributed outbound control fixture");
+
+    let sent = registry_a
+        .dispatch(
+            "comm.inbox",
+            serde_json::json!({ "box": "sent", "limit": 10 }),
+        )
+        .await
+        .expect("attributed sent history");
+    assert_eq!(
+        sent["count"], 2,
+        "attributed rows visible, legacy from_actor-less row excluded; got {sent}"
+    );
+    let contents: Vec<&str> = sent["messages"]
+        .as_array()
+        .expect("messages array")
+        .iter()
+        .filter_map(|message| message["content"].as_str())
+        .collect();
+    assert!(
+        contents.contains(&"attributed fixture, from_actor present"),
+        "in-scope control fixture must be listed; got {contents:?}"
+    );
+    assert!(
+        !contents.contains(&"legacy outbound, no from_actor"),
+        "attributed caller must not inherit legacy from_actor-less rows; got {contents:?}"
+    );
+}
