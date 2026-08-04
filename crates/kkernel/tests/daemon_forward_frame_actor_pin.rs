@@ -68,6 +68,7 @@ fn base_args(db: &str, actor: Option<&str>) -> ExecArgs {
         ops: Some("stats()".to_string()),
         pending_events: false,
         db: Some(db.to_string()),
+        config: None,
         namespace: "local".to_string(),
         actor: actor.map(str::to_string),
         expect_actor: None,

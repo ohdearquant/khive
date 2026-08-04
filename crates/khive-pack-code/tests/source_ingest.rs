@@ -11,8 +11,10 @@ use std::path::Path;
 
 use chrono::Utc;
 use khive_pack_code::source_ingest::{run_code_ingest, CodeSourceIngestOptions};
-use khive_runtime::{KhiveRuntime, Namespace, RuntimeConfig};
+use khive_pack_kg::KgPack;
+use khive_runtime::{KhiveRuntime, Namespace, RuntimeConfig, VerbRegistryBuilder};
 use khive_storage::types::{SqlStatement, SqlValue};
+use serde_json::json;
 use tempfile::TempDir;
 
 fn all_languages() -> BTreeSet<&'static str> {
@@ -262,6 +264,48 @@ async fn reingesting_same_fixture_is_idempotent() {
     assert_eq!(
         second.modules_created, 0,
         "second pass must create zero new modules"
+    );
+}
+
+/// Issue #1590: `code.ingest` writes an ordinary khive map database, so a
+/// successful ingest must populate the FTS documents that the generic KG
+/// `search` verb reads. Entity rows without these documents made exact-name
+/// searches return an indistinguishable empty result.
+#[tokio::test]
+async fn ingested_map_entities_are_visible_to_generic_search() {
+    let root = TempDir::new().expect("tempdir");
+    write_two_package_fixture(root.path());
+    let db = root.path().join("searchable.db");
+    let rt = rt_at(&db);
+    let token = rt.authorize(Namespace::local()).expect("token");
+
+    let report = run_code_ingest(
+        &rt,
+        &token,
+        CodeSourceIngestOptions {
+            path: root.path(),
+            languages: all_languages(),
+            sweep_time: Utc::now(),
+        },
+    )
+    .await
+    .expect("source ingest succeeds");
+    assert!(
+        report.fts_indexed > 0,
+        "successful report must expose populated FTS work: {report:?}"
+    );
+
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(KgPack::new(rt));
+    let registry = builder.build().expect("kg registry builds");
+    let result = registry
+        .dispatch("search", json!({"kind": "entity", "query": "pkg_a"}))
+        .await
+        .expect("generic search against map succeeds");
+    let hits = result.as_array().expect("search returns an array");
+    assert!(
+        hits.iter().any(|hit| hit["name"] == "pkg_a"),
+        "exact ingested project name must be searchable; got {hits:?}"
     );
 }
 

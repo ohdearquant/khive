@@ -21,7 +21,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
-use khive_runtime::{secret_gate, KhiveRuntime, NamespaceToken, RuntimeError};
+use khive_runtime::{entity_fts_document, secret_gate, KhiveRuntime, NamespaceToken, RuntimeError};
 use khive_storage::{Edge, Entity, LinkId};
 use khive_types::EdgeRelation;
 use serde_json::{json, Value};
@@ -57,6 +57,10 @@ pub struct CodeSourceIngestReport {
     pub edges_updated: u64,
     pub unresolved_recorded: u64,
     pub unresolved_resolved: u64,
+    /// Entity documents successfully written to the map database's FTS index.
+    /// A successful ingest indexes every non-blocked entity upsert, so generic
+    /// KG `search` and query-anchored `context` can read the resulting map.
+    pub fts_indexed: u64,
     pub languages: Vec<String>,
     /// Per-manifest / per-file failures that did not abort the pass (fail
     /// loud without silently dropping the rest of the run).
@@ -201,10 +205,20 @@ async fn upsert_entity(
             other => Err(other.into()),
         };
     }
+    let document = entity_fts_document(&entity);
     rt.entities(token)?
         .upsert_entity(entity)
         .await
         .map_err(|e| CodeSourceIngestError::Storage(e.to_string()))?;
+    // This direct ingest path intentionally bypasses the runtime create/update
+    // verbs, so it must compose the same FTS write itself. Fail the call if the
+    // index write fails: returning an apparently healthy but unsearchable map
+    // makes an empty search result indistinguishable from a correct answer.
+    rt.text(token)?
+        .upsert_document(document)
+        .await
+        .map_err(|e| CodeSourceIngestError::Storage(format!("entity FTS indexing: {e}")))?;
+    report.fts_indexed += 1;
     Ok(true)
 }
 

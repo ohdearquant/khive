@@ -199,6 +199,11 @@ pub struct ExecArgs {
     #[arg(long, env = "KHIVE_DB")]
     pub db: Option<String>,
 
+    /// Explicit khive configuration file. This selects the same engine,
+    /// backend-topology, and actor configuration used by `kkernel mcp`.
+    #[arg(long, env = "KHIVE_CONFIG")]
+    pub config: Option<PathBuf>,
+
     /// Namespace to operate in.
     #[arg(long, default_value = "local")]
     pub namespace: String,
@@ -521,9 +526,13 @@ async fn apply_ops_file(
 pub async fn run_exec(args: ExecArgs) -> Result<()> {
     // ── pending-events drain ─────────────────────────────────────────────────
     if args.pending_events {
-        let summary =
-            pending_events::run_pending_events(args.db.as_deref(), &args.namespace, args.verbose)
-                .await?;
+        let summary = pending_events::run_pending_events_with_config(
+            args.db.as_deref(),
+            args.config.as_deref(),
+            &args.namespace,
+            args.verbose,
+        )
+        .await?;
         pending_events::print_summary(&summary);
         return Ok(());
     }
@@ -559,7 +568,7 @@ pub async fn run_exec(args: ExecArgs) -> Result<()> {
     let (mut cfg, db_anchor) =
         khive_mcp::serve::resolve_runtime_config_with_db_anchor(RuntimeConfigInputs {
             db: args.db.as_deref(),
-            config: None, // `kkernel exec` has no `--config` flag today
+            config: args.config.as_deref(),
             namespace,
             // `--namespace` has a clap `default_value = "local"`, so it is always
             // present — there is no way to distinguish "operator typed --namespace
@@ -606,6 +615,7 @@ pub async fn run_exec(args: ExecArgs) -> Result<()> {
     let db_context = ExecDbContext {
         raw: args.db,
         anchor: db_anchor,
+        config: args.config,
     };
 
     match mode {
@@ -729,6 +739,7 @@ enum ExecMode {
 struct ExecDbContext {
     raw: Option<String>,
     anchor: Option<PathBuf>,
+    config: Option<PathBuf>,
 }
 
 async fn run_exec_inline(
@@ -803,9 +814,8 @@ async fn run_exec_inline_with_forward(
     // topology (further below) resolve from the identical TOML file the
     // daemon's own boot path loads (`serve.rs`'s `build_server`:
     // `KhiveConfig::load_with_home_fallback(args.config.as_deref(),
-    // config_discovery_db_anchor(args.db.as_deref()).as_deref())` —
-    // `kkernel exec` has no `--config` flag, so the first argument here is
-    // always `None`, exactly like there. The second argument is the raw
+    // config_discovery_db_anchor(args.db.as_deref()).as_deref())`. The second
+    // argument is the raw
     // `--db`/`KHIVE_DB` discovery anchor (`None` unless `--db` was set) rather
     // than `cfg.db_path` — `cfg.db_path` materializes the `$HOME/.khive`
     // default when `--db` is unset (#689), which would incorrectly re-anchor
@@ -820,9 +830,12 @@ async fn run_exec_inline_with_forward(
     // `ConfigMismatch` and silently fell back to the cold in-process path on
     // every call.
     let db_path_for_config = config_discovery_db_anchor(db_context.raw.as_deref());
-    let khive_cfg = KhiveConfig::load_with_home_fallback(None, db_path_for_config.as_deref())
-        .map_err(|e| anyhow::anyhow!("config error: {e}"))?
-        .unwrap_or_default();
+    let khive_cfg = KhiveConfig::load_with_home_fallback(
+        db_context.config.as_deref(),
+        db_path_for_config.as_deref(),
+    )
+    .map_err(|e| anyhow::anyhow!("config error: {e}"))?
+    .unwrap_or_default();
 
     // #1226: apply the same --db/[[backends]] conflict guard the in-process
     // fallback below applies, BEFORE the daemon fast-path — otherwise a warm
@@ -990,9 +1003,12 @@ async fn run_exec_ops_file(
     // path — see `build_local_fallback_server`.
     enforce_strict_actor_mode(cfg.actor_id.as_deref(), &cfg.packs)?;
     let db_path_for_config = config_discovery_db_anchor(db_context.raw.as_deref());
-    let khive_cfg = KhiveConfig::load_with_home_fallback(None, db_path_for_config.as_deref())
-        .map_err(|e| anyhow::anyhow!("config error: {e}"))?
-        .unwrap_or_default();
+    let khive_cfg = KhiveConfig::load_with_home_fallback(
+        db_context.config.as_deref(),
+        db_path_for_config.as_deref(),
+    )
+    .map_err(|e| anyhow::anyhow!("config error: {e}"))?
+    .unwrap_or_default();
 
     if atomic {
         let max_ops = atomic_max_ops.unwrap_or(khive_types::pack::ATOMIC_MAX_OPS_DEFAULT);
@@ -1205,6 +1221,20 @@ mod tests {
         let args = ExecArgs::parse_from(["exec", "stats()"]);
         std::env::remove_var("KHIVE_DB");
         assert_eq!(args.db.as_deref(), Some("/tmp/kkernel-exec-env.db"));
+    }
+
+    #[test]
+    fn explicit_config_flag_parses_for_exec() {
+        let args = ExecArgs::parse_from([
+            "exec",
+            "stats()",
+            "--config",
+            "/tmp/kkernel-exec-config.toml",
+        ]);
+        assert_eq!(
+            args.config.as_deref(),
+            Some(std::path::Path::new("/tmp/kkernel-exec-config.toml"))
+        );
     }
 
     #[test]
@@ -1544,9 +1574,8 @@ default = true
 
         let ns = Namespace::parse("local").expect("ns");
 
-        // exec-shaped inputs: `config: None` (kkernel exec has no `--config`
-        // flag today), `namespace_explicit: true` (the choice made in `run_exec`
-        // above).
+        // Exec-shaped inputs with no explicit config in this scenario and
+        // `namespace_explicit: true` (the choice made in `run_exec` above).
         // Pin the pack list explicitly rather than inheriting `KHIVE_PACKS`
         // from the ambient environment (same rationale as `isolated_server`
         // above, #1276): `RuntimeConfig::default()` reads `KHIVE_PACKS` fresh
@@ -3174,6 +3203,88 @@ id = "lambda:fallback"
     #[cfg(unix)]
     #[tokio::test]
     #[serial]
+    async fn explicit_config_is_loaded_for_exec_forward_frame() {
+        std::env::remove_var("KHIVE_EMBEDDING_MODEL");
+        std::env::remove_var("KHIVE_ADDITIONAL_EMBEDDING_MODELS");
+        std::env::remove_var("KHIVE_ACTOR");
+        std::env::remove_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR");
+        let (prev_home, _home_dir) = isolate_home_for_test();
+        SPY_CAPTURED_CONFIG_ID.with(|captured| *captured.borrow_mut() = None);
+
+        let fixture = tempfile::tempdir().expect("config fixture tempdir");
+        let config_path = fixture.path().join("code-map.toml");
+        let main_backend_path = fixture.path().join("code-map.db");
+        let sessions_backend_path = fixture.path().join("sessions.db");
+        std::fs::write(
+            &config_path,
+            format!(
+                r#"
+[[backends]]
+name = "main"
+kind = "sqlite"
+path = "{}"
+
+[[backends]]
+name = "sessions"
+kind = "sqlite"
+path = "{}"
+"#,
+                main_backend_path.display(),
+                sessions_backend_path.display(),
+            ),
+        )
+        .expect("write explicit exec config");
+
+        let cfg = resolve_runtime_config(RuntimeConfigInputs {
+            db: None,
+            config: Some(&config_path),
+            namespace: Namespace::parse("local").expect("namespace"),
+            namespace_explicit: true,
+            actor_explicit: false,
+            no_embed: true,
+            packs: Some(vec!["kg".to_string()]),
+            brain_profile: None,
+        })
+        .expect("resolve explicit exec config");
+
+        let result = run_exec_inline_with_forward(
+            "stats()".to_string(),
+            cfg.clone(),
+            None,
+            None,
+            None,
+            ExecDbContext {
+                raw: None,
+                anchor: None,
+                config: Some(config_path.clone()),
+            },
+            false,
+            spy_capture_config_id,
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "explicit-config dispatch failed: {result:?}"
+        );
+
+        let captured = SPY_CAPTURED_CONFIG_ID
+            .with(|value| value.borrow_mut().take())
+            .expect("spy must capture the forwarded config id");
+        let khive_cfg = KhiveConfig::load_with_home_fallback(Some(&config_path), None)
+            .expect("load explicit config")
+            .expect("explicit config must exist");
+        let expected = compute_config_id(&cfg, Some(&khive_cfg));
+        restore_home(prev_home);
+
+        assert_eq!(
+            captured, expected,
+            "the exec forward frame must fold the explicitly selected backend topology"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial]
     async fn exec_frame_config_id_matches_daemon_config_id_for_multi_backend_project_toml() {
         std::env::remove_var("KHIVE_EMBEDDING_MODEL");
         std::env::remove_var("KHIVE_ADDITIONAL_EMBEDDING_MODELS");
@@ -3398,6 +3509,7 @@ backend = "sessions"
             ExecDbContext {
                 raw: Some(matching_override.clone()),
                 anchor: khive_runtime::resolve_db_anchor(Some(&matching_override)),
+                config: None,
             },
             false,
             spy_capture_config_id,
@@ -3421,6 +3533,7 @@ backend = "sessions"
             ExecDbContext {
                 raw: Some(conflicting_override.display().to_string()),
                 anchor: None,
+                config: None,
             },
             false,
             spy_capture_config_id,
