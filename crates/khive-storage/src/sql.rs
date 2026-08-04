@@ -46,6 +46,12 @@ pub trait SqlReader: Send + 'static {
     /// they can stop row conversion at `page.limit`; khive-db's SQLite bridge
     /// does so, bounding owned result materialization without rewriting the
     /// caller's SQL.
+    ///
+    /// Like [`Self::query_all`], the default has no result-size bound: it
+    /// materializes every matching row before slicing. Callers issuing
+    /// unconstrained SQL must not rely on the default to keep memory
+    /// proportional to `page.limit` — that bound holds only on backends that
+    /// override this method.
     async fn query_page(
         &mut self,
         statement: SqlStatement,

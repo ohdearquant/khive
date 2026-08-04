@@ -1367,6 +1367,79 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pool_backed_query_page_beyond_result_set_returns_empty() {
+        let config = PoolConfig {
+            path: None,
+            ..PoolConfig::default()
+        };
+        let pool = Arc::new(ConnectionPool::new(config).unwrap());
+        {
+            let writer = pool.writer().unwrap();
+            writer
+                .conn()
+                .execute_batch(
+                    "CREATE TABLE page_test (id INTEGER PRIMARY KEY, val TEXT NOT NULL);\
+                     INSERT INTO page_test (id, val) VALUES (1, 'a'), (2, 'b'), (3, 'c');",
+                )
+                .unwrap();
+        }
+        let bridge = SqlBridge::new(Arc::clone(&pool), false);
+
+        let statement = || SqlStatement {
+            sql: "SELECT val FROM page_test ORDER BY id".into(),
+            params: vec![],
+            label: None,
+        };
+
+        let mut reader = bridge.reader().await.unwrap();
+        let page = reader
+            .query_page(
+                statement(),
+                PageRequest {
+                    offset: 1,
+                    limit: 2,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(page.len(), 2);
+        assert!(matches!(page[0].get("val"), Some(SqlValue::Text(v)) if v == "b"));
+        assert!(matches!(page[1].get("val"), Some(SqlValue::Text(v)) if v == "c"));
+
+        let empty = reader
+            .query_page(
+                statement(),
+                PageRequest {
+                    offset: 99,
+                    limit: 10,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            empty.is_empty(),
+            "offset past the last row must return an empty page, got {empty:?}"
+        );
+        drop(reader);
+
+        let mut writer = bridge.writer().await.unwrap();
+        let empty = writer
+            .query_page(
+                statement(),
+                PageRequest {
+                    offset: 99,
+                    limit: 10,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            empty.is_empty(),
+            "offset past the last row must return an empty page, got {empty:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn file_bridge_caps_live_reader_and_writer_handles_per_pool() {
         let dir = tempfile::tempdir().unwrap();
         let config = PoolConfig {
