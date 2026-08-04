@@ -1,6 +1,6 @@
 # ADR-142: Agentic Process Runtime
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date:** 2026-08-03
 
 ## Context
