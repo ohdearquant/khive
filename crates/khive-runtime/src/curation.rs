@@ -2952,8 +2952,10 @@ pub(crate) fn count_new_property_keys(
         // keeps that rule rather than counting the keys — the alternative
         // silently changes `properties_merged` for ordinary notes, which never
         // enter the restoration path and were being reported correctly by the
-        // fold. The single exception is an object restoration has emptied: no
-        // key survived, so there is no contribution left to report.
+        // fold. The rule here is: an empty final object has no contribution
+        // left to report, whatever emptied it — restoration removing every
+        // owner-established key is one way that happens, but an ordinary
+        // `PreferFrom` replacement with an empty object reaches this same arm.
         (Some(_), Some(Value::Object(final_map))) => usize::from(!final_map.is_empty()),
         // Whole-value replacement by a non-object. `merge_json` scores a
         // `PreferFrom` fold that replaces one properties value with a

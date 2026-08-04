@@ -10387,3 +10387,100 @@ async fn merge_reports_zero_properties_merged_for_nested_union_reversion() {
          got {merged}"
     );
 }
+
+/// ROUTE-LEVEL RESTORATION arm: the whole scenario driven through the pack's
+/// actual `comm.send`/`create` + `merge` verbs (not `count_new_property_keys`
+/// called directly — that unit-level coverage already lives in
+/// `khive-runtime`'s `curation.rs` tests), on a pack-owned `message` note.
+///
+/// `external_id` is an `OWNER_ESTABLISHED_PROPERTIES` key `comm.send` never
+/// sets, so the into-note's property map genuinely lacks the key entirely
+/// (unlike `subject`, which `comm.send` always writes, even as `null` — a
+/// present-but-null key would already be "in" the into-note's map and
+/// wouldn't exercise the "absent from into" removal path). The from-note is
+/// built with `create` so `properties` can name `external_id` directly.
+///
+/// Under `prefer_from` the fold treats `external_id` as a genuinely new key
+/// — the into-note's property map does not have it — and counts it as one
+/// contribution. Restoration then reverts it: `external_id` is absent on the
+/// into-note, so it is removed from the merged result rather than kept.
+/// Nothing the fold counted actually survives, so `properties_merged` must
+/// report 0, and the into-note's owner-established properties (here
+/// `from_actor`) must still read as the into-note's own, not the absorbed
+/// note's.
+#[tokio::test]
+async fn merge_reports_zero_properties_merged_when_restoration_reverts_the_only_new_key_through_the_route(
+) {
+    let (registry, _rt) = build_registry_with_owned_kinds_and_validator();
+
+    let into_id = send_message_as(
+        &registry,
+        "lambda:x",
+        "into note, route-level restoration arm — no external_id",
+    )
+    .await;
+
+    let from_created = registry
+        .dispatch_with_identity(
+            "create",
+            serde_json::json!({
+                "kind": "message",
+                "content": "from note, route-level restoration arm — has an external_id",
+                "properties": {"external_id": "wire-abc-123"},
+            }),
+            Some(RequestIdentity {
+                namespace: "local".to_string(),
+                actor_id: Some("lambda:y".to_string()),
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect("create must succeed");
+    let from_id = from_created["id"]
+        .as_str()
+        .expect("create must return id")
+        .to_string();
+
+    let before = registry
+        .dispatch("get", serde_json::json!({"id": into_id}))
+        .await
+        .expect("get must succeed");
+    assert!(
+        before["properties"].get("external_id").is_none(),
+        "fixture invariant: the into-note must not already carry an \
+         `external_id`; got {before}"
+    );
+
+    let merged = registry
+        .dispatch(
+            "merge",
+            serde_json::json!({
+                "kind": "message",
+                "into_id": into_id,
+                "from_id": from_id,
+                "strategy": "prefer_from",
+            }),
+        )
+        .await
+        .expect("merge must succeed");
+
+    let after = registry
+        .dispatch("get", serde_json::json!({"id": into_id}))
+        .await
+        .expect("get must succeed");
+    assert!(
+        after["properties"].get("external_id").is_none(),
+        "restoration must strip the absorbed note's `external_id`, since the \
+         into-note never had one — got {after}"
+    );
+    assert_eq!(
+        after["properties"]["from_actor"], "lambda:x",
+        "the into-note's owner-established `from_actor` must survive the merge \
+         unchanged"
+    );
+    assert_eq!(
+        merged["properties_merged"], 0,
+        "the only key the fold counted as new (`external_id`) was reverted by \
+         restoration, so nothing genuinely survived; got {merged}"
+    );
+}
