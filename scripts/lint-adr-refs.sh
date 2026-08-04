@@ -8,9 +8,9 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 # `ADR-NNN: <title>` form embedded in plain prose, e.g. inside a crate's
 # docs/design.md "ADR Compliance" section) against synthetic fixtures rather
 # than the live repo, since the real corpus only carries a handful of these.
-# Regression case 1 reproduces the bm25 design.md drift this was added for
-# (PR #886 review r1): a parenthetical citation that echoes a truncated ADR
-# title must fail. Regression case 2 asserts a bare "(ADR-030)" reference
+# Regression case 1 reproduces the bm25 design.md drift this was added for:
+# a parenthetical citation that echoes a truncated ADR title must fail.
+# Regression case 2 asserts a bare "(ADR-030)" reference
 # with no restated title never false-positives.
 self_test() {
     tmp="$(mktemp -d)"
@@ -943,9 +943,9 @@ for path in sorted(adr_dir.glob("ADR-*.md")):
 index_path = adr_dir / "README.md"
 relative = index_path.relative_to(root)
 # The catalog is a GENERATED block, so it is validated against a closed grammar
-# rather than by modelling the Markdown around it. Four review rounds of a
-# hand-rolled fence and comment scanner each closed one way a quoted marker
-# could act as a real delimiter and left another -- mismatched fence
+# rather than by modelling the Markdown around it. A hand-rolled fence and
+# comment scanner was tried first, and each repair closed one way a quoted
+# marker could act as a real delimiter while leaving another -- mismatched fence
 # characters, short closers, comments reopened on one line, four-space indented
 # code, fences inside list items, tab expansion. Those are structural
 # CommonMark concepts, and a line-at-a-time model in this script will keep
