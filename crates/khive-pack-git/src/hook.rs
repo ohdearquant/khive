@@ -17,14 +17,15 @@ fn is_40_hex(s: &str) -> bool {
 
 fn is_repo_relative_path(path: &str) -> bool {
     let bytes = path.as_bytes();
-    let windows_drive_absolute = bytes.len() >= 3
-        && bytes[0].is_ascii_alphabetic()
-        && bytes[1] == b':'
-        && (bytes[2] == b'/' || bytes[2] == b'\\');
+    // Any `X:` prefix is a Windows drive reference — absolute (`C:/...`) or
+    // drive-relative (`C:foo`). The canonical shape is `/`-separated
+    // repo-relative, so reject the prefix regardless of what follows it.
+    let windows_drive_prefix =
+        bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':';
     !path.is_empty()
         && !path.starts_with('/')
-        && !path.starts_with('\\')
-        && !windows_drive_absolute
+        && !path.contains('\\')
+        && !windows_drive_prefix
         && !path.contains('\0')
         && path
             .split('/')
@@ -45,8 +46,9 @@ fn properties_obj(args: &Value) -> Result<&serde_json::Map<String, Value>, Runti
 ///
 /// Validates `properties.sha` (required, 40-hex) and, when present,
 /// `properties.parents` (array of 40-hex strings) and `properties.changed_paths`
-/// (array of repository-relative path strings). Commits have no lifecycle and
-/// no `after_create` edge work.
+/// (array of repository-relative path strings; an explicit JSON `null` is
+/// treated the same as an absent property). Commits have no lifecycle and no
+/// `after_create` edge work.
 #[derive(Debug, Default)]
 pub struct CommitHook;
 
@@ -95,7 +97,10 @@ impl KindHook for CommitHook {
             }
         }
 
-        if let Some(paths) = props.get("changed_paths") {
+        // An explicit JSON `null` carries no path facts and is treated the
+        // same as an absent property; anything else must be the canonical
+        // sorted, deduplicated array.
+        if let Some(paths) = props.get("changed_paths").filter(|value| !value.is_null()) {
             let arr = paths.as_array().ok_or_else(|| {
                 RuntimeError::InvalidInput(
                     "commit properties.changed_paths must be an array".into(),

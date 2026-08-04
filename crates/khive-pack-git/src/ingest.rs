@@ -595,18 +595,22 @@ async fn find_document_for_path(
 /// module's `source_revision` to equal the snapshot HEAD keeps unrelated maps
 /// out; a path with more than one matching live row remains ambiguous and is
 /// deliberately represented by `None` rather than selecting or annotating an
-/// arbitrary candidate.
+/// arbitrary candidate. A row whose `id` does not parse as a UUID still
+/// counts toward that ambiguity — it is evidence of a second live row for
+/// the same key — but can never itself serve as a binding target.
 ///
-/// A load failure returns `None` instead of aborting the pass: module
-/// annotation is best-effort enrichment (ADR-088 Amendment 1), while the
-/// durable `changed_paths` fact must still be recorded.
+/// A reader/query failure returns `Err` carrying the underlying error text;
+/// the caller degrades to no module annotation with a warning that includes
+/// it rather than aborting the pass: module annotation is best-effort
+/// enrichment (ADR-088 Amendment 1), while the durable `changed_paths` fact
+/// must still be recorded.
 async fn load_code_modules_by_snapshot_path(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
     source_revision: &str,
-) -> Option<HashMap<String, Option<Uuid>>> {
+) -> Result<HashMap<String, Option<Uuid>>> {
     let sql = runtime.sql();
-    let mut r = sql.reader().await.map_err(|e| anyhow!("{e}")).ok()?;
+    let mut r = sql.reader().await.map_err(|e| anyhow!("{e}"))?;
     let rows = r
         .query_all(SqlStatement {
             sql: "SELECT id, json_extract(properties,'$.source_path') AS source_path \
@@ -623,21 +627,24 @@ async fn load_code_modules_by_snapshot_path(
             label: Some("git_ingest_load_code_modules_by_snapshot_path".into()),
         })
         .await
-        .map_err(|e| anyhow!("{e}"))
-        .ok()?;
+        .map_err(|e| anyhow!("{e}"))?;
 
     let mut modules: HashMap<String, Option<Uuid>> = HashMap::new();
     for row in rows {
-        let Some(id) = row_uuid(&row) else { continue };
         let Some(SqlValue::Text(path)) = row.get("source_path") else {
             continue;
         };
+        // A row whose id does not parse is still a live row for its
+        // `(source_revision, source_path)` key: it occupies the slot (so any
+        // second row for the same key marks the pair ambiguous) but can
+        // never bind as an annotation target itself.
+        let id = row_uuid(&row);
         modules
             .entry(path.clone())
             .and_modify(|candidate| *candidate = None)
-            .or_insert(Some(id));
+            .or_insert(id);
     }
-    Some(modules)
+    Ok(modules)
 }
 
 /// Read the last-ingested cursor value for `(project_id, kind)`, if any.
@@ -1178,14 +1185,15 @@ async fn ingest_commits(
         .sha
         .clone();
     // Module annotation is best-effort enrichment: a failed index load
-    // degrades to no module annotation with a warning rather than aborting
-    // the pass that records the durable `changed_paths` facts.
+    // degrades to no module annotation with a warning carrying the load
+    // error's text rather than aborting the pass that records the durable
+    // `changed_paths` facts.
     let code_modules_by_source_path =
         match load_code_modules_by_snapshot_path(runtime, token, &snapshot_head).await {
-            Some(modules) => modules,
-            None => {
+            Ok(modules) => modules,
+            Err(e) => {
                 report.warnings.push(format!(
-                    "code module index load failed for snapshot {snapshot_head}; \
+                    "code module index load failed for snapshot {snapshot_head}: {e}; \
                      commits ingest without code-module annotation"
                 ));
                 HashMap::new()
@@ -2464,6 +2472,155 @@ mod find_document_for_path_tests {
             Some(exact_id),
             "a single query covering both exact and broadened candidates \
              must still rank the exact match first, regardless of insertion order"
+        );
+    }
+}
+
+/// `load_code_modules_by_snapshot_path` ambiguity and error-surface
+/// regression tests. See
+/// crates/khive-pack-git/docs/api/ingest.md#test-module-notes.
+#[cfg(test)]
+mod module_index_loader_tests {
+    use super::*;
+    use khive_runtime::Namespace;
+
+    const REVISION: &str = "1111111111111111111111111111111111111111";
+    const AMBIGUOUS_PATH: &str = "crates/ambig/src/lib.rs";
+
+    fn rt_and_token() -> (KhiveRuntime, NamespaceToken) {
+        let rt = KhiveRuntime::memory().unwrap();
+        let token = rt.authorize(Namespace::local()).unwrap();
+        (rt, token)
+    }
+
+    async fn create_module(
+        rt: &KhiveRuntime,
+        token: &NamespaceToken,
+        name: &str,
+        path: &str,
+    ) -> Uuid {
+        rt.create_entity(
+            token,
+            "concept",
+            Some("module"),
+            name,
+            None,
+            Some(json!({
+                "source_path": path,
+                "source_revision": REVISION
+            })),
+            vec![],
+        )
+        .await
+        .unwrap()
+        .id
+    }
+
+    /// A live module row whose `id` does not parse as a UUID — a shape the
+    /// normal `create` path never writes, inserted raw to prove the loader
+    /// still counts it toward ambiguity.
+    async fn insert_unparsable_module_row(
+        rt: &KhiveRuntime,
+        token: &NamespaceToken,
+        name: &str,
+        path: &str,
+    ) {
+        let mut writer = rt.sql().writer().await.unwrap();
+        writer
+            .execute(SqlStatement {
+                sql: "INSERT INTO entities \
+                      (id, namespace, kind, entity_type, name, properties, created_at, updated_at) \
+                      VALUES (?1, ?2, 'concept', 'module', ?3, ?4, 0, 0)"
+                    .into(),
+                params: vec![
+                    SqlValue::Text("not-a-parseable-uuid".to_string()),
+                    SqlValue::Text(token.namespace().as_str().to_string()),
+                    SqlValue::Text(name.to_string()),
+                    SqlValue::Text(
+                        json!({
+                            "source_path": path,
+                            "source_revision": REVISION
+                        })
+                        .to_string(),
+                    ),
+                ],
+                label: Some("test_insert_unparsable_module_row".into()),
+            })
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn single_valid_module_row_binds() {
+        let (rt, token) = rt_and_token();
+        let id = create_module(&rt, &token, "solo_module", AMBIGUOUS_PATH).await;
+
+        let index = load_code_modules_by_snapshot_path(&rt, &token, REVISION)
+            .await
+            .unwrap();
+        assert_eq!(index.get(AMBIGUOUS_PATH), Some(&Some(id)));
+    }
+
+    /// Contract: more than one live module with the same
+    /// `(source_revision, source_path)` is ambiguous and annotates none. An
+    /// unparsable-id row is still a live row for that key, so it must mark
+    /// the pair ambiguous even though it can never bind itself.
+    #[tokio::test]
+    async fn unparsable_module_row_counts_toward_ambiguity() {
+        let (rt, token) = rt_and_token();
+        let valid_id = create_module(&rt, &token, "valid_module", AMBIGUOUS_PATH).await;
+        insert_unparsable_module_row(&rt, &token, "malformed_module", AMBIGUOUS_PATH).await;
+
+        let index = load_code_modules_by_snapshot_path(&rt, &token, REVISION)
+            .await
+            .unwrap();
+        assert_eq!(
+            index.get(AMBIGUOUS_PATH),
+            Some(&None),
+            "a malformed row is evidence of a second live module for \
+             {AMBIGUOUS_PATH}; the valid row {valid_id} must not be selected"
+        );
+    }
+
+    #[tokio::test]
+    async fn unparsable_module_row_alone_never_binds() {
+        let (rt, token) = rt_and_token();
+        insert_unparsable_module_row(&rt, &token, "lonely_malformed", AMBIGUOUS_PATH).await;
+
+        let index = load_code_modules_by_snapshot_path(&rt, &token, REVISION)
+            .await
+            .unwrap();
+        assert_eq!(
+            index.get(AMBIGUOUS_PATH),
+            Some(&None),
+            "an unparsable id can never serve as an annotation target"
+        );
+    }
+
+    /// A failed index load must surface its cause: the caller includes this
+    /// error text in the degradation warning, so persistent SQL/schema
+    /// problems stay diagnosable.
+    #[tokio::test]
+    async fn load_failure_surfaces_error_text() {
+        let (rt, token) = rt_and_token();
+        // Break the substrate directly: the index query then fails with a
+        // real SQL error that must reach the caller.
+        let mut writer = rt.sql().writer().await.unwrap();
+        writer
+            .execute(SqlStatement {
+                sql: "DROP TABLE entities".into(),
+                params: vec![],
+                label: Some("test_drop_entities".into()),
+            })
+            .await
+            .unwrap();
+
+        let err = load_code_modules_by_snapshot_path(&rt, &token, REVISION)
+            .await
+            .expect_err("a failed index load must return Err");
+        assert!(
+            format!("{err}").contains("no such table"),
+            "the error must carry the underlying SQL cause: {err}"
         );
     }
 }

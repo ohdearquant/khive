@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 
 use async_trait::async_trait;
-use khive_pack_git::ingest::{run_ingest, IngestOptions};
+use khive_pack_git::ingest::{run_ingest, IngestInclude, IngestOptions};
 use khive_pack_git::GitPack;
 use khive_pack_kg::KgPack;
 use khive_runtime::{
@@ -196,6 +196,19 @@ fn head_sha(repo: &Path) -> String {
         .args(["rev-parse", "HEAD"])
         .output()
         .expect("rev-parse");
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+/// Absolute path of the real `git` binary, resolved BEFORE any test shadows
+/// `PATH` — shims delegate every invocation they do not script to it (same
+/// technique as `src/recovery_tests.rs`).
+fn resolve_real_git() -> String {
+    let out = Command::new("sh")
+        .arg("-c")
+        .arg("command -v git")
+        .output()
+        .expect("resolve real git");
+    assert!(out.status.success(), "could not resolve real git on PATH");
     String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
@@ -657,7 +670,12 @@ async fn ingest_preserves_unicode_and_delimiter_bearing_changed_paths() {
     let dir = tempfile::tempdir().expect("tempdir");
     let repo = dir.path();
     init_repo(repo);
-    let unusual_path = "src/café\t\"quoted\"\\leaf\nline.rs";
+    // Backslash is deliberately absent: the hook's canonical shape is
+    // `/`-separated repo-relative and rejects `\` anywhere, so a
+    // backslash-bearing filesystem name can never round-trip through
+    // `changed_paths`. Tab, quote, newline, and non-ASCII coverage remain —
+    // all of them still trigger git's quoted display form without `-z`.
+    let unusual_path = "src/café\t\"quoted\"leaf\nline.rs";
     write(repo, unusual_path, "pub fn unusual() {}\n");
     commit(repo, &[unusual_path], "Add unusual path");
     let revision = head_sha(repo);
@@ -857,6 +875,130 @@ async fn ingest_records_both_sides_of_a_rename() {
         rename["properties"]["changed_paths"],
         json!(["new.rs", "old.rs"]),
         "a rename records both the deleted and the added path"
+    );
+}
+
+/// A walked commit with no touched-path entry must never be stored with a
+/// fabricated `[]`: the run warns naming the commit, stalls the cursor at
+/// the last contiguous successful commit, and still completes (see
+/// docs/api/ingest.md#changed-paths-and-code-module-annotations).
+#[tokio::test]
+async fn ingest_stalls_cursor_for_commit_missing_touched_paths() {
+    let _guard = ENV_MUTEX.lock().await;
+    let (rt, token, registry) = fixture().await;
+    let project_id = create(
+        &registry,
+        json!({"kind": "project", "name": "touched-gap-repo"}),
+    )
+    .await;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_repo(repo);
+    write(repo, "first.rs", "pub fn first() {}\n");
+    commit(repo, &["first.rs"], "First");
+    let first_sha = head_sha(repo);
+    write(repo, "second.rs", "pub fn second() {}\n");
+    commit(repo, &["second.rs"], "Second");
+    let second_sha = head_sha(repo);
+    write(repo, "third.rs", "pub fn third() {}\n");
+    commit(repo, &["third.rs"], "Third");
+    let third_sha = head_sha(repo);
+
+    // The `--name-only` pass is the sole authority for touched paths. This
+    // PATH-shadowing shim deletes the middle commit's header from that one
+    // stream so the two snapshot passes disagree exactly the way the
+    // degradation branch handles; every other invocation delegates to the
+    // real git binary (same technique as `src/recovery_tests.rs`).
+    let real_git = resolve_real_git();
+    let bin_dir = dir.path().join("bin");
+    std::fs::create_dir_all(&bin_dir).expect("create bin dir");
+    std::fs::write(
+        bin_dir.join("git"),
+        format!(
+            r#"#!/bin/sh
+REAL_GIT="{real_git}"
+case " $* " in
+  *" --name-only "*)
+    "$REAL_GIT" "$@" | tr '\0' '\n' | grep -av '{second_sha}' | tr '\n' '\0'
+    exit 0
+    ;;
+esac
+exec "$REAL_GIT" "$@"
+"#,
+            real_git = real_git,
+            second_sha = second_sha,
+        ),
+    )
+    .expect("write git shim");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(bin_dir.join("git"))
+            .expect("shim metadata")
+            .permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(bin_dir.join("git"), perms).expect("chmod shim");
+    }
+    let _path_guard = PathGuard::install(&bin_dir);
+
+    let report = run_ingest(
+        &rt,
+        &token,
+        &registry,
+        IngestOptions {
+            repo: repo.to_path_buf(),
+            project: project_id.to_string(),
+            max_items: None,
+            include: IngestInclude {
+                commits: true,
+                issues: false,
+                pull_requests: false,
+            },
+        },
+    )
+    .await
+    .expect("the run completes despite the touched-path gap");
+    assert!(report.done, "an unbounded pass still finishes: {report:?}");
+    assert!(
+        report
+            .warnings
+            .iter()
+            .any(|w| w.contains("no touched-path set recorded") && w.contains(&second_sha)),
+        "the gap must surface as a warning naming the stalled commit: {:?}",
+        report.warnings
+    );
+    assert_eq!(
+        report.commits_ingested, 2,
+        "the two commits with recorded path sets still land: {report:?}"
+    );
+
+    let cursor = read_git_cursor(&rt, project_id, "commits")
+        .await
+        .expect("cursor must be written");
+    assert_eq!(
+        cursor, first_sha,
+        "the cursor must stall at the last contiguous successful commit, \
+         never advance past the gap"
+    );
+
+    let commits = registry
+        .dispatch("list", json!({"kind": "commit", "limit": 10}))
+        .await
+        .expect("list commits");
+    let stored_shas: Vec<&str> = commits
+        .as_array()
+        .expect("commit array")
+        .iter()
+        .map(|note| note["properties"]["sha"].as_str().expect("sha"))
+        .collect();
+    assert!(
+        !stored_shas.contains(&second_sha.as_str()),
+        "the gap commit must never be stored with a fabricated []: {stored_shas:?}"
+    );
+    assert!(
+        stored_shas.contains(&third_sha.as_str()),
+        "a commit after the gap is still attempted and lands: {stored_shas:?}"
     );
 }
 
@@ -2460,6 +2602,8 @@ async fn commit_hook_rejects_invalid_changed_path_shapes() {
         json!(["/absolute.rs"]),
         json!(["C:/absolute.rs"]),
         json!(["C:\\absolute.rs"]),
+        json!(["C:drive-relative.rs"]),
+        json!(["src\\file.rs"]),
         json!(["\\\\server\\share\\file.rs"]),
         json!(["src/../secret.rs"]),
         json!([7]),
@@ -2504,6 +2648,45 @@ async fn commit_hook_accepts_empty_changed_paths() {
         )
         .await
         .expect("an empty changed_paths array is the canonical empty-commit shape");
+
+    // An explicit JSON `null` carries no path facts and is treated the same
+    // as an absent property.
+    registry
+        .dispatch(
+            "create",
+            json!({
+                "kind": "commit",
+                "content": "null changed_paths fixture",
+                "properties": {
+                    "sha": "1111111111111111111111111111111111111111",
+                    "changed_paths": null
+                }
+            }),
+        )
+        .await
+        .expect("null changed_paths is optional, same as absent");
+}
+
+/// The must-keep control for the canonical shape: a sorted, deduplicated
+/// array of `/`-separated repo-relative paths is accepted (e.g. `src/lib.rs`
+/// survives the tightened path-shape validation unchanged).
+#[tokio::test]
+async fn commit_hook_accepts_canonical_changed_paths() {
+    let (_rt, _token, registry) = fixture().await;
+    registry
+        .dispatch(
+            "create",
+            json!({
+                "kind": "commit",
+                "content": "canonical changed_paths fixture",
+                "properties": {
+                    "sha": "2222222222222222222222222222222222222222",
+                    "changed_paths": ["src/lib.rs"]
+                }
+            }),
+        )
+        .await
+        .expect("a sorted, deduplicated repo-relative path array is accepted");
 }
 
 // ── project-scoped idempotency ──────────────────────────────────────────

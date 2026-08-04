@@ -16,12 +16,13 @@ generic `create(kind=..., annotates=[...])` call; the runtime's own
 
 In addition to the governed SHA, parent, and short-SHA shapes,
 `properties.changed_paths` is optional for manually created commit notes but
-validated when present. It must be an array of non-empty, repository-relative
-`/`-separated strings without empty, `.` or `..` components, and the array
-must already be sorted and deduplicated. The git ingester always supplies that
-canonical shape, including `[]` for an empty commit. POSIX-absolute paths and
-the Windows absolute shapes (drive-letter with either separator, `\\`-prefixed
-UNC) are rejected.
+validated when present. An explicit JSON `null` is treated the same as an
+absent property. When present, it must be an array of non-empty,
+repository-relative `/`-separated strings without empty, `.` or `..`
+components, and the array must already be sorted and deduplicated. The git
+ingester always supplies that canonical shape, including `[]` for an empty
+commit. POSIX-absolute paths, any path containing a backslash, and any `X:`
+drive prefix (absolute or drive-relative) are rejected.
 
 ## `IssueLikeHook`
 
