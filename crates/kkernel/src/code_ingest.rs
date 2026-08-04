@@ -23,6 +23,14 @@ use khive_pack_code::{ingest_findings_json, CodeIngestBatch, CodeIngestOptions};
 use khive_runtime::{entity_fts_document, note_fts_document, secret_gate, KhiveRuntime, Namespace};
 use khive_storage::{SqlStatement, SqlValue, SubstrateKind};
 
+/// Upper bound on how long the real ingest path waits for the pool's writer
+/// task to exit after the last write returned. Generous relative to any
+/// realistic queue depth for a findings batch; hitting it means something is
+/// holding a `WriterTaskHandle` clone alive (the queue never closed) or the
+/// writer is wedged, and the caller is told loudly rather than returning
+/// with the database file still in motion.
+const WRITER_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Arguments for `kkernel code-ingest`.
 #[derive(Parser, Debug)]
 pub struct CodeIngestArgs {
@@ -358,6 +366,34 @@ where
             .upsert_edge(edge.clone())
             .await
             .map_err(|e| anyhow::anyhow!("{e}"))?;
+    }
+
+    // The migrated stores above route writes through the pool's shared
+    // writer task (ADR-067 Component A), which owns its own SQLite
+    // connection and exits only after every WriterTaskHandle clone has
+    // dropped and the queue has drained. That connection's close fires
+    // SQLite's close-time WAL checkpoint, so until the task exits the
+    // database file bytes can still move after this function returns. Drop
+    // every handle owner (the stores, then the runtime and its pool — which
+    // closes the queue), then await the task's exit with a bounded, loud
+    // timeout: a returned `Ok(report)` implies settled file state.
+    let writer_join = runtime.backend().pool().take_writer_task_join();
+    drop(graph);
+    drop(notes);
+    drop(entities);
+    drop(token);
+    drop(runtime);
+    if let Some(join) = writer_join {
+        match tokio::time::timeout(WRITER_DRAIN_TIMEOUT, join).await {
+            Ok(Ok(())) => {}
+            Ok(Err(join_err)) => anyhow::bail!(
+                "writer task terminated abnormally after ingest completed: {join_err}"
+            ),
+            Err(_elapsed) => anyhow::bail!(
+                "writer task did not drain within {WRITER_DRAIN_TIMEOUT:?} after ingest; \
+                 database file state may still be unsettled"
+            ),
+        }
     }
 
     Ok(report)
@@ -760,6 +796,54 @@ mod tests {
         assert_eq!(
             bytes_before, bytes_after,
             "a dry run against an existing db must not change a single byte of it"
+        );
+    }
+
+    /// The contract the writer-task drain in `code_ingest_batch` exists to
+    /// provide, pinned as its own test: a real ingest's RETURN implies the
+    /// database file state is settled. Without the drain, the pool's writer
+    /// task exits asynchronously after the last `WriterTaskHandle` clone
+    /// drops, and its connection's close-time WAL checkpoint moves the file
+    /// bytes after `code_ingest_batch` has already returned — which is the
+    /// race the sibling dry-run byte test used to lose. That test passing
+    /// is a consequence of this contract, not a substitute for it.
+    #[serial]
+    #[tokio::test]
+    async fn code_ingest_return_implies_settled_file_state() {
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let findings = write_valid_findings(tmp.path());
+        let db = tmp.path().join("settled.db");
+
+        code_ingest_batch(base_args(findings, db.clone()))
+            .await
+            .expect("real ingest must succeed");
+
+        // Every connection — the pool's synchronous ones and the writer
+        // task's own — must be closed by the time the call returns, so
+        // SQLite's last-close checkpoint has already run and removed the
+        // WAL sidecars.
+        let wal_path = wal_sidecar_path(&db);
+        let shm_path = shm_sidecar_path(&db);
+        assert!(
+            !wal_path.exists(),
+            "ingest return must imply the -wal sidecar was checkpointed and removed"
+        );
+        assert!(
+            !shm_path.exists(),
+            "ingest return must imply the -shm sidecar was removed"
+        );
+
+        let bytes_at_return = std::fs::read(&db).expect("read db at the return boundary");
+
+        // Give any (incorrectly) still-pending async writer a generous
+        // window: if the writer task were still alive past the return
+        // boundary, its close-time checkpoint would move these bytes.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        let bytes_later = std::fs::read(&db).expect("re-read db after the settle window");
+        assert_eq!(
+            bytes_at_return, bytes_later,
+            "no byte of the database may move after code_ingest_batch has returned"
         );
     }
 

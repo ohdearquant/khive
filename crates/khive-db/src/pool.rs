@@ -258,6 +258,14 @@ pub struct ConnectionPool {
     /// see that method's doc comment for why this lives here rather than on
     /// each store.
     writer_task: OnceLock<Option<WriterTaskHandle>>,
+    /// The `tokio::spawn` JoinHandle of the writer task above, stored by
+    /// [`crate::writer_task::spawn`] so short-lived callers (batch CLI
+    /// paths) can await the task's exit — and therefore its connection's
+    /// close-time WAL checkpoint — before treating the database file state
+    /// as settled. Long-running callers never take it; dropping an untaken
+    /// JoinHandle detaches the task, which is exactly the pre-existing
+    /// behavior.
+    writer_task_join: Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// This pool's ADR-091 backend-scoped attribution origin, minted exactly
     /// once at construction (see [`mint_db_identity`]): `Database(_)` for a
     /// file-backed pool, `Memory` for an in-memory pool. Every
@@ -485,6 +493,7 @@ impl ConnectionPool {
             max_readers,
             config,
             writer_task: OnceLock::new(),
+            writer_task_join: Mutex::new(None),
             origin,
             identity_path,
             #[cfg(test)]
@@ -747,6 +756,29 @@ impl ConnectionPool {
     pub(crate) fn writer_task_spawn_count(&self) -> usize {
         self.writer_task_spawn_count
             .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Record the writer task's `tokio::spawn` JoinHandle. Called exactly
+    /// once, by [`crate::writer_task::spawn`], immediately after spawning —
+    /// the same `writer_task` OnceLock init that makes spawn at-most-once
+    /// per pool makes this write at-most-once per pool.
+    pub(crate) fn set_writer_task_join(&self, join: tokio::task::JoinHandle<()>) {
+        *self.writer_task_join.lock() = Some(join);
+    }
+
+    /// Take the writer task's JoinHandle, if a writer task was spawned and
+    /// the handle has not already been taken.
+    ///
+    /// Intended for short-lived batch callers that drop every
+    /// [`WriterTaskHandle`] clone (closing the queue) and then need to await
+    /// the task's exit before treating the database file as settled: the
+    /// task's connection close fires SQLite's close-time WAL checkpoint, so
+    /// until the task exits the file bytes can still move after the caller's
+    /// last write returned. `None` means either the write queue never
+    /// spawned (disabled, or spawn degraded) or another caller already took
+    /// the handle — in both cases there is nothing further to await here.
+    pub fn take_writer_task_join(&self) -> Option<tokio::task::JoinHandle<()>> {
+        self.writer_task_join.lock().take()
     }
 
     /// Compatibility method: returns the writer connection wrapped in `Arc<Mutex>`.
