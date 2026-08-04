@@ -193,210 +193,229 @@ where
     }
 
     let runtime = KhiveRuntime::new(cfg).map_err(|e| anyhow::anyhow!("{e}"))?;
-    runtime_setup(&runtime)?;
-    let resolved_ns = runtime.config().default_namespace.clone();
-    let token = runtime
-        .authorize(resolved_ns)
-        .map_err(|e| anyhow::anyhow!("{e}"))
-        .context("failed to authorize namespace")?;
+    // Every path out of the write section below — success or error — must
+    // still drain the pool's writer task before this function returns, so
+    // the section runs as an inner block and the drain happens once, after
+    // it, on the captured result.
+    let ingest_result: Result<CodeIngestReport> = async {
+        runtime_setup(&runtime)?;
+        let resolved_ns = runtime.config().default_namespace.clone();
+        let token = runtime
+            .authorize(resolved_ns)
+            .map_err(|e| anyhow::anyhow!("{e}"))
+            .context("failed to authorize namespace")?;
 
-    // One immutable model-name snapshot governs this ingest pass. Each report
-    // below is still derived from the corresponding completed embed call, so a
-    // provider cannot appear in execution without also appearing in reporting.
-    let embedding_model_names = runtime.registered_embedding_model_names();
+        // One immutable model-name snapshot governs this ingest pass. Each report
+        // below is still derived from the corresponding completed embed call, so a
+        // provider cannot appear in execution without also appearing in reporting.
+        let embedding_model_names = runtime.registered_embedding_model_names();
 
-    let mut report = CodeIngestReport {
-        dry_run: false,
-        ..CodeIngestReport::default()
-    };
+        let mut report = CodeIngestReport {
+            dry_run: false,
+            ..CodeIngestReport::default()
+        };
 
-    let entities = runtime
-        .entities(&token)
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
-    for entity in &batch.entities {
-        let existing = entities
-            .get_entity(entity.id)
-            .await
+        let entities = runtime
+            .entities(&token)
             .map_err(|e| anyhow::anyhow!("{e}"))?;
-        if existing.is_some() {
-            report.entities_skipped_existing += 1;
-            continue;
-        }
-        report.entities_created += 1;
-        entities
-            .upsert_entity(entity.clone())
-            .await
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-
-        let doc = entity_fts_document(entity);
-        let embed_body = doc.body.clone();
-        if let Ok(fts) = runtime.text(&token) {
-            if let Err(e) = fts.upsert_document(doc).await {
-                tracing::warn!(
-                    entity_id = %entity.id,
-                    error = %e,
-                    "code-ingest: entity FTS indexing failed (non-fatal)"
-                );
-            }
-        }
-        for model_name in &embedding_model_names {
-            match runtime
-                .embed_document_with_model_outcome(model_name, &embed_body)
+        for entity in &batch.entities {
+            let existing = entities
+                .get_entity(entity.id)
                 .await
-            {
-                Ok(outcome) => {
-                    report
-                        .truncation_by_model
-                        .entry(model_name.clone())
-                        .or_default()
-                        .observe(&outcome);
-                    if let Ok(vs) = runtime.vectors_for_model(&token, model_name) {
-                        if let Err(e) = vs
-                            .insert(
-                                entity.id,
-                                SubstrateKind::Entity,
-                                token.namespace().as_str(),
-                                // Canonical field label for the entity body
-                                // vector (khive-runtime/src/operations.rs,
-                                // curation.rs) — must match so vector
-                                // provenance metadata agrees with every
-                                // other write path.
-                                "entity.body",
-                                vec![outcome.vector],
-                            )
-                            .await
-                        {
-                            tracing::warn!(
-                                entity_id = %entity.id,
-                                model = %model_name,
-                                error = %e,
-                                "code-ingest: entity vector insert failed (non-fatal)"
-                            );
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            if existing.is_some() {
+                report.entities_skipped_existing += 1;
+                continue;
+            }
+            report.entities_created += 1;
+            entities
+                .upsert_entity(entity.clone())
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+            let doc = entity_fts_document(entity);
+            let embed_body = doc.body.clone();
+            if let Ok(fts) = runtime.text(&token) {
+                if let Err(e) = fts.upsert_document(doc).await {
+                    tracing::warn!(
+                        entity_id = %entity.id,
+                        error = %e,
+                        "code-ingest: entity FTS indexing failed (non-fatal)"
+                    );
+                }
+            }
+            for model_name in &embedding_model_names {
+                match runtime
+                    .embed_document_with_model_outcome(model_name, &embed_body)
+                    .await
+                {
+                    Ok(outcome) => {
+                        report
+                            .truncation_by_model
+                            .entry(model_name.clone())
+                            .or_default()
+                            .observe(&outcome);
+                        if let Ok(vs) = runtime.vectors_for_model(&token, model_name) {
+                            if let Err(e) = vs
+                                .insert(
+                                    entity.id,
+                                    SubstrateKind::Entity,
+                                    token.namespace().as_str(),
+                                    // Canonical field label for the entity body
+                                    // vector (khive-runtime/src/operations.rs,
+                                    // curation.rs) — must match so vector
+                                    // provenance metadata agrees with every
+                                    // other write path.
+                                    "entity.body",
+                                    vec![outcome.vector],
+                                )
+                                .await
+                            {
+                                tracing::warn!(
+                                    entity_id = %entity.id,
+                                    model = %model_name,
+                                    error = %e,
+                                    "code-ingest: entity vector insert failed (non-fatal)"
+                                );
+                            }
                         }
                     }
+                    Err(e) => tracing::warn!(
+                        entity_id = %entity.id,
+                        model = %model_name,
+                        error = %e,
+                        "code-ingest: entity embedding failed (non-fatal)"
+                    ),
                 }
-                Err(e) => tracing::warn!(
-                    entity_id = %entity.id,
-                    model = %model_name,
-                    error = %e,
-                    "code-ingest: entity embedding failed (non-fatal)"
-                ),
             }
         }
-    }
 
-    let notes = runtime.notes(&token).map_err(|e| anyhow::anyhow!("{e}"))?;
-    for note in &batch.notes {
-        let existing = notes
-            .get_note(note.id)
-            .await
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-        if existing.is_some() {
-            report.notes_skipped_existing += 1;
-            continue;
-        }
-        report.notes_created += 1;
-        notes
-            .upsert_note(note.clone())
-            .await
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-
-        if let Ok(fts) = runtime.text_for_notes(&token) {
-            if let Err(e) = fts.upsert_document(note_fts_document(note)).await {
-                tracing::warn!(
-                    note_id = %note.id,
-                    error = %e,
-                    "code-ingest: note FTS indexing failed (non-fatal)"
-                );
-            }
-        }
-        for model_name in &embedding_model_names {
-            match runtime
-                .embed_document_with_model_outcome(model_name, &note.content)
+        let notes = runtime.notes(&token).map_err(|e| anyhow::anyhow!("{e}"))?;
+        for note in &batch.notes {
+            let existing = notes
+                .get_note(note.id)
                 .await
-            {
-                Ok(outcome) => {
-                    report
-                        .truncation_by_model
-                        .entry(model_name.clone())
-                        .or_default()
-                        .observe(&outcome);
-                    if let Ok(vs) = runtime.vectors_for_model(&token, model_name) {
-                        if let Err(e) = vs
-                            .insert(
-                                note.id,
-                                SubstrateKind::Note,
-                                token.namespace().as_str(),
-                                "note.content",
-                                vec![outcome.vector],
-                            )
-                            .await
-                        {
-                            tracing::warn!(
-                                note_id = %note.id,
-                                model = %model_name,
-                                error = %e,
-                                "code-ingest: note vector insert failed (non-fatal)"
-                            );
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            if existing.is_some() {
+                report.notes_skipped_existing += 1;
+                continue;
+            }
+            report.notes_created += 1;
+            notes
+                .upsert_note(note.clone())
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+            if let Ok(fts) = runtime.text_for_notes(&token) {
+                if let Err(e) = fts.upsert_document(note_fts_document(note)).await {
+                    tracing::warn!(
+                        note_id = %note.id,
+                        error = %e,
+                        "code-ingest: note FTS indexing failed (non-fatal)"
+                    );
+                }
+            }
+            for model_name in &embedding_model_names {
+                match runtime
+                    .embed_document_with_model_outcome(model_name, &note.content)
+                    .await
+                {
+                    Ok(outcome) => {
+                        report
+                            .truncation_by_model
+                            .entry(model_name.clone())
+                            .or_default()
+                            .observe(&outcome);
+                        if let Ok(vs) = runtime.vectors_for_model(&token, model_name) {
+                            if let Err(e) = vs
+                                .insert(
+                                    note.id,
+                                    SubstrateKind::Note,
+                                    token.namespace().as_str(),
+                                    "note.content",
+                                    vec![outcome.vector],
+                                )
+                                .await
+                            {
+                                tracing::warn!(
+                                    note_id = %note.id,
+                                    model = %model_name,
+                                    error = %e,
+                                    "code-ingest: note vector insert failed (non-fatal)"
+                                );
+                            }
                         }
                     }
+                    Err(e) => tracing::warn!(
+                        note_id = %note.id,
+                        model = %model_name,
+                        error = %e,
+                        "code-ingest: note embedding failed (non-fatal)"
+                    ),
                 }
-                Err(e) => tracing::warn!(
-                    note_id = %note.id,
-                    model = %model_name,
-                    error = %e,
-                    "code-ingest: note embedding failed (non-fatal)"
-                ),
             }
         }
-    }
 
-    let graph = runtime.graph(&token).map_err(|e| anyhow::anyhow!("{e}"))?;
-    for edge in &batch.edges {
-        let existing = graph
-            .get_edge(edge.id)
-            .await
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-        if existing.is_some() {
-            report.edges_skipped_existing += 1;
-            continue;
+        let graph = runtime.graph(&token).map_err(|e| anyhow::anyhow!("{e}"))?;
+        for edge in &batch.edges {
+            let existing = graph
+                .get_edge(edge.id)
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            if existing.is_some() {
+                report.edges_skipped_existing += 1;
+                continue;
+            }
+            report.edges_created += 1;
+            graph
+                .upsert_edge(edge.clone())
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
         }
-        report.edges_created += 1;
-        graph
-            .upsert_edge(edge.clone())
-            .await
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+        Ok(report)
     }
+    .await;
 
     // The migrated stores above route writes through the pool's shared
     // writer task (ADR-067 Component A), which owns its own SQLite
     // connection and exits only after every WriterTaskHandle clone has
     // dropped and the queue has drained. That connection's close fires
     // SQLite's close-time WAL checkpoint, so until the task exits the
-    // database file bytes can still move after this function returns. Drop
-    // every handle owner (the stores, then the runtime and its pool — which
-    // closes the queue), then await the task's exit with a bounded, loud
-    // timeout: a returned `Ok(report)` implies settled file state.
+    // database file bytes can still move after this function returns. The
+    // inner block above dropped every store handle and the token on its way
+    // out (success or error); dropping the runtime here closes the queue.
+    // Then await the task's exit with a bounded, loud timeout — on BOTH
+    // paths, so an early error return cannot leave the file still moving.
     let writer_join = runtime.backend().pool().take_writer_task_join();
-    drop(graph);
-    drop(notes);
-    drop(entities);
-    drop(token);
     drop(runtime);
     if let Some(join) = writer_join {
-        match tokio::time::timeout(WRITER_DRAIN_TIMEOUT, join).await {
-            Ok(Ok(())) => {}
-            Ok(Err(join_err)) => anyhow::bail!(
+        let drained = tokio::time::timeout(WRITER_DRAIN_TIMEOUT, join).await;
+        match (&ingest_result, drained) {
+            (_, Ok(Ok(()))) => {}
+            // The ingest itself failed: that error is the primary one. A
+            // drain problem on this path is logged, not returned, so it
+            // cannot mask the actual failure.
+            (Err(_), Ok(Err(join_err))) => {
+                tracing::warn!(error = %join_err, "writer task terminated abnormally after failed ingest");
+            }
+            (Err(_), Err(_elapsed)) => {
+                tracing::warn!(
+                    timeout = ?WRITER_DRAIN_TIMEOUT,
+                    "writer task did not drain after failed ingest; database file state may still be unsettled"
+                );
+            }
+            (Ok(_), Ok(Err(join_err))) => anyhow::bail!(
                 "writer task terminated abnormally after ingest completed: {join_err}"
             ),
-            Err(_elapsed) => anyhow::bail!(
+            (Ok(_), Err(_elapsed)) => anyhow::bail!(
                 "writer task did not drain within {WRITER_DRAIN_TIMEOUT:?} after ingest; \
                  database file state may still be unsettled"
             ),
         }
     }
 
-    Ok(report)
+    ingest_result
 }
 
 /// Scan every entity/note content field and nested property value in `batch`
@@ -810,6 +829,12 @@ mod tests {
     #[serial]
     #[tokio::test]
     async fn code_ingest_return_implies_settled_file_state() {
+        // Pin the queue default: with the variable unset, a file-backed pool
+        // resolves the write queue ON, so this test exercises the writer-task
+        // drain rather than silently passing through the queue-off path an
+        // ambient KHIVE_WRITE_QUEUE=0 would select. (#[serial] guards the
+        // env mutation.)
+        std::env::remove_var("KHIVE_WRITE_QUEUE");
         let tmp = tempfile::TempDir::new().expect("temp dir");
         let findings = write_valid_findings(tmp.path());
         let db = tmp.path().join("settled.db");

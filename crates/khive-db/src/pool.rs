@@ -763,7 +763,12 @@ impl ConnectionPool {
     /// the same `writer_task` OnceLock init that makes spawn at-most-once
     /// per pool makes this write at-most-once per pool.
     pub(crate) fn set_writer_task_join(&self, join: tokio::task::JoinHandle<()>) {
-        *self.writer_task_join.lock() = Some(join);
+        let prev = self.writer_task_join.lock().replace(join);
+        debug_assert!(
+            prev.is_none(),
+            "writer task JoinHandle stored twice; the writer_task OnceLock is \
+             supposed to make spawn at-most-once per pool"
+        );
     }
 
     /// Take the writer task's JoinHandle, if a writer task was spawned and
@@ -1441,9 +1446,9 @@ mod tests {
         assert!(pool.max_readers() > 0);
     }
 
-    #[test]
+    #[tokio::test]
     #[serial]
-    fn unset_write_queue_resolves_on_for_file_backed_pool() {
+    async fn unset_write_queue_resolves_on_for_file_backed_pool() {
         let _pool_env = clear_pool_env();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("unset_file_backed.db");
@@ -1454,11 +1459,19 @@ mod tests {
         })
         .expect("file-backed pool should open");
         assert_eq!(pool.config().write_queue_enabled, Some(true));
+        // Behavioral half: the resolved value actually routes — a writer
+        // task spawns for this pool, not merely a config field flipping.
+        assert!(
+            pool.writer_task_handle()
+                .expect("spawn inside a runtime context must not error")
+                .is_some(),
+            "resolved-on file-backed pool must actually spawn the writer task"
+        );
     }
 
-    #[test]
+    #[tokio::test]
     #[serial]
-    fn unset_write_queue_resolves_off_for_memory_backed_pool() {
+    async fn unset_write_queue_resolves_off_for_memory_backed_pool() {
         let _pool_env = clear_pool_env();
         let pool = ConnectionPool::new(PoolConfig {
             path: None,
@@ -1467,6 +1480,14 @@ mod tests {
         })
         .expect("in-memory pool should open");
         assert_eq!(pool.config().write_queue_enabled, Some(false));
+        // Behavioral half: resolved-off means no writer task, even inside a
+        // runtime context where one could spawn.
+        assert!(
+            pool.writer_task_handle()
+                .expect("disabled queue must resolve without error")
+                .is_none(),
+            "resolved-off in-memory pool must not spawn a writer task"
+        );
     }
 
     #[test]
