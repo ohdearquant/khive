@@ -1,6 +1,6 @@
 # ADR-143: Store-held caller grants and hierarchical subactor identity
 
-- Status: Proposed
+- Status: Accepted
 - Date: 2026-08-03
 - Amends: [ADR-129](ADR-129-fail-closed-gate-default.md) — supersedes Amendment 2's
   configuration-text caller enumeration and its "no runtime registration API"
