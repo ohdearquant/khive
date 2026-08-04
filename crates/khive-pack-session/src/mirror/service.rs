@@ -334,10 +334,18 @@ impl CandidateDispatch {
                 self.stats = Some(stats);
                 true
             }
-            Ok(stats) => {
+            Ok(stats) if stats.new_offset >= start_offset => {
                 if self.stats.is_none() {
                     self.stats = Some(stats);
                 }
+                false
+            }
+            Ok(_) => {
+                // The ingest contract guarantees `new_offset >= start_offset`
+                // (read_bounded_chunk only advances from start_offset; export
+                // paths return start_offset or the file length after a
+                // `file_len <= start_offset` guard). Defend against future
+                // drift: never record a regressing cursor.
                 false
             }
             Err(error) => {
@@ -365,6 +373,9 @@ struct DiscoveryIndex {
     priority_cold_enqueued: HashSet<PathBuf>,
     cold_queue: VecDeque<PathBuf>,
     cold_enqueued: HashSet<PathBuf>,
+    /// Paths removed from `files` since the last drain, so the service loop
+    /// can prune their in-memory offsets and persisted cursor rows.
+    removed_files: Vec<PathBuf>,
 }
 
 enum ClassifiedEntry {
@@ -544,9 +555,18 @@ impl DiscoveryIndex {
 
             match std::fs::metadata(&path) {
                 Ok(metadata) if metadata.is_dir() => {
+                    // A path tracked as a directory that is one again must
+                    // not keep a stale file record left by an intervening
+                    // file phase (the directory-to-file transition below).
+                    if self.files.contains_key(&path) {
+                        self.remove_file(&path, false);
+                    }
                     let fingerprint = DirectoryFingerprint::from_metadata(&metadata);
                     if force_rescan || Some(fingerprint) != stored_fingerprint {
-                        if let Err(error) = self.refresh_directory(&path, &kinds, fingerprint) {
+                        let changed = Some(fingerprint) != stored_fingerprint;
+                        if let Err(error) =
+                            self.refresh_directory(&path, &kinds, fingerprint, changed)
+                        {
                             tracing::debug!(
                                 path = %path.display(),
                                 error = %error,
@@ -568,7 +588,10 @@ impl DiscoveryIndex {
                         .directories
                         .get(&path)
                         .is_some_and(|directory| directory.pinned);
-                    self.remove_directory_tree(&path, false);
+                    // Keep pinned identity (as the NotFound/other arms do) so
+                    // a configured root that became a file and later reverts to
+                    // a directory stays scheduled instead of being dropped.
+                    self.remove_directory_tree(&path, true);
                     for kind in kinds {
                         let file_kind = match kind {
                             DirectoryKind::ChatGptExport => Some(DiscoveredKind::ChatGptExport),
@@ -580,7 +603,15 @@ impl DiscoveryIndex {
                         }
                     }
                 }
-                Ok(_) => self.remove_directory_tree(&path, true),
+                Ok(_) => {
+                    // A stale file record from an intervening file phase must
+                    // not shadow the retained directory identity while the
+                    // path holds an unrelated entry.
+                    if self.files.contains_key(&path) {
+                        self.remove_file(&path, false);
+                    }
+                    self.remove_directory_tree(&path, true);
+                }
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {
                     self.remove_directory_tree(&path, true);
                 }
@@ -606,16 +637,35 @@ impl DiscoveryIndex {
         path: &Path,
         kinds: &[DirectoryKind],
         fingerprint: DirectoryFingerprint,
+        prioritize: bool,
     ) -> io::Result<()> {
         let read_dir = std::fs::read_dir(path)?;
         let mut entries = HashSet::new();
         let mut directories = Vec::new();
         let mut files = Vec::new();
+        let mut complete = true;
 
         for entry in read_dir {
-            let entry = entry?;
+            // A faulty entry (raced removal, unreadable metadata) must not
+            // abort the whole refresh and freeze discovery of the directory's
+            // other files: skip it, and mark the listing incomplete so the
+            // stored fingerprint is cleared and the next probe retries —
+            // matching `add_directory_tree`'s non-fatal entry handling.
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(_) => {
+                    complete = false;
+                    continue;
+                }
+            };
             let child_path = entry.path();
-            let file_type = entry.file_type()?;
+            let file_type = match entry.file_type() {
+                Ok(file_type) => file_type,
+                Err(_) => {
+                    complete = false;
+                    continue;
+                }
+            };
             for kind in kinds {
                 let Some(classified) = classify_entry(*kind, &child_path, file_type.is_dir())
                 else {
@@ -633,17 +683,23 @@ impl DiscoveryIndex {
             }
         }
 
-        let removed = self
-            .directories
-            .get(path)
-            .map(|directory| {
-                directory
-                    .entries
-                    .difference(&entries)
-                    .cloned()
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
+        let removed = if complete {
+            self.directories
+                .get(path)
+                .map(|directory| {
+                    directory
+                        .entries
+                        .difference(&entries)
+                        .cloned()
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
+        } else {
+            // An incomplete listing cannot prove entries are gone; defer
+            // removals until a complete read (the cleared fingerprint below
+            // retries on the next probe).
+            Vec::new()
+        };
 
         for removed_path in removed {
             if self.directories.contains_key(&removed_path) {
@@ -656,7 +712,11 @@ impl DiscoveryIndex {
         for (file_path, file_kind) in files {
             let already_tracked = self.files.contains_key(&file_path);
             self.add_file(file_path.clone(), file_kind, false);
-            if already_tracked {
+            // Only a real fingerprint change carries a change signal worth
+            // reprioritizing cold files for; a forced rescan of an unchanged
+            // directory would otherwise periodically flood the priority queue
+            // and starve the ordinary cold round-robin.
+            if prioritize && already_tracked {
                 self.prioritize_cold(&file_path);
             }
         }
@@ -665,8 +725,16 @@ impl DiscoveryIndex {
         }
 
         if let Some(directory) = self.directories.get_mut(path) {
-            directory.fingerprint = Some(fingerprint);
-            directory.entries = entries;
+            if complete {
+                directory.fingerprint = Some(fingerprint);
+                directory.entries = entries;
+            } else {
+                // Keep the last complete snapshot: a partial listing could
+                // drop still-present paths from `entries` and hide their
+                // later removal from the difference computation. The cleared
+                // fingerprint retries the listing on the next probe.
+                directory.fingerprint = None;
+            }
             directory.unchanged_probes = 0;
         }
 
@@ -696,6 +764,8 @@ impl DiscoveryIndex {
             }
         } else {
             self.directories.remove(path);
+            self.directory_queue.retain(|queued| queued != path);
+            self.directory_enqueued.remove(path);
         }
     }
 
@@ -703,8 +773,23 @@ impl DiscoveryIndex {
         if preserve_pinned && self.files.get(path).is_some_and(|file| file.pinned) {
             return;
         }
-        self.files.remove(path);
+        if self.files.remove(path).is_none() {
+            return;
+        }
         self.hot_files.remove(path);
+        // Drop stale scheduler state so a later re-add of this path starts
+        // with clean queues instead of being shadowed by leftover entries.
+        self.cold_queue.retain(|queued| queued != path);
+        self.cold_enqueued.remove(path);
+        self.priority_cold_queue.retain(|queued| queued != path);
+        self.priority_cold_enqueued.remove(path);
+        self.removed_files.push(path.to_path_buf());
+    }
+
+    /// Drain paths removed from tracking since the last call so the service
+    /// loop can prune their cursors.
+    fn take_removed_files(&mut self) -> Vec<PathBuf> {
+        std::mem::take(&mut self.removed_files)
     }
 
     fn reactivate_file(&mut self, path: &Path) {
@@ -838,10 +923,12 @@ fn should_mark_cold(unchanged_polls: u8, modified: Option<SystemTime>, now: Syst
         return false;
     }
 
-    match modified {
-        Some(modified) => now
-            .duration_since(modified)
-            .is_ok_and(|age| age >= FILE_COLD_AGE),
+    // A modified time that cannot be compared against `now` (e.g. a
+    // future-dated mtime from clock skew) is treated like a missing mtime:
+    // fall back to the unchanged-poll threshold instead of keeping the file
+    // hot indefinitely.
+    match modified.and_then(|modified| now.duration_since(modified).ok()) {
+        Some(age) => age >= FILE_COLD_AGE,
         None => unchanged_polls >= FILE_UNCHANGED_POLLS_WITHOUT_MTIME,
     }
 }
@@ -937,6 +1024,18 @@ pub async fn run_mirror_service(runtime: KhiveRuntime, config: MirrorConfig) {
 
     loop {
         let directory_work = discovery.probe_directories();
+        // Files removed from discovery must not leave stale cursors behind:
+        // a recreated same-path file would otherwise inherit its
+        // predecessor's offset and skip early data.
+        let removed_files = discovery.take_removed_files();
+        if !removed_files.is_empty() {
+            for removed in &removed_files {
+                offsets.remove(removed);
+            }
+            if let Err(error) = delete_cursors(&runtime, &removed_files).await {
+                tracing::debug!(error = %error, "session mirror: cursor cleanup failed");
+            }
+        }
         let scheduled = discovery.schedule_files();
         let total_tracked = discovery.tracked_files();
         let mut files_mirrored: u64 = 0;
@@ -957,6 +1056,12 @@ pub async fn run_mirror_service(runtime: KhiveRuntime, config: MirrorConfig) {
                             path = %scheduled_file.path.display(),
                             error = %e,
                             "session mirror: stat failed"
+                        );
+                    } else {
+                        tracing::debug!(
+                            path = %scheduled_file.path.display(),
+                            error = %e,
+                            "session mirror: file missing during probe"
                         );
                     }
                     continue;
@@ -1025,7 +1130,12 @@ pub async fn run_mirror_service(runtime: KhiveRuntime, config: MirrorConfig) {
             }
 
             if let Some(stats) = stats {
-                offsets.insert(scheduled_file.path.clone(), stats.new_offset);
+                // `CandidateDispatch::record` already rejects regressing
+                // cursors; guard the write side too so the stored offset can
+                // only advance or hold.
+                if stats.new_offset >= offset {
+                    offsets.insert(scheduled_file.path.clone(), stats.new_offset);
+                }
                 if stats.inserted > 0 || stats.new_offset > offset {
                     files_mirrored += 1;
                     rows_inserted += stats.inserted;
@@ -1105,6 +1215,33 @@ async fn load_cursors(runtime: &KhiveRuntime) -> Result<HashMap<PathBuf, u64>, R
     }
 }
 
+/// Delete persisted cursor rows for files that left discovery.
+///
+/// A recreated same-path file must start from a fresh cursor instead of
+/// inheriting its predecessor's offset (and skipping early data). The caller
+/// logs errors and continues: the in-memory offset map is already pruned, so
+/// a failure here only risks a stale row being reloaded on restart, never
+/// data loss (ingest is idempotent via `INSERT OR IGNORE`).
+async fn delete_cursors(runtime: &KhiveRuntime, paths: &[PathBuf]) -> Result<(), RuntimeError> {
+    let sql = runtime.sql();
+    let mut writer = sql
+        .writer()
+        .await
+        .map_err(|e| RuntimeError::Internal(format!("mirror: cursor writer: {e}")))?;
+
+    for path in paths {
+        writer
+            .execute(SqlStatement {
+                sql: "DELETE FROM session_mirror_cursor WHERE file_path=?1".into(),
+                params: vec![SqlValue::Text(path.to_string_lossy().into_owned())],
+                label: Some("mirror_cursor_delete".into()),
+            })
+            .await
+            .map_err(|e| RuntimeError::Internal(format!("mirror: cursor delete: {e}")))?;
+    }
+    Ok(())
+}
+
 /// Extract the session UUID from a Codex filename of the form
 /// `rollout-<timestamp>-<uuid>.jsonl`.
 ///
@@ -1144,14 +1281,14 @@ fn extract_codex_session_id(path: &std::path::Path) -> Option<String> {
 mod discovery_tests {
     use super::{
         should_mark_cold, CandidateDispatch, DirectoryKind, DiscoveredKind, DiscoveryIndex,
-        COLD_FILE_PROBES_PER_TICK, DIRECTORY_PROBES_PER_TICK, FILE_COLD_AGE,
-        FILE_UNCHANGED_POLLS_BEFORE_COLD,
+        COLD_FILE_PROBES_PER_TICK, DIRECTORY_FORCE_RESCAN_PROBES, DIRECTORY_PROBES_PER_TICK,
+        FILE_COLD_AGE, FILE_UNCHANGED_POLLS_BEFORE_COLD, FILE_UNCHANGED_POLLS_WITHOUT_MTIME,
     };
     use crate::mirror::ingest::MirrorStats;
     use std::fs::OpenOptions;
     use std::io::Write;
     use std::path::{Path, PathBuf};
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     fn mark_cold(discovery: &mut DiscoveryIndex, path: &Path) {
         let file = discovery.files.get_mut(path).expect("tracked file");
@@ -1371,6 +1508,221 @@ mod discovery_tests {
             Some(now),
             now
         ));
+    }
+
+    #[test]
+    fn future_mtime_falls_back_to_unchanged_poll_threshold() {
+        let now = SystemTime::now();
+        let future = now
+            .checked_add(Duration::from_secs(3600))
+            .expect("future timestamp");
+        assert!(
+            !should_mark_cold(FILE_UNCHANGED_POLLS_WITHOUT_MTIME - 1, Some(future), now),
+            "below the no-mtime threshold an unusable mtime must not mark cold"
+        );
+        assert!(
+            should_mark_cold(FILE_UNCHANGED_POLLS_WITHOUT_MTIME, Some(future), now),
+            "a future-dated mtime must fall back to the unchanged-poll threshold"
+        );
+    }
+
+    #[test]
+    fn regressing_candidate_offset_is_never_recorded() {
+        let start_offset = 100;
+        let mut dispatch = CandidateDispatch::default();
+
+        assert!(!dispatch.record(
+            Ok(MirrorStats {
+                inserted: 4,
+                scanned: 4,
+                new_offset: start_offset - 60,
+            }),
+            start_offset,
+        ));
+        assert!(
+            dispatch.stats.is_none(),
+            "a regressing cursor must not be recorded"
+        );
+
+        assert!(dispatch.record(
+            Ok(MirrorStats {
+                inserted: 1,
+                scanned: 1,
+                new_offset: start_offset + 50,
+            }),
+            start_offset,
+        ));
+        assert_eq!(
+            dispatch
+                .stats
+                .expect("advancing candidate recorded")
+                .new_offset,
+            150
+        );
+    }
+
+    #[test]
+    fn remove_file_clears_scheduler_state_and_readd_starts_clean() {
+        let mut discovery = DiscoveryIndex::default();
+        let path = PathBuf::from("/cold/session.jsonl");
+        discovery.add_file(path.clone(), DiscoveredKind::ChatGptExport, false);
+        mark_cold(&mut discovery, &path);
+        assert!(discovery.cold_enqueued.contains(&path));
+
+        discovery.remove_file(&path, false);
+        assert!(discovery.cold_queue.iter().all(|queued| queued != &path));
+        assert!(!discovery.cold_enqueued.contains(&path));
+        assert!(discovery
+            .priority_cold_queue
+            .iter()
+            .all(|queued| queued != &path));
+        assert!(!discovery.priority_cold_enqueued.contains(&path));
+
+        // A re-added path is scheduled on the next tick instead of being
+        // shadowed by leftover queue state.
+        discovery.add_file(path.clone(), DiscoveredKind::ChatGptExport, false);
+        mark_cold(&mut discovery, &path);
+        assert!(discovery
+            .schedule_files()
+            .iter()
+            .any(|file| file.path == path && file.was_cold));
+    }
+
+    #[test]
+    fn remove_directory_tree_clears_directory_schedule_state() {
+        let temp = tempfile::TempDir::new().expect("temp dir");
+        let root = temp.path().join("projects");
+        std::fs::create_dir_all(&root).expect("root dir");
+
+        let mut discovery = DiscoveryIndex::default();
+        discovery.add_directory_tree(&root, DirectoryKind::ClaudeCodeRoot, false);
+        assert!(discovery.directory_enqueued.contains(&root));
+
+        discovery.remove_directory_tree(&root, false);
+        assert!(discovery
+            .directory_queue
+            .iter()
+            .all(|queued| queued != &root));
+        assert!(!discovery.directory_enqueued.contains(&root));
+
+        // A re-added directory is probed again instead of waiting for a
+        // stale queue entry to drain.
+        discovery.add_directory_tree(&root, DirectoryKind::ClaudeCodeRoot, false);
+        let stats = discovery.probe_directories();
+        assert_eq!(stats.metadata_probes, 1);
+    }
+
+    #[test]
+    fn removed_files_are_reported_once_for_cursor_cleanup() {
+        let mut discovery = DiscoveryIndex::default();
+        let path = PathBuf::from("/exports/conversations.json");
+        discovery.add_file(path.clone(), DiscoveredKind::ChatGptExport, false);
+
+        discovery.remove_file(&path, false);
+        assert_eq!(discovery.take_removed_files(), vec![path.clone()]);
+        assert!(discovery.take_removed_files().is_empty());
+
+        // A pinned file that survives removal is not reported as removed.
+        discovery.add_file(path.clone(), DiscoveredKind::ChatGptExport, true);
+        discovery.remove_file(&path, true);
+        assert!(discovery.files.contains_key(&path));
+        assert!(discovery.take_removed_files().is_empty());
+    }
+
+    #[test]
+    fn pinned_missing_file_stays_tracked_and_hot_for_retry() {
+        let mut discovery = DiscoveryIndex::default();
+        let pinned = PathBuf::from("/exports/conversations.json");
+        discovery.add_file(pinned.clone(), DiscoveredKind::ChatGptExport, true);
+
+        discovery.record_probe_error(&pinned, false, true);
+        assert!(discovery.files.contains_key(&pinned));
+        assert!(discovery.hot_files.contains(&pinned));
+        assert!(discovery
+            .schedule_files()
+            .iter()
+            .any(|file| file.path == pinned && !file.was_cold));
+
+        let transient = PathBuf::from("/projects/gone.jsonl");
+        discovery.add_file(transient.clone(), DiscoveredKind::ChatGptExport, false);
+        discovery.record_probe_error(&transient, false, true);
+        assert!(!discovery.files.contains_key(&transient));
+        assert!(!discovery.hot_files.contains(&transient));
+    }
+
+    #[test]
+    fn export_directory_becoming_a_file_keeps_pinned_identity_for_reversion() {
+        let temp = tempfile::TempDir::new().expect("temp dir");
+        let root = temp.path().join("conversations.json");
+        std::fs::create_dir(&root).expect("root directory");
+
+        let mut discovery = DiscoveryIndex::default();
+        discovery.add_directory_tree(&root, DirectoryKind::ChatGptExport, true);
+
+        // The configured root is replaced by a regular export file.
+        std::fs::remove_dir(&root).expect("remove root directory");
+        std::fs::write(&root, "[]").expect("export file fixture");
+        discovery.probe_directories();
+
+        let file = discovery.files.get(&root).expect("export file tracked");
+        assert!(file.pinned);
+        assert!(file.kinds.contains(&DiscoveredKind::ChatGptExport));
+        let directory = discovery
+            .directories
+            .get(&root)
+            .expect("directory identity retained while the path is a file");
+        assert!(directory.pinned);
+        assert!(directory.kinds.contains(&DirectoryKind::ChatGptExport));
+
+        // The path reverts to a directory containing an export file.
+        std::fs::remove_file(&root).expect("remove export file");
+        std::fs::create_dir(&root).expect("recreate root directory");
+        std::fs::write(root.join("conversations.json"), "[]").expect("nested export fixture");
+        discovery.probe_directories();
+
+        let directory = discovery
+            .directories
+            .get(&root)
+            .expect("configured root still scheduled after reversion");
+        assert!(directory.pinned);
+        assert!(directory.kinds.contains(&DirectoryKind::ChatGptExport));
+        assert!(
+            !discovery.files.contains_key(&root),
+            "the stale file record from the file phase must not shadow the directory"
+        );
+        assert!(discovery
+            .files
+            .contains_key(&root.join("conversations.json")));
+    }
+
+    #[test]
+    fn force_rescan_without_fingerprint_change_does_not_reprioritize_cold_files() {
+        let temp = tempfile::TempDir::new().expect("temp dir");
+        let project = temp.path().join("project-slug");
+        std::fs::create_dir(&project).expect("project dir");
+        let transcript = project.join("session.jsonl");
+        std::fs::write(&transcript, "first\n").expect("transcript fixture");
+
+        let mut discovery = DiscoveryIndex::default();
+        discovery.add_directory_tree(temp.path(), DirectoryKind::ClaudeCodeRoot, true);
+        mark_cold(&mut discovery, &transcript);
+
+        // Drain the startup enqueue with an unchanged probe.
+        discovery.probe_directories();
+
+        discovery
+            .directories
+            .get_mut(&project)
+            .expect("tracked project directory")
+            .unchanged_probes = DIRECTORY_FORCE_RESCAN_PROBES;
+
+        let stats = discovery.probe_directories();
+        assert_eq!(stats.walks, 1);
+        assert!(
+            discovery.priority_cold_queue.is_empty(),
+            "a forced rescan of an unchanged directory carries no change signal"
+        );
+        assert!(discovery.cold_enqueued.contains(&transcript));
     }
 }
 
