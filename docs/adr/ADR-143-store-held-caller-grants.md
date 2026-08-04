@@ -240,6 +240,16 @@ outside-gate constructor.
   parent holds, and the live-intersection rule means authority a parent loses
   is lost to its subactors at the same consultation — a revoked parent has no
   live legs.
+- **Only the parent grants to its own leg.** A subactor's grants are minted by
+  its parent and by no one else: the grant surface refuses a mint whose grantee
+  is a `(P, leg)` subactor unless the caller IS `P`. This is the grantee-side
+  counterpart to §2's grantor-side rule (subactors are never grantors); §2
+  closes who may grant, this closes to whom a non-parent may grant. Both
+  readings of the attenuation prose are authority-safe under the
+  live-intersection rule, but this record's standard is that only one
+  implementation is admissible, so the parent-only rule is stated rather than
+  left to inference. Acceptance 3 gains an arm: a non-parent principal holding
+  the target right cannot mint to another principal's leg.
 - **Attribution.** Audit records for a subactor carry the full structural
   identity. The parent is recoverable from every record its legs produce.
 
@@ -409,7 +419,10 @@ All conditions are executed tests, not review assertions:
    capability, not a root selected by the surface. **Multi-pair revoke arm:**
    a revoke whose derived target pair set includes one pair the revoker lacks
    `GrantAdmin` for is denied whole, with the pair set enumerated from the
-   pre-revocation records rather than the request text.
+   pre-revocation records rather than the request text. **Parent-only-grantee
+   arm:** a non-parent principal that itself holds `GrantAdmin` on a pair is
+   still denied minting a grant whose grantee is another principal's `(P, leg)`
+   subactor; only `P` may mint to `P`'s legs.
 4. **Subactor bounds.** A leg serves only where its parent currently serves;
    revoking the parent denies the leg at the next consultation with no
    restart; a leg label violating the grammar is refused at intake; a
