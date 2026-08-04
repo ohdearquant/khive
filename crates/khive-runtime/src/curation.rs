@@ -2483,8 +2483,11 @@ fn merge_note_sql(
     // partial reversal of a nested contribution. Diffing the final object
     // against the into-note's pre-merge properties sidesteps that fold/
     // restoration coupling entirely.
-    let properties_merged =
-        count_new_property_keys(into_note.properties.as_ref(), merged_props.as_ref());
+    let properties_merged = count_new_property_keys(
+        into_note.properties.as_ref(),
+        merged_props.as_ref(),
+        strategy,
+    );
 
     let merge_history_entry = serde_json::json!({
         "merged_from": from_id.to_string(),
@@ -2934,21 +2937,26 @@ pub(crate) fn preserve_owner_established_properties(
 pub(crate) fn count_new_property_keys(
     original: Option<&Value>,
     final_value: Option<&Value>,
+    strategy: EntityDedupMergePolicy,
 ) -> usize {
     match (original, final_value) {
         (_, None) => 0,
         (None, Some(Value::Object(map))) => map.len(),
         (None, Some(_)) => 1,
         (Some(Value::Object(orig_map)), Some(Value::Object(final_map))) => {
-            count_new_keys_within_object(orig_map, final_map)
+            count_new_keys_within_object(orig_map, final_map, strategy)
         }
-        // Whole-value replacement. `merge_json` scores a `PreferFrom` fold that
-        // replaces one properties value with a differently-shaped one as a
-        // single contribution, and that is the right answer: something from the
-        // from-note is what the record now holds. This arm exists so the
-        // recomputed count agrees with the fold there — a bare 0 here would
-        // under-report every scalar/object replacement, including on note kinds
-        // that have no owner-established properties and never enter the
+        // The record ended up holding an object where it previously held
+        // something else, so every key it now carries is new. Counting the keys
+        // rather than scoring the replacement as 1 matters when restoration has
+        // emptied the object: nothing survived, and the count must say so.
+        (Some(_), Some(Value::Object(final_map))) => final_map.len(),
+        // Whole-value replacement by a non-object. `merge_json` scores a
+        // `PreferFrom` fold that replaces one properties value with a
+        // differently-shaped one as a single contribution, and that is the right
+        // answer: what the record now holds came from the from-note. A bare 0
+        // here would under-report every such replacement, including on note
+        // kinds that have no owner-established properties and never enter the
         // restoration path at all. Equal values mean nothing was contributed,
         // which is the `properties: Some(a)` merged with `properties: None`
         // case.
@@ -2958,25 +2966,39 @@ pub(crate) fn count_new_property_keys(
 
 /// Per-key counting inside a properties object.
 ///
-/// Deliberately NOT the same rule as the top level: within an object, a key
-/// that already exists and is merely overwritten counts 0, matching
-/// `merge_json`'s rule that only keys absent from the into-note are counted as
-/// added. Only nested objects recurse, so a nested contribution is counted at
-/// the depth it actually occurred.
+/// Deliberately NOT the same rule as the top level: within an object, a key that
+/// already exists and is merely overwritten counts 0, matching `merge_json`'s
+/// rule that only keys absent from the into-note are counted as added.
+///
+/// Recursion is STRATEGY-AWARE, and it has to be, because `merge_json` only
+/// descends into a same-named nested object under [`Union`]. Under `PreferFrom`
+/// an existing top-level key is replaced wholesale, and under `PreferInto` it is
+/// kept wholesale; in neither case is anything merged *beneath* that key, so
+/// descending here would count a nested value that the fold never treated as a
+/// separate contribution. Counting `{"meta":{"old":1}}` merged with
+/// `{"meta":{"new":2}}` under `PreferFrom` as 1 is exactly that mistake — one
+/// existing property was replaced, none was added.
+///
+/// [`Union`]: EntityDedupMergePolicy::Union
 fn count_new_keys_within_object(
     orig_map: &serde_json::Map<String, Value>,
     final_map: &serde_json::Map<String, Value>,
+    strategy: EntityDedupMergePolicy,
 ) -> usize {
     final_map
         .iter()
         .map(|(key, value)| match orig_map.get(key) {
             None => 1,
-            Some(Value::Object(nested_orig)) => match value {
-                Value::Object(nested_final) => {
-                    count_new_keys_within_object(nested_orig, nested_final)
+            Some(Value::Object(nested_orig))
+                if matches!(strategy, EntityDedupMergePolicy::Union) =>
+            {
+                match value {
+                    Value::Object(nested_final) => {
+                        count_new_keys_within_object(nested_orig, nested_final, strategy)
+                    }
+                    _ => 0,
                 }
-                _ => 0,
-            },
+            }
             Some(_) => 0,
         })
         .sum()
@@ -7714,7 +7736,11 @@ mod tests {
             (json!(7), json!({"b": 2}), "scalar replaced by object"),
         ] {
             let (merged, fold_count) = merge_json(&into, &from, EntityDedupMergePolicy::PreferFrom);
-            let recomputed = count_new_property_keys(Some(&into), Some(&merged));
+            let recomputed = count_new_property_keys(
+                Some(&into),
+                Some(&merged),
+                EntityDedupMergePolicy::PreferFrom,
+            );
             assert_eq!(
                 recomputed, fold_count,
                 "{label}: recomputed count must match the fold's own count",
@@ -7730,16 +7756,102 @@ mod tests {
             &json!({"a": 2}),
             EntityDedupMergePolicy::PreferFrom,
         );
-        let recomputed = count_new_property_keys(Some(&json!({"a": 1})), Some(&merged));
+        let recomputed = count_new_property_keys(
+            Some(&json!({"a": 1})),
+            Some(&merged),
+            EntityDedupMergePolicy::PreferFrom,
+        );
         assert_eq!(fold_count, 0, "control: overwrite is never a fold addition");
         assert_eq!(recomputed, 0, "control: overwrite is never a new key");
 
         // Control: equal values mean nothing was contributed (the `from` note
         // carrying no properties at all).
         assert_eq!(
-            count_new_property_keys(Some(&json!({"a": 1})), Some(&json!({"a": 1}))),
+            count_new_property_keys(
+                Some(&json!({"a": 1})),
+                Some(&json!({"a": 1})),
+                EntityDedupMergePolicy::PreferFrom,
+            ),
             0,
             "control: an unchanged properties object contributes nothing",
+        );
+    }
+
+    /// Recursion into a same-named nested object is only correct under `Union`.
+    ///
+    /// `merge_json` descends into a nested object ONLY for `Union`. Under
+    /// `PreferFrom` an existing top-level key is replaced wholesale and under
+    /// `PreferInto` it is kept wholesale, so nothing is merged beneath that key
+    /// and nothing beneath it may be counted. An earlier version of the
+    /// recomputation recursed unconditionally and reported 1 for the
+    /// `PreferFrom` case below, where one existing property was replaced and
+    /// none was added. This affects ordinary notes with no owner-established
+    /// properties, which never reach the restoration path at all.
+    #[test]
+    fn recomputed_count_recurses_into_nested_objects_only_under_union() {
+        use serde_json::json;
+
+        let into = json!({"meta": {"old": 1}});
+        let from = json!({"meta": {"new": 2}});
+
+        for (strategy, expected, label) in [
+            (
+                EntityDedupMergePolicy::PreferFrom,
+                0,
+                "prefer_from replaces the whole key",
+            ),
+            (
+                EntityDedupMergePolicy::PreferInto,
+                0,
+                "prefer_into keeps the whole key",
+            ),
+            (
+                EntityDedupMergePolicy::Union,
+                1,
+                "union merges beneath the key",
+            ),
+        ] {
+            let (merged, fold_count) = merge_json(&into, &from, strategy);
+            let recomputed = count_new_property_keys(Some(&into), Some(&merged), strategy);
+            assert_eq!(
+                recomputed, fold_count,
+                "{label}: recomputed count must match the fold's own count",
+            );
+            assert_eq!(recomputed, expected, "{label}");
+        }
+    }
+
+    /// An object emptied by restoration contributed nothing, and the count must
+    /// say so.
+    ///
+    /// When the surviving record's properties were not an object and the fold
+    /// installed the from-note's object, restoration removes the owner keys the
+    /// survivor never had — which can leave `{}`. Scoring that as a whole-value
+    /// replacement would report 1 for a record holding no properties at all.
+    #[test]
+    fn recomputed_count_is_zero_when_restoration_empties_the_object() {
+        use serde_json::json;
+
+        assert_eq!(
+            count_new_property_keys(
+                Some(&json!("scalar-properties")),
+                Some(&json!({})),
+                EntityDedupMergePolicy::PreferFrom,
+            ),
+            0,
+            "an emptied object retains nothing from the absorbed record",
+        );
+
+        // Control: the same shape with a surviving key counts that key, so the
+        // arm above is not simply returning 0 for every non-object original.
+        assert_eq!(
+            count_new_property_keys(
+                Some(&json!("scalar-properties")),
+                Some(&json!({"kept": 1})),
+                EntityDedupMergePolicy::PreferFrom,
+            ),
+            1,
+            "a surviving key is still counted",
         );
     }
 }
