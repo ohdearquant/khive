@@ -21,8 +21,9 @@ Two things break when you are `"local"`:
 
 - **Recipients can't tell who sent it** — every unattributed sender looks identical, and the
   reader has to guess from the content.
-- **Your inbox becomes a party line** — `comm.inbox` as `"local"` returns _every_ local
-  message, not just yours, because there is no actor to scope on.
+- **Anonymous delivery shares one mailbox** — `comm.inbox` as `"local"` returns messages
+  addressed to `"local"` (plus legacy rows without `to_actor`), so anonymous sessions cannot
+  distinguish ownership. Messages explicitly addressed to another actor remain filtered out.
 
 So set `KHIVE_ACTOR=lambda:<you>` in the MCP server env. The server logs a startup warning when
 the comm pack is loaded and the actor is still `"local"`. Attribution is the price of admission
@@ -78,7 +79,11 @@ operation. Always pass a `limit` — active inboxes are large. If `next_offset` 
 the same inbox filters with `offset=<next_offset>` until it is null; pagination itself never marks
 messages read. Use `content_contains` when automated notifications omit `subject`; sender
 exact/prefix/exclusion, RFC3339 `since`/`before`, and subject/content substring filters can be
-combined. Mark writes are best-effort and cross-message updates are not atomic: inspect every
+combined. Use `box="sent"` with optional `to_actor` and `since` to inspect your own outbound
+history; omitting `box` remains inbound-only. For cheap list reads, pass the same strict
+`fields=[...]` projection to `comm.inbox` or `comm.thread` (for example
+`fields=["id","subject","from_actor","sent_at"]`); unknown fields fail rather than being
+ignored. Mark writes are best-effort and cross-message updates are not atomic: inspect every
 result's `read`/`mark_error`, and re-issue failures later.
 
 Use `wait_ms` (maximum 30,000) when you need the next message promptly without

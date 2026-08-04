@@ -96,13 +96,13 @@ caller's namespace) or `outbound` (message sent by the caller). This is set by `
 
 #### Five verbs
 
-| Verb          | Speech act (ADR-025) | Args                                      | What it does                                                                                                                                                                                                                                                                                     |
-| ------------- | -------------------- | ----------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `comm.send`   | commissive           | `to`, `subject?`, `content`, `thread_id?` | Create a message note in the recipient's namespace (`direction=inbound`) and an outbound copy in the caller's namespace (`direction=outbound`). `from` is set to the caller's identity. Both writes are atomic: if the inbound write fails, the outbound copy is rolled back.                    |
-| `comm.inbox`  | assertive            | `limit?`, `offset?`, filters, `wait_ms?`  | List inbound messages (`direction=inbound`) for the caller. `status` filters on `read`: `unread` (default), `read`, or `all`. Offset pagination and sender/time/text filters apply without changing message state; a bounded long poll waits only when the fully filtered initial page is empty. |
-| `comm.read`   | declaration          | `id?`, `ids?`                             | Set `properties.read = true` on one or more **inbound** messages. Exactly one of `id` or `ids` is required. Outbound messages cannot be marked read.                                                                                                                                             |
-| `comm.reply`  | commissive           | `id`, `content`                           | Fetch the target message's `thread_id` (or use the message's own UUID as the thread root). Create a new message with the same `thread_id`, `to` set to the other party, `subject` prefixed with `"Re: "` if not already. Uses dual-write for inbound delivery to the recipient.                  |
-| `comm.thread` | assertive            | `id`, `limit?`                            | Validate the root message by UUID (must exist, must be `kind=message`), then return the root plus all messages whose `properties.thread_id` equals the root UUID, sorted by `created_at` ascending (chronological). Uses a paginated scan. `id` accepts 8-char short prefix or full UUID.        |
+| Verb          | Speech act (ADR-025) | Args                                                        | What it does                                                                                                                                                                                                                                                                                                                                                     |
+| ------------- | -------------------- | ----------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `comm.send`   | commissive           | `to`, `subject?`, `content`, `thread_id?`                   | Create a message note in the recipient's namespace (`direction=inbound`) and an outbound copy in the caller's namespace (`direction=outbound`). `from` is set to the caller's identity. Both writes are atomic: if the inbound write fails, the outbound copy is rolled back.                                                                                    |
+| `comm.inbox`  | assertive            | `limit?`, `offset?`, `box?`, `fields?`, `wait_ms?`, filters | List inbound messages (`direction=inbound`) by default, or caller-authored outbound rows with `box="sent"`. `status` filters inbox read state; offset pagination, field projection, and box-appropriate actor/time/text filters do not change message state. A bounded long poll (`wait_ms`, 1-30,000) waits only when the fully filtered initial page is empty. |
+| `comm.read`   | declaration          | `id?`, `ids?`                                               | Set `properties.read = true` on one or more **inbound** messages. Exactly one of `id` or `ids` is required. Outbound messages cannot be marked read.                                                                                                                                                                                                             |
+| `comm.reply`  | commissive           | `id`, `content`                                             | Fetch the target message's `thread_id` (or use the message's own UUID as the thread root). Create a new message with the same `thread_id`, `to` set to the other party, `subject` prefixed with `"Re: "` if not already. Uses dual-write for inbound delivery to the recipient.                                                                                  |
+| `comm.thread` | assertive            | `id`, `limit?`, `order?`, `after?`, `fields?`               | Validate and resolve the thread root, enforce actor visibility, deduplicate dual-write copies, then apply cursor filtering, requested order, truncation, and optional field projection. `id` accepts an 8-char short prefix or full UUID.                                                                                                                        |
 
 #### Inbox pagination, richer filters, and bulk read amendment (2026-08-01)
 
@@ -134,6 +134,22 @@ single-message response shape; an update failure carries `read=false` and `mark_
 are not promised to be one transaction: any validation failure rejects the operation before writes,
 but a later storage failure does not roll back an earlier successful result. The single-`id`
 response remains unchanged.
+
+#### Sent-history and list-read projection amendment (2026-08-01)
+
+`comm.inbox` adds `box="sent"` without changing its omitted/default inbound
+behavior. The sent box requires `direction=outbound` and a `from_actor` match
+to the calling actor; `to_actor` optionally filters the recipient. Attributed
+callers fail closed on legacy outbound rows with no `from_actor`, while the
+anonymous `local` single-actor fallback retains those rows. Inbox-only sender
+and read-status filters are rejected on the sent box instead of being ignored.
+
+`comm.inbox` and `comm.thread` share one non-empty `fields` projection over the
+message view. The closed vocabulary includes existing top-level fields and
+stable property aliases such as `from_actor`, `to_actor`, and `sent_at`.
+Unknown fields are errors. Omission preserves the full response. Projection is
+the final presentation step: actor visibility, filters, pagination counts,
+thread deduplication, and ordering continue to use the complete record.
 
 #### Message-filter scan cap
 

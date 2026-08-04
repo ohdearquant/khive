@@ -1255,27 +1255,33 @@ request(ops="comm.delivered(id=\"<full-outbound-uuid>\")")
 
 ### `comm.inbox` — Assertive
 
-List and page through filtered inbound messages for the caller. With `wait_ms`,
-an initially empty fully filtered page waits for a newly committed matching
-message and otherwise returns at the deadline.
+List and page through the caller's filtered inbound messages (default) or sent
+history (`box="sent"`).
+The response keeps the inbox envelope; `unread_count` is zero for sent rows.
+With `wait_ms`, an initially empty fully filtered page waits for a newly
+committed matching message and otherwise returns at the deadline.
 
 | Param                | Type    | Required | Notes                                                                     |
 | -------------------- | ------- | -------- | ------------------------------------------------------------------------- |
 | `limit`              | integer | no       | Default 20, max 200.                                                      |
+| `box`                | string  | no       | `inbox` (default)\|`sent`. Sent rows are scoped to the caller.            |
 | `offset`             | integer | no       | Default 0; offset after every supplied filter.                            |
-| `status`             | string  | no       | `unread` (default)\|`read`\|`all`.                                        |
+| `status`             | string  | no       | Inbox-only: `unread` (default)\|`read`\|`all`.                            |
 | `wait_ms`            | integer | no       | Long-poll only when the initial page is empty; default 0, max 30,000.     |
 | `from_actor`         | string  | no       | Exact sender; mutually exclusive with `from_prefix`.                      |
 | `from_prefix`        | string  | no       | Sender prefix; mutually exclusive with `from_actor`.                      |
 | `exclude_from_actor` | string  | no       | Exclude an exact sender actor label.                                      |
+| `to_actor`           | string  | no       | Sent-only exact recipient actor filter.                                   |
 | `since`              | string  | no       | Inclusive RFC 3339 lower bound on top-level `created_at`.                 |
 | `before`             | string  | no       | Exclusive RFC 3339 upper bound on top-level `created_at`.                 |
 | `subject_contains`   | string  | no       | Case-insensitive non-empty subject substring; null subjects do not match. |
 | `content_contains`   | string  | no       | Case-insensitive non-empty content substring.                             |
+| `fields`             | array   | no       | Non-empty message-field projection shared with `comm.thread`.             |
 
 ```
 request(ops="comm.inbox(limit=10)")
 request(ops="comm.inbox(status=\"all\", content_contains=\"timeout\", offset=200)")
+request(ops="comm.inbox(box=\"sent\", to_actor=\"lambda:leo\", since=\"2026-08-01T00:00:00Z\", fields=[\"id\",\"subject\",\"sent_at\"])")
 request(ops="comm.inbox(limit=10, wait_ms=30000)")
 ```
 
@@ -1290,6 +1296,11 @@ Responses also carry `offset`, `has_more`, and `next_offset`; repeat the same
 filtered call with each non-null `next_offset` to enumerate every match without
 marking it read. All filters are ANDed. Time bounds use response `created_at`,
 not optional transport `sent_at` metadata.
+
+`fields` accepts the ordinary top-level message keys plus stable property
+aliases (`comm_schema_version`, `from_actor`, `to_actor`, `thread_id`,
+`sent_at`, `outbound_ref`, `sent_by_process`). Unknown names and an empty list
+are errors. Omit it for the existing full-body response.
 
 ### `comm.unread` — Assertive
 
@@ -1343,13 +1354,17 @@ request(ops="comm.reply(id=\"<message-id>\", content=\"On it.\")")
 
 Retrieve all messages in a conversation thread, ordered chronologically.
 
-| Param   | Type    | Required | Notes                                                               |
-| ------- | ------- | -------- | ------------------------------------------------------------------- |
-| `id`    | string  | yes      | Thread root: 8-char prefix or full UUID of the originating message. |
-| `limit` | integer | no       | Default 100, max 500.                                               |
+| Param    | Type    | Required | Notes                                                               |
+| -------- | ------- | -------- | ------------------------------------------------------------------- |
+| `id`     | string  | yes      | Thread root: 8-char prefix or full UUID of the originating message. |
+| `limit`  | integer | no       | Default 100, max 500.                                               |
+| `order`  | string  | no       | `asc` (default)\|`desc`.                                            |
+| `after`  | string  | no       | Message-id or RFC 3339 cursor in the chosen order.                  |
+| `fields` | array   | no       | Same strict message-field projection as `comm.inbox`.               |
 
 ```
 request(ops="comm.thread(id=\"<thread-root-id>\")")
+request(ops="comm.thread(id=\"<thread-root-id>\", fields=[\"id\",\"from_actor\",\"sent_at\"])")
 ```
 
 ### `comm.probe` — Assertive

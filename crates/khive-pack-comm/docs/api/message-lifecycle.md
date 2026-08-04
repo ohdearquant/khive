@@ -90,9 +90,11 @@ inbound copy addressed to the actor label supplied in `to` (ADR-057).
 
 Both copies land in the caller's namespace; no cross-namespace write occurs.
 `from_actor` is set to `token.actor().id`; the caller namespace is carried separately as the routing `from`/`to` values passed to `dual_write_message`. `to_actor` is set to the
-`to` argument. When the caller's actor label is `"local"` (single-actor
-fallback), `comm.inbox` does not apply an actor filter, preserving backward
-compatibility.
+`to` argument. `comm.inbox` scopes every caller, including the anonymous
+`"local"` fallback, with `to_actor = caller OR to_actor IS NULL`. Anonymous
+callers therefore share messages addressed to `"local"` and can still read
+legacy rows without `to_actor`, but cannot read messages explicitly addressed
+to another actor.
 
 The routing `from` and `to` passed to `dual_write_message` are both set to the
 caller's namespace string so that `from == recipient_ns_str` is always true:
@@ -152,13 +154,22 @@ future caller-supplied idempotency/correlation contract and is out of scope.
 
 ## `handlers.rs::handle_inbox`
 
-Lists inbound messages for the caller's actor label (ADR-057).
+Lists inbound messages for the caller's actor label by default (ADR-057).
+`box="sent"` selects outbound rows authored by that caller instead; no separate
+storage format or verb is involved. An attributed caller's sent view requires
+an exact `from_actor` match. The anonymous `local` single-actor fallback also
+admits legacy outbound rows without `from_actor`. `to_actor` is an optional
+exact recipient filter for the sent box. Read `status` and sender filters are
+inbox-only and are rejected with `box="sent"`, while `to_actor` is rejected for
+the default inbox, so a misplaced filter cannot silently return the wrong box.
+The existing envelope remains stable; `unread_count` is zero for the sent box
+because outbound rows have no recipient read state.
 
-When the caller's actor label is `"local"` (single-actor fallback), no
-`to_actor` filter is applied and the inbox behaves as before (party-line).
-When the caller has a non-`"local"` actor label, only messages addressed to
-that actor are returned. Legacy messages without a `to_actor` field are
-visible regardless (Q3: OR IS NULL).
+Every caller is filtered by `to_actor = caller OR to_actor IS NULL`. A
+configured actor therefore sees messages addressed to that actor plus legacy
+rows without `to_actor`. The anonymous `"local"` fallback sees messages
+addressed to `"local"` plus the same legacy rows; it does not bypass the filter
+or expose messages explicitly addressed to another actor.
 
 `from_actor`/`from_prefix` (#493) sender filters are mutually exclusive.
 Direction + read-status + `to_actor` filters are pushed into SQL so
@@ -179,6 +190,21 @@ is inclusive and `before` is exclusive, both RFC 3339 and both evaluated against
 the top-level note `created_at` exposed in the response, not optional transport
 metadata in `properties.sent_at`. Empty substring filters are rejected, and a
 missing/non-string subject does not match `subject_contains`.
+
+`fields` is the same strict, non-empty projection used by `comm.thread`.
+Omitting it preserves the full message object. The accepted top-level names are
+`id`, `short_id`, `full_id`, `kind`, `from`, `to`, `subject`, `read`,
+`direction`, `preview`, `content`, `namespace`, `properties`, `created_at`, and
+`updated_at`. Stable property aliases `comm_schema_version`, `from_actor`,
+`to_actor`, `thread_id`, `sent_at`, `outbound_ref`, and `sent_by_process` are
+also available without returning the full `properties` map; an absent optional
+property projects as null, except `from_actor`/`to_actor`, which fall back to
+the full view's `from`/`to` values, and `short_id`/`full_id`, which fall back
+to the projected `id` value so the identifier aliases stay consistent with the
+row's UUID. Unknown names and an empty list are hard errors. Duplicate names
+are allowed and collapse to one key.
+Authorization, filtering, unread counting, pagination lookahead, and thread
+deduplication all operate on the complete internal view before projection.
 
 `wait_ms` (#1499) adds bounded long-polling without changing the response
 shape. Omission or `0` returns the first query immediately; values from 1
@@ -360,6 +386,10 @@ compare exact `(i64, Uuid)` tuples instead of re-parsing the ISO string
 embedded in the JSON. `AfterCursor::Id` carries the full tuple for
 tie-breaking; `AfterCursor::Timestamp` carries only the parsed microsecond
 value since there is no specific row to break ties against.
+
+The optional `fields` projection is identical to `comm.inbox` and is applied
+only after visibility filtering, dual-write deduplication, cursor filtering,
+ordering, and truncation. Omitting it preserves the full thread response.
 
 ## `handlers.rs::handle_ingest`
 

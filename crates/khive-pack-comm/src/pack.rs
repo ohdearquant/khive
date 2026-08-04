@@ -262,6 +262,29 @@ mod help_tests {
     }
 
     #[test]
+    fn list_reads_declare_sent_box_and_shared_projection_contract() {
+        let inbox = find_handler("comm.inbox");
+        for name in ["box", "to_actor", "fields"] {
+            let param = inbox
+                .params
+                .iter()
+                .find(|param| param.name == name)
+                .unwrap_or_else(|| panic!("comm.inbox help must declare {name:?}"));
+            assert!(!param.required, "comm.inbox.{name} must be optional");
+        }
+
+        let thread = find_handler("comm.thread");
+        let fields = thread
+            .params
+            .iter()
+            .find(|param| param.name == "fields")
+            .expect("comm.thread help must declare the shared fields projection");
+        assert_eq!(fields.param_type, "array of string");
+        assert!(!fields.required);
+        assert!(fields.description.contains("comm.inbox"));
+    }
+
+    #[test]
     fn read_has_optional_id_and_ids_for_exactly_one_validation() {
         let h = find_handler("comm.read");
         assert!(!h.params.is_empty(), "read must have non-empty params");

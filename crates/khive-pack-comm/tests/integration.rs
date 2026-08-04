@@ -11020,3 +11020,472 @@ async fn merge_reports_zero_properties_merged_when_restoration_reverts_the_only_
          restoration, so nothing genuinely survived; got {merged}"
     );
 }
+
+// ── #1468 / #1471: projected inbox/thread reads and sent history ─────────────
+
+#[tokio::test]
+async fn i1471_sent_box_is_sender_scoped_and_filters_recipient_and_since() {
+    let backend = shared_backend();
+    let (registry_a, _runtime_a) = build_actor_registry(backend.clone(), "lambda:a");
+    let (registry_other, _runtime_other) = build_actor_registry(backend, "lambda:other");
+    let since = (chrono::Utc::now() - chrono::Duration::seconds(1)).to_rfc3339();
+
+    let to_b = registry_a
+        .dispatch(
+            "comm.send",
+            serde_json::json!({
+                "to": "lambda:b",
+                "subject": "for B",
+                "content": "sender A to B",
+            }),
+        )
+        .await
+        .expect("A sends to B");
+    registry_a
+        .dispatch(
+            "comm.send",
+            serde_json::json!({ "to": "lambda:c", "content": "sender A to C" }),
+        )
+        .await
+        .expect("A sends to C");
+    registry_other
+        .dispatch(
+            "comm.send",
+            serde_json::json!({ "to": "lambda:b", "content": "other sender to B" }),
+        )
+        .await
+        .expect("other actor sends to B");
+
+    let default_box = registry_a
+        .dispatch(
+            "comm.inbox",
+            serde_json::json!({ "status": "all", "limit": 10 }),
+        )
+        .await
+        .expect("default inbox remains inbound-only");
+    assert_eq!(default_box["count"], 0);
+
+    let sent_to_b = registry_a
+        .dispatch(
+            "comm.inbox",
+            serde_json::json!({
+                "box": "sent",
+                "to_actor": "lambda:b",
+                "since": since,
+                "limit": 10,
+            }),
+        )
+        .await
+        .expect("sent history");
+    assert_eq!(sent_to_b["count"], 1);
+    assert_eq!(sent_to_b["messages"][0]["full_id"], to_b["full_id"]);
+    assert_eq!(sent_to_b["messages"][0]["from"], "lambda:a");
+    assert_eq!(sent_to_b["messages"][0]["to"], "lambda:b");
+    assert_eq!(sent_to_b["messages"][0]["direction"], "outbound");
+    assert_eq!(sent_to_b["unread_count"], 0);
+
+    let all_sent = registry_a
+        .dispatch(
+            "comm.inbox",
+            serde_json::json!({ "box": "sent", "limit": 10 }),
+        )
+        .await
+        .expect("all caller-authored sent rows");
+    assert_eq!(
+        all_sent["count"], 2,
+        "another actor's outbound row must not leak"
+    );
+
+    let future = (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339();
+    let none = registry_a
+        .dispatch(
+            "comm.inbox",
+            serde_json::json!({ "box": "sent", "since": future }),
+        )
+        .await
+        .expect("sent since filter");
+    assert_eq!(none["count"], 0);
+
+    let status_error = registry_a
+        .dispatch(
+            "comm.inbox",
+            serde_json::json!({ "box": "sent", "status": "all" }),
+        )
+        .await
+        .expect_err("read status has no meaning for sent rows");
+    assert!(status_error.to_string().contains("applies only"));
+}
+
+#[tokio::test]
+async fn i1468_fields_projects_inbox_and_thread_with_one_strict_vocabulary() {
+    let backend = shared_backend();
+    let (registry_a, _runtime_a) = build_actor_registry(backend.clone(), "lambda:a");
+    let (registry_b, _runtime_b) = build_actor_registry(backend, "lambda:b");
+
+    let sent = registry_a
+        .dispatch(
+            "comm.send",
+            serde_json::json!({
+                "to": "lambda:b",
+                "subject": "projection contract",
+                "content": "body must be omitted from the projected view",
+            }),
+        )
+        .await
+        .expect("send for projection test");
+    let fields = serde_json::json!(["id", "subject", "from_actor", "sent_at", "created_at"]);
+
+    let inbox = registry_b
+        .dispatch(
+            "comm.inbox",
+            serde_json::json!({ "status": "all", "fields": fields.clone() }),
+        )
+        .await
+        .expect("projected inbox");
+    assert_eq!(inbox["count"], 1);
+    let inbox_message = inbox["messages"][0].as_object().unwrap();
+    let expected: std::collections::BTreeSet<&str> =
+        ["id", "subject", "from_actor", "sent_at", "created_at"]
+            .into_iter()
+            .collect();
+    let actual: std::collections::BTreeSet<&str> =
+        inbox_message.keys().map(String::as_str).collect();
+    assert_eq!(actual, expected);
+    assert_eq!(inbox_message["from_actor"], "lambda:a");
+    assert!(inbox_message["sent_at"].as_str().is_some());
+    assert!(inbox_message["created_at"].as_str().is_some());
+
+    let thread = registry_a
+        .dispatch(
+            "comm.thread",
+            serde_json::json!({ "id": sent["full_id"], "fields": fields }),
+        )
+        .await
+        .expect("projected thread");
+    assert_eq!(thread["count"], 1);
+    let thread_message = thread["messages"][0].as_object().unwrap();
+    let thread_keys: std::collections::BTreeSet<&str> =
+        thread_message.keys().map(String::as_str).collect();
+    assert_eq!(thread_keys, expected);
+
+    let full = registry_b
+        .dispatch("comm.inbox", serde_json::json!({ "status": "all" }))
+        .await
+        .expect("omitted projection preserves the full view");
+    assert!(full["messages"][0].get("content").is_some());
+    assert!(full["messages"][0].get("properties").is_some());
+
+    for (verb, params) in [
+        (
+            "comm.inbox",
+            serde_json::json!({ "fields": ["not_a_message_field"] }),
+        ),
+        (
+            "comm.thread",
+            serde_json::json!({
+                "id": sent["full_id"],
+                "fields": ["not_a_message_field"],
+            }),
+        ),
+    ] {
+        let error = registry_a
+            .dispatch(verb, params)
+            .await
+            .expect_err("unknown projection field must fail");
+        assert!(error.to_string().contains("unknown projection field"));
+    }
+
+    let empty = registry_a
+        .dispatch("comm.inbox", serde_json::json!({ "fields": [] }))
+        .await
+        .expect_err("an empty projection is ambiguous and must fail");
+    assert!(empty.to_string().contains("at least one field"));
+}
+
+// ── #1471 follow-up: anonymous-local scoping, cross-box rejections, sent fallback ──
+
+/// The anonymous `"local"` caller is scoped by `to_actor = "local" OR to_actor IS NULL`
+/// like every other caller (ADR-057 amendment): it shares messages addressed to
+/// `"local"`, keeps legacy rows without `to_actor` visible, and must not see
+/// messages explicitly addressed to another actor.
+#[tokio::test]
+async fn i1471_anonymous_local_inbox_scoping_and_legacy_visibility() {
+    let backend = shared_backend();
+    let (registry_a, _rt_a) = build_actor_registry(backend.clone(), "lambda:a");
+    let (registry_local, rt_local) = build_actor_registry(backend, "local");
+
+    registry_a
+        .dispatch(
+            "comm.send",
+            serde_json::json!({ "to": "lambda:b", "content": "addressed away from local" }),
+        )
+        .await
+        .expect("A sends to B");
+    registry_a
+        .dispatch(
+            "comm.send",
+            serde_json::json!({ "to": "local", "content": "addressed to local" }),
+        )
+        .await
+        .expect("A sends to local");
+
+    let local_tok = rt_local
+        .authorize(Namespace::local())
+        .expect("authorize local fixture namespace");
+    rt_local
+        .create_note(
+            &local_tok,
+            "message",
+            None,
+            "legacy inbound, no to_actor",
+            None,
+            Some(serde_json::json!({
+                "from": "lambda:a",
+                "from_actor": "lambda:a",
+                "direction": "inbound",
+            })),
+            vec![],
+        )
+        .await
+        .expect("legacy to_actor-less inbound fixture");
+
+    let inbox = registry_local
+        .dispatch(
+            "comm.inbox",
+            serde_json::json!({ "status": "all", "limit": 10 }),
+        )
+        .await
+        .expect("anonymous local inbox");
+    assert_eq!(
+        inbox["count"], 2,
+        "local-addressed row plus legacy row only"
+    );
+    let contents: Vec<&str> = inbox["messages"]
+        .as_array()
+        .expect("messages array")
+        .iter()
+        .filter_map(|message| message["content"].as_str())
+        .collect();
+    assert!(
+        contents.contains(&"addressed to local"),
+        "row addressed to \"local\" must be visible; got {contents:?}"
+    );
+    assert!(
+        contents.contains(&"legacy inbound, no to_actor"),
+        "legacy row without to_actor must stay visible; got {contents:?}"
+    );
+    assert!(
+        !contents.contains(&"addressed away from local"),
+        "row addressed to another actor must stay hidden; got {contents:?}"
+    );
+}
+
+/// Cross-box filters must fail loudly rather than silently return the wrong
+/// box: sender filters and read `status` are inbox-only, while `to_actor` is
+/// sent-only (ADR-057 amendment).
+#[tokio::test]
+async fn i1471_cross_box_filters_are_rejected() {
+    let (registry, _rt) = build_registry_for_ns("local");
+
+    for params in [
+        serde_json::json!({ "box": "sent", "status": "unread" }),
+        serde_json::json!({ "box": "sent", "from_actor": "local" }),
+        serde_json::json!({ "box": "sent", "from_prefix": "lambda:" }),
+        serde_json::json!({ "box": "sent", "exclude_from_actor": "local" }),
+    ] {
+        let error = registry
+            .dispatch("comm.inbox", params)
+            .await
+            .expect_err("inbox-only filter with box=\"sent\" must fail");
+        assert!(
+            error.to_string().contains("only to box=\"inbox\""),
+            "error must explain the filter is inbox-only; got {error}"
+        );
+    }
+
+    for params in [
+        serde_json::json!({ "to_actor": "lambda:b" }),
+        serde_json::json!({ "box": "inbox", "to_actor": "lambda:b" }),
+    ] {
+        let error = registry
+            .dispatch("comm.inbox", params)
+            .await
+            .expect_err("to_actor with the inbox box must fail");
+        assert!(
+            error.to_string().contains("applies only"),
+            "error must explain to_actor is sent-only; got {error}"
+        );
+    }
+}
+
+/// The anonymous `"local"` sent box keeps legacy outbound rows without
+/// `from_actor` visible (EqOrMissing fallback), while rows attributed to
+/// another actor never leak into it.
+#[tokio::test]
+async fn i1471_local_sent_box_includes_legacy_rows_only() {
+    let backend = shared_backend();
+    let (registry_other, _rt_other) = build_actor_registry(backend.clone(), "lambda:other");
+    let (registry_local, rt_local) = build_actor_registry(backend, "local");
+
+    registry_local
+        .dispatch(
+            "comm.send",
+            serde_json::json!({ "to": "local", "content": "sent by local" }),
+        )
+        .await
+        .expect("local sends");
+    registry_other
+        .dispatch(
+            "comm.send",
+            serde_json::json!({ "to": "local", "content": "sent by other" }),
+        )
+        .await
+        .expect("other actor sends");
+
+    let local_tok = rt_local
+        .authorize(Namespace::local())
+        .expect("authorize local fixture namespace");
+    rt_local
+        .create_note(
+            &local_tok,
+            "message",
+            None,
+            "legacy outbound, no from_actor",
+            None,
+            Some(serde_json::json!({
+                "to": "lambda:b",
+                "direction": "outbound",
+            })),
+            vec![],
+        )
+        .await
+        .expect("legacy from_actor-less outbound fixture");
+    rt_local
+        .create_note(
+            &local_tok,
+            "message",
+            None,
+            "foreign outbound, different from_actor",
+            None,
+            Some(serde_json::json!({
+                "from_actor": "lambda:foreign",
+                "to": "lambda:b",
+                "direction": "outbound",
+            })),
+            vec![],
+        )
+        .await
+        .expect("foreign-attributed outbound fixture");
+
+    let sent = registry_local
+        .dispatch(
+            "comm.inbox",
+            serde_json::json!({ "box": "sent", "limit": 10 }),
+        )
+        .await
+        .expect("local sent history");
+    assert_eq!(
+        sent["count"], 2,
+        "local-authored row plus legacy row only; got {sent}"
+    );
+    let contents: Vec<&str> = sent["messages"]
+        .as_array()
+        .expect("messages array")
+        .iter()
+        .filter_map(|message| message["content"].as_str())
+        .collect();
+    assert!(
+        contents.contains(&"sent by local"),
+        "local-authored outbound row must be listed; got {contents:?}"
+    );
+    assert!(
+        contents.contains(&"legacy outbound, no from_actor"),
+        "legacy row without from_actor must stay visible; got {contents:?}"
+    );
+    assert!(
+        !contents.contains(&"sent by other")
+            && !contents.contains(&"foreign outbound, different from_actor"),
+        "rows attributed to another actor must not leak; got {contents:?}"
+    );
+}
+
+/// An ATTRIBUTED caller's sent box requires an exact `from_actor` match:
+/// legacy outbound rows without `from_actor` are never inherited (fail
+/// closed), even when they live in the namespace the caller's query scans.
+/// Only the anonymous `"local"` actor gets the EqOrMissing fallback.
+#[tokio::test]
+async fn i1471_attributed_sent_box_excludes_legacy_rows() {
+    let backend = shared_backend();
+    let (registry_a, rt_a) = build_actor_registry(backend, "lambda:a");
+
+    registry_a
+        .dispatch(
+            "comm.send",
+            serde_json::json!({ "to": "lambda:b", "content": "attributed outbound" }),
+        )
+        .await
+        .expect("attributed actor sends");
+
+    let tok = rt_a
+        .authorize(Namespace::local())
+        .expect("authorize fixture namespace");
+    rt_a.create_note(
+        &tok,
+        "message",
+        None,
+        "legacy outbound, no from_actor",
+        None,
+        Some(serde_json::json!({
+            "to": "lambda:b",
+            "direction": "outbound",
+        })),
+        vec![],
+    )
+    .await
+    .expect("legacy from_actor-less outbound fixture");
+    // In-scope control: an identically created note that DOES carry the
+    // caller's `from_actor` must be visible, proving the exclusion above is
+    // the actor predicate and not namespace scoping making the legacy row
+    // unreachable.
+    rt_a.create_note(
+        &tok,
+        "message",
+        None,
+        "attributed fixture, from_actor present",
+        None,
+        Some(serde_json::json!({
+            "from_actor": "lambda:a",
+            "to": "lambda:b",
+            "direction": "outbound",
+        })),
+        vec![],
+    )
+    .await
+    .expect("attributed outbound control fixture");
+
+    let sent = registry_a
+        .dispatch(
+            "comm.inbox",
+            serde_json::json!({ "box": "sent", "limit": 10 }),
+        )
+        .await
+        .expect("attributed sent history");
+    assert_eq!(
+        sent["count"], 2,
+        "attributed rows visible, legacy from_actor-less row excluded; got {sent}"
+    );
+    let contents: Vec<&str> = sent["messages"]
+        .as_array()
+        .expect("messages array")
+        .iter()
+        .filter_map(|message| message["content"].as_str())
+        .collect();
+    assert!(
+        contents.contains(&"attributed fixture, from_actor present"),
+        "in-scope control fixture must be listed; got {contents:?}"
+    );
+    assert!(
+        !contents.contains(&"legacy outbound, no from_actor"),
+        "attributed caller must not inherit legacy from_actor-less rows; got {contents:?}"
+    );
+}
