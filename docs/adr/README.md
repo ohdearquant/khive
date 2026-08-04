@@ -149,6 +149,7 @@ The same head-binding governs review: a verdict authorizes only the exact commit
 | [ADR-140](ADR-140-context-graph-payload.md)                             | Add a bounded graph payload to context responses                                                           |
 | [ADR-141](ADR-141-store-backup-runner.md)                               | Executable store backup runner                                                                             |
 | [ADR-142](ADR-142-agentic-process-runtime.md)                           | Agentic Process Runtime                                                                                    |
+| [ADR-143](ADR-143-store-held-caller-grants.md)                          | Store-held caller grants and hierarchical subactor identity                                                |
 
 <!-- END GENERATED ADR CATALOG -->
 
