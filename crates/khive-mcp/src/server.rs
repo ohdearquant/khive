@@ -432,6 +432,16 @@ impl KhiveMcpServer {
         // update/delete verbs notify caching packs even though there is no
         // crate-level dependency between them.
         registry.call_register_note_mutation_hooks(&runtime);
+        // Note-write identity: the pack-owned kind set drives `update`'s
+        // properties refusal so a pack-owned note's identity properties
+        // cannot be overwritten by a caller-supplied `properties` patch.
+        runtime.install_pack_owned_note_kinds(
+            registry
+                .pack_owned_note_kinds()
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+        );
         // Apply pack-auxiliary schema plans at startup so pack tables are
         // present before any handler runs. Errors are logged but not propagated
         // so a single pack's schema failure cannot abort startup.

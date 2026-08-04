@@ -9613,3 +9613,204 @@ async fn i1422_rejects_invalid_filter_and_bulk_shapes() {
         .await
         .is_err());
 }
+
+// ---- ADR-124 note-write identity guard: update-path refusal on pack-owned kinds ----
+
+/// Build a registry the same way as [`build_registry`] but also install the
+/// pack-owned note kind set, mirroring `khive-mcp`'s boot path
+/// (`KhiveMcpServer::with_packs`). Without this the runtime never learns
+/// `message` is pack-owned and the guard stays inert.
+fn build_registry_with_owned_kinds() -> (VerbRegistry, KhiveRuntime) {
+    let (registry, rt) = build_registry();
+    rt.install_pack_owned_note_kinds(
+        registry
+            .pack_owned_note_kinds()
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
+    );
+    (registry, rt)
+}
+
+/// The confirmed hole, reproduced as a test: a generic `update(properties=
+/// {from_actor: ...})` must no longer be able to forge the handler-stamped
+/// `from_actor` on a `message` note. This is the central regression test —
+/// send a message, forge via update, assert the forgery is refused and the
+/// stored value is unchanged.
+#[tokio::test]
+async fn update_refuses_to_forge_owner_established_properties_on_message_note() {
+    let (registry, _rt) = build_registry_with_owned_kinds();
+
+    let sent = registry
+        .dispatch(
+            "comm.send",
+            serde_json::json!({"to": "local", "content": "identity guard probe"}),
+        )
+        .await
+        .expect("self-send must succeed");
+    let full_id = sent
+        .get("full_id")
+        .and_then(serde_json::Value::as_str)
+        .expect("send must return full_id")
+        .to_string();
+
+    let before = registry
+        .dispatch("get", serde_json::json!({"id": full_id}))
+        .await
+        .expect("get must succeed");
+    let original_from_actor = before["properties"]["from_actor"].clone();
+
+    for (key, forged_value) in [
+        ("from_actor", "lambda:leo"),
+        ("direction", "inbound"),
+        ("sent_at", "1970-01-01T00:00:00Z"),
+        ("thread_id", "forged-thread"),
+    ] {
+        let err = registry
+            .dispatch(
+                "update",
+                serde_json::json!({"id": full_id, "properties": {key: forged_value}}),
+            )
+            .await
+            .expect_err(&format!(
+                "update naming `{key}` on a message note must be refused"
+            ));
+        let msg = format!("{err}");
+        assert!(
+            msg.contains(key),
+            "refusal error must name the offending key `{key}`; got: {msg}"
+        );
+        assert!(
+            !msg.contains(forged_value),
+            "refusal error must never echo the attempted value `{forged_value}` \
+             (secret-gate discipline applies to error strings); got: {msg}"
+        );
+    }
+
+    let after = registry
+        .dispatch("get", serde_json::json!({"id": full_id}))
+        .await
+        .expect("get must succeed");
+    assert_eq!(
+        after["properties"]["from_actor"], original_from_actor,
+        "stored from_actor must be unchanged after every refused forgery attempt"
+    );
+    assert_eq!(
+        after["properties"]["direction"],
+        before["properties"]["direction"]
+    );
+    assert_eq!(
+        after["properties"]["sent_at"],
+        before["properties"]["sent_at"]
+    );
+}
+
+/// Positive arm: a non-owned property update on the same `message` note must
+/// still succeed and round-trip — the guard admits everything it does not
+/// specifically name.
+#[tokio::test]
+async fn update_admits_non_owned_properties_on_message_note() {
+    let (registry, _rt) = build_registry_with_owned_kinds();
+
+    let sent = registry
+        .dispatch(
+            "comm.send",
+            serde_json::json!({"to": "local", "content": "identity guard positive arm"}),
+        )
+        .await
+        .expect("self-send must succeed");
+    let full_id = sent
+        .get("full_id")
+        .and_then(serde_json::Value::as_str)
+        .expect("send must return full_id")
+        .to_string();
+
+    registry
+        .dispatch(
+            "update",
+            serde_json::json!({"id": full_id, "properties": {"blocked_on": "review"}}),
+        )
+        .await
+        .expect("update naming only a non-owned key must succeed");
+
+    let after = registry
+        .dispatch("get", serde_json::json!({"id": full_id}))
+        .await
+        .expect("get must succeed");
+    assert_eq!(
+        after["properties"]["blocked_on"], "review",
+        "non-owned property must round-trip"
+    );
+    assert!(
+        after["properties"]["from_actor"].is_string(),
+        "from_actor must still be present and untouched by the unrelated patch"
+    );
+}
+
+/// The guard fires only on pack-owned kinds: naming `from_actor` on a base
+/// kg note kind (e.g. `observation`) must succeed.
+#[tokio::test]
+async fn update_permits_from_actor_key_on_generic_note_kind() {
+    let (registry, _rt) = build_registry_with_owned_kinds();
+
+    let created = registry
+        .dispatch(
+            "create",
+            serde_json::json!({"kind": "observation", "content": "generic-kind arm"}),
+        )
+        .await
+        .expect("create observation must succeed");
+    let id = created
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .expect("create must return id")
+        .to_string();
+
+    registry
+        .dispatch(
+            "update",
+            serde_json::json!({"id": id, "properties": {"from_actor": "anyone"}}),
+        )
+        .await
+        .expect("`from_actor` is not a reserved key on a non-pack-owned note kind");
+
+    let after = registry
+        .dispatch("get", serde_json::json!({"id": id}))
+        .await
+        .expect("get must succeed");
+    assert_eq!(after["properties"]["from_actor"], "anyone");
+}
+
+/// A non-object `properties` patch on a `message` note is refused: it would
+/// replace the whole property object (erasing every owned key) rather than
+/// merging into it.
+#[tokio::test]
+async fn update_refuses_non_object_properties_patch_on_message_note() {
+    let (registry, _rt) = build_registry_with_owned_kinds();
+
+    let sent = registry
+        .dispatch(
+            "comm.send",
+            serde_json::json!({"to": "local", "content": "non-object patch arm"}),
+        )
+        .await
+        .expect("self-send must succeed");
+    let full_id = sent
+        .get("full_id")
+        .and_then(serde_json::Value::as_str)
+        .expect("send must return full_id")
+        .to_string();
+
+    let err = registry
+        .dispatch(
+            "update",
+            serde_json::json!({"id": full_id, "properties": "not-an-object"}),
+        )
+        .await
+        .expect_err("a non-object properties patch on a pack-owned note must be refused");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("object"),
+        "refusal error must explain the object requirement; got: {msg}"
+    );
+}
