@@ -96,13 +96,13 @@ caller's namespace) or `outbound` (message sent by the caller). This is set by `
 
 #### Five verbs
 
-| Verb          | Speech act (ADR-025) | Args                                      | What it does                                                                                                                                                                                                                                                                              |
-| ------------- | -------------------- | ----------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `comm.send`   | commissive           | `to`, `subject?`, `content`, `thread_id?` | Create a message note in the recipient's namespace (`direction=inbound`) and an outbound copy in the caller's namespace (`direction=outbound`). `from` is set to the caller's identity. Both writes are atomic: if the inbound write fails, the outbound copy is rolled back.             |
+| Verb          | Speech act (ADR-025) | Args                                      | What it does                                                                                                                                                                                                                                                                                     |
+| ------------- | -------------------- | ----------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `comm.send`   | commissive           | `to`, `subject?`, `content`, `thread_id?` | Create a message note in the recipient's namespace (`direction=inbound`) and an outbound copy in the caller's namespace (`direction=outbound`). `from` is set to the caller's identity. Both writes are atomic: if the inbound write fails, the outbound copy is rolled back.                    |
 | `comm.inbox`  | assertive            | `limit?`, `offset?`, filters, `wait_ms?`  | List inbound messages (`direction=inbound`) for the caller. `status` filters on `read`: `unread` (default), `read`, or `all`. Offset pagination and sender/time/text filters apply without changing message state; a bounded long poll waits only when the fully filtered initial page is empty. |
-| `comm.read`   | declaration          | `id?`, `ids?`                             | Set `properties.read = true` on one or more **inbound** messages. Exactly one of `id` or `ids` is required. Outbound messages cannot be marked read.                                                                                                                                      |
-| `comm.reply`  | commissive           | `id`, `content`                           | Fetch the target message's `thread_id` (or use the message's own UUID as the thread root). Create a new message with the same `thread_id`, `to` set to the other party, `subject` prefixed with `"Re: "` if not already. Uses dual-write for inbound delivery to the recipient.           |
-| `comm.thread` | assertive            | `id`, `limit?`                            | Validate the root message by UUID (must exist, must be `kind=message`), then return the root plus all messages whose `properties.thread_id` equals the root UUID, sorted by `created_at` ascending (chronological). Uses a paginated scan. `id` accepts 8-char short prefix or full UUID. |
+| `comm.read`   | declaration          | `id?`, `ids?`                             | Set `properties.read = true` on one or more **inbound** messages. Exactly one of `id` or `ids` is required. Outbound messages cannot be marked read.                                                                                                                                             |
+| `comm.reply`  | commissive           | `id`, `content`                           | Fetch the target message's `thread_id` (or use the message's own UUID as the thread root). Create a new message with the same `thread_id`, `to` set to the other party, `subject` prefixed with `"Re: "` if not already. Uses dual-write for inbound delivery to the recipient.                  |
+| `comm.thread` | assertive            | `id`, `limit?`                            | Validate the root message by UUID (must exist, must be `kind=message`), then return the root plus all messages whose `properties.thread_id` equals the root UUID, sorted by `created_at` ascending (chronological). Uses a paginated scan. `id` accepts 8-char short prefix or full UUID.        |
 
 #### Inbox pagination, richer filters, and bulk read amendment (2026-08-01)
 
@@ -696,7 +696,9 @@ inbox handler snapshots the generation before every query, so a commit between
 an empty query and waiter registration cannot be lost. The signal is deliberately
 payload-free and unscoped: every wake is followed by the normal authorized query,
 and an unrelated actor/namespace/filter result causes the call to continue waiting
-within its original deadline. A final query closes the deadline-edge race.
+within its original deadline. A final query at deadline expiry observes commits
+visible before that query takes its storage snapshot; a commit landing after the
+snapshot is left to the caller's next request.
 
 Successful `comm.send` and `comm.reply` handlers publish only after their atomic
 dual-write commits. `comm.ingest` publishes only after `try_create_note` returns a

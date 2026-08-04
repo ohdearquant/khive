@@ -631,6 +631,175 @@ async fn inbox_long_poll_returns_immediately_when_matches_exist() {
     );
 }
 
+#[tokio::test(start_paused = true)]
+async fn inbox_long_poll_accepts_thirty_second_budget() {
+    let (registry, _rt) = build_registry_for_ns("local");
+    let started = tokio::time::Instant::now();
+
+    let inbox = registry
+        .dispatch(
+            "comm.inbox",
+            serde_json::json!({ "status": "all", "wait_ms": 30_000 }),
+        )
+        .await
+        .expect("the inclusive maximum wait_ms must be accepted");
+
+    assert_eq!(inbox["count"].as_u64(), Some(0));
+    assert_eq!(
+        tokio::time::Instant::now().duration_since(started),
+        std::time::Duration::from_millis(30_000),
+        "wait_ms=30000 is the inclusive boundary and must run its full budget"
+    );
+}
+
+#[tokio::test]
+async fn inbox_rejects_non_numeric_wait_ms() {
+    let (registry, _rt) = build_registry();
+
+    let err = registry
+        .dispatch("comm.inbox", serde_json::json!({ "wait_ms": "soon" }))
+        .await
+        .expect_err("a non-numeric wait_ms must be rejected");
+    assert!(
+        err.to_string().contains("invalid input"),
+        "a non-numeric wait_ms must fail parameter deserialization: {err}"
+    );
+
+    let err = registry
+        .dispatch("comm.inbox", serde_json::json!({ "wait_ms": -5 }))
+        .await
+        .expect_err("a negative wait_ms must be rejected");
+    assert!(
+        err.to_string().contains("invalid input"),
+        "a negative wait_ms must fail parameter deserialization: {err}"
+    );
+}
+
+#[tokio::test]
+async fn inbox_long_poll_wakes_after_concurrent_reply() {
+    let (registry, _rt) = build_registry_for_ns("local");
+    let waiter_registry = registry.clone();
+    let mut waiter = tokio::spawn(async move {
+        waiter_registry
+            .dispatch(
+                "comm.inbox",
+                serde_json::json!({
+                    "status": "all",
+                    "content_contains": "reply wake arrives",
+                    "wait_ms": 5_000,
+                }),
+            )
+            .await
+    });
+
+    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    assert!(
+        !waiter.is_finished(),
+        "empty inbox must remain blocked before a matching reply"
+    );
+
+    let original = registry
+        .dispatch(
+            "comm.send",
+            serde_json::json!({ "to": "local", "content": "original for reply wake" }),
+        )
+        .await
+        .expect("send succeeds");
+    let original_full_id = original["full_id"].as_str().expect("send returns full_id");
+
+    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    assert!(
+        !waiter.is_finished(),
+        "a send that fails the content filter must keep the reply waiter waiting"
+    );
+
+    registry
+        .dispatch(
+            "comm.reply",
+            serde_json::json!({ "id": original_full_id, "content": "reply wake arrives" }),
+        )
+        .await
+        .expect("reply succeeds");
+
+    let inbox = match tokio::time::timeout(std::time::Duration::from_secs(1), &mut waiter).await {
+        Ok(joined) => joined
+            .expect("long-poll task must not panic")
+            .expect("long-poll inbox succeeds"),
+        Err(_) => {
+            waiter.abort();
+            panic!("long-poll inbox did not wake within one second of reply");
+        }
+    };
+    assert_eq!(inbox["count"].as_u64(), Some(1));
+    assert_eq!(
+        inbox["messages"][0]["content"].as_str(),
+        Some("reply wake arrives")
+    );
+}
+
+#[tokio::test]
+async fn inbox_long_poll_with_offset_wakes_and_pages() {
+    let (registry, _rt) = build_registry_for_ns("local");
+
+    registry
+        .dispatch(
+            "comm.send",
+            serde_json::json!({ "to": "local", "content": "page: first" }),
+        )
+        .await
+        .expect("first send succeeds");
+    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    registry
+        .dispatch(
+            "comm.send",
+            serde_json::json!({ "to": "local", "content": "page: second" }),
+        )
+        .await
+        .expect("second send succeeds");
+    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+
+    let waiter_registry = registry.clone();
+    let mut waiter = tokio::spawn(async move {
+        waiter_registry
+            .dispatch(
+                "comm.inbox",
+                serde_json::json!({ "status": "all", "offset": 2, "wait_ms": 5_000 }),
+            )
+            .await
+    });
+
+    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    assert!(
+        !waiter.is_finished(),
+        "an offset beyond the current last page must keep waiting"
+    );
+
+    registry
+        .dispatch(
+            "comm.send",
+            serde_json::json!({ "to": "local", "content": "page: third" }),
+        )
+        .await
+        .expect("third send succeeds");
+
+    let inbox = match tokio::time::timeout(std::time::Duration::from_secs(1), &mut waiter).await {
+        Ok(joined) => joined
+            .expect("long-poll task must not panic")
+            .expect("long-poll inbox succeeds"),
+        Err(_) => {
+            waiter.abort();
+            panic!("long-poll inbox did not wake within one second of the third send");
+        }
+    };
+    assert_eq!(inbox["count"].as_u64(), Some(1));
+    assert_eq!(inbox["offset"].as_u64(), Some(2));
+    assert_eq!(
+        inbox["messages"][0]["content"].as_str(),
+        Some("page: first"),
+        "the same-offset re-query must page from the newest-first filtered sequence"
+    );
+}
+
 #[tokio::test]
 async fn read_marks_message_as_read() {
     let (registry, rt) = build_registry_for_ns("local");

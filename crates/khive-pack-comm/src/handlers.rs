@@ -511,7 +511,9 @@ where
         let response = query().await?;
         let is_empty = response["messages"]
             .as_array()
-            .expect("inbox response always contains a messages array")
+            .ok_or_else(|| {
+                RuntimeError::Internal("inbox: response is missing the `messages` array".into())
+            })?
             .is_empty();
         if !is_empty || deadline.is_none() {
             return Ok(response);
@@ -2742,6 +2744,104 @@ mod tests {
         assert_eq!(
             response["messages"][0]["content"],
             json!("committed during query")
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn inbox_wait_rejects_response_without_messages_array() {
+        let signal = InboxSignal::new();
+        let result = wait_for_inbox_response(&signal, None, || async { Ok(json!({})) }).await;
+        let err = result.expect_err("a response without `messages` must error, not panic");
+        assert!(
+            matches!(err, khive_runtime::RuntimeError::Internal(_)),
+            "missing `messages` must surface as an internal error: {err}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn inbox_final_query_after_timeout_returns_newly_visible_message() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let signal = InboxSignal::new();
+        let query_calls = Arc::new(AtomicUsize::new(0));
+        let deadline = Some(tokio::time::Instant::now() + std::time::Duration::from_millis(250));
+
+        let query = || {
+            let query_calls = Arc::clone(&query_calls);
+            async move {
+                let call = query_calls.fetch_add(1, Ordering::SeqCst);
+                if call == 0 {
+                    Ok(json!({ "messages": [] }))
+                } else {
+                    Ok(json!({ "messages": [{ "content": "visible at the timeout edge" }] }))
+                }
+            }
+        };
+
+        // No publish happens, so the timer wins the select; the final query
+        // must still surface the row that became visible by deadline expiry.
+        let response = wait_for_inbox_response(&signal, deadline, query)
+            .await
+            .expect("timeout-edge final query succeeds");
+        assert_eq!(query_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            response["messages"][0]["content"],
+            json!("visible at the timeout edge")
+        );
+    }
+
+    #[tokio::test]
+    async fn ingest_dedup_hit_does_not_publish() {
+        use khive_runtime::{AllowAllGate, BackendId, Namespace, RuntimeConfig};
+        use uuid::Uuid;
+
+        let ns = format!("ingest-dedup-{}", Uuid::new_v4().simple());
+        let runtime = super::KhiveRuntime::new(RuntimeConfig {
+            git_write: Default::default(),
+            db_path: None,
+            default_namespace: Namespace::parse(&ns).unwrap(),
+            embedding_model: None,
+            additional_embedding_models: vec![],
+            gate: std::sync::Arc::new(AllowAllGate),
+            packs: vec!["kg".to_string(), "comm".to_string()],
+            backend_id: BackendId::main(),
+            brain_profile: None,
+            visible_namespaces: vec![],
+            allowed_outbound_namespaces: vec![],
+            actor_id: None,
+        })
+        .expect("in-memory runtime");
+        let token = runtime
+            .authorize(Namespace::parse(&ns).unwrap())
+            .expect("authorize");
+        let signal = InboxSignal::new();
+
+        let body = json!({
+            "from": "email:sender@example.com",
+            "to": "local",
+            "content": "dedup probe",
+            "external_id": "imap:long-poll:dedup:1",
+        });
+
+        let first = super::handle_ingest(&runtime, &signal, &token, body.clone())
+            .await
+            .expect("first ingest succeeds");
+        assert_eq!(first["deduplicated"].as_bool(), Some(false));
+        let generation_after_commit = signal.snapshot();
+        assert_ne!(
+            generation_after_commit, 0,
+            "a newly committed ingest must publish a wake"
+        );
+
+        let second = super::handle_ingest(&runtime, &signal, &token, body)
+            .await
+            .expect("deduplicated ingest succeeds");
+        assert_eq!(second["deduplicated"].as_bool(), Some(true));
+        assert_eq!(
+            signal.snapshot(),
+            generation_after_commit,
+            "a deduplicated ingest must not publish a wake"
         );
     }
 

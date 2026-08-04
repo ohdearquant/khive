@@ -184,7 +184,9 @@ captures the generation before every query, preventing a commit between the
 empty query and waiter registration from becoming a lost wakeup. A wake always
 re-runs the complete namespace, actor, status, and sender-filtered query; an
 unrelated message therefore causes only a re-query and the caller keeps waiting
-within the original deadline. A final query closes the race at deadline expiry.
+within the original deadline. A final query at deadline expiry observes any commit
+visible before that query takes its storage snapshot; a commit that lands after
+the snapshot is left to the caller's next request.
 
 `comm.send` and `comm.reply` publish after their dual-write has committed.
 `comm.ingest` publishes only after `try_create_note` returns a newly committed
@@ -214,7 +216,7 @@ back an earlier successful item.
 Patches only the `read` key via `NoteStore::try_patch_note_property`, a
 storage-side `json_set`, not a caller-side merge-then-overwrite of the whole
 `properties` column: the write re-evaluates namespace, message kind, direction,
-and addressee against the row's *current* state in the same `UPDATE`, so a
+and addressee against the row's _current_ state in the same `UPDATE`, so a
 property written by another caller between validation and this call (the bulk
 form's window can span up to 500 targets) survives untouched, and an
 eligibility change in that window degrades the mark instead of silently

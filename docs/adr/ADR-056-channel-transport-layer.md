@@ -51,8 +51,10 @@ boundary. The signal is payload-free and may wake calls for unrelated actors or
 filters; every wake re-runs the ordinary ADR-057/namespace-scoped database query
 and continues waiting if it is still empty. Durable storage remains authoritative,
 and a timeout-edge final query observes commits that arrive without this process's
-signal. The amendment changes wake latency only; channel lifecycle, dedup,
-checkpointing, and gate ownership are unchanged.
+signal when they are visible before that query takes its storage snapshot; a commit
+landing after the snapshot is left to the caller's next request. The amendment
+changes wake latency only; channel lifecycle, dedup, checkpointing, and gate
+ownership are unchanged.
 
 ## Amendment 2026-07-02 -- Inbound authentication hardening
 
