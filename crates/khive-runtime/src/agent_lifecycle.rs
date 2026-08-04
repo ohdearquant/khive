@@ -18,7 +18,8 @@ pub use khive_types::{AgentRecord, AgentState, TerminalReason};
 pub enum Trigger {
     /// The provider begins producing the first turn (`spawned` -> `running`).
     Dispatch,
-    /// A subsequent round of an already-running turn (`running` -> `running`, timestamp only).
+    /// A subsequent round of an already-running turn (`running` -> `running`, a no-op:
+    /// no state change is persisted and `state_changed_at` is not refreshed).
     Activity,
     Suspend,
     Resume,
