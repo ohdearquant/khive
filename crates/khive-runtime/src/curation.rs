@@ -1466,6 +1466,12 @@ impl KhiveRuntime {
             let _ = self.vectors_for_model(token, model_name)?;
         }
 
+        // Resolved here, where the runtime's installed pack-kind list is in
+        // reach; `merge_note_sql` runs on the writer connection with no runtime
+        // handle. Both notes share a kind (checked inside), so the into-note's
+        // kind decides for the merge.
+        let preserve_owner_established = self.is_pack_owned_note_kind(&into_note.kind);
+
         let pool = self.backend().pool_arc();
         let writer_task = pool.writer_task_handle().ok().flatten();
 
@@ -1483,6 +1489,7 @@ impl KhiveRuntime {
                         content_strategy,
                         dry_run,
                         pack_rules,
+                        preserve_owner_established,
                     )
                     .map_err(|e| {
                         khive_storage::StorageError::driver(
@@ -1509,6 +1516,7 @@ impl KhiveRuntime {
                         content_strategy,
                         dry_run,
                         pack_rules,
+                        preserve_owner_established,
                     )
                 })
             })
@@ -2354,6 +2362,7 @@ fn merge_note_sql(
     content_strategy: ContentMergeStrategy,
     dry_run: bool,
     pack_rules: Vec<EdgeEndpointRule>,
+    preserve_owner_established: bool,
 ) -> Result<(MergeSummary, khive_storage::note::Note), SqliteError> {
     let into_note = read_merge_note(conn, into_id, &namespace)?;
     let from_note = read_merge_note(conn, from_id, &namespace)?;
@@ -2454,8 +2463,18 @@ fn merge_note_sql(
         _ => into_note.name.clone().or(from_note.name.clone()),
     };
 
-    let (merged_props, properties_merged) =
+    let (mut merged_props, mut properties_merged) =
         merge_properties(&into_note.properties, &from_note.properties, strategy);
+
+    // A merge folds two records together; it does not transfer attribution.
+    // On a pack-owned note kind the into-note's owned identity properties are
+    // restored after the fold, under every strategy including `PreferFrom`, so
+    // the surviving row still says who wrote it.
+    if preserve_owner_established {
+        let reverted =
+            preserve_owner_established_properties(&into_note.properties, &mut merged_props);
+        properties_merged = properties_merged.saturating_sub(reverted);
+    }
 
     let merge_history_entry = serde_json::json!({
         "merged_from": from_id.to_string(),
@@ -2826,6 +2845,67 @@ pub(crate) fn owner_established_property_named_in(patch: &Value) -> Option<&'sta
         .iter()
         .copied()
         .find(|key| map.contains_key(*key))
+}
+
+/// Restore the into-note's [`OWNER_ESTABLISHED_PROPERTIES`] into `merged`
+/// after a property fold, and return how many of them the fold had taken from
+/// the from-note (so the caller can correct its merged-field count).
+///
+/// A key absent on the into-note is removed from `merged` rather than left as
+/// the from-note's value: a record that carried no owner-established value
+/// must not acquire one by being merged into. That applies to grouping as much
+/// as to attribution — a note with no `thread_id` must not join a conversation
+/// because another note was folded into it.
+///
+/// A fold can also yield a value that is not an object at all: `merge_json`
+/// applies a non-object `from` directly under `PreferFrom`, replacing the
+/// into-note's whole object with a scalar. A scalar cannot carry the
+/// owner-established keys, so there is nothing to restore them into and they
+/// would be erased. The into-note's properties are kept instead — the scalar
+/// contributes no key that could coexist with them, so nothing the fold
+/// intended is lost.
+pub(crate) fn preserve_owner_established_properties(
+    into: &Option<Value>,
+    merged: &mut Option<Value>,
+) -> usize {
+    if !matches!(merged, Some(Value::Object(_))) {
+        let Some(Value::Object(into_map)) = into else {
+            return 0;
+        };
+        let owned_on_into = OWNER_ESTABLISHED_PROPERTIES
+            .iter()
+            .filter(|key| into_map.contains_key(**key))
+            .count();
+        if owned_on_into > 0 {
+            *merged = into.clone();
+        }
+        return owned_on_into;
+    }
+    let Some(Value::Object(merged_map)) = merged.as_mut() else {
+        return 0;
+    };
+    let into_map = match into {
+        Some(Value::Object(m)) => Some(m),
+        _ => None,
+    };
+    let mut reverted = 0usize;
+    for key in OWNER_ESTABLISHED_PROPERTIES {
+        let original = into_map.and_then(|m| m.get(*key));
+        match original {
+            Some(value) => {
+                let replaced = merged_map.insert((*key).to_string(), value.clone());
+                if replaced.as_ref() != Some(value) {
+                    reverted += 1;
+                }
+            }
+            None => {
+                if merged_map.remove(*key).is_some() {
+                    reverted += 1;
+                }
+            }
+        }
+    }
+    reverted
 }
 
 /// Merge two property objects. Returns (merged, count_of_fields_from_from_that_were_added).

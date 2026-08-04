@@ -1811,13 +1811,14 @@ fn build_registry_for_multi_backend_inner(
     // update/delete verbs notify caching packs even though there is no
     // crate-level dependency between them.
     registry.call_register_note_mutation_hooks(&default_runtime);
-    // Note-write identity: the pack-owned kind set drives `update`'s
-    // properties refusal so a pack-owned note's identity properties cannot
-    // be overwritten by a caller-supplied `properties` patch. Each per-pack
-    // runtime is constructed independently in the multi-backend boot path
-    // (unlike the single-backend `KhiveMcpServer::with_packs` path), so the
-    // registry must be installed on every runtime that could actually serve
-    // a generic `update` for a pack-owned kind, not just `default_runtime`.
+    // Note-write identity: install the pack-owned kind set and the pack-owned
+    // note-write validator so identity properties are derived at the write and
+    // preserved through merge/update on every path, including the ones that
+    // reach no pack verb. Each per-pack runtime is constructed independently
+    // in the multi-backend boot path (unlike the single-backend
+    // `KhiveMcpServer::with_packs` path), so both must be installed on every
+    // runtime that could actually serve a generic `create`/`update`/`merge`
+    // for a pack-owned kind, not just `default_runtime`.
     let owned_note_kinds: Vec<String> = registry
         .pack_owned_note_kinds()
         .into_iter()
@@ -1826,6 +1827,15 @@ fn build_registry_for_multi_backend_inner(
     default_runtime.install_pack_owned_note_kinds(owned_note_kinds.clone());
     for rt in per_pack_runtimes_local.values() {
         rt.install_pack_owned_note_kinds(owned_note_kinds.clone());
+    }
+    // The validator is installed on every runtime the kind list reaches, not
+    // just the default: each per-pack runtime is built independently, so none
+    // of them shares the default's validator slot, and `core()` clones the
+    // secondary's own slots rather than the default's. A runtime that has the
+    // kind list but no validator enforces half the rule.
+    registry.call_register_note_write_validators(&default_runtime);
+    for rt in per_pack_runtimes_local.values() {
+        registry.call_register_note_write_validators(rt);
     }
 
     let backend_for_pack: HashMap<&str, &StorageBackend> = per_pack_runtimes_local
