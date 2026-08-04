@@ -17,6 +17,7 @@ members = [
     "khive-hnsw",
     "khive-vamana",
     "khive-runtime",
+    "khive-wire-protocol",
     "khive-request",
     "khive-pack-kg",
     "khive-pack-gtd",
