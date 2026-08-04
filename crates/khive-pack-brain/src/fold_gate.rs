@@ -682,7 +682,7 @@ mod tests {
     /// manual seed transaction hit "cannot start a transaction within a
     /// transaction" under `cargo test`'s default parallelism before this test
     /// was rewritten to avoid the env var). Constructing the pool directly
-    /// with `write_queue_enabled: true` in the config literal, and driving
+    /// with `write_queue_enabled: Some(true)` in the config literal, and driving
     /// `apply_fold_gate` over a bare `SqlBridge` instead of a full
     /// `KhiveRuntime`, sidesteps global mutable state entirely — no
     /// `#[serial]` needed, and no risk to any other test in this binary.
@@ -692,7 +692,7 @@ mod tests {
         let db_path = dir.path().join("fold-gate-write-queue-routing.db");
         let pool_cfg = khive_db::PoolConfig {
             path: Some(db_path),
-            write_queue_enabled: true,
+            write_queue_enabled: Some(true),
             ..khive_db::PoolConfig::default()
         };
         let pool = std::sync::Arc::new(khive_db::ConnectionPool::new(pool_cfg).expect("pool"));

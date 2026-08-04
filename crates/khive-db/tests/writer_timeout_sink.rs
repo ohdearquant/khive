@@ -154,6 +154,10 @@ async fn sql_bridge_busy_standalone_writer_emits_ndjson_row() {
     let pool_cfg = PoolConfig {
         path: Some(db_path.clone()),
         busy_timeout: Duration::from_millis(100),
+        // Force the legacy standalone-writer path so this test keeps
+        // exercising the `standalone:sql_bridge` busy site regardless of
+        // the file-backed write-queue default.
+        write_queue_enabled: Some(false),
         ..PoolConfig::default()
     };
     let pool = Arc::new(ConnectionPool::new(pool_cfg).unwrap());
@@ -222,6 +226,10 @@ async fn graph_busy_standalone_writer_emits_ndjson_row() {
     let pool_cfg = PoolConfig {
         path: Some(db_path.clone()),
         busy_timeout: Duration::from_millis(100),
+        // Force the legacy standalone-writer path so this test keeps
+        // exercising the `standalone:graph` busy site regardless of the
+        // file-backed write-queue default.
+        write_queue_enabled: Some(false),
         ..PoolConfig::default()
     };
     let pool = Arc::new(ConnectionPool::new(pool_cfg).unwrap());
@@ -290,6 +298,10 @@ async fn event_busy_standalone_writer_emits_ndjson_row() {
     let pool_cfg = PoolConfig {
         path: Some(db_path.clone()),
         busy_timeout: Duration::from_millis(100),
+        // Force the legacy standalone-writer path so this test keeps
+        // exercising the `standalone:event` busy site regardless of the
+        // file-backed write-queue default.
+        write_queue_enabled: Some(false),
         ..PoolConfig::default()
     };
     let pool = Arc::new(ConnectionPool::new(pool_cfg).unwrap());
@@ -346,10 +358,13 @@ async fn event_busy_standalone_writer_emits_ndjson_row() {
 /// itself is crate-private, so this goes through the public
 /// `StorageBackend::sqlite`/`.text()` surface instead of constructing the
 /// store type directly. `#[serial]` because, unlike the other tests here,
-/// this one must read `KHIVE_BUSY_TIMEOUT_SECS` off `PoolConfig::default()`
-/// (there is no field to override directly through `StorageBackend`) —
-/// serializing avoids a hypothetical future test in this file racing the
-/// same env var.
+/// this one must read `KHIVE_BUSY_TIMEOUT_SECS` and `KHIVE_WRITE_QUEUE` off
+/// `PoolConfig::default()` (there is no field to override directly through
+/// `StorageBackend`) — serializing avoids a hypothetical future test in this
+/// file racing the same env vars. `KHIVE_WRITE_QUEUE=0` forces the legacy
+/// standalone-writer path so this test keeps exercising the
+/// `standalone:text` busy site regardless of the file-backed write-queue
+/// default.
 #[tokio::test]
 #[serial_test::serial(writer_timeout_sink_busy_env)]
 async fn text_busy_standalone_writer_emits_ndjson_row() {
@@ -359,11 +374,17 @@ async fn text_busy_standalone_writer_emits_ndjson_row() {
     let db_path = dir.path().join("text_busy_sink_test.db");
 
     let previous_busy_timeout = std::env::var_os("KHIVE_BUSY_TIMEOUT_SECS");
+    let previous_write_queue = std::env::var_os("KHIVE_WRITE_QUEUE");
     std::env::set_var("KHIVE_BUSY_TIMEOUT_SECS", "1");
+    std::env::set_var("KHIVE_WRITE_QUEUE", "0");
     let backend = khive_db::StorageBackend::sqlite(&db_path).expect("file-backed backend");
     match previous_busy_timeout {
         Some(v) => std::env::set_var("KHIVE_BUSY_TIMEOUT_SECS", v),
         None => std::env::remove_var("KHIVE_BUSY_TIMEOUT_SECS"),
+    }
+    match previous_write_queue {
+        Some(v) => std::env::set_var("KHIVE_WRITE_QUEUE", v),
+        None => std::env::remove_var("KHIVE_WRITE_QUEUE"),
     }
 
     let store = backend.text("wts_busy_test").expect("text search");
@@ -428,7 +449,7 @@ async fn slow_queued_write_emits_slow_write_row() {
         std::env::set_var("KHIVE_SLOW_WRITE_THRESHOLD_MS", "1");
         let cfg = PoolConfig {
             path: Some(db_path.clone()),
-            write_queue_enabled: true,
+            write_queue_enabled: Some(true),
             ..PoolConfig::default()
         };
         let pool = ConnectionPool::new(cfg).expect("file-backed pool should open");
@@ -484,7 +505,7 @@ async fn slow_write_disabled_by_zero_threshold_emits_nothing() {
         std::env::set_var("KHIVE_SLOW_WRITE_THRESHOLD_MS", "0");
         let cfg = PoolConfig {
             path: Some(db_path.clone()),
-            write_queue_enabled: true,
+            write_queue_enabled: Some(true),
             ..PoolConfig::default()
         };
         let pool = ConnectionPool::new(cfg).expect("file-backed pool should open");

@@ -72,9 +72,15 @@ pub struct PoolConfig {
     /// single-writer guarantee — other write paths still open their own
     /// writers until later slices migrate them.
     ///
+    /// `None` means the caller expressed no preference: [`ConnectionPool::new`]
+    /// resolves it once `path` is known, defaulting to `true` for file-backed
+    /// pools and `false` for in-memory ones. `Some(_)` is an explicit
+    /// preference and always wins, in both directions, over that default.
+    ///
     /// Overridable via `KHIVE_WRITE_QUEUE` (`"1"` or `"true"`,
-    /// case-insensitive, enables it; anything else, or unset, leaves it off).
-    pub write_queue_enabled: bool,
+    /// case-insensitive, sets `Some(true)`; any other value sets `Some(false)`;
+    /// unset leaves it `None`).
+    pub write_queue_enabled: Option<bool>,
     /// Bounded channel capacity for the `WriterTask` write queue.
     ///
     /// Overridable via `KHIVE_WRITE_QUEUE_CAPACITY`. Default: 256 pending
@@ -123,8 +129,8 @@ impl Default for PoolConfig {
                 .unwrap_or(DEFAULT_JOURNAL_SIZE_LIMIT_BYTES),
             read_only: false,
             write_queue_enabled: std::env::var("KHIVE_WRITE_QUEUE")
-                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-                .unwrap_or(false),
+                .ok()
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true")),
             write_queue_capacity: std::env::var("KHIVE_WRITE_QUEUE_CAPACITY")
                 .ok()
                 .and_then(|v| v.parse::<usize>().ok())
@@ -451,6 +457,13 @@ impl ConnectionPool {
     pub fn new(config: PoolConfig) -> Result<Self, SqliteError> {
         refuse_home_data_store_in_tests(&config)?;
 
+        // Resolve "no preference" (`None`) now that `path` is known: on for
+        // file-backed pools, off for in-memory ones. An explicit `Some(_)`
+        // preference is left untouched and always wins.
+        let mut config = config;
+        config.write_queue_enabled =
+            Some(config.write_queue_enabled.unwrap_or(config.path.is_some()));
+
         let writer = open_writer_connection(&config)?;
         let wal_enabled = configure_writer_connection(&writer, &config)?;
         let max_readers = effective_reader_count(&config, wal_enabled);
@@ -690,7 +703,7 @@ impl ConnectionPool {
     /// fail loud on a genuine misconfiguration (write queue requested but no
     /// runtime to run it on) can propagate the `Err` directly.
     pub fn writer_task_handle(&self) -> Result<Option<WriterTaskHandle>, StorageError> {
-        if !self.config.write_queue_enabled {
+        if !self.config.write_queue_enabled.unwrap_or(false) {
             return Ok(None);
         }
         // Fast path: already resolved (spawned, degraded, or off) by an
@@ -1261,10 +1274,10 @@ mod tests {
 
     #[test]
     #[serial]
-    fn pool_config_write_queue_defaults_off() {
+    fn pool_config_write_queue_defaults_unset() {
         let _pool_env = clear_pool_env();
         let cfg = PoolConfig::default();
-        assert!(!cfg.write_queue_enabled);
+        assert_eq!(cfg.write_queue_enabled, None);
         assert_eq!(cfg.write_queue_capacity, DEFAULT_WRITE_QUEUE_CAPACITY);
     }
 
@@ -1291,7 +1304,7 @@ mod tests {
         std::env::set_var("KHIVE_WRITE_QUEUE", "1");
         let cfg = PoolConfig::default();
         std::env::remove_var("KHIVE_WRITE_QUEUE");
-        assert!(cfg.write_queue_enabled);
+        assert_eq!(cfg.write_queue_enabled, Some(true));
     }
 
     #[test]
@@ -1300,7 +1313,16 @@ mod tests {
         std::env::set_var("KHIVE_WRITE_QUEUE", "True");
         let cfg = PoolConfig::default();
         std::env::remove_var("KHIVE_WRITE_QUEUE");
-        assert!(cfg.write_queue_enabled);
+        assert_eq!(cfg.write_queue_enabled, Some(true));
+    }
+
+    #[test]
+    #[serial]
+    fn pool_config_env_override_write_queue_enabled_accepts_zero_as_explicit_off() {
+        std::env::set_var("KHIVE_WRITE_QUEUE", "0");
+        let cfg = PoolConfig::default();
+        std::env::remove_var("KHIVE_WRITE_QUEUE");
+        assert_eq!(cfg.write_queue_enabled, Some(false));
     }
 
     #[test]
@@ -1385,6 +1407,62 @@ mod tests {
         let pool = ConnectionPool::new(cfg).expect("file-backed pool should open");
         assert!(path.exists());
         assert!(pool.max_readers() > 0);
+    }
+
+    #[test]
+    #[serial]
+    fn unset_write_queue_resolves_on_for_file_backed_pool() {
+        let _pool_env = clear_pool_env();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("unset_file_backed.db");
+        let pool = ConnectionPool::new(PoolConfig {
+            path: Some(path),
+            write_queue_enabled: None,
+            ..PoolConfig::default()
+        })
+        .expect("file-backed pool should open");
+        assert_eq!(pool.config().write_queue_enabled, Some(true));
+    }
+
+    #[test]
+    #[serial]
+    fn unset_write_queue_resolves_off_for_memory_backed_pool() {
+        let _pool_env = clear_pool_env();
+        let pool = ConnectionPool::new(PoolConfig {
+            path: None,
+            write_queue_enabled: None,
+            ..PoolConfig::default()
+        })
+        .expect("in-memory pool should open");
+        assert_eq!(pool.config().write_queue_enabled, Some(false));
+    }
+
+    #[test]
+    #[serial]
+    fn explicit_false_stays_off_for_file_backed_pool() {
+        let _pool_env = clear_pool_env();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("explicit_false_file_backed.db");
+        let pool = ConnectionPool::new(PoolConfig {
+            path: Some(path),
+            write_queue_enabled: Some(false),
+            ..PoolConfig::default()
+        })
+        .expect("file-backed pool should open");
+        assert_eq!(pool.config().write_queue_enabled, Some(false));
+    }
+
+    #[test]
+    #[serial]
+    fn explicit_true_stays_on_for_memory_backed_pool() {
+        let _pool_env = clear_pool_env();
+        let pool = ConnectionPool::new(PoolConfig {
+            path: None,
+            write_queue_enabled: Some(true),
+            ..PoolConfig::default()
+        })
+        .expect("in-memory pool should open");
+        assert_eq!(pool.config().write_queue_enabled, Some(true));
     }
 
     #[test]
@@ -1554,7 +1632,7 @@ mod tests {
         let path = dir.path().join("writer_task_no_runtime.db");
         let cfg = PoolConfig {
             path: Some(path),
-            write_queue_enabled: true,
+            write_queue_enabled: Some(true),
             ..PoolConfig::default()
         };
         let pool = ConnectionPool::new(cfg).expect("file-backed pool should open");

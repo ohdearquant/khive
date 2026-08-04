@@ -9124,7 +9124,7 @@ mod tests {
     // delete against the guarded write via `tokio::join!` with no explicit
     // ordering control, so the scheduler could run them fully sequentially
     // on one thread without ever exercising real interleaving, and neither
-    // the file-backed storage path nor `write_queue_enabled: true`
+    // the file-backed storage path nor `write_queue_enabled: Some(true)`
     // (`KHIVE_WRITE_QUEUE=1`, the `WriterTask`-routed write path in
     // `SqlGraphStore`) is covered at all. The four tests below close both
     // gaps: file-backed databases, one run with the writer queue off

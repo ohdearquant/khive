@@ -1431,7 +1431,7 @@ mod tests {
         let path = dir.path().join("writer_task_wrapped_panic.db");
         let cfg = PoolConfig {
             path: Some(path),
-            write_queue_enabled: true,
+            write_queue_enabled: Some(true),
             write_queue_capacity: 8,
             ..PoolConfig::default()
         };

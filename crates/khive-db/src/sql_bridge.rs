@@ -1075,7 +1075,7 @@ impl khive_storage::SqlAccess for SqlBridge {
                         .into(),
                 });
             }
-            if writer_task.is_none() && self.pool.config().write_queue_enabled {
+            if writer_task.is_none() && self.pool.config().write_queue_enabled.unwrap_or(false) {
                 // The queue is enabled but this call didn't get a handle
                 // (spawn/runtime degrade) — a direct-route violation in the
                 // making once this writer's execute*/query* methods run.
@@ -1144,7 +1144,7 @@ impl khive_storage::SqlAccess for SqlBridge {
                         .into(),
                 });
             }
-            if handle.is_none() && self.pool.config().write_queue_enabled {
+            if handle.is_none() && self.pool.config().write_queue_enabled.unwrap_or(false) {
                 crate::timeout_sink::emit_direct_route_violation(
                     &crate::timeout_sink::db_label(&self.pool),
                     crate::timeout_sink::Site::DirectRouteAtomicUnit,
@@ -1219,7 +1219,7 @@ mod tests {
         let path = dir.path().join("write_queue_execute_batch.db");
         let config = PoolConfig {
             path: Some(path.clone()),
-            write_queue_enabled: true,
+            write_queue_enabled: Some(true),
             ..PoolConfig::default()
         };
         let pool = Arc::new(ConnectionPool::new(config).unwrap());
@@ -1286,7 +1286,7 @@ mod tests {
         let path = dir.path().join("write_queue_execute_batch_rollback.db");
         let config = PoolConfig {
             path: Some(path.clone()),
-            write_queue_enabled: true,
+            write_queue_enabled: Some(true),
             ..PoolConfig::default()
         };
         let pool = Arc::new(ConnectionPool::new(config).unwrap());
@@ -1362,7 +1362,7 @@ mod tests {
     /// call immediately afterward.
     ///
     /// Not `#[serial]` / no env var: builds the pool directly with
-    /// `write_queue_enabled: true` in the `PoolConfig` literal, same
+    /// `write_queue_enabled: Some(true)` in the `PoolConfig` literal, same
     /// technique as this round's other new routing tests.
     #[tokio::test]
     async fn atomic_unit_pending_future_errors_without_killing_writer_task() {
@@ -1370,7 +1370,7 @@ mod tests {
         let path = dir.path().join("atomic_unit_pending_future.db");
         let config = PoolConfig {
             path: Some(path.clone()),
-            write_queue_enabled: true,
+            write_queue_enabled: Some(true),
             ..PoolConfig::default()
         };
         let pool = Arc::new(ConnectionPool::new(config).unwrap());
@@ -1468,7 +1468,7 @@ mod tests {
         let path = dir.path().join("strict_writer.db");
         let config = PoolConfig {
             path: Some(path),
-            write_queue_enabled: false,
+            write_queue_enabled: Some(false),
             write_routing_strict: true,
             ..PoolConfig::default()
         };
@@ -1499,7 +1499,7 @@ mod tests {
         let path = dir.path().join("strict_atomic_unit.db");
         let config = PoolConfig {
             path: Some(path),
-            write_queue_enabled: false,
+            write_queue_enabled: Some(false),
             write_routing_strict: true,
             ..PoolConfig::default()
         };
@@ -1535,7 +1535,7 @@ mod tests {
         let path = dir.path().join("writer_read_after_write.db");
         let config = PoolConfig {
             path: Some(path),
-            write_queue_enabled: true,
+            write_queue_enabled: Some(true),
             write_routing_strict: true,
             ..PoolConfig::default()
         };
@@ -1595,7 +1595,7 @@ mod tests {
         let path = dir.path().join("writer_readonly_returning.db");
         let config = PoolConfig {
             path: Some(path),
-            write_queue_enabled: true,
+            write_queue_enabled: Some(true),
             write_routing_strict: true,
             ..PoolConfig::default()
         };
@@ -1671,7 +1671,7 @@ mod tests {
         let path = dir.path().join("acceptance_batch.db");
         let config = PoolConfig {
             path: Some(path),
-            write_queue_enabled: true,
+            write_queue_enabled: Some(true),
             write_routing_strict: true,
             ..PoolConfig::default()
         };
@@ -1862,7 +1862,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let config = PoolConfig {
             path: Some(dir.path().join("bridge_writer_acquisitions.db")),
-            write_queue_enabled: false,
+            write_queue_enabled: Some(false),
             ..PoolConfig::default()
         };
         let pool = Arc::new(ConnectionPool::new(config).unwrap());

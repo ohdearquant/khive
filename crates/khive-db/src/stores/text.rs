@@ -44,7 +44,7 @@ fn refuse_direct_route_if_strict(
                 .into(),
         });
     }
-    if pool.config().write_queue_enabled {
+    if pool.config().write_queue_enabled.unwrap_or(false) {
         crate::timeout_sink::emit_direct_route_violation(
             &crate::timeout_sink::db_label(pool),
             site,
