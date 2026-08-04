@@ -425,6 +425,30 @@ FIXTURE
         '  <!-- END GENERATED ADR CATALOG -->' \
         > "$tmp/case-continuation-indent-end/docs/adr/README.md"
 
+    # Regression case 23 (must-PASS control, trailing whitespace on both markers):
+    # the discriminator for the rstrip/strip asymmetry. Without it a suite of
+    # leading-indentation must-FAIL arms is equally satisfied by a script that
+    # rejects any marker line that is not byte-exact, which would go red on a
+    # correct index over an invisible character. Markdown reads these two lines
+    # identically to the clean ones.
+    mkdir -p "$tmp/case-trailing-space-markers/docs/adr"
+    cat > "$tmp/case-trailing-space-markers/docs/adr/ADR-216-fixture-trailing-space.md" <<'FIXTURE'
+# ADR-216: Fixture Trailing Space
+
+**Status**: accepted
+FIXTURE
+    printf '%s\n' \
+        '# ADR Index' \
+        '' \
+        '<!-- BEGIN GENERATED ADR CATALOG -->  ' \
+        '' \
+        '| ADR | Title |' \
+        '| --- | --- |' \
+        '| [ADR-216](ADR-216-fixture-trailing-space.md) | Fixture Trailing Space |' \
+        '' \
+        '<!-- END GENERATED ADR CATALOG -->	' \
+        > "$tmp/case-trailing-space-markers/docs/adr/README.md"
+
     # Regression case 22 (must-FAIL control, the Round-5 list-item fence
     # reproducer verbatim). Recorded because it is the reported defect, NOT
     # because it isolates one mechanism: under this grammar it is rejected
@@ -699,6 +723,14 @@ FIXTURE
         fi
     done
 
+    if ! sh "$SCRIPT_DIR/lint-adr-refs.sh" "$tmp/case-trailing-space-markers" > "$tmp/trailing-space.log" 2>&1; then
+        echo "self-test FAILED: markers carrying trailing whitespace should still delimit the catalog"
+        cat "$tmp/trailing-space.log"
+        status=1
+    else
+        echo "self-test OK: trailing whitespace on a marker does not hide it"
+    fi
+
     # Cases 17-22: the catalog grammar rejects every one of these outright, so
     # each asserts a rejection rather than a particular repair. Their value is
     # that none of them needs Markdown state to be recognised as inert.
@@ -933,8 +965,13 @@ catalog_separator_re = re.compile(r"^\|\s*-{3,}\s*\|\s*-{3,}\s*\|$")
 cataloged_numbers: set[str] = set()
 
 index_lines = index_path.read_text(encoding="utf-8").split("\n")
-begin_positions = [i for i, line in enumerate(index_lines) if line == catalog_begin]
-end_positions = [i for i, line in enumerate(index_lines) if line == catalog_end]
+# rstrip, never strip: trailing whitespace is invisible to a reader and changes
+# nothing about how Markdown reads the line, while LEADING whitespace is exactly
+# what has to keep failing -- it is what turns a marker into indented code or a
+# container child. The repository's trailing-whitespace hook excludes .md, so
+# nothing upstream removes it.
+begin_positions = [i for i, line in enumerate(index_lines) if line.rstrip() == catalog_begin]
+end_positions = [i for i, line in enumerate(index_lines) if line.rstrip() == catalog_end]
 
 
 def describe(count: int, marker: str) -> str:
