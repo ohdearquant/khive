@@ -2570,9 +2570,16 @@ pub fn resolved_database_disclosure(
         Some(_) if !backends.is_empty() => {
             let targets: Vec<String> = backends
                 .iter()
-                .map(|backend| match backend.path.as_deref() {
-                    Some(path) => format!("{}={}", backend.name, path.display()),
-                    None => format!("{}=:memory:", backend.name),
+                .map(|backend| match (&backend.kind, backend.path.as_deref()) {
+                    // Kind decides first: a `memory` backend's `path` is
+                    // ignored by construction (see `BackendConfig::path`), so
+                    // a stray configured path must not be presented as a
+                    // write target.
+                    (BackendKind::Memory, _) => format!("{}=:memory:", backend.name),
+                    (BackendKind::Sqlite, Some(path)) => {
+                        format!("{}={}", backend.name, path.display())
+                    }
+                    (BackendKind::Sqlite, None) => format!("{}=<unresolved>", backend.name),
                 })
                 .collect();
             format!(
@@ -2993,7 +3000,9 @@ mod tests {
             BackendConfig {
                 name: "scratch".into(),
                 kind: BackendKind::Memory,
-                path: None,
+                // Stray path on a memory backend: ignored by construction, so
+                // the disclosure must not present it as a write target.
+                path: Some(std::path::PathBuf::from("/data/ignored-stray.db")),
                 cache_mb: None,
                 journal_mode: None,
                 read_only: false,
@@ -3008,6 +3017,10 @@ mod tests {
         assert!(
             !line.contains("/home/op/.khive/khive.db"),
             "multi-backend disclosure must not present the anchor path as a write target; got: {line}"
+        );
+        assert!(
+            !line.contains("ignored-stray"),
+            "a memory backend's stray configured path is ignored by construction and must not be disclosed; got: {line}"
         );
     }
 
