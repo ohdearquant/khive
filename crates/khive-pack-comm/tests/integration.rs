@@ -11489,3 +11489,270 @@ async fn i1471_attributed_sent_box_excludes_legacy_rows() {
         "attributed caller must not inherit legacy from_actor-less rows; got {contents:?}"
     );
 }
+
+// ── #1471 follow-up: sent-box combination pins ──────────────────────────────
+
+/// Projection applies to sent rows through the same strict vocabulary as the
+/// inbox box, and the sent box always reports `unread_count = 0` (outbound
+/// rows carry no recipient read state).
+#[tokio::test]
+async fn sent_box_fields_projection_applies_and_unread_count_is_zero() {
+    let backend = shared_backend();
+    let (registry_a, _rt_a) = build_actor_registry(backend, "lambda:a");
+
+    registry_a
+        .dispatch(
+            "comm.send",
+            serde_json::json!({
+                "to": "lambda:b",
+                "subject": "sent projection",
+                "content": "body must be omitted from the projected sent view",
+            }),
+        )
+        .await
+        .expect("send for sent projection test");
+
+    let sent = registry_a
+        .dispatch(
+            "comm.inbox",
+            serde_json::json!({
+                "box": "sent",
+                "fields": ["id", "to_actor", "subject", "direction"],
+            }),
+        )
+        .await
+        .expect("projected sent history");
+    assert_eq!(sent["count"], 1);
+    assert_eq!(
+        sent["unread_count"], 0,
+        "sent rows have no recipient read state, so the sent box reports zero; got {sent}"
+    );
+    let message = sent["messages"][0].as_object().expect("message object");
+    let expected: std::collections::BTreeSet<&str> = ["id", "to_actor", "subject", "direction"]
+        .into_iter()
+        .collect();
+    let actual: std::collections::BTreeSet<&str> = message.keys().map(String::as_str).collect();
+    assert_eq!(actual, expected, "projection must select exactly `fields`");
+    assert_eq!(message["to_actor"], "lambda:b");
+    assert_eq!(message["subject"], "sent projection");
+    assert_eq!(message["direction"], "outbound");
+}
+
+/// Sent-box paging walks the newest-first filtered sequence with stable page
+/// boundaries: `next_offset` chains pages without overlap or gaps, and the
+/// terminal page reports `has_more = false` with a null `next_offset`.
+#[tokio::test]
+async fn sent_box_paginates_newest_first_with_stable_boundaries() {
+    let backend = shared_backend();
+    let (registry_a, _rt_a) = build_actor_registry(backend, "lambda:a");
+
+    for index in 1..=3 {
+        registry_a
+            .dispatch(
+                "comm.send",
+                serde_json::json!({
+                    "to": "lambda:b",
+                    "content": format!("sent page {index}"),
+                }),
+            )
+            .await
+            .expect("send succeeds");
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+
+    let page_one = registry_a
+        .dispatch(
+            "comm.inbox",
+            serde_json::json!({ "box": "sent", "limit": 2 }),
+        )
+        .await
+        .expect("first sent page");
+    assert_eq!(page_one["count"], 2);
+    assert_eq!(page_one["offset"], 0);
+    assert_eq!(page_one["has_more"], true);
+    assert_eq!(page_one["next_offset"], 2);
+    let page_one_contents: Vec<&str> = page_one["messages"]
+        .as_array()
+        .expect("messages array")
+        .iter()
+        .filter_map(|message| message["content"].as_str())
+        .collect();
+    assert_eq!(
+        page_one_contents,
+        vec!["sent page 3", "sent page 2"],
+        "the first page must be the two newest rows, newest first"
+    );
+
+    let page_two = registry_a
+        .dispatch(
+            "comm.inbox",
+            serde_json::json!({ "box": "sent", "limit": 2, "offset": 2 }),
+        )
+        .await
+        .expect("second sent page");
+    assert_eq!(page_two["count"], 1);
+    assert_eq!(page_two["offset"], 2);
+    assert_eq!(page_two["has_more"], false);
+    assert!(
+        page_two["next_offset"].is_null(),
+        "the terminal page must not hand out a next offset; got {page_two}"
+    );
+    assert_eq!(
+        page_two["messages"][0]["content"].as_str(),
+        Some("sent page 1"),
+        "the final page picks up exactly where page one ended"
+    );
+}
+
+/// A `box` value outside the accepted set is rejected, and the error names
+/// the valid values.
+#[tokio::test]
+async fn inbox_rejects_box_value_outside_the_accepted_set() {
+    let (registry, _rt) = build_registry_for_ns("local");
+
+    let error = registry
+        .dispatch("comm.inbox", serde_json::json!({ "box": "banana" }))
+        .await
+        .expect_err("an unknown box value must be rejected");
+    let message = error.to_string();
+    assert!(
+        message.contains("invalid `box`"),
+        "error must name the `box` parameter; got {message}"
+    );
+    assert!(
+        message.contains("inbox") && message.contains("sent"),
+        "error must name the valid values; got {message}"
+    );
+}
+
+/// An empty-string `to_actor` filter is caller error: stored actor labels are
+/// never empty (`send` validates), so the filter could only silently match
+/// nothing. It is rejected with the same shape as the empty substring-filter
+/// validations.
+#[tokio::test]
+async fn sent_box_rejects_empty_to_actor_filter() {
+    let (registry, _rt) = build_registry_for_ns("local");
+
+    let error = registry
+        .dispatch(
+            "comm.inbox",
+            serde_json::json!({ "box": "sent", "to_actor": "" }),
+        )
+        .await
+        .expect_err("an empty to_actor filter must be rejected");
+    let message = error.to_string();
+    assert!(
+        message.contains("`to_actor`") && message.contains("must not be empty"),
+        "error must name the parameter and the empty-value rule; got {message}"
+    );
+}
+
+/// A stored outbound row missing `to_actor`/`from_actor` degrades per the
+/// handler's definitions instead of panicking: for the anonymous `"local"`
+/// caller the `from_actor` predicate falls back to EqOrMissing so the row
+/// stays listed, the projected `to_actor` alias has no property or top-level
+/// `to` to fall back to and renders as null, and an exact `to_actor` filter
+/// simply does not match the property-less row.
+#[tokio::test]
+async fn sent_box_null_property_fallback_does_not_panic() {
+    let backend = shared_backend();
+    let (registry_local, rt_local) = build_actor_registry(backend, "local");
+
+    let local_tok = rt_local
+        .authorize(Namespace::local())
+        .expect("authorize local fixture namespace");
+    let fixture = rt_local
+        .create_note(
+            &local_tok,
+            "message",
+            None,
+            "legacy outbound, no actor properties",
+            None,
+            Some(serde_json::json!({ "direction": "outbound" })),
+            vec![],
+        )
+        .await
+        .expect("actor-property-less outbound fixture");
+    let fixture_id = fixture.id.as_hyphenated().to_string();
+
+    let sent = registry_local
+        .dispatch(
+            "comm.inbox",
+            serde_json::json!({ "box": "sent", "fields": ["id", "to_actor", "from_actor"] }),
+        )
+        .await
+        .expect("projected sent history over a property-less row");
+    assert_eq!(
+        sent["count"], 1,
+        "the local caller's EqOrMissing from_actor fallback must keep the row visible; got {sent}"
+    );
+    let message = &sent["messages"][0];
+    assert_eq!(message["id"], fixture_id);
+    assert!(
+        message["to_actor"].is_null(),
+        "to_actor has no property or top-level `to` to fall back to; got {message}"
+    );
+    assert_eq!(
+        message["from_actor"], "local",
+        "from_actor falls back to the top-level `from`, which defaults to the row namespace"
+    );
+
+    let filtered = registry_local
+        .dispatch(
+            "comm.inbox",
+            serde_json::json!({ "box": "sent", "to_actor": "lambda:b" }),
+        )
+        .await
+        .expect("exact to_actor filter over a property-less row");
+    assert_eq!(
+        filtered["count"], 0,
+        "an exact to_actor predicate must not match a row without the property; got {filtered}"
+    );
+}
+
+/// A long-poll on the sent box wakes when the caller sends a new message: the
+/// inbox generation counter is direction-agnostic, so an outbound commit
+/// publishes the same signal an inbound one does.
+#[tokio::test]
+async fn sent_box_long_poll_wakes_after_concurrent_send() {
+    let (registry, _rt) = build_registry_for_ns("local");
+    let waiter_registry = registry.clone();
+    let mut waiter = tokio::spawn(async move {
+        waiter_registry
+            .dispatch(
+                "comm.inbox",
+                serde_json::json!({ "box": "sent", "wait_ms": 5_000 }),
+            )
+            .await
+    });
+
+    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    assert!(
+        !waiter.is_finished(),
+        "an empty sent box must remain blocked before a matching send"
+    );
+
+    registry
+        .dispatch(
+            "comm.send",
+            serde_json::json!({ "to": "lambda:b", "content": "send wakes the sent box" }),
+        )
+        .await
+        .expect("concurrent send succeeds");
+
+    let sent = match tokio::time::timeout(std::time::Duration::from_secs(1), &mut waiter).await {
+        Ok(joined) => joined
+            .expect("long-poll task must not panic")
+            .expect("long-poll sent box succeeds"),
+        Err(_) => {
+            waiter.abort();
+            panic!("long-poll sent box did not wake within one second of send");
+        }
+    };
+    assert_eq!(sent["count"].as_u64(), Some(1));
+    assert_eq!(
+        sent["messages"][0]["content"].as_str(),
+        Some("send wakes the sent box")
+    );
+    assert_eq!(sent["messages"][0]["direction"].as_str(), Some("outbound"));
+}

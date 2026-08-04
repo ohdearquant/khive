@@ -479,6 +479,10 @@ pub(crate) async fn handle_inbox(
 
     validate_inbox_substring("subject_contains", p.subject_contains.as_deref())?;
     validate_inbox_substring("content_contains", p.content_contains.as_deref())?;
+    // Stored actor labels are never empty (`send`/`ingest` validate them), so
+    // an empty exact-match filter can only be caller error; reject it like the
+    // substring filters above instead of silently matching nothing.
+    validate_inbox_substring("to_actor", p.to_actor.as_deref())?;
 
     let since_micros = p
         .since
