@@ -786,14 +786,22 @@ the Gate's former fail-open one, and remains the construction-primary defense fo
 `session.search` (ADR-117a) is the first member. Future verbs that return cross-tenant-sensitive rows
 join by the same handler-seam contract.
 
+_Implementation status (2026-08-04)._ `session.search` does not exist. No pack registers it — the
+session pack registers `session.export`, `session.list`, `session.resume`, and `session.store` — and
+neither the migration nor the no-scope-refusal tests ADR-117a specifies have landed. The class
+contract above is in force for any verb that joins it, but the class has no live member today, so
+nothing in this amendment is currently exercised by shipped code. ADR-117a requires the verb, the
+migration, and the enforcement predicate to land as one change; only the contract half reached this
+record. Remove this note when `session.search` ships.
+
 ### Consequences
 
 - The Gate model is unchanged; this adds a named handler-seam obligation, not a new Gate mode.
 - A fail-closed-class member is safe under `AllowAllGate` and under a gate `Err`, because its isolation
   never depended on the Gate returning `Deny`.
 - Membership is a per-verb contract a pack declares; the enforcement lives in the member's handler and
-  is proven by that verb's isolation and no-scope-refusal tests (ADR-117a discharges both for
-  `session.search`).
+  is proven by that verb's isolation and no-scope-refusal tests (ADR-117a specifies both for
+  `session.search`; see the implementation-status note above for what has actually landed).
 
 ---
 
