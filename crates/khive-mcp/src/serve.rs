@@ -2029,8 +2029,10 @@ pub fn build_server_with_explicit_namespace(
 
     // Issue #1586: disclose the resolved database target once at startup so a
     // no-override invocation's silent default (`$HOME/.khive/khive.db`) is
-    // visible in the operator's log alongside the other startup facts.
-    tracing::info!(target: "khive.boot", "{}", resolved_database_disclosure(config.db_path.as_deref()));
+    // visible in the operator's log alongside the other startup facts. The
+    // backends slice keeps the line truthful in multi-backend mode, where the
+    // config-declared backend paths — not `config.db_path` — receive writes.
+    tracing::info!(target: "khive.boot", "{}", resolved_database_disclosure(config.db_path.as_deref(), &khive_cfg.backends));
 
     if khive_cfg.backends.is_empty() {
         // Single-backend path — identical to pre-ADR-028 behavior.
@@ -2538,10 +2540,19 @@ pub fn config_discovery_db_anchor(db: Option<&str>) -> Option<std::path::PathBuf
     db.and_then(|d| khive_runtime::resolve_db_anchor(Some(d)))
 }
 
-/// One-line disclosure of the database this process will write to, for CLI
-/// entry points that resolve a database path. Returns a sentence naming the
-/// resolved target: the concrete file path, or the ephemeral in-memory marker
-/// when the resolved path is `:memory:`.
+/// One-line disclosure of the database target(s) this process will write to,
+/// for CLI entry points that resolve a database path. Returns a sentence
+/// naming the resolved target: the concrete file path, the ephemeral
+/// in-memory marker when the resolved path is `:memory:`, or — when the
+/// loaded config declares `[[backends]]` — the config-declared backend
+/// targets, which are what actually receive writes in multi-backend mode
+/// (the single resolved anchor path is a discovery/fingerprint input there,
+/// not a write target).
+///
+/// The `:memory:` arm (resolved path `None`) wins even when backends are
+/// declared: a `:memory:` override forces every declared backend ephemeral
+/// (`force_memory` in [`validate_db_override_against_backends`]'s caller), so
+/// the ephemeral line is the truthful one.
 ///
 /// Issue #1586: with no `--db`/`KHIVE_DB` override the resolver silently
 /// targets the default `$HOME/.khive/khive.db` — the production database for
@@ -2550,10 +2561,26 @@ pub fn config_discovery_db_anchor(db: Option<&str>) -> Option<std::path::PathBuf
 /// the channel: `kkernel mcp` logs it at INFO with its other startup facts;
 /// `kkernel exec` prints it to stderr (its default log level is `warn`, so an
 /// INFO record would never surface there).
-pub fn resolved_database_disclosure(resolved_db_path: Option<&std::path::Path>) -> String {
+pub fn resolved_database_disclosure(
+    resolved_db_path: Option<&std::path::Path>,
+    backends: &[BackendConfig],
+) -> String {
     match resolved_db_path {
-        Some(path) => format!("database: {} (resolved)", path.display()),
         None => "database: :memory: (ephemeral in-memory; nothing persists)".to_string(),
+        Some(_) if !backends.is_empty() => {
+            let targets: Vec<String> = backends
+                .iter()
+                .map(|backend| match backend.path.as_deref() {
+                    Some(path) => format!("{}={}", backend.name, path.display()),
+                    None => format!("{}=:memory:", backend.name),
+                })
+                .collect();
+            format!(
+                "database: config-declared backends govern storage targets: {}",
+                targets.join(", ")
+            )
+        }
+        Some(path) => format!("database: {} (resolved)", path.display()),
     }
 }
 
@@ -2926,8 +2953,10 @@ mod tests {
     // visible at startup.
     #[test]
     fn resolved_database_disclosure_names_file_path() {
-        let line =
-            resolved_database_disclosure(Some(std::path::Path::new("/home/op/.khive/khive.db")));
+        let line = resolved_database_disclosure(
+            Some(std::path::Path::new("/home/op/.khive/khive.db")),
+            &[],
+        );
         assert!(
             line.contains("/home/op/.khive/khive.db"),
             "disclosure must carry the resolved path; got: {line}"
@@ -2940,10 +2969,65 @@ mod tests {
 
     #[test]
     fn resolved_database_disclosure_marks_memory_ephemeral() {
-        let line = resolved_database_disclosure(None);
+        let line = resolved_database_disclosure(None, &[]);
         assert!(
             line.contains(":memory:") && line.contains("ephemeral"),
             "in-memory disclosure must say the target is ephemeral; got: {line}"
+        );
+    }
+
+    // Multi-backend mode: writes go to the config-declared backend paths, not
+    // the resolved anchor path — the disclosure must name the real targets and
+    // must NOT present the anchor as the write target.
+    #[test]
+    fn resolved_database_disclosure_names_backend_targets_in_multi_backend_mode() {
+        let backends = vec![
+            BackendConfig {
+                name: "main".into(),
+                kind: BackendKind::Sqlite,
+                path: Some(std::path::PathBuf::from("/data/main.db")),
+                cache_mb: None,
+                journal_mode: None,
+                read_only: false,
+            },
+            BackendConfig {
+                name: "scratch".into(),
+                kind: BackendKind::Memory,
+                path: None,
+                cache_mb: None,
+                journal_mode: None,
+                read_only: false,
+            },
+        ];
+        let anchor = std::path::Path::new("/home/op/.khive/khive.db");
+        let line = resolved_database_disclosure(Some(anchor), &backends);
+        assert!(
+            line.contains("main=/data/main.db") && line.contains("scratch=:memory:"),
+            "multi-backend disclosure must name each declared target; got: {line}"
+        );
+        assert!(
+            !line.contains("/home/op/.khive/khive.db"),
+            "multi-backend disclosure must not present the anchor path as a write target; got: {line}"
+        );
+    }
+
+    // A `:memory:` override with declared backends forces every backend
+    // ephemeral (force_memory), so the ephemeral line wins over the backend
+    // listing.
+    #[test]
+    fn resolved_database_disclosure_memory_override_wins_over_backends() {
+        let backends = vec![BackendConfig {
+            name: "main".into(),
+            kind: BackendKind::Sqlite,
+            path: Some(std::path::PathBuf::from("/data/main.db")),
+            cache_mb: None,
+            journal_mode: None,
+            read_only: false,
+        }];
+        let line = resolved_database_disclosure(None, &backends);
+        assert!(
+            line.contains("ephemeral") && !line.contains("/data/main.db"),
+            "memory-forced run must disclose ephemerality, not the overridden file targets; got: {line}"
         );
     }
 
