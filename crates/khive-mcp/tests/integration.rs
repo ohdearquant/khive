@@ -2447,6 +2447,7 @@ async fn inbox_help_returns_optional_pagination_and_filters() -> anyhow::Result<
         "limit",
         "offset",
         "status",
+        "wait_ms",
         "from_actor",
         "from_prefix",
         "exclude_from_actor",

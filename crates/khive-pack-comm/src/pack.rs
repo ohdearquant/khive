@@ -8,6 +8,7 @@ use khive_runtime::{KhiveRuntime, NamespaceToken, RuntimeError, SchemaPlan, Verb
 use khive_types::{HandlerDef, Pack};
 
 use crate::handlers;
+use crate::inbox_signal::InboxSignal;
 use crate::vocab::{COMM_HANDLERS, COMM_SCHEMA_PLAN_STMTS};
 
 /// Communication pack providing the public `comm.*` verbs and channel subhandlers.
@@ -16,6 +17,7 @@ use crate::vocab::{COMM_HANDLERS, COMM_SCHEMA_PLAN_STMTS};
 /// metadata lives in the `properties` JSON column.
 pub struct CommPack {
     runtime: KhiveRuntime,
+    inbox_signal: InboxSignal,
 }
 
 impl Pack for CommPack {
@@ -29,7 +31,10 @@ impl Pack for CommPack {
 impl CommPack {
     /// Create a new `CommPack` bound to the given runtime.
     pub fn new(runtime: KhiveRuntime) -> Self {
-        Self { runtime }
+        Self {
+            runtime,
+            inbox_signal: InboxSignal::new(),
+        }
     }
     pub(crate) fn runtime(&self) -> &KhiveRuntime {
         &self.runtime
@@ -132,14 +137,22 @@ impl PackRuntime for CommPack {
         token: &NamespaceToken,
     ) -> Result<Value, RuntimeError> {
         match verb {
-            "comm.send" => handlers::handle_send(self.runtime(), token, params).await,
+            "comm.send" => {
+                handlers::handle_send(self.runtime(), &self.inbox_signal, token, params).await
+            }
             "comm.delivered" => handlers::handle_delivered(self.runtime(), token, params).await,
-            "comm.inbox" => handlers::handle_inbox(self.runtime(), token, params).await,
+            "comm.inbox" => {
+                handlers::handle_inbox(self.runtime(), &self.inbox_signal, token, params).await
+            }
             "comm.read" => handlers::handle_read(self.runtime(), token, params).await,
             "comm.unread" => handlers::handle_unread(self.runtime(), token, params).await,
-            "comm.reply" => handlers::handle_reply(self.runtime(), token, params).await,
+            "comm.reply" => {
+                handlers::handle_reply(self.runtime(), &self.inbox_signal, token, params).await
+            }
             "comm.thread" => handlers::handle_thread(self.runtime(), token, params).await,
-            "comm.ingest" => handlers::handle_ingest(self.runtime(), token, params).await,
+            "comm.ingest" => {
+                handlers::handle_ingest(self.runtime(), &self.inbox_signal, token, params).await
+            }
             "comm.heartbeat" => handlers::handle_heartbeat(self.runtime(), token, params).await,
             "comm.health" => handlers::handle_health(self.runtime(), token, params).await,
             "comm.probe" => handlers::handle_probe(self.runtime(), token, params).await,
@@ -224,7 +237,7 @@ mod help_tests {
     }
 
     #[test]
-    fn inbox_has_optional_limit_and_status() {
+    fn inbox_has_optional_limit_status_and_wait() {
         let h = find_handler("comm.inbox");
         assert!(!h.params.is_empty(), "inbox must have non-empty params");
         let limit = h
@@ -239,6 +252,13 @@ mod help_tests {
             .find(|p| p.name == "status")
             .expect("inbox must have 'status'");
         assert!(!status.required, "inbox.status must be optional");
+        let wait_ms = h
+            .params
+            .iter()
+            .find(|p| p.name == "wait_ms")
+            .expect("inbox must have 'wait_ms'");
+        assert_eq!(wait_ms.param_type, "integer");
+        assert!(!wait_ms.required, "inbox.wait_ms must be optional");
     }
 
     #[test]

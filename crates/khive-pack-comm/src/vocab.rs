@@ -107,7 +107,7 @@ pub(crate) static COMM_HANDLERS: [HandlerDef; 13] = [
     },
     HandlerDef {
         name: "comm.inbox",
-        description: "List and page through filtered inbound messages for the caller.",
+        description: "List and page through filtered inbound messages for the caller, optionally waiting for a new matching message.",
         visibility: Visibility::Verb,
         category: khive_types::VerbCategory::Assertive,
         params: &[
@@ -128,6 +128,12 @@ pub(crate) static COMM_HANDLERS: [HandlerDef; 13] = [
                 param_type: "string",
                 required: false,
                 description: "Filter by read status: \"unread\" (default) | \"read\" | \"all\".",
+            },
+            ParamDef {
+                name: "wait_ms",
+                param_type: "integer",
+                required: false,
+                description: "Long-poll budget in milliseconds. Returns immediately when the initial query matches; otherwise waits for a new matching message, up to 30000 ms. Default 0 (no wait).",
             },
             ParamDef {
                 name: "from_actor",

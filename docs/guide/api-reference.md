@@ -1255,13 +1255,16 @@ request(ops="comm.delivered(id=\"<full-outbound-uuid>\")")
 
 ### `comm.inbox` — Assertive
 
-List and page through filtered inbound messages for the caller.
+List and page through filtered inbound messages for the caller. With `wait_ms`,
+an initially empty fully filtered page waits for a newly committed matching
+message and otherwise returns at the deadline.
 
 | Param                | Type    | Required | Notes                                                                     |
 | -------------------- | ------- | -------- | ------------------------------------------------------------------------- |
 | `limit`              | integer | no       | Default 20, max 200.                                                      |
 | `offset`             | integer | no       | Default 0; offset after every supplied filter.                            |
 | `status`             | string  | no       | `unread` (default)\|`read`\|`all`.                                        |
+| `wait_ms`            | integer | no       | Long-poll only when the initial page is empty; default 0, max 30,000.     |
 | `from_actor`         | string  | no       | Exact sender; mutually exclusive with `from_prefix`.                      |
 | `from_prefix`        | string  | no       | Sender prefix; mutually exclusive with `from_actor`.                      |
 | `exclude_from_actor` | string  | no       | Exclude an exact sender actor label.                                      |
@@ -1273,7 +1276,11 @@ List and page through filtered inbound messages for the caller.
 ```
 request(ops="comm.inbox(limit=10)")
 request(ops="comm.inbox(status=\"all\", content_contains=\"timeout\", offset=200)")
+request(ops="comm.inbox(limit=10, wait_ms=30000)")
 ```
+
+The long-poll wake is process-local and carries no payload. Every wake re-runs
+the same scoped query, and the response shape is identical to an immediate inbox call.
 
 Every returned message uses the hyphenated full UUID for `id`, so the value is
 always accepted unchanged by `comm.read`, `comm.reply`, or `comm.thread`, even

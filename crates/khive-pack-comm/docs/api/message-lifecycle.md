@@ -180,6 +180,32 @@ the top-level note `created_at` exposed in the response, not optional transport
 metadata in `properties.sent_at`. Empty substring filters are rejected, and a
 missing/non-string subject does not match `subject_contains`.
 
+`wait_ms` (#1499) adds bounded long-polling without changing the response
+shape. Omission or `0` returns the first query immediately; values from 1
+through 30,000 wait only when that query is empty. `limit=0` remains a
+count-only immediate return and never waits. The deadline is established before
+the initial storage query, so query time reduces the remaining signal-wait
+budget. The timeout-edge final query and response serialization can add ordinary
+request-processing time after that deadline.
+
+One process-local `InboxSignal` belongs to each `CommPack` instance. It combines
+`tokio::sync::Notify` with a monotonically increasing generation. The handler
+captures the generation before every query, preventing a commit between the
+empty query and waiter registration from becoming a lost wakeup. A wake always
+re-runs the complete namespace, actor, status, and sender-filtered query; an
+unrelated message therefore causes only a re-query and the caller keeps waiting
+within the original deadline. A final query at deadline expiry observes any commit
+visible before that query takes its storage snapshot; a commit that lands after
+the snapshot is left to the caller's next request.
+
+`comm.send` and `comm.reply` publish after their dual-write has committed.
+`comm.ingest` publishes only after `try_create_note` returns a newly committed
+note; the deduplicated path does not publish. The signal carries no message or
+identity data and is not a delivery or authorization boundary. It is intentionally
+not cross-process pubsub: direct writes through another registry/process become
+visible on the timeout-edge final query or a subsequent call, while normal daemon
+dispatches share the same pack instance and wake immediately.
+
 ## `handlers.rs::handle_read`
 
 Marks a message as read. Rejects `read()` on outbound messages — "read" is a
@@ -200,7 +226,7 @@ back an earlier successful item.
 Patches only the `read` key via `NoteStore::try_patch_note_property`, a
 storage-side `json_set`, not a caller-side merge-then-overwrite of the whole
 `properties` column: the write re-evaluates namespace, message kind, direction,
-and addressee against the row's *current* state in the same `UPDATE`, so a
+and addressee against the row's _current_ state in the same `UPDATE`, so a
 property written by another caller between validation and this call (the bulk
 form's window can span up to 500 targets) survives untouched, and an
 eligibility change in that window degrades the mark instead of silently

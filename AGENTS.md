@@ -168,7 +168,7 @@ it does not train the default/live namespace's posterior state.
 | ---------------- | ------------------------------------------------------------------------------------------------------ | --------------------------------------------- |
 | `comm.send`      | Send a message (optionally threaded)                                                                   | Inter-agent or inter-namespace messaging      |
 | `comm.delivered` | Confirm the internal inbound sibling for an outbound UUID                                              | Resolve an ambiguous atomic-write outcome     |
-| `comm.inbox`     | Page and filter inbound messages                                                                       | Check or triage what's waiting                |
+| `comm.inbox`     | Page/filter inbound messages; `wait_ms?` enables a bounded long poll                                   | Check, triage, or wait for what's next        |
 | `comm.unread`    | Count-only view of unread inbound messages (no args, no payloads)                                      | Cheap unread check without listing            |
 | `comm.read`      | Mark one or more **inbound** messages as read (best-effort: inspect each result's `read`/`mark_error`) | Acknowledge receipt (recipient action)        |
 | `comm.reply`     | Reply to a message (threading linkage)                                                                 | Respond in-thread                             |
@@ -188,6 +188,12 @@ Use `offset=<next_offset>` with otherwise-identical `comm.inbox` arguments until
 changing read state. Filters include exact/prefix/excluded sender, inclusive `since`, exclusive
 `before`, and case-insensitive `subject_contains`/`content_contains`; time bounds use the
 response's top-level `created_at`.
+
+**Inbox long poll.** Pass `wait_ms` (1–30,000) to wait only when the initial
+fully filtered page is empty. Existing matches return immediately; new messages
+re-run the same actor/status/sender/time/text-filtered query with the same offset,
+and the paginated response shape is unchanged. Omit it (or pass `0`) for the
+snapshot behavior.
 
 **`comm.read` is inbound-only.** It marks a received message as read; calling it on an outbound
 (sent) message returns `read: message <uuid> is outbound; only received (inbound) messages can be
