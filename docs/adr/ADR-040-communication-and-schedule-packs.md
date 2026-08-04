@@ -1,7 +1,7 @@
 # ADR-040: Communication and Schedule Packs
 
-**Status**: accepted\
-**Date**: 2026-05-23\
+**Status**: accepted (amended 2026-08-01 — bounded inbox long poll)\
+**Date**: 2026-05-23 (amended 2026-08-01)\
 **Authors**: khive maintainers
 
 ## Context
@@ -36,8 +36,9 @@ The system must satisfy:
 3. **Event observable disambiguation.** The substrate's `Event` type (ADR-004) is a read-only
    audit observable. The schedule pack's `scheduled_event` note kind is user-authored future
    intent. These must not be conflated.
-4. **Mailbox model for comm.** No real-time delivery mechanism. Agents poll via `inbox`.
-   This matches the agent-scale interaction model and avoids network/pubsub dependencies.
+4. **Mailbox model for comm.** No network/pubsub delivery mechanism. Agents originally polled
+   via `inbox`; the 2026-08-01 amendment adds a bounded process-local long poll without changing
+   the durable mailbox model or adding infrastructure dependencies.
 5. **Intent storage for schedule.** The pack stores what should happen and when. Trigger
    evaluation (replay the stored verb+args payload at the designated time) is the runtime's
    and execution environment's responsibility — the pack does not own a polling loop.
@@ -95,13 +96,13 @@ caller's namespace) or `outbound` (message sent by the caller). This is set by `
 
 #### Five verbs
 
-| Verb          | Speech act (ADR-025) | Args                                            | What it does                                                                                                                                                                                                                                                                    |
-| ------------- | -------------------- | ----------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `comm.send`   | commissive           | `to`, `subject?`, `content`, `thread_id?`       | Create a message note in the recipient's namespace (`direction=inbound`) and an outbound copy in the caller's namespace (`direction=outbound`). `from` is set to the caller's identity. Both writes are atomic: if the inbound write fails, the outbound copy is rolled back.   |
-| `comm.inbox`  | assertive            | `limit?`, `offset?`, `box?`, `fields?`, filters | List inbound messages (`direction=inbound`) by default, or caller-authored outbound rows with `box="sent"`. `status` filters inbox read state; offset pagination, field projection, and box-appropriate actor/time/text filters do not change message state.                    |
-| `comm.read`   | declaration          | `id?`, `ids?`                                   | Set `properties.read = true` on one or more **inbound** messages. Exactly one of `id` or `ids` is required. Outbound messages cannot be marked read.                                                                                                                            |
-| `comm.reply`  | commissive           | `id`, `content`                                 | Fetch the target message's `thread_id` (or use the message's own UUID as the thread root). Create a new message with the same `thread_id`, `to` set to the other party, `subject` prefixed with `"Re: "` if not already. Uses dual-write for inbound delivery to the recipient. |
-| `comm.thread` | assertive            | `id`, `limit?`, `order?`, `after?`, `fields?`   | Validate and resolve the thread root, enforce actor visibility, deduplicate dual-write copies, then apply cursor filtering, requested order, truncation, and optional field projection. `id` accepts an 8-char short prefix or full UUID.                                       |
+| Verb          | Speech act (ADR-025) | Args                                                        | What it does                                                                                                                                                                                                                                                                                                                                                     |
+| ------------- | -------------------- | ----------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `comm.send`   | commissive           | `to`, `subject?`, `content`, `thread_id?`                   | Create a message note in the recipient's namespace (`direction=inbound`) and an outbound copy in the caller's namespace (`direction=outbound`). `from` is set to the caller's identity. Both writes are atomic: if the inbound write fails, the outbound copy is rolled back.                                                                                    |
+| `comm.inbox`  | assertive            | `limit?`, `offset?`, `box?`, `fields?`, `wait_ms?`, filters | List inbound messages (`direction=inbound`) by default, or caller-authored outbound rows with `box="sent"`. `status` filters inbox read state; offset pagination, field projection, and box-appropriate actor/time/text filters do not change message state. A bounded long poll (`wait_ms`, 1-30,000) waits only when the fully filtered initial page is empty. |
+| `comm.read`   | declaration          | `id?`, `ids?`                                               | Set `properties.read = true` on one or more **inbound** messages. Exactly one of `id` or `ids` is required. Outbound messages cannot be marked read.                                                                                                                                                                                                             |
+| `comm.reply`  | commissive           | `id`, `content`                                             | Fetch the target message's `thread_id` (or use the message's own UUID as the thread root). Create a new message with the same `thread_id`, `to` set to the other party, `subject` prefixed with `"Re: "` if not already. Uses dual-write for inbound delivery to the recipient.                                                                                  |
+| `comm.thread` | assertive            | `id`, `limit?`, `order?`, `after?`, `fields?`               | Validate and resolve the thread root, enforce actor visibility, deduplicate dual-write copies, then apply cursor filtering, requested order, truncation, and optional field projection. `id` accepts an 8-char short prefix or full UUID.                                                                                                                        |
 
 #### Inbox pagination, richer filters, and bulk read amendment (2026-08-01)
 
@@ -507,6 +508,11 @@ and retry mechanics — none of which belong in the pack layer. Agents operate a
 interaction cadence and avoids hard infrastructure dependencies in the binary. Operators
 who need real-time delivery build atop the mailbox by polling.
 
+The 2026-08-01 amendment below supersedes only the polling-latency conclusion:
+`comm.inbox(wait_ms=...)` may now wait on a process-local commit signal. The
+database-backed mailbox remains authoritative, and there is still no network
+pubsub, persistent delivery socket, or independent delivery-guarantee layer.
+
 ### Why intent-only for schedule
 
 The pack cannot know what polling infrastructure exists in the execution environment. A pack
@@ -689,3 +695,37 @@ implementation. The `comm.read` discovery description in
 `docs/guide/api-reference.md`, `docs/guide/communication.md`, the comm skill) carry the
 best-effort wording; the verbatim `HandlerDef` snippet earlier in this ADR reflects the
 original pre-amendment description.
+
+## Amendment (2026-08-01): bounded `comm.inbox` long poll (#1499)
+
+`comm.inbox` accepts optional `wait_ms` in the inclusive range 0 through
+30,000. Omission and zero preserve the original immediate snapshot. A positive
+value establishes one deadline before the initial query; if that fully scoped
+query finds a message, the call returns immediately. Otherwise it waits for a
+process-local message-commit signal and re-runs the same namespace, actor,
+status, and sender-filtered query. `limit=0` remains an immediate count-only
+operation and never waits. The response schema is unchanged.
+
+Each `CommPack` instance owns an `InboxSignal` consisting of
+`tokio::sync::Notify` plus a monotonically increasing generation counter. The
+inbox handler snapshots the generation before every query, so a commit between
+an empty query and waiter registration cannot be lost. The signal is deliberately
+payload-free and unscoped: every wake is followed by the normal authorized query,
+and an unrelated actor/namespace/filter result causes the call to continue waiting
+within its original deadline. A final query at deadline expiry observes commits
+visible before that query takes its storage snapshot; a commit landing after the
+snapshot is left to the caller's next request.
+
+Successful `comm.send` and `comm.reply` handlers publish only after their atomic
+dual-write commits. `comm.ingest` publishes only after `try_create_note` returns a
+newly committed note; an `external_id` dedup hit does not publish. Publishing in
+the comm handler is both more precise and narrower than teaching each channel
+poll loop to interpret an ingest response. It also requires no post-construction
+injection: the waiting and writing handlers already execute on the same immutable,
+registry-owned `CommPack` instance.
+
+This is an in-process latency optimization, not a second source of delivery
+truth. Direct database writes or a distinct process/registry do not share the
+signal; the timeout-edge final query or the caller's next request observes them
+from durable storage. No notification carries message content, actor identity,
+or authorization, and no wake bypasses ADR-018/ADR-057 filtering.

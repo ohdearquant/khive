@@ -45,6 +45,9 @@ pub(crate) struct InboxParams {
     pub offset: Option<u64>,
     #[serde(default)]
     pub status: Option<String>,
+    /// Long-poll budget. Zero or omission preserves the immediate-return path.
+    #[serde(default)]
+    pub wait_ms: Option<u64>,
     /// Exact match on `properties.from_actor`. Mutually exclusive with `from_prefix`.
     #[serde(default)]
     pub from_actor: Option<String>,

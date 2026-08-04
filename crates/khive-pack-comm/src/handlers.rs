@@ -14,6 +14,7 @@ use khive_runtime::{KhiveRuntime, NamespaceToken, RuntimeError};
 use khive_storage::note::{FilterOp, Note, NoteFilter, PropertyFilter};
 use khive_storage::types::{PageRequest, SqlValue};
 
+use crate::inbox_signal::InboxSignal;
 use crate::message::{
     dual_write_message, note_to_message_json, project_message_json, resolve_id, short_id,
     validate_message_projection_fields, COMM_SCHEMA_VERSION, COMM_STABLE_PROPERTY_KEYS,
@@ -246,6 +247,7 @@ fn canonicalize_ingest_sent_at(raw: &str) -> Result<String, RuntimeError> {
 /// See crates/khive-pack-comm/docs/api/message-lifecycle.md#handlersrshandle_send
 pub(crate) async fn handle_send(
     runtime: &KhiveRuntime,
+    inbox_signal: &InboxSignal,
     token: &NamespaceToken,
     params: Value,
 ) -> Result<Value, RuntimeError> {
@@ -321,6 +323,7 @@ pub(crate) async fn handle_send(
         p.tags.as_deref(),
     )
     .await?;
+    inbox_signal.publish();
 
     let mut response = json!({
         "id": short_id(outbound_note.id),
@@ -401,13 +404,22 @@ pub(crate) async fn handle_delivered(
 
 /// `inbox` — list inbound messages by default, or caller-authored sent rows (ADR-057).
 /// See crates/khive-pack-comm/docs/api/message-lifecycle.md#handlersrshandle_inbox
+const MAX_INBOX_WAIT_MS: u64 = 30_000;
+
 pub(crate) async fn handle_inbox(
     runtime: &KhiveRuntime,
+    inbox_signal: &InboxSignal,
     token: &NamespaceToken,
     params: Value,
 ) -> Result<Value, RuntimeError> {
     let p: InboxParams = deser(params)?;
     validate_message_projection_fields("inbox", p.fields.as_deref())?;
+    let wait_ms = p.wait_ms.unwrap_or(0);
+    if wait_ms > MAX_INBOX_WAIT_MS {
+        return Err(RuntimeError::InvalidInput(format!(
+            "inbox: `wait_ms` must be at most {MAX_INBOX_WAIT_MS}"
+        )));
+    }
     let raw_limit = p.limit.unwrap_or(20);
     let offset = p.offset.unwrap_or(0);
     if offset > i64::MAX as u64 {
@@ -575,7 +587,8 @@ pub(crate) async fn handle_inbox(
         ..Default::default()
     };
     let store = runtime.notes(token)?;
-
+    let deadline = (wait_ms > 0)
+        .then(|| tokio::time::Instant::now() + std::time::Duration::from_millis(wait_ms));
     let subject_needle = p
         .subject_contains
         .as_ref()
@@ -584,8 +597,89 @@ pub(crate) async fn handle_inbox(
         .content_contains
         .as_ref()
         .map(|value| value.to_lowercase());
-    let has_post_filter = p.from_prefix.is_some()
-        || p.exclude_from_actor.is_some()
+
+    let store = store.as_ref();
+    let namespace = token.namespace().as_str();
+    wait_for_inbox_response(inbox_signal, deadline, || {
+        query_inbox_response(
+            store,
+            namespace,
+            &filter,
+            &p,
+            before_micros,
+            subject_needle.as_deref(),
+            content_needle.as_deref(),
+            offset,
+            limit,
+        )
+    })
+    .await
+}
+
+async fn wait_for_inbox_response<Query, QueryFuture>(
+    inbox_signal: &InboxSignal,
+    deadline: Option<tokio::time::Instant>,
+    mut query: Query,
+) -> Result<Value, RuntimeError>
+where
+    Query: FnMut() -> QueryFuture,
+    QueryFuture: std::future::Future<Output = Result<Value, RuntimeError>>,
+{
+    loop {
+        // Snapshot before querying. If a writer commits between this query and
+        // waiter registration, the generation change makes the wait immediately ready.
+        let observed = inbox_signal.snapshot();
+        let response = query().await?;
+        let is_empty = response["messages"]
+            .as_array()
+            .ok_or_else(|| {
+                RuntimeError::Internal("inbox: response is missing the `messages` array".into())
+            })?
+            .is_empty();
+        if !is_empty || deadline.is_none() {
+            return Ok(response);
+        }
+
+        // Enforce one fixed deadline before registering another wait. If the
+        // query itself crossed that deadline, only a publish observed during
+        // the query earns one final re-query; unrelated publish streams can
+        // never reset the budget.
+        let deadline_at = *deadline.as_ref().expect("non-empty wait has a deadline");
+        if tokio::time::Instant::now() >= deadline_at {
+            // The query itself may have crossed the deadline. If a writer
+            // published after that query took its storage snapshot, returning
+            // `response` here would lose the wake. Re-query once to observe the
+            // committed row; the fixed deadline still prevents another wait.
+            if inbox_signal.snapshot() != observed {
+                return query().await;
+            }
+            return Ok(response);
+        }
+
+        let wait_result =
+            tokio::time::timeout_at(deadline_at, inbox_signal.wait_for_change(observed)).await;
+        if wait_result.is_err() {
+            // Close the timeout-edge race: a commit concurrent with deadline
+            // expiry is still visible even if the timer wins the select.
+            return query().await;
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn query_inbox_response(
+    store: &dyn khive_storage::NoteStore,
+    namespace: &str,
+    filter: &NoteFilter,
+    params: &InboxParams,
+    before_micros: Option<i64>,
+    subject_needle: Option<&str>,
+    content_needle: Option<&str>,
+    offset: u64,
+    limit: usize,
+) -> Result<Value, RuntimeError> {
+    let has_post_filter = params.from_prefix.is_some()
+        || params.exclude_from_actor.is_some()
         || before_micros.is_some()
         || subject_needle.is_some()
         || content_needle.is_some();
@@ -601,8 +695,8 @@ pub(crate) async fn handle_inbox(
         loop {
             let page = store
                 .query_notes_filtered(
-                    token.namespace().as_str(),
-                    &filter,
+                    namespace,
+                    filter,
                     PageRequest {
                         limit: PAGE_SIZE,
                         offset: db_offset,
@@ -611,13 +705,7 @@ pub(crate) async fn handle_inbox(
                 .await?;
             let fetched = page.items.len() as u32;
             for n in &page.items {
-                if !inbox_note_matches(
-                    n,
-                    &p,
-                    before_micros,
-                    subject_needle.as_deref(),
-                    content_needle.as_deref(),
-                ) {
+                if !inbox_note_matches(n, params, before_micros, subject_needle, content_needle) {
                     continue;
                 }
                 if matched < offset {
@@ -640,8 +728,8 @@ pub(crate) async fn handle_inbox(
     } else {
         let page = store
             .query_notes_filtered(
-                token.namespace().as_str(),
-                &filter,
+                namespace,
+                filter,
                 PageRequest {
                     limit: (limit + 1) as u32,
                     offset,
@@ -661,7 +749,7 @@ pub(crate) async fn handle_inbox(
     // state and report zero. For inbox `status="unread"`, this equals `count`;
     // for `"read"`/`"all"`, it counts unread rows in this page (not a global
     // total — `comm.unread` is the verb for that).
-    let unread_count = if mailbox == "inbox" {
+    let unread_count = if params.mailbox.as_deref().unwrap_or("inbox") == "inbox" {
         messages
             .iter()
             .filter(|m| !m["read"].as_bool().unwrap_or(false))
@@ -678,7 +766,7 @@ pub(crate) async fn handle_inbox(
     };
     let messages: Vec<Value> = messages
         .into_iter()
-        .map(|message| project_message_json(message, p.fields.as_deref()))
+        .map(|message| project_message_json(message, params.fields.as_deref()))
         .collect();
     Ok(json!({
         "messages": messages,
@@ -1065,6 +1153,7 @@ fn read_response(
 /// crates/khive-pack-comm/docs/api/message-lifecycle.md#handlersrshandle_reply
 pub(crate) async fn handle_reply(
     runtime: &KhiveRuntime,
+    inbox_signal: &InboxSignal,
     token: &NamespaceToken,
     params: Value,
 ) -> Result<Value, RuntimeError> {
@@ -1229,6 +1318,7 @@ pub(crate) async fn handle_reply(
         p.tags.as_deref(),
     )
     .await?;
+    inbox_signal.publish();
 
     // Replying is the strongest possible read signal, and callers universally
     // chained `reply | read` to say so — fold it in. Skips only an explicitly
@@ -1616,6 +1706,7 @@ enum AfterCursor {
 /// crates/khive-pack-comm/docs/api/message-lifecycle.md#handlersrshandle_ingest
 pub(crate) async fn handle_ingest(
     runtime: &KhiveRuntime,
+    inbox_signal: &InboxSignal,
     token: &NamespaceToken,
     params: Value,
 ) -> Result<Value, RuntimeError> {
@@ -1878,6 +1969,7 @@ pub(crate) async fn handle_ingest(
             }));
         }
     };
+    inbox_signal.publish();
 
     Ok(json!({
         "id": short_id(note.id),
@@ -2735,10 +2827,156 @@ mod tests {
         add_embedding_truncation_warning, build_references_header, channel_stalled,
         heartbeat_note_id, mark_read_target, message_id_match_candidates, parent_references_chain,
         parent_wire_message_id, read_response, sanitize_reference_token, validate_read_target,
-        wrap_message_id,
+        wait_for_inbox_response, wrap_message_id,
     };
+    use crate::inbox_signal::InboxSignal;
     use khive_storage::StorageError;
     use serde_json::{json, Value};
+
+    #[tokio::test(start_paused = true)]
+    async fn inbox_query_crossing_deadline_requeries_after_publish() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let signal = InboxSignal::new();
+        let query_started = Arc::new(tokio::sync::Barrier::new(2));
+        let release_query = Arc::new(tokio::sync::Notify::new());
+        let query_calls = Arc::new(AtomicUsize::new(0));
+        let deadline = Some(tokio::time::Instant::now() + std::time::Duration::from_millis(250));
+
+        let query = || {
+            let query_started = Arc::clone(&query_started);
+            let release_query = Arc::clone(&release_query);
+            let query_calls = Arc::clone(&query_calls);
+            async move {
+                let call = query_calls.fetch_add(1, Ordering::SeqCst);
+                if call == 0 {
+                    query_started.wait().await;
+                    release_query.notified().await;
+                    Ok(json!({ "messages": [] }))
+                } else {
+                    Ok(json!({ "messages": [{ "content": "committed during query" }] }))
+                }
+            }
+        };
+
+        let commit_during_query = async {
+            query_started.wait().await;
+            tokio::time::advance(std::time::Duration::from_millis(250)).await;
+            signal.publish();
+            release_query.notify_one();
+        };
+
+        let (response, ()) = tokio::join!(
+            wait_for_inbox_response(&signal, deadline, query),
+            commit_during_query,
+        );
+        let response = response.expect("deadline-edge re-query succeeds");
+
+        assert_eq!(query_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            response["messages"][0]["content"],
+            json!("committed during query")
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn inbox_wait_rejects_response_without_messages_array() {
+        let signal = InboxSignal::new();
+        let result = wait_for_inbox_response(&signal, None, || async { Ok(json!({})) }).await;
+        let err = result.expect_err("a response without `messages` must error, not panic");
+        assert!(
+            matches!(err, khive_runtime::RuntimeError::Internal(_)),
+            "missing `messages` must surface as an internal error: {err}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn inbox_final_query_after_timeout_returns_newly_visible_message() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let signal = InboxSignal::new();
+        let query_calls = Arc::new(AtomicUsize::new(0));
+        let deadline = Some(tokio::time::Instant::now() + std::time::Duration::from_millis(250));
+
+        let query = || {
+            let query_calls = Arc::clone(&query_calls);
+            async move {
+                let call = query_calls.fetch_add(1, Ordering::SeqCst);
+                if call == 0 {
+                    Ok(json!({ "messages": [] }))
+                } else {
+                    Ok(json!({ "messages": [{ "content": "visible at the timeout edge" }] }))
+                }
+            }
+        };
+
+        // No publish happens, so the timer wins the select; the final query
+        // must still surface the row that became visible by deadline expiry.
+        let response = wait_for_inbox_response(&signal, deadline, query)
+            .await
+            .expect("timeout-edge final query succeeds");
+        assert_eq!(query_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            response["messages"][0]["content"],
+            json!("visible at the timeout edge")
+        );
+    }
+
+    #[tokio::test]
+    async fn ingest_dedup_hit_does_not_publish() {
+        use khive_runtime::{AllowAllGate, BackendId, Namespace, RuntimeConfig};
+        use uuid::Uuid;
+
+        let ns = format!("ingest-dedup-{}", Uuid::new_v4().simple());
+        let runtime = super::KhiveRuntime::new(RuntimeConfig {
+            git_write: Default::default(),
+            db_path: None,
+            default_namespace: Namespace::parse(&ns).unwrap(),
+            embedding_model: None,
+            additional_embedding_models: vec![],
+            gate: std::sync::Arc::new(AllowAllGate),
+            packs: vec!["kg".to_string(), "comm".to_string()],
+            backend_id: BackendId::main(),
+            brain_profile: None,
+            visible_namespaces: vec![],
+            allowed_outbound_namespaces: vec![],
+            actor_id: None,
+        })
+        .expect("in-memory runtime");
+        let token = runtime
+            .authorize(Namespace::parse(&ns).unwrap())
+            .expect("authorize");
+        let signal = InboxSignal::new();
+
+        let body = json!({
+            "from": "email:sender@example.com",
+            "to": "local",
+            "content": "dedup probe",
+            "external_id": "imap:long-poll:dedup:1",
+        });
+
+        let first = super::handle_ingest(&runtime, &signal, &token, body.clone())
+            .await
+            .expect("first ingest succeeds");
+        assert_eq!(first["deduplicated"].as_bool(), Some(false));
+        let generation_after_commit = signal.snapshot();
+        assert_ne!(
+            generation_after_commit, 0,
+            "a newly committed ingest must publish a wake"
+        );
+
+        let second = super::handle_ingest(&runtime, &signal, &token, body)
+            .await
+            .expect("deduplicated ingest succeeds");
+        assert_eq!(second["deduplicated"].as_bool(), Some(true));
+        assert_eq!(
+            signal.snapshot(),
+            generation_after_commit,
+            "a deduplicated ingest must not publish a wake"
+        );
+    }
 
     #[test]
     fn channel_stalled_uses_strict_three_interval_threshold() {

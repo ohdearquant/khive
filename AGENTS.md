@@ -164,17 +164,17 @@ it does not train the default/live namespace's posterior state.
 
 ### Comm pack — 9 verbs (`comm.` prefix)
 
-| Verb             | What it does                                                                                           | When to use                                   |
-| ---------------- | ------------------------------------------------------------------------------------------------------ | --------------------------------------------- |
-| `comm.send`      | Send a message (optionally threaded)                                                                   | Inter-agent or inter-namespace messaging      |
-| `comm.delivered` | Confirm the internal inbound sibling for an outbound UUID                                              | Resolve an ambiguous atomic-write outcome     |
-| `comm.inbox`     | Page/filter inbound or caller-authored sent messages; optionally project fields                        | Triage inbox or inspect sent history          |
-| `comm.unread`    | Count-only view of unread inbound messages (no args, no payloads)                                      | Cheap unread check without listing            |
-| `comm.read`      | Mark one or more **inbound** messages as read (best-effort: inspect each result's `read`/`mark_error`) | Acknowledge receipt (recipient action)        |
-| `comm.reply`     | Reply to a message (threading linkage)                                                                 | Respond in-thread                             |
-| `comm.thread`    | Retrieve full conversation thread                                                                      | Read the whole conversation                   |
-| `comm.health`    | Per-channel health snapshot with nominal cadence and advisory staleness (no args)                      | Check daemon channel-poll state               |
-| `comm.probe`     | Read-only poll for new inbound message metadata and stale unread count                                 | Cheap wake-up check without a full inbox scan |
+| Verb             | What it does                                                                                                            | When to use                                                 |
+| ---------------- | ----------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------- |
+| `comm.send`      | Send a message (optionally threaded)                                                                                    | Inter-agent or inter-namespace messaging                    |
+| `comm.delivered` | Confirm the internal inbound sibling for an outbound UUID                                                               | Resolve an ambiguous atomic-write outcome                   |
+| `comm.inbox`     | Page/filter inbound or caller-authored sent messages; `wait_ms?` enables a bounded long poll; optionally project fields | Triage inbox, wait for what's next, or inspect sent history |
+| `comm.unread`    | Count-only view of unread inbound messages (no args, no payloads)                                                       | Cheap unread check without listing                          |
+| `comm.read`      | Mark one or more **inbound** messages as read (best-effort: inspect each result's `read`/`mark_error`)                  | Acknowledge receipt (recipient action)                      |
+| `comm.reply`     | Reply to a message (threading linkage)                                                                                  | Respond in-thread                                           |
+| `comm.thread`    | Retrieve full conversation thread                                                                                       | Read the whole conversation                                 |
+| `comm.health`    | Per-channel health snapshot with nominal cadence and advisory staleness (no args)                                       | Check daemon channel-poll state                             |
+| `comm.probe`     | Read-only poll for new inbound message metadata and stale unread count                                                  | Cheap wake-up check without a full inbox scan               |
 
 **Inbox shape (ADR-057).** `comm.inbox` is scannable: each entry carries top-level `from`, `to`,
 `subject`, `read`, `direction`, and a derived `preview` (whitespace-collapsed, truncated to 80
@@ -193,6 +193,12 @@ response's top-level `created_at`.
 outbound rows; omitting `box` keeps the inbound default. `status` and sender filters are inbox-only.
 Both `comm.inbox` and `comm.thread` accept the same strict, non-empty `fields=[...]` projection;
 unknown names fail and omission preserves the full message object.
+
+**Inbox long poll.** Pass `wait_ms` (1–30,000) to wait only when the initial
+fully filtered page is empty. Existing matches return immediately; new messages
+re-run the same actor/status/sender/time/text-filtered query with the same offset,
+and the paginated response shape is unchanged. Omit it (or pass `0`) for the
+snapshot behavior.
 
 **`comm.read` is inbound-only.** It marks a received message as read; calling it on an outbound
 (sent) message returns `read: message <uuid> is outbound; only received (inbound) messages can be

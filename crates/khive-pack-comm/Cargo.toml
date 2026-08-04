@@ -25,9 +25,10 @@ serde_json = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
 tracing = { workspace = true }
+tokio = { workspace = true }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["full"] }
+tokio = { workspace = true, features = ["full", "test-util"] }
 khive-pack-kg = { version = "0.7.0", path = "../khive-pack-kg" }
 khive-db = { version = "0.7.0", path = "../khive-db" }
 criterion = { workspace = true }

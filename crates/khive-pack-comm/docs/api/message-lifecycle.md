@@ -206,6 +206,32 @@ are allowed and collapse to one key.
 Authorization, filtering, unread counting, pagination lookahead, and thread
 deduplication all operate on the complete internal view before projection.
 
+`wait_ms` (#1499) adds bounded long-polling without changing the response
+shape. Omission or `0` returns the first query immediately; values from 1
+through 30,000 wait only when that query is empty. `limit=0` remains a
+count-only immediate return and never waits. The deadline is established before
+the initial storage query, so query time reduces the remaining signal-wait
+budget. The timeout-edge final query and response serialization can add ordinary
+request-processing time after that deadline.
+
+One process-local `InboxSignal` belongs to each `CommPack` instance. It combines
+`tokio::sync::Notify` with a monotonically increasing generation. The handler
+captures the generation before every query, preventing a commit between the
+empty query and waiter registration from becoming a lost wakeup. A wake always
+re-runs the complete namespace, actor, status, and sender-filtered query; an
+unrelated message therefore causes only a re-query and the caller keeps waiting
+within the original deadline. A final query at deadline expiry observes any commit
+visible before that query takes its storage snapshot; a commit that lands after
+the snapshot is left to the caller's next request.
+
+`comm.send` and `comm.reply` publish after their dual-write has committed.
+`comm.ingest` publishes only after `try_create_note` returns a newly committed
+note; the deduplicated path does not publish. The signal carries no message or
+identity data and is not a delivery or authorization boundary. It is intentionally
+not cross-process pubsub: direct writes through another registry/process become
+visible on the timeout-edge final query or a subsequent call, while normal daemon
+dispatches share the same pack instance and wake immediately.
+
 ## `handlers.rs::handle_read`
 
 Marks a message as read. Rejects `read()` on outbound messages — "read" is a

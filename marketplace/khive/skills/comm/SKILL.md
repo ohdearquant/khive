@@ -57,6 +57,7 @@ request(ops="comm.send(to=\"lambda:leo\", subject=\"CI status\", content=\"all 7
 
 ```
 request(ops="comm.inbox(limit=10)")
+request(ops="comm.inbox(limit=10, wait_ms=30000)")
 ```
 
 The fields you triage on are surfaced at the **top level** — no digging into `properties`:
@@ -84,6 +85,11 @@ history; omitting `box` remains inbound-only. For cheap list reads, pass the sam
 `fields=["id","subject","from_actor","sent_at"]`); unknown fields fail rather than being
 ignored. Mark writes are best-effort and cross-message updates are not atomic: inspect every
 result's `read`/`mark_error`, and re-issue failures later.
+
+Use `wait_ms` (maximum 30,000) when you need the next message promptly without
+repeated polling. It waits only if the fully filtered page is initially empty
+and returns the ordinary paginated inbox response as soon as a matching
+message commits.
 
 ### 4. Reply to thread, don't start a new one
 

@@ -85,6 +85,7 @@ the structured error and therefore does not know the server-generated UUID.
 | `box`                | string  | no       | `inbox` (default) \| `sent`; sent rows are scoped to the caller.             |
 | `offset`             | integer | no       | Default 0; offset in the fully-filtered newest-first result set.             |
 | `status`             | string  | no       | Inbox-only: `"unread"` (default) \| `"read"` \| `"all"`.                     |
+| `wait_ms`            | integer | no       | Long-poll only when the initial page is empty; default 0, max 30,000.        |
 | `from_actor`         | string  | no       | Exact sender; mutually exclusive with `from_prefix`.                         |
 | `from_prefix`        | string  | no       | Sender prefix; mutually exclusive with `from_actor`.                         |
 | `exclude_from_actor` | string  | no       | Exclude an exact sender actor label.                                         |
@@ -100,6 +101,7 @@ request(ops="comm.inbox(limit=10)")
 request(ops="comm.inbox(status=\"all\")")
 request(ops="comm.inbox(status=\"all\", content_contains=\"timeout\", since=\"2026-07-31T00:00:00Z\")")
 request(ops="comm.inbox(box=\"sent\", to_actor=\"lambda:leo\", fields=[\"id\",\"subject\",\"sent_at\"])")
+request(ops="comm.inbox(limit=10, wait_ms=30000)")
 ```
 
 Responses include `offset`, `has_more`, and `next_offset`. Repeat the same call
@@ -112,6 +114,12 @@ Omit `fields` for the full message body and properties. When supplied, it is a
 strict whitelist shared with `comm.thread`; unknown fields and an empty list
 fail loudly. Stable property aliases such as `from_actor`, `to_actor`, and
 `sent_at` can be projected directly.
+
+Long-polling preserves that paginated response shape and every actor/status/
+sender/time/text filter, including the requested offset. Existing matches
+return immediately. A new committed message wakes the call and causes the full
+filtered query to run again; unrelated messages cannot leak through or end the
+wait early. `limit=0` remains immediate.
 
 ### Read
 
