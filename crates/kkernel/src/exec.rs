@@ -64,16 +64,18 @@ type ForwardFuture<'a> = std::pin::Pin<
 
 /// Function pointer type for the daemon-forwarding seam.
 #[cfg(unix)]
-type ForwardFnPtr = for<'a> fn(&'a DaemonRequestFrame, Option<PathBuf>) -> ForwardFuture<'a>;
+type ForwardFnPtr =
+    for<'a> fn(&'a DaemonRequestFrame, Option<PathBuf>, Option<&'a str>) -> ForwardFuture<'a>;
 
 /// Adapts the real `forward_or_spawn` to the `ForwardFnPtr` signature.
 #[cfg(unix)]
-fn forward_or_spawn_boxed(
-    frame: &DaemonRequestFrame,
+fn forward_or_spawn_boxed<'a>(
+    frame: &'a DaemonRequestFrame,
     config: Option<PathBuf>,
-) -> ForwardFuture<'_> {
+    db: Option<&'a str>,
+) -> ForwardFuture<'a> {
     Box::pin(async move {
-        khive_mcp::daemon::forward_or_spawn_with_config(frame, config.as_deref()).await
+        khive_mcp::daemon::forward_or_spawn_with_config(frame, config.as_deref(), db).await
     })
 }
 
@@ -903,7 +905,9 @@ async fn run_exec_inline_with_forward(
             from_wire: false,
             request_id: None,
         };
-        if let Some(res) = forward_fn(&frame, db_context.config.clone()).await {
+        if let Some(res) =
+            forward_fn(&frame, db_context.config.clone(), db_context.raw.as_deref()).await
+        {
             let output = res.map_err(|e| anyhow::anyhow!("{}", e.message))?;
             println!("{output}");
             enforce_strict_batch_result(&output, strict)?;
@@ -3099,10 +3103,11 @@ id = "lambda:fallback"
     }
 
     #[cfg(unix)]
-    fn spy_forward_records_call(
-        _frame: &DaemonRequestFrame,
+    fn spy_forward_records_call<'a>(
+        _frame: &'a DaemonRequestFrame,
         _config: Option<PathBuf>,
-    ) -> super::ForwardFuture<'_> {
+        _db: Option<&'a str>,
+    ) -> super::ForwardFuture<'a> {
         SPY_WAS_CALLED.with(|c| c.set(true));
         Box::pin(async { None })
     }
@@ -3236,25 +3241,31 @@ id = "lambda:fallback"
             const { std::cell::RefCell::new(None) };
         static SPY_CAPTURED_CONFIG_PATH: std::cell::RefCell<Option<PathBuf>> =
             const { std::cell::RefCell::new(None) };
+        static SPY_CAPTURED_DB: std::cell::RefCell<Option<String>> =
+            const { std::cell::RefCell::new(None) };
     }
 
     #[cfg(unix)]
-    fn spy_capture_config_id(
-        frame: &DaemonRequestFrame,
+    fn spy_capture_config_id<'a>(
+        frame: &'a DaemonRequestFrame,
         config: Option<PathBuf>,
-    ) -> super::ForwardFuture<'_> {
+        db: Option<&'a str>,
+    ) -> super::ForwardFuture<'a> {
         SPY_CAPTURED_CONFIG_ID.with(|c| *c.borrow_mut() = Some(frame.config_id.clone()));
         SPY_CAPTURED_CONFIG_PATH.with(|c| *c.borrow_mut() = config);
+        SPY_CAPTURED_DB.with(|c| *c.borrow_mut() = db.map(str::to_string));
         Box::pin(async { None })
     }
 
     #[cfg(unix)]
-    fn spy_capture_config_and_succeed(
-        frame: &DaemonRequestFrame,
+    fn spy_capture_config_and_succeed<'a>(
+        frame: &'a DaemonRequestFrame,
         config: Option<PathBuf>,
-    ) -> super::ForwardFuture<'_> {
+        db: Option<&'a str>,
+    ) -> super::ForwardFuture<'a> {
         SPY_CAPTURED_CONFIG_ID.with(|c| *c.borrow_mut() = Some(frame.config_id.clone()));
         SPY_CAPTURED_CONFIG_PATH.with(|c| *c.borrow_mut() = config);
+        SPY_CAPTURED_DB.with(|c| *c.borrow_mut() = db.map(str::to_string));
         Box::pin(async {
             Some(Ok(
                 r#"{"results":[{"ok":true,"tool":"stats","result":{}}],"summary":{"total":1,"succeeded":1,"failed":0}}"#
@@ -3314,6 +3325,62 @@ id = "lambda:fallback"
             SPY_CAPTURED_CONFIG_PATH.with(|captured| captured.borrow_mut().take()),
             Some(config_path),
             "the daemon spawn seam must receive the same explicit config path used to resolve the exec frame"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial]
+    async fn memory_db_override_reaches_daemon_spawn_seam() {
+        std::env::remove_var("KHIVE_EMBEDDING_MODEL");
+        std::env::remove_var("KHIVE_ADDITIONAL_EMBEDDING_MODELS");
+        std::env::remove_var("KHIVE_ACTOR");
+        std::env::remove_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR");
+        std::env::remove_var("KHIVE_DB");
+        SPY_CAPTURED_DB.with(|c| *c.borrow_mut() = None);
+
+        let dir = tempfile::tempdir().expect("config tempdir");
+        let config_path = dir.path().join("selected.toml");
+        std::fs::write(&config_path, "[runtime]\npacks = [\"kg\"]\n")
+            .expect("write explicit config");
+
+        let cfg = resolve_runtime_config(RuntimeConfigInputs {
+            db: Some(":memory:"),
+            config: Some(&config_path),
+            namespace: Namespace::parse("local").expect("ns"),
+            namespace_explicit: true,
+            actor_explicit: false,
+            no_embed: true,
+            packs: Some(vec!["kg".to_string()]),
+            brain_profile: None,
+        })
+        .expect("resolve exec-shaped config");
+
+        let result = run_exec_inline_with_forward(
+            "stats()".to_string(),
+            cfg,
+            None,
+            None,
+            None,
+            ExecDbContext {
+                raw: Some(":memory:".to_string()),
+                anchor: None,
+                config: Some(config_path.clone()),
+            },
+            false,
+            spy_capture_config_and_succeed,
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "forwarded dispatch must succeed: {result:?}"
+        );
+        assert_eq!(
+            SPY_CAPTURED_DB.with(|captured| captured.borrow_mut().take()),
+            Some(":memory:".to_string()),
+            "the daemon spawn seam must receive the raw --db override so a spawned daemon \
+             can be constructed with the same ephemeral in-memory storage"
         );
     }
 

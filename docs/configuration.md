@@ -127,7 +127,7 @@ This is the default for anyone who has never touched `[[backends]]`. `--db`
 kkernel mcp                                # ~/.khive/khive.db (default)
 kkernel mcp --db /path/to/my.db            # custom path
 KHIVE_DB=/path/to/my.db kkernel mcp        # same, via env
-kkernel mcp --db :memory:                  # ephemeral, in-process only
+kkernel mcp --db :memory:                  # ephemeral in-memory storage
 ```
 
 ### `[[backends]]` declared
@@ -140,7 +140,11 @@ Three cases:
   documented escape hatch. It forces _every_ declared backend to an in-memory
   database for that invocation, logged loudly at `warn` level. This is for
   ephemeral test runs where you want the declared pack-to-backend topology
-  exercised without touching any real file on disk.
+  exercised without touching any real file on disk. `kkernel exec` forwards
+  `:memory:` (and an explicit `--config`) to a warm daemon it spawns, so the
+  daemon it binds is just as ephemeral; it never reuses a daemon already
+  bound to the persistent files, because `:memory:` produces a distinct
+  `config_id` that no persistent-storage daemon can match.
 
 - **A concrete path equal to the declared `main` backend path**: accepted as
   a redundant no-op after canonical path comparison. It does not collapse or
