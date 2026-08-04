@@ -612,6 +612,19 @@ pub async fn run_exec(args: ExecArgs) -> Result<()> {
         cfg.db_path.as_deref(),
         db_anchor.as_deref(),
     )?;
+
+    // Issue #1586: disclose the resolved database target once, before any
+    // dispatch. With no `--db`/`KHIVE_DB` override the resolver silently
+    // defaults to `$HOME/.khive/khive.db` (the production database); naming it
+    // keeps that implicit choice visible. Stderr rather than a tracing record
+    // because kkernel's default log level is `warn` — an INFO line would never
+    // surface — and stdout is reserved for JSON results. Disclosure only: no
+    // prompt, no refusal.
+    eprintln!(
+        "{}",
+        khive_mcp::serve::resolved_database_disclosure(cfg.db_path.as_deref())
+    );
+
     let db_context = ExecDbContext {
         raw: args.db,
         anchor: db_anchor,
