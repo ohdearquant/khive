@@ -3368,6 +3368,83 @@ async fn page_offset_over_i64max_rejected() {
     );
 }
 
+/// #1671: offset pages over edges whose primary sort key (`created_at`)
+/// repeats must form a deterministic total order — a full paged sweep returns
+/// every edge exactly once (no duplicates, no misses across page boundaries).
+#[tokio::test]
+async fn query_edges_offset_sweep_covers_equal_created_at_exactly_once() {
+    let store = setup_memory_store();
+    let created_at = DateTime::from_timestamp_micros(1_750_000_000_000_000).unwrap();
+    let mut expected_ids = Vec::new();
+    let mut edges = Vec::new();
+    for _ in 0..211 {
+        let mut edge = make_edge(Uuid::new_v4(), Uuid::new_v4(), EdgeRelation::Extends, 1.0);
+        edge.created_at = created_at;
+        expected_ids.push(edge.id);
+        edges.push(edge);
+    }
+    expected_ids.sort_unstable_by(|a, b| Uuid::from(*b).cmp(&Uuid::from(*a)));
+    store.upsert_edges(edges).await.unwrap();
+
+    // Default order (created_at DESC) — the empty-sort path.
+    let mut actual_ids = Vec::new();
+    let page_size = 37_u32;
+    let mut offset = 0_u64;
+    loop {
+        let page = store
+            .query_edges(
+                EdgeFilter::default(),
+                vec![],
+                PageRequest {
+                    offset,
+                    limit: page_size,
+                },
+            )
+            .await
+            .unwrap();
+        if page.items.is_empty() {
+            break;
+        }
+        offset += page.items.len() as u64;
+        actual_ids.extend(page.items.into_iter().map(|edge| edge.id));
+    }
+    assert_eq!(
+        actual_ids, expected_ids,
+        "default-order sweep must cover every edge exactly once"
+    );
+
+    // Explicit ASC primary sort — tiebreak direction follows the primary key.
+    let mut asc_ids = Vec::new();
+    let mut offset = 0_u64;
+    loop {
+        let page = store
+            .query_edges(
+                EdgeFilter::default(),
+                vec![SortOrder {
+                    field: EdgeSortField::CreatedAt,
+                    direction: SortDirection::Asc,
+                }],
+                PageRequest {
+                    offset,
+                    limit: page_size,
+                },
+            )
+            .await
+            .unwrap();
+        if page.items.is_empty() {
+            break;
+        }
+        offset += page.items.len() as u64;
+        asc_ids.extend(page.items.into_iter().map(|edge| edge.id));
+    }
+    let mut expected_asc = expected_ids.clone();
+    expected_asc.reverse();
+    assert_eq!(
+        asc_ids, expected_asc,
+        "ASC sweep must cover every edge exactly once in id ASC order"
+    );
+}
+
 #[tokio::test]
 async fn query_edges_after_exact_multiple_final_page_has_no_next_after() {
     let store = setup_memory_store();

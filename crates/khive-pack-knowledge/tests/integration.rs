@@ -1325,6 +1325,54 @@ async fn list_respects_limit_and_offset() {
     );
 }
 
+/// #1671: a full offset sweep over `knowledge.list` must enumerate every atom
+/// exactly once — no duplicates, no misses across page boundaries — even when
+/// many atoms land on the same `created_at` second (the column the primary
+/// sort key uses).
+#[tokio::test]
+async fn list_offset_sweep_covers_all_atoms_exactly_once() {
+    let f = pack(rt());
+    let content = "dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity";
+    for chunk in 0..7 {
+        let atoms: Vec<Value> = (0..17)
+            .map(|i| {
+                let n = chunk * 17 + i;
+                json!({ "slug": format!("sweep-{n:03}"), "name": format!("Sweep {n}"), "content": content })
+            })
+            .collect();
+        f.dispatch("knowledge.upsert_atoms", json!({ "atoms": atoms }))
+            .await
+            .expect("upsert");
+    }
+
+    let mut seen = std::collections::HashSet::new();
+    let mut offset = 0_u64;
+    let page_size = 13_u64;
+    loop {
+        let page = f
+            .dispatch(
+                "knowledge.list",
+                json!({ "limit": page_size, "offset": offset }),
+            )
+            .await
+            .expect("list page");
+        let results = page["results"].as_array().expect("results array");
+        if results.is_empty() {
+            break;
+        }
+        for row in results {
+            let id = row["id"].as_str().expect("atom id").to_string();
+            assert!(seen.insert(id.clone()), "duplicate id across pages: {id}");
+        }
+        offset += results.len() as u64;
+    }
+    assert_eq!(
+        seen.len(),
+        7 * 17,
+        "sweep must cover every atom exactly once"
+    );
+}
+
 // ── delete_atoms ──────────────────────────────────────────────────────────────
 
 #[tokio::test]

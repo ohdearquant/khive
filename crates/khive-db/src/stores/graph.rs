@@ -1865,9 +1865,13 @@ impl GraphStore for SqlGraphStore {
             };
 
             let order_clause = if sort.is_empty() {
-                " ORDER BY created_at DESC".to_string()
+                // #1671: offset pagination is only sound over a deterministic
+                // total order. Keep the primary key and append `id` as a final
+                // tiebreak in the primary key's direction so pages can never
+                // duplicate or skip rows that share the primary sort value.
+                " ORDER BY created_at DESC, id DESC".to_string()
             } else {
-                let parts: Vec<String> = sort
+                let mut parts: Vec<String> = sort
                     .iter()
                     .map(|s| {
                         let dir = match s.direction {
@@ -1877,6 +1881,11 @@ impl GraphStore for SqlGraphStore {
                         format!("{} {}", edge_sort_col(&s.field), dir)
                     })
                     .collect();
+                let dir = match sort.last().map(|s| &s.direction) {
+                    Some(SortDirection::Asc) => "ASC",
+                    _ => "DESC",
+                };
+                parts.push(format!("id {dir}"));
                 format!(" ORDER BY {}", parts.join(", "))
             };
 

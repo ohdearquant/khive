@@ -12507,6 +12507,53 @@ async fn list_proposal_limit_over_cap_reports_effective_limit() {
     assert_eq!(response["limit_clamped"], true);
 }
 
+/// #1671: a full offset sweep over `list(kind="proposal")` must enumerate
+/// every proposal exactly once — no duplicates, no misses across page
+/// boundaries — even when proposals share `updated_at` timestamps.
+#[tokio::test]
+async fn list_proposals_offset_sweep_covers_all_exactly_once() {
+    let f = pack_with_events();
+    for i in 0..61 {
+        f.dispatch(
+            "propose",
+            json!({
+                "title": format!("sweep-{i:03}"),
+                "description": "offset sweep coverage",
+                "changeset": changeset_add_entity(),
+            }),
+        )
+        .await
+        .expect("propose must succeed");
+    }
+
+    let mut seen = std::collections::HashSet::new();
+    let mut offset = 0_u64;
+    let page_size = 7_u64;
+    loop {
+        let page = f
+            .dispatch(
+                "list",
+                json!({"kind": "proposal", "limit": page_size, "offset": offset}),
+            )
+            .await
+            .expect("list proposals page");
+        let items = page.as_array().expect("proposal list is a JSON array");
+        if items.is_empty() {
+            break;
+        }
+        for row in items {
+            let id = row["id"].as_str().expect("proposal id").to_string();
+            assert!(seen.insert(id.clone()), "duplicate id across pages: {id}");
+        }
+        offset += items.len() as u64;
+    }
+    assert_eq!(
+        seen.len(),
+        61,
+        "sweep must cover every proposal exactly once"
+    );
+}
+
 // ── #806: `search_executed` event-plane emission ────────────────────────────
 //
 // Mirrors memory.recall's `#866` `recall_executed` regression

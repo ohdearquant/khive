@@ -744,11 +744,15 @@ impl EntityStore for SqlEntityStore {
             let order_by = if let Some(ref prefix) = filter.name_prefix {
                 data_params.push(Box::new(prefix.to_ascii_lowercase()));
                 format!(
-                    "CASE WHEN LOWER(name) = ?{} THEN 0 ELSE 1 END, created_at DESC",
+                    "CASE WHEN LOWER(name) = ?{} THEN 0 ELSE 1 END, created_at DESC, id DESC",
                     data_params.len()
                 )
             } else {
-                "created_at DESC".to_string()
+                // #1671: offset pagination is only sound over a deterministic
+                // total order; append `id` as the final tiebreak in the primary
+                // key's direction so equal-`created_at` rows can never be
+                // duplicated or skipped across page boundaries.
+                "created_at DESC, id DESC".to_string()
             };
 
             data_params.push(Box::new(limit_i64));

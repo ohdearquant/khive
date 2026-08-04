@@ -1098,7 +1098,7 @@ impl NoteStore for SqlNoteStore {
             let data_sql = format!(
                 "SELECT id, namespace, kind, status, name, content, salience, decay_factor, expires_at, \
                  properties, created_at, updated_at, deleted_at \
-                 FROM notes{} ORDER BY created_at DESC LIMIT ?{} OFFSET ?{}",
+                 FROM notes{} ORDER BY created_at DESC, id DESC LIMIT ?{} OFFSET ?{}",
                 where_sql, limit_idx, offset_idx,
             );
 
@@ -1155,9 +1155,15 @@ impl NoteStore for SqlNoteStore {
                         SortDir::Asc => "ASC",
                         SortDir::Desc => "DESC",
                     };
-                    format!(" ORDER BY {} {dir_str}", json_extract_expr(path))
+                    // #1671: append `id` as the final tiebreak in the primary
+                    // key's direction so offset pages form a deterministic
+                    // total order even when the JSON sort value repeats.
+                    format!(
+                        " ORDER BY {} {dir_str}, id {dir_str}",
+                        json_extract_expr(path)
+                    )
                 }
-                None => " ORDER BY created_at DESC, id ASC".to_string(),
+                None => " ORDER BY created_at DESC, id DESC".to_string(),
             };
 
             let limit_idx = data_params.len() - 1;

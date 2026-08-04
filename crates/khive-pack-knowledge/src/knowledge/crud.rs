@@ -505,7 +505,8 @@ impl KnowledgeHandlers {
             Some("domain") => {
                 let rows = reader
                     .query_all(SqlStatement {
-                        sql: "SELECT * FROM knowledge_domains WHERE namespace = ?1 AND deleted_at IS NULL ORDER BY created_at DESC LIMIT ?2 OFFSET ?3".into(),
+                        // #1671: `id` tiebreak — deterministic total order for offset pages.
+                        sql: "SELECT * FROM knowledge_domains WHERE namespace = ?1 AND deleted_at IS NULL ORDER BY created_at DESC, id DESC LIMIT ?2 OFFSET ?3".into(),
                         params: vec![
                             SqlValue::Text(ns.clone()),
                             SqlValue::Integer(limit),
@@ -550,7 +551,7 @@ impl KnowledgeHandlers {
                     status_sql_clause(&requested_statuses, &exclude_buf, 2);
 
                 let sql_str = format!(
-                    "SELECT * FROM knowledge_atoms WHERE namespace = ?1 AND deleted_at IS NULL AND tags NOT LIKE '%type:domain%'{} ORDER BY created_at DESC LIMIT ?2 OFFSET ?3",
+                    "SELECT * FROM knowledge_atoms WHERE namespace = ?1 AND deleted_at IS NULL AND tags NOT LIKE '%type:domain%'{} ORDER BY created_at DESC, id DESC LIMIT ?2 OFFSET ?3",
                     data_status_clause
                 );
                 let count_sql = format!(
