@@ -2947,10 +2947,14 @@ pub(crate) fn count_new_property_keys(
             count_new_keys_within_object(orig_map, final_map, strategy)
         }
         // The record ended up holding an object where it previously held
-        // something else, so every key it now carries is new. Counting the keys
-        // rather than scoring the replacement as 1 matters when restoration has
-        // emptied the object: nothing survived, and the count must say so.
-        (Some(_), Some(Value::Object(final_map))) => final_map.len(),
+        // something else. `merge_json` scores that replacement as ONE
+        // contribution however many keys the new object carries, and this arm
+        // keeps that rule rather than counting the keys — the alternative
+        // silently changes `properties_merged` for ordinary notes, which never
+        // enter the restoration path and were being reported correctly by the
+        // fold. The single exception is an object restoration has emptied: no
+        // key survived, so there is no contribution left to report.
+        (Some(_), Some(Value::Object(final_map))) => usize::from(!final_map.is_empty()),
         // Whole-value replacement by a non-object. `merge_json` scores a
         // `PreferFrom` fold that replaces one properties value with a
         // differently-shaped one as a single contribution, and that is the right
@@ -7733,7 +7737,21 @@ mod tests {
 
         for (into, from, label) in [
             (json!({"a": 1}), json!(5), "object replaced by scalar"),
-            (json!(7), json!({"b": 2}), "scalar replaced by object"),
+            (
+                json!(7),
+                json!({"b": 2}),
+                "scalar replaced by single-key object",
+            ),
+            // A whole-value replacement is ONE contribution however many keys
+            // the replacing object carries. The single-key vector above cannot
+            // see the difference between that rule and counting the object's
+            // keys, so it stayed green while the count was wrong for ordinary
+            // notes. This vector is the one that distinguishes them.
+            (
+                json!(7),
+                json!({"b": 2, "c": 3}),
+                "scalar replaced by multi-key object",
+            ),
         ] {
             let (merged, fold_count) = merge_json(&into, &from, EntityDedupMergePolicy::PreferFrom);
             let recomputed = count_new_property_keys(
