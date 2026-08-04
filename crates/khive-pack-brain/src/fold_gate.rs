@@ -434,25 +434,12 @@ async fn fold_within_tx(
 
 // ADR-067 Component A (Fork C slice 2): `apply_fold_gate`/
 // `apply_fold_gate_and_append_event` no longer issue their own manual
-// `BEGIN IMMEDIATE`/`COMMIT`/`ROLLBACK` via this helper (that now lives in
-// `SqlBridge::atomic_unit`'s `run_manual_atomic_unit`) — this remains only
-// as a small test-seeding utility.
-#[cfg(test)]
-async fn exec_stmt(
-    writer: &mut dyn SqlWriter,
-    sql: &str,
-    params: Vec<SqlValue>,
-    label: &str,
-) -> khive_storage::StorageResult<()> {
-    writer
-        .execute(SqlStatement {
-            sql: sql.to_string(),
-            params,
-            label: Some(label.to_string()),
-        })
-        .await?;
-    Ok(())
-}
+// `BEGIN IMMEDIATE`/`COMMIT`/`ROLLBACK`; that logic lives in
+// `SqlBridge::atomic_unit`'s `run_manual_atomic_unit`. The `exec_stmt`
+// test-seeding helper that once lived here is gone with the last manual
+// seed transaction: under a write-queue-enabled pool every statement is
+// wrapped in the writer task's own transaction, so test seeding issues
+// plain DML through the writer handle instead.
 
 #[cfg(test)]
 mod tests {
@@ -628,8 +615,10 @@ mod tests {
     }
 
     /// Shared setup for the file-backed concurrency/skew tests below: only a
-    /// real file-backed pool opens a standalone `rusqlite::Connection` per
-    /// `writer()` call (module doc above) — the property production needs
+    /// real file-backed pool resolves `write_queue_enabled` to true (ADR-136
+    /// write-queue default where the backing store is known), so `writer()`
+    /// hands out a handle whose statements run inside the pool's shared
+    /// writer task's own `BEGIN IMMEDIATE` — the property production needs
     /// and the in-memory pool cannot exercise.
     fn file_backed_runtime(db_name: &str) -> (khive_runtime::KhiveRuntime, tempfile::TempDir) {
         use khive_runtime::{BackendId, KhiveRuntime, Namespace, RuntimeConfig};
@@ -1047,7 +1036,14 @@ mod tests {
     /// The failure is injected by making `build_event` return an `Event`
     /// whose `id` collides with a row already seeded in `events` (`id` is
     /// that table's `PRIMARY KEY`) — a real, deterministic SQLite
-    /// constraint violation on the INSERT, not a mock. `append_event_on_writer`'s
+    /// constraint violation on the INSERT, not a mock. The seed runs in the
+    /// fixture writer's own transaction (the queue-routed writer task wraps
+    /// each drained request in `BEGIN IMMEDIATE`, so a manual bare `BEGIN`
+    /// here would nest and fail `cannot start a transaction within a
+    /// transaction`); the collision itself still bites inside the unit
+    /// under test's separate `atomic_unit` transaction, where the injected
+    /// event INSERT conflicts with the by-then-committed seeded row.
+    /// `append_event_on_writer`'s
     /// INSERT has no `OR IGNORE`, so the conflict surfaces as an `Err` from
     /// `SqlWriter::execute`, propagating out of `apply_fold_gate_and_append_event`
     /// before `COMMIT` — exercising the previously untested rollback path
@@ -1072,12 +1068,17 @@ mod tests {
         let event_target = uuid::Uuid::new_v4();
         let colliding_id = uuid::Uuid::new_v4();
 
-        // Seed a colliding `events` row outside the unit under test.
+        // Seed a colliding `events` row outside the unit under test, inside
+        // the fixture writer's own transaction: this file-backed pool routes
+        // `writer()` statements through the shared writer task, which opens
+        // its own `BEGIN IMMEDIATE` per drained request — a manual bare
+        // `BEGIN` here would nest inside it and fail `cannot start a
+        // transaction within a transaction`, and a bare `COMMIT` would close
+        // the writer task's transaction early. The single insert therefore
+        // runs as one queued statement (atomic on its own), and the seeded
+        // row is durable before the unit under test runs.
         {
             let mut writer = sql.writer().await.expect("writer");
-            exec_stmt(writer.as_mut(), "BEGIN IMMEDIATE", vec![], "seed_begin")
-                .await
-                .expect("begin seed txn");
             let seed_event = Event {
                 id: colliding_id,
                 ..Event::new(
@@ -1091,9 +1092,6 @@ mod tests {
             khive_db::stores::event::append_event_on_writer(writer.as_mut(), &seed_event)
                 .await
                 .expect("seed colliding event");
-            exec_stmt(writer.as_mut(), "COMMIT", vec![], "seed_commit")
-                .await
-                .expect("commit seed txn");
         }
 
         // First attempt: claim succeeds, mass folds, but the event append
