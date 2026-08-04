@@ -302,6 +302,84 @@ FIXTURE
 <!-- END GENERATED ADR CATALOG -->
 FIXTURE
 
+    # Regression case 14 (must-FAIL control, mismatched fence characters): the
+    # catalog never closes, and the only END sits inside a tilde fence that a
+    # backtick line appears to close. In Markdown a backtick line is ordinary
+    # text inside a tilde fence, so a single in-fence flag toggled off there
+    # and exposed the quoted END as a real delimiter.
+    mkdir -p "$tmp/case-mixed-fence/docs/adr"
+    cat > "$tmp/case-mixed-fence/docs/adr/ADR-207-fixture-mixed-fence.md" <<'FIXTURE'
+# ADR-207: Fixture Mixed Fence
+
+**Status**: accepted
+FIXTURE
+    cat > "$tmp/case-mixed-fence/docs/adr/README.md" <<'FIXTURE'
+# ADR Index
+
+<!-- BEGIN GENERATED ADR CATALOG -->
+
+| ADR | Title |
+| --- | --- |
+| [ADR-207](ADR-207-fixture-mixed-fence.md) | Fixture Mixed Fence |
+
+~~~
+```
+<!-- END GENERATED ADR CATALOG -->
+```
+~~~
+FIXTURE
+
+    # Regression case 15 (must-FAIL control, short closing fence): a fence
+    # closes only on a run at least as long as the one that opened it, so a
+    # three-backtick line does not close a four-backtick fence and the END
+    # quoted after it stays inert.
+    mkdir -p "$tmp/case-short-fence/docs/adr"
+    cat > "$tmp/case-short-fence/docs/adr/ADR-208-fixture-short-fence.md" <<'FIXTURE'
+# ADR-208: Fixture Short Fence
+
+**Status**: accepted
+FIXTURE
+    cat > "$tmp/case-short-fence/docs/adr/README.md" <<'FIXTURE'
+# ADR Index
+
+<!-- BEGIN GENERATED ADR CATALOG -->
+
+| ADR | Title |
+| --- | --- |
+| [ADR-208](ADR-208-fixture-short-fence.md) | Fixture Short Fence |
+
+````
+```
+<!-- END GENERATED ADR CATALOG -->
+```
+````
+FIXTURE
+
+    # Regression case 16 (must-FAIL control, adjacent comments): one line both
+    # closes a comment and opens the next. A scanner that stops at the first
+    # `-->` reads the rest of the file as live text, so the END quoted inside
+    # the second comment closed the catalog.
+    mkdir -p "$tmp/case-chained-comment/docs/adr"
+    cat > "$tmp/case-chained-comment/docs/adr/ADR-209-fixture-chained-comment.md" <<'FIXTURE'
+# ADR-209: Fixture Chained Comment
+
+**Status**: accepted
+FIXTURE
+    cat > "$tmp/case-chained-comment/docs/adr/README.md" <<'FIXTURE'
+# ADR Index
+
+<!-- BEGIN GENERATED ADR CATALOG -->
+
+| ADR | Title |
+| --- | --- |
+| [ADR-209](ADR-209-fixture-chained-comment.md) | Fixture Chained Comment |
+
+<!-- first comment
+--> <!-- second comment
+<!-- END GENERATED ADR CATALOG -->
+-->
+FIXTURE
+
     cat > "$tmp/case-fail/crates/fixture-crate/docs/design.md" <<'FIXTURE'
 # fixture-crate Design
 
@@ -463,6 +541,25 @@ FIXTURE
     else
         echo "self-test OK: BEGIN marker quoted inside an HTML comment does not open the catalog"
     fi
+
+    for case in mixed-fence short-fence chained-comment; do
+        case "$case" in
+            mixed-fence) why="an END quoted inside a tilde fence that a backtick line appeared to close" ;;
+            short-fence) why="an END quoted after a short closing fence that does not close the longer opening one" ;;
+            chained-comment) why="an END quoted inside a comment reopened on the same line that closed the previous one" ;;
+        esac
+        if sh "$SCRIPT_DIR/lint-adr-refs.sh" "$tmp/case-$case" > "$tmp/$case.log" 2>&1; then
+            echo "self-test FAILED: $why closed the catalog"
+            cat "$tmp/$case.log"
+            status=1
+        elif ! grep -q 'missing "<!-- END GENERATED ADR CATALOG -->" marker' "$tmp/$case.log"; then
+            echo "self-test FAILED: $case lint failed, but not for the expected reason:"
+            cat "$tmp/$case.log"
+            status=1
+        else
+            echo "self-test OK: $why does not close the catalog"
+        fi
+    done
 
     return "$status"
 }
@@ -659,40 +756,81 @@ catalog_end = "<!-- END GENERATED ADR CATALOG -->"
 cataloged_numbers: set[str] = set()
 in_catalog = False
 saw_catalog_end = False
-in_fence = False
+open_fence: tuple[str, int] | None = None
 in_comment = False
+
+fence_re = re.compile(r"^\s{0,3}(?P<marker>`{3,}|~{3,})(?P<info>.*)$")
+
+
+def advance_comment_state(text: str, inside: bool) -> bool:
+    """Comment nesting state after consuming one line.
+
+    A single pass looking only for the first `-->` is not enough: `--> <!--`
+    both closes a comment and opens the next one on the same line, and a
+    scanner that stops at the close treats everything after it as live text.
+    Alternating the search keeps the state correct however many delimiters a
+    line carries.
+    """
+    index = 0
+    while True:
+        if inside:
+            close = text.find("-->", index)
+            if close < 0:
+                return True
+            index = close + 3
+            inside = False
+        else:
+            opening = text.find("<!--", index)
+            if opening < 0:
+                return False
+            index = opening + 4
+            inside = True
+
+
 with index_path.open(encoding="utf-8") as handle:
     for line_number, raw_line in enumerate(handle, 1):
         line = raw_line.rstrip("\n")
         # Fence and comment state is resolved BEFORE either delimiter is
         # tested, and for every line rather than only inside the catalog. A
-        # marker quoted in a code fence or inside a multi-line comment is
-        # illustrative text, not a delimiter: testing the delimiters first let
-        # an inert END satisfy the end-marker assertion, and let an inert
-        # BEGIN open the scan early so stale rows above the real catalog
-        # counted as coverage.
-        if re.match(r"^\s*(```|~~~)", line):
-            in_fence = not in_fence
-            continue
-        if in_fence:
-            continue
-        if in_comment:
-            if "-->" in line:
-                in_comment = False
-            continue
-        if not in_catalog:
-            if line.strip() == catalog_begin:
-                in_catalog = True
+        # marker quoted in a code fence or inside a comment is illustrative
+        # text, not a delimiter: testing the delimiters first let an inert END
+        # satisfy the end-marker assertion, and let an inert BEGIN open the
+        # scan early so stale rows above the real catalog counted as coverage.
+        #
+        # The fence state carries the opening character and run length rather
+        # than a single flag. A flag treats any fence line as a toggle, so a
+        # backtick line inside a tilde fence -- ordinary text, in Markdown --
+        # closed the fence and exposed whatever followed. A fence closes only
+        # on the same character, at a run at least as long, with nothing after
+        # it.
+        fence_match = fence_re.match(line)
+        if open_fence is None:
+            if fence_match is not None and not in_comment:
+                marker = fence_match.group("marker")
+                open_fence = (marker[0], len(marker))
                 continue
-        elif line.strip() == catalog_end:
-            saw_catalog_end = True
-            break
-        # Single-line comments are opened here, after the delimiter tests: the
-        # markers are themselves single-line HTML comments and must not be
-        # swallowed as ordinary comment text.
-        if "<!--" in line:
-            if "-->" not in line:
-                in_comment = True
+        else:
+            fence_char, fence_len = open_fence
+            if (
+                fence_match is not None
+                and fence_match.group("marker")[0] == fence_char
+                and len(fence_match.group("marker")) >= fence_len
+                and not fence_match.group("info").strip()
+            ):
+                open_fence = None
+            continue
+        entered_in_comment = in_comment
+        if not entered_in_comment:
+            if not in_catalog:
+                if line.strip() == catalog_begin:
+                    in_catalog = True
+                    in_comment = advance_comment_state(line, in_comment)
+                    continue
+            elif line.strip() == catalog_end:
+                saw_catalog_end = True
+                break
+        in_comment = advance_comment_state(line, in_comment)
+        if entered_in_comment or in_comment:
             continue
         if not in_catalog:
             continue
