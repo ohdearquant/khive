@@ -109,7 +109,7 @@ a paper delivered through a conversation is content worth naming, which makes it
 message note `annotates` it. The test: "is this byte payload another form of what this record
 itself says, or an independent thing?" Text that fits a text column stays in the text column;
 attachments are for bytes that do not belong there. The dividing line is modality and size,
-never importance.
+not significance.
 
 External references are not attachments. A URL (an arXiv link, a web page) lives in record
 properties as it does today; the attachment map holds only content the store physically holds.

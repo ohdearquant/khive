@@ -31,6 +31,11 @@ pub struct MultiBackendRegistry {
     pub per_pack_runtimes: HashMap<String, Arc<KhiveRuntime>>,
     /// The `main` backend (needed by the coordinator to build the BackendRegistry).
     pub main_backend: Arc<StorageBackend>,
+    /// The default runtime this boot built alongside the per-pack runtimes.
+    /// A clone (cheap: internal state is `Arc<RwLock<_>>`-shared), kept so
+    /// callers — chiefly boot-wiring tests — can assert on its installed
+    /// state (e.g. `has_note_write_validator()`) without re-deriving it.
+    pub default_runtime: KhiveRuntime,
 }
 
 /// Build a server from `args`, then serve it over `--daemon` or the named transport.
@@ -1811,6 +1816,32 @@ fn build_registry_for_multi_backend_inner(
     // update/delete verbs notify caching packs even though there is no
     // crate-level dependency between them.
     registry.call_register_note_mutation_hooks(&default_runtime);
+    // Note-write identity: install the pack-owned kind set and the pack-owned
+    // note-write validator so identity properties are derived at the write and
+    // preserved through merge/update on every path, including the ones that
+    // reach no pack verb. Each per-pack runtime is constructed independently
+    // in the multi-backend boot path (unlike the single-backend
+    // `KhiveMcpServer::with_packs` path), so both must be installed on every
+    // runtime that could actually serve a generic `create`/`update`/`merge`
+    // for a pack-owned kind, not just `default_runtime`.
+    let owned_note_kinds: Vec<String> = registry
+        .pack_owned_note_kinds()
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    default_runtime.install_pack_owned_note_kinds(owned_note_kinds.clone());
+    for rt in per_pack_runtimes_local.values() {
+        rt.install_pack_owned_note_kinds(owned_note_kinds.clone());
+    }
+    // The validator is installed on every runtime the kind list reaches, not
+    // just the default: each per-pack runtime is built independently, so none
+    // of them shares the default's validator slot, and `core()` clones the
+    // secondary's own slots rather than the default's. A runtime that has the
+    // kind list but no validator enforces half the rule.
+    registry.call_register_note_write_validators(&default_runtime);
+    for rt in per_pack_runtimes_local.values() {
+        registry.call_register_note_write_validators(rt);
+    }
 
     let backend_for_pack: HashMap<&str, &StorageBackend> = per_pack_runtimes_local
         .iter()
@@ -1833,6 +1864,7 @@ fn build_registry_for_multi_backend_inner(
         config_id,
         per_pack_runtimes: per_pack_runtimes_arc,
         main_backend,
+        default_runtime,
     })
 }
 
@@ -3990,6 +4022,262 @@ id = "lambda:project-actor"
             first_comm_ok,
             Some(true),
             "comm.send must succeed; response: {comm_resp}"
+        );
+    }
+
+    /// ADR-124 note-write identity guard: the pack-owned note kind set must
+    /// be installed on the multi-backend boot path, not only on
+    /// `KhiveMcpServer::with_packs` (single-backend). Routes `kg` and `comm`
+    /// to the same "main" backend through the real `build_server_multi_backend`
+    /// builder — no manual `install_pack_owned_note_kinds` call, unlike
+    /// `build_registry_with_owned_kinds` in the `khive-pack-comm` integration
+    /// tests — so this test exercises the actual boot wiring rather than a
+    /// hand-simulated one. Without the install this fix added in `serve.rs`
+    /// (alongside the edge-rules/note-mutation-hook installs), a generic
+    /// `update(properties={from_actor: ...})` on an inbound message note
+    /// would silently succeed on a served multi-backend instance. Verified by
+    /// temporarily reverting the `install_pack_owned_note_kinds` calls in
+    /// `build_registry_for_multi_backend_inner` and re-running this test: it
+    /// fails (`from_actor` forgery succeeds) without the fix and passes with
+    /// it restored.
+    #[tokio::test]
+    #[serial]
+    async fn multi_backend_boot_installs_owned_note_kinds_so_update_is_refused() {
+        use crate::tools::request::RequestParams;
+
+        let khive_cfg = KhiveConfig {
+            backends: vec![BackendConfig {
+                name: "main".to_string(),
+                kind: BackendKind::Memory,
+                path: None,
+                cache_mb: None,
+                journal_mode: None,
+                read_only: false,
+            }],
+            ..KhiveConfig::default()
+        };
+
+        let base_cfg = base_runtime_config_for_multi_backend();
+
+        let server = build_server_multi_backend(base_cfg, &khive_cfg, None)
+            .expect("multi-backend boot must succeed");
+
+        let send_resp = server
+            .dispatch_request_local(RequestParams {
+                ops: r#"comm.send(to="local", content="adr-124 multi-backend boot probe")"#
+                    .to_string(),
+                presentation: None,
+                presentation_per_op: None,
+                save_to: None,
+                format: None,
+                format_per_op: None,
+                request_id: None,
+            })
+            .await
+            .expect("comm.send dispatch must not error");
+        let send_json: serde_json::Value =
+            serde_json::from_str(&send_resp).expect("send response is valid JSON");
+        assert_eq!(
+            send_json["results"][0]["ok"].as_bool(),
+            Some(true),
+            "comm.send must succeed; response: {send_resp}"
+        );
+        let full_id = send_json["results"][0]["result"]["full_id"]
+            .as_str()
+            .expect("send must return full_id")
+            .to_string();
+
+        let get_before_resp = server
+            .dispatch_request_local(RequestParams {
+                ops: format!(r#"get(id="{full_id}")"#),
+                presentation: None,
+                presentation_per_op: None,
+                save_to: None,
+                format: None,
+                format_per_op: None,
+                request_id: None,
+            })
+            .await
+            .expect("get dispatch must not error");
+        let get_before_json: serde_json::Value =
+            serde_json::from_str(&get_before_resp).expect("get response is valid JSON");
+        let original_from_actor =
+            get_before_json["results"][0]["result"]["properties"]["from_actor"].clone();
+
+        let update_resp = server
+            .dispatch_request_local(RequestParams {
+                ops: format!(
+                    r#"update(id="{full_id}", properties={{"from_actor": "forged-actor"}})"#
+                ),
+                presentation: None,
+                presentation_per_op: None,
+                save_to: None,
+                format: None,
+                format_per_op: None,
+                request_id: None,
+            })
+            .await
+            .expect("update dispatch must not error");
+        let update_json: serde_json::Value =
+            serde_json::from_str(&update_resp).expect("update response is valid JSON");
+        assert_eq!(
+            update_json["results"][0]["ok"].as_bool(),
+            Some(false),
+            "update forging `from_actor` on a message note must be refused on a served \
+             multi-backend instance; response: {update_resp}"
+        );
+        let error_msg = update_json["results"][0]["error"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(
+            error_msg.contains("from_actor"),
+            "refusal error must name `from_actor`; got: {error_msg}"
+        );
+
+        let get_after_resp = server
+            .dispatch_request_local(RequestParams {
+                ops: format!(r#"get(id="{full_id}")"#),
+                presentation: None,
+                presentation_per_op: None,
+                save_to: None,
+                format: None,
+                format_per_op: None,
+                request_id: None,
+            })
+            .await
+            .expect("get dispatch must not error");
+        let get_after_json: serde_json::Value =
+            serde_json::from_str(&get_after_resp).expect("get response is valid JSON");
+        assert_eq!(
+            get_after_json["results"][0]["result"]["properties"]["from_actor"], original_from_actor,
+            "stored from_actor must be unchanged after the refused forgery attempt"
+        );
+    }
+
+    /// ADR-124 boot-occupancy regression (multi-backend twin of
+    /// `server::tests::single_runtime_boot_installs_note_write_validator`):
+    /// `has_note_write_validator` exists specifically so a transport's own
+    /// tests can assert, per boot path, that the documented startup
+    /// sequence actually filled the slot — but nothing called it for the
+    /// multi-backend builder either. Each per-pack runtime is constructed
+    /// independently in this boot path (unlike single-backend
+    /// `with_packs`), so the validator must be installed on the default
+    /// runtime AND on every per-pack runtime, not just one — installing it
+    /// on only the default would leave `kg`'s own per-pack runtime (which
+    /// actually serves the generic `create` verb below) unenforced. Asserts
+    /// occupancy directly on all of them through the real
+    /// `build_registry_for_multi_backend_inner` builder, then proves the
+    /// slot is wired, not just occupied: a generic `create` naming a forged
+    /// `from_actor` on a `message` note must come back derived to the same
+    /// actor a legitimate `comm.send` on this server stamps, not the forged
+    /// value. Sensitivity verified by temporarily commenting out both
+    /// `registry.call_register_note_write_validators(...)` calls in
+    /// `build_registry_for_multi_backend_inner` and re-running: all
+    /// assertions fail without them (occupancy false; forged value
+    /// survives) and pass with them restored.
+    #[tokio::test]
+    #[serial]
+    async fn multi_backend_boot_installs_note_write_validator_on_every_runtime() {
+        use crate::tools::request::RequestParams;
+
+        let khive_cfg = KhiveConfig {
+            backends: vec![BackendConfig {
+                name: "main".to_string(),
+                kind: BackendKind::Memory,
+                path: None,
+                cache_mb: None,
+                journal_mode: None,
+                read_only: false,
+            }],
+            ..KhiveConfig::default()
+        };
+
+        let base_cfg = base_runtime_config_for_multi_backend();
+
+        let multi = build_registry_for_multi_backend_inner(base_cfg, &khive_cfg, None)
+            .expect("multi-backend registry build must succeed");
+
+        assert!(
+            multi.default_runtime.has_note_write_validator(),
+            "multi-backend boot must install the note-write validator on the \
+             default runtime"
+        );
+        for (pack_name, rt) in &multi.per_pack_runtimes {
+            assert!(
+                rt.has_note_write_validator(),
+                "multi-backend boot must install the note-write validator on \
+                 the per-pack runtime for {pack_name:?}"
+            );
+        }
+
+        let server = build_server_from_multi_backend_registry(multi, &khive_cfg, None);
+
+        let send_resp = server
+            .dispatch_request_local(RequestParams {
+                ops: r#"comm.send(to="local", content="adr-124 boot-occupancy actor probe")"#
+                    .to_string(),
+                presentation: None,
+                presentation_per_op: None,
+                save_to: None,
+                format: None,
+                format_per_op: None,
+                request_id: None,
+            })
+            .await
+            .expect("comm.send dispatch must not error");
+        let send_json: serde_json::Value =
+            serde_json::from_str(&send_resp).expect("send response is valid JSON");
+        assert_eq!(
+            send_json["results"][0]["ok"].as_bool(),
+            Some(true),
+            "comm.send must succeed; response: {send_resp}"
+        );
+        let full_id = send_json["results"][0]["result"]["full_id"]
+            .as_str()
+            .expect("send must return full_id")
+            .to_string();
+
+        let get_resp = server
+            .dispatch_request_local(RequestParams {
+                ops: format!(r#"get(id="{full_id}")"#),
+                presentation: None,
+                presentation_per_op: None,
+                save_to: None,
+                format: None,
+                format_per_op: None,
+                request_id: None,
+            })
+            .await
+            .expect("get dispatch must not error");
+        let get_json: serde_json::Value =
+            serde_json::from_str(&get_resp).expect("get response is valid JSON");
+        let legitimate_actor = get_json["results"][0]["result"]["properties"]["from_actor"].clone();
+
+        let create_resp = server
+            .dispatch_request_local(RequestParams {
+                ops: r#"create(kind="message", content="adr-124 boot-occupancy create probe", properties={"from_actor": "forged-actor"})"#
+                    .to_string(),
+                presentation: None,
+                presentation_per_op: None,
+                save_to: None,
+                format: None,
+                format_per_op: None,
+                request_id: None,
+            })
+            .await
+            .expect("create dispatch must not error");
+        let create_json: serde_json::Value =
+            serde_json::from_str(&create_resp).expect("create response is valid JSON");
+        assert_eq!(
+            create_json["results"][0]["ok"].as_bool(),
+            Some(true),
+            "create must succeed; response: {create_resp}"
+        );
+        assert_eq!(
+            create_json["results"][0]["result"]["properties"]["from_actor"], legitimate_actor,
+            "a forged from_actor on a generic create must come back derived to \
+             the same actor a legitimate comm.send on this server stamps, not \
+             the forged value; response: {create_resp}"
         );
     }
 

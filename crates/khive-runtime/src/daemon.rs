@@ -569,10 +569,10 @@ pub struct MetricsSnapshot {
     /// bring the WAL back below `warn_pages`; resets to 0 the next time an
     /// attempt clears it.
     pub wal_truncate_consecutive_failures: u64,
-    /// Total checkpoint ticks skipped because the writer mutex was busy
-    /// (ADR-091 checkpoint-pressure telemetry), across this process's
-    /// lifetime. `#[serde(default)]` so an older client decoding a newer
-    /// daemon's snapshot (or vice versa) does not fail.
+    /// Total checkpoint ticks skipped because the dedicated checkpoint
+    /// connection was unavailable (ADR-091 checkpoint-pressure telemetry),
+    /// across this process's lifetime. `#[serde(default)]` so an older client
+    /// decoding a newer daemon's snapshot (or vice versa) does not fail.
     #[serde(default)]
     pub wal_checkpoint_skipped_ticks: u64,
     /// Current consecutive-skip run length; 0 once the next tick is observed.
@@ -2728,15 +2728,16 @@ mod tests {
                 .expect("seed writes");
         }
 
-        let tick = khive_db::checkpoint_once(
+        let dedicated_conn = pool
+            .open_standalone_writer()
+            .expect("open dedicated checkpoint connection");
+        khive_db::checkpoint_once(
             &pool,
+            &dedicated_conn,
             &CheckpointConfig::default(),
             &mut khive_db::checkpoint::TruncateState::default(),
-        );
-        assert!(
-            matches!(tick, khive_db::CheckpointTick::Observed(_)),
-            "checkpoint_once on a freshly-writer-held pool must observe, not skip: {tick:?}"
-        );
+        )
+        .expect("checkpoint_once must observe on a healthy dedicated connection");
 
         let dispatcher = MockDispatch {
             namespace: "local".to_string(),

@@ -348,7 +348,7 @@ mod tests {
     use crate::{EmbedderProvider, Namespace};
     use async_trait::async_trait;
     use khive_storage::EdgeRelation;
-    use lattice_embed::{EmbedError, EmbeddingModel, EmbeddingService, MAX_TEXT_CHARS};
+    use lattice_embed::{EmbedError, EmbeddingModel, EmbeddingService, MAX_TEXT_BYTES};
 
     const IMPORT_TEST_MODEL: &str = "all-minilm-l6-v2";
 
@@ -415,7 +415,7 @@ mod tests {
                 kind: "concept".to_string(),
                 entity_type: None,
                 name: "Imported long entity".to_string(),
-                description: Some("x".repeat(MAX_TEXT_CHARS + 1)),
+                description: Some("x".repeat(MAX_TEXT_BYTES + 1)),
                 properties: None,
                 tags: vec![],
                 created_at: Utc::now(),

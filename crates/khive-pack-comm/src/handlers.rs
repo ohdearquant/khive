@@ -84,6 +84,59 @@ fn canonicalize_thread_id(verb: &str, raw: &str) -> Result<String, RuntimeError>
         })
 }
 
+/// Fail-closed resolution for a caller-supplied thread root (issue #1673):
+/// shape validation alone accepts any UUID-shaped value, and an unresolvable
+/// one strands the new message — `comm.thread` cannot reconstruct a thread
+/// whose root row no live note points at, so the phantom send would succeed
+/// silently while no reader could ever see the conversation whole. A supplied
+/// root therefore has to resolve to at least one live `message` note in the
+/// caller's namespace carrying that `thread_id` (probing the alternate
+/// spellings a pre-v1 handler could have stored, exactly as thread lookup
+/// does), or the send is rejected and nothing is persisted.
+async fn require_existing_thread_root(
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+    verb: &str,
+    canonical_thread_id: &str,
+) -> Result<(), RuntimeError> {
+    let root_uuid = canonical_thread_id
+        .parse::<Uuid>()
+        .expect("canonicalize_thread_id produced this value from a parsed UUID");
+    let spellings = thread_id_query_spellings(root_uuid, None)
+        .into_iter()
+        .map(SqlValue::Text)
+        .collect();
+    let filter = NoteFilter {
+        kind: Some("message".to_string()),
+        property_filters: vec![PropertyFilter {
+            json_path: "$.thread_id".to_string(),
+            op: FilterOp::In(spellings),
+            value: SqlValue::Null,
+        }],
+        ..Default::default()
+    };
+    let store = runtime.notes(token)?;
+    let page = store
+        .query_notes_filtered(
+            token.namespace().as_str(),
+            &filter,
+            PageRequest {
+                limit: 1,
+                offset: 0,
+            },
+        )
+        .await?;
+    if page.items.is_empty() {
+        return Err(RuntimeError::InvalidInput(format!(
+            "{verb}: `thread_id` {canonical_thread_id:?} does not resolve to an existing \
+             thread: no live message in this namespace carries that thread_id. Refusing to \
+             strand the message on a phantom thread -- omit `thread_id` to \
+             start a new thread, or pass the `full_id` of an existing message (see comm.thread)."
+        )));
+    }
+    Ok(())
+}
+
 fn validate_inbox_substring(field: &str, value: Option<&str>) -> Result<(), RuntimeError> {
     if value.is_some_and(|raw| raw.trim().is_empty()) {
         return Err(RuntimeError::InvalidInput(format!(
@@ -208,6 +261,9 @@ pub(crate) async fn handle_send(
         .as_deref()
         .map(|raw| canonicalize_thread_id("send", raw))
         .transpose()?;
+    if let Some(ref tid) = thread_id {
+        require_existing_thread_root(runtime, token, "send", tid).await?;
+    }
 
     let caller_ns = token.namespace().as_str().to_string();
     let from_actor = token.actor().id.clone();

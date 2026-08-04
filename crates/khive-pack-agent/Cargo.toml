@@ -1,0 +1,25 @@
+[package]
+name = "khive-pack-agent"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "Agent verb pack — spawn/resume/kill/suspend/observe wire surface over the runtime-owned agent process table (ADR-142 §1)"
+
+[dependencies]
+khive-types = { version = "0.7.0", path = "../khive-types", features = ["serde", "blake3"] }
+khive-runtime = { version = "0.7.0", path = "../khive-runtime" }
+khive-storage = { version = "0.7.0", path = "../khive-storage" }
+async-trait = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full"] }
+khive-pack-kg = { version = "0.7.0", path = "../khive-pack-kg" }

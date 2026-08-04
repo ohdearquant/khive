@@ -36,6 +36,50 @@ impl CommPack {
     }
 }
 
+/// Derive a `message` note's authored-by identity from the authorization
+/// token, whatever the caller supplied.
+///
+/// `comm.send` already resolves `from_actor` from `token.actor().id`
+/// (`handlers.rs::handle_send`); this is that same resolution applied at the
+/// runtime note-write, so a `message` row's `from_actor` is a function of the
+/// token on every write path rather than of caller input on some of them. The
+/// derived value therefore names the actor whose token performed the write —
+/// on the proposal-apply path that is the applying caller, not the proposer
+/// who composed the changeset.
+///
+/// Only `from_actor` is derived. `direction` and `sent_at` are equally
+/// identity-bearing (they are preserved through `merge` and refused by
+/// `update`), but neither is a function of the token: `dual_write_message`
+/// writes an inbound copy with `direction="inbound"` under the sender's own
+/// token, and `comm.ingest` carries a transport-supplied `sent_at`. Deriving
+/// either here would overwrite a value a legitimate caller must set.
+///
+/// Kinds other than `message` — including comm's own `channel_health` — pass
+/// through untouched: the runtime holds one validator slot for all packs.
+pub(crate) fn derive_message_identity(
+    kind: &str,
+    actor_id: &str,
+    properties: Option<Value>,
+) -> Result<Option<Value>, RuntimeError> {
+    if kind != "message" {
+        return Ok(properties);
+    }
+    let mut props = match properties {
+        Some(Value::Object(map)) => map,
+        Some(other) => {
+            return Err(RuntimeError::InvalidInput(format!(
+                "a `message` note's properties must be a JSON object, got: {other}"
+            )));
+        }
+        None => serde_json::Map::new(),
+    };
+    props.insert(
+        "from_actor".to_string(),
+        Value::String(actor_id.to_string()),
+    );
+    Ok(Some(Value::Object(props)))
+}
+
 struct CommPackFactory;
 
 impl khive_runtime::PackFactory for CommPackFactory {
@@ -65,6 +109,9 @@ impl PackRuntime for CommPack {
     }
     fn handlers(&self) -> &'static [HandlerDef] {
         &COMM_HANDLERS
+    }
+    fn register_note_write_validator(&self, runtime: &KhiveRuntime) {
+        runtime.install_note_write_validator(std::sync::Arc::new(derive_message_identity));
     }
     fn requires(&self) -> &'static [&'static str] {
         <CommPack as Pack>::REQUIRES

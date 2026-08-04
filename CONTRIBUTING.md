@@ -46,6 +46,13 @@ The full CI pipeline is in `scripts/ci.sh` and can be run locally with:
 make ci
 ```
 
+The Rust test and doctest phases run under a fresh temporary `HOME`, while preserving the
+caller's `CARGO_HOME` and `RUSTUP_HOME`. This keeps the store-isolation tripwire meaningful on a
+workstation that is also running a khive daemon: accidental default-path writes are detected in
+the temporary home, and unrelated writes to the operator's live `~/.khive` store cannot make the
+suite fail. Tests that need persistent fixtures must pass an explicit temporary `db_path` rather
+than depend on the operator's home directory.
+
 Individual targets: `make check`, `make clippy`, `make test`, `make fmt`.
 
 ## Pull Request Workflow
