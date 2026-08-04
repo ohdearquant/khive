@@ -99,6 +99,24 @@
 //! shape is owned by the verb result surface (ADR-016) and the per-topic
 //! event catalog respectively, not by this crate.
 //!
+//! Three deliberate boundaries of the strictness, stated so nobody
+//! re-derives them:
+//!
+//! - **Explicit `null` on an optional field is equivalent to absence.**
+//!   Optional payload fields are `Option<T>`; a member present with value
+//!   `null` decodes as absent and re-encodes with the member omitted. No
+//!   frame distinguishes present-null from absent.
+//! - **Duplicate members are last-wins, not rejected.** Payloads pass
+//!   through `serde_json`'s object model before field checking, so a
+//!   duplicated member name silently keeps the last occurrence —
+//!   `deny_unknown_fields` cannot see the earlier one. Rejecting
+//!   duplicates would require validating the raw document; the grammar
+//!   takes the documented last-wins stance instead.
+//! - **`topic` syntax is not validated here.** The codec accepts any JSON
+//!   string (including empty) for `subscribe`/`unsubscribe`/`event`
+//!   topics; the `<domain>.<event>` shape is enforced by the server
+//!   against its topic catalog, where the catalog lives.
+//!
 //! ## Opaque payload fidelity
 //!
 //! `response.result` and `event.payload` are preserved as JSON VALUES —

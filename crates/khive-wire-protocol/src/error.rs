@@ -41,7 +41,10 @@ pub enum TerminalScope {
 /// set: their terminal scopes are fixed by the table. A code outside the
 /// set fell back to [`WireErrorCode::Internal`] via `#[serde(other)]`; its
 /// true scope is unknown to this protocol version, and ADR-137 directs the
-/// client to treat it as `internal` rather than reject the frame.
+/// client to treat it as `internal` rather than reject the frame. Code
+/// names are case-sensitive: a case-variant of a known code (`"Cancelled"`)
+/// is simply an unknown code string and takes the same documented fallback
+/// — the exemption is one rule, not a bypass of the closed set.
 pub const WIRE_ERROR_CODES: &[&str] = &[
     "unsupported_version",
     "identity_rejected",

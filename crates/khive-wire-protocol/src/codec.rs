@@ -59,7 +59,10 @@ pub enum CodecError {
     #[error("frame of {declared} bytes exceeds the u32 length prefix's {max} byte capacity")]
     U32PrefixLimitExceeded { declared: usize, max: usize },
 
-    /// The payload bytes are not valid JSON at all.
+    /// Decode side: the payload bytes are not valid JSON at all. Encode
+    /// side: the frame failed to serialize (only reachable for opaque
+    /// payloads that cannot be represented, e.g. a map with non-string
+    /// keys smuggled into `response.result`).
     #[error("payload is not valid JSON: {0}")]
     InvalidJson(String),
 

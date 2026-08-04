@@ -422,7 +422,22 @@ impl Serialize for Frame {
                     3
                 }
             }
-            _ => 5,
+            Frame::Request {
+                deadline_ms,
+                namespace,
+                actor_id,
+                visible_namespaces,
+                ..
+            } => {
+                3 + usize::from(deadline_ms.is_some())
+                    + usize::from(namespace.is_some())
+                    + usize::from(actor_id.is_some())
+                    + usize::from(visible_namespaces.is_some())
+            }
+            Frame::Error { id, .. } => 3 + usize::from(id.is_some()),
+            Frame::Response { .. } | Frame::Unsubscribe { .. } | Frame::UnsubscribeAck { .. } => 3,
+            Frame::SubscribeAck { .. } => 4,
+            Frame::Event { .. } => 5,
         };
         let mut map = serializer.serialize_map(Some(size_hint))?;
         map.serialize_entry("kind", self.kind())?;
