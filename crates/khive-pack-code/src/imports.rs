@@ -39,7 +39,9 @@ fn python_import_re() -> &'static Regex {
 
 fn python_from_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"(?m)^\s*from\s+([.]*[A-Za-z0-9_.]*)\s+import").unwrap())
+    RE.get_or_init(|| {
+        Regex::new(r"(?m)^\s*from\s+([.]*[A-Za-z0-9_.]*)\s+import\s+([^\n#;]+)").unwrap()
+    })
 }
 
 fn ts_import_re() -> &'static Regex {
@@ -50,6 +52,23 @@ fn ts_import_re() -> &'static Regex {
 fn ts_require_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| Regex::new(r#"require\(\s*['"]([^'"]+)['"]\s*\)"#).unwrap())
+}
+
+/// The plain names bound by a `from ... import <names>` clause: splits on
+/// commas, drops `as` aliases and empty entries, and stops before `*` or any
+/// parenthesized form (neither names a resolvable module).
+fn python_imported_names(names: &str) -> Vec<&str> {
+    names
+        .split(',')
+        .filter_map(|part| part.split_whitespace().next())
+        .filter(|name| {
+            !name.is_empty()
+                && *name != "*"
+                && name
+                    .chars()
+                    .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+        })
+        .collect()
 }
 
 /// Extract raw, unclassified import specifiers from `content`.
@@ -69,7 +88,33 @@ pub(crate) fn extract_raw_imports(language: &str, content: &str) -> Vec<String> 
                 out.push(c[1].to_string());
             }
             for c in python_from_re().captures_iter(content) {
-                out.push(c[1].to_string());
+                let module = c[1].to_string();
+                if module.chars().all(|ch| ch == '.') {
+                    // A dots-only specifier names only the containing
+                    // package: for `from . import z` the imported name *is*
+                    // the target module, so emit one specifier per name for
+                    // `classify_python` to resolve against the package base.
+                    // Attribute imports (`from . import run` where `run` is a
+                    // function) resolve to their containing module via the
+                    // resolver's longest-prefix fallback
+                    // (`module_candidate_specifiers`). When no plain name can
+                    // be extracted (star or parenthesized forms), fall back to
+                    // the bare package specifier so the pre-expansion behavior
+                    // is preserved rather than dropping the reference.
+                    let names = python_imported_names(&c[2]);
+                    if names.is_empty() {
+                        out.push(module);
+                    } else {
+                        for name in names {
+                            out.push(format!("{module}{name}"));
+                        }
+                    }
+                } else {
+                    // `from .mod import ...` / `from pkg.mod import ...`: the
+                    // module specifier already names the target — keep the
+                    // imported names out of the specifier.
+                    out.push(module);
+                }
             }
         }
         "typescript" => {
@@ -212,6 +257,9 @@ fn classify_python(
         if base.is_empty() {
             return Resolved::Skip;
         }
+        // A raw specifier that is still dots-only here (`from . import` with
+        // no resolvable names, e.g. a star or parenthesized import) names the
+        // package itself.
         let target = if rest.is_empty() {
             base.join(".")
         } else {
@@ -423,13 +471,45 @@ mod tests {
             classify_import("python", "..a", "pkg.x", "pkg", true),
             Resolved::IntraModule("pkg.a".to_string())
         );
-        // `from . import x` in `pkg/x/__init__.py` resolves to the package
+        // A genuinely nameless relative import in `pkg/x/__init__.py` (a
+        // star or parenthesized `from . import`) resolves to the package
         // itself — a self-reference, skipped rather than recorded as a
-        // self-loop edge.
+        // self-loop edge. Named submodule imports never reach this shape:
+        // `extract_raw_imports` expands them per imported name (#1692).
         assert_eq!(
             classify_import("python", ".", "pkg.x", "pkg", true),
             Resolved::Skip
         );
+    }
+
+    #[test]
+    fn python_dotless_from_import_expands_imported_names() {
+        // `from . import z` keeps the imported name — for a dotless relative
+        // import the name *is* the target module (#1692).
+        let raw = extract_raw_imports("python", "from . import z\n");
+        assert_eq!(raw, vec![".z".to_string()]);
+        // Comma-separated and aliased names expand one specifier per name.
+        let raw = extract_raw_imports("python", "from .. import a, b as _b\n");
+        assert_eq!(raw, vec!["..a".to_string(), "..b".to_string()]);
+        // Star imports extract no plain name; the bare package specifier is
+        // kept so the pre-expansion behavior (a package-level reference) is
+        // preserved rather than dropped.
+        let raw = extract_raw_imports("python", "from . import *\n");
+        assert_eq!(raw, vec![".".to_string()]);
+        // Parenthesized groups fall back to the bare package specifier
+        // rather than fabricating a name (multi-line groups stay out of
+        // scope for the line-based scanner).
+        let raw = extract_raw_imports("python", "from . import (a, b)\n");
+        assert_eq!(raw, vec![".".to_string()]);
+        // A specifier with a real module part is unchanged — the imported
+        // names stay out of it.
+        let raw = extract_raw_imports("python", "from .x import A\n");
+        assert_eq!(raw, vec![".x".to_string()]);
+        let raw = extract_raw_imports("python", "from pkg.mod import thing\n");
+        assert_eq!(raw, vec!["pkg.mod".to_string()]);
+        // Trailing comments are not part of the name list.
+        let raw = extract_raw_imports("python", "from . import z  # re-export\n");
+        assert_eq!(raw, vec![".z".to_string()]);
     }
 
     #[test]
