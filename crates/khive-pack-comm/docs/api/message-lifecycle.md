@@ -189,8 +189,10 @@ Omitting it preserves the full message object. The accepted top-level names are
 `to_actor`, `thread_id`, `sent_at`, `outbound_ref`, and `sent_by_process` are
 also available without returning the full `properties` map; an absent optional
 property projects as null, except `from_actor`/`to_actor`, which fall back to
-the full view's `from`/`to` values. Unknown names and an empty list are hard
-errors.
+the full view's `from`/`to` values, and `short_id`/`full_id`, which fall back
+to the projected `id` value so the identifier aliases stay consistent with the
+row's UUID. Unknown names and an empty list are hard errors. Duplicate names
+are allowed and collapse to one key.
 Authorization, filtering, unread counting, pagination lookahead, and thread
 deduplication all operate on the complete internal view before projection.
 

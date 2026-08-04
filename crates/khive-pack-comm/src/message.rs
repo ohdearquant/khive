@@ -93,6 +93,13 @@ pub(crate) fn project_message_json(message: Value, fields: Option<&[String]>) ->
                 .or_else(|| match field.as_str() {
                     "from_actor" => message.get("from").cloned(),
                     "to_actor" => message.get("to").cloned(),
+                    // `id` is the round-trippable form of the same UUID; keep the
+                    // compatibility aliases consistent with it rather than null.
+                    "short_id" => message
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .map(|id| Value::String(id.chars().take(8).collect())),
+                    "full_id" => message.get("id").cloned(),
                     _ => None,
                 })
                 .unwrap_or(Value::Null)
@@ -999,6 +1006,31 @@ mod tests {
         let v = note_to_message_json(&note);
         assert_eq!(v["content"], json!("body text"));
         assert_eq!(v["properties"]["custom"], json!(42));
+    }
+
+    #[test]
+    fn projection_derives_id_aliases_from_id_field() {
+        let note = make_note("local", "projection fixture", None);
+        let view = note_to_message_json(&note);
+        let mut bare = view.clone();
+        bare.as_object_mut()
+            .expect("message view is an object")
+            .retain(|key, _| key != "short_id" && key != "full_id");
+        assert!(
+            bare.get("short_id").is_none() && bare.get("full_id").is_none(),
+            "fixture must actually drop the alias keys"
+        );
+
+        let fields = vec![
+            "id".to_string(),
+            "short_id".to_string(),
+            "full_id".to_string(),
+        ];
+        let projected = project_message_json(bare, Some(&fields));
+        let id = view["id"].as_str().expect("id is a string");
+        assert_eq!(projected["id"], view["id"]);
+        assert_eq!(projected["full_id"], json!(id));
+        assert_eq!(projected["short_id"], json!(&id[..8]));
     }
 
     #[test]
