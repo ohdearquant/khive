@@ -1861,6 +1861,16 @@ diagnostic names the attempted `verb`, the provenance `record_kind` and natural
 Because a digest continues after a per-record refusal, callers that require a clean run
 should assert `writes_refused == 0` in addition to waiting for `done == true`.
 
+Per-source coverage is machine-readable via `sources` and `history_exhausted`. Every
+source requested by `include` reports one of `completed`, `stopped_early` (with a
+`reason`: budget exhausted, incomplete `gh` paging window, or a frozen cursor), or
+`skipped` (with a `reason`: budget exhausted before the source was reached, `gh` CLI
+absent, or a `gh` failure) — so "this repo has no issues/PRs" is distinguishable from
+"issues/PRs were never reached" without parsing `warnings[]`. `history_exhausted` is
+`true` only when every requested source completed: it separates "the walk visited
+everything" from "the walk stopped before the end", a distinction `done`'s
+budget-cursor semantics do not carry.
+
 ### `git.commit` / `git.branch` / `git.push` — Commissive (ADR-108)
 
 Thin write verbs that shell to system git (`std::process::Command::args`, no shell

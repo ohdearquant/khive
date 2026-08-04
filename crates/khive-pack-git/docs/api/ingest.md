@@ -40,6 +40,35 @@ excerpt. It never includes the rejected content. Accounting is per ingest call r
 than process-global daemon telemetry, so a caller can reliably assert
 `writes_refused == 0` even when other digests run concurrently.
 
+## Per-source tri-state and walk exhaustion (issue #1617)
+
+`done` is a budget-cursor statement ("callers loop until `true`"), and
+`warnings[]` is prose — neither lets a program distinguish "this repo has no
+issues/PRs" from "issues/PRs were never reached". `IngestReport::sources`
+closes that gap: every source requested by `include` reports exactly one
+state, written by the walk path itself rather than reconstructed at report
+time:
+
+- `completed` — the source was walked to the end of its history this pass
+  (an idempotent empty-range walk over an ancestor cursor counts).
+- `stopped_early` — the source was visited but not exhausted; `reason`
+  names the cause (budget exhausted mid-source, an incomplete `gh` paging
+  window, or a per-record write failure that froze the cursor — the same
+  events that force `done = false` / `cursor_stalled`).
+- `skipped` — the source was never walked; `reason` names the cause (budget
+  exhausted before an earlier-ordered source finished, `gh` CLI absent, or
+  `gh` itself failed). A gate refusal therefore never terminates the walk:
+  it is recorded on the source and the pass continues to the remaining
+  sources.
+
+`IngestReport::history_exhausted` is the top-level roll-up: `true` only when
+every requested source is `completed`, so a reader can tell "silence means
+nothing left" apart from "stopped before the end". Sources not requested by
+`include` are `null` and do not count against exhaustion. Both fields are
+purely additive — `done`, `cursor_stalled`, and `writes_refused` keep their
+existing meanings, and existing consumers (the `git.digest` handler,
+`kkernel git-ingest`) serialize the same struct with no behavior change.
+
 ## `NewRecordForRef`
 
 A newly created note this pass, retained so the post-ingestion

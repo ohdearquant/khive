@@ -114,6 +114,38 @@ pub struct IngestWriteRefusal {
     pub masked: String,
 }
 
+/// Machine-readable state of one ingest source (`commits`, `issues`,
+/// `pull_requests`) after a pass — issue #1617. A reader no longer has to
+/// infer coverage from `done` (a budget-cursor statement) or parse prose
+/// out of `warnings[]`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "state", content = "reason", rename_all = "snake_case")]
+pub enum IngestSourceState {
+    /// The source was walked to the end of its history this pass.
+    Completed,
+    /// The source was visited but not exhausted: the budget ran out, a
+    /// paging window was left incomplete, or a per-record write failure
+    /// froze the cursor (`cursor_stalled`). The reason names the cause.
+    StoppedEarly(String),
+    /// The source was never walked this pass. The reason names the cause:
+    /// the budget was already exhausted before the source was reached, the
+    /// `gh` CLI was unusable, the source's remote is not github.com, or
+    /// `gh` itself failed.
+    Skipped(String),
+}
+
+/// Per-source ingest coverage for one pass (issue #1617): which sources
+/// were walked to completion, which stopped early and why, and which were
+/// never reached. Written by the walk paths themselves, not reconstructed
+/// at report time, so the states stay truthful when a new walk path is
+/// added later.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize)]
+pub struct IngestSourceStatus {
+    pub commits: Option<IngestSourceState>,
+    pub issues: Option<IngestSourceState>,
+    pub pull_requests: Option<IngestSourceState>,
+}
+
 /// Outcome of one ingest pass. Serializable so CLI callers can emit it as JSON.
 #[derive(Debug, Default, Serialize)]
 pub struct IngestReport {
@@ -200,6 +232,19 @@ pub struct IngestReport {
     /// to compare directly against an independent source of truth (e.g.
     /// `git rev-list --count <ref>`).
     pub commits_total_in_db: u64,
+    /// Per-source ingest coverage for this pass (issue #1617): each
+    /// included source reports `completed`, `stopped_early { reason }`, or
+    /// `skipped { reason }`, so a gate refusal, budget exhaustion, and a
+    /// `gh`/remote skip are distinguishable without parsing `warnings[]`.
+    /// Additive companion to `done`/`cursor_stalled`, which keep their
+    /// existing budget-cursor meaning.
+    pub sources: IngestSourceStatus,
+    /// `true` only when every included source was walked to the end of its
+    /// history this pass — "silence means nothing left", as opposed to
+    /// "stopped before the end" (budget exhausted, incomplete paging
+    /// window, or a frozen cursor). Unlike `done`, this is a coverage
+    /// statement, not a resume-loop signal (issue #1617).
+    pub history_exhausted: bool,
 }
 
 fn record_write_failure(
@@ -268,6 +313,14 @@ pub(crate) async fn run_ingest_with_commit_recovery(
         remaining: opts.max_items,
     };
     let mut new_records: Vec<NewRecordForRef> = Vec::new();
+    // Per-source completion flags folded into `report.sources` at the end of
+    // the pass (issue #1617). The flags are seeded by the failure/walk paths
+    // themselves (`ingest_commits`/`ingest_prs`/`ingest_issues` set them
+    // false on a budget break, incomplete paging window, or frozen cursor),
+    // never reconstructed from counts at report time.
+    let mut commits_complete = false;
+    let mut prs_complete = false;
+    let mut issues_complete = false;
 
     // Graceful degradation covers both "gh is not on PATH" and "gh is present
     // but this repo has no usable GitHub remote" (e.g. a synthetic/local-only
@@ -289,14 +342,24 @@ pub(crate) async fn run_ingest_with_commit_recovery(
                     &mut number_to_pr,
                     &mut budget,
                     &mut new_records,
+                    &mut prs_complete,
                 )
                 .await
                 {
                     Ok(()) => {}
-                    Err(e) => report
-                        .warnings
-                        .push(format!("gh pr list failed, skipping pull requests: {e}")),
+                    Err(e) => {
+                        report
+                            .warnings
+                            .push(format!("gh pr list failed, skipping pull requests: {e}"));
+                        report.sources.pull_requests = Some(IngestSourceState::Skipped(format!(
+                            "gh pr list failed: {e}"
+                        )));
+                    }
                 }
+            } else if opts.include.pull_requests {
+                report.sources.pull_requests = Some(IngestSourceState::Skipped(
+                    "budget exhausted before pull requests were reached".to_string(),
+                ));
             }
             if opts.include.issues && !budget.exhausted() {
                 if let Err(e) = ingest_issues(
@@ -308,13 +371,21 @@ pub(crate) async fn run_ingest_with_commit_recovery(
                     &mut report,
                     &mut budget,
                     &mut new_records,
+                    &mut issues_complete,
                 )
                 .await
                 {
                     report
                         .warnings
                         .push(format!("gh issue list failed, skipping issues: {e}"));
+                    report.sources.issues = Some(IngestSourceState::Skipped(format!(
+                        "gh issue list failed: {e}"
+                    )));
                 }
+            } else if opts.include.issues {
+                report.sources.issues = Some(IngestSourceState::Skipped(
+                    "budget exhausted before issues were reached".to_string(),
+                ));
             }
         } else {
             report.gh_available = Some(false);
@@ -322,6 +393,16 @@ pub(crate) async fn run_ingest_with_commit_recovery(
                 "gh CLI not found on PATH; skipped issues and pull requests — commits still ingest"
                     .to_string(),
             );
+            if opts.include.pull_requests {
+                report.sources.pull_requests = Some(IngestSourceState::Skipped(
+                    "gh CLI not found on PATH".to_string(),
+                ));
+            }
+            if opts.include.issues {
+                report.sources.issues = Some(IngestSourceState::Skipped(
+                    "gh CLI not found on PATH".to_string(),
+                ));
+            }
         }
     }
 
@@ -338,13 +419,58 @@ pub(crate) async fn run_ingest_with_commit_recovery(
             &mut budget,
             &mut new_records,
             &mut recover,
+            &mut commits_complete,
         )
         .await?;
+    } else if opts.include.commits {
+        report.sources.commits = Some(IngestSourceState::Skipped(
+            "budget exhausted before commits were reached".to_string(),
+        ));
     }
 
     if budget.exhausted() {
         report.done = false;
     }
+
+    // Fold the walk-recorded completion flags into the per-source tri-state
+    // (issue #1617) — a source with no state yet was walked: Completed when
+    // its flag held, StoppedEarly otherwise. The walk paths clear their flag
+    // at the exact point they stop early, so the reason names the real cause.
+    if report.sources.pull_requests.is_none() && opts.include.pull_requests {
+        report.sources.pull_requests = Some(if prs_complete {
+            IngestSourceState::Completed
+        } else {
+            IngestSourceState::StoppedEarly("stopped before the PR history was exhausted".into())
+        });
+    }
+    if report.sources.issues.is_none() && opts.include.issues {
+        report.sources.issues = Some(if issues_complete {
+            IngestSourceState::Completed
+        } else {
+            IngestSourceState::StoppedEarly("stopped before the issue history was exhausted".into())
+        });
+    }
+    if report.sources.commits.is_none() && opts.include.commits {
+        report.sources.commits = Some(if commits_complete {
+            IngestSourceState::Completed
+        } else {
+            IngestSourceState::StoppedEarly(
+                "stopped before the commit history was exhausted".into(),
+            )
+        });
+    }
+    // A source left `None` was not requested by `include`, so it cannot
+    // count against exhaustion.
+    report.history_exhausted = [
+        &report.sources.commits,
+        &report.sources.issues,
+        &report.sources.pull_requests,
+    ]
+    .into_iter()
+    .all(|s| {
+        s.as_ref()
+            .is_none_or(|state| matches!(state, IngestSourceState::Completed))
+    });
 
     link_references(
         runtime,
@@ -975,6 +1101,7 @@ async fn ingest_commits(
     budget: &mut Budget,
     new_records: &mut Vec<NewRecordForRef>,
     recover: &mut (dyn FnMut(&Path, &GitLogError) -> Result<Option<RecoveredRepo>> + Send),
+    walk_complete: &mut bool,
 ) -> Result<()> {
     let since = read_cursor(runtime, project_id, "commits").await?;
     let (snapshot, recovery_warning) = recover_commit_snapshot(repo, since.as_deref(), recover)?;
@@ -1003,6 +1130,9 @@ async fn ingest_commits(
         if let Some(warning) = recovery_warning {
             report.warnings.push(warning);
         }
+        // An empty `{cursor}..HEAD` range over an ancestor cursor means the
+        // walk genuinely reached the tip: the commit source is exhausted.
+        *walk_complete = true;
         return Ok(());
     }
 
@@ -1033,6 +1163,9 @@ async fn ingest_commits(
         }
 
         if budget.exhausted() {
+            report.sources.commits = Some(IngestSourceState::StoppedEarly(
+                "budget exhausted before the commit history was exhausted".into(),
+            ));
             break;
         }
 
@@ -1166,6 +1299,13 @@ async fn ingest_commits(
     if cursor_stalled {
         report.cursor_stalled = true;
         report.done = false;
+        report.sources.commits = Some(IngestSourceState::StoppedEarly(
+            "a per-record write failure froze the commits cursor (cursor_stalled)".into(),
+        ));
+    } else if report.sources.commits.is_none() {
+        // Neither a budget break nor a stall fired: the loop visited every
+        // commit in the snapshot.
+        *walk_complete = true;
     }
     if let Some(sha) = last_sha {
         write_cursor(runtime, project_id, "commits", &sha).await?;
@@ -1557,6 +1697,7 @@ async fn ingest_prs(
     number_to_pr: &mut HashMap<u64, Uuid>,
     budget: &mut Budget,
     new_records: &mut Vec<NewRecordForRef>,
+    walk_complete: &mut bool,
 ) -> Result<()> {
     let since = read_cursor(runtime, project_id, "prs").await?;
 
@@ -1714,6 +1855,9 @@ async fn ingest_prs(
         // not a complete signal; report `done = false` regardless of budget
         // state so the caller's resume loop keeps going.
         report.done = false;
+        report.sources.pull_requests = Some(IngestSourceState::StoppedEarly(
+            "budget exhausted or the paging floor stalled before the PR window completed".into(),
+        ));
     }
     if cursor_stalled {
         // A stalled PR cursor means records past the frozen floor were never
@@ -1721,6 +1865,12 @@ async fn ingest_prs(
         // complete when it is permanently behind (issue #1645).
         report.cursor_stalled = true;
         report.done = false;
+        report.sources.pull_requests = Some(IngestSourceState::StoppedEarly(
+            "a per-record write failure froze the pull_requests cursor (cursor_stalled)".into(),
+        ));
+    }
+    if window_complete && !cursor_stalled {
+        *walk_complete = true;
     }
 
     if let Some(cursor) = max_updated {
@@ -1739,6 +1889,7 @@ async fn ingest_issues(
     report: &mut IngestReport,
     budget: &mut Budget,
     new_records: &mut Vec<NewRecordForRef>,
+    walk_complete: &mut bool,
 ) -> Result<()> {
     let since = read_cursor(runtime, project_id, "issues").await?;
 
@@ -1904,6 +2055,9 @@ async fn ingest_issues(
 
     if !window_complete {
         report.done = false;
+        report.sources.issues = Some(IngestSourceState::StoppedEarly(
+            "budget exhausted or the paging floor stalled before the issue window completed".into(),
+        ));
     }
     if cursor_stalled {
         // Same contract as the commits and PR paths: a frozen issue cursor
@@ -1911,6 +2065,12 @@ async fn ingest_issues(
         // complete (issue #1645).
         report.cursor_stalled = true;
         report.done = false;
+        report.sources.issues = Some(IngestSourceState::StoppedEarly(
+            "a per-record write failure froze the issues cursor (cursor_stalled)".into(),
+        ));
+    }
+    if window_complete && !cursor_stalled {
+        *walk_complete = true;
     }
 
     if let Some(cursor) = max_updated {

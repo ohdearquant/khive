@@ -3417,6 +3417,194 @@ async fn digest_verb_max_items_is_bounded_and_resumable() {
     );
 }
 
+// ── issue #1617: per-source tri-state + history-exhaustion reporting ───────
+
+/// A clean full pass marks every included source `completed` and reports
+/// `history_exhausted: true` — "nothing walked past this point" is now
+/// distinguishable from silence (issue #1617).
+#[tokio::test]
+async fn digest_verb_sources_completed_and_history_exhausted_on_full_walk() {
+    let _guard = ENV_MUTEX.lock().await;
+    let (_rt, _token, registry) = fixture().await;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_repo(repo);
+    for i in 0..2 {
+        write(repo, "f.txt", &format!("v{i}\n"));
+        commit(repo, &["f.txt"], &format!("commit {i}"));
+    }
+
+    // No fake `gh` on PATH: issues/PRs take the gh_cli_absent skip arm.
+    let resp = registry
+        .dispatch(
+            "git.digest",
+            json!({
+                "source": repo.to_str().unwrap(),
+                "include": ["commits", "issues", "pull_requests"]
+            }),
+        )
+        .await
+        .expect("digest ok");
+
+    assert_eq!(resp["commits_ingested"].as_u64().unwrap(), 2);
+    assert_eq!(
+        resp["sources"]["commits"],
+        json!({"state": "completed"}),
+        "a walked-to-the-tip commit source completes: {resp:?}"
+    );
+    assert_eq!(
+        resp["sources"]["issues"]["state"], "skipped",
+        "gh absent must surface as a structured skip, not prose: {resp:?}"
+    );
+    assert_eq!(resp["sources"]["pull_requests"]["state"], "skipped");
+    assert!(
+        !resp["history_exhausted"].as_bool().unwrap(),
+        "skipped sources mean the walk did not cover everything requested: {resp:?}"
+    );
+
+    // A commits-only pass walks every requested source to the end.
+    let commits_only = registry
+        .dispatch(
+            "git.digest",
+            json!({
+                "source": repo.to_str().unwrap(),
+                "include": ["commits"]
+            }),
+        )
+        .await
+        .expect("digest ok");
+    assert_eq!(
+        commits_only["sources"]["commits"],
+        json!({"state": "completed"}),
+        "an idempotent empty-range walk is still a completion: {commits_only:?}"
+    );
+    assert!(
+        commits_only["history_exhausted"].as_bool().unwrap(),
+        "every requested source completed: {commits_only:?}"
+    );
+    assert!(
+        commits_only["done"].as_bool().unwrap(),
+        "done keeps its budget-cursor meaning alongside: {commits_only:?}"
+    );
+}
+
+/// Budget exhaustion marks the source `stopped_early` and
+/// `history_exhausted: false`, while `done: false` keeps its existing
+/// resume-loop meaning (issue #1617).
+#[tokio::test]
+async fn digest_verb_sources_stopped_early_on_budget_exhaustion() {
+    let _guard = ENV_MUTEX.lock().await;
+    let (_rt, _token, registry) = fixture().await;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_repo(repo);
+    for i in 0..3 {
+        write(repo, "f.txt", &format!("v{i}\n"));
+        commit(repo, &["f.txt"], &format!("commit {i}"));
+    }
+
+    let resp = registry
+        .dispatch(
+            "git.digest",
+            json!({"source": repo.to_str().unwrap(), "max_items": 1, "include": ["commits"]}),
+        )
+        .await
+        .expect("digest ok");
+
+    assert_eq!(resp["commits_ingested"].as_u64().unwrap(), 1);
+    assert!(
+        !resp["done"].as_bool().unwrap(),
+        "budget exhausted with commits unwalked: {resp:?}"
+    );
+    assert_eq!(
+        resp["sources"]["commits"]["state"], "stopped_early",
+        "budget exhaustion is a stop-early, not a completion: {resp:?}"
+    );
+    assert!(
+        resp["sources"]["commits"]["reason"]
+            .as_str()
+            .is_some_and(|r| r.contains("budget")),
+        "the reason names the budget as the cause: {resp:?}"
+    );
+    assert!(
+        !resp["history_exhausted"].as_bool().unwrap(),
+        "a budget-stopped walk is not exhaustion: {resp:?}"
+    );
+}
+
+/// A per-record write refusal on one commit skips that record and the walk
+/// continues: later commits in the same pass still land. The source is
+/// `stopped_early` (cursor frozen for retry, issue #1645 semantics) and the
+/// refusal is mechanically attributable to the commits source (issue #1617).
+/// The deterministic failure uses the design-mandated fail-once embedder
+/// (see `pr_ingest_sorts_by_updated_at_so_frozen_cursor_survives_out_of_order_listing`
+/// for why a leaked-credential fixture no longer forces a create failure).
+#[tokio::test]
+async fn digest_verb_sources_gate_refusal_skips_record_and_walk_continues() {
+    let _guard = ENV_MUTEX.lock().await;
+    let (rt, _token, registry) = fixture().await;
+    rt.register_embedder(FailOnceEmbedderProvider);
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_repo(repo);
+    // Oldest first: clean, refused (sentinel body), clean.
+    write(repo, "f.txt", "v0\n");
+    commit(repo, &["f.txt"], "commit 0");
+    write(repo, "f.txt", "v1\n");
+    commit(
+        repo,
+        &["f.txt"],
+        &format!("commit 1\n\n{CURSOR_FAIL_SENTINEL}"),
+    );
+    write(repo, "f.txt", "v2\n");
+    commit(repo, &["f.txt"], "commit 2");
+
+    let resp = registry
+        .dispatch(
+            "git.digest",
+            json!({"source": repo.to_str().unwrap(), "include": ["commits"]}),
+        )
+        .await
+        .expect("a per-record refusal must stay an in-band digest result");
+
+    assert_eq!(
+        resp["commits_ingested"].as_u64().unwrap(),
+        2,
+        "the refusal never terminates the walk — the later commit lands: {resp:?}"
+    );
+    assert_eq!(
+        resp["warnings"]
+            .as_array()
+            .expect("warnings")
+            .iter()
+            .filter(|w| w.as_str().is_some_and(|w| w.contains("create commit")))
+            .count(),
+        1,
+        "exactly one warning records the refused commit write: {resp:?}"
+    );
+    assert_eq!(
+        resp["sources"]["commits"]["state"], "stopped_early",
+        "a frozen cursor is a stop-early, distinct from budget and skip: {resp:?}"
+    );
+    assert!(
+        resp["sources"]["commits"]["reason"]
+            .as_str()
+            .is_some_and(|r| r.contains("cursor_stalled")),
+        "the reason names the frozen cursor as the cause: {resp:?}"
+    );
+    assert!(
+        !resp["history_exhausted"].as_bool().unwrap(),
+        "an unretried refused record means the history is not exhausted: {resp:?}"
+    );
+    assert!(
+        !resp["done"].as_bool().unwrap(),
+        "cursor_stalled still forces done:false beside the new fields: {resp:?}"
+    );
+}
+
 /// Source validation surfaces as a normal verb error (ssh:// rejected,
 /// ADR-088 Amendment 1 security posture) rather than panicking or silently
 /// no-op'ing.
