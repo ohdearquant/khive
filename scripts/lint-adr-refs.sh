@@ -217,6 +217,91 @@ FIXTURE
 - follows the suffix convention (ADR-117a: Fixture Letter Suffix).
 FIXTURE
 
+    # Regression case 11 (must-FAIL control, inert END in a fence): the catalog
+    # never really closes, but a quoted END marker sits inside a code fence.
+    # Testing the delimiter before resolving fence state let that quoted text
+    # satisfy the end-marker assertion, so an unclosed catalog passed again by
+    # a different route than case 8.
+    mkdir -p "$tmp/case-fenced-end/docs/adr"
+    cat > "$tmp/case-fenced-end/docs/adr/ADR-204-fixture-fenced-end.md" <<'FIXTURE'
+# ADR-204: Fixture Fenced End
+
+**Status**: accepted
+FIXTURE
+    cat > "$tmp/case-fenced-end/docs/adr/README.md" <<'FIXTURE'
+# ADR Index
+
+<!-- BEGIN GENERATED ADR CATALOG -->
+
+| ADR | Title |
+| --- | --- |
+| [ADR-204](ADR-204-fixture-fenced-end.md) | Fixture Fenced End |
+
+The catalog is delimited like this:
+
+```
+<!-- END GENERATED ADR CATALOG -->
+```
+FIXTURE
+
+    # Regression case 12 (must-FAIL control, inert END in a comment): the same
+    # defect reached through the multi-line HTML-comment state instead of the
+    # fence state.
+    mkdir -p "$tmp/case-commented-end/docs/adr"
+    cat > "$tmp/case-commented-end/docs/adr/ADR-205-fixture-commented-end.md" <<'FIXTURE'
+# ADR-205: Fixture Commented End
+
+**Status**: accepted
+FIXTURE
+    cat > "$tmp/case-commented-end/docs/adr/README.md" <<'FIXTURE'
+# ADR Index
+
+<!-- BEGIN GENERATED ADR CATALOG -->
+
+| ADR | Title |
+| --- | --- |
+| [ADR-205](ADR-205-fixture-commented-end.md) | Fixture Commented End |
+
+<!--
+<!-- END GENERATED ADR CATALOG -->
+-->
+FIXTURE
+
+    # Regression case 13 (must-FAIL control, inert BEGIN): the mirror of cases
+    # 11 and 12 on the opening delimiter. A quoted BEGIN inside a multi-line
+    # HTML comment, above the real catalog, opened the scan early, so a stale
+    # row sitting between the quoted marker and the real one counted as live
+    # coverage for an ADR the real catalog omits.
+    #
+    # The quoted marker is inside a COMMENT rather than a fence deliberately.
+    # A fenced variant of this fixture goes red either way: the fence's own
+    # closing line lands after the delimiter test and swallows the stale row,
+    # so the arm would pass without the opening delimiter being fence-aware at
+    # all. It would have been an arm satisfied for a reason other than the one
+    # it names.
+    mkdir -p "$tmp/case-quoted-begin/docs/adr"
+    cat > "$tmp/case-quoted-begin/docs/adr/ADR-206-fixture-quoted-begin.md" <<'FIXTURE'
+# ADR-206: Fixture Quoted Begin
+
+**Status**: accepted
+FIXTURE
+    cat > "$tmp/case-quoted-begin/docs/adr/README.md" <<'FIXTURE'
+# ADR Index
+
+<!--
+<!-- BEGIN GENERATED ADR CATALOG -->
+-->
+
+| [ADR-206](ADR-206-fixture-quoted-begin.md) | Fixture Quoted Begin |
+
+<!-- BEGIN GENERATED ADR CATALOG -->
+
+| ADR | Title |
+| --- | --- |
+
+<!-- END GENERATED ADR CATALOG -->
+FIXTURE
+
     cat > "$tmp/case-fail/crates/fixture-crate/docs/design.md" <<'FIXTURE'
 # fixture-crate Design
 
@@ -343,6 +428,42 @@ FIXTURE
         echo "self-test OK: correctly titled citation of a letter-suffixed ADR does not false-positive"
     fi
 
+    if sh "$SCRIPT_DIR/lint-adr-refs.sh" "$tmp/case-fenced-end" > "$tmp/fenced-end.log" 2>&1; then
+        echo "self-test FAILED: an END marker quoted inside a code fence satisfied the end-marker assertion"
+        cat "$tmp/fenced-end.log"
+        status=1
+    elif ! grep -q 'missing "<!-- END GENERATED ADR CATALOG -->" marker' "$tmp/fenced-end.log"; then
+        echo "self-test FAILED: fenced-end lint failed, but not for the expected reason:"
+        cat "$tmp/fenced-end.log"
+        status=1
+    else
+        echo "self-test OK: END marker quoted inside a code fence does not close the catalog"
+    fi
+
+    if sh "$SCRIPT_DIR/lint-adr-refs.sh" "$tmp/case-commented-end" > "$tmp/commented-end.log" 2>&1; then
+        echo "self-test FAILED: an END marker inside a multi-line HTML comment satisfied the end-marker assertion"
+        cat "$tmp/commented-end.log"
+        status=1
+    elif ! grep -q 'missing "<!-- END GENERATED ADR CATALOG -->" marker' "$tmp/commented-end.log"; then
+        echo "self-test FAILED: commented-end lint failed, but not for the expected reason:"
+        cat "$tmp/commented-end.log"
+        status=1
+    else
+        echo "self-test OK: END marker inside an HTML comment does not close the catalog"
+    fi
+
+    if sh "$SCRIPT_DIR/lint-adr-refs.sh" "$tmp/case-quoted-begin" > "$tmp/quoted-begin.log" 2>&1; then
+        echo "self-test FAILED: a BEGIN marker quoted inside an HTML comment opened the scan early, so a row above the real catalog counted as coverage"
+        cat "$tmp/quoted-begin.log"
+        status=1
+    elif ! grep -q "ADR-206 (ADR-206-fixture-quoted-begin.md) has no index catalog row" "$tmp/quoted-begin.log"; then
+        echo "self-test FAILED: quoted-begin lint failed, but not for the expected reason:"
+        cat "$tmp/quoted-begin.log"
+        status=1
+    else
+        echo "self-test OK: BEGIN marker quoted inside an HTML comment does not open the catalog"
+    fi
+
     return "$status"
 }
 
@@ -368,7 +489,7 @@ adr_dir = root / "docs" / "adr"
 # three agree on what an ADR id looks like -- e.g. the letter-suffixed
 # "ADR-117a" naming a follow-on ADR that shares its parent's number. Captured
 # numbers are lowercased at every use site so "117A" and "117a" join.
-ADR_NUMBER = r"\d{3}[a-z]?"
+ADR_NUMBER = r"[0-9]{3}[a-z]?"
 adr_file_re = re.compile(rf"^ADR-({ADR_NUMBER})-.*\.md$", re.IGNORECASE)
 h1_re = re.compile(
     rf"^#\s+ADR-(?P<number>{ADR_NUMBER})(?:\s+Rev\s+\d+)?\s*:\s*(?P<title>.+?)\s*#*\s*$",
@@ -543,13 +664,13 @@ in_comment = False
 with index_path.open(encoding="utf-8") as handle:
     for line_number, raw_line in enumerate(handle, 1):
         line = raw_line.rstrip("\n")
-        if not in_catalog:
-            if line.strip() == catalog_begin:
-                in_catalog = True
-            continue
-        if line.strip() == catalog_end:
-            saw_catalog_end = True
-            break
+        # Fence and comment state is resolved BEFORE either delimiter is
+        # tested, and for every line rather than only inside the catalog. A
+        # marker quoted in a code fence or inside a multi-line comment is
+        # illustrative text, not a delimiter: testing the delimiters first let
+        # an inert END satisfy the end-marker assertion, and let an inert
+        # BEGIN open the scan early so stale rows above the real catalog
+        # counted as coverage.
         if re.match(r"^\s*(```|~~~)", line):
             in_fence = not in_fence
             continue
@@ -559,9 +680,21 @@ with index_path.open(encoding="utf-8") as handle:
             if "-->" in line:
                 in_comment = False
             continue
+        if not in_catalog:
+            if line.strip() == catalog_begin:
+                in_catalog = True
+                continue
+        elif line.strip() == catalog_end:
+            saw_catalog_end = True
+            break
+        # Single-line comments are opened here, after the delimiter tests: the
+        # markers are themselves single-line HTML comments and must not be
+        # swallowed as ordinary comment text.
         if "<!--" in line:
             if "-->" not in line:
                 in_comment = True
+            continue
+        if not in_catalog:
             continue
         match = index_row_re.match(line)
         if match is None:
