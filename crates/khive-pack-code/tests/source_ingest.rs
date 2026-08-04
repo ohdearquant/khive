@@ -435,6 +435,63 @@ async fn python_init_reexport_resolves_in_package_without_self_loop() {
     );
 }
 
+/// A dotless relative import keeps its imported name (#1692): for
+/// `from . import z` the name *is* the target module, so the package
+/// `__init__` records a `depends_on` edge to the submodule — not nothing
+/// (self-reference skip) and not a package-level edge. The `__init__` and
+/// regular-module cases resolve to different targets, so neither can be
+/// satisfied by one collapsed answer.
+fn write_python_dotless_from_import_fixture(root: &Path) {
+    let pkg_x = root.join("pkg/x");
+    std::fs::create_dir_all(&pkg_x).unwrap();
+    std::fs::write(
+        root.join("pyproject.toml"),
+        "[project]\nname = \"pyproj\"\n",
+    )
+    .unwrap();
+    std::fs::write(root.join("pkg/__init__.py"), "").unwrap();
+    std::fs::write(pkg_x.join("__init__.py"), "from . import z\n").unwrap();
+    std::fs::write(pkg_x.join("w.py"), "from . import z\n").unwrap();
+    std::fs::write(pkg_x.join("z.py"), "VALUE = 1\n").unwrap();
+}
+
+#[tokio::test]
+async fn python_dotless_from_import_emits_submodule_edges() {
+    let root = TempDir::new().expect("tempdir");
+    write_python_dotless_from_import_fixture(root.path());
+    let db = root.path().join("dotless_from.db");
+    let rt = rt_at(&db);
+    let token = rt.authorize(Namespace::local()).expect("token");
+
+    let opts = || CodeSourceIngestOptions {
+        path: root.path(),
+        languages: all_languages(),
+        sweep_time: Utc::now(),
+    };
+    run_code_ingest(&rt, &token, opts())
+        .await
+        .expect("first ingest succeeds");
+    run_code_ingest(&rt, &token, opts())
+        .await
+        .expect("second ingest succeeds");
+
+    let edges = edge_fingerprints(&rt).await;
+    for (src, tgt) in [("pkg.x", "pkg.x.z"), ("pkg.x.w", "pkg.x.z")] {
+        assert!(
+            edges.iter().any(|(rel, s, t, kinds)| rel == "depends_on"
+                && s == src
+                && t == tgt
+                && kinds == "import"),
+            "expected {src} -> {tgt} depends_on import edge, got: {edges:?}"
+        );
+    }
+    let self_loops: Vec<_> = edges.iter().filter(|(_, s, t, _)| s == t).collect();
+    assert!(
+        self_loops.is_empty(),
+        "dotless relative import must not produce self-loop edges, got: {self_loops:?}"
+    );
+}
+
 /// A manifestless folder (no `Cargo.toml`/`pyproject.toml`/`package.json`
 /// anywhere above its source files) must still produce project/module
 /// entities and import edges under the basename-fallback identity rule
