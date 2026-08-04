@@ -1,5 +1,6 @@
 //! Storage capability traits: `SqlAccess`, `VectorStore`, `TextSearch`, `GraphStore`, `NoteStore`, `EventStore`, `BlobStore`.
 
+pub mod agent;
 pub mod blob;
 pub mod capability;
 pub mod entity;
@@ -16,6 +17,7 @@ pub mod types;
 pub mod usage;
 pub mod vectors;
 
+pub use agent::AgentStore;
 pub use blob::{BlobOrphanSweepConfig, BlobOrphanSweepResult, BlobStore, ContentRef};
 pub use capability::StorageCapability;
 pub use entity::{Entity, EntityFilter, EntityStore};
@@ -53,4 +55,7 @@ pub use types::{
     MAX_TRAVERSAL_ROOTS, MAX_TRAVERSAL_WORK,
 };
 
-pub use khive_types::{EdgeCategory, EdgeRelation, EventOutcome, SubstrateKind};
+pub use khive_types::{
+    AgentRecord, AgentState, EdgeCategory, EdgeRelation, EventOutcome, SubstrateKind,
+    TerminalReason,
+};
