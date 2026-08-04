@@ -129,6 +129,15 @@ fn execute_query_page(
     statement: &SqlStatement,
     page: &PageRequest,
 ) -> Result<Vec<SqlRow>, rusqlite::Error> {
+    // A zero-limit page still prepares and binds the statement, so invalid
+    // SQL fails identically across every limit; it skips the row cursor
+    // entirely and returns no rows.
+    if page.limit == 0 {
+        let mut stmt = conn.prepare(&statement.sql)?;
+        bind_params(&mut stmt, &statement.params)?;
+        return Ok(Vec::new());
+    }
+
     let mut stmt = conn.prepare(&statement.sql)?;
     bind_params(&mut stmt, &statement.params)?;
 
@@ -141,6 +150,10 @@ fn execute_query_page(
     let mut offset = page.offset;
     let mut remaining = u64::from(page.limit);
     let mut raw_rows = stmt.raw_query();
+    // The bound covers owned Rust rows only: SQLite still steps and discards
+    // `offset` rows, so a large-offset page costs O(offset + limit) engine
+    // work. Callers deep-paging a large result set should prefer keyset
+    // pagination over growing offsets.
     while remaining > 0 {
         let Some(row) = raw_rows.next()? else {
             break;
@@ -1233,6 +1246,16 @@ impl khive_storage::SqlAccess for SqlBridge {
             // Flag-off (or no writer task available): manual
             // BEGIN IMMEDIATE/COMMIT/ROLLBACK on a standalone writer —
             // byte-for-byte the pre-ADR-067 shape.
+            //
+            // Contract: this acquire waits on the pool-wide one-permit
+            // writer-handle budget — the same permit a live `writer()` handle
+            // holds for its lifetime — so it times out with
+            // `StorageError::Timeout` after `checkout_timeout` while a writer
+            // handle is checked out (and a `writer()` call times out while
+            // this unit runs). Callers must not hold a boxed writer handle
+            // across an `atomic_unit()` call on the same pool; drop the
+            // handle first. The `writer_task` branch above never touches this
+            // budget.
             let handle_slot = acquire_handle_slot(
                 self.pool.sql_bridge_writer_slots(),
                 self.pool.config().checkout_timeout,
@@ -1364,6 +1387,51 @@ mod tests {
         assert!(matches!(rows[0].get("value"), Some(SqlValue::Integer(40))));
         assert!(matches!(rows[2].get("value"), Some(SqlValue::Integer(42))));
         ROW_CONVERSIONS.with(|count| assert_eq!(count.get(), 3));
+    }
+
+    #[test]
+    fn query_page_zero_limit_converts_no_rows_but_still_validates_sql() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        let statement = SqlStatement {
+            sql: "WITH RECURSIVE rows(value) AS (\
+                  SELECT 0 UNION ALL SELECT value + 1 FROM rows WHERE value < 99\
+                  ) SELECT value FROM rows ORDER BY value"
+                .into(),
+            params: vec![],
+            label: None,
+        };
+
+        ROW_CONVERSIONS.with(|count| count.set(0));
+        let rows = execute_query_page(
+            &conn,
+            &statement,
+            &PageRequest {
+                offset: 0,
+                limit: 0,
+            },
+        )
+        .unwrap();
+
+        assert!(rows.is_empty());
+        ROW_CONVERSIONS.with(|count| assert_eq!(count.get(), 0));
+
+        let invalid = SqlStatement {
+            sql: "SELECT FROM WHERE".into(),
+            params: vec![],
+            label: None,
+        };
+        assert!(
+            execute_query_page(
+                &conn,
+                &invalid,
+                &PageRequest {
+                    offset: 0,
+                    limit: 0
+                }
+            )
+            .is_err(),
+            "a zero-limit page must still fail on invalid SQL at prepare time"
+        );
     }
 
     #[tokio::test]
@@ -1605,6 +1673,128 @@ mod tests {
             .await
             .expect("cancelled writer's detached SQLite call did not finish");
         assert!(cancelled, "writer query task did not report cancellation");
+        assert!(
+            retained_slot,
+            "cancellation released the writer slot before SQLite stopped"
+        );
+        let writer_after_completion = bridge.writer().await.unwrap();
+        drop(writer_after_completion);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_reader_query_page_retains_slot_until_blocking_work_finishes() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = PoolConfig {
+            path: Some(dir.path().join("sql_bridge_cancelled_reader_page.db")),
+            max_readers: 1,
+            checkout_timeout: std::time::Duration::from_millis(250),
+            ..PoolConfig::default()
+        };
+        let pool = Arc::new(ConnectionPool::new(config).unwrap());
+        let bridge = SqlBridge::new(Arc::clone(&pool), true);
+
+        let handle_slot = pool
+            .sql_bridge_reader_slots()
+            .acquire_owned()
+            .await
+            .unwrap();
+        let conn = open_standalone_reader(&pool).unwrap();
+        let (entered, release, completed) = blocking_progress_gate(&conn);
+        let mut reader = SqliteReader {
+            handle: Some(StandaloneHandle {
+                conn,
+                _slot: handle_slot,
+            }),
+        };
+        let query = tokio::spawn(async move {
+            reader
+                .query_page(
+                    progress_gate_statement(),
+                    PageRequest {
+                        offset: 0,
+                        limit: 10,
+                    },
+                )
+                .await
+        });
+
+        entered.notified().await;
+        query.abort();
+        let cancelled = matches!(query.await, Err(error) if error.is_cancelled());
+
+        let contender = bridge.reader().await;
+        let retained_slot = matches!(
+            &contender,
+            Err(StorageError::Timeout { operation })
+                if operation.as_ref() == "sql_bridge.reader_handle"
+        );
+        drop(contender);
+
+        tokio::task::spawn_blocking(move || release.wait())
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), completed.notified())
+            .await
+            .expect("cancelled reader's detached SQLite call did not finish");
+        assert!(cancelled, "reader query task did not report cancellation");
+        assert!(
+            retained_slot,
+            "cancellation released the reader slot before SQLite stopped"
+        );
+        let reader_after_completion = bridge.reader().await.unwrap();
+        drop(reader_after_completion);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_writer_execute_batch_retains_slot_until_blocking_work_finishes() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = PoolConfig {
+            path: Some(dir.path().join("sql_bridge_cancelled_writer_batch.db")),
+            checkout_timeout: std::time::Duration::from_millis(250),
+            ..PoolConfig::default()
+        };
+        let pool = Arc::new(ConnectionPool::new(config).unwrap());
+        let bridge = SqlBridge::new(Arc::clone(&pool), true);
+
+        let handle_slot = pool
+            .sql_bridge_writer_slots()
+            .acquire_owned()
+            .await
+            .unwrap();
+        let conn = open_standalone_writer(&pool).unwrap();
+        let (entered, release, completed) = blocking_progress_gate(&conn);
+        let mut writer = SqliteWriter {
+            handle: Some(StandaloneHandle {
+                conn,
+                _slot: handle_slot,
+            }),
+            writer_task: None,
+            origin: pool.origin(),
+        };
+        let query = tokio::spawn(async move {
+            khive_storage::SqlWriter::execute_batch(&mut writer, vec![progress_gate_statement()])
+                .await
+        });
+
+        entered.notified().await;
+        query.abort();
+        let cancelled = matches!(query.await, Err(error) if error.is_cancelled());
+
+        let contender = bridge.writer().await;
+        let retained_slot = matches!(
+            &contender,
+            Err(StorageError::Timeout { operation })
+                if operation.as_ref() == "sql_bridge.writer_handle"
+        );
+        drop(contender);
+
+        tokio::task::spawn_blocking(move || release.wait())
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), completed.notified())
+            .await
+            .expect("cancelled writer's detached SQLite call did not finish");
+        assert!(cancelled, "writer batch task did not report cancellation");
         assert!(
             retained_slot,
             "cancellation released the writer slot before SQLite stopped"

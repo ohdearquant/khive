@@ -49,6 +49,21 @@ an idle boxed handle releases its permit. Once an operation has entered
 awaiting task retains both until SQLite finishes and drops the resource, so a
 detached blocking call cannot escape the cap.
 
+The manual `atomic_unit` path (write queue flag off, or no writer task
+available) acquires the same one-permit writer budget before opening its
+standalone writer. A live `writer()` handle therefore makes such an
+`atomic_unit()` wait and time out after `checkout_timeout`, and vice versa:
+do not hold a boxed writer handle across an `atomic_unit()` call on the same
+pool — drop the handle first. With the write queue enabled, `atomic_unit`
+runs inside the writer task instead and never touches this budget.
+
+A boxed writer handle retains its standalone connection and writer permit for
+the handle's whole lifetime even when the write queue is enabled and its
+mutating calls route through the writer task: the permit reserves the
+handle's fallback paths (every read method, and every mutating method once
+the writer task is unavailable) plus its connection-local behavior. Hold a
+writer handle only for a burst of operations, then drop it.
+
 The optional writer task owns its separate, fixed connection and is not a
 caller-held SQL bridge handle. Store-specific standalone connections are also
 outside this raw-SQL handle budget; their write ownership remains governed by
