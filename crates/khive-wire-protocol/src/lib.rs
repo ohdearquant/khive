@@ -163,7 +163,10 @@ pub mod frame;
 pub mod handshake;
 pub mod version;
 
-pub use codec::{decode_frame, encode_frame, CodecError, FrameCodec, DEFAULT_MAX_FRAME_BYTES};
+pub use codec::{
+    decode_frame, encode_frame, encode_frame_with_max, CodecError, FrameCodec,
+    DEFAULT_MAX_FRAME_BYTES,
+};
 pub use error::{TerminalScope, WireErrorCode};
 pub use frame::{Cursor, Frame, OperationId, FRAME_KINDS};
 pub use handshake::{HandshakeGate, HandshakeOutcome, HandshakeSequenceError};

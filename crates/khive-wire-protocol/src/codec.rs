@@ -90,9 +90,10 @@ impl FrameCodec {
     }
 
     /// Encode one frame as a complete length-prefixed wire buffer: 4-byte
-    /// BE length followed by the JSON payload.
+    /// BE length followed by the JSON payload, guarded by this codec's own
+    /// configured maximum so encode and decode share one bound.
     pub fn encode(&self, frame: &Frame) -> Result<Vec<u8>, CodecError> {
-        encode_frame(frame)
+        encode_frame_with_max(frame, self.max_frame_bytes)
     }
 
     /// Decode one complete length-prefixed frame from `buf`.
@@ -115,12 +116,21 @@ impl Default for FrameCodec {
 
 /// Encode one frame as a complete length-prefixed wire buffer, using
 /// [`DEFAULT_MAX_FRAME_BYTES`] as the encode-side size guard.
+///
+/// Use [`encode_frame_with_max`] to encode against a different bound; a
+/// [`FrameCodec`] always encodes against its own configured maximum so that
+/// both directions of one codec share a single bound.
 pub fn encode_frame(frame: &Frame) -> Result<Vec<u8>, CodecError> {
+    encode_frame_with_max(frame, DEFAULT_MAX_FRAME_BYTES)
+}
+
+/// Encode one frame against an explicit maximum payload size.
+pub fn encode_frame_with_max(frame: &Frame, max_frame_bytes: usize) -> Result<Vec<u8>, CodecError> {
     let payload = serde_json::to_vec(frame).map_err(|e| CodecError::InvalidJson(e.to_string()))?;
-    if payload.len() > DEFAULT_MAX_FRAME_BYTES {
+    if payload.len() > max_frame_bytes {
         return Err(CodecError::FrameTooLarge {
             declared: payload.len(),
-            max: DEFAULT_MAX_FRAME_BYTES,
+            max: max_frame_bytes,
         });
     }
     let mut buf = Vec::with_capacity(LENGTH_PREFIX_BYTES + payload.len());
@@ -251,5 +261,47 @@ mod tests {
             CodecError::InvalidFields { kind, .. } => assert_eq!(kind, "cancel"),
             other => panic!("expected InvalidFields, got {other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod configured_max_tests {
+    use super::*;
+    use crate::frame::Frame;
+
+    fn oversized_frame() -> Frame {
+        Frame::Request {
+            id: crate::frame::OperationId("x".into()),
+            ops: "a".repeat(4096),
+            deadline_ms: None,
+            namespace: None,
+            actor_id: None,
+            visible_namespaces: None,
+        }
+    }
+
+    #[test]
+    fn codec_encode_honors_its_own_maximum_not_the_default() {
+        let codec = FrameCodec::new(1024);
+        let err = codec.encode(&oversized_frame()).unwrap_err();
+        match err {
+            CodecError::FrameTooLarge { max, .. } => assert_eq!(max, 1024),
+            other => panic!("expected FrameTooLarge with the configured max, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn codec_encode_accepts_a_frame_within_its_own_maximum() {
+        let codec = FrameCodec::new(1024 * 1024);
+        let wire = codec
+            .encode(&oversized_frame())
+            .expect("within configured max");
+        assert_eq!(codec.decode(&wire).unwrap(), oversized_frame());
+    }
+
+    #[test]
+    fn free_function_encode_still_uses_the_default_maximum() {
+        let wire = encode_frame(&oversized_frame()).expect("well under 8 MiB");
+        assert!(wire.len() > 4096);
     }
 }

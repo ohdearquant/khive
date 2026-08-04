@@ -62,7 +62,12 @@ pub struct HandshakeSequenceError {
 }
 
 /// Drives the per-connection handshake state machine.
-#[derive(Debug, Clone)]
+///
+/// Deliberately not `Clone`: the gate's entire guarantee is that its state
+/// only ever moves forward for one connection. A copy of a completed gate
+/// would admit requests on a connection that never handshook, and a copy of
+/// an earlier state could be restored after a violation closed the original.
+#[derive(Debug)]
 pub struct HandshakeGate {
     state: State,
     supported: SupportedVersions,
