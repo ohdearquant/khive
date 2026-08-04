@@ -2463,7 +2463,7 @@ fn merge_note_sql(
         _ => into_note.name.clone().or(from_note.name.clone()),
     };
 
-    let (mut merged_props, mut properties_merged) =
+    let (mut merged_props, _) =
         merge_properties(&into_note.properties, &from_note.properties, strategy);
 
     // A merge folds two records together; it does not transfer attribution.
@@ -2471,10 +2471,20 @@ fn merge_note_sql(
     // restored after the fold, under every strategy including `PreferFrom`, so
     // the surviving row still says who wrote it.
     if preserve_owner_established {
-        let reverted =
-            preserve_owner_established_properties(&into_note.properties, &mut merged_props);
-        properties_merged = properties_merged.saturating_sub(reverted);
+        preserve_owner_established_properties(&into_note.properties, &mut merged_props);
     }
+
+    // Recomputed from the final retained properties rather than carried
+    // forward from the fold's own count. The fold's count and post-
+    // restoration reality diverge whenever an owner-established key holds a
+    // nested object: `union` recurses into it and counts the absorbed
+    // note's leaf as merged, but restoration then reverts the whole key,
+    // and the fold's flat "keys contributed" number cannot express a
+    // partial reversal of a nested contribution. Diffing the final object
+    // against the into-note's pre-merge properties sidesteps that fold/
+    // restoration coupling entirely.
+    let properties_merged =
+        count_new_property_keys(into_note.properties.as_ref(), merged_props.as_ref());
 
     let merge_history_entry = serde_json::json!({
         "merged_from": from_id.to_string(),
@@ -2848,9 +2858,7 @@ pub(crate) fn owner_established_property_named_in(patch: &Value) -> Option<&'sta
 }
 
 /// Restore the into-note's [`OWNER_ESTABLISHED_PROPERTIES`] into `merged`
-/// after a property fold, and return how many of the fold's counted
-/// `from`-contributed keys this restoration took back out (so the caller can
-/// correct its merged-field count).
+/// after a property fold.
 ///
 /// A key absent on the into-note is removed from `merged` rather than left as
 /// the from-note's value: a record that carried no owner-established value
@@ -2858,73 +2866,120 @@ pub(crate) fn owner_established_property_named_in(patch: &Value) -> Option<&'sta
 /// as to attribution — a note with no `thread_id` must not join a conversation
 /// because another note was folded into it.
 ///
-/// The returned count only covers that removal case. `merge_json`'s fold only
-/// counts a key as "added" when it was absent from `into` — a key already
-/// present on `into` is never counted, even when the fold's chosen strategy
-/// (e.g. `PreferFrom`) overwrote its value with the from-note's. Restoring
-/// such a key's original value here (the `Some` arm below) therefore reverts
-/// a change the fold never counted in the first place, and must not be
-/// subtracted from `properties_merged` — doing so double-counts and can drive
-/// the reported total below the number of non-owned keys that genuinely
-/// survived the merge.
-///
 /// A fold can also yield a value that is not an object at all: `merge_json`
 /// applies a non-object `from` directly under `PreferFrom`, replacing the
 /// into-note's whole object with a scalar. A scalar cannot carry the
 /// owner-established keys, so there is nothing to restore them into and they
 /// would be erased. The into-note's properties are kept instead — the scalar
 /// contributes no key that could coexist with them, so nothing the fold
-/// intended is lost. That branch returns the number of owner-established keys
-/// found on the into-note, which is not itself a fold count: the fold scores a
-/// scalar `PreferFrom` replace as exactly 1 regardless of how many keys the
-/// into-note carried. The two agree only after the caller's `saturating_sub`,
-/// which clamps to the correct answer of zero merged properties whenever the
-/// replace is undone. Returning the key count rather than 1 is therefore safe
-/// here but is not a value any other caller should read as a fold count.
+/// intended is lost.
+///
+/// This function only restores values; callers that need to report how many
+/// properties genuinely survived a merge should diff the final result
+/// against the into-note's pre-merge properties (see
+/// [`count_new_property_keys`]) rather than try to track the restoration as
+/// a correction to the fold's own count — a nested owner-established value
+/// (an object) makes that correction ill-defined, since the fold's flat
+/// "keys contributed" number cannot express a partial reversal of a nested
+/// contribution.
 pub(crate) fn preserve_owner_established_properties(
     into: &Option<Value>,
     merged: &mut Option<Value>,
-) -> usize {
+) {
     if !matches!(merged, Some(Value::Object(_))) {
         let Some(Value::Object(into_map)) = into else {
-            return 0;
+            return;
         };
         let owned_on_into = OWNER_ESTABLISHED_PROPERTIES
             .iter()
-            .filter(|key| into_map.contains_key(**key))
-            .count();
-        if owned_on_into > 0 {
+            .any(|key| into_map.contains_key(*key));
+        if owned_on_into {
             *merged = into.clone();
         }
-        return owned_on_into;
+        return;
     }
     let Some(Value::Object(merged_map)) = merged.as_mut() else {
-        return 0;
+        return;
     };
     let into_map = match into {
         Some(Value::Object(m)) => Some(m),
         _ => None,
     };
-    let mut reverted_from_fold = 0usize;
     for key in OWNER_ESTABLISHED_PROPERTIES {
-        let original = into_map.and_then(|m| m.get(*key));
-        match original {
+        match into_map.and_then(|m| m.get(*key)) {
             Some(value) => {
-                // Already present on `into` — the fold never counted an
-                // overwrite of this key, so restoring it is not a reversal of
-                // any counted addition.
+                // Already present on `into` — restore it verbatim.
                 merged_map.insert((*key).to_string(), value.clone());
             }
             None => {
-                // Absent from `into` — any value the fold placed here came
-                // from `from` and WAS counted as an added property.
-                if merged_map.remove(*key).is_some() {
-                    reverted_from_fold += 1;
-                }
+                // Absent from `into` — a value here came from `from` and
+                // must not survive the merge.
+                merged_map.remove(*key);
             }
         }
     }
-    reverted_from_fold
+}
+
+/// Count properties present in `final_value` that are new relative to
+/// `original` — the same "did this key actually get added" question
+/// [`merge_json`]'s fold answers, but computed from what the record finally
+/// holds rather than carried forward through the fold-then-restore pipeline.
+///
+/// A key present in both `original` and `final_value` is never counted, even
+/// when its value changed — this matches `merge_json`'s own rule that an
+/// overwrite of a key already present on `into` is not a merged addition.
+/// Nested objects recurse only when the key exists on both sides (mirroring
+/// `merge_json`'s `Union` recursion); a key that is wholly new at some level
+/// counts once for that level, not once per leaf beneath it.
+pub(crate) fn count_new_property_keys(
+    original: Option<&Value>,
+    final_value: Option<&Value>,
+) -> usize {
+    match (original, final_value) {
+        (_, None) => 0,
+        (None, Some(Value::Object(map))) => map.len(),
+        (None, Some(_)) => 1,
+        (Some(Value::Object(orig_map)), Some(Value::Object(final_map))) => {
+            count_new_keys_within_object(orig_map, final_map)
+        }
+        // Whole-value replacement. `merge_json` scores a `PreferFrom` fold that
+        // replaces one properties value with a differently-shaped one as a
+        // single contribution, and that is the right answer: something from the
+        // from-note is what the record now holds. This arm exists so the
+        // recomputed count agrees with the fold there — a bare 0 here would
+        // under-report every scalar/object replacement, including on note kinds
+        // that have no owner-established properties and never enter the
+        // restoration path at all. Equal values mean nothing was contributed,
+        // which is the `properties: Some(a)` merged with `properties: None`
+        // case.
+        (Some(orig), Some(final_val)) => usize::from(orig != final_val),
+    }
+}
+
+/// Per-key counting inside a properties object.
+///
+/// Deliberately NOT the same rule as the top level: within an object, a key
+/// that already exists and is merely overwritten counts 0, matching
+/// `merge_json`'s rule that only keys absent from the into-note are counted as
+/// added. Only nested objects recurse, so a nested contribution is counted at
+/// the depth it actually occurred.
+fn count_new_keys_within_object(
+    orig_map: &serde_json::Map<String, Value>,
+    final_map: &serde_json::Map<String, Value>,
+) -> usize {
+    final_map
+        .iter()
+        .map(|(key, value)| match orig_map.get(key) {
+            None => 1,
+            Some(Value::Object(nested_orig)) => match value {
+                Value::Object(nested_final) => {
+                    count_new_keys_within_object(nested_orig, nested_final)
+                }
+                _ => 0,
+            },
+            Some(_) => 0,
+        })
+        .sum()
 }
 
 /// Merge two property objects. Returns (merged, count_of_fields_from_from_that_were_added).
@@ -7635,5 +7690,56 @@ mod tests {
 
         assert_eq!(stored.title, expected.title, "title after merge");
         assert_eq!(stored.body, expected.body, "body after merge");
+    }
+
+    /// The recomputed `properties_merged` count must agree with the fold on
+    /// whole-value replacement.
+    ///
+    /// `merge_json` scores a `PreferFrom` replace of one properties value by a
+    /// differently-shaped one as a single contribution. An earlier version of
+    /// `count_new_property_keys` returned 0 for that shape, which under-reported
+    /// every such merge — including on note kinds with no owner-established
+    /// properties, which never enter the restoration path and were being counted
+    /// correctly before the recompute was introduced. Measured at the time:
+    /// fold=1, recompute=0, on both orderings.
+    ///
+    /// The flat-overwrite control is load-bearing: it is what distinguishes this
+    /// test from one that a function returning 1 unconditionally would also pass.
+    #[test]
+    fn recomputed_count_agrees_with_fold_on_whole_value_replacement() {
+        use serde_json::json;
+
+        for (into, from, label) in [
+            (json!({"a": 1}), json!(5), "object replaced by scalar"),
+            (json!(7), json!({"b": 2}), "scalar replaced by object"),
+        ] {
+            let (merged, fold_count) = merge_json(&into, &from, EntityDedupMergePolicy::PreferFrom);
+            let recomputed = count_new_property_keys(Some(&into), Some(&merged));
+            assert_eq!(
+                recomputed, fold_count,
+                "{label}: recomputed count must match the fold's own count",
+            );
+            assert_eq!(recomputed, 1, "{label}: one value was contributed");
+        }
+
+        // Control: an ordinary overwrite of an existing key contributes nothing
+        // under BOTH rules. Without this arm, a function returning 1 for every
+        // differing pair would pass the loop above.
+        let (merged, fold_count) = merge_json(
+            &json!({"a": 1}),
+            &json!({"a": 2}),
+            EntityDedupMergePolicy::PreferFrom,
+        );
+        let recomputed = count_new_property_keys(Some(&json!({"a": 1})), Some(&merged));
+        assert_eq!(fold_count, 0, "control: overwrite is never a fold addition");
+        assert_eq!(recomputed, 0, "control: overwrite is never a new key");
+
+        // Control: equal values mean nothing was contributed (the `from` note
+        // carrying no properties at all).
+        assert_eq!(
+            count_new_property_keys(Some(&json!({"a": 1})), Some(&json!({"a": 1}))),
+            0,
+            "control: an unchanged properties object contributes nothing",
+        );
     }
 }

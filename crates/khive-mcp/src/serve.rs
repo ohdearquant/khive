@@ -31,6 +31,11 @@ pub struct MultiBackendRegistry {
     pub per_pack_runtimes: HashMap<String, Arc<KhiveRuntime>>,
     /// The `main` backend (needed by the coordinator to build the BackendRegistry).
     pub main_backend: Arc<StorageBackend>,
+    /// The default runtime this boot built alongside the per-pack runtimes.
+    /// A clone (cheap: internal state is `Arc<RwLock<_>>`-shared), kept so
+    /// callers — chiefly boot-wiring tests — can assert on its installed
+    /// state (e.g. `has_note_write_validator()`) without re-deriving it.
+    pub default_runtime: KhiveRuntime,
 }
 
 /// Build a server from `args`, then serve it over `--daemon` or the named transport.
@@ -1859,6 +1864,7 @@ fn build_registry_for_multi_backend_inner(
         config_id,
         per_pack_runtimes: per_pack_runtimes_arc,
         main_backend,
+        default_runtime,
     })
 }
 
@@ -4145,6 +4151,133 @@ id = "lambda:project-actor"
         assert_eq!(
             get_after_json["results"][0]["result"]["properties"]["from_actor"], original_from_actor,
             "stored from_actor must be unchanged after the refused forgery attempt"
+        );
+    }
+
+    /// ADR-124 boot-occupancy regression (multi-backend twin of
+    /// `server::tests::single_runtime_boot_installs_note_write_validator`):
+    /// `has_note_write_validator` exists specifically so a transport's own
+    /// tests can assert, per boot path, that the documented startup
+    /// sequence actually filled the slot — but nothing called it for the
+    /// multi-backend builder either. Each per-pack runtime is constructed
+    /// independently in this boot path (unlike single-backend
+    /// `with_packs`), so the validator must be installed on the default
+    /// runtime AND on every per-pack runtime, not just one — installing it
+    /// on only the default would leave `kg`'s own per-pack runtime (which
+    /// actually serves the generic `create` verb below) unenforced. Asserts
+    /// occupancy directly on all of them through the real
+    /// `build_registry_for_multi_backend_inner` builder, then proves the
+    /// slot is wired, not just occupied: a generic `create` naming a forged
+    /// `from_actor` on a `message` note must come back derived to the same
+    /// actor a legitimate `comm.send` on this server stamps, not the forged
+    /// value. Sensitivity verified by temporarily commenting out both
+    /// `registry.call_register_note_write_validators(...)` calls in
+    /// `build_registry_for_multi_backend_inner` and re-running: all
+    /// assertions fail without them (occupancy false; forged value
+    /// survives) and pass with them restored.
+    #[tokio::test]
+    #[serial]
+    async fn multi_backend_boot_installs_note_write_validator_on_every_runtime() {
+        use crate::tools::request::RequestParams;
+
+        let khive_cfg = KhiveConfig {
+            backends: vec![BackendConfig {
+                name: "main".to_string(),
+                kind: BackendKind::Memory,
+                path: None,
+                cache_mb: None,
+                journal_mode: None,
+                read_only: false,
+            }],
+            ..KhiveConfig::default()
+        };
+
+        let base_cfg = base_runtime_config_for_multi_backend();
+
+        let multi = build_registry_for_multi_backend_inner(base_cfg, &khive_cfg, None)
+            .expect("multi-backend registry build must succeed");
+
+        assert!(
+            multi.default_runtime.has_note_write_validator(),
+            "multi-backend boot must install the note-write validator on the \
+             default runtime"
+        );
+        for (pack_name, rt) in &multi.per_pack_runtimes {
+            assert!(
+                rt.has_note_write_validator(),
+                "multi-backend boot must install the note-write validator on \
+                 the per-pack runtime for {pack_name:?}"
+            );
+        }
+
+        let server = build_server_from_multi_backend_registry(multi, &khive_cfg, None);
+
+        let send_resp = server
+            .dispatch_request_local(RequestParams {
+                ops: r#"comm.send(to="local", content="adr-124 boot-occupancy actor probe")"#
+                    .to_string(),
+                presentation: None,
+                presentation_per_op: None,
+                save_to: None,
+                format: None,
+                format_per_op: None,
+                request_id: None,
+            })
+            .await
+            .expect("comm.send dispatch must not error");
+        let send_json: serde_json::Value =
+            serde_json::from_str(&send_resp).expect("send response is valid JSON");
+        assert_eq!(
+            send_json["results"][0]["ok"].as_bool(),
+            Some(true),
+            "comm.send must succeed; response: {send_resp}"
+        );
+        let full_id = send_json["results"][0]["result"]["full_id"]
+            .as_str()
+            .expect("send must return full_id")
+            .to_string();
+
+        let get_resp = server
+            .dispatch_request_local(RequestParams {
+                ops: format!(r#"get(id="{full_id}")"#),
+                presentation: None,
+                presentation_per_op: None,
+                save_to: None,
+                format: None,
+                format_per_op: None,
+                request_id: None,
+            })
+            .await
+            .expect("get dispatch must not error");
+        let get_json: serde_json::Value =
+            serde_json::from_str(&get_resp).expect("get response is valid JSON");
+        let legitimate_actor = get_json["results"][0]["result"]["properties"]["from_actor"].clone();
+
+        let create_resp = server
+            .dispatch_request_local(RequestParams {
+                ops: r#"create(kind="message", content="adr-124 boot-occupancy create probe", properties={"from_actor": "forged-actor"})"#
+                    .to_string(),
+                presentation: None,
+                presentation_per_op: None,
+                save_to: None,
+                format: None,
+                format_per_op: None,
+                request_id: None,
+            })
+            .await
+            .expect("create dispatch must not error");
+        let create_json: serde_json::Value =
+            serde_json::from_str(&create_resp).expect("create response is valid JSON");
+        assert_eq!(
+            create_json["results"][0]["ok"].as_bool(),
+            Some(true),
+            "create must succeed; response: {create_resp}"
+        );
+        assert_eq!(
+            create_json["results"][0]["result"]["properties"]["from_actor"], legitimate_actor,
+            "a forged from_actor on a generic create must come back derived to \
+             the same actor a legitimate comm.send on this server stamps, not \
+             the forged value; response: {create_resp}"
         );
     }
 

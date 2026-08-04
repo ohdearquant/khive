@@ -10069,8 +10069,20 @@ async fn merge_preserves_into_note_from_actor_under_prefer_from() {
 }
 
 /// CONTROL arm: the same merge under `strategy="prefer_into"` must also
-/// leave `from_actor` as X — proving the preserve step is not just
-/// coincidentally matching the default fold direction.
+/// leave `from_actor` as X.
+///
+/// Honesty note (khive-oss PR #1690 round 3): this arm is NOT sensitive to
+/// the preservation step being removed. `PreferInto`'s fold
+/// (`merge_json` in `khive-runtime`'s `curation.rs`) only ever inserts a
+/// `from`-note key that is absent on `into` — `from_actor` is already
+/// present on X's into-note before the merge runs, so the fold itself never
+/// touches it. This arm stays green with `preserve_owner_established_properties`
+/// deleted entirely; it is a legitimate control (it proves the merge doesn't
+/// silently overwrite under this strategy) but it is NOT evidence the guard
+/// works. `merge_preserves_into_note_from_actor_under_prefer_from` above is
+/// the arm carrying the security-relevant assertion: `PreferFrom`'s fold
+/// does overwrite `from_actor` with Y's value, so that arm only passes
+/// because the preserve step reverts it.
 #[tokio::test]
 async fn merge_preserves_into_note_from_actor_under_prefer_into() {
     let (registry, _rt) = build_registry_with_owned_kinds_and_validator();
@@ -10290,5 +10302,88 @@ async fn merge_reports_properties_merged_for_key_that_actually_survives() {
         after["properties"]["to_actor"], "into",
         "the owner-established key must remain pinned to the into-note, not \
          the from-note's value"
+    );
+}
+
+/// NESTED-UNION arm: an owner-established key that holds an OBJECT
+/// (`thread_id`) merged under `strategy="union"` must not be double-counted
+/// either. The round-2 fix above corrected the flat case
+/// (`merge_reports_properties_merged_for_key_that_actually_survives`); this
+/// is the nested case that fix left uncorrected. Under `union` the fold
+/// recurses into `thread_id` and counts the absorbed note's nested key as a
+/// merged contribution, but restoration then reverts `thread_id` wholesale
+/// back to the into-note's pre-merge value — so nothing the fold counted
+/// actually survived, and `properties_merged` must report 0.
+#[tokio::test]
+async fn merge_reports_zero_properties_merged_for_nested_union_reversion() {
+    let (registry, _rt) = build_registry_with_owned_kinds_and_validator();
+
+    let identity = RequestIdentity {
+        namespace: "local".to_string(),
+        actor_id: Some("lambda:z".to_string()),
+        ..Default::default()
+    };
+
+    let into_created = registry
+        .dispatch_with_identity(
+            "create",
+            serde_json::json!({
+                "kind": "message",
+                "content": "into note, nested-union accuracy arm",
+                "properties": {"thread_id": {"keep": 1}},
+            }),
+            Some(identity.clone()),
+        )
+        .await
+        .expect("create must succeed");
+    let into_id = into_created["id"]
+        .as_str()
+        .expect("create must return id")
+        .to_string();
+
+    let from_created = registry
+        .dispatch_with_identity(
+            "create",
+            serde_json::json!({
+                "kind": "message",
+                "content": "from note, nested-union accuracy arm",
+                "properties": {"thread_id": {"discarded": 2}},
+            }),
+            Some(identity),
+        )
+        .await
+        .expect("create must succeed");
+    let from_id = from_created["id"]
+        .as_str()
+        .expect("create must return id")
+        .to_string();
+
+    let merged = registry
+        .dispatch(
+            "merge",
+            serde_json::json!({
+                "kind": "message",
+                "into_id": into_id,
+                "from_id": from_id,
+                "strategy": "union",
+            }),
+        )
+        .await
+        .expect("merge must succeed");
+
+    let after = registry
+        .dispatch("get", serde_json::json!({"id": into_id}))
+        .await
+        .expect("get must succeed");
+    assert_eq!(
+        after["properties"]["thread_id"],
+        serde_json::json!({"keep": 1}),
+        "the absorbed note's nested contribution must not survive restoration"
+    );
+    assert_eq!(
+        merged["properties_merged"], 0,
+        "nothing from the absorbed note actually survived restoration, so \
+         properties_merged must report 0, not the nested fold's raw count; \
+         got {merged}"
     );
 }

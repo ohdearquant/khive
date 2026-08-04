@@ -814,14 +814,33 @@ impl KhiveRuntime {
     /// Install a pack-owned note-write validator.
     ///
     /// Called during pack registration (`PackRuntime::register_note_write_validator`)
-    /// so that every runtime note-write site carrying caller-supplied
-    /// `properties` derives the owning pack's identity properties from the
+    /// so that the covered note-write sites carrying caller-supplied
+    /// `properties` derive the owning pack's identity properties from the
     /// authorization token, closing the gap where a direct Rust caller, the
     /// generic `create` verb, or the proposal-apply path (which dispatches no
     /// pack hooks) writes them unchecked. Single-slot semantics, same as
     /// [`install_note_mutation_hook`](Self::install_note_mutation_hook): a
     /// second installing pack overwrites the first, so a validator must return
     /// kinds it does not own unchanged.
+    ///
+    /// Covered sites — each calls `derive_note_write_properties`
+    /// before the write: `create_note_inner` (`operations.rs`, the generic
+    /// `create` verb funnel and every other public `create_note*` variant),
+    /// `atomic_prepare::prepare_add_note` (the proposal-apply add-note path),
+    /// and `atomic_message::create_notes_atomic_with_report` (the atomic
+    /// multi-note writer).
+    ///
+    /// NOT covered: `try_create_note` (`operations.rs`), and the raw
+    /// `try_insert_note` / `upsert_note` methods on the [`NoteStore`] returned
+    /// by [`notes`](Self::notes). `try_create_note` is deliberately excluded —
+    /// its only caller path is `comm.ingest`, where `properties.from_actor` is
+    /// the external transport sender named by the `from` parameter, not the
+    /// authenticated caller; deriving it from the token here would stamp
+    /// every inbound message as the ingesting daemon and destroy inbound
+    /// attribution. The `NoteStore` accessors are a lower-level storage
+    /// escape hatch with no properties-derivation contract of their own; a
+    /// caller reaching storage directly is expected to have already decided
+    /// what `properties` to write.
     pub fn install_note_write_validator(&self, f: NoteWriteValidatorFn) {
         if let Ok(mut guard) = self.note_write_validator.write() {
             *guard = Some(f);
