@@ -354,6 +354,126 @@ async fn fan_out_search_two_backends_merged() {
     );
 }
 
+/// With two backends each contributing more hits than `limit`, the RRF merge
+/// must cap the final entity result set at `limit` — the per-backend
+/// truncation alone would allow up to (#backends × limit) merged hits.
+#[tokio::test]
+async fn fan_out_search_caps_merged_entity_hits_at_limit() {
+    let mut registry = BackendRegistry::new();
+    let rt_main = memory_runtime();
+    let rt_lore = memory_runtime();
+    registry.register(BackendId::new("main"), Arc::clone(&rt_main));
+    registry.register(BackendId::new("lore"), Arc::clone(&rt_lore));
+    let coord = SubstrateCoordinator::new(registry);
+    let ns = Namespace::local();
+
+    // Seed 3 matching entities per backend (6 total > limit of 2).
+    for (rt, prefix) in [(&rt_main, "Main"), (&rt_lore, "Lore")] {
+        let token = rt.authorize(ns.clone()).unwrap();
+        for i in 0..3 {
+            rt.create_entity(
+                &token,
+                "concept",
+                None,
+                &format!("{prefix}LimitProbe{i}"),
+                Some("shared limitprobe token"),
+                None,
+                vec![],
+            )
+            .await
+            .expect("create entity");
+        }
+    }
+
+    let request = validated_kg_search(serde_json::json!({
+        "kind": "entity",
+        "query": "limitprobe",
+        "limit": 2,
+    }));
+    let (merged_hits, _note_hits, per_backend) = coord.fan_out_search(&request, &ns).await;
+
+    assert_eq!(per_backend.len(), 2, "both backends in report");
+    assert!(
+        per_backend.iter().all(|r| r.error.is_none()),
+        "no backend errors"
+    );
+    assert!(
+        merged_hits.len() <= 2,
+        "merged entity hits must be capped at limit=2, got {}",
+        merged_hits.len()
+    );
+}
+
+/// Same merged-cap guarantee for note fan-out: two backends each holding more
+/// notes than `limit` must not yield more than `limit` merged note hits.
+#[tokio::test]
+async fn fan_out_search_caps_merged_note_hits_at_limit() {
+    let mut registry = BackendRegistry::new();
+    let rt_main = memory_runtime();
+    let rt_lore = memory_runtime();
+    registry.register(BackendId::new("main"), Arc::clone(&rt_main));
+    registry.register(BackendId::new("lore"), Arc::clone(&rt_lore));
+    let coord = SubstrateCoordinator::new(registry);
+    let ns = Namespace::local();
+
+    // Seed 3 matching notes per backend (6 total > limit of 2).
+    for (rt, prefix) in [(&rt_main, "Main"), (&rt_lore, "Lore")] {
+        let token = rt.authorize(ns.clone()).unwrap();
+        for i in 0..3 {
+            rt.create_note(
+                &token,
+                "observation",
+                Some(&format!("{prefix}NoteLimitProbe{i}")),
+                "shared notelimitprobe token",
+                None,
+                None,
+                vec![],
+            )
+            .await
+            .expect("create note");
+        }
+    }
+
+    let request = validated_kg_search(serde_json::json!({
+        "kind": "note",
+        "query": "notelimitprobe",
+        "limit": 2,
+    }));
+    let (_entity_hits, note_hits, per_backend) = coord.fan_out_search(&request, &ns).await;
+
+    assert_eq!(per_backend.len(), 2, "both backends in report");
+    assert!(
+        per_backend.iter().all(|r| r.error.is_none()),
+        "no backend errors"
+    );
+    assert!(
+        note_hits.len() <= 2,
+        "merged note hits must be capped at limit=2, got {}",
+        note_hits.len()
+    );
+}
+
+/// The canonical search request reuses `SearchParams` deny-unknown-fields
+/// deserialization on every dispatch path, so an unknown wire field must be
+/// rejected rather than silently ignored.
+#[test]
+fn validated_search_rejects_unknown_fields() {
+    let registry = packs_registry(memory_runtime(), &["kg"]);
+    let error = ValidatedSearchRequest::from_value(
+        serde_json::json!({
+            "kind": "entity",
+            "query": "typed request",
+            "bogus_field": true,
+        }),
+        &registry,
+    )
+    .expect_err("unknown search field must reject");
+    assert!(
+        error.to_string().contains("unknown field"),
+        "error must name the unknown-field rejection: {error}"
+    );
+}
+
 #[test]
 fn cross_backend_entity_merge_preserves_retrieval_leg_membership() {
     let text_only = Uuid::new_v4();
