@@ -107,6 +107,44 @@ fn exec_db_override_refusal_covers_config_flag_and_env() {
 }
 
 #[test]
+fn exec_pending_events_db_override_refusal_emits_envelope() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let home = tempfile::tempdir().expect("isolated home");
+    let config = write_multi_backend_config(&dir);
+    let override_path = dir.path().join("must-not-open.db");
+    let binary = env!("CARGO_BIN_EXE_kkernel");
+
+    let from_flag = Command::new(binary)
+        .args([
+            "exec",
+            "--pending-events",
+            "--config",
+            config.to_str().expect("utf8 config path"),
+            "--db",
+            override_path.to_str().expect("utf8 db path"),
+        ])
+        .current_dir(dir.path())
+        .env("HOME", home.path())
+        .env("KHIVE_NO_DAEMON", "1")
+        .env_remove("KHIVE_CONFIG")
+        .env_remove("KHIVE_DB")
+        .output()
+        .expect("run kkernel exec --pending-events with flags");
+    assert_exec_refusal(from_flag, &config, &override_path);
+
+    let from_env = Command::new(binary)
+        .args(["exec", "--pending-events"])
+        .current_dir(dir.path())
+        .env("HOME", home.path())
+        .env("KHIVE_NO_DAEMON", "1")
+        .env("KHIVE_CONFIG", &config)
+        .env("KHIVE_DB", &override_path)
+        .output()
+        .expect("run kkernel exec --pending-events with environment overrides");
+    assert_exec_refusal(from_env, &config, &override_path);
+}
+
+#[test]
 fn mcp_db_override_refusal_names_selected_config_without_protocol_output() {
     let dir = tempfile::tempdir().expect("tempdir");
     let home = tempfile::tempdir().expect("isolated home");

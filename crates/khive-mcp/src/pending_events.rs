@@ -216,9 +216,12 @@ pub async fn run_pending_events_with_config(
         brain_profile: None,
         resumed_generation: None,
     };
+    // NOTE: no `.context(...)` wrapper here — a `DatabaseOverrideConflict`
+    // raised by the builder must reach `kkernel exec`'s caller as the
+    // top-level error so `db_override_refusal_envelope`'s `downcast_ref`
+    // recognizes it and the documented JSON refusal envelope is emitted.
     let (server, schedule_rt) =
-        crate::serve::build_server_with_explicit_namespace(&args, ns, true, false)
-            .context("pending-events: build server")?;
+        crate::serve::build_server_with_explicit_namespace(&args, ns, true, false)?;
     let rt = schedule_rt.ok_or_else(|| {
         anyhow::anyhow!(
             "pending-events: resolved pack set does not include \"schedule\"; nothing to drain"
