@@ -29,9 +29,13 @@ FIXTURE
         cat > "$tmp/$case/docs/adr/README.md" <<'FIXTURE'
 # ADR Index
 
+<!-- BEGIN GENERATED ADR CATALOG -->
+
 | ADR | Title |
 | --- | --- |
 | [ADR-030](ADR-030-retrieval-stack-port.md) | Retrieval Stack Port — khive-retrieval |
+
+<!-- END GENERATED ADR CATALOG -->
 FIXTURE
     done
 
@@ -42,6 +46,94 @@ FIXTURE
     # yet a check, so this case IS that observation, kept permanent.
     grep -v '^| \[ADR-030\]' "$tmp/case-uncataloged/docs/adr/README.md" > "$tmp/case-uncataloged/README.tmp"
     mv "$tmp/case-uncataloged/README.tmp" "$tmp/case-uncataloged/docs/adr/README.md"
+
+    # Regression case 4 (must-FAIL control, H1): a letter-suffixed ADR id
+    # (the real "ADR-117a" shape) is invisible to the old \d{3}-only file
+    # pattern on both sides of the join -- neither added to the authoritative
+    # set nor checked against the index -- so it silently passed uncatalogued.
+    # A header-only index with no row for it must now go red.
+    mkdir -p "$tmp/case-letter-uncataloged/docs/adr"
+    cat > "$tmp/case-letter-uncataloged/docs/adr/ADR-117a-fixture-letter-suffix.md" <<'FIXTURE'
+# ADR-117a: Fixture Letter Suffix
+
+**Status**: accepted
+FIXTURE
+    cat > "$tmp/case-letter-uncataloged/docs/adr/README.md" <<'FIXTURE'
+# ADR Index
+
+<!-- BEGIN GENERATED ADR CATALOG -->
+
+| ADR | Title |
+| --- | --- |
+
+<!-- END GENERATED ADR CATALOG -->
+FIXTURE
+
+    # Regression case 5 (must-PASS control, H1): the same letter-suffixed ADR
+    # correctly catalogued must not be flagged -- proves the fix admits the
+    # id rather than merely rejecting it everywhere.
+    mkdir -p "$tmp/case-letter-cataloged/docs/adr"
+    cat > "$tmp/case-letter-cataloged/docs/adr/ADR-117a-fixture-letter-suffix.md" <<'FIXTURE'
+# ADR-117a: Fixture Letter Suffix
+
+**Status**: accepted
+FIXTURE
+    cat > "$tmp/case-letter-cataloged/docs/adr/README.md" <<'FIXTURE'
+# ADR Index
+
+<!-- BEGIN GENERATED ADR CATALOG -->
+
+| ADR | Title |
+| --- | --- |
+| [ADR-117a](ADR-117a-fixture-letter-suffix.md) | Fixture Letter Suffix |
+
+<!-- END GENERATED ADR CATALOG -->
+FIXTURE
+
+    # Regression case 6 (must-FAIL control, H2): the only index row for the
+    # ADR sits inside an HTML comment spanning multiple lines -- a stale
+    # example kept for reference, not a live catalog entry. Must go red.
+    mkdir -p "$tmp/case-comment-row/docs/adr"
+    cat > "$tmp/case-comment-row/docs/adr/ADR-201-fixture-comment-row.md" <<'FIXTURE'
+# ADR-201: Fixture Comment Row
+
+**Status**: accepted
+FIXTURE
+    cat > "$tmp/case-comment-row/docs/adr/README.md" <<'FIXTURE'
+# ADR Index
+
+<!-- BEGIN GENERATED ADR CATALOG -->
+
+| ADR | Title |
+| --- | --- |
+<!--
+| [ADR-201](ADR-201-fixture-comment-row.md) | Fixture Comment Row |
+-->
+
+<!-- END GENERATED ADR CATALOG -->
+FIXTURE
+
+    # Regression case 7 (must-FAIL control, H2): the only index row for the
+    # ADR sits inside a fenced code block. Must go red.
+    mkdir -p "$tmp/case-fenced-row/docs/adr"
+    cat > "$tmp/case-fenced-row/docs/adr/ADR-202-fixture-fenced-row.md" <<'FIXTURE'
+# ADR-202: Fixture Fenced Row
+
+**Status**: accepted
+FIXTURE
+    cat > "$tmp/case-fenced-row/docs/adr/README.md" <<'FIXTURE'
+# ADR Index
+
+<!-- BEGIN GENERATED ADR CATALOG -->
+
+| ADR | Title |
+| --- | --- |
+```
+| [ADR-202](ADR-202-fixture-fenced-row.md) | Fixture Fenced Row |
+```
+
+<!-- END GENERATED ADR CATALOG -->
+FIXTURE
 
     cat > "$tmp/case-fail/crates/fixture-crate/docs/design.md" <<'FIXTURE'
 # fixture-crate Design
@@ -93,6 +185,50 @@ FIXTURE
         echo "self-test OK: uncataloged ADR caught"
     fi
 
+    if sh "$SCRIPT_DIR/lint-adr-refs.sh" "$tmp/case-letter-uncataloged" > "$tmp/letter-uncataloged.log" 2>&1; then
+        echo "self-test FAILED: uncatalogued letter-suffixed ADR-117a was not caught"
+        cat "$tmp/letter-uncataloged.log"
+        status=1
+    elif ! grep -q "ADR-117a (ADR-117a-fixture-letter-suffix.md) has no index catalog row" "$tmp/letter-uncataloged.log"; then
+        echo "self-test FAILED: letter-suffixed lint failed, but not for the expected reason:"
+        cat "$tmp/letter-uncataloged.log"
+        status=1
+    else
+        echo "self-test OK: uncatalogued letter-suffixed ADR caught"
+    fi
+
+    if ! sh "$SCRIPT_DIR/lint-adr-refs.sh" "$tmp/case-letter-cataloged" > "$tmp/letter-cataloged.log" 2>&1; then
+        echo "self-test FAILED: correctly catalogued letter-suffixed ADR-117a should not trip the lint"
+        cat "$tmp/letter-cataloged.log"
+        status=1
+    else
+        echo "self-test OK: correctly catalogued letter-suffixed ADR does not false-positive"
+    fi
+
+    if sh "$SCRIPT_DIR/lint-adr-refs.sh" "$tmp/case-comment-row" > "$tmp/comment-row.log" 2>&1; then
+        echo "self-test FAILED: index row hidden inside an HTML comment was counted as catalog coverage"
+        cat "$tmp/comment-row.log"
+        status=1
+    elif ! grep -q "ADR-201 (ADR-201-fixture-comment-row.md) has no index catalog row" "$tmp/comment-row.log"; then
+        echo "self-test FAILED: comment-row lint failed, but not for the expected reason:"
+        cat "$tmp/comment-row.log"
+        status=1
+    else
+        echo "self-test OK: index row hidden inside an HTML comment does not count as coverage"
+    fi
+
+    if sh "$SCRIPT_DIR/lint-adr-refs.sh" "$tmp/case-fenced-row" > "$tmp/fenced-row.log" 2>&1; then
+        echo "self-test FAILED: index row hidden inside a fenced code block was counted as catalog coverage"
+        cat "$tmp/fenced-row.log"
+        status=1
+    elif ! grep -q "ADR-202 (ADR-202-fixture-fenced-row.md) has no index catalog row" "$tmp/fenced-row.log"; then
+        echo "self-test FAILED: fenced-row lint failed, but not for the expected reason:"
+        cat "$tmp/fenced-row.log"
+        status=1
+    else
+        echo "self-test OK: index row hidden inside a fenced code block does not count as coverage"
+    fi
+
     return "$status"
 }
 
@@ -114,9 +250,14 @@ from pathlib import Path
 
 root = Path(sys.argv[1]).resolve()
 adr_dir = root / "docs" / "adr"
-adr_file_re = re.compile(r"^ADR-(\d{3})-.*\.md$", re.IGNORECASE)
+# Shared by the authoritative-file, H1-header, and index-row patterns so the
+# three agree on what an ADR id looks like -- e.g. the letter-suffixed
+# "ADR-117a" naming a follow-on ADR that shares its parent's number. Captured
+# numbers are lowercased at every use site so "117A" and "117a" join.
+ADR_NUMBER = r"\d{3}[a-z]?"
+adr_file_re = re.compile(rf"^ADR-({ADR_NUMBER})-.*\.md$", re.IGNORECASE)
 h1_re = re.compile(
-    r"^#\s+ADR-(?P<number>\d{3})(?:\s+Rev\s+\d+)?\s*:\s*(?P<title>.+?)\s*#*\s*$",
+    rf"^#\s+ADR-(?P<number>{ADR_NUMBER})(?:\s+Rev\s+\d+)?\s*:\s*(?P<title>.+?)\s*#*\s*$",
     re.IGNORECASE,
 )
 colon_ref_re = re.compile(r"\bADR-(?P<number>\d{3})\s*:\s*", re.IGNORECASE)
@@ -126,7 +267,7 @@ heading_re = re.compile(r"^\s{0,3}#{1,6}\s+(?P<body>.+?)\s*#*\s*$")
 link_re = re.compile(r"\[(?P<label>[^]\n]+)\]\((?P<target>[^\n)]+)\)")
 adr_led_re = re.compile(r"^(?:\[)?ADR-\d{3}\b", re.IGNORECASE)
 index_row_re = re.compile(
-    r"^\|\s*\[ADR-(?P<number>\d{3})\]\((?P<target>[^)]+)\)\s*"
+    rf"^\|\s*\[ADR-(?P<number>{ADR_NUMBER})\]\((?P<target>[^)]+)\)\s*"
     r"\|\s*(?P<title>.*?)\s*\|\s*$",
     re.IGNORECASE,
 )
@@ -257,8 +398,8 @@ for path in sorted(adr_dir.glob("ADR-*.md")):
     if heading_match is None:
         errors.append(f"{relative}:{line_number}: malformed ADR H1: {heading!r}")
         continue
-    file_number = file_match.group(1)
-    heading_number = heading_match.group("number")
+    file_number = file_match.group(1).lower()
+    heading_number = heading_match.group("number").lower()
     if file_number != heading_number:
         errors.append(
             f"{relative}:{line_number}: filename ADR-{file_number} does not match H1 ADR-{heading_number}"
@@ -271,15 +412,44 @@ for path in sorted(adr_dir.glob("ADR-*.md")):
     titles[file_number] = (heading_match.group("title"), path)
 
 index_path = adr_dir / "README.md"
+relative = index_path.relative_to(root)
+# Scoped to the generated catalog table's own markers rather than the whole
+# file: a prose table elsewhere in README.md, or a row sitting inside an HTML
+# comment or fenced block *within* the marked region (e.g. a stale example
+# kept for reference), must never count as catalog coverage.
+catalog_begin = "<!-- BEGIN GENERATED ADR CATALOG -->"
+catalog_end = "<!-- END GENERATED ADR CATALOG -->"
 cataloged_numbers: set[str] = set()
+in_catalog = False
+in_fence = False
+in_comment = False
 with index_path.open(encoding="utf-8") as handle:
-    for line_number, line in enumerate(handle, 1):
-        match = index_row_re.match(line.rstrip("\n"))
+    for line_number, raw_line in enumerate(handle, 1):
+        line = raw_line.rstrip("\n")
+        if not in_catalog:
+            if line.strip() == catalog_begin:
+                in_catalog = True
+            continue
+        if line.strip() == catalog_end:
+            break
+        if re.match(r"^\s*(```|~~~)", line):
+            in_fence = not in_fence
+            continue
+        if in_fence:
+            continue
+        if in_comment:
+            if "-->" in line:
+                in_comment = False
+            continue
+        if "<!--" in line:
+            if "-->" not in line:
+                in_comment = True
+            continue
+        match = index_row_re.match(line)
         if match is None:
             continue
-        number = match.group("number")
+        number = match.group("number").lower()
         cataloged_numbers.add(number)
-        relative = index_path.relative_to(root)
         canonical = titles.get(number)
         if canonical is None:
             errors.append(f"{relative}:{line_number}: ADR-{number} index entry has no authoritative file")
@@ -297,6 +467,10 @@ with index_path.open(encoding="utf-8") as handle:
                 f'{relative}:{line_number}: ADR-{number} index title mismatch; '
                 f'expected "{expected}", found "{found}"'
             )
+if not in_catalog:
+    errors.append(
+        f'{relative}: missing "{catalog_begin}" marker; catalog-coverage scan did not run'
+    )
 
 # Catalog coverage: every authoritative ADR file must have an index row.
 # The index and the tree can otherwise drift silently -- a merged ADR with no
