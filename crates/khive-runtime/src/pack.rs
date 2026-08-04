@@ -32,6 +32,15 @@ pub use khive_types::VerbDef;
 
 use crate::validation::ValidationRule;
 
+/// Name of the pack providing the shared CRUD verbs and the general-purpose
+/// note kinds those verbs exist to serve.
+///
+/// Its note kinds are the ones any caller may author freely through `create`
+/// and `update`; every other pack's note kinds are records maintained by that
+/// pack's own verbs. Used by
+/// [`VerbRegistry::pack_owned_note_kinds`].
+pub const GENERIC_CRUD_PACK: &str = "kg";
+
 /// Pack-auxiliary schema plan.
 ///
 /// Declares `CREATE TABLE IF NOT EXISTS` statements for pack-owned tables that
@@ -2040,6 +2049,33 @@ impl VerbRegistry {
             .iter()
             .flat_map(|p| p.note_kinds().iter().copied())
             .filter(|k| seen.insert(*k))
+            .collect()
+    }
+
+    /// Note kinds owned by a pack, i.e. every kind in [`all_note_kinds`] that
+    /// is not one of the generic-CRUD pack's own kinds.
+    ///
+    /// [`GENERIC_CRUD_PACK`] declares the general-purpose note kinds the shared
+    /// CRUD verbs exist to serve (`observation`, `insight`, …); every other
+    /// pack's kinds are records that pack's own verbs create and maintain.
+    /// Derived from the packs' `NOTE_KINDS` constants, so a pack that adds or
+    /// drops a kind moves this set with it — nothing is hardcoded here but the
+    /// name of the generic pack itself.
+    ///
+    /// [`all_note_kinds`]: Self::all_note_kinds
+    pub fn pack_owned_note_kinds(&self) -> Vec<&'static str> {
+        let generic: std::collections::HashSet<&'static str> = self
+            .packs
+            .iter()
+            .filter(|p| p.name() == GENERIC_CRUD_PACK)
+            .flat_map(|p| p.note_kinds().iter().copied())
+            .collect();
+        let mut seen = std::collections::HashSet::new();
+        self.packs
+            .iter()
+            .filter(|p| p.name() != GENERIC_CRUD_PACK)
+            .flat_map(|p| p.note_kinds().iter().copied())
+            .filter(|k| !generic.contains(k) && seen.insert(*k))
             .collect()
     }
 

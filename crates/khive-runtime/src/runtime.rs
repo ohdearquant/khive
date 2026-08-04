@@ -103,6 +103,13 @@ pub struct KhiveRuntime {
     /// no pack cares about note-mutation notifications) — the call becomes a
     /// no-op check of an `Option`.
     note_mutation_hook: Arc<RwLock<Option<NoteMutationHookFn>>>,
+    /// Pack-owned note kinds — every note kind declared by a pack other than
+    /// the generic-CRUD pack, installed by the transport from the registry
+    /// (see `VerbRegistry::pack_owned_note_kinds`). Records of these kinds are
+    /// maintained by their owning pack's own verbs, so `update`'s `properties`
+    /// patch is refused on them at the runtime layer. Empty until installed
+    /// (bare runtime), which leaves the rule inert.
+    pack_owned_note_kinds: Arc<RwLock<Vec<String>>>,
     /// The config-resolved `BlobStore` (ADR-111 Amendment 2), installed by
     /// the boot path (`khive-mcp`'s single- and multi-backend startup paths)
     /// via [`install_blob_store`](Self::install_blob_store) once `khive.toml`'s
@@ -149,6 +156,7 @@ impl KhiveRuntime {
             valid_note_kinds: Arc::new(RwLock::new(Vec::new())),
             entity_type_validator: Arc::new(RwLock::new(None)),
             note_mutation_hook: Arc::new(RwLock::new(None)),
+            pack_owned_note_kinds: Arc::new(RwLock::new(Vec::new())),
             blob_store: Arc::new(RwLock::new(None)),
         })
     }
@@ -179,6 +187,7 @@ impl KhiveRuntime {
             valid_note_kinds: Arc::new(RwLock::new(Vec::new())),
             entity_type_validator: Arc::new(RwLock::new(None)),
             note_mutation_hook: Arc::new(RwLock::new(None)),
+            pack_owned_note_kinds: Arc::new(RwLock::new(Vec::new())),
             blob_store: Arc::new(RwLock::new(None)),
         })
     }
@@ -208,6 +217,7 @@ impl KhiveRuntime {
             valid_note_kinds: Arc::new(RwLock::new(Vec::new())),
             entity_type_validator: Arc::new(RwLock::new(None)),
             note_mutation_hook: Arc::new(RwLock::new(None)),
+            pack_owned_note_kinds: Arc::new(RwLock::new(Vec::new())),
             blob_store: Arc::new(RwLock::new(None)),
         }
     }
@@ -266,6 +276,7 @@ impl KhiveRuntime {
                     valid_note_kinds: self.valid_note_kinds.clone(),
                     entity_type_validator: self.entity_type_validator.clone(),
                     note_mutation_hook: self.note_mutation_hook.clone(),
+                    pack_owned_note_kinds: self.pack_owned_note_kinds.clone(),
                     blob_store: self.blob_store.clone(),
                 }
             }
@@ -658,6 +669,28 @@ impl KhiveRuntime {
         if let Ok(mut guard) = self.valid_note_kinds.write() {
             *guard = note_kinds;
         }
+    }
+
+    /// Install the pack-owned note kinds aggregated from the pack registry.
+    ///
+    /// Called by the transport after the `VerbRegistry` is built, same timing
+    /// as [`install_kind_registry`](Self::install_kind_registry).
+    pub fn install_pack_owned_note_kinds(&self, kinds: Vec<String>) {
+        if let Ok(mut guard) = self.pack_owned_note_kinds.write() {
+            *guard = kinds;
+        }
+    }
+
+    /// Whether `kind` is a note kind owned by a pack (see
+    /// [`install_pack_owned_note_kinds`](Self::install_pack_owned_note_kinds)).
+    ///
+    /// Always `false` before the transport installs the list — a bare runtime
+    /// has no packs, so no kind is pack-owned there.
+    pub fn is_pack_owned_note_kind(&self, kind: &str) -> bool {
+        self.pack_owned_note_kinds
+            .read()
+            .map(|g| g.iter().any(|k| k == kind))
+            .unwrap_or(false)
     }
 
     /// Validate that `kind` is a pack-registered entity kind.

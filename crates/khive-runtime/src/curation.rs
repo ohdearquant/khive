@@ -1288,6 +1288,47 @@ impl KhiveRuntime {
             note.decay_factor = decay_patch;
         }
         if let Some(props) = patch.properties {
+            // On a pack-owned note kind, the properties in
+            // `OWNER_ESTABLISHED_PROPERTIES` are established by the owning pack
+            // and read back by it to decide something structural — who wrote
+            // the record and when, which author-side record it copies, which
+            // conversation it belongs to. A caller cannot patch them here.
+            // Only a patch that *names* one of them is refused, and naming is
+            // the exact test: the merge below is `PreferFrom`, so a patch that
+            // names an owned key would overwrite it while a patch that does
+            // not name it leaves it intact. Every other key still merges
+            // normally — arbitrary metadata on a pack-owned record (a
+            // `blocked_on` note on a `task`) has no other write path and must
+            // keep working.
+            if self.is_pack_owned_note_kind(&note.kind) {
+                // A non-object patch names nothing, so it slips past the
+                // named-key check below and then takes `merge_json`'s
+                // non-object `PreferFrom` arm, which replaces the whole
+                // property object rather than merging into it — erasing
+                // every owned key. Refused on every pack-owned kind, not only
+                // rows that currently carry an owned key, so an identical
+                // call cannot succeed or fail on state the caller cannot see.
+                if !props.is_object() {
+                    return Err(RuntimeError::InvalidInput(format!(
+                        "properties on a `{}` note must be patched with an object: a non-object \
+                         patch names no key, so it would replace the whole property object rather \
+                         than merging into it. Pass an object containing the keys you intend to \
+                         set.",
+                        note.kind
+                    )));
+                }
+                if let Some(named) = owner_established_property_named_in(&props) {
+                    return Err(RuntimeError::InvalidInput(format!(
+                        "`{named}` is not patchable on a `{}` note: the pack that owns this \
+                         kind establishes it and reads it back — to decide how the record is \
+                         attributed and grouped, or to reproduce it verbatim when the record \
+                         is re-emitted — so it is written by the owner and immutable to a \
+                         caller patch. Patch any other property key here, or omit \
+                         `{named}` from this patch.",
+                        note.kind
+                    )));
+                }
+            }
             let (merged, _) = merge_properties(
                 &note.properties,
                 &Some(props),
@@ -2729,6 +2770,62 @@ pub(crate) fn merge_string_field(
         EntityDedupMergePolicy::PreferInto | EntityDedupMergePolicy::Union => into.to_string(),
         EntityDedupMergePolicy::PreferFrom => from.to_string(),
     }
+}
+
+/// Property keys on a pack-owned note that the owning pack establishes and
+/// then reads back to decide something structural about the record.
+///
+/// The test for membership is that both halves hold: the key is written
+/// under the owner's authority rather than from caller input, AND its value
+/// is read to decide identity, grouping, routing, lifecycle, visibility,
+/// authorization, deduplication, or membership. `from_actor`, `direction` and
+/// `sent_at` answer "who wrote this, in which direction, when"; `outbound_ref`
+/// and `thread_id` answer "which record is this one's author-side original,
+/// and which conversation does it belong to". `subject` is reproduced
+/// verbatim when a record is re-emitted; `wire_message_id` and `external_id`
+/// are the author-side citation and correlation key a reply is routed
+/// against. The set is therefore not "keys that identify a party" — it is
+/// "keys the owner established and later trusts".
+///
+/// Naming one of these in a caller-supplied `properties` patch is refused by
+/// `update` on a pack-owned kind (see [`owner_established_property_named_in`]).
+///
+/// `to_actor` belongs here alongside `from_actor`: comm establishes it at
+/// send time from the `to=` param, and `comm.read` trusts a present string
+/// value to decide whether the caller is the addressee, failing open only
+/// when the key is absent or non-string. A caller must not be able to
+/// retarget a delivered message's addressee via a patch that names no other
+/// currently-protected key.
+///
+/// Membership here governs writes to an EXISTING record only. Introducing one
+/// of these keys at create time is a separate question and is not addressed
+/// by this constant.
+pub(crate) const OWNER_ESTABLISHED_PROPERTIES: &[&str] = &[
+    "from_actor",
+    "to_actor",
+    "direction",
+    "sent_at",
+    "outbound_ref",
+    "thread_id",
+    "subject",
+    "wire_message_id",
+    "external_id",
+];
+
+/// The first [`OWNER_ESTABLISHED_PROPERTIES`] key a caller-supplied
+/// `properties` patch names, if any.
+///
+/// Naming a key is the whole test: `update_note` folds the patch with
+/// `PreferFrom`, so a named key overwrites the stored value and an unnamed one
+/// leaves it untouched. A non-object patch names nothing.
+pub(crate) fn owner_established_property_named_in(patch: &Value) -> Option<&'static str> {
+    let Value::Object(map) = patch else {
+        return None;
+    };
+    OWNER_ESTABLISHED_PROPERTIES
+        .iter()
+        .copied()
+        .find(|key| map.contains_key(*key))
 }
 
 /// Merge two property objects. Returns (merged, count_of_fields_from_from_that_were_added).
