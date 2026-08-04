@@ -748,10 +748,13 @@ impl EntityStore for SqlEntityStore {
                     data_params.len()
                 )
             } else {
-                // #1671: offset pagination is only sound over a deterministic
-                // total order; append `id` as the final tiebreak in the primary
-                // key's direction so equal-`created_at` rows can never be
-                // duplicated or skipped across page boundaries.
+                // #1671: append `id` as the final tiebreak in the primary
+                // key's direction so equal-`created_at` rows keep a fixed
+                // order across page boundaries. The deterministic total order
+                // removes tie-order instability only — offset paging can still
+                // duplicate or skip rows under concurrent inserts/deletes or
+                // sort-key updates (that would need snapshot isolation or
+                // keyset pagination).
                 "created_at DESC, id DESC".to_string()
             };
 

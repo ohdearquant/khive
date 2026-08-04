@@ -990,6 +990,10 @@ async fn query_entities_offset_sweep_covers_equal_created_at_exactly_once() {
 /// #1671: the name-prefix branch ranks exact matches first, then orders by
 /// `created_at DESC` — that branch needs the same `id` tiebreak so offset
 /// pages over equal `created_at` rows are a deterministic total order.
+///
+/// One row is named exactly `Alpha` (the prefix) so the sweep also exercises
+/// the exact-match `CASE WHEN LOWER(name) = ?` branch under ties: it must
+/// sort ahead of every prefix match.
 #[tokio::test]
 async fn query_entities_name_prefix_offset_sweep_covers_equal_created_at_exactly_once() {
     let store = setup_memory_store_ns("ns1");
@@ -1001,7 +1005,14 @@ async fn query_entities_name_prefix_offset_sweep_covers_equal_created_at_exactly
         expected_ids.push(entity.id);
         store.upsert_entity(entity).await.unwrap();
     }
+    // An exact match for the prefix must rank first despite sharing the same
+    // `created_at` as every prefix-matching row.
+    let mut exact_entity = make_entity("ns1", "concept", "Alpha");
+    exact_entity.created_at = created_at;
+    let exact_id = exact_entity.id;
+    store.upsert_entity(exact_entity).await.unwrap();
     expected_ids.sort_unstable_by(|a, b| b.cmp(a));
+    expected_ids.insert(0, exact_id);
 
     let mut actual_ids = Vec::new();
     let page_size = 23_u32;
@@ -1028,6 +1039,11 @@ async fn query_entities_name_prefix_offset_sweep_covers_equal_created_at_exactly
         actual_ids.extend(page.items.into_iter().map(|entity| entity.id));
     }
 
+    assert_eq!(
+        actual_ids.first(),
+        Some(&exact_id),
+        "the exact-match row must sort into the exact-match-first group, ahead of prefix matches"
+    );
     assert_eq!(
         actual_ids, expected_ids,
         "name-prefix sweep must cover every entity exactly once"

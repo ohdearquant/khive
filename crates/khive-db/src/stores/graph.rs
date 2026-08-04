@@ -1865,10 +1865,13 @@ impl GraphStore for SqlGraphStore {
             };
 
             let order_clause = if sort.is_empty() {
-                // #1671: offset pagination is only sound over a deterministic
-                // total order. Keep the primary key and append `id` as a final
-                // tiebreak in the primary key's direction so pages can never
-                // duplicate or skip rows that share the primary sort value.
+                // #1671: append `id` as the final tiebreak in the same DESC
+                // direction as the `created_at` primary sort key, giving a
+                // deterministic total order. That removes tie-order
+                // instability only — offset paging can still duplicate or
+                // skip rows under concurrent inserts/deletes or sort-key
+                // updates (that would need snapshot isolation or keyset
+                // pagination).
                 " ORDER BY created_at DESC, id DESC".to_string()
             } else {
                 let mut parts: Vec<String> = sort
@@ -1881,6 +1884,10 @@ impl GraphStore for SqlGraphStore {
                         format!("{} {}", edge_sort_col(&s.field), dir)
                     })
                     .collect();
+                // #1671: the appended `id` tiebreak follows the LAST sort
+                // field's direction (the behavior the multi-field sweep tests
+                // codify), so pages over equal sort values stay a
+                // deterministic total order.
                 let dir = match sort.last().map(|s| &s.direction) {
                     Some(SortDirection::Asc) => "ASC",
                     _ => "DESC",

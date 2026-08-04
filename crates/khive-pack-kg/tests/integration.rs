@@ -12509,7 +12509,10 @@ async fn list_proposal_limit_over_cap_reports_effective_limit() {
 
 /// #1671: a full offset sweep over `list(kind="proposal")` must enumerate
 /// every proposal exactly once — no duplicates, no misses across page
-/// boundaries — even when proposals share `updated_at` timestamps.
+/// boundaries — even when proposals share `updated_at` timestamps — and the
+/// concatenated pages must follow the documented `updated_at DESC,
+/// proposal_id DESC` order (with one shared `updated_at`, that is `proposal_id
+/// DESC`). Uniqueness alone would still pass with a wrong tiebreak direction.
 #[tokio::test]
 async fn list_proposals_offset_sweep_covers_all_exactly_once() {
     let rt = KhiveRuntime::memory().expect("in-memory runtime must succeed");
@@ -12561,6 +12564,7 @@ async fn list_proposals_offset_sweep_covers_all_exactly_once() {
     created_ids.sort_unstable_by(|a, b| b.cmp(a));
 
     let mut seen = std::collections::HashSet::new();
+    let mut ordered_ids: Vec<String> = Vec::new();
     let mut offset = 0_u64;
     let page_size = 7_u64;
     loop {
@@ -12578,6 +12582,7 @@ async fn list_proposals_offset_sweep_covers_all_exactly_once() {
         for row in items {
             let id = row["id"].as_str().expect("proposal id").to_string();
             assert!(seen.insert(id.clone()), "duplicate id across pages: {id}");
+            ordered_ids.push(id);
         }
         offset += items.len() as u64;
     }
@@ -12591,6 +12596,13 @@ async fn list_proposals_offset_sweep_covers_all_exactly_once() {
     assert_eq!(
         seen_sorted, created_ids,
         "sweep must return exactly the proposals that were created"
+    );
+    // `created_ids` is sorted `proposal_id DESC`; with one shared `updated_at`
+    // that is exactly the documented `updated_at DESC, proposal_id DESC` order,
+    // so the pages concatenated must reproduce it.
+    assert_eq!(
+        ordered_ids, created_ids,
+        "sweep pages must appear in updated_at DESC, proposal_id DESC order"
     );
 }
 
