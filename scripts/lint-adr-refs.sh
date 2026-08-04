@@ -449,9 +449,9 @@ FIXTURE
         '<!-- END GENERATED ADR CATALOG -->	' \
         > "$tmp/case-trailing-space-markers/docs/adr/README.md"
 
-    # Regression case 22 (must-FAIL control, the Round-5 list-item fence
-    # reproducer verbatim). Recorded because it is the reported defect, NOT
-    # because it isolates one mechanism: under this grammar it is rejected
+    # Regression case 22 (must-FAIL control, a fence nested in a list item,
+    # kept verbatim as it was originally reported). Recorded because it is the
+    # reported defect, NOT because it isolates one mechanism: it is rejected
     # twice over, by the indented END failing the marker comparison AND by the
     # fence line being an unexpected line inside the catalog region. Case 18
     # is the arm that isolates the marker comparison.
