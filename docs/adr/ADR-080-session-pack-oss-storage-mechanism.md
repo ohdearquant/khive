@@ -245,9 +245,13 @@ recognizable conversation shape, and a mixed-provider array is unsupported. This
 cursor untouched instead of allowing a misconfigured overlapping root to let the wrong source
 consume that path first. Candidate dispatch claims the path only when a pass advances its
 cursor and inserts rows; an empty advance (a cursor-only pass over blank or unparseable
-lines) records its committed offset but falls through to the next configured provider
-candidate, as does a no-progress success such as one provider's lower whole-file size
-ceiling.
+lines) records its consumed offset and falls through to the next configured provider
+candidate, committing its cursor only if dispatch ends without any candidate inserting
+rows for the span and without any candidate erroring. The commit is a single cursor
+upsert at the end of dispatch, so an interrupted or partially failing dispatch can never
+strand the cursor past bytes that no candidate inserted — the bytes are re-read on a
+later pass, bounded and idempotent. A no-progress success, such as one provider's lower
+whole-file size ceiling, likewise falls through without committing.
 
 #### Delta-proportional polling (Amendment, 2026-08-02)
 
@@ -261,9 +265,11 @@ completed transcript:
   puts its directly contained cold transcripts at the front of the bounded probe schedule;
   newly discovered transcripts enter the active set immediately.
 - A file remains active while it is growing, while ingest is catching up to its cursor, or
-  while a per-file error requires retry; once every source candidate has errored on three
-  consecutive probes the file is demoted to the cold sample (logged once at demotion), whose
-  ordinary cadence retries it. Once its cursor is caught up, two unchanged probes
+  while a per-file error requires retry; once three consecutive probes end with no candidate
+  advancing the offset and at least one source candidate erroring — including a mixed probe
+  where one candidate reports a no-progress success such as its whole-file size ceiling
+  while another errors — the file is demoted to the cold sample (logged once at demotion),
+  whose ordinary cadence retries it. Once its cursor is caught up, two unchanged probes
   and an mtime at least five minutes old make it cold. Filesystems that do not report mtime
   use 30 unchanged probes instead.
 - Cold files are sampled through a round-robin queue capped at 256 metadata probes per tick.
@@ -288,9 +294,17 @@ root: removing and recreating the ancestor cannot discard the nested root's sour
 A non-pinned file is removed from tracking only after two consecutive probes report it
 missing; a single NotFound (a transient atomic replace or filesystem hiccup) keeps the file
 and its cursor for one grace probe so a promptly recreated path resumes from its old offset
-instead of being reseeded to EOF. Cursor rows whose deletion fails are retried on later
-ticks until deleted, because a stale row reloaded after a restart would let a recreated
-same-path file silently skip bytes.
+instead of being reseeded to EOF.
+A directory-difference removal deliberately bypasses that grace: a complete directory
+listing is a positive enumeration of its contents, so an absent entry is stronger evidence
+of removal than a single probe NotFound; a refresh whose listing is incomplete defers
+removals until a complete read. When a removal is cancelled by a same-pass reappearance,
+the in-memory offset is restored from the preserved cursor row so the next seed never
+falls back to EOF while the preserved row proves bytes were already mirrored. Cursor rows
+whose deletion fails are retried on every later tick, because a stale row reloaded after a
+restart would let a recreated same-path file silently skip bytes; the retry set is bounded,
+and evicting an entry beyond the bound logs an error naming that residual skip risk
+rather than growing the set without bound.
 
 #### Auxiliary schema
 

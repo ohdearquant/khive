@@ -372,10 +372,22 @@ impl CandidateDispatch {
     ///
     /// An advance with zero inserts (a cursor-only pass over
     /// blank/unparseable/oversized lines, `mirror_file_with_limits`) is
-    /// recorded — the bytes really were consumed — but does NOT end
+    /// recorded — the bytes were consumed off the file — but does NOT end
     /// dispatch: under misconfigured overlapping roots, a wrong provider
     /// candidate could otherwise swallow bytes that a later, correct
-    /// provider candidate would have parsed into rows.
+    /// provider candidate would have parsed into rows. Its cursor commit is
+    /// deferred (`mirror_file_deferred`) and committed by the dispatch loop
+    /// only when no inserting candidate claims the span and no candidate
+    /// errored.
+    ///
+    /// Recording precedence: an advancing result (`new_offset >
+    /// start_offset`) always replaces a recorded non-advancing one, so a
+    /// later empty advance cannot be hidden behind an earlier no-progress
+    /// candidate — the in-memory offset must track the durably committed
+    /// cursor. Among advancing results the first recorded wins (an empty
+    /// advance never overwrites an inserting one, and an inserting
+    /// candidate ends dispatch anyway). A non-advancing success is
+    /// recorded only when nothing is recorded yet.
     fn record(
         &mut self,
         result: Result<ingest::MirrorStats, RuntimeError>,
@@ -387,9 +399,18 @@ impl CandidateDispatch {
                 true
             }
             Ok(stats) if stats.new_offset > start_offset => {
-                // Empty advance: cursor durably committed, but no rows were
-                // inserted — fall through to remaining candidates.
-                if self.stats.is_none() {
+                // Empty advance: bytes consumed, but no rows were inserted —
+                // fall through to remaining candidates. (The cursor commit is
+                // deferred to the end of dispatch by `mirror_file_deferred`;
+                // an inserting candidate or an erroring candidate can still
+                // veto it.) Always replace a recorded non-advancing result so
+                // the in-memory offset follows the furthest consumed byte;
+                // keep the first advancing record.
+                let recorded_advancing = self
+                    .stats
+                    .as_ref()
+                    .is_some_and(|recorded| recorded.new_offset > start_offset);
+                if !recorded_advancing {
                     self.stats = Some(stats);
                 }
                 false
@@ -699,11 +720,26 @@ impl DiscoveryIndex {
                     self.remove_directory_tree(&path, true);
                 }
                 Err(error) => {
-                    tracing::debug!(
-                        path = %path.display(),
-                        error = %error,
-                        "session mirror: directory metadata probe failed"
-                    );
+                    // A wedged directory must not stay invisible in debug
+                    // logs forever: count the failure toward the same
+                    // escalation as a failed refresh walk. NotFound is
+                    // excluded — it removes the tree above, not an error.
+                    let failures = self.record_refresh_failure(&path);
+                    if failures == DIRECTORY_REFRESH_FAILURES_BEFORE_WARN {
+                        tracing::warn!(
+                            path = %path.display(),
+                            error = %error,
+                            consecutive_failures = failures,
+                            "session mirror: directory metadata probe keeps failing"
+                        );
+                    } else {
+                        tracing::debug!(
+                            path = %path.display(),
+                            error = %error,
+                            consecutive_failures = failures,
+                            "session mirror: directory metadata probe failed"
+                        );
+                    }
                 }
             }
 
@@ -1130,11 +1166,41 @@ fn should_mark_cold(unchanged_polls: u8, modified: Option<SystemTime>, now: Syst
     }
 }
 
+/// Tally one dispatch pass's outcome against the file's error streak.
+/// Returns `true` exactly on the tick whose streak crosses
+/// `FILE_ERROR_POLLS_BEFORE_COLD` (the caller's one-shot warn).
+///
+/// A pass counts as an error poll when no candidate advanced the offset and
+/// at least one candidate errored — including mixed passes where one
+/// candidate reported a no-progress success (e.g. a whole-file size ceiling
+/// below the current file length) while another errored. Treating only
+/// all-error passes as error polls would let such a mixed file stay hot and
+/// be re-dispatched every tick forever.
+fn tally_dispatch_errors(
+    discovery: &mut DiscoveryIndex,
+    path: &Path,
+    advanced: bool,
+    had_errors: bool,
+) -> bool {
+    if advanced {
+        discovery.clear_error_polls(path);
+        return false;
+    }
+    had_errors && discovery.record_error_poll(path)
+}
+
 fn classify_entry(
     directory_kind: DirectoryKind,
     path: &Path,
     is_directory: bool,
 ) -> Option<ClassifiedEntry> {
+    // `is_directory` comes from `DirEntry::file_type()`, which does not
+    // follow symlinks: a symlinked directory arrives here as NOT a
+    // directory and is never queued for traversal by `add_directory_tree`
+    // or `refresh_directory`, so discovery cannot loop on symlink cycles.
+    // Traversal depth is therefore bounded by the real on-disk tree depth,
+    // and `remove_directory_tree` (which descends only into tracked
+    // directories) inherits the same bound — no depth cap is needed.
     if is_directory {
         return match directory_kind {
             DirectoryKind::ClaudeCodeRoot => {
@@ -1221,8 +1287,12 @@ pub async fn run_mirror_service(runtime: KhiveRuntime, config: MirrorConfig) {
     // Cursor rows whose deletion failed, retried on later ticks. A stale
     // row that survives to a daemon restart is reloaded by `load_cursors`,
     // and a recreated same-path file would then resume from the old offset
-    // and silently skip bytes — so failed deletions must be retried until
-    // they succeed, not dropped (bounded by `CURSOR_DELETE_RETRY_LIMIT`).
+    // and silently skip bytes — so failed deletions are retried on every
+    // later tick. The retry set itself is bounded by
+    // `CURSOR_DELETE_RETRY_LIMIT`: beyond it the oldest entry is evicted
+    // with an ERROR log naming that residual risk (see
+    // `queue_cursor_deletes`), rather than letting the set grow without
+    // bound during a store outage.
     let mut pending_cursor_deletes: VecDeque<PathBuf> = VecDeque::new();
 
     loop {
@@ -1237,7 +1307,13 @@ pub async fn run_mirror_service(runtime: KhiveRuntime, config: MirrorConfig) {
             }
             queue_cursor_deletes(&mut pending_cursor_deletes, &removed_files);
         }
-        drain_pending_cursor_deletes(&runtime, &discovery, &mut pending_cursor_deletes).await;
+        drain_pending_cursor_deletes(
+            &runtime,
+            &discovery,
+            &mut offsets,
+            &mut pending_cursor_deletes,
+        )
+        .await;
         let scheduled = discovery.schedule_files();
         let total_tracked = discovery.tracked_files();
         let mut files_mirrored: u64 = 0;
@@ -1296,10 +1372,18 @@ pub async fn run_mirror_service(runtime: KhiveRuntime, config: MirrorConfig) {
                 continue;
             };
             let mut candidate_dispatch = CandidateDispatch::default();
+            let mut ended_by_inserting = false;
             for kind in kinds {
                 let result = match kind {
                     DiscoveredKind::LineTail { source, session_id } => {
-                        ingest::mirror_file(
+                        // Deferred variant: an empty advance (bytes consumed,
+                        // zero rows) does NOT commit its cursor inline, so the
+                        // commit cannot race ahead of a later candidate that
+                        // would parse the same span, and an interrupt between
+                        // candidates cannot strand a committed cursor past
+                        // uninserted rows. The commit happens below, only when
+                        // dispatch ends without an inserting candidate.
+                        ingest::mirror_file_deferred(
                             &runtime,
                             &scheduled_file.path,
                             offset,
@@ -1318,6 +1402,7 @@ pub async fn run_mirror_service(runtime: KhiveRuntime, config: MirrorConfig) {
                     }
                 };
                 if candidate_dispatch.record(result, offset) {
+                    ended_by_inserting = true;
                     break;
                 }
             }
@@ -1332,28 +1417,64 @@ pub async fn run_mirror_service(runtime: KhiveRuntime, config: MirrorConfig) {
                 );
             }
 
+            // Commit a deferred empty advance only when dispatch ended with
+            // no inserting candidate AND no candidate error. An erroring
+            // candidate might have parsed the span had it succeeded, so the
+            // cursor stays at the old offset and a later pass re-reads the
+            // bytes (bounded and idempotent) rather than skipping them. On
+            // commit failure the in-memory offset is likewise NOT applied.
+            let stats = match stats {
+                Some(stats)
+                    if !ended_by_inserting && stats.inserted == 0 && stats.new_offset > offset =>
+                {
+                    if had_errors {
+                        tracing::debug!(
+                            path = %scheduled_file.path.display(),
+                            new_offset = stats.new_offset,
+                            "session mirror: deferring empty-advance cursor commit because a \
+                             candidate errored; the span will be re-read on a later pass"
+                        );
+                        None
+                    } else {
+                        match ingest::commit_empty_advance(
+                            &runtime,
+                            &scheduled_file.path,
+                            stats.new_offset,
+                        )
+                        .await
+                        {
+                            Ok(()) => Some(stats),
+                            Err(error) => {
+                                tracing::warn!(
+                                    path = %scheduled_file.path.display(),
+                                    error = %error,
+                                    new_offset = stats.new_offset,
+                                    "session mirror: empty-advance cursor commit failed; \
+                                     offset held back for a bounded re-read"
+                                );
+                                None
+                            }
+                        }
+                    }
+                }
+                other => other,
+            };
+
             // A successful advance ends the error streak; a tick on which
-            // every candidate errored grows it toward demotion.
+            // no candidate advanced and at least one errored grows it toward
+            // demotion. A no-progress success from one candidate does not
+            // make the file healthy while another candidate errors: without
+            // this, a misconfigured file with one capped-out provider and
+            // one broken provider would stay hot forever.
             let advanced = stats
                 .as_ref()
                 .is_some_and(|stats| stats.new_offset > offset);
-            if advanced {
-                discovery.clear_error_polls(&scheduled_file.path);
-            } else if stats.is_none() && had_errors {
-                // Every source candidate errored this tick: the offset did
-                // not advance and nothing was recorded. Without
-                // intervention the file would stay hot and be re-dispatched
-                // every tick forever; after `FILE_ERROR_POLLS_BEFORE_COLD`
-                // consecutive such ticks, demote it to the cold sample,
-                // whose ordinary cadence retries it (no separate retry
-                // machinery).
-                if discovery.record_error_poll(&scheduled_file.path) {
-                    tracing::warn!(
-                        path = %scheduled_file.path.display(),
-                        consecutive_error_polls = FILE_ERROR_POLLS_BEFORE_COLD,
-                        "session mirror: demoting persistently erroring file to cold"
-                    );
-                }
+            if tally_dispatch_errors(&mut discovery, &scheduled_file.path, advanced, had_errors) {
+                tracing::warn!(
+                    path = %scheduled_file.path.display(),
+                    consecutive_error_polls = FILE_ERROR_POLLS_BEFORE_COLD,
+                    "session mirror: demoting persistently erroring file to cold"
+                );
             }
 
             if let Some(stats) = stats {
@@ -1452,29 +1573,54 @@ async fn load_cursors(runtime: &KhiveRuntime) -> Result<HashMap<PathBuf, u64>, R
 /// recreated same-path file then resumes from the old offset and silently
 /// skips the bytes written in between. Idempotent `INSERT OR IGNORE` does
 /// not cover this case because the skipped bytes are never read at all.
-async fn delete_cursors(runtime: &KhiveRuntime, paths: &[PathBuf]) -> Result<(), RuntimeError> {
+///
+/// Returns the paths whose DELETE failed (empty on full success); `Err`
+/// only when the writer cannot be acquired at all. A failing path must not
+/// block the rest of the batch — head-of-line blocking would let one bad
+/// row stall every later deletion, and the failed paths are retried on
+/// later ticks via the pending-delete set either way.
+///
+/// The DELETE keys on `path.to_string_lossy()` — the same lossy text the
+/// ingest cursor upserts (`upsert_cursor_on_writer`, `write_cursor_only`)
+/// use as the row key — so a delete always targets the row the inserts
+/// wrote, even for non-UTF-8 paths.
+async fn delete_cursors(
+    runtime: &KhiveRuntime,
+    paths: &[PathBuf],
+) -> Result<Vec<PathBuf>, RuntimeError> {
     let sql = runtime.sql();
     let mut writer = sql
         .writer()
         .await
         .map_err(|e| RuntimeError::Internal(format!("mirror: cursor writer: {e}")))?;
 
+    let mut failed = Vec::new();
     for path in paths {
-        writer
+        if let Err(error) = writer
             .execute(SqlStatement {
                 sql: "DELETE FROM session_mirror_cursor WHERE file_path=?1".into(),
                 params: vec![SqlValue::Text(path.to_string_lossy().into_owned())],
                 label: Some("mirror_cursor_delete".into()),
             })
             .await
-            .map_err(|e| RuntimeError::Internal(format!("mirror: cursor delete: {e}")))?;
+        {
+            tracing::debug!(
+                path = %path.display(),
+                error = %error,
+                "session mirror: cursor delete failed for one path; continuing batch"
+            );
+            failed.push(path.clone());
+        }
     }
-    Ok(())
+    Ok(failed)
 }
 
 /// Add removed paths to the pending cursor-delete set, deduplicating and
-/// evicting (warn-logged) beyond `CURSOR_DELETE_RETRY_LIMIT` so an outage
-/// cannot grow the set without bound.
+/// evicting (ERROR-logged) beyond `CURSOR_DELETE_RETRY_LIMIT` so an outage
+/// cannot grow the set without bound. Eviction is the escape valve, not a
+/// neutral log: an evicted path's stale cursor row can survive a daemon
+/// restart and skip bytes if the path is recreated — the error names that
+/// consequence.
 fn queue_cursor_deletes(pending: &mut VecDeque<PathBuf>, removed: &[PathBuf]) {
     for path in removed {
         if pending.contains(path) {
@@ -1482,10 +1628,12 @@ fn queue_cursor_deletes(pending: &mut VecDeque<PathBuf>, removed: &[PathBuf]) {
         }
         if pending.len() >= CURSOR_DELETE_RETRY_LIMIT {
             let dropped = pending.pop_front();
-            tracing::warn!(
+            tracing::error!(
                 dropped = %dropped.map(|p| p.display().to_string()).unwrap_or_default(),
                 limit = CURSOR_DELETE_RETRY_LIMIT,
-                "session mirror: cursor-delete retry set full; dropping oldest entry"
+                "session mirror: cursor-delete retry set full; evicting oldest entry — \
+                 its stale cursor row can survive a daemon restart and skip bytes if \
+                 the path is recreated"
             );
         }
         pending.push_back(path.clone());
@@ -1495,32 +1643,82 @@ fn queue_cursor_deletes(pending: &mut VecDeque<PathBuf>, removed: &[PathBuf]) {
 /// Drain the pending cursor-delete set against the store. A path re-tracked
 /// since its removal seeds a fresh in-memory offset and rewrites its cursor
 /// row on the next successful ingest, so its pending delete is cancelled
-/// instead of removing the fresh row out from under it. On failure the set
-/// is kept for retry on later ticks (escalated to warn: a dropped failure
-/// leaves the stale row in place across restarts). Paths deleted before the
-/// error stay in the set and are re-deleted idempotently later.
+/// instead of removing the fresh row out from under it. When the removal
+/// already dropped the in-memory offset, the cancel restores it from the
+/// preserved cursor row — otherwise the next seed falls back to `file_len`
+/// (`backfill=false`) and silently skips bytes the preserved row proves
+/// were already mirrored. On failure only the failed paths are kept for
+/// retry on later ticks (escalated to warn: a dropped failure leaves the
+/// stale row in place across restarts); paths deleted before a failure are
+/// not retried.
 async fn drain_pending_cursor_deletes(
     runtime: &KhiveRuntime,
     discovery: &DiscoveryIndex,
+    offsets: &mut HashMap<PathBuf, u64>,
     pending: &mut VecDeque<PathBuf>,
 ) {
     if pending.is_empty() {
         return;
     }
-    pending.retain(|path| !discovery.files.contains_key(path));
+    let mut cancelled = Vec::new();
+    pending.retain(|path| {
+        if discovery.files.contains_key(path) {
+            cancelled.push(path.clone());
+            false
+        } else {
+            true
+        }
+    });
+    for path in &cancelled {
+        if offsets.contains_key(path) {
+            continue;
+        }
+        if let Some(offset) = read_cursor_offset(runtime, path).await {
+            offsets.insert(path.clone(), offset);
+        }
+    }
     if pending.is_empty() {
         return;
     }
     let paths: Vec<PathBuf> = pending.iter().cloned().collect();
     match delete_cursors(runtime, &paths).await {
-        Ok(()) => pending.clear(),
+        Ok(failed) if failed.is_empty() => pending.clear(),
+        Ok(failed) => {
+            tracing::warn!(
+                failed = failed.len(),
+                remaining = failed.len(),
+                "session mirror: cursor cleanup partially failed; retrying failed paths next tick"
+            );
+            *pending = failed.into();
+        }
         Err(error) => {
             tracing::warn!(
                 error = %error,
                 remaining = pending.len(),
-                "session mirror: cursor cleanup failed; retrying next tick"
+                "session mirror: cursor cleanup failed before any delete; retrying next tick"
             );
         }
+    }
+}
+
+/// Read one persisted cursor offset, or `None` when the table is missing,
+/// the path has no row, or the reader cannot be acquired. Used by the
+/// delete-cancel path to restore an in-memory offset that the removal
+/// handling already dropped.
+async fn read_cursor_offset(runtime: &KhiveRuntime, path: &Path) -> Option<u64> {
+    let sql = runtime.sql();
+    let mut reader = sql.reader().await.ok()?;
+    let rows = reader
+        .query_all(SqlStatement {
+            sql: "SELECT byte_offset FROM session_mirror_cursor WHERE file_path=?1".into(),
+            params: vec![SqlValue::Text(path.to_string_lossy().into_owned())],
+            label: Some("mirror_cursor_read".into()),
+        })
+        .await
+        .ok()?;
+    match rows.first().and_then(|row| row.get("byte_offset")) {
+        Some(SqlValue::Integer(offset)) => Some(*offset as u64),
+        _ => None,
     }
 }
 
@@ -2085,6 +2283,108 @@ mod discovery_tests {
         assert_eq!(stats.new_offset, start_offset + 40);
     }
 
+    /// Regression for the recording-precedence finding: a no-progress
+    /// candidate recorded first must not hide a later empty advance, or the
+    /// in-memory offset stays behind a durably committed cursor.
+    #[test]
+    fn later_empty_advance_replaces_earlier_no_progress_record() {
+        let start_offset = 100;
+        let mut dispatch = CandidateDispatch::default();
+
+        // Candidate A: no progress (whole-file ceiling below the current
+        // length). Recorded only because nothing else is recorded yet.
+        assert!(!dispatch.record(
+            Ok(MirrorStats {
+                inserted: 0,
+                scanned: 0,
+                new_offset: start_offset,
+            }),
+            start_offset,
+        ));
+
+        // Candidate B: empty advance past start_offset. Must replace A's
+        // non-advancing record so the in-memory offset follows the cursor.
+        assert!(!dispatch.record(
+            Ok(MirrorStats {
+                inserted: 0,
+                scanned: 0,
+                new_offset: start_offset + 64,
+            }),
+            start_offset,
+        ));
+
+        let stats = dispatch.stats.expect("empty advance recorded");
+        assert_eq!(
+            stats.new_offset,
+            start_offset + 64,
+            "the advancing result wins over the earlier no-progress record"
+        );
+        assert_eq!(stats.inserted, 0);
+    }
+
+    /// An advancing record is kept against a later empty advance (first
+    /// advancing record wins; an inserting candidate ends dispatch anyway).
+    #[test]
+    fn first_advancing_record_is_kept_against_later_empty_advance() {
+        let start_offset = 50;
+        let mut dispatch = CandidateDispatch::default();
+
+        assert!(!dispatch.record(
+            Ok(MirrorStats {
+                inserted: 0,
+                scanned: 0,
+                new_offset: start_offset + 30,
+            }),
+            start_offset,
+        ));
+        assert!(!dispatch.record(
+            Ok(MirrorStats {
+                inserted: 0,
+                scanned: 0,
+                new_offset: start_offset + 90,
+            }),
+            start_offset,
+        ));
+
+        assert_eq!(
+            dispatch
+                .stats
+                .expect("first advancing record kept")
+                .new_offset,
+            start_offset + 30
+        );
+    }
+
+    /// Item 6: a mixed poll — one candidate's no-progress success plus
+    /// another candidate's error — must count toward demotion; otherwise the
+    /// file stays hot forever.
+    #[test]
+    fn mixed_no_progress_and_error_polls_count_toward_demotion() {
+        let mut discovery = DiscoveryIndex::default();
+        let path = PathBuf::from("/projects/mixed.jsonl");
+        discovery.add_file(path.clone(), DiscoveredKind::ChatGptExport, false);
+
+        for _ in 1..FILE_ERROR_POLLS_BEFORE_COLD {
+            assert!(
+                !super::tally_dispatch_errors(&mut discovery, &path, false, true),
+                "below the threshold no demotion"
+            );
+            assert!(!discovery.files[&path].cold);
+        }
+        assert!(
+            super::tally_dispatch_errors(&mut discovery, &path, false, true),
+            "the crossing tick reports the one-shot demotion warn"
+        );
+        assert!(
+            discovery.files[&path].cold,
+            "the mixed no-progress+error file is demoted to cold"
+        );
+
+        // A successful advance resets the streak.
+        super::tally_dispatch_errors(&mut discovery, &path, true, false);
+        assert_eq!(discovery.files[&path].consecutive_error_polls, 0);
+    }
+
     #[test]
     fn refresh_failure_counter_crosses_the_warn_threshold_once_per_episode() {
         let mut discovery = DiscoveryIndex::default();
@@ -2211,6 +2511,7 @@ mod cursor_retry_tests {
     use crate::vocab::SESSION_SCHEMA_PLAN_STMTS;
     use khive_runtime::{AllowAllGate, BackendId, KhiveRuntime, Namespace, RuntimeConfig};
     use khive_storage::types::{SqlStatement, SqlValue};
+    use std::collections::HashMap;
     use std::collections::VecDeque;
     use std::path::PathBuf;
     use std::sync::Arc;
@@ -2290,11 +2591,12 @@ mod cursor_retry_tests {
         let mut pending = VecDeque::new();
         queue_cursor_deletes(&mut pending, std::slice::from_ref(&path));
         assert_eq!(pending.len(), 1);
+        let mut offsets = HashMap::new();
 
         // No cursor table yet: the delete fails and the entry must stay
         // pending — dropping it would let a stale row survive a daemon
         // restart and skip bytes on a recreated file.
-        drain_pending_cursor_deletes(&rt, &discovery, &mut pending).await;
+        drain_pending_cursor_deletes(&rt, &discovery, &mut offsets, &mut pending).await;
         assert_eq!(
             pending.len(),
             1,
@@ -2305,7 +2607,7 @@ mod cursor_retry_tests {
         // the next tick's retry deletes it and drains the set.
         apply_session_schema(&rt).await;
         insert_cursor_row(&rt, &path, 4096).await;
-        drain_pending_cursor_deletes(&rt, &discovery, &mut pending).await;
+        drain_pending_cursor_deletes(&rt, &discovery, &mut offsets, &mut pending).await;
         assert!(pending.is_empty(), "successful retry drains the set");
         assert!(
             !cursor_row_exists(&rt, &path).await,
@@ -2324,13 +2626,69 @@ mod cursor_retry_tests {
         let mut discovery = DiscoveryIndex::default();
         let mut pending = VecDeque::new();
         queue_cursor_deletes(&mut pending, std::slice::from_ref(&path));
+        let mut offsets = HashMap::new();
 
         // The file is re-discovered before the delete drains: its fresh
         // cursor row must not be deleted out from under it.
         discovery.add_file(path.clone(), DiscoveredKind::ChatGptExport, false);
-        drain_pending_cursor_deletes(&rt, &discovery, &mut pending).await;
+        drain_pending_cursor_deletes(&rt, &discovery, &mut offsets, &mut pending).await;
         assert!(pending.is_empty(), "re-tracked path cancels its delete");
         assert!(cursor_row_exists(&rt, &path).await, "fresh row preserved");
+        assert_eq!(
+            offsets.get(&path),
+            Some(&512),
+            "canceling the delete restores the in-memory offset from the preserved row"
+        );
+    }
+
+    /// Item 3 regression: remove + re-add in the same pass. The removal
+    /// drops the in-memory offset and queues the cursor delete; the re-add
+    /// cancels the delete. The cancel must restore the offset from the
+    /// preserved cursor row — otherwise the next seed falls back to
+    /// `file_len` (`backfill=false`) and skips bytes the preserved row
+    /// proves were already mirrored.
+    #[tokio::test]
+    async fn same_pass_remove_and_readd_restores_offset_from_preserved_cursor_row() {
+        let (rt, _dir) = runtime_without_schema();
+        apply_session_schema(&rt).await;
+
+        let path = PathBuf::from("/projects/flap.jsonl");
+        insert_cursor_row(&rt, &path, 4096).await;
+
+        let mut discovery = DiscoveryIndex::default();
+        discovery.add_file(path.clone(), DiscoveredKind::ChatGptExport, false);
+
+        // Same-pass removal: discovery reports the file gone, the service
+        // loop drops the in-memory offset and queues the cursor delete.
+        discovery.remove_file(&path, false);
+        let removed = discovery.take_removed_files();
+        assert_eq!(removed, vec![path.clone()]);
+        let mut offsets = HashMap::from([(path.clone(), 4096u64)]);
+        for removed_path in &removed {
+            offsets.remove(removed_path);
+        }
+        let mut pending = VecDeque::new();
+        queue_cursor_deletes(&mut pending, &removed);
+        assert!(offsets.is_empty(), "removal dropped the in-memory offset");
+
+        // Same-pass re-discovery: the file is back before the delete drains.
+        discovery.add_file(path.clone(), DiscoveredKind::ChatGptExport, false);
+        drain_pending_cursor_deletes(&rt, &discovery, &mut offsets, &mut pending).await;
+
+        assert!(
+            pending.is_empty(),
+            "re-added path cancels its pending delete"
+        );
+        assert!(
+            cursor_row_exists(&rt, &path).await,
+            "the preserved cursor row survives the cancel"
+        );
+        assert_eq!(
+            offsets.get(&path),
+            Some(&4096),
+            "the cancel restores the in-memory offset from the preserved row, \
+             so backfill=false seeding never falls back to EOF and skips bytes"
+        );
     }
 
     #[tokio::test]
@@ -2349,20 +2707,63 @@ mod cursor_retry_tests {
             CURSOR_DELETE_RETRY_LIMIT,
             "the retry set is bounded; oldest entries are evicted"
         );
+        assert!(
+            !pending.contains(&path),
+            "the oldest entry is the one evicted under the bound"
+        );
     }
 
     #[tokio::test]
-    async fn delete_cursors_reports_the_sql_error_for_retry() {
+    async fn delete_cursors_reports_per_path_failures_without_aborting_the_batch() {
         let (rt, _dir) = runtime_without_schema();
         let path = PathBuf::from("/projects/gone.jsonl");
-        let error = delete_cursors(&rt, &[path])
+        let failed = delete_cursors(&rt, std::slice::from_ref(&path))
             .await
-            .expect_err("missing table must surface as an error, not silence");
-        let message = error.to_string();
-        assert!(
-            message.contains("mirror: cursor delete"),
-            "error names the failing operation; got: {message}"
+            .expect("writer acquisition succeeds even when the table is missing");
+        assert_eq!(
+            failed,
+            vec![path],
+            "the failing path is reported for retry instead of aborting the batch"
         );
+    }
+
+    /// Item 7 regression: a failing DELETE must not block later paths in the
+    /// batch (head-of-line blocking). With the cursor table missing, every
+    /// path fails — and every path is still attempted and reported, rather
+    /// than the batch aborting at the first failure.
+    #[tokio::test]
+    async fn head_of_line_cursor_delete_failure_does_not_block_the_batch() {
+        let (rt, _dir) = runtime_without_schema();
+        let first = PathBuf::from("/projects/first.jsonl");
+        let second = PathBuf::from("/projects/second.jsonl");
+        let third = PathBuf::from("/projects/third.jsonl");
+        let failed = delete_cursors(&rt, &[first.clone(), second.clone(), third.clone()])
+            .await
+            .expect("writer acquisition succeeds even when the table is missing");
+        assert_eq!(
+            failed,
+            vec![first, second, third],
+            "every path is attempted past the first failure; the failed paths \
+             are retained for retry"
+        );
+    }
+
+    /// The happy path still drains the whole batch and reports nothing.
+    #[tokio::test]
+    async fn delete_cursors_drains_the_batch_when_every_delete_succeeds() {
+        let (rt, _dir) = runtime_without_schema();
+        apply_session_schema(&rt).await;
+        let first = PathBuf::from("/projects/a.jsonl");
+        let second = PathBuf::from("/projects/b.jsonl");
+        insert_cursor_row(&rt, &first, 10).await;
+        insert_cursor_row(&rt, &second, 20).await;
+
+        let failed = delete_cursors(&rt, &[first.clone(), second.clone()])
+            .await
+            .expect("delete batch");
+        assert!(failed.is_empty(), "no per-path failures on the happy path");
+        assert!(!cursor_row_exists(&rt, &first).await);
+        assert!(!cursor_row_exists(&rt, &second).await);
     }
 }
 
