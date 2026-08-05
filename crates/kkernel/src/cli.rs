@@ -256,7 +256,19 @@ pub async fn cli_main() -> Result<()> {
         Command::Engine(e) => engine::run_engine(e).await,
         Command::Vector(v) => vector::run_vector(v),
         Command::Reindex(r) => reindex::run_reindex(r).await,
-        Command::Exec(e) => exec::run_exec(e).await,
+        Command::Exec(e) => {
+            let result = exec::run_exec(e).await;
+            if let Err(error) = &result {
+                if let Some(envelope) = khive_mcp::serve::db_override_refusal_envelope(error) {
+                    println!(
+                        "{}",
+                        serde_json::to_string(&envelope)
+                            .expect("database override refusal envelope must serialize")
+                    );
+                }
+            }
+            result
+        }
         Command::Mcp(a) => {
             let transport_registry = khive_mcp::transport::TransportRegistry::with_builtins();
 
@@ -273,10 +285,43 @@ pub async fn cli_main() -> Result<()> {
             // instead of the project, silently skipping a project-local
             // `.khive/config.toml`).
             let db_path_hint = khive_mcp::serve::config_discovery_db_anchor(a.db.as_deref());
-            let khive_cfg =
-                KhiveConfig::load_with_home_fallback(a.config.as_deref(), db_path_hint.as_deref())
-                    .unwrap_or_default()
-                    .unwrap_or_default();
+            // An explicit `--config`/`KHIVE_CONFIG` that fails to load — a
+            // malformed file OR a missing one — must fail loud: silently
+            // defaulting would boot against a config the operator did not
+            // select (ADR-035). The loader itself enforces the explicit tier
+            // (`load_with_home_fallback_and_source` returns
+            // `ConfigError::ExplicitConfigMissing` for a missing explicit
+            // path), so every entry point inherits the refusal; the
+            // automatic-discovery tiers keep the historical tolerant
+            // default: the CLI-level topology check is advisory, and a
+            // malformed discovered file is still reported by the builder's
+            // own load further down.
+            let loaded_config = match KhiveConfig::load_with_home_fallback_and_source(
+                a.config.as_deref(),
+                db_path_hint.as_deref(),
+            ) {
+                Ok(loaded) => loaded,
+                Err(load_error) => {
+                    if a.config.is_some() {
+                        return Err(load_error)
+                            .context("failed to load the explicitly selected config file");
+                    }
+                    None
+                }
+            };
+            let config_source = loaded_config.as_ref().map(|(_, source)| source.as_path());
+            let khive_cfg = loaded_config
+                .as_ref()
+                .map(|(config, _)| config.clone())
+                .unwrap_or_default();
+
+            if !khive_cfg.backends.is_empty() {
+                khive_mcp::serve::reject_conflicting_db_override_with_source(
+                    a.db.as_deref(),
+                    &khive_cfg.backends,
+                    config_source,
+                )?;
+            }
 
             if khive_cfg.backends.len() <= 1 {
                 // Single-backend: zero-change path — no coordinator.
@@ -803,6 +848,93 @@ mod tests {
         .await
         .expect("db check succeeds on a missing file");
         assert!(!path.exists(), "db check must not create the database file");
+    }
+
+    // An explicit `--config` that fails to parse must fail the `kkernel mcp`
+    // boot loud — silently defaulting would serve against a config the
+    // operator did not select (ADR-035).
+    #[tokio::test]
+    async fn mcp_fails_loud_when_explicit_config_is_invalid() {
+        let tmp = TempDir::new().expect("temp dir");
+        let config_path = tmp.path().join("broken.toml");
+        std::fs::write(&config_path, "this is not [valid toml\n").expect("write malformed config");
+
+        let mcp_args = khive_mcp::args::Args {
+            db: Some(":memory:".to_string()),
+            actor: None,
+            namespace: None,
+            no_embed: true,
+            pack: Vec::new(),
+            config: Some(config_path.clone()),
+            daemon: false,
+            transport: None,
+            bind: None,
+            brain_profile: None,
+            resumed_generation: None,
+        };
+
+        // The exact load the `Command::Mcp` branch performs first.
+        let db_path_hint = khive_mcp::serve::config_discovery_db_anchor(mcp_args.db.as_deref());
+        let loaded_config = match KhiveConfig::load_with_home_fallback_and_source(
+            mcp_args.config.as_deref(),
+            db_path_hint.as_deref(),
+        ) {
+            Ok(loaded) => loaded,
+            Err(load_error) => {
+                assert!(
+                    mcp_args.config.is_some(),
+                    "this test always passes an explicit --config"
+                );
+                let error: Result<()> =
+                    Err(load_error).context("failed to load the explicitly selected config file");
+                let error = error.expect_err("an invalid explicit config must fail the boot");
+                let rendered = format!("{error:#}");
+                assert!(
+                    rendered.contains("failed to load the explicitly selected config file"),
+                    "the failure must name the explicit selection: {rendered}"
+                );
+                return;
+            }
+        };
+        panic!(
+            "an invalid explicit --config must never reach the tolerant default: {loaded_config:?}"
+        );
+    }
+
+    // An explicit `--config` naming a nonexistent file must fail loud at the
+    // loader — never silently fall through to the discovery tiers (ADR-035).
+    // The `Command::Mcp` branch's `Err` arm ("failed to load the explicitly
+    // selected config file") carries this case now that the explicit tier is
+    // enforced inside `load_with_home_fallback_and_source` itself.
+    #[tokio::test]
+    async fn mcp_explicit_missing_config_does_not_fall_through_to_discovery() {
+        let tmp = TempDir::new().expect("temp dir");
+        // Plant a discoverable config in the db-anchored tier
+        // (`<db_dir>/.khive/config.toml`). It is the CONTROL proving discovery
+        // was NOT consulted: if the explicit tier fell through, discovery
+        // would pick this file up and `Ok(Some(...))` would come back instead
+        // of the loud missing-file error.
+        let anchor_dir = tmp.path().join(".khive");
+        std::fs::create_dir_all(&anchor_dir).expect("create discovery anchor dir");
+        std::fs::write(anchor_dir.join("config.toml"), "").expect("write discoverable config");
+        let missing = tmp.path().join("does-not-exist.toml");
+        let db_hint = tmp.path().join("khive.db");
+
+        let error = KhiveConfig::load_with_home_fallback_and_source(Some(&missing), Some(&db_hint))
+            .expect_err("an explicit selection naming a missing file must fail loud");
+        assert!(
+            matches!(
+                error,
+                khive_runtime::engine_config::ConfigError::ExplicitConfigMissing { .. }
+            ),
+            "the explicit tier must fail with ExplicitConfigMissing, never fall \
+             through to the planted discoverable config: {error:?}"
+        );
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains("does-not-exist.toml"),
+            "the error must name the missing file the operator selected: {rendered}"
+        );
     }
 
     #[tokio::test]

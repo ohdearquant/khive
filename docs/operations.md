@@ -417,6 +417,7 @@ pack owns it, exactly like the MCP `request` tool:
 
 ```bash
 kkernel exec 'knowledge.import(path="/path/to/corpus.jsonl", format="ndjson")' --db ~/.khive/khive.db
+kkernel exec 'stats()' --config /absolute/path/to/config.toml
 ```
 
 See §3 below for `exec`'s general resolution rules, and the `knowledge` pack's own docs for
@@ -594,9 +595,10 @@ kkernel exec --pending-events --db ~/.khive/khive.db --namespace local --verbose
 ```
 
 `--pending-events` is mutually exclusive with both the positional `ops` string and `--ops-file`
-(clap `conflicts_with`, `exec.rs:105-106`) and, when set, bypasses the rest of `ExecArgs` entirely
-(no `--presentation`/`--output-format`/`--save-file` handling); it calls
-`pending_events::run_pending_events` directly.
+(clap `conflicts_with`, `exec.rs`) and, when set, bypasses result-presentation and sink handling
+(no `--presentation`/`--output-format`/`--save-file` handling). It still honors `--db` and the
+explicit `--config` / `KHIVE_CONFIG` tier, then calls
+`pending_events::run_pending_events_with_config` directly.
 
 "Pending events" are **notes of kind `scheduled_event`** (the same `notes` substrate as everything
 else, created by the `schedule` pack's `remind`/`schedule` verbs), each carrying `trigger_at`,

@@ -739,16 +739,48 @@ fn spawn_daemon() -> std::io::Result<std::process::Child> {
 }
 
 fn spawn_daemon_with_exe(exe: &std::path::Path) -> std::io::Result<std::process::Child> {
+    spawn_daemon_with_exe_and_config(exe, None, None)
+}
+
+fn spawn_daemon_with_exe_and_config(
+    exe: &std::path::Path,
+    config: Option<&std::path::Path>,
+    db: Option<&str>,
+) -> std::io::Result<std::process::Child> {
     #[cfg(test)]
     SPAWN_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
     // The binary is `kkernel`; the MCP server (and its daemon mode) live under
     // the `mcp` subcommand.
     let mut cmd = std::process::Command::new(exe);
-    cmd.arg("mcp")
-        .arg("--daemon")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null());
+    cmd.arg("mcp").arg("--daemon");
+    if let Some(path) = config {
+        cmd.arg("--config").arg(path);
+    }
+    // Forward whatever override the caller hands over — the caller owns the
+    // decision of WHICH override a spawned daemon must be constructed with
+    // (`run_exec_inline_with_forward` in `crates/kkernel/src/exec.rs`):
+    //
+    // - `:memory:` always forwards: it is the one override a newly spawned
+    //   daemon can honor byte-identically to the client (ephemeral by
+    //   definition), and without it the fresh daemon would bind the config's
+    //   declared persistent backend files instead — the opposite of what the
+    //   operator requested.
+    // - A CONCRETE path forwards in the single-backend case (no
+    //   `[[backends]]` declared): the spawned daemon has no config-declared
+    //   database path to default to, so without the override it would bind
+    //   `$HOME/.khive/khive.db` and its `config_id` would never match the
+    //   client's override-anchored frame.
+    // - A redundant concrete override (multi-backend, proven to name the
+    //   declared `main` backend) is deliberately NOT passed here by the
+    //   caller: the spawned daemon's config-declared path IS that override's
+    //   target, and the client's `config_id` has already been normalized to
+    //   the no-override anchor — forwarding it would desync the child's
+    //   fingerprint from the normalized frame.
+    if let Some(db) = db {
+        cmd.arg("--db").arg(db);
+    }
+    cmd.stdin(Stdio::null()).stdout(Stdio::null());
     // The daemon's tracing (including WAL/checkpoint telemetry) goes to
     // stderr honoring KHIVE_LOG (init_tracing in kkernel's main.rs) — wiring
     // it to /dev/null silently discards all of it. Route it to a log file
@@ -1936,6 +1968,28 @@ pub async fn forward_or_spawn(frame: &DaemonRequestFrame) -> Option<Result<Strin
     forward_or_spawn_with(frame, &spawn_daemon).await
 }
 
+/// Forward a request while preserving an explicit config selection (and an
+/// ephemeral `:memory:` database override) on a daemon this call may need to
+/// spawn.
+///
+/// An already-running daemon is still matched exclusively by `config_id`.
+/// `config` and `db` only supply construction inputs for a missing daemon;
+/// without them, `kkernel exec --config <path>` would spawn `kkernel mcp
+/// --daemon` against automatic discovery and immediately disagree with the
+/// request it was spawned to serve, and `kkernel exec --db :memory:` would
+/// bind the fresh daemon to the config's declared persistent files.
+pub async fn forward_or_spawn_with_config(
+    frame: &DaemonRequestFrame,
+    config: Option<&std::path::Path>,
+    db: Option<&str>,
+) -> Option<Result<String, McpError>> {
+    let spawn = || {
+        let exe = std::env::current_exe()?;
+        spawn_daemon_with_exe_and_config(&exe, config, db)
+    };
+    forward_or_spawn_with(frame, &spawn).await
+}
+
 #[cfg(test)]
 async fn forward_or_spawn_with_exe(
     frame: &DaemonRequestFrame,
@@ -2976,6 +3030,101 @@ mod tests {
         std::fs::set_permissions(&path, permissions)
             .expect("make daemon executable fixture executable");
         path
+    }
+
+    /// The config path threaded through `forward_or_spawn_with_config` must
+    /// actually appear on the spawned daemon's command line; a script
+    /// fixture records its argv so the assertion observes the real child
+    /// invocation (`crates/kkernel/src/exec.rs`'s spy seam proves the exec
+    /// side hands the path over; this side proves it reaches `argv`).
+    #[test]
+    fn spawn_daemon_with_exe_and_config_appends_config_flag_to_command_line() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let record = dir.path().join("argv.txt");
+        let exe = daemon_script_fixture(
+            &dir,
+            "record-argv.sh",
+            &format!("#!/bin/sh\nprintf '%s\\n' \"$*\" > {}\n", record.display()),
+        );
+
+        let config_path = dir.path().join("selected.toml");
+        let mut child = spawn_daemon_with_exe_and_config(&exe, Some(&config_path), None)
+            .expect("spawn argv-recording fixture");
+        let status = child.wait().expect("wait for argv-recording fixture");
+        assert!(status.success(), "fixture must exit 0: {status}");
+
+        let recorded = std::fs::read_to_string(&record).expect("read recorded argv");
+        assert_eq!(
+            recorded.trim_end(),
+            format!("mcp --daemon --config {}", config_path.display()),
+            "the explicit config selection must reach the daemon command line"
+        );
+    }
+
+    /// An accepted `--db :memory:` override must follow the spawn: without
+    /// `--db :memory:` on the daemon's own command line, a fresh daemon
+    /// would bind the config's declared persistent backend files, the exact
+    /// inversion of the operator's ephemeral invocation.
+    #[test]
+    fn spawn_daemon_with_exe_and_config_appends_memory_db_flag_to_command_line() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let record = dir.path().join("argv.txt");
+        let exe = daemon_script_fixture(
+            &dir,
+            "record-argv.sh",
+            &format!("#!/bin/sh\nprintf '%s\\n' \"$*\" > {}\n", record.display()),
+        );
+
+        let config_path = dir.path().join("selected.toml");
+        let mut child =
+            spawn_daemon_with_exe_and_config(&exe, Some(&config_path), Some(":memory:"))
+                .expect("spawn argv-recording fixture");
+        let status = child.wait().expect("wait for argv-recording fixture");
+        assert!(status.success(), "fixture must exit 0: {status}");
+
+        let recorded = std::fs::read_to_string(&record).expect("read recorded argv");
+        assert_eq!(
+            recorded.trim_end(),
+            format!(
+                "mcp --daemon --config {} --db :memory:",
+                config_path.display()
+            ),
+            "the ephemeral :memory: override must reach the daemon command line"
+        );
+    }
+
+    /// A concrete override handed to the spawn seam must reach the spawned
+    /// daemon's command line: this is the single-backend case (no
+    /// `[[backends]]` declared), where the fresh daemon has no
+    /// config-declared database path and would otherwise bind
+    /// `$HOME/.khive/khive.db` instead of the operator's override — a
+    /// `config_id` mismatch against the client's override-anchored frame.
+    /// The redundant-concrete multi-backend case never reaches this
+    /// function: the caller (`run_exec_inline_with_forward` in
+    /// `crates/kkernel/src/exec.rs`) withholds the override there because
+    /// the frame's fingerprint has already been normalized to the
+    /// no-override anchor (`normalize_redundant_db_override_with_source`).
+    #[test]
+    fn spawn_daemon_with_exe_and_config_forwards_concrete_db_flag_to_command_line() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let record = dir.path().join("argv.txt");
+        let exe = daemon_script_fixture(
+            &dir,
+            "record-argv.sh",
+            &format!("#!/bin/sh\nprintf '%s\\n' \"$*\" > {}\n", record.display()),
+        );
+
+        let mut child = spawn_daemon_with_exe_and_config(&exe, None, Some("/tmp/main.db"))
+            .expect("spawn argv-recording fixture");
+        let status = child.wait().expect("wait for argv-recording fixture");
+        assert!(status.success(), "fixture must exit 0: {status}");
+
+        let recorded = std::fs::read_to_string(&record).expect("read recorded argv");
+        assert_eq!(
+            recorded.trim_end(),
+            "mcp --daemon --db /tmp/main.db",
+            "the concrete override handed to the spawn seam must reach the daemon command line"
+        );
     }
 
     #[derive(Clone, Default)]
