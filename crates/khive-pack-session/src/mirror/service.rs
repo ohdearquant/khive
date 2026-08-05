@@ -40,10 +40,33 @@ enum DiscoveredKind {
 
 const DIRECTORY_PROBES_PER_TICK: usize = 64;
 const COLD_FILE_PROBES_PER_TICK: usize = 256;
+/// Worst-case number of STALE cold-queue pops per tick. A stale pop is a
+/// queue entry that turns out to be reactivated, removed, or already
+/// selected — it performs no filesystem work, but lazily invalidated
+/// residue must still be bounded so one tick cannot drain an arbitrary
+/// backlog. Productive pops remain capped by `COLD_FILE_PROBES_PER_TICK`,
+/// independently of this budget (ADR-080 §6).
+const COLD_STALE_POPS_PER_TICK: usize = COLD_FILE_PROBES_PER_TICK * 4;
 const DIRECTORY_FORCE_RESCAN_PROBES: u16 = 30;
 const FILE_UNCHANGED_POLLS_BEFORE_COLD: u8 = 2;
 const FILE_COLD_AGE: Duration = Duration::from_secs(5 * 60);
 const FILE_UNCHANGED_POLLS_WITHOUT_MTIME: u8 = 30;
+/// Consecutive probes on which every source candidate for a file errors
+/// before the file is demoted from hot polling to the cold sample. The
+/// ordinary cold cadence retries it; no separate retry machinery exists.
+const FILE_ERROR_POLLS_BEFORE_COLD: u8 = 3;
+/// Consecutive NotFound probes required before a non-pinned file is removed
+/// from tracking. A single NotFound can be transient (an atomic replace or
+/// a filesystem hiccup); immediate removal would also delete the cursor
+/// row, so a file recreated one tick later would be reseeded to EOF
+/// (`backfill = false`) and skip the bytes written in between.
+const FILE_MISSING_PROBES_BEFORE_REMOVAL: u8 = 2;
+/// Bound on cursor-row deletions awaiting retry after a failed cleanup.
+const CURSOR_DELETE_RETRY_LIMIT: usize = 1024;
+/// Consecutive directory-refresh failures before the failure log escalates
+/// from debug to warn. The counter resets on success, so one warn is
+/// emitted per failure episode, not per tick.
+const DIRECTORY_REFRESH_FAILURES_BEFORE_WARN: u16 = 3;
 
 /// Configuration for the mirror service.
 ///
@@ -303,6 +326,9 @@ struct TrackedDirectory {
     entries: HashSet<PathBuf>,
     unchanged_probes: u16,
     pinned: bool,
+    /// Consecutive refresh failures; drives the one-shot debug→warn
+    /// escalation and resets on success.
+    refresh_failures: u16,
 }
 
 struct TrackedFile {
@@ -310,6 +336,15 @@ struct TrackedFile {
     cold: bool,
     unchanged_polls: u8,
     pinned: bool,
+    /// Probes in a row on which every source candidate errored while the
+    /// file was hot. Resets on any successful advance; at
+    /// `FILE_ERROR_POLLS_BEFORE_COLD` the file is demoted to cold.
+    consecutive_error_polls: u8,
+    /// Consecutive probes on which `stat` reported the file missing.
+    /// Resets on any successful probe; removal requires
+    /// `FILE_MISSING_PROBES_BEFORE_REMOVAL` in a row so a transient
+    /// NotFound (atomic replace, FS hiccup) gets one grace probe.
+    missing_probes: u8,
 }
 
 struct ScheduledFile {
@@ -324,15 +359,40 @@ struct CandidateDispatch {
 }
 
 impl CandidateDispatch {
+    /// Record one candidate's result. Returns `true` when this candidate
+    /// should end dispatch for the file: it advanced the offset past
+    /// `start_offset` AND inserted rows.
+    ///
+    /// Invariant relied on (ADR-080 §6 invariant 4): an `Err` never advances
+    /// the cursor — every ingest path commits the cursor only inside the
+    /// same successful write that consumed the bytes (`write_events_and_cursor`
+    /// is one transaction; `write_cursor_only` failures propagate; export
+    /// paths set `new_offset` only after a successful parse+commit). An
+    /// advancing candidate has therefore durably consumed its byte range.
+    ///
+    /// An advance with zero inserts (a cursor-only pass over
+    /// blank/unparseable/oversized lines, `mirror_file_with_limits`) is
+    /// recorded — the bytes really were consumed — but does NOT end
+    /// dispatch: under misconfigured overlapping roots, a wrong provider
+    /// candidate could otherwise swallow bytes that a later, correct
+    /// provider candidate would have parsed into rows.
     fn record(
         &mut self,
         result: Result<ingest::MirrorStats, RuntimeError>,
         start_offset: u64,
     ) -> bool {
         match result {
-            Ok(stats) if stats.new_offset > start_offset => {
+            Ok(stats) if stats.new_offset > start_offset && stats.inserted > 0 => {
                 self.stats = Some(stats);
                 true
+            }
+            Ok(stats) if stats.new_offset > start_offset => {
+                // Empty advance: cursor durably committed, but no rows were
+                // inserted — fall through to remaining candidates.
+                if self.stats.is_none() {
+                    self.stats = Some(stats);
+                }
+                false
             }
             Ok(stats) if stats.new_offset >= start_offset => {
                 if self.stats.is_none() {
@@ -436,6 +496,10 @@ impl DiscoveryIndex {
                     directory.kinds.push(directory_kind);
                     directory.fingerprint = None;
                 }
+                // The queued invariant is non-local (a directory is only
+                // guaranteed to be in `directory_queue` while its own probe
+                // cycle is intact), so re-assert it on every re-entry.
+                self.enqueue_directory(&path);
                 continue;
             }
             if self.files.contains_key(&path) {
@@ -508,6 +572,7 @@ impl DiscoveryIndex {
                     entries,
                     unchanged_probes: 0,
                     pinned: is_pinned,
+                    refresh_failures: 0,
                 },
             );
             self.enqueue_directory(&path);
@@ -531,6 +596,8 @@ impl DiscoveryIndex {
                 cold: false,
                 unchanged_polls: 0,
                 pinned,
+                consecutive_error_polls: 0,
+                missing_probes: 0,
             },
         );
         self.hot_files.insert(path);
@@ -567,12 +634,28 @@ impl DiscoveryIndex {
                         if let Err(error) =
                             self.refresh_directory(&path, &kinds, fingerprint, changed)
                         {
-                            tracing::debug!(
-                                path = %path.display(),
-                                error = %error,
-                                "session mirror: directory refresh failed"
-                            );
+                            // Escalate once per failure episode: the counter
+                            // crosses the threshold exactly once until a
+                            // success resets it, so a wedged directory is
+                            // visible without per-tick warn spam.
+                            let failures = self.record_refresh_failure(&path);
+                            if failures == DIRECTORY_REFRESH_FAILURES_BEFORE_WARN {
+                                tracing::warn!(
+                                    path = %path.display(),
+                                    error = %error,
+                                    consecutive_failures = failures,
+                                    "session mirror: directory refresh keeps failing"
+                                );
+                            } else {
+                                tracing::debug!(
+                                    path = %path.display(),
+                                    error = %error,
+                                    consecutive_failures = failures,
+                                    "session mirror: directory refresh failed"
+                                );
+                            }
                         } else {
+                            self.clear_refresh_failures(&path);
                             stats.walks += 1;
                         }
                     } else if let Some(directory) = self.directories.get_mut(&path) {
@@ -762,10 +845,20 @@ impl DiscoveryIndex {
                 directory.entries.clear();
                 directory.unchanged_probes = 0;
             }
+            // The queued invariant is non-local — this path's queue entry
+            // may have been popped earlier in the current tick without a
+            // re-enqueue yet — so re-assert it: a retained pinned root must
+            // stay scheduled or its later reappearance is never noticed.
+            self.enqueue_directory(path);
         } else {
             self.directories.remove(path);
-            self.directory_queue.retain(|queued| queued != path);
-            self.directory_enqueued.remove(path);
+            // Queue residue is invalidated lazily: `probe_directories` skips
+            // popped paths that are no longer tracked, and a recursive
+            // O(queue) retain per removed node would make deep tree removals
+            // quadratic. The enqueue flag is deliberately left set until the
+            // residue is popped: it means "an entry is queued", and clearing
+            // it early would let a re-add enqueue a duplicate that gets
+            // probed twice in one tick.
         }
     }
 
@@ -777,11 +870,13 @@ impl DiscoveryIndex {
             return;
         }
         self.hot_files.remove(path);
-        // Drop stale scheduler state so a later re-add of this path starts
-        // with clean queues instead of being shadowed by leftover entries.
-        self.cold_queue.retain(|queued| queued != path);
+        // Cold-queue entries for the removed path are invalidated lazily:
+        // `schedule_files` pops them under the counted stale-pop budget and
+        // skips them because the path is no longer tracked. An O(queue)
+        // `retain` per removal would scan the whole cold ring for residue
+        // that drains itself; clearing the enqueue flags is enough for a
+        // later re-add to start clean.
         self.cold_enqueued.remove(path);
-        self.priority_cold_queue.retain(|queued| queued != path);
         self.priority_cold_enqueued.remove(path);
         self.removed_files.push(path.to_path_buf());
     }
@@ -793,9 +888,18 @@ impl DiscoveryIndex {
     }
 
     fn reactivate_file(&mut self, path: &Path) {
+        // Deliberately does NOT purge `cold_queue` / `priority_cold_queue`:
+        // reactivation can race queued entries, and they are invalidated
+        // lazily by `schedule_files`' counted stale-pop skip instead of an
+        // O(queue) scan here.
         if let Some(file) = self.files.get_mut(path) {
             file.cold = false;
             file.unchanged_polls = 0;
+            // A successful growth probe ends the missing-file streak.
+            file.missing_probes = 0;
+            // ...and starts a fresh error-streak window: "consecutive
+            // error ticks" counts between successful probes.
+            file.consecutive_error_polls = 0;
             self.hot_files.insert(path.to_path_buf());
         }
     }
@@ -811,12 +915,21 @@ impl DiscoveryIndex {
                 was_cold: false,
             })
             .collect::<Vec<_>>();
+        // Productive pops (a still-cold file that gets scheduled and
+        // stat'ed) consume `remaining_cold_probes`, keeping the ADR-080 §6
+        // "at most 256 cold-file metadata probes" ceiling exact. Stale pops
+        // — reactivated, removed, or duplicate entries, invalidated lazily
+        // instead of `retain`-purged on every hot/reactivate/remove path —
+        // do no filesystem work but are still bounded by
+        // `remaining_stale_pops`, so one tick can drain at most a fixed
+        // backlog of residue instead of an arbitrary queue.
         let mut remaining_cold_probes = COLD_FILE_PROBES_PER_TICK;
+        let mut remaining_stale_pops = COLD_STALE_POPS_PER_TICK;
         let mut selected_cold = HashSet::new();
         let priority_candidates = self.priority_cold_queue.len();
 
         for _ in 0..priority_candidates {
-            if remaining_cold_probes == 0 {
+            if remaining_stale_pops == 0 {
                 break;
             }
             let Some(path) = self.priority_cold_queue.pop_front() else {
@@ -826,18 +939,27 @@ impl DiscoveryIndex {
             if self.files.get(&path).is_some_and(|file| file.cold)
                 && selected_cold.insert(path.clone())
             {
+                if remaining_cold_probes == 0 {
+                    // Productive entry popped but the probe budget is
+                    // spent: hand it back and stop.
+                    self.priority_cold_queue.push_front(path.clone());
+                    self.priority_cold_enqueued.insert(path);
+                    break;
+                }
                 scheduled.push(ScheduledFile {
                     path,
                     was_cold: true,
                 });
                 remaining_cold_probes -= 1;
+            } else {
+                remaining_stale_pops -= 1;
             }
         }
 
         let cold_candidates = self.cold_queue.len();
 
         for _ in 0..cold_candidates {
-            if remaining_cold_probes == 0 {
+            if remaining_stale_pops == 0 {
                 break;
             }
             let Some(path) = self.cold_queue.pop_front() else {
@@ -847,11 +969,18 @@ impl DiscoveryIndex {
             if self.files.get(&path).is_some_and(|file| file.cold)
                 && selected_cold.insert(path.clone())
             {
+                if remaining_cold_probes == 0 {
+                    self.cold_queue.push_front(path.clone());
+                    self.cold_enqueued.insert(path);
+                    break;
+                }
                 scheduled.push(ScheduledFile {
                     path,
                     was_cold: true,
                 });
                 remaining_cold_probes -= 1;
+            } else {
+                remaining_stale_pops -= 1;
             }
         }
 
@@ -868,6 +997,8 @@ impl DiscoveryIndex {
         let Some(file) = self.files.get_mut(path) else {
             return;
         };
+        // A successful probe ends any missing-file streak.
+        file.missing_probes = 0;
 
         if was_cold || file.cold {
             file.cold = true;
@@ -886,9 +1017,55 @@ impl DiscoveryIndex {
     fn record_probe_error(&mut self, path: &Path, was_cold: bool, missing: bool) {
         let pinned = self.files.get(path).is_some_and(|file| file.pinned);
         if missing && !pinned {
-            self.remove_file(path, false);
+            // A single NotFound can be transient (an atomic replace or a
+            // filesystem hiccup). Removal also queues the cursor row for
+            // deletion, after which a recreated file would be reseeded to
+            // EOF when `backfill` is off and silently skip the bytes
+            // written in between — so require a second consecutive
+            // NotFound before removing (one-tick grace).
+            let remove = if let Some(file) = self.files.get_mut(path) {
+                file.missing_probes = file.missing_probes.saturating_add(1);
+                file.missing_probes >= FILE_MISSING_PROBES_BEFORE_REMOVAL
+            } else {
+                false
+            };
+            if remove {
+                self.remove_file(path, false);
+            } else if was_cold {
+                self.enqueue_cold(path);
+            }
         } else if was_cold {
             self.enqueue_cold(path);
+        }
+    }
+
+    /// Count a probe on which every source candidate errored. Returns
+    /// `true` exactly on the tick whose streak crosses
+    /// `FILE_ERROR_POLLS_BEFORE_COLD` — the caller's one-shot warn for the
+    /// demotion. A streak of `N` keeps a persistently broken file demoted
+    /// on every later reactivated probe without re-warning, and any
+    /// successful advance resets the streak via [`Self::clear_error_polls`].
+    fn record_error_poll(&mut self, path: &Path) -> bool {
+        let Some(file) = self.files.get_mut(path) else {
+            return false;
+        };
+        file.consecutive_error_polls = file.consecutive_error_polls.saturating_add(1);
+        let crossed_threshold = file.consecutive_error_polls == FILE_ERROR_POLLS_BEFORE_COLD;
+        if file.consecutive_error_polls >= FILE_ERROR_POLLS_BEFORE_COLD && !file.cold {
+            // Demote to the cold sample: the ordinary cold cadence retries
+            // the file, so no separate retry machinery is needed.
+            file.cold = true;
+            file.unchanged_polls = 0;
+            self.hot_files.remove(path);
+            self.enqueue_cold(path);
+        }
+        crossed_threshold
+    }
+
+    /// Reset the consecutive-error streak after a successful cursor advance.
+    fn clear_error_polls(&mut self, path: &Path) {
+        if let Some(file) = self.files.get_mut(path) {
+            file.consecutive_error_polls = 0;
         }
     }
 
@@ -910,6 +1087,26 @@ impl DiscoveryIndex {
         if self.directories.contains_key(path) && self.directory_enqueued.insert(path.to_path_buf())
         {
             self.directory_queue.push_back(path.to_path_buf());
+        }
+    }
+
+    /// Bump the consecutive refresh-failure counter for a directory and
+    /// return the new value (0 when untracked). The caller escalates to
+    /// warn exactly when it crosses `DIRECTORY_REFRESH_FAILURES_BEFORE_WARN`.
+    fn record_refresh_failure(&mut self, path: &Path) -> u16 {
+        self.directories
+            .get_mut(path)
+            .map(|directory| {
+                directory.refresh_failures = directory.refresh_failures.saturating_add(1);
+                directory.refresh_failures
+            })
+            .unwrap_or(0)
+    }
+
+    /// Reset the refresh-failure counter after a successful walk.
+    fn clear_refresh_failures(&mut self, path: &Path) {
+        if let Some(directory) = self.directories.get_mut(path) {
+            directory.refresh_failures = 0;
         }
     }
 
@@ -1021,6 +1218,12 @@ pub async fn run_mirror_service(runtime: KhiveRuntime, config: MirrorConfig) {
         }
     };
     let mut discovery = DiscoveryIndex::from_config(&config);
+    // Cursor rows whose deletion failed, retried on later ticks. A stale
+    // row that survives to a daemon restart is reloaded by `load_cursors`,
+    // and a recreated same-path file would then resume from the old offset
+    // and silently skip bytes — so failed deletions must be retried until
+    // they succeed, not dropped (bounded by `CURSOR_DELETE_RETRY_LIMIT`).
+    let mut pending_cursor_deletes: VecDeque<PathBuf> = VecDeque::new();
 
     loop {
         let directory_work = discovery.probe_directories();
@@ -1032,10 +1235,9 @@ pub async fn run_mirror_service(runtime: KhiveRuntime, config: MirrorConfig) {
             for removed in &removed_files {
                 offsets.remove(removed);
             }
-            if let Err(error) = delete_cursors(&runtime, &removed_files).await {
-                tracing::debug!(error = %error, "session mirror: cursor cleanup failed");
-            }
+            queue_cursor_deletes(&mut pending_cursor_deletes, &removed_files);
         }
+        drain_pending_cursor_deletes(&runtime, &discovery, &mut pending_cursor_deletes).await;
         let scheduled = discovery.schedule_files();
         let total_tracked = discovery.tracked_files();
         let mut files_mirrored: u64 = 0;
@@ -1121,12 +1323,37 @@ pub async fn run_mirror_service(runtime: KhiveRuntime, config: MirrorConfig) {
             }
 
             let CandidateDispatch { stats, errors } = candidate_dispatch;
+            let had_errors = !errors.is_empty();
             for error in errors {
                 tracing::warn!(
                     path = %scheduled_file.path.display(),
                     error = %error,
                     "session mirror: per-file source candidate error"
                 );
+            }
+
+            // A successful advance ends the error streak; a tick on which
+            // every candidate errored grows it toward demotion.
+            let advanced = stats
+                .as_ref()
+                .is_some_and(|stats| stats.new_offset > offset);
+            if advanced {
+                discovery.clear_error_polls(&scheduled_file.path);
+            } else if stats.is_none() && had_errors {
+                // Every source candidate errored this tick: the offset did
+                // not advance and nothing was recorded. Without
+                // intervention the file would stay hot and be re-dispatched
+                // every tick forever; after `FILE_ERROR_POLLS_BEFORE_COLD`
+                // consecutive such ticks, demote it to the cold sample,
+                // whose ordinary cadence retries it (no separate retry
+                // machinery).
+                if discovery.record_error_poll(&scheduled_file.path) {
+                    tracing::warn!(
+                        path = %scheduled_file.path.display(),
+                        consecutive_error_polls = FILE_ERROR_POLLS_BEFORE_COLD,
+                        "session mirror: demoting persistently erroring file to cold"
+                    );
+                }
             }
 
             if let Some(stats) = stats {
@@ -1219,9 +1446,12 @@ async fn load_cursors(runtime: &KhiveRuntime) -> Result<HashMap<PathBuf, u64>, R
 ///
 /// A recreated same-path file must start from a fresh cursor instead of
 /// inheriting its predecessor's offset (and skipping early data). The caller
-/// logs errors and continues: the in-memory offset map is already pruned, so
-/// a failure here only risks a stale row being reloaded on restart, never
-/// data loss (ingest is idempotent via `INSERT OR IGNORE`).
+/// retries failures via the pending-delete set: the in-memory offset map is
+/// already pruned, so an *unretried* failure here is worse than wasted work —
+/// `load_cursors` reloads the stale row on the next daemon restart, and a
+/// recreated same-path file then resumes from the old offset and silently
+/// skips the bytes written in between. Idempotent `INSERT OR IGNORE` does
+/// not cover this case because the skipped bytes are never read at all.
 async fn delete_cursors(runtime: &KhiveRuntime, paths: &[PathBuf]) -> Result<(), RuntimeError> {
     let sql = runtime.sql();
     let mut writer = sql
@@ -1240,6 +1470,58 @@ async fn delete_cursors(runtime: &KhiveRuntime, paths: &[PathBuf]) -> Result<(),
             .map_err(|e| RuntimeError::Internal(format!("mirror: cursor delete: {e}")))?;
     }
     Ok(())
+}
+
+/// Add removed paths to the pending cursor-delete set, deduplicating and
+/// evicting (warn-logged) beyond `CURSOR_DELETE_RETRY_LIMIT` so an outage
+/// cannot grow the set without bound.
+fn queue_cursor_deletes(pending: &mut VecDeque<PathBuf>, removed: &[PathBuf]) {
+    for path in removed {
+        if pending.contains(path) {
+            continue;
+        }
+        if pending.len() >= CURSOR_DELETE_RETRY_LIMIT {
+            let dropped = pending.pop_front();
+            tracing::warn!(
+                dropped = %dropped.map(|p| p.display().to_string()).unwrap_or_default(),
+                limit = CURSOR_DELETE_RETRY_LIMIT,
+                "session mirror: cursor-delete retry set full; dropping oldest entry"
+            );
+        }
+        pending.push_back(path.clone());
+    }
+}
+
+/// Drain the pending cursor-delete set against the store. A path re-tracked
+/// since its removal seeds a fresh in-memory offset and rewrites its cursor
+/// row on the next successful ingest, so its pending delete is cancelled
+/// instead of removing the fresh row out from under it. On failure the set
+/// is kept for retry on later ticks (escalated to warn: a dropped failure
+/// leaves the stale row in place across restarts). Paths deleted before the
+/// error stay in the set and are re-deleted idempotently later.
+async fn drain_pending_cursor_deletes(
+    runtime: &KhiveRuntime,
+    discovery: &DiscoveryIndex,
+    pending: &mut VecDeque<PathBuf>,
+) {
+    if pending.is_empty() {
+        return;
+    }
+    pending.retain(|path| !discovery.files.contains_key(path));
+    if pending.is_empty() {
+        return;
+    }
+    let paths: Vec<PathBuf> = pending.iter().cloned().collect();
+    match delete_cursors(runtime, &paths).await {
+        Ok(()) => pending.clear(),
+        Err(error) => {
+            tracing::warn!(
+                error = %error,
+                remaining = pending.len(),
+                "session mirror: cursor cleanup failed; retrying next tick"
+            );
+        }
+    }
 }
 
 /// Extract the session UUID from a Codex filename of the form
@@ -1281,10 +1563,13 @@ fn extract_codex_session_id(path: &std::path::Path) -> Option<String> {
 mod discovery_tests {
     use super::{
         should_mark_cold, CandidateDispatch, DirectoryKind, DiscoveredKind, DiscoveryIndex,
-        COLD_FILE_PROBES_PER_TICK, DIRECTORY_FORCE_RESCAN_PROBES, DIRECTORY_PROBES_PER_TICK,
-        FILE_COLD_AGE, FILE_UNCHANGED_POLLS_BEFORE_COLD, FILE_UNCHANGED_POLLS_WITHOUT_MTIME,
+        TrackedDirectory, COLD_FILE_PROBES_PER_TICK, COLD_STALE_POPS_PER_TICK,
+        DIRECTORY_FORCE_RESCAN_PROBES, DIRECTORY_PROBES_PER_TICK,
+        DIRECTORY_REFRESH_FAILURES_BEFORE_WARN, FILE_COLD_AGE, FILE_ERROR_POLLS_BEFORE_COLD,
+        FILE_UNCHANGED_POLLS_BEFORE_COLD, FILE_UNCHANGED_POLLS_WITHOUT_MTIME,
     };
     use crate::mirror::ingest::MirrorStats;
+    use std::collections::HashSet;
     use std::fs::OpenOptions;
     use std::io::Write;
     use std::path::{Path, PathBuf};
@@ -1570,13 +1855,15 @@ mod discovery_tests {
         assert!(discovery.cold_enqueued.contains(&path));
 
         discovery.remove_file(&path, false);
-        assert!(discovery.cold_queue.iter().all(|queued| queued != &path));
+        // Queue residue is invalidated lazily: the entry may still sit in
+        // the cold queue, but it must never schedule again, and the enqueue
+        // flags are cleared so a re-add starts clean.
         assert!(!discovery.cold_enqueued.contains(&path));
-        assert!(discovery
-            .priority_cold_queue
-            .iter()
-            .all(|queued| queued != &path));
         assert!(!discovery.priority_cold_enqueued.contains(&path));
+        assert!(discovery
+            .schedule_files()
+            .iter()
+            .all(|file| file.path != path));
 
         // A re-added path is scheduled on the next tick instead of being
         // shadowed by leftover queue state.
@@ -1599,14 +1886,14 @@ mod discovery_tests {
         assert!(discovery.directory_enqueued.contains(&root));
 
         discovery.remove_directory_tree(&root, false);
-        assert!(discovery
-            .directory_queue
-            .iter()
-            .all(|queued| queued != &root));
-        assert!(!discovery.directory_enqueued.contains(&root));
+        // Queue residue is invalidated lazily: the entry may still sit in
+        // the queue, but an untracked path is skipped on pop, and the
+        // enqueue flag stays set until that pop so a re-add cannot enqueue
+        // a duplicate.
+        assert!(discovery.directory_enqueued.contains(&root));
 
-        // A re-added directory is probed again instead of waiting for a
-        // stale queue entry to drain.
+        // A re-added directory is probed exactly once on the next tick
+        // instead of twice (once per queue entry).
         discovery.add_directory_tree(&root, DirectoryKind::ClaudeCodeRoot, false);
         let stats = discovery.probe_directories();
         assert_eq!(stats.metadata_probes, 1);
@@ -1642,12 +1929,201 @@ mod discovery_tests {
             .schedule_files()
             .iter()
             .any(|file| file.path == pinned && !file.was_cold));
+    }
 
+    #[test]
+    fn transient_not_found_gets_one_grace_probe_before_removal() {
+        let mut discovery = DiscoveryIndex::default();
         let transient = PathBuf::from("/projects/gone.jsonl");
         discovery.add_file(transient.clone(), DiscoveredKind::ChatGptExport, false);
+
+        // One NotFound (an atomic replace or FS hiccup) keeps the file and
+        // its cursor so a promptly recreated path resumes from its old
+        // offset instead of being reseeded to EOF.
+        discovery.record_probe_error(&transient, false, true);
+        assert!(discovery.files.contains_key(&transient));
+        assert!(discovery.hot_files.contains(&transient));
+        assert!(discovery.take_removed_files().is_empty());
+
+        // A successful probe in between resets the streak entirely.
+        discovery.record_unchanged(&transient, false, None, SystemTime::now());
+        discovery.record_probe_error(&transient, false, true);
+        assert!(discovery.files.contains_key(&transient));
+
+        // A second consecutive NotFound removes the file and queues cursor
+        // cleanup.
         discovery.record_probe_error(&transient, false, true);
         assert!(!discovery.files.contains_key(&transient));
         assert!(!discovery.hot_files.contains(&transient));
+        assert_eq!(discovery.take_removed_files(), vec![transient.clone()]);
+    }
+
+    #[test]
+    fn stale_cold_queue_residue_is_pop_bounded_and_hot_files_still_scheduled() {
+        let mut discovery = DiscoveryIndex::default();
+
+        // A large backlog of stale entries at the queue head: files that
+        // were cold, enqueued, then reactivated (e.g. growth noticed via a
+        // directory priority sweep) — their queue entries are invalidated
+        // lazily instead of by an O(queue) purge on reactivation.
+        let stale_count = COLD_STALE_POPS_PER_TICK * 5;
+        for index in 0..stale_count {
+            let path = PathBuf::from(format!("/stale/session-{index}.jsonl"));
+            discovery.add_file(path.clone(), DiscoveredKind::ChatGptExport, false);
+            mark_cold(&mut discovery, &path);
+            discovery.reactivate_file(&path);
+        }
+        // Fresh cold files behind the residue.
+        let fresh_count = COLD_FILE_PROBES_PER_TICK * 3;
+        let first_fresh = PathBuf::from("/cold/session-0.jsonl");
+        for index in 0..fresh_count {
+            let path = PathBuf::from(format!("/cold/session-{index}.jsonl"));
+            discovery.add_file(path.clone(), DiscoveredKind::ChatGptExport, false);
+            mark_cold(&mut discovery, &path);
+        }
+        // A hot file must still be scheduled in the same tick.
+        let hot = PathBuf::from("/hot/session.jsonl");
+        discovery.add_file(hot.clone(), DiscoveredKind::ChatGptExport, false);
+
+        let queue_before = discovery.cold_queue.len();
+        assert_eq!(queue_before, stale_count + fresh_count);
+
+        let mut scheduled = discovery.schedule_files();
+        assert!(
+            scheduled
+                .iter()
+                .any(|file| file.path == hot && !file.was_cold),
+            "hot scheduling is unaffected by the residue backlog"
+        );
+        // One tick cannot drain the arbitrary stale backlog: with residue
+        // at the queue head, total pops are bounded by the stale-pop budget
+        // plus the productive probe budget.
+        let drained = queue_before - discovery.cold_queue.len();
+        assert!(drained <= COLD_STALE_POPS_PER_TICK + COLD_FILE_PROBES_PER_TICK);
+        assert!(
+            discovery.cold_queue.len() > fresh_count / 2,
+            "most of the backlog survives one tick"
+        );
+
+        // Bounded lag, no starvation: the residue drains at the stale-pop
+        // rate and the fresh cold files are scheduled once it clears.
+        let mut ticks = 1;
+        while !scheduled.iter().any(|file| file.path == first_fresh) {
+            scheduled = discovery.schedule_files();
+            ticks += 1;
+            assert!(
+                ticks <= (stale_count / COLD_STALE_POPS_PER_TICK) + 2,
+                "stale residue must drain at the bounded per-tick rate"
+            );
+        }
+        assert!(
+            scheduled.iter().filter(|file| file.was_cold).count() <= COLD_FILE_PROBES_PER_TICK,
+            "the productive metadata-probe ceiling holds on the catch-up tick"
+        );
+    }
+
+    #[test]
+    fn persistently_erroring_hot_file_is_demoted_to_cold_and_recovers() {
+        let mut discovery = DiscoveryIndex::default();
+        let path = PathBuf::from("/broken/session.jsonl");
+        discovery.add_file(path.clone(), DiscoveredKind::ChatGptExport, false);
+        assert!(discovery.hot_files.contains(&path));
+
+        // Below the threshold the file stays hot.
+        for _tick in 1..FILE_ERROR_POLLS_BEFORE_COLD {
+            assert!(!discovery.record_error_poll(&path));
+            assert!(discovery.hot_files.contains(&path));
+            assert!(!discovery.files[&path].cold);
+        }
+        // Crossing the threshold demotes to cold exactly once (the one-shot
+        // warn tick) and enqueues it for the ordinary cold cadence.
+        assert!(discovery.record_error_poll(&path));
+        assert!(!discovery.hot_files.contains(&path));
+        assert!(discovery.files[&path].cold);
+        assert!(discovery.cold_enqueued.contains(&path));
+
+        // Further error ticks keep it cold without re-crossing.
+        assert!(!discovery.record_error_poll(&path));
+
+        // Recovery reactivates through the normal hot path and resets the
+        // streak.
+        discovery.reactivate_file(&path);
+        assert!(discovery.hot_files.contains(&path));
+        assert!(!discovery.files[&path].cold);
+        for _ in 1..FILE_ERROR_POLLS_BEFORE_COLD {
+            assert!(!discovery.record_error_poll(&path));
+        }
+        assert!(discovery.record_error_poll(&path));
+    }
+
+    #[test]
+    fn empty_advance_candidate_does_not_mask_inserting_provider() {
+        let start_offset = 10;
+        let mut dispatch = CandidateDispatch::default();
+
+        // A wrong provider can advance the cursor while inserting nothing
+        // (a cursor-only pass over unparseable lines); that must not end
+        // dispatch and hide the provider that parses the same bytes.
+        assert!(!dispatch.record(
+            Ok(MirrorStats {
+                inserted: 0,
+                scanned: 0,
+                new_offset: start_offset + 40,
+            }),
+            start_offset,
+        ));
+        assert!(dispatch.record(
+            Ok(MirrorStats {
+                inserted: 3,
+                scanned: 3,
+                new_offset: start_offset + 40,
+            }),
+            start_offset,
+        ));
+        let stats = dispatch.stats.expect("inserting provider recorded");
+        assert_eq!(stats.inserted, 3);
+        assert_eq!(stats.new_offset, start_offset + 40);
+    }
+
+    #[test]
+    fn refresh_failure_counter_crosses_the_warn_threshold_once_per_episode() {
+        let mut discovery = DiscoveryIndex::default();
+        let path = PathBuf::from("/projects/wedged");
+        discovery.directories.insert(
+            path.clone(),
+            TrackedDirectory {
+                kinds: vec![DirectoryKind::ClaudeCodeRoot],
+                fingerprint: None,
+                entries: HashSet::new(),
+                unchanged_probes: 0,
+                pinned: false,
+                refresh_failures: 0,
+            },
+        );
+
+        for _ in 1..DIRECTORY_REFRESH_FAILURES_BEFORE_WARN {
+            assert_ne!(
+                discovery.record_refresh_failure(&path),
+                DIRECTORY_REFRESH_FAILURES_BEFORE_WARN,
+                "below the threshold the log stays at debug"
+            );
+        }
+        assert_eq!(
+            discovery.record_refresh_failure(&path),
+            DIRECTORY_REFRESH_FAILURES_BEFORE_WARN,
+            "exactly one escalation per episode"
+        );
+        assert_ne!(
+            discovery.record_refresh_failure(&path),
+            DIRECTORY_REFRESH_FAILURES_BEFORE_WARN,
+            "subsequent failures in the same episode do not re-escalate"
+        );
+
+        discovery.clear_refresh_failures(&path);
+        assert_eq!(
+            discovery.directories[&path].refresh_failures, 0,
+            "a successful walk resets the episode"
+        );
     }
 
     #[test]
@@ -1723,6 +2199,170 @@ mod discovery_tests {
             "a forced rescan of an unchanged directory carries no change signal"
         );
         assert!(discovery.cold_enqueued.contains(&transcript));
+    }
+}
+
+#[cfg(test)]
+mod cursor_retry_tests {
+    use super::{
+        delete_cursors, drain_pending_cursor_deletes, queue_cursor_deletes, DiscoveredKind,
+        DiscoveryIndex, CURSOR_DELETE_RETRY_LIMIT,
+    };
+    use crate::vocab::SESSION_SCHEMA_PLAN_STMTS;
+    use khive_runtime::{AllowAllGate, BackendId, KhiveRuntime, Namespace, RuntimeConfig};
+    use khive_storage::types::{SqlStatement, SqlValue};
+    use std::collections::VecDeque;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+    use tempfile::TempDir;
+
+    /// File-backed runtime WITHOUT the session schema applied — cursor DML
+    /// fails with "no such table", which doubles as the fault injection for
+    /// the retry path. Caller keeps the `TempDir` alive.
+    fn runtime_without_schema() -> (KhiveRuntime, TempDir) {
+        let dir = TempDir::new().expect("tempdir");
+        let db_path = dir.path().join("test.db");
+        let rt = KhiveRuntime::new(RuntimeConfig {
+            git_write: Default::default(),
+            db_path: Some(db_path),
+            default_namespace: Namespace::local(),
+            embedding_model: None,
+            additional_embedding_models: vec![],
+            gate: Arc::new(AllowAllGate),
+            packs: vec!["kg".to_string()],
+            backend_id: BackendId::main(),
+            brain_profile: None,
+            visible_namespaces: vec![],
+            allowed_outbound_namespaces: vec![],
+            actor_id: None,
+        })
+        .expect("file-backed runtime");
+        (rt, dir)
+    }
+
+    async fn apply_session_schema(rt: &KhiveRuntime) {
+        let sql = rt.sql();
+        let mut writer = sql.writer().await.expect("writer");
+        for stmt in &SESSION_SCHEMA_PLAN_STMTS {
+            writer
+                .execute_script(stmt.to_string())
+                .await
+                .expect("schema stmt");
+        }
+    }
+
+    async fn insert_cursor_row(rt: &KhiveRuntime, path: &std::path::Path, offset: i64) {
+        let mut writer = rt.sql().writer().await.expect("writer");
+        writer
+            .execute(SqlStatement {
+                sql: "INSERT INTO session_mirror_cursor(file_path, session_id, byte_offset, updated_at) \
+                      VALUES(?1, NULL, ?2, 0)"
+                    .into(),
+                params: vec![
+                    SqlValue::Text(path.to_string_lossy().into_owned()),
+                    SqlValue::Integer(offset),
+                ],
+                label: None,
+            })
+            .await
+            .expect("cursor insert");
+    }
+
+    async fn cursor_row_exists(rt: &KhiveRuntime, path: &std::path::Path) -> bool {
+        let mut reader = rt.sql().reader().await.expect("reader");
+        let rows = reader
+            .query_all(SqlStatement {
+                sql: "SELECT byte_offset FROM session_mirror_cursor WHERE file_path = ?1".into(),
+                params: vec![SqlValue::Text(path.to_string_lossy().into_owned())],
+                label: None,
+            })
+            .await
+            .expect("cursor query");
+        !rows.is_empty()
+    }
+
+    #[tokio::test]
+    async fn failed_cursor_delete_stays_pending_and_is_retried_next_tick() {
+        let (rt, _dir) = runtime_without_schema();
+        let discovery = DiscoveryIndex::default();
+        let path = PathBuf::from("/projects/gone.jsonl");
+
+        let mut pending = VecDeque::new();
+        queue_cursor_deletes(&mut pending, std::slice::from_ref(&path));
+        assert_eq!(pending.len(), 1);
+
+        // No cursor table yet: the delete fails and the entry must stay
+        // pending — dropping it would let a stale row survive a daemon
+        // restart and skip bytes on a recreated file.
+        drain_pending_cursor_deletes(&rt, &discovery, &mut pending).await;
+        assert_eq!(
+            pending.len(),
+            1,
+            "failed delete must remain in the retry set"
+        );
+
+        // The table appears (schema applied) and a row exists for the path:
+        // the next tick's retry deletes it and drains the set.
+        apply_session_schema(&rt).await;
+        insert_cursor_row(&rt, &path, 4096).await;
+        drain_pending_cursor_deletes(&rt, &discovery, &mut pending).await;
+        assert!(pending.is_empty(), "successful retry drains the set");
+        assert!(
+            !cursor_row_exists(&rt, &path).await,
+            "stale row deleted on retry"
+        );
+    }
+
+    #[tokio::test]
+    async fn retracked_path_cancels_its_pending_cursor_delete() {
+        let (rt, _dir) = runtime_without_schema();
+        apply_session_schema(&rt).await;
+
+        let path = PathBuf::from("/projects/recreated.jsonl");
+        insert_cursor_row(&rt, &path, 512).await;
+
+        let mut discovery = DiscoveryIndex::default();
+        let mut pending = VecDeque::new();
+        queue_cursor_deletes(&mut pending, std::slice::from_ref(&path));
+
+        // The file is re-discovered before the delete drains: its fresh
+        // cursor row must not be deleted out from under it.
+        discovery.add_file(path.clone(), DiscoveredKind::ChatGptExport, false);
+        drain_pending_cursor_deletes(&rt, &discovery, &mut pending).await;
+        assert!(pending.is_empty(), "re-tracked path cancels its delete");
+        assert!(cursor_row_exists(&rt, &path).await, "fresh row preserved");
+    }
+
+    #[tokio::test]
+    async fn queue_cursor_deletes_deduplicates_and_is_bounded() {
+        let mut pending = VecDeque::new();
+        let path = PathBuf::from("/projects/gone.jsonl");
+        queue_cursor_deletes(&mut pending, &[path.clone(), path.clone()]);
+        assert_eq!(pending.len(), 1, "duplicate removals collapse to one entry");
+
+        for index in 0..(CURSOR_DELETE_RETRY_LIMIT + 8) {
+            let extra = PathBuf::from(format!("/projects/extra-{index}.jsonl"));
+            queue_cursor_deletes(&mut pending, &[extra]);
+        }
+        assert_eq!(
+            pending.len(),
+            CURSOR_DELETE_RETRY_LIMIT,
+            "the retry set is bounded; oldest entries are evicted"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_cursors_reports_the_sql_error_for_retry() {
+        let (rt, _dir) = runtime_without_schema();
+        let path = PathBuf::from("/projects/gone.jsonl");
+        let error = delete_cursors(&rt, &[path])
+            .await
+            .expect_err("missing table must surface as an error, not silence");
+        let message = error.to_string();
+        assert!(
+            message.contains("mirror: cursor delete"),
+            "error names the failing operation; got: {message}"
+        );
     }
 }
 

@@ -244,8 +244,10 @@ file path. Each export parser therefore rejects a document containing the other 
 recognizable conversation shape, and a mixed-provider array is unsupported. This leaves the
 cursor untouched instead of allowing a misconfigured overlapping root to let the wrong source
 consume that path first. Candidate dispatch claims the path only when a pass advances its
-cursor; a no-progress success such as one provider's lower whole-file size ceiling falls
-through to the next configured provider candidate.
+cursor and inserts rows; an empty advance (a cursor-only pass over blank or unparseable
+lines) records its committed offset but falls through to the next configured provider
+candidate, as does a no-progress success such as one provider's lower whole-file size
+ceiling.
 
 #### Delta-proportional polling (Amendment, 2026-08-02)
 
@@ -259,7 +261,9 @@ completed transcript:
   puts its directly contained cold transcripts at the front of the bounded probe schedule;
   newly discovered transcripts enter the active set immediately.
 - A file remains active while it is growing, while ingest is catching up to its cursor, or
-  while a per-file error requires retry. Once its cursor is caught up, two unchanged probes
+  while a per-file error requires retry; once every source candidate has errored on three
+  consecutive probes the file is demoted to the cold sample (logged once at demotion), whose
+  ordinary cadence retries it. Once its cursor is caught up, two unchanged probes
   and an mtime at least five minutes old make it cold. Filesystems that do not report mtime
   use 30 unchanged probes instead.
 - Cold files are sampled through a round-robin queue capped at 256 metadata probes per tick.
@@ -267,6 +271,10 @@ completed transcript:
   directory mtime on every supported filesystem. Consequently a resumed cold transcript is
   noticed within the priority sweep started by a parent-directory change, or within one
   complete bounded cold-file sweep even without that change.
+  Queue entries left behind by reactivation or removal are invalidated lazily and drained at
+  a bounded rate (at most four times the probe cap of stale pops per tick, each performing
+  no filesystem work), so residue can neither drain unbounded in one tick nor starve
+  productive probes.
 
 Once the historical corpus is cold, a quiet tick performs at most 64 directory metadata probes,
 256 cold-file metadata probes, and one metadata probe per active file; those fixed terms do not
@@ -277,6 +285,12 @@ limits, idempotency, and the rule that errors do not advance cursors are unchang
 roots that do not exist at startup remain in the directory schedule so later creation is
 discovered. The same pinned identity applies to a configured root nested below another source
 root: removing and recreating the ancestor cannot discard the nested root's source kinds.
+A non-pinned file is removed from tracking only after two consecutive probes report it
+missing; a single NotFound (a transient atomic replace or filesystem hiccup) keeps the file
+and its cursor for one grace probe so a promptly recreated path resumes from its old offset
+instead of being reseeded to EOF. Cursor rows whose deletion fails are retried on later
+ticks until deleted, because a stale row reloaded after a restart would let a recreated
+same-path file silently skip bytes.
 
 #### Auxiliary schema
 
