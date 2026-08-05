@@ -105,7 +105,9 @@ def registry_counts(verbs_result: object) -> RegistryCounts:
     verbs = verbs_result.get("verbs")
     total = verbs_result.get("total")
     pack_counts = verbs_result.get("pack_counts")
-    if not isinstance(verbs, list) or not isinstance(total, int):
+    # bool is an int subclass in Python: reject it explicitly so a malformed
+    # producer emitting true/false cannot pass the integer checks.
+    if not isinstance(verbs, list) or not isinstance(total, int) or isinstance(total, bool):
         raise ValueError("verbs() result must contain list 'verbs' and integer 'total'")
     if not isinstance(pack_counts, dict):
         raise ValueError("verbs() result must contain object 'pack_counts'")
@@ -114,9 +116,19 @@ def registry_counts(verbs_result: object) -> RegistryCounts:
 
     parsed_pack_counts: dict[str, int] = {}
     for pack, count in pack_counts.items():
-        if not isinstance(pack, str) or not isinstance(count, int) or count < 0:
+        if (
+            not isinstance(pack, str)
+            or not isinstance(count, int)
+            or isinstance(count, bool)
+            or count < 0
+        ):
             raise ValueError(f"invalid verbs().pack_counts entry: {pack!r}: {count!r}")
-        parsed_pack_counts[pack.lower()] = count
+        key = pack.lower()
+        if key in parsed_pack_counts:
+            raise ValueError(
+                f"verbs().pack_counts contains case-colliding pack names for {key!r}"
+            )
+        parsed_pack_counts[key] = count
 
     observed = Counter()
     for entry in verbs:
@@ -611,9 +623,11 @@ def scan_repository(repo_root: Path, counts: RegistryCounts) -> list[CountClaim]
     claims: list[CountClaim] = []
     for path in _published_files(repo_root, counts.pack_verbs):
         relative = path.relative_to(repo_root).as_posix()
-        claims.extend(
-            scan_document(relative, path.read_text(encoding="utf-8"), counts.pack_verbs)
-        )
+        try:
+            text = path.read_text(encoding="utf-8")
+        except UnicodeDecodeError as exc:
+            raise ValueError(f"published file {relative} is not valid UTF-8: {exc}") from exc
+        claims.extend(scan_document(relative, text, counts.pack_verbs))
     return claims
 
 
@@ -627,7 +641,14 @@ def validate_documented_counts(repo_root: Path, verbs_result: object) -> list[st
         elif claim.kind == "total_packs":
             actual = counts.total_packs
         else:
-            actual = counts.pack_verbs[claim.pack or ""]
+            pack_key = claim.pack or ""
+            if pack_key not in counts.pack_verbs:
+                errors.append(
+                    f"{claim.path}:{claim.line}: claim attributed to unknown pack "
+                    f"{pack_key!r}: {claim.text}"
+                )
+                continue
+            actual = counts.pack_verbs[pack_key]
         if claim.value != actual:
             subject = f"{claim.pack} verbs" if claim.pack else claim.kind.replace("_", " ")
             errors.append(

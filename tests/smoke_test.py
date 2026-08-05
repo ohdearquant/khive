@@ -205,6 +205,22 @@ def main():
         assert isinstance(verbs_result["pack_counts"], dict), (
             f"verbs.pack_counts must be an object: {verbs_result}"
         )
+        # pack_counts covers every loaded pack, zero-verb packs included, and
+        # its values sum to the unfiltered total. `workspace` is the default
+        # set's zero-verb pack: its presence at 0 is the tripwire proving
+        # pack_counts enumerates packs rather than surviving verbs.
+        assert len(verbs_result["pack_counts"]) == 12, (
+            f"default config loads 12 packs; pack_counts must name each once: "
+            f"{sorted(verbs_result['pack_counts'])}"
+        )
+        assert verbs_result["pack_counts"].get("workspace") == 0, (
+            f"zero-verb workspace pack must appear in pack_counts with count 0: "
+            f"{verbs_result['pack_counts']}"
+        )
+        assert sum(verbs_result["pack_counts"].values()) == verbs_result["total"], (
+            f"pack_counts must sum to total: {verbs_result['pack_counts']} vs "
+            f"{verbs_result['total']}"
+        )
         documented_count_errors = validate_documented_counts(
             Path(__file__).resolve().parent.parent,
             verbs_result,
