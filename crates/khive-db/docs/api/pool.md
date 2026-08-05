@@ -63,12 +63,16 @@ do not hold a boxed writer handle across an `atomic_unit()` call on the same
 pool — drop the handle first. With the write queue enabled, `atomic_unit`
 runs inside the writer task instead and never touches this budget.
 
-A boxed writer handle retains its standalone connection and writer permit for
-the handle's whole lifetime even when the write queue is enabled and its
-mutating calls route through the writer task: the permit reserves the
-handle's fallback paths (every read method, and every mutating method once
-the writer task is unavailable) plus its connection-local behavior. Hold a
-writer handle only for a burst of operations, then drop it.
+When the write queue is enabled, `writer()` is queue-first (ADR-136 D1
+gate 1): it opens no standalone connection and holds no writer permit, and
+every mutating call routes through the writer task. Reads through such a
+queue-backed writer handle lazily open a standalone READ-ONLY connection on
+first use (`SqliteWriter::ensure_conn`) and hold a pool-wide reader permit
+for it, so a queue-backed handle can never execute DML on an untracked
+read-write connection. The one-permit writer budget therefore counts only
+standalone read-write writer handles — the flag-off/degraded `writer()`
+path and the manual `atomic_unit` path above. Hold a writer handle only for
+a burst of operations, then drop it.
 
 The optional writer task owns its separate, fixed connection and is not a
 caller-held SQL bridge handle. Store-specific standalone connections are also

@@ -492,12 +492,18 @@ The SQLite bridge also bounds its file-backed caller-held connections without
 changing their connection-local semantics. Permit state lives on the shared
 `ConnectionPool`, so constructing multiple `SqlBridge` values cannot multiply
 the budget. Live reader handles are capped at the pool's effective reader count
-(minimum one); live writer handles are capped at one. Acquisition uses the
-existing finite `checkout_timeout`, returns a typed timeout when saturated,
-and normally releases the permit when the boxed handle drops. If cancellation
-drops a handle while SQLite work is already running on a blocking thread, the
-connection and permit remain one owned resource until that blocking operation
-actually finishes; cancellation therefore cannot temporarily exceed the live
-connection budget. The writer task's fixed connection and store-internal
-operation-scoped connections are outside this raw-SQL handle budget and retain
-their ADR-067/ADR-135 contracts.
+(minimum one); live standalone writer connections are capped at one. Under
+queue-first write routing (ADR-136 D1), a `writer()` handle that obtained a
+`WriterTaskHandle` opens no standalone connection and holds no writer permit —
+its reads lazily open a read-only connection under a reader permit instead —
+so the one-permit writer budget counts exactly the standalone read-write
+writer handles (the flag-off/degraded `writer()` path and the manual
+`atomic_unit` path). Acquisition uses the existing finite `checkout_timeout`,
+returns a typed timeout when saturated, and normally releases the permit when
+the boxed handle drops. If cancellation drops a handle while SQLite work is
+already running on a blocking thread, the connection and permit remain one
+owned resource until that blocking operation actually finishes; cancellation
+therefore cannot temporarily exceed the live connection budget. The writer
+task's fixed connection and store-internal operation-scoped connections are
+outside this raw-SQL handle budget and retain their ADR-067/ADR-135
+contracts.
