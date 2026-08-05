@@ -902,7 +902,7 @@ pub enum ReplaySkipCategory {
     /// `section_signals`, missing payload column).
     Quarantine,
     /// Readable, valid row excluded by the replay-time policy filter
-    /// (see [`POLICY_EXCLUSION_WINDOW_START_US`]).
+    /// (see `POLICY_EXCLUSION_WINDOW_START_US`, private to this module).
     PolicyExcluded,
 }
 
