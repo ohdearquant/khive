@@ -224,31 +224,44 @@ impl<D> InProcessDaemonLauncher<D> {
 }
 
 pub(super) struct InProcessDaemonHandle {
-    task: tokio::task::JoinHandle<anyhow::Result<()>>,
+    task: Option<tokio::task::JoinHandle<anyhow::Result<()>>>,
 }
 
 impl std::fmt::Debug for InProcessDaemonHandle {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("InProcessDaemonHandle")
-            .field("finished", &self.task.is_finished())
+            .field(
+                "finished",
+                &self
+                    .task
+                    .as_ref()
+                    .map(tokio::task::JoinHandle::is_finished)
+                    .unwrap_or(true),
+            )
             .finish()
     }
 }
 
 impl InProcessDaemonHandle {
     pub(super) fn is_finished(&self) -> bool {
-        self.task.is_finished()
+        self.task
+            .as_ref()
+            .map(tokio::task::JoinHandle::is_finished)
+            .unwrap_or(true)
     }
 
-    pub(super) async fn stop(self) {
-        let aborted = !self.task.is_finished();
+    pub(super) async fn stop(mut self) {
+        let Some(task) = self.task.take() else {
+            return;
+        };
+        let aborted = !task.is_finished();
         if aborted {
             // Abort IS the teardown contract for a serving in-process daemon:
             // it otherwise serves until SIGTERM, which tests have no channel
             // to deliver. A still-running task is cancelled here on purpose.
-            self.task.abort();
+            task.abort();
         }
-        match self.task.await {
+        match task.await {
             Ok(result) => result.expect("in-process daemon task must exit without error"),
             Err(join_error) if aborted && join_error.is_cancelled() => {
                 // The expected outcome of this stop()'s own abort.
@@ -263,6 +276,14 @@ impl InProcessDaemonHandle {
             Err(join_error) => {
                 panic!("in-process daemon task failed: {join_error:?}");
             }
+        }
+    }
+}
+
+impl Drop for InProcessDaemonHandle {
+    fn drop(&mut self) {
+        if let Some(task) = self.task.take() {
+            task.abort();
         }
     }
 }
@@ -282,6 +303,43 @@ where
             let _running = RunningTaskGuard(state);
             run_daemon_in_process_test(dispatcher).await
         });
-        Ok(InProcessDaemonHandle { task })
+        Ok(InProcessDaemonHandle { task: Some(task) })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn in_process_daemon_handle_drop_aborts_task() {
+        let started = Arc::new(AtomicBool::new(false));
+        let completed = Arc::new(AtomicBool::new(false));
+        let task_started = Arc::clone(&started);
+        let task_completed = Arc::clone(&completed);
+        let task = tokio::spawn(async move {
+            task_started.store(true, Ordering::SeqCst);
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            task_completed.store(true, Ordering::SeqCst);
+            Ok(())
+        });
+        let handle = InProcessDaemonHandle { task: Some(task) };
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !started.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("drop regression fixture task must start");
+
+        drop(handle);
+        for _ in 0..20 {
+            assert!(
+                !completed.load(Ordering::SeqCst),
+                "dropping an in-process daemon handle must abort its task"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
     }
 }

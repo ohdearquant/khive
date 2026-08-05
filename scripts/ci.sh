@@ -206,7 +206,8 @@ run_daemon_recovery_repeats() {
     #
     # Fail-closed count gate: a libtest name filter that matches zero tests
     # still exits 0, so renaming or moving either test would silently turn
-    # this gate into a no-op. Enumerate the exact expected test names, capture
+    # this gate into a no-op. Enumerate the exact expected test names, pass
+    # --exact because libtest filters are substring matches by default, capture
     # the harness summary on every iteration, and require exactly that many
     # passes; any mismatch (including zero) exits 1 naming the filter.
     expected_test_names="\
@@ -225,7 +226,7 @@ run_daemon_recovery_repeats() {
         # the caller's shell mode (the script runs `set -e`, but a pipeline or
         # a future context change must not be able to disarm it).
         # shellcheck disable=SC2086
-        cargo test -p khive-mcp --lib -- --test-threads=1 $expected_test_names \
+        cargo test -p khive-mcp --lib -- --test-threads=1 --exact $expected_test_names \
             > "$output_file" 2>&1 || {
                 cat "$output_file" >&2
                 rm -f "$output_file"

@@ -5150,20 +5150,20 @@ mod tests {
             });
         }
 
-        let (spawned, skipped_or_uncertain) =
+        let (spawned, skipped, uncertain) =
             tokio::time::timeout(std::time::Duration::from_secs(30), async move {
                 let mut spawned: Vec<InProcessDaemonHandle> = Vec::new();
-                let mut skipped_or_uncertain = 0usize;
+                let mut skipped = 0usize;
+                let mut uncertain = 0usize;
                 while let Some(result) = recoverers.join_next().await {
                     match result.expect("recoverer task must not panic") {
                         Ok(RecoveryOutcome::Spawned(handle)) => spawned.push(handle),
-                        Ok(RecoveryOutcome::Skipped | RecoveryOutcome::Uncertain) => {
-                            skipped_or_uncertain += 1;
-                        }
+                        Ok(RecoveryOutcome::Skipped) => skipped += 1,
+                        Ok(RecoveryOutcome::Uncertain) => uncertain += 1,
                         Err(error) => panic!("parallel NoSocket recovery failed: {error:?}"),
                     }
                 }
-                (spawned, skipped_or_uncertain)
+                (spawned, skipped, uncertain)
             })
             .await
             .expect("parallel recoverers must quiesce within 30s");
@@ -5172,10 +5172,15 @@ mod tests {
             "at least one recoverer must launch a daemon"
         );
         assert_eq!(
-            spawned.len() + skipped_or_uncertain,
+            spawned.len() + skipped + uncertain,
             CLIENTS,
             "every parallel recoverer must reach a classified outcome"
         );
+        // Uncertain is a deadline-bound degraded outcome per
+        // docs/api/daemon-lifecycle.md. The healthy parallel path resolves
+        // losers as Skipped well inside the 16s deadline, so any Uncertain
+        // here is a regression signal, not noise.
+        assert_eq!(uncertain, 0, "healthy parallel recovery must not time out");
         assert_eq!(
             launcher.launched_count(),
             spawned.len(),
