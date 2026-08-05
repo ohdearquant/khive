@@ -62,9 +62,14 @@ fn parse_after_cursor(raw: &str) -> Result<Option<uuid::Uuid>, RuntimeError> {
 async fn resolve_message_thread_filter(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
-    kind_filter: Option<&str>,
     raw: &str,
 ) -> Result<String, RuntimeError> {
+    // Message-scope invariant: this resolver ONLY serves the message thread
+    // filter, so the DISTINCT scan binds kind='message' unconditionally. The
+    // caller's kind_filter can legitimately be None (list(kind="note")), and
+    // scanning every note kind would let a non-message note carrying a
+    // `thread_id` property inject candidates — producing false ambiguity
+    // errors or resolutions against rows the message filter can never return.
     if let Ok(thread_id) = raw.parse::<uuid::Uuid>() {
         return Ok(thread_id.as_hyphenated().to_string());
     }
@@ -76,15 +81,12 @@ async fn resolve_message_thread_filter(
     }
 
     let normalized_prefix = raw.to_ascii_lowercase();
-    let mut sql = "SELECT DISTINCT json_extract(properties, '$.thread_id') AS thread_id \
+    let sql = "SELECT DISTINCT json_extract(properties, '$.thread_id') AS thread_id \
                    FROM notes WHERE namespace = ?1 AND deleted_at IS NULL \
-                   AND json_type(properties, '$.thread_id') = 'text'"
+                   AND json_type(properties, '$.thread_id') = 'text' \
+                   AND kind = 'message'"
         .to_string();
-    let mut params = vec![SqlValue::Text(token.namespace().as_str().to_string())];
-    if let Some(kind) = kind_filter {
-        sql.push_str(" AND kind = ?2");
-        params.push(SqlValue::Text(kind.to_string()));
-    }
+    let params = vec![SqlValue::Text(token.namespace().as_str().to_string())];
     let mut reader = runtime
         .sql()
         .reader()
@@ -422,13 +424,7 @@ impl KgPack {
                 )?;
                 if let Some(raw_thread_id) = p.thread_id.clone() {
                     p.thread_id = Some(
-                        resolve_message_thread_filter(
-                            &self.runtime,
-                            token,
-                            kind_filter.as_deref(),
-                            &raw_thread_id,
-                        )
-                        .await?,
+                        resolve_message_thread_filter(&self.runtime, token, &raw_thread_id).await?,
                     );
                 }
                 let requested = p.limit.unwrap_or(20);

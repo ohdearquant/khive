@@ -386,9 +386,16 @@ Deduplication: when `external_id` is supplied, `try_create_note` uses a
 verify-after-insert check on the durable unique index on `external_id`. A
 confirmed duplicate returns `Ok(None)` without error; only an external_id
 collision is treated as dedup, other constraint violations surface as errors.
-The acknowledgement returns the canonical 36-character `thread_id` read from
-the existing row (falling back to that row's UUID for pre-v1 data), never the
-new root proposed by the duplicate delivery.
+The acknowledgement returns the `thread_id` read from the existing row — the
+canonical 36-character hyphenated UUID for v1 rows — never the new root
+proposed by the duplicate delivery. Exception: a pre-v1 row may store a
+non-UUID legacy thread label; the ack echoes that stored value verbatim
+(fabricating the duplicate's note UUID instead would route a caller echoing
+the ack into a DIFFERENT thread) and flags it with `thread_id_canonical:
+false` so a strict caller can detect the non-canonical shape without
+re-parsing the string. A row with NO stored `thread_id` falls back to the
+duplicate's note UUID as the thread root (#479b, ADR-040) and is flagged with
+`thread_id_warning` instead. See ADR-056 §Amendment 2026-08-04.
 
 Generic transport-layer metadata passthrough (issue #448, `IngestParams::metadata`):
 merged additively so it can never clobber a key already present. Names in the

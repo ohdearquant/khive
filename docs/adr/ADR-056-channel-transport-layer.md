@@ -3,13 +3,15 @@
 **Status**: Accepted (amended 2026-07-02 -- inbound authentication hardening; amended 2026-07-03
 -- Exchange Online no-authserv-id boundary; amended 2026-07-05 -- Telegram adapter
 implementation and two-way chat; amended 2026-07-09 -- durable IMAP UID cursor; amended
-2026-07-17 -- iMessage channel over an SSH bridge; see
+2026-07-17 -- iMessage channel over an SSH bridge; amended 2026-08-04 -- non-canonical thread
+identifiers in dedup acknowledgements; see
 [§Amendment 2026-07-02](#amendment-2026-07-02----inbound-authentication-hardening),
 [§Amendment 2026-07-03](#amendment-2026-07-03----exchange-online-no-authserv-id-boundary),
 [§Amendment 2026-07-05](#amendment-2026-07-05----telegram-adapter-implementation-and-two-way-chat),
 [§Amendment 2026-07-09](#amendment-2026-07-09----durable-imap-uid-cursor),
-[§Amendment 2026-07-17](#amendment-2026-07-17----imessage-channel-over-an-ssh-bridge))\
-**Date**: 2026-06-14 (amended 2026-07-02, 2026-07-03, 2026-07-05, 2026-07-09, 2026-07-17)\
+[§Amendment 2026-07-17](#amendment-2026-07-17----imessage-channel-over-an-ssh-bridge),
+[§Amendment 2026-08-04](#amendment-2026-08-04----non-canonical-thread-identifiers-in-dedup-acknowledgements))\
+**Date**: 2026-06-14 (amended 2026-07-02, 2026-07-03, 2026-07-05, 2026-07-09, 2026-07-17, 2026-08-04)\
 **Authors**: khive maintainers
 **Amended by**: [ADR-122](ADR-122-email-outbound-delivery.md) (email outbound
 delivery now runs as an externally linked supervised component)\
@@ -2754,6 +2756,48 @@ properties and is corrected here.
   path an unvalidated or malformed target value would otherwise open.
 - The address form (`imessage:<slug>`, normative) and the poll-interval and sender-validation
   rules are settled by this amendment text; no open items remain for design sign-off.
+
+## Amendment 2026-08-04 -- Non-canonical thread identifiers in dedup acknowledgements
+
+### Finding
+
+The dedup-response passages in §5a and §10 state that a confirmed duplicate `external_id`
+returns `{"ok": true, "deduplicated": true, "thread_id": "<canonical full UUID>"}`. That
+contract holds for rows written under the message-properties v1 schema, whose `thread_id` is
+always a canonical 36-character hyphenated UUID. It does not hold for pre-v1 rows: legacy and
+imported data may store an arbitrary non-UUID string as `properties.thread_id`.
+
+### Decision
+
+The acknowledgement echoes whatever `thread_id` the stored row carries, verbatim. Substituting
+the duplicate's note UUID when a non-UUID label is stored would be worse than the
+non-canonical shape: a caller that fed the fabricated value back into `comm.send(thread_id=...)`
+would silently root a NEW thread instead of continuing the stored one. The verbatim echo is
+the only value that keeps the round trip stable.
+
+To keep the canonical contract machine-checkable, the acknowledgement carries an explicit
+shape flag:
+
+- Stored `thread_id` parses as a UUID: the ack returns it with no extra field. The canonical
+  contract of §5a and §10 applies unchanged.
+- Stored `thread_id` is present but does NOT parse as a UUID: the ack echoes the stored string
+  and sets `thread_id_canonical: false`, so a strict caller can detect the non-canonical shape
+  without re-parsing the value.
+- Stored `thread_id` is absent (pre-v1 row with no thread field): the ack falls back to the
+  duplicate's note UUID as the thread root (ADR-040) and sets `thread_id_warning` naming the
+  value as derived, not stored.
+
+The two earlier response examples are therefore read as the v1-row case. With this amendment
+the full ack contract is: canonical UUID thread identifier for v1 rows; verbatim stored legacy
+label plus `thread_id_canonical: false` for non-UUID stored labels; derived note UUID plus
+`thread_id_warning` for rows with no stored `thread_id`.
+
+### Consequences
+
+- No change to `comm.ingest`'s dedup or write semantics; only the acknowledgement shape gains
+  the optional `thread_id_canonical` field (absent unless the stored value is non-canonical).
+- Channel adapters that echo the ack's `thread_id` into later sends remain correct in all three
+  cases; strict adapters can branch on the flag.
 
 ## Context
 

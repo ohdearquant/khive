@@ -95,6 +95,37 @@ fn validate_inbox_substring(field: &str, value: Option<&str>) -> Result<(), Runt
     Ok(())
 }
 
+/// Derive the `thread_id` a `comm.send` response reports from the persisted
+/// outbound note. A present, non-empty stored value is authoritative. An
+/// empty stored value is treated exactly like a missing one: it is only
+/// honest to fall back to the note's own UUID when the caller did NOT supply
+/// a thread root (the note genuinely IS the new root). When the caller
+/// supplied one, a missing or empty stored value means the write did not
+/// persist the requested root, and silently reporting the note UUID would
+/// route any continuation send into a NEW thread instead of the caller's.
+fn send_response_thread_id(
+    supplied_thread_id: Option<&str>,
+    outbound_note: &Note,
+) -> Result<String, RuntimeError> {
+    let stored_thread_id = outbound_note
+        .properties
+        .as_ref()
+        .and_then(|properties| properties.get("thread_id"))
+        .and_then(Value::as_str)
+        .filter(|raw| !raw.is_empty())
+        .map(str::to_owned);
+    match stored_thread_id {
+        Some(value) => Ok(value),
+        None if supplied_thread_id.is_some() => Err(RuntimeError::Internal(format!(
+            "send: outbound note {} was persisted without the caller-supplied thread_id \
+             {supplied_thread_id:?}; refusing to report the note's own UUID as the thread \
+             root because a continuation send would silently root a new thread",
+            outbound_note.id
+        ))),
+        None => Ok(outbound_note.id.as_hyphenated().to_string()),
+    }
+}
+
 fn inbox_note_matches(
     note: &Note,
     params: &InboxParams,
@@ -271,13 +302,10 @@ pub(crate) async fn handle_send(
     // `thread_id` is a strict full-UUID input on a later send. Surface the
     // canonical value persisted by `dual_write_message` so this response can
     // start or continue a thread without fetching the message first (#1482).
-    let response_thread_id = outbound_note
-        .properties
-        .as_ref()
-        .and_then(|properties| properties.get("thread_id"))
-        .and_then(Value::as_str)
-        .map(str::to_owned)
-        .unwrap_or_else(|| outbound_note.id.as_hyphenated().to_string());
+    // An empty stored value is treated as absent, and a missing/empty value
+    // after a caller-supplied root fails closed instead of silently rooting a
+    // new thread (#1623).
+    let response_thread_id = send_response_thread_id(thread_id.as_deref(), &outbound_note)?;
 
     let mut response = json!({
         "id": short_id(outbound_note.id),
@@ -1789,7 +1817,10 @@ pub(crate) async fn handle_ingest(
             // stored row genuinely has no thread_id (pre-v1 row) do we fall
             // back to the duplicate's note UUID as the thread root (#479b,
             // ADR-040) — and then flag it so a strict caller knows the value
-            // is derived, not stored.
+            // is derived, not stored. A present-but-non-UUID stored label is
+            // additionally flagged `thread_id_canonical: false` so a strict
+            // caller can detect the non-canonical shape without parsing the
+            // string itself (ADR-056 §Amendment 2026-08-04).
             let existing_thread_id = duplicate
                 .properties
                 .as_ref()
@@ -1810,6 +1841,11 @@ pub(crate) async fn handle_ingest(
                     "stored duplicate has no thread_id (legacy row); echoed the message's \
                      own note UUID as the thread root"
                 );
+            } else if existing_thread_id
+                .as_deref()
+                .is_some_and(|raw| raw.parse::<Uuid>().is_err())
+            {
+                ack["thread_id_canonical"] = json!(false);
             }
             return Ok(ack);
         }
@@ -2670,11 +2706,68 @@ mod tests {
     use super::{
         add_embedding_truncation_warning, build_references_header, channel_stalled,
         heartbeat_note_id, mark_read_target, message_id_match_candidates, parent_references_chain,
-        parent_wire_message_id, read_response, sanitize_reference_token, validate_read_target,
-        wrap_message_id,
+        parent_wire_message_id, read_response, sanitize_reference_token, send_response_thread_id,
+        validate_read_target, wrap_message_id,
     };
+    use khive_storage::note::Note;
     use khive_storage::StorageError;
     use serde_json::{json, Value};
+
+    fn note_with_thread_id(thread_id: Value) -> Note {
+        Note::new("local", "message", "body").with_properties(json!({ "thread_id": thread_id }))
+    }
+
+    fn note_without_thread_id() -> Note {
+        Note::new("local", "message", "body").with_properties(json!({}))
+    }
+
+    #[test]
+    fn send_response_thread_id_returns_stored_value_when_present() {
+        let note = note_with_thread_id(json!("stored-thread-root"));
+        let resolved = send_response_thread_id(Some("supplied-root"), &note)
+            .expect("a stored thread_id is authoritative");
+        assert_eq!(resolved, "stored-thread-root");
+    }
+
+    #[test]
+    fn send_response_thread_id_roots_new_thread_when_unsupplied() {
+        let note = note_without_thread_id();
+        let resolved =
+            send_response_thread_id(None, &note).expect("a root send reports the note's own UUID");
+        assert_eq!(resolved, note.id.as_hyphenated().to_string());
+    }
+
+    #[test]
+    fn send_response_thread_id_treats_empty_stored_value_as_absent() {
+        let note = note_with_thread_id(json!(""));
+        let resolved = send_response_thread_id(None, &note)
+            .expect("an empty stored value must not surface as an empty thread_id");
+        assert_eq!(resolved, note.id.as_hyphenated().to_string());
+    }
+
+    #[test]
+    fn send_response_thread_id_fails_closed_on_missing_stored_value_after_supply() {
+        let note = note_without_thread_id();
+        let err = send_response_thread_id(Some("supplied-root"), &note)
+            .expect_err("silently rooting a new thread would corrupt the caller's continuation");
+        let message = err.to_string();
+        assert!(
+            message.contains("without the caller-supplied thread_id"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn send_response_thread_id_fails_closed_on_empty_stored_value_after_supply() {
+        let note = note_with_thread_id(json!(""));
+        let err = send_response_thread_id(Some("supplied-root"), &note)
+            .expect_err("an empty stored value is not a persisted root");
+        let message = err.to_string();
+        assert!(
+            message.contains("without the caller-supplied thread_id"),
+            "{message}"
+        );
+    }
 
     #[test]
     fn channel_stalled_uses_strict_three_interval_threshold() {

@@ -1053,13 +1053,16 @@ async fn list_thread_filter_distinguishes_full_uuid_and_rejects_ambiguous_prefix
     let first_thread = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
     let second_thread = "aaaaaaaa-cccc-dddd-eeee-ffffffffffff";
 
+    // The thread-prefix resolver scans ONLY message notes (PR #1623 round 3),
+    // so both seed rows are messages — a same-shaped observation row below
+    // proves the message-scope binding excludes it.
     for (content, thread_id) in [
         ("first shared-prefix thread", first_thread),
         ("second shared-prefix thread", second_thread),
     ] {
         rt.create_note(
             &token,
-            "observation",
+            "message",
             None,
             content,
             None,
@@ -1069,6 +1072,17 @@ async fn list_thread_filter_distinguishes_full_uuid_and_rejects_ambiguous_prefix
         .await
         .expect("create threaded note");
     }
+    rt.create_note(
+        &token,
+        "observation",
+        None,
+        "non-message decoy sharing the same prefix",
+        None,
+        Some(serde_json::json!({"thread_id": "aaaaaaaa-9999-4000-8000-000000000003"})),
+        vec![],
+    )
+    .await
+    .expect("create decoy observation");
 
     let pack = KgPack::new(rt.clone());
     let mut builder = VerbRegistryBuilder::new();
@@ -1094,7 +1108,10 @@ async fn list_thread_filter_distinguishes_full_uuid_and_rejects_ambiguous_prefix
             &registry,
         )
         .await
-        .expect_err("shared prefix must be ambiguous");
+        .expect_err(
+            "shared prefix across two MESSAGE threads must be ambiguous; the \
+                     observation decoy must not be counted",
+        );
     let message = error.to_string();
     assert!(message.contains("ambiguous thread_id prefix"), "{message}");
     assert!(message.contains("one exact thread"), "{message}");

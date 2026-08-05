@@ -102,15 +102,21 @@ impl KgPack {
         khive_runtime::secret_gate::check_json(&p.changeset)?;
 
         // Error-shape split: only identifier-validation failures carry the
-        // full-UUID hint (Id128 serde errors surface ParseIdError's "UUID"
-        // wording). Generic shape errors — missing field, wrong type, unknown
-        // variant, non-identifier parse failures — surface serde's own
-        // message so the hint never misleads a caller whose identifiers were
-        // already well-formed.
+        // full-UUID hint. Detection matches on Id128's OWN ParseIdError
+        // Display constants (pinned by a unit test in khive-types), not on a
+        // prose substring like "UUID": serde surfaces a custom Deserialize
+        // error's Display text verbatim in its message, so an identifier
+        // failure always contains one of these exact strings while generic
+        // shape errors (missing field, wrong type, unknown variant) do not.
+        // Generic failures surface serde's own message so the hint never
+        // misleads a caller whose identifiers were already well-formed.
         let changeset: ProposalChangeset =
             serde_json::from_value(p.changeset.clone()).map_err(|e| {
                 let serde_message = e.to_string();
-                if serde_message.contains("UUID") {
+                let is_identifier_failure = serde_message
+                    .contains(khive_types::ParseIdError::INVALID_LENGTH_TEXT)
+                    || serde_message.contains(khive_types::ParseIdError::INVALID_HEX_TEXT);
+                if is_identifier_failure {
                     RuntimeError::InvalidInput(format!(
                         "invalid changeset: {serde_message}; every changeset identifier must be \
                          a full UUID because resolving a short prefix could miss, be ambiguous, \

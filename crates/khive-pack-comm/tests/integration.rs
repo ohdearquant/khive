@@ -3096,6 +3096,53 @@ async fn send_rejects_thread_prefix_with_resolution_consequence() {
     assert!(message.contains("explicit stable reference"), "{message}");
 }
 
+/// `comm.send` reports the persisted thread root so a continuation send can
+/// reuse it without fetching the message first (#1482). A root send reports
+/// the note's own UUID; a continuation send echoes the caller-supplied root.
+#[tokio::test]
+async fn send_response_thread_id_round_trips_root_and_continuation() {
+    let (registry, _rt) = build_registry_for_ns("local");
+
+    let root = registry
+        .dispatch(
+            "comm.send",
+            serde_json::json!({ "to": "local", "content": "root message" }),
+        )
+        .await
+        .expect("root send succeeds");
+    assert_eq!(
+        root["thread_id"], root["full_id"],
+        "a root send must report its own UUID as the thread root: {root}"
+    );
+    assert_eq!(
+        root["thread_id"].as_str().map(str::len),
+        Some(36),
+        "the reported root thread_id must be a full canonical UUID: {root}"
+    );
+
+    let supplied = root["thread_id"].as_str().unwrap();
+    let continuation = registry
+        .dispatch(
+            "comm.send",
+            serde_json::json!({
+                "to": "local",
+                "content": "continuation",
+                "thread_id": supplied,
+            }),
+        )
+        .await
+        .expect("continuation send succeeds");
+    assert_eq!(
+        continuation["thread_id"], supplied,
+        "a continuation send must echo the caller-supplied thread root so the \
+         caller can keep the thread going: {continuation}"
+    );
+    assert_ne!(
+        continuation["thread_id"], continuation["full_id"],
+        "the continuation note must not be reported as its own thread root: {continuation}"
+    );
+}
+
 /// `send` accepts UUID parser variants but stores only the v1 hyphenated form,
 /// so later exact-string thread queries cannot split the conversation.
 #[tokio::test]
@@ -4952,6 +4999,10 @@ async fn ingest_dedup_returns_existing_canonical_thread_id() {
         "the acknowledgement must identify the persisted thread, not the retry's proposed root"
     );
     assert_eq!(duplicate["thread_id"].as_str().unwrap().len(), 36);
+    assert!(
+        duplicate.get("thread_id_canonical").is_none(),
+        "a UUID-valued stored thread_id must not carry the non-canonical flag: {duplicate:?}"
+    );
 }
 
 /// Dedup ack for a legacy row whose stored thread_id is a non-UUID label must
@@ -5007,6 +5058,10 @@ async fn ingest_dedup_echoes_stored_non_uuid_thread_label() {
         duplicate.get("thread_id_warning").is_none(),
         "no warning when a stored thread_id is present: {duplicate:?}"
     );
+    assert_eq!(
+        duplicate["thread_id_canonical"], false,
+        "a non-UUID stored thread_id must be flagged non-canonical: {duplicate:?}"
+    );
 }
 
 /// Dedup ack for a legacy row with NO stored thread_id falls back to the
@@ -5056,6 +5111,11 @@ async fn ingest_dedup_without_stored_thread_id_falls_back_with_warning() {
     assert!(
         duplicate["thread_id_warning"].as_str().is_some(),
         "fallback must be flagged as derived, not stored: {duplicate:?}"
+    );
+    assert!(
+        duplicate.get("thread_id_canonical").is_none(),
+        "the derived note-UUID fallback is a parseable UUID and must not carry the \
+         non-canonical flag: {duplicate:?}"
     );
 }
 
@@ -5130,6 +5190,64 @@ async fn list_message_thread_filter_matches_legacy_hex_label_and_uuid_prefix() {
         "UUID prefix must return exactly its thread's message"
     );
     assert_eq!(prefixed[0]["properties"]["thread_id"], thread);
+}
+
+/// Regression (PR #1623 round 3): the thread-prefix resolver must scan ONLY
+/// `message` notes. A non-message note carrying a `thread_id` property that
+/// shares the queried prefix must not inject a second candidate (which would
+/// surface as a false "ambiguous thread_id prefix" error) when the caller
+/// lists with the substrate-level kind that leaves the note kind unbound.
+#[tokio::test]
+async fn list_thread_prefix_resolution_ignores_non_message_notes() {
+    let (registry, rt) = build_registry_for_ns("local");
+    let token = rt
+        .authorize(khive_runtime::Namespace::local())
+        .expect("authorize local");
+
+    let message_thread = "aaaa0000-1111-4000-8000-000000000001";
+    rt.create_note(
+        &token,
+        "message",
+        None,
+        "uuid-threaded message",
+        None,
+        Some(serde_json::json!({"thread_id": message_thread})),
+        vec![],
+    )
+    .await
+    .expect("create uuid-threaded message");
+
+    // Decoy: a non-message note carrying a thread_id whose first 8 hex chars
+    // collide with the message thread's prefix.
+    rt.create_note(
+        &token,
+        "observation",
+        None,
+        "non-message note with a colliding thread_id",
+        None,
+        Some(serde_json::json!({"thread_id": "aaaa0000-9999-4000-8000-000000000002"})),
+        vec![],
+    )
+    .await
+    .expect("create decoy observation");
+
+    // list(kind="note") leaves the note-kind filter unbound, so pre-fix the
+    // DISTINCT scan saw both UUIDs and errored "ambiguous thread_id prefix".
+    let result = registry
+        .dispatch(
+            "list",
+            serde_json::json!({"kind": "note", "thread_id": "aaaa0000"}),
+        )
+        .await
+        .expect("prefix resolution must ignore non-message notes");
+    let notes = result.as_array().expect("list result array");
+    assert_eq!(
+        notes.len(),
+        1,
+        "only the message carrying the resolved thread must match: {notes:?}"
+    );
+    assert_eq!(notes[0]["kind"], "message");
+    assert_eq!(notes[0]["properties"]["thread_id"], message_thread);
 }
 
 /// (a) Reply with correlation matching an outbound note whose from_actor=lambda:khive

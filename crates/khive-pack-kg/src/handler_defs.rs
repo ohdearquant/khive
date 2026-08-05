@@ -294,7 +294,12 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 20] = [
                 description: "Filter messages by thread ID (kind=\"message\" only). Accepts a \
                               complete UUID or a unique 8+ hex prefix resolved across stored \
                               thread roots in the caller's primary namespace; missing or \
-                              ambiguous prefixes fail explicitly.",
+                              ambiguous prefixes fail explicitly. Legacy exceptions: input that \
+                              is not hex, or is shorter than 8 chars, is never treated as a \
+                              prefix — it is matched exactly against stored thread labels \
+                              (e.g. pre-v1 non-UUID labels), and no match yields an empty list \
+                              rather than an error. For all-hex >=8-char input, a stored label \
+                              equal to the input takes precedence over any UUID-prefix match.",
             },
             ParamDef {
                 name: "direction",
