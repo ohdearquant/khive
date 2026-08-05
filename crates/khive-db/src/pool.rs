@@ -128,9 +128,14 @@ impl Default for PoolConfig {
                 .and_then(|v| v.parse::<i64>().ok())
                 .unwrap_or(DEFAULT_JOURNAL_SIZE_LIMIT_BYTES),
             read_only: false,
-            write_queue_enabled: std::env::var("KHIVE_WRITE_QUEUE")
-                .ok()
-                .map(|v| v == "1" || v.eq_ignore_ascii_case("true")),
+            // `var_os`, not `var`: the documented contract is "any SET value
+            // other than 1/true means Some(false)" — a set-but-non-Unicode
+            // value must count as set (var() would return Err and silently
+            // fall through to the file-backed default of enabled).
+            write_queue_enabled: std::env::var_os("KHIVE_WRITE_QUEUE").map(|v| {
+                v.to_str()
+                    .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            }),
             write_queue_capacity: std::env::var("KHIVE_WRITE_QUEUE_CAPACITY")
                 .ok()
                 .and_then(|v| v.parse::<usize>().ok())
