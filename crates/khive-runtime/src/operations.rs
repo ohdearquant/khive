@@ -806,6 +806,9 @@ pub const BASE_ENTITY_ENDPOINT_RULES: &[(&str, EdgeRelation, &str)] = &[
     ("artifact", EdgeRelation::DerivedFrom, "document"),
     ("artifact", EdgeRelation::DerivedFrom, "project"),
     ("artifact", EdgeRelation::DerivedFrom, "artifact"),
+    // ADR-002 amendment 2026-07-27: publication provenance — a curated or
+    // filtered publication copy points at the canonical source document.
+    ("document", EdgeRelation::DerivedFrom, "document"),
     // Temporal
     ("document", EdgeRelation::Precedes, "document"),
     ("dataset", EdgeRelation::Precedes, "dataset"),
@@ -6422,6 +6425,51 @@ mod tests {
             note.content,
             "issue-396 regression: model-less remember must succeed"
         );
+    }
+
+    #[tokio::test]
+    async fn document_derived_from_document_is_legal_per_adr002_amendment() {
+        assert!(base_entity_rule_allows(
+            "document",
+            EdgeRelation::DerivedFrom,
+            "document"
+        ));
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let canonical = rt
+            .create_entity(
+                &tok,
+                "document",
+                None,
+                "canonical source",
+                None,
+                None,
+                vec![],
+            )
+            .await
+            .unwrap();
+        let publication = rt
+            .create_entity(
+                &tok,
+                "document",
+                None,
+                "publication copy",
+                None,
+                None,
+                vec![],
+            )
+            .await
+            .unwrap();
+        rt.link(
+            &tok,
+            publication.id,
+            canonical.id,
+            EdgeRelation::DerivedFrom,
+            1.0,
+            None,
+        )
+        .await
+        .expect("ADR-002 2026-07-27 amendment: publication provenance edge must be accepted");
     }
 
     #[tokio::test]
