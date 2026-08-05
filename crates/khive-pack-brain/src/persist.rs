@@ -873,10 +873,15 @@ const POLICY_EXCLUSION_WINDOW_START_US: i64 = 1_777_593_600_000_000;
 
 /// End of the policy-exclusion window (exclusive), epoch µs.
 ///
-/// Open-ended (`None`) for now: the PR #1630 fix must reach the deployed
-/// binary before an end instant is truthful. Pin this bound to
-/// `Some(instant)` when that deployment is recorded — the predicate below
-/// already honours it, so flipping `None` to `Some(..)` is a one-line change.
+/// Open-ended (`None`) DELIBERATELY, not as an oversight: deployed binaries
+/// built before the PR #1630 fix keep minting class-member events, so any end
+/// instant chosen before that fix is verifiably serving would be false. Pin
+/// this bound to `Some(instant)` only when the deployment is verified by a
+/// positive artifact (behavior only the fixed binary emits, with a pre-state
+/// contrast), and cite that artifact in the pinning change — never a typed
+/// date. The predicate below already honours the bound, so the pin is a
+/// one-line change. Post-fix the handler abstains on omitted signals, so the
+/// predicate goes naturally quiet rather than over-excluding.
 const POLICY_EXCLUSION_WINDOW_END_US: Option<i64> = None;
 
 /// The excluded signal spelling — the same canonical string that
