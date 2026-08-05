@@ -1582,9 +1582,11 @@ pub fn validate_db_override_against_backends(
     match cli_db_override {
         Some(":memory:") => {
             tracing::warn!(
-                "--db :memory: (or KHIVE_DB=:memory:) is overriding {backend_count} \
-                 configured [[backends]] entries to in-memory storage for this invocation; \
-                 khive.toml's declared backend paths will not be used this run"
+                "--db :memory: (or KHIVE_DB=:memory:) is forcing {backend_count} configured \
+                 [[backends]] entries to ephemeral in-memory storage for this invocation; \
+                 the backend paths declared in the discovered config (./khive.toml, \
+                 <db-dir>/config.toml, or ~/.khive/config.toml) will not be used, and nothing \
+                 written this run persists after the process exits"
             );
             Ok(true)
         }
@@ -1598,11 +1600,12 @@ pub fn validate_db_override_against_backends(
             } else {
                 anyhow::bail!(
                     "--db {other:?} (or KHIVE_DB) cannot be combined with [[backends]]: \
-                 {backend_count} backend(s) are already declared in khive.toml, so applying \
-                 this override here is ambiguous (it could silently collapse distinct \
-                 declared backends onto a single file). Edit khive.toml directly to change \
-                 backend paths, or pass --db :memory: to force all backends in-memory for \
-                 this invocation."
+                 {backend_count} backend(s) are already declared in the discovered config, so \
+                 applying this override here is ambiguous (it could silently collapse distinct \
+                 declared backends onto a single file). Remedy: edit the backend paths in the \
+                 discovered config file (searched in order: ./khive.toml, \
+                 <db-dir>/config.toml, ~/.khive/config.toml), or point at a different config \
+                 with --config <file> / KHIVE_CONFIG."
                 );
             }
         }
@@ -2023,6 +2026,13 @@ pub fn build_server_with_explicit_namespace(
         KhiveConfig::load_with_home_fallback(args.config.as_deref(), db_path_for_config.as_deref())
             .map_err(|e| anyhow::anyhow!("config error: {e}"))?
             .unwrap_or_default();
+
+    // Issue #1586: disclose the resolved database target once at startup so a
+    // no-override invocation's silent default (`$HOME/.khive/khive.db`) is
+    // visible in the operator's log alongside the other startup facts. The
+    // backends slice keeps the line truthful in multi-backend mode, where the
+    // config-declared backend paths — not `config.db_path` — receive writes.
+    tracing::info!(target: "khive.boot", "{}", resolved_database_disclosure(config.db_path.as_deref(), &khive_cfg.backends));
 
     if khive_cfg.backends.is_empty() {
         // Single-backend path — identical to pre-ADR-028 behavior.
@@ -2530,6 +2540,57 @@ pub fn config_discovery_db_anchor(db: Option<&str>) -> Option<std::path::PathBuf
     db.and_then(|d| khive_runtime::resolve_db_anchor(Some(d)))
 }
 
+/// One-line disclosure of the database target(s) this process will write to,
+/// for CLI entry points that resolve a database path. Returns a sentence
+/// naming the resolved target: the concrete file path, the ephemeral
+/// in-memory marker when the resolved path is `:memory:`, or — when the
+/// loaded config declares `[[backends]]` — the config-declared backend
+/// targets, which are what actually receive writes in multi-backend mode
+/// (the single resolved anchor path is a discovery/fingerprint input there,
+/// not a write target).
+///
+/// The `:memory:` arm (resolved path `None`) wins even when backends are
+/// declared: a `:memory:` override forces every declared backend ephemeral
+/// (`force_memory` in [`validate_db_override_against_backends`]'s caller), so
+/// the ephemeral line is the truthful one.
+///
+/// Issue #1586: with no `--db`/`KHIVE_DB` override the resolver silently
+/// targets the default `$HOME/.khive/khive.db` — the production database for
+/// most installs. Naming the resolved target once at startup makes that
+/// implicit choice visible without adding a prompt or refusal. Callers decide
+/// the channel: `kkernel mcp` logs it at INFO with its other startup facts;
+/// `kkernel exec` prints it to stderr (its default log level is `warn`, so an
+/// INFO record would never surface there).
+pub fn resolved_database_disclosure(
+    resolved_db_path: Option<&std::path::Path>,
+    backends: &[BackendConfig],
+) -> String {
+    match resolved_db_path {
+        None => "database: :memory: (ephemeral in-memory; nothing persists)".to_string(),
+        Some(_) if !backends.is_empty() => {
+            let targets: Vec<String> = backends
+                .iter()
+                .map(|backend| match (&backend.kind, backend.path.as_deref()) {
+                    // Kind decides first: a `memory` backend's `path` is
+                    // ignored by construction (see `BackendConfig::path`), so
+                    // a stray configured path must not be presented as a
+                    // write target.
+                    (BackendKind::Memory, _) => format!("{}=:memory:", backend.name),
+                    (BackendKind::Sqlite, Some(path)) => {
+                        format!("{}={}", backend.name, path.display())
+                    }
+                    (BackendKind::Sqlite, None) => format!("{}=<unresolved>", backend.name),
+                })
+                .collect();
+            format!(
+                "database: config-declared backends govern storage targets: {}",
+                targets.join(", ")
+            )
+        }
+        Some(path) => format!("database: {} (resolved)", path.display()),
+    }
+}
+
 /// Inputs for [`resolve_runtime_config`] — the subset of serve-time arguments
 /// that determine the resolved [`RuntimeConfig`]. Callers other than
 /// `kkernel mcp` (e.g. `kkernel reindex`) supply these directly so they resolve
@@ -2892,6 +2953,95 @@ mod tests {
     #[test]
     fn config_discovery_db_anchor_memory_sentinel_is_none() {
         assert_eq!(config_discovery_db_anchor(Some(":memory:")), None);
+    }
+
+    // #1586: the resolved-database disclosure must name the concrete resolved
+    // path (or the ephemeral in-memory marker) so a default-targeted write is
+    // visible at startup.
+    #[test]
+    fn resolved_database_disclosure_names_file_path() {
+        let line = resolved_database_disclosure(
+            Some(std::path::Path::new("/home/op/.khive/khive.db")),
+            &[],
+        );
+        assert!(
+            line.contains("/home/op/.khive/khive.db"),
+            "disclosure must carry the resolved path; got: {line}"
+        );
+        assert!(
+            line.starts_with("database:"),
+            "disclosure is a single labelled startup line; got: {line}"
+        );
+    }
+
+    #[test]
+    fn resolved_database_disclosure_marks_memory_ephemeral() {
+        let line = resolved_database_disclosure(None, &[]);
+        assert!(
+            line.contains(":memory:") && line.contains("ephemeral"),
+            "in-memory disclosure must say the target is ephemeral; got: {line}"
+        );
+    }
+
+    // Multi-backend mode: writes go to the config-declared backend paths, not
+    // the resolved anchor path — the disclosure must name the real targets and
+    // must NOT present the anchor as the write target.
+    #[test]
+    fn resolved_database_disclosure_names_backend_targets_in_multi_backend_mode() {
+        let backends = vec![
+            BackendConfig {
+                name: "main".into(),
+                kind: BackendKind::Sqlite,
+                path: Some(std::path::PathBuf::from("/data/main.db")),
+                cache_mb: None,
+                journal_mode: None,
+                read_only: false,
+            },
+            BackendConfig {
+                name: "scratch".into(),
+                kind: BackendKind::Memory,
+                // Stray path on a memory backend: ignored by construction, so
+                // the disclosure must not present it as a write target.
+                path: Some(std::path::PathBuf::from("/data/ignored-stray.db")),
+                cache_mb: None,
+                journal_mode: None,
+                read_only: false,
+            },
+        ];
+        let anchor = std::path::Path::new("/home/op/.khive/khive.db");
+        let line = resolved_database_disclosure(Some(anchor), &backends);
+        assert!(
+            line.contains("main=/data/main.db") && line.contains("scratch=:memory:"),
+            "multi-backend disclosure must name each declared target; got: {line}"
+        );
+        assert!(
+            !line.contains("/home/op/.khive/khive.db"),
+            "multi-backend disclosure must not present the anchor path as a write target; got: {line}"
+        );
+        assert!(
+            !line.contains("ignored-stray"),
+            "a memory backend's stray configured path is ignored by construction and must not be disclosed; got: {line}"
+        );
+    }
+
+    // A `:memory:` override with declared backends forces every backend
+    // ephemeral (force_memory), so the ephemeral line wins over the backend
+    // listing.
+    #[test]
+    fn resolved_database_disclosure_memory_override_wins_over_backends() {
+        let backends = vec![BackendConfig {
+            name: "main".into(),
+            kind: BackendKind::Sqlite,
+            path: Some(std::path::PathBuf::from("/data/main.db")),
+            cache_mb: None,
+            journal_mode: None,
+            read_only: false,
+        }];
+        let line = resolved_database_disclosure(None, &backends);
+        assert!(
+            line.contains("ephemeral") && !line.contains("/data/main.db"),
+            "memory-forced run must disclose ephemerality, not the overridden file targets; got: {line}"
+        );
     }
 
     fn write_config(dir: &std::path::Path, body: &str) -> PathBuf {
@@ -5128,7 +5278,21 @@ region = "us-east-1"
                 Err(error) => error,
             };
 
-        assert!(error.to_string().contains("khive.toml"));
+        let msg = error.to_string();
+        assert!(
+            msg.contains("./khive.toml")
+                && msg.contains("<db-dir>/config.toml")
+                && msg.contains("~/.khive/config.toml"),
+            "remedy must name every searched config filename; got: {msg}"
+        );
+        assert!(
+            msg.contains("--config <file>") && msg.contains("KHIVE_CONFIG"),
+            "remedy must name the --config/KHIVE_CONFIG escape; got: {msg}"
+        );
+        assert!(
+            !msg.contains(":memory:"),
+            "remedy must not recommend the discarding :memory: override for ingest-shaped work; got: {msg}"
+        );
         assert!(
             !override_path.exists(),
             "rejecting an override must not create its database path"
@@ -5366,9 +5530,14 @@ region = "us-east-1"
         if let Err(err) = result {
             let msg = err.to_string();
             assert!(
-                msg.contains("khive.toml"),
-                "error message must point at khive.toml as where to make the change \
-                 instead; got: {msg}"
+                msg.contains("./khive.toml")
+                    && msg.contains("<db-dir>/config.toml")
+                    && msg.contains("~/.khive/config.toml"),
+                "remedy must name every searched config filename; got: {msg}"
+            );
+            assert!(
+                msg.contains("--config <file>") && msg.contains("KHIVE_CONFIG"),
+                "remedy must name the --config/KHIVE_CONFIG escape; got: {msg}"
             );
         }
     }
@@ -5998,9 +6167,14 @@ region = "us-east-1"
         if let Err(err) = result {
             let msg = err.to_string();
             assert!(
-                msg.contains("khive.toml"),
-                "error message must point at khive.toml as where to make the change \
-                 instead; got: {msg}"
+                msg.contains("./khive.toml")
+                    && msg.contains("<db-dir>/config.toml")
+                    && msg.contains("~/.khive/config.toml"),
+                "remedy must name every searched config filename; got: {msg}"
+            );
+            assert!(
+                msg.contains("--config <file>") && msg.contains("KHIVE_CONFIG"),
+                "remedy must name the --config/KHIVE_CONFIG escape; got: {msg}"
             );
         }
     }

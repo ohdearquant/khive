@@ -612,6 +612,7 @@ pub async fn run_exec(args: ExecArgs) -> Result<()> {
         cfg.db_path.as_deref(),
         db_anchor.as_deref(),
     )?;
+
     let db_context = ExecDbContext {
         raw: args.db,
         anchor: db_anchor,
@@ -735,6 +736,24 @@ enum ExecMode {
     OpsFile(PathBuf),
 }
 
+/// Issue #1586: disclose the resolved database target(s) once, before any
+/// dispatch, so a no-override invocation's silent default
+/// (`$HOME/.khive/khive.db` — the production database for most installs) is
+/// visible. Emitted after the caller has loaded the `[[backends]]` topology,
+/// so the line names the config-declared backend targets when those — not
+/// `cfg.db_path` — are what receive writes. Stderr rather than a tracing
+/// record because kkernel's default log level is `warn` (an INFO record would
+/// never surface) and stdout is reserved for JSON results. Best-effort write:
+/// the disclosure is nonessential, so a closed or failing stderr must not
+/// become an exec failure (`eprintln!` panics on a failed stderr write).
+/// Disclosure only: no prompt, no refusal.
+fn disclose_resolved_database(cfg: &RuntimeConfig, khive_cfg: &KhiveConfig) {
+    use std::io::Write;
+    let line =
+        khive_mcp::serve::resolved_database_disclosure(cfg.db_path.as_deref(), &khive_cfg.backends);
+    let _ = writeln!(std::io::stderr(), "{line}");
+}
+
 #[derive(Default)]
 struct ExecDbContext {
     raw: Option<String>,
@@ -850,6 +869,8 @@ async fn run_exec_inline_with_forward(
             db_context.anchor = cfg.db_path.clone();
         }
     }
+
+    disclose_resolved_database(&cfg, &khive_cfg);
 
     // ── daemon fast-path (Unix only) ─────────────────────────────────────────
     // The daemon path does not support --save-file (the daemon returns a string;
@@ -1009,6 +1030,8 @@ async fn run_exec_ops_file(
     )
     .map_err(|e| anyhow::anyhow!("config error: {e}"))?
     .unwrap_or_default();
+
+    disclose_resolved_database(&cfg, &khive_cfg);
 
     if atomic {
         let max_ops = atomic_max_ops.unwrap_or(khive_types::pack::ATOMIC_MAX_OPS_DEFAULT);
