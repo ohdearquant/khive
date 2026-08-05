@@ -47,8 +47,9 @@ pub trait SqlReader: Send + 'static {
     /// The default preserves source compatibility for alternate backends by
     /// slicing [`Self::query_all`]. Backends should override this method when
     /// they can stop row conversion at `page.limit`; khive-db's SQLite bridge
-    /// does so, bounding owned result materialization without rewriting the
-    /// caller's SQL.
+    /// does so. On that path, materialization is bounded by the caller-supplied
+    /// `page.limit`, and callers own choosing a sane limit; the database engine
+    /// may still do work for the query plan and offset.
     ///
     /// Like [`Self::query_all`], the default has no result-size bound: it
     /// materializes every matching row before slicing. Callers issuing
@@ -79,10 +80,17 @@ pub trait SqlReader: Send + 'static {
 #[async_trait]
 pub trait SqlWriter: SqlReader + Send + 'static {
     /// Execute a single DML statement and return the number of rows affected.
+    ///
+    /// Transaction-control rejection is an `execute_batch` contract; this
+    /// primitive remains available to internal transaction owners such as
+    /// `atomic_unit` for their `BEGIN`/`COMMIT`/`ROLLBACK` calls.
     async fn execute(&mut self, statement: SqlStatement) -> StorageResult<u64>;
     /// Execute multiple DML statements and return the total rows affected.
     async fn execute_batch(&mut self, statements: Vec<SqlStatement>) -> StorageResult<u64>;
     /// Execute a raw SQL script (no parameters; used for migrations).
+    ///
+    /// This script boundary is internal/migration-only and deliberately does
+    /// not inherit `execute_batch`'s transaction-control rejection.
     async fn execute_script(&mut self, script: String) -> StorageResult<()>;
 
     /// Execute a raw SQL script that MUST run outside any open transaction
@@ -98,6 +106,9 @@ pub trait SqlWriter: SqlReader + Send + 'static {
     /// overrides this to route around its writer task's per-request `BEGIN
     /// IMMEDIATE` specifically for this call, while still serializing
     /// through the single writer owner.
+    ///
+    /// This is an internal maintenance boundary (for example `VACUUM` or a
+    /// checkpoint script), not an `execute_batch` transaction-control guard.
     async fn execute_script_top_level(&mut self, script: String) -> StorageResult<()> {
         self.execute_script(script).await
     }

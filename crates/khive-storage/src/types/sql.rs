@@ -21,6 +21,12 @@ pub enum SqlValue {
 }
 
 /// A parameterized SQL statement with optional diagnostic label.
+///
+/// `sql` is one SQLite statement, not a script. Backends must reject trailing
+/// executable SQL (including a trailing transaction-control statement) before
+/// executing the statement; use [`crate::SqlWriter::execute_batch`] for
+/// multiple parameterized statements and [`crate::SqlWriter::execute_script`]
+/// for raw scripts.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SqlStatement {
     pub sql: String,

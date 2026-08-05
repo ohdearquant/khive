@@ -90,6 +90,11 @@ caller-held SQL bridge handle. Store-specific standalone connections are also
 outside this raw-SQL handle budget; their write ownership remains governed by
 ADR-067 and ADR-135.
 
+`query_page` materializes at most the caller's requested `page.limit` rows on
+the SQLite bridge, but it does not impose a server-side maximum. Callers own
+choosing sane limits; large offsets and expensive query plans can still make
+SQLite do substantial engine work before those bounded rows are returned.
+
 These caps are NOT a global SQLite connection cap: they bound live
 caller-held bridge handles only. The pool's own reader queue and writer
 connection, the writer task's fixed connection, store-specific standalone
@@ -143,6 +148,11 @@ acquire a fresh one, exactly as for cancellation invalidation above:
   original BEGIN error. Pinned by
   `non_transient_begin_failure_poisons_handle` and
   `busy_begin_failure_restores_handle_reusable`.
+- **COMMIT failure followed by successful ROLLBACK.** The transaction's
+  `COMMIT` failed, cleanup `ROLLBACK` succeeded, and the handle is restored as
+  reusable while the COMMIT error is surfaced to the caller. A failed
+  ROLLBACK is the separate poisoning case above; the distinction keeps a
+  recoverable connection available.
 
 ### `writer_task_handle_fails_loud_without_tokio_runtime`
 

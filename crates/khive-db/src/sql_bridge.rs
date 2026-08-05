@@ -85,6 +85,34 @@ pub(crate) fn bind_params(
     Ok(())
 }
 
+/// Prepare exactly one [`SqlStatement`] SQL string.
+///
+/// rusqlite's `Connection::prepare` checks SQLite's returned tail and returns
+/// `rusqlite::Error::MultipleStatement` when the tail contains another
+/// executable statement (tail comments remain valid). Keeping this wrapper at
+/// the bridge boundary makes the single-statement `SqlStatement` contract
+/// explicit for queries and writes alike.
+fn prepare_sql_statement<'conn>(
+    conn: &'conn rusqlite::Connection,
+    sql: &str,
+) -> Result<rusqlite::Statement<'conn>, rusqlite::Error> {
+    conn.prepare(sql)
+}
+
+/// Preflight only the multiple-statement boundary. Other prepare errors are
+/// left for the normal execution phase so transaction/rollback behavior for
+/// ordinary invalid SQL remains unchanged.
+fn reject_multiple_statement(
+    conn: &rusqlite::Connection,
+    sql: &str,
+) -> Result<(), rusqlite::Error> {
+    match prepare_sql_statement(conn, sql) {
+        Ok(_) => Ok(()),
+        Err(error @ rusqlite::Error::MultipleStatement) => Err(error),
+        Err(_) => Ok(()),
+    }
+}
+
 /// SQL statement heads that are transaction control. `execute_batch` owns the
 /// `BEGIN`/`COMMIT` boundary for the whole batch (the standalone path wraps
 /// the list in its own `BEGIN IMMEDIATE`, and the queue-backed path runs
@@ -103,6 +131,9 @@ const TRANSACTION_CONTROL_KEYWORDS: [&str; 6] =
 /// never matches.
 fn transaction_control_head(sql: &str) -> Option<&'static str> {
     let mut rest: &[u8] = sql.as_bytes();
+    if rest.starts_with(b"\xEF\xBB\xBF") {
+        rest = &rest[3..];
+    }
     loop {
         let mut idx = 0;
         while idx < rest.len() && rest[idx].is_ascii_whitespace() {
@@ -211,7 +242,7 @@ fn execute_query(
     conn: &rusqlite::Connection,
     statement: &SqlStatement,
 ) -> Result<Vec<SqlRow>, rusqlite::Error> {
-    let mut stmt = conn.prepare(&statement.sql)?;
+    let mut stmt = prepare_sql_statement(conn, &statement.sql)?;
     bind_params(&mut stmt, &statement.params)?;
 
     let col_count = stmt.column_count();
@@ -231,7 +262,7 @@ fn execute_query_row(
     conn: &rusqlite::Connection,
     statement: &SqlStatement,
 ) -> Result<Option<SqlRow>, rusqlite::Error> {
-    let mut stmt = conn.prepare(&statement.sql)?;
+    let mut stmt = prepare_sql_statement(conn, &statement.sql)?;
     bind_params(&mut stmt, &statement.params)?;
 
     let col_count = stmt.column_count();
@@ -254,12 +285,12 @@ fn execute_query_page(
     // SQL fails identically across every limit; it skips the row cursor
     // entirely and returns no rows.
     if page.limit == 0 {
-        let mut stmt = conn.prepare(&statement.sql)?;
+        let mut stmt = prepare_sql_statement(conn, &statement.sql)?;
         bind_params(&mut stmt, &statement.params)?;
         return Ok(Vec::new());
     }
 
-    let mut stmt = conn.prepare(&statement.sql)?;
+    let mut stmt = prepare_sql_statement(conn, &statement.sql)?;
     bind_params(&mut stmt, &statement.params)?;
 
     let col_count = stmt.column_count();
@@ -272,8 +303,9 @@ fn execute_query_page(
     let mut remaining = u64::from(page.limit);
     let mut raw_rows = stmt.raw_query();
     // The bound covers owned Rust rows only — this function advances past
-    // `offset`, owns at most `limit` rows, and drops the statement cursor
-    // immediately afterward (ADR-005's bounded-materialization amendment).
+    // `offset`, owns at most the caller-supplied `page.limit` rows, and drops
+    // the statement cursor immediately afterward (ADR-005's bounded-
+    // materialization amendment). Callers own choosing a sane limit.
     // Engine work is the query plan's own cost, not O(offset + limit):
     // SQLite still produces and discards `offset` rows, and an unindexed
     // ORDER BY can force a full sort of the result set before the first row
@@ -359,6 +391,26 @@ fn open_standalone_writer(pool: &ConnectionPool) -> Result<rusqlite::Connection,
     Ok(conn)
 }
 
+/// Lift a standalone open onto the blocking thread pool while carrying the
+/// connection-cap permit into the same closure.
+///
+/// If the awaiting future is cancelled, the detached blocking closure owns
+/// both the connection result and the permit until it finishes, so the cap
+/// cannot be released while an open is still running.
+async fn open_standalone_on_blocking<F>(
+    pool: Arc<ConnectionPool>,
+    slot: OwnedSemaphorePermit,
+    operation: &'static str,
+    open: F,
+) -> khive_storage::types::StorageResult<(rusqlite::Connection, OwnedSemaphorePermit)>
+where
+    F: FnOnce(&ConnectionPool) -> Result<rusqlite::Connection, StorageError> + Send + 'static,
+{
+    tokio::task::spawn_blocking(move || open(&pool).map(|conn| (conn, slot)))
+        .await
+        .map_err(|e| StorageError::driver(StorageCapability::Sql, operation, e))?
+}
+
 /// [`open_standalone_reader`] lifted onto the blocking thread pool.
 ///
 /// Opening a SQLite connection is filesystem I/O (open the file, read the
@@ -366,25 +418,22 @@ fn open_standalone_writer(pool: &ConnectionPool) -> Result<rusqlite::Connection,
 /// database lock is acquired at open itself — locks are taken on the first
 /// statement — but filesystem latency is unbounded, and this module already
 /// runs every other rusqlite call under `spawn_blocking`, so the open gets
-/// the same treatment instead of blocking an async worker thread. Callers
-/// must already hold the reader permit; it is held across the open exactly
-/// as in the synchronous shape.
+/// the same treatment instead of blocking an async worker thread. The reader
+/// permit is supplied to the helper and returned with the connection.
 async fn open_standalone_reader_on_blocking(
     pool: Arc<ConnectionPool>,
-) -> khive_storage::types::StorageResult<rusqlite::Connection> {
-    tokio::task::spawn_blocking(move || open_standalone_reader(&pool))
-        .await
-        .map_err(|e| StorageError::driver(StorageCapability::Sql, "open_reader", e))?
+    slot: OwnedSemaphorePermit,
+) -> khive_storage::types::StorageResult<(rusqlite::Connection, OwnedSemaphorePermit)> {
+    open_standalone_on_blocking(pool, slot, "open_reader", open_standalone_reader).await
 }
 
 /// [`open_standalone_writer`] lifted onto the blocking thread pool; see
 /// [`open_standalone_reader_on_blocking`] for the blocking rationale.
 async fn open_standalone_writer_on_blocking(
     pool: Arc<ConnectionPool>,
-) -> khive_storage::types::StorageResult<rusqlite::Connection> {
-    tokio::task::spawn_blocking(move || open_standalone_writer(&pool))
-        .await
-        .map_err(|e| StorageError::driver(StorageCapability::Sql, "open_writer", e))?
+    slot: OwnedSemaphorePermit,
+) -> khive_storage::types::StorageResult<(rusqlite::Connection, OwnedSemaphorePermit)> {
+    open_standalone_on_blocking(pool, slot, "open_writer", open_standalone_writer).await
 }
 
 // =============================================================================
@@ -554,7 +603,7 @@ impl SqliteWriter {
             "sql_bridge.reader_handle",
         )
         .await?;
-        let conn = open_standalone_reader_on_blocking(pool).await?;
+        let (conn, handle_slot) = open_standalone_reader_on_blocking(pool, handle_slot).await?;
         Ok(StandaloneHandle {
             conn,
             _slot: handle_slot,
@@ -666,14 +715,15 @@ impl khive_storage::SqlWriter for SqliteWriter {
     ) -> khive_storage::types::StorageResult<u64> {
         // ADR-067 Component A (Fork C slice 2): a single statement is
         // self-contained, just like `execute_batch`'s full statement list —
+        // transaction-control rejection remains an `execute_batch` contract;
+        // this primitive is also used by internal atomic transaction owners.
         // route it through the writer task when available. `self.handle` is
         // left untouched so a subsequent `execute`/`execute_script` call on
         // this same handle still works over the standalone connection.
         if let Some(writer_task) = self.writer_task.clone() {
             return writer_task
                 .send(move |conn| {
-                    let mut stmt = conn
-                        .prepare_cached(&statement.sql)
+                    let mut stmt = prepare_sql_statement(conn, &statement.sql)
                         .map_err(|e| map_rusqlite_err(e, "execute"))?;
                     bind_params(&mut stmt, &statement.params)
                         .map_err(|e| map_rusqlite_err(e, "execute"))?;
@@ -691,7 +741,7 @@ impl khive_storage::SqlWriter for SqliteWriter {
         })?;
         let (handle, result) = tokio::task::spawn_blocking(move || {
             let res = (|| -> Result<usize, rusqlite::Error> {
-                let mut stmt = handle.conn.prepare_cached(&statement.sql)?;
+                let mut stmt = prepare_sql_statement(&handle.conn, &statement.sql)?;
                 bind_params(&mut stmt, &statement.params)?;
                 stmt.raw_execute()
             })();
@@ -734,10 +784,13 @@ impl khive_storage::SqlWriter for SqliteWriter {
         if let Some(writer_task) = self.writer_task.clone() {
             return writer_task
                 .send(move |conn| {
+                    for statement in &statements {
+                        reject_multiple_statement(conn, &statement.sql)
+                            .map_err(|e| map_rusqlite_err(e, "execute_batch"))?;
+                    }
                     let mut total: u64 = 0;
                     for statement in &statements {
-                        let mut stmt = conn
-                            .prepare(&statement.sql)
+                        let mut stmt = prepare_sql_statement(conn, &statement.sql)
                             .map_err(|e| map_rusqlite_err(e, "execute_batch"))?;
                         bind_params(&mut stmt, &statement.params)
                             .map_err(|e| map_rusqlite_err(e, "execute_batch"))?;
@@ -757,6 +810,18 @@ impl khive_storage::SqlWriter for SqliteWriter {
         })?;
         let origin = self.origin.clone();
         let (handle, result) = tokio::task::spawn_blocking(move || {
+            if let Err(error) = statements
+                .iter()
+                .try_for_each(|statement| reject_multiple_statement(&handle.conn, &statement.sql))
+            {
+                return (
+                    Some(handle),
+                    Err(BatchFailure {
+                        error,
+                        poison_reason: None,
+                    }),
+                );
+            }
             if let Err(begin_error) = handle.conn.execute_batch("BEGIN IMMEDIATE") {
                 // Busy/locked is transient contention (another writer held
                 // SQLite's write lock past `busy_timeout`); the connection
@@ -805,7 +870,7 @@ impl khive_storage::SqlWriter for SqliteWriter {
             let result = (|| -> Result<u64, rusqlite::Error> {
                 let mut total: u64 = 0;
                 for statement in &statements {
-                    let mut stmt = handle.conn.prepare(&statement.sql)?;
+                    let mut stmt = prepare_sql_statement(&handle.conn, &statement.sql)?;
                     bind_params(&mut stmt, &statement.params)?;
                     total += stmt.raw_execute()? as u64;
                 }
@@ -880,7 +945,10 @@ impl khive_storage::SqlWriter for SqliteWriter {
         // over the standalone connection. Callers must supply a DML-only
         // script (no bare `BEGIN`/`COMMIT`/`ROLLBACK`) on the flag-on path,
         // since it runs inside the writer task's own transaction — same
-        // contract as `execute_batch`'s statement list.
+        // Boundary: transaction-control rejection is an `execute_batch`
+        // contract; this raw script path is internal/migration-only. The
+        // queue-backed branch still requires a DML-only script because it
+        // runs inside the writer task's transaction.
         if let Some(writer_task) = self.writer_task.clone() {
             return writer_task
                 .send(move |conn| {
@@ -915,6 +983,8 @@ impl khive_storage::SqlWriter for SqliteWriter {
         &mut self,
         script: String,
     ) -> khive_storage::types::StorageResult<()> {
+        // Boundary: this internal maintenance/migration path deliberately
+        // bypasses the `execute_batch` transaction-control rejection.
         // ADR-067 Component A: unlike
         // `execute_script`, this must NOT run inside the writer task's
         // per-request `BEGIN IMMEDIATE` — statements such as VACUUM are
@@ -1118,13 +1188,16 @@ impl khive_storage::SqlWriter for PoolBackedWriter {
         &mut self,
         statement: SqlStatement,
     ) -> khive_storage::types::StorageResult<u64> {
+        // Boundary: `execute_batch` owns transaction-control rejection;
+        // this one-statement primitive is used by internal DML/transaction
+        // owners and is still guarded by the SqlStatement single-statement
+        // prepare contract.
         let pool = Arc::clone(&self.pool);
         tokio::task::spawn_blocking(move || {
             let guard = pool.try_writer().map_err(|e: SqliteError| {
                 StorageError::driver(StorageCapability::Sql, "pool_writer.execute", e)
             })?;
-            let mut stmt = guard
-                .prepare_cached(&statement.sql)
+            let mut stmt = prepare_sql_statement(&guard, &statement.sql)
                 .map_err(|e| map_rusqlite_err(e, "pool_writer.execute"))?;
             bind_params(&mut stmt, &statement.params)
                 .map_err(|e| map_rusqlite_err(e, "pool_writer.execute"))?;
@@ -1150,6 +1223,10 @@ impl khive_storage::SqlWriter for PoolBackedWriter {
             let guard = pool.try_writer().map_err(|e: SqliteError| {
                 StorageError::driver(StorageCapability::Sql, "pool_writer.execute_batch", e)
             })?;
+            for statement in &statements {
+                reject_multiple_statement(&guard, &statement.sql)
+                    .map_err(|e| map_rusqlite_err(e, "pool_writer.execute_batch"))?;
+            }
             guard
                 .execute_batch("BEGIN IMMEDIATE")
                 .map_err(|e| map_rusqlite_err(e, "pool_writer.execute_batch"))?;
@@ -1160,8 +1237,7 @@ impl khive_storage::SqlWriter for PoolBackedWriter {
             let result = (|| -> Result<u64, StorageError> {
                 let mut total = 0u64;
                 for statement in &statements {
-                    let mut stmt = guard
-                        .prepare(&statement.sql)
+                    let mut stmt = prepare_sql_statement(&guard, &statement.sql)
                         .map_err(|e| map_rusqlite_err(e, "pool_writer.execute_batch"))?;
                     bind_params(&mut stmt, &statement.params)
                         .map_err(|e| map_rusqlite_err(e, "pool_writer.execute_batch"))?;
@@ -1192,6 +1268,8 @@ impl khive_storage::SqlWriter for PoolBackedWriter {
     }
 
     async fn execute_script(&mut self, script: String) -> khive_storage::types::StorageResult<()> {
+        // Boundary: raw scripts are internal/migration-only and do not inherit
+        // `execute_batch`'s transaction-control rejection.
         let pool = Arc::clone(&self.pool);
         tokio::task::spawn_blocking(move || {
             let guard = pool.try_writer().map_err(|e: SqliteError| {
@@ -1307,9 +1385,9 @@ impl khive_storage::SqlWriter for InlineWriter {
         &mut self,
         statement: SqlStatement,
     ) -> khive_storage::types::StorageResult<u64> {
-        let mut stmt = self
-            .conn()
-            .prepare_cached(&statement.sql)
+        // Boundary: `execute_batch` owns transaction-control rejection;
+        // `atomic_unit` uses this one-statement primitive for its own boundary.
+        let mut stmt = prepare_sql_statement(self.conn(), &statement.sql)
             .map_err(|e| map_rusqlite_err(e, "inline.execute"))?;
         bind_params(&mut stmt, &statement.params)
             .map_err(|e| map_rusqlite_err(e, "inline.execute"))?;
@@ -1328,11 +1406,13 @@ impl khive_storage::SqlWriter for InlineWriter {
         // task's transaction — reject transaction-control statements up
         // front, same contract as every other `execute_batch`.
         reject_transaction_control_statements(&statements, "inline.execute_batch")?;
+        for statement in &statements {
+            reject_multiple_statement(self.conn(), &statement.sql)
+                .map_err(|e| map_rusqlite_err(e, "inline.execute_batch"))?;
+        }
         let mut total: u64 = 0;
         for statement in &statements {
-            let mut stmt = self
-                .conn()
-                .prepare(&statement.sql)
+            let mut stmt = prepare_sql_statement(self.conn(), &statement.sql)
                 .map_err(|e| map_rusqlite_err(e, "inline.execute_batch"))?;
             bind_params(&mut stmt, &statement.params)
                 .map_err(|e| map_rusqlite_err(e, "inline.execute_batch"))?;
@@ -1345,6 +1425,8 @@ impl khive_storage::SqlWriter for InlineWriter {
     }
 
     async fn execute_script(&mut self, script: String) -> khive_storage::types::StorageResult<()> {
+        // Boundary: this raw script path is internal maintenance only and is
+        // outside the `execute_batch` transaction-control contract.
         self.conn()
             .execute_batch(&script)
             .map_err(|e| map_rusqlite_err(e, "inline.execute_script"))
@@ -1485,7 +1567,8 @@ impl khive_storage::SqlAccess for SqlBridge {
                 "sql_bridge.reader_handle",
             )
             .await?;
-            let conn = open_standalone_reader_on_blocking(Arc::clone(&self.pool)).await?;
+            let (conn, handle_slot) =
+                open_standalone_reader_on_blocking(Arc::clone(&self.pool), handle_slot).await?;
             Ok(Box::new(SqliteReader {
                 handle: Some(StandaloneHandle {
                     conn,
@@ -1565,7 +1648,8 @@ impl khive_storage::SqlAccess for SqlBridge {
                     "sql_bridge.writer_handle",
                 )
                 .await?;
-                let conn = open_standalone_writer_on_blocking(Arc::clone(&self.pool)).await?;
+                let (conn, handle_slot) =
+                    open_standalone_writer_on_blocking(Arc::clone(&self.pool), handle_slot).await?;
                 Some(StandaloneHandle {
                     conn,
                     _slot: handle_slot,
@@ -1674,7 +1758,8 @@ impl khive_storage::SqlAccess for SqlBridge {
                 "sql_bridge.atomic_unit_handle",
             )
             .await?;
-            let conn = open_standalone_writer_on_blocking(Arc::clone(&self.pool)).await?;
+            let (conn, handle_slot) =
+                open_standalone_writer_on_blocking(Arc::clone(&self.pool), handle_slot).await?;
             let mut writer = SqliteWriter {
                 handle: Some(StandaloneHandle {
                     conn,
@@ -1982,6 +2067,64 @@ mod tests {
         drop(writer);
         let writer_after_release = bridge.writer().await.unwrap();
         drop(writer_after_release);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_standalone_open_retains_slot_until_open_finishes() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = PoolConfig {
+            path: Some(dir.path().join("sql_bridge_cancelled_open.db")),
+            max_readers: 1,
+            checkout_timeout: std::time::Duration::from_millis(250),
+            ..PoolConfig::default()
+        };
+        let pool = Arc::new(ConnectionPool::new(config).unwrap());
+        let slots = pool.sql_bridge_reader_slots();
+        let slot = Arc::clone(&slots).acquire_owned().await.unwrap();
+        assert_eq!(slots.available_permits(), 0);
+
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let open = tokio::spawn(open_standalone_on_blocking(
+            Arc::clone(&pool),
+            slot,
+            "test_open_reader",
+            move |pool| {
+                entered_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                open_standalone_reader(pool)
+            },
+        ));
+        tokio::task::spawn_blocking(move || entered_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+
+        open.abort();
+        assert!(matches!(open.await, Err(error) if error.is_cancelled()));
+        assert_eq!(
+            slots.available_permits(),
+            0,
+            "the permit must remain in the detached open closure"
+        );
+        let contender = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            Arc::clone(&slots).acquire_owned(),
+        )
+        .await;
+        assert!(contender.is_err(), "an in-flight open must retain the cap");
+
+        release_tx.send(()).unwrap();
+        let recovered = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            Arc::clone(&slots).acquire_owned(),
+        )
+        .await
+        .expect("the detached open did not release its permit")
+        .unwrap();
+        assert_eq!(slots.available_permits(), 0);
+        drop(recovered);
+        assert_eq!(slots.available_permits(), 1);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2348,6 +2491,29 @@ mod tests {
             pool: Arc::clone(&pool),
         };
 
+        for tail in ["COMMIT", "BEGIN"] {
+            let multi = khive_storage::SqlWriter::execute_batch(
+                &mut writer,
+                vec![SqlStatement {
+                    sql: format!(
+                        "INSERT INTO tx_reject_test (id, val) VALUES (10, 'tail'); {tail}"
+                    ),
+                    params: vec![],
+                    label: None,
+                }],
+            )
+            .await;
+            let message = multi
+                .as_ref()
+                .err()
+                .map(ToString::to_string)
+                .unwrap_or_default();
+            assert!(
+                message.contains("Multiple statements"),
+                "a SqlStatement with trailing {tail} must be rejected before execution; got {message}"
+            );
+        }
+
         // A valid INSERT first, then a bare COMMIT: the whole batch must be
         // rejected and the INSERT must NOT have run.
         let batch = khive_storage::SqlWriter::execute_batch(
@@ -2433,6 +2599,109 @@ mod tests {
         assert_eq!(affected, 1);
     }
 
+    #[tokio::test]
+    async fn execute_batch_rejects_multi_statement_on_pool_backed_path() {
+        let pool = Arc::new(ConnectionPool::new(PoolConfig::default()).unwrap());
+        pool.writer()
+            .unwrap()
+            .conn()
+            .execute_batch(
+                "CREATE TABLE multi_statement_pool_test (id INTEGER PRIMARY KEY, val TEXT)",
+            )
+            .unwrap();
+        let bridge = SqlBridge::new(Arc::clone(&pool), false);
+        let mut writer = bridge.writer().await.unwrap();
+
+        let result = khive_storage::SqlWriter::execute_batch(
+            &mut *writer,
+            vec![SqlStatement {
+                sql: "INSERT INTO multi_statement_pool_test (id, val) VALUES (1, 'x'); COMMIT"
+                    .into(),
+                params: vec![],
+                label: None,
+            }],
+        )
+        .await;
+        let message = result
+            .as_ref()
+            .err()
+            .map(ToString::to_string)
+            .unwrap_or_default();
+        assert!(
+            message.contains("Multiple statements"),
+            "pool-backed execute_batch must reject a trailing COMMIT; got {message}"
+        );
+        let count: i64 = pool
+            .reader()
+            .unwrap()
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM multi_statement_pool_test",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[tokio::test]
+    async fn inline_execute_batch_rejects_multi_statement_sql() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = Arc::new(
+            ConnectionPool::new(PoolConfig {
+                path: Some(dir.path().join("sql_bridge_multi_statement_inline.db")),
+                write_queue_enabled: true,
+                write_routing_strict: true,
+                ..PoolConfig::default()
+            })
+            .unwrap(),
+        );
+        pool.writer()
+            .unwrap()
+            .conn()
+            .execute_batch(
+                "CREATE TABLE multi_statement_inline_test (id INTEGER PRIMARY KEY, val TEXT)",
+            )
+            .unwrap();
+        let bridge = SqlBridge::new(Arc::clone(&pool), true);
+
+        let result = bridge
+            .atomic_unit(Box::new(|writer| {
+                Box::pin(async move {
+                    writer
+                        .execute_batch(vec![SqlStatement {
+                            sql: "INSERT INTO multi_statement_inline_test (id, val) VALUES (1, 'x'); BEGIN"
+                                .into(),
+                            params: vec![],
+                            label: None,
+                        }])
+                        .await
+                        .map(|_| Box::new(()) as Box<dyn Any + Send>)
+                })
+            }))
+            .await;
+        let message = result
+            .as_ref()
+            .err()
+            .map(ToString::to_string)
+            .unwrap_or_default();
+        assert!(
+            message.contains("Multiple statements"),
+            "InlineWriter must reject a trailing BEGIN; got {message}"
+        );
+        let count: i64 = pool
+            .reader()
+            .unwrap()
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM multi_statement_inline_test",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
     /// Unit matrix for [`transaction_control_head`]: statement heads are
     /// classified case-insensitively through leading whitespace and
     /// comments; non-transaction-control heads (including identifiers that
@@ -2452,6 +2721,7 @@ mod tests {
             ("RELEASE sp1", Some("RELEASE")),
             ("release savepoint sp1", Some("RELEASE")),
             ("   \t COMMIT", Some("COMMIT")),
+            ("\u{feff}BEGIN", Some("BEGIN")),
             ("-- a comment\nCOMMIT", Some("COMMIT")),
             // SQLite does not nest block comments: the comment ends at the
             // first `*/`, leaving `*/ COMMIT`, which is not a statement head.
@@ -2471,6 +2741,15 @@ mod tests {
                 "classification mismatch for {sql:?}"
             );
         }
+    }
+
+    #[test]
+    fn sqlite_accepts_utf8_bom_before_transaction_control() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE bom_transaction_test (id INTEGER)")
+            .unwrap();
+        conn.execute_batch("\u{feff}BEGIN IMMEDIATE").unwrap();
+        conn.execute_batch("ROLLBACK").unwrap();
     }
 
     /// The queue-backed `execute_batch` path rejects transaction-control
