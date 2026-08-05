@@ -299,7 +299,9 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 20] = [
                               prefix — it is matched exactly against stored thread labels \
                               (e.g. pre-v1 non-UUID labels), and no match yields an empty list \
                               rather than an error. For all-hex >=8-char input, a stored label \
-                              equal to the input takes precedence over any UUID-prefix match.",
+                              byte-equal to the input takes precedence over any UUID-prefix \
+                              match; a label differing only in ASCII case is a fallback, \
+                              consulted only when no UUID-prefix candidate resolves.",
             },
             ParamDef {
                 name: "direction",

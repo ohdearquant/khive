@@ -2796,8 +2796,12 @@ label plus `thread_id_canonical: false` for non-UUID stored labels; derived note
 
 - No change to `comm.ingest`'s dedup or write semantics; only the acknowledgement shape gains
   the optional `thread_id_canonical` field (absent unless the stored value is non-canonical).
-- Channel adapters that echo the ack's `thread_id` into later sends remain correct in all three
-  cases; strict adapters can branch on the flag.
+- Channel adapters that echo the ack's `thread_id` into later `comm.send` calls remain correct
+  in the canonical-UUID and derived-UUID cases. The non-canonical legacy-label case is the
+  exception: `comm.send` requires a full UUID `thread_id` and refuses anything else, so an
+  adapter MUST branch on `thread_id_canonical: false` and not feed that value back into
+  `comm.send`. Thread continuity for a legacy-label thread comes from `comm.ingest`'s reply
+  correlation (In-Reply-To/References), which does not depend on echoing the stored label.
 
 ## Context
 
