@@ -134,8 +134,9 @@ pub enum IngestSourceState {
     /// `gh --version`, so such a repo skips only when `gh` is absent, and
     /// when `gh` IS present it takes the walker-failure path, whose reason
     /// carries `gh`'s own stderr) — or `gh` itself failed before the walk
-    /// began (a failure after the walk began is `StoppedEarly`, never
-    /// `Skipped`).
+    /// began. A local cursor/database read failure before remote listing is
+    /// also `Skipped`, with a distinct local-failure reason. A failure after
+    /// the walk began is `StoppedEarly`, never `Skipped`.
     Skipped(String),
 }
 
@@ -391,7 +392,10 @@ pub(crate) async fn run_ingest_with_commit_recovery(
                         // walker signals that case by leaving its
                         // `pull_requests` state unset. Anything else
                         // preserves the state the walker already wrote.
-                        let walked = report.sources.pull_requests.is_some();
+                        let walked = matches!(
+                            report.sources.pull_requests.as_ref(),
+                            Some(IngestSourceState::Completed | IngestSourceState::StoppedEarly(_))
+                        );
                         if walked {
                             // Align the prose with the structured state:
                             // the walk happened, so nothing was "skipped" —
@@ -402,16 +406,20 @@ pub(crate) async fn run_ingest_with_commit_recovery(
                                 "gh pr list failed after walking {visited} {noun} — \
                                  stopped early, not skipped: {e}"
                             ));
-                        } else {
+                        } else if report.sources.pull_requests.is_none() {
                             report
                                 .warnings
                                 .push(format!("gh pr list failed, skipping pull requests: {e}"));
+                        } else {
+                            report.warnings.push(format!(
+                                "pull request ingest failed before remote listing; local source failure retained: {e}"
+                            ));
                         }
-                        if !walked {
+                        if !walked && report.sources.pull_requests.is_none() {
                             report.sources.pull_requests = Some(IngestSourceState::Skipped(
                                 format!("gh pr list failed: {e}"),
                             ));
-                        } else {
+                        } else if walked {
                             match report.sources.pull_requests.as_mut() {
                                 Some(IngestSourceState::StoppedEarly(reason)) => {
                                     reason.push_str(&format!(
@@ -468,27 +476,35 @@ pub(crate) async fn run_ingest_with_commit_recovery(
                     // See the PR arm above: "skipping" is only accurate for
                     // a first-fetch failure; a walked-then-failed source
                     // names how far the walk got.
-                    if report.sources.issues.is_some() {
+                    let walked = matches!(
+                        report.sources.issues.as_ref(),
+                        Some(IngestSourceState::Completed | IngestSourceState::StoppedEarly(_))
+                    );
+                    if walked {
                         let visited = report.issues_ingested + report.issues_skipped_existing;
                         let noun = if visited == 1 { "record" } else { "records" };
                         report.warnings.push(format!(
                             "gh issue list failed after walking {visited} {noun} — \
                              stopped early, not skipped: {e}"
                         ));
-                    } else {
+                    } else if report.sources.issues.is_none() {
                         report
                             .warnings
                             .push(format!("gh issue list failed, skipping issues: {e}"));
+                    } else {
+                        report.warnings.push(format!(
+                            "issue ingest failed before remote listing; local source failure retained: {e}"
+                        ));
                     }
                     // See the PR arm above: `Skipped` only when the walk
                     // never began (the walker signals that by leaving its
                     // state unset); a walked-then-failed source keeps the
                     // state the walker already wrote.
-                    if report.sources.issues.is_none() {
+                    if !walked && report.sources.issues.is_none() {
                         report.sources.issues = Some(IngestSourceState::Skipped(format!(
                             "gh issue list failed: {e}"
                         )));
-                    } else {
+                    } else if walked {
                         match report.sources.issues.as_mut() {
                             Some(IngestSourceState::StoppedEarly(reason)) => {
                                 reason.push_str(&format!("; pass then failed after the walk: {e}"));
@@ -1232,6 +1248,13 @@ const NAME_MAX_CHARS: usize = 120;
 /// stored and FTS-indexed; only the candidate vector input is capped.
 const MAX_COMMIT_EMBED_BYTES: usize = 32_768;
 
+/// Sentinel reason seeded into the commit source slot when a walk begins.
+/// A slot still holding this exact reason at the end of the pass means the
+/// walk ran to the end of its snapshot without a budget break or a stall,
+/// and is rewritten to `Completed`; any other reason was written by a real
+/// early-stop arm and is preserved.
+const COMMIT_WALK_SEED_REASON: &str = "walk began but did not report completion";
+
 /// Returns a UTF-8-valid, proper head prefix of `content` when it exceeds
 /// `MAX_COMMIT_EMBED_BYTES`, or `None` when `content` is at or under the cap
 /// (nothing to truncate — the full text is a valid embedding input as-is).
@@ -1349,6 +1372,14 @@ async fn ingest_commits(
         }
         return Ok(());
     }
+
+    // A non-empty snapshot means the commit walk is now underway. Seed the
+    // source before the first natural-key lookup so a mid-walk database error
+    // is reported in-band as walked-then-failed rather than as a pre-walk
+    // hard error. Cursor and snapshot failures above remain pre-walk errors.
+    report.sources.commits = Some(IngestSourceState::StoppedEarly(
+        COMMIT_WALK_SEED_REASON.into(),
+    ));
 
     // `cursor_stalled` freezes `last_sha` at the last contiguous successfully
     // processed commit: once a record fails to create, later records in this
@@ -1524,13 +1555,21 @@ async fn ingest_commits(
         report.sources.commits = Some(IngestSourceState::StoppedEarly(
             "a per-record write failure froze the commits cursor (cursor_stalled)".into(),
         ));
-    } else if report.sources.commits.is_none() {
-        // Neither a budget break nor a stall fired: the loop visited every
-        // commit in the snapshot. Recorded HERE, like the budget and stall
-        // arms — every walker exit records its own state so the end-of-pass
-        // fill is a pure instrumentation-gap fallback.
-        report.sources.commits = Some(IngestSourceState::Completed);
-        *walk_complete = true;
+    } else {
+        let walk_ended_clean = match &report.sources.commits {
+            None => true,
+            Some(IngestSourceState::StoppedEarly(reason)) => reason == COMMIT_WALK_SEED_REASON,
+            Some(_) => false,
+        };
+        if walk_ended_clean {
+            // Neither a budget break nor a stall fired: the loop visited
+            // every commit in the snapshot, so the walk-start seed (or a
+            // `None` from an instrumentation gap) is rewritten to
+            // `Completed`. Any other reason was written by a real
+            // early-stop arm and is preserved.
+            report.sources.commits = Some(IngestSourceState::Completed);
+            *walk_complete = true;
+        }
     }
     if let Some(sha) = last_sha {
         // A stalled cursor has already frozen `last_sha` at the last
@@ -1930,7 +1969,15 @@ async fn ingest_prs(
     new_records: &mut Vec<NewRecordForRef>,
     walk_complete: &mut bool,
 ) -> Result<()> {
-    let since = read_cursor(runtime, project_id, "prs").await?;
+    let since = match read_cursor(runtime, project_id, "prs").await {
+        Ok(since) => since,
+        Err(e) => {
+            report.sources.pull_requests = Some(IngestSourceState::Skipped(format!(
+                "local cursor/database read failed before pull request listing: {e}"
+            )));
+            return Err(e);
+        }
+    };
 
     // `cursor_stalled` mirrors `ingest_commits`: once one PR fails to create,
     // later PRs in this pass are still attempted (so every failure surfaces
@@ -1941,6 +1988,7 @@ async fn ingest_prs(
     let mut cursor_stalled = false;
     let mut floor = since.clone();
     let mut window_complete = true;
+    let mut stop_reason: Option<&'static str> = None;
 
     'paging: loop {
         // The FIRST fetch failing must report `skipped` (never walked);
@@ -2028,6 +2076,7 @@ async fn ingest_prs(
                 // "records remained", and the conservative answer is
                 // stopped-early — a resumed pass completes idempotently.
                 window_complete = false;
+                stop_reason = Some("budget exhausted before the pull request window completed");
                 break;
             }
 
@@ -2112,8 +2161,16 @@ async fn ingest_prs(
             budget.exhausted(),
         ) {
             PageOutcome::WindowComplete => break 'paging,
-            PageOutcome::StopBudgetExhausted | PageOutcome::StopFloorStalled => {
+            PageOutcome::StopBudgetExhausted => {
                 window_complete = false;
+                stop_reason = Some("budget exhausted before the pull request window completed");
+                break 'paging;
+            }
+            PageOutcome::StopFloorStalled => {
+                window_complete = false;
+                stop_reason = Some(
+                    "full page returned but the pull request paging floor stalled before the window completed",
+                );
                 break 'paging;
             }
             PageOutcome::Continue(next_floor) => floor = Some(next_floor),
@@ -2132,7 +2189,9 @@ async fn ingest_prs(
         // is a release-mode soft fallback, never a panic.
         pin_stopped_early(
             &mut report.sources.pull_requests,
-            "budget exhausted or the paging floor stalled before the PR window completed".into(),
+            stop_reason
+                .unwrap_or("the pull request paging window was not proven complete")
+                .into(),
         );
     }
     if cursor_stalled {
@@ -2173,7 +2232,15 @@ async fn ingest_issues(
     new_records: &mut Vec<NewRecordForRef>,
     walk_complete: &mut bool,
 ) -> Result<()> {
-    let since = read_cursor(runtime, project_id, "issues").await?;
+    let since = match read_cursor(runtime, project_id, "issues").await {
+        Ok(since) => since,
+        Err(e) => {
+            report.sources.issues = Some(IngestSourceState::Skipped(format!(
+                "local cursor/database read failed before issue listing: {e}"
+            )));
+            return Err(e);
+        }
+    };
 
     // `cursor_stalled` mirrors `ingest_commits`/`ingest_prs`: a per-record
     // create failure is aggregated as a warning and later records in this
@@ -2184,6 +2251,7 @@ async fn ingest_issues(
     let mut cursor_stalled = false;
     let mut floor = since.clone();
     let mut window_complete = true;
+    let mut stop_reason: Option<&'static str> = None;
 
     'paging: loop {
         // See `ingest_prs`: the first fetch failing must report `skipped`
@@ -2263,6 +2331,7 @@ async fn ingest_issues(
                 // exact-budget boundary resolves conservatively and a
                 // resumed pass completes idempotently.
                 window_complete = false;
+                stop_reason = Some("budget exhausted before the issue window completed");
                 break;
             }
 
@@ -2354,8 +2423,16 @@ async fn ingest_issues(
             budget.exhausted(),
         ) {
             PageOutcome::WindowComplete => break 'paging,
-            PageOutcome::StopBudgetExhausted | PageOutcome::StopFloorStalled => {
+            PageOutcome::StopBudgetExhausted => {
                 window_complete = false;
+                stop_reason = Some("budget exhausted before the issue window completed");
+                break 'paging;
+            }
+            PageOutcome::StopFloorStalled => {
+                window_complete = false;
+                stop_reason = Some(
+                    "full page returned but the issue paging floor stalled before the window completed",
+                );
                 break 'paging;
             }
             PageOutcome::Continue(next_floor) => floor = Some(next_floor),
@@ -2369,7 +2446,9 @@ async fn ingest_issues(
         // successful fetch seeds the slot above.
         pin_stopped_early(
             &mut report.sources.issues,
-            "budget exhausted or the paging floor stalled before the issue window completed".into(),
+            stop_reason
+                .unwrap_or("the issue paging window was not proven complete")
+                .into(),
         );
     }
     if cursor_stalled {

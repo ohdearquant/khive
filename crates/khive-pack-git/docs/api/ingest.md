@@ -56,18 +56,24 @@ time:
   window, or a per-record write failure that froze the cursor — the same
   events that force `done = false` / `cursor_stalled`).
 - `skipped` — the source was never walked; `reason` names the cause (budget
-  exhausted before an earlier-ordered source finished, `gh` CLI absent, or
-  `gh` itself failed). A gate refusal therefore never terminates the walk:
+  exhausted before an earlier-ordered source finished, `gh` CLI absent, a
+  `gh` listing failure, or a local cursor/database read failure before remote
+  listing). A gate refusal therefore never terminates the walk:
   it is recorded on the source and the pass continues to the remaining
   sources.
 
 `IngestReport::history_exhausted` is the top-level roll-up: `true` only when
 every requested source is `completed`, so a reader can tell "silence means
 nothing left" apart from "stopped before the end". Sources not requested by
-`include` are `null` and do not count against exhaustion. Both fields are
-purely additive — `done`, `cursor_stalled`, and `writes_refused` keep their
-existing meanings, and existing consumers (the `git.digest` handler,
-`kkernel git-ingest`) serialize the same struct with no behavior change.
+`include` are `null` and do not count against exhaustion. The source fields
+are additive to the serialized report, but `done` has an intentional behavior
+change for a walked-then-failed source: if a walk ran (even to apparent
+completion) and a later operation such as the final cursor write failed, the
+source is downgraded to `stopped_early` and `done` is forced to `false`.
+Budget exhaustion and cursor stalls continue to force `done` to `false`; a
+first-fetch remote failure or a pre-listing local cursor read failure does not,
+because no source walk consumed the budget. Consumers using `done` as a resume
+signal must handle these newly reported false values.
 
 Two edge semantics, stated explicitly:
 

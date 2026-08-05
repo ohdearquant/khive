@@ -2831,6 +2831,13 @@ async fn empty_walk_with_non_ancestor_cursor_refuses_completion() {
         "nothing to walk in the empty range: {report2:?}"
     );
     assert!(
+        matches!(
+            report2.sources.commits.as_ref(),
+            Some(khive_pack_git::ingest::IngestSourceState::StoppedEarly(_))
+        ),
+        "a diverged empty range records a stopped-early commit source: {report2:?}"
+    );
+    assert!(
         !report2.done,
         "an empty walk from a non-ancestor cursor is not a completion \
          (issue #1644): {report2:?}"
@@ -3553,6 +3560,7 @@ async fn digest_verb_sources_gate_refusal_skips_record_and_walk_continues() {
     // Oldest first: clean, refused (sentinel body), clean.
     write(repo, "f.txt", "v0\n");
     commit(repo, &["f.txt"], "commit 0");
+    let sha0 = head_sha(repo);
     write(repo, "f.txt", "v1\n");
     commit(
         repo,
@@ -3561,6 +3569,7 @@ async fn digest_verb_sources_gate_refusal_skips_record_and_walk_continues() {
     );
     write(repo, "f.txt", "v2\n");
     commit(repo, &["f.txt"], "commit 2");
+    let sha2 = head_sha(repo);
 
     let resp = registry
         .dispatch(
@@ -3569,6 +3578,12 @@ async fn digest_verb_sources_gate_refusal_skips_record_and_walk_continues() {
         )
         .await
         .expect("a per-record refusal must stay an in-band digest result");
+    let project_id = Uuid::parse_str(
+        resp["project_id"]
+            .as_str()
+            .expect("the digest response carries its project id"),
+    )
+    .expect("project id is a UUID");
 
     assert_eq!(
         resp["commits_ingested"].as_u64().unwrap(),
@@ -3602,6 +3617,33 @@ async fn digest_verb_sources_gate_refusal_skips_record_and_walk_continues() {
     assert!(
         !resp["done"].as_bool().unwrap(),
         "cursor_stalled still forces done:false beside the new fields: {resp:?}"
+    );
+
+    let cursor_after_pass1 = read_git_cursor(&rt, project_id, "commits")
+        .await
+        .expect("the successful prefix persists a cursor");
+    assert_eq!(
+        cursor_after_pass1, sha0,
+        "the cursor freezes before the refused commit and does not skip it: {resp:?}"
+    );
+
+    let resp2 = registry
+        .dispatch(
+            "git.digest",
+            json!({"source": repo.to_str().unwrap(), "include": ["commits"]}),
+        )
+        .await
+        .expect("the next pass retries the frozen commit");
+    assert_eq!(
+        resp2["commits_ingested"].as_u64().unwrap(),
+        1,
+        "the refused commit is retried and lands on the next pass: {resp2:?}"
+    );
+    assert!(!resp2["cursor_stalled"].as_bool().unwrap(), "{resp2:?}");
+    assert_eq!(
+        read_git_cursor(&rt, project_id, "commits").await,
+        Some(sha2),
+        "the cursor advances through the recovered commit after retry: {resp2:?}"
     );
 }
 
@@ -3714,6 +3756,33 @@ async fn digest_verb_pr_issue_sources_completed_on_happy_path() {
     assert!(report.done, "{report:?}");
 }
 
+/// With no source requested, exhaustion is vacuously true.
+#[tokio::test]
+async fn digest_history_exhausted_is_true_when_include_is_empty() {
+    let _guard = ENV_MUTEX.lock().await;
+    let (rt, token, registry) = fixture().await;
+    let project_id = create(
+        &registry,
+        json!({"kind": "project", "name": "empty-include-repo"}),
+    )
+    .await;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut opts = IngestOptions::unbounded(dir.path().to_path_buf(), project_id.to_string());
+    opts.include.commits = false;
+    opts.include.issues = false;
+    opts.include.pull_requests = false;
+
+    let report = run_ingest(&rt, &token, &registry, opts)
+        .await
+        .expect("an empty include completes without walking a source");
+
+    assert!(report.history_exhausted, "{report:?}");
+    assert!(report.done, "{report:?}");
+    assert!(report.sources.commits.is_none(), "{report:?}");
+    assert!(report.sources.issues.is_none(), "{report:?}");
+    assert!(report.sources.pull_requests.is_none(), "{report:?}");
+}
+
 /// With the budget spent mid-walk, a walker that breaks inside its record
 /// loop reports `stopped_early` (visited, not exhausted) while sources
 /// never even reached report `skipped` with the pre-reached budget reason
@@ -3782,7 +3851,7 @@ async fn digest_verb_pr_issue_sources_stopped_early_on_budget_stop() {
     match &report.sources.pull_requests {
         Some(khive_pack_git::ingest::IngestSourceState::StoppedEarly(reason)) => {
             assert!(
-                reason.contains("budget"),
+                reason.contains("budget exhausted"),
                 "the reason names the budget as the cause: {reason:?}"
             );
         }
@@ -3869,8 +3938,8 @@ async fn digest_verb_pr_source_stopped_early_on_full_page_then_refetch_failure_s
     match &report.sources.pull_requests {
         Some(khive_pack_git::ingest::IngestSourceState::StoppedEarly(reason)) => {
             assert!(
-                reason.contains("window"),
-                "the reason names the incomplete paging window: {reason:?}"
+                reason.contains("full page"),
+                "the reason names the full-page floor stop: {reason:?}"
             );
         }
         other => panic!("a full page with an unproven window is stopped_early, got {other:?}"),
@@ -3915,6 +3984,10 @@ esac
             .any(|w| w.contains("gh pr list failed")),
         "the failure also surfaces as a warning: {:?}",
         report2.warnings
+    );
+    assert!(
+        report2.done,
+        "a first-fetch listing failure leaves the budget-cursor signal unchanged: {report2:?}"
     );
 }
 
@@ -4232,6 +4305,74 @@ async fn issue_cursor_does_not_advance_past_refused_record_on_later_existing() {
     );
 }
 
+/// A database error during the first commit lookup is reported after the
+/// commit walk has started, not as a pre-walk hard failure.
+#[tokio::test]
+async fn ingest_commit_lookup_failure_is_reported_in_band_after_walk_start() {
+    let _guard = ENV_MUTEX.lock().await;
+    let (rt, token, registry) = fixture().await;
+    let project_id = create(
+        &registry,
+        json!({"kind": "project", "name": "commit-lookup-failure-repo"}),
+    )
+    .await;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo: PathBuf = dir.path().join("repo");
+    std::fs::create_dir_all(&repo).expect("mk repo dir");
+    init_repo(&repo);
+    write(&repo, "README.md", "hello\n");
+    commit(&repo, &["README.md"], "Initial commit");
+
+    // The comm external-id index evaluates json_extract over properties on
+    // every insert, so a malformed-JSON row cannot land while it exists.
+    // Drop it (test database only) so the sabotage row is storable; the
+    // lookup's own json_extract then fails at query time, mid-walk.
+    let mut writer = rt.sql().writer().await.expect("writer");
+    writer
+        .execute(SqlStatement {
+            sql: "DROP INDEX IF EXISTS idx_comm_message_external_id".into(),
+            params: vec![],
+            label: Some("test_drop_json_index".into()),
+        })
+        .await
+        .expect("drop json-evaluating index");
+    writer
+        .execute(SqlStatement {
+            sql: "INSERT INTO notes(id, namespace, kind, content, properties, created_at, updated_at) \
+                  VALUES(?1, ?2, 'commit', '', ?3, 0, 0)"
+                .into(),
+            params: vec![
+                SqlValue::Text(Uuid::new_v4().to_string()),
+                SqlValue::Text("local".into()),
+                SqlValue::Text("not-json".into()),
+            ],
+            label: Some("test_malformed_commit_properties".into()),
+        })
+        .await
+        .expect("insert malformed lookup row");
+    drop(writer);
+
+    let mut opts = IngestOptions::unbounded(repo, project_id.to_string());
+    opts.include.issues = false;
+    opts.include.pull_requests = false;
+    let report = run_ingest(&rt, &token, &registry, opts)
+        .await
+        .expect("a mid-walk lookup failure stays in-band");
+
+    match &report.sources.commits {
+        Some(khive_pack_git::ingest::IngestSourceState::StoppedEarly(reason)) => {
+            assert!(
+                reason.contains("walk began") && reason.contains("pass then failed after the walk"),
+                "the source records a walked-then-failed lookup: {reason:?}"
+            );
+        }
+        other => panic!("a mid-walk lookup failure must be stopped-early: {other:?}"),
+    }
+    assert!(!report.done, "{report:?}");
+    assert!(!report.history_exhausted, "{report:?}");
+}
+
 /// The commit walker's post-walk cursor-write failure (round-2 finding 4):
 /// the walk records `completed` and THEN the final cursor write fails (here
 /// via the same sabotage trigger the issue-side test uses). The call site
@@ -4365,6 +4506,75 @@ async fn digest_report_serializes_omitted_sources_as_null() {
     );
 }
 
+/// A local cursor read failure happens before either remote listing. It keeps
+/// the source-level failure distinct from a remote listing skip.
+#[tokio::test]
+async fn digest_verb_local_cursor_read_failure_is_not_remote_listing_skip() {
+    let _guard = ENV_MUTEX.lock().await;
+    let (rt, token, registry) = fixture().await;
+    let project_id = create(
+        &registry,
+        json!({"kind": "project", "name": "cursor-read-failure-repo"}),
+    )
+    .await;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo: PathBuf = dir.path().join("repo");
+    std::fs::create_dir_all(&repo).expect("mk repo dir");
+    init_repo(&repo);
+    let bin_dir = dir.path().join("bin");
+    std::fs::create_dir_all(&bin_dir).expect("mk bin dir");
+    let log_dir = dir.path().join("log");
+    std::fs::create_dir_all(&log_dir).expect("mk log dir");
+    write_fake_gh(&bin_dir, &log_dir, "[]", "[]");
+    let _path_guard = PathGuard::install(&bin_dir);
+
+    let mut writer = rt.sql().writer().await.expect("writer");
+    writer
+        .execute(SqlStatement {
+            sql: "DROP TABLE git_mirror_cursor".into(),
+            params: vec![],
+            label: Some("test_drop_cursor_table".into()),
+        })
+        .await
+        .expect("drop cursor table");
+    drop(writer);
+
+    let mut opts = IngestOptions::unbounded(repo, project_id.to_string());
+    opts.include.commits = false;
+    let report = run_ingest(&rt, &token, &registry, opts)
+        .await
+        .expect("a local cursor read failure stays in-band");
+
+    for (source, state) in [
+        ("pull requests", &report.sources.pull_requests),
+        ("issues", &report.sources.issues),
+    ] {
+        match state {
+            Some(khive_pack_git::ingest::IngestSourceState::Skipped(reason)) => {
+                assert!(
+                    reason.contains("local cursor/database read failed"),
+                    "{source}: local cursor failure is classified explicitly: {reason:?}"
+                );
+                assert!(
+                    !reason.contains("gh pr list failed")
+                        && !reason.contains("gh issue list failed"),
+                    "{source}: the state is not a remote listing failure: {reason:?}"
+                );
+            }
+            other => panic!("{source}: expected local cursor read classification, got {other:?}"),
+        }
+    }
+    assert!(
+        report
+            .warnings
+            .iter()
+            .all(|warning| !warning.contains("list failed, skipping")),
+        "a local cursor failure must not use the remote-skip warning: {:?}",
+        report.warnings
+    );
+}
+
 /// A `gh pr list`/`gh issue list` failure on the FIRST fetch — the stub
 /// answers the `--version` probe but exits 1 on listing — leaves both
 /// sources `skipped` with the failure in the reason: the source was never
@@ -4443,6 +4653,10 @@ esac
     assert!(
         !resp["history_exhausted"].as_bool().unwrap(),
         "skipped sources mean the pass did not cover everything requested: {resp:?}"
+    );
+    assert_eq!(
+        resp["done"], true,
+        "a first-fetch listing failure does not consume the budget-cursor signal: {resp:?}"
     );
     let warnings: Vec<&str> = resp["warnings"]
         .as_array()
