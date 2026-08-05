@@ -945,7 +945,32 @@ async fn run_exec_inline_with_forward(
             Some(concrete) if khive_cfg.backends.is_empty() => Some(concrete),
             _ => None,
         };
-        if let Some(res) = forward_fn(&frame, db_context.config.clone(), spawn_db).await {
+        // Which config file a daemon this call may need to SPAWN must be
+        // constructed with:
+        // - An explicit `--config`/`KHIVE_CONFIG` selection always: it is the
+        //   operator's choice and the frame already folds its topology.
+        // - Otherwise, in exactly the redundant-multi-backend case withheld
+        //   above: the config that declared the backend topology was
+        //   DISCOVERED (retained in `config_source` — e.g. via the db-dir
+        //   tier-3 anchor of `KhiveConfig::load_with_home_fallback_and_source`),
+        //   and the withheld override was the child's only other clue about
+        //   which database to bind. Without forwarding the resolved path as
+        //   the child's explicit `--config`, the spawned daemon re-discovers
+        //   from its own cwd/HOME, fails to reach a config anchored only
+        //   beside the database, binds `$HOME/.khive/khive.db`, and squats
+        //   the socket with a `config_id` that never matches this frame.
+        //   Forwarding the retained path makes the child fold the identical
+        //   topology, so its fingerprint matches.
+        // - Otherwise nothing: the empty-backends child gets its database
+        //   directly via the forwarded concrete override above.
+        let spawn_config = match (&db_context.config, db_context.raw.as_deref()) {
+            (Some(explicit), _) => Some(explicit.clone()),
+            (None, Some(raw)) if raw != ":memory:" && !khive_cfg.backends.is_empty() => {
+                config_source.clone()
+            }
+            _ => None,
+        };
+        if let Some(res) = forward_fn(&frame, spawn_config, spawn_db).await {
             let output = res.map_err(|e| anyhow::anyhow!("{}", e.message))?;
             println!("{output}");
             enforce_strict_batch_result(&output, strict)?;
@@ -3506,6 +3531,190 @@ id = "lambda:fallback"
             "the single-backend concrete override must reach the daemon spawn seam so a \
              spawned daemon binds the operator's file instead of the default database"
         );
+    }
+
+    /// The redundant-multi-backend spawn decision (override withheld from the
+    /// spawned daemon) has a config-side twin: when no explicit `--config`
+    /// was given, the config that declared the backend topology was
+    /// DISCOVERED (here via the db-dir tier-3 anchor of
+    /// `KhiveConfig::load_with_home_fallback_and_source`), and the withheld
+    /// override was the child's only other clue about which database to
+    /// bind. The spawn seam must receive that retained resolved path as the
+    /// child's explicit `--config`, or the spawned daemon re-discovers from
+    /// its own cwd/HOME, cannot reach a config anchored only beside the
+    /// database, binds `$HOME/.khive/khive.db`, and squats the socket with a
+    /// `config_id` that never matches the normalized frame.
+    ///
+    /// Control arms: with an explicit config the seam receives the explicit
+    /// path (never the discovered one), and in the empty-backends case the
+    /// seam receives no config at all (the concrete override supplies the
+    /// database directly).
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial]
+    async fn redundant_db_override_forwards_discovered_config_to_spawn_seam() {
+        std::env::remove_var("KHIVE_EMBEDDING_MODEL");
+        std::env::remove_var("KHIVE_ADDITIONAL_EMBEDDING_MODELS");
+        std::env::remove_var("KHIVE_ACTOR");
+        std::env::remove_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR");
+        std::env::remove_var("KHIVE_DB");
+        let (prev_home, _home_dir) = isolate_home_for_test();
+        SPY_CAPTURED_CONFIG_PATH.with(|c| *c.borrow_mut() = None);
+        SPY_CAPTURED_DB.with(|c| *c.borrow_mut() = None);
+
+        // A multi-backend config discoverable ONLY via the db-dir tier-3
+        // anchor (`project_config_anchor_dir`): it lives in
+        // `<main-db-dir>/.khive/config.toml`, not at the process cwd and not
+        // under `$HOME/.khive`.
+        let backend_dir = tempfile::tempdir().expect("backend tempdir");
+        let main_backend_path = backend_dir.path().join("main-backend.db");
+        let sessions_backend_path = backend_dir.path().join("sessions-backend.db");
+        let anchor_dir = backend_dir.path().join(".khive");
+        std::fs::create_dir_all(&anchor_dir).expect("mkdir db-dir anchor");
+        let discovered_config_path = anchor_dir.join("config.toml");
+        std::fs::write(
+            &discovered_config_path,
+            format!(
+                r#"
+[[backends]]
+name = "main"
+kind = "sqlite"
+path = "{}"
+
+[[backends]]
+name = "sessions"
+kind = "sqlite"
+path = "{}"
+"#,
+                main_backend_path.display(),
+                sessions_backend_path.display(),
+            ),
+        )
+        .expect("write tier-3 multi-backend config");
+        let canonical_config_path =
+            std::fs::canonicalize(&discovered_config_path).expect("canonicalize config path");
+
+        let cfg = resolve_runtime_config(RuntimeConfigInputs {
+            db: Some(main_backend_path.to_str().expect("utf8")),
+            config: None,
+            namespace: Namespace::parse("local").expect("ns"),
+            namespace_explicit: true,
+            actor_explicit: false,
+            no_embed: true,
+            packs: Some(vec!["kg".to_string()]),
+            brain_profile: None,
+        })
+        .expect("resolve exec-shaped config");
+
+        // ── the fix case: redundant multi-backend, no explicit config ──
+        let result = run_exec_inline_with_forward(
+            "stats()".to_string(),
+            cfg.clone(),
+            None,
+            None,
+            None,
+            ExecDbContext {
+                raw: Some(main_backend_path.display().to_string()),
+                anchor: khive_runtime::resolve_db_anchor(main_backend_path.to_str()),
+                config: None,
+            },
+            false,
+            spy_capture_config_and_succeed,
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "redundant-override dispatch must reach daemon forwarding: {result:?}"
+        );
+        assert_eq!(
+            SPY_CAPTURED_DB.with(|captured| captured.borrow_mut().take()),
+            None,
+            "the redundant override stays withheld from the spawn seam"
+        );
+        assert_eq!(
+            SPY_CAPTURED_CONFIG_PATH.with(|captured| captured.borrow_mut().take()),
+            Some(canonical_config_path.clone()),
+            "the spawn seam must receive the retained resolved config path as the \
+             child's explicit --config when the redundant override is withheld"
+        );
+
+        // ── control: explicit config wins, discovered path is not substituted ──
+        let explicit_config_path = backend_dir.path().join("explicit.toml");
+        std::fs::copy(&discovered_config_path, &explicit_config_path)
+            .expect("copy topology as explicit config");
+        SPY_CAPTURED_CONFIG_PATH.with(|c| *c.borrow_mut() = None);
+        let result = run_exec_inline_with_forward(
+            "stats()".to_string(),
+            cfg.clone(),
+            None,
+            None,
+            None,
+            ExecDbContext {
+                raw: Some(main_backend_path.display().to_string()),
+                anchor: khive_runtime::resolve_db_anchor(main_backend_path.to_str()),
+                config: Some(explicit_config_path.clone()),
+            },
+            false,
+            spy_capture_config_and_succeed,
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "explicit-config dispatch must reach daemon forwarding: {result:?}"
+        );
+        assert_eq!(
+            SPY_CAPTURED_CONFIG_PATH.with(|captured| captured.borrow_mut().take()),
+            Some(explicit_config_path),
+            "with an explicit config the seam receives the operator's path, never a discovered one"
+        );
+
+        // ── control: empty backends get no config, only the concrete override ──
+        let single_dir = tempfile::tempdir().expect("single-backend tempdir");
+        let override_path = single_dir.path().join("override.db");
+        let single_cfg = resolve_runtime_config(RuntimeConfigInputs {
+            db: Some(override_path.to_str().expect("utf8")),
+            config: None,
+            namespace: Namespace::parse("local").expect("ns"),
+            namespace_explicit: true,
+            actor_explicit: false,
+            no_embed: true,
+            packs: Some(vec!["kg".to_string()]),
+            brain_profile: None,
+        })
+        .expect("resolve single-backend exec-shaped config");
+        SPY_CAPTURED_CONFIG_PATH.with(|c| *c.borrow_mut() = None);
+        SPY_CAPTURED_DB.with(|c| *c.borrow_mut() = None);
+        let result = run_exec_inline_with_forward(
+            "stats()".to_string(),
+            single_cfg,
+            None,
+            None,
+            None,
+            ExecDbContext {
+                raw: Some(override_path.display().to_string()),
+                anchor: khive_runtime::resolve_db_anchor(override_path.to_str()),
+                config: None,
+            },
+            false,
+            spy_capture_config_and_succeed,
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "single-backend dispatch must reach daemon forwarding: {result:?}"
+        );
+        assert_eq!(
+            SPY_CAPTURED_CONFIG_PATH.with(|captured| captured.borrow_mut().take()),
+            None,
+            "the empty-backends case forwards no config — the concrete override supplies the database"
+        );
+        assert_eq!(
+            SPY_CAPTURED_DB.with(|captured| captured.borrow_mut().take()),
+            Some(override_path.display().to_string()),
+            "the single-backend concrete override still reaches the spawn seam"
+        );
+
+        restore_home(prev_home);
     }
 
     #[cfg(unix)]

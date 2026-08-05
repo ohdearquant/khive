@@ -118,10 +118,14 @@ impl std::fmt::Display for DatabaseOverrideConflict {
 impl std::error::Error for DatabaseOverrideConflict {}
 
 /// Return the stable invocation-refusal envelope when `error` carries a
-/// [`DatabaseOverrideConflict`].
+/// [`DatabaseOverrideConflict`] anywhere in its source chain, not only as
+/// the top-level error: an intermediate carrier that adds context
+/// (`anyhow::Context`) must not silently degrade the documented JSON
+/// refusal to a generic error rendering.
 pub fn db_override_refusal_envelope(error: &anyhow::Error) -> Option<serde_json::Value> {
     error
-        .downcast_ref::<DatabaseOverrideConflict>()
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<DatabaseOverrideConflict>())
         .map(DatabaseOverrideConflict::envelope)
 }
 
@@ -1708,6 +1712,14 @@ pub fn reject_conflicting_db_override_with_source(
     backends: &[BackendConfig],
     config_source: Option<&std::path::Path>,
 ) -> anyhow::Result<()> {
+    // Self-guard (not a caller contract): with no declared backends there is
+    // nothing to collapse, so a concrete override is the ordinary
+    // single-backend case and must pass. Without this, the main-backend
+    // lookup below finds nothing and EVERY concrete override would be
+    // misclassified as ambiguous.
+    if backends.is_empty() {
+        return Ok(());
+    }
     let Some(other) = cli_db_override.filter(|path| *path != ":memory:") else {
         return Ok(());
     };
@@ -5450,6 +5462,62 @@ region = "us-east-1"
             !override_path.exists(),
             "rejecting an override must not create its database path"
         );
+    }
+
+    /// An intermediate error carrier (a `std::error::Error` whose `source()`
+    /// is the typed conflict) one level deep must still yield the refusal
+    /// envelope: the top-level `downcast_ref` sees only the carrier itself,
+    /// so the lookup walks the error's source chain.
+    #[test]
+    fn refusal_envelope_survives_one_level_of_error_wrapping() {
+        /// One-level carrier: its `source()` IS the typed conflict.
+        #[derive(Debug)]
+        struct FrameCarrier(DatabaseOverrideConflict);
+
+        impl std::fmt::Display for FrameCarrier {
+            fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(formatter, "daemon spawn refused the frame")
+            }
+        }
+
+        impl std::error::Error for FrameCarrier {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                Some(&self.0)
+            }
+        }
+
+        let wrapped = anyhow::Error::from(FrameCarrier(DatabaseOverrideConflict::new(
+            "/tmp/other.db",
+            2,
+            None,
+        )));
+
+        assert!(
+            wrapped.downcast_ref::<DatabaseOverrideConflict>().is_none(),
+            "precondition: the top-level downcast must NOT see through an intermediate carrier"
+        );
+        let envelope = db_override_refusal_envelope(&wrapped)
+            .expect("the refusal envelope must survive a one-level error wrapper");
+        assert_eq!(envelope["ok"], false);
+        assert_eq!(envelope["invocation"]["started"], false);
+        assert_eq!(envelope["error"]["code"], DB_OVERRIDE_CONFLICT_CODE);
+        assert_eq!(envelope["error"]["db_override"], "/tmp/other.db");
+        assert_eq!(envelope["error"]["declared_backends"], 2);
+    }
+
+    /// The conflict guard must not fire when no backends are declared at all:
+    /// there is nothing for a concrete override to collapse, and the
+    /// main-backend lookup finds nothing — without the helper's own
+    /// empty-backends guard, EVERY single-backend override would be
+    /// misclassified as ambiguous.
+    #[test]
+    fn reject_conflicting_db_override_accepts_any_concrete_override_with_no_backends() {
+        reject_conflicting_db_override_with_source(
+            Some("/tmp/single-backend-override.db"),
+            &[],
+            None,
+        )
+        .expect("no declared backends means no possible conflict");
     }
 
     /// A declared `main` backend that is a symlink whose target does not

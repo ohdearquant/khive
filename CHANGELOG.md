@@ -13,6 +13,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   write namespace, and read-visible namespace set already resolved by the
   runtime for the current request.
 
+### Changed
+
+- `resolve_project_actor_id` (khive-runtime) now returns
+  `ConfigError::ExplicitConfigMissing` when the explicit
+  `--config`/`KHIVE_CONFIG` path does not exist, instead of resolving to
+  `None` and falling through to discovery. This matches the explicit-tier
+  contract of the database-anchored config loader (ADR-035).
+
 ## [0.5.0] - 2026-07-13
 
 ### Added
