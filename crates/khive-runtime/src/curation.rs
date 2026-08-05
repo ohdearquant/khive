@@ -1183,7 +1183,7 @@ impl KhiveRuntime {
                 .embed_document_with_model_outcome_for_token(
                     token,
                     model_name,
-                    &note_embedding_text(note),
+                    note_embedding_text_ref(note),
                 )
                 .await
             {
@@ -1288,6 +1288,47 @@ impl KhiveRuntime {
             note.decay_factor = decay_patch;
         }
         if let Some(props) = patch.properties {
+            // On a pack-owned note kind, the properties in
+            // `OWNER_ESTABLISHED_PROPERTIES` are established by the owning pack
+            // and read back by it to decide something structural — who wrote
+            // the record and when, which author-side record it copies, which
+            // conversation it belongs to. A caller cannot patch them here.
+            // Only a patch that *names* one of them is refused, and naming is
+            // the exact test: the merge below is `PreferFrom`, so a patch that
+            // names an owned key would overwrite it while a patch that does
+            // not name it leaves it intact. Every other key still merges
+            // normally — arbitrary metadata on a pack-owned record (a
+            // `blocked_on` note on a `task`) has no other write path and must
+            // keep working.
+            if self.is_pack_owned_note_kind(&note.kind) {
+                // A non-object patch names nothing, so it slips past the
+                // named-key check below and then takes `merge_json`'s
+                // non-object `PreferFrom` arm, which replaces the whole
+                // property object rather than merging into it — erasing
+                // every owned key. Refused on every pack-owned kind, not only
+                // rows that currently carry an owned key, so an identical
+                // call cannot succeed or fail on state the caller cannot see.
+                if !props.is_object() {
+                    return Err(RuntimeError::InvalidInput(format!(
+                        "properties on a `{}` note must be patched with an object: a non-object \
+                         patch names no key, so it would replace the whole property object rather \
+                         than merging into it. Pass an object containing the keys you intend to \
+                         set.",
+                        note.kind
+                    )));
+                }
+                if let Some(named) = owner_established_property_named_in(&props) {
+                    return Err(RuntimeError::InvalidInput(format!(
+                        "`{named}` is not patchable on a `{}` note: the pack that owns this \
+                         kind establishes it and reads it back — to decide how the record is \
+                         attributed and grouped, or to reproduce it verbatim when the record \
+                         is re-emitted — so it is written by the owner and immutable to a \
+                         caller patch. Patch any other property key here, or omit \
+                         `{named}` from this patch.",
+                        note.kind
+                    )));
+                }
+            }
             let (merged, _) = merge_properties(
                 &note.properties,
                 &Some(props),
@@ -1425,6 +1466,12 @@ impl KhiveRuntime {
             let _ = self.vectors_for_model(token, model_name)?;
         }
 
+        // Resolved here, where the runtime's installed pack-kind list is in
+        // reach; `merge_note_sql` runs on the writer connection with no runtime
+        // handle. Both notes share a kind (checked inside), so the into-note's
+        // kind decides for the merge.
+        let preserve_owner_established = self.is_pack_owned_note_kind(&into_note.kind);
+
         let pool = self.backend().pool_arc();
         let writer_task = pool.writer_task_handle().ok().flatten();
 
@@ -1442,6 +1489,7 @@ impl KhiveRuntime {
                         content_strategy,
                         dry_run,
                         pack_rules,
+                        preserve_owner_established,
                     )
                     .map_err(|e| {
                         khive_storage::StorageError::driver(
@@ -1468,6 +1516,7 @@ impl KhiveRuntime {
                         content_strategy,
                         dry_run,
                         pack_rules,
+                        preserve_owner_established,
                     )
                 })
             })
@@ -1564,7 +1613,13 @@ pub fn entity_embedding_text(entity: &Entity) -> String {
 /// Build the canonical text embedded for a note when no explicit bounded
 /// embedding prefix was supplied at creation time.
 pub fn note_embedding_text(note: &Note) -> String {
-    note.content.clone()
+    note_embedding_text_ref(note).to_owned()
+}
+
+/// Borrow the canonical note embedding text for runtime paths that do not
+/// require ownership.
+pub(crate) fn note_embedding_text_ref(note: &Note) -> &str {
+    &note.content
 }
 
 /// Build the `TextDocument` for an entity. This is the single source of truth for
@@ -2313,6 +2368,7 @@ fn merge_note_sql(
     content_strategy: ContentMergeStrategy,
     dry_run: bool,
     pack_rules: Vec<EdgeEndpointRule>,
+    preserve_owner_established: bool,
 ) -> Result<(MergeSummary, khive_storage::note::Note), SqliteError> {
     let into_note = read_merge_note(conn, into_id, &namespace)?;
     let from_note = read_merge_note(conn, from_id, &namespace)?;
@@ -2413,8 +2469,31 @@ fn merge_note_sql(
         _ => into_note.name.clone().or(from_note.name.clone()),
     };
 
-    let (merged_props, properties_merged) =
+    let (mut merged_props, _) =
         merge_properties(&into_note.properties, &from_note.properties, strategy);
+
+    // A merge folds two records together; it does not transfer attribution.
+    // On a pack-owned note kind the into-note's owned identity properties are
+    // restored after the fold, under every strategy including `PreferFrom`, so
+    // the surviving row still says who wrote it.
+    if preserve_owner_established {
+        preserve_owner_established_properties(&into_note.properties, &mut merged_props);
+    }
+
+    // Recomputed from the final retained properties rather than carried
+    // forward from the fold's own count. The fold's count and post-
+    // restoration reality diverge whenever an owner-established key holds a
+    // nested object: `union` recurses into it and counts the absorbed
+    // note's leaf as merged, but restoration then reverts the whole key,
+    // and the fold's flat "keys contributed" number cannot express a
+    // partial reversal of a nested contribution. Diffing the final object
+    // against the into-note's pre-merge properties sidesteps that fold/
+    // restoration coupling entirely.
+    let properties_merged = count_new_property_keys(
+        into_note.properties.as_ref(),
+        merged_props.as_ref(),
+        strategy,
+    );
 
     let merge_history_entry = serde_json::json!({
         "merged_from": from_id.to_string(),
@@ -2731,6 +2810,212 @@ pub(crate) fn merge_string_field(
     }
 }
 
+/// Property keys on a pack-owned note that the owning pack establishes and
+/// then reads back to decide something structural about the record.
+///
+/// The test for membership is that both halves hold: the key is written
+/// under the owner's authority rather than from caller input, AND its value
+/// is read to decide identity, grouping, routing, lifecycle, visibility,
+/// authorization, deduplication, or membership. `from_actor`, `direction` and
+/// `sent_at` answer "who wrote this, in which direction, when"; `outbound_ref`
+/// and `thread_id` answer "which record is this one's author-side original,
+/// and which conversation does it belong to". `subject` is reproduced
+/// verbatim when a record is re-emitted; `wire_message_id` and `external_id`
+/// are the author-side citation and correlation key a reply is routed
+/// against. The set is therefore not "keys that identify a party" — it is
+/// "keys the owner established and later trusts".
+///
+/// Naming one of these in a caller-supplied `properties` patch is refused by
+/// `update` on a pack-owned kind (see [`owner_established_property_named_in`]).
+///
+/// `to_actor` belongs here alongside `from_actor`: comm establishes it at
+/// send time from the `to=` param, and `comm.read` trusts a present string
+/// value to decide whether the caller is the addressee, failing open only
+/// when the key is absent or non-string. A caller must not be able to
+/// retarget a delivered message's addressee via a patch that names no other
+/// currently-protected key.
+///
+/// Membership here governs writes to an EXISTING record only. Introducing one
+/// of these keys at create time is a separate question and is not addressed
+/// by this constant.
+pub(crate) const OWNER_ESTABLISHED_PROPERTIES: &[&str] = &[
+    "from_actor",
+    "to_actor",
+    "direction",
+    "sent_at",
+    "outbound_ref",
+    "thread_id",
+    "subject",
+    "wire_message_id",
+    "external_id",
+];
+
+/// The first [`OWNER_ESTABLISHED_PROPERTIES`] key a caller-supplied
+/// `properties` patch names, if any.
+///
+/// Naming a key is the whole test: `update_note` folds the patch with
+/// `PreferFrom`, so a named key overwrites the stored value and an unnamed one
+/// leaves it untouched. A non-object patch names nothing.
+pub(crate) fn owner_established_property_named_in(patch: &Value) -> Option<&'static str> {
+    let Value::Object(map) = patch else {
+        return None;
+    };
+    OWNER_ESTABLISHED_PROPERTIES
+        .iter()
+        .copied()
+        .find(|key| map.contains_key(*key))
+}
+
+/// Restore the into-note's [`OWNER_ESTABLISHED_PROPERTIES`] into `merged`
+/// after a property fold.
+///
+/// A key absent on the into-note is removed from `merged` rather than left as
+/// the from-note's value: a record that carried no owner-established value
+/// must not acquire one by being merged into. That applies to grouping as much
+/// as to attribution — a note with no `thread_id` must not join a conversation
+/// because another note was folded into it.
+///
+/// A fold can also yield a value that is not an object at all: `merge_json`
+/// applies a non-object `from` directly under `PreferFrom`, replacing the
+/// into-note's whole object with a scalar. A scalar cannot carry the
+/// owner-established keys, so there is nothing to restore them into and they
+/// would be erased. The into-note's properties are kept instead — the scalar
+/// contributes no key that could coexist with them, so nothing the fold
+/// intended is lost.
+///
+/// This function only restores values; callers that need to report how many
+/// properties genuinely survived a merge should diff the final result
+/// against the into-note's pre-merge properties (see
+/// [`count_new_property_keys`]) rather than try to track the restoration as
+/// a correction to the fold's own count — a nested owner-established value
+/// (an object) makes that correction ill-defined, since the fold's flat
+/// "keys contributed" number cannot express a partial reversal of a nested
+/// contribution.
+pub(crate) fn preserve_owner_established_properties(
+    into: &Option<Value>,
+    merged: &mut Option<Value>,
+) {
+    if !matches!(merged, Some(Value::Object(_))) {
+        let Some(Value::Object(into_map)) = into else {
+            return;
+        };
+        let owned_on_into = OWNER_ESTABLISHED_PROPERTIES
+            .iter()
+            .any(|key| into_map.contains_key(*key));
+        if owned_on_into {
+            *merged = into.clone();
+        }
+        return;
+    }
+    let Some(Value::Object(merged_map)) = merged.as_mut() else {
+        return;
+    };
+    let into_map = match into {
+        Some(Value::Object(m)) => Some(m),
+        _ => None,
+    };
+    for key in OWNER_ESTABLISHED_PROPERTIES {
+        match into_map.and_then(|m| m.get(*key)) {
+            Some(value) => {
+                // Already present on `into` — restore it verbatim.
+                merged_map.insert((*key).to_string(), value.clone());
+            }
+            None => {
+                // Absent from `into` — a value here came from `from` and
+                // must not survive the merge.
+                merged_map.remove(*key);
+            }
+        }
+    }
+}
+
+/// Count properties present in `final_value` that are new relative to
+/// `original` — the same "did this key actually get added" question
+/// [`merge_json`]'s fold answers, but computed from what the record finally
+/// holds rather than carried forward through the fold-then-restore pipeline.
+///
+/// A key present in both `original` and `final_value` is never counted, even
+/// when its value changed — this matches `merge_json`'s own rule that an
+/// overwrite of a key already present on `into` is not a merged addition.
+/// Nested objects recurse only when the key exists on both sides (mirroring
+/// `merge_json`'s `Union` recursion); a key that is wholly new at some level
+/// counts once for that level, not once per leaf beneath it.
+pub(crate) fn count_new_property_keys(
+    original: Option<&Value>,
+    final_value: Option<&Value>,
+    strategy: EntityDedupMergePolicy,
+) -> usize {
+    match (original, final_value) {
+        (_, None) => 0,
+        (None, Some(Value::Object(map))) => map.len(),
+        (None, Some(_)) => 1,
+        (Some(Value::Object(orig_map)), Some(Value::Object(final_map))) => {
+            count_new_keys_within_object(orig_map, final_map, strategy)
+        }
+        // The record ended up holding an object where it previously held
+        // something else. `merge_json` scores that replacement as ONE
+        // contribution however many keys the new object carries, and this arm
+        // keeps that rule rather than counting the keys — the alternative
+        // silently changes `properties_merged` for ordinary notes, which never
+        // enter the restoration path and were being reported correctly by the
+        // fold. The rule here is: an empty final object has no contribution
+        // left to report, whatever emptied it — restoration removing every
+        // owner-established key is one way that happens, but an ordinary
+        // `PreferFrom` replacement with an empty object reaches this same arm.
+        (Some(_), Some(Value::Object(final_map))) => usize::from(!final_map.is_empty()),
+        // Whole-value replacement by a non-object. `merge_json` scores a
+        // `PreferFrom` fold that replaces one properties value with a
+        // differently-shaped one as a single contribution, and that is the right
+        // answer: what the record now holds came from the from-note. A bare 0
+        // here would under-report every such replacement, including on note
+        // kinds that have no owner-established properties and never enter the
+        // restoration path at all. Equal values mean nothing was contributed,
+        // which is the `properties: Some(a)` merged with `properties: None`
+        // case.
+        (Some(orig), Some(final_val)) => usize::from(orig != final_val),
+    }
+}
+
+/// Per-key counting inside a properties object.
+///
+/// Deliberately NOT the same rule as the top level: within an object, a key that
+/// already exists and is merely overwritten counts 0, matching `merge_json`'s
+/// rule that only keys absent from the into-note are counted as added.
+///
+/// Recursion is STRATEGY-AWARE, and it has to be, because `merge_json` only
+/// descends into a same-named nested object under [`Union`]. Under `PreferFrom`
+/// an existing top-level key is replaced wholesale, and under `PreferInto` it is
+/// kept wholesale; in neither case is anything merged *beneath* that key, so
+/// descending here would count a nested value that the fold never treated as a
+/// separate contribution. Counting `{"meta":{"old":1}}` merged with
+/// `{"meta":{"new":2}}` under `PreferFrom` as 1 is exactly that mistake — one
+/// existing property was replaced, none was added.
+///
+/// [`Union`]: EntityDedupMergePolicy::Union
+fn count_new_keys_within_object(
+    orig_map: &serde_json::Map<String, Value>,
+    final_map: &serde_json::Map<String, Value>,
+    strategy: EntityDedupMergePolicy,
+) -> usize {
+    final_map
+        .iter()
+        .map(|(key, value)| match orig_map.get(key) {
+            None => 1,
+            Some(Value::Object(nested_orig))
+                if matches!(strategy, EntityDedupMergePolicy::Union) =>
+            {
+                match value {
+                    Value::Object(nested_final) => {
+                        count_new_keys_within_object(nested_orig, nested_final, strategy)
+                    }
+                    _ => 0,
+                }
+            }
+            Some(_) => 0,
+        })
+        .sum()
+}
+
 /// Merge two property objects. Returns (merged, count_of_fields_from_from_that_were_added).
 /// `pub(crate)` so `crate::atomic_prepare` can reuse this exact properties-merge
 /// semantics when building an `update` write plan's row statement, matching
@@ -2842,6 +3127,20 @@ mod tests {
             .map(|index| char::from(ALPHANUMERIC[(index * 17 + 11) % ALPHANUMERIC.len()]))
             .collect();
         format!("secret value: {candidate}")
+    }
+
+    #[test]
+    fn note_embedding_text_ref_borrows_stored_content() {
+        let note = Note::new("embedding-borrow", "observation", "borrow this content");
+        let text = note_embedding_text_ref(&note);
+
+        assert_eq!(text, note.content.as_str());
+        assert!(
+            std::ptr::eq(text, note.content.as_str()),
+            "internal canonical note text must borrow instead of cloning"
+        );
+        let owned: String = note_embedding_text(&note);
+        assert_eq!(owned.as_str(), note.content.as_str());
     }
 
     async fn restore_edge_preimage(
@@ -7439,5 +7738,160 @@ mod tests {
 
         assert_eq!(stored.title, expected.title, "title after merge");
         assert_eq!(stored.body, expected.body, "body after merge");
+    }
+
+    /// The recomputed `properties_merged` count must agree with the fold on
+    /// whole-value replacement.
+    ///
+    /// `merge_json` scores a `PreferFrom` replace of one properties value by a
+    /// differently-shaped one as a single contribution. An earlier version of
+    /// `count_new_property_keys` returned 0 for that shape, which under-reported
+    /// every such merge — including on note kinds with no owner-established
+    /// properties, which never enter the restoration path and were being counted
+    /// correctly before the recompute was introduced. Measured at the time:
+    /// fold=1, recompute=0, on both orderings.
+    ///
+    /// The flat-overwrite control is load-bearing: it is what distinguishes this
+    /// test from one that a function returning 1 unconditionally would also pass.
+    #[test]
+    fn recomputed_count_agrees_with_fold_on_whole_value_replacement() {
+        use serde_json::json;
+
+        for (into, from, label) in [
+            (json!({"a": 1}), json!(5), "object replaced by scalar"),
+            (
+                json!(7),
+                json!({"b": 2}),
+                "scalar replaced by single-key object",
+            ),
+            // A whole-value replacement is ONE contribution however many keys
+            // the replacing object carries. The single-key vector above cannot
+            // see the difference between that rule and counting the object's
+            // keys, so it stayed green while the count was wrong for ordinary
+            // notes. This vector is the one that distinguishes them.
+            (
+                json!(7),
+                json!({"b": 2, "c": 3}),
+                "scalar replaced by multi-key object",
+            ),
+        ] {
+            let (merged, fold_count) = merge_json(&into, &from, EntityDedupMergePolicy::PreferFrom);
+            let recomputed = count_new_property_keys(
+                Some(&into),
+                Some(&merged),
+                EntityDedupMergePolicy::PreferFrom,
+            );
+            assert_eq!(
+                recomputed, fold_count,
+                "{label}: recomputed count must match the fold's own count",
+            );
+            assert_eq!(recomputed, 1, "{label}: one value was contributed");
+        }
+
+        // Control: an ordinary overwrite of an existing key contributes nothing
+        // under BOTH rules. Without this arm, a function returning 1 for every
+        // differing pair would pass the loop above.
+        let (merged, fold_count) = merge_json(
+            &json!({"a": 1}),
+            &json!({"a": 2}),
+            EntityDedupMergePolicy::PreferFrom,
+        );
+        let recomputed = count_new_property_keys(
+            Some(&json!({"a": 1})),
+            Some(&merged),
+            EntityDedupMergePolicy::PreferFrom,
+        );
+        assert_eq!(fold_count, 0, "control: overwrite is never a fold addition");
+        assert_eq!(recomputed, 0, "control: overwrite is never a new key");
+
+        // Control: equal values mean nothing was contributed (the `from` note
+        // carrying no properties at all).
+        assert_eq!(
+            count_new_property_keys(
+                Some(&json!({"a": 1})),
+                Some(&json!({"a": 1})),
+                EntityDedupMergePolicy::PreferFrom,
+            ),
+            0,
+            "control: an unchanged properties object contributes nothing",
+        );
+    }
+
+    /// Recursion into a same-named nested object is only correct under `Union`.
+    ///
+    /// `merge_json` descends into a nested object ONLY for `Union`. Under
+    /// `PreferFrom` an existing top-level key is replaced wholesale and under
+    /// `PreferInto` it is kept wholesale, so nothing is merged beneath that key
+    /// and nothing beneath it may be counted. An earlier version of the
+    /// recomputation recursed unconditionally and reported 1 for the
+    /// `PreferFrom` case below, where one existing property was replaced and
+    /// none was added. This affects ordinary notes with no owner-established
+    /// properties, which never reach the restoration path at all.
+    #[test]
+    fn recomputed_count_recurses_into_nested_objects_only_under_union() {
+        use serde_json::json;
+
+        let into = json!({"meta": {"old": 1}});
+        let from = json!({"meta": {"new": 2}});
+
+        for (strategy, expected, label) in [
+            (
+                EntityDedupMergePolicy::PreferFrom,
+                0,
+                "prefer_from replaces the whole key",
+            ),
+            (
+                EntityDedupMergePolicy::PreferInto,
+                0,
+                "prefer_into keeps the whole key",
+            ),
+            (
+                EntityDedupMergePolicy::Union,
+                1,
+                "union merges beneath the key",
+            ),
+        ] {
+            let (merged, fold_count) = merge_json(&into, &from, strategy);
+            let recomputed = count_new_property_keys(Some(&into), Some(&merged), strategy);
+            assert_eq!(
+                recomputed, fold_count,
+                "{label}: recomputed count must match the fold's own count",
+            );
+            assert_eq!(recomputed, expected, "{label}");
+        }
+    }
+
+    /// An object emptied by restoration contributed nothing, and the count must
+    /// say so.
+    ///
+    /// When the surviving record's properties were not an object and the fold
+    /// installed the from-note's object, restoration removes the owner keys the
+    /// survivor never had — which can leave `{}`. Scoring that as a whole-value
+    /// replacement would report 1 for a record holding no properties at all.
+    #[test]
+    fn recomputed_count_is_zero_when_restoration_empties_the_object() {
+        use serde_json::json;
+
+        assert_eq!(
+            count_new_property_keys(
+                Some(&json!("scalar-properties")),
+                Some(&json!({})),
+                EntityDedupMergePolicy::PreferFrom,
+            ),
+            0,
+            "an emptied object retains nothing from the absorbed record",
+        );
+
+        // Control: the same shape with a surviving key counts that key, so the
+        // arm above is not simply returning 0 for every non-object original.
+        assert_eq!(
+            count_new_property_keys(
+                Some(&json!("scalar-properties")),
+                Some(&json!({"kept": 1})),
+                EntityDedupMergePolicy::PreferFrom,
+            ),
+            1,
+            "a surviving key is still counted",
+        );
     }
 }

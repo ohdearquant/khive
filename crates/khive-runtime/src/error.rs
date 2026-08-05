@@ -1,12 +1,30 @@
 //! Runtime error types.
 
 use std::fmt;
+use std::time::Duration;
 
 use thiserror::Error;
 use uuid::Uuid;
 
 /// Convenience alias for `Result<T, RuntimeError>`.
 pub type RuntimeResult<T> = Result<T, RuntimeError>;
+
+/// Stable ADR-135 F6 stage and wire code for a finite-wait pooled writer
+/// checkout that expires before SQLite executes.
+pub const WRITER_POOL_CHECKOUT_TIMEOUT_STAGE: &str = "writer_pool_checkout_timeout";
+
+/// Structured context recovered from either a direct SQLite runtime error or
+/// a typed SQLite source preserved inside a storage-driver wrapper.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WriterPoolCheckoutTimeoutContext {
+    /// Finite checkout deadline that elapsed before the pooled mutex was
+    /// acquired.
+    pub timeout: Duration,
+    /// Storage capability that wrapped the SQLite source, if one did.
+    pub capability: Option<khive_storage::StorageCapability>,
+    /// Storage operation that wrapped the SQLite source, if one did.
+    pub operation: Option<String>,
+}
 
 /// A guarded edge write (`link`/`link_many`) was refused because one or both
 /// endpoints no longer existed at write time. Names the exact endpoint(s)
@@ -286,6 +304,40 @@ pub enum RuntimeError {
         budget_ms: u64,
         elapsed_ms: u64,
     },
+}
+
+impl RuntimeError {
+    /// Recover a finite-wait pool-checkout timeout without inspecting rendered
+    /// error text.
+    ///
+    /// Store implementations retain [`khive_db::SqliteError`] as the typed
+    /// source of `StorageError::Driver`; this method carries that structure
+    /// through the runtime wrapper for the MCP wire serializer. A direct
+    /// `RuntimeError::Sqlite` follows the same classification path.
+    pub fn writer_pool_checkout_timeout_context(&self) -> Option<WriterPoolCheckoutTimeoutContext> {
+        let (sqlite_error, capability, operation) = match self {
+            Self::Sqlite(error) => (error, None, None),
+            Self::Storage(khive_storage::StorageError::Driver {
+                capability,
+                operation,
+                source,
+            }) => (
+                source.downcast_ref::<khive_db::SqliteError>()?,
+                Some(*capability),
+                Some(operation.to_string()),
+            ),
+            _ => return None,
+        };
+
+        let khive_db::SqliteError::WriterPoolCheckoutTimeout { timeout } = sqlite_error else {
+            return None;
+        };
+        Some(WriterPoolCheckoutTimeoutContext {
+            timeout: *timeout,
+            capability,
+            operation,
+        })
+    }
 }
 
 /// Resolve an FTS text-leg search result, failing loud on parser syntax

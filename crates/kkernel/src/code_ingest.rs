@@ -523,7 +523,7 @@ mod tests {
 
     use async_trait::async_trait;
     use khive_runtime::{EmbedderProvider, RuntimeError};
-    use lattice_embed::{EmbedError, EmbeddingModel, EmbeddingService, MAX_TEXT_CHARS};
+    use lattice_embed::{EmbedError, EmbeddingModel, EmbeddingService, MAX_TEXT_BYTES};
     use serial_test::serial;
 
     use super::*;
@@ -1030,7 +1030,7 @@ mod tests {
         // Finding-note embeddings use the canonical `title: impact` content,
         // while evidence remains structured properties only.
         document["findings"][0]["impact"] =
-            serde_json::Value::String("x".repeat(MAX_TEXT_CHARS + 1));
+            serde_json::Value::String("x".repeat(MAX_TEXT_BYTES + 1));
         std::fs::write(
             &findings,
             serde_json::to_vec(&document).expect("serialize long findings fixture"),

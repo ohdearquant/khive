@@ -216,9 +216,11 @@ stats() → {atoms: N, domains: N, ...}
 index(ids?: [<slug|uuid>], batch_size?: 500, insert_only?: false) → {indexed: N}
 ```
 
-Backfills embedding vectors and FTS content. When `ids` is omitted, indexes the
-entire corpus in batches. `insert_only` skips the delete-then-reinsert cycle for
-fresh corpus backfill.
+Backfills default-model embedding vectors and FTS content. The knowledge retrieval
+paths read only the default model, so secondary registered models are not embedded
+until a model-aware or fused knowledge read path exists. When `ids` is omitted,
+indexes the entire corpus in batches. `insert_only` skips the delete-then-reinsert
+cycle for fresh corpus backfill.
 
 #### `knowledge.fold` — budget-constrained selection
 
