@@ -200,12 +200,12 @@ pub struct IngestReport {
     pub changed_paths_filtered_noncanonical: u64,
     /// Changed paths whose `(source_revision, source_path)` module binding
     /// was unusable and therefore received no code-module annotation. Two
-    /// shapes fold into this counter: an ambiguous key (more than one live
-    /// row, at most one with a parseable id) and the single-row sub-case
-    /// whose one row's id does not parse (not ambiguous — just no bindable
-    /// candidate). Counted only when an ingested commit's path actually
-    /// hits the key, so unusable keys untouched by this pass never inflate
-    /// the count.
+    /// shapes fold into this counter: an ambiguous key (two or more live
+    /// rows, whether two or more have parseable ids or at most one has a
+    /// parseable id) and the single-row sub-case whose one row's id does not
+    /// parse (not ambiguous — just no bindable candidate). Counted only when
+    /// an ingested commit's path actually hits the key, so unusable keys
+    /// untouched by this pass never inflate the count.
     pub code_module_ambiguous_path_skips: u64,
 }
 
@@ -614,13 +614,14 @@ async fn find_document_for_path(
 /// out; a path with more than one matching live row remains ambiguous and is
 /// deliberately represented by `None` rather than selecting or annotating an
 /// arbitrary candidate. That `None` folds two distinct shapes, both
-/// counted in the same skip counter: (a) two or more rows of which at most
-/// one has a parseable id (true ambiguity), and (b) exactly ONE row whose
-/// id does not parse — a key that is not ambiguous but has no bindable
-/// candidate, so it must skip for the same reason. Shape (b) is a live row
-/// for the key exactly like any other; it occupies the slot (a second row
-/// for the same key marks the pair ambiguous under shape (a)) but can never
-/// itself serve as a binding target.
+/// counted in the same skip counter: (a) two or more rows, including two or
+/// more rows with parseable ids and the case where at most one has a
+/// parseable id (true ambiguity), and (b) exactly ONE row whose id does not
+/// parse — a key that is not ambiguous but has no bindable candidate, so it
+/// must skip for the same reason. Shape (b) is a live row for the key exactly
+/// like any other; it occupies the slot (a second row for the same key marks
+/// the pair ambiguous under shape (a)) but can never itself serve as a
+/// binding target.
 ///
 /// A reader/query failure returns `Err` carrying the underlying error text;
 /// the caller degrades to no module annotation with a warning that includes
@@ -925,9 +926,12 @@ fn parse_touched_files(bytes: &[u8]) -> Result<HashMap<String, Vec<String>>> {
         }
         if let Some(header) = token.strip_prefix(TOUCHED_HEADER_PREFIX) {
             if header.len() < 40 || !header[..40].iter().all(u8::is_ascii_hexdigit) {
+                let lossy = String::from_utf8_lossy(header);
+                let masked = secret_gate::mask_secrets(lossy.as_ref());
+                let display = refs::truncate_chars(masked.as_ref(), 80);
                 return Err(anyhow!(
                     "git log --name-only output contains a malformed commit header {:?}",
-                    String::from_utf8_lossy(&header[..header.len().min(80)])
+                    display
                 ));
             }
             let sha = String::from_utf8_lossy(&header[..40]).into_owned();
@@ -952,11 +956,12 @@ fn parse_touched_files(bytes: &[u8]) -> Result<HashMap<String, Vec<String>>> {
             // Path bytes are attacker/repo-controlled, so the error snippet
             // is secret-masked the same way stored changed_paths are —
             // never raw token bytes in a log/error path.
-            let lossy = String::from_utf8_lossy(&token[..token.len().min(80)]);
-            let masked = secret_gate::mask_secrets(&lossy);
+            let lossy = String::from_utf8_lossy(token);
+            let masked = secret_gate::mask_secrets(lossy.as_ref());
+            let display = refs::truncate_chars(masked.as_ref(), 80);
             return Err(anyhow!(
                 "git log --name-only output contains a path token before any \
-                 commit header: {masked:?}"
+                 commit header: {display:?}"
             ));
         };
         map.get_mut(sha)
@@ -1023,6 +1028,32 @@ mod touched_file_parser_tests {
         // stored changed_paths, never raw token bytes.
         let fake_token = "ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
         let raw = format!("src/{fake_token}.rs\0");
+
+        let err = parse_touched_files(raw.as_bytes()).expect_err("orphan path must fail");
+        let text = format!("{err}");
+        assert!(!text.contains(fake_token), "{text}");
+        assert!(text.contains("MASKED"), "{text}");
+    }
+
+    #[test]
+    fn masks_a_secret_shaped_malformed_header_in_the_error() {
+        let fake_token = "ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let raw = format!("/\x1e{fake_token}\0");
+
+        let err = parse_touched_files(raw.as_bytes()).expect_err("bad header must fail");
+        let text = format!("{err}");
+        assert!(!text.contains(fake_token), "{text}");
+        assert!(text.contains("MASKED"), "{text}");
+    }
+
+    #[test]
+    fn masks_an_orphan_secret_before_truncating_the_error() {
+        let fake_token = "ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        // The credential crosses the old byte-80 cut, so masking only the
+        // prefix would leave the raw secret in the error path.
+        let token = format!("{} {fake_token}", "x".repeat(59));
+        assert!(token.len() > 80);
+        let raw = format!("{token}\0");
 
         let err = parse_touched_files(raw.as_bytes()).expect_err("orphan path must fail");
         let text = format!("{err}");
@@ -1317,10 +1348,28 @@ async fn ingest_commits(
         // the contract reserves for a genuinely empty commit.
         let Some(touched_paths) = files_by_sha.get(&c.sha) else {
             cursor_stalled = true;
+            let recipient_detail = commits
+                .iter()
+                .position(|candidate| candidate.sha == c.sha)
+                .and_then(|index| {
+                    commits
+                        .iter()
+                        .skip(index + 1)
+                        .find(|candidate| files_by_sha.contains_key(&candidate.sha))
+                })
+                .map(|recipient| {
+                    format!(
+                        "; orphaned paths may have been absorbed by newer commit {}",
+                        recipient.sha
+                    )
+                })
+                .unwrap_or_else(|| {
+                    "; no newer path-set recipient was identifiable from this snapshot".to_string()
+                });
             report.warnings.push(format!(
                 "create commit {}: no touched-path set recorded by the \
-                 --name-only pass; not ingested",
-                c.sha
+                 --name-only pass; not ingested{}",
+                c.sha, recipient_detail
             ));
             continue;
         };
@@ -1374,15 +1423,17 @@ async fn ingest_commits(
                     annotates.insert(module_id.to_string());
                 }
                 // The key is unusable — either more than one live row binds
-                // it (at most one with a parseable id) or its single row's
-                // id does not parse — so no candidate is annotated. Both
-                // shapes count once per commit path that hits the key (the
+                // it (including the two-parseable-row case) or its single
+                // row's id does not parse — so no candidate is annotated.
+                // Both shapes count once per commit path that hits the key (the
                 // path is also remembered for the bounded per-run warning
                 // below); see `load_code_modules_by_snapshot_path` for the
                 // fold.
                 Some(None) => {
                     report.code_module_ambiguous_path_skips += 1;
-                    ambiguous_module_skip_paths.push(path.clone());
+                    if ambiguous_module_skip_paths.len() < AMBIGUOUS_SKIP_DETAIL_CAP {
+                        ambiguous_module_skip_paths.push(path.clone());
+                    }
                 }
                 None => {}
             }
@@ -1520,8 +1571,8 @@ async fn ingest_commits(
         ));
     }
     if report.code_module_ambiguous_path_skips > 0 {
-        // Every skip records its masked path above, so the vec length is the
-        // exact count; only the displayed sample is capped.
+        // Every skip increments the exact counter above; only the retained
+        // masked path sample is capped at AMBIGUOUS_SKIP_DETAIL_CAP.
         let shown = ambiguous_module_skip_paths
             .len()
             .min(AMBIGUOUS_SKIP_DETAIL_CAP);
@@ -1533,7 +1584,9 @@ async fn ingest_commits(
             })
             .collect::<Vec<_>>()
             .join(", ");
-        let remaining = ambiguous_module_skip_paths.len() - shown;
+        let remaining = report
+            .code_module_ambiguous_path_skips
+            .saturating_sub(shown as u64);
         let suffix = if remaining > 0 {
             format!(", +{remaining} more")
         } else {
@@ -2745,6 +2798,22 @@ mod module_index_loader_tests {
             Some(&None),
             "a malformed row is evidence of a second live module for \
              {AMBIGUOUS_PATH}; the valid row {valid_id} must not be selected"
+        );
+    }
+
+    #[tokio::test]
+    async fn two_parseable_module_rows_fold_to_ambiguity() {
+        let (rt, token) = rt_and_token();
+        let first_id = create_module(&rt, &token, "first_module", AMBIGUOUS_PATH).await;
+        let second_id = create_module(&rt, &token, "second_module", AMBIGUOUS_PATH).await;
+
+        let index = load_code_modules_by_snapshot_path(&rt, &token, REVISION)
+            .await
+            .unwrap();
+        assert_eq!(
+            index.get(AMBIGUOUS_PATH),
+            Some(&None),
+            "two live parseable rows ({first_id}, {second_id}) must not select a winner"
         );
     }
 

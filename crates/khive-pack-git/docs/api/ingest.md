@@ -378,9 +378,10 @@ revision prevents an identically named path in another repository snapshot
 from receiving a fabricated annotation. If more than one live module still
 has the same `(source_revision, source_path)`, the binding is ambiguous and no
 candidate is annotated. The skip folds two shapes into one counter,
-`IngestReport.code_module_ambiguous_path_skips`: an ambiguous key (more than
-one live row, at most one with a parseable id — a row whose `id` does not
-parse as a UUID is still a live row for the key, so it marks the pair
+`IngestReport.code_module_ambiguous_path_skips`: an ambiguous key (two or
+more live rows, including the simplest case where both rows have parseable
+ids, or the case where at most one has a parseable id — a row whose `id` does
+not parse as a UUID is still a live row for the key, so it marks the pair
 ambiguous, but can never itself be the annotated candidate) and the
 single-row sub-case whose one row's id does not parse (not ambiguous — just
 no bindable candidate). Each skip is counted only when an ingested commit's

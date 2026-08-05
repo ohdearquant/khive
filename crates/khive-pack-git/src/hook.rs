@@ -121,7 +121,8 @@ impl KindHook for CommitHook {
                 if !is_repo_relative_path(path) {
                     return Err(RuntimeError::InvalidInput(format!(
                         "commit properties.changed_paths[{idx}] must be a non-empty \
-                         repository-relative '/'-separated path without '.' or '..' components"
+                         repository-relative path using '/' separators, with no empty, '.' or \
+                         '..' components, leading '/', drive prefix, backslash, or NUL byte"
                     )));
                 }
                 if previous.is_some_and(|prior| path <= prior) {

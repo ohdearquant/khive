@@ -1022,11 +1022,12 @@ exec "$REAL_GIT" "$@"
     .expect("the run completes despite the touched-path gap");
     assert!(report.done, "an unbounded pass still finishes: {report:?}");
     assert!(
-        report
-            .warnings
-            .iter()
-            .any(|w| w.contains("no touched-path set recorded") && w.contains(&second_sha)),
-        "the gap must surface as a warning naming the stalled commit: {:?}",
+        report.warnings.iter().any(|w| {
+            w.contains("no touched-path set recorded")
+                && w.contains(&second_sha)
+                && w.contains(&third_sha)
+        }),
+        "the gap warning must name both the stalled commit and the newer polluted recipient: {:?}",
         report.warnings
     );
     assert_eq!(
