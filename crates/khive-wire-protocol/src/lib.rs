@@ -213,21 +213,28 @@
 //! codec's `decode_payload` path (which re-classifies the
 //! rejection into the typed [`codec::CodecError::InconsistentErrorScope`])
 //! AND a direct `serde_json::from_str::<Frame>`. The check covers the
-//! codes in the closed set ([`error::WIRE_ERROR_CODES`]); an unrecognized
+//! same wire invariants in `Frame`'s serializer, so direct
+//! `serde_json::to_vec::<Frame>` cannot bypass the encode-side validation.
+//! On decode, the check covers the codes in the closed set
+//! ([`error::WIRE_ERROR_CODES`]); an unrecognized
 //! code falls back to `internal` and is processed per the fallback rule
 //! above (its true scope is unknown to this version, so the pairing is
 //! not enforced for it), but the raw code string is preserved in the
 //! decoded frame's `unrecognized_code` diagnostic field rather than
 //! discarded.
+//! If that fallback has no operation id, a consumer has nothing safe to
+//! correlate: it should surface the frame as a connection-level diagnostic
+//! and must not guess which request to fail.
 //!
-//! **Fallback frames are terminal for relay.** A decoded frame carrying
-//! `unrecognized_code` can be inspected locally, but the encode path
-//! rejects it with [`codec::CodecError::FallbackFrameNotEncodable`]:
+//! **Fallback frames are not re-encodable by this relay.** A decoded frame
+//! carrying `unrecognized_code` can be inspected locally, but the encode
+//! path rejects it with [`codec::CodecError::FallbackFrameNotEncodable`]:
 //! re-encoding would emit `internal` and silently discard the newer code
-//! the peer sent, so this crate never corrupts it. A relay that must pass
-//! unknown codes through has to operate on the raw frame bytes, not on a
-//! decoded-and-re-encoded frame. The one decode-only guarantee the codec
-//! path holds over a direct serde decode is the finer-grained
+//! the peer sent, so this crate never corrupts it; the connection remains
+//! healthy. A relay that must pass unknown codes through has to operate on
+//! the raw frame bytes, not on a decoded-and-re-encoded frame. The one
+//! decode-only guarantee the codec path holds over a direct serde decode is
+//! the finer-grained
 //! [`codec::CodecError::UnknownFrameKind`] classification for a `"kind"`
 //! outside the closed set; every other decode-time rule — strict field
 //! rejection, the id/scope pairing, and the unknown-code diagnostic — is

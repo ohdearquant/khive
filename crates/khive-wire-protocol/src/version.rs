@@ -67,8 +67,8 @@ impl SupportedVersions {
         }
     }
 
-    /// Construct an explicit `[min, max]` inclusive supported range, for a
-    /// server that intentionally narrows or widens the default policy.
+    /// Construct an explicit `[min, max]` inclusive supported range within
+    /// the protocol grammar implemented by this crate.
     ///
     /// Fails with [`SupportedVersionsError`] rather than panicking on an
     /// unusable range:
@@ -79,6 +79,9 @@ impl SupportedVersions {
     /// - [`SupportedVersionsError::InvertedRange`] if `min > max` — an
     ///   inverted range would silently reject every handshake (no version
     ///   satisfies it), which is always a configuration bug.
+    /// - [`SupportedVersionsError::MaxAboveCurrent`] if `max` exceeds
+    ///   [`CURRENT_VERSION`] — this crate cannot admit a version whose wire
+    ///   grammar it does not implement.
     pub const fn new(
         min: ProtocolVersion,
         max: ProtocolVersion,
@@ -88,6 +91,9 @@ impl SupportedVersions {
         }
         if min.0 > max.0 {
             return Err(SupportedVersionsError::InvertedRange);
+        }
+        if max.0 > CURRENT_VERSION.0 {
+            return Err(SupportedVersionsError::MaxAboveCurrent);
         }
         Ok(Self { min, max })
     }
@@ -122,6 +128,10 @@ pub enum SupportedVersionsError {
     /// satisfies it, so it would reject every handshake.
     #[error("supported-version range is inverted: min must not exceed max")]
     InvertedRange,
+    /// The range's upper bound is newer than the grammar implemented by this
+    /// crate.
+    #[error("supported-version range max must not exceed the current protocol version")]
+    MaxAboveCurrent,
 }
 
 #[cfg(test)]
@@ -129,20 +139,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn new_accepts_a_valid_range() {
+    fn new_accepts_the_current_range() {
         let supported =
-            SupportedVersions::new(ProtocolVersion::new(2), ProtocolVersion::new(5)).unwrap();
-        assert_eq!(supported.min(), ProtocolVersion::new(2));
-        assert_eq!(supported.max(), ProtocolVersion::new(5));
+            SupportedVersions::new(ProtocolVersion::new(1), ProtocolVersion::new(1)).unwrap();
+        assert_eq!(supported.min(), ProtocolVersion::new(1));
+        assert_eq!(supported.max(), ProtocolVersion::new(1));
     }
 
     #[test]
-    fn new_accepts_a_single_version_range() {
-        let supported =
-            SupportedVersions::new(ProtocolVersion::new(3), ProtocolVersion::new(3)).unwrap();
-        assert!(supported.contains(ProtocolVersion::new(3)));
-        assert!(!supported.contains(ProtocolVersion::new(2)));
-        assert!(!supported.contains(ProtocolVersion::new(4)));
+    fn new_rejects_a_range_above_current_version() {
+        for (min, max) in [(1, 2), (2, 2)] {
+            let err = SupportedVersions::new(ProtocolVersion::new(min), ProtocolVersion::new(max))
+                .unwrap_err();
+            assert_eq!(err, SupportedVersionsError::MaxAboveCurrent);
+        }
     }
 
     #[test]
@@ -178,12 +188,10 @@ mod tests {
         // Boundary inclusion: min and max themselves are supported; one
         // below min and one above max are not.
         let supported =
-            SupportedVersions::new(ProtocolVersion::new(2), ProtocolVersion::new(4)).unwrap();
-        assert!(!supported.contains(ProtocolVersion::new(1)));
-        assert!(supported.contains(ProtocolVersion::new(2)));
-        assert!(supported.contains(ProtocolVersion::new(3)));
-        assert!(supported.contains(ProtocolVersion::new(4)));
-        assert!(!supported.contains(ProtocolVersion::new(5)));
+            SupportedVersions::new(ProtocolVersion::new(1), ProtocolVersion::new(1)).unwrap();
+        assert!(!supported.contains(ProtocolVersion::new(0)));
+        assert!(supported.contains(ProtocolVersion::new(1)));
+        assert!(!supported.contains(ProtocolVersion::new(2)));
     }
 
     #[test]

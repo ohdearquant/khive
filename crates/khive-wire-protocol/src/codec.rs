@@ -35,9 +35,10 @@ pub(crate) const INCONSISTENT_SCOPE_ERROR_PREFIX: &str = "error frame violates t
 /// [`FrameCodec::max_frame_bytes`] explicitly.
 pub const DEFAULT_MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 
-/// A codec failure, distinguishing every malformed-frame case this crate
-/// can identify. Every variant maps onto the wire error taxonomy —
-/// [`crate::error::WireErrorCode::MalformedFrame`] or
+/// A codec failure, distinguishing every frame-level case this crate can
+/// identify. Every variant maps onto the wire error taxonomy —
+/// [`crate::error::WireErrorCode::MalformedFrame`],
+/// [`crate::error::WireErrorCode::Internal`], or
 /// [`crate::error::WireErrorCode::FrameTooLarge`] — canonically via
 /// [`wire_code`](Self::wire_code) (and the `From<&CodecError>` impl), so
 /// servers need no hand-maintained mapping; this crate keeps the
@@ -110,12 +111,12 @@ pub enum CodecError {
     /// Encode side: the frame is a decoded unknown-code fallback — a
     /// [`crate::frame::Frame::Error`] carrying a `Some`
     /// `unrecognized_code`, which only a decode path sets when the wire
-    /// carried a code outside the closed set. Fallback frames are
-    /// TERMINAL FOR RELAY: re-encoding one would emit the fallback code
-    /// (`internal`) and silently discard the newer code the peer sent, so
-    /// the encode path rejects the frame outright rather than corrupt it.
-    /// If a relay must pass unknown codes through, it has to operate on
-    /// the raw frame bytes, not on a decoded-and-re-encoded frame.
+    /// carried a code outside the closed set. Re-encoding one would emit
+    /// the fallback code (`internal`) and silently discard the newer code
+    /// the peer sent, so the encode path rejects this local relay attempt;
+    /// the connection remains healthy, but this relay cannot re-encode the
+    /// decoded frame. If a relay must pass unknown codes through, it has to
+    /// operate on the raw frame bytes, not on a decoded-and-re-encoded frame.
     #[error(
         "fallback error frame (unrecognized code {code:?}) is not re-encodable: \
          re-encoding would emit \"internal\" and discard the newer wire code"
@@ -127,13 +128,17 @@ impl CodecError {
     /// The wire error code this failure maps to under ADR-137's taxonomy:
     /// [`FrameTooLarge`](Self::FrameTooLarge) and
     /// [`U32PrefixLimitExceeded`](Self::U32PrefixLimitExceeded) — the size
-    /// failures — map to [`WireErrorCode::FrameTooLarge`]; every other
-    /// variant maps to [`WireErrorCode::MalformedFrame`]. This is the
-    /// canonical codec→wire-error mapping: servers should use it (or the
+    /// failures — map to [`WireErrorCode::FrameTooLarge`]. A decoded fallback
+    /// that this local relay cannot re-encode maps to
+    /// [`WireErrorCode::Internal`]; the connection is healthy and only the
+    /// relay attempt failed. Every other variant maps to
+    /// [`WireErrorCode::MalformedFrame`]. This is the canonical
+    /// codec→wire-error mapping: servers should use it (or the
     /// `From<&CodecError>` impl) rather than hand-maintain their own.
     ///
     /// [`WireErrorCode::FrameTooLarge`]: crate::error::WireErrorCode::FrameTooLarge
     /// [`WireErrorCode::MalformedFrame`]: crate::error::WireErrorCode::MalformedFrame
+    /// [`WireErrorCode::Internal`]: crate::error::WireErrorCode::Internal
     pub const fn wire_code(&self) -> crate::error::WireErrorCode {
         match self {
             CodecError::FrameTooLarge { .. } | CodecError::U32PrefixLimitExceeded { .. } => {
@@ -145,10 +150,10 @@ impl CodecError {
             | CodecError::MissingKind
             | CodecError::UnknownFrameKind(_)
             | CodecError::InvalidFields { .. }
-            | CodecError::InconsistentErrorScope { .. }
-            | CodecError::FallbackFrameNotEncodable { .. } => {
+            | CodecError::InconsistentErrorScope { .. } => {
                 crate::error::WireErrorCode::MalformedFrame
             }
+            CodecError::FallbackFrameNotEncodable { .. } => crate::error::WireErrorCode::Internal,
         }
     }
 }
@@ -236,7 +241,9 @@ pub fn encode_frame(frame: &Frame) -> Result<Vec<u8>, CodecError> {
 ///
 /// Before serializing, the frame is validated against the same wire rules
 /// the decode side enforces (`validate_frame_for_wire`, private): an empty
-/// operation id in any id field ([`CodecError::InvalidFields`]), an
+/// operation id in any id field ([`CodecError::InvalidFields`]), a handshake
+/// or handshake acknowledgment naming version 0
+/// ([`CodecError::InvalidFields`]), an
 /// `error` frame whose id presence contradicts its code's terminal scope
 /// ([`CodecError::InconsistentErrorScope`]), and a decoded unknown-code
 /// fallback `error` frame ([`CodecError::FallbackFrameNotEncodable`]) are
@@ -278,12 +285,14 @@ pub fn encode_frame_with_max(frame: &Frame, max_frame_bytes: usize) -> Result<Ve
 ///    [`decode_payload`] enforces via [`CodecError::InconsistentErrorScope`].
 ///    Every [`crate::error::WireErrorCode`] variant is in the closed set,
 ///    so the decode side's unknown-code exemption never applies here.
-/// 3. An `error` frame carrying a `Some` `unrecognized_code` — the
+/// 3. A handshake or handshake acknowledgment may not name version 0;
+///    version 0 does not exist in this protocol.
+/// 4. An `error` frame carrying a `Some` `unrecognized_code` — the
 ///    decoded unknown-code fallback marker, which only a decode path sets
 ///    — is rejected with [`CodecError::FallbackFrameNotEncodable`].
-///    Fallback frames are terminal for relay: re-encoding one would emit
-///    the fallback code (`internal`) and silently discard the newer code
-///    the peer sent, so this crate refuses to corrupt it.
+///    This relay cannot re-encode a fallback: doing so would emit the
+///    fallback code (`internal`) and silently discard the newer code the
+///    peer sent, so this crate refuses to corrupt it.
 fn validate_frame_for_wire(frame: &Frame) -> Result<(), CodecError> {
     use crate::error::TerminalScope;
 
@@ -298,7 +307,23 @@ fn validate_frame_for_wire(frame: &Frame) -> Result<(), CodecError> {
     }
 
     match frame {
-        Frame::Handshake { .. } | Frame::HandshakeAck { .. } | Frame::Event { .. } => {}
+        Frame::Handshake { version } => {
+            if version.get() == 0 {
+                return Err(CodecError::InvalidFields {
+                    kind: "handshake".to_string(),
+                    detail: "protocol version 0 does not exist".to_string(),
+                });
+            }
+        }
+        Frame::HandshakeAck { version } => {
+            if version.get() == 0 {
+                return Err(CodecError::InvalidFields {
+                    kind: "handshake_ack".to_string(),
+                    detail: "protocol version 0 does not exist".to_string(),
+                });
+            }
+        }
+        Frame::Event { .. } => {}
         Frame::Request { id, .. } => check_id("request", id)?,
         Frame::Response { id, .. } => check_id("response", id)?,
         Frame::Cancel { id } => check_id("cancel", id)?,
@@ -312,7 +337,8 @@ fn validate_frame_for_wire(frame: &Frame) -> Result<(), CodecError> {
             unrecognized_code,
             ..
         } => {
-            // A decoded-fallback frame is terminal for relay; see rule 3.
+            // A decoded-fallback frame cannot be re-encoded by this relay;
+            // see rule 4.
             if let Some(raw_code) = unrecognized_code {
                 return Err(CodecError::FallbackFrameNotEncodable {
                     code: raw_code.clone(),
@@ -924,11 +950,40 @@ mod tests {
                 id: OperationId::from(""),
                 topic: "a.b".to_string(),
             },
+            Frame::Error {
+                id: Some(OperationId::from("")),
+                code: crate::error::WireErrorCode::Internal,
+                message: "failure".to_string(),
+                unrecognized_code: None,
+            },
         ];
         for frame in frames {
             match encode_frame(&frame).unwrap_err() {
                 CodecError::InvalidFields { detail, .. } => {
                     assert!(detail.contains("non-empty"), "detail: {detail}");
+                }
+                other => panic!(
+                    "kind {:?}: expected InvalidFields, got {other:?}",
+                    frame.kind()
+                ),
+            }
+        }
+    }
+
+    #[test]
+    fn encode_rejects_zero_protocol_version_in_both_handshake_kinds() {
+        for frame in [
+            Frame::Handshake {
+                version: crate::version::ProtocolVersion::new(0),
+            },
+            Frame::HandshakeAck {
+                version: crate::version::ProtocolVersion::new(0),
+            },
+        ] {
+            match encode_frame(&frame).unwrap_err() {
+                CodecError::InvalidFields { kind, detail } => {
+                    assert_eq!(kind, frame.kind());
+                    assert!(detail.contains("version 0"), "detail: {detail}");
                 }
                 other => panic!(
                     "kind {:?}: expected InvalidFields, got {other:?}",
@@ -1001,7 +1056,7 @@ mod tests {
         }
     }
 
-    // ── unknown wire code: fallback keeps the raw string (item 3) ──
+    // ── unknown wire code: fallback keeps the raw string ──
 
     #[test]
     fn unknown_code_fallback_preserves_the_raw_string_with_an_id() {
@@ -1079,7 +1134,7 @@ mod tests {
         }
     }
 
-    // ── fallback frames are terminal for relay (item 2) ──
+    // ── fallback frames cannot be re-encoded by this relay ──
 
     #[test]
     fn encode_rejects_a_fallback_frame_with_an_id() {
@@ -1129,7 +1184,7 @@ mod tests {
         assert_eq!(decoded, frame);
     }
 
-    // ── decode_with_consumed (item 4) ──
+    // ── decode_with_consumed ──
 
     #[test]
     fn decode_with_consumed_reports_consumed_length_on_a_two_frame_buffer() {
@@ -1173,7 +1228,7 @@ mod tests {
         assert!(matches!(err, CodecError::TruncatedPayload { .. }));
     }
 
-    // ── serde_json feature posture probe (item 2) ──
+    // ── serde_json feature posture probe ──
 
     #[test]
     fn serde_json_feature_posture_is_default_keys_serialize_sorted() {
@@ -1201,7 +1256,7 @@ mod tests {
         );
     }
 
-    // ── CodecError → WireErrorCode canonical mapping (item 8) ──
+    // ── CodecError → WireErrorCode canonical mapping ──
 
     #[test]
     fn codec_errors_map_to_their_wire_error_codes() {
@@ -1259,7 +1314,7 @@ mod tests {
                 CodecError::FallbackFrameNotEncodable {
                     code: "future_code_xyz".to_string(),
                 },
-                WireErrorCode::MalformedFrame,
+                WireErrorCode::Internal,
             ),
         ];
         for (err, expected) in cases {

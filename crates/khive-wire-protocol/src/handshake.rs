@@ -91,6 +91,19 @@ pub struct HandshakeSequenceError {
     pub error: Box<Frame>,
 }
 
+impl std::fmt::Display for HandshakeSequenceError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.error.as_ref() {
+            Frame::Error { code, message, .. } => {
+                write!(f, "handshake sequence rejected ({code}): {message}")
+            }
+            frame => write!(f, "handshake sequence rejected by {} frame", frame.kind()),
+        }
+    }
+}
+
+impl std::error::Error for HandshakeSequenceError {}
+
 /// Drives the per-connection handshake state machine.
 ///
 /// Deliberately not `Clone`: the gate's entire guarantee is that its state
@@ -276,6 +289,21 @@ mod tests {
             id: crate::frame::OperationId::from("op-1"),
         });
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn sequence_error_displays_the_contained_refusal_reason() {
+        let mut gate = HandshakeGate::default();
+        let error = gate
+            .admit(&Frame::Cancel {
+                id: crate::frame::OperationId::from("op-1"),
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("malformed_frame"));
+        assert!(error.to_string().contains("expected \"handshake\""));
+
+        fn assert_error<T: std::error::Error>() {}
+        assert_error::<HandshakeSequenceError>();
     }
 
     #[test]
