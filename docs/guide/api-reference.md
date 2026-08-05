@@ -699,16 +699,51 @@ request(ops="whoami()")
 
 ### `db_diagnostics` — Assertive
 
-Report WAL/checkpoint diagnostics for the main database: build identity, the checkpoint
-counters, a single PASSIVE checkpoint probe, the `-wal` sidecar file size, and a WAL-pin
-holder census. Takes no parameters.
+Report writer-contention and WAL/checkpoint diagnostics for the main database: build identity,
+the checkpoint counters, a single PASSIVE checkpoint probe, the `-wal` sidecar file size, and a
+WAL-pin holder census. Takes no parameters.
+
+`writer_contention` contains monotonic counters captured once per request:
+`writer_acquisitions` is the total of `pooled_writer_acquisitions`,
+`standalone_writer_acquisitions`, and `writer_task_acquisitions`. The first counts successful
+finite-wait main-pool mutex checkouts, the second counts successful per-operation file-backed
+standalone writer opens, and the third counts dequeued writer-task requests that acquired its
+dedicated connection (or successfully completed `BEGIN IMMEDIATE`).
+`writer_acquisition_timeouts` remains specific to the finite-wait main-pool mutex before SQLite
+executes; SQLite `BEGIN`/statement failures are separate stages. `audit_append_failures` counts
+process-wide best-effort audit appends whose storage error was logged and swallowed. Zero-wait
+checkpoint skips, the diagnostics probe connection, the writer task's one-time lifetime
+connection, and the checkpoint task's dedicated long-lived connection (opened once at startup
+and reused across ticks) do not inflate the write-traffic acquisition total.
+
+A finite-wait pooled checkout failure retains its compatibility display text in `message`, but
+the MCP error is a stable object rather than a string:
+
+```json
+{
+  "kind": "unavailable",
+  "code": "writer_pool_checkout_timeout",
+  "stage": "writer_pool_checkout_timeout",
+  "message": "storage: ... timed out ... waiting for sqlite writer connection",
+  "timeout_ms": 5000,
+  "capability": "notes",
+  "operation": "append_note"
+}
+```
+
+`capability` and `operation` are `null` when the typed SQLite error reaches runtime directly
+rather than through a storage capability wrapper. Callers should branch on `code` or `stage`,
+never on `message`.
 
 The PASSIVE probe may backfill WAL frames into the database — that is normal checkpoint
 I/O and is what the reported `checkpointed_frames` counts. It never changes logical
 state, never escalates to TRUNCATE, never creates a missing database file, and never
-deletes WAL-pin sidecar evidence. Sections that cannot be collected (in-memory backend,
-missing file, unsupported platform) carry explicit `unavailable_reason` strings rather
-than being silently omitted.
+deletes WAL-pin sidecar evidence. `wal_pin.status` reports `complete`, `degraded`, or
+`unavailable`; its tagged `census.status` is independently `complete`, `incomplete`, or
+`unavailable`. An incomplete OS walk retains partial PID evidence but states why additional
+holders cannot be ruled out. The legacy sibling booleans and PID arrays remain for compatibility.
+Sections that cannot be collected (in-memory backend, missing file, unsupported platform) carry
+explicit reasons rather than being silently omitted.
 
 ```
 request(ops="db_diagnostics()")
@@ -1220,25 +1255,38 @@ request(ops="comm.delivered(id=\"<full-outbound-uuid>\")")
 
 ### `comm.inbox` — Assertive
 
-List and page through filtered inbound messages for the caller.
+List and page through the caller's filtered inbound messages (default) or sent
+history (`box="sent"`).
+The response keeps the inbox envelope; `unread_count` is zero for sent rows.
+With `wait_ms`, an initially empty fully filtered page waits for a newly
+committed matching message and otherwise returns at the deadline.
 
 | Param                | Type    | Required | Notes                                                                     |
 | -------------------- | ------- | -------- | ------------------------------------------------------------------------- |
 | `limit`              | integer | no       | Default 20, max 200.                                                      |
+| `box`                | string  | no       | `inbox` (default)\|`sent`. Sent rows are scoped to the caller.            |
 | `offset`             | integer | no       | Default 0; offset after every supplied filter.                            |
-| `status`             | string  | no       | `unread` (default)\|`read`\|`all`.                                        |
+| `status`             | string  | no       | Inbox-only: `unread` (default)\|`read`\|`all`.                            |
+| `wait_ms`            | integer | no       | Long-poll only when the initial page is empty; default 0, max 30,000.     |
 | `from_actor`         | string  | no       | Exact sender; mutually exclusive with `from_prefix`.                      |
 | `from_prefix`        | string  | no       | Sender prefix; mutually exclusive with `from_actor`.                      |
 | `exclude_from_actor` | string  | no       | Exclude an exact sender actor label.                                      |
+| `to_actor`           | string  | no       | Sent-only exact recipient actor filter.                                   |
 | `since`              | string  | no       | Inclusive RFC 3339 lower bound on top-level `created_at`.                 |
 | `before`             | string  | no       | Exclusive RFC 3339 upper bound on top-level `created_at`.                 |
 | `subject_contains`   | string  | no       | Case-insensitive non-empty subject substring; null subjects do not match. |
 | `content_contains`   | string  | no       | Case-insensitive non-empty content substring.                             |
+| `fields`             | array   | no       | Non-empty message-field projection shared with `comm.thread`.             |
 
 ```
 request(ops="comm.inbox(limit=10)")
 request(ops="comm.inbox(status=\"all\", content_contains=\"timeout\", offset=200)")
+request(ops="comm.inbox(box=\"sent\", to_actor=\"lambda:leo\", since=\"2026-08-01T00:00:00Z\", fields=[\"id\",\"subject\",\"sent_at\"])")
+request(ops="comm.inbox(limit=10, wait_ms=30000)")
 ```
+
+The long-poll wake is process-local and carries no payload. Every wake re-runs
+the same scoped query, and the response shape is identical to an immediate inbox call.
 
 Every returned message uses the hyphenated full UUID for `id`, so the value is
 always accepted unchanged by `comm.read`, `comm.reply`, or `comm.thread`, even
@@ -1248,6 +1296,11 @@ Responses also carry `offset`, `has_more`, and `next_offset`; repeat the same
 filtered call with each non-null `next_offset` to enumerate every match without
 marking it read. All filters are ANDed. Time bounds use response `created_at`,
 not optional transport `sent_at` metadata.
+
+`fields` accepts the ordinary top-level message keys plus stable property
+aliases (`comm_schema_version`, `from_actor`, `to_actor`, `thread_id`,
+`sent_at`, `outbound_ref`, `sent_by_process`). Unknown names and an empty list
+are errors. Omit it for the existing full-body response.
 
 ### `comm.unread` — Assertive
 
@@ -1301,13 +1354,17 @@ request(ops="comm.reply(id=\"<message-id>\", content=\"On it.\")")
 
 Retrieve all messages in a conversation thread, ordered chronologically.
 
-| Param   | Type    | Required | Notes                                                               |
-| ------- | ------- | -------- | ------------------------------------------------------------------- |
-| `id`    | string  | yes      | Thread root: 8-char prefix or full UUID of the originating message. |
-| `limit` | integer | no       | Default 100, max 500.                                               |
+| Param    | Type    | Required | Notes                                                               |
+| -------- | ------- | -------- | ------------------------------------------------------------------- |
+| `id`     | string  | yes      | Thread root: 8-char prefix or full UUID of the originating message. |
+| `limit`  | integer | no       | Default 100, max 500.                                               |
+| `order`  | string  | no       | `asc` (default)\|`desc`.                                            |
+| `after`  | string  | no       | Message-id or RFC 3339 cursor in the chosen order.                  |
+| `fields` | array   | no       | Same strict message-field projection as `comm.inbox`.               |
 
 ```
 request(ops="comm.thread(id=\"<thread-root-id>\")")
+request(ops="comm.thread(id=\"<thread-root-id>\", fields=[\"id\",\"from_actor\",\"sent_at\"])")
 ```
 
 ### `comm.probe` — Assertive
@@ -1874,6 +1931,34 @@ becomes known.
 ```
 request(ops="code.ingest(path=\"/repo/crates/my-crate\")")
 ```
+
+The success report includes `fts_indexed`, the number of entity documents written to the map's
+full-text index. Entity and FTS writes are a single success postcondition for this verb: an FTS
+failure makes the ingest fail rather than returning a structurally populated but unsearchable map.
+
+The map database uses the ordinary khive schema. To explore it with the generic KG read verbs,
+select it as a backend in a dedicated config:
+
+```toml
+[[backends]]
+name = "main"
+kind = "sqlite"
+path = "/absolute/path/to/code-map.db"
+```
+
+```sh
+kkernel exec --config /absolute/path/to/code-map.toml \
+  'search(kind="entity", query="my-crate")'
+kkernel exec --config /absolute/path/to/code-map.toml \
+  'resolve(refs=["my-crate"])'
+```
+
+Use `--config` without `--db` for this read path. With `[[backends]]` configured, a conflicting
+concrete `--db` override is refused; `:memory:` remains an explicit ephemeral override, and a path
+that canonically matches the declared `main` backend is normalized as a no-op. A warning that a
+daemon has a different configuration and local fallback is required is expected and prevents
+accidentally serving the production database. `kkernel code-audit` is the distinct policy-driven
+reporting surface over a code-map database.
 
 ---
 

@@ -502,6 +502,12 @@ pub async fn prepare_add_note(
 
     let name = optional_create_string(args, "name")?;
     let properties = optional_properties(args, "properties")?;
+    // Same note-write validator `create_note_inner` runs: this path builds its
+    // args itself and dispatches no pack hook, so without this call a proposal
+    // changeset would be the one note-write that stores caller-supplied owned
+    // identity properties verbatim. The token here is the applying caller's
+    // (threaded in by the apply worker), not the proposer's.
+    let properties = runtime.derive_note_write_properties(kind, token, properties)?;
 
     crate::secret_gate::check(content)?;
     if let Some(ref n) = name {
@@ -1578,7 +1584,7 @@ mod tests {
     use super::*;
 
     use async_trait::async_trait;
-    use lattice_embed::{EmbedError, EmbeddingModel, EmbeddingService, MAX_TEXT_CHARS};
+    use lattice_embed::{EmbedError, EmbeddingModel, EmbeddingService, MAX_TEXT_BYTES};
     use serde_json::json;
 
     use khive_types::Namespace;
@@ -1782,7 +1788,7 @@ mod tests {
             .expect("vec store");
         assert_eq!(vec_store.count().await.expect("count before"), 0);
 
-        let updated_content = format!("freshly-updated-content-xyz{}", "x".repeat(MAX_TEXT_CHARS));
+        let updated_content = format!("freshly-updated-content-xyz{}", "x".repeat(MAX_TEXT_BYTES));
         let plan = prepare_update(
             &runtime,
             &token,

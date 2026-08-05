@@ -97,7 +97,12 @@ pub async fn run_git_ingest(args: GitIngestArgs) -> Result<()> {
             report.prs_ingested,
             report.prs_skipped_existing,
             report.writes_refused,
-            report.gh_available,
+            // Tri-state: the probe only runs when issues/PRs are requested.
+            match report.gh_available {
+                Some(true) => "true",
+                Some(false) => "false",
+                None => "not probed",
+            },
         );
         for w in &report.warnings {
             eprintln!("warning: {w}");

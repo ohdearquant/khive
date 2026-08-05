@@ -45,7 +45,7 @@ use crate::atomic_plan::{
     AddEntityPlan, AffectedRowGuard, DeletePlan, PlanStatement, PostCommitEffect,
 };
 use crate::atomic_runner::{run_atomic_unit, AtomicOpFailure, AtomicOpPlan, AtomicRunOutcome};
-use crate::curation::{entity_fts_document, note_embedding_text, note_fts_document};
+use crate::curation::{entity_fts_document, note_embedding_text_ref, note_fts_document};
 use crate::error::{GuardedWriteFailure, RuntimeError, RuntimeResult};
 use crate::runtime::{KhiveRuntime, NamespaceToken};
 
@@ -3199,7 +3199,7 @@ impl KhiveRuntime {
                 .embed_document_with_model_outcome_for_token(
                     token,
                     model_name,
-                    &note_embedding_text(&note),
+                    note_embedding_text_ref(&note),
                 )
                 .await
             {
@@ -3265,6 +3265,12 @@ impl KhiveRuntime {
         embedding_model: Option<&str>,
     ) -> RuntimeResult<(Note, crate::retrieval::EmbeddingTruncationReport)> {
         self.validate_note_kind(kind)?;
+        // Owned identity properties are derived from the authorization token
+        // before anything else touches them, so every caller of this function —
+        // the generic `create` verb and direct Rust callers alike — stores the
+        // same derived values. Runs before the secret gate so the gate scans
+        // exactly what will be written.
+        let properties = self.derive_note_write_properties(kind, token, properties)?;
         // Secret gate: scan content, optional name, and structured properties.
         crate::secret_gate::check(content)?;
         if let Some(n) = name {
@@ -3405,8 +3411,8 @@ impl KhiveRuntime {
         // capped override when present, otherwise the full stored content.
         // FTS indexing above always used the full `note.content` — this cap
         // affects only the vector-embedding input.
-        let canonical_embed_text = note_embedding_text(&note);
-        let embed_text: &str = embedding_content.unwrap_or(&canonical_embed_text);
+        let canonical_embed_text = note_embedding_text_ref(&note);
+        let embed_text = embedding_content.unwrap_or(canonical_embed_text);
 
         let mut embedding_report = crate::retrieval::EmbeddingTruncationReport::default();
         if embed_model_names.len() == 1 {
@@ -3485,17 +3491,23 @@ impl KhiveRuntime {
             // Multi-model path: embed with each model in parallel via spawned tasks,
             // then insert one VectorRecord per model.
             let rt_clone = self.clone();
-            let content_owned = embed_text.to_string();
+            // JoinSet tasks require owned text; an Arc keeps this to one
+            // content-sized allocation rather than one clone per model.
+            let content_owned: std::sync::Arc<str> = std::sync::Arc::from(embed_text);
             let usage_ctx = crate::usage::current();
             let mut join_set = tokio::task::JoinSet::new();
             for (idx, model_name) in embed_model_names.iter().enumerate() {
                 let rt = rt_clone.clone();
-                let text = content_owned.clone();
+                let text = std::sync::Arc::clone(&content_owned);
                 let name = model_name.clone();
                 let ctx = usage_ctx.clone();
                 let token = (*token).clone();
                 join_set.spawn(async move {
-                    let fut = rt.embed_document_with_model_outcome_for_token(&token, &name, &text);
+                    let fut = rt.embed_document_with_model_outcome_for_token(
+                        &token,
+                        &name,
+                        text.as_ref(),
+                    );
                     let result = match ctx {
                         Some(ctx) => crate::usage::scope(ctx, fut).await,
                         None => fut.await,
@@ -5862,7 +5874,7 @@ mod tests {
     use crate::{ActorRef, Namespace};
     use async_trait::async_trait;
     use khive_storage::types::PathNode;
-    use lattice_embed::{EmbedError, EmbeddingModel, EmbeddingService, MAX_TEXT_CHARS};
+    use lattice_embed::{EmbedError, EmbeddingModel, EmbeddingService, MAX_TEXT_BYTES};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
 
@@ -15644,10 +15656,10 @@ mod tests {
             _model: EmbeddingModel,
         ) -> std::result::Result<Vec<Vec<f32>>, EmbedError> {
             for text in texts {
-                if text.len() > MAX_TEXT_CHARS {
+                if text.len() > MAX_TEXT_BYTES {
                     return Err(EmbedError::TextTooLong {
                         length: text.len(),
-                        max: MAX_TEXT_CHARS,
+                        max: MAX_TEXT_BYTES,
                     });
                 }
             }
@@ -15699,7 +15711,7 @@ mod tests {
             captured: Arc::clone(&captured),
         });
 
-        let content = format!("{}\u{1f980}tail", "a".repeat(MAX_TEXT_CHARS - 1));
+        let content = format!("{}\u{1f980}tail", "a".repeat(MAX_TEXT_BYTES - 1));
         let note = rt
             .create_note(&tok, "observation", None, &content, None, None, vec![])
             .await
@@ -15715,7 +15727,7 @@ mod tests {
 
         let embedded = captured.lock().unwrap().clone();
         assert_eq!(embedded.len(), 1);
-        assert_eq!(embedded[0].len(), MAX_TEXT_CHARS - 1);
+        assert_eq!(embedded[0].len(), MAX_TEXT_BYTES - 1);
         assert!(embedded[0].is_char_boundary(embedded[0].len()));
         assert!(!embedded[0].contains('\u{1f980}'));
 
@@ -15732,13 +15744,13 @@ mod tests {
         rt.reindex_note(&tok, &fetched)
             .await
             .expect("reindex must bound the same stored content");
-        assert_eq!(captured.lock().unwrap()[0].len(), MAX_TEXT_CHARS - 1);
+        assert_eq!(captured.lock().unwrap()[0].len(), MAX_TEXT_BYTES - 1);
 
         captured.lock().unwrap().clear();
         rt.embed_document_batch_with_model("strict-length-test", std::slice::from_ref(&content))
             .await
             .expect("batch reindex seam must bound stored content");
-        assert_eq!(captured.lock().unwrap()[0].len(), MAX_TEXT_CHARS - 1);
+        assert_eq!(captured.lock().unwrap()[0].len(), MAX_TEXT_BYTES - 1);
 
         let normal = "normal byte-identical embedding input";
         rt.create_note(&tok, "observation", None, normal, None, None, vec![])
@@ -15746,7 +15758,7 @@ mod tests {
             .expect("normal note create must succeed");
         assert_eq!(captured.lock().unwrap().last().unwrap(), normal);
 
-        let long_description = format!("{}\u{1f980}tail", "b".repeat(MAX_TEXT_CHARS));
+        let long_description = format!("{}\u{1f980}tail", "b".repeat(MAX_TEXT_BYTES));
         rt.create_entity(
             &tok,
             "concept",

@@ -1,5 +1,7 @@
 //! Error types for the SQLite storage layer.
 
+use std::time::Duration;
+
 use thiserror::Error;
 
 /// Errors produced by the SQLite storage backend.
@@ -12,6 +14,20 @@ pub enum SqliteError {
     /// Data invariant violation (corrupt row, unexpected schema state).
     #[error("invalid data: {0}")]
     InvalidData(String),
+
+    /// The process-local writer mutex was not acquired within the pool's
+    /// configured finite checkout deadline. This stage happens before SQLite
+    /// executes, so callers must not conflate it with SQLite busy/locked or
+    /// checkpoint starvation.
+    ///
+    /// The display text intentionally retains the historical `InvalidData`
+    /// prefix for compatibility while the variant supplies stable structural
+    /// classification (ADR-135 F6).
+    #[error("invalid data: timed out after {timeout:?} waiting for sqlite writer connection")]
+    WriterPoolCheckoutTimeout {
+        /// Pool checkout deadline that elapsed.
+        timeout: Duration,
+    },
 
     /// Filesystem I/O error.
     #[error("io error: {0}")]

@@ -129,6 +129,16 @@ Every native SQLite failure preserves primary and extended result codes through 
 
 The five-second pool checkout error will be renamed and documented prominently as occurring before SQLite execution. Metrics separately time admission, checkout, `BEGIN IMMEDIATE`, transaction body, and commit.
 
+Implementation note (2026-08-02, first observability slice): the typed
+`WriterPoolCheckoutTimeout` source is retained through storage and runtime wrappers. MCP serializes
+it with stable `code` and `stage` values of `writer_pool_checkout_timeout`, plus `timeout_ms`,
+`capability`, and `operation`; `message` retains the compatibility rendering. The same slice's
+diagnostics report an aggregate writer-acquisition count together with pooled, per-operation
+standalone, and writer-task connection classes. The PASSIVE diagnostics connection and the writer
+task's one-time lifetime connection are infrastructure opens and do not enter that traffic total.
+This is counter-level observability only; it does not claim the full per-attempt timing matrix in
+F7 is implemented.
+
 Strongest case against this decision: expanding public error variants creates compatibility work and invites callers to bind to low-level implementation stages. The decision flips only if a stable higher-level taxonomy can distinguish safe retry, unsafe retry, overload, and outcome-unknown without losing the stage needed for incident attribution. It does not flip to preserving the current misleading string. During compatibility rollout, old codes may remain as aliases while structured stage fields are added.
 
 ### F7. Experiments and decision gates

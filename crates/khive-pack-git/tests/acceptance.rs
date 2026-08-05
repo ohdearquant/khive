@@ -2140,9 +2140,10 @@ async fn gh_boundary_contract_and_partial_ingest_failure() {
     .await
     .expect("ingest ok (pass 1)");
 
-    assert!(
+    assert_eq!(
         report.gh_available,
-        "fake gh must be found on PATH: {report:?}"
+        Some(true),
+        "fake gh must be probed and found on PATH: {report:?}"
     );
     assert_eq!(report.prs_ingested, 1, "{report:?}");
     assert_eq!(
@@ -2676,6 +2677,15 @@ async fn pr_ingest_sorts_by_updated_at_so_frozen_cursor_survives_out_of_order_li
         "exactly one warning names the rejected record: {:?}",
         report.warnings
     );
+    assert!(
+        report.cursor_stalled,
+        "a frozen PR cursor must surface as cursor_stalled (issue #1645): {report:?}"
+    );
+    assert!(
+        !report.done,
+        "a stalled cursor means unretried records exist past the floor, so the \
+         pass must not report done (issue #1645): {report:?}"
+    );
 
     let cursor_after_pass1 = read_git_cursor(&rt, project_id, "prs")
         .await
@@ -2715,6 +2725,15 @@ async fn pr_ingest_sorts_by_updated_at_so_frozen_cursor_survives_out_of_order_li
         "#20 must not warn once the embedder fuse is spent: {:?}",
         report2.warnings
     );
+    assert!(
+        !report2.cursor_stalled,
+        "a clean recovery pass must not report a stall (issue #1645): {report2:?}"
+    );
+    assert!(
+        report2.done,
+        "with the stall recovered and the window walked, the pass is complete \
+         (issue #1645): {report2:?}"
+    );
 
     let prs_list = registry
         .dispatch("list", json!({"kind": "pull_request", "limit": 20}))
@@ -2736,6 +2755,96 @@ async fn pr_ingest_sorts_by_updated_at_so_frozen_cursor_survives_out_of_order_li
         .await
         .expect("cursor must be written");
     assert_eq!(cursor_after_pass2, "2026-01-03T00:00:00Z");
+}
+
+// ── an empty walk is only a completion when the cursor is an ancestor ───────
+
+/// A `{cursor}..HEAD` walk that yields nothing is a genuine completion only
+/// when the cursor is an ancestor of the walked HEAD. If the walked source's
+/// history LAGS the history that advanced the cursor (measured in production:
+/// a scratch clone whose checked-out HEAD trailed the cursor by weeks walked
+/// nothing and reported zero commits, `done: true` — issue #1644), the empty
+/// range means "this source cannot see the cursor's history", not "nothing is
+/// new". The fix surfaces a warning and refuses the completion claim.
+///
+/// Fixture: pass 1 ingests commits A and B, planting the cursor at B. HEAD is
+/// then reset back to A — B still exists in the object store (so the walk's
+/// `B..HEAD` range resolves and is empty) but is no longer an ancestor of
+/// HEAD, exactly the lagging-source shape.
+#[tokio::test]
+async fn empty_walk_with_non_ancestor_cursor_refuses_completion() {
+    let _guard = ENV_MUTEX.lock().await;
+    let (rt, token, registry) = fixture().await;
+
+    let project_id = create(
+        &registry,
+        json!({"kind": "project", "name": "non-ancestor-cursor-repo"}),
+    )
+    .await;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo: PathBuf = dir.path().join("repo");
+    std::fs::create_dir_all(&repo).expect("mk repo dir");
+    init_repo(&repo);
+    write(&repo, "a.md", "a\n");
+    commit(&repo, &["a.md"], "commit A");
+    let sha_a = head_sha(&repo);
+    write(&repo, "b.md", "b\n");
+    commit(&repo, &["b.md"], "commit B");
+    let sha_b = head_sha(&repo);
+
+    let bin_dir = dir.path().join("bin");
+    std::fs::create_dir_all(&bin_dir).expect("mk bin dir");
+    let log_dir = dir.path().join("log");
+    std::fs::create_dir_all(&log_dir).expect("mk log dir");
+    write_fake_gh(&bin_dir, &log_dir, "[]", "[]");
+    let _path_guard = PathGuard::install(&bin_dir);
+
+    let report = run_ingest(
+        &rt,
+        &token,
+        &registry,
+        IngestOptions::unbounded(repo.clone(), project_id.to_string()),
+    )
+    .await
+    .expect("ingest ok (pass 1)");
+    assert_eq!(report.commits_ingested, 2, "{report:?}");
+    assert!(report.done, "clean full walk completes: {report:?}");
+    let cursor = read_git_cursor(&rt, project_id, "commits")
+        .await
+        .expect("cursor written");
+    assert_eq!(cursor, sha_b, "cursor advances to HEAD (B)");
+
+    // The walked source now lags the cursor: HEAD back at A, cursor still B.
+    git(&repo, &["reset", "--hard", "-q", &sha_a]);
+
+    let report2 = run_ingest(
+        &rt,
+        &token,
+        &registry,
+        IngestOptions::unbounded(repo.clone(), project_id.to_string()),
+    )
+    .await
+    .expect("ingest ok (pass 2)");
+    assert_eq!(
+        report2.commits_ingested, 0,
+        "nothing to walk in the empty range: {report2:?}"
+    );
+    assert!(
+        !report2.done,
+        "an empty walk from a non-ancestor cursor is not a completion \
+         (issue #1644): {report2:?}"
+    );
+    assert_eq!(
+        report2
+            .warnings
+            .iter()
+            .filter(|w| w.contains("not an ancestor"))
+            .count(),
+        1,
+        "exactly one warning names the lagging source: {:?}",
+        report2.warnings
+    );
 }
 
 // ── equal-`updated_at` ties must not strand a failed record ─────────────────

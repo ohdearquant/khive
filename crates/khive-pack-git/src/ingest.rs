@@ -123,9 +123,13 @@ pub struct IngestReport {
     pub issues_skipped_existing: u64,
     pub prs_ingested: u64,
     pub prs_skipped_existing: u64,
-    /// `false` when the `gh` CLI was not found on PATH — issues/PRs were
-    /// skipped but commits still ingested (ADR-088 §5 graceful-absence rule).
-    pub gh_available: bool,
+    /// `Some(false)` when the `gh` CLI probe ran and gh was unusable —
+    /// issues/PRs were skipped but commits still ingested (ADR-088 §5
+    /// graceful-absence rule). `Some(true)` when the probe succeeded. `None`
+    /// when this pass never probed: the probe runs only when `include`
+    /// requests issues or pull requests, and a commits-only pass says nothing
+    /// about `gh` either way (issue #1645).
+    pub gh_available: Option<bool>,
     pub warnings: Vec<String>,
     /// Number of per-record content writes refused by the runtime secret gate
     /// during this pass. Callers can assert this is zero independently of
@@ -140,6 +144,13 @@ pub struct IngestReport {
     /// (ADR-088 Amendment 1). Always `true` for an unbounded
     /// (`max_items: None`) pass.
     pub done: bool,
+    /// `true` when a per-record write failure pinned the commits cursor at
+    /// the last contiguous success this pass. The failed record is retried
+    /// (and its warning re-surfaced) on every subsequent pass until it is
+    /// fixed upstream. `done` is forced `false` whenever this is set: commits
+    /// beyond the stall were still attempted this pass, but history cannot be
+    /// called exhausted while the cursor cannot advance (issue #1645).
+    pub cursor_stalled: bool,
     /// The repo-anchor `project` entity id this pass resolved (or the
     /// verb-level caller created).
     pub project_id: Option<String>,
@@ -265,7 +276,7 @@ pub(crate) async fn run_ingest_with_commit_recovery(
     // whole pass.
     if opts.include.issues || opts.include.pull_requests {
         if gh_available(&opts.repo) {
-            report.gh_available = true;
+            report.gh_available = Some(true);
             if opts.include.pull_requests && !budget.exhausted() {
                 match ingest_prs(
                     runtime,
@@ -306,7 +317,7 @@ pub(crate) async fn run_ingest_with_commit_recovery(
                 }
             }
         } else {
-            report.gh_available = false;
+            report.gh_available = Some(false);
             report.warnings.push(
                 "gh CLI not found on PATH; skipped issues and pull requests — commits still ingest"
                     .to_string(),
@@ -972,6 +983,23 @@ async fn ingest_commits(
         files_by_sha,
     } = snapshot;
     if commits.is_empty() {
+        // An empty `{cursor}..HEAD` range is a genuine completion only when
+        // the cursor is an ancestor of the tip being walked. A cursor that is
+        // NOT an ancestor means this source's history lags or diverged from
+        // whatever advanced the cursor (measured: a scratch clone whose HEAD
+        // trailed the cursor by weeks walked nothing and reported a clean
+        // pass, issue #1644) — surface it and refuse the completion claim.
+        if let Some(since_sha) = last_sha_of(&since) {
+            if !is_ancestor_of_head(repo, since_sha) {
+                report.warnings.push(format!(
+                    "commits cursor {since_sha} is not an ancestor of this \
+                     source's HEAD: the walked history lags or diverged from \
+                     the history that advanced the cursor, so nothing was \
+                     walked (issue #1644)"
+                ));
+                report.done = false;
+            }
+        }
         if let Some(warning) = recovery_warning {
             report.warnings.push(warning);
         }
@@ -1135,6 +1163,10 @@ async fn ingest_commits(
         }
     }
 
+    if cursor_stalled {
+        report.cursor_stalled = true;
+        report.done = false;
+    }
     if let Some(sha) = last_sha {
         write_cursor(runtime, project_id, "commits", &sha).await?;
     }
@@ -1142,6 +1174,25 @@ async fn ingest_commits(
         report.warnings.push(warning);
     }
     Ok(())
+}
+
+/// Borrow the cursor SHA out of the `Option<String>` read from the store.
+fn last_sha_of(since: &Option<String>) -> Option<&str> {
+    since.as_deref().filter(|s| !s.is_empty())
+}
+
+/// `true` when `sha` is an ancestor of (or equal to) `repo`'s HEAD. A SHA
+/// that is unknown to this repo returns `false` — for the empty-walk guard
+/// that is the correct reading: the walked source does not contain the
+/// history that advanced the cursor.
+fn is_ancestor_of_head(repo: &Path, sha: &str) -> bool {
+    Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["merge-base", "--is-ancestor", sha, "HEAD"])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
 }
 
 /// Count `commit` notes annotating `project_id`, derived fresh from the
@@ -1664,6 +1715,13 @@ async fn ingest_prs(
         // state so the caller's resume loop keeps going.
         report.done = false;
     }
+    if cursor_stalled {
+        // A stalled PR cursor means records past the frozen floor were never
+        // retried; `done: true` here would tell the caller the slot is
+        // complete when it is permanently behind (issue #1645).
+        report.cursor_stalled = true;
+        report.done = false;
+    }
 
     if let Some(cursor) = max_updated {
         write_cursor(runtime, project_id, "prs", &cursor).await?;
@@ -1845,6 +1903,13 @@ async fn ingest_issues(
     }
 
     if !window_complete {
+        report.done = false;
+    }
+    if cursor_stalled {
+        // Same contract as the commits and PR paths: a frozen issue cursor
+        // means unretried records exist past the floor, so the slot is not
+        // complete (issue #1645).
+        report.cursor_stalled = true;
         report.done = false;
     }
 

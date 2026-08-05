@@ -1,15 +1,16 @@
 # ADR-056: Channel Transport Layer -- `khive-channel` and External Messaging Adapters
 
-**Status**: Accepted (amended 2026-07-02 -- inbound authentication hardening; amended 2026-07-03
+**Status**: Accepted (amended 2026-08-01 -- bounded inbox long poll; amended 2026-07-02 -- inbound authentication hardening; amended 2026-07-03
 -- Exchange Online no-authserv-id boundary; amended 2026-07-05 -- Telegram adapter
 implementation and two-way chat; amended 2026-07-09 -- durable IMAP UID cursor; amended
 2026-07-17 -- iMessage channel over an SSH bridge; see
+[§Amendment 2026-08-01](#amendment-2026-08-01----bounded-inbox-long-poll),
 [§Amendment 2026-07-02](#amendment-2026-07-02----inbound-authentication-hardening),
 [§Amendment 2026-07-03](#amendment-2026-07-03----exchange-online-no-authserv-id-boundary),
 [§Amendment 2026-07-05](#amendment-2026-07-05----telegram-adapter-implementation-and-two-way-chat),
 [§Amendment 2026-07-09](#amendment-2026-07-09----durable-imap-uid-cursor),
 [§Amendment 2026-07-17](#amendment-2026-07-17----imessage-channel-over-an-ssh-bridge))\
-**Date**: 2026-06-14 (amended 2026-07-02, 2026-07-03, 2026-07-05, 2026-07-09, 2026-07-17)\
+**Date**: 2026-06-14 (amended 2026-07-02, 2026-07-03, 2026-07-05, 2026-07-09, 2026-07-17, 2026-08-01)\
 **Authors**: khive maintainers
 **Amended by**: [ADR-122](ADR-122-email-outbound-delivery.md) (email outbound
 delivery now runs as an externally linked supervised component)\
@@ -20,7 +21,40 @@ ADR-108 (Git Write Surface -- hardened shell-out argv pattern reused by this ame
 statement; its SessionStore design was not carried forward\
 **Related issues**: #112 (khive-channel umbrella), #113 (Telegram adapter), #114 (email adapter),
 #448 (inbound header spoofing -- resolved by this amendment), #449 (IMAP UID progress -- resolved
-by the 2026-07-09 amendment)
+by the 2026-07-09 amendment), #1499 (inbox long poll -- resolved by the 2026-08-01 amendment)
+
+## Amendment 2026-08-01 -- Bounded inbox long poll
+
+Channel ingestion remains a gated `comm.ingest` dispatch and durable note write.
+After a successful, non-deduplicated insert, the comm handler now publishes a
+process-local wake signal; the channel loop does not interpret the response or
+own a second signaling path. This places the signal at the only point that knows
+both that the insert committed and that it was not suppressed by the durable
+`external_id` dedup constraint.
+
+`comm.inbox(wait_ms=N)` with `1 <= N <= 30000` first runs its normal scoped
+query. It returns immediately on a match, or waits on the signal until the
+deadline and re-runs the same query after each wake. Omission or zero preserves
+the immediate behavior, and `limit=0` never waits. The response shape is
+unchanged. `comm.send` and `comm.reply` publish the same signal after their
+successful atomic dual-writes, so the public long poll covers every comm-owned
+message creation path, not only external adapters.
+
+The signal is owned by the immutable `CommPack` instance constructed by
+`PackFactory::create(runtime)`. No post-construction injection is needed: both
+the waiting `comm.inbox` handler and the publishing write handlers already run
+through that instance. A generation counter paired with `tokio::sync::Notify`
+prevents a commit between query and waiter registration from being lost.
+
+This is not transport delivery state, cross-process pubsub, or an authorization
+boundary. The signal is payload-free and may wake calls for unrelated actors or
+filters; every wake re-runs the ordinary ADR-057/namespace-scoped database query
+and continues waiting if it is still empty. Durable storage remains authoritative,
+and a timeout-edge final query observes commits that arrive without this process's
+signal when they are visible before that query takes its storage snapshot; a commit
+landing after the snapshot is left to the caller's next request. The amendment
+changes wake latency only; channel lifecycle, dedup, checkpointing, and gate
+ownership are unchanged.
 
 ## Amendment 2026-07-02 -- Inbound authentication hardening
 
