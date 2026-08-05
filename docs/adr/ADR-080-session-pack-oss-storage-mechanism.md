@@ -277,6 +277,9 @@ completed transcript:
   directory mtime on every supported filesystem. Consequently a resumed cold transcript is
   noticed within the priority sweep started by a parent-directory change, or within one
   complete bounded cold-file sweep even without that change.
+  The priority ordering is bounded but not fair under continuous directory churn: repeated
+  changes can keep refilling the priority queue ahead of the ordinary cold sweep. The
+  productive cold-file metadata-probe cap remains 256 per tick.
   Queue entries left behind by reactivation or removal are invalidated lazily and drained at
   a bounded rate (at most four times the probe cap of stale pops per tick, each performing
   no filesystem work), so residue can neither drain unbounded in one tick nor starve
@@ -298,7 +301,10 @@ instead of being reseeded to EOF.
 A directory-difference removal deliberately bypasses that grace: a complete directory
 listing is a positive enumeration of its contents, so an absent entry is stronger evidence
 of removal than a single probe NotFound; a refresh whose listing is incomplete defers
-removals until a complete read. When a removal is cancelled by a same-pass reappearance,
+removals until a complete read. Children newly discovered during such a partial listing
+remain independently queued; if the parent later disappears, their NotFound probes reap
+non-pinned orphans. Pinned configured roots are intentionally retained as placeholders and
+can remain queued until they reappear. When a removal is cancelled by a same-pass reappearance,
 the in-memory offset is restored from the preserved cursor row so the next seed never
 falls back to EOF while the preserved row proves bytes were already mirrored. Cursor rows
 whose deletion fails are retried on every later tick, because a stale row reloaded after a

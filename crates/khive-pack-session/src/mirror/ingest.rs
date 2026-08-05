@@ -162,7 +162,9 @@ pub async fn mirror_file(
 /// keeps the empty advance's cursor commit atomic with respect to the
 /// candidate dispatch order: bytes are never skipped ahead of a later
 /// candidate that could parse them, and an interrupt between candidates
-/// cannot leave the cursor advanced past bytes no candidate inserted.
+/// cannot leave the cursor advanced past bytes no candidate inserted. The
+/// service additionally vetoes that commit when ANY candidate errors during
+/// the pass, even if another candidate returned an empty advance.
 pub async fn mirror_file_deferred(
     runtime: &KhiveRuntime,
     path: &Path,
@@ -188,7 +190,8 @@ pub async fn mirror_file_deferred(
 /// is a single `INSERT ... ON CONFLICT DO UPDATE` on the cursor row; on
 /// failure the error propagates and the in-memory offset is not applied, so
 /// the bytes are re-read (bounded, idempotent) on a later pass instead of
-/// being silently skipped.
+/// being silently skipped. The service-level caller also vetoes this commit
+/// when ANY candidate errored in the dispatch pass.
 pub async fn commit_empty_advance(
     runtime: &KhiveRuntime,
     path: &Path,

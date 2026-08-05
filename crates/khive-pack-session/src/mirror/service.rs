@@ -543,6 +543,12 @@ impl DiscoveryIndex {
                     self.add_file(path, file_kind, true);
                     continue;
                 }
+                // Keep a pinned configured root as a directory placeholder
+                // even when startup finds an unexpected file at that path.
+                // The probe path retains the same identity for a runtime
+                // directory-to-file transition, allowing a later directory
+                // reversion to be discovered.
+                Ok(_) if is_pinned => None,
                 Ok(_) => continue,
                 Err(_) if is_pinned => None,
                 Err(_) => continue,
@@ -1189,6 +1195,59 @@ fn tally_dispatch_errors(
     had_errors && discovery.record_error_poll(path)
 }
 
+/// Finish dispatch bookkeeping for a deferred empty advance. The service
+/// vetoes the cursor commit when any candidate errored, and a commit failure
+/// itself becomes an error poll so persistent failures reach cold cadence.
+async fn finalize_dispatch_stats(
+    runtime: &KhiveRuntime,
+    path: &Path,
+    offset: u64,
+    ended_by_inserting: bool,
+    stats: Option<ingest::MirrorStats>,
+    mut had_errors: bool,
+) -> (Option<ingest::MirrorStats>, bool) {
+    // Commit a deferred empty advance only when dispatch ended with no
+    // inserting candidate AND no candidate error. An erroring candidate might
+    // have parsed the span had it succeeded, so the cursor stays at the old
+    // offset and a later pass re-reads the bytes (bounded and idempotent)
+    // rather than skipping them. On commit failure the in-memory offset is
+    // likewise NOT applied.
+    let stats = match stats {
+        Some(stats) if !ended_by_inserting && stats.inserted == 0 && stats.new_offset > offset => {
+            if had_errors {
+                tracing::debug!(
+                    path = %path.display(),
+                    new_offset = stats.new_offset,
+                    "session mirror: deferring empty-advance cursor commit because a \
+                     candidate errored; the span will be re-read on a later pass"
+                );
+                None
+            } else {
+                match ingest::commit_empty_advance(runtime, path, stats.new_offset).await {
+                    Ok(()) => Some(stats),
+                    Err(error) => {
+                        // A failed deferred cursor commit is an ingest error
+                        // for cadence purposes: the file made no durable
+                        // progress and must eventually be demoted to the cold
+                        // retry cadence just like any other failed pass.
+                        had_errors = true;
+                        tracing::warn!(
+                            path = %path.display(),
+                            error = %error,
+                            new_offset = stats.new_offset,
+                            "session mirror: empty-advance cursor commit failed; \
+                             offset held back for a bounded re-read"
+                        );
+                        None
+                    }
+                }
+            }
+        }
+        other => other,
+    };
+    (stats, had_errors)
+}
+
 fn classify_entry(
     directory_kind: DirectoryKind,
     path: &Path,
@@ -1307,14 +1366,20 @@ pub async fn run_mirror_service(runtime: KhiveRuntime, config: MirrorConfig) {
             }
             queue_cursor_deletes(&mut pending_cursor_deletes, &removed_files);
         }
-        drain_pending_cursor_deletes(
+        let blocked_cursor_restores = drain_pending_cursor_deletes(
             &runtime,
             &discovery,
             &mut offsets,
             &mut pending_cursor_deletes,
         )
         .await;
-        let scheduled = discovery.schedule_files();
+        let scheduled = discovery
+            .schedule_files()
+            .into_iter()
+            .filter(|scheduled_file| {
+                !blocked_cursor_restores.contains(scheduled_file.path.as_path())
+            })
+            .collect::<Vec<_>>();
         let total_tracked = discovery.tracked_files();
         let mut files_mirrored: u64 = 0;
         let mut rows_inserted: u64 = 0;
@@ -1417,48 +1482,15 @@ pub async fn run_mirror_service(runtime: KhiveRuntime, config: MirrorConfig) {
                 );
             }
 
-            // Commit a deferred empty advance only when dispatch ended with
-            // no inserting candidate AND no candidate error. An erroring
-            // candidate might have parsed the span had it succeeded, so the
-            // cursor stays at the old offset and a later pass re-reads the
-            // bytes (bounded and idempotent) rather than skipping them. On
-            // commit failure the in-memory offset is likewise NOT applied.
-            let stats = match stats {
-                Some(stats)
-                    if !ended_by_inserting && stats.inserted == 0 && stats.new_offset > offset =>
-                {
-                    if had_errors {
-                        tracing::debug!(
-                            path = %scheduled_file.path.display(),
-                            new_offset = stats.new_offset,
-                            "session mirror: deferring empty-advance cursor commit because a \
-                             candidate errored; the span will be re-read on a later pass"
-                        );
-                        None
-                    } else {
-                        match ingest::commit_empty_advance(
-                            &runtime,
-                            &scheduled_file.path,
-                            stats.new_offset,
-                        )
-                        .await
-                        {
-                            Ok(()) => Some(stats),
-                            Err(error) => {
-                                tracing::warn!(
-                                    path = %scheduled_file.path.display(),
-                                    error = %error,
-                                    new_offset = stats.new_offset,
-                                    "session mirror: empty-advance cursor commit failed; \
-                                     offset held back for a bounded re-read"
-                                );
-                                None
-                            }
-                        }
-                    }
-                }
-                other => other,
-            };
+            let (stats, had_errors) = finalize_dispatch_stats(
+                &runtime,
+                &scheduled_file.path,
+                offset,
+                ended_by_inserting,
+                stats,
+                had_errors,
+            )
+            .await;
 
             // A successful advance ends the error streak; a tick on which
             // no candidate advanced and at least one errored grows it toward
@@ -1647,18 +1679,19 @@ fn queue_cursor_deletes(pending: &mut VecDeque<PathBuf>, removed: &[PathBuf]) {
 /// already dropped the in-memory offset, the cancel restores it from the
 /// preserved cursor row — otherwise the next seed falls back to `file_len`
 /// (`backfill=false`) and silently skips bytes the preserved row proves
-/// were already mirrored. On failure only the failed paths are kept for
-/// retry on later ticks (escalated to warn: a dropped failure leaves the
-/// stale row in place across restarts); paths deleted before a failure are
-/// not retried.
+/// were already mirrored. A failed restore keeps the pending entry and
+/// returns the path in the blocked set so this tick cannot seed or schedule
+/// it; the cursor row remains authoritative until a successful read restores
+/// the offset. Paths deleted before a failure are retried independently.
 async fn drain_pending_cursor_deletes(
     runtime: &KhiveRuntime,
     discovery: &DiscoveryIndex,
     offsets: &mut HashMap<PathBuf, u64>,
     pending: &mut VecDeque<PathBuf>,
-) {
+) -> HashSet<PathBuf> {
+    let mut blocked = HashSet::new();
     if pending.is_empty() {
-        return;
+        return blocked;
     }
     let mut cancelled = Vec::new();
     pending.retain(|path| {
@@ -1669,27 +1702,54 @@ async fn drain_pending_cursor_deletes(
             true
         }
     });
+    let mut restore_failed = Vec::new();
     for path in &cancelled {
         if offsets.contains_key(path) {
             continue;
         }
-        if let Some(offset) = read_cursor_offset(runtime, path).await {
-            offsets.insert(path.clone(), offset);
+        match read_cursor_offset(runtime, path).await {
+            Ok(Some(offset)) => {
+                offsets.insert(path.clone(), offset);
+            }
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %error,
+                    "session mirror: failed to restore cancelled cursor; retrying before scheduling"
+                );
+                restore_failed.push(path.clone());
+                blocked.insert(path.clone());
+            }
         }
     }
+    // A failed restore remains pending, but must not be sent through the
+    // delete batch while the path is tracked: its preserved row is still
+    // authoritative, and scheduling it with no offset would seed at EOF.
+    pending.extend(restore_failed);
     if pending.is_empty() {
-        return;
+        return blocked;
     }
-    let paths: Vec<PathBuf> = pending.iter().cloned().collect();
+    let paths: Vec<PathBuf> = pending
+        .iter()
+        .filter(|path| !blocked.contains(path.as_path()))
+        .cloned()
+        .collect();
+    if paths.is_empty() {
+        return blocked;
+    }
+    let blocked_pending = blocked.iter().cloned().collect::<VecDeque<_>>();
     match delete_cursors(runtime, &paths).await {
-        Ok(failed) if failed.is_empty() => pending.clear(),
+        Ok(failed) if failed.is_empty() => *pending = blocked_pending,
         Ok(failed) => {
+            let mut remaining = blocked_pending;
+            remaining.extend(failed.iter().cloned());
             tracing::warn!(
                 failed = failed.len(),
-                remaining = failed.len(),
+                remaining = remaining.len(),
                 "session mirror: cursor cleanup partially failed; retrying failed paths next tick"
             );
-            *pending = failed.into();
+            *pending = remaining;
         }
         Err(error) => {
             tracing::warn!(
@@ -1699,27 +1759,29 @@ async fn drain_pending_cursor_deletes(
             );
         }
     }
+    blocked
 }
 
-/// Read one persisted cursor offset, or `None` when the table is missing,
-/// the path has no row, or the reader cannot be acquired. Used by the
-/// delete-cancel path to restore an in-memory offset that the removal
-/// handling already dropped.
-async fn read_cursor_offset(runtime: &KhiveRuntime, path: &Path) -> Option<u64> {
+/// Read one persisted cursor offset. `Ok(None)` means the query succeeded but
+/// no row exists; an acquisition or query failure is returned so a cancelled
+/// delete can remain pending instead of allowing an EOF seed.
+async fn read_cursor_offset(
+    runtime: &KhiveRuntime,
+    path: &Path,
+) -> Result<Option<u64>, RuntimeError> {
     let sql = runtime.sql();
-    let mut reader = sql.reader().await.ok()?;
+    let mut reader = sql.reader().await?;
     let rows = reader
         .query_all(SqlStatement {
             sql: "SELECT byte_offset FROM session_mirror_cursor WHERE file_path=?1".into(),
             params: vec![SqlValue::Text(path.to_string_lossy().into_owned())],
             label: Some("mirror_cursor_read".into()),
         })
-        .await
-        .ok()?;
-    match rows.first().and_then(|row| row.get("byte_offset")) {
+        .await?;
+    Ok(match rows.first().and_then(|row| row.get("byte_offset")) {
         Some(SqlValue::Integer(offset)) => Some(*offset as u64),
         _ => None,
-    }
+    })
 }
 
 /// Extract the session UUID from a Codex filename of the form
@@ -2472,6 +2534,41 @@ mod discovery_tests {
     }
 
     #[test]
+    fn pinned_file_placeholder_at_startup_reverts_to_a_directory() {
+        let temp = tempfile::TempDir::new().expect("temp dir");
+        let root = temp.path().join("codex-sessions");
+        std::fs::write(&root, "unexpected regular file").expect("startup file fixture");
+
+        let mut discovery = DiscoveryIndex::default();
+        discovery.add_directory_tree(&root, DirectoryKind::Codex, true);
+
+        let placeholder = discovery
+            .directories
+            .get(&root)
+            .expect("pinned file gets a directory placeholder");
+        assert!(placeholder.pinned);
+        assert!(placeholder.kinds.contains(&DirectoryKind::Codex));
+        assert!(!discovery.files.contains_key(&root));
+
+        std::fs::remove_file(&root).expect("remove startup file");
+        std::fs::create_dir(&root).expect("recreate configured root as directory");
+        let day = root.join("2026/08/05");
+        std::fs::create_dir_all(&day).expect("date directory");
+        let transcript =
+            day.join("rollout-2026-08-05T12-00-00-019a731e-4a58-71b1-a71f-a8d2f9782113.jsonl");
+        std::fs::write(&transcript, "{}\n").expect("reversion transcript");
+
+        discovery.probe_directories();
+
+        let directory = discovery
+            .directories
+            .get(&root)
+            .expect("placeholder remains scheduled after reversion");
+        assert!(directory.pinned);
+        assert!(discovery.files.contains_key(&transcript));
+    }
+
+    #[test]
     fn force_rescan_without_fingerprint_change_does_not_reprioritize_cold_files() {
         let temp = tempfile::TempDir::new().expect("temp dir");
         let project = temp.path().join("project-slug");
@@ -2505,17 +2602,20 @@ mod discovery_tests {
 #[cfg(test)]
 mod cursor_retry_tests {
     use super::{
-        delete_cursors, drain_pending_cursor_deletes, queue_cursor_deletes, DiscoveredKind,
-        DiscoveryIndex, CURSOR_DELETE_RETRY_LIMIT,
+        delete_cursors, drain_pending_cursor_deletes, finalize_dispatch_stats,
+        queue_cursor_deletes, tally_dispatch_errors, DiscoveredKind, DiscoveryIndex,
+        CURSOR_DELETE_RETRY_LIMIT, FILE_ERROR_POLLS_BEFORE_COLD,
     };
+    use crate::mirror::ingest::{mirror_file, LineTailSource, MirrorStats};
     use crate::vocab::SESSION_SCHEMA_PLAN_STMTS;
     use khive_runtime::{AllowAllGate, BackendId, KhiveRuntime, Namespace, RuntimeConfig};
     use khive_storage::types::{SqlStatement, SqlValue};
     use std::collections::HashMap;
     use std::collections::VecDeque;
+    use std::io::Write;
     use std::path::PathBuf;
     use std::sync::Arc;
-    use tempfile::TempDir;
+    use tempfile::{NamedTempFile, TempDir};
 
     /// File-backed runtime WITHOUT the session schema applied — cursor DML
     /// fails with "no such table", which doubles as the fault injection for
@@ -2689,6 +2789,117 @@ mod cursor_retry_tests {
             "the cancel restores the in-memory offset from the preserved row, \
              so backfill=false seeding never falls back to EOF and skips bytes"
         );
+    }
+
+    #[tokio::test]
+    async fn failed_cancelled_cursor_restore_blocks_eof_seed_until_retry() {
+        let (rt, _dir) = runtime_without_schema();
+        let mut file = NamedTempFile::new().expect("tmpfile");
+        let prefix = b"already mirrored\n";
+        let new_line = br#"{"uuid":"uuid-restored","sessionId":"sess-restored","type":"user","timestamp":"2026-08-05T10:00:00Z","message":{"role":"user","content":"restored"}}"#;
+        file.write_all(prefix).expect("prefix");
+        file.write_all(new_line).expect("new line");
+        file.write_all(b"\n").expect("line terminator");
+        let path = file.path().to_path_buf();
+        let true_offset = prefix.len() as u64;
+        let file_len = std::fs::metadata(&path).expect("file metadata").len();
+
+        let mut discovery = DiscoveryIndex::default();
+        discovery.add_file(path.clone(), DiscoveredKind::ChatGptExport, false);
+        let gone = path.with_file_name("gone.jsonl");
+        let mut pending = VecDeque::new();
+        queue_cursor_deletes(&mut pending, &[path.clone(), gone.clone()]);
+        let mut offsets = HashMap::new();
+
+        // The missing schema injects a cursor-read failure. The cancellation
+        // remains pending and the tracked path is explicitly blocked from the
+        // scheduling pass, so backfill=false cannot seed it at EOF.
+        let blocked =
+            drain_pending_cursor_deletes(&rt, &discovery, &mut offsets, &mut pending).await;
+        assert!(blocked.contains(path.as_path()));
+        assert!(pending.contains(&path));
+        assert!(
+            pending.contains(&gone),
+            "an unrelated failed delete remains pending"
+        );
+        let scheduled = discovery
+            .schedule_files()
+            .into_iter()
+            .filter(|file| !blocked.contains(file.path.as_path()))
+            .collect::<Vec<_>>();
+        assert!(scheduled.is_empty(), "failed restore must block this tick");
+        assert!(
+            !offsets.contains_key(&path),
+            "failed restore must not insert an EOF seed before retry"
+        );
+
+        // Once the schema and preserved row are available, the next drain
+        // restores the true offset and removes the pending cancellation.
+        apply_session_schema(&rt).await;
+        insert_cursor_row(&rt, &path, true_offset as i64).await;
+        let blocked =
+            drain_pending_cursor_deletes(&rt, &discovery, &mut offsets, &mut pending).await;
+        assert!(blocked.is_empty());
+        assert!(pending.is_empty());
+        assert_eq!(offsets.get(&path), Some(&true_offset));
+
+        // The restored offset points at the new line, proving the retry does
+        // not skip bytes that followed the already mirrored prefix.
+        let restored_offset = *offsets.entry(path.clone()).or_insert(file_len);
+        assert_eq!(restored_offset, true_offset);
+        let stats = mirror_file(
+            &rt,
+            &path,
+            restored_offset,
+            LineTailSource::ClaudeCode,
+            None,
+        )
+        .await
+        .expect("mirror bytes after restored cursor");
+        assert_eq!(
+            stats.inserted, 1,
+            "bytes after the preserved cursor are mirrored"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_empty_advance_commit_counts_as_error_for_cold_demotion() {
+        let (rt, _dir) = runtime_without_schema();
+        let path = PathBuf::from("/projects/blank.jsonl");
+        let mut discovery = DiscoveryIndex::default();
+        discovery.add_file(path.clone(), DiscoveredKind::ChatGptExport, false);
+
+        let (stats, had_errors) = finalize_dispatch_stats(
+            &rt,
+            &path,
+            0,
+            false,
+            Some(MirrorStats {
+                inserted: 0,
+                scanned: 0,
+                new_offset: 64,
+            }),
+            false,
+        )
+        .await;
+        assert!(stats.is_none(), "failed commit must hold back the offset");
+        assert!(had_errors, "failed commit must become an error poll");
+
+        for _ in 1..FILE_ERROR_POLLS_BEFORE_COLD {
+            assert!(!tally_dispatch_errors(
+                &mut discovery,
+                &path,
+                false,
+                had_errors
+            ));
+        }
+        assert!(tally_dispatch_errors(
+            &mut discovery,
+            &path,
+            false,
+            had_errors
+        ));
+        assert!(discovery.files[&path].cold);
     }
 
     #[tokio::test]

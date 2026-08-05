@@ -49,7 +49,10 @@ actively growing transcripts directly, and samples cold transcripts through
 fixed round-robin budgets. Quiet-tick metadata work therefore stays bounded as
 the historical transcript corpus grows; directory changes prioritize their
 cold files, with the ordinary bounded sweep covering filesystems where append
-does not update parent-directory mtime.
+does not update parent-directory mtime. The priority ordering is bounded but
+not fair under continuous directory churn: repeated changes can keep the
+priority queue ahead of the ordinary cold sweep, while productive cold-file
+metadata probes remain capped at 256 per tick.
 
 ## Where this sits
 
