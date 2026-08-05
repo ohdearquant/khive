@@ -13,9 +13,12 @@ use crate::version::ProtocolVersion;
 /// lifetime of one connection. The server echoes it on the operation's
 /// single terminal frame.
 ///
-/// The codec rejects an EMPTY operation id at decode: an empty string can
-/// never be a unique caller-generated id, so it is a frame-grammar
-/// violation rather than a value the protocol has to give meaning to.
+/// The codec rejects an EMPTY operation id in BOTH directions: an empty
+/// string can never be a unique caller-generated id, so it is a
+/// frame-grammar violation rather than a value the protocol has to give
+/// meaning to. Decode rejects it in `OperationId`'s [`Deserialize`] impl;
+/// encode rejects it in [`crate::codec::encode_frame_with_max`], so a
+/// locally constructed frame carrying one can never leave this crate.
 /// In-memory construction (`From<String>`, `From<&str>`) remains
 /// unrestricted; only the wire form is validated.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -320,6 +323,15 @@ pub enum Frame {
         /// A human-readable detail message. Not part of the closed
         /// contract — callers must branch on `code`, never on this string.
         message: String,
+        /// The raw code string when the wire carried a code OUTSIDE the
+        /// closed set ([`crate::error::WIRE_ERROR_CODES`]) and serde's
+        /// `#[serde(other)]` fallback mapped it to
+        /// [`crate::error::WireErrorCode::Internal`]; `None` for every
+        /// recognized code, and for every frame this crate produced by
+        /// encoding or by in-memory construction. Diagnostic only: it is
+        /// never serialized, and [`crate::codec::decode_payload`] is the
+        /// only path that ever fills it.
+        unrecognized_code: Option<String>,
     },
 
     /// Asks the server to terminate an in-flight `request`.
@@ -475,7 +487,12 @@ impl Serialize for Frame {
                 map.serialize_entry("id", id)?;
                 map.serialize_entry("result", result)?;
             }
-            Frame::Error { id, code, message } => {
+            // `unrecognized_code` is a decode-only diagnostic; it is
+            // deliberately NOT a wire field (strict grammar), so `..`
+            // drops it here.
+            Frame::Error {
+                id, code, message, ..
+            } => {
                 if let Some(id) = id {
                     map.serialize_entry("id", id)?;
                 }
@@ -603,10 +620,16 @@ impl<'de> Deserialize<'de> for Frame {
                     }
                     "error" => {
                         let payload: ErrorPayload = parse(&object).map_err(A::Error::custom)?;
+                        // `unrecognized_code` starts `None`; the codec's
+                        // [`crate::codec::decode_payload`] fills it when the
+                        // wire code fell back to `Internal` via
+                        // `#[serde(other)]`. A direct serde decode of
+                        // `Frame` leaves it `None`.
                         Ok(Frame::Error {
                             id: payload.id,
                             code: payload.code,
                             message: payload.message,
+                            unrecognized_code: None,
                         })
                     }
                     "cancel" => {

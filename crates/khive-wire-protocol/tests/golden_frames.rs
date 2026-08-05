@@ -7,6 +7,14 @@
 //! fixture into a [`Frame`] and re-encodes that `Frame`, asserting the
 //! re-encoded bytes match the fixture byte-for-byte — the round trip is
 //! checked in both directions, not just that decode succeeds.
+//!
+//! Byte-exactness here DEPENDS on the workspace's serde_json feature
+//! posture (crates/Cargo.toml: `serde_json = "1.0"`, default features —
+//! no `preserve_order`, no `arbitrary_precision`). Cargo features unify
+//! additively across the workspace, so a `preserve_order` enabled by any
+//! other crate would silently change key order and break these fixtures.
+//! The `serde_json_feature_posture_is_default_keys_serialize_sorted` probe
+//! in `src/codec.rs` pins that posture at test time.
 
 use khive_wire_protocol::frame::OperationId;
 use khive_wire_protocol::{
@@ -93,6 +101,7 @@ fn error() {
             id: Some(OperationId::from("op-1")),
             code: WireErrorCode::PeerClassDenied,
             message: "verb 'delete' is outside the mapped class allowlist".to_string(),
+            unrecognized_code: None,
         },
     );
 }
@@ -105,6 +114,7 @@ fn connection_terminal_error_carries_no_id() {
         id: None,
         code: WireErrorCode::UnsupportedVersion,
         message: "unsupported protocol version 9999; server supports [1, 1]".to_string(),
+        unrecognized_code: None,
     };
     let wire = encode_frame(&frame).unwrap();
     let payload = br#"{"kind":"error","code":"unsupported_version","message":"unsupported protocol version 9999; server supports [1, 1]"}"#;
@@ -295,6 +305,7 @@ fn frame_kinds_matches_the_frame_enum() {
             id: None,
             code: WireErrorCode::MalformedFrame,
             message: String::new(),
+            unrecognized_code: None,
         },
         Frame::Cancel {
             id: OperationId::from("op-1"),

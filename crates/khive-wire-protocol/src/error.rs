@@ -183,9 +183,17 @@ mod tests {
         let payload = br#"{"kind":"error","code":"bogus","message":"future code"}"#;
         let frame = crate::codec::decode_payload(payload).unwrap();
         match frame {
-            crate::frame::Frame::Error { id, code, .. } => {
+            crate::frame::Frame::Error {
+                id,
+                code,
+                unrecognized_code,
+                ..
+            } => {
                 assert_eq!(code, WireErrorCode::Internal);
                 assert!(id.is_none());
+                // The raw string survives the fallback; it is not
+                // silently discarded.
+                assert_eq!(unrecognized_code.as_deref(), Some("bogus"));
             }
             other => panic!("expected an error frame, got {other:?}"),
         }

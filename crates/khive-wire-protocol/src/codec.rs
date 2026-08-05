@@ -26,13 +26,14 @@ pub const LENGTH_PREFIX_BYTES: usize = 4;
 /// [`FrameCodec::max_frame_bytes`] explicitly.
 pub const DEFAULT_MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 
-/// A decode failure, distinguishing every malformed-frame case this crate
-/// can identify. All of these correspond to the wire error
+/// A codec failure, distinguishing every malformed-frame case this crate
+/// can identify. Every variant maps onto the wire error taxonomy —
 /// [`crate::error::WireErrorCode::MalformedFrame`] or
-/// [`crate::error::WireErrorCode::FrameTooLarge`] once mapped onto the wire
-/// error taxonomy by a server; this crate keeps the finer-grained variant
-/// so a caller (including a test) can assert the specific failure rather
-/// than only "decoding failed".
+/// [`crate::error::WireErrorCode::FrameTooLarge`] — canonically via
+/// [`wire_code`](Self::wire_code) (and the `From<&CodecError>` impl), so
+/// servers need no hand-maintained mapping; this crate keeps the
+/// finer-grained variant so a caller (including a test) can assert the
+/// specific failure rather than only "decoding failed".
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum CodecError {
     /// Fewer than [`LENGTH_PREFIX_BYTES`] bytes were supplied — the 4-byte
@@ -79,16 +80,55 @@ pub enum CodecError {
     /// The frame's `"kind"` was recognized but a field required by that
     /// frame kind's shape is missing, has the wrong type, or is unknown to
     /// the closed grammar (strict field rejection — see the crate
-    /// documentation's "Strict field rejection" section).
+    /// documentation's "Strict field rejection" section). Encode side: an
+    /// operation id field carries the empty string, which the wire grammar
+    /// forbids ([`crate::frame::OperationId`]).
     #[error("frame kind {kind:?}: {detail}")]
     InvalidFields { kind: String, detail: String },
 
     /// An `error` frame whose operation-id presence contradicts its code's
     /// terminal scope (ADR-137, "Operation correlation"): a
     /// connection-terminal code carries no operation id, and a
-    /// request-terminal code echoes the one it terminates.
+    /// request-terminal code echoes the one it terminates. Enforced at
+    /// decode ([`decode_payload`]) AND at encode
+    /// ([`encode_frame_with_max`]).
     #[error("error frame violates the id/scope rule: {detail}")]
     InconsistentErrorScope { detail: String },
+}
+
+impl CodecError {
+    /// The wire error code this failure maps to under ADR-137's taxonomy:
+    /// [`FrameTooLarge`](Self::FrameTooLarge) and
+    /// [`U32PrefixLimitExceeded`](Self::U32PrefixLimitExceeded) — the size
+    /// failures — map to [`WireErrorCode::FrameTooLarge`]; every other
+    /// variant maps to [`WireErrorCode::MalformedFrame`]. This is the
+    /// canonical codec→wire-error mapping: servers should use it (or the
+    /// `From<&CodecError>` impl) rather than hand-maintain their own.
+    ///
+    /// [`WireErrorCode::FrameTooLarge`]: crate::error::WireErrorCode::FrameTooLarge
+    /// [`WireErrorCode::MalformedFrame`]: crate::error::WireErrorCode::MalformedFrame
+    pub const fn wire_code(&self) -> crate::error::WireErrorCode {
+        match self {
+            CodecError::FrameTooLarge { .. } | CodecError::U32PrefixLimitExceeded { .. } => {
+                crate::error::WireErrorCode::FrameTooLarge
+            }
+            CodecError::TruncatedLengthPrefix { .. }
+            | CodecError::TruncatedPayload { .. }
+            | CodecError::InvalidJson(_)
+            | CodecError::MissingKind
+            | CodecError::UnknownFrameKind(_)
+            | CodecError::InvalidFields { .. }
+            | CodecError::InconsistentErrorScope { .. } => {
+                crate::error::WireErrorCode::MalformedFrame
+            }
+        }
+    }
+}
+
+impl From<&CodecError> for crate::error::WireErrorCode {
+    fn from(err: &CodecError) -> Self {
+        err.wire_code()
+    }
 }
 
 /// A configured framing codec.
@@ -126,9 +166,21 @@ impl FrameCodec {
     /// function does not support partial/streaming input. Bytes in `buf`
     /// beyond the decoded frame, if any, are ignored — a transport that
     /// reads a stream is responsible for slicing exactly one frame's bytes
-    /// (using the length prefix) before calling this.
+    /// (using the length prefix) before calling this, or for using
+    /// [`decode_with_consumed`](Self::decode_with_consumed) to learn where
+    /// the decoded frame ends.
     pub fn decode(&self, buf: &[u8]) -> Result<Frame, CodecError> {
         decode_frame(buf, self.max_frame_bytes)
+    }
+
+    /// Decode one complete length-prefixed frame from `buf` and report the
+    /// number of bytes consumed: the 4-byte length prefix plus the
+    /// declared payload length. The remainder `buf[consumed..]` — if any —
+    /// is the next frame's bytes, letting a transport split a buffered
+    /// stream into frames without re-parsing the length prefix itself.
+    /// The frame itself is decoded exactly as [`decode`](Self::decode).
+    pub fn decode_with_consumed(&self, buf: &[u8]) -> Result<(Frame, usize), CodecError> {
+        decode_frame_with_consumed(buf, self.max_frame_bytes)
     }
 }
 
@@ -153,13 +205,95 @@ pub fn encode_frame(frame: &Frame) -> Result<Vec<u8>, CodecError> {
 /// `max_frame_bytes` is PAYLOAD-ONLY: the maximum JSON payload length, not
 /// counting the 4-byte length prefix — the same bound [`decode_frame`]
 /// checks against.
+///
+/// Before serializing, the frame is validated against the same wire rules
+/// the decode side enforces ([`validate_frame_for_wire`]): an empty
+/// operation id in any id field ([`CodecError::InvalidFields`]) and an
+/// `error` frame whose id presence contradicts its code's terminal scope
+/// ([`CodecError::InconsistentErrorScope`]) are rejected here, so a frame
+/// this function accepts is one any conforming decoder accepts. This keeps
+/// encode and decode symmetric: a locally constructed frame that violates
+/// the grammar can never leave this crate as wire bytes.
+///
+/// Cost note: the size guard runs on the SERIALIZED payload, so the frame
+/// is fully serialized (and its bytes allocated) before the bound is
+/// checked; an oversized frame therefore pays one full serialization before
+/// [`CodecError::FrameTooLarge`] is returned. This is the accepted cost of
+/// a local, non-I/O encode: no cheaper pre-estimate of the serialized size
+/// exists without serializing.
 pub fn encode_frame_with_max(frame: &Frame, max_frame_bytes: usize) -> Result<Vec<u8>, CodecError> {
+    validate_frame_for_wire(frame)?;
     let payload = serde_json::to_vec(frame).map_err(|e| CodecError::InvalidJson(e.to_string()))?;
     check_encode_payload_len(payload.len(), max_frame_bytes)?;
     let mut buf = Vec::with_capacity(LENGTH_PREFIX_BYTES + payload.len());
     buf.extend_from_slice(&(payload.len() as u32).to_be_bytes());
     buf.extend_from_slice(&payload);
     Ok(buf)
+}
+
+/// The encode-side mirror of the decode-side grammar checks: rejects a
+/// frame that [`decode_payload`] would reject, so encode and decode are
+/// symmetric and a locally constructed frame can never serialize into wire
+/// bytes no conforming decoder would accept.
+///
+/// Two rules are enforced here:
+///
+/// 1. No operation id field may carry the empty string — an empty string
+///    can never be a unique caller-generated id. Decode enforces this in
+///    `OperationId`'s `Deserialize` impl; the encode side checks the
+///    in-memory value directly, because [`crate::frame::OperationId`]
+///    construction is deliberately unrestricted.
+/// 2. An `error` frame's operation-id presence must agree with its code's
+///    terminal scope (ADR-137, "Operation correlation"), exactly as
+///    [`decode_payload`] enforces via [`CodecError::InconsistentErrorScope`].
+///    Every [`crate::error::WireErrorCode`] variant is in the closed set,
+///    so the decode side's unknown-code exemption never applies here.
+fn validate_frame_for_wire(frame: &Frame) -> Result<(), CodecError> {
+    use crate::error::TerminalScope;
+
+    fn check_id(kind: &str, id: &crate::frame::OperationId) -> Result<(), CodecError> {
+        if id.0.is_empty() {
+            return Err(CodecError::InvalidFields {
+                kind: kind.to_string(),
+                detail: "operation id must be a non-empty string".to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    match frame {
+        Frame::Handshake { .. } | Frame::HandshakeAck { .. } | Frame::Event { .. } => {}
+        Frame::Request { id, .. } => check_id("request", id)?,
+        Frame::Response { id, .. } => check_id("response", id)?,
+        Frame::Cancel { id } => check_id("cancel", id)?,
+        Frame::Subscribe { id, .. } => check_id("subscribe", id)?,
+        Frame::SubscribeAck { id, .. } => check_id("subscribe_ack", id)?,
+        Frame::Unsubscribe { id, .. } => check_id("unsubscribe", id)?,
+        Frame::UnsubscribeAck { id, .. } => check_id("unsubscribe_ack", id)?,
+        Frame::Error { id, code, .. } => {
+            if let Some(id) = id {
+                check_id("error", id)?;
+            }
+            match (code.terminal_scope(), id) {
+                (TerminalScope::Connection, Some(id)) => {
+                    return Err(CodecError::InconsistentErrorScope {
+                        detail: format!(
+                            "connection-terminal code {code} must not carry an operation id, got {id}"
+                        ),
+                    });
+                }
+                (TerminalScope::Request, None) => {
+                    return Err(CodecError::InconsistentErrorScope {
+                        detail: format!(
+                            "request-terminal code {code} must echo the operation id it terminates"
+                        ),
+                    });
+                }
+                (TerminalScope::Connection, None) | (TerminalScope::Request, Some(_)) => {}
+            }
+        }
+    }
+    Ok(())
 }
 
 /// The encode-side size decision, split out from
@@ -195,6 +329,21 @@ fn check_encode_payload_len(payload_len: usize, max_frame_bytes: usize) -> Resul
 /// counting the 4-byte prefix. Passing a total wire length here is a caller
 /// bug — it admits payloads 4 bytes over the intended bound.
 pub fn decode_frame(buf: &[u8], max_frame_bytes: usize) -> Result<Frame, CodecError> {
+    decode_frame_with_consumed(buf, max_frame_bytes).map(|(frame, _)| frame)
+}
+
+/// Decode one complete length-prefixed frame from `buf` and report the
+/// number of bytes consumed: [`LENGTH_PREFIX_BYTES`] plus the declared
+/// payload length. Bytes beyond the consumed prefix — if any — belong to
+/// the next frame, letting a transport split a buffered stream into frames
+/// without re-parsing the length prefix itself. [`decode_frame`] is this
+/// function with the consumed count discarded.
+///
+/// `max_frame_bytes` is PAYLOAD-ONLY, as in [`decode_frame`].
+pub fn decode_frame_with_consumed(
+    buf: &[u8],
+    max_frame_bytes: usize,
+) -> Result<(Frame, usize), CodecError> {
     if buf.len() < LENGTH_PREFIX_BYTES {
         return Err(CodecError::TruncatedLengthPrefix {
             available: buf.len(),
@@ -220,7 +369,8 @@ pub fn decode_frame(buf: &[u8], max_frame_bytes: usize) -> Result<Frame, CodecEr
     }
 
     let payload = &buf[LENGTH_PREFIX_BYTES..LENGTH_PREFIX_BYTES + declared];
-    decode_payload(payload)
+    let frame = decode_payload(payload)?;
+    Ok((frame, LENGTH_PREFIX_BYTES + declared))
 }
 
 /// Decode one frame's JSON payload (without the length prefix).
@@ -229,12 +379,21 @@ pub fn decode_frame(buf: &[u8], max_frame_bytes: usize) -> Result<Frame, CodecEr
 /// payload bytes (for example, from fixture files that store payload-only
 /// JSON) does not have to synthesize a length prefix first.
 ///
+/// **Size guard:** this function applies NO `max_frame_bytes` check — the
+/// bound is enforced only in [`decode_frame`] / [`FrameCodec::decode`],
+/// which is where the length prefix is read. Callers with untrusted payload
+/// bytes must check `payload.len()` against their bound before calling, or
+/// go through [`decode_frame`] with a synthesized prefix.
+///
 /// Enforces, beyond serde: the closed `"kind"` set
 /// ([`CodecError::UnknownFrameKind`]), and — after the frame parses — the
 /// ADR-137 id/scope consistency rule for `error` frames
 /// ([`CodecError::InconsistentErrorScope`]). Strict field rejection (no
 /// unknown fields) is carried by the per-kind payload structs in
-/// [`crate::frame`].
+/// [`crate::frame`]. For an `error` frame whose wire code is outside the
+/// closed set, the raw code string is preserved in
+/// [`Frame::Error`](crate::frame::Frame)'s `unrecognized_code` diagnostic
+/// field.
 pub fn decode_payload(payload: &[u8]) -> Result<Frame, CodecError> {
     let value: serde_json::Value =
         serde_json::from_slice(payload).map_err(|e| CodecError::InvalidJson(e.to_string()))?;
@@ -259,10 +418,11 @@ pub fn decode_payload(payload: &[u8]) -> Result<Frame, CodecError> {
         .and_then(|c| c.as_str())
         .map(str::to_string);
 
-    let frame: Frame = serde_json::from_value(value).map_err(|e| CodecError::InvalidFields {
-        kind,
-        detail: e.to_string(),
-    })?;
+    let mut frame: Frame =
+        serde_json::from_value(value).map_err(|e| CodecError::InvalidFields {
+            kind,
+            detail: e.to_string(),
+        })?;
 
     // ADR-137, "Operation correlation": a connection-terminal error carries
     // no operation id, and a request-terminal error echoes the one it
@@ -271,15 +431,24 @@ pub fn decode_payload(payload: &[u8]) -> Result<Frame, CodecError> {
     // covers the codes in the closed set — the table fixes their scopes. A
     // code outside the set fell back to `Internal` (its true scope is
     // unknown to this version), and ADR-137 directs the client to treat it
-    // as `internal` rather than reject the frame.
-    if let Frame::Error { id, code, .. } = &frame {
+    // as `internal` rather than reject the frame; the raw code string is
+    // preserved in the frame's `unrecognized_code` diagnostic field so the
+    // information is not silently discarded.
+    if let Frame::Error {
+        id,
+        code,
+        unrecognized_code,
+        ..
+    } = &mut frame
+    {
         let code_in_closed_set = raw_error_code
             .as_deref()
             .is_some_and(|c| crate::error::WIRE_ERROR_CODES.contains(&c));
         if !code_in_closed_set {
+            *unrecognized_code = raw_error_code;
             return Ok(frame);
         }
-        match (code.terminal_scope(), id) {
+        match (code.terminal_scope(), id.as_ref()) {
             (TerminalScope::Connection, Some(id)) => {
                 return Err(CodecError::InconsistentErrorScope {
                     detail: format!(
@@ -332,6 +501,7 @@ mod tests {
                 id: Some(OperationId::from("op-1")),
                 code: crate::error::WireErrorCode::PeerClassDenied,
                 message: "denied".to_string(),
+                unrecognized_code: None,
             },
             Frame::Cancel {
                 id: OperationId::from("op-1"),
@@ -690,6 +860,338 @@ mod tests {
             alpha < zeta,
             "expected sorted key order in re-encoded payload: {payload}"
         );
+    }
+
+    // ── encode-side validation: the mirror of the decode checks above ──
+
+    #[test]
+    fn encode_rejects_empty_operation_id() {
+        // Encode arm of `rejects_empty_operation_id`: `From<&str>` is
+        // deliberately unrestricted, so the empty id can exist in memory —
+        // the codec must refuse to put it on the wire in any id field.
+        let frame = Frame::Cancel {
+            id: OperationId::from(""),
+        };
+        match encode_frame(&frame).unwrap_err() {
+            CodecError::InvalidFields { kind, detail } => {
+                assert_eq!(kind, "cancel");
+                assert!(detail.contains("non-empty"), "detail: {detail}");
+            }
+            other => panic!("expected InvalidFields, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn encode_rejects_empty_operation_id_in_every_id_field() {
+        // The empty-id guard covers every frame kind with an operation id,
+        // not just the one the decode test exercises.
+        let frames = [
+            Frame::Request {
+                id: OperationId::from(""),
+                ops: "stats()".to_string(),
+                deadline_ms: None,
+                namespace: None,
+                actor_id: None,
+                visible_namespaces: None,
+            },
+            Frame::Response {
+                id: OperationId::from(""),
+                result: serde_json::json!({}),
+            },
+            Frame::Subscribe {
+                id: OperationId::from(""),
+                topic: "a.b".to_string(),
+                resume_cursor: None,
+            },
+            Frame::SubscribeAck {
+                id: OperationId::from(""),
+                topic: "a.b".to_string(),
+                start_cursor: 0,
+            },
+            Frame::Unsubscribe {
+                id: OperationId::from(""),
+                topic: "a.b".to_string(),
+            },
+            Frame::UnsubscribeAck {
+                id: OperationId::from(""),
+                topic: "a.b".to_string(),
+            },
+        ];
+        for frame in frames {
+            match encode_frame(&frame).unwrap_err() {
+                CodecError::InvalidFields { detail, .. } => {
+                    assert!(detail.contains("non-empty"), "detail: {detail}");
+                }
+                other => panic!(
+                    "kind {:?}: expected InvalidFields, got {other:?}",
+                    frame.kind()
+                ),
+            }
+        }
+    }
+
+    #[test]
+    fn encode_rejects_connection_terminal_error_carrying_an_id() {
+        // Encode arm of `rejects_connection_terminal_error_carrying_an_id`:
+        // `frame_too_large` is connection-terminal and must not echo an
+        // operation id (ADR-137, "Operation correlation").
+        let frame = Frame::Error {
+            id: Some(OperationId::from("op-1")),
+            code: crate::error::WireErrorCode::FrameTooLarge,
+            message: "too big".to_string(),
+            unrecognized_code: None,
+        };
+        match encode_frame(&frame).unwrap_err() {
+            CodecError::InconsistentErrorScope { detail } => {
+                assert!(detail.contains("frame_too_large"), "detail: {detail}");
+                assert!(detail.contains("op-1"), "detail: {detail}");
+            }
+            other => panic!("expected InconsistentErrorScope, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn encode_rejects_request_terminal_error_without_an_id() {
+        // Encode arm of `rejects_request_terminal_error_without_an_id`:
+        // `cancelled` is request-terminal and must echo the id it
+        // terminates.
+        let frame = Frame::Error {
+            id: None,
+            code: crate::error::WireErrorCode::Cancelled,
+            message: "cancelled".to_string(),
+            unrecognized_code: None,
+        };
+        match encode_frame(&frame).unwrap_err() {
+            CodecError::InconsistentErrorScope { detail } => {
+                assert!(detail.contains("cancelled"), "detail: {detail}");
+            }
+            other => panic!("expected InconsistentErrorScope, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn encode_accepts_both_consistent_error_scopes() {
+        // Happy-path control for the encode-side scope check: both legal
+        // pairings encode and round-trip through decode unchanged.
+        let consistent = [
+            Frame::Error {
+                id: None,
+                code: crate::error::WireErrorCode::MalformedFrame,
+                message: "connection scope".to_string(),
+                unrecognized_code: None,
+            },
+            Frame::Error {
+                id: Some(OperationId::from("op-1")),
+                code: crate::error::WireErrorCode::DeadlineExceeded,
+                message: "request scope".to_string(),
+                unrecognized_code: None,
+            },
+        ];
+        for frame in consistent {
+            let wire = encode_frame(&frame).expect("consistent scope must encode");
+            assert_eq!(decode_frame(&wire, DEFAULT_MAX_FRAME_BYTES).unwrap(), frame);
+        }
+    }
+
+    // ── unknown wire code: fallback keeps the raw string (item 3) ──
+
+    #[test]
+    fn unknown_code_fallback_preserves_the_raw_string_with_an_id() {
+        // A newer peer may send a code this version does not know. The
+        // frame must still decode (forward compatibility), the code falls
+        // back to `internal`, the id/scope pairing is NOT enforced for it
+        // (its true scope is unknown), and the raw string survives in the
+        // `unrecognized_code` diagnostic instead of being discarded.
+        let payload =
+            br#"{"kind":"error","id":"op-7","code":"future_code_xyz","message":"from newer peer"}"#;
+        let frame = decode_payload(payload).unwrap();
+        match frame {
+            Frame::Error {
+                id,
+                code,
+                unrecognized_code,
+                ..
+            } => {
+                assert_eq!(code, crate::error::WireErrorCode::Internal);
+                assert_eq!(id, Some(OperationId::from("op-7")));
+                assert_eq!(unrecognized_code.as_deref(), Some("future_code_xyz"));
+            }
+            other => panic!("expected an error frame, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unknown_code_fallback_preserves_the_raw_string_without_an_id() {
+        let payload = br#"{"kind":"error","code":"future_code_xyz","message":"from newer peer"}"#;
+        match decode_payload(payload).unwrap() {
+            Frame::Error {
+                id,
+                code,
+                unrecognized_code,
+                ..
+            } => {
+                assert_eq!(code, crate::error::WireErrorCode::Internal);
+                assert!(id.is_none());
+                assert_eq!(unrecognized_code.as_deref(), Some("future_code_xyz"));
+            }
+            other => panic!("expected an error frame, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn closed_set_code_never_populates_unrecognized_code() {
+        // The diagnostic stays `None` for every code in the closed set: it
+        // records only the serde-other fallback, never a recognized code.
+        let payload =
+            br#"{"kind":"error","id":"op-9","code":"deadline_exceeded","message":"too slow"}"#;
+        match decode_payload(payload).unwrap() {
+            Frame::Error {
+                unrecognized_code, ..
+            } => assert!(unrecognized_code.is_none()),
+            other => panic!("expected an error frame, got {other:?}"),
+        }
+    }
+
+    // ── decode_with_consumed (item 4) ──
+
+    #[test]
+    fn decode_with_consumed_reports_consumed_length_on_a_two_frame_buffer() {
+        // Two concatenated frames: the consumed count must end exactly at
+        // the first frame's last byte, and the remainder must be the
+        // second frame, decodable without re-slicing by hand.
+        let first = Frame::Cancel {
+            id: OperationId::from("op-1"),
+        };
+        let second = Frame::Handshake {
+            version: crate::version::CURRENT_VERSION,
+        };
+        let codec = FrameCodec::default();
+        let mut buf = codec.encode(&first).unwrap();
+        let first_len = buf.len();
+        buf.extend_from_slice(&codec.encode(&second).unwrap());
+
+        let (decoded, consumed) = codec.decode_with_consumed(&buf).unwrap();
+        assert_eq!(decoded, first);
+        assert_eq!(consumed, first_len);
+
+        let (decoded2, consumed2) = codec.decode_with_consumed(&buf[consumed..]).unwrap();
+        assert_eq!(decoded2, second);
+        assert_eq!(consumed + consumed2, buf.len());
+
+        // `decode` keeps its documented contract on the same buffer.
+        assert_eq!(codec.decode(&buf).unwrap(), first);
+    }
+
+    #[test]
+    fn decode_with_consumed_errors_without_reporting_length_on_truncation() {
+        let codec = FrameCodec::default();
+        let wire = codec
+            .encode(&Frame::Cancel {
+                id: OperationId::from("op-1"),
+            })
+            .unwrap();
+        let err = codec
+            .decode_with_consumed(&wire[..wire.len() - 1])
+            .unwrap_err();
+        assert!(matches!(err, CodecError::TruncatedPayload { .. }));
+    }
+
+    // ── serde_json feature posture probe (item 2) ──
+
+    #[test]
+    fn serde_json_feature_posture_is_default_keys_serialize_sorted() {
+        // Golden byte-exactness (tests/golden_frames.rs) and the semantic
+        // opaque-payload guarantee above both assume serde_json's DEFAULT
+        // feature posture: no `preserve_order` (the Map is BTreeMap-backed,
+        // so keys serialize in sorted order regardless of insertion) and no
+        // `arbitrary_precision`. Cargo features are ADDITIVE across the
+        // workspace: if any crate in the dependency graph enables
+        // `preserve_order` or `arbitrary_precision`, serde_json unifies on
+        // it for this crate too, silently changing key order (or number
+        // handling) and invalidating the golden fixtures. This probe pins
+        // the assumed posture at test time: if it fails, the workspace
+        // feature set drifted — reconcile the workspace or the fixtures,
+        // do not weaken this assertion.
+        let mut map = serde_json::Map::new();
+        map.insert("zeta".to_string(), serde_json::json!(1));
+        map.insert("alpha".to_string(), serde_json::json!(2));
+        map.insert("mid".to_string(), serde_json::json!(3));
+        let wire = serde_json::to_string(&serde_json::Value::Object(map)).unwrap();
+        assert_eq!(
+            wire, r#"{"alpha":2,"mid":3,"zeta":1}"#,
+            "serde_json keys did not serialize in sorted order — \
+             `preserve_order` may have been enabled workspace-wide"
+        );
+    }
+
+    // ── CodecError → WireErrorCode canonical mapping (item 8) ──
+
+    #[test]
+    fn codec_errors_map_to_their_wire_error_codes() {
+        use crate::error::WireErrorCode;
+
+        let cases: &[(CodecError, WireErrorCode)] = &[
+            (
+                CodecError::TruncatedLengthPrefix { available: 2 },
+                WireErrorCode::MalformedFrame,
+            ),
+            (
+                CodecError::TruncatedPayload {
+                    declared: 8,
+                    available: 3,
+                },
+                WireErrorCode::MalformedFrame,
+            ),
+            (
+                CodecError::FrameTooLarge {
+                    declared: 10,
+                    max: 4,
+                },
+                WireErrorCode::FrameTooLarge,
+            ),
+            (
+                CodecError::U32PrefixLimitExceeded {
+                    declared: 10,
+                    max: 4,
+                },
+                WireErrorCode::FrameTooLarge,
+            ),
+            (
+                CodecError::InvalidJson("x".to_string()),
+                WireErrorCode::MalformedFrame,
+            ),
+            (CodecError::MissingKind, WireErrorCode::MalformedFrame),
+            (
+                CodecError::UnknownFrameKind("ping".to_string()),
+                WireErrorCode::MalformedFrame,
+            ),
+            (
+                CodecError::InvalidFields {
+                    kind: "cancel".to_string(),
+                    detail: "x".to_string(),
+                },
+                WireErrorCode::MalformedFrame,
+            ),
+            (
+                CodecError::InconsistentErrorScope {
+                    detail: "x".to_string(),
+                },
+                WireErrorCode::MalformedFrame,
+            ),
+        ];
+        for (err, expected) in cases {
+            assert_eq!(
+                err.wire_code(),
+                *expected,
+                "{err:?} mapped to {:?}, expected {expected:?}",
+                err.wire_code()
+            );
+            assert_eq!(
+                WireErrorCode::from(err),
+                *expected,
+                "From<&CodecError> disagrees"
+            );
+        }
     }
 }
 

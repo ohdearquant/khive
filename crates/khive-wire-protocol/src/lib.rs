@@ -199,13 +199,15 @@
 //! A **connection-terminal** error is followed by connection close and
 //! carries no operation id. A **request-terminal** error terminates only
 //! the operation id it echoes; the connection stays usable. The codec
-//! enforces that pairing at decode time
+//! enforces that pairing at encode AND decode time
 //! ([`codec::CodecError::InconsistentErrorScope`]): an `error` frame whose
 //! id presence contradicts its code's terminal scope is rejected, never
-//! represented. The check covers the codes in the closed set
-//! ([`error::WIRE_ERROR_CODES`]); an unrecognized code falls back to
+//! represented and never emitted. The check covers the codes in the closed
+//! set ([`error::WIRE_ERROR_CODES`]); an unrecognized code falls back to
 //! `internal` and is processed per the fallback rule above (its true scope
-//! is unknown to this version, so the pairing is not enforced for it).
+//! is unknown to this version, so the pairing is not enforced for it), but
+//! the raw code string is preserved in the decoded frame's
+//! `unrecognized_code` diagnostic field rather than discarded.
 //! The set is
 //! closed within a protocol version: adding a code requires a version bump,
 //! and a client that decodes a code it does not recognize treats it as
@@ -239,8 +241,8 @@ pub mod handshake;
 pub mod version;
 
 pub use codec::{
-    decode_frame, encode_frame, encode_frame_with_max, CodecError, FrameCodec,
-    DEFAULT_MAX_FRAME_BYTES,
+    decode_frame, decode_frame_with_consumed, encode_frame, encode_frame_with_max, CodecError,
+    FrameCodec, DEFAULT_MAX_FRAME_BYTES,
 };
 pub use error::{TerminalScope, WireErrorCode, WIRE_ERROR_CODES};
 pub use frame::{Cursor, Frame, OperationId, CLIENT_TO_SERVER_KINDS, FRAME_KINDS};

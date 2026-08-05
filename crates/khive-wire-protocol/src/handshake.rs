@@ -136,6 +136,7 @@ impl HandshakeGate {
                                 self.supported.min(),
                                 self.supported.max()
                             ),
+                            unrecognized_code: None,
                         },
                     })
                 }
@@ -150,6 +151,7 @@ impl HandshakeGate {
                             "expected \"handshake\" as the first frame, got {:?}",
                             frame.kind()
                         ),
+                        unrecognized_code: None,
                     }),
                 })
             }
@@ -160,6 +162,7 @@ impl HandshakeGate {
                         id: None,
                         code: WireErrorCode::MalformedFrame,
                         message: "handshake already completed on this connection".to_string(),
+                        unrecognized_code: None,
                     }),
                 })
             }
@@ -180,6 +183,7 @@ impl HandshakeGate {
                                 "frame kind {:?} is server-to-client only; a server never accepts it as an inbound frame",
                                 frame.kind()
                             ),
+                            unrecognized_code: None,
                         }),
                     })
                 }
@@ -189,6 +193,7 @@ impl HandshakeGate {
                     id: None,
                     code: WireErrorCode::MalformedFrame,
                     message: "connection already closed by a prior handshake failure".to_string(),
+                    unrecognized_code: None,
                 }),
             }),
         }
@@ -299,6 +304,7 @@ mod tests {
                 id: None,
                 code: WireErrorCode::Internal,
                 message: "x".to_string(),
+                unrecognized_code: None,
             },
             Frame::SubscribeAck {
                 id: crate::frame::OperationId::from("op-2"),
@@ -335,7 +341,9 @@ mod tests {
         };
         let err = gate.admit(&response).unwrap_err();
         match err.error.as_ref() {
-            Frame::Error { id, code, message } => {
+            Frame::Error {
+                id, code, message, ..
+            } => {
                 assert_eq!(id, &None);
                 assert_eq!(*code, WireErrorCode::MalformedFrame);
                 assert!(message.contains("server-to-client"), "message: {message}");
