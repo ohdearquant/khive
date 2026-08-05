@@ -889,6 +889,11 @@ const POLICY_EXCLUSION_WINDOW_END_US: Option<i64> = None;
 /// `ImplicitPositive` kind.
 const POLICY_EXCLUDED_SIGNAL: &str = "implicit_positive";
 
+/// Per-row stderr detail is emitted for at most this many policy-excluded
+/// rows per replay; the cohort can number in the thousands and the summary
+/// line carries the authoritative counts. Quarantine rows are never capped.
+const POLICY_EXCLUDED_LOG_DETAIL_CAP: usize = 10;
+
 /// Why a replay row was skipped: unreadable/invalid (quarantine) vs readable
 /// but excluded by policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -915,6 +920,15 @@ pub enum ReplaySkipCategory {
 ///    replay;
 /// 4. `created_at` lies in `[window_start_us, window_end_us)`; an end of
 ///    `None` means the window is open-ended.
+///
+/// Timestamp authority: the predicate reads the PAYLOAD's `created_at`, and
+/// on the `brain.feedback` write path that is the same value as the row's
+/// `created_at` column by construction — the handler stamps `commit_at_us`
+/// into the event (`event.created_at = commit_at_us`), serializes THAT event
+/// as the row payload, and passes the same `commit_at_us` as the column
+/// value (see the `FeedbackEventWrite` arms and the
+/// `append_brain_event_on_writer` call in this file). The two clocks cannot
+/// diverge for the class this window describes.
 ///
 /// The window is passed as parameters so tests can exercise both bounds
 /// without touching the production constants.
@@ -967,6 +981,12 @@ pub struct LoadEventsResult {
     /// (quarantine) and readable rows excluded by policy — each tagged with
     /// its [`ReplaySkipCategory`]. The physical rows remain in
     /// `brain_event_log`; this vec makes them queryable.
+    ///
+    /// NOTE: because both categories share this vec, `quarantined.len()` is
+    /// NOT the quarantine count — use [`Self::quarantine_count`] /
+    /// [`Self::policy_excluded_count`]. (At the time this split landed the
+    /// only consumers outside this module were tests; any new consumer must
+    /// filter by category.)
     pub quarantined: Vec<QuarantinedRow>,
 }
 
@@ -993,6 +1013,27 @@ pub async fn load_events_since(
     sql: &dyn SqlAccess,
     namespace: &str,
     since_us: i64,
+) -> Result<LoadEventsResult, RuntimeError> {
+    load_events_since_with_window(
+        sql,
+        namespace,
+        since_us,
+        POLICY_EXCLUSION_WINDOW_START_US,
+        POLICY_EXCLUSION_WINDOW_END_US,
+    )
+    .await
+}
+
+/// Replay loader with the policy-exclusion window as parameters. The public
+/// entry point above pins the production constants; this seam exists so the
+/// `Some(end)` arm is integration-testable through the full row path today —
+/// when the end bound is eventually pinned, the wiring is already exercised.
+async fn load_events_since_with_window(
+    sql: &dyn SqlAccess,
+    namespace: &str,
+    since_us: i64,
+    window_start_us: i64,
+    window_end_us: Option<i64>,
 ) -> Result<LoadEventsResult, RuntimeError> {
     let mut reader = sql.reader().await.map_err(|e| sql_err("reader", e))?;
     let rows = reader
@@ -1041,9 +1082,26 @@ pub async fn load_events_since(
                 ReplaySkipCategory::Quarantine => "quarantined",
                 ReplaySkipCategory::PolicyExcluded => "policy-excluded",
             };
-            eprintln!(
+            // Quarantine rows are rare and indicate corruption — always loud.
+            // Policy-excluded rows can number in the thousands (open-ended
+            // window over a historical cohort), so per-row detail stops after
+            // the first few; the end-of-replay summary carries the full count.
+            let policy_detail_logged = quarantined
+                .iter()
+                .filter(|row| row.category == ReplaySkipCategory::PolicyExcluded)
+                .count();
+            let log_row = category == ReplaySkipCategory::Quarantine
+                || policy_detail_logged < POLICY_EXCLUDED_LOG_DETAIL_CAP;
+            if log_row {
+                eprintln!(
                     "[brain] event-log replay: {label} row id={row_id} profile={profile_id:?}: {reason}"
                 );
+            } else if policy_detail_logged == POLICY_EXCLUDED_LOG_DETAIL_CAP {
+                eprintln!(
+                    "[brain] event-log replay: further policy-excluded rows elided from per-row \
+                     logging (cap {POLICY_EXCLUDED_LOG_DETAIL_CAP}); see the summary line for totals"
+                );
+            }
             quarantined.push(QuarantinedRow {
                 id: row_id,
                 profile_id: profile_id.clone(),
@@ -1095,11 +1153,7 @@ pub async fn load_events_since(
         // the miscalibrated implicit-positive window are skipped at replay
         // time. The physical row stays in brain_event_log (audit preserved);
         // it never reaches interpret/apply_signal.
-        if is_policy_excluded(
-            &event,
-            POLICY_EXCLUSION_WINDOW_START_US,
-            POLICY_EXCLUSION_WINDOW_END_US,
-        ) {
+        if is_policy_excluded(&event, window_start_us, window_end_us) {
             push_quarantine(
                 ReplaySkipCategory::PolicyExcluded,
                 "policy_excluded: implicit_positive feedback inside the PR #1630 window".into(),
@@ -1113,7 +1167,12 @@ pub async fn load_events_since(
         .iter()
         .filter(|row| row.category == ReplaySkipCategory::Quarantine)
         .count();
-    let policy_excluded_count = quarantined.len() - quarantine_count;
+    // Counted explicitly (not by subtraction) so a future third
+    // ReplaySkipCategory variant cannot silently miscount this line.
+    let policy_excluded_count = quarantined
+        .iter()
+        .filter(|row| row.category == ReplaySkipCategory::PolicyExcluded)
+        .count();
     if !quarantined.is_empty() {
         eprintln!(
             "[brain] event-log replay: {} row(s) quarantined, {} row(s) policy-excluded \
@@ -2217,6 +2276,59 @@ mod replay_policy_exclusion {
             start + 5,
         );
         assert!(is_policy_excluded(&in_window, start, Some(end)));
+    }
+
+    /// The `Some(end)` arm through the FULL row path: rows land in SQLite,
+    /// `load_events_since_with_window` reads them back, and only the
+    /// pre-end class member is excluded. This is the integration coverage
+    /// the pinning change will inherit — the wiring is exercised today,
+    /// not first on the day the constant moves.
+    #[tokio::test]
+    async fn end_bound_integration_excludes_only_pre_end_rows() {
+        let rt = KhiveRuntime::memory().expect("memory runtime");
+        let token = rt.authorize(Namespace::local()).expect("token");
+        let ns = token.namespace().as_str();
+
+        let start = POLICY_EXCLUSION_WINDOW_START_US;
+        let end = start + 10_000;
+
+        // Class member BEFORE the end bound — must be excluded.
+        let pre_end = make_implicit_positive_event_json(
+            ns,
+            "implicit_positive",
+            Some("profile-a"),
+            start + 5_000,
+        );
+        insert_raw_payload_at(&rt, ns, &pre_end, start + 5_000).await;
+        // Identical class member AFTER the end bound — must replay.
+        let post_end = make_implicit_positive_event_json(
+            ns,
+            "implicit_positive",
+            Some("profile-a"),
+            end + 5_000,
+        );
+        insert_raw_payload_at(&rt, ns, &post_end, end + 5_000).await;
+        // Unattributed control inside the window — must replay.
+        let control =
+            make_implicit_positive_event_json(ns, "implicit_positive", None, start + 6_000);
+        insert_raw_payload_at(&rt, ns, &control, start + 6_000).await;
+
+        let result = load_events_since_with_window(rt.sql().as_ref(), ns, 0, start, Some(end))
+            .await
+            .expect("windowed replay");
+
+        assert_eq!(
+            result.policy_excluded_count(),
+            1,
+            "exactly the pre-end class member is excluded"
+        );
+        assert_eq!(result.quarantine_count(), 0);
+        assert_eq!(
+            result.events.len(),
+            2,
+            "post-end class member and unattributed control both replay"
+        );
+        assert_eq!(result.quarantined[0].created_at, start + 5_000);
     }
 
     #[tokio::test]
