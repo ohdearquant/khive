@@ -248,7 +248,10 @@ pub struct IngestReport {
     /// history this pass — "silence means nothing left", as opposed to
     /// "stopped before the end" (budget exhausted, incomplete paging
     /// window, or a frozen cursor). Unlike `done`, this is a coverage
-    /// statement, not a resume-loop signal (issue #1617).
+    /// statement, not a resume-loop signal (issue #1617). Vacuously `true`
+    /// when `include` is empty: no source was requested, so nothing can
+    /// count against it — it is a statement about the REQUESTED sources,
+    /// not about the repository.
     pub history_exhausted: bool,
 }
 
@@ -272,6 +275,27 @@ fn record_write_failure(
     report
         .warnings
         .push(format!("{verb} {record_kind} {record_key}: {error}"));
+}
+
+/// Overwrite a walker's source slot with `StoppedEarly(reason)` from an
+/// end-of-walk arm. Seed invariant: every end-of-walk arm
+/// (`!window_complete` / `cursor_stalled`) is reachable only after at least
+/// one successful page fetch, and each walk seeds its slot on its FIRST
+/// successful fetch — so the slot is `Some` on every path today. The
+/// `None` arm keeps that a release-mode soft fallback: it constructs the
+/// state instead of panicking, with a debug tripwire for the
+/// instrumentation gap.
+fn pin_stopped_early(slot: &mut Option<IngestSourceState>, reason: String) {
+    match slot {
+        Some(state) => *state = IngestSourceState::StoppedEarly(reason),
+        None => {
+            debug_assert!(
+                false,
+                "walker reached an end-of-walk arm without seeding its source state"
+            );
+            *slot = Some(IngestSourceState::StoppedEarly(reason));
+        }
+    }
 }
 
 /// Run one ingest pass over `opts.repo`: issues + PRs first (via `gh`, when
@@ -368,9 +392,21 @@ pub(crate) async fn run_ingest_with_commit_recovery(
                         // `pull_requests` state unset. Anything else
                         // preserves the state the walker already wrote.
                         let walked = report.sources.pull_requests.is_some();
-                        report
-                            .warnings
-                            .push(format!("gh pr list failed, skipping pull requests: {e}"));
+                        if walked {
+                            // Align the prose with the structured state:
+                            // the walk happened, so nothing was "skipped" —
+                            // name how far it got before the pass failed.
+                            let visited = report.prs_ingested + report.prs_skipped_existing;
+                            let noun = if visited == 1 { "record" } else { "records" };
+                            report.warnings.push(format!(
+                                "gh pr list failed after walking {visited} {noun} — \
+                                 stopped early, not skipped: {e}"
+                            ));
+                        } else {
+                            report
+                                .warnings
+                                .push(format!("gh pr list failed, skipping pull requests: {e}"));
+                        }
                         if !walked {
                             report.sources.pull_requests = Some(IngestSourceState::Skipped(
                                 format!("gh pr list failed: {e}"),
@@ -429,9 +465,21 @@ pub(crate) async fn run_ingest_with_commit_recovery(
                 )
                 .await
                 {
-                    report
-                        .warnings
-                        .push(format!("gh issue list failed, skipping issues: {e}"));
+                    // See the PR arm above: "skipping" is only accurate for
+                    // a first-fetch failure; a walked-then-failed source
+                    // names how far the walk got.
+                    if report.sources.issues.is_some() {
+                        let visited = report.issues_ingested + report.issues_skipped_existing;
+                        let noun = if visited == 1 { "record" } else { "records" };
+                        report.warnings.push(format!(
+                            "gh issue list failed after walking {visited} {noun} — \
+                             stopped early, not skipped: {e}"
+                        ));
+                    } else {
+                        report
+                            .warnings
+                            .push(format!("gh issue list failed, skipping issues: {e}"));
+                    }
                     // See the PR arm above: `Skipped` only when the walk
                     // never began (the walker signals that by leaving its
                     // state unset); a walked-then-failed source keeps the
@@ -489,7 +537,7 @@ pub(crate) async fn run_ingest_with_commit_recovery(
     }
 
     if opts.include.commits && !budget.exhausted() {
-        ingest_commits(
+        match ingest_commits(
             runtime,
             token,
             registry,
@@ -503,7 +551,45 @@ pub(crate) async fn run_ingest_with_commit_recovery(
             &mut recover,
             &mut commits_complete,
         )
-        .await?;
+        .await
+        {
+            Ok(()) => {}
+            Err(e) => {
+                // `ingest_commits` records its source slot at every walker
+                // exit, so a `Some` slot beside an Err means the walk ran
+                // (possibly to completion) and the pass failed AFTER it —
+                // the final cursor write is the canonical case. Handle that
+                // in-band exactly like the gh walkers: downgrade to
+                // stopped-early and report, never abort the whole ingest
+                // over a failure that leaves the walked records landed. A
+                // `None` slot is a pre-walk failure (snapshot recovery,
+                // cursor read) and stays a hard error — the recovery
+                // contract depends on those surfacing.
+                if report.sources.commits.is_some() {
+                    match report.sources.commits.as_mut() {
+                        Some(IngestSourceState::StoppedEarly(reason)) => {
+                            reason.push_str(&format!("; pass then failed after the walk: {e}"));
+                        }
+                        // See the gh arms above: a completed walk whose pass
+                        // then fails is downgraded so the failure is never
+                        // invisible next to a `completed` claim.
+                        Some(state @ IngestSourceState::Completed) => {
+                            *state = IngestSourceState::StoppedEarly(format!(
+                                "walk completed but the pass then failed: {e}"
+                            ));
+                        }
+                        Some(IngestSourceState::Skipped(_)) | None => {}
+                    }
+                    report
+                        .warnings
+                        .push(format!("commit ingest failed after the walk: {e}"));
+                    report.done = false;
+                    commits_complete = false;
+                } else {
+                    return Err(e);
+                }
+            }
+        }
     } else if opts.include.commits {
         report.sources.commits = Some(IngestSourceState::Skipped(
             "budget exhausted before commits were reached".to_string(),
@@ -521,7 +607,14 @@ pub(crate) async fn run_ingest_with_commit_recovery(
     // at every exit), so each arm below is a release-mode belt-and-braces
     // fallback for a walker that returned without recording anything — an
     // instrumentation gap, not a normal stop, and its reason says so
-    // loudly instead of dressing the gap up as one.
+    // loudly instead of dressing the gap up as one. Fabrication risk, named
+    // for the next maintainer: in release builds the `debug_assert!` is a
+    // no-op and these arms synthesize a state from the bare completion flag
+    // alone — a future walker that sets a completion flag WITHOUT recording
+    // a source state would silently report a fabricated `completed` /
+    // `stopped_early` here with no real reason behind it. Every walker exit
+    // must record its own state; these arms exist only so a gap degrades to
+    // a loud placeholder instead of leaving the slot empty.
     if report.sources.pull_requests.is_none() && opts.include.pull_requests {
         debug_assert!(
             false,
@@ -1272,6 +1365,14 @@ async fn ingest_commits(
     // oldest-first) — combined with `find_commit_by_sha`'s DB lookup below,
     // this resolves parent edges regardless of which pass the parent landed
     // in.
+    //
+    // Stall guard on every `last_sha` advance below (`!cursor_stalled`):
+    // once a commit create fails, the persisted cursor must freeze at the
+    // last contiguous success — advancing it past a refused/failed record
+    // (including on a later EXISTING record, whose natural-key lookup
+    // proves only its own landing, not the failed record's) would strand
+    // the failed commit behind the floor and skip it forever instead of
+    // retrying it next pass.
     let mut local_sha_to_id: HashMap<String, Uuid> = HashMap::new();
     for c in &commits {
         if let Some(existing) = find_commit_by_sha(runtime, token, &c.sha).await? {
@@ -1432,6 +1533,12 @@ async fn ingest_commits(
         *walk_complete = true;
     }
     if let Some(sha) = last_sha {
+        // A stalled cursor has already frozen `last_sha` at the last
+        // contiguous success above; the write persists exactly that floor.
+        // A failure here surfaces at the call site, which distinguishes it
+        // from a pre-walk failure by the already-recorded source state and
+        // downgrades the pass to stopped-early in-band (never a hard
+        // abort of the whole ingest).
         write_cursor(runtime, project_id, "commits", &sha).await?;
     }
     if let Some(warning) = recovery_warning {
@@ -1875,19 +1982,26 @@ async fn ingest_prs(
                     merge_sha_to_pr.insert(oid, existing);
                 }
                 report.prs_skipped_existing += 1;
-                // Cursor advancement past an existing record is always safe:
-                // the record provably landed (natural-key lookup), so no
-                // stall can strand it. Restricting this to `!cursor_stalled`
-                // would freeze the cursor at the pass floor on any pass
-                // whose page is all-existing (the common resumed-pass
-                // shape), re-fetching the same full window forever.
-                if let Some(u) = &pr.updated_at {
-                    if max_updated
-                        .as_deref()
-                        .map(|m| u.as_str() > m)
-                        .unwrap_or(true)
-                    {
-                        max_updated = Some(u.clone());
+                // The natural-key lookup proves THIS record landed — but
+                // while this pass is stalled, records walked after the stall
+                // point sort at/after the refused record (pages are sorted
+                // ascending by `updated_at`). Advancing the floor past them
+                // would persist a cursor strictly newer than the refused
+                // record's timestamp, so the next pass's inclusive
+                // `updated >= cursor` filter would never re-fetch it —
+                // the refusal would be skipped forever instead of retried.
+                // The guard only fires on a stalled pass: a clean
+                // all-existing pass (the common resumed-pass shape) still
+                // advances normally and never re-fetches its window twice.
+                if !cursor_stalled {
+                    if let Some(u) = &pr.updated_at {
+                        if max_updated
+                            .as_deref()
+                            .map(|m| u.as_str() > m)
+                            .unwrap_or(true)
+                        {
+                            max_updated = Some(u.clone());
+                        }
                     }
                 }
                 continue;
@@ -2012,15 +2126,14 @@ async fn ingest_prs(
         // not a complete signal; report `done = false` regardless of budget
         // state so the caller's resume loop keeps going.
         report.done = false;
-        *report
-            .sources
-            .pull_requests
-            .as_mut()
-            .expect("pull_requests state set when the walk began") =
-            IngestSourceState::StoppedEarly(
-                "budget exhausted or the paging floor stalled before the PR window completed"
-                    .into(),
-            );
+        // Seed invariant (see `pin_stopped_early`): this arm is reachable
+        // only after at least one successful page fetch, and the first
+        // successful fetch seeds the slot above — the helper's `None` arm
+        // is a release-mode soft fallback, never a panic.
+        pin_stopped_early(
+            &mut report.sources.pull_requests,
+            "budget exhausted or the paging floor stalled before the PR window completed".into(),
+        );
     }
     if cursor_stalled {
         // A stalled PR cursor means records past the frozen floor were never
@@ -2028,14 +2141,11 @@ async fn ingest_prs(
         // complete when it is permanently behind (issue #1645).
         report.cursor_stalled = true;
         report.done = false;
-        *report
-            .sources
-            .pull_requests
-            .as_mut()
-            .expect("pull_requests state set when the walk began") =
-            IngestSourceState::StoppedEarly(
-                "a per-record write failure froze the pull_requests cursor (cursor_stalled)".into(),
-            );
+        // See the `!window_complete` arm above for the seed invariant.
+        pin_stopped_early(
+            &mut report.sources.pull_requests,
+            "a per-record write failure froze the pull_requests cursor (cursor_stalled)".into(),
+        );
     }
     if window_complete && !cursor_stalled {
         // Completion is recorded HERE too — every walker exit leaves the
@@ -2118,17 +2228,21 @@ async fn ingest_issues(
                 .is_some()
             {
                 report.issues_skipped_existing += 1;
-                // See `ingest_prs`: cursor advancement past an existing
-                // record is always safe — the natural-key lookup proves the
-                // record landed, so no stall can strand it, and freezing
-                // here would re-fetch the same all-existing window forever.
-                if let Some(u) = &masked.updated_at {
-                    if max_updated
-                        .as_deref()
-                        .map(|m| u.as_str() > m)
-                        .unwrap_or(true)
-                    {
-                        max_updated = Some(u.clone());
+                // See `ingest_prs`: while this pass is stalled, advancing
+                // the floor past records walked after the stall point would
+                // persist a cursor strictly newer than the refused record's
+                // timestamp and skip it forever instead of retrying it. A
+                // clean (non-stalled) all-existing pass still advances
+                // normally.
+                if !cursor_stalled {
+                    if let Some(u) = &masked.updated_at {
+                        if max_updated
+                            .as_deref()
+                            .map(|m| u.as_str() > m)
+                            .unwrap_or(true)
+                        {
+                            max_updated = Some(u.clone());
+                        }
                     }
                 }
                 continue;
@@ -2250,11 +2364,11 @@ async fn ingest_issues(
 
     if !window_complete {
         report.done = false;
-        *report
-            .sources
-            .issues
-            .as_mut()
-            .expect("issues state set when the walk began") = IngestSourceState::StoppedEarly(
+        // Seed invariant (see `pin_stopped_early`): this arm is reachable
+        // only after at least one successful page fetch, and the first
+        // successful fetch seeds the slot above.
+        pin_stopped_early(
+            &mut report.sources.issues,
             "budget exhausted or the paging floor stalled before the issue window completed".into(),
         );
     }
@@ -2264,11 +2378,9 @@ async fn ingest_issues(
         // complete (issue #1645).
         report.cursor_stalled = true;
         report.done = false;
-        *report
-            .sources
-            .issues
-            .as_mut()
-            .expect("issues state set when the walk began") = IngestSourceState::StoppedEarly(
+        // See the `!window_complete` arm above for the seed invariant.
+        pin_stopped_early(
+            &mut report.sources.issues,
             "a per-record write failure froze the issues cursor (cursor_stalled)".into(),
         );
     }

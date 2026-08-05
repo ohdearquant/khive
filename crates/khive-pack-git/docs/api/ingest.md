@@ -69,6 +69,19 @@ purely additive — `done`, `cursor_stalled`, and `writes_refused` keep their
 existing meanings, and existing consumers (the `git.digest` handler,
 `kkernel git-ingest`) serialize the same struct with no behavior change.
 
+Two edge semantics, stated explicitly:
+
+- `history_exhausted` is **vacuously `true` when `include` is empty**: no
+  source was requested, so nothing can count against it. It is a statement
+  about the REQUESTED sources, not about the repository.
+- The tri-state is additive, but `done`'s VALUE can still move: a
+  walked-then-failed source (the walk ran — possibly to completion — and a
+  post-walk step such as the final cursor write then failed) downgrades to
+  `stopped_early` and forces `done = false` at the call site, even when the
+  walk itself recorded completion. `done` keeps its existing MEANING ("call
+  until `true`"); the walked-then-failed arms are simply new events that
+  make it `false`, like budget exhaustion.
+
 ## `NewRecordForRef`
 
 A newly created note this pass, retained so the post-ingestion
@@ -146,6 +159,12 @@ failure (see the `cursor_stalled` handling in each `ingest_*` loop) — so
 the next pass re-walks from before the failure and retries it, while
 records that already landed (including ones ingested later in a stalled
 pass) are no-ops via natural-key dedupe.
+While a pass is stalled, the persisted floor also never advances on the
+strength of an ALREADY-EXISTING record walked after the stall point (its
+natural-key lookup proves only its own landing): advancing past one would
+persist a cursor strictly newer than the refused record's timestamp, and
+the next pass's inclusive `updated >= cursor` filter would skip the refused
+record forever instead of retrying it.
 
 ## Issue #765: commit-snapshot recovery
 
@@ -284,6 +303,10 @@ later records in this pass are still attempted (so every failure surfaces
 in this pass's warnings), but `max_updated` no longer advances past the
 stall point — the next pass re-fetches from before the failure and retries
 it, while already-landed records are no-ops via the natural key.
+The freeze applies on every `max_updated` advance, including the
+already-existing-record branch: while stalled, a later existing record with
+a newer timestamp must not pull the floor past the refused record (see
+`write_cursor` above).
 
 Each page is already `sort:updated-asc` server-side, but `--search` makes
 no hard ordering guarantee across ties — both loops re-sort defensively so
