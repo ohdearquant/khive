@@ -150,6 +150,7 @@ The same head-binding governs review: a verdict authorizes only the exact commit
 | [ADR-141](ADR-141-store-backup-runner.md)                               | Executable store backup runner                                                                             |
 | [ADR-142](ADR-142-agentic-process-runtime.md)                           | Agentic Process Runtime                                                                                    |
 | [ADR-143](ADR-143-store-held-caller-grants.md)                          | Store-held caller grants and hierarchical subactor identity                                                |
+| [ADR-144](ADR-144-memory-write-visibility-fence.md)                     | Operation-level write-visibility fence for memory recall                                                   |
 
 <!-- END GENERATED ADR CATALOG -->
 
