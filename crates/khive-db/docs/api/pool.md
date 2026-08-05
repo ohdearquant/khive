@@ -58,7 +58,13 @@ fresh one. A QUEUE-BACKED writer handle is different by design: its writes
 route through the writer task (no boxed connection to lose), and its reads
 lazily reopen a read-only connection under a reader permit, so a cancelled
 queue-backed read is followed by a successful reopen on the next read
-rather than a hard failure.
+rather than a hard failure. The reopen is still bounded by the reader
+permit budget: the cancelled call's connection and permit travel into the
+detached blocking task and stay held until SQLite finishes, so while a
+detached cancelled read holds the LAST reader permit, the reopen times out
+on the reader budget (typed `Timeout`, `sql_bridge.reader_handle`) and
+succeeds only once the detached read completes and releases the permit
+(pinned by `cancelled_inflight_queue_backed_read_reopens_after_detached_read_completes`).
 
 The manual `atomic_unit` path (write queue flag off, or no writer task
 available) acquires the same one-permit writer budget before opening its
@@ -83,6 +89,60 @@ The optional writer task owns its separate, fixed connection and is not a
 caller-held SQL bridge handle. Store-specific standalone connections are also
 outside this raw-SQL handle budget; their write ownership remains governed by
 ADR-067 and ADR-135.
+
+These caps are NOT a global SQLite connection cap: they bound live
+caller-held bridge handles only. The pool's own reader queue and writer
+connection, the writer task's fixed connection, store-specific standalone
+connections, and diagnostics/checkpoint connections all sit outside the
+budget and are not counted against it. Both semaphore capacities
+(`sql_bridge_reader_slots` at the effective reader count,
+`sql_bridge_writer_slots` at one) are fixed at pool construction
+(`ConnectionPool::new`) and never resized; the budget for a database file is
+whatever the pool that owns it was built with.
+
+## `execute_batch` transaction-control rejection and handle poisoning
+
+Every `execute_batch` implementation rejects transaction-control statements
+(`BEGIN`, `COMMIT`, `END`, `ROLLBACK`, `SAVEPOINT`, `RELEASE` — matched
+case-insensitively at the statement head, tolerating leading whitespace and
+`--`/`/* */` comments) with a typed `StorageError::InvalidInput` BEFORE
+executing anything:
+
+- The queue-backed path runs inside the writer task's own `BEGIN
+  IMMEDIATE`; a caller `COMMIT` would close the task's transaction and
+  terminate the writer task permanently.
+- The standalone path wraps the caller list in its own `BEGIN IMMEDIATE`; a
+  caller `COMMIT` would commit early, and a later statement failure would
+  roll back only the tail — breaking all-or-nothing.
+- The in-memory pool-backed path and the `InlineWriter` used by
+  `atomic_unit` enforce the same rejection, since both run under an owned
+  transaction boundary.
+
+Rejected batches execute nothing, leave the handle untouched, and the handle
+remains fully reusable.
+
+Two further poisoning paths apply to the standalone (file-backed)
+`execute_batch`, both dropping the handle instead of restoring it. Every
+subsequent call on the poisoned handle then fails with the generic
+"connection already consumed" pool error — callers must drop the handle and
+acquire a fresh one, exactly as for cancellation invalidation above:
+
+- **Failed ROLLBACK.** A statement failed and the error path's `ROLLBACK`
+  also failed, leaving the connection's transaction state unknown. The
+  returned error carries the poison context ("ROLLBACK after statement
+  failure failed: ...") alongside the ORIGINAL statement error (never
+  masked by the rollback failure alone). Pinned by
+  `failed_rollback_poisons_handle_reuse_fails_loud`, which forces the
+  failed ROLLBACK via a connection authorizer that denies the rollback
+  transaction operation.
+- **Non-transient BEGIN failure.** `BEGIN IMMEDIATE` failed with anything
+  other than SQLite busy/locked (which is transient contention and restores
+  the handle as reusable); the connection's transaction state is suspect.
+  The returned error carries the poison context ("BEGIN IMMEDIATE failed
+  non-transiently; connection transaction state is suspect") alongside the
+  original BEGIN error. Pinned by
+  `non_transient_begin_failure_poisons_handle` and
+  `busy_begin_failure_restores_handle_reusable`.
 
 ### `writer_task_handle_fails_loud_without_tokio_runtime`
 

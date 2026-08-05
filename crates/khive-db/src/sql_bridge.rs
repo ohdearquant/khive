@@ -85,6 +85,127 @@ pub(crate) fn bind_params(
     Ok(())
 }
 
+/// SQL statement heads that are transaction control. `execute_batch` owns the
+/// `BEGIN`/`COMMIT` boundary for the whole batch (the standalone path wraps
+/// the list in its own `BEGIN IMMEDIATE`, and the queue-backed path runs
+/// inside the writer task's per-request transaction), so a caller-supplied
+/// statement that itself starts, ends, or branches a transaction can commit
+/// or roll back early and break the batch's all-or-nothing contract. `END`
+/// is included: SQLite accepts `END [TRANSACTION]` as a `COMMIT` spelling.
+const TRANSACTION_CONTROL_KEYWORDS: [&str; 6] =
+    ["BEGIN", "COMMIT", "END", "ROLLBACK", "SAVEPOINT", "RELEASE"];
+
+/// Return the transaction-control keyword heading `sql`, if any.
+///
+/// Tolerates leading whitespace and `--` line / `/* */` block comments (SQLite
+/// skips both before a statement) and matches the keyword case-insensitively
+/// with a word-boundary check, so e.g. an identifier beginning with `begin`
+/// never matches.
+fn transaction_control_head(sql: &str) -> Option<&'static str> {
+    let mut rest: &[u8] = sql.as_bytes();
+    loop {
+        let mut idx = 0;
+        while idx < rest.len() && rest[idx].is_ascii_whitespace() {
+            idx += 1;
+        }
+        rest = &rest[idx..];
+        if let Some(tail) = rest.strip_prefix(b"--") {
+            let mut idx = 0;
+            while idx < tail.len() && tail[idx] != b'\n' {
+                idx += 1;
+            }
+            rest = if idx < tail.len() {
+                &tail[idx + 1..]
+            } else {
+                &[]
+            };
+            continue;
+        }
+        if let Some(tail) = rest.strip_prefix(b"/*") {
+            let mut idx = 0;
+            while idx + 1 < tail.len() && !(tail[idx] == b'*' && tail[idx + 1] == b'/') {
+                idx += 1;
+            }
+            rest = if idx + 1 < tail.len() {
+                &tail[idx + 2..]
+            } else {
+                &[]
+            };
+            continue;
+        }
+        break;
+    }
+    TRANSACTION_CONTROL_KEYWORDS
+        .iter()
+        .copied()
+        .find(|keyword| {
+            let kw = keyword.as_bytes();
+            if rest.len() < kw.len() || !rest[..kw.len()].eq_ignore_ascii_case(kw) {
+                return false;
+            }
+            match rest.get(kw.len()) {
+                Some(next) => !(next.is_ascii_alphanumeric() || *next == b'_'),
+                None => true,
+            }
+        })
+}
+
+/// Reject transaction-control statements in `statements` with a typed
+/// [`StorageError::InvalidInput`] BEFORE anything executes, preserving the
+/// batch's all-or-nothing contract (see [`TRANSACTION_CONTROL_KEYWORDS`]).
+fn reject_transaction_control_statements(
+    statements: &[SqlStatement],
+    operation: &'static str,
+) -> khive_storage::types::StorageResult<()> {
+    for (index, statement) in statements.iter().enumerate() {
+        if let Some(keyword) = transaction_control_head(&statement.sql) {
+            return Err(StorageError::InvalidInput {
+                capability: StorageCapability::Sql,
+                operation: operation.into(),
+                message: format!(
+                    "statement at index {index} is transaction control ({keyword}); \
+                     execute_batch owns the BEGIN/COMMIT boundary for the whole \
+                     batch — remove transaction-control statements from the batch"
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// One standalone-`execute_batch` failure, paired with the reason the handle
+/// was poisoned (dropped instead of restored), if it was.
+struct BatchFailure {
+    error: rusqlite::Error,
+    poison_reason: Option<String>,
+}
+
+/// A `rusqlite::Error` whose display carries the poison context, so a
+/// poisoned handle is visible to the caller in the returned error instead of
+/// being discoverable only through later calls' generic "connection already
+/// consumed" failures.
+#[derive(Debug)]
+struct PoisonedBatchError {
+    original: rusqlite::Error,
+    poison_reason: String,
+}
+
+impl std::fmt::Display for PoisonedBatchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}; original error: {}",
+            self.poison_reason, self.original
+        )
+    }
+}
+
+impl std::error::Error for PoisonedBatchError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.original)
+    }
+}
+
 /// Execute a query on a `rusqlite::Connection` and return owned rows.
 fn execute_query(
     conn: &rusqlite::Connection,
@@ -150,10 +271,14 @@ fn execute_query_page(
     let mut offset = page.offset;
     let mut remaining = u64::from(page.limit);
     let mut raw_rows = stmt.raw_query();
-    // The bound covers owned Rust rows only: SQLite still steps and discards
-    // `offset` rows, so a large-offset page costs O(offset + limit) engine
-    // work. Callers deep-paging a large result set should prefer keyset
-    // pagination over growing offsets.
+    // The bound covers owned Rust rows only — this function advances past
+    // `offset`, owns at most `limit` rows, and drops the statement cursor
+    // immediately afterward (ADR-005's bounded-materialization amendment).
+    // Engine work is the query plan's own cost, not O(offset + limit):
+    // SQLite still produces and discards `offset` rows, and an unindexed
+    // ORDER BY can force a full sort of the result set before the first row
+    // is stepped. Callers deep-paging a large result set should prefer
+    // keyset pagination over growing offsets.
     while remaining > 0 {
         let Some(row) = raw_rows.next()? else {
             break;
@@ -232,6 +357,34 @@ fn open_standalone_writer(pool: &ConnectionPool) -> Result<rusqlite::Connection,
         .map_err(|e| map_rusqlite_err(e, "open_writer"))?;
 
     Ok(conn)
+}
+
+/// [`open_standalone_reader`] lifted onto the blocking thread pool.
+///
+/// Opening a SQLite connection is filesystem I/O (open the file, read the
+/// database header) followed by pragmas executed through SQLite. No
+/// database lock is acquired at open itself — locks are taken on the first
+/// statement — but filesystem latency is unbounded, and this module already
+/// runs every other rusqlite call under `spawn_blocking`, so the open gets
+/// the same treatment instead of blocking an async worker thread. Callers
+/// must already hold the reader permit; it is held across the open exactly
+/// as in the synchronous shape.
+async fn open_standalone_reader_on_blocking(
+    pool: Arc<ConnectionPool>,
+) -> khive_storage::types::StorageResult<rusqlite::Connection> {
+    tokio::task::spawn_blocking(move || open_standalone_reader(&pool))
+        .await
+        .map_err(|e| StorageError::driver(StorageCapability::Sql, "open_reader", e))?
+}
+
+/// [`open_standalone_writer`] lifted onto the blocking thread pool; see
+/// [`open_standalone_reader_on_blocking`] for the blocking rationale.
+async fn open_standalone_writer_on_blocking(
+    pool: Arc<ConnectionPool>,
+) -> khive_storage::types::StorageResult<rusqlite::Connection> {
+    tokio::task::spawn_blocking(move || open_standalone_writer(&pool))
+        .await
+        .map_err(|e| StorageError::driver(StorageCapability::Sql, "open_writer", e))?
 }
 
 // =============================================================================
@@ -401,7 +554,7 @@ impl SqliteWriter {
             "sql_bridge.reader_handle",
         )
         .await?;
-        let conn = open_standalone_reader(&pool)?;
+        let conn = open_standalone_reader_on_blocking(pool).await?;
         Ok(StandaloneHandle {
             conn,
             _slot: handle_slot,
@@ -570,6 +723,14 @@ impl khive_storage::SqlWriter for SqliteWriter {
         // subsequent `execute`/`execute_script` call on this same handle still
         // works over the standalone connection (that dispatch is unmigrated —
         // see `SqlBridge::writer()`).
+        //
+        // Both paths reject transaction-control statements BEFORE executing
+        // anything: the queue-backed branch runs inside the writer task's own
+        // `BEGIN IMMEDIATE` (a caller `COMMIT` there would close the task's
+        // transaction and terminate the writer task), and the standalone
+        // branch below wraps the list in its own `BEGIN IMMEDIATE` (a caller
+        // `COMMIT` would commit early and break all-or-nothing).
+        reject_transaction_control_statements(&statements, "execute_batch")?;
         if let Some(writer_task) = self.writer_task.clone() {
             return writer_task
                 .send(move |conn| {
@@ -596,8 +757,41 @@ impl khive_storage::SqlWriter for SqliteWriter {
         })?;
         let origin = self.origin.clone();
         let (handle, result) = tokio::task::spawn_blocking(move || {
-            if let Err(e) = handle.conn.execute_batch("BEGIN IMMEDIATE") {
-                return (Some(handle), Err(e));
+            if let Err(begin_error) = handle.conn.execute_batch("BEGIN IMMEDIATE") {
+                // Busy/locked is transient contention (another writer held
+                // SQLite's write lock past `busy_timeout`); the connection
+                // itself is untouched, so the handle is restored as reusable.
+                // Any other failure leaves the connection's transaction state
+                // suspect (e.g. "cannot start a transaction within a
+                // transaction" after a caller-driven bare `BEGIN` on this
+                // same connection), so the handle is poisoned — dropped, not
+                // restored — and the returned error carries the poison
+                // context instead of letting a later call fail with only the
+                // generic "connection already consumed".
+                let mut poison_reason = None;
+                let retained = if crate::timeout_sink::is_busy_or_locked(&begin_error) {
+                    Some(handle)
+                } else {
+                    tracing::warn!(
+                        %begin_error,
+                        "execute_batch: BEGIN IMMEDIATE failed non-transiently; \
+                         poisoning the standalone connection — the handle is \
+                         dropped and must be re-acquired"
+                    );
+                    poison_reason = Some(
+                        "BEGIN IMMEDIATE failed non-transiently; connection \
+                         transaction state is suspect"
+                            .to_string(),
+                    );
+                    None
+                };
+                return (
+                    retained,
+                    Err(BatchFailure {
+                        error: begin_error,
+                        poison_reason,
+                    }),
+                );
             }
             // Registered only after BEGIN succeeds, so an unopened transaction is
             // never counted. The handle is declared here — enclosing both the
@@ -618,14 +812,16 @@ impl khive_storage::SqlWriter for SqliteWriter {
                 handle.conn.execute_batch("COMMIT")?;
                 Ok(total)
             })();
+            let mut poison_reason = None;
             let retained = if let Err(error) = &result {
                 if let Err(rollback_error) = handle.conn.execute_batch("ROLLBACK") {
                     // A failed ROLLBACK leaves the connection in an unknown
                     // transaction state, so it must never be reused: the handle
                     // is poisoned (dropped instead of restored) and every
                     // subsequent call on this bridge fails with "connection
-                    // already consumed". The caller still sees the ORIGINAL
-                    // statement error (never masked by the rollback failure).
+                    // already consumed". The caller sees the ORIGINAL statement
+                    // error with the poison context attached (never masked by
+                    // the rollback failure alone).
                     tracing::warn!(
                         %error,
                         %rollback_error,
@@ -633,6 +829,9 @@ impl khive_storage::SqlWriter for SqliteWriter {
                          poisoning the standalone connection — the handle is \
                          dropped and must be re-acquired"
                     );
+                    poison_reason = Some(format!(
+                        "ROLLBACK after statement failure failed: {rollback_error}"
+                    ));
                     None
                 } else {
                     Some(handle)
@@ -641,18 +840,34 @@ impl khive_storage::SqlWriter for SqliteWriter {
                 Some(handle)
             };
             // `_tx_handle` drops here, after ROLLBACK (or COMMIT) has already run.
-            (retained, result)
+            (
+                retained,
+                result.map_err(|error| BatchFailure {
+                    error,
+                    poison_reason,
+                }),
+            )
         })
         .await
         .map_err(|e| StorageError::driver(StorageCapability::Sql, "execute_batch", e))?;
         self.handle = handle;
-        result.map_err(|e| {
+        result.map_err(|failure| {
             crate::timeout_sink::maybe_emit_busy(
                 &self.db,
                 crate::timeout_sink::Site::StandaloneSqlBridge,
-                &e,
+                &failure.error,
             );
-            map_rusqlite_err(e, "execute_batch")
+            match failure.poison_reason {
+                Some(poison_reason) => StorageError::driver(
+                    StorageCapability::Sql,
+                    "execute_batch",
+                    PoisonedBatchError {
+                        original: failure.error,
+                        poison_reason,
+                    },
+                ),
+                None => map_rusqlite_err(failure.error, "execute_batch"),
+            }
         })
     }
 
@@ -926,6 +1141,10 @@ impl khive_storage::SqlWriter for PoolBackedWriter {
         &mut self,
         statements: Vec<SqlStatement>,
     ) -> khive_storage::types::StorageResult<u64> {
+        // Same all-or-nothing contract as the file-backed path: this batch
+        // wraps its list in its own `BEGIN IMMEDIATE`, so reject caller
+        // transaction-control statements before executing anything.
+        reject_transaction_control_statements(&statements, "pool_writer.execute_batch")?;
         let pool = Arc::clone(&self.pool);
         tokio::task::spawn_blocking(move || {
             let guard = pool.try_writer().map_err(|e: SqliteError| {
@@ -1104,6 +1323,11 @@ impl khive_storage::SqlWriter for InlineWriter {
         &mut self,
         statements: Vec<SqlStatement>,
     ) -> khive_storage::types::StorageResult<u64> {
+        // Runs inside the writer task's per-request `BEGIN IMMEDIATE`
+        // (atomic_unit flag-on path), so a caller `COMMIT` would close the
+        // task's transaction — reject transaction-control statements up
+        // front, same contract as every other `execute_batch`.
+        reject_transaction_control_statements(&statements, "inline.execute_batch")?;
         let mut total: u64 = 0;
         for statement in &statements {
             let mut stmt = self
@@ -1261,7 +1485,7 @@ impl khive_storage::SqlAccess for SqlBridge {
                 "sql_bridge.reader_handle",
             )
             .await?;
-            let conn = open_standalone_reader(&self.pool)?;
+            let conn = open_standalone_reader_on_blocking(Arc::clone(&self.pool)).await?;
             Ok(Box::new(SqliteReader {
                 handle: Some(StandaloneHandle {
                     conn,
@@ -1341,7 +1565,7 @@ impl khive_storage::SqlAccess for SqlBridge {
                     "sql_bridge.writer_handle",
                 )
                 .await?;
-                let conn = open_standalone_writer(&self.pool)?;
+                let conn = open_standalone_writer_on_blocking(Arc::clone(&self.pool)).await?;
                 Some(StandaloneHandle {
                     conn,
                     _slot: handle_slot,
@@ -1450,7 +1674,7 @@ impl khive_storage::SqlAccess for SqlBridge {
                 "sql_bridge.atomic_unit_handle",
             )
             .await?;
-            let conn = open_standalone_writer(&self.pool)?;
+            let conn = open_standalone_writer_on_blocking(Arc::clone(&self.pool)).await?;
             let mut writer = SqliteWriter {
                 handle: Some(StandaloneHandle {
                     conn,
@@ -2077,25 +2301,33 @@ mod tests {
         assert!(cancelled, "writer batch task did not report cancellation");
     }
 
-    /// A failed ROLLBACK after a statement failure poisons the handle: the
-    /// connection may be in an unknown transaction state, so it is dropped
-    /// instead of restored, and every subsequent call on the same handle
-    /// fails loudly with "connection already consumed". The caller still
-    /// sees the ORIGINAL statement error, never the rollback failure.
-    ///
-    /// Forcing the arm: the first statement is a bare `COMMIT`, which ends
-    /// the batch's own `BEGIN IMMEDIATE` transaction; the second statement
-    /// fails at prepare, so the error path's `ROLLBACK` runs with no active
-    /// transaction and itself fails.
+    /// Transaction-control statements (`BEGIN`/`COMMIT`/`END`/`ROLLBACK`/
+    /// `SAVEPOINT`/`RELEASE`) in `execute_batch` input are rejected with a
+    /// typed invalid-input error BEFORE anything executes, on the standalone
+    /// path: a caller `COMMIT` inside the batch's own `BEGIN IMMEDIATE`
+    /// would commit early and break the all-or-nothing contract. The
+    /// rejection must leave the handle untouched and fully reusable, and no
+    /// statement (not even the valid ones before the offending one) may
+    /// have run.
     #[tokio::test]
-    async fn failed_rollback_poisons_handle_reuse_fails_loud() {
+    async fn execute_batch_rejects_transaction_control_before_executing_anything() {
         let dir = tempfile::tempdir().unwrap();
         let config = PoolConfig {
-            path: Some(dir.path().join("sql_bridge_rollback_poison.db")),
+            path: Some(dir.path().join("sql_bridge_tx_control_reject.db")),
             checkout_timeout: std::time::Duration::from_millis(250),
+            write_queue_enabled: false,
             ..PoolConfig::default()
         };
         let pool = Arc::new(ConnectionPool::new(config).unwrap());
+        {
+            let guard = pool.writer().unwrap();
+            guard
+                .conn()
+                .execute_batch(
+                    "CREATE TABLE tx_reject_test (id INTEGER PRIMARY KEY, val TEXT NOT NULL)",
+                )
+                .unwrap();
+        }
 
         let handle_slot = acquire_handle_slot(
             pool.sql_bridge_writer_slots(),
@@ -2116,11 +2348,275 @@ mod tests {
             pool: Arc::clone(&pool),
         };
 
+        // A valid INSERT first, then a bare COMMIT: the whole batch must be
+        // rejected and the INSERT must NOT have run.
         let batch = khive_storage::SqlWriter::execute_batch(
             &mut writer,
             vec![
                 SqlStatement {
+                    sql: "INSERT INTO tx_reject_test (id, val) VALUES (1, 'a')".into(),
+                    params: vec![],
+                    label: None,
+                },
+                SqlStatement {
                     sql: "COMMIT".into(),
+                    params: vec![],
+                    label: None,
+                },
+            ],
+        )
+        .await;
+        match &batch {
+            Err(StorageError::InvalidInput {
+                operation, message, ..
+            }) => {
+                assert_eq!(operation.as_ref(), "execute_batch");
+                assert!(
+                    message.contains("transaction control") && message.contains("COMMIT"),
+                    "the rejection must name the offending statement head; got {message:?}"
+                );
+            }
+            other => {
+                panic!("a batch containing a bare COMMIT must be rejected up front; got {other:?}")
+            }
+        }
+
+        // Every transaction-control head is rejected, case-insensitively and
+        // through leading whitespace and `--`/`/* */` comments.
+        for sql in [
+            "BEGIN IMMEDIATE",
+            "commit",
+            "End transaction",
+            "ROLLBACK",
+            "SAVEPOINT sp1",
+            "RELEASE sp1",
+            "  -- leading comment\nCOMMIT",
+            "/* block */ rollback to savepoint sp1",
+        ] {
+            let rejected = khive_storage::SqlWriter::execute_batch(
+                &mut writer,
+                vec![SqlStatement {
+                    sql: sql.into(),
+                    params: vec![],
+                    label: None,
+                }],
+            )
+            .await;
+            assert!(
+                matches!(&rejected, Err(StorageError::InvalidInput { .. })),
+                "transaction-control head {sql:?} must be rejected; got {rejected:?}"
+            );
+        }
+
+        // The rejection ran before the handle was taken: no statement
+        // executed (the INSERT above did not land), and the handle is still
+        // fully reusable.
+        let count: i64 = {
+            let guard = pool.reader().unwrap();
+            guard
+                .conn()
+                .query_row("SELECT COUNT(*) FROM tx_reject_test", [], |r| r.get(0))
+                .unwrap()
+        };
+        assert_eq!(count, 0, "a rejected batch must not have executed anything");
+
+        let affected = khive_storage::SqlWriter::execute(
+            &mut writer,
+            SqlStatement {
+                sql: "INSERT INTO tx_reject_test (id, val) VALUES (2, 'b')".into(),
+                params: vec![],
+                label: None,
+            },
+        )
+        .await
+        .expect("the handle must survive a rejected batch untouched");
+        assert_eq!(affected, 1);
+    }
+
+    /// Unit matrix for [`transaction_control_head`]: statement heads are
+    /// classified case-insensitively through leading whitespace and
+    /// comments; non-transaction-control heads (including identifiers that
+    /// merely START with a keyword) never match.
+    #[test]
+    fn transaction_control_head_classification_matrix() {
+        for (sql, expected) in [
+            ("BEGIN", Some("BEGIN")),
+            ("begin immediate", Some("BEGIN")),
+            ("COMMIT", Some("COMMIT")),
+            ("commit;", Some("COMMIT")),
+            ("END", Some("END")),
+            ("end transaction", Some("END")),
+            ("ROLLBACK", Some("ROLLBACK")),
+            ("rollback to savepoint sp1", Some("ROLLBACK")),
+            ("SAVEPOINT sp1", Some("SAVEPOINT")),
+            ("RELEASE sp1", Some("RELEASE")),
+            ("release savepoint sp1", Some("RELEASE")),
+            ("   \t COMMIT", Some("COMMIT")),
+            ("-- a comment\nCOMMIT", Some("COMMIT")),
+            // SQLite does not nest block comments: the comment ends at the
+            // first `*/`, leaving `*/ COMMIT`, which is not a statement head.
+            ("/* /* nested? no */ */ COMMIT", None),
+            ("-- one\n-- two\n  /* x */ begin", Some("BEGIN")),
+            ("INSERT INTO t VALUES (1)", None),
+            ("UPDATE t SET x = 1", None),
+            ("DELETE FROM t", None),
+            ("SELECT * FROM commit_log", None),
+            ("CREATE TABLE rollback_audit (id INTEGER)", None),
+            ("/* comment only */", None),
+            ("", None),
+        ] {
+            assert_eq!(
+                transaction_control_head(sql),
+                expected,
+                "classification mismatch for {sql:?}"
+            );
+        }
+    }
+
+    /// The queue-backed `execute_batch` path rejects transaction-control
+    /// statements too, and the rejection protects the writer task: a caller
+    /// `COMMIT` that reached the task would close its per-request `BEGIN
+    /// IMMEDIATE` and terminate the task permanently. After the typed
+    /// rejection, a legitimate batch must still succeed through the SAME
+    /// writer task (it was never touched).
+    #[tokio::test]
+    async fn execute_batch_rejects_transaction_control_on_queue_backed_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = PoolConfig {
+            path: Some(dir.path().join("sql_bridge_tx_reject_queue.db")),
+            checkout_timeout: std::time::Duration::from_millis(250),
+            write_queue_enabled: true,
+            write_routing_strict: true,
+            ..PoolConfig::default()
+        };
+        let pool = Arc::new(ConnectionPool::new(config).unwrap());
+        {
+            let guard = pool.writer().unwrap();
+            guard
+                .conn()
+                .execute_batch(
+                    "CREATE TABLE tx_reject_queue_test (id INTEGER PRIMARY KEY, val TEXT NOT NULL)",
+                )
+                .unwrap();
+        }
+        let bridge = SqlBridge::new(Arc::clone(&pool), true);
+        let mut writer = bridge.writer().await.unwrap();
+
+        let rejected = khive_storage::SqlWriter::execute_batch(
+            &mut *writer,
+            vec![
+                SqlStatement {
+                    sql: "INSERT INTO tx_reject_queue_test (id, val) VALUES (1, 'a')".into(),
+                    params: vec![],
+                    label: None,
+                },
+                SqlStatement {
+                    sql: "COMMIT".into(),
+                    params: vec![],
+                    label: None,
+                },
+            ],
+        )
+        .await;
+        assert!(
+            matches!(&rejected, Err(StorageError::InvalidInput { .. })),
+            "a bare COMMIT in a queue-backed batch must be rejected up front; got {rejected:?}"
+        );
+
+        let affected = khive_storage::SqlWriter::execute_batch(
+            &mut *writer,
+            vec![SqlStatement {
+                sql: "INSERT INTO tx_reject_queue_test (id, val) VALUES (2, 'b')".into(),
+                params: vec![],
+                label: None,
+            }],
+        )
+        .await
+        .expect("the writer task must survive the rejected batch");
+        assert_eq!(affected, 1);
+
+        let count: i64 = {
+            let guard = pool.reader().unwrap();
+            guard
+                .conn()
+                .query_row("SELECT COUNT(*) FROM tx_reject_queue_test", [], |r| {
+                    r.get(0)
+                })
+                .unwrap()
+        };
+        assert_eq!(
+            count, 1,
+            "exactly the post-rejection batch's row may have landed"
+        );
+    }
+
+    /// A failed ROLLBACK after a statement failure poisons the handle: the
+    /// connection may be in an unknown transaction state, so it is dropped
+    /// instead of restored, and every subsequent call on the same handle
+    /// fails loudly with "connection already consumed". The caller sees the
+    /// ORIGINAL statement error with the poison context attached (the
+    /// rollback failure is never hidden, but never replaces the original).
+    ///
+    /// Forcing the arm legitimately (the pre-round-2 version smuggled a
+    /// bare `COMMIT` into the batch, which `execute_batch` now rejects up
+    /// front): a connection authorizer denies the `ROLLBACK` transaction
+    /// operation, so the error path's `ROLLBACK` genuinely fails while the
+    /// batch's own `BEGIN IMMEDIATE` and the statements run normally.
+    #[tokio::test]
+    async fn failed_rollback_poisons_handle_reuse_fails_loud() {
+        use rusqlite::hooks::{AuthAction, AuthContext, Authorization, TransactionOperation};
+
+        fn deny_rollback(ctx: AuthContext<'_>) -> Authorization {
+            match ctx.action {
+                AuthAction::Transaction {
+                    operation: TransactionOperation::Rollback,
+                } => Authorization::Deny,
+                _ => Authorization::Allow,
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let config = PoolConfig {
+            path: Some(dir.path().join("sql_bridge_rollback_poison.db")),
+            checkout_timeout: std::time::Duration::from_millis(250),
+            ..PoolConfig::default()
+        };
+        let pool = Arc::new(ConnectionPool::new(config).unwrap());
+        {
+            let guard = pool.writer().unwrap();
+            guard
+                .conn()
+                .execute_batch(
+                    "CREATE TABLE rollback_poison_test (id INTEGER PRIMARY KEY, val TEXT NOT NULL)",
+                )
+                .unwrap();
+        }
+
+        let handle_slot = acquire_handle_slot(
+            pool.sql_bridge_writer_slots(),
+            pool.config().checkout_timeout,
+            "sql_bridge.writer_handle",
+        )
+        .await
+        .unwrap();
+        let conn = open_standalone_writer(&pool).unwrap();
+        conn.authorizer(Some(deny_rollback)).unwrap();
+        let mut writer = SqliteWriter {
+            handle: Some(StandaloneHandle {
+                conn,
+                _slot: handle_slot,
+            }),
+            writer_task: None,
+            origin: pool.origin(),
+            db: crate::timeout_sink::db_label(&pool),
+            pool: Arc::clone(&pool),
+        };
+
+        let batch = khive_storage::SqlWriter::execute_batch(
+            &mut writer,
+            vec![
+                SqlStatement {
+                    sql: "INSERT INTO rollback_poison_test (id, val) VALUES (1, 'a')".into(),
                     params: vec![],
                     label: None,
                 },
@@ -2135,9 +2631,14 @@ mod tests {
         let batch_error = batch.expect_err("invalid second statement must fail the batch");
         let batch_message = batch_error.to_string();
         assert!(
-            !batch_message.contains("cannot rollback"),
-            "the caller must see the original statement error, not the \
-             rollback failure; got {batch_message:?}"
+            batch_message.contains("ROLLBACK after statement failure failed"),
+            "the caller must see the poison context naming the failed \
+             rollback; got {batch_message:?}"
+        );
+        assert!(
+            batch_message.contains("original error"),
+            "the original statement error must stay visible alongside the \
+             poison context; got {batch_message:?}"
         );
 
         let reuse = khive_storage::SqlWriter::execute(
@@ -2161,6 +2662,162 @@ mod tests {
             "expected the poisoned handle's reuse error to name the pinned \
              failure; got {message:?}"
         );
+    }
+
+    /// A NON-TRANSIENT `BEGIN IMMEDIATE` failure poisons the handle instead
+    /// of restoring it: the connection's transaction state is suspect (here
+    /// a caller-driven transaction is already open on the same connection,
+    /// so SQLite answers "cannot start a transaction within a transaction"),
+    /// and the returned error carries the poison context.
+    #[tokio::test]
+    async fn non_transient_begin_failure_poisons_handle() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = PoolConfig {
+            path: Some(dir.path().join("sql_bridge_begin_poison.db")),
+            checkout_timeout: std::time::Duration::from_millis(250),
+            ..PoolConfig::default()
+        };
+        let pool = Arc::new(ConnectionPool::new(config).unwrap());
+
+        let handle_slot = acquire_handle_slot(
+            pool.sql_bridge_writer_slots(),
+            pool.config().checkout_timeout,
+            "sql_bridge.writer_handle",
+        )
+        .await
+        .unwrap();
+        let conn = open_standalone_writer(&pool).unwrap();
+        // A caller-driven open transaction on the same connection: the
+        // batch's own `BEGIN IMMEDIATE` fails non-transiently.
+        conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let mut writer = SqliteWriter {
+            handle: Some(StandaloneHandle {
+                conn,
+                _slot: handle_slot,
+            }),
+            writer_task: None,
+            origin: pool.origin(),
+            db: crate::timeout_sink::db_label(&pool),
+            pool: Arc::clone(&pool),
+        };
+
+        let batch = khive_storage::SqlWriter::execute_batch(
+            &mut writer,
+            vec![SqlStatement {
+                sql: "SELECT 1".into(),
+                params: vec![],
+                label: None,
+            }],
+        )
+        .await;
+        let batch_error = batch.expect_err("BEGIN inside an open transaction must fail");
+        let batch_message = batch_error.to_string();
+        assert!(
+            batch_message.contains("BEGIN IMMEDIATE failed non-transiently"),
+            "a non-transient BEGIN failure must surface the poison context; \
+             got {batch_message:?}"
+        );
+        assert!(
+            batch_message.contains("cannot start a transaction within a transaction"),
+            "the original BEGIN error must stay visible; got {batch_message:?}"
+        );
+
+        let reuse = khive_storage::SqlWriter::execute(
+            &mut writer,
+            SqlStatement {
+                sql: "CREATE TABLE begin_poison_probe (id INTEGER PRIMARY KEY)".into(),
+                params: vec![],
+                label: None,
+            },
+        )
+        .await;
+        assert!(
+            matches!(
+                &reuse,
+                Err(StorageError::Pool { message, .. })
+                    if message.contains("connection already consumed")
+            ),
+            "a handle poisoned by a non-transient BEGIN failure must be \
+             dropped, not restored; got {reuse:?}"
+        );
+    }
+
+    /// A BUSY/LOCKED `BEGIN IMMEDIATE` failure is transient contention: the
+    /// connection itself is untouched, so the handle is restored as
+    /// reusable, and the next call succeeds once the contending lock is
+    /// released.
+    #[tokio::test]
+    async fn busy_begin_failure_restores_handle_reusable() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = PoolConfig {
+            path: Some(dir.path().join("sql_bridge_begin_busy.db")),
+            checkout_timeout: std::time::Duration::from_millis(250),
+            busy_timeout: std::time::Duration::from_millis(100),
+            ..PoolConfig::default()
+        };
+        let pool = Arc::new(ConnectionPool::new(config).unwrap());
+        {
+            let guard = pool.writer().unwrap();
+            guard
+                .conn()
+                .execute_batch("CREATE TABLE begin_busy_test (id INTEGER PRIMARY KEY)")
+                .unwrap();
+        }
+
+        // Hold SQLite's write lock from a separate connection so the batch's
+        // `BEGIN IMMEDIATE` genuinely fails with SQLITE_BUSY after the short
+        // busy timeout.
+        let lock_conn = pool.open_standalone_writer().unwrap();
+        lock_conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+
+        let handle_slot = acquire_handle_slot(
+            pool.sql_bridge_writer_slots(),
+            pool.config().checkout_timeout,
+            "sql_bridge.writer_handle",
+        )
+        .await
+        .unwrap();
+        let conn = open_standalone_writer(&pool).unwrap();
+        let mut writer = SqliteWriter {
+            handle: Some(StandaloneHandle {
+                conn,
+                _slot: handle_slot,
+            }),
+            writer_task: None,
+            origin: pool.origin(),
+            db: crate::timeout_sink::db_label(&pool),
+            pool: Arc::clone(&pool),
+        };
+
+        let batch = khive_storage::SqlWriter::execute_batch(
+            &mut writer,
+            vec![SqlStatement {
+                sql: "INSERT INTO begin_busy_test (id) VALUES (1)".into(),
+                params: vec![],
+                label: None,
+            }],
+        )
+        .await;
+        let batch_error = batch.expect_err("BEGIN IMMEDIATE under a held write lock must fail");
+        assert!(
+            batch_error.to_string().contains("database is locked"),
+            "the busy BEGIN failure must surface SQLite's busy error; got {batch_error:?}"
+        );
+
+        lock_conn.execute_batch("ROLLBACK").unwrap();
+        drop(lock_conn);
+
+        let affected = khive_storage::SqlWriter::execute(
+            &mut writer,
+            SqlStatement {
+                sql: "INSERT INTO begin_busy_test (id) VALUES (2)".into(),
+                params: vec![],
+                label: None,
+            },
+        )
+        .await
+        .expect("a busy BEGIN failure must restore the handle as reusable");
+        assert_eq!(affected, 1);
     }
 
     /// The manual `atomic_unit` path (write queue off) shares the pool's
@@ -2711,6 +3368,141 @@ mod tests {
             })
             .await
             .expect("read on a queue-backed handle with no resident connection must reopen")
+            .expect("seeded row must be visible");
+        assert!(
+            matches!(&row.columns[0].value, SqlValue::Text(v) if v == "seed"),
+            "reopened read must return the seeded row; got {:?}",
+            row.columns[0].value
+        );
+    }
+
+    /// Cancelling an actual IN-FLIGHT queue-backed read (not a constructed
+    /// post-cancel state): the detached blocking task keeps running the
+    /// query, holding the lazily opened connection and its reader permit
+    /// until SQLite finishes. With a single reader permit, the next read's
+    /// reopen therefore cannot succeed while the detached read still holds
+    /// the permit — it times out on the reader budget (a typed `Timeout`,
+    /// not the hard "connection already consumed" failure of standalone
+    /// handles) — and succeeds once the detached read completes and
+    /// releases the permit. This pins the documented reopen claim together
+    /// with its permit-contention boundary.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_inflight_queue_backed_read_reopens_after_detached_read_completes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("queue_backed_inflight_cancel.db");
+        let config = PoolConfig {
+            path: Some(path),
+            write_queue_enabled: true,
+            write_routing_strict: true,
+            max_readers: 1,
+            checkout_timeout: std::time::Duration::from_millis(250),
+            ..PoolConfig::default()
+        };
+        let pool = Arc::new(ConnectionPool::new(config).unwrap());
+        {
+            let guard = pool.writer().unwrap();
+            guard
+                .conn()
+                .execute_batch(
+                    "CREATE TABLE IF NOT EXISTS inflight_cancel_test \
+                     (id INTEGER PRIMARY KEY, val TEXT NOT NULL);
+                     INSERT INTO inflight_cancel_test (id, val) VALUES (1, 'seed');",
+                )
+                .unwrap();
+        }
+
+        let writer_task = pool
+            .writer_task_handle()
+            .expect("queue-enabled file pool must offer a writer task")
+            .expect("writer task present under write_queue_enabled");
+        let writer = Arc::new(tokio::sync::Mutex::new(SqliteWriter {
+            handle: None,
+            writer_task: Some(writer_task),
+            origin: pool.origin(),
+            db: crate::timeout_sink::db_label(&pool),
+            pool: Arc::clone(&pool),
+        }));
+
+        // A real first read through the queue-backed handle: lazily opens
+        // and retains the read-only connection under the sole reader permit.
+        writer
+            .lock()
+            .await
+            .query_row(SqlStatement {
+                sql: "SELECT val FROM inflight_cancel_test WHERE id = 1".into(),
+                params: vec![],
+                label: None,
+            })
+            .await
+            .unwrap()
+            .expect("seeded row must be visible");
+
+        // Install the blocking progress gate on the resident connection so
+        // the next read is genuinely in flight when it is aborted.
+        let (entered, release, completed) = {
+            let mut w = writer.lock().await;
+            let handle = w.handle.take().expect("first read must retain the handle");
+            let gate = blocking_progress_gate(&handle.conn);
+            w.handle = Some(handle);
+            gate
+        };
+
+        let writer_clone = Arc::clone(&writer);
+        let read = tokio::spawn(async move {
+            writer_clone
+                .lock()
+                .await
+                .query_row(progress_gate_statement())
+                .await
+        });
+        entered.notified().await;
+        read.abort();
+        assert!(
+            matches!(&read.await, Err(error) if error.is_cancelled()),
+            "the in-flight queue-backed read must be cancellable"
+        );
+
+        // The detached blocking task still holds the sole reader permit, so
+        // the reopen must time out on the reader budget — typed, not the
+        // hard "connection already consumed" failure of standalone handles.
+        let blocked = writer
+            .lock()
+            .await
+            .query_row(SqlStatement {
+                sql: "SELECT val FROM inflight_cancel_test WHERE id = 1".into(),
+                params: vec![],
+                label: None,
+            })
+            .await;
+        assert!(
+            matches!(
+                &blocked,
+                Err(StorageError::Timeout { operation })
+                    if operation.as_ref() == "sql_bridge.reader_handle"
+            ),
+            "while the detached cancelled read holds the last reader permit, \
+             the reopen must time out on the reader budget; got {blocked:?}"
+        );
+
+        // Release the gate: the detached read finishes and releases the permit.
+        tokio::task::spawn_blocking(move || release.wait())
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), completed.notified())
+            .await
+            .expect("the detached cancelled read did not complete");
+
+        // Now the reopen on the same handle succeeds.
+        let row = writer
+            .lock()
+            .await
+            .query_row(SqlStatement {
+                sql: "SELECT val FROM inflight_cancel_test WHERE id = 1".into(),
+                params: vec![],
+                label: None,
+            })
+            .await
+            .expect("after the detached cancelled read completes, the reopen must succeed")
             .expect("seeded row must be visible");
         assert!(
             matches!(&row.columns[0].value, SqlValue::Text(v) if v == "seed"),
