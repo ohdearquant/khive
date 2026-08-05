@@ -34,11 +34,13 @@ After `memory.recall` returns results, emit a signal on each result you can eval
 convenience verb handles the common case:
 
 ```
-request(ops="brain.auto_feedback(query=\"<the recall query>\", results=[{\"id\":\"<uuid-1>\"}])")
+request(ops="brain.auto_feedback(query=\"<the recall query>\", results=[{\"id\":\"<uuid-1>\"}], target_id=\"<uuid-1>\", signal=\"implicit_positive\")")
 ```
 
-Both `query` (the recall query that produced the results) and `results` are required; the first
-result's id is credited. For explicit per-item control, use `brain.feedback`. Eight signals are available: `useful`,
+Both `query` (the recall query that produced the results) and `results` are required. A supplied
+signal also requires `target_id` to exactly match one result; rank position never creates a
+judgment. Omit `signal` to abstain without emitting a feedback event. For direct per-item control, use
+`brain.feedback`. Eight signals are available: `useful`,
 `not_useful`, `wrong`, `explicit_positive`, `explicit_negative`, `implicit_positive`,
 `implicit_negative`, `correction`. Batch across multiple results in one call:
 

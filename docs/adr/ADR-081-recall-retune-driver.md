@@ -7,7 +7,9 @@
 **Depends on**: [ADR-021](ADR-021-memory-pack.md) (Memory Pack), [ADR-033](ADR-033-recall-pipeline.md) (Recall Pipeline), [ADR-032](ADR-032-brain-profile-orchestration.md) (Brain Profile Orchestration), [ADR-035](ADR-035-cli-config-and-auto-embed.md) (Feedback Profile Resolution Order), [ADR-055](ADR-055-epistemic-edge-relations.md) (Epistemic Relations)\
 **Amends**: the brain feedback weight table (`FeedbackEventKind::update_weight()`, khive-brain-core, issue #268) and the `brain.feedback` / `brain.auto_feedback` parameter surface (additive optional scorer-provenance fields, section 6)\
 **Amended**: 2026-08-01, issue #1505 adds an optional exact `namespace` to
-`brain.auto_feedback`; the selected namespace owns both the event and posterior fold.\
+`brain.auto_feedback`; the selected namespace owns both the event and posterior fold;
+2026-08-01, issues #1587/#1588 make automatic feedback abstention- and target-safe and
+record its originating verb.\
 **GitHub**: #517 (auto_feedback), #394 (recall latency), #391/#393 (resolver legs)
 
 ---
@@ -223,9 +225,10 @@ and auditable in place.
 ### 6. Emission surface
 
 Scorer batches emit through the existing surface: DSL batches of `brain.auto_feedback`
-(100 ops per request; the 200-event budget is two requests). `memory.recall` and
-`brain.auto_feedback` cannot be chained through `$prev` (recall returns a bare array),
-so emission is two-step with ids inlined.
+(100 ops per request; the 200-event budget is two requests). A bare-array
+`memory.recall` result is addressable through `$prev[N].field`, so a judged item can be
+chained directly into `brain.auto_feedback`. Scorer batches that select or compare many
+items may still use a two-step flow with ids inlined.
 
 **Parameter surface amendment.** The handlers reject unknown fields
 (`deny_unknown_fields`). This ADR amends `brain.feedback` and `brain.auto_feedback` with
@@ -256,6 +259,25 @@ the emitted event, fold-gate
 accounting key, durable snapshot, and live posterior mutation all belong to exactly that
 namespace. Invalid namespace strings fail closed. In particular, feedback emitted into a
 measurement namespace cannot mutate the default/live namespace's posteriors.
+
+**Automatic-feedback attribution amendment (#1587/#1588).** `brain.auto_feedback` does
+not infer a judgment from rank position. Its existing optional `signal` now has literal
+optional semantics: omission appends no `FeedbackExplicit` signal event and changes no
+posterior. A nonempty result set returns `emitted=false, reason="no_signal"`; an empty result
+set retains the existing `reason="no_results"`. The ordinary dispatch audit row is unchanged.
+When `signal` is present, the caller must also supply
+`target_id`; that value must exactly equal one and only one `results[].id`. A missing,
+out-of-set, or duplicate target is invalid input. The selected result supplies result-level
+serve attribution when no top-level attribution pair is present. The full results list and
+query remain persisted as candidate context, but neither chooses the target.
+
+Every new `FeedbackExplicit` payload carries `originating_verb`, stamped internally as
+`brain.feedback`, `brain.auto_feedback`, or the deprecated `brain.emit` alias. Callers cannot
+override it. The event row's
+canonical `verb` remains `brain.feedback` so replay and historical verb filters do not split
+one signal kind into two vocabularies. `brain.event_counts` exposes
+`feedback_by_originating_verb`; legacy rows without the payload marker fall back to their
+stored event verb.
 
 ADR-016 batches are per-op independent with no cross-op transaction; that is acceptable
 here **because no correctness property lives on the emission surface**: the clamp and

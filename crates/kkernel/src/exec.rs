@@ -207,7 +207,8 @@ pub struct ExecArgs {
     #[arg(long, env = "KHIVE_DB")]
     pub db: Option<String>,
 
-    /// Path to the khive TOML config file. Overrides automatic discovery.
+    /// Explicit khive configuration file. This selects the same engine,
+    /// backend-topology, and actor configuration used by `kkernel mcp`.
     #[arg(long, env = "KHIVE_CONFIG")]
     pub config: Option<PathBuf>,
 
@@ -619,6 +620,7 @@ pub async fn run_exec(args: ExecArgs) -> Result<()> {
         cfg.db_path.as_deref(),
         db_anchor.as_deref(),
     )?;
+
     let db_context = ExecDbContext {
         raw: args.db,
         anchor: db_anchor,
@@ -740,6 +742,24 @@ fn enforce_strict_batch_result(raw: &str, strict: bool) -> Result<()> {
 enum ExecMode {
     Inline(String),
     OpsFile(PathBuf),
+}
+
+/// Issue #1586: disclose the resolved database target(s) once, before any
+/// dispatch, so a no-override invocation's silent default
+/// (`$HOME/.khive/khive.db` — the production database for most installs) is
+/// visible. Emitted after the caller has loaded the `[[backends]]` topology,
+/// so the line names the config-declared backend targets when those — not
+/// `cfg.db_path` — are what receive writes. Stderr rather than a tracing
+/// record because kkernel's default log level is `warn` (an INFO record would
+/// never surface) and stdout is reserved for JSON results. Best-effort write:
+/// the disclosure is nonessential, so a closed or failing stderr must not
+/// become an exec failure (`eprintln!` panics on a failed stderr write).
+/// Disclosure only: no prompt, no refusal.
+fn disclose_resolved_database(cfg: &RuntimeConfig, khive_cfg: &KhiveConfig) {
+    use std::io::Write;
+    let line =
+        khive_mcp::serve::resolved_database_disclosure(cfg.db_path.as_deref(), &khive_cfg.backends);
+    let _ = writeln!(std::io::stderr(), "{line}");
 }
 
 #[derive(Default)]
@@ -870,6 +890,8 @@ async fn run_exec_inline_with_forward(
             db_context.anchor = cfg.db_path.clone();
         }
     }
+
+    disclose_resolved_database(&cfg, &khive_cfg);
 
     // ── daemon fast-path (Unix only) ─────────────────────────────────────────
     // The daemon path does not support --save-file (the daemon returns a string;
@@ -1053,6 +1075,8 @@ async fn run_exec_ops_file(
             config_source.as_deref(),
         )?;
     }
+
+    disclose_resolved_database(&cfg, &khive_cfg);
 
     if atomic {
         let max_ops = atomic_max_ops.unwrap_or(khive_types::pack::ATOMIC_MAX_OPS_DEFAULT);
@@ -1294,6 +1318,20 @@ mod tests {
             Some(value) => std::env::set_var("KHIVE_CONFIG", value),
             None => std::env::remove_var("KHIVE_CONFIG"),
         }
+    }
+
+    #[test]
+    fn explicit_config_flag_parses_for_exec() {
+        let args = ExecArgs::parse_from([
+            "exec",
+            "stats()",
+            "--config",
+            "/tmp/kkernel-exec-config.toml",
+        ]);
+        assert_eq!(
+            args.config.as_deref(),
+            Some(std::path::Path::new("/tmp/kkernel-exec-config.toml"))
+        );
     }
 
     #[test]
@@ -1633,8 +1671,8 @@ default = true
 
         let ns = Namespace::parse("local").expect("ns");
 
-        // Exec-shaped inputs using automatic config discovery (`config: None`)
-        // and `namespace_explicit: true` (the choice made in `run_exec` above).
+        // Exec-shaped inputs with no explicit config in this scenario and
+        // `namespace_explicit: true` (the choice made in `run_exec` above).
         // Pin the pack list explicitly rather than inheriting `KHIVE_PACKS`
         // from the ambient environment (same rationale as `isolated_server`
         // above, #1276): `RuntimeConfig::default()` reads `KHIVE_PACKS` fresh
@@ -3473,6 +3511,88 @@ id = "lambda:fallback"
     #[cfg(unix)]
     #[tokio::test]
     #[serial]
+    async fn explicit_config_is_loaded_for_exec_forward_frame() {
+        std::env::remove_var("KHIVE_EMBEDDING_MODEL");
+        std::env::remove_var("KHIVE_ADDITIONAL_EMBEDDING_MODELS");
+        std::env::remove_var("KHIVE_ACTOR");
+        std::env::remove_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR");
+        let (prev_home, _home_dir) = isolate_home_for_test();
+        SPY_CAPTURED_CONFIG_ID.with(|captured| *captured.borrow_mut() = None);
+
+        let fixture = tempfile::tempdir().expect("config fixture tempdir");
+        let config_path = fixture.path().join("code-map.toml");
+        let main_backend_path = fixture.path().join("code-map.db");
+        let sessions_backend_path = fixture.path().join("sessions.db");
+        std::fs::write(
+            &config_path,
+            format!(
+                r#"
+[[backends]]
+name = "main"
+kind = "sqlite"
+path = "{}"
+
+[[backends]]
+name = "sessions"
+kind = "sqlite"
+path = "{}"
+"#,
+                main_backend_path.display(),
+                sessions_backend_path.display(),
+            ),
+        )
+        .expect("write explicit exec config");
+
+        let cfg = resolve_runtime_config(RuntimeConfigInputs {
+            db: None,
+            config: Some(&config_path),
+            namespace: Namespace::parse("local").expect("namespace"),
+            namespace_explicit: true,
+            actor_explicit: false,
+            no_embed: true,
+            packs: Some(vec!["kg".to_string()]),
+            brain_profile: None,
+        })
+        .expect("resolve explicit exec config");
+
+        let result = run_exec_inline_with_forward(
+            "stats()".to_string(),
+            cfg.clone(),
+            None,
+            None,
+            None,
+            ExecDbContext {
+                raw: None,
+                anchor: None,
+                config: Some(config_path.clone()),
+            },
+            false,
+            spy_capture_config_id,
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "explicit-config dispatch failed: {result:?}"
+        );
+
+        let captured = SPY_CAPTURED_CONFIG_ID
+            .with(|value| value.borrow_mut().take())
+            .expect("spy must capture the forwarded config id");
+        let khive_cfg = KhiveConfig::load_with_home_fallback(Some(&config_path), None)
+            .expect("load explicit config")
+            .expect("explicit config must exist");
+        let expected = compute_config_id(&cfg, Some(&khive_cfg));
+        restore_home(prev_home);
+
+        assert_eq!(
+            captured, expected,
+            "the exec forward frame must fold the explicitly selected backend topology"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial]
     async fn exec_frame_config_id_matches_daemon_config_id_for_multi_backend_project_toml() {
         std::env::remove_var("KHIVE_EMBEDDING_MODEL");
         std::env::remove_var("KHIVE_ADDITIONAL_EMBEDDING_MODELS");
@@ -3971,6 +4091,167 @@ backend = "sessions"
         assert!(
             x_resp["results"][0]["result"]["deleted_at"].is_null(),
             "x must NOT be deleted — the whole unit must have rolled back: {x_resp}"
+        );
+    }
+
+    /// #1474: the user-facing `--atomic` executor prepares every operation
+    /// before its commit pass. Two individually acyclic task writes can
+    /// therefore form a cycle only inside the unit. The V16 commit-time
+    /// guards must reject the later statement and roll the earlier one back
+    /// for both authoritative dependency stores.
+    #[tokio::test]
+    async fn atomic_ops_file_rejects_same_unit_gtd_dependency_cycles() {
+        let db_file = NamedTempFile::new().expect("temp db");
+        let db_path = db_file.path().to_str().expect("utf8").to_string();
+
+        let (a_id, b_id) = {
+            let server = isolated_server(&db_path);
+            let response = dispatch_json(
+                &server,
+                r#"[gtd.assign(title="AtomicCycleA", status="next"), gtd.assign(title="AtomicCycleB", status="next")]"#,
+            )
+            .await;
+            (
+                response["results"][0]["result"]["full_id"]
+                    .as_str()
+                    .expect("task A id")
+                    .to_string(),
+                response["results"][1]["result"]["full_id"]
+                    .as_str()
+                    .expect("task B id")
+                    .to_string(),
+            )
+        };
+
+        let compact_a_id = a_id.replace('-', "");
+        let compact_b_id = b_id.replace('-', "");
+        let alternate_spelling_error = crate::atomic_apply::execute_atomic_ops_file(
+            vec![
+                atomic_op(
+                    "update",
+                    serde_json::json!({
+                        "id": a_id.clone(),
+                        "properties": {"depends_on": [compact_b_id]}
+                    }),
+                ),
+                atomic_op(
+                    "update",
+                    serde_json::json!({
+                        "id": b_id.clone(),
+                        "properties": {"depends_on": [compact_a_id]}
+                    }),
+                ),
+            ],
+            atomic_cfg(&db_path),
+            &KhiveConfig::default(),
+            khive_types::pack::ATOMIC_MAX_OPS_DEFAULT,
+        )
+        .await
+        .expect_err("atomic preparation must reject an alternate dependency UUID spelling");
+        let alternate_spelling_message = format!("{alternate_spelling_error:#}");
+        assert!(
+            alternate_spelling_message.contains("canonical lowercase hyphenated UUID"),
+            "unexpected alternate-spelling error: {alternate_spelling_message}"
+        );
+
+        {
+            let server = isolated_server(&db_path);
+            let response = dispatch_json(&server, &format!(r#"get(id="{a_id}")"#)).await;
+            assert!(
+                response["results"][0]["result"]["properties"]
+                    .get("depends_on")
+                    .is_none(),
+                "alternate dependency spelling must not persist: {response}"
+            );
+        }
+
+        let property_envelope = crate::atomic_apply::execute_atomic_ops_file(
+            vec![
+                atomic_op(
+                    "update",
+                    serde_json::json!({
+                        "id": a_id.clone(),
+                        "properties": {"depends_on": [b_id.clone()]}
+                    }),
+                ),
+                atomic_op(
+                    "update",
+                    serde_json::json!({
+                        "id": b_id.clone(),
+                        "properties": {"depends_on": [a_id.clone()]}
+                    }),
+                ),
+            ],
+            atomic_cfg(&db_path),
+            &KhiveConfig::default(),
+            khive_types::pack::ATOMIC_MAX_OPS_DEFAULT,
+        )
+        .await
+        .expect("cycle is a clean atomic rollback, not a seam failure");
+        assert_eq!(property_envelope["atomic"]["rolled_back"], true);
+        assert_eq!(property_envelope["atomic"]["failed_op_index"], 1);
+        assert!(
+            property_envelope["atomic"]["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("dependency cycle")),
+            "envelope: {property_envelope}"
+        );
+
+        let server = isolated_server(&db_path);
+        for task_id in [&a_id, &b_id] {
+            let response = dispatch_json(&server, &format!(r#"get(id="{task_id}")"#)).await;
+            assert!(
+                response["results"][0]["result"]["properties"]
+                    .get("depends_on")
+                    .is_none(),
+                "the earlier update must roll back too: {response}"
+            );
+        }
+
+        let edge_envelope = crate::atomic_apply::execute_atomic_ops_file(
+            vec![
+                atomic_op(
+                    "link",
+                    serde_json::json!({
+                        "source_id": a_id.clone(),
+                        "target_id": b_id.clone(),
+                        "relation": "depends_on"
+                    }),
+                ),
+                atomic_op(
+                    "link",
+                    serde_json::json!({
+                        "source_id": b_id.clone(),
+                        "target_id": a_id.clone(),
+                        "relation": "depends_on"
+                    }),
+                ),
+            ],
+            atomic_cfg(&db_path),
+            &KhiveConfig::default(),
+            khive_types::pack::ATOMIC_MAX_OPS_DEFAULT,
+        )
+        .await
+        .expect("edge cycle is a clean atomic rollback, not a seam failure");
+        assert_eq!(edge_envelope["atomic"]["rolled_back"], true);
+        assert_eq!(edge_envelope["atomic"]["failed_op_index"], 1);
+        assert!(
+            edge_envelope["atomic"]["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("dependency cycle")),
+            "envelope: {edge_envelope}"
+        );
+
+        let server = isolated_server(&db_path);
+        let response = dispatch_json(
+            &server,
+            &format!(r#"neighbors(id="{a_id}", direction="out", relations=["depends_on"])"#),
+        )
+        .await;
+        assert_eq!(
+            response["results"][0]["result"],
+            serde_json::json!([]),
+            "the earlier link must roll back too: {response}"
         );
     }
 

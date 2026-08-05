@@ -56,9 +56,11 @@ still in `inbox` / `waiting` / `someday`, use `gtd.transition` (`status="cancell
 request(ops="gtd.next(assignee=\"agent:docs\", limit=20)")
 ```
 
-`gtd.next` returns only `next` and `active` tasks, sorted by priority then recency. If it is
-empty, the inbox has unprocessed items or everything is parked. Use `gtd.tasks` for broader
-filtering:
+`gtd.next` returns only ready `next` and `active` tasks by default, sorted by priority then
+recency. Pass `include_blocked=true` to include blocked or structurally broken candidates
+after ready work. Query results carry `dependency_state`, `actionable`, and `blocked_by`
+diagnostics. If it is empty, the inbox has unprocessed items or everything is parked. Use
+`gtd.tasks` for broader filtering:
 
 ```
 request(ops="[

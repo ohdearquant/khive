@@ -48,7 +48,11 @@ When no installed graph is available after the readiness attempt — except when
 
 ## Fusion
 
-Retrieval sources are labeled `text`, `vector`, or `both`. Per-model vector lists are unioned by UUID before cross-source fusion, retaining the best vector score for duplicates.
+Retrieval sources are labeled `text`, `vector`, or `both`. How per-model vector lists reach fusion depends on the configured strategy:
+
+- `rrf` and `union` keep each embedding model's vector hits as a separate source, in `vector_hits_per_model` order, followed by the text source. A note ranking in more than one model's results gets one rank contribution per model instead of being collapsed to its best raw score.
+- `weighted` first unions all per-model vector hits into one combined vector source by UUID (retaining the best score per duplicate), then fuses `[combined_vector, text]` under the configured vector/keyword weights.
+- `vector_only` and `keyword_only` union per-model vector hits the same way as `weighted` and route only the relevant arm; the unused arm is passed as an explicit empty source so the two-arm `[vector, keyword]` positions stay stable rather than being rebound.
 
 Supported strategies are:
 

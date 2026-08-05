@@ -11,8 +11,10 @@ use std::path::Path;
 
 use chrono::Utc;
 use khive_pack_code::source_ingest::{run_code_ingest, CodeSourceIngestOptions};
-use khive_runtime::{KhiveRuntime, Namespace, RuntimeConfig};
+use khive_pack_kg::KgPack;
+use khive_runtime::{KhiveRuntime, Namespace, RuntimeConfig, VerbRegistryBuilder};
 use khive_storage::types::{SqlStatement, SqlValue};
+use serde_json::json;
 use tempfile::TempDir;
 
 fn all_languages() -> BTreeSet<&'static str> {
@@ -265,6 +267,48 @@ async fn reingesting_same_fixture_is_idempotent() {
     );
 }
 
+/// Issue #1590: `code.ingest` writes an ordinary khive map database, so a
+/// successful ingest must populate the FTS documents that the generic KG
+/// `search` verb reads. Entity rows without these documents made exact-name
+/// searches return an indistinguishable empty result.
+#[tokio::test]
+async fn ingested_map_entities_are_visible_to_generic_search() {
+    let root = TempDir::new().expect("tempdir");
+    write_two_package_fixture(root.path());
+    let db = root.path().join("searchable.db");
+    let rt = rt_at(&db);
+    let token = rt.authorize(Namespace::local()).expect("token");
+
+    let report = run_code_ingest(
+        &rt,
+        &token,
+        CodeSourceIngestOptions {
+            path: root.path(),
+            languages: all_languages(),
+            sweep_time: Utc::now(),
+        },
+    )
+    .await
+    .expect("source ingest succeeds");
+    assert!(
+        report.fts_indexed > 0,
+        "successful report must expose populated FTS work: {report:?}"
+    );
+
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(KgPack::new(rt));
+    let registry = builder.build().expect("kg registry builds");
+    let result = registry
+        .dispatch("search", json!({"kind": "entity", "query": "pkg_a"}))
+        .await
+        .expect("generic search against map succeeds");
+    let hits = result.as_array().expect("search returns an array");
+    assert!(
+        hits.iter().any(|hit| hit["name"] == "pkg_a"),
+        "exact ingested project name must be searchable; got {hits:?}"
+    );
+}
+
 /// `src/lib.rs` importing `crate::foo::Thing`, an item declared in
 /// `src/foo.rs`, must resolve to a `crate -> foo` `depends_on` edge with
 /// `dependency_kinds=["import"]` — not stay unresolved because the raw
@@ -322,6 +366,129 @@ async fn rust_item_import_resolves_to_containing_module_after_reingest() {
             && tgt == "foo"
             && kinds == "import"),
         "expected one crate -> foo depends_on edge with dependency_kinds=[\"import\"], got: {edges:?}"
+    );
+}
+
+/// Relative imports declared in a package `__init__.py` must resolve inside
+/// that package, not its parent (#1662): `module_path_for_file` collapses
+/// `pkg/x/__init__.py` to `pkg.x`, so the single leading dot already names
+/// the package itself. Before the fix, `from .x import A` in
+/// `pkg/x/__init__.py` resolved to `pkg.x` — a self-loop — and every other
+/// `__init__` relative import landed one package too high.
+fn write_python_init_reexport_fixture(root: &Path) {
+    let pkg_x = root.join("pkg/x");
+    std::fs::create_dir_all(&pkg_x).unwrap();
+    std::fs::write(
+        root.join("pyproject.toml"),
+        "[project]\nname = \"pyproj\"\n",
+    )
+    .unwrap();
+    std::fs::write(root.join("pkg/__init__.py"), "").unwrap();
+    std::fs::write(
+        pkg_x.join("__init__.py"),
+        "from .x import A\nfrom .y import B\n",
+    )
+    .unwrap();
+    std::fs::write(pkg_x.join("x.py"), "A = 1\n").unwrap();
+    std::fs::write(pkg_x.join("y.py"), "B = 2\n").unwrap();
+    std::fs::write(pkg_x.join("z.py"), "from .y import B\n").unwrap();
+}
+
+#[tokio::test]
+async fn python_init_reexport_resolves_in_package_without_self_loop() {
+    let root = TempDir::new().expect("tempdir");
+    write_python_init_reexport_fixture(root.path());
+    let db = root.path().join("init_reexport.db");
+    let rt = rt_at(&db);
+    let token = rt.authorize(Namespace::local()).expect("token");
+
+    let opts = || CodeSourceIngestOptions {
+        path: root.path(),
+        languages: all_languages(),
+        sweep_time: Utc::now(),
+    };
+    run_code_ingest(&rt, &token, opts())
+        .await
+        .expect("first ingest succeeds");
+    run_code_ingest(&rt, &token, opts())
+        .await
+        .expect("second ingest succeeds");
+
+    let edges = edge_fingerprints(&rt).await;
+    for (src, tgt) in [
+        ("pkg.x", "pkg.x.x"),
+        ("pkg.x", "pkg.x.y"),
+        ("pkg.x.z", "pkg.x.y"),
+    ] {
+        assert!(
+            edges.iter().any(|(rel, s, t, kinds)| rel == "depends_on"
+                && s == src
+                && t == tgt
+                && kinds == "import"),
+            "expected {src} -> {tgt} depends_on import edge, got: {edges:?}"
+        );
+    }
+    let self_loops: Vec<_> = edges.iter().filter(|(_, s, t, _)| s == t).collect();
+    assert!(
+        self_loops.is_empty(),
+        "same-name submodule re-export must not produce self-loop edges, got: {self_loops:?}"
+    );
+}
+
+/// A dotless relative import keeps its imported name (#1692): for
+/// `from . import z` the name *is* the target module, so the package
+/// `__init__` records a `depends_on` edge to the submodule — not nothing
+/// (self-reference skip) and not a package-level edge. The `__init__` and
+/// regular-module cases resolve to different targets, so neither can be
+/// satisfied by one collapsed answer.
+fn write_python_dotless_from_import_fixture(root: &Path) {
+    let pkg_x = root.join("pkg/x");
+    std::fs::create_dir_all(&pkg_x).unwrap();
+    std::fs::write(
+        root.join("pyproject.toml"),
+        "[project]\nname = \"pyproj\"\n",
+    )
+    .unwrap();
+    std::fs::write(root.join("pkg/__init__.py"), "").unwrap();
+    std::fs::write(pkg_x.join("__init__.py"), "from . import z\n").unwrap();
+    std::fs::write(pkg_x.join("w.py"), "from . import z\n").unwrap();
+    std::fs::write(pkg_x.join("z.py"), "VALUE = 1\n").unwrap();
+}
+
+#[tokio::test]
+async fn python_dotless_from_import_emits_submodule_edges() {
+    let root = TempDir::new().expect("tempdir");
+    write_python_dotless_from_import_fixture(root.path());
+    let db = root.path().join("dotless_from.db");
+    let rt = rt_at(&db);
+    let token = rt.authorize(Namespace::local()).expect("token");
+
+    let opts = || CodeSourceIngestOptions {
+        path: root.path(),
+        languages: all_languages(),
+        sweep_time: Utc::now(),
+    };
+    run_code_ingest(&rt, &token, opts())
+        .await
+        .expect("first ingest succeeds");
+    run_code_ingest(&rt, &token, opts())
+        .await
+        .expect("second ingest succeeds");
+
+    let edges = edge_fingerprints(&rt).await;
+    for (src, tgt) in [("pkg.x", "pkg.x.z"), ("pkg.x.w", "pkg.x.z")] {
+        assert!(
+            edges.iter().any(|(rel, s, t, kinds)| rel == "depends_on"
+                && s == src
+                && t == tgt
+                && kinds == "import"),
+            "expected {src} -> {tgt} depends_on import edge, got: {edges:?}"
+        );
+    }
+    let self_loops: Vec<_> = edges.iter().filter(|(_, s, t, _)| s == t).collect();
+    assert!(
+        self_loops.is_empty(),
+        "dotless relative import must not produce self-loop edges, got: {self_loops:?}"
     );
 }
 

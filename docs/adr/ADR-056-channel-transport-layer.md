@@ -1,15 +1,16 @@
 # ADR-056: Channel Transport Layer -- `khive-channel` and External Messaging Adapters
 
-**Status**: Accepted (amended 2026-07-02 -- inbound authentication hardening; amended 2026-07-03
+**Status**: Accepted (amended 2026-08-01 -- bounded inbox long poll; amended 2026-07-02 -- inbound authentication hardening; amended 2026-07-03
 -- Exchange Online no-authserv-id boundary; amended 2026-07-05 -- Telegram adapter
 implementation and two-way chat; amended 2026-07-09 -- durable IMAP UID cursor; amended
 2026-07-17 -- iMessage channel over an SSH bridge; see
+[§Amendment 2026-08-01](#amendment-2026-08-01----bounded-inbox-long-poll),
 [§Amendment 2026-07-02](#amendment-2026-07-02----inbound-authentication-hardening),
 [§Amendment 2026-07-03](#amendment-2026-07-03----exchange-online-no-authserv-id-boundary),
 [§Amendment 2026-07-05](#amendment-2026-07-05----telegram-adapter-implementation-and-two-way-chat),
 [§Amendment 2026-07-09](#amendment-2026-07-09----durable-imap-uid-cursor),
 [§Amendment 2026-07-17](#amendment-2026-07-17----imessage-channel-over-an-ssh-bridge))\
-**Date**: 2026-06-14 (amended 2026-07-02, 2026-07-03, 2026-07-05, 2026-07-09, 2026-07-17)\
+**Date**: 2026-06-14 (amended 2026-07-02, 2026-07-03, 2026-07-05, 2026-07-09, 2026-07-17, 2026-08-01)\
 **Authors**: khive maintainers
 **Amended by**: [ADR-122](ADR-122-email-outbound-delivery.md) (email outbound
 delivery now runs as an externally linked supervised component)\
@@ -20,7 +21,40 @@ ADR-108 (Git Write Surface -- hardened shell-out argv pattern reused by this ame
 statement; its SessionStore design was not carried forward\
 **Related issues**: #112 (khive-channel umbrella), #113 (Telegram adapter), #114 (email adapter),
 #448 (inbound header spoofing -- resolved by this amendment), #449 (IMAP UID progress -- resolved
-by the 2026-07-09 amendment)
+by the 2026-07-09 amendment), #1499 (inbox long poll -- resolved by the 2026-08-01 amendment)
+
+## Amendment 2026-08-01 -- Bounded inbox long poll
+
+Channel ingestion remains a gated `comm.ingest` dispatch and durable note write.
+After a successful, non-deduplicated insert, the comm handler now publishes a
+process-local wake signal; the channel loop does not interpret the response or
+own a second signaling path. This places the signal at the only point that knows
+both that the insert committed and that it was not suppressed by the durable
+`external_id` dedup constraint.
+
+`comm.inbox(wait_ms=N)` with `1 <= N <= 30000` first runs its normal scoped
+query. It returns immediately on a match, or waits on the signal until the
+deadline and re-runs the same query after each wake. Omission or zero preserves
+the immediate behavior, and `limit=0` never waits. The response shape is
+unchanged. `comm.send` and `comm.reply` publish the same signal after their
+successful atomic dual-writes, so the public long poll covers every comm-owned
+message creation path, not only external adapters.
+
+The signal is owned by the immutable `CommPack` instance constructed by
+`PackFactory::create(runtime)`. No post-construction injection is needed: both
+the waiting `comm.inbox` handler and the publishing write handlers already run
+through that instance. A generation counter paired with `tokio::sync::Notify`
+prevents a commit between query and waiter registration from being lost.
+
+This is not transport delivery state, cross-process pubsub, or an authorization
+boundary. The signal is payload-free and may wake calls for unrelated actors or
+filters; every wake re-runs the ordinary ADR-057/namespace-scoped database query
+and continues waiting if it is still empty. Durable storage remains authoritative,
+and a timeout-edge final query observes commits that arrive without this process's
+signal when they are visible before that query takes its storage snapshot; a commit
+landing after the snapshot is left to the caller's next request. The amendment
+changes wake latency only; channel lifecycle, dedup, checkpointing, and gate
+ownership are unchanged.
 
 ## Amendment 2026-07-02 -- Inbound authentication hardening
 
@@ -480,8 +514,9 @@ Telegram's offset remains in-memory as originally documented.
 - `comm_channel_cursor`'s subhandlers are pack-owned operational bookkeeping and not a new
   MCP-callable verb, exercised in production only through the email component's internal
   dispatch calls. Its table schema was pack-declared through `CREATE TABLE IF NOT EXISTS` when
-  this bullet was written; the 2026-07-17 amendment below moves that schema to core migration
-  `V11`, so the table's schema is core-migrated while its subhandlers stay pack-internal.
+  this bullet was written; the 2026-07-17 amendment below requires a future core migration while
+  its subhandlers stay pack-internal. The 2026-08-01 allocation correction in that amendment is
+  authoritative for the migration version.
 - Telegram's in-memory offset watermark and its restart-durability rationale (Amendment
   2026-07-05) are unchanged by this amendment.
 
@@ -2071,7 +2106,8 @@ than as a separate write. This is the precise, API-level statement of the `curso
 > **Migration-sequence reconciliation (2026-08-01).** The V11 reservation in the
 > amendment below was never implemented and is superseded. The live post-consolidation
 > ledger now assigns V11 to `ann_write_log`, V12 to its model/sequence index, and V13
-> to stable list-cursor sequences. A future implementation of the
+> to stable list-cursor sequences, V14 to the graph-edge identifier compatibility guard,
+> and V15 to GTD dependency-cycle guards. A future implementation of the
 > `comm_channel_cursor` widening MUST claim the next available version in ADR-015 in
 > the same PR. References below to V10 as the then-current tree and to V11/`011-*` as
 > the target are retained as the amendment's historical snapshot, not as a live schema
@@ -2090,31 +2126,27 @@ core `khive-db` versioned migration recorded in the ADR-015 ledger, exactly as
 to a durable unique index over an existing table, and `006-brain-retune-driver.sql` (V6) shipped the
 brain pack's `brain_implicit_mass` accounting table: pack-owned logical state whose evolving schema
 lands as a core `khive-db` versioned migration, so the production ledger records it. This amendment
-therefore ships the cursor change as the next core migration, `V11`
-(`crates/khive-db/sql/011-comm-channel-cursor-source-key.sql`, the slot immediately after the current
-latest migration `V10`/`010-entities-content-ref.sql`), registered in the `MIGRATIONS` array and
-recorded in `_schema_migrations` -- not as a further extension of the constant
+therefore requires the cursor change to ship as a future core migration, registered in the
+`MIGRATIONS` array and recorded in `_schema_migrations` -- not as a further extension of the constant
 `CREATE TABLE IF NOT EXISTS` statement and not a pack-owned versioned migration. It introduces no new
 migration mechanism: it uses the core versioned-migration lane V5 and V6 already exercise for
-pack-owned state, and records `V11` as a new row in ADR-015's canonical migration ledger. Appending
-that ledger row is the ledger's defined bookkeeping for every core migration, not a normative change
-to ADR-015's design.
+pack-owned state. Claiming the next free ledger row is ADR-015's defined bookkeeping for every core
+migration, not a normative change to ADR-015's design.
 
-**Current tree state versus this amendment's target.** This section is a normative specification, not
-a description of the checked-out tree. As of this amendment the tree is at core migration `V10`;
+**Current tree state versus this amendment's target.** This section is a normative specification.
+As of the allocation correction the live ledger is allocated through V13;
 `comm_channel_cursor` exists only in its two-column-primary-key form, minted by the pack constant
 `COMM_CHANNEL_CURSOR_SCHEMA_STMT` (`crates/khive-pack-comm/src/vocab.rs`) and lazily re-declared by
 the two cursor handlers before they query it (`crates/khive-pack-comm/src/handlers.rs`: the
 `cursor_get` read path and the cursor upsert path each `execute_script` that same constant). No
-`011-*.sql` file, no `MIGRATIONS`-array `V11` entry, and no three-column key are present in the tree
-yet. The migration file, its ledger registration, and the constant/bootstrap retirements described
-below are authored in the implementation PR that follows this design amendment, not in this docs
-change. The reconciliation is therefore explicit and single-sourced: **current** = `V10`, the
-two-column constant, and the two lazy handler bootstraps; **target** = `V11` rebuilding
-`comm_channel_cursor` to the three-column `(channel_kind, channel_slug, source)` key with the
-constant and both bootstraps retired so `V11` is the sole creator. Every sentence below that reads in
-the present tense ("the constant is retired", "`V11` is applied by `kkernel db migrate`") states the
-target this amendment mandates, which the implementation PR realizes.
+cursor-widening core migration and no three-column key are present in the tree yet. The migration
+file, its ledger registration, and the constant/bootstrap retirements described below belong in a
+future implementation PR. The reconciliation is therefore explicit and single-sourced:
+**current** = the two-column constant and the two lazy handler bootstraps; **target** = a newly
+allocated core migration rebuilding `comm_channel_cursor` to the three-column
+`(channel_kind, channel_slug, source)` key, with the constant and both bootstraps retired so that
+migration is the sole creator. Present-tense statements below describe that target, not current
+implementation state.
 
 Because `CREATE TABLE IF NOT EXISTS` cannot alter an existing table's primary key, widening the
 uniqueness key to three columns requires a full table rebuild rather than an in-place `ALTER TABLE`.
@@ -2144,24 +2176,26 @@ that makes the rebuild all-or-nothing. This is the reason the change belongs in 
 than a pack boot migration: the core runner already provides apply-and-record in one transaction,
 whereas the pack's idempotent `CREATE TABLE IF NOT EXISTS` path has no ledger and no such guarantee.
 
-Acceptance property: interrupting `kkernel db migrate` at any point during the V11 migration and
-re-running it leaves the database either entirely pre-migration or entirely post-migration -- never a
-half-rebuilt, data-less, or applied-but-unrecorded `comm_channel_cursor` -- because the runner
+Acceptance property: interrupting `kkernel db migrate` at any point during the future cursor
+migration and re-running it leaves the database either entirely pre-migration or entirely
+post-migration -- never a half-rebuilt, data-less, or applied-but-unrecorded
+`comm_channel_cursor` -- because the runner
 commits the rebuild DDL and the `_schema_migrations` record in one transaction, and the version guard
 skips an already-recorded migration on re-run.
 
 The pack's `COMM_CHANNEL_CURSOR_SCHEMA_STMT` constant is retired in the same change -- from
 `COMM_SCHEMA_PLAN_STMTS` (the plain-DDL boot path) and from the two inline lazy bootstraps the cursor
 handlers run, where the `cursor_get` read path and the cursor upsert path each `execute_script` the
-same `CREATE TABLE IF NOT EXISTS` before their own query today -- so the V11 migration is the sole
-creator of `comm_channel_cursor` and no boot path or verb handler mints the stale two-column-PK table
-ahead of it. As a core migration, V11 is applied by `kkernel db migrate` (and auto-applied on
-in-memory and ephemeral backends at creation, per ADR-015's exception for stores with no operator to
+same `CREATE TABLE IF NOT EXISTS` before their own query today -- so the cursor migration is the
+sole creator of `comm_channel_cursor` and no boot path or verb handler mints the stale two-column-PK
+table ahead of it. As a core migration, the cursor migration is applied by `kkernel db migrate`
+(and auto-applied on in-memory and ephemeral backends at creation, per ADR-015's exception for
+stores with no operator to
 invoke it), and the MCP binary's existing fail-fast-on-stale-schema guard refuses to serve until the
 operator has migrated -- so a production database reaches the three-column shape before the daemon
 serves any cursor verb, and a database created through the migration path never lands on the retired
 two-column shape. No new boot-wiring, pack-ordering, or fail-closed-boot semantics are introduced:
-V11 reuses the operator-run migration contract of ADR-015 and ADR-071 unchanged.
+the cursor migration reuses the operator-run migration contract of ADR-015 and ADR-071 unchanged.
 
 Acceptance property: an upgraded database preserves every pre-existing cursor row's progress -- no
 adapter's high-water mark regresses or is lost across the migration -- and a fresh database created
@@ -2593,7 +2627,7 @@ properties and is corrected here.
     session never falls back to a default identity file or an agent-offered key.
 19. The bridge host's `sshd_config` sets `PermitTunnel no` explicitly, and a session opened with
     the daemon's key that requests tunnel-device forwarding is refused.
-20. Interrupting `kkernel db migrate` at any point during the cursor-widening migration (V11) and
+20. Interrupting `kkernel db migrate` at any point during the future cursor-widening migration and
     re-running it leaves the database either entirely pre-migration or entirely post-migration, never
     with a half-rebuilt, data-less, or applied-but-unrecorded `comm_channel_cursor`: the core runner
     commits the rebuild DDL and the `_schema_migrations` record in one transaction, and the version

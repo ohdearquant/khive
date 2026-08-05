@@ -146,6 +146,10 @@ where
     }
 
     /// Merge results from primary and legacy indexes using the configured strategy.
+    ///
+    /// Positional strategies use `[primary, legacy]`. This migration-specific
+    /// contract is independent of the `[vector, keyword]` order used by
+    /// two-arm hybrid search APIs.
     pub fn merge_results(
         &self,
         primary_results: Vec<(Id, DeterministicScore)>,
@@ -371,6 +375,21 @@ mod tests {
         assert!(ids.contains(&"a"));
         assert!(ids.contains(&"b"));
         assert!(ids.contains(&"c"));
+    }
+
+    #[test]
+    fn test_merge_weighted_uses_primary_then_legacy_order() {
+        let config = DualIndexConfig::default().with_strategy(DualIndexStrategy::Weighted {
+            primary_weight: 0.8,
+        });
+        let router = DualIndexRouter::<String>::new(config);
+
+        let primary = make_results(vec![("primary", 0.9)]);
+        let legacy = make_results(vec![("legacy", 0.9)]);
+        let merged = router.merge_results(primary, legacy, 10);
+
+        assert_eq!(merged[0].0, "primary");
+        assert!(merged[0].1 > merged[1].1);
     }
 
     #[test]

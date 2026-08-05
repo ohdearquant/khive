@@ -2511,7 +2511,7 @@ async fn feedback_697_unspecified_resolves_via_actor_binding() {
 }
 
 /// #1486: explicit failed-read attribution is not the same as omission. The
-/// first recall result carries the marker through auto_feedback, which records
+/// selected recall result carries the marker through auto_feedback, which records
 /// a forced-zero event without invoking the otherwise-matching actor binding.
 #[tokio::test]
 async fn auto_feedback_failed_read_marker_does_not_fall_back_to_binding() {
@@ -2550,6 +2550,8 @@ async fn auto_feedback_failed_read_marker_does_not_fall_back_to_binding() {
             "brain.auto_feedback",
             json!({
                 "query": "failed profile read",
+                "target_id": target,
+                "signal": "implicit_positive",
                 "results": [{
                     "id": target,
                     "serve_attribution": "unattributed"
@@ -2618,6 +2620,8 @@ async fn auto_feedback_top_level_attribution_pair_wins_over_result_metadata() {
             "brain.auto_feedback",
             json!({
                 "query": "explicit top-level attribution",
+                "target_id": target,
+                "signal": "implicit_positive",
                 "served_by_profile_id": "top-level-profile-v1",
                 "results": [{
                     "id": target,
@@ -3263,18 +3267,21 @@ async fn test_289_feedback_event_records_nonzero_duration() {
 // ── #517: brain.auto_feedback ─────────────────────────────────────────────
 
 #[tokio::test]
-async fn brain_auto_feedback_emits_implicit_positive_for_first_result() {
+async fn brain_auto_feedback_credits_only_the_selected_result() {
     let (pack, rt) = make_pack();
     let registry = empty_registry();
     let token = rt.authorize(Namespace::local()).unwrap();
-    let target = create_test_entity(&rt, &token).await;
+    let first = create_test_entity(&rt, &token).await;
+    let selected = create_test_entity(&rt, &token).await;
 
     let result = pack
         .dispatch(
             "brain.auto_feedback",
             json!({
                 "query": "recall calibration target",
-                "results": [{ "id": target }]
+                "results": [{ "id": first }, { "id": selected }],
+                "target_id": selected,
+                "signal": "implicit_positive"
             }),
             &registry,
             &token,
@@ -3286,7 +3293,7 @@ async fn brain_auto_feedback_emits_implicit_positive_for_first_result() {
     assert_eq!(
         result["signal"],
         json!("implicit_positive"),
-        "default signal must be implicit_positive"
+        "the caller's signal must be preserved"
     );
     let returned_target_id = result["target_id"].as_str().unwrap_or("");
     assert_eq!(
@@ -3295,8 +3302,8 @@ async fn brain_auto_feedback_emits_implicit_positive_for_first_result() {
         "target_id in auto_feedback response must be full 36-char UUID"
     );
     assert_eq!(
-        returned_target_id, target,
-        "target_id must match the created entity"
+        returned_target_id, selected,
+        "rank position must not override the caller-selected result"
     );
     assert_eq!(
         pack.snapshot().balanced_recall.total_events,
@@ -3305,8 +3312,133 @@ async fn brain_auto_feedback_emits_implicit_positive_for_first_result() {
     );
 }
 
-/// #35 cheap half: `brain.auto_feedback` must persist the `query` it received
-/// and the raw candidate ids for every result (not just the chosen `first`),
+#[tokio::test]
+async fn brain_auto_feedback_without_signal_abstains_without_writing() {
+    let (pack, rt) = make_pack();
+    let registry = empty_registry();
+    let token = rt.authorize(Namespace::local()).unwrap();
+    let target = create_test_entity(&rt, &token).await;
+    let before = pack.snapshot().balanced_recall.total_events;
+
+    let result = pack
+        .dispatch(
+            "brain.auto_feedback",
+            json!({
+                "query": "no caller judgment",
+                "results": [{"id": target}],
+                "target_id": target
+            }),
+            &registry,
+            &token,
+        )
+        .await
+        .expect("omitting signal is an explicit abstention");
+
+    assert_eq!(result["emitted"], json!(false));
+    assert_eq!(result["reason"], json!("no_signal"));
+    assert_eq!(pack.snapshot().balanced_recall.total_events, before);
+
+    let malformed = pack
+        .dispatch(
+            "brain.auto_feedback",
+            json!({
+                "query": "malformed scorer abstention",
+                "results": [{"id": target}],
+                "scorer_run_id": "run-without-ledger"
+            }),
+            &registry,
+            &token,
+        )
+        .await
+        .expect_err("abstention must not bypass scorer-pair validation");
+    assert!(malformed
+        .to_string()
+        .contains("scorer_run_id and serve_ledger_id must be supplied together"));
+
+    let events = rt
+        .events(&token)
+        .expect("event store")
+        .query_events(
+            khive_storage::event::EventFilter {
+                kinds: vec![khive_types::EventKind::FeedbackExplicit],
+                ..Default::default()
+            },
+            khive_storage::types::PageRequest {
+                limit: 10,
+                offset: 0,
+            },
+        )
+        .await
+        .expect("feedback event query");
+    assert!(
+        events.items.is_empty(),
+        "abstention must not append an event"
+    );
+}
+
+#[tokio::test]
+async fn brain_auto_feedback_signal_requires_a_unique_result_target() {
+    let (pack, rt) = make_pack();
+    let registry = empty_registry();
+    let token = rt.authorize(Namespace::local()).unwrap();
+    let candidate = create_test_entity(&rt, &token).await;
+    let other = create_test_entity(&rt, &token).await;
+
+    let missing = pack
+        .dispatch(
+            "brain.auto_feedback",
+            json!({
+                "query": "missing judged target",
+                "results": [{"id": candidate}],
+                "signal": "implicit_positive"
+            }),
+            &registry,
+            &token,
+        )
+        .await
+        .expect_err("a signal without a target must be rejected");
+    assert!(missing.to_string().contains("target_id` is required"));
+
+    let outside = pack
+        .dispatch(
+            "brain.auto_feedback",
+            json!({
+                "query": "outside candidate set",
+                "results": [{"id": candidate}],
+                "target_id": other,
+                "signal": "implicit_positive"
+            }),
+            &registry,
+            &token,
+        )
+        .await
+        .expect_err("a target outside results must be rejected");
+    assert!(outside
+        .to_string()
+        .contains("does not match any results[].id"));
+
+    let duplicate = pack
+        .dispatch(
+            "brain.auto_feedback",
+            json!({
+                "query": "ambiguous duplicate candidate",
+                "results": [{"id": candidate}, {"id": candidate}],
+                "target_id": candidate,
+                "signal": "implicit_positive"
+            }),
+            &registry,
+            &token,
+        )
+        .await
+        .expect_err("a duplicated target must be rejected as ambiguous");
+    assert!(duplicate
+        .to_string()
+        .contains("matches more than one result"));
+    assert_eq!(pack.snapshot().balanced_recall.total_events, 0);
+}
+
+/// #1509 cheap half: `brain.auto_feedback` must persist the `query` it received
+/// and the raw candidate ids for every result (not just the selected result),
 /// instead of dropping both on emission.
 #[tokio::test]
 async fn brain_auto_feedback_persists_query_and_candidate_ids() {
@@ -3321,7 +3453,9 @@ async fn brain_auto_feedback_persists_query_and_candidate_ids() {
             "brain.auto_feedback",
             json!({
                 "query": "recall calibration target",
-                "results": [{ "id": first }, { "id": second }]
+                "results": [{ "id": first }, { "id": second }],
+                "target_id": second,
+                "signal": "implicit_positive"
             }),
             &registry,
             &token,
@@ -3353,9 +3487,142 @@ async fn brain_auto_feedback_persists_query_and_candidate_ids() {
     assert_eq!(
         event.payload["candidate_ids"],
         json!([first, second]),
-        "emitted event must persist every candidate id, not just results.first(): {:?}",
+        "emitted event must persist every candidate id, not just the selected result: {:?}",
         event.payload
     );
+}
+
+/// #1587: the canonical event verb remains `brain.feedback` for replay, while
+/// the payload records whether direct or automatic feedback originated it.
+#[tokio::test]
+async fn feedback_events_record_and_count_the_originating_verb() {
+    let (pack, rt) = make_pack();
+    let registry = empty_registry();
+    let token = rt.authorize(Namespace::local()).unwrap();
+    let direct_target = create_test_entity(&rt, &token).await;
+    let automatic_target = create_test_entity(&rt, &token).await;
+    let alias_target = create_test_entity(&rt, &token).await;
+
+    let direct = pack
+        .dispatch(
+            "brain.feedback",
+            json!({"target_id": direct_target, "signal": "useful"}),
+            &registry,
+            &token,
+        )
+        .await
+        .expect("direct feedback succeeds");
+    let automatic = pack
+        .dispatch(
+            "brain.auto_feedback",
+            json!({
+                "query": "origin attribution",
+                "results": [{"id": automatic_target}],
+                "target_id": automatic_target,
+                "signal": "implicit_positive"
+            }),
+            &registry,
+            &token,
+        )
+        .await
+        .expect("automatic feedback succeeds");
+    let alias = pack
+        .dispatch(
+            "brain.emit",
+            json!({"target_id": alias_target, "signal": "useful"}),
+            &registry,
+            &token,
+        )
+        .await
+        .expect("deprecated feedback alias succeeds");
+
+    let store = rt.events(&token).expect("event store");
+    for (response, expected_origin) in [
+        (&direct, "brain.feedback"),
+        (&automatic, "brain.auto_feedback"),
+        (&alias, "brain.emit"),
+    ] {
+        let event_id = uuid::Uuid::parse_str(
+            response["event_id"]
+                .as_str()
+                .expect("feedback response must carry event_id"),
+        )
+        .expect("event_id must be a UUID");
+        let event = store
+            .get_event(event_id)
+            .await
+            .expect("event read must succeed")
+            .expect("feedback event must exist");
+        assert_eq!(event.verb, "brain.feedback");
+        assert_eq!(event.payload["originating_verb"], json!(expected_origin));
+    }
+
+    let counts = pack
+        .dispatch(
+            "brain.event_counts",
+            json!({
+                "since": "1970-01-01T00:00:00Z",
+                "kind": "feedback_explicit"
+            }),
+            &registry,
+            &token,
+        )
+        .await
+        .expect("event counts succeed");
+    assert_eq!(counts["counts_by_verb"]["brain.feedback"], json!(3));
+    assert_eq!(
+        counts["feedback_by_originating_verb"]["brain.feedback"],
+        json!(1)
+    );
+    assert_eq!(
+        counts["feedback_by_originating_verb"]["brain.auto_feedback"],
+        json!(1)
+    );
+    assert_eq!(
+        counts["feedback_by_originating_verb"]["brain.emit"],
+        json!(1)
+    );
+}
+
+#[tokio::test]
+async fn feedback_originating_verb_is_not_a_forgeable_public_parameter() {
+    let (pack, rt) = make_pack();
+    let registry = empty_registry();
+    let token = rt.authorize(Namespace::local()).unwrap();
+    let target = create_test_entity(&rt, &token).await;
+
+    let error = pack
+        .dispatch(
+            "brain.feedback",
+            json!({
+                "target_id": target,
+                "signal": "useful",
+                "originating_verb": "brain.auto_feedback"
+            }),
+            &registry,
+            &token,
+        )
+        .await
+        .expect_err("callers must not be able to forge feedback origin");
+    let message = error.to_string();
+    assert!(message.contains("unknown field") && message.contains("originating_verb"));
+
+    let events = rt
+        .events(&token)
+        .expect("event store")
+        .query_events(
+            khive_storage::event::EventFilter {
+                kinds: vec![khive_types::EventKind::FeedbackExplicit],
+                ..Default::default()
+            },
+            khive_storage::types::PageRequest {
+                limit: 10,
+                offset: 0,
+            },
+        )
+        .await
+        .expect("feedback event query");
+    assert!(events.items.is_empty());
 }
 
 /// #38: `memory.recall` fans results out across namespaces by design (root
@@ -3388,7 +3655,9 @@ async fn brain_auto_feedback_resolves_short_prefix_across_namespaces() {
             "brain.auto_feedback",
             json!({
                 "query": "cross-namespace prefix resolution",
-                "results": [{ "id": prefix }]
+                "results": [{ "id": prefix }],
+                "target_id": prefix,
+                "signal": "implicit_positive"
             }),
             &registry,
             &token_b,
@@ -3425,6 +3694,43 @@ async fn brain_auto_feedback_empty_results_returns_no_emit() {
 
     assert_eq!(result["emitted"], json!(false));
     assert_eq!(result["reason"], json!("no_results"));
+
+    let missing_target = pack
+        .dispatch(
+            "brain.auto_feedback",
+            json!({
+                "query": "empty recall results with judgment",
+                "results": [],
+                "signal": "implicit_positive"
+            }),
+            &registry,
+            &token,
+        )
+        .await
+        .expect_err("a signal on an empty result set still requires a target");
+    assert!(missing_target
+        .to_string()
+        .contains("target_id` is required"));
+
+    let target = create_test_entity(&rt, &token).await;
+    let out_of_set = pack
+        .dispatch(
+            "brain.auto_feedback",
+            json!({
+                "query": "empty recall results with named judgment",
+                "results": [],
+                "target_id": target,
+                "signal": "implicit_positive"
+            }),
+            &registry,
+            &token,
+        )
+        .await
+        .expect_err("an empty result set cannot contain the named target");
+    assert!(out_of_set
+        .to_string()
+        .contains("does not match any results[].id"));
+    assert_eq!(pack.snapshot().balanced_recall.total_events, 0);
 }
 
 #[tokio::test]
@@ -3441,7 +3747,9 @@ async fn brain_auto_feedback_accepts_short_note_id_prefix() {
             "brain.auto_feedback",
             json!({
                 "query": "prefix resolution test",
-                "results": [{ "id": prefix }]
+                "results": [{ "id": prefix }],
+                "target_id": prefix,
+                "signal": "implicit_positive"
             }),
             &registry,
             &token,
@@ -3470,6 +3778,8 @@ async fn brain_auto_feedback_direct_dispatch_honors_exact_namespace() {
         json!({
             "query": "direct namespace regression",
             "results": [{"id": target}],
+            "target_id": target,
+            "signal": "implicit_positive",
             "namespace": "bench-arm-a",
         }),
         &registry,
@@ -3551,6 +3861,8 @@ async fn brain_auto_feedback_direct_dispatch_rejects_namespace_token_mismatch() 
             json!({
                 "query": "unauthorized direct namespace",
                 "results": [{"id": target}],
+                "target_id": target,
+                "signal": "implicit_positive",
                 "namespace": "bench-arm-a",
             }),
             &registry,
@@ -3758,6 +4070,34 @@ mod help_tests {
         assert!(
             h.params.iter().any(|p| p.name == "results" && p.required),
             "brain.auto_feedback must have required results param"
+        );
+        let target_id = h
+            .params
+            .iter()
+            .find(|p| p.name == "target_id")
+            .unwrap_or_else(|| panic!("brain.auto_feedback must declare target_id"));
+        assert!(!target_id.required, "target_id is conditional on signal");
+        assert_eq!(
+            target_id.param_type, "string",
+            "target_id accepts either a full UUID or the compact id returned by recall"
+        );
+        assert!(
+            target_id.description.contains("compact id")
+                && target_id.description.contains("Required when signal")
+                && target_id.description.contains("exactly once"),
+            "target_id help must describe conditional uniqueness: {:?}",
+            target_id.description
+        );
+        let signal = h
+            .params
+            .iter()
+            .find(|p| p.name == "signal")
+            .unwrap_or_else(|| panic!("brain.auto_feedback must declare signal"));
+        assert!(!signal.required);
+        assert!(
+            signal.description.contains("Omission means abstain"),
+            "signal help must not imply an automatic positive: {:?}",
+            signal.description
         );
         let namespace = h
             .params
@@ -4058,6 +4398,8 @@ mod help_tests {
                 json!({
                     "query": "isolated recall measurement",
                     "results": [{"id": target}],
+                    "target_id": target,
+                    "signal": "implicit_positive",
                     "namespace": "bench-arm-a",
                 }),
             )
@@ -7296,6 +7638,10 @@ mod event_counts_tests {
             result.get("by_profile").is_none(),
             "by_profile must be omitted when no feedback events are in the window: {result}"
         );
+        assert!(
+            result.get("feedback_by_originating_verb").is_none(),
+            "feedback origin split must be omitted when no feedback events are in the window: {result}"
+        );
     }
 
     /// #26: with a shrunk `page_limit`, a busy `audit` kind must not crowd a
@@ -7985,6 +8331,11 @@ mod event_counts_tests {
             result["by_profile"]["unspecified"],
             json!(1),
             "got: {result}"
+        );
+        assert_eq!(
+            result["feedback_by_originating_verb"]["brain.feedback"],
+            json!(3),
+            "legacy rows without an origin marker must fall back to event.verb: {result}"
         );
     }
 

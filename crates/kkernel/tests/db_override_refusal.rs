@@ -59,9 +59,8 @@ fn assert_exec_refusal(
         stderr.contains(&selected_config.display().to_string()),
         "{stderr}"
     );
-    assert!(stderr.contains("--config <path>"), "{stderr}");
-    assert!(stderr.contains("KHIVE_CONFIG=<path>"), "{stderr}");
-    assert!(stderr.contains("ephemeral"), "{stderr}");
+    assert!(stderr.contains("--config <file>"), "{stderr}");
+    assert!(stderr.contains("KHIVE_CONFIG"), "{stderr}");
     assert!(
         !override_path.exists(),
         "refusal must happen before the override database is opened"
@@ -181,8 +180,8 @@ fn mcp_db_override_refusal_names_selected_config_without_protocol_output() {
         stderr.contains(&selected_config.display().to_string()),
         "{stderr}"
     );
-    assert!(stderr.contains("--config <path>"), "{stderr}");
-    assert!(stderr.contains("KHIVE_CONFIG=<path>"), "{stderr}");
+    assert!(stderr.contains("--config <file>"), "{stderr}");
+    assert!(stderr.contains("KHIVE_CONFIG"), "{stderr}");
     assert!(
         !override_path.exists(),
         "refusal must happen before the override database is opened"

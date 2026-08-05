@@ -49,8 +49,11 @@ system-default fallback for `consumer_kind="recall"` when no explicit binding ma
 `BRAIN_CONSUMER_KINDS`; `"*"` remains the explicit wildcard.
 
 **Event interpretation** (`event::interpret`): The `brain.feedback` verb is the
-`FeedbackExplicit` event emitter. `brain.emit` predates this design and its log entries are
-treated as `Irrelevant` to avoid spurious updates during event replay.
+`FeedbackExplicit` event emitter. Legacy rows whose canonical event verb is `brain.emit` predate
+this design and are treated as `Irrelevant` to avoid spurious updates during event replay.
+Every new feedback payload records `originating_verb`; direct calls stamp `brain.feedback`, the
+automatic wrapper stamps `brain.auto_feedback`, and the deprecated alias stamps `brain.emit`. The canonical event verb stays
+`brain.feedback` so replay and historical queries keep one event vocabulary.
 
 ### Section Posteriors (ADR-048)
 
@@ -133,3 +136,7 @@ $$\text{Beta}(\alpha_1 + \alpha_2 - \alpha_{\text{prior}},\; \beta_1 + \beta_2 -
   posterior state. Target IDs remain globally resolvable by ID. Direct `PackRuntime` calls must
   present an authorized token whose namespace matches the parameter; the handler validates that
   equality and never treats the business parameter itself as authority (issue #1505).
+- `brain.auto_feedback` never infers utility from rank. An omitted `signal` returns a no-emit
+  abstention. A supplied signal requires `target_id` to equal exactly one `results[].id`, and
+  result-level serve attribution is copied from that selected result rather than the first hit
+  (issue #1588).

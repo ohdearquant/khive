@@ -796,7 +796,7 @@ async fn gtd_task_mismatch_bypasses_enriched_hint_on_real_link_path() {
         "target_id": tgt.id.to_string(),
         "relation": "extends",
     });
-    let result = pack.handle_link(&token, params).await;
+    let result = pack.handle_link(&token, params, &registry).await;
     assert!(result.is_err(), "task->task extends must be rejected");
     let err_msg = format!("{}", result.unwrap_err());
     assert!(
@@ -819,7 +819,7 @@ async fn gtd_task_mismatch_bypasses_enriched_hint_on_real_link_path() {
         "relation": "depends_on",
     });
     assert!(
-        pack.handle_link(&token, params_ok).await.is_ok(),
+        pack.handle_link(&token, params_ok, &registry).await.is_ok(),
         "task->task depends_on must be accepted by the real link path"
     );
 }
@@ -828,7 +828,7 @@ async fn gtd_task_mismatch_bypasses_enriched_hint_on_real_link_path() {
 #[tokio::test]
 async fn link_invalid_relation_error_suggests_valid_relations() {
     use crate::KgPack;
-    use khive_runtime::KhiveRuntime;
+    use khive_runtime::{KhiveRuntime, VerbRegistryBuilder};
 
     let rt = KhiveRuntime::memory().expect("in-memory runtime");
     let token = rt.authorize(khive_runtime::Namespace::local()).unwrap();
@@ -843,6 +843,10 @@ async fn link_invalid_relation_error_suggests_valid_relations() {
         .expect("create target entity");
 
     let pack = KgPack::new(rt.clone());
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(KgPack::new(rt.clone()));
+    let registry = builder.build().expect("kg registry builds");
+    rt.install_edge_rules(registry.all_edge_rules());
 
     // "depends_on" is a valid relation string but NOT in the concept->concept allowlist.
     let params = json!({
@@ -850,7 +854,7 @@ async fn link_invalid_relation_error_suggests_valid_relations() {
         "target_id": tgt_val.id.to_string(),
         "relation": "depends_on",
     });
-    let result = pack.handle_link(&token, params).await;
+    let result = pack.handle_link(&token, params, &registry).await;
     assert!(
         result.is_err(),
         "#486: depends_on on concept->concept should fail"
@@ -914,7 +918,7 @@ async fn seed_entity_with_id(
 // reverse project->concept legal set before this regression fix.
 #[tokio::test]
 async fn bulk_link_symmetric_rejection_preserves_requested_pair_in_both_modes() {
-    let (rt, token, pack, _registry) = configured_kg_endpoint_test_surface();
+    let (rt, token, pack, registry) = configured_kg_endpoint_test_surface();
     let concept_id =
         uuid::Uuid::parse_str("ffffffff-ffff-ffff-ffff-ffffffffffff").expect("high UUID");
     let project_id = uuid::Uuid::nil();
@@ -932,13 +936,13 @@ async fn bulk_link_symmetric_rejection_preserves_requested_pair_in_both_modes() 
             "atomic": atomic,
         });
         let message = if atomic {
-            pack.handle_link(&token, params)
+            pack.handle_link(&token, params, &registry)
                 .await
                 .expect_err("atomic bulk must reject concept competes_with project")
                 .to_string()
         } else {
             let response = pack
-                .handle_link(&token, params)
+                .handle_link(&token, params, &registry)
                 .await
                 .expect("non-atomic bulk reports entry failures in-band");
             response["errors"][0]["error"]
@@ -1711,7 +1715,7 @@ async fn create_dispatch_emits_embedding_truncation_advisory() {
             json!({
                 "kind": "concept",
                 "name": "warning target",
-                "description": "x".repeat(lattice_embed::MAX_TEXT_CHARS),
+                "description": "x".repeat(lattice_embed::MAX_TEXT_BYTES),
                 "skip_dedup_check": true,
             }),
         )
@@ -1727,14 +1731,14 @@ async fn create_dispatch_emits_embedding_truncation_advisory() {
             json!({
                 "kind": "entity",
                 "id": truncated["id"],
-                "description": "y".repeat(lattice_embed::MAX_TEXT_CHARS + 1),
+                "description": "y".repeat(lattice_embed::MAX_TEXT_BYTES + 1),
             }),
         )
         .await
         .expect("over-limit update");
     assert_eq!(
         updated["description"].as_str().map(str::len),
-        Some(lattice_embed::MAX_TEXT_CHARS + 1),
+        Some(lattice_embed::MAX_TEXT_BYTES + 1),
         "the stored and FTS-indexed source remains complete"
     );
     assert!(
@@ -1781,7 +1785,7 @@ async fn create_dispatch_uses_registry_snapshot_taken_before_embedding() {
         "create",
         json!({
             "kind": "concept",
-            "name": "x".repeat(lattice_embed::MAX_TEXT_CHARS),
+            "name": "x".repeat(lattice_embed::MAX_TEXT_BYTES),
             "skip_dedup_check": true,
         }),
     );
@@ -1912,6 +1916,7 @@ async fn configured_kg_pack() -> (
     khive_runtime::KhiveRuntime,
     khive_runtime::NamespaceToken,
     crate::KgPack,
+    khive_runtime::VerbRegistry,
 ) {
     use crate::KgPack;
     use khive_runtime::VerbRegistryBuilder;
@@ -1923,7 +1928,7 @@ async fn configured_kg_pack() -> (
     rt.install_edge_rules(registry.all_edge_rules());
     let token = rt.authorize(khive_runtime::Namespace::local()).unwrap();
     let pack = KgPack::new(rt.clone());
-    (rt, token, pack)
+    (rt, token, pack, registry)
 }
 
 // ADR-087 Amendment 1 §A9: review-round chains are `decision precedes
@@ -1933,7 +1938,7 @@ async fn configured_kg_pack() -> (
 // `depends_on` rule.
 #[tokio::test]
 async fn link_accepts_decision_precedes_decision() {
-    let (rt, token, pack) = configured_kg_pack().await;
+    let (rt, token, pack, registry) = configured_kg_pack().await;
 
     let round1 = rt
         .create_note(
@@ -1966,14 +1971,14 @@ async fn link_accepts_decision_precedes_decision() {
         "relation": "precedes",
     });
     assert!(
-        pack.handle_link(&token, params).await.is_ok(),
+        pack.handle_link(&token, params, &registry).await.is_ok(),
         "decision->decision precedes must be accepted"
     );
 }
 
 #[tokio::test]
 async fn link_rejects_decision_precedes_observation() {
-    let (rt, token, pack) = configured_kg_pack().await;
+    let (rt, token, pack, registry) = configured_kg_pack().await;
 
     let decision = rt
         .create_note(&token, "decision", None, "a decision", None, None, vec![])
@@ -1998,14 +2003,14 @@ async fn link_rejects_decision_precedes_observation() {
         "relation": "precedes",
     });
     assert!(
-        pack.handle_link(&token, params).await.is_err(),
+        pack.handle_link(&token, params, &registry).await.is_err(),
         "decision->observation precedes must be rejected"
     );
 }
 
 #[tokio::test]
 async fn link_rejects_observation_precedes_decision() {
-    let (rt, token, pack) = configured_kg_pack().await;
+    let (rt, token, pack, registry) = configured_kg_pack().await;
 
     let observation = rt
         .create_note(
@@ -2030,14 +2035,14 @@ async fn link_rejects_observation_precedes_decision() {
         "relation": "precedes",
     });
     assert!(
-        pack.handle_link(&token, params).await.is_err(),
+        pack.handle_link(&token, params, &registry).await.is_err(),
         "observation->decision precedes must be rejected"
     );
 }
 
 #[tokio::test]
 async fn link_entity_precedes_entity_unaffected_by_decision_note_rule() {
-    let (rt, token, pack) = configured_kg_pack().await;
+    let (rt, token, pack, registry) = configured_kg_pack().await;
 
     let src = rt
         .create_entity(&token, "project", None, "step 1", None, None, vec![])
@@ -2054,7 +2059,7 @@ async fn link_entity_precedes_entity_unaffected_by_decision_note_rule() {
         "relation": "precedes",
     });
     assert!(
-        pack.handle_link(&token, params).await.is_ok(),
+        pack.handle_link(&token, params, &registry).await.is_ok(),
         "entity->entity precedes must remain accepted under the composed rule set (base ADR-002 contract)"
     );
 }
@@ -2213,7 +2218,7 @@ async fn merge_note_reason_forwarded_through_registry_dispatch() {
 async fn get_dispatch_after_merge_discloses_kept_id() {
     use khive_runtime::RuntimeError;
 
-    let (rt, token, _pack) = configured_kg_pack().await;
+    let (rt, token, _pack, _registry) = configured_kg_pack().await;
     let mut builder = khive_runtime::VerbRegistryBuilder::new();
     builder.register(crate::KgPack::new(rt.clone()));
     let registry = builder.build().expect("registry build");
@@ -2273,7 +2278,7 @@ async fn get_dispatch_after_merge_discloses_kept_id() {
 
 #[tokio::test]
 async fn get_dispatch_short_prefix_with_include_deleted_returns_deleted_entity() {
-    let (rt, token, _pack) = configured_kg_pack().await;
+    let (rt, token, _pack, _registry) = configured_kg_pack().await;
     let mut builder = khive_runtime::VerbRegistryBuilder::new();
     builder.register(crate::KgPack::new(rt.clone()));
     let registry = builder.build().expect("registry build");
@@ -2303,7 +2308,7 @@ async fn get_dispatch_short_prefix_with_include_deleted_returns_deleted_entity()
 async fn get_dispatch_on_plain_deleted_and_absent_ids_unchanged() {
     use khive_runtime::RuntimeError;
 
-    let (rt, token, _pack) = configured_kg_pack().await;
+    let (rt, token, _pack, _registry) = configured_kg_pack().await;
     let mut builder = khive_runtime::VerbRegistryBuilder::new();
     builder.register(crate::KgPack::new(rt.clone()));
     let registry = builder.build().expect("registry build");
@@ -2346,7 +2351,7 @@ async fn get_dispatch_on_plain_deleted_and_absent_ids_unchanged() {
 // resolving an absorbed uuid still reports a bare `not_found` status.
 #[tokio::test]
 async fn resolve_dispatch_on_merged_uuid_stays_bare_not_found() {
-    let (rt, token, _pack) = configured_kg_pack().await;
+    let (rt, token, _pack, _registry) = configured_kg_pack().await;
     let mut builder = khive_runtime::VerbRegistryBuilder::new();
     builder.register(crate::KgPack::new(rt.clone()));
     let registry = builder.build().expect("registry build");

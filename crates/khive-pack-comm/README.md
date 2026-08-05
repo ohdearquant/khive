@@ -10,7 +10,7 @@ delivery confirmation, and channel polling observability.
 | ---------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `comm.send`      | Send a message, optionally threaded                                                                                                                           |
 | `comm.delivered` | Confirm the internal inbound sibling for an outbound UUID                                                                                                     |
-| `comm.inbox`     | Page and filter inbound messages for the caller                                                                                                               |
+| `comm.inbox`     | Page and filter the caller's inbound inbox or sent-message history, optionally waiting up to 30 seconds for a new matching message                            |
 | `comm.read`      | Mark one or up to 500 inbound messages as read (best-effort: inspect each result's `read`/`mark_error`)                                                       |
 | `comm.unread`    | Count the caller's unread inbound messages without message payloads                                                                                           |
 | `comm.reply`     | Reply to a message, preserving thread linkage                                                                                                                 |
@@ -21,6 +21,20 @@ delivery confirmation, and channel polling observability.
 The internal `comm.ingest` handler is `Visibility::Subhandler` — it lets an
 out-of-band channel adapter (email, Telegram, etc.) write an inbound message
 directly, deduplicated by `external_id`, but it is not callable on the MCP wire.
+
+## `comm.inbox` — optional long poll
+
+`wait_ms` is optional and defaults to `0`, preserving the immediate snapshot
+behavior. When it is positive and the initial filtered query is empty, the
+call waits for a newly committed message and re-runs the same actor, status,
+and sender-filtered query. The maximum is 30,000 ms. Existing messages still
+return immediately, and `limit=0` never waits.
+
+The wake signal is process-local and advisory; the database remains the source
+of truth. Successful `comm.send`/`comm.reply` deliveries and successful,
+non-deduplicated `comm.ingest` writes publish after commit. An unrelated wake
+only causes a filtered re-query, so it cannot leak another actor's message or
+make a filtered call return early with an empty page.
 
 ## `comm.probe` — polling contract
 
@@ -128,13 +142,21 @@ registry
     .await?;
 
 let inbox = registry.dispatch("comm.inbox", json!({"limit": 20})).await?;
+let next = registry.dispatch("comm.inbox", json!({"limit": 20, "wait_ms": 30_000})).await?;
 ```
 
-`comm.inbox` returns `has_more`/`next_offset`; pass the latter back as `offset`
-with otherwise-identical filters to enumerate the complete read-only result.
-Filters include sender exact/prefix/exclusion, inclusive `since`, exclusive
-`before`, and case-insensitive subject/content substring matching. Time bounds
-apply to top-level `created_at`.
+`comm.inbox` defaults to inbound messages. Pass `box="sent"` to list only the
+caller's outbound rows; `to_actor` filters that sent history by recipient, and
+the existing `limit`/`offset`/`since`/`before`/subject/content filters still
+apply. The default inbox behavior is unchanged. Responses return
+`has_more`/`next_offset`; pass the latter back as `offset` with otherwise-identical
+filters to enumerate the complete read-only result. Time bounds apply to
+top-level `created_at`.
+
+Both `comm.inbox` and `comm.thread` accept the same non-empty `fields=[...]`
+projection. Unknown names fail loudly; omitting `fields` preserves the complete
+message view. Stable property aliases such as `from_actor`, `to_actor`, and
+`sent_at` can be requested without returning the full body or `properties` map.
 
 `comm.read(id=...)` keeps the single-message response. The additive
 `comm.read(ids=[...])` form validates 1-500 supplied IDs and returns per-item

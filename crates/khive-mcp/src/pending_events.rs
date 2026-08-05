@@ -151,7 +151,11 @@ pub async fn run_pending_events(
     run_pending_events_with_config(db, None, namespace, verbose).await
 }
 
-/// Config-selecting form of [`run_pending_events`] used by `kkernel exec`.
+/// One-shot drain with an explicit configuration-file selection.
+///
+/// This is the `kkernel exec --pending-events --config …` entrypoint. The
+/// compatibility wrapper above retains the original discovery behavior for
+/// callers that do not carry a config path.
 pub async fn run_pending_events_with_config(
     db: Option<&str>,
     config: Option<&std::path::Path>,
@@ -172,9 +176,10 @@ pub async fn run_pending_events_with_config(
     // (single- or multi-backend), so replayed actions route through the
     // correct per-pack backend exactly like the daemon tick now does — not a
     // single runtime standing in for every pack (the same issue this fix
-    // closes for the daemon-resident tick). An explicit config selection is
-    // threaded through from `kkernel exec`; `None` retains the standard
-    // cwd/database-anchor/home discovery order.
+    // closes for the daemon-resident tick). An explicit `kkernel exec
+    // --config` path is forwarded unchanged; otherwise `config: None` still
+    // triggers `khive.toml`'s standard cwd/home search order inside
+    // `resolve_runtime_config`.
     //
     // This does NOT call `crate::serve::build_server` directly (PR #782):
     // `build_server` derives BOTH

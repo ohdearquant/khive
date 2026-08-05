@@ -40,7 +40,9 @@
 - `gtd_lifecycle_audit` table records every `transition` and `complete` invocation for
   replay and compliance. Writes are best-effort (non-fatal on failure).
 - `depends_on` property stores UUIDs of blocking tasks; `gtd.next` excludes tasks whose
-  blockers are not in `done` state.
+  blockers are not in `done` state by default. Query results report `dependency_state`,
+  `actionable`, and structural `blocked_by` diagnostics; `include_blocked=true` makes
+  `gtd.next` include blocked or broken candidates after ready work.
 
 ### Illocutionary verb classification (Searle 1976) (ADR-025)
 
@@ -70,6 +72,8 @@
 - Pre-validation in `gtd.assign` and `TaskHook.prepare_create` ensures the target of each
   `depends_on` UUID is a `task` note before any storage write. This preserves the
   atomicity invariant: no task is persisted if its dependency chain is invalid.
+- The task hook also validates generic KG property updates and task-to-task `depends_on`
+  links, rejecting direct, transitive, and same-batch dependency cycles before writes.
 
 ## Consistency Notes
 

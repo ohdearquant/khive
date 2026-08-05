@@ -65,13 +65,19 @@ transaction or savepoint and its rollback semantics, so this can run equally
 inside a plain `Connection`, an `unchecked_transaction()`, or a named
 `SAVEPOINT`.
 
-Before deleting, the helper compares the stored row's complete ANN log
-identity (`namespace`, `embedding_model`, `kind`, and `field`) with the
-incoming identity. When they differ, it copies the stored row's identity into
-`ann_write_log` as a `delete`, then deletes the vector and records the incoming
-row as an `upsert`. All three writes share the caller's transaction/savepoint,
-so they commit or roll back together. A same-identity replacement emits only
-the incoming `upsert`; it does not create redundant delete/upsert churn.
+The helper first attempts an identity-constrained delete using `subject_id`,
+`namespace`, `embedding_model`, `kind`, and `field`. That delete is the common
+steady-state path: an affected row proves the old and incoming ANN identities
+match, so the incoming `upsert` log is sufficient and no delete-log
+`INSERT ... SELECT` is prepared. This reduces the common replacement from four
+DML statements to three.
+
+If the constrained delete affects no row, the helper runs the delete-log scan
+by `subject_id`. A returned row carries a different stored identity, so the
+helper logs that identity as `delete` before removing it; no returned row means
+the subject is new and needs no second delete. Cross-identity repair therefore
+retains the original delete-then-upsert log order. Every statement shares the
+caller's transaction/savepoint, so all of them commit or roll back together.
 
 `failpoint_flag`, when `Some` in a `cfg(test)` build, is checked between the
 DELETE and the INSERT so tests can force an error at that exact point and

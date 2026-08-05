@@ -20,6 +20,7 @@ pub use khive_fusion::FusionStrategy;
 const CANDIDATE_MULTIPLIER: u32 = 4;
 
 /// Fuse text and vector hits using the given strategy, returning at most `limit` results.
+/// Positional weighted strategies use `[vector, keyword]` order.
 pub fn fuse_with_strategy(
     text_hits: Vec<TextSearchHit>,
     vector_hits: Vec<VectorSearchHit>,
@@ -91,10 +92,9 @@ fn fuse_sources(
         })
         .collect();
 
-    let sources: Vec<Vec<(Uuid, DeterministicScore)>> = vec![text_source, vector_source]
-        .into_iter()
-        .filter(|s| !s.is_empty())
-        .collect();
+    // Canonical positional order is [vector, keyword]. Empty arms remain in
+    // place: removing one would shift the surviving arm onto the wrong weight.
+    let sources: Vec<Vec<(Uuid, DeterministicScore)>> = vec![vector_source, text_source];
 
     Ok(khive_fusion::fuse(sources, strategy, limit)?
         .into_iter()
@@ -136,6 +136,38 @@ fn merge_sources(left: SearchSource, right: SearchSource) -> SearchSource {
 }
 
 impl KhiveRuntime {
+    async fn retain_alive_search_hits(
+        &self,
+        token: &NamespaceToken,
+        mut fused: Vec<SearchHit>,
+        limit: usize,
+    ) -> RuntimeResult<Vec<SearchHit>> {
+        // Filter out soft-deleted entities. A single query fetches all alive IDs from the
+        // fused candidate pool; any ID absent from the result has been soft-deleted.
+        if !fused.is_empty() {
+            let candidate_ids: Vec<Uuid> = fused.iter().map(|h| h.entity_id).collect();
+            let alive_page = self
+                .entities(token)?
+                .query_entities(
+                    token.namespace().as_str(),
+                    EntityFilter {
+                        ids: candidate_ids,
+                        ..EntityFilter::default()
+                    },
+                    PageRequest {
+                        offset: 0,
+                        limit: u32::try_from(fused.len()).unwrap_or(u32::MAX),
+                    },
+                )
+                .await?;
+            let alive: HashSet<Uuid> = alive_page.items.into_iter().map(|e| e.id).collect();
+            fused.retain(|h| alive.contains(&h.entity_id));
+        }
+
+        fused.truncate(limit);
+        Ok(fused)
+    }
+
     /// Hybrid search with a caller-supplied fusion strategy.
     pub async fn hybrid_search_with_strategy(
         &self,
@@ -184,38 +216,26 @@ impl KhiveRuntime {
             Vec::new()
         };
 
-        let mut fused = fuse_with_strategy(text_hits, vector_hits, &strategy, limit as usize)?;
-
-        // Filter out soft-deleted entities. A single query fetches all alive IDs from the
-        // fused set; any ID absent from the result has been soft-deleted (deleted_at IS NOT NULL).
-        if !fused.is_empty() {
-            let candidate_ids: Vec<Uuid> = fused.iter().map(|h| h.entity_id).collect();
-            let alive_page = self
-                .entities(token)?
-                .query_entities(
-                    token.namespace().as_str(),
-                    EntityFilter {
-                        ids: candidate_ids,
-                        ..EntityFilter::default()
-                    },
-                    PageRequest {
-                        offset: 0,
-                        limit: fused.len() as u32,
-                    },
-                )
-                .await?;
-            let alive: HashSet<Uuid> = alive_page.items.into_iter().map(|e| e.id).collect();
-            fused.retain(|h| alive.contains(&h.entity_id));
-        }
-
-        Ok(fused)
+        // Each arm fetched `candidates` independently, so their union can contain
+        // twice that many distinct IDs. Keep the complete fetched pool through
+        // ranking and the alive check; truncating it first lets stale hits hide
+        // live candidates from the other arm.
+        let fusion_limit = text_hits.len().saturating_add(vector_hits.len());
+        let fused = fuse_with_strategy(text_hits, vector_hits, &strategy, fusion_limit)?;
+        self.retain_alive_search_hits(token, fused, limit as usize)
+            .await
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use khive_storage::types::{TextSearchHit, VectorSearchHit};
+    use chrono::Utc;
+    use khive_storage::types::{TextDocument, TextSearchHit, VectorSearchHit, VectorSearchRequest};
+    use khive_storage::Entity;
+    use lattice_embed::EmbeddingModel;
+
+    use crate::RuntimeConfig;
 
     fn text_hit(id: Uuid, score: f64, title: &str) -> TextSearchHit {
         TextSearchHit {
@@ -233,6 +253,135 @@ mod tests {
             score: DeterministicScore::from_f64(score),
             rank: 1,
         }
+    }
+
+    fn cosine_fixture_vector(dimensions: usize, x: f32, y: f32) -> Vec<f32> {
+        let mut vector = vec![0.0; dimensions];
+        vector[0] = x;
+        vector[1] = y;
+        vector
+    }
+
+    async fn stale_full_prefix_fixture() -> (
+        KhiveRuntime,
+        NamespaceToken,
+        &'static str,
+        Vec<f32>,
+        Vec<TextSearchHit>,
+        Vec<VectorSearchHit>,
+        HashSet<Uuid>,
+    ) {
+        let model = EmbeddingModel::AllMiniLmL6V2;
+        let dimensions = model.dimensions();
+        let rt = KhiveRuntime::new(RuntimeConfig {
+            db_path: None,
+            embedding_model: Some(model),
+            additional_embedding_models: vec![],
+            ..RuntimeConfig::default()
+        })
+        .unwrap();
+        let tok = NamespaceToken::local();
+        let query_text = "fusionrefillterm";
+        let query_vector = cosine_fixture_vector(dimensions, 1.0, 0.0);
+
+        let common_stale_a = Uuid::from_u128(1);
+        let common_stale_b = Uuid::from_u128(2);
+        let text_only_stale = Uuid::from_u128(3);
+        let vector_only_stale = Uuid::from_u128(4);
+
+        let live_text = Entity::new("local", "concept", "live text candidate");
+        let live_vector = Entity::new("local", "concept", "live vector candidate");
+        rt.entities(&tok)
+            .unwrap()
+            .upsert_entities(vec![live_text.clone(), live_vector.clone()])
+            .await
+            .unwrap();
+
+        let document = |subject_id, repetitions: usize| TextDocument {
+            subject_id,
+            kind: SubstrateKind::Entity,
+            namespace: "local".to_string(),
+            title: None,
+            body: std::iter::repeat_n(query_text, repetitions)
+                .collect::<Vec<_>>()
+                .join(" "),
+            tags: vec![],
+            metadata: None,
+            updated_at: Utc::now(),
+        };
+        rt.text(&tok)
+            .unwrap()
+            .upsert_documents(vec![
+                document(common_stale_a, 12),
+                document(common_stale_b, 8),
+                document(text_only_stale, 4),
+                document(live_text.id, 1),
+            ])
+            .await
+            .unwrap();
+
+        let vectors = rt.vectors(&tok).unwrap();
+        for (id, vector) in [
+            (common_stale_a, cosine_fixture_vector(dimensions, 1.0, 0.0)),
+            (common_stale_b, cosine_fixture_vector(dimensions, 0.8, 0.6)),
+            (
+                vector_only_stale,
+                cosine_fixture_vector(dimensions, 0.5, 0.866_025_4),
+            ),
+            (live_vector.id, cosine_fixture_vector(dimensions, -1.0, 0.0)),
+        ] {
+            vectors
+                .insert(
+                    id,
+                    SubstrateKind::Entity,
+                    "local",
+                    "entity.body",
+                    vec![vector],
+                )
+                .await
+                .unwrap();
+        }
+
+        let text_hits = rt
+            .text(&tok)
+            .unwrap()
+            .search(TextSearchRequest {
+                query: query_text.to_string(),
+                mode: TextQueryMode::Plain,
+                filter: Some(TextFilter {
+                    namespaces: vec!["local".to_string()],
+                    ..TextFilter::default()
+                }),
+                top_k: CANDIDATE_MULTIPLIER,
+                snippet_chars: 0,
+            })
+            .await
+            .unwrap();
+        let vector_hits = vectors
+            .search(VectorSearchRequest {
+                query_vectors: vec![query_vector.clone()],
+                top_k: CANDIDATE_MULTIPLIER,
+                namespace: Some("local".to_string()),
+                kind: Some(SubstrateKind::Entity),
+                embedding_model: None,
+                filter: None,
+                backend_hints: None,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(text_hits.len(), CANDIDATE_MULTIPLIER as usize);
+        assert_eq!(vector_hits.len(), CANDIDATE_MULTIPLIER as usize);
+        let live = HashSet::from([live_text.id, live_vector.id]);
+        (
+            rt,
+            tok,
+            query_text,
+            query_vector,
+            text_hits,
+            vector_hits,
+            live,
+        )
     }
 
     // 1. RRF with custom k produces different ordering than k=60
@@ -255,7 +404,7 @@ mod tests {
         assert!(hits_k1[0].score > hits_k60[0].score);
     }
 
-    // 2. Weighted [0.7, 0.3] gives different ordering than [0.3, 0.7]
+    // 2. Canonical [vector, keyword] weights change ordering as documented.
     #[test]
     fn weighted_ordering_depends_on_weights() {
         let a = Uuid::new_v4();
@@ -264,7 +413,7 @@ mod tests {
         let text = vec![text_hit(a, 0.9, "a"), text_hit(b, 0.1, "b")];
         let vec_hits = vec![vector_hit(b, 0.9), vector_hit(a, 0.1)];
 
-        let heavy_text = fuse_with_strategy(
+        let heavy_vector = fuse_with_strategy(
             text.clone(),
             vec_hits.clone(),
             &FusionStrategy::Weighted {
@@ -273,7 +422,7 @@ mod tests {
             10,
         )
         .unwrap();
-        let heavy_vec = fuse_with_strategy(
+        let heavy_keyword = fuse_with_strategy(
             text,
             vec_hits,
             &FusionStrategy::Weighted {
@@ -283,8 +432,8 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(heavy_text[0].entity_id, a);
-        assert_eq!(heavy_vec[0].entity_id, b);
+        assert_eq!(heavy_vector[0].entity_id, b);
+        assert_eq!(heavy_keyword[0].entity_id, a);
     }
 
     // 3. Weighted [7.0, 3.0] = Weighted [0.7, 0.3] (normalization)
@@ -346,18 +495,37 @@ mod tests {
     fn weighted_negative_weight_clamped() {
         let a = Uuid::new_v4();
         let text = vec![text_hit(a, 0.9, "a")];
-        // Negative vector weight → only text contributes
+        // Negative vector weight → only keyword/text contributes.
         let hits = fuse_with_strategy(
             text,
             vec![],
             &FusionStrategy::Weighted {
-                weights: vec![1.0, -0.5],
+                weights: vec![-0.5, 1.0],
             },
             10,
         )
         .unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].entity_id, a);
+    }
+
+    #[test]
+    fn weighted_empty_arm_keeps_canonical_position() {
+        let text_only = Uuid::new_v4();
+        let hits = fuse_with_strategy(
+            vec![text_hit(text_only, 0.9, "text")],
+            vec![],
+            &FusionStrategy::Weighted {
+                // Canonical [vector, keyword]: the only non-empty arm has zero weight.
+                weights: vec![1.0, 0.0],
+            },
+            10,
+        )
+        .unwrap();
+        assert!(
+            hits.is_empty(),
+            "dropping the empty vector arm would incorrectly rebind text to its weight"
+        );
     }
 
     // 6. Union returns max score per entity when same id appears in both lists
@@ -388,10 +556,100 @@ mod tests {
         assert!(hits[0].title.is_none());
     }
 
+    #[test]
+    fn keyword_only_drops_vector() {
+        let text_id = Uuid::new_v4();
+        let vector_id = Uuid::new_v4();
+        let hits = fuse_with_strategy(
+            vec![text_hit(text_id, 0.8, "text")],
+            vec![vector_hit(vector_id, 0.9)],
+            &FusionStrategy::KeywordOnly,
+            10,
+        )
+        .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].entity_id, text_id);
+        assert_eq!(hits[0].source, SearchSource::Text);
+    }
+
     // 8. Default strategy is Rrf{k:60}
     #[test]
     fn default_strategy_is_rrf_k60() {
         assert_eq!(FusionStrategy::default(), FusionStrategy::Rrf { k: 60 });
+    }
+
+    #[tokio::test]
+    async fn hybrid_union_alive_filter_refills_below_complete_four_x_prefix() {
+        let (rt, tok, query_text, query_vector, text_hits, vector_hits, live) =
+            stale_full_prefix_fixture().await;
+        let truncated = fuse_with_strategy(
+            text_hits,
+            vector_hits,
+            &FusionStrategy::Union,
+            CANDIDATE_MULTIPLIER as usize,
+        )
+        .unwrap();
+        assert!(truncated.iter().all(|hit| !live.contains(&hit.entity_id)));
+
+        let hits = rt
+            .hybrid_search_with_strategy(
+                &tok,
+                query_text,
+                Some(query_vector),
+                FusionStrategy::Union,
+                1,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(hits.len(), 1);
+        assert!(live.contains(&hits[0].entity_id));
+    }
+
+    #[tokio::test]
+    async fn hybrid_rrf_alive_filter_refills_below_complete_four_x_prefix() {
+        let (rt, tok, query_text, query_vector, text_hits, vector_hits, live) =
+            stale_full_prefix_fixture().await;
+        let strategy = FusionStrategy::Rrf { k: 60 };
+        let truncated = fuse_with_strategy(
+            text_hits,
+            vector_hits,
+            &strategy,
+            CANDIDATE_MULTIPLIER as usize,
+        )
+        .unwrap();
+        assert!(truncated.iter().all(|hit| !live.contains(&hit.entity_id)));
+
+        let hits = rt
+            .hybrid_search_with_strategy(&tok, query_text, Some(query_vector), strategy, 1)
+            .await
+            .unwrap();
+
+        assert_eq!(hits.len(), 1);
+        assert!(live.contains(&hits[0].entity_id));
+    }
+
+    #[tokio::test]
+    async fn hybrid_default_rrf_alive_filter_refills_below_complete_four_x_prefix() {
+        let (rt, tok, query_text, query_vector, _text_hits, _vector_hits, live) =
+            stale_full_prefix_fixture().await;
+
+        let hits = rt
+            .hybrid_search(
+                &tok,
+                query_text,
+                Some(query_vector),
+                1,
+                None,
+                None,
+                &[],
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(hits.len(), 1);
+        assert!(live.contains(&hits[0].entity_id));
     }
 
     // 9. Roundtrip serde preserves variant
@@ -405,6 +663,7 @@ mod tests {
             },
             FusionStrategy::Union,
             FusionStrategy::VectorOnly,
+            FusionStrategy::KeywordOnly,
         ];
         for strategy in cases {
             let json = serde_json::to_string(&strategy).expect("serialize");

@@ -6,6 +6,14 @@ transaction without invoking the normal async handler. This document covers whic
 in scope, why some are deliberately excluded, and the DML-shape parity guarantees for the
 functions that build those plans.
 
+Pack-owned mutation invariants are adapted at the `kkernel` boundary, where both
+the `VerbRegistry` and this runtime plan vocabulary are visible. For task note
+updates and task dependency links, `kkernel` invokes the same `KindHook` validators
+as canonical KG dispatch after building the substrate plan. Core migration V15's
+transaction-time triggers remain the final backstop: they see earlier statements
+in the same atomic unit and close concurrent check/write races that an async prepare
+pass cannot.
+
 ## Scope: what is excluded and why
 
 `gtd.transition` / `gtd.complete` prepare is deliberately **not** here: their lifecycle

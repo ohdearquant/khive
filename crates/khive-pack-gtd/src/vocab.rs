@@ -169,6 +169,12 @@ pub(crate) static GTD_HANDLERS: [HandlerDef; 5] = [
                 required: false,
                 description: "Filter to this assignee.",
             },
+            ParamDef {
+                name: "include_blocked",
+                param_type: "boolean",
+                required: false,
+                description: "Include status=next/active tasks that are blocked. Returned tasks carry actionable, dependency_state, and blocked_by diagnostics (default false).",
+            },
         ],
     },
     // Declaration: declares a task done or cancelled

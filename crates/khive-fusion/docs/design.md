@@ -23,9 +23,11 @@
 ### Multi-Engine Retrieval (ADR-031)
 
 - The `fuse()` dispatcher accepts results from any number of retrieval sources and routes them
-  through the appropriate strategy. VectorOnly and KeywordOnly are single-source passthrough
-  strategies — supplying multiple sources for these returns an empty vector so wiring errors are
-  detectable without panicking.
+  through the appropriate strategy. Positional source meaning belongs to each caller:
+  two-arm hybrid search uses `[vector, keyword]`, multi-engine fusion uses registry order,
+  and dual-index migration uses `[primary, legacy]`. VectorOnly selects slot 0 and KeywordOnly
+  slot 1 when both hybrid slots are present; a lone source is authoritative for either
+  passthrough mode.
 
 ## Consistency Notes
 

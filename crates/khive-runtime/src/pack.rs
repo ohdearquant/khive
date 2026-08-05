@@ -14,6 +14,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::Instant;
 
+use crate::operations::{LinkSpec, Resolved};
 use crate::runtime::NamespaceToken;
 use async_trait::async_trait;
 use khive_gate::{AllowAllGate, AuditEvent, GateDecision, GateRef, GateRequest};
@@ -30,6 +31,15 @@ pub use khive_types::{
 pub use khive_types::VerbDef;
 
 use crate::validation::ValidationRule;
+
+/// Name of the pack providing the shared CRUD verbs and the general-purpose
+/// note kinds those verbs exist to serve.
+///
+/// Its note kinds are the ones any caller may author freely through `create`
+/// and `update`; every other pack's note kinds are records maintained by that
+/// pack's own verbs. Used by
+/// [`VerbRegistry::pack_owned_note_kinds`].
+pub const GENERIC_CRUD_PACK: &str = "kg";
 
 /// Pack-auxiliary schema plan.
 ///
@@ -223,6 +233,18 @@ pub trait PackRuntime: Send + Sync {
     /// See `docs/api/pack.md#register_note_mutation_hook` for cross-pack notification rationale.
     fn register_note_mutation_hook(&self, _runtime: &KhiveRuntime) {}
 
+    /// Install a note-write validator on the runtime, called at pack
+    /// initialisation with the same timing as `register_note_mutation_hook`.
+    ///
+    /// A pack owning a note kind whose properties carry identity that the
+    /// runtime can derive from the authorization token implements this and
+    /// calls `KhiveRuntime::install_note_write_validator`, so the identity is
+    /// derived at every note-write site rather than trusted from caller input
+    /// on the write paths that reach no pack verb. Default no-op leaves the
+    /// slot absent. The slot holds one validator, so an implementation must
+    /// return properties for kinds it does not own unchanged.
+    fn register_note_write_validator(&self, _runtime: &KhiveRuntime) {}
+
     /// Warm up any in-memory state from persisted snapshots (optional). Called after
     /// all packs are registered but before serving the first request. Must be
     /// idempotent and infallible — errors are logged internally, never propagated.
@@ -257,13 +279,15 @@ pub trait PackRuntime: Send + Sync {
 /// - **Defaults** filled into create args (e.g. `status="inbox"` for tasks)
 /// - **Derived properties** computed from args (e.g. salience from priority)
 /// - **Side-effect writes** after the storage commit (e.g. `depends_on` edges)
+/// - **Cross-pack validation** before shared CRUD mutates an owned kind
 ///
 /// Hooks are stateless from the framework's perspective — they receive the
-/// runtime as a method parameter and operate on the args `Value` directly.
-/// The pack registers them via [`PackRuntime::kind_hook`].
+/// runtime and the current mutation inputs as method parameters. The pack
+/// registers them via [`PackRuntime::kind_hook`].
 ///
 /// Lifecycle verbs (e.g. gtd's `complete`, `transition`) remain pack-owned
-/// verbs and do not flow through this trait — only the create path does.
+/// verbs. Shared `create`, note `update`, and `link` calls flow through this
+/// trait when an endpoint kind has an owning pack hook.
 #[async_trait]
 pub trait KindHook: Send + Sync + std::fmt::Debug {
     /// Mutate args before the storage write. Fill defaults, normalize values,
@@ -291,6 +315,34 @@ pub trait KindHook: Send + Sync + std::fmt::Debug {
         id: uuid::Uuid,
         args: &Value,
     ) -> Result<(), RuntimeError>;
+
+    /// Validate a shared note-property update before storage is mutated.
+    ///
+    /// The default accepts the update. Kind-owning packs override this when a
+    /// property has invariants that generic CRUD cannot know about (for
+    /// example, GTD task dependency acyclicity).
+    async fn validate_note_update(
+        &self,
+        _runtime: &KhiveRuntime,
+        _token: &NamespaceToken,
+        _note: &khive_storage::Note,
+        _properties: Option<&Value>,
+    ) -> Result<(), RuntimeError> {
+        Ok(())
+    }
+
+    /// Validate one or more shared graph links before any edge is written.
+    ///
+    /// A batch is supplied as a unit so a hook can reject a cycle formed only
+    /// by the proposed edges. The default accepts every link.
+    async fn validate_links(
+        &self,
+        _runtime: &KhiveRuntime,
+        _token: &NamespaceToken,
+        _links: &[crate::LinkSpec],
+    ) -> Result<(), RuntimeError> {
+        Ok(())
+    }
 }
 
 /// Optional sub-trait for packs that own private SQL tables and issue UUIDs
@@ -1901,6 +1953,55 @@ impl VerbRegistry {
         None
     }
 
+    /// Run the owning kind's shared-note-update validator, if it declares one.
+    ///
+    /// Both canonical KG dispatch and user-facing atomic preparation call this
+    /// seam so pack-specific property invariants cannot drift between them.
+    pub async fn validate_note_update_hook(
+        &self,
+        runtime: &KhiveRuntime,
+        token: &NamespaceToken,
+        note: &khive_storage::Note,
+        properties: Option<&Value>,
+    ) -> Result<(), RuntimeError> {
+        if let Some(hook) = self.find_kind_hook(&note.kind) {
+            hook.validate_note_update(runtime, token, note, properties)
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Run shared-link validators grouped by the owning source-note kind.
+    ///
+    /// Supplying the whole proposed batch lets a kind hook reject an invariant
+    /// violation formed only by multiple entries in that batch. Sources that
+    /// are not live notes, or whose kind has no hook, remain the canonical
+    /// endpoint validator's responsibility.
+    pub async fn validate_link_hooks(
+        &self,
+        runtime: &KhiveRuntime,
+        token: &NamespaceToken,
+        specs: &[LinkSpec],
+    ) -> Result<(), RuntimeError> {
+        let mut specs_by_kind: HashMap<String, Vec<LinkSpec>> = HashMap::new();
+        for spec in specs {
+            let Some(Resolved::Note(source)) = runtime.resolve_by_id(token, spec.source_id).await?
+            else {
+                continue;
+            };
+            specs_by_kind
+                .entry(source.kind)
+                .or_default()
+                .push(spec.clone());
+        }
+        for (kind, kind_specs) in specs_by_kind {
+            if let Some(hook) = self.find_kind_hook(&kind) {
+                hook.validate_links(runtime, token, &kind_specs).await?;
+            }
+        }
+        Ok(())
+    }
+
     /// Whether any registered pack declares a handler with this verb name.
     ///
     /// A non-dispatch capability check: callers that would otherwise pay a
@@ -1960,6 +2061,33 @@ impl VerbRegistry {
             .iter()
             .flat_map(|p| p.note_kinds().iter().copied())
             .filter(|k| seen.insert(*k))
+            .collect()
+    }
+
+    /// Note kinds owned by a pack, i.e. every kind in [`all_note_kinds`] that
+    /// is not one of the generic-CRUD pack's own kinds.
+    ///
+    /// [`GENERIC_CRUD_PACK`] declares the general-purpose note kinds the shared
+    /// CRUD verbs exist to serve (`observation`, `insight`, …); every other
+    /// pack's kinds are records that pack's own verbs create and maintain.
+    /// Derived from the packs' `NOTE_KINDS` constants, so a pack that adds or
+    /// drops a kind moves this set with it — nothing is hardcoded here but the
+    /// name of the generic pack itself.
+    ///
+    /// [`all_note_kinds`]: Self::all_note_kinds
+    pub fn pack_owned_note_kinds(&self) -> Vec<&'static str> {
+        let generic: std::collections::HashSet<&'static str> = self
+            .packs
+            .iter()
+            .filter(|p| p.name() == GENERIC_CRUD_PACK)
+            .flat_map(|p| p.note_kinds().iter().copied())
+            .collect();
+        let mut seen = std::collections::HashSet::new();
+        self.packs
+            .iter()
+            .filter(|p| p.name() != GENERIC_CRUD_PACK)
+            .flat_map(|p| p.note_kinds().iter().copied())
+            .filter(|k| !generic.contains(k) && seen.insert(*k))
             .collect()
     }
 
@@ -2136,6 +2264,19 @@ impl VerbRegistry {
     pub fn call_register_note_mutation_hooks(&self, runtime: &KhiveRuntime) {
         for pack in self.packs.iter() {
             pack.register_note_mutation_hook(runtime);
+        }
+    }
+
+    /// Invoke `PackRuntime::register_note_write_validator` on every registered pack.
+    ///
+    /// Called by the transport during startup with the same timing as
+    /// `call_register_note_mutation_hooks`, so note-write validation is active
+    /// at the runtime layer for every write path — the generic `create` verb,
+    /// direct Rust callers, and proposal apply, none of which dispatch a pack
+    /// hook of their own on the note-write.
+    pub fn call_register_note_write_validators(&self, runtime: &KhiveRuntime) {
+        for pack in self.packs.iter() {
+            pack.register_note_write_validator(runtime);
         }
     }
 
@@ -2561,12 +2702,20 @@ fn build_audit_storage_event(
     storage_event
 }
 
+static AUDIT_APPEND_FAILURES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub(crate) fn audit_append_failure_count() -> u64 {
+    AUDIT_APPEND_FAILURES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Append an audit event, logging and swallowing store failures.
 ///
 /// Audit persistence is best-effort everywhere in the dispatch path: a store
-/// write failure must never fail the verb call it is auditing.
+/// write failure must never fail the verb call it is auditing. Every swallowed
+/// failure increments the process-wide diagnostics counter above.
 async fn append_audit_event_best_effort(store: &Arc<dyn EventStore>, event: Event, verb: &str) {
     if let Err(store_err) = store.append_event(event).await {
+        AUDIT_APPEND_FAILURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         tracing::warn!(
             verb,
             error = %store_err,
@@ -4197,11 +4346,17 @@ mod tests {
     #[derive(Default, Debug)]
     struct MemoryEventStore {
         events: std::sync::Mutex<Vec<Event>>,
+        fail_appends: bool,
     }
 
     #[async_trait]
     impl EventStore for MemoryEventStore {
         async fn append_event(&self, event: Event) -> khive_storage::StorageResult<()> {
+            if self.fail_appends {
+                return Err(khive_storage::StorageError::Internal(
+                    "injected audit append failure".to_string(),
+                ));
+            }
             self.events.lock().unwrap().push(event);
             Ok(())
         }
@@ -4366,6 +4521,46 @@ mod tests {
         assert_eq!(ev.namespace, "test-ns");
         assert_eq!(ev.substrate, SubstrateKind::Event);
         assert_eq!(ev.outcome, EventOutcome::Success);
+    }
+
+    #[tokio::test]
+    #[serial(audit_append_failures)]
+    async fn swallowed_audit_append_failure_is_counted_without_failing_dispatch() {
+        let before = audit_append_failure_count();
+
+        let successful_store = Arc::new(MemoryEventStore::default());
+        let mut successful_builder = VerbRegistryBuilder::new();
+        successful_builder.register(AlphaPack);
+        successful_builder.with_event_store(successful_store);
+        let successful_registry = successful_builder.build().expect("registry builds");
+        successful_registry
+            .dispatch("list", Value::Null)
+            .await
+            .expect("successful audit append must not affect dispatch");
+        assert_eq!(
+            audit_append_failure_count(),
+            before,
+            "successful audit appends must not increment the failure counter"
+        );
+
+        let failing_store = Arc::new(MemoryEventStore {
+            fail_appends: true,
+            ..MemoryEventStore::default()
+        });
+        let mut failing_builder = VerbRegistryBuilder::new();
+        failing_builder.register(AlphaPack);
+        failing_builder.with_event_store(failing_store);
+        let failing_registry = failing_builder.build().expect("registry builds");
+        failing_registry
+            .dispatch("list", Value::Null)
+            .await
+            .expect("best-effort audit failure must preserve dispatch success");
+
+        assert_eq!(
+            audit_append_failure_count(),
+            before + 1,
+            "the swallowed append failure must remain visible to diagnostics"
+        );
     }
 
     #[tokio::test]

@@ -9,8 +9,8 @@ use std::sync::Arc;
 
 use khive_pack_comm::CommPack;
 use khive_runtime::{
-    AllowAllGate, BackendId, KhiveRuntime, Namespace, NamespaceToken, RuntimeConfig, VerbRegistry,
-    VerbRegistryBuilder,
+    AllowAllGate, BackendId, KhiveRuntime, Namespace, NamespaceToken, RequestIdentity,
+    RuntimeConfig, VerbRegistry, VerbRegistryBuilder,
 };
 use khive_storage::types::{SqlRow, SqlValue};
 use khive_types::Pack;
@@ -391,6 +391,413 @@ async fn delivered_rejects_short_or_malformed_ids() {
             "error must explain the stable correlation requirement: {error}"
         );
     }
+}
+
+#[tokio::test]
+async fn inbox_long_poll_wakes_after_concurrent_ingest() {
+    let (registry, _rt) = build_registry_for_ns("local");
+    let waiter_registry = registry.clone();
+    let started = std::time::Instant::now();
+    let mut waiter = tokio::spawn(async move {
+        waiter_registry
+            .dispatch(
+                "comm.inbox",
+                serde_json::json!({
+                    "status": "all",
+                    "from_actor": "email:sender@example.com",
+                    "content_contains": "wake the blocked inbox",
+                    "wait_ms": 5_000,
+                }),
+            )
+            .await
+    });
+
+    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    assert!(
+        !waiter.is_finished(),
+        "empty inbox must remain blocked before a matching ingest"
+    );
+
+    registry
+        .dispatch(
+            "comm.ingest",
+            serde_json::json!({
+                "namespace": "local",
+                "from": "email:other@example.com",
+                "to": "local",
+                "content": "unrelated wake",
+                "external_id": "imap:long-poll:1:1",
+            }),
+        )
+        .await
+        .expect("unrelated ingest succeeds");
+    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    assert!(
+        !waiter.is_finished(),
+        "an unrelated signal must re-query and keep waiting"
+    );
+
+    registry
+        .dispatch(
+            "comm.ingest",
+            serde_json::json!({
+                "namespace": "local",
+                "from": "email:sender@example.com",
+                "to": "local",
+                "content": "same sender, wrong content",
+                "external_id": "imap:long-poll:1:content-miss",
+            }),
+        )
+        .await
+        .expect("same-sender non-matching ingest succeeds");
+    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    assert!(
+        !waiter.is_finished(),
+        "a wake that fails a post-query text filter must keep waiting"
+    );
+
+    let ingest = registry
+        .dispatch(
+            "comm.ingest",
+            serde_json::json!({
+                "namespace": "local",
+                "from": "email:sender@example.com",
+                "to": "local",
+                "content": "wake the blocked inbox",
+                "external_id": "imap:long-poll:1:2",
+            }),
+        )
+        .await
+        .expect("concurrent ingest succeeds");
+    assert_eq!(ingest["deduplicated"].as_bool(), Some(false));
+
+    let inbox = match tokio::time::timeout(std::time::Duration::from_secs(1), &mut waiter).await {
+        Ok(joined) => joined
+            .expect("long-poll task must not panic")
+            .expect("long-poll inbox succeeds"),
+        Err(_) => {
+            waiter.abort();
+            panic!("long-poll inbox did not wake within one second of ingest");
+        }
+    };
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(1),
+        "signal wake must beat the five-second polling baseline"
+    );
+    assert_eq!(inbox["count"].as_u64(), Some(1));
+    assert_eq!(
+        inbox["messages"][0]["content"].as_str(),
+        Some("wake the blocked inbox")
+    );
+    assert_eq!(inbox["offset"].as_u64(), Some(0));
+    assert_eq!(inbox["has_more"].as_bool(), Some(false));
+    assert!(inbox["next_offset"].is_null());
+}
+
+#[tokio::test]
+async fn inbox_long_poll_wakes_after_concurrent_send() {
+    let (registry, _rt) = build_registry_for_ns("local");
+    let waiter_registry = registry.clone();
+    let mut waiter = tokio::spawn(async move {
+        waiter_registry
+            .dispatch(
+                "comm.inbox",
+                serde_json::json!({ "status": "all", "wait_ms": 5_000 }),
+            )
+            .await
+    });
+
+    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    assert!(
+        !waiter.is_finished(),
+        "empty inbox must remain blocked before a matching send"
+    );
+
+    registry
+        .dispatch(
+            "comm.send",
+            serde_json::json!({ "to": "local", "content": "send wakes the inbox" }),
+        )
+        .await
+        .expect("concurrent send succeeds");
+
+    let inbox = match tokio::time::timeout(std::time::Duration::from_secs(1), &mut waiter).await {
+        Ok(joined) => joined
+            .expect("long-poll task must not panic")
+            .expect("long-poll inbox succeeds"),
+        Err(_) => {
+            waiter.abort();
+            panic!("long-poll inbox did not wake within one second of send");
+        }
+    };
+    assert_eq!(inbox["count"].as_u64(), Some(1));
+    assert_eq!(
+        inbox["messages"][0]["content"].as_str(),
+        Some("send wakes the inbox")
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn inbox_long_poll_stops_at_requested_budget() {
+    let (registry, _rt) = build_registry_for_ns("local");
+    let started = tokio::time::Instant::now();
+
+    let inbox = registry
+        .dispatch(
+            "comm.inbox",
+            serde_json::json!({ "status": "all", "wait_ms": 250 }),
+        )
+        .await
+        .expect("empty long poll succeeds at its deadline");
+
+    assert_eq!(inbox["count"].as_u64(), Some(0));
+    assert_eq!(
+        tokio::time::Instant::now().duration_since(started),
+        std::time::Duration::from_millis(250),
+        "the signal wait must use one fixed budget rather than resetting it"
+    );
+}
+
+#[tokio::test]
+async fn inbox_rejects_wait_budget_above_thirty_seconds() {
+    let (registry, _rt) = build_registry();
+
+    let err = registry
+        .dispatch("comm.inbox", serde_json::json!({ "wait_ms": 30_001 }))
+        .await
+        .expect_err("oversized long-poll budget must be rejected");
+    assert!(
+        err.to_string().contains("wait_ms") && err.to_string().contains("30000"),
+        "error must name wait_ms and its maximum: {err}"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn inbox_count_only_never_waits() {
+    let (registry, _rt) = build_registry_for_ns("local");
+    let started = tokio::time::Instant::now();
+
+    let inbox = registry
+        .dispatch(
+            "comm.inbox",
+            serde_json::json!({ "limit": 0, "wait_ms": 5_000 }),
+        )
+        .await
+        .expect("count-only inbox succeeds");
+
+    assert_eq!(inbox["count"].as_u64(), Some(0));
+    assert!(
+        inbox["messages"]
+            .as_array()
+            .is_some_and(|rows| rows.is_empty()),
+        "count-only inbox returns no message payloads: {inbox}"
+    );
+    assert_eq!(
+        tokio::time::Instant::now().duration_since(started),
+        std::time::Duration::ZERO,
+        "limit=0 must return immediately even with a positive wait_ms"
+    );
+}
+
+#[tokio::test]
+async fn inbox_long_poll_returns_immediately_when_matches_exist() {
+    let (registry, _rt) = build_registry_for_ns("local");
+
+    registry
+        .dispatch(
+            "comm.send",
+            serde_json::json!({ "to": "local", "content": "already waiting" }),
+        )
+        .await
+        .expect("send succeeds");
+
+    let started = std::time::Instant::now();
+    let inbox = registry
+        .dispatch(
+            "comm.inbox",
+            serde_json::json!({ "status": "all", "wait_ms": 5_000 }),
+        )
+        .await
+        .expect("long poll over a non-empty inbox succeeds");
+
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(1),
+        "an initial query with matches must return without waiting out the budget"
+    );
+    assert_eq!(inbox["count"].as_u64(), Some(1));
+    assert_eq!(
+        inbox["messages"][0]["content"].as_str(),
+        Some("already waiting")
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn inbox_long_poll_accepts_thirty_second_budget() {
+    let (registry, _rt) = build_registry_for_ns("local");
+    let started = tokio::time::Instant::now();
+
+    let inbox = registry
+        .dispatch(
+            "comm.inbox",
+            serde_json::json!({ "status": "all", "wait_ms": 30_000 }),
+        )
+        .await
+        .expect("the inclusive maximum wait_ms must be accepted");
+
+    assert_eq!(inbox["count"].as_u64(), Some(0));
+    assert_eq!(
+        tokio::time::Instant::now().duration_since(started),
+        std::time::Duration::from_millis(30_000),
+        "wait_ms=30000 is the inclusive boundary and must run its full budget"
+    );
+}
+
+#[tokio::test]
+async fn inbox_rejects_non_numeric_wait_ms() {
+    let (registry, _rt) = build_registry();
+
+    let err = registry
+        .dispatch("comm.inbox", serde_json::json!({ "wait_ms": "soon" }))
+        .await
+        .expect_err("a non-numeric wait_ms must be rejected");
+    assert!(
+        err.to_string().contains("invalid input"),
+        "a non-numeric wait_ms must fail parameter deserialization: {err}"
+    );
+
+    let err = registry
+        .dispatch("comm.inbox", serde_json::json!({ "wait_ms": -5 }))
+        .await
+        .expect_err("a negative wait_ms must be rejected");
+    assert!(
+        err.to_string().contains("invalid input"),
+        "a negative wait_ms must fail parameter deserialization: {err}"
+    );
+}
+
+#[tokio::test]
+async fn inbox_long_poll_wakes_after_concurrent_reply() {
+    let (registry, _rt) = build_registry_for_ns("local");
+    let waiter_registry = registry.clone();
+    let mut waiter = tokio::spawn(async move {
+        waiter_registry
+            .dispatch(
+                "comm.inbox",
+                serde_json::json!({
+                    "status": "all",
+                    "content_contains": "reply wake arrives",
+                    "wait_ms": 5_000,
+                }),
+            )
+            .await
+    });
+
+    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    assert!(
+        !waiter.is_finished(),
+        "empty inbox must remain blocked before a matching reply"
+    );
+
+    let original = registry
+        .dispatch(
+            "comm.send",
+            serde_json::json!({ "to": "local", "content": "original for reply wake" }),
+        )
+        .await
+        .expect("send succeeds");
+    let original_full_id = original["full_id"].as_str().expect("send returns full_id");
+
+    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    assert!(
+        !waiter.is_finished(),
+        "a send that fails the content filter must keep the reply waiter waiting"
+    );
+
+    registry
+        .dispatch(
+            "comm.reply",
+            serde_json::json!({ "id": original_full_id, "content": "reply wake arrives" }),
+        )
+        .await
+        .expect("reply succeeds");
+
+    let inbox = match tokio::time::timeout(std::time::Duration::from_secs(1), &mut waiter).await {
+        Ok(joined) => joined
+            .expect("long-poll task must not panic")
+            .expect("long-poll inbox succeeds"),
+        Err(_) => {
+            waiter.abort();
+            panic!("long-poll inbox did not wake within one second of reply");
+        }
+    };
+    assert_eq!(inbox["count"].as_u64(), Some(1));
+    assert_eq!(
+        inbox["messages"][0]["content"].as_str(),
+        Some("reply wake arrives")
+    );
+}
+
+#[tokio::test]
+async fn inbox_long_poll_with_offset_wakes_and_pages() {
+    let (registry, _rt) = build_registry_for_ns("local");
+
+    registry
+        .dispatch(
+            "comm.send",
+            serde_json::json!({ "to": "local", "content": "page: first" }),
+        )
+        .await
+        .expect("first send succeeds");
+    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    registry
+        .dispatch(
+            "comm.send",
+            serde_json::json!({ "to": "local", "content": "page: second" }),
+        )
+        .await
+        .expect("second send succeeds");
+    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+
+    let waiter_registry = registry.clone();
+    let mut waiter = tokio::spawn(async move {
+        waiter_registry
+            .dispatch(
+                "comm.inbox",
+                serde_json::json!({ "status": "all", "offset": 2, "wait_ms": 5_000 }),
+            )
+            .await
+    });
+
+    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    assert!(
+        !waiter.is_finished(),
+        "an offset beyond the current last page must keep waiting"
+    );
+
+    registry
+        .dispatch(
+            "comm.send",
+            serde_json::json!({ "to": "local", "content": "page: third" }),
+        )
+        .await
+        .expect("third send succeeds");
+
+    let inbox = match tokio::time::timeout(std::time::Duration::from_secs(1), &mut waiter).await {
+        Ok(joined) => joined
+            .expect("long-poll task must not panic")
+            .expect("long-poll inbox succeeds"),
+        Err(_) => {
+            waiter.abort();
+            panic!("long-poll inbox did not wake within one second of the third send");
+        }
+    };
+    assert_eq!(inbox["count"].as_u64(), Some(1));
+    assert_eq!(inbox["offset"].as_u64(), Some(2));
+    assert_eq!(
+        inbox["messages"][0]["content"].as_str(),
+        Some("page: first"),
+        "the same-offset re-query must page from the newest-first filtered sequence"
+    );
 }
 
 #[tokio::test]
@@ -1588,22 +1995,33 @@ async fn test_inbox_returns_self_send_as_inbound() {
 async fn test_list_message_thread_id_filter() {
     let (send_registry, rt) = build_registry_for_ns("lambda:khive");
 
-    // Send two messages — one with a thread_id, one without.
-    let msg1 = send_registry
+    // Establish a real thread root, then send one message onto it and one
+    // outside it (a fabricated thread_id is rejected at the send boundary,
+    // so the filter fixture must thread onto an existing root).
+    let root = send_registry
+        .dispatch(
+            "comm.send",
+            serde_json::json!({ "to": "lambda:khive", "content": "thread root" }),
+        )
+        .await
+        .expect("send root succeeds");
+    let thread_id = root
+        .get("full_id")
+        .and_then(|v| v.as_str())
+        .expect("root full_id")
+        .to_string();
+
+    send_registry
         .dispatch(
             "comm.send",
             serde_json::json!({
                 "to": "lambda:khive",
                 "content": "threaded message",
-                "thread_id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+                "thread_id": thread_id
             }),
         )
         .await
-        .expect("send msg1 succeeds");
-    let _thread_id = msg1
-        .get("full_id")
-        .and_then(|v| v.as_str())
-        .expect("msg1 full_id");
+        .expect("send threaded message succeeds");
 
     send_registry
         .dispatch(
@@ -1625,14 +2043,19 @@ async fn test_list_message_thread_id_filter() {
             "list",
             serde_json::json!({
                 "kind": "message",
-                "thread_id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+                "thread_id": thread_id
             }),
         )
         .await
         .expect("list with thread_id filter succeeds");
 
     let items = result.as_array().expect("list returns an array");
-    // Every returned message must have the requested thread_id.
+    // The filter must actually select rows (a vacuously empty pass proves
+    // nothing) and every returned message must carry the requested thread_id.
+    assert!(
+        !items.is_empty(),
+        "CC-2 C1 regression: list(thread_id=X) returned no rows for a thread with a live message"
+    );
     for item in items {
         let stored_thread = item
             .get("properties")
@@ -1640,7 +2063,7 @@ async fn test_list_message_thread_id_filter() {
             .and_then(|v| v.as_str())
             .unwrap_or("");
         assert_eq!(
-            stored_thread, "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+            stored_thread, thread_id,
             "CC-2 C1 regression: list(thread_id=X) must only return messages in that thread; got {item}"
         );
     }
@@ -3073,6 +3496,119 @@ async fn send_rejects_malformed_thread_id() {
     assert!(
         err.is_err(),
         "send with malformed thread_id must fail; got: {err:?}"
+    );
+}
+
+/// send with a UUID-shaped but unresolvable thread_id must fail closed (issue
+/// #1673): the error names the unresolvable id and no message row is persisted.
+#[tokio::test]
+async fn send_rejects_unresolvable_thread_id() {
+    use khive_storage::note::{FilterOp, NoteFilter, PropertyFilter};
+    use khive_storage::types::PageRequest;
+
+    let (registry, rt) = build_registry_for_ns("local");
+
+    let phantom_thread_id = uuid::Uuid::new_v4().as_hyphenated().to_string();
+    let err = registry
+        .dispatch(
+            "comm.send",
+            serde_json::json!({
+                "to": "local",
+                "content": "stranded reply",
+                "thread_id": phantom_thread_id,
+            }),
+        )
+        .await
+        .expect_err("send with a thread_id no message carries must fail");
+    let err_text = format!("{err:?}");
+    assert!(
+        err_text.contains(&phantom_thread_id),
+        "the error must name the unresolvable thread_id {phantom_thread_id:?}; got {err_text}"
+    );
+
+    let token = rt.authorize(Namespace::local()).expect("local token");
+    let store = rt.notes(&token).expect("note store");
+    let stranded_filter = NoteFilter {
+        kind: Some("message".to_string()),
+        property_filters: vec![PropertyFilter {
+            json_path: "$.thread_id".to_string(),
+            op: FilterOp::Eq,
+            value: SqlValue::Text(phantom_thread_id.clone()),
+        }],
+        ..Default::default()
+    };
+    let stranded = store
+        .query_notes_filtered("local", &stranded_filter, PageRequest::default())
+        .await
+        .expect("filtered query");
+    assert!(
+        stranded.items.is_empty(),
+        "a rejected send must leave no message row behind; got {:?}",
+        stranded
+            .items
+            .iter()
+            .map(|n| &n.content)
+            .collect::<Vec<_>>()
+    );
+    let all = rt
+        .list_notes(&token, Some("message"), 100, 0)
+        .await
+        .expect("list messages");
+    assert!(
+        all.is_empty(),
+        "a rejected send must persist nothing at all; got {:?}",
+        all.iter().map(|n| &n.content).collect::<Vec<_>>()
+    );
+}
+
+/// send with a thread_id that resolves to an existing thread must still
+/// thread correctly (issue #1673 must not regress legitimate threading).
+#[tokio::test]
+async fn send_accepts_resolvable_thread_id() {
+    let (registry, _rt) = build_registry_for_ns("local");
+
+    let root = registry
+        .dispatch(
+            "comm.send",
+            serde_json::json!({ "to": "local", "content": "root message" }),
+        )
+        .await
+        .expect("root send succeeds");
+    let root_id = root
+        .get("full_id")
+        .and_then(|v| v.as_str())
+        .expect("full_id present")
+        .to_string();
+
+    registry
+        .dispatch(
+            "comm.send",
+            serde_json::json!({
+                "to": "local",
+                "content": "threaded follow-up",
+                "thread_id": root_id,
+            }),
+        )
+        .await
+        .expect("send threaded onto an existing root must succeed");
+
+    let thread = registry
+        .dispatch("comm.thread", serde_json::json!({ "id": root_id }))
+        .await
+        .expect("thread lookup succeeds");
+    let messages = thread["messages"].as_array().expect("messages array");
+    for expected_content in ["root message", "threaded follow-up"] {
+        assert!(
+            messages
+                .iter()
+                .any(|message| message["content"].as_str() == Some(expected_content)),
+            "thread must contain {expected_content:?}; got {thread}"
+        );
+    }
+    assert_eq!(
+        thread["thread_id"].as_str(),
+        Some(root_id.as_str()),
+        "the follow-up must land on the supplied root thread; got {thread}"
     );
 }
 
@@ -9612,4 +10148,1611 @@ async fn i1422_rejects_invalid_filter_and_bulk_shapes() {
         )
         .await
         .is_err());
+}
+
+// ---- ADR-124 note-write identity guard: update-path refusal on pack-owned kinds ----
+
+/// Build a registry the same way as [`build_registry`] but also install the
+/// pack-owned note kind set, mirroring `khive-mcp`'s boot path
+/// (`KhiveMcpServer::with_packs`). Without this the runtime never learns
+/// `message` is pack-owned and the guard stays inert.
+fn build_registry_with_owned_kinds() -> (VerbRegistry, KhiveRuntime) {
+    let (registry, rt) = build_registry();
+    rt.install_pack_owned_note_kinds(
+        registry
+            .pack_owned_note_kinds()
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
+    );
+    (registry, rt)
+}
+
+/// Build a registry the same way as [`build_registry_with_owned_kinds`] but
+/// also install the pack-owned note-write validator, mirroring both
+/// `khive-mcp` boot paths. A test exercising the CREATE- or MERGE-path guard
+/// against a registry that skips this call proves nothing: the derive/preserve
+/// step is inert on an unwired runtime exactly like the update-path refusal
+/// was inert before `install_pack_owned_note_kinds` existed.
+fn build_registry_with_owned_kinds_and_validator() -> (VerbRegistry, KhiveRuntime) {
+    let (registry, rt) = build_registry_with_owned_kinds();
+    registry.call_register_note_write_validators(&rt);
+    (registry, rt)
+}
+
+/// The confirmed hole, reproduced as a test: a generic `update(properties=
+/// {from_actor: ...})` must no longer be able to forge the handler-stamped
+/// `from_actor` on a `message` note. This is the central regression test —
+/// send a message, forge via update, assert the forgery is refused and the
+/// stored value is unchanged.
+///
+/// Table-driven over every key in `OWNER_ESTABLISHED_PROPERTIES`
+/// (khive-runtime's `curation.rs`, kept in sync by hand here since the
+/// const is crate-private and this is a different crate). Nothing here
+/// detects that drift: a key added to the const without an arm added below
+/// leaves this test green and that key uncovered, so a change that protects
+/// a new key adds its arm here in the same change. For each key, a complete snapshot of
+/// the note's stored `properties` is compared before and after the refused
+/// attempt — not just a handful of named fields — so a forgery that lands
+/// on any untested field is still caught.
+#[tokio::test]
+async fn update_refuses_to_forge_owner_established_properties_on_message_note() {
+    let (registry, _rt) = build_registry_with_owned_kinds();
+
+    let sent = registry
+        .dispatch(
+            "comm.send",
+            serde_json::json!({"to": "local", "content": "identity guard probe"}),
+        )
+        .await
+        .expect("self-send must succeed");
+    let full_id = sent
+        .get("full_id")
+        .and_then(serde_json::Value::as_str)
+        .expect("send must return full_id")
+        .to_string();
+
+    for (key, forged_value) in [
+        ("from_actor", "lambda:leo"),
+        ("to_actor", "lambda:leo"),
+        ("direction", "inbound"),
+        ("sent_at", "1970-01-01T00:00:00Z"),
+        ("outbound_ref", "00000000-0000-0000-0000-000000000000"),
+        ("thread_id", "forged-thread"),
+        ("subject", "forged-subject"),
+        ("wire_message_id", "<forged@example.com>"),
+        ("external_id", "<forged-external@example.com>"),
+    ] {
+        let before = registry
+            .dispatch("get", serde_json::json!({"id": full_id}))
+            .await
+            .expect("get must succeed");
+        let before_props = before["properties"].clone();
+
+        let err = registry
+            .dispatch(
+                "update",
+                serde_json::json!({"id": full_id, "properties": {key: forged_value}}),
+            )
+            .await
+            .expect_err(&format!(
+                "update naming `{key}` on a message note must be refused"
+            ));
+        let msg = format!("{err}");
+        assert!(
+            msg.contains(key),
+            "refusal error must name the offending key `{key}`; got: {msg}"
+        );
+        assert!(
+            !msg.contains(forged_value),
+            "refusal error must never echo the attempted value `{forged_value}` \
+             (secret-gate discipline applies to error strings); got: {msg}"
+        );
+
+        let after = registry
+            .dispatch("get", serde_json::json!({"id": full_id}))
+            .await
+            .expect("get must succeed");
+        assert_eq!(
+            after["properties"],
+            before_props,
+            "refused update naming `{key}` must leave the ENTIRE stored properties \
+             object unchanged; got before={before_props} after={after}",
+            after = after["properties"]
+        );
+    }
+}
+
+/// Positive arm: a non-owned property update on the same `message` note must
+/// still succeed and round-trip — the guard admits everything it does not
+/// specifically name.
+#[tokio::test]
+async fn update_admits_non_owned_properties_on_message_note() {
+    let (registry, _rt) = build_registry_with_owned_kinds();
+
+    let sent = registry
+        .dispatch(
+            "comm.send",
+            serde_json::json!({"to": "local", "content": "identity guard positive arm"}),
+        )
+        .await
+        .expect("self-send must succeed");
+    let full_id = sent
+        .get("full_id")
+        .and_then(serde_json::Value::as_str)
+        .expect("send must return full_id")
+        .to_string();
+
+    registry
+        .dispatch(
+            "update",
+            serde_json::json!({"id": full_id, "properties": {"blocked_on": "review"}}),
+        )
+        .await
+        .expect("update naming only a non-owned key must succeed");
+
+    let after = registry
+        .dispatch("get", serde_json::json!({"id": full_id}))
+        .await
+        .expect("get must succeed");
+    assert_eq!(
+        after["properties"]["blocked_on"], "review",
+        "non-owned property must round-trip"
+    );
+    assert!(
+        after["properties"]["from_actor"].is_string(),
+        "from_actor must still be present and untouched by the unrelated patch"
+    );
+}
+
+/// The guard fires only on pack-owned kinds: naming `from_actor` on a base
+/// kg note kind (e.g. `observation`) must succeed.
+#[tokio::test]
+async fn update_permits_from_actor_key_on_generic_note_kind() {
+    let (registry, _rt) = build_registry_with_owned_kinds();
+
+    let created = registry
+        .dispatch(
+            "create",
+            serde_json::json!({"kind": "observation", "content": "generic-kind arm"}),
+        )
+        .await
+        .expect("create observation must succeed");
+    let id = created
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .expect("create must return id")
+        .to_string();
+
+    registry
+        .dispatch(
+            "update",
+            serde_json::json!({"id": id, "properties": {"from_actor": "anyone"}}),
+        )
+        .await
+        .expect("`from_actor` is not a reserved key on a non-pack-owned note kind");
+
+    let after = registry
+        .dispatch("get", serde_json::json!({"id": id}))
+        .await
+        .expect("get must succeed");
+    assert_eq!(after["properties"]["from_actor"], "anyone");
+}
+
+/// A non-object `properties` patch on a `message` note is refused: it would
+/// replace the whole property object (erasing every owned key) rather than
+/// merging into it.
+#[tokio::test]
+async fn update_refuses_non_object_properties_patch_on_message_note() {
+    let (registry, _rt) = build_registry_with_owned_kinds();
+
+    let sent = registry
+        .dispatch(
+            "comm.send",
+            serde_json::json!({"to": "local", "content": "non-object patch arm"}),
+        )
+        .await
+        .expect("self-send must succeed");
+    let full_id = sent
+        .get("full_id")
+        .and_then(serde_json::Value::as_str)
+        .expect("send must return full_id")
+        .to_string();
+
+    let err = registry
+        .dispatch(
+            "update",
+            serde_json::json!({"id": full_id, "properties": "not-an-object"}),
+        )
+        .await
+        .expect_err("a non-object properties patch on a pack-owned note must be refused");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("object"),
+        "refusal error must explain the object requirement; got: {msg}"
+    );
+}
+
+// ---- ADR-124 note-write identity guard: CREATE-path derivation ----
+
+/// FORGE arm: a generic `create(kind="message", properties={from_actor:
+/// "forged"})` call under an authenticated token for actor X must store
+/// `from_actor == X` — the true caller — not the forged value. This is not a
+/// refusal: the create succeeds and the identity property is silently
+/// corrected to the value the authorization token actually names.
+#[tokio::test]
+async fn create_derives_from_actor_overwriting_a_forged_value() {
+    let (registry, _rt) = build_registry_with_owned_kinds_and_validator();
+    let true_actor = "lambda:true-caller";
+
+    let created = registry
+        .dispatch_with_identity(
+            "create",
+            serde_json::json!({
+                "kind": "message",
+                "content": "create-path forgery probe",
+                "properties": {"from_actor": "forged"},
+            }),
+            Some(RequestIdentity {
+                namespace: "local".to_string(),
+                actor_id: Some(true_actor.to_string()),
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect("create must succeed — the guard derives, it does not refuse");
+
+    assert_eq!(
+        created["properties"]["from_actor"], true_actor,
+        "the stored from_actor must be the authenticated caller, not the forged value"
+    );
+}
+
+/// LEGITIMATE-NO-KEY arm: a `create(kind="message", content=...)` with no
+/// `from_actor` in properties at all must still come out stamped with the
+/// authenticated caller.
+#[tokio::test]
+async fn create_stamps_from_actor_when_caller_supplies_no_identity_key() {
+    let (registry, _rt) = build_registry_with_owned_kinds_and_validator();
+    let true_actor = "lambda:no-key-caller";
+
+    let created = registry
+        .dispatch_with_identity(
+            "create",
+            serde_json::json!({
+                "kind": "message",
+                "content": "create-path no-key probe",
+            }),
+            Some(RequestIdentity {
+                namespace: "local".to_string(),
+                actor_id: Some(true_actor.to_string()),
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect("create with no properties key must succeed");
+
+    assert_eq!(
+        created["properties"]["from_actor"], true_actor,
+        "an absent from_actor key must be stamped with the authenticated caller"
+    );
+}
+
+/// DAEMON-STAMP arm: the real `comm.send` writer path must still stamp
+/// `from_actor` correctly and succeed once the validator is installed. A
+/// guard that broke the writer that is supposed to set `from_actor` would
+/// fail closed into an outage — prove it does not.
+///
+/// MECHANISM SENSITIVITY: this arm stays green even with the atomic
+/// multi-note writer's own derivation call removed entirely, because
+/// `comm.send`'s handler (`crates/khive-pack-comm/src/handlers.rs`) derives
+/// and stamps `from_actor` onto the message spec BEFORE it ever reaches
+/// `khive-runtime`'s `create_notes_atomic_with_report`. A failure here means
+/// the send handler itself, or the ordinary (non-atomic) write path, broke —
+/// it says nothing about the atomic writer's own guard. That coverage lives
+/// in `khive-runtime`'s
+/// `atomic_message::tests::create_notes_atomic_derives_from_actor_overwriting_a_forged_value`,
+/// which calls the atomic writer directly with a forged property and would
+/// fail if this arm alone were relied on.
+#[tokio::test]
+async fn comm_send_still_stamps_from_actor_with_validator_installed() {
+    let (registry, _rt) = build_registry_with_owned_kinds_and_validator();
+    let true_actor = "lambda:sender";
+
+    let sent = registry
+        .dispatch_with_identity(
+            "comm.send",
+            serde_json::json!({"to": "local", "content": "validator does not break comm.send"}),
+            Some(RequestIdentity {
+                namespace: "local".to_string(),
+                actor_id: Some(true_actor.to_string()),
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect("comm.send must still succeed with the validator installed");
+
+    let full_id = sent
+        .get("full_id")
+        .and_then(serde_json::Value::as_str)
+        .expect("send must return full_id")
+        .to_string();
+    let after = registry
+        .dispatch("get", serde_json::json!({"id": full_id}))
+        .await
+        .expect("get must succeed");
+    assert_eq!(
+        after["properties"]["from_actor"], true_actor,
+        "comm.send's own from_actor stamp must still be the sending actor"
+    );
+}
+
+/// GENERIC-KIND arm: the validator is single-occupancy across all packs, so
+/// a `create` on a kind comm does not own (`observation`, owned by kg) must
+/// pass its properties through untouched.
+///
+/// MECHANISM SENSITIVITY: the foreign-kind passthrough assertion alone would
+/// stay green even if the validator were never installed at all — with no
+/// validator, every kind's properties pass through untouched, so that
+/// assertion by itself cannot tell "validator installed and correctly scoped
+/// to `message`" apart from "no validator at all". The paired `message`
+/// assertion below closes that gap: it only passes if a validator is
+/// installed AND correctly scoped, so this arm fails if the validator is
+/// missing, not just if it is mis-scoped.
+#[tokio::test]
+async fn create_leaves_generic_kind_properties_untouched() {
+    let (registry, _rt) = build_registry_with_owned_kinds_and_validator();
+
+    let created = registry
+        .dispatch_with_identity(
+            "create",
+            serde_json::json!({
+                "kind": "observation",
+                "content": "generic-kind create arm",
+                "properties": {"from_actor": "x"},
+            }),
+            Some(RequestIdentity {
+                namespace: "local".to_string(),
+                actor_id: Some("lambda:someone-else".to_string()),
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect("create observation must succeed");
+
+    assert_eq!(
+        created["properties"]["from_actor"], "x",
+        "a foreign (non-message) kind's properties must pass through the validator unchanged"
+    );
+
+    let message_created = registry
+        .dispatch_with_identity(
+            "create",
+            serde_json::json!({
+                "kind": "message",
+                "content": "same-fixture message arm — validator must be scoped, not absent",
+                "properties": {"from_actor": "forged"},
+            }),
+            Some(RequestIdentity {
+                namespace: "local".to_string(),
+                actor_id: Some("lambda:someone-else".to_string()),
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect("create message must succeed");
+
+    assert_eq!(
+        message_created["properties"]["from_actor"], "lambda:someone-else",
+        "on the SAME registry, a `message` create must still be derived — proving \
+         the validator is installed and merely scoped away from `observation`, \
+         not absent entirely"
+    );
+}
+
+// ---- ADR-124 note-write identity guard: MERGE-path preservation ----
+
+async fn send_message_as(registry: &VerbRegistry, actor: &str, content: &str) -> String {
+    let sent = registry
+        .dispatch_with_identity(
+            "comm.send",
+            serde_json::json!({"to": "local", "content": content}),
+            Some(RequestIdentity {
+                namespace: "local".to_string(),
+                actor_id: Some(actor.to_string()),
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect("self-send must succeed");
+    sent.get("full_id")
+        .and_then(serde_json::Value::as_str)
+        .expect("send must return full_id")
+        .to_string()
+}
+
+/// FORGERY-BLOCKED arm: merging a `message` note authored by Y into one
+/// authored by X with `strategy="prefer_from"` — the attack this guard
+/// exists for — must leave the surviving note's `from_actor` as X, not Y.
+#[tokio::test]
+async fn merge_preserves_into_note_from_actor_under_prefer_from() {
+    let (registry, _rt) = build_registry_with_owned_kinds_and_validator();
+
+    let into_id = send_message_as(&registry, "lambda:x", "into-note, authored by X").await;
+    let from_id = send_message_as(&registry, "lambda:y", "from-note, authored by Y").await;
+
+    registry
+        .dispatch(
+            "merge",
+            serde_json::json!({
+                "kind": "message",
+                "into_id": into_id,
+                "from_id": from_id,
+                "strategy": "prefer_from",
+            }),
+        )
+        .await
+        .expect("merge must succeed");
+
+    let after = registry
+        .dispatch("get", serde_json::json!({"id": into_id}))
+        .await
+        .expect("get must succeed");
+    assert_eq!(
+        after["properties"]["from_actor"], "lambda:x",
+        "prefer_from must not be able to transfer attribution from the absorbed note"
+    );
+}
+
+/// CONTROL arm: the same merge under `strategy="prefer_into"` must also
+/// leave `from_actor` as X.
+///
+/// Honesty note (khive-oss PR #1690 round 3): this arm is NOT sensitive to
+/// the preservation step being removed. `PreferInto`'s fold
+/// (`merge_json` in `khive-runtime`'s `curation.rs`) only ever inserts a
+/// `from`-note key that is absent on `into` — `from_actor` is already
+/// present on X's into-note before the merge runs, so the fold itself never
+/// touches it. This arm stays green with `preserve_owner_established_properties`
+/// deleted entirely; it is a legitimate control (it proves the merge doesn't
+/// silently overwrite under this strategy) but it is NOT evidence the guard
+/// works. `merge_preserves_into_note_from_actor_under_prefer_from` above is
+/// the arm carrying the security-relevant assertion: `PreferFrom`'s fold
+/// does overwrite `from_actor` with Y's value, so that arm only passes
+/// because the preserve step reverts it.
+#[tokio::test]
+async fn merge_preserves_into_note_from_actor_under_prefer_into() {
+    let (registry, _rt) = build_registry_with_owned_kinds_and_validator();
+
+    let into_id = send_message_as(&registry, "lambda:x", "into-note, control arm").await;
+    let from_id = send_message_as(&registry, "lambda:y", "from-note, control arm").await;
+
+    registry
+        .dispatch(
+            "merge",
+            serde_json::json!({
+                "kind": "message",
+                "into_id": into_id,
+                "from_id": from_id,
+                "strategy": "prefer_into",
+            }),
+        )
+        .await
+        .expect("merge must succeed");
+
+    let after = registry
+        .dispatch("get", serde_json::json!({"id": into_id}))
+        .await
+        .expect("get must succeed");
+    assert_eq!(after["properties"]["from_actor"], "lambda:x");
+}
+
+/// NON-IDENTITY-KEY arm: a non-owned property that differs between the two
+/// notes still folds by strategy — `prefer_from` takes the from-note's
+/// value — proving the preserve step pins only the owner-established keys,
+/// not the whole property object.
+#[tokio::test]
+async fn merge_still_folds_non_owned_properties_by_strategy() {
+    let (registry, _rt) = build_registry_with_owned_kinds_and_validator();
+
+    let into_id = send_message_as(&registry, "lambda:x", "into-note, non-identity arm").await;
+    let from_id = send_message_as(&registry, "lambda:y", "from-note, non-identity arm").await;
+
+    registry
+        .dispatch(
+            "update",
+            serde_json::json!({"id": into_id, "properties": {"tag": "into-tag"}}),
+        )
+        .await
+        .expect("update must succeed");
+    registry
+        .dispatch(
+            "update",
+            serde_json::json!({"id": from_id, "properties": {"tag": "from-tag"}}),
+        )
+        .await
+        .expect("update must succeed");
+
+    registry
+        .dispatch(
+            "merge",
+            serde_json::json!({
+                "kind": "message",
+                "into_id": into_id,
+                "from_id": from_id,
+                "strategy": "prefer_from",
+            }),
+        )
+        .await
+        .expect("merge must succeed");
+
+    let after = registry
+        .dispatch("get", serde_json::json!({"id": into_id}))
+        .await
+        .expect("get must succeed");
+    assert_eq!(
+        after["properties"]["tag"], "from-tag",
+        "a non-owned key must still fold by strategy — only owner-established keys are pinned"
+    );
+    assert_eq!(
+        after["properties"]["from_actor"], "lambda:x",
+        "the owner-established key must remain pinned to the into-note in the same merge"
+    );
+}
+
+/// GENERIC-KIND arm: merging two `observation` notes (a kind comm does not
+/// own) under `prefer_from` must let a `from_actor`-named property overwrite
+/// normally — the preservation guard fires only on pack-owned kinds.
+#[tokio::test]
+async fn merge_overwrites_from_actor_on_generic_kind_under_prefer_from() {
+    let (registry, _rt) = build_registry_with_owned_kinds_and_validator();
+
+    let into_created = registry
+        .dispatch(
+            "create",
+            serde_json::json!({
+                "kind": "observation",
+                "content": "into observation",
+                "properties": {"from_actor": "x"},
+            }),
+        )
+        .await
+        .expect("create must succeed");
+    let into_id = into_created["id"]
+        .as_str()
+        .expect("create must return id")
+        .to_string();
+
+    let from_created = registry
+        .dispatch(
+            "create",
+            serde_json::json!({
+                "kind": "observation",
+                "content": "from observation",
+                "properties": {"from_actor": "y"},
+            }),
+        )
+        .await
+        .expect("create must succeed");
+    let from_id = from_created["id"]
+        .as_str()
+        .expect("create must return id")
+        .to_string();
+
+    registry
+        .dispatch(
+            "merge",
+            serde_json::json!({
+                "kind": "observation",
+                "into_id": into_id,
+                "from_id": from_id,
+                "strategy": "prefer_from",
+            }),
+        )
+        .await
+        .expect("merge must succeed");
+
+    let after = registry
+        .dispatch("get", serde_json::json!({"id": into_id}))
+        .await
+        .expect("get must succeed");
+    assert_eq!(
+        after["properties"]["from_actor"], "y",
+        "on a non-pack-owned kind, prefer_from must overwrite from_actor normally"
+    );
+}
+
+/// PROPERTIES-MERGED-ACCURACY arm: restoring an owner-established key that
+/// was already present on the into-note (here `to_actor`) must not be
+/// double-counted against `properties_merged` — the fold never counted that
+/// key as "added" in the first place, because `to_actor` already existed on
+/// the into-note before the merge. Only the genuinely new non-owned key
+/// (`added`) contributed to the fold, so `properties_merged` must report 1,
+/// not 0, and the non-owned key must actually survive on the merged note.
+#[tokio::test]
+async fn merge_reports_properties_merged_for_key_that_actually_survives() {
+    let (registry, _rt) = build_registry_with_owned_kinds_and_validator();
+
+    let into_created = registry
+        .dispatch(
+            "create",
+            serde_json::json!({
+                "kind": "message",
+                "content": "into note, properties_merged accuracy arm",
+                "properties": {"to_actor": "into", "base": "i"},
+            }),
+        )
+        .await
+        .expect("create must succeed");
+    let into_id = into_created["id"]
+        .as_str()
+        .expect("create must return id")
+        .to_string();
+
+    let from_created = registry
+        .dispatch(
+            "create",
+            serde_json::json!({
+                "kind": "message",
+                "content": "from note, properties_merged accuracy arm",
+                "properties": {"to_actor": "from", "added": "x"},
+            }),
+        )
+        .await
+        .expect("create must succeed");
+    let from_id = from_created["id"]
+        .as_str()
+        .expect("create must return id")
+        .to_string();
+
+    let merged = registry
+        .dispatch(
+            "merge",
+            serde_json::json!({
+                "kind": "message",
+                "into_id": into_id,
+                "from_id": from_id,
+                "strategy": "prefer_from",
+            }),
+        )
+        .await
+        .expect("merge must succeed");
+
+    assert_eq!(
+        merged["properties_merged"], 1,
+        "exactly one non-owned key (`added`) genuinely survived the merge; got {merged}"
+    );
+
+    let after = registry
+        .dispatch("get", serde_json::json!({"id": into_id}))
+        .await
+        .expect("get must succeed");
+    assert_eq!(
+        after["properties"]["added"], "x",
+        "the newly introduced non-owned key must survive on the merged note"
+    );
+    assert_eq!(
+        after["properties"]["base"], "i",
+        "the into-note's own pre-existing non-owned key must survive too"
+    );
+    assert_eq!(
+        after["properties"]["to_actor"], "into",
+        "the owner-established key must remain pinned to the into-note, not \
+         the from-note's value"
+    );
+}
+
+/// NESTED-UNION arm: an owner-established key that holds an OBJECT
+/// (`thread_id`) merged under `strategy="union"` must not be double-counted
+/// either. The round-2 fix above corrected the flat case
+/// (`merge_reports_properties_merged_for_key_that_actually_survives`); this
+/// is the nested case that fix left uncorrected. Under `union` the fold
+/// recurses into `thread_id` and counts the absorbed note's nested key as a
+/// merged contribution, but restoration then reverts `thread_id` wholesale
+/// back to the into-note's pre-merge value — so nothing the fold counted
+/// actually survived, and `properties_merged` must report 0.
+#[tokio::test]
+async fn merge_reports_zero_properties_merged_for_nested_union_reversion() {
+    let (registry, _rt) = build_registry_with_owned_kinds_and_validator();
+
+    let identity = RequestIdentity {
+        namespace: "local".to_string(),
+        actor_id: Some("lambda:z".to_string()),
+        ..Default::default()
+    };
+
+    let into_created = registry
+        .dispatch_with_identity(
+            "create",
+            serde_json::json!({
+                "kind": "message",
+                "content": "into note, nested-union accuracy arm",
+                "properties": {"thread_id": {"keep": 1}},
+            }),
+            Some(identity.clone()),
+        )
+        .await
+        .expect("create must succeed");
+    let into_id = into_created["id"]
+        .as_str()
+        .expect("create must return id")
+        .to_string();
+
+    let from_created = registry
+        .dispatch_with_identity(
+            "create",
+            serde_json::json!({
+                "kind": "message",
+                "content": "from note, nested-union accuracy arm",
+                "properties": {"thread_id": {"discarded": 2}},
+            }),
+            Some(identity),
+        )
+        .await
+        .expect("create must succeed");
+    let from_id = from_created["id"]
+        .as_str()
+        .expect("create must return id")
+        .to_string();
+
+    let merged = registry
+        .dispatch(
+            "merge",
+            serde_json::json!({
+                "kind": "message",
+                "into_id": into_id,
+                "from_id": from_id,
+                "strategy": "union",
+            }),
+        )
+        .await
+        .expect("merge must succeed");
+
+    let after = registry
+        .dispatch("get", serde_json::json!({"id": into_id}))
+        .await
+        .expect("get must succeed");
+    assert_eq!(
+        after["properties"]["thread_id"],
+        serde_json::json!({"keep": 1}),
+        "the absorbed note's nested contribution must not survive restoration"
+    );
+    assert_eq!(
+        merged["properties_merged"], 0,
+        "nothing from the absorbed note actually survived restoration, so \
+         properties_merged must report 0, not the nested fold's raw count; \
+         got {merged}"
+    );
+}
+
+/// ROUTE-LEVEL RESTORATION arm: the whole scenario driven through the pack's
+/// actual `comm.send`/`create` + `merge` verbs (not `count_new_property_keys`
+/// called directly — that unit-level coverage already lives in
+/// `khive-runtime`'s `curation.rs` tests), on a pack-owned `message` note.
+///
+/// `external_id` is an `OWNER_ESTABLISHED_PROPERTIES` key `comm.send` never
+/// sets, so the into-note's property map genuinely lacks the key entirely
+/// (unlike `subject`, which `comm.send` always writes, even as `null` — a
+/// present-but-null key would already be "in" the into-note's map and
+/// wouldn't exercise the "absent from into" removal path). The from-note is
+/// built with `create` so `properties` can name `external_id` directly.
+///
+/// Under `prefer_from` the fold treats `external_id` as a genuinely new key
+/// — the into-note's property map does not have it — and counts it as one
+/// contribution. Restoration then reverts it: `external_id` is absent on the
+/// into-note, so it is removed from the merged result rather than kept.
+/// Nothing the fold counted actually survives, so `properties_merged` must
+/// report 0, and the into-note's owner-established properties (here
+/// `from_actor`) must still read as the into-note's own, not the absorbed
+/// note's.
+#[tokio::test]
+async fn merge_reports_zero_properties_merged_when_restoration_reverts_the_only_new_key_through_the_route(
+) {
+    let (registry, _rt) = build_registry_with_owned_kinds_and_validator();
+
+    let into_id = send_message_as(
+        &registry,
+        "lambda:x",
+        "into note, route-level restoration arm — no external_id",
+    )
+    .await;
+
+    let from_created = registry
+        .dispatch_with_identity(
+            "create",
+            serde_json::json!({
+                "kind": "message",
+                "content": "from note, route-level restoration arm — has an external_id",
+                "properties": {"external_id": "wire-abc-123"},
+            }),
+            Some(RequestIdentity {
+                namespace: "local".to_string(),
+                actor_id: Some("lambda:y".to_string()),
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect("create must succeed");
+    let from_id = from_created["id"]
+        .as_str()
+        .expect("create must return id")
+        .to_string();
+
+    let before = registry
+        .dispatch("get", serde_json::json!({"id": into_id}))
+        .await
+        .expect("get must succeed");
+    assert!(
+        before["properties"].get("external_id").is_none(),
+        "fixture invariant: the into-note must not already carry an \
+         `external_id`; got {before}"
+    );
+
+    let merged = registry
+        .dispatch(
+            "merge",
+            serde_json::json!({
+                "kind": "message",
+                "into_id": into_id,
+                "from_id": from_id,
+                "strategy": "prefer_from",
+            }),
+        )
+        .await
+        .expect("merge must succeed");
+
+    let after = registry
+        .dispatch("get", serde_json::json!({"id": into_id}))
+        .await
+        .expect("get must succeed");
+    assert!(
+        after["properties"].get("external_id").is_none(),
+        "restoration must strip the absorbed note's `external_id`, since the \
+         into-note never had one — got {after}"
+    );
+    assert_eq!(
+        after["properties"]["from_actor"], "lambda:x",
+        "the into-note's owner-established `from_actor` must survive the merge \
+         unchanged"
+    );
+    assert_eq!(
+        merged["properties_merged"], 0,
+        "the only key the fold counted as new (`external_id`) was reverted by \
+         restoration, so nothing genuinely survived; got {merged}"
+    );
+}
+
+// ── #1468 / #1471: projected inbox/thread reads and sent history ─────────────
+
+#[tokio::test]
+async fn i1471_sent_box_is_sender_scoped_and_filters_recipient_and_since() {
+    let backend = shared_backend();
+    let (registry_a, _runtime_a) = build_actor_registry(backend.clone(), "lambda:a");
+    let (registry_other, _runtime_other) = build_actor_registry(backend, "lambda:other");
+    let since = (chrono::Utc::now() - chrono::Duration::seconds(1)).to_rfc3339();
+
+    let to_b = registry_a
+        .dispatch(
+            "comm.send",
+            serde_json::json!({
+                "to": "lambda:b",
+                "subject": "for B",
+                "content": "sender A to B",
+            }),
+        )
+        .await
+        .expect("A sends to B");
+    registry_a
+        .dispatch(
+            "comm.send",
+            serde_json::json!({ "to": "lambda:c", "content": "sender A to C" }),
+        )
+        .await
+        .expect("A sends to C");
+    registry_other
+        .dispatch(
+            "comm.send",
+            serde_json::json!({ "to": "lambda:b", "content": "other sender to B" }),
+        )
+        .await
+        .expect("other actor sends to B");
+
+    let default_box = registry_a
+        .dispatch(
+            "comm.inbox",
+            serde_json::json!({ "status": "all", "limit": 10 }),
+        )
+        .await
+        .expect("default inbox remains inbound-only");
+    assert_eq!(default_box["count"], 0);
+
+    let sent_to_b = registry_a
+        .dispatch(
+            "comm.inbox",
+            serde_json::json!({
+                "box": "sent",
+                "to_actor": "lambda:b",
+                "since": since,
+                "limit": 10,
+            }),
+        )
+        .await
+        .expect("sent history");
+    assert_eq!(sent_to_b["count"], 1);
+    assert_eq!(sent_to_b["messages"][0]["full_id"], to_b["full_id"]);
+    assert_eq!(sent_to_b["messages"][0]["from"], "lambda:a");
+    assert_eq!(sent_to_b["messages"][0]["to"], "lambda:b");
+    assert_eq!(sent_to_b["messages"][0]["direction"], "outbound");
+    assert_eq!(sent_to_b["unread_count"], 0);
+
+    let all_sent = registry_a
+        .dispatch(
+            "comm.inbox",
+            serde_json::json!({ "box": "sent", "limit": 10 }),
+        )
+        .await
+        .expect("all caller-authored sent rows");
+    assert_eq!(
+        all_sent["count"], 2,
+        "another actor's outbound row must not leak"
+    );
+
+    let future = (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339();
+    let none = registry_a
+        .dispatch(
+            "comm.inbox",
+            serde_json::json!({ "box": "sent", "since": future }),
+        )
+        .await
+        .expect("sent since filter");
+    assert_eq!(none["count"], 0);
+
+    let status_error = registry_a
+        .dispatch(
+            "comm.inbox",
+            serde_json::json!({ "box": "sent", "status": "all" }),
+        )
+        .await
+        .expect_err("read status has no meaning for sent rows");
+    assert!(status_error.to_string().contains("applies only"));
+}
+
+#[tokio::test]
+async fn i1468_fields_projects_inbox_and_thread_with_one_strict_vocabulary() {
+    let backend = shared_backend();
+    let (registry_a, _runtime_a) = build_actor_registry(backend.clone(), "lambda:a");
+    let (registry_b, _runtime_b) = build_actor_registry(backend, "lambda:b");
+
+    let sent = registry_a
+        .dispatch(
+            "comm.send",
+            serde_json::json!({
+                "to": "lambda:b",
+                "subject": "projection contract",
+                "content": "body must be omitted from the projected view",
+            }),
+        )
+        .await
+        .expect("send for projection test");
+    let fields = serde_json::json!(["id", "subject", "from_actor", "sent_at", "created_at"]);
+
+    let inbox = registry_b
+        .dispatch(
+            "comm.inbox",
+            serde_json::json!({ "status": "all", "fields": fields.clone() }),
+        )
+        .await
+        .expect("projected inbox");
+    assert_eq!(inbox["count"], 1);
+    let inbox_message = inbox["messages"][0].as_object().unwrap();
+    let expected: std::collections::BTreeSet<&str> =
+        ["id", "subject", "from_actor", "sent_at", "created_at"]
+            .into_iter()
+            .collect();
+    let actual: std::collections::BTreeSet<&str> =
+        inbox_message.keys().map(String::as_str).collect();
+    assert_eq!(actual, expected);
+    assert_eq!(inbox_message["from_actor"], "lambda:a");
+    assert!(inbox_message["sent_at"].as_str().is_some());
+    assert!(inbox_message["created_at"].as_str().is_some());
+
+    let thread = registry_a
+        .dispatch(
+            "comm.thread",
+            serde_json::json!({ "id": sent["full_id"], "fields": fields }),
+        )
+        .await
+        .expect("projected thread");
+    assert_eq!(thread["count"], 1);
+    let thread_message = thread["messages"][0].as_object().unwrap();
+    let thread_keys: std::collections::BTreeSet<&str> =
+        thread_message.keys().map(String::as_str).collect();
+    assert_eq!(thread_keys, expected);
+
+    let full = registry_b
+        .dispatch("comm.inbox", serde_json::json!({ "status": "all" }))
+        .await
+        .expect("omitted projection preserves the full view");
+    assert!(full["messages"][0].get("content").is_some());
+    assert!(full["messages"][0].get("properties").is_some());
+
+    for (verb, params) in [
+        (
+            "comm.inbox",
+            serde_json::json!({ "fields": ["not_a_message_field"] }),
+        ),
+        (
+            "comm.thread",
+            serde_json::json!({
+                "id": sent["full_id"],
+                "fields": ["not_a_message_field"],
+            }),
+        ),
+    ] {
+        let error = registry_a
+            .dispatch(verb, params)
+            .await
+            .expect_err("unknown projection field must fail");
+        assert!(error.to_string().contains("unknown projection field"));
+    }
+
+    let empty = registry_a
+        .dispatch("comm.inbox", serde_json::json!({ "fields": [] }))
+        .await
+        .expect_err("an empty projection is ambiguous and must fail");
+    assert!(empty.to_string().contains("at least one field"));
+}
+
+// ── #1471 follow-up: anonymous-local scoping, cross-box rejections, sent fallback ──
+
+/// The anonymous `"local"` caller is scoped by `to_actor = "local" OR to_actor IS NULL`
+/// like every other caller (ADR-057 amendment): it shares messages addressed to
+/// `"local"`, keeps legacy rows without `to_actor` visible, and must not see
+/// messages explicitly addressed to another actor.
+#[tokio::test]
+async fn i1471_anonymous_local_inbox_scoping_and_legacy_visibility() {
+    let backend = shared_backend();
+    let (registry_a, _rt_a) = build_actor_registry(backend.clone(), "lambda:a");
+    let (registry_local, rt_local) = build_actor_registry(backend, "local");
+
+    registry_a
+        .dispatch(
+            "comm.send",
+            serde_json::json!({ "to": "lambda:b", "content": "addressed away from local" }),
+        )
+        .await
+        .expect("A sends to B");
+    registry_a
+        .dispatch(
+            "comm.send",
+            serde_json::json!({ "to": "local", "content": "addressed to local" }),
+        )
+        .await
+        .expect("A sends to local");
+
+    let local_tok = rt_local
+        .authorize(Namespace::local())
+        .expect("authorize local fixture namespace");
+    rt_local
+        .create_note(
+            &local_tok,
+            "message",
+            None,
+            "legacy inbound, no to_actor",
+            None,
+            Some(serde_json::json!({
+                "from": "lambda:a",
+                "from_actor": "lambda:a",
+                "direction": "inbound",
+            })),
+            vec![],
+        )
+        .await
+        .expect("legacy to_actor-less inbound fixture");
+
+    let inbox = registry_local
+        .dispatch(
+            "comm.inbox",
+            serde_json::json!({ "status": "all", "limit": 10 }),
+        )
+        .await
+        .expect("anonymous local inbox");
+    assert_eq!(
+        inbox["count"], 2,
+        "local-addressed row plus legacy row only"
+    );
+    let contents: Vec<&str> = inbox["messages"]
+        .as_array()
+        .expect("messages array")
+        .iter()
+        .filter_map(|message| message["content"].as_str())
+        .collect();
+    assert!(
+        contents.contains(&"addressed to local"),
+        "row addressed to \"local\" must be visible; got {contents:?}"
+    );
+    assert!(
+        contents.contains(&"legacy inbound, no to_actor"),
+        "legacy row without to_actor must stay visible; got {contents:?}"
+    );
+    assert!(
+        !contents.contains(&"addressed away from local"),
+        "row addressed to another actor must stay hidden; got {contents:?}"
+    );
+}
+
+/// Cross-box filters must fail loudly rather than silently return the wrong
+/// box: sender filters and read `status` are inbox-only, while `to_actor` is
+/// sent-only (ADR-057 amendment).
+#[tokio::test]
+async fn i1471_cross_box_filters_are_rejected() {
+    let (registry, _rt) = build_registry_for_ns("local");
+
+    for params in [
+        serde_json::json!({ "box": "sent", "status": "unread" }),
+        serde_json::json!({ "box": "sent", "from_actor": "local" }),
+        serde_json::json!({ "box": "sent", "from_prefix": "lambda:" }),
+        serde_json::json!({ "box": "sent", "exclude_from_actor": "local" }),
+    ] {
+        let error = registry
+            .dispatch("comm.inbox", params)
+            .await
+            .expect_err("inbox-only filter with box=\"sent\" must fail");
+        assert!(
+            error.to_string().contains("only to box=\"inbox\""),
+            "error must explain the filter is inbox-only; got {error}"
+        );
+    }
+
+    for params in [
+        serde_json::json!({ "to_actor": "lambda:b" }),
+        serde_json::json!({ "box": "inbox", "to_actor": "lambda:b" }),
+    ] {
+        let error = registry
+            .dispatch("comm.inbox", params)
+            .await
+            .expect_err("to_actor with the inbox box must fail");
+        assert!(
+            error.to_string().contains("applies only"),
+            "error must explain to_actor is sent-only; got {error}"
+        );
+    }
+}
+
+/// The anonymous `"local"` sent box keeps legacy outbound rows without
+/// `from_actor` visible (EqOrMissing fallback), while rows attributed to
+/// another actor never leak into it.
+#[tokio::test]
+async fn i1471_local_sent_box_includes_legacy_rows_only() {
+    let backend = shared_backend();
+    let (registry_other, _rt_other) = build_actor_registry(backend.clone(), "lambda:other");
+    let (registry_local, rt_local) = build_actor_registry(backend, "local");
+
+    registry_local
+        .dispatch(
+            "comm.send",
+            serde_json::json!({ "to": "local", "content": "sent by local" }),
+        )
+        .await
+        .expect("local sends");
+    registry_other
+        .dispatch(
+            "comm.send",
+            serde_json::json!({ "to": "local", "content": "sent by other" }),
+        )
+        .await
+        .expect("other actor sends");
+
+    let local_tok = rt_local
+        .authorize(Namespace::local())
+        .expect("authorize local fixture namespace");
+    rt_local
+        .create_note(
+            &local_tok,
+            "message",
+            None,
+            "legacy outbound, no from_actor",
+            None,
+            Some(serde_json::json!({
+                "to": "lambda:b",
+                "direction": "outbound",
+            })),
+            vec![],
+        )
+        .await
+        .expect("legacy from_actor-less outbound fixture");
+    rt_local
+        .create_note(
+            &local_tok,
+            "message",
+            None,
+            "foreign outbound, different from_actor",
+            None,
+            Some(serde_json::json!({
+                "from_actor": "lambda:foreign",
+                "to": "lambda:b",
+                "direction": "outbound",
+            })),
+            vec![],
+        )
+        .await
+        .expect("foreign-attributed outbound fixture");
+
+    let sent = registry_local
+        .dispatch(
+            "comm.inbox",
+            serde_json::json!({ "box": "sent", "limit": 10 }),
+        )
+        .await
+        .expect("local sent history");
+    assert_eq!(
+        sent["count"], 2,
+        "local-authored row plus legacy row only; got {sent}"
+    );
+    let contents: Vec<&str> = sent["messages"]
+        .as_array()
+        .expect("messages array")
+        .iter()
+        .filter_map(|message| message["content"].as_str())
+        .collect();
+    assert!(
+        contents.contains(&"sent by local"),
+        "local-authored outbound row must be listed; got {contents:?}"
+    );
+    assert!(
+        contents.contains(&"legacy outbound, no from_actor"),
+        "legacy row without from_actor must stay visible; got {contents:?}"
+    );
+    assert!(
+        !contents.contains(&"sent by other")
+            && !contents.contains(&"foreign outbound, different from_actor"),
+        "rows attributed to another actor must not leak; got {contents:?}"
+    );
+}
+
+/// An ATTRIBUTED caller's sent box requires an exact `from_actor` match:
+/// legacy outbound rows without `from_actor` are never inherited (fail
+/// closed), even when they live in the namespace the caller's query scans.
+/// Only the anonymous `"local"` actor gets the EqOrMissing fallback.
+#[tokio::test]
+async fn i1471_attributed_sent_box_excludes_legacy_rows() {
+    let backend = shared_backend();
+    let (registry_a, rt_a) = build_actor_registry(backend, "lambda:a");
+
+    registry_a
+        .dispatch(
+            "comm.send",
+            serde_json::json!({ "to": "lambda:b", "content": "attributed outbound" }),
+        )
+        .await
+        .expect("attributed actor sends");
+
+    let tok = rt_a
+        .authorize(Namespace::local())
+        .expect("authorize fixture namespace");
+    rt_a.create_note(
+        &tok,
+        "message",
+        None,
+        "legacy outbound, no from_actor",
+        None,
+        Some(serde_json::json!({
+            "to": "lambda:b",
+            "direction": "outbound",
+        })),
+        vec![],
+    )
+    .await
+    .expect("legacy from_actor-less outbound fixture");
+    // In-scope control: an identically created note that DOES carry the
+    // caller's `from_actor` must be visible, proving the exclusion above is
+    // the actor predicate and not namespace scoping making the legacy row
+    // unreachable.
+    rt_a.create_note(
+        &tok,
+        "message",
+        None,
+        "attributed fixture, from_actor present",
+        None,
+        Some(serde_json::json!({
+            "from_actor": "lambda:a",
+            "to": "lambda:b",
+            "direction": "outbound",
+        })),
+        vec![],
+    )
+    .await
+    .expect("attributed outbound control fixture");
+
+    let sent = registry_a
+        .dispatch(
+            "comm.inbox",
+            serde_json::json!({ "box": "sent", "limit": 10 }),
+        )
+        .await
+        .expect("attributed sent history");
+    assert_eq!(
+        sent["count"], 2,
+        "attributed rows visible, legacy from_actor-less row excluded; got {sent}"
+    );
+    let contents: Vec<&str> = sent["messages"]
+        .as_array()
+        .expect("messages array")
+        .iter()
+        .filter_map(|message| message["content"].as_str())
+        .collect();
+    assert!(
+        contents.contains(&"attributed fixture, from_actor present"),
+        "in-scope control fixture must be listed; got {contents:?}"
+    );
+    assert!(
+        !contents.contains(&"legacy outbound, no from_actor"),
+        "attributed caller must not inherit legacy from_actor-less rows; got {contents:?}"
+    );
+}
+
+// ── #1471 follow-up: sent-box combination pins ──────────────────────────────
+
+/// Projection applies to sent rows through the same strict vocabulary as the
+/// inbox box, and the sent box always reports `unread_count = 0` (outbound
+/// rows carry no recipient read state).
+#[tokio::test]
+async fn sent_box_fields_projection_applies_and_unread_count_is_zero() {
+    let backend = shared_backend();
+    let (registry_a, _rt_a) = build_actor_registry(backend, "lambda:a");
+
+    registry_a
+        .dispatch(
+            "comm.send",
+            serde_json::json!({
+                "to": "lambda:b",
+                "subject": "sent projection",
+                "content": "body must be omitted from the projected sent view",
+            }),
+        )
+        .await
+        .expect("send for sent projection test");
+
+    let sent = registry_a
+        .dispatch(
+            "comm.inbox",
+            serde_json::json!({
+                "box": "sent",
+                "fields": ["id", "to_actor", "subject", "direction"],
+            }),
+        )
+        .await
+        .expect("projected sent history");
+    assert_eq!(sent["count"], 1);
+    assert_eq!(
+        sent["unread_count"], 0,
+        "sent rows have no recipient read state, so the sent box reports zero; got {sent}"
+    );
+    let message = sent["messages"][0].as_object().expect("message object");
+    let expected: std::collections::BTreeSet<&str> = ["id", "to_actor", "subject", "direction"]
+        .into_iter()
+        .collect();
+    let actual: std::collections::BTreeSet<&str> = message.keys().map(String::as_str).collect();
+    assert_eq!(actual, expected, "projection must select exactly `fields`");
+    assert_eq!(message["to_actor"], "lambda:b");
+    assert_eq!(message["subject"], "sent projection");
+    assert_eq!(message["direction"], "outbound");
+}
+
+/// Sent-box paging walks the newest-first filtered sequence with stable page
+/// boundaries: `next_offset` chains pages without overlap or gaps, and the
+/// terminal page reports `has_more = false` with a null `next_offset`.
+#[tokio::test]
+async fn sent_box_paginates_newest_first_with_stable_boundaries() {
+    let backend = shared_backend();
+    let (registry_a, _rt_a) = build_actor_registry(backend, "lambda:a");
+
+    for index in 1..=3 {
+        registry_a
+            .dispatch(
+                "comm.send",
+                serde_json::json!({
+                    "to": "lambda:b",
+                    "content": format!("sent page {index}"),
+                }),
+            )
+            .await
+            .expect("send succeeds");
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+
+    let page_one = registry_a
+        .dispatch(
+            "comm.inbox",
+            serde_json::json!({ "box": "sent", "limit": 2 }),
+        )
+        .await
+        .expect("first sent page");
+    assert_eq!(page_one["count"], 2);
+    assert_eq!(page_one["offset"], 0);
+    assert_eq!(page_one["has_more"], true);
+    assert_eq!(page_one["next_offset"], 2);
+    let page_one_contents: Vec<&str> = page_one["messages"]
+        .as_array()
+        .expect("messages array")
+        .iter()
+        .filter_map(|message| message["content"].as_str())
+        .collect();
+    assert_eq!(
+        page_one_contents,
+        vec!["sent page 3", "sent page 2"],
+        "the first page must be the two newest rows, newest first"
+    );
+
+    let page_two = registry_a
+        .dispatch(
+            "comm.inbox",
+            serde_json::json!({ "box": "sent", "limit": 2, "offset": 2 }),
+        )
+        .await
+        .expect("second sent page");
+    assert_eq!(page_two["count"], 1);
+    assert_eq!(page_two["offset"], 2);
+    assert_eq!(page_two["has_more"], false);
+    assert!(
+        page_two["next_offset"].is_null(),
+        "the terminal page must not hand out a next offset; got {page_two}"
+    );
+    assert_eq!(
+        page_two["messages"][0]["content"].as_str(),
+        Some("sent page 1"),
+        "the final page picks up exactly where page one ended"
+    );
+}
+
+/// A `box` value outside the accepted set is rejected, and the error names
+/// the valid values.
+#[tokio::test]
+async fn inbox_rejects_box_value_outside_the_accepted_set() {
+    let (registry, _rt) = build_registry_for_ns("local");
+
+    let error = registry
+        .dispatch("comm.inbox", serde_json::json!({ "box": "banana" }))
+        .await
+        .expect_err("an unknown box value must be rejected");
+    let message = error.to_string();
+    assert!(
+        message.contains("invalid `box`"),
+        "error must name the `box` parameter; got {message}"
+    );
+    assert!(
+        message.contains("inbox") && message.contains("sent"),
+        "error must name the valid values; got {message}"
+    );
+}
+
+/// An empty-string `to_actor` filter is caller error: stored actor labels are
+/// never empty (`send` validates), so the filter could only silently match
+/// nothing. It is rejected with the same shape as the empty substring-filter
+/// validations.
+#[tokio::test]
+async fn sent_box_rejects_empty_to_actor_filter() {
+    let (registry, _rt) = build_registry_for_ns("local");
+
+    let error = registry
+        .dispatch(
+            "comm.inbox",
+            serde_json::json!({ "box": "sent", "to_actor": "" }),
+        )
+        .await
+        .expect_err("an empty to_actor filter must be rejected");
+    let message = error.to_string();
+    assert!(
+        message.contains("`to_actor`") && message.contains("must not be empty"),
+        "error must name the parameter and the empty-value rule; got {message}"
+    );
+}
+
+/// A stored outbound row missing `to_actor`/`from_actor` degrades per the
+/// handler's definitions instead of panicking: for the anonymous `"local"`
+/// caller the `from_actor` predicate falls back to EqOrMissing so the row
+/// stays listed, the projected `to_actor` alias has no property or top-level
+/// `to` to fall back to and renders as null, and an exact `to_actor` filter
+/// simply does not match the property-less row.
+#[tokio::test]
+async fn sent_box_null_property_fallback_does_not_panic() {
+    let backend = shared_backend();
+    let (registry_local, rt_local) = build_actor_registry(backend, "local");
+
+    let local_tok = rt_local
+        .authorize(Namespace::local())
+        .expect("authorize local fixture namespace");
+    let fixture = rt_local
+        .create_note(
+            &local_tok,
+            "message",
+            None,
+            "legacy outbound, no actor properties",
+            None,
+            Some(serde_json::json!({ "direction": "outbound" })),
+            vec![],
+        )
+        .await
+        .expect("actor-property-less outbound fixture");
+    let fixture_id = fixture.id.as_hyphenated().to_string();
+
+    let sent = registry_local
+        .dispatch(
+            "comm.inbox",
+            serde_json::json!({ "box": "sent", "fields": ["id", "to_actor", "from_actor"] }),
+        )
+        .await
+        .expect("projected sent history over a property-less row");
+    assert_eq!(
+        sent["count"], 1,
+        "the local caller's EqOrMissing from_actor fallback must keep the row visible; got {sent}"
+    );
+    let message = &sent["messages"][0];
+    assert_eq!(message["id"], fixture_id);
+    assert!(
+        message["to_actor"].is_null(),
+        "to_actor has no property or top-level `to` to fall back to; got {message}"
+    );
+    assert_eq!(
+        message["from_actor"], "local",
+        "from_actor falls back to the top-level `from`, which defaults to the row namespace"
+    );
+
+    let filtered = registry_local
+        .dispatch(
+            "comm.inbox",
+            serde_json::json!({ "box": "sent", "to_actor": "lambda:b" }),
+        )
+        .await
+        .expect("exact to_actor filter over a property-less row");
+    assert_eq!(
+        filtered["count"], 0,
+        "an exact to_actor predicate must not match a row without the property; got {filtered}"
+    );
+}
+
+/// A long-poll on the sent box wakes when the caller sends a new message: the
+/// inbox generation counter is direction-agnostic, so an outbound commit
+/// publishes the same signal an inbound one does.
+#[tokio::test]
+async fn sent_box_long_poll_wakes_after_concurrent_send() {
+    let (registry, _rt) = build_registry_for_ns("local");
+    let waiter_registry = registry.clone();
+    let mut waiter = tokio::spawn(async move {
+        waiter_registry
+            .dispatch(
+                "comm.inbox",
+                serde_json::json!({ "box": "sent", "wait_ms": 5_000 }),
+            )
+            .await
+    });
+
+    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    assert!(
+        !waiter.is_finished(),
+        "an empty sent box must remain blocked before a matching send"
+    );
+
+    registry
+        .dispatch(
+            "comm.send",
+            serde_json::json!({ "to": "lambda:b", "content": "send wakes the sent box" }),
+        )
+        .await
+        .expect("concurrent send succeeds");
+
+    let sent = match tokio::time::timeout(std::time::Duration::from_secs(1), &mut waiter).await {
+        Ok(joined) => joined
+            .expect("long-poll task must not panic")
+            .expect("long-poll sent box succeeds"),
+        Err(_) => {
+            waiter.abort();
+            panic!("long-poll sent box did not wake within one second of send");
+        }
+    };
+    assert_eq!(sent["count"].as_u64(), Some(1));
+    assert_eq!(
+        sent["messages"][0]["content"].as_str(),
+        Some("send wakes the sent box")
+    );
+    assert_eq!(sent["messages"][0]["direction"].as_str(), Some("outbound"));
 }
