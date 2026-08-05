@@ -219,12 +219,14 @@ jobs:
       # macos-pr-tests, so the focused portability lane keeps one serial run
       # of the pair while push/nightly/manual full lanes repeat it 25x per OS
       # (ADR-049 Amendment 3). timeout-minutes: a warm iteration measures
-      # ~0.6s of test time locally (2 tests, serial); 25 iterations plus
-      # per-iteration cargo overhead stays far below 10 minutes even on
-      # slower runners.
+      # Observed on ubuntu-latest runners: ~24s per iteration (2 tests,
+      # serial, plus per-iteration cargo overhead), so 25 iterations need
+      # ~10 minutes of test time alone before the initial build. Budget
+      # accordingly; a timeout here means the gate ran out of wall clock,
+      # not that a recovery flake was caught.
       - name: Daemon recovery flake gate
         if: env.CI_SUITE == 'full' && matrix.shard == 1
-        timeout-minutes: 10
+        timeout-minutes: 25
         run: ../scripts/ci.sh daemon-recovery-flake
       - name: No-default-features check
         if: env.CI_SUITE == 'full' && matrix.shard == 1
