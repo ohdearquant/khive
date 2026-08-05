@@ -40,6 +40,54 @@ excerpt. It never includes the rejected content. Accounting is per ingest call r
 than process-global daemon telemetry, so a caller can reliably assert
 `writes_refused == 0` even when other digests run concurrently.
 
+## Per-source tri-state and walk exhaustion (issue #1617)
+
+`done` is a budget-cursor statement ("callers loop until `true`"), and
+`warnings[]` is prose — neither lets a program distinguish "this repo has no
+issues/PRs" from "issues/PRs were never reached". `IngestReport::sources`
+closes that gap: every source requested by `include` reports exactly one
+state, written by the walk path itself rather than reconstructed at report
+time:
+
+- `completed` — the source was walked to the end of its history this pass
+  (an idempotent empty-range walk over an ancestor cursor counts).
+- `stopped_early` — the source was visited but not exhausted; `reason`
+  names the cause (budget exhausted mid-source, an incomplete `gh` paging
+  window, or a per-record write failure that froze the cursor — the same
+  events that force `done = false` / `cursor_stalled`).
+- `skipped` — the source was never walked; `reason` names the cause (budget
+  exhausted before an earlier-ordered source finished, `gh` CLI absent, a
+  `gh` listing failure, or a local cursor/database read failure before remote
+  listing). A gate refusal therefore never terminates the walk:
+  it is recorded on the source and the pass continues to the remaining
+  sources.
+
+`IngestReport::history_exhausted` is the top-level roll-up: `true` only when
+every requested source is `completed`, so a reader can tell "silence means
+nothing left" apart from "stopped before the end". Sources not requested by
+`include` are `null` and do not count against exhaustion. The source fields
+are additive to the serialized report, but `done` has an intentional behavior
+change for a walked-then-failed source: if a walk ran (even to apparent
+completion) and a later operation such as the final cursor write failed, the
+source is downgraded to `stopped_early` and `done` is forced to `false`.
+Budget exhaustion and cursor stalls continue to force `done` to `false`; a
+first-fetch remote failure or a pre-listing local cursor read failure does not,
+because no source walk consumed the budget. Consumers using `done` as a resume
+signal must handle these newly reported false values.
+
+Two edge semantics, stated explicitly:
+
+- `history_exhausted` is **vacuously `true` when `include` is empty**: no
+  source was requested, so nothing can count against it. It is a statement
+  about the REQUESTED sources, not about the repository.
+- The tri-state is additive, but `done`'s VALUE can still move: a
+  walked-then-failed source (the walk ran — possibly to completion — and a
+  post-walk step such as the final cursor write then failed) downgrades to
+  `stopped_early` and forces `done = false` at the call site, even when the
+  walk itself recorded completion. `done` keeps its existing MEANING ("call
+  until `true`"); the walked-then-failed arms are simply new events that
+  make it `false`, like budget exhaustion.
+
 ## `NewRecordForRef`
 
 A newly created note this pass, retained so the post-ingestion
@@ -117,6 +165,12 @@ failure (see the `cursor_stalled` handling in each `ingest_*` loop) — so
 the next pass re-walks from before the failure and retries it, while
 records that already landed (including ones ingested later in a stalled
 pass) are no-ops via natural-key dedupe.
+While a pass is stalled, the persisted floor also never advances on the
+strength of an ALREADY-EXISTING record walked after the stall point (its
+natural-key lookup proves only its own landing): advancing past one would
+persist a cursor strictly newer than the refused record's timestamp, and
+the next pass's inclusive `updated >= cursor` filter would skip the refused
+record forever instead of retrying it.
 
 ## Issue #765: commit-snapshot recovery
 
@@ -255,6 +309,10 @@ later records in this pass are still attempted (so every failure surfaces
 in this pass's warnings), but `max_updated` no longer advances past the
 stall point — the next pass re-fetches from before the failure and retries
 it, while already-landed records are no-ops via the natural key.
+The freeze applies on every `max_updated` advance, including the
+already-existing-record branch: while stalled, a later existing record with
+a newer timestamp must not pull the floor past the refused record (see
+`write_cursor` above).
 
 Each page is already `sort:updated-asc` server-side, but `--search` makes
 no hard ordering guarantee across ties — both loops re-sort defensively so
