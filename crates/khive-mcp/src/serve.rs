@@ -1693,10 +1693,17 @@ pub fn validate_db_override_against_backends_with_source(
             Ok(true)
         }
         Some(other) => {
-            tracing::info!(
-                "--db {other:?} (or KHIVE_DB) matches the path declared for the \
-                 \"main\" backend in khive.toml; proceeding because the override is a no-op"
-            );
+            if backends.is_empty() {
+                tracing::info!(
+                    "--db {other:?} (or KHIVE_DB) with no declared [[backends]]: the \
+                     override names the database directly (ordinary single-backend case)"
+                );
+            } else {
+                tracing::info!(
+                    "--db {other:?} (or KHIVE_DB) matches the path declared for the \
+                     \"main\" backend in khive.toml; proceeding because the override is a no-op"
+                );
+            }
             Ok(false)
         }
         None => Ok(false),
@@ -1756,7 +1763,12 @@ pub fn normalize_redundant_db_override_with_source(
         backends,
         config_source,
     )?;
-    if matches!(cli_db_override, Some(path) if path != ":memory:") {
+    // The anchor rewrite is only sound once the override has been proven
+    // redundant against a declared `main` backend. With no declared backends
+    // the concrete override is the ordinary single-backend case: it names the
+    // database directly and must be preserved, not collapsed to the
+    // no-override anchor.
+    if !backends.is_empty() && matches!(cli_db_override, Some(path) if path != ":memory:") {
         config.db_path = khive_runtime::resolve_db_anchor(None);
     }
     Ok(force_memory)
@@ -5518,6 +5530,41 @@ region = "us-east-1"
             None,
         )
         .expect("no declared backends means no possible conflict");
+    }
+
+    /// With no declared backends a concrete override names the database
+    /// directly, so normalization must PRESERVE the override-derived anchor
+    /// rather than collapsing it to the no-override anchor — the rewrite is
+    /// only proven sound against a declared `main` backend. Break the
+    /// `!backends.is_empty()` guard in
+    /// `normalize_redundant_db_override_with_source` and this test fails.
+    #[test]
+    fn normalize_preserves_concrete_override_with_no_backends() {
+        let override_value = "/tmp/single-backend-override.db";
+        let mut config = RuntimeConfig {
+            db_path: khive_runtime::resolve_db_anchor(Some(override_value)),
+            ..RuntimeConfig::default()
+        };
+        let anchor_before = config.db_path.clone();
+        assert_ne!(
+            anchor_before,
+            khive_runtime::resolve_db_anchor(None),
+            "fixture must start from an override-derived anchor distinct from the default"
+        );
+
+        let force_memory = normalize_redundant_db_override_with_source(
+            &mut config,
+            Some(override_value),
+            &[],
+            None,
+        )
+        .expect("a concrete override with no declared backends must be accepted");
+
+        assert!(!force_memory, "a concrete override never forces :memory:");
+        assert_eq!(
+            config.db_path, anchor_before,
+            "override-derived anchor must survive normalization when no backends are declared"
+        );
     }
 
     /// A declared `main` backend that is a symlink whose target does not
