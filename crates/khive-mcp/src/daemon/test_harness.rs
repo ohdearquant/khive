@@ -90,7 +90,9 @@ pub(super) async fn connect_when_ready(sock: &std::path::Path) -> UnixStream {
             tokio::time::Instant::now() < deadline,
             "daemon never bound {sock:?} within 5s"
         );
-        tokio::task::yield_now().await;
+        // Sleep, not yield_now(): the daemon binds on its own task, and a
+        // millisecond-scale sleep keeps this poll from hot-spinning a worker.
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
 }
 
@@ -213,7 +215,10 @@ impl<D> InProcessDaemonLauncher<D> {
                 self.launched_count(),
                 self.running_count()
             );
-            tokio::task::yield_now().await;
+            // Sleep, not yield_now(): launched daemons progress on other
+            // workers (blocking flock boot); polling at millisecond scale
+            // avoids a hot spin.
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
     }
 }
@@ -236,10 +241,29 @@ impl InProcessDaemonHandle {
     }
 
     pub(super) async fn stop(self) {
-        if !self.task.is_finished() {
+        let aborted = !self.task.is_finished();
+        if aborted {
+            // Abort IS the teardown contract for a serving in-process daemon:
+            // it otherwise serves until SIGTERM, which tests have no channel
+            // to deliver. A still-running task is cancelled here on purpose.
             self.task.abort();
         }
-        let _ = self.task.await;
+        match self.task.await {
+            Ok(result) => result.expect("in-process daemon task must exit without error"),
+            Err(join_error) if aborted && join_error.is_cancelled() => {
+                // The expected outcome of this stop()'s own abort.
+            }
+            Err(join_error) if join_error.is_panic() => {
+                // Never swallow a panic: resume it so the failure surfaces
+                // with its original payload and backtrace. A losing candidate
+                // exits Ok(()) through the ownership fence, so a panic here
+                // is a real regression in the server path.
+                std::panic::resume_unwind(join_error.into_panic());
+            }
+            Err(join_error) => {
+                panic!("in-process daemon task failed: {join_error:?}");
+            }
+        }
     }
 }
 

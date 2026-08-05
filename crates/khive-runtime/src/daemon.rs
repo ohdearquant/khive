@@ -2142,8 +2142,18 @@ mod tests {
             pid_can_name_incumbent(current, current, true),
             "the in-process harness must let a responsive same-PID owner win"
         );
+        // A fixed probe PID, not one derived from `current`: eligibility must
+        // hold for ANY distinct PID, and deriving the probe from the value
+        // under test could mask an off-by-one regression that special-cased
+        // adjacent PIDs. The precondition keeps the assertion logically exact
+        // even in the (astronomically unlikely) PID-collision case.
+        const DISTINCT_PROBE_PID: u32 = 40_000;
+        assert_ne!(
+            DISTINCT_PROBE_PID, current,
+            "probe PID must differ from this process's PID"
+        );
         assert!(
-            pid_can_name_incumbent(current.saturating_add(1), current, false),
+            pid_can_name_incumbent(DISTINCT_PROBE_PID, current, false),
             "a distinct PID remains eligible under ordinary production rules"
         );
     }

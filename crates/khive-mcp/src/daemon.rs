@@ -5313,6 +5313,21 @@ mod tests {
                     }
                 }
             }
+            // Teardown race: done_tx fires the instant the last client has its
+            // terminal error, but a regression-produced follow-up connect may
+            // already sit queued in the listener backlog. Dropping the listener
+            // immediately would let it escape uncounted. Quiesce-drain instead:
+            // every first-wave connection is already accepted (done only fires
+            // after all CLIENTS completed), so anything still arriving here is
+            // a retry, and counting it makes `accepted == CLIENTS` below fail
+            // the test rather than pass silently.
+            while let Ok(incoming) =
+                tokio::time::timeout(std::time::Duration::from_millis(250), listener.accept()).await
+            {
+                let (stream, _) = incoming.expect("accept client frame");
+                accepted += 1;
+                drop(stream);
+            }
             while let Some(connection) = connections.join_next().await {
                 connection.expect("crash fixture connection task must not panic");
             }

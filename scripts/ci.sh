@@ -203,10 +203,42 @@ run_daemon_recovery_repeats() {
     # intentionally create maximal recovery contention. Run them serially
     # inside each process, but repeat the paired scenario enough times on every
     # supported CI OS to expose scheduler-sensitive ownership leaks.
+    #
+    # Fail-closed count gate: a libtest name filter that matches zero tests
+    # still exits 0, so renaming or moving either test would silently turn
+    # this gate into a no-op. Enumerate the exact expected test names, capture
+    # the harness summary on every iteration, and require exactly that many
+    # passes; any mismatch (including zero) exits 1 naming the filter.
+    expected_test_names="\
+        daemon::tests::parallel_no_socket_recovery_converges_to_one_usable_daemon \
+        daemon::tests::parallel_parse_failure_is_terminal_and_never_recovers"
+    expected_tests=0
+    for name in $expected_test_names; do
+        expected_tests=$((expected_tests + 1))
+    done
     repeat=1
     while [ "$repeat" -le 25 ]; do
         echo "daemon recovery repeat ${repeat}/25"
-        cargo test -p khive-mcp --lib 'daemon::tests::parallel_' -- --test-threads=1
+        output_file=$(mktemp)
+        # --test-threads=1: the pair mutates process-global rendezvous state.
+        # The explicit failure branch keeps this gate fail-fast regardless of
+        # the caller's shell mode (the script runs `set -e`, but a pipeline or
+        # a future context change must not be able to disarm it).
+        # shellcheck disable=SC2086
+        cargo test -p khive-mcp --lib -- --test-threads=1 $expected_test_names \
+            > "$output_file" 2>&1 || {
+                cat "$output_file" >&2
+                rm -f "$output_file"
+                echo "FAIL: daemon recovery repeat ${repeat}/25: cargo test exited non-zero (filter: ${expected_test_names})" >&2
+                exit 1
+            }
+        cat "$output_file"
+        ran_count=$(sed -n 's/^test result: ok\. \{0,\}\([0-9][0-9]*\) passed;.*/\1/p' "$output_file" | head -n 1)
+        rm -f "$output_file"
+        if [ -z "$ran_count" ] || [ "$ran_count" -ne "$expected_tests" ]; then
+            echo "FAIL: daemon recovery repeat ${repeat}/25 ran ${ran_count:-0} tests, expected ${expected_tests} (filter: ${expected_test_names}) — the gate must run exactly the enumerated tests" >&2
+            exit 1
+        fi
         repeat=$((repeat + 1))
     done
 }
