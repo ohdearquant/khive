@@ -413,6 +413,65 @@ async fn manifest_scopes_keep_dev_back_edges_out_of_the_production_graph() {
 }
 
 #[tokio::test]
+async fn renamed_dev_dependency_keeps_its_declared_scope_for_import_edges() {
+    let root = TempDir::new().expect("tempdir");
+    for package in ["pkg_a", "mock_dep"] {
+        std::fs::create_dir_all(root.path().join(package).join("src")).unwrap();
+    }
+    std::fs::write(
+        root.path().join("pkg_a/src/lib.rs"),
+        "use mock_dep::stub;\n\npub fn pkg_a() { stub(); }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.path().join("mock_dep/src/lib.rs"),
+        "pub fn stub() {}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.path().join("pkg_a/Cargo.toml"),
+        "[package]\nname = \"pkg-a\"\n\n[dev-dependencies]\nmock = { package = \"mock-dep\", path = \"../mock_dep\" }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.path().join("mock_dep/Cargo.toml"),
+        "[package]\nname = \"mock-dep\"\n",
+    )
+    .unwrap();
+
+    let rt = rt_at(&root.path().join("renamed.db"));
+    let token = rt.authorize(Namespace::local()).expect("token");
+    run_code_ingest(
+        &rt,
+        &token,
+        CodeSourceIngestOptions {
+            path: root.path(),
+            languages: all_languages(),
+            sweep_time: Utc::now(),
+        },
+    )
+    .await
+    .expect("renamed-dependency fixture ingests");
+
+    // `use mock_dep::…` names the real crate, not the `mock` alias: the
+    // declared `dev` scope must survive that lookup rather than fall back
+    // to the import default `build`.
+    let edges = edge_fingerprints(&rt).await;
+    assert!(
+        edges
+            .iter()
+            .any(|(relation, source, target, kinds, scopes)| {
+                relation == "depends_on"
+                    && source == "pkg-a"
+                    && target == "mock-dep"
+                    && kinds.contains("import")
+                    && scopes == "dev"
+            }),
+        "renamed dev-dependency import edge must keep the declared dev scope: {edges:?}"
+    );
+}
+
+#[tokio::test]
 async fn module_paths_revisions_coverage_and_contains_ownership_are_queryable() {
     let root = TempDir::new().expect("tempdir");
     std::fs::create_dir_all(root.path().join("src")).unwrap();
@@ -919,4 +978,55 @@ async fn rejects_nonexistent_path() {
         err,
         khive_pack_code::CodeSourceIngestError::InvalidPath(_)
     ));
+}
+
+#[tokio::test]
+async fn gitless_fixture_reports_unversioned_source_revision() {
+    let root = TempDir::new().expect("tempdir");
+    std::fs::create_dir_all(root.path().join("src")).unwrap();
+    std::fs::write(
+        root.path().join("Cargo.toml"),
+        "[package]\nname = \"unversioned_fixture\"\n",
+    )
+    .unwrap();
+    std::fs::write(root.path().join("src/lib.rs"), "pub fn f() {}\n").unwrap();
+
+    // `git rev-parse` climbs parent directories, so the tempdir could sit
+    // inside an enclosing checkout: mask it and refuse to leak a parent
+    // repo into the fixture (a parent `GIT_*` env would defeat the mask,
+    // so assert those out too).
+    let elsewhere = TempDir::new().expect("gitdir tempdir");
+    let mask = elsewhere.path().join("mask.git");
+    git(
+        root.path(),
+        &[
+            "init",
+            "-q",
+            "--separate-git-dir",
+            mask.to_str().expect("utf-8 gitdir"),
+        ],
+    );
+    std::fs::remove_dir_all(&mask).expect("remove mask gitdir");
+    for var in ["GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR"] {
+        assert!(std::env::var_os(var).is_none(), "{var} must not be set");
+    }
+
+    let rt = rt_at(&root.path().join("unversioned.db"));
+    let token = rt.authorize(Namespace::local()).expect("token");
+    let report = run_code_ingest(
+        &rt,
+        &token,
+        CodeSourceIngestOptions {
+            path: root.path(),
+            languages: all_languages(),
+            sweep_time: Utc::now(),
+        },
+    )
+    .await
+    .expect("gitless fixture ingests");
+
+    assert_eq!(report.source_revision, "unversioned");
+    let module = module_properties_for_path(&rt, "unversioned_fixture", "src/lib.rs").await;
+    assert_eq!(module.len(), 1);
+    assert_eq!(module[0]["source_revision"].as_str(), Some("unversioned"));
 }

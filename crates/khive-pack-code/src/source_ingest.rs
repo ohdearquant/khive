@@ -141,7 +141,13 @@ fn source_snapshot(ingest_root: &Path) -> SourceSnapshot {
 }
 
 fn source_path(file: &Path, source_root: &Path) -> Option<String> {
-    let canonical_file = file.canonicalize().ok()?;
+    // Canonicalization can fail on a racy or dangling walk entry; fall back
+    // to the path as walked so the module still ingests with a
+    // best-effort repository-relative path rather than vanishing from the
+    // sweep. `source_path` is provenance metadata only — module identity
+    // stays the uuid5 `(source_project, language, module_path)` triple — so
+    // the fallback poisons no dedup invariant.
+    let canonical_file = file.canonicalize().unwrap_or_else(|_| file.to_path_buf());
     let canonical_root = source_root
         .canonicalize()
         .unwrap_or_else(|_| source_root.to_path_buf());
@@ -1095,12 +1101,32 @@ async fn run_import_scan(
         let Some(module_path) = imports::module_path_for_file(&file, &proj_root, language) else {
             continue;
         };
-        let Some(source_path) = source_path(&file, &snapshot.root) else {
-            report.warnings.push(format!(
-                "deriving repository-relative path for {}",
-                file.display()
-            ));
-            continue;
+        let source_path = match source_path(&file, &snapshot.root) {
+            Some(source_path) => source_path,
+            None => {
+                // Best-effort provenance fallback: keep the module in the
+                // sweep under its ingest-root-relative path (with a
+                // warning) instead of dropping it — see `source_path`.
+                report.warnings.push(format!(
+                    "canonical repository-relative path unavailable for {}; \
+                     falling back to the ingest-relative path",
+                    file.display()
+                ));
+                let fallback = file.strip_prefix(ingest_root).unwrap_or(&file);
+                let components: Vec<String> = fallback
+                    .components()
+                    .filter_map(|component| match component {
+                        std::path::Component::Normal(value) => {
+                            Some(value.to_string_lossy().to_string())
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                if components.is_empty() {
+                    continue;
+                }
+                components.join("/")
+            }
         };
 
         let file_label = file.display().to_string();

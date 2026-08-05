@@ -119,11 +119,34 @@ pub(crate) fn parse_cargo_toml(root: &Path, text: &str) -> Option<ManifestProjec
         ("dev-dependencies", "dev"),
         ("build-dependencies", "build"),
     ];
+    // A renamed dependency (`alias = { package = "real" }`) is keyed by the
+    // alias, but Rust `use` statements name the real crate: index both so
+    // the declared scope survives either lookup key.
+    let push_declared = |table: &toml::map::Map<String, TomlValue>,
+                         section: &str,
+                         scope: &str,
+                         dependencies: &mut Vec<(String, String, String)>| {
+        for dep_name in table.keys() {
+            dependencies.push((dep_name.clone(), section.to_string(), scope.to_string()));
+            if let Some(package) = table
+                .get(dep_name)
+                .and_then(TomlValue::as_table)
+                .and_then(|spec| spec.get("package"))
+                .and_then(TomlValue::as_str)
+            {
+                if package != dep_name {
+                    dependencies.push((
+                        package.to_string(),
+                        section.to_string(),
+                        scope.to_string(),
+                    ));
+                }
+            }
+        }
+    };
     for (section, scope) in sections {
         if let Some(TomlValue::Table(table)) = doc.get(section) {
-            for dep_name in table.keys() {
-                dependencies.push((dep_name.clone(), section.to_string(), scope.to_string()));
-            }
+            push_declared(table, section, scope, &mut dependencies);
         }
     }
     if let Some(TomlValue::Table(targets)) = doc.get("target") {
@@ -133,13 +156,7 @@ pub(crate) fn parse_cargo_toml(root: &Path, text: &str) -> Option<ManifestProjec
             };
             for (section, scope) in sections {
                 if let Some(TomlValue::Table(table)) = target.get(section) {
-                    for dep_name in table.keys() {
-                        dependencies.push((
-                            dep_name.clone(),
-                            section.to_string(),
-                            scope.to_string(),
-                        ));
-                    }
+                    push_declared(table, section, scope, &mut dependencies);
                 }
             }
         }
@@ -317,6 +334,39 @@ cc = "1"
             "cc".to_string(),
             "build-dependencies".to_string(),
             "build".to_string()
+        )));
+    }
+
+    #[test]
+    fn cargo_toml_renamed_dependency_indexes_alias_and_package() {
+        let text = r#"
+[package]
+name = "foo"
+
+[dev-dependencies]
+mock = { package = "real-mock", version = "1" }
+
+[target.'cfg(unix)'.dependencies]
+unix_alias = { package = "real_unix", version = "2" }
+"#;
+        let project = parse_cargo_toml(Path::new("/tmp"), text).expect("governing");
+        // Alias key stays for manifest-edge evidence.
+        assert!(project.dependencies.contains(&(
+            "mock".to_string(),
+            "dev-dependencies".to_string(),
+            "dev".to_string()
+        )));
+        // Rename target is indexed too: Rust `use real_mock::…` names the
+        // real crate, and its declared `dev` scope must survive the lookup.
+        assert!(project.dependencies.contains(&(
+            "real-mock".to_string(),
+            "dev-dependencies".to_string(),
+            "dev".to_string()
+        )));
+        assert!(project.dependencies.contains(&(
+            "real_unix".to_string(),
+            "dependencies".to_string(),
+            "normal".to_string()
         )));
     }
 
