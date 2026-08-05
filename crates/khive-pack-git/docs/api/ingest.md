@@ -44,7 +44,7 @@ than process-global daemon telemetry, so a caller can reliably assert
 
 A newly created note this pass, retained so the post-ingestion
 reference-extraction sweep (`link_references`) can resolve cross-references
-between records created in the *same* pass regardless of ingestion order
+between records created in the _same_ pass regardless of ingestion order
 (PRs and issues are ingested before commits) without re-reading them from
 storage.
 
@@ -80,7 +80,7 @@ namespace (matches the by-ID resolution contract used by `get`/`update`).
 ## `link_references`
 
 Post-ingestion sweep (ADR-088 Amendment 1 ingest enrichment): extracts
-GitHub reference-grammar mentions from every note created *this pass*
+GitHub reference-grammar mentions from every note created _this pass_
 (commits, issues, PRs — order-independent, since all three are already in
 `new_records` by the time this runs) and materializes `annotates` edges to
 the referenced issue/PR note, carrying `ref_kind` ("closes" | "mentions")
@@ -169,7 +169,7 @@ available), and any other error (including an unclassified `GitLogError` or
 a non-`GitLogError` failure) is returned immediately without ever calling
 `recover`. A later repair attempt's strategy replaces the pending warning
 rather than accumulating one per attempt, so exactly one success warning is
-ever returned — describing the *last* repair that was needed, not every
+ever returned — describing the _last_ repair that was needed, not every
 one tried.
 
 ## Masking boundaries (`MaskedCommitFields`, `MaskedIssueFields`, `MaskedPrFields`)
@@ -309,3 +309,89 @@ not a complete signal.
   Resolution now happens in one query/snapshot: both candidates are
   visible to the same `SELECT`, and the `ORDER BY` — not read ordering —
   decides the exact match wins.
+
+## Changed paths and code-module annotations
+
+The commit snapshot's `git log -z --name-only --no-renames
+--diff-merges=first-parent` pass is the authority for
+`commit.properties.changed_paths`. NUL-delimited paths bypass Git's quoted
+display encoding and are decoded with the same lossy UTF-8 normalization as
+ADR-085's filesystem path producer. At this parse stage tabs, newlines,
+quotes, backslashes, and non-ASCII text retain their path identity — but
+parsing identity is not storage identity. `changed_paths` storage is
+governed by `CommitHook`'s canonical repo-relative shape (see
+docs/api/hooks.md): a valid Unix filename containing a `\` byte or starting
+with an `X:` drive prefix can never round-trip through it. Before create,
+the ingester filters exactly those elements out of the array (the same
+predicate the hook enforces: a NUL byte, a backslash, an `X:` drive prefix,
+a leading `/`, or an empty/`.`/`..` component), keeps the canonical
+remainder, stores the commit, and counts the dropped paths in
+`IngestReport.changed_paths_filtered_noncanonical` with one bounded warning
+per run. The predicate runs on the RAW path, not the masked one: a secret
+token can itself contain a rejected byte (the masker's tokens are
+whitespace-delimited), and filtering after masking would flip the verdict
+from reject to accept; masking applies only to the paths that survive. Only actual predicate rejections count as drops: the BTreeSet
+dedup and post-masking collisions the sorted array also performs are not
+drops and are neither counted nor warned. Rename detection is
+pinned off (`--no-renames`) so a rename always surfaces as the delete + add
+pair `--name-only` reports without it; because Git does not mark which entry
+is the rename source, leaving detection on could silently swap one side of
+the pair away from the exact path facts that join against ADR-085 modules.
+A merge commit carries one canonical path set: its diff against the first
+parent. Paths that survive the canonical filter are secret-masked, sorted,
+and deduplicated before storage.
+The stored property has exactly three states: `[]` for a genuinely empty
+commit — and only for one; the canonical remainder array when at least one
+touched path survives the filter; and an omitted `changed_paths` (the hook
+treats it as optional) when the raw touched set was non-empty but every
+path was filtered — the all-filtered third state, whose evidence is the
+run's `changed_paths_filtered_noncanonical` count and bounded warning. A
+malformed `--name-only` token
+stream fails the phase (retried on the next pass via the cursor contract),
+and a walked commit with no recorded path set is skipped with a warning and
+a stalled cursor rather than stored with a fabricated `[]`. One residual
+parser ambiguity is deliberate: a non-header token is indistinguishable from
+a real path of the most recent header's commit. The `--name-only` walk is
+newest-first, so a header lost mid-stream attaches its record's path tokens
+to that NEWER commit — the commit already walked in the same stream — never
+to an older one. The parser does not guess at path content; containment is
+per-record, not per-stream: the missing sha has no path-set entry, so the
+run warns and stalls the cursor, but the polluted newer commit is created as
+usual — the orphaned tokens ride into its `changed_paths`, and commit notes
+are immutable, so the pollution persists (a re-ingest skips the stored sha;
+repair requires deleting the note and re-ingesting).
+`ingest_stalls_cursor_for_commit_missing_touched_paths` pins both halves:
+its shim's `tr` round-trip splits git's combined `<header>\n<first-path>`
+token into two lines, so `grep -av` removes only the header line and the
+deleted commit's path token survives in the stream as the orphan.
+
+Before walking commits, the ingester loads the same-namespace live ADR-085
+module index once for the repository snapshot HEAD. That snapshot is never
+truncated: `walk_commits` issues one unbounded `git log {since}..HEAD`, and
+`max_items` bounds only the create loop (a budget check after the snapshot
+loads), never the walk — so the snapshot HEAD is always the true repository
+HEAD of this pass, and the index anchors to modules-as-of-HEAD regardless of
+how many commits the budget lets this pass create. A module is eligible only
+when both `properties.source_revision` equals that HEAD and
+`properties.source_path` exactly equals the changed path. Requiring the
+revision prevents an identically named path in another repository snapshot
+from receiving a fabricated annotation. If more than one live module still
+has the same `(source_revision, source_path)`, the binding is ambiguous and no
+candidate is annotated. The skip folds two shapes into one counter,
+`IngestReport.code_module_ambiguous_path_skips`: an ambiguous key (two or
+more live rows, including the simplest case where both rows have parseable
+ids, or the case where at most one has a parseable id — a row whose `id` does
+not parse as a UUID is still a live row for the key, so it marks the pair
+ambiguous, but can never itself be the annotated candidate) and the
+single-row sub-case whose one row's id does not parse (not ambiguous — just
+no bindable candidate). Each skip is counted only when an ingested commit's
+path actually hits the key, so unusable keys untouched by the pass never
+inflate the count, and the run's bounded warning names the first skipped
+paths (masked, truncated) so the count is actionable. There is no suffix match, inferred rename, entity
+creation, or arbitrary winner. A failure to load the module index degrades
+the pass to no module annotation with a warning instead of aborting it,
+because the annotation is best-effort enrichment while `changed_paths` is
+the durable fact. This makes module churn and repeated
+cross-project co-change derivable from incoming `annotates` graph reads while
+retaining `changed_paths` as a durable path fact when no matching code map
+exists.

@@ -5,12 +5,29 @@ Extracted from `crates/khive-pack-git/src/hook.rs` doc-comments.
 ## Module overview
 
 Validation only — this pack introduces no new edges at `after_create` time.
-Provenance edges (`annotates` -> project / document / merging PR) are
+Provenance edges (`annotates` -> project / document / code module / merging PR) are
 supplied by the caller (the ingester, see `src/ingest.rs`) as part of the
 generic `create(kind=..., annotates=[...])` call; the runtime's own
 `create_note` path validates and links them atomically, so no
 `after_create` edge-creation logic is needed here (unlike gtd's
 `TaskHook::after_create`).
+
+## `CommitHook`
+
+In addition to the governed SHA, parent, and short-SHA shapes,
+`properties.changed_paths` is optional for manually created commit notes but
+validated when present. An explicit JSON `null` is treated the same as an
+absent property. When present, it must be an array of non-empty,
+repository-relative `/`-separated strings without empty, `.` or `..`
+components, and the array must already be sorted and deduplicated. The git
+ingester always supplies that canonical shape, including `[]` for an empty
+commit, except that the property is omitted when the raw touched set was
+non-empty but every path was filtered as non-canonical — the all-filtered
+third state named by
+`docs/api/ingest.md#changed-paths-and-code-module-annotations` (the hook's
+optional treatment above is what keeps the omitted shape valid). POSIX-absolute
+paths, any path containing a backslash, and any `X:` drive prefix (absolute or
+drive-relative) are rejected.
 
 ## `IssueLikeHook`
 

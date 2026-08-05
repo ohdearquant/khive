@@ -4,7 +4,7 @@
 //! the standard `create` verb. See crates/khive-pack-git/docs/api/ingest.md for
 //! the full module overview.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -200,6 +200,24 @@ pub struct IngestReport {
     /// to compare directly against an independent source of truth (e.g.
     /// `git rev-list --count <ref>`).
     pub commits_total_in_db: u64,
+    /// Touched paths the `--name-only` pass recorded but `changed_paths`
+    /// storage cannot carry: valid Unix filenames that violate the hook's
+    /// canonical shape (a `\` byte, an `X:` drive prefix, a leading `/`,
+    /// or an empty/`.`/`..` component). Only actual predicate rejections
+    /// count — dedup/post-masking collisions in the stored array are not
+    /// drops. Dropped before create rather than failing the whole commit —
+    /// see
+    /// crates/khive-pack-git/docs/api/ingest.md#changed-paths-and-code-module-annotations.
+    pub changed_paths_filtered_noncanonical: u64,
+    /// Changed paths whose `(source_revision, source_path)` module binding
+    /// was unusable and therefore received no code-module annotation. Two
+    /// shapes fold into this counter: an ambiguous key (two or more live
+    /// rows, whether two or more have parseable ids or at most one has a
+    /// parseable id) and the single-row sub-case whose one row's id does not
+    /// parse (not ambiguous — just no bindable candidate). Counted only when
+    /// an ingested commit's path actually hits the key, so unusable keys
+    /// untouched by this pass never inflate the count.
+    pub code_module_ambiguous_path_skips: u64,
 }
 
 fn record_write_failure(
@@ -600,6 +618,75 @@ async fn find_document_for_path(
     Ok(row.and_then(|r| row_uuid(&r)))
 }
 
+/// Load the live code-map module index for the exact repository snapshot
+/// being digested. ADR-085's `source_path` is relative to a repository root,
+/// so path alone is not a safe cross-repository join key. Requiring the
+/// module's `source_revision` to equal the snapshot HEAD keeps unrelated maps
+/// out; a path with more than one matching live row remains ambiguous and is
+/// deliberately represented by `None` rather than selecting or annotating an
+/// arbitrary candidate. That `None` folds two distinct shapes, both
+/// counted in the same skip counter: (a) two or more rows, including two or
+/// more rows with parseable ids and the case where at most one has a
+/// parseable id (true ambiguity), and (b) exactly ONE row whose id does not
+/// parse — a key that is not ambiguous but has no bindable candidate, so it
+/// must skip for the same reason. Shape (b) is a live row for the key exactly
+/// like any other; it occupies the slot (a second row for the same key marks
+/// the pair ambiguous under shape (a)) but can never itself serve as a
+/// binding target.
+///
+/// A reader/query failure returns `Err` carrying the underlying error text;
+/// the caller degrades to no module annotation with a warning that includes
+/// it rather than aborting the pass: module annotation is best-effort
+/// enrichment (ADR-088 Amendment 1), while the durable `changed_paths` fact
+/// must still be recorded.
+///
+/// The map alone is returned; the caller counts a skip only when a commit
+/// path actually hits an ambiguous (`None`) key, so ambiguous keys no
+/// ingested commit touches never inflate
+/// `IngestReport.code_module_ambiguous_path_skips`.
+async fn load_code_modules_by_snapshot_path(
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+    source_revision: &str,
+) -> Result<HashMap<String, Option<Uuid>>> {
+    let sql = runtime.sql();
+    let mut r = sql.reader().await.map_err(|e| anyhow!("{e}"))?;
+    let rows = r
+        .query_all(SqlStatement {
+            sql: "SELECT id, json_extract(properties,'$.source_path') AS source_path \
+                  FROM entities WHERE kind='concept' AND entity_type='module' \
+                  AND namespace=?1 AND deleted_at IS NULL \
+                  AND json_type(properties,'$.source_path')='text' \
+                  AND json_extract(properties,'$.source_revision')=?2 \
+                  ORDER BY source_path, id"
+                .into(),
+            params: vec![
+                SqlValue::Text(token.namespace().as_str().to_string()),
+                SqlValue::Text(source_revision.to_string()),
+            ],
+            label: Some("git_ingest_load_code_modules_by_snapshot_path".into()),
+        })
+        .await
+        .map_err(|e| anyhow!("{e}"))?;
+
+    let mut modules: HashMap<String, Option<Uuid>> = HashMap::new();
+    for row in rows {
+        let Some(SqlValue::Text(path)) = row.get("source_path") else {
+            continue;
+        };
+        // A row whose id does not parse is still a live row for its
+        // `(source_revision, source_path)` key: it occupies the slot (so any
+        // second row for the same key marks the pair ambiguous) but can
+        // never bind as an annotation target itself.
+        let id = row_uuid(&row);
+        modules
+            .entry(path.clone())
+            .and_modify(|candidate| *candidate = None)
+            .or_insert(id);
+    }
+    Ok(modules)
+}
+
 /// Read the last-ingested cursor value for `(project_id, kind)`, if any.
 async fn read_cursor(
     runtime: &KhiveRuntime,
@@ -661,6 +748,7 @@ async fn write_cursor(
 
 const RECORD_SEP: char = '\u{1e}';
 const FIELD_SEP: char = '\u{1f}';
+const TOUCHED_HEADER_PREFIX: &[u8] = b"/\x1e";
 
 struct RawCommit {
     sha: String,
@@ -778,14 +866,27 @@ fn walk_commits(repo: &Path, since_sha: Option<&str>) -> Result<Vec<RawCommit>> 
 }
 
 /// `sha -> \[touched paths\]` for every commit in `repo`'s history, via a
-/// separate `--name-only` pass.
+/// separate NUL-delimited `--name-only` pass. Merge commits use their
+/// first-parent diff as the one canonical path set. The resulting paths drive
+/// document/module annotations and the durable
+/// `commit.properties.changed_paths` fact. Rename detection is pinned off so
+/// a rename always surfaces as the delete + add pair `--name-only` reports
+/// without it: those exact path facts are the ADR-085 module join keys, and
+/// Git does not mark which entry is the rename source, so an inferred rename
+/// could otherwise silently swap one side of the pair away.
 fn touched_files(repo: &Path) -> Result<HashMap<String, Vec<String>>> {
     let output = Command::new("git")
         .arg("-C")
         .arg(repo)
         .arg("log")
+        .arg("-z")
         .arg("--name-only")
-        .arg(format!("--pretty=format:{RECORD_SEP}%H"))
+        .arg("--no-renames")
+        .arg("--diff-merges=first-parent")
+        // Git paths are always repository-relative, so no tracked path token
+        // can start with `/`. This absolute-looking prefix is therefore an
+        // unambiguous header sentinel in the NUL-delimited token stream.
+        .arg(format!("--pretty=format:/{RECORD_SEP}%H"))
         .output()
         .context("spawning git log --name-only")?;
     if !output.status.success() {
@@ -794,15 +895,205 @@ fn touched_files(repo: &Path) -> Result<HashMap<String, Vec<String>>> {
             stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
         }));
     }
-    let text = String::from_utf8_lossy(&output.stdout);
+    parse_touched_files(&output.stdout)
+}
+
+/// Decode the `-z --name-only` stream [`touched_files`] produces. The stream
+/// is unambiguous only when every token is either a `/\x1e<40-hex-sha>`
+/// header (optionally followed by one newline and the commit's first path)
+/// or a path belonging to the most recent header; anything else fails the
+/// phase rather than storing a silently partial path set. A bare `[]` is
+/// therefore meaningful: it is a genuinely empty commit, never the residue
+/// of a parser/git-output mismatch.
+///
+/// One ambiguity this layer cannot resolve: a non-header token is
+/// indistinguishable from a real path of the most recent header's commit.
+/// The `--name-only` walk is newest-first, so a header lost mid-stream (with
+/// its NUL separator) leaves the deleted record's path tokens attached to
+/// that NEWER commit — the commit already walked in the same stream — never
+/// to an older one. Containment is partial and per-record, not per-stream:
+/// the missing sha has no path-set entry, so `ingest_commits` skips it,
+/// warns, and stalls the cursor
+/// (`ingest_stalls_cursor_for_commit_missing_touched_paths` pins both), but
+/// the polluted NEWER commit is created as usual — the orphaned tokens ride
+/// into its `changed_paths`, and commit notes are immutable, so the
+/// pollution persists (a re-ingest skips the already-stored sha; repair
+/// requires deleting the note and re-ingesting). The fixture asserts
+/// exactly that pollution.
+/// The parser deliberately does not try to detect it: that would require
+/// judging path content against a commit the parse never saw.
+fn parse_touched_files(bytes: &[u8]) -> Result<HashMap<String, Vec<String>>> {
     let mut map: HashMap<String, Vec<String>> = HashMap::new();
-    for block in text.split(RECORD_SEP) {
-        let mut lines = block.lines().filter(|l| !l.trim().is_empty());
-        let Some(sha) = lines.next() else { continue };
-        let files: Vec<String> = lines.map(str::to_string).collect();
-        map.insert(sha.trim().to_string(), files);
+    // With `-z`, git emits paths verbatim and NUL-terminates each one. Git
+    // may place either one or two NULs between adjacent commit sections, so
+    // parse individual tokens and recognize only the impossible-path header
+    // prefix above. The header and its first path share a token, separated by
+    // one newline; removing exactly that one byte preserves a filename whose
+    // own first byte is a newline.
+    let mut current_sha: Option<String> = None;
+    for token in bytes.split(|byte| *byte == 0) {
+        if token.is_empty() {
+            continue;
+        }
+        if let Some(header) = token.strip_prefix(TOUCHED_HEADER_PREFIX) {
+            if header.len() < 40 || !header[..40].iter().all(u8::is_ascii_hexdigit) {
+                let lossy = String::from_utf8_lossy(header);
+                let masked = secret_gate::mask_secrets(lossy.as_ref());
+                let display = refs::truncate_chars(masked.as_ref(), 80);
+                return Err(anyhow!(
+                    "git log --name-only output contains a malformed commit header {:?}",
+                    display
+                ));
+            }
+            let sha = String::from_utf8_lossy(&header[..40]).into_owned();
+            let files = map.entry(sha.clone()).or_default();
+            if let Some(first_path) = header[40..].strip_prefix(b"\n") {
+                if !first_path.is_empty() {
+                    files.push(String::from_utf8_lossy(first_path).into_owned());
+                }
+            } else if !header[40..].is_empty() {
+                // Anything after the SHA that does not start with the one
+                // newline separator is a shape git never emits; guessing at
+                // it could drop or fabricate a first path.
+                return Err(anyhow!(
+                    "git log --name-only header for commit {sha} carries a \
+                     malformed first-path separator"
+                ));
+            }
+            current_sha = Some(sha);
+            continue;
+        }
+        let Some(sha) = &current_sha else {
+            // Path bytes are attacker/repo-controlled, so the error snippet
+            // is secret-masked the same way stored changed_paths are —
+            // never raw token bytes in a log/error path.
+            let lossy = String::from_utf8_lossy(token);
+            let masked = secret_gate::mask_secrets(lossy.as_ref());
+            let display = refs::truncate_chars(masked.as_ref(), 80);
+            return Err(anyhow!(
+                "git log --name-only output contains a path token before any \
+                 commit header: {display:?}"
+            ));
+        };
+        map.get_mut(sha)
+            .expect("current SHA was inserted with its header")
+            .push(String::from_utf8_lossy(token).into_owned());
     }
     Ok(map)
+}
+
+#[cfg(test)]
+mod touched_file_parser_tests {
+    use super::parse_touched_files;
+
+    #[test]
+    fn accepts_single_or_double_nul_commit_boundaries() {
+        let sha_a = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let sha_b = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let sha_c = "cccccccccccccccccccccccccccccccccccccccc";
+        let raw =
+            format!("/\x1e{sha_a}\nfirst.rs\0second.rs\0/\x1e{sha_b}\nthird.rs\0\0/\x1e{sha_c}\0");
+
+        let parsed = parse_touched_files(raw.as_bytes()).expect("well-formed stream");
+        assert_eq!(
+            parsed[sha_a],
+            vec!["first.rs".to_string(), "second.rs".to_string()]
+        );
+        assert_eq!(parsed[sha_b], vec!["third.rs".to_string()]);
+        assert!(parsed[sha_c].is_empty());
+    }
+
+    #[test]
+    fn preserves_delimiters_and_uses_lossy_utf8_path_normalization() {
+        let sha = "dddddddddddddddddddddddddddddddddddddddd";
+        let mut raw = format!("/\x1e{sha}\n").into_bytes();
+        raw.extend_from_slice(b"src/caf\xc3\xa9\t\"quoted\"\\leaf\nline.rs\0bad-\xff.rs\0");
+
+        let parsed = parse_touched_files(&raw).expect("well-formed stream");
+        assert_eq!(
+            parsed[sha],
+            vec![
+                "src/café\t\"quoted\"\\leaf\nline.rs".to_string(),
+                "bad-�.rs".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn rejects_a_path_token_before_any_header() {
+        // Silently dropping this token could store `[]` for a commit that
+        // touched files; failing the phase preserves the retry contract.
+        let sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let raw = format!("orphan.rs\0/\x1e{sha}\nfirst.rs\0");
+
+        let err = parse_touched_files(raw.as_bytes()).expect_err("orphan path must fail");
+        assert!(
+            format!("{err}").contains("before any commit header"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn masks_a_secret_shaped_orphan_token_in_the_error() {
+        // The error snippet is a log path: it must carry the same masking as
+        // stored changed_paths, never raw token bytes.
+        let fake_token = "ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let raw = format!("src/{fake_token}.rs\0");
+
+        let err = parse_touched_files(raw.as_bytes()).expect_err("orphan path must fail");
+        let text = format!("{err}");
+        assert!(!text.contains(fake_token), "{text}");
+        assert!(text.contains("MASKED"), "{text}");
+    }
+
+    #[test]
+    fn masks_a_secret_shaped_malformed_header_in_the_error() {
+        let fake_token = "ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let raw = format!("/\x1e{fake_token}\0");
+
+        let err = parse_touched_files(raw.as_bytes()).expect_err("bad header must fail");
+        let text = format!("{err}");
+        assert!(!text.contains(fake_token), "{text}");
+        assert!(text.contains("MASKED"), "{text}");
+    }
+
+    #[test]
+    fn masks_an_orphan_secret_before_truncating_the_error() {
+        let fake_token = "ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        // The credential crosses the old byte-80 cut, so masking only the
+        // prefix would leave the raw secret in the error path.
+        let token = format!("{} {fake_token}", "x".repeat(59));
+        assert!(token.len() > 80);
+        let raw = format!("{token}\0");
+
+        let err = parse_touched_files(raw.as_bytes()).expect_err("orphan path must fail");
+        let text = format!("{err}");
+        assert!(!text.contains(fake_token), "{text}");
+        assert!(text.contains("MASKED"), "{text}");
+    }
+
+    #[test]
+    fn rejects_a_malformed_header_sha() {
+        let raw = "/\x1enot-hex-at-all\nfirst.rs\0second.rs\0";
+
+        let err = parse_touched_files(raw.as_bytes()).expect_err("bad header must fail");
+        assert!(
+            format!("{err}").contains("malformed commit header"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn rejects_a_header_remainder_without_the_newline_separator() {
+        // A header remainder that does not start with exactly one newline is
+        // a shape git never emits; silently discarding it could lose the
+        // first path or misread it as a leading-newline path.
+        let sha = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let raw = format!("/\x1e{sha}XXfirst.rs\0");
+
+        let err = parse_touched_files(raw.as_bytes()).expect_err("bad separator must fail");
+        assert!(format!("{err}").contains("first-path separator"), "{err}");
+    }
 }
 
 /// The two `git log` passes a commit-ingest phase needs, loaded together so
@@ -1006,6 +1297,36 @@ async fn ingest_commits(
         return Ok(());
     }
 
+    // `walk_commits` is oldest-first and includes HEAD whenever this phase
+    // has work, so the last record is the exact repository snapshot against
+    // which ADR-085 `source_revision` must bind. The walk itself is never
+    // truncated: it issues one unbounded `git log {since}..HEAD`, and
+    // `max_items` bounds only the create loop below (a budget check AFTER
+    // this point), never the snapshot. `snapshot_head` is therefore always
+    // the true repository HEAD of this pass, and the module index anchors to
+    // modules-as-of-HEAD regardless of how many commits the budget lets this
+    // pass create.
+    let snapshot_head = commits
+        .last()
+        .expect("non-empty commit snapshot checked above")
+        .sha
+        .clone();
+    // Module annotation is best-effort enrichment: a failed index load
+    // degrades to no module annotation with a warning carrying the load
+    // error's text rather than aborting the pass that records the durable
+    // `changed_paths` facts.
+    let code_modules_by_source_path =
+        match load_code_modules_by_snapshot_path(runtime, token, &snapshot_head).await {
+            Ok(modules) => modules,
+            Err(e) => {
+                report.warnings.push(format!(
+                    "code module index load failed for snapshot {snapshot_head}: {e}; \
+                     commits ingest without code-module annotation"
+                ));
+                HashMap::new()
+            }
+        };
+
     // `cursor_stalled` freezes `last_sha` at the last contiguous successfully
     // processed commit: once a record fails to create, later records in this
     // same pass are still attempted (so a run surfaces every failure it can,
@@ -1017,6 +1338,12 @@ async fn ingest_commits(
     // sha natural key), so a retried pass never double-creates them.
     let mut last_sha: Option<String> = since;
     let mut cursor_stalled = false;
+    // Bounded detail for the per-run ambiguous-module-skip warning: the
+    // masked skipped paths in encounter order, capped so one pathological
+    // run cannot bloat the report (the full count is always exact).
+    const AMBIGUOUS_SKIP_DETAIL_CAP: usize = 5;
+    const AMBIGUOUS_SKIP_PATH_DISPLAY_CHARS: usize = 80;
+    let mut ambiguous_module_skip_paths: Vec<String> = Vec::new();
     // Parent SHA -> note id for commits created earlier THIS pass (walked
     // oldest-first) — combined with `find_commit_by_sha`'s DB lookup below,
     // this resolves parent edges regardless of which pass the parent landed
@@ -1043,15 +1370,104 @@ async fn ingest_commits(
             format!("{}\n\n{}", masked.subject, masked.body)
         };
 
-        let mut annotates = vec![project_id.to_string()];
-
-        if let Some(paths) = files_by_sha.get(&c.sha) {
-            for p in paths {
-                if !p.starts_with("docs/adr/") {
-                    continue;
+        // Both `git log` passes walk the same history, so every walked
+        // commit should have a path-set entry. A missing entry means the two
+        // passes disagree; surface it instead of silently storing the `[]`
+        // the contract reserves for a genuinely empty commit.
+        let Some(touched_paths) = files_by_sha.get(&c.sha) else {
+            cursor_stalled = true;
+            let recipient_detail = commits
+                .iter()
+                .position(|candidate| candidate.sha == c.sha)
+                .and_then(|index| {
+                    commits
+                        .iter()
+                        .skip(index + 1)
+                        .find(|candidate| files_by_sha.contains_key(&candidate.sha))
+                })
+                .map(|recipient| {
+                    format!(
+                        "; orphaned paths may have been absorbed by newer commit {}",
+                        recipient.sha
+                    )
+                })
+                .unwrap_or_else(|| {
+                    "; no newer path-set recipient was identifiable from this snapshot".to_string()
+                });
+            report.warnings.push(format!(
+                "create commit {}: no touched-path set recorded by the \
+                 --name-only pass; not ingested{}",
+                c.sha, recipient_detail
+            ));
+            continue;
+        };
+        // The `-z` stream is verbatim: a Unix filename may legitimately
+        // contain `\` or start `X:`, and the hook's canonical
+        // `changed_paths` shape can never carry those (CommitHook rejects
+        // them, which would fail the whole commit create and stall the
+        // cursor on every pass). Filter them here, against the same
+        // predicate the hook enforces, and surface the per-run count below.
+        // The predicate runs on the RAW path, not the masked one: a secret
+        // token can itself contain a rejected byte (the masker's tokens are
+        // whitespace-delimited, so a backslash or NUL inside a token is
+        // redacted along with it), and filtering post-masking would then
+        // flip the verdict from reject to accept. Masking is applied only
+        // to the paths that survive the raw filter, for storage. Only
+        // actual predicate rejections count as drops: BTreeSet dedup and
+        // post-masking collisions are not drops and are neither counted
+        // nor warned.
+        let mut noncanonical = 0_u64;
+        let changed_paths: Vec<String> = touched_paths
+            .iter()
+            .filter(|path| {
+                let canonical = hook::is_repo_relative_path(path);
+                if !canonical {
+                    noncanonical += 1;
                 }
-                if let Some(doc_id) = find_document_for_path(runtime, token, p).await? {
-                    annotates.push(doc_id.to_string());
+                canonical
+            })
+            .map(|path| secret_gate::mask_secrets(path).into_owned())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        report.changed_paths_filtered_noncanonical += noncanonical;
+        // Distinguish the three stored states the contract defines: a
+        // genuinely empty commit stores `[]`; a commit whose raw touched
+        // paths were ALL rejected omits `changed_paths` entirely (the drop
+        // count in `changed_paths_filtered_noncanonical` and the per-run
+        // warning carry the evidence); anything else stores the canonical
+        // remainder. The hook treats a missing `changed_paths` as optional,
+        // so the omitted shape still validates.
+        let changed_paths_property = if touched_paths.is_empty() || !changed_paths.is_empty() {
+            Some(changed_paths.clone())
+        } else {
+            None
+        };
+        let mut annotates = BTreeSet::from([project_id.to_string()]);
+
+        for path in &changed_paths {
+            match code_modules_by_source_path.get(path) {
+                Some(Some(module_id)) => {
+                    annotates.insert(module_id.to_string());
+                }
+                // The key is unusable — either more than one live row binds
+                // it (including the two-parseable-row case) or its single
+                // row's id does not parse — so no candidate is annotated.
+                // Both shapes count once per commit path that hits the key (the
+                // path is also remembered for the bounded per-run warning
+                // below); see `load_code_modules_by_snapshot_path` for the
+                // fold.
+                Some(None) => {
+                    report.code_module_ambiguous_path_skips += 1;
+                    if ambiguous_module_skip_paths.len() < AMBIGUOUS_SKIP_DETAIL_CAP {
+                        ambiguous_module_skip_paths.push(path.clone());
+                    }
+                }
+                None => {}
+            }
+            if path.starts_with("docs/adr/") {
+                if let Some(doc_id) = find_document_for_path(runtime, token, path).await? {
+                    annotates.insert(doc_id.to_string());
                 }
             }
         }
@@ -1072,10 +1488,10 @@ async fn ingest_commits(
             },
         };
         if let Some(pr_id) = pr_id {
-            annotates.push(pr_id.to_string());
+            annotates.insert(pr_id.to_string());
         }
 
-        let properties = json!({
+        let mut properties = json!({
             "sha": masked.sha,
             "short_sha": masked.short_sha,
             "author": masked.author,
@@ -1083,6 +1499,9 @@ async fn ingest_commits(
             "committed_at": masked.committed_at,
             "parents": masked.parents,
         });
+        if let Some(paths) = changed_paths_property {
+            properties["changed_paths"] = json!(paths);
+        }
 
         let name = refs::truncate_chars(
             &format!("{} {}", masked.short_sha, masked.subject),
@@ -1095,7 +1514,7 @@ async fn ingest_commits(
             "name": name,
             "content": content,
             "properties": properties,
-            "annotates": annotates,
+            "annotates": annotates.into_iter().collect::<Vec<_>>(),
         });
         if let Some(head) = embedding_head {
             create_request["embedding_content"] = json!(head);
@@ -1169,6 +1588,48 @@ async fn ingest_commits(
     }
     if let Some(sha) = last_sha {
         write_cursor(runtime, project_id, "commits", &sha).await?;
+    }
+    // One bounded line per run (never one per path): filenames are
+    // attacker/repo-controlled and may be long, so the count is the
+    // load-bearing fact; a bounded masked path sample rides along so the
+    // count is actionable, and the full set remains recoverable from the
+    // raw `git log -z --name-only` stream if an operator needs it.
+    if report.changed_paths_filtered_noncanonical > 0 {
+        report.warnings.push(format!(
+            "{} touched path(s) dropped from changed_paths: outside the \
+             canonical repo-relative shape (NUL byte, backslash, `X:` \
+             drive prefix, leading `/`, or empty/`.`/`..` component)",
+            report.changed_paths_filtered_noncanonical
+        ));
+    }
+    if report.code_module_ambiguous_path_skips > 0 {
+        // Every skip increments the exact counter above; only the retained
+        // masked path sample is capped at AMBIGUOUS_SKIP_DETAIL_CAP.
+        let shown = ambiguous_module_skip_paths
+            .len()
+            .min(AMBIGUOUS_SKIP_DETAIL_CAP);
+        let detail = ambiguous_module_skip_paths[..shown]
+            .iter()
+            .map(|path| {
+                let display = refs::truncate_chars(path, AMBIGUOUS_SKIP_PATH_DISPLAY_CHARS);
+                format!("{display:?}")
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        let remaining = report
+            .code_module_ambiguous_path_skips
+            .saturating_sub(shown as u64);
+        let suffix = if remaining > 0 {
+            format!(", +{remaining} more")
+        } else {
+            String::new()
+        };
+        report.warnings.push(format!(
+            "{} changed path(s) skipped code-module annotation: no usable \
+             (source_revision, source_path) binding (first {shown}: \
+             [{detail}]{suffix})",
+            report.code_module_ambiguous_path_skips
+        ));
     }
     if let Some(warning) = recovery_warning {
         report.warnings.push(warning);
@@ -2295,6 +2756,171 @@ mod find_document_for_path_tests {
             Some(exact_id),
             "a single query covering both exact and broadened candidates \
              must still rank the exact match first, regardless of insertion order"
+        );
+    }
+}
+
+/// `load_code_modules_by_snapshot_path` ambiguity and error-surface
+/// regression tests. See
+/// crates/khive-pack-git/docs/api/ingest.md#test-module-notes.
+#[cfg(test)]
+mod module_index_loader_tests {
+    use super::*;
+    use khive_runtime::Namespace;
+
+    const REVISION: &str = "1111111111111111111111111111111111111111";
+    const AMBIGUOUS_PATH: &str = "crates/ambig/src/lib.rs";
+
+    fn rt_and_token() -> (KhiveRuntime, NamespaceToken) {
+        let rt = KhiveRuntime::memory().unwrap();
+        let token = rt.authorize(Namespace::local()).unwrap();
+        (rt, token)
+    }
+
+    async fn create_module(
+        rt: &KhiveRuntime,
+        token: &NamespaceToken,
+        name: &str,
+        path: &str,
+    ) -> Uuid {
+        rt.create_entity(
+            token,
+            "concept",
+            Some("module"),
+            name,
+            None,
+            Some(json!({
+                "source_path": path,
+                "source_revision": REVISION
+            })),
+            vec![],
+        )
+        .await
+        .unwrap()
+        .id
+    }
+
+    /// A live module row whose `id` does not parse as a UUID — a shape the
+    /// normal `create` path never writes, inserted raw to prove the loader
+    /// still counts it toward ambiguity.
+    async fn insert_unparsable_module_row(
+        rt: &KhiveRuntime,
+        token: &NamespaceToken,
+        name: &str,
+        path: &str,
+    ) {
+        let mut writer = rt.sql().writer().await.unwrap();
+        writer
+            .execute(SqlStatement {
+                sql: "INSERT INTO entities \
+                      (id, namespace, kind, entity_type, name, properties, created_at, updated_at) \
+                      VALUES (?1, ?2, 'concept', 'module', ?3, ?4, 0, 0)"
+                    .into(),
+                params: vec![
+                    SqlValue::Text("not-a-parseable-uuid".to_string()),
+                    SqlValue::Text(token.namespace().as_str().to_string()),
+                    SqlValue::Text(name.to_string()),
+                    SqlValue::Text(
+                        json!({
+                            "source_path": path,
+                            "source_revision": REVISION
+                        })
+                        .to_string(),
+                    ),
+                ],
+                label: Some("test_insert_unparsable_module_row".into()),
+            })
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn single_valid_module_row_binds() {
+        let (rt, token) = rt_and_token();
+        let id = create_module(&rt, &token, "solo_module", AMBIGUOUS_PATH).await;
+
+        let index = load_code_modules_by_snapshot_path(&rt, &token, REVISION)
+            .await
+            .unwrap();
+        assert_eq!(index.get(AMBIGUOUS_PATH), Some(&Some(id)));
+    }
+
+    /// Contract: more than one live module with the same
+    /// `(source_revision, source_path)` is ambiguous and annotates none. An
+    /// unparsable-id row is still a live row for that key, so it must mark
+    /// the pair ambiguous even though it can never bind itself.
+    #[tokio::test]
+    async fn unparsable_module_row_counts_toward_ambiguity() {
+        let (rt, token) = rt_and_token();
+        let valid_id = create_module(&rt, &token, "valid_module", AMBIGUOUS_PATH).await;
+        insert_unparsable_module_row(&rt, &token, "malformed_module", AMBIGUOUS_PATH).await;
+
+        let index = load_code_modules_by_snapshot_path(&rt, &token, REVISION)
+            .await
+            .unwrap();
+        assert_eq!(
+            index.get(AMBIGUOUS_PATH),
+            Some(&None),
+            "a malformed row is evidence of a second live module for \
+             {AMBIGUOUS_PATH}; the valid row {valid_id} must not be selected"
+        );
+    }
+
+    #[tokio::test]
+    async fn two_parseable_module_rows_fold_to_ambiguity() {
+        let (rt, token) = rt_and_token();
+        let first_id = create_module(&rt, &token, "first_module", AMBIGUOUS_PATH).await;
+        let second_id = create_module(&rt, &token, "second_module", AMBIGUOUS_PATH).await;
+
+        let index = load_code_modules_by_snapshot_path(&rt, &token, REVISION)
+            .await
+            .unwrap();
+        assert_eq!(
+            index.get(AMBIGUOUS_PATH),
+            Some(&None),
+            "two live parseable rows ({first_id}, {second_id}) must not select a winner"
+        );
+    }
+
+    #[tokio::test]
+    async fn unparsable_module_row_alone_never_binds() {
+        let (rt, token) = rt_and_token();
+        insert_unparsable_module_row(&rt, &token, "lonely_malformed", AMBIGUOUS_PATH).await;
+
+        let index = load_code_modules_by_snapshot_path(&rt, &token, REVISION)
+            .await
+            .unwrap();
+        assert_eq!(
+            index.get(AMBIGUOUS_PATH),
+            Some(&None),
+            "an unparsable id can never serve as an annotation target"
+        );
+    }
+
+    /// A failed index load must surface its cause: the caller includes this
+    /// error text in the degradation warning, so persistent SQL/schema
+    /// problems stay diagnosable.
+    #[tokio::test]
+    async fn load_failure_surfaces_error_text() {
+        let (rt, token) = rt_and_token();
+        // Break the substrate directly: the index query then fails with a
+        // real SQL error that must reach the caller.
+        let mut writer = rt.sql().writer().await.unwrap();
+        writer
+            .execute(SqlStatement {
+                sql: "DROP TABLE entities".into(),
+                params: vec![],
+                label: Some("test_drop_entities".into()),
+            })
+            .await
+            .unwrap();
+
+        let err = load_code_modules_by_snapshot_path(&rt, &token, REVISION)
+            .await
+            .expect_err("a failed index load must return Err");
+        assert!(
+            format!("{err}").contains("no such table"),
+            "the error must carry the underlying SQL cause: {err}"
         );
     }
 }
