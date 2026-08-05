@@ -67,6 +67,10 @@ pub struct CodeSourceIngestReport {
     /// for them at all (see the `source_path` fallback arm) — counted so a
     /// vanished module is visible instead of silent.
     pub files_dropped_without_source_path: u64,
+    /// Files returned by the walk for which no language-specific module path
+    /// could be derived — counted instead of silently skipping them.
+    #[serde(default)]
+    pub files_skipped_without_module_path: u64,
     /// Entity documents successfully written to the map database's FTS index.
     /// A successful ingest indexes every non-blocked entity upsert, so generic
     /// KG `search` and query-anchored `context` can read the resulting map.
@@ -112,6 +116,7 @@ const UNVERSIONED_REVISION: &str = "unversioned";
 struct SourceSnapshot {
     root: PathBuf,
     revision: String,
+    git_metadata_available: bool,
 }
 
 #[derive(Debug)]
@@ -122,34 +127,45 @@ struct ModuleScan {
 
 type ManifestScopeIndex = BTreeMap<(String, String, String), BTreeSet<String>>;
 
-fn source_snapshot(ingest_root: &Path) -> SourceSnapshot {
+async fn source_snapshot(ingest_root: &Path) -> SourceSnapshot {
     let fallback_root = ingest_root
         .canonicalize()
         .unwrap_or_else(|_| ingest_root.to_path_buf());
-    let git_output = |args: &[&str]| {
-        Command::new("git")
-            .arg("-C")
-            .arg(ingest_root)
-            .args(args)
-            .env("GIT_OPTIONAL_LOCKS", "0")
-            .env_remove("GIT_DIR")
-            .env_remove("GIT_WORK_TREE")
-            .env_remove("GIT_COMMON_DIR")
-            .env_remove("GIT_INDEX_FILE")
-            .output()
-            .ok()
-            .filter(|output| output.status.success())
-            .and_then(|output| String::from_utf8(output.stdout).ok())
-            .map(|stdout| stdout.trim().to_string())
-    };
-    let root = git_output(&["rev-parse", "--show-toplevel"])
-        .filter(|root| !root.is_empty())
-        .map(PathBuf::from)
-        .unwrap_or(fallback_root);
-    let revision = git_output(&["rev-parse", "--verify", "HEAD"])
-        .filter(|revision| !revision.is_empty())
-        .unwrap_or_else(|| UNVERSIONED_REVISION.to_string());
-    SourceSnapshot { root, revision }
+    let ingest_root = ingest_root.to_path_buf();
+    let git_result = tokio::task::spawn_blocking(move || {
+        let git_output = |args: &[&str]| {
+            Command::new("git")
+                .arg("-C")
+                .arg(&ingest_root)
+                .args(args)
+                .env("GIT_OPTIONAL_LOCKS", "0")
+                .env_remove("GIT_DIR")
+                .env_remove("GIT_WORK_TREE")
+                .env_remove("GIT_COMMON_DIR")
+                .env_remove("GIT_INDEX_FILE")
+                .output()
+                .ok()
+                .filter(|output| output.status.success())
+                .and_then(|output| String::from_utf8(output.stdout).ok())
+                .map(|stdout| stdout.trim().to_string())
+        };
+        let root = git_output(&["rev-parse", "--show-toplevel"])
+            .filter(|root| !root.is_empty())
+            .map(PathBuf::from);
+        let revision =
+            git_output(&["rev-parse", "--verify", "HEAD"]).filter(|revision| !revision.is_empty());
+        (root, revision)
+    })
+    .await
+    .ok();
+
+    let (git_root, git_revision) = git_result.unwrap_or((None, None));
+    let git_metadata_available = git_root.is_some() && git_revision.is_some();
+    SourceSnapshot {
+        root: git_root.unwrap_or(fallback_root),
+        revision: git_revision.unwrap_or_else(|| UNVERSIONED_REVISION.to_string()),
+        git_metadata_available,
+    }
 }
 
 fn source_path(file: &Path, source_root: &Path) -> Option<String> {
@@ -317,34 +333,69 @@ fn canonical_project_target(
         .unwrap_or_else(|| target_project.to_string())
 }
 
+#[derive(Debug)]
+struct DeclaredProjectImport {
+    target: String,
+    scope: &'static str,
+    /// All declared targets that shared the normalized Rust identifier.
+    /// An empty vector means there was no collision.
+    normalization_matches: Vec<String>,
+}
+
+/// Resolve a declared import target and scope. On a Rust dash/underscore
+/// normalization collision the lexicographically first declared target wins.
 fn declared_project_import_target_and_scope(
     manifest_scopes: &ManifestScopeIndex,
     source_project: &str,
     language: &str,
     target_project: &str,
-) -> Option<(String, &'static str)> {
+) -> Option<DeclaredProjectImport> {
     let exact_key = (
         source_project.to_string(),
         language.to_string(),
         target_project.to_string(),
     );
-    if let Some(scopes) = manifest_scopes.get(&exact_key) {
-        return Some((target_project.to_string(), preferred_import_scope(scopes)));
-    }
     if language != "rust" {
-        return None;
+        return manifest_scopes
+            .get(&exact_key)
+            .map(|scopes| DeclaredProjectImport {
+                target: target_project.to_string(),
+                scope: preferred_import_scope(scopes),
+                normalization_matches: Vec::new(),
+            });
     }
     let normalized_target = target_project.replace('-', "_");
-    manifest_scopes
+    let matches: Vec<_> = manifest_scopes
         .iter()
-        .find(|((source, declared_language, declared_target), _)| {
+        .filter(|((source, declared_language, declared_target), _)| {
             source == source_project
                 && declared_language == language
                 && declared_target.replace('-', "_") == normalized_target
         })
-        .map(|((_, _, declared_target), scopes)| {
-            (declared_target.clone(), preferred_import_scope(scopes))
-        })
+        .collect();
+
+    if matches.len() > 1 {
+        let (key, scopes) = matches[0];
+        return Some(DeclaredProjectImport {
+            target: key.2.clone(),
+            scope: preferred_import_scope(scopes),
+            normalization_matches: matches.iter().map(|(key, _)| key.2.clone()).collect(),
+        });
+    }
+
+    if let Some(scopes) = manifest_scopes.get(&exact_key) {
+        return Some(DeclaredProjectImport {
+            target: target_project.to_string(),
+            scope: preferred_import_scope(scopes),
+            normalization_matches: Vec::new(),
+        });
+    }
+
+    matches.first().map(|(key, scopes)| DeclaredProjectImport {
+        target: key.2.clone(),
+        scope: preferred_import_scope(scopes),
+        normalization_matches: Vec::new(),
+    })
 }
 
 fn project_import_target_and_scope(
@@ -353,11 +404,35 @@ fn project_import_target_and_scope(
     source_project: &str,
     language: &str,
     target_project: &str,
-) -> (String, &'static str) {
+) -> DeclaredProjectImport {
     let canonical =
         canonical_project_target(project_renames, source_project, language, target_project);
     declared_project_import_target_and_scope(manifest_scopes, source_project, language, &canonical)
-        .unwrap_or((canonical, IMPORT_DEPENDENCY_SCOPE))
+        .unwrap_or(DeclaredProjectImport {
+            target: canonical,
+            scope: IMPORT_DEPENDENCY_SCOPE,
+            normalization_matches: Vec::new(),
+        })
+}
+
+fn report_normalization_collision(
+    report: &mut CodeSourceIngestReport,
+    source_project: &str,
+    target_project: &str,
+    resolution: &DeclaredProjectImport,
+) {
+    if resolution.normalization_matches.len() <= 1 {
+        return;
+    }
+    let warning = format!(
+        "Rust import target {target_project:?} in project {source_project:?} has a \
+         dash/underscore normalization collision among declared targets {:?}; \
+         lexicographically first declared target {:?} wins",
+        resolution.normalization_matches, resolution.target
+    );
+    if !report.warnings.contains(&warning) {
+        report.warnings.push(warning);
+    }
 }
 
 async fn get_entity_opt(
@@ -861,15 +936,22 @@ async fn reresolve_pass(
                     changed = true;
                 }
                 if spec.dependency_kind == IMPORT_DEPENDENCY_KIND {
-                    if let Some((target, scope)) = declared_project_import_target_and_scope(
+                    if let Some(target) = declared_project_import_target_and_scope(
                         manifest_scopes,
                         &source_project,
                         &spec.language,
                         &spec.specifier,
                     ) {
-                        changed |= spec.specifier != target || spec.dependency_scope != scope;
-                        spec.specifier = target;
-                        spec.dependency_scope = scope.to_string();
+                        report_normalization_collision(
+                            report,
+                            &source_project,
+                            &spec.specifier,
+                            &target,
+                        );
+                        changed |= spec.specifier != target.target
+                            || spec.dependency_scope != target.scope;
+                        spec.specifier = target.target;
+                        spec.dependency_scope = target.scope.to_string();
                     }
                 }
             }
@@ -974,14 +1056,16 @@ async fn stamp_import_scan_coverage(
         let mut props = match module.properties.clone() {
             Some(Value::Object(map)) => map,
             _ => {
-                // `upsert_module` always writes an object; anything else
-                // means the row drifted outside this pipeline — fail loud
-                // rather than silently rebuilding from nothing.
+                // `upsert_module` normally writes an object; anything else
+                // means the row drifted outside this pipeline. Never rebuild
+                // from nothing because that would destroy unrelated module
+                // provenance properties.
                 report.warnings.push(format!(
                     "module {module_id} has missing or non-object properties at stamp time; \
-                     rebuilding coverage stamps from scratch (F2 contract violation)"
+                     coverage stamp skipped (F2 contract violation)"
                 ));
-                serde_json::Map::new()
+                report.coverage_stamps_missed += 1;
+                continue;
             }
         };
         props.insert(
@@ -995,7 +1079,9 @@ async fn stamp_import_scan_coverage(
         props.insert("import_specifier_count".into(), json!(scan.imports.len()));
         props.insert("unresolved_import_count".into(), json!(unresolved_count));
         module.properties = Some(Value::Object(props));
-        upsert_entity(rt, token, module, &source_label, report).await?;
+        if !upsert_entity(rt, token, module, &source_label, report).await? {
+            report.coverage_stamps_missed += 1;
+        }
     }
     Ok(())
 }
@@ -1052,12 +1138,18 @@ pub async fn run_code_ingest(
         return Err(CodeSourceIngestError::InvalidPath(opts.path.to_path_buf()));
     }
 
-    let snapshot = source_snapshot(opts.path);
+    let snapshot = source_snapshot(opts.path).await;
     let mut report = CodeSourceIngestReport {
         languages: opts.languages.iter().map(|s| s.to_string()).collect(),
         source_revision: snapshot.revision.clone(),
         ..Default::default()
     };
+    if !snapshot.git_metadata_available {
+        report.warnings.push(format!(
+            "git metadata unavailable for {}; source revision degraded to {UNVERSIONED_REVISION}",
+            opts.path.display()
+        ));
+    }
 
     let manifests = manifest::discover_manifests(opts.path, &opts.languages)
         .map_err(|e| CodeSourceIngestError::InvalidPath(opts.path.join(e.to_string())))?;
@@ -1223,6 +1315,7 @@ async fn run_import_scan(
                 },
             );
         let Some(module_path) = imports::module_path_for_file(&file, &proj_root, language) else {
+            report.files_skipped_without_module_path += 1;
             continue;
         };
         let source_path = match source_path(&file, &snapshot.root) {
@@ -1237,12 +1330,24 @@ async fn run_import_scan(
                 // repository root (a symlinked ingest path, or one side's
                 // canonicalize racing and failing) makes `strip_prefix`
                 // fail and lands here.
-                report.warnings.push(format!(
-                    "canonical repository-relative path unavailable for {}; \
-                     falling back to the ingest-relative path",
-                    file.display()
-                ));
-                let fallback = file.strip_prefix(ingest_root).unwrap_or(&file);
+                let fallback = match file.strip_prefix(ingest_root) {
+                    Ok(path) => {
+                        report.warnings.push(format!(
+                            "canonical repository-relative path unavailable for {}; \
+                             falling back to the ingest-relative path",
+                            file.display()
+                        ));
+                        path
+                    }
+                    Err(_) => {
+                        report.warnings.push(format!(
+                            "canonical repository-relative path unavailable for {}; path is \
+                             outside the ingest root and is recorded as-is",
+                            file.display()
+                        ));
+                        &file
+                    }
+                };
                 let components: Vec<String> = fallback
                     .components()
                     .filter_map(|component| match component {
@@ -1370,18 +1475,19 @@ async fn run_import_scan(
                     record_unresolved(rt, token, module_id, spec, &file_label, report).await?;
                 }
                 Resolved::ExternalProject(target_name) => {
-                    let (target_name, dependency_scope) = project_import_target_and_scope(
+                    let resolution = project_import_target_and_scope(
                         manifest_scopes,
                         project_renames,
                         &proj_name,
                         language,
                         &target_name,
                     );
+                    report_normalization_collision(report, &proj_name, &target_name, &resolution);
                     let spec = UnresolvedSpec {
-                        specifier: target_name,
+                        specifier: resolution.target,
                         target_kind: "project".to_string(),
                         dependency_kind: IMPORT_DEPENDENCY_KIND.to_string(),
-                        dependency_scope: dependency_scope.to_string(),
+                        dependency_scope: resolution.scope.to_string(),
                         language: language.to_string(),
                     };
                     scan_imports.push(spec.clone());
@@ -1396,4 +1502,60 @@ async fn run_import_scan(
         scan.imports.extend(scan_imports);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use khive_runtime::{Namespace, RuntimeConfig};
+    use tempfile::TempDir;
+
+    #[tokio::test]
+    async fn stamp_skips_non_object_properties_without_rebuilding() {
+        let root = TempDir::new().expect("temporary database directory");
+        let rt = KhiveRuntime::new(RuntimeConfig {
+            db_path: Some(root.path().join("stamp.db")),
+            packs: vec![],
+            ..RuntimeConfig::no_embeddings()
+        })
+        .expect("target runtime opens");
+        let token = rt.authorize(Namespace::local()).expect("token");
+        let module_id = module_uuid("fixture", "rust", "crate");
+        let mut module = Entity::new(token.namespace().as_str(), "concept", "crate")
+            .with_entity_type(Some("module"));
+        module.id = module_id;
+        module.properties = Some(json!("corrupt"));
+        let original_properties = module.properties.clone();
+        rt.entities(&token)
+            .expect("entity store")
+            .upsert_entity(module)
+            .await
+            .expect("direct entity write");
+
+        let mut module_scans = HashMap::new();
+        module_scans.insert(
+            module_id,
+            ModuleScan {
+                source_project: "fixture".to_string(),
+                imports: Vec::new(),
+            },
+        );
+        let mut report = CodeSourceIngestReport::default();
+        stamp_import_scan_coverage(&rt, &token, module_scans, &mut report)
+            .await
+            .expect("stamp path completes");
+
+        let stored = rt
+            .entities(&token)
+            .expect("entity store")
+            .get_entity(module_id)
+            .await
+            .expect("fetch stamped module")
+            .expect("module remains present");
+        assert_eq!(stored.properties, original_properties);
+        assert_eq!(report.coverage_stamps_missed, 1);
+        assert!(report.warnings.iter().any(|warning| {
+            warning.contains("F2 contract violation") && warning.contains("coverage stamp skipped")
+        }));
+    }
 }

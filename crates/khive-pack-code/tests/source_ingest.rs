@@ -1193,9 +1193,109 @@ async fn gitless_fixture_reports_unversioned_source_revision() {
     .expect("gitless fixture ingests");
 
     assert_eq!(report.source_revision, "unversioned");
+    assert!(report
+        .warnings
+        .iter()
+        .any(|warning| warning.contains("git metadata unavailable")));
     let module = module_properties_for_path(&rt, "unversioned_fixture", "src/lib.rs").await;
     assert_eq!(module.len(), 1);
     assert_eq!(module[0]["source_revision"].as_str(), Some("unversioned"));
+}
+
+fn write_normalization_collision_fixture(root: &Path) {
+    let pkg_a = root.join("pkg_a");
+    let z_dash = root.join("z_dash");
+    let z_underscore = root.join("z_underscore");
+    for package in [&pkg_a, &z_dash, &z_underscore] {
+        std::fs::create_dir_all(package.join("src")).unwrap();
+    }
+    std::fs::write(
+        pkg_a.join("Cargo.toml"),
+        "[package]\nname = \"pkg-a\"\n\n[dependencies]\nz-dep = { path = \"../z_dash\" }\nz_alias = { package = \"z_dep\", path = \"../z_underscore\" }\n",
+    )
+    .unwrap();
+    std::fs::write(pkg_a.join("src/lib.rs"), "use z_dep::helper;\n").unwrap();
+    std::fs::write(z_dash.join("Cargo.toml"), "[package]\nname = \"z-dep\"\n").unwrap();
+    std::fs::write(z_dash.join("src/lib.rs"), "pub fn helper() {}\n").unwrap();
+    std::fs::write(
+        z_underscore.join("Cargo.toml"),
+        "[package]\nname = \"z_dep\"\n",
+    )
+    .unwrap();
+    std::fs::write(z_underscore.join("src/lib.rs"), "pub fn helper() {}\n").unwrap();
+}
+
+#[tokio::test]
+async fn rust_normalization_collision_warns_and_picks_lexicographically_first() {
+    let root = TempDir::new().expect("tempdir");
+    write_normalization_collision_fixture(root.path());
+    let rt = rt_at(&root.path().join("normalization_collision.db"));
+    let token = rt.authorize(Namespace::local()).expect("token");
+
+    let report = run_code_ingest(
+        &rt,
+        &token,
+        CodeSourceIngestOptions {
+            path: root.path(),
+            languages: all_languages(),
+            sweep_time: Utc::now(),
+        },
+    )
+    .await
+    .expect("normalization-collision fixture ingests");
+
+    assert!(report.warnings.iter().any(|warning| {
+        warning.contains("normalization collision")
+            && warning.contains("z-dep")
+            && warning.contains("z_dep")
+            && warning.contains("lexicographically first declared target \"z-dep\" wins")
+    }));
+    let edges = edge_fingerprints(&rt).await;
+    assert!(
+        edges.iter().any(|(relation, source, target, kinds, _)| {
+            relation == "depends_on"
+                && source == "pkg-a"
+                && target == "z-dep"
+                && kinds == "dependencies,import"
+        }),
+        "the deterministic collision pick must put the import evidence on z-dep: {edges:?}"
+    );
+    assert!(
+        edges.iter().any(|(relation, source, target, kinds, _)| {
+            relation == "depends_on"
+                && source == "pkg-a"
+                && target == "z_dep"
+                && kinds == "dependencies"
+        }),
+        "the renamed package declaration must remain distinct from the collision pick: {edges:?}"
+    );
+}
+
+#[tokio::test]
+async fn root_python_init_is_counted_as_skipped_without_module_path() {
+    let root = TempDir::new().expect("tempdir");
+    std::fs::write(
+        root.path().join("pyproject.toml"),
+        "[project]\nname = \"pyproj\"\n",
+    )
+    .unwrap();
+    std::fs::write(root.path().join("__init__.py"), "").unwrap();
+    let rt = rt_at(&root.path().join("module_path_skip.db"));
+    let token = rt.authorize(Namespace::local()).expect("token");
+
+    let report = run_code_ingest(
+        &rt,
+        &token,
+        CodeSourceIngestOptions {
+            path: root.path(),
+            languages: all_languages(),
+            sweep_time: Utc::now(),
+        },
+    )
+    .await
+    .expect("root __init__ fixture ingests");
+
+    assert_eq!(report.files_skipped_without_module_path, 1);
 }
 
 #[tokio::test]

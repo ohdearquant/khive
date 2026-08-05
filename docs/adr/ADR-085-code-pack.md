@@ -1527,6 +1527,12 @@ path/revision/content provenance on the stable semantic module entity instead
 of accumulating one entity per commit. Future L2 symbol entities copy the
 declaring module's `source_path` and `source_revision`.
 
+Migration boundary: databases ingested before this correction may retain a
+stale `crate` module row (and its edges) for binary roots. Correcting those
+databases requires a fresh-namespace re-ingest or manual cleanup. The
+pre-correction state was itself incorrect because two distinct modules shared
+one identity.
+
 ### F4: Acceptance
 
 1. A two-project fixture with a normal dependency in one direction and a

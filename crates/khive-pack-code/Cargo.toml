@@ -15,6 +15,7 @@ description = "Code ontology pack - typed edge rules and audit findings vocabula
 khive-types = { version = "0.7.0", path = "../khive-types", features = ["serde"] }
 khive-runtime = { version = "0.7.0", path = "../khive-runtime" }
 khive-storage = { version = "0.7.0", path = "../khive-storage" }
+tokio = { workspace = true }
 inventory = { workspace = true }
 async-trait = { workspace = true }
 chrono = { workspace = true }
