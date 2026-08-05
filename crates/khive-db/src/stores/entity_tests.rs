@@ -1473,3 +1473,69 @@ async fn offset_pagination_deterministic_order() {
         assert!(seen.contains(id), "row {id} missing from paged sweep");
     }
 }
+
+/// #1656: a seek-cursor walk with an active `kind` filter must return every
+/// matching row, matching the count an offset-based query would return for
+/// the same filter, even when matching rows are sparse relative to the
+/// sequence range being walked.
+#[tokio::test]
+async fn cursor_kind_filter_returns_records() {
+    let store = setup_memory_store_ns("ns1");
+
+    // Insert a large run of "document" entities first, then a sparse run of
+    // "concept" entities, so a naive seq-first probe window can land
+    // entirely on non-matching rows.
+    for i in 0..40 {
+        store
+            .upsert_entity(make_entity("ns1", "document", &format!("Doc{i}")))
+            .await
+            .unwrap();
+    }
+    let mut concept_ids = Vec::new();
+    for i in 0..5 {
+        let entity = make_entity("ns1", "concept", &format!("Concept{i}"));
+        concept_ids.push(entity.id);
+        store.upsert_entity(entity).await.unwrap();
+    }
+
+    let filter = EntityFilter {
+        kinds: vec!["concept".to_string()],
+        ..Default::default()
+    };
+
+    let mut walked_ids: Vec<Uuid> = Vec::new();
+    let mut after = None;
+    loop {
+        let page = store
+            .query_entities_after("ns1", filter.clone(), after, 2)
+            .await
+            .unwrap();
+        for entity in &page.items {
+            walked_ids.push(entity.id);
+        }
+        after = page.next_after;
+        if after.is_none() {
+            break;
+        }
+    }
+
+    assert_eq!(
+        walked_ids.len(),
+        concept_ids.len(),
+        "cursor walk with kind filter must return every matching row"
+    );
+    let walked_set: std::collections::HashSet<Uuid> = walked_ids.into_iter().collect();
+    for id in &concept_ids {
+        assert!(
+            walked_set.contains(id),
+            "cursor walk missing expected concept entity {id}"
+        );
+    }
+
+    // Control: offset-based query for the same filter must return the same set.
+    let offset_page = store
+        .query_entities("ns1", filter, PageRequest::default())
+        .await
+        .unwrap();
+    assert_eq!(offset_page.items.len(), concept_ids.len());
+}
