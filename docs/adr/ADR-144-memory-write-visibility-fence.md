@@ -1,6 +1,7 @@
 # ADR-144: Operation-Level Write-Visibility Fence for Memory Recall
 
-- Status: Proposed
+- Status: Accepted
+- Decision: Arm A — additive write receipt plus session read fence
 - Date: 2026-08-05
 - Related: ADR-118 (fresh exact tail), #1084 (per-hit route labels, declined shape),
   #1161 (Cold/Empty cap divergence, separate lane)
@@ -40,7 +41,7 @@ legitimately contain both origins, and a route summary cannot prove that one
 particular write is covered. Origin labels are diagnostics, not a correctness
 primitive.
 
-## Decision (proposed — the fork below is the sign-off question)
+## Decision (accepted: Arm A — the fork below records the sign-off question as posed)
 
 Add an additive, operation-scoped visibility contract to the memory pack:
 
@@ -61,9 +62,9 @@ Add an additive, operation-scoped visibility contract to the memory pack:
 3. **Diagnostics stay diagnostics.** Verbose responses may report per-hit
    origin and per-model watermarks, but no correctness claim rides on them.
 
-### The fork requiring sign-off
+### The fork as posed at sign-off (resolved: Arm A)
 
-- **Arm A (this proposal):** the receipt/fence contract above.
+- **Arm A (accepted):** the receipt/fence contract above.
 - **Arm B (explicit null):** formally decide that `memory.remember`
   acknowledges storage durability only, that search visibility is best-effort,
   and document that contract at the verb surface. This is a legitimate product
@@ -113,7 +114,17 @@ Add an additive, operation-scoped visibility contract to the memory pack:
 
 ## Acceptance
 
-This record is accepted only with an explicit choice of Arm A or Arm B. If
-Arm A: implementation follows as tracked work (receipt first, fence second;
-both additive). If Arm B: the verb documentation change lands with the
-acceptance and this record stands as the decision trail.
+Accepted with Arm A, under four conditions recorded here as part of the
+decision:
+
+1. This record's Status and Decision lines name the accepted arm before the
+   record merges.
+2. Sequencing is as written: receipt first, fence second, both additive.
+   Implementation is tracked follow-up work and does not preempt existing
+   scheduled priorities.
+3. The one-consistent-snapshot property of the coverage proof (see
+   Consequences) is review-blocking at implementation time: a coverage proof
+   assembled from two separately read clocks must fail review.
+4. The session-fence wait carries a server-side maximum timeout cap;
+   caller-provided timeouts bound below that cap and can never request an
+   unbounded hold.
