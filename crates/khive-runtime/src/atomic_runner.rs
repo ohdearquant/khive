@@ -403,7 +403,7 @@ mod tests {
 
     /// A scratch pool wired exactly like the daemon.rs / sql_bridge.rs
     /// tests above it: file-backed (atomic_unit's single-writer path is
-    /// only reachable file-backed), `write_queue_enabled: true` so
+    /// only reachable file-backed), `write_queue_enabled: Some(true)` so
     /// `atomic_unit` routes through the real `WriterTask` + `block_on_sync`
     /// seam rather than the flag-off manual-transaction fallback — the
     /// suspend-trap contract only fires on this path.
@@ -413,7 +413,7 @@ mod tests {
         let pool = StdArc::new(
             ConnectionPool::new(PoolConfig {
                 path: Some(path),
-                write_queue_enabled: true,
+                write_queue_enabled: Some(true),
                 ..PoolConfig::default()
             })
             .expect("pool open"),

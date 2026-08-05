@@ -953,7 +953,7 @@ mod tests {
     /// channel instead of the pool-mutex path, and both rows are actually
     /// committed and independently searchable back.
     ///
-    /// Constructed via a `PoolConfig` literal (`write_queue_enabled: true`),
+    /// Constructed via a `PoolConfig` literal (`write_queue_enabled: Some(true)`),
     /// not the `KHIVE_WRITE_QUEUE` env var — that env var is process-global
     /// and this crate's other tests are NOT `#[serial]` against it, so a
     /// window where it is set here could leak into a
@@ -969,7 +969,7 @@ mod tests {
         let path = dir.path().join("write_queue_sparse.db");
         let pool_cfg = PoolConfig {
             path: Some(path.clone()),
-            write_queue_enabled: true,
+            write_queue_enabled: Some(true),
             ..PoolConfig::default()
         };
         let pool = Arc::new(ConnectionPool::new(pool_cfg).expect("pool"));

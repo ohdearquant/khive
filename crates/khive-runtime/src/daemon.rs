@@ -2819,7 +2819,7 @@ mod tests {
         let enabled_pool = Arc::new(
             ConnectionPool::new(khive_db::PoolConfig {
                 path: Some(dir.path().join("wq_enabled.db")),
-                write_queue_enabled: true,
+                write_queue_enabled: Some(true),
                 ..khive_db::PoolConfig::default()
             })
             .expect("pool open"),
@@ -2841,7 +2841,7 @@ mod tests {
         let disabled_pool = Arc::new(
             ConnectionPool::new(khive_db::PoolConfig {
                 path: Some(dir.path().join("wq_disabled.db")),
-                write_queue_enabled: false,
+                write_queue_enabled: Some(false),
                 ..khive_db::PoolConfig::default()
             })
             .expect("pool open"),

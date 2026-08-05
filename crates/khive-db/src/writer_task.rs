@@ -544,13 +544,17 @@ pub fn spawn(pool: &ConnectionPool, capacity: usize) -> Result<WriterTaskHandle,
     let origin = pool.origin();
     let db = crate::timeout_sink::db_label(pool);
     let (tx, rx) = mpsc::channel(capacity.max(1));
-    tokio::spawn(run_writer_task(
+    let join = tokio::spawn(run_writer_task(
         conn,
         rx,
         origin,
         db.clone(),
         acquisition_counters,
     ));
+    // Stored on the pool (not returned) so the handle's clone-and-share
+    // contract stays untouched; see ConnectionPool::take_writer_task_join
+    // for who awaits it and why.
+    pool.set_writer_task_join(join);
     Ok(WriterTaskHandle {
         tx,
         db,
@@ -1431,7 +1435,7 @@ mod tests {
         let path = dir.path().join("writer_task_wrapped_panic.db");
         let cfg = PoolConfig {
             path: Some(path),
-            write_queue_enabled: true,
+            write_queue_enabled: Some(true),
             write_queue_capacity: 8,
             ..PoolConfig::default()
         };

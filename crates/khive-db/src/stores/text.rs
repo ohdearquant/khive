@@ -44,7 +44,10 @@ fn refuse_direct_route_if_strict(
                 .into(),
         });
     }
-    if pool.config().write_queue_enabled {
+    if pool.write_queue_active() {
+        // In-memory pools never spawn a writer task by documented design
+        // (explicit `Some(true)` degrades), so a violation row there would
+        // be noise, not signal.
         crate::timeout_sink::emit_direct_route_violation(
             &crate::timeout_sink::db_label(pool),
             site,

@@ -1250,7 +1250,7 @@ mod tests {
         let config = crate::pool::PoolConfig {
             path: Some(path.clone()),
             busy_timeout: std::time::Duration::from_millis(200),
-            write_queue_enabled,
+            write_queue_enabled: Some(write_queue_enabled),
             ..crate::pool::PoolConfig::default()
         };
         let pool = ConnectionPool::new(config).expect("fresh tenant-shaped pool should open");
@@ -1329,7 +1329,7 @@ mod tests {
     /// `OnceLock`s) opened against the SAME tenant DB file — the shape a
     /// per-store (rather than per-backend) pool construction would produce.
     /// Entity writes go through pool A, the FTS write through pool B, each
-    /// with `write_queue_enabled: true` so each independently spawns its own
+    /// with `write_queue_enabled: Some(true)` so each independently spawns its own
     /// WriterTask on first access.
     #[tokio::test]
     async fn issue_1029_two_pools_same_file_write_queue_on() {
@@ -1339,7 +1339,7 @@ mod tests {
         let cfg = |p: std::path::PathBuf| crate::pool::PoolConfig {
             path: Some(p),
             busy_timeout: std::time::Duration::from_millis(200),
-            write_queue_enabled: true,
+            write_queue_enabled: Some(true),
             ..crate::pool::PoolConfig::default()
         };
 

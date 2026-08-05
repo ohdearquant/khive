@@ -564,7 +564,7 @@ mod tests {
         let pool = Arc::new(
             khive_db::ConnectionPool::new(khive_db::PoolConfig {
                 path: Some(db_path),
-                write_queue_enabled: false,
+                write_queue_enabled: Some(false),
                 ..khive_db::PoolConfig::default()
             })
             .expect("pool"),
@@ -654,7 +654,7 @@ mod tests {
     /// (see `fold_gate::tests::fold_gate_apply_routes_through_writer_task_when_flag_enabled`'s
     /// doc comment for the concrete failure this caused before both tests
     /// were rewritten to avoid the env var). Constructing the pool directly
-    /// with `write_queue_enabled: true` in the config literal, and driving
+    /// with `write_queue_enabled: Some(true)` in the config literal, and driving
     /// `record_serve` over a bare `SqlBridge` instead of a full
     /// `KhiveRuntime`, sidesteps global mutable state entirely.
     #[tokio::test]
@@ -663,7 +663,7 @@ mod tests {
         let db_path = dir.path().join("serve-ledger-write-queue-routing.db");
         let pool_cfg = khive_db::PoolConfig {
             path: Some(db_path),
-            write_queue_enabled: true,
+            write_queue_enabled: Some(true),
             ..khive_db::PoolConfig::default()
         };
         let pool = std::sync::Arc::new(khive_db::ConnectionPool::new(pool_cfg).expect("pool"));

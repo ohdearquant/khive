@@ -5,7 +5,7 @@ use rusqlite::{Connection, OpenFlags};
 use std::fs;
 use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -72,9 +72,21 @@ pub struct PoolConfig {
     /// single-writer guarantee — other write paths still open their own
     /// writers until later slices migrate them.
     ///
+    /// `None` means the caller expressed no preference: [`ConnectionPool::new`]
+    /// resolves it once `path` is known, defaulting to `true` for file-backed
+    /// pools and `false` for in-memory ones. `Some(_)` is an explicit
+    /// preference and always wins, in both directions, over that default.
+    /// An explicit `Some(true)` on an in-memory pool is accepted DELIBERATELY
+    /// and emits a warning before degrading to the legacy path — an in-memory
+    /// pool cannot host a writer task (`writer_task::spawn`'s
+    /// standalone-connection open fails); see
+    /// `ConnectionPool::writer_task_handle` and the
+    /// `explicit_true_stays_on_for_memory_backed_pool` test.
+    ///
     /// Overridable via `KHIVE_WRITE_QUEUE` (`"1"` or `"true"`,
-    /// case-insensitive, enables it; anything else, or unset, leaves it off).
-    pub write_queue_enabled: bool,
+    /// case-insensitive, sets `Some(true)`; any other value sets `Some(false)`;
+    /// unset leaves it `None`).
+    pub write_queue_enabled: Option<bool>,
     /// Bounded channel capacity for the `WriterTask` write queue.
     ///
     /// Overridable via `KHIVE_WRITE_QUEUE_CAPACITY`. Default: 256 pending
@@ -122,9 +134,14 @@ impl Default for PoolConfig {
                 .and_then(|v| v.parse::<i64>().ok())
                 .unwrap_or(DEFAULT_JOURNAL_SIZE_LIMIT_BYTES),
             read_only: false,
-            write_queue_enabled: std::env::var("KHIVE_WRITE_QUEUE")
-                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-                .unwrap_or(false),
+            // `var_os`, not `var`: the documented contract is "any SET value
+            // other than 1/true means Some(false)" — a set-but-non-Unicode
+            // value must count as set (var() would return Err and silently
+            // fall through to the file-backed default of enabled).
+            write_queue_enabled: std::env::var_os("KHIVE_WRITE_QUEUE").map(|v| {
+                v.to_str()
+                    .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            }),
             write_queue_capacity: std::env::var("KHIVE_WRITE_QUEUE_CAPACITY")
                 .ok()
                 .and_then(|v| v.parse::<usize>().ok())
@@ -252,6 +269,19 @@ pub struct ConnectionPool {
     /// see that method's doc comment for why this lives here rather than on
     /// each store.
     writer_task: OnceLock<Option<WriterTaskHandle>>,
+    /// The `tokio::spawn` JoinHandle of the writer task above, stored by
+    /// [`crate::writer_task::spawn`] so short-lived callers (batch CLI
+    /// paths) can await the task's exit — and therefore its connection's
+    /// close-time WAL checkpoint — before treating the database file state
+    /// as settled. Long-running callers never take it; dropping an untaken
+    /// JoinHandle detaches the task, which is exactly the pre-existing
+    /// behavior.
+    writer_task_join: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Monotonic "a writer-task JoinHandle was stored at least once" flag
+    /// backing [`Self::set_writer_task_join`]'s at-most-once guard: it holds
+    /// the invariant even after [`Self::take_writer_task_join`] empties the
+    /// slot, so a second store never re-arms it.
+    writer_task_join_stored: AtomicBool,
     /// This pool's ADR-091 backend-scoped attribution origin, minted exactly
     /// once at construction (see [`mint_db_identity`]): `Database(_)` for a
     /// file-backed pool, `Memory` for an in-memory pool. Every
@@ -451,6 +481,21 @@ impl ConnectionPool {
     pub fn new(config: PoolConfig) -> Result<Self, SqliteError> {
         refuse_home_data_store_in_tests(&config)?;
 
+        // Resolve "no preference" (`None`) now that `path` is known: on for
+        // file-backed pools, off for in-memory ones. An explicit `Some(_)`
+        // preference is left untouched and always wins.
+        let mut config = config;
+        let inert_memory_queue_request =
+            config.path.is_none() && config.write_queue_enabled == Some(true);
+        config.write_queue_enabled =
+            Some(config.write_queue_enabled.unwrap_or(config.path.is_some()));
+        if inert_memory_queue_request {
+            tracing::warn!(
+                "write queue explicitly requested for an in-memory pool; it is inert because \
+                 in-memory pools cannot host a writer task"
+            );
+        }
+
         let writer = open_writer_connection(&config)?;
         let wal_enabled = configure_writer_connection(&writer, &config)?;
         let max_readers = effective_reader_count(&config, wal_enabled);
@@ -472,6 +517,8 @@ impl ConnectionPool {
             max_readers,
             config,
             writer_task: OnceLock::new(),
+            writer_task_join: Mutex::new(None),
+            writer_task_join_stored: AtomicBool::new(false),
             origin,
             identity_path,
             #[cfg(test)]
@@ -666,6 +713,35 @@ impl ConnectionPool {
         self.identity_path.as_deref()
     }
 
+    /// Whether the write queue is effectively enabled for this pool: the
+    /// resolved `write_queue_enabled` flag AND file-backed.
+    ///
+    /// `ConnectionPool::new` resolves the "no preference" (`None`) preference
+    /// to a concrete `Some(..)` once `path` is known, so every reader of
+    /// `config.write_queue_enabled` sees a resolved value; the `debug_assert`
+    /// pins that invariant and a `None` that slipped past would read as
+    /// disabled. Bypassing `ConnectionPool::new` to construct a pool is a
+    /// construction-path bug. Use this instead of repeating
+    /// `config().write_queue_enabled.unwrap_or(false) && config().path.is_some()`
+    /// at every routing/violation site.
+    pub fn write_queue_active(&self) -> bool {
+        debug_assert!(
+            self.config.write_queue_enabled.is_some(),
+            "write_queue_enabled must be resolved to Some(..) by ConnectionPool::new \
+             before any write_queue_active read"
+        );
+        self.config.write_queue_enabled.unwrap_or(false) && self.config.path.is_some()
+    }
+
+    /// Whether a writer-task JoinHandle has been stored at least once.
+    ///
+    /// Unlike [`Self::take_writer_task_join`], this remains true after the
+    /// one-shot handle slot is emptied, distinguishing a task that never
+    /// spawned from a handle another caller already consumed.
+    pub fn writer_task_join_was_stored(&self) -> bool {
+        self.writer_task_join_stored.load(Ordering::SeqCst)
+    }
+
     /// Return the pool-wide ADR-067 Component A writer task, spawning it
     /// lazily on first access if `PoolConfig::write_queue_enabled` is set.
     /// Exactly one writer task exists per `ConnectionPool` (per DB file); see
@@ -690,7 +766,19 @@ impl ConnectionPool {
     /// fail loud on a genuine misconfiguration (write queue requested but no
     /// runtime to run it on) can propagate the `Err` directly.
     pub fn writer_task_handle(&self) -> Result<Option<WriterTaskHandle>, StorageError> {
-        if !self.config.write_queue_enabled {
+        // Same pinned invariant `write_queue_active` asserts, kept inline
+        // here because this gate keys on the flag ALONE: an explicit
+        // `Some(true)` on an in-memory pool must still attempt the spawn
+        // and degrade (documented + tested in
+        // `explicit_true_stays_on_for_memory_backed_pool`), so the
+        // file-backed half of `write_queue_active` cannot gate this early
+        // return.
+        debug_assert!(
+            self.config.write_queue_enabled.is_some(),
+            "write_queue_enabled must be resolved to Some(..) by ConnectionPool::new \
+             before any writer_task_handle read"
+        );
+        if !self.config.write_queue_enabled.unwrap_or(false) {
             return Ok(None);
         }
         // Fast path: already resolved (spawned, degraded, or off) by an
@@ -734,6 +822,55 @@ impl ConnectionPool {
     pub(crate) fn writer_task_spawn_count(&self) -> usize {
         self.writer_task_spawn_count
             .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Record the writer task's `tokio::spawn` JoinHandle. Called exactly
+    /// once, by [`crate::writer_task::spawn`], immediately after spawning —
+    /// the same `writer_task` OnceLock init that makes spawn at-most-once
+    /// per pool makes this write at-most-once per pool.
+    ///
+    /// First-wins: if a handle was ever stored (including one a caller has
+    /// since taken — `writer_task_join_stored` remembers), the existing
+    /// state is kept and the new handle is dropped (dropping a `JoinHandle`
+    /// detaches its task without cancelling it). A second store violates the
+    /// at-most-once contract and trips the debug_assert in debug builds;
+    /// release builds keep the first handle rather than silently swapping
+    /// the drain owner out from under whichever caller already took it.
+    pub(crate) fn set_writer_task_join(&self, join: tokio::task::JoinHandle<()>) {
+        // `swap(true)` returns the prior value: `true` means a handle was
+        // stored at least once before, so this is a second store — even when
+        // the slot itself is empty because `take_writer_task_join` already
+        // ran (the slot alone cannot tell "never stored" from "taken").
+        let first_store = !self.writer_task_join_stored.swap(true, Ordering::SeqCst);
+        debug_assert!(
+            first_store,
+            "writer task JoinHandle stored twice (even counting a taken one); \
+             the writer_task OnceLock is supposed to make spawn at-most-once per pool"
+        );
+        if first_store {
+            *self.writer_task_join.lock() = Some(join);
+        }
+    }
+
+    /// Take the writer task's JoinHandle, if a writer task was spawned and
+    /// the handle has not already been taken.
+    ///
+    /// Intended for short-lived batch callers that drop every
+    /// [`WriterTaskHandle`] clone (closing the queue) and then need to await
+    /// the task's exit before treating the database file as settled: the
+    /// task's connection close fires SQLite's close-time WAL checkpoint, so
+    /// until the task exits the file bytes can still move after the caller's
+    /// last write returned.
+    ///
+    /// One-shot: `None` means either the write queue never spawned
+    /// (disabled, or spawn degraded) or another caller already took the
+    /// handle — in both cases there is nothing further to await here.
+    /// Exactly one subsystem may own the drain: the single caller that
+    /// receives `Some(_)` is the sole owner of the task-exit await (and of
+    /// the close-time WAL checkpoint that settles the database file); every
+    /// later caller receives `None` and must not arrange its own await.
+    pub fn take_writer_task_join(&self) -> Option<tokio::task::JoinHandle<()>> {
+        self.writer_task_join.lock().take()
     }
 
     /// Compatibility method: returns the writer connection wrapped in `Arc<Mutex>`.
@@ -1137,6 +1274,50 @@ mod tests {
     use super::*;
     use serial_test::serial;
 
+    struct WarningCapture {
+        messages: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl tracing::Subscriber for WarningCapture {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            struct Visitor(Option<String>);
+
+            impl tracing::field::Visit for Visitor {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    if field.name() == "message" {
+                        self.0 = Some(format!("{value:?}"));
+                    }
+                }
+            }
+
+            let mut visitor = Visitor(None);
+            event.record(&mut visitor);
+            if let Some(message) = visitor.0 {
+                self.messages.lock().unwrap().push(message);
+            }
+        }
+
+        fn enter(&self, _: &tracing::span::Id) {}
+
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
     /// Restores the process CWD on drop — including on panic — so a mid-test
     /// assertion failure (or an unexpected panic from the code under test)
     /// can never leave the process chdir'd into a `tempfile::tempdir()` that
@@ -1261,10 +1442,10 @@ mod tests {
 
     #[test]
     #[serial]
-    fn pool_config_write_queue_defaults_off() {
+    fn pool_config_write_queue_defaults_unset() {
         let _pool_env = clear_pool_env();
         let cfg = PoolConfig::default();
-        assert!(!cfg.write_queue_enabled);
+        assert_eq!(cfg.write_queue_enabled, None);
         assert_eq!(cfg.write_queue_capacity, DEFAULT_WRITE_QUEUE_CAPACITY);
     }
 
@@ -1291,7 +1472,7 @@ mod tests {
         std::env::set_var("KHIVE_WRITE_QUEUE", "1");
         let cfg = PoolConfig::default();
         std::env::remove_var("KHIVE_WRITE_QUEUE");
-        assert!(cfg.write_queue_enabled);
+        assert_eq!(cfg.write_queue_enabled, Some(true));
     }
 
     #[test]
@@ -1300,7 +1481,46 @@ mod tests {
         std::env::set_var("KHIVE_WRITE_QUEUE", "True");
         let cfg = PoolConfig::default();
         std::env::remove_var("KHIVE_WRITE_QUEUE");
-        assert!(cfg.write_queue_enabled);
+        assert_eq!(cfg.write_queue_enabled, Some(true));
+    }
+
+    #[test]
+    #[serial]
+    fn pool_config_env_override_write_queue_enabled_accepts_zero_as_explicit_off() {
+        std::env::set_var("KHIVE_WRITE_QUEUE", "0");
+        let cfg = PoolConfig::default();
+        std::env::remove_var("KHIVE_WRITE_QUEUE");
+        assert_eq!(cfg.write_queue_enabled, Some(false));
+    }
+
+    /// A SET-but-non-Unicode `KHIVE_WRITE_QUEUE` value (invalid UTF-8 on
+    /// unix) must count as SET — `Some(false)` ("any SET value other than
+    /// 1/true means off"), never a fall-through to the file-backed default.
+    /// That is why `PoolConfig::default()` reads `var_os`, not `var`.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn pool_config_env_override_write_queue_non_unicode_value_is_explicit_off() {
+        use std::os::unix::ffi::OsStrExt;
+        let _pool_env = clear_pool_env();
+        std::env::set_var(
+            "KHIVE_WRITE_QUEUE",
+            std::ffi::OsStr::from_bytes(b"\xff\xfe"),
+        );
+        let cfg = PoolConfig::default();
+        assert_eq!(cfg.write_queue_enabled, Some(false));
+    }
+
+    #[test]
+    #[serial]
+    fn pool_config_env_override_write_queue_invalid_value_is_explicit_off() {
+        // Documented contract (`write_queue_enabled` docs): `"1"`/`"true"`
+        // (case-insensitive) set `Some(true)`; any other value — garbage
+        // included — sets `Some(false)`, never `None`.
+        std::env::set_var("KHIVE_WRITE_QUEUE", "banana");
+        let cfg = PoolConfig::default();
+        std::env::remove_var("KHIVE_WRITE_QUEUE");
+        assert_eq!(cfg.write_queue_enabled, Some(false));
     }
 
     #[test]
@@ -1385,6 +1605,147 @@ mod tests {
         let pool = ConnectionPool::new(cfg).expect("file-backed pool should open");
         assert!(path.exists());
         assert!(pool.max_readers() > 0);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn unset_write_queue_resolves_on_for_file_backed_pool() {
+        let _pool_env = clear_pool_env();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("unset_file_backed.db");
+        let pool = ConnectionPool::new(PoolConfig {
+            path: Some(path),
+            write_queue_enabled: None,
+            ..PoolConfig::default()
+        })
+        .expect("file-backed pool should open");
+        assert_eq!(pool.config().write_queue_enabled, Some(true));
+        // Behavioral half: the resolved value actually routes — a writer
+        // task spawns for this pool, not merely a config field flipping.
+        assert!(
+            pool.writer_task_handle()
+                .expect("spawn inside a runtime context must not error")
+                .is_some(),
+            "resolved-on file-backed pool must actually spawn the writer task"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn unset_write_queue_resolves_off_for_memory_backed_pool() {
+        let _pool_env = clear_pool_env();
+        let pool = ConnectionPool::new(PoolConfig {
+            path: None,
+            write_queue_enabled: None,
+            ..PoolConfig::default()
+        })
+        .expect("in-memory pool should open");
+        assert_eq!(pool.config().write_queue_enabled, Some(false));
+        // Behavioral half: resolved-off means no writer task, even inside a
+        // runtime context where one could spawn.
+        assert!(
+            pool.writer_task_handle()
+                .expect("disabled queue must resolve without error")
+                .is_none(),
+            "resolved-off in-memory pool must not spawn a writer task"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn explicit_false_stays_off_for_file_backed_pool() {
+        let _pool_env = clear_pool_env();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("explicit_false_file_backed.db");
+        let pool = ConnectionPool::new(PoolConfig {
+            path: Some(path),
+            write_queue_enabled: Some(false),
+            ..PoolConfig::default()
+        })
+        .expect("file-backed pool should open");
+        assert_eq!(pool.config().write_queue_enabled, Some(false));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn explicit_true_stays_on_for_memory_backed_pool() {
+        let _pool_env = clear_pool_env();
+        let pool = ConnectionPool::new(PoolConfig {
+            path: None,
+            write_queue_enabled: Some(true),
+            ..PoolConfig::default()
+        })
+        .expect("in-memory pool should open");
+        assert_eq!(pool.config().write_queue_enabled, Some(true));
+        // Pinned behavioral contract: the explicit-on preference survives in
+        // the stored config, but an in-memory pool cannot host a writer
+        // task — `writer_task::spawn` fails its standalone-connection open
+        // and degrades to no writer task, so callers fall back to the
+        // legacy pool-mutex write path and there is no JoinHandle to drain.
+        assert!(
+            pool.writer_task_handle()
+                .expect("spawn degrade must resolve without error")
+                .is_none(),
+            "explicit-on in-memory pool must degrade to no writer task"
+        );
+        assert_eq!(
+            pool.writer_task_spawn_count(),
+            1,
+            "the spawn attempt must happen exactly once and degrade, not retry"
+        );
+        assert!(
+            pool.take_writer_task_join().is_none(),
+            "a degraded spawn stores no JoinHandle to drain"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn explicit_true_on_memory_pool_warns_but_false_and_none_do_not() {
+        let _pool_env = clear_pool_env();
+        let messages = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = WarningCapture {
+            messages: Arc::clone(&messages),
+        };
+
+        tracing::subscriber::with_default(subscriber, || {
+            let _explicit_true = ConnectionPool::new(PoolConfig {
+                path: None,
+                write_queue_enabled: Some(true),
+                ..PoolConfig::default()
+            })
+            .expect("in-memory pool should open");
+            let _explicit_false = ConnectionPool::new(PoolConfig {
+                path: None,
+                write_queue_enabled: Some(false),
+                ..PoolConfig::default()
+            })
+            .expect("in-memory pool should open");
+            let _unset = ConnectionPool::new(PoolConfig {
+                path: None,
+                write_queue_enabled: None,
+                ..PoolConfig::default()
+            })
+            .expect("in-memory pool should open");
+        });
+
+        let messages = messages.lock().unwrap();
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|message| message.contains("write queue explicitly requested"))
+                .count(),
+            1,
+            "only an explicit in-memory queue request should warn: {messages:?}"
+        );
+        let warning = messages
+            .iter()
+            .find(|message| message.contains("write queue explicitly requested"))
+            .expect("explicit in-memory queue warning should be captured");
+        assert!(
+            warning.contains("in-memory pools cannot host a writer task"),
+            "warning must explain why the request is inert: {messages:?}"
+        );
     }
 
     #[test]
@@ -1554,7 +1915,7 @@ mod tests {
         let path = dir.path().join("writer_task_no_runtime.db");
         let cfg = PoolConfig {
             path: Some(path),
-            write_queue_enabled: true,
+            write_queue_enabled: Some(true),
             ..PoolConfig::default()
         };
         let pool = ConnectionPool::new(cfg).expect("file-backed pool should open");
@@ -1570,6 +1931,119 @@ mod tests {
             pool.writer_task_spawn_count(),
             0,
             "the guard must reject before ever attempting tokio::spawn"
+        );
+    }
+
+    /// Join-handle lifecycle: a spawn-configured pool stores exactly one
+    /// JoinHandle — the first `take_writer_task_join` after spawn returns
+    /// it, and every later take returns `None` (the one-shot contract that
+    /// lets exactly one subsystem own the drain).
+    #[tokio::test]
+    async fn take_writer_task_join_returns_some_once_then_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("join_lifecycle.db");
+        let pool = ConnectionPool::new(PoolConfig {
+            path: Some(path),
+            write_queue_enabled: Some(true),
+            ..PoolConfig::default()
+        })
+        .expect("file-backed pool should open");
+
+        // Spawning is lazy: nothing to take before the first
+        // `writer_task_handle()` call actually spawns the task.
+        assert!(
+            pool.take_writer_task_join().is_none(),
+            "before spawn there is no JoinHandle to take"
+        );
+        assert!(!pool.writer_task_join_was_stored());
+        pool.writer_task_handle()
+            .expect("runtime is present")
+            .expect("write queue enabled must spawn a writer task");
+        assert!(pool.writer_task_join_was_stored());
+
+        let join = pool
+            .take_writer_task_join()
+            .expect("the first take must return the spawned task's JoinHandle");
+        assert!(
+            pool.take_writer_task_join().is_none(),
+            "the second take must return None — the handle is one-shot"
+        );
+
+        // Await the taken handle before the test exits instead of dropping
+        // it detached. The writer task only exits once every
+        // `WriterTaskHandle` clone (the mpsc senders) is gone, and the pool's
+        // own `writer_task` OnceLock holds one, so the pool must drop first —
+        // the same drop-then-await order the batch-ingest drain relies on.
+        drop(pool);
+        tokio::time::timeout(Duration::from_secs(5), join)
+            .await
+            .expect("the writer task must exit once every handle clone is dropped")
+            .expect("the writer task must not panic");
+    }
+
+    /// Debug half of the first-wins contract: a second
+    /// `set_writer_task_join` call is a construction bug, and debug builds
+    /// trip the method's debug_assert loudly instead of carrying on.
+    #[cfg(debug_assertions)]
+    #[tokio::test]
+    #[should_panic(expected = "writer task JoinHandle stored twice")]
+    async fn set_writer_task_join_second_store_trips_debug_assert() {
+        let pool = ConnectionPool::new(PoolConfig::default()).expect("in-memory pool should open");
+        pool.set_writer_task_join(tokio::spawn(async {}));
+        pool.set_writer_task_join(tokio::spawn(async {}));
+    }
+
+    /// The at-most-once guard holds across the TAKEN state too: once the
+    /// handle has been taken, the slot is empty, but a second store is still
+    /// a construction bug and must trip the same debug_assert (the
+    /// `writer_task_join_stored` flag remembers the first store).
+    #[cfg(debug_assertions)]
+    #[tokio::test]
+    #[should_panic(expected = "writer task JoinHandle stored twice")]
+    async fn set_writer_task_join_second_store_after_take_trips_debug_assert() {
+        let pool = ConnectionPool::new(PoolConfig::default()).expect("in-memory pool should open");
+        pool.set_writer_task_join(tokio::spawn(async {}));
+        assert!(pool.take_writer_task_join().is_some());
+        pool.set_writer_task_join(tokio::spawn(async {}));
+    }
+
+    /// Release half of the first-wins contract: with the debug_assert
+    /// compiled out, a second `set_writer_task_join` call keeps the
+    /// EXISTING handle and drops the new one. The stored handle is
+    /// therefore the first task's, so awaiting the taken handle completes
+    /// the FIRST task's observable effect.
+    #[cfg(not(debug_assertions))]
+    #[tokio::test]
+    async fn set_writer_task_join_first_wins_keeps_existing_handle() {
+        let pool = ConnectionPool::new(PoolConfig::default()).expect("in-memory pool should open");
+
+        // First task: completes promptly and signals completion — the
+        // observable effect the bounded await below asserts on.
+        let (first_done_tx, first_done_rx) = tokio::sync::oneshot::channel::<()>();
+        let first = tokio::spawn(async move {
+            let _ = first_done_tx.send(());
+        });
+        // Second task: parks on a receiver nobody sends to, so it never
+        // completes on its own. If first-wins failed and this task's handle
+        // were the stored one, the bounded await below would time out.
+        let (_never_sent, never_rx) = tokio::sync::oneshot::channel::<()>();
+        let second = tokio::spawn(async move {
+            let _ = never_rx.await;
+        });
+
+        pool.set_writer_task_join(first);
+        pool.set_writer_task_join(second);
+
+        let taken = pool
+            .take_writer_task_join()
+            .expect("the first handle must still be stored");
+        tokio::time::timeout(Duration::from_secs(5), taken)
+            .await
+            .expect("stored handle must be the first task's; the second never completes")
+            .expect("the first task must not panic");
+        assert!(
+            first_done_rx.await.is_ok(),
+            "completing the taken handle must mean the FIRST task ran to completion"
         );
     }
 

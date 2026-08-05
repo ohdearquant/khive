@@ -4361,7 +4361,7 @@ mod tests {
             ConnectionPool::new(PoolConfig {
                 path: None,
                 checkout_timeout: Duration::from_secs(5),
-                write_queue_enabled: false,
+                write_queue_enabled: Some(false),
                 ..PoolConfig::default()
             })
             .expect("event pool"),
