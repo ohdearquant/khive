@@ -744,11 +744,11 @@ impl EntityStore for SqlEntityStore {
             let order_by = if let Some(ref prefix) = filter.name_prefix {
                 data_params.push(Box::new(prefix.to_ascii_lowercase()));
                 format!(
-                    "CASE WHEN LOWER(name) = ?{} THEN 0 ELSE 1 END, created_at DESC",
+                    "CASE WHEN LOWER(name) = ?{} THEN 0 ELSE 1 END, created_at DESC, id ASC",
                     data_params.len()
                 )
             } else {
-                "created_at DESC".to_string()
+                "created_at DESC, id ASC".to_string()
             };
 
             data_params.push(Box::new(limit_i64));

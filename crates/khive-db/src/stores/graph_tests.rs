@@ -4253,3 +4253,78 @@ async fn traverse_both_direction_hub_depth_two_returns_full_node_set() {
         "no duplicate or spurious nodes"
     );
 }
+
+/// #1671: offset pagination over `query_edges` must be deterministic when
+/// many rows share the same `created_at`. Without an `id` tie-breaker,
+/// SQLite's ORDER BY over a non-unique key can return rows in a different
+/// order on each execution, causing paged sweeps to duplicate and miss rows.
+#[tokio::test]
+async fn offset_pagination_deterministic_order() {
+    let store = setup_memory_store();
+    let shared_created_at = Utc::now();
+
+    let mut ids = Vec::new();
+    for _ in 0..37 {
+        let mut edge = make_edge(Uuid::new_v4(), Uuid::new_v4(), EdgeRelation::Extends, 1.0);
+        edge.created_at = shared_created_at;
+        ids.push(edge.id);
+        store.upsert_edge(edge).await.unwrap();
+    }
+
+    let first = store
+        .query_edges(
+            EdgeFilter::default(),
+            vec![],
+            PageRequest {
+                offset: 0,
+                limit: 10,
+            },
+        )
+        .await
+        .unwrap();
+    let second = store
+        .query_edges(
+            EdgeFilter::default(),
+            vec![],
+            PageRequest {
+                offset: 0,
+                limit: 10,
+            },
+        )
+        .await
+        .unwrap();
+    let first_ids: Vec<_> = first.items.iter().map(|e| e.id).collect();
+    let second_ids: Vec<_> = second.items.iter().map(|e| e.id).collect();
+    assert_eq!(
+        first_ids, second_ids,
+        "identical offset queries must return identical order"
+    );
+
+    let mut seen: HashSet<LinkId> = HashSet::new();
+    let mut offset = 0u64;
+    loop {
+        let page = store
+            .query_edges(
+                EdgeFilter::default(),
+                vec![],
+                PageRequest { offset, limit: 10 },
+            )
+            .await
+            .unwrap();
+        if page.items.is_empty() {
+            break;
+        }
+        for item in &page.items {
+            assert!(
+                seen.insert(item.id),
+                "row {:?} returned more than once across the paged sweep",
+                item.id
+            );
+        }
+        offset += page.items.len() as u64;
+    }
+    assert_eq!(seen.len(), ids.len());
+    for id in &ids {
+        assert!(seen.contains(id), "row {id:?} missing from paged sweep");
+    }
+}

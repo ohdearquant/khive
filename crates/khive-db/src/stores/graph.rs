@@ -1865,7 +1865,7 @@ impl GraphStore for SqlGraphStore {
             };
 
             let order_clause = if sort.is_empty() {
-                " ORDER BY created_at DESC".to_string()
+                " ORDER BY created_at DESC, id ASC".to_string()
             } else {
                 let parts: Vec<String> = sort
                     .iter()
@@ -1877,7 +1877,7 @@ impl GraphStore for SqlGraphStore {
                         format!("{} {}", edge_sort_col(&s.field), dir)
                     })
                     .collect();
-                format!(" ORDER BY {}", parts.join(", "))
+                format!(" ORDER BY {}, id ASC", parts.join(", "))
             };
 
             let (_, data_filter_params) = build_edge_filter_sql(&namespace, &filter);

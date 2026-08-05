@@ -1098,7 +1098,7 @@ impl NoteStore for SqlNoteStore {
             let data_sql = format!(
                 "SELECT id, namespace, kind, status, name, content, salience, decay_factor, expires_at, \
                  properties, created_at, updated_at, deleted_at \
-                 FROM notes{} ORDER BY created_at DESC LIMIT ?{} OFFSET ?{}",
+                 FROM notes{} ORDER BY created_at DESC, id ASC LIMIT ?{} OFFSET ?{}",
                 where_sql, limit_idx, offset_idx,
             );
 

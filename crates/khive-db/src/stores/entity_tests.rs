@@ -1396,3 +1396,80 @@ async fn test_content_ref_survives_batch_upsert() {
     let without_ref = store.get_entity(ids[1]).await.unwrap().unwrap();
     assert_eq!(without_ref.content_ref, None);
 }
+
+/// #1671: offset pagination must be deterministic when many rows share the
+/// same `created_at`. Without an `id` tie-breaker, SQLite's ORDER BY over a
+/// non-unique key can return rows in a different order on each execution,
+/// causing paged sweeps to duplicate and miss rows.
+#[tokio::test]
+async fn offset_pagination_deterministic_order() {
+    let store = setup_memory_store_ns("ns1");
+    let shared_created_at = 1_000_000_i64;
+
+    let mut ids = Vec::new();
+    for i in 0..37 {
+        let mut entity = make_entity("ns1", "concept", &format!("Item{i}"));
+        entity.created_at = shared_created_at;
+        ids.push(entity.id);
+        store.upsert_entity(entity).await.unwrap();
+    }
+
+    // Repeated identical queries must return identical order.
+    let first = store
+        .query_entities(
+            "ns1",
+            EntityFilter::default(),
+            PageRequest {
+                offset: 0,
+                limit: 10,
+            },
+        )
+        .await
+        .unwrap();
+    let second = store
+        .query_entities(
+            "ns1",
+            EntityFilter::default(),
+            PageRequest {
+                offset: 0,
+                limit: 10,
+            },
+        )
+        .await
+        .unwrap();
+    let first_ids: Vec<Uuid> = first.items.iter().map(|e| e.id).collect();
+    let second_ids: Vec<Uuid> = second.items.iter().map(|e| e.id).collect();
+    assert_eq!(
+        first_ids, second_ids,
+        "identical offset queries must return identical order"
+    );
+
+    // A full paged sweep must cover every row exactly once.
+    let mut seen: std::collections::HashSet<Uuid> = std::collections::HashSet::new();
+    let mut offset = 0u64;
+    loop {
+        let page = store
+            .query_entities(
+                "ns1",
+                EntityFilter::default(),
+                PageRequest { offset, limit: 10 },
+            )
+            .await
+            .unwrap();
+        if page.items.is_empty() {
+            break;
+        }
+        for item in &page.items {
+            assert!(
+                seen.insert(item.id),
+                "row {} returned more than once across the paged sweep",
+                item.id
+            );
+        }
+        offset += page.items.len() as u64;
+    }
+    assert_eq!(seen.len(), ids.len());
+    for id in &ids {
+        assert!(seen.contains(id), "row {id} missing from paged sweep");
+    }
+}
