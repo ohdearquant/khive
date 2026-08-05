@@ -2618,6 +2618,107 @@ mod tests {
         );
     }
 
+    /// Queue-backed reads charge the READER permit budget (`ensure_conn`
+    /// acquires `sql_bridge_reader_slots`), and a cancelled queue-backed
+    /// read is followed by a successful lazy reopen — the documented
+    /// contrast with standalone handles, whose consumed connection makes
+    /// every later call fail. Arm 1 saturates the one reader permit and
+    /// asserts the queue-backed read times out on the READER budget (not
+    /// the writer budget). Arm 2 aborts an in-flight read and asserts the
+    /// next read on the same handle succeeds by reopening.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn queue_backed_read_uses_reader_budget_and_reopens_after_cancel() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("queue_backed_reader_budget.db");
+        let config = PoolConfig {
+            path: Some(path),
+            write_queue_enabled: true,
+            write_routing_strict: true,
+            max_readers: 1,
+            checkout_timeout: std::time::Duration::from_millis(250),
+            ..PoolConfig::default()
+        };
+        let pool = Arc::new(ConnectionPool::new(config).unwrap());
+        {
+            let guard = pool.writer().unwrap();
+            guard
+                .conn()
+                .execute_batch(
+                    "CREATE TABLE IF NOT EXISTS reopen_test \
+                     (id INTEGER PRIMARY KEY, val TEXT NOT NULL)",
+                )
+                .unwrap();
+        }
+        let bridge = SqlBridge::new(Arc::clone(&pool), true);
+
+        let mut w = bridge.writer().await.unwrap();
+        w.execute(SqlStatement {
+            sql: "INSERT INTO reopen_test (id, val) VALUES (1, 'seed')".into(),
+            params: vec![],
+            label: None,
+        })
+        .await
+        .unwrap();
+
+        // Arm 1: with the sole reader permit held, the queue-backed read
+        // must time out on the reader budget.
+        let held = pool
+            .sql_bridge_reader_slots()
+            .acquire_owned()
+            .await
+            .unwrap();
+        let starved = w
+            .query_row(SqlStatement {
+                sql: "SELECT val FROM reopen_test WHERE id = 1".into(),
+                params: vec![],
+                label: None,
+            })
+            .await;
+        assert!(
+            matches!(
+                &starved,
+                Err(StorageError::Timeout { operation })
+                    if operation.as_ref() == "sql_bridge.reader_handle"
+            ),
+            "queue-backed read with reader permits saturated must time out \
+             on the reader budget; got {starved:?}"
+        );
+        drop(held);
+
+        // Arm 2: a queue-backed handle in the exact post-cancelled-read
+        // state — `handle: None` because the cancelled call took the boxed
+        // connection out and never returned it — must serve the next read by
+        // lazily reopening, never a hard "connection already consumed"
+        // failure (that contract is standalone-only; the doc names the
+        // contrast). Constructed directly so the state is deterministic
+        // rather than racing an abort against ensure_conn.
+        let writer_task = pool
+            .writer_task_handle()
+            .expect("queue-enabled file pool must offer a writer task")
+            .expect("writer task present under write_queue_enabled");
+        let mut post_cancel = SqliteWriter {
+            handle: None,
+            writer_task: Some(writer_task),
+            origin: pool.origin(),
+            db: crate::timeout_sink::db_label(&pool),
+            pool: Arc::clone(&pool),
+        };
+        let row = post_cancel
+            .query_row(SqlStatement {
+                sql: "SELECT val FROM reopen_test WHERE id = 1".into(),
+                params: vec![],
+                label: None,
+            })
+            .await
+            .expect("read on a queue-backed handle with no resident connection must reopen")
+            .expect("seeded row must be visible");
+        assert!(
+            matches!(&row.columns[0].value, SqlValue::Text(v) if v == "seed"),
+            "reopened read must return the seeded row; got {:?}",
+            row.columns[0].value
+        );
+    }
+
     /// ADR-136 D1 gate 3 amendment: `SqlWriter::query_row`/`query_all` carry
     /// no read-only restriction at the trait level — a caller could hand a
     /// DML-with-RETURNING statement to `query_row` expecting it to behave

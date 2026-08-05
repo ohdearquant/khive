@@ -49,11 +49,16 @@ an idle boxed handle releases its permit. Once an operation has entered
 awaiting task retains both until SQLite finishes and drops the resource, so a
 detached blocking call cannot escape the cap.
 
-Cancelling an in-flight call also permanently invalidates that reader/writer
-handle: the call takes the boxed handle's connection on entry and only a
-completed await returns it, so every subsequent call on the same handle
-returns a "connection already consumed" error. Callers that cancel or time
-out a bridge call must drop the handle and acquire a fresh one.
+Cancelling an in-flight call also permanently invalidates a STANDALONE
+reader/writer handle: the call takes the boxed handle's connection on entry
+and only a completed await returns it, so every subsequent call on the same
+standalone handle returns a "connection already consumed" error. Callers
+that cancel or time out such a call must drop the handle and acquire a
+fresh one. A QUEUE-BACKED writer handle is different by design: its writes
+route through the writer task (no boxed connection to lose), and its reads
+lazily reopen a read-only connection under a reader permit, so a cancelled
+queue-backed read is followed by a successful reopen on the next read
+rather than a hard failure.
 
 The manual `atomic_unit` path (write queue flag off, or no writer task
 available) acquires the same one-permit writer budget before opening its
