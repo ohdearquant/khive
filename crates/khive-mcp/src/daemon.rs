@@ -1228,6 +1228,11 @@ where
     kill_and_respawn_with_launcher(config_id, namespace, &launcher).await
 }
 
+/// Test-only shim over [`kill_and_respawn_with_launcher_and_exit_timeout`]:
+/// same production code path, with only the launcher construction and the
+/// exit-timeout parameter (production passes its own constant through
+/// [`kill_and_respawn`]) supplied by the test. Keep it a pure forwarder —
+/// any logic added here would drift from the non-test path.
 #[cfg(test)]
 async fn kill_and_respawn_with_exit_timeout<F>(
     config_id: &str,
@@ -5102,6 +5107,13 @@ mod tests {
     /// is one live, responsive owner after quiescence — not an exact spawn-call
     /// count, because a launch can legitimately lose the server-side ownership
     /// fence before it binds.
+    ///
+    /// Deliberately NOT `launched_count() == 1`: racing launches are tolerated
+    /// by design. The recoverer lock is best-effort serialization (it shrinks
+    /// the raced-launch window; it is not the correctness mechanism), and the
+    /// server-side boot fence alone guarantees convergence — so removing the
+    /// lock would degrade this test to more raced launches without violating
+    /// its oracle, and that is the intended contract, not a coverage gap.
     #[tokio::test(flavor = "multi_thread", worker_threads = 12)]
     #[serial]
     async fn parallel_no_socket_recovery_converges_to_one_usable_daemon() {
