@@ -31,6 +31,11 @@ pub struct MultiBackendRegistry {
     pub per_pack_runtimes: HashMap<String, Arc<KhiveRuntime>>,
     /// The `main` backend (needed by the coordinator to build the BackendRegistry).
     pub main_backend: Arc<StorageBackend>,
+    /// The default runtime this boot built alongside the per-pack runtimes.
+    /// A clone (cheap: internal state is `Arc<RwLock<_>>`-shared), kept so
+    /// callers — chiefly boot-wiring tests — can assert on its installed
+    /// state (e.g. `has_note_write_validator()`) without re-deriving it.
+    pub default_runtime: KhiveRuntime,
 }
 
 /// Build a server from `args`, then serve it over `--daemon` or the named transport.
@@ -1577,9 +1582,11 @@ pub fn validate_db_override_against_backends(
     match cli_db_override {
         Some(":memory:") => {
             tracing::warn!(
-                "--db :memory: (or KHIVE_DB=:memory:) is overriding {backend_count} \
-                 configured [[backends]] entries to in-memory storage for this invocation; \
-                 khive.toml's declared backend paths will not be used this run"
+                "--db :memory: (or KHIVE_DB=:memory:) is forcing {backend_count} configured \
+                 [[backends]] entries to ephemeral in-memory storage for this invocation; \
+                 the backend paths declared in the discovered config (./khive.toml, \
+                 <db-dir>/config.toml, or ~/.khive/config.toml) will not be used, and nothing \
+                 written this run persists after the process exits"
             );
             Ok(true)
         }
@@ -1593,11 +1600,12 @@ pub fn validate_db_override_against_backends(
             } else {
                 anyhow::bail!(
                     "--db {other:?} (or KHIVE_DB) cannot be combined with [[backends]]: \
-                 {backend_count} backend(s) are already declared in khive.toml, so applying \
-                 this override here is ambiguous (it could silently collapse distinct \
-                 declared backends onto a single file). Edit khive.toml directly to change \
-                 backend paths, or pass --db :memory: to force all backends in-memory for \
-                 this invocation."
+                 {backend_count} backend(s) are already declared in the discovered config, so \
+                 applying this override here is ambiguous (it could silently collapse distinct \
+                 declared backends onto a single file). Remedy: edit the backend paths in the \
+                 discovered config file (searched in order: ./khive.toml, \
+                 <db-dir>/config.toml, ~/.khive/config.toml), or point at a different config \
+                 with --config <file> / KHIVE_CONFIG."
                 );
             }
         }
@@ -1811,6 +1819,32 @@ fn build_registry_for_multi_backend_inner(
     // update/delete verbs notify caching packs even though there is no
     // crate-level dependency between them.
     registry.call_register_note_mutation_hooks(&default_runtime);
+    // Note-write identity: install the pack-owned kind set and the pack-owned
+    // note-write validator so identity properties are derived at the write and
+    // preserved through merge/update on every path, including the ones that
+    // reach no pack verb. Each per-pack runtime is constructed independently
+    // in the multi-backend boot path (unlike the single-backend
+    // `KhiveMcpServer::with_packs` path), so both must be installed on every
+    // runtime that could actually serve a generic `create`/`update`/`merge`
+    // for a pack-owned kind, not just `default_runtime`.
+    let owned_note_kinds: Vec<String> = registry
+        .pack_owned_note_kinds()
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    default_runtime.install_pack_owned_note_kinds(owned_note_kinds.clone());
+    for rt in per_pack_runtimes_local.values() {
+        rt.install_pack_owned_note_kinds(owned_note_kinds.clone());
+    }
+    // The validator is installed on every runtime the kind list reaches, not
+    // just the default: each per-pack runtime is built independently, so none
+    // of them shares the default's validator slot, and `core()` clones the
+    // secondary's own slots rather than the default's. A runtime that has the
+    // kind list but no validator enforces half the rule.
+    registry.call_register_note_write_validators(&default_runtime);
+    for rt in per_pack_runtimes_local.values() {
+        registry.call_register_note_write_validators(rt);
+    }
 
     let backend_for_pack: HashMap<&str, &StorageBackend> = per_pack_runtimes_local
         .iter()
@@ -1833,6 +1867,7 @@ fn build_registry_for_multi_backend_inner(
         config_id,
         per_pack_runtimes: per_pack_runtimes_arc,
         main_backend,
+        default_runtime,
     })
 }
 
@@ -1991,6 +2026,13 @@ pub fn build_server_with_explicit_namespace(
         KhiveConfig::load_with_home_fallback(args.config.as_deref(), db_path_for_config.as_deref())
             .map_err(|e| anyhow::anyhow!("config error: {e}"))?
             .unwrap_or_default();
+
+    // Issue #1586: disclose the resolved database target once at startup so a
+    // no-override invocation's silent default (`$HOME/.khive/khive.db`) is
+    // visible in the operator's log alongside the other startup facts. The
+    // backends slice keeps the line truthful in multi-backend mode, where the
+    // config-declared backend paths — not `config.db_path` — receive writes.
+    tracing::info!(target: "khive.boot", "{}", resolved_database_disclosure(config.db_path.as_deref(), &khive_cfg.backends));
 
     if khive_cfg.backends.is_empty() {
         // Single-backend path — identical to pre-ADR-028 behavior.
@@ -2498,6 +2540,57 @@ pub fn config_discovery_db_anchor(db: Option<&str>) -> Option<std::path::PathBuf
     db.and_then(|d| khive_runtime::resolve_db_anchor(Some(d)))
 }
 
+/// One-line disclosure of the database target(s) this process will write to,
+/// for CLI entry points that resolve a database path. Returns a sentence
+/// naming the resolved target: the concrete file path, the ephemeral
+/// in-memory marker when the resolved path is `:memory:`, or — when the
+/// loaded config declares `[[backends]]` — the config-declared backend
+/// targets, which are what actually receive writes in multi-backend mode
+/// (the single resolved anchor path is a discovery/fingerprint input there,
+/// not a write target).
+///
+/// The `:memory:` arm (resolved path `None`) wins even when backends are
+/// declared: a `:memory:` override forces every declared backend ephemeral
+/// (`force_memory` in [`validate_db_override_against_backends`]'s caller), so
+/// the ephemeral line is the truthful one.
+///
+/// Issue #1586: with no `--db`/`KHIVE_DB` override the resolver silently
+/// targets the default `$HOME/.khive/khive.db` — the production database for
+/// most installs. Naming the resolved target once at startup makes that
+/// implicit choice visible without adding a prompt or refusal. Callers decide
+/// the channel: `kkernel mcp` logs it at INFO with its other startup facts;
+/// `kkernel exec` prints it to stderr (its default log level is `warn`, so an
+/// INFO record would never surface there).
+pub fn resolved_database_disclosure(
+    resolved_db_path: Option<&std::path::Path>,
+    backends: &[BackendConfig],
+) -> String {
+    match resolved_db_path {
+        None => "database: :memory: (ephemeral in-memory; nothing persists)".to_string(),
+        Some(_) if !backends.is_empty() => {
+            let targets: Vec<String> = backends
+                .iter()
+                .map(|backend| match (&backend.kind, backend.path.as_deref()) {
+                    // Kind decides first: a `memory` backend's `path` is
+                    // ignored by construction (see `BackendConfig::path`), so
+                    // a stray configured path must not be presented as a
+                    // write target.
+                    (BackendKind::Memory, _) => format!("{}=:memory:", backend.name),
+                    (BackendKind::Sqlite, Some(path)) => {
+                        format!("{}={}", backend.name, path.display())
+                    }
+                    (BackendKind::Sqlite, None) => format!("{}=<unresolved>", backend.name),
+                })
+                .collect();
+            format!(
+                "database: config-declared backends govern storage targets: {}",
+                targets.join(", ")
+            )
+        }
+        Some(path) => format!("database: {} (resolved)", path.display()),
+    }
+}
+
 /// Inputs for [`resolve_runtime_config`] — the subset of serve-time arguments
 /// that determine the resolved [`RuntimeConfig`]. Callers other than
 /// `kkernel mcp` (e.g. `kkernel reindex`) supply these directly so they resolve
@@ -2860,6 +2953,95 @@ mod tests {
     #[test]
     fn config_discovery_db_anchor_memory_sentinel_is_none() {
         assert_eq!(config_discovery_db_anchor(Some(":memory:")), None);
+    }
+
+    // #1586: the resolved-database disclosure must name the concrete resolved
+    // path (or the ephemeral in-memory marker) so a default-targeted write is
+    // visible at startup.
+    #[test]
+    fn resolved_database_disclosure_names_file_path() {
+        let line = resolved_database_disclosure(
+            Some(std::path::Path::new("/home/op/.khive/khive.db")),
+            &[],
+        );
+        assert!(
+            line.contains("/home/op/.khive/khive.db"),
+            "disclosure must carry the resolved path; got: {line}"
+        );
+        assert!(
+            line.starts_with("database:"),
+            "disclosure is a single labelled startup line; got: {line}"
+        );
+    }
+
+    #[test]
+    fn resolved_database_disclosure_marks_memory_ephemeral() {
+        let line = resolved_database_disclosure(None, &[]);
+        assert!(
+            line.contains(":memory:") && line.contains("ephemeral"),
+            "in-memory disclosure must say the target is ephemeral; got: {line}"
+        );
+    }
+
+    // Multi-backend mode: writes go to the config-declared backend paths, not
+    // the resolved anchor path — the disclosure must name the real targets and
+    // must NOT present the anchor as the write target.
+    #[test]
+    fn resolved_database_disclosure_names_backend_targets_in_multi_backend_mode() {
+        let backends = vec![
+            BackendConfig {
+                name: "main".into(),
+                kind: BackendKind::Sqlite,
+                path: Some(std::path::PathBuf::from("/data/main.db")),
+                cache_mb: None,
+                journal_mode: None,
+                read_only: false,
+            },
+            BackendConfig {
+                name: "scratch".into(),
+                kind: BackendKind::Memory,
+                // Stray path on a memory backend: ignored by construction, so
+                // the disclosure must not present it as a write target.
+                path: Some(std::path::PathBuf::from("/data/ignored-stray.db")),
+                cache_mb: None,
+                journal_mode: None,
+                read_only: false,
+            },
+        ];
+        let anchor = std::path::Path::new("/home/op/.khive/khive.db");
+        let line = resolved_database_disclosure(Some(anchor), &backends);
+        assert!(
+            line.contains("main=/data/main.db") && line.contains("scratch=:memory:"),
+            "multi-backend disclosure must name each declared target; got: {line}"
+        );
+        assert!(
+            !line.contains("/home/op/.khive/khive.db"),
+            "multi-backend disclosure must not present the anchor path as a write target; got: {line}"
+        );
+        assert!(
+            !line.contains("ignored-stray"),
+            "a memory backend's stray configured path is ignored by construction and must not be disclosed; got: {line}"
+        );
+    }
+
+    // A `:memory:` override with declared backends forces every backend
+    // ephemeral (force_memory), so the ephemeral line wins over the backend
+    // listing.
+    #[test]
+    fn resolved_database_disclosure_memory_override_wins_over_backends() {
+        let backends = vec![BackendConfig {
+            name: "main".into(),
+            kind: BackendKind::Sqlite,
+            path: Some(std::path::PathBuf::from("/data/main.db")),
+            cache_mb: None,
+            journal_mode: None,
+            read_only: false,
+        }];
+        let line = resolved_database_disclosure(None, &backends);
+        assert!(
+            line.contains("ephemeral") && !line.contains("/data/main.db"),
+            "memory-forced run must disclose ephemerality, not the overridden file targets; got: {line}"
+        );
     }
 
     fn write_config(dir: &std::path::Path, body: &str) -> PathBuf {
@@ -3993,6 +4175,262 @@ id = "lambda:project-actor"
         );
     }
 
+    /// ADR-124 note-write identity guard: the pack-owned note kind set must
+    /// be installed on the multi-backend boot path, not only on
+    /// `KhiveMcpServer::with_packs` (single-backend). Routes `kg` and `comm`
+    /// to the same "main" backend through the real `build_server_multi_backend`
+    /// builder — no manual `install_pack_owned_note_kinds` call, unlike
+    /// `build_registry_with_owned_kinds` in the `khive-pack-comm` integration
+    /// tests — so this test exercises the actual boot wiring rather than a
+    /// hand-simulated one. Without the install this fix added in `serve.rs`
+    /// (alongside the edge-rules/note-mutation-hook installs), a generic
+    /// `update(properties={from_actor: ...})` on an inbound message note
+    /// would silently succeed on a served multi-backend instance. Verified by
+    /// temporarily reverting the `install_pack_owned_note_kinds` calls in
+    /// `build_registry_for_multi_backend_inner` and re-running this test: it
+    /// fails (`from_actor` forgery succeeds) without the fix and passes with
+    /// it restored.
+    #[tokio::test]
+    #[serial]
+    async fn multi_backend_boot_installs_owned_note_kinds_so_update_is_refused() {
+        use crate::tools::request::RequestParams;
+
+        let khive_cfg = KhiveConfig {
+            backends: vec![BackendConfig {
+                name: "main".to_string(),
+                kind: BackendKind::Memory,
+                path: None,
+                cache_mb: None,
+                journal_mode: None,
+                read_only: false,
+            }],
+            ..KhiveConfig::default()
+        };
+
+        let base_cfg = base_runtime_config_for_multi_backend();
+
+        let server = build_server_multi_backend(base_cfg, &khive_cfg, None)
+            .expect("multi-backend boot must succeed");
+
+        let send_resp = server
+            .dispatch_request_local(RequestParams {
+                ops: r#"comm.send(to="local", content="adr-124 multi-backend boot probe")"#
+                    .to_string(),
+                presentation: None,
+                presentation_per_op: None,
+                save_to: None,
+                format: None,
+                format_per_op: None,
+                request_id: None,
+            })
+            .await
+            .expect("comm.send dispatch must not error");
+        let send_json: serde_json::Value =
+            serde_json::from_str(&send_resp).expect("send response is valid JSON");
+        assert_eq!(
+            send_json["results"][0]["ok"].as_bool(),
+            Some(true),
+            "comm.send must succeed; response: {send_resp}"
+        );
+        let full_id = send_json["results"][0]["result"]["full_id"]
+            .as_str()
+            .expect("send must return full_id")
+            .to_string();
+
+        let get_before_resp = server
+            .dispatch_request_local(RequestParams {
+                ops: format!(r#"get(id="{full_id}")"#),
+                presentation: None,
+                presentation_per_op: None,
+                save_to: None,
+                format: None,
+                format_per_op: None,
+                request_id: None,
+            })
+            .await
+            .expect("get dispatch must not error");
+        let get_before_json: serde_json::Value =
+            serde_json::from_str(&get_before_resp).expect("get response is valid JSON");
+        let original_from_actor =
+            get_before_json["results"][0]["result"]["properties"]["from_actor"].clone();
+
+        let update_resp = server
+            .dispatch_request_local(RequestParams {
+                ops: format!(
+                    r#"update(id="{full_id}", properties={{"from_actor": "forged-actor"}})"#
+                ),
+                presentation: None,
+                presentation_per_op: None,
+                save_to: None,
+                format: None,
+                format_per_op: None,
+                request_id: None,
+            })
+            .await
+            .expect("update dispatch must not error");
+        let update_json: serde_json::Value =
+            serde_json::from_str(&update_resp).expect("update response is valid JSON");
+        assert_eq!(
+            update_json["results"][0]["ok"].as_bool(),
+            Some(false),
+            "update forging `from_actor` on a message note must be refused on a served \
+             multi-backend instance; response: {update_resp}"
+        );
+        let error_msg = update_json["results"][0]["error"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(
+            error_msg.contains("from_actor"),
+            "refusal error must name `from_actor`; got: {error_msg}"
+        );
+
+        let get_after_resp = server
+            .dispatch_request_local(RequestParams {
+                ops: format!(r#"get(id="{full_id}")"#),
+                presentation: None,
+                presentation_per_op: None,
+                save_to: None,
+                format: None,
+                format_per_op: None,
+                request_id: None,
+            })
+            .await
+            .expect("get dispatch must not error");
+        let get_after_json: serde_json::Value =
+            serde_json::from_str(&get_after_resp).expect("get response is valid JSON");
+        assert_eq!(
+            get_after_json["results"][0]["result"]["properties"]["from_actor"], original_from_actor,
+            "stored from_actor must be unchanged after the refused forgery attempt"
+        );
+    }
+
+    /// ADR-124 boot-occupancy regression (multi-backend twin of
+    /// `server::tests::single_runtime_boot_installs_note_write_validator`):
+    /// `has_note_write_validator` exists specifically so a transport's own
+    /// tests can assert, per boot path, that the documented startup
+    /// sequence actually filled the slot — but nothing called it for the
+    /// multi-backend builder either. Each per-pack runtime is constructed
+    /// independently in this boot path (unlike single-backend
+    /// `with_packs`), so the validator must be installed on the default
+    /// runtime AND on every per-pack runtime, not just one — installing it
+    /// on only the default would leave `kg`'s own per-pack runtime (which
+    /// actually serves the generic `create` verb below) unenforced. Asserts
+    /// occupancy directly on all of them through the real
+    /// `build_registry_for_multi_backend_inner` builder, then proves the
+    /// slot is wired, not just occupied: a generic `create` naming a forged
+    /// `from_actor` on a `message` note must come back derived to the same
+    /// actor a legitimate `comm.send` on this server stamps, not the forged
+    /// value. Sensitivity verified by temporarily commenting out both
+    /// `registry.call_register_note_write_validators(...)` calls in
+    /// `build_registry_for_multi_backend_inner` and re-running: all
+    /// assertions fail without them (occupancy false; forged value
+    /// survives) and pass with them restored.
+    #[tokio::test]
+    #[serial]
+    async fn multi_backend_boot_installs_note_write_validator_on_every_runtime() {
+        use crate::tools::request::RequestParams;
+
+        let khive_cfg = KhiveConfig {
+            backends: vec![BackendConfig {
+                name: "main".to_string(),
+                kind: BackendKind::Memory,
+                path: None,
+                cache_mb: None,
+                journal_mode: None,
+                read_only: false,
+            }],
+            ..KhiveConfig::default()
+        };
+
+        let base_cfg = base_runtime_config_for_multi_backend();
+
+        let multi = build_registry_for_multi_backend_inner(base_cfg, &khive_cfg, None)
+            .expect("multi-backend registry build must succeed");
+
+        assert!(
+            multi.default_runtime.has_note_write_validator(),
+            "multi-backend boot must install the note-write validator on the \
+             default runtime"
+        );
+        for (pack_name, rt) in &multi.per_pack_runtimes {
+            assert!(
+                rt.has_note_write_validator(),
+                "multi-backend boot must install the note-write validator on \
+                 the per-pack runtime for {pack_name:?}"
+            );
+        }
+
+        let server = build_server_from_multi_backend_registry(multi, &khive_cfg, None);
+
+        let send_resp = server
+            .dispatch_request_local(RequestParams {
+                ops: r#"comm.send(to="local", content="adr-124 boot-occupancy actor probe")"#
+                    .to_string(),
+                presentation: None,
+                presentation_per_op: None,
+                save_to: None,
+                format: None,
+                format_per_op: None,
+                request_id: None,
+            })
+            .await
+            .expect("comm.send dispatch must not error");
+        let send_json: serde_json::Value =
+            serde_json::from_str(&send_resp).expect("send response is valid JSON");
+        assert_eq!(
+            send_json["results"][0]["ok"].as_bool(),
+            Some(true),
+            "comm.send must succeed; response: {send_resp}"
+        );
+        let full_id = send_json["results"][0]["result"]["full_id"]
+            .as_str()
+            .expect("send must return full_id")
+            .to_string();
+
+        let get_resp = server
+            .dispatch_request_local(RequestParams {
+                ops: format!(r#"get(id="{full_id}")"#),
+                presentation: None,
+                presentation_per_op: None,
+                save_to: None,
+                format: None,
+                format_per_op: None,
+                request_id: None,
+            })
+            .await
+            .expect("get dispatch must not error");
+        let get_json: serde_json::Value =
+            serde_json::from_str(&get_resp).expect("get response is valid JSON");
+        let legitimate_actor = get_json["results"][0]["result"]["properties"]["from_actor"].clone();
+
+        let create_resp = server
+            .dispatch_request_local(RequestParams {
+                ops: r#"create(kind="message", content="adr-124 boot-occupancy create probe", properties={"from_actor": "forged-actor"})"#
+                    .to_string(),
+                presentation: None,
+                presentation_per_op: None,
+                save_to: None,
+                format: None,
+                format_per_op: None,
+                request_id: None,
+            })
+            .await
+            .expect("create dispatch must not error");
+        let create_json: serde_json::Value =
+            serde_json::from_str(&create_resp).expect("create response is valid JSON");
+        assert_eq!(
+            create_json["results"][0]["ok"].as_bool(),
+            Some(true),
+            "create must succeed; response: {create_resp}"
+        );
+        assert_eq!(
+            create_json["results"][0]["result"]["properties"]["from_actor"], legitimate_actor,
+            "a forged from_actor on a generic create must come back derived to \
+             the same actor a legitimate comm.send on this server stamps, not \
+             the forged value; response: {create_resp}"
+        );
+    }
+
     /// #658 multi-backend regression: `build_registry_for_multi_backend` — the
     /// production multi-backend wiring path — must also wire the brain
     /// dispatch hook produced by `PackFactory::create_install`, observing the
@@ -4840,7 +5278,21 @@ region = "us-east-1"
                 Err(error) => error,
             };
 
-        assert!(error.to_string().contains("khive.toml"));
+        let msg = error.to_string();
+        assert!(
+            msg.contains("./khive.toml")
+                && msg.contains("<db-dir>/config.toml")
+                && msg.contains("~/.khive/config.toml"),
+            "remedy must name every searched config filename; got: {msg}"
+        );
+        assert!(
+            msg.contains("--config <file>") && msg.contains("KHIVE_CONFIG"),
+            "remedy must name the --config/KHIVE_CONFIG escape; got: {msg}"
+        );
+        assert!(
+            !msg.contains(":memory:"),
+            "remedy must not recommend the discarding :memory: override for ingest-shaped work; got: {msg}"
+        );
         assert!(
             !override_path.exists(),
             "rejecting an override must not create its database path"
@@ -5078,9 +5530,14 @@ region = "us-east-1"
         if let Err(err) = result {
             let msg = err.to_string();
             assert!(
-                msg.contains("khive.toml"),
-                "error message must point at khive.toml as where to make the change \
-                 instead; got: {msg}"
+                msg.contains("./khive.toml")
+                    && msg.contains("<db-dir>/config.toml")
+                    && msg.contains("~/.khive/config.toml"),
+                "remedy must name every searched config filename; got: {msg}"
+            );
+            assert!(
+                msg.contains("--config <file>") && msg.contains("KHIVE_CONFIG"),
+                "remedy must name the --config/KHIVE_CONFIG escape; got: {msg}"
             );
         }
     }
@@ -5710,9 +6167,14 @@ region = "us-east-1"
         if let Err(err) = result {
             let msg = err.to_string();
             assert!(
-                msg.contains("khive.toml"),
-                "error message must point at khive.toml as where to make the change \
-                 instead; got: {msg}"
+                msg.contains("./khive.toml")
+                    && msg.contains("<db-dir>/config.toml")
+                    && msg.contains("~/.khive/config.toml"),
+                "remedy must name every searched config filename; got: {msg}"
+            );
+            assert!(
+                msg.contains("--config <file>") && msg.contains("KHIVE_CONFIG"),
+                "remedy must name the --config/KHIVE_CONFIG escape; got: {msg}"
             );
         }
     }

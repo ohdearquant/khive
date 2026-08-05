@@ -5,6 +5,7 @@ use rusqlite::{Connection, OpenFlags};
 use std::fs;
 use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -22,7 +23,7 @@ const DEFAULT_WAL_AUTOCHECKPOINT_PAGES: u32 = 4000;
 const DEFAULT_JOURNAL_SIZE_LIMIT_BYTES: i64 = 67_108_864; // 64 MiB
 const DEFAULT_WRITE_QUEUE_CAPACITY: usize = 256;
 
-const TEST_HARNESS_ENV: &str = "KHIVE_TEST_HARNESS";
+pub(crate) const TEST_HARNESS_ENV: &str = "KHIVE_TEST_HARNESS";
 
 /// Configuration for the connection pool.
 #[derive(Clone, Debug)]
@@ -79,6 +80,16 @@ pub struct PoolConfig {
     /// Overridable via `KHIVE_WRITE_QUEUE_CAPACITY`. Default: 256 pending
     /// operations (ADR-067 Component A recommended default).
     pub write_queue_capacity: usize,
+    /// ADR-136 D1: when `true`, every write path that would otherwise
+    /// silently degrade to the legacy pool-mutex/standalone-connection path
+    /// on a missing or failed `WriterTask` handle instead returns an error.
+    /// Exercises the completed routing (ADR-135 F2's strict-routing
+    /// precondition) without changing behavior for callers that never set
+    /// the env var.
+    ///
+    /// Overridable via `KHIVE_WRITE_ROUTING` (value `"strict"`,
+    /// case-insensitive; anything else, or unset, leaves this `false`).
+    pub write_routing_strict: bool,
 }
 
 impl Default for PoolConfig {
@@ -119,6 +130,9 @@ impl Default for PoolConfig {
                 .and_then(|v| v.parse::<usize>().ok())
                 .filter(|&n| n > 0)
                 .unwrap_or(DEFAULT_WRITE_QUEUE_CAPACITY),
+            write_routing_strict: std::env::var("KHIVE_WRITE_ROUTING")
+                .map(|v| v.eq_ignore_ascii_case("strict"))
+                .unwrap_or(false),
         }
     }
 }
@@ -225,6 +239,11 @@ fn canonicalize_deepest_existing(path: &Path) -> Result<PathBuf, SqliteError> {
 /// writer connection.
 pub struct ConnectionPool {
     writer: Arc<Mutex<Connection>>,
+    /// Process-local writer acquisition counters shared with the pool's
+    /// lifetime-owned writer task. Keeping the counters at the actual
+    /// acquisition boundaries means new verbs inherit instrumentation without
+    /// per-verb classification (ADR-133 D8 / issue #1389).
+    writer_acquisition_counters: Arc<WriterAcquisitionCounters>,
     readers: ArrayQueue<Connection>,
     max_readers: usize,
     config: PoolConfig,
@@ -311,6 +330,63 @@ pub struct WriterGuard<'pool> {
     origin: TxOrigin,
 }
 
+/// Process-local monotonic counters for every instrumented writer acquisition
+/// boundary owned by one [`ConnectionPool`].
+///
+/// The aggregate `acquisitions` is the saturating sum of its three explicit
+/// connection classes. Infrastructure-only opens (the diagnostics PASSIVE
+/// probe, the writer task's one-time lifetime connection, and the checkpoint
+/// task's dedicated long-lived connection) are excluded; zero-wait
+/// maintenance probes also remain outside these request-traffic counters.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WriterAcquisitionSnapshot {
+    /// Successful acquisitions across pooled, standalone, and writer-task
+    /// connection classes.
+    pub acquisitions: u64,
+    /// Successful finite-wait pool-mutex writer checkouts.
+    pub pooled_acquisitions: u64,
+    /// Successful per-operation standalone writer connection opens.
+    pub standalone_acquisitions: u64,
+    /// Successful writer-task ownership acquisitions (one per dequeued
+    /// top-level request or successful `BEGIN IMMEDIATE`).
+    pub writer_task_acquisitions: u64,
+    /// Finite-wait pool writer checkouts that exhausted their deadline.
+    pub timeouts: u64,
+}
+
+/// Atomics backing [`WriterAcquisitionSnapshot`]. The writer task retains an
+/// `Arc` after spawn so its per-request acquisition site can update the same
+/// pool-scoped snapshot without retaining the whole pool.
+#[derive(Debug, Default)]
+pub(crate) struct WriterAcquisitionCounters {
+    pooled_acquisitions: AtomicU64,
+    standalone_acquisitions: AtomicU64,
+    writer_task_acquisitions: AtomicU64,
+    pooled_timeouts: AtomicU64,
+}
+
+impl WriterAcquisitionCounters {
+    pub(crate) fn record_writer_task_acquisition(&self) {
+        self.writer_task_acquisitions
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> WriterAcquisitionSnapshot {
+        let pooled_acquisitions = self.pooled_acquisitions.load(Ordering::Relaxed);
+        let standalone_acquisitions = self.standalone_acquisitions.load(Ordering::Relaxed);
+        let writer_task_acquisitions = self.writer_task_acquisitions.load(Ordering::Relaxed);
+        WriterAcquisitionSnapshot {
+            acquisitions: pooled_acquisitions
+                .saturating_add(standalone_acquisitions)
+                .saturating_add(writer_task_acquisitions),
+            pooled_acquisitions,
+            standalone_acquisitions,
+            writer_task_acquisitions,
+            timeouts: self.pooled_timeouts.load(Ordering::Relaxed),
+        }
+    }
+}
+
 impl<'pool> WriterGuard<'pool> {
     /// Returns a shared reference to the underlying connection.
     pub fn conn(&self) -> &Connection {
@@ -391,6 +467,7 @@ impl ConnectionPool {
 
         let pool = Self {
             writer: Arc::new(Mutex::new(writer)),
+            writer_acquisition_counters: Arc::new(WriterAcquisitionCounters::default()),
             readers,
             max_readers,
             config,
@@ -407,6 +484,15 @@ impl ConnectionPool {
                 .push(conn)
                 .expect("reader queue must have capacity during pool initialization");
         }
+
+        // Best-effort, process-global: the first pool to boot in this
+        // process resolves the writer-timeout sink's log directory and
+        // spawns its heartbeat thread; every later pool's call here is a
+        // cheap no-op. See `crate::timeout_sink` module docs.
+        crate::timeout_sink::init(
+            pool.canonical_path().and_then(Path::parent),
+            &crate::timeout_sink::db_label(&pool),
+        );
 
         Ok(pool)
     }
@@ -473,17 +559,35 @@ impl ConnectionPool {
     /// Check out the writer connection.
     ///
     /// Waits up to `checkout_timeout` for the writer Mutex and returns
-    /// `Err(SqliteError::InvalidData)` if the timeout is exceeded.
+    /// `Err(SqliteError::WriterPoolCheckoutTimeout)` if the timeout is
+    /// exceeded.
     pub fn writer(&self) -> Result<WriterGuard<'_>, SqliteError> {
-        let guard = self
-            .writer
-            .try_lock_for(self.config.checkout_timeout)
-            .ok_or_else(|| {
-                SqliteError::InvalidData(format!(
-                    "timed out after {:?} waiting for sqlite writer connection",
-                    self.config.checkout_timeout
-                ))
-            })?;
+        let Some(guard) = self.writer.try_lock_for(self.config.checkout_timeout) else {
+            self.writer_acquisition_counters
+                .pooled_timeouts
+                .fetch_add(1, Ordering::Relaxed);
+            let message = format!(
+                "timed out after {:?} waiting for sqlite writer connection",
+                self.config.checkout_timeout
+            );
+            crate::timeout_sink::emit_timeout(
+                &crate::timeout_sink::db_label(self),
+                crate::timeout_sink::Site::PoolAdmission,
+                &message,
+                Some(
+                    self.config
+                        .checkout_timeout
+                        .as_millis()
+                        .min(u128::from(u64::MAX)) as u64,
+                ),
+            );
+            return Err(SqliteError::WriterPoolCheckoutTimeout {
+                timeout: self.config.checkout_timeout,
+            });
+        };
+        self.writer_acquisition_counters
+            .pooled_acquisitions
+            .fetch_add(1, Ordering::Relaxed);
         Ok(WriterGuard {
             guard,
             origin: self.origin(),
@@ -516,6 +620,17 @@ impl ConnectionPool {
             guard,
             origin: self.origin(),
         })
+    }
+
+    /// Snapshot all instrumented writer acquisition outcomes since this pool
+    /// was constructed.
+    pub fn writer_acquisition_snapshot(&self) -> WriterAcquisitionSnapshot {
+        self.writer_acquisition_counters.snapshot()
+    }
+
+    /// Clone the pool-scoped counter set for the lifetime-owned writer task.
+    pub(crate) fn writer_acquisition_counters(&self) -> Arc<WriterAcquisitionCounters> {
+        Arc::clone(&self.writer_acquisition_counters)
     }
 
     /// Get the current number of available reader connections.
@@ -646,8 +761,26 @@ impl ConnectionPool {
     /// must still honor `PoolConfig::read_only`: opening
     /// `SQLITE_OPEN_READ_WRITE` unconditionally here would let a read-only
     /// backend's graph/event/text stores bypass the flag that the pooled
-    /// writer enforces via `query_only`.
+    /// writer enforces via `query_only`. A fully configured successful open
+    /// increments the standalone acquisition class exactly once.
     pub fn open_standalone_writer(&self) -> Result<Connection, SqliteError> {
+        let conn = self.open_standalone_writer_untracked()?;
+        self.writer_acquisition_counters
+            .standalone_acquisitions
+            .fetch_add(1, Ordering::Relaxed);
+        Ok(conn)
+    }
+
+    /// Open an infrastructure-owned standalone writer connection without
+    /// counting it as one write-operation acquisition.
+    ///
+    /// Restricted to the diagnostics PASSIVE probe, the writer task's
+    /// one-time lifetime connection, and the checkpoint task's dedicated
+    /// long-lived connection (opened once at startup and reused across
+    /// ticks — see `CheckpointConnection::ensure_open`). Actual file-backed
+    /// write paths must call [`Self::open_standalone_writer`] so their
+    /// acquisitions are observable.
+    pub(crate) fn open_standalone_writer_untracked(&self) -> Result<Connection, SqliteError> {
         let path = self.config.path.as_ref().ok_or_else(|| {
             SqliteError::InvalidData(
                 "in-memory databases do not support standalone connections".to_string(),
@@ -1026,13 +1159,14 @@ mod tests {
         }
     }
 
-    const POOL_ENV_VARS: [&str; 6] = [
+    const POOL_ENV_VARS: [&str; 7] = [
         "KHIVE_BUSY_TIMEOUT_SECS",
         "KHIVE_CHECKOUT_TIMEOUT_SECS",
         "KHIVE_WAL_AUTOCHECKPOINT_PAGES",
         "KHIVE_JOURNAL_SIZE_LIMIT_BYTES",
         "KHIVE_WRITE_QUEUE",
         "KHIVE_WRITE_QUEUE_CAPACITY",
+        "KHIVE_WRITE_ROUTING",
     ];
 
     struct PoolEnvGuard {
@@ -1171,6 +1305,41 @@ mod tests {
 
     #[test]
     #[serial]
+    fn pool_config_write_routing_strict_defaults_off() {
+        let _pool_env = clear_pool_env();
+        let cfg = PoolConfig::default();
+        assert!(!cfg.write_routing_strict);
+    }
+
+    #[test]
+    #[serial]
+    fn pool_config_env_override_write_routing_strict() {
+        std::env::set_var("KHIVE_WRITE_ROUTING", "strict");
+        let cfg = PoolConfig::default();
+        std::env::remove_var("KHIVE_WRITE_ROUTING");
+        assert!(cfg.write_routing_strict);
+    }
+
+    #[test]
+    #[serial]
+    fn pool_config_env_override_write_routing_strict_case_insensitive() {
+        std::env::set_var("KHIVE_WRITE_ROUTING", "STRICT");
+        let cfg = PoolConfig::default();
+        std::env::remove_var("KHIVE_WRITE_ROUTING");
+        assert!(cfg.write_routing_strict);
+    }
+
+    #[test]
+    #[serial]
+    fn pool_config_env_write_routing_ignores_unrecognized_value() {
+        std::env::set_var("KHIVE_WRITE_ROUTING", "eventual");
+        let cfg = PoolConfig::default();
+        std::env::remove_var("KHIVE_WRITE_ROUTING");
+        assert!(!cfg.write_routing_strict);
+    }
+
+    #[test]
+    #[serial]
     fn pool_config_env_override_write_queue_capacity() {
         std::env::set_var("KHIVE_WRITE_QUEUE_CAPACITY", "64");
         let cfg = PoolConfig::default();
@@ -1219,6 +1388,33 @@ mod tests {
     }
 
     #[test]
+    fn standalone_writer_open_counts_its_connection_class_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("standalone_writer_counter.db");
+        let pool = ConnectionPool::new(PoolConfig {
+            path: Some(path),
+            ..PoolConfig::default()
+        })
+        .expect("file-backed pool");
+
+        let _standalone = pool
+            .open_standalone_writer()
+            .expect("standalone writer opens");
+
+        assert_eq!(
+            pool.writer_acquisition_snapshot(),
+            WriterAcquisitionSnapshot {
+                acquisitions: 1,
+                pooled_acquisitions: 0,
+                standalone_acquisitions: 1,
+                writer_task_acquisitions: 0,
+                timeouts: 0,
+            },
+            "the public standalone boundary must contribute to the aggregate exactly once"
+        );
+    }
+
+    #[test]
     fn in_memory_pool_degrades_to_single_connection() {
         let cfg = PoolConfig {
             path: None,
@@ -1242,6 +1438,77 @@ mod tests {
         let _writer2 = pool
             .writer()
             .expect("second writer checkout should succeed");
+    }
+
+    #[test]
+    fn writer_checkout_snapshot_counts_successes_and_timeouts_at_the_pool_boundary() {
+        let cfg = PoolConfig {
+            path: None,
+            checkout_timeout: Duration::from_millis(1),
+            ..PoolConfig::default()
+        };
+        let pool = ConnectionPool::new(cfg).unwrap();
+
+        assert_eq!(
+            pool.writer_acquisition_snapshot(),
+            WriterAcquisitionSnapshot::default()
+        );
+
+        let held = pool.writer().expect("first checkout succeeds");
+        let error = match pool.writer() {
+            Ok(_) => panic!("the held pool mutex must force a finite-wait timeout"),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(
+                &error,
+                SqliteError::WriterPoolCheckoutTimeout { timeout }
+                    if *timeout == Duration::from_millis(1)
+            ),
+            "timeout must have a stable, structurally matchable stage: {error}"
+        );
+        assert_eq!(
+            pool.writer_acquisition_snapshot(),
+            WriterAcquisitionSnapshot {
+                acquisitions: 1,
+                pooled_acquisitions: 1,
+                standalone_acquisitions: 0,
+                writer_task_acquisitions: 0,
+                timeouts: 1,
+            }
+        );
+
+        drop(held);
+        let _reacquired = pool.writer().expect("checkout succeeds after release");
+        assert_eq!(
+            pool.writer_acquisition_snapshot(),
+            WriterAcquisitionSnapshot {
+                acquisitions: 2,
+                pooled_acquisitions: 2,
+                standalone_acquisitions: 0,
+                writer_task_acquisitions: 0,
+                timeouts: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn zero_wait_maintenance_skip_is_not_reported_as_a_checkout_timeout() {
+        let pool = ConnectionPool::new(PoolConfig::default()).unwrap();
+        let held = pool.writer().expect("finite-wait checkout succeeds");
+        let before = pool.writer_acquisition_snapshot();
+
+        assert!(
+            pool.try_writer_nowait().is_err(),
+            "zero-wait maintenance checkout must skip while held"
+        );
+
+        assert_eq!(
+            pool.writer_acquisition_snapshot(),
+            before,
+            "a checkpoint-style zero-wait skip is not a finite-wait checkout timeout"
+        );
+        drop(held);
     }
 
     /// ADR-091 Plank 0: `WriterGuard::transaction` registers/deregisters a

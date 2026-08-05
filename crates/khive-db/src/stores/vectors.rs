@@ -22,6 +22,34 @@ use crate::error::SqliteError;
 use crate::pool::ConnectionPool;
 use crate::sql_bridge::bind_params;
 
+/// ADR-136 D1 gate 3: called immediately before a `with_writer_unmanaged`
+/// fallback so this store's two remaining direct-writer call sites
+/// (`vec_delete_subjects`, `orphan_sweep`) fail closed under strict routing
+/// instead of silently bypassing an enabled queue. Under non-strict routing
+/// this is a no-op except for a `direct_route_violation` sink row when the
+/// queue is enabled (ADR-136 D1 gate 6c) — observable, but not yet fatal.
+fn refuse_direct_route_if_strict(
+    pool: &ConnectionPool,
+    site: crate::timeout_sink::Site,
+    op: &'static str,
+) -> Result<(), StorageError> {
+    if pool.config().write_routing_strict {
+        return Err(StorageError::Pool {
+            operation: op.into(),
+            message: "KHIVE_WRITE_ROUTING=strict but no writer-task handle is available; \
+                      refusing to fall back to a direct connection"
+                .into(),
+        });
+    }
+    if pool.config().write_queue_enabled {
+        crate::timeout_sink::emit_direct_route_violation(
+            &crate::timeout_sink::db_label(pool),
+            site,
+        );
+    }
+    Ok(())
+}
+
 /// The exact `DELETE` this store's `delete` issues, for a given vector table
 /// (ADR-099 B3 r6 structural cut — see `stores::entity`'s sibling block).
 /// `table` must already be a trusted, sanitized table name (mirrors
@@ -335,6 +363,21 @@ impl SqliteVecStore {
         Ok(conn)
     }
 
+    /// Re-derive writer-task availability at write time instead of trusting
+    /// only the field cached at construction (ADR-136 D1 gate 3 amendment).
+    /// `self.writer_task` permanently caches `None` when this store was
+    /// constructed outside a Tokio runtime (`writer_task_handle()` returns
+    /// `Err(WriterTaskNoRuntime)`, which construction collapses via
+    /// `.ok().flatten()`) — every later write, even ones running inside a
+    /// runtime, would otherwise silently keep bypassing an enabled queue.
+    /// `ConnectionPool::writer_task_handle()` is a cheap `OnceCell` read once
+    /// resolved, so re-checking here costs nothing on the hot path.
+    fn current_writer_task(&self) -> Option<crate::writer_task::WriterTaskHandle> {
+        self.writer_task
+            .clone()
+            .or_else(|| self.pool.writer_task_handle().ok().flatten())
+    }
+
     /// Route a single-row DML-only write through the pool-wide `WriterTask`
     /// when available, else fall back to `with_writer_unmanaged`. See
     /// crates/khive-db/docs/api/vectors.md#with_writer--with_writer_unmanaged--writertask-routing-adr-067-component-a-fork-c-slice-2
@@ -343,12 +386,17 @@ impl SqliteVecStore {
         F: FnOnce(&rusqlite::Connection) -> Result<R, rusqlite::Error> + Send + 'static,
         R: Send + 'static,
     {
-        if let Some(writer_task) = &self.writer_task {
+        if let Some(writer_task) = self.current_writer_task() {
             return writer_task
                 .send(move |conn| f(conn).map_err(|e| map_err(e, op)))
                 .await;
         }
 
+        refuse_direct_route_if_strict(
+            &self.pool,
+            crate::timeout_sink::Site::DirectRouteVecGeneralWrite,
+            op,
+        )?;
         self.with_writer_unmanaged(op, f).await
     }
 
@@ -421,25 +469,32 @@ fn replace_vector_row_dml(
         ));
     }
 
-    // Vector tables use subject_id as their primary key. Replace by that same
-    // identity so a successful write also repairs stale namespace metadata.
+    // Vector tables use subject_id as their primary key. Delete the common
+    // same-identity row directly; its incoming upsert log is sufficient. Only
+    // the metadata-repair path needs to discover and log the old ANN identity.
     // The caller's transaction/savepoint restores the prior row on failure.
     let subject_id = row.subject_id.to_string();
-    log_vector_deletes(
-        conn,
-        table,
-        "subject_id = ?1 AND NOT (namespace = ?2 AND embedding_model = ?3 \
-         AND kind = ?4 AND field = ?5)",
-        &[
+    let delete_same_identity_sql = format!(
+        "DELETE FROM {table} WHERE subject_id = ?1 AND namespace = ?2 \
+         AND embedding_model = ?3 AND kind = ?4 AND field = ?5"
+    );
+    let deleted_same_identity = conn.execute(
+        &delete_same_identity_sql,
+        rusqlite::params![
             &subject_id,
-            &row.namespace,
-            &row.embedding_model,
-            &row.kind,
-            &row.field,
+            row.namespace,
+            row.embedding_model,
+            row.kind,
+            row.field
         ],
     )?;
-    let del_sql = format!("DELETE FROM {table} WHERE subject_id = ?1");
-    conn.execute(&del_sql, rusqlite::params![subject_id])?;
+    if deleted_same_identity == 0 {
+        let logged = log_vector_deletes(conn, table, "subject_id = ?1", &[&subject_id])?;
+        if logged > 0 {
+            let delete_prior_identity_sql = format!("DELETE FROM {table} WHERE subject_id = ?1");
+            conn.execute(&delete_prior_identity_sql, rusqlite::params![&subject_id])?;
+        }
+    }
 
     // Failpoint: fires only in cfg(test) when the guard is active. DELETE has
     // already run; if the caller's rollback (transaction or SAVEPOINT) is
@@ -463,7 +518,7 @@ fn replace_vector_row_dml(
     conn.execute(
         &ins_sql,
         rusqlite::params![
-            row.subject_id.to_string(),
+            &subject_id,
             row.namespace,
             row.kind,
             row.field,
@@ -482,7 +537,7 @@ fn replace_vector_row_dml(
             row.embedding_model,
             row.kind,
             row.field,
-            row.subject_id.to_string()
+            &subject_id
         ],
     )?;
 
@@ -492,20 +547,20 @@ fn replace_vector_row_dml(
 /// Log `'delete'` rows into `ann_write_log` for every vector row in `table`
 /// matching `where_clause` (a predicate over the vec0 table's own columns).
 /// Must run in the same transaction as — and before — the corresponding
-/// `DELETE`, so the logged set is exactly the deleted set.
+/// `DELETE`, so the logged set is exactly the deleted set. Returns the number
+/// of identities logged.
 fn log_vector_deletes(
     conn: &rusqlite::Connection,
     table: &str,
     where_clause: &str,
     params: &[&dyn rusqlite::ToSql],
-) -> Result<(), rusqlite::Error> {
+) -> Result<usize, rusqlite::Error> {
     let sql = format!(
         "INSERT INTO ann_write_log (namespace, embedding_model, kind, field, subject_id, op) \
          SELECT namespace, embedding_model, kind, field, subject_id, 'delete' \
          FROM {table} WHERE {where_clause}"
     );
-    conn.execute(&sql, params)?;
-    Ok(())
+    conn.execute(&sql, params)
 }
 
 /// DML-only multi-chunk subject deletion shared by both the legacy
@@ -880,7 +935,7 @@ impl VectorStore for SqliteVecStore {
         // named SAVEPOINT rather than `conn.unchecked_transaction()`,
         // which would attempt a nested `BEGIN` and fail under the
         // WriterTask's already-open transaction.
-        if let Some(writer_task) = &self.writer_task {
+        if let Some(writer_task) = self.current_writer_task() {
             let table2 = table.clone();
             let namespace2 = namespace.clone();
             let field2 = field.clone();
@@ -964,7 +1019,7 @@ impl VectorStore for SqliteVecStore {
         // `SAVEPOINT vec_batch_record` is preserved unchanged — only the
         // OUTER BEGIN IMMEDIATE/COMMIT is removed, since the WriterTask's
         // run loop owns the enclosing transaction).
-        if let Some(writer_task) = &self.writer_task {
+        if let Some(writer_task) = self.current_writer_task() {
             let table2 = table.clone();
             let store_embedding_model2 = store_embedding_model.clone();
             return writer_task
@@ -1050,7 +1105,7 @@ impl VectorStore for SqliteVecStore {
         // named SAVEPOINT rather than `conn.unchecked_transaction()`,
         // which would attempt a nested `BEGIN` and fail under the
         // WriterTask's already-open transaction.
-        if let Some(writer_task) = &self.writer_task {
+        if let Some(writer_task) = self.current_writer_task() {
             let table2 = table.clone();
             let namespace2 = namespace.clone();
             let field2 = field.clone();
@@ -1332,6 +1387,11 @@ impl VectorStore for SqliteVecStore {
         // outermost SAVEPOINT. `Transaction` rolls back on early DML errors and
         // also when COMMIT fails while SQLite leaves the transaction open,
         // preventing a poisoned transaction from returning to the pool.
+        refuse_direct_route_if_strict(
+            &self.pool,
+            crate::timeout_sink::Site::DirectRouteVecDeleteSubjects,
+            "vec_delete_subjects",
+        )?;
         let table_for_error = table.clone();
         let origin = self.pool.origin();
         self.with_writer_unmanaged("vec_delete_subjects", move |conn| {
@@ -1469,6 +1529,11 @@ impl VectorStore for SqliteVecStore {
         // Flag-off (default) path: byte-for-byte unchanged from pre-ADR-067
         // behavior — the closure owns its own transaction via
         // `Transaction::new_unchecked`.
+        refuse_direct_route_if_strict(
+            &self.pool,
+            crate::timeout_sink::Site::DirectRouteOrphanSweep,
+            "orphan_sweep",
+        )?;
         let origin = self.pool.origin();
         self.with_writer_unmanaged("orphan_sweep", move |conn| {
             // `Transaction::new_unchecked` issues `BEGIN IMMEDIATE` and RAII-manages
@@ -2732,11 +2797,13 @@ mod delete_subjects_atomic_tests {
 
 #[cfg(all(test, feature = "vectors"))]
 mod atomic_replace_tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
     use khive_storage::types::VectorRecord;
     use khive_storage::VectorStore;
     use khive_types::SubstrateKind;
+    use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
     use uuid::Uuid;
 
     use super::*;
@@ -3276,6 +3343,26 @@ mod atomic_replace_tests {
             .expect("initial insert");
         clear_ann_write_log(&pool);
 
+        let prepared_log_inserts = Arc::new(AtomicUsize::new(0));
+        {
+            let prepared_log_inserts = Arc::clone(&prepared_log_inserts);
+            pool.try_writer()
+                .expect("pool writer")
+                .conn()
+                .authorizer(Some(move |context: AuthContext<'_>| {
+                    if matches!(
+                        context.action,
+                        AuthAction::Insert {
+                            table_name: "ann_write_log"
+                        }
+                    ) {
+                        prepared_log_inserts.fetch_add(1, Ordering::SeqCst);
+                    }
+                    Authorization::Allow
+                }))
+                .expect("install statement authorizer");
+        }
+
         store
             .update(
                 id,
@@ -3292,6 +3379,16 @@ mod atomic_replace_tests {
             vec![ann_write_log_row(ns, model_key, "upsert")],
             "same-identity replacement must not emit delete/upsert churn"
         );
+        assert_eq!(
+            prepared_log_inserts.load(Ordering::SeqCst),
+            1,
+            "the common replacement path must prepare only the required upsert log statement"
+        );
+        pool.try_writer()
+            .expect("pool writer")
+            .conn()
+            .authorizer(None::<fn(AuthContext<'_>) -> Authorization>)
+            .expect("remove statement authorizer");
     }
 
     // True ROLLBACK TO SAVEPOINT sentinels (failpoint-driven) — see
@@ -4648,5 +4745,342 @@ mod write_queue_tests {
             "expected the deterministic nested-transaction failure (SQLite's own message \
              for a second BEGIN issued inside an already-open transaction), got: {msg}"
         );
+    }
+
+    /// ADR-136 D1 gate 2/4: `vec_delete_subjects`'s flag-on path must route
+    /// through the pool-wide `WriterTask`, not `with_writer_unmanaged`'s
+    /// pool-mutex path, when the write queue is enabled — same occupier /
+    /// `queue_depth()` technique as
+    /// `orphan_sweep_routes_through_writer_task_when_flag_enabled` above (a
+    /// `writer_task_spawn_count() == 1` assertion alone is a false positive:
+    /// `SqliteVecStore::new` and the setup insert already spawn/use the
+    /// task). Red-proof: reverting the `if let Some(writer_task) =
+    /// &self.writer_task` branch in `vec_delete_subjects` (forcing every
+    /// call through `with_writer_unmanaged`) makes `saw_enqueued` stay
+    /// `false` and this test fail — see the impl report for the exact
+    /// revert/run/restore transcript.
+    #[tokio::test]
+    async fn vec_delete_subjects_routes_through_writer_task_when_flag_enabled() {
+        crate::extension::ensure_extensions_loaded();
+
+        let model_key = "write_queue_vec_delete_subjects";
+        let dims = 4usize;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("write_queue_vec_delete_subjects.db");
+        let pool = Arc::new(
+            ConnectionPool::new(PoolConfig {
+                path: Some(path),
+                write_queue_enabled: true,
+                ..PoolConfig::default()
+            })
+            .expect("file-backed pool"),
+        );
+        create_vec_table(&pool, model_key, dims);
+
+        let store = SqliteVecStore::new(
+            Arc::clone(&pool),
+            true,
+            model_key.to_string(),
+            model_key.to_string(),
+            dims,
+            "ns:test".to_string(),
+        )
+        .expect("SqliteVecStore::new");
+
+        let id = Uuid::new_v4();
+        store
+            .insert(
+                id,
+                SubstrateKind::Entity,
+                "ns:test",
+                "body",
+                vec![vec![0.1, 0.2, 0.3, 0.4]],
+            )
+            .await
+            .expect("insert vector");
+
+        let writer_task = pool
+            .writer_task_handle()
+            .expect("writer task handle")
+            .expect("writer task must be spawned for a file-backed pool with the flag on");
+
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel::<()>();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let occupier = {
+            let writer_task = writer_task.clone();
+            tokio::spawn(async move {
+                writer_task
+                    .send(move |_conn| {
+                        let _ = started_tx.send(());
+                        let _ = release_rx.blocking_recv();
+                        Ok::<(), StorageError>(())
+                    })
+                    .await
+            })
+        };
+
+        started_rx
+            .await
+            .expect("occupier must signal it has started running inside the writer task");
+        assert_eq!(
+            writer_task.queue_depth(),
+            0,
+            "channel must start empty once the occupier has been dequeued and is running"
+        );
+
+        let delete_task = tokio::spawn(async move { store.delete_subjects(&[id]).await });
+
+        let mut saw_enqueued = false;
+        for _ in 0..100 {
+            if writer_task.queue_depth() >= 1 {
+                saw_enqueued = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(
+            saw_enqueued,
+            "vec_delete_subjects's write request never appeared in the writer task's channel \
+             while the occupier held the single drain slot — vec_delete_subjects is not \
+             routing through the shared writer task"
+        );
+
+        release_tx
+            .send(())
+            .expect("occupier must still be waiting on the release signal");
+        occupier
+            .await
+            .expect("occupier task must not panic")
+            .expect("occupier write must succeed");
+        let deleted = delete_task
+            .await
+            .expect("delete task must not panic")
+            .expect("vec_delete_subjects must succeed once unblocked");
+        assert_eq!(deleted, 1);
+    }
+
+    /// ADR-136 D1 gate 3/4: with `KHIVE_WRITE_ROUTING=strict` and no writer
+    /// task available, `vec_delete_subjects` must error instead of silently
+    /// falling back to `with_writer_unmanaged`'s pool-mutex path.
+    #[tokio::test]
+    async fn vec_delete_subjects_strict_routing_fails_closed_without_writer_task() {
+        crate::extension::ensure_extensions_loaded();
+
+        let model_key = "strict_vec_delete_subjects";
+        let dims = 4usize;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("strict_vec_delete_subjects.db");
+        let pool = Arc::new(
+            ConnectionPool::new(PoolConfig {
+                path: Some(path),
+                write_queue_enabled: false,
+                write_routing_strict: true,
+                ..PoolConfig::default()
+            })
+            .expect("file-backed pool"),
+        );
+        create_vec_table(&pool, model_key, dims);
+
+        let store = SqliteVecStore::new(
+            Arc::clone(&pool),
+            true,
+            model_key.to_string(),
+            model_key.to_string(),
+            dims,
+            "ns:test".to_string(),
+        )
+        .expect("SqliteVecStore::new");
+
+        let id = Uuid::new_v4();
+        let err = store.delete_subjects(&[id]).await.expect_err(
+            "KHIVE_WRITE_ROUTING=strict with no writer task must fail closed, not silently \
+             fall back to with_writer_unmanaged",
+        );
+        assert!(
+            err.to_string().contains("strict"),
+            "error must name strict routing, got: {err}"
+        );
+    }
+
+    /// ADR-136 D1 gate 3/4: same fail-closed contract as
+    /// `vec_delete_subjects_strict_routing_fails_closed_without_writer_task`,
+    /// for `orphan_sweep`'s own `with_writer_unmanaged` fallback.
+    #[tokio::test]
+    async fn orphan_sweep_strict_routing_fails_closed_without_writer_task() {
+        crate::extension::ensure_extensions_loaded();
+
+        let model_key = "strict_orphan_sweep";
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("strict_orphan_sweep.db");
+        let pool = Arc::new(
+            ConnectionPool::new(PoolConfig {
+                path: Some(path),
+                write_queue_enabled: false,
+                write_routing_strict: true,
+                ..PoolConfig::default()
+            })
+            .expect("file-backed pool"),
+        );
+        create_substrate_tables(&pool);
+        create_vec_table(&pool, model_key, 4);
+
+        let store = SqliteVecStore::new(
+            Arc::clone(&pool),
+            true,
+            model_key.to_string(),
+            model_key.to_string(),
+            4,
+            "ns:test".to_string(),
+        )
+        .expect("SqliteVecStore::new");
+
+        let err = store
+            .orphan_sweep(&OrphanSweepConfig {
+                subject_id_allowlist: None,
+                namespaces: vec![],
+                substrate_kinds: vec![],
+                max_delete: 100,
+                dry_run: true,
+            })
+            .await
+            .expect_err(
+                "KHIVE_WRITE_ROUTING=strict with no writer task must fail closed, not \
+                 silently fall back to with_writer_unmanaged",
+            );
+        assert!(
+            err.to_string().contains("strict"),
+            "error must name strict routing, got: {err}"
+        );
+    }
+
+    /// ADR-136 D1 gate 3 amendment: a store built on a thread with no
+    /// ambient Tokio runtime caches `writer_task: None` at construction —
+    /// the pool returns `Err(WriterTaskNoRuntime)`, which `SqliteVecStore::
+    /// new` collapses via `.ok().flatten()` (a documented, deliberate
+    /// best-effort degrade). The bug this guards against: without
+    /// `with_writer`'s write-time re-lookup (`current_writer_task`), that
+    /// construction-time `None` would stick forever, so a *normal* vector
+    /// write (`insert`, routed through the general `with_writer` helper, not
+    /// a maintenance path) issued later inside a real runtime would silently
+    /// bypass the queue via the direct-connection path instead of routing
+    /// through the shared `WriterTask` like every other write on this pool.
+    /// Same occupier / `queue_depth()` discriminator as
+    /// `vec_delete_subjects_routes_through_writer_task_when_flag_enabled`
+    /// above, proving genuine queue routing rather than a
+    /// `writer_task_spawn_count() == 1` false positive.
+    ///
+    /// Deliberately `#[test]`, not `#[tokio::test]`: construction must
+    /// happen with no ambient runtime, which a `#[tokio::test]` function
+    /// body would not give it (the whole test body already runs on a Tokio
+    /// worker thread). Red-proof: reverting `with_writer`'s
+    /// `self.current_writer_task()` check back to `&self.writer_task` makes
+    /// `saw_enqueued` stay `false` and this test fail — the write takes the
+    /// direct-connection path immediately instead of ever appearing in the
+    /// writer task's channel.
+    #[test]
+    fn general_write_routes_through_writer_task_when_store_built_outside_runtime() {
+        crate::extension::ensure_extensions_loaded();
+
+        let model_key = "general_write_no_runtime_construction";
+        let dims = 4usize;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("general_write_no_runtime_construction.db");
+        let pool = Arc::new(
+            ConnectionPool::new(PoolConfig {
+                path: Some(path),
+                write_queue_enabled: true,
+                ..PoolConfig::default()
+            })
+            .expect("file-backed pool"),
+        );
+        create_vec_table(&pool, model_key, dims);
+
+        assert!(
+            tokio::runtime::Handle::try_current().is_err(),
+            "sanity: this test body must not already be running inside a Tokio runtime"
+        );
+        // Construction happens here, outside any runtime — reproduces the
+        // permanent-`None`-cache scenario `writer_task_handle()`'s doc
+        // comment describes.
+        let store = SqliteVecStore::new(
+            Arc::clone(&pool),
+            true,
+            model_key.to_string(),
+            model_key.to_string(),
+            dims,
+            "ns:test".to_string(),
+        )
+        .expect("SqliteVecStore::new");
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async move {
+            let writer_task = pool
+                .writer_task_handle()
+                .unwrap()
+                .expect("writer task must be available now that a runtime exists");
+
+            let (started_tx, started_rx) = tokio::sync::oneshot::channel::<()>();
+            let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+            let occupier = {
+                let writer_task = writer_task.clone();
+                tokio::spawn(async move {
+                    writer_task
+                        .send(move |_conn| {
+                            let _ = started_tx.send(());
+                            let _ = release_rx.blocking_recv();
+                            Ok::<(), StorageError>(())
+                        })
+                        .await
+                })
+            };
+            started_rx
+                .await
+                .expect("occupier must signal it has started running inside the writer task");
+            assert_eq!(
+                writer_task.queue_depth(),
+                0,
+                "channel must start empty once the occupier has been dequeued and is running"
+            );
+
+            let id = Uuid::new_v4();
+            let write_task = tokio::spawn(async move {
+                store
+                    .insert(
+                        id,
+                        SubstrateKind::Entity,
+                        "ns:test",
+                        "body",
+                        vec![vec![0.1, 0.2, 0.3, 0.4]],
+                    )
+                    .await
+            });
+
+            let mut saw_enqueued = false;
+            for _ in 0..100 {
+                if writer_task.queue_depth() >= 1 {
+                    saw_enqueued = true;
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            assert!(
+                saw_enqueued,
+                "insert's write request never appeared in the writer task's channel while \
+                 the occupier held the single drain slot — a store built outside a runtime \
+                 is not re-checking writer-task availability at write time"
+            );
+
+            release_tx
+                .send(())
+                .expect("occupier must still be waiting on the release signal");
+            occupier
+                .await
+                .expect("occupier task must not panic")
+                .expect("occupier write must succeed");
+            write_task
+                .await
+                .expect("write task must not panic")
+                .expect("insert must succeed once unblocked");
+        });
     }
 }

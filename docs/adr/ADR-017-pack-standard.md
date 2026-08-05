@@ -204,6 +204,23 @@ pub trait KindHook: Send + Sync + std::fmt::Debug {
         id: Uuid,
         args: &Value,
     ) -> Result<(), RuntimeError>;
+
+    /// Validate a generic note-property update before the write. Default: accept.
+    async fn validate_note_update(
+        &self,
+        runtime: &KhiveRuntime,
+        token: &NamespaceToken,
+        note: &Note,
+        properties: Option<&Value>,
+    ) -> Result<(), RuntimeError> { Ok(()) }
+
+    /// Validate a generic link batch before any edge is written. Default: accept.
+    async fn validate_links(
+        &self,
+        runtime: &KhiveRuntime,
+        token: &NamespaceToken,
+        links: &[LinkSpec],
+    ) -> Result<(), RuntimeError> { Ok(()) }
 }
 ```
 
@@ -211,10 +228,14 @@ A pack registers a hook for kinds it wants to specialize. Storage-shape kinds
 (no defaults, no derived data, no side effects) skip the hook entirely and ride pure
 shared CRUD.
 
-`KindHook` is one of many possible specialization points. Future hooks
-(`prepare_update`, `after_update`, `before_delete`) extend the pattern. v1 ships
-`prepare_create` + `after_create` because those cover the common case of "fill
-defaults, fire side effects on creation."
+The 2026-08-01 dependency-integrity amendment adds the two default-accepting
+pre-write validators after GTD demonstrated a cross-record invariant that generic
+CRUD cannot own: task dependency acyclicity. `validate_note_update` receives only
+note-property patches, while `validate_links` receives the whole proposed batch so a
+cycle formed entirely inside one atomic link request cannot evade validation. Packs
+that do not need either hook inherit a no-op and remain source-compatible. Future
+hooks (`after_update`, `before_delete`) can extend the same pattern when a concrete
+consumer requires them.
 
 ### `VerbRegistry`: the runtime's pack catalog
 
@@ -598,6 +619,13 @@ Core substrate tables (entities, notes, edges, events) are NOT pack-owned — th
 owned by `khive-db` and evolve through versioned migrations (ADR-015). Pack schema is
 strictly for pack-auxiliary tables.
 
+The 2026-08-01 dependency-integrity amendment uses ADR-015's narrow core-row
+invariant-trigger exception: GTD's typed `KindHook` checks remain the early-error seam,
+while versioned migration V15 installs transaction-time cycle guards on live `task`
+rows and live task-to-task `depends_on` edges. Those triggers are core migration DDL,
+not GTD `SchemaPlan` statements. They govern only the owned kind/relation combination,
+so unrelated notes, edge relations, and entity dependency graphs are unchanged.
+
 ### Dispatch path
 
 ```text
@@ -836,10 +864,13 @@ dedicated ADR. v1 is compile-time.
 
 - The kg pack's name carries weight beyond its origins (it owns shared CRUD for all
   kinds). Renaming is not justified.
-- `KindHook` covers `prepare_create` + `after_create`. Update and delete hooks extend
-  the pattern when a real consumer asks.
+- `KindHook` covers create specialization plus default-accepting note-update and
+  link-batch validation. Post-update and delete hooks extend the pattern when a real
+  consumer asks.
 - Pack auxiliary schema is non-evolving in v1. If a pack needs to evolve its schema, it
   coordinates with khive-db migrations (ADR-015).
+- A pack invariant that must be race-safe across processes may use ADR-015's narrowly
+  governed core-row trigger exception; it does not widen `SchemaPlan` beyond auxiliary DDL.
 
 ## Implementation
 

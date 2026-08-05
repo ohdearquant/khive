@@ -502,6 +502,12 @@ pub async fn prepare_add_note(
 
     let name = optional_create_string(args, "name")?;
     let properties = optional_properties(args, "properties")?;
+    // Same note-write validator `create_note_inner` runs: this path builds its
+    // args itself and dispatches no pack hook, so without this call a proposal
+    // changeset would be the one note-write that stores caller-supplied owned
+    // identity properties verbatim. The token here is the applying caller's
+    // (threaded in by the apply worker), not the proposer's.
+    let properties = runtime.derive_note_write_properties(kind, token, properties)?;
 
     crate::secret_gate::check(content)?;
     if let Some(ref n) = name {
@@ -1578,7 +1584,7 @@ mod tests {
     use super::*;
 
     use async_trait::async_trait;
-    use lattice_embed::{EmbedError, EmbeddingModel, EmbeddingService, MAX_TEXT_CHARS};
+    use lattice_embed::{EmbedError, EmbeddingModel, EmbeddingService, MAX_TEXT_BYTES};
     use serde_json::json;
 
     use khive_types::Namespace;
@@ -1782,7 +1788,7 @@ mod tests {
             .expect("vec store");
         assert_eq!(vec_store.count().await.expect("count before"), 0);
 
-        let updated_content = format!("freshly-updated-content-xyz{}", "x".repeat(MAX_TEXT_CHARS));
+        let updated_content = format!("freshly-updated-content-xyz{}", "x".repeat(MAX_TEXT_BYTES));
         let plan = prepare_update(
             &runtime,
             &token,
@@ -2178,6 +2184,52 @@ mod tests {
             .await
             .expect("query ANN write log");
         assert!(matches!(count, Some(SqlValue::Integer(2))));
+    }
+
+    /// Atomic prepare validates the requested orientation before canonicalizing
+    /// a symmetric edge for persistence. Fixed UUIDs force target < source so a
+    /// regression would report the reverse ordered pair.
+    #[tokio::test]
+    async fn atomic_link_symmetric_rejection_preserves_requested_pair() {
+        let runtime = scratch_runtime();
+        let token = runtime
+            .authorize(Namespace::parse("local").expect("ns"))
+            .expect("authorize");
+        let entities = runtime.entities(&token).expect("entities store");
+        let concept_id =
+            Uuid::parse_str("ffffffff-ffff-ffff-ffff-ffffffffffff").expect("high UUID");
+        let project_id = Uuid::nil();
+        assert!(project_id < concept_id, "test must exercise UUID reversal");
+
+        let mut concept = khive_storage::Entity::new("local", "concept", "Concept source");
+        concept.id = concept_id;
+        let mut project = khive_storage::Entity::new("local", "project", "Project target");
+        project.id = project_id;
+        entities.upsert_entity(concept).await.expect("seed concept");
+        entities.upsert_entity(project).await.expect("seed project");
+
+        let error = prepare_link(
+            &runtime,
+            &token,
+            &json!({
+                "source_id": concept_id.to_string(),
+                "target_id": project_id.to_string(),
+                "relation": "competes_with",
+            }),
+        )
+        .await
+        .expect_err("atomic link must reject concept competes_with project");
+        let message = error.to_string();
+        assert!(
+            message.contains(
+                "currently legal relations for concept -> project under the loaded endpoint rules: none"
+            ),
+            "atomic validation must diagnose caller order before persistence canonicalization; got: {message}"
+        );
+        assert!(
+            !message.contains("currently legal relations for project -> concept"),
+            "atomic validation must not diagnose the UUID-canonical reverse pair; got: {message}"
+        );
     }
 
     /// Atomic link must persist an explicit top-level `dependency_kind`

@@ -2050,11 +2050,19 @@ crate-b = 1
             // (namespace, id), so SQLite's `ALTER TABLE ... DROP COLUMN`
             // refuses it ("cannot drop PRIMARY KEY column"); rebuild the
             // table without the column instead to simulate a map missing
-            // ONLY `graph_edges.id`.
+            // ONLY `graph_edges.id`. Drop the GTD integrity triggers first:
+            // they intentionally depend on `graph_edges`, while this fixture
+            // intentionally replaces that table with a malformed schema.
             writer
                 .conn_mut()
                 .execute_batch(
-                    "CREATE TABLE graph_edges_no_id (
+                    "DROP TRIGGER gtd_task_dependency_cycle_notes_bi;
+                     DROP TRIGGER gtd_task_dependency_cycle_notes_bu;
+                     DROP TRIGGER gtd_task_dependency_cycle_note_activation_bi;
+                     DROP TRIGGER gtd_task_dependency_cycle_note_activation_bu;
+                     DROP TRIGGER gtd_task_dependency_cycle_edges_bi;
+                     DROP TRIGGER gtd_task_dependency_cycle_edges_bu;
+                     CREATE TABLE graph_edges_no_id (
                          namespace      TEXT NOT NULL,
                          source_id      TEXT NOT NULL,
                          target_id      TEXT NOT NULL,

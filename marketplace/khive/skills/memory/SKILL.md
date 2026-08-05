@@ -92,8 +92,10 @@ request(ops="search(kind=\"note\", query=\"<topic>\", limit=10)")
 After using recall results, emit feedback so the brain pack can tune future ranking:
 
 ```
-request(ops="brain.auto_feedback(query=\"<the recall query that produced these>\", results=[{\"id\":\"<uuid>\",\"score\":0.42}], signal=\"useful\")")
+request(ops="brain.auto_feedback(query=\"<the recall query that produced these>\", results=[{\"id\":\"<uuid>\",\"score\":0.42}], target_id=\"<uuid>\", signal=\"useful\")")
 ```
+
+Name the exact result being judged. Omitting `signal` means abstain and writes no feedback event.
 
 ## Anti-patterns
 

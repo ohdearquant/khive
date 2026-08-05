@@ -20,10 +20,12 @@ pool's Mutex-guarded `writer()` connection, so this slice does not yet
 reduce contention or claim the ADR's single-writer guarantee on its own — it
 proves the mechanism works and that the flag-off path is unchanged.
 
-`spawn` opens a dedicated standalone writer connection
-(`ConnectionPool::open_standalone_writer`), independent of that
-Mutex-guarded connection. `capacity` bounds the channel (ADR-067 recommends
-256; `PoolConfig::write_queue_capacity` resolves the default from
+`spawn` opens a dedicated standalone writer connection independent of that
+Mutex-guarded connection. The lifetime connection is an infrastructure open
+and does not enter write-traffic counters; the drain loop increments the
+writer-task acquisition class once per dequeued top-level request or successful
+`BEGIN IMMEDIATE`. `capacity` bounds the channel (ADR-067 recommends 256;
+`PoolConfig::write_queue_capacity` resolves the default from
 `KHIVE_WRITE_QUEUE_CAPACITY`).
 
 ## `run_writer_task` — drain loop and failure modes

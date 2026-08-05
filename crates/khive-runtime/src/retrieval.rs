@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use lattice_embed::{EmbeddingModel, MAX_TEXT_CHARS};
+use lattice_embed::{EmbeddingModel, MAX_TEXT_BYTES};
 use uuid::Uuid;
 
 use crate::config::{parse_embedding_model_alias, sanitize_key};
@@ -130,8 +130,8 @@ impl EmbeddingTruncationReport {
 pub fn document_embedding_budget(model_name: &str) -> usize {
     parse_embedding_model_alias(model_name)
         .and_then(|model| model.document_instruction())
-        .map_or(MAX_TEXT_CHARS, |prefix| {
-            MAX_TEXT_CHARS.saturating_sub(prefix.len())
+        .map_or(MAX_TEXT_BYTES, |prefix| {
+            MAX_TEXT_BYTES.saturating_sub(prefix.len())
         })
 }
 
@@ -754,10 +754,12 @@ impl KhiveRuntime {
             vector_hits.retain(|hit| hit.score >= score_floor);
         }
 
-        // Keep the full candidate pool (untruncated) through the alive/kind/tag/property
-        // filter below, so matching hits ranked below `limit` in the raw fusion aren't
-        // lost when higher-ranked candidates get excluded by a filter.
-        let mut fused = rrf_fuse(text_hits, vector_hits, candidates as usize, query_text);
+        // Each arm fetched `candidates` independently, so their union can contain
+        // twice that many distinct IDs. Keep the complete fetched pool through
+        // ranking and the alive/kind/tag/property filters below; reusing one arm's
+        // cap here lets stale or filtered hits hide live candidates from the other.
+        let fusion_limit = text_hits.len().saturating_add(vector_hits.len());
+        let mut fused = rrf_fuse(text_hits, vector_hits, fusion_limit, query_text);
 
         // tags_any has a SQL column and is pushed into query_entities; properties
         // filtering has no SQL column and is applied in Rust below on the fetched records.
@@ -777,7 +779,7 @@ impl KhiveRuntime {
                     },
                     PageRequest {
                         offset: 0,
-                        limit: fused.len() as u32,
+                        limit: u32::try_from(fused.len()).unwrap_or(u32::MAX),
                     },
                 )
                 .await?;
@@ -1395,13 +1397,13 @@ mod tests {
     fn bounded_embedding_input_reserves_prefix_and_preserves_utf8() {
         assert_eq!(
             document_embedding_budget("multilingual-e5-base"),
-            MAX_TEXT_CHARS - "passage: ".len()
+            MAX_TEXT_BYTES - "passage: ".len()
         );
 
-        let input = format!("{}\u{1f980}tail", "a".repeat(MAX_TEXT_CHARS - 1));
-        let (bounded, truncated) = bounded_embedding_input(&input, MAX_TEXT_CHARS);
+        let input = format!("{}\u{1f980}tail", "a".repeat(MAX_TEXT_BYTES - 1));
+        let (bounded, truncated) = bounded_embedding_input(&input, MAX_TEXT_BYTES);
         assert!(truncated);
-        assert_eq!(bounded.len(), MAX_TEXT_CHARS - 1);
+        assert_eq!(bounded.len(), MAX_TEXT_BYTES - 1);
         assert!(bounded.is_char_boundary(bounded.len()));
         assert!(!bounded.contains('\u{1f980}'));
     }
@@ -1409,7 +1411,7 @@ mod tests {
     #[test]
     fn bounded_embedding_input_leaves_normal_text_unchanged() {
         let input = "normal byte-identical embedding input";
-        let (bounded, truncated) = bounded_embedding_input(input, MAX_TEXT_CHARS);
+        let (bounded, truncated) = bounded_embedding_input(input, MAX_TEXT_BYTES);
         assert!(!truncated);
         assert_eq!(bounded, input);
         assert_eq!(bounded.as_ptr(), input.as_ptr());
@@ -2192,7 +2194,7 @@ mod tests {
         let (runtime, captured) = runtime_with_capturing_embedder(model);
         let texts = vec![
             "first normal document".to_string(),
-            "x".repeat(MAX_TEXT_CHARS + 1),
+            "x".repeat(MAX_TEXT_BYTES + 1),
             "second normal document".to_string(),
         ];
 
@@ -2204,14 +2206,14 @@ mod tests {
         assert!(!outcomes[0].truncated);
         assert_eq!(outcomes[0].source_bytes, outcomes[0].embedded_bytes);
         assert!(outcomes[1].truncated);
-        assert_eq!(outcomes[1].source_bytes, MAX_TEXT_CHARS + 1);
-        assert_eq!(outcomes[1].embedded_bytes, MAX_TEXT_CHARS);
+        assert_eq!(outcomes[1].source_bytes, MAX_TEXT_BYTES + 1);
+        assert_eq!(outcomes[1].embedded_bytes, MAX_TEXT_BYTES);
         assert!(!outcomes[2].truncated);
         assert_eq!(
             captured.lock().unwrap().as_slice(),
             [vec![
                 texts[0].clone(),
-                "x".repeat(MAX_TEXT_CHARS),
+                "x".repeat(MAX_TEXT_BYTES),
                 texts[2].clone(),
             ]]
         );
@@ -2222,7 +2224,7 @@ mod tests {
         let runtime = KhiveRuntime::memory().unwrap();
         runtime.register_embedder(WrongCardinalityEmbedderProvider);
         let model_name = "wrong-cardinality-embedding-service";
-        let texts = vec!["x".repeat(MAX_TEXT_CHARS + 1), "normal".to_string()];
+        let texts = vec!["x".repeat(MAX_TEXT_BYTES + 1), "normal".to_string()];
 
         let error = runtime
             .embed_document_batch_with_model_outcomes(model_name, &texts)

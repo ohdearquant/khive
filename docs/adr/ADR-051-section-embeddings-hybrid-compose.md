@@ -28,6 +28,16 @@ tracked for the read side in issue #6.
 
 Restore section-level embeddings and hybrid compose, adapted to the current schema.
 
+### Amendment 1 (2026-08-01): searchable-model-only atom indexing
+
+Knowledge atom vectors are also single-model. `knowledge.index` embeds and writes only the
+default model because `knowledge.search`, ANN warming, fresh-tail fusion, and compose all embed
+and probe only that model. Writing secondary-model atom vectors without a model selector or fused
+knowledge retrieval pays embedding and storage cost for rows no knowledge read path can consume.
+Multi-model atom indexing must therefore land together with a model-aware or fused knowledge read
+path; configuring additional models continues to fan out entity, note, and memory retrieval work.
+This records the default-only disposition selected in issue #1513.
+
 ### Storage — reuse the existing column, single-model
 
 The spec proposed a **separate** `section_embeddings` table (its engine_v1 target

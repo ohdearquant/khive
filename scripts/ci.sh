@@ -100,12 +100,12 @@ phase_docs() {
 
 # #1204 tripwire (shared by phase_tests and phase_tests_doc):
 # RuntimeConfig::default() resolves db_path to $HOME/.khive/khive.db, and
-# migrations apply on open (forward-only, ADR-015). A test that boots a
-# runtime through a config path inheriting that default reaches the
-# operator's/runner's real store instead of an isolated one. Fingerprint the
-# sentinel file set before the suite and compare after; any change fails the
-# gate loudly instead of leaving the drift for a later direct-open to
-# discover. Covered paths are khive.db, khive.db-wal, khive.db-shm,
+# migrations apply on open (forward-only, ADR-015). Run each guarded phase in
+# an ephemeral HOME, while preserving the operator's Cargo and rustup homes,
+# then fingerprint that isolated store before and after. A test that inherits
+# the default path still fails loudly, but an unrelated live daemon can mutate
+# the operator's real store without creating a false attribution (#1627).
+# Covered paths are khive.db, khive.db-wal, khive.db-shm,
 # khive.db.walpin/**, and khive.db.ann/**.
 # A WAL-mode open can leave the main file unchanged until checkpoint, while
 # WAL-pin attribution and ANN persistence write the adjacent directories.
@@ -144,21 +144,46 @@ sentinel_fingerprint() {
 # executes workspace tests of any kind (unit/integration or doctests) must go
 # through this wrapper so no test-execution path escapes the default-store
 # isolation invariant.
-run_with_store_sentinel() {
+run_with_store_sentinel() (
+    operator_home=${HOME:-}
+    isolated_home=$(mktemp -d "${TMPDIR:-/tmp}/khive-ci-home.XXXXXX")
+    trap 'rm -rf -- "$isolated_home"' 0
+    trap 'exit 130' HUP INT TERM
+
+    # `cargo` and `rustup` normally keep their toolchains below HOME. Preserve
+    # those locations before swapping HOME so isolation does not trigger a
+    # toolchain download or make `cargo` disappear on developer machines.
+    if [ -z "${CARGO_HOME+x}" ] && [ -n "$operator_home" ]; then
+        CARGO_HOME="$operator_home/.cargo"
+        export CARGO_HOME
+    fi
+    if [ -z "${RUSTUP_HOME+x}" ] && [ -n "$operator_home" ]; then
+        RUSTUP_HOME="$operator_home/.rustup"
+        export RUSTUP_HOME
+    fi
+    HOME=$isolated_home
+    export HOME
+
     sentinel_before=$(sentinel_fingerprint)
 
-    "$@"
+    if "$@"; then
+        command_status=0
+    else
+        command_status=$?
+    fi
 
     sentinel_after=$(sentinel_fingerprint)
     if [ "$sentinel_after" != "$sentinel_before" ]; then
-        echo "FAIL: test suite touched the real default store under \$HOME/.khive — a test opened/migrated it instead of an isolated db_path/HOME (#1204)" >&2
+        echo "FAIL: test suite touched the default store in its isolated sentinel HOME — a test opened/migrated it instead of using an explicit temporary db_path (#1204)" >&2
         echo "before:" >&2
         printf '%s\n' "$sentinel_before" >&2
         echo "after:" >&2
         printf '%s\n' "$sentinel_after" >&2
         exit 1
     fi
-}
+
+    exit "$command_status"
+)
 
 phase_tests() {
     echo "=== Tests ==="

@@ -1297,24 +1297,33 @@ async fn search_kind_filter_surfaces_right_kind_when_wrong_kind_outranks() -> an
     Ok(())
 }
 
-// ── Structured KhiveError preservation through the MCP boundary ──────────────
+// ── Structured runtime-error preservation through the MCP boundary ──────────
 
-/// A minimal mock pack whose single verb always returns a `RuntimeError::Khive`
-/// with code + details + retry_hint set. Used to verify that the MCP per-op
-/// serializer emits a structured JSON error object (not a flat string).
+/// A minimal mock pack whose verbs return structured errors. Used to verify
+/// that the MCP per-op serializer does not flatten typed runtime/storage
+/// errors at the wire boundary.
 struct ErrorInjectPack;
 
 impl khive_types::Pack for ErrorInjectPack {
     const NAME: &'static str = "error-inject";
     const NOTE_KINDS: &'static [&'static str] = &[];
     const ENTITY_KINDS: &'static [&'static str] = &[];
-    const HANDLERS: &'static [HandlerDef] = &[HandlerDef {
-        name: "always_fail",
-        description: "always returns a KhiveError::unavailable with code + details",
-        visibility: Visibility::Verb,
-        category: VerbCategory::Assertive,
-        params: &[],
-    }];
+    const HANDLERS: &'static [HandlerDef] = &[
+        HandlerDef {
+            name: "always_fail",
+            description: "always returns a KhiveError::unavailable with code + details",
+            visibility: Visibility::Verb,
+            category: VerbCategory::Assertive,
+            params: &[],
+        },
+        HandlerDef {
+            name: "writer_pool_timeout",
+            description: "returns a typed writer pool timeout through a storage wrapper",
+            visibility: Visibility::Verb,
+            category: VerbCategory::Assertive,
+            params: &[],
+        },
+    ];
 }
 
 #[async_trait]
@@ -1337,11 +1346,21 @@ impl PackRuntime for ErrorInjectPack {
 
     async fn dispatch(
         &self,
-        _verb: &str,
+        verb: &str,
         _params: serde_json::Value,
         _registry: &VerbRegistry,
         _token: &NamespaceToken,
     ) -> Result<serde_json::Value, RuntimeError> {
+        if verb == "writer_pool_timeout" {
+            let storage = khive_storage::StorageError::driver(
+                khive_storage::StorageCapability::Notes,
+                "append_note",
+                khive_db::SqliteError::WriterPoolCheckoutTimeout {
+                    timeout: std::time::Duration::from_millis(175),
+                },
+            );
+            return Err(RuntimeError::Storage(storage));
+        }
         let err = KhiveError::unavailable("downstream service offline")
             .with_code(KhiveErrorCode::new(ErrorDomain::Runtime, 10))
             .with_details(Details::new([
@@ -1440,6 +1459,40 @@ async fn runtime_khive_error_serializes_as_structured_object() -> anyhow::Result
         error["details"]["service"].as_str().unwrap(),
         "embed",
         "details key 'service' should be preserved"
+    );
+
+    Ok(())
+}
+
+/// A typed SQLite checkout timeout must remain structurally classifiable after
+/// `StorageError::Driver` and `RuntimeError::Storage` wrap it, then cross the
+/// real MCP request transport. Compatibility display text is retained in the
+/// `message` field while callers use `code`/`stage` instead of matching it.
+#[tokio::test]
+async fn writer_pool_timeout_survives_storage_runtime_and_mcp_wire() -> anyhow::Result<()> {
+    let client = connect_error_inject().await?;
+    let result = call(
+        &client,
+        "request",
+        serde_json::json!({"ops": "writer_pool_timeout()"}),
+    )
+    .await?;
+    let body: serde_json::Value = serde_json::from_str(&first_text(&result))?;
+    let first = &body["results"][0];
+
+    assert_eq!(first["ok"], false, "expected op failure: {first}");
+    assert_eq!(
+        first["error"],
+        serde_json::json!({
+            "kind": "unavailable",
+            "code": "writer_pool_checkout_timeout",
+            "stage": "writer_pool_checkout_timeout",
+            "message": "storage: backend driver error in Notes during append_note: invalid data: timed out after 175ms waiting for sqlite writer connection",
+            "timeout_ms": 175,
+            "capability": "notes",
+            "operation": "append_note",
+        }),
+        "the exact wire contract must preserve stage, deadline, and storage context"
     );
 
     Ok(())
@@ -2394,6 +2447,7 @@ async fn inbox_help_returns_optional_pagination_and_filters() -> anyhow::Result<
         "limit",
         "offset",
         "status",
+        "wait_ms",
         "from_actor",
         "from_prefix",
         "exclude_from_actor",

@@ -1997,7 +1997,10 @@ mod embed_failure_tests {
     use khive_runtime::{AllowAllGate, BackendId, EmbedderProvider, RuntimeConfig};
     use khive_types::Namespace;
     use lattice_embed::{EmbedError, EmbeddingModel, EmbeddingService};
-    use std::sync::Arc;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
 
     const MODEL_KEY: &str = "all-minilm-l6-v2";
 
@@ -2211,15 +2214,17 @@ mod embed_failure_tests {
         );
     }
 
-    /// Issue #1115: `knowledge.index` must write a vector for every configured
-    /// engine, not just the default. Fake providers stand in for both engines
-    /// so the test doesn't load real lattice weights.
+    /// Issue #1513: `knowledge.index` must embed and write only the default model
+    /// because every knowledge retrieval path reads only that model. Fake
+    /// providers stand in for both engines so the test does not load lattice
+    /// weights and can prove that the secondary provider is never called.
     #[tokio::test]
-    async fn index_writes_vector_for_every_configured_engine() {
+    async fn index_writes_only_the_searchable_default_model() {
         const SECONDARY_KEY: &str = "paraphrase-multilingual-minilm-l12-v2";
 
         struct FixedVecService {
             seed: f32,
+            calls: Arc<AtomicUsize>,
         }
 
         #[async_trait]
@@ -2229,6 +2234,7 @@ mod embed_failure_tests {
                 texts: &[String],
                 _model: EmbeddingModel,
             ) -> std::result::Result<Vec<Vec<f32>>, EmbedError> {
+                self.calls.fetch_add(1, Ordering::Relaxed);
                 Ok(texts.iter().map(|_| vec![self.seed; 384]).collect())
             }
 
@@ -2244,6 +2250,7 @@ mod embed_failure_tests {
         struct FixedVecProvider {
             key: &'static str,
             seed: f32,
+            calls: Arc<AtomicUsize>,
         }
 
         #[async_trait]
@@ -2260,9 +2267,15 @@ mod embed_failure_tests {
                 &self,
             ) -> std::result::Result<Arc<dyn EmbeddingService>, khive_runtime::RuntimeError>
             {
-                Ok(Arc::new(FixedVecService { seed: self.seed }))
+                Ok(Arc::new(FixedVecService {
+                    seed: self.seed,
+                    calls: Arc::clone(&self.calls),
+                }))
             }
         }
+
+        let primary_calls = Arc::new(AtomicUsize::new(0));
+        let secondary_calls = Arc::new(AtomicUsize::new(0));
 
         let rt = KhiveRuntime::new(RuntimeConfig {
             git_write: Default::default(),
@@ -2282,13 +2295,17 @@ mod embed_failure_tests {
         rt.register_embedder(FixedVecProvider {
             key: MODEL_KEY,
             seed: 0.5,
+            calls: Arc::clone(&primary_calls),
         });
         rt.register_embedder(FixedVecProvider {
             key: SECONDARY_KEY,
             seed: 0.6,
+            calls: Arc::clone(&secondary_calls),
         });
 
         let f = fixture_with_two_atoms(rt).await;
+        let primary_before = primary_calls.load(Ordering::Relaxed);
+        let secondary_before = secondary_calls.load(Ordering::Relaxed);
         let result = f
             .dispatch("knowledge.index", json!({}))
             .await
@@ -2297,6 +2314,16 @@ mod embed_failure_tests {
             result["indexed"].as_u64().unwrap_or(0),
             2,
             "both atoms must index via the default engine: {result:?}"
+        );
+        assert_eq!(
+            primary_calls.load(Ordering::Relaxed),
+            primary_before + 1,
+            "one default-model batch must be embedded"
+        );
+        assert_eq!(
+            secondary_calls.load(Ordering::Relaxed),
+            secondary_before,
+            "the unread secondary model must not incur an embed call"
         );
 
         let row_primary = f
@@ -2310,15 +2337,17 @@ mod embed_failure_tests {
             "primary engine table must have a row"
         );
 
-        let row_secondary = f
+        let secondary_table = f
             .sql_query_one(
-                "SELECT subject_id FROM vec_paraphrase_multilingual_minilm_l12_v2 LIMIT 1",
-                vec![],
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ? LIMIT 1",
+                vec![SqlValue::Text(
+                    "vec_paraphrase_multilingual_minilm_l12_v2".to_string(),
+                )],
             )
             .await;
         assert!(
-            row_secondary.is_some(),
-            "secondary engine table must have a row — issue #1115 write-path coverage"
+            secondary_table.is_none(),
+            "the unread secondary engine table must not even be initialized"
         );
     }
 
@@ -3102,7 +3131,7 @@ mod edit_inline_reembed {
     use async_trait::async_trait;
     use khive_runtime::{AllowAllGate, BackendId, EmbedderProvider, RuntimeConfig};
     use khive_types::Namespace;
-    use lattice_embed::{EmbedError, EmbeddingModel, EmbeddingService, MAX_TEXT_CHARS};
+    use lattice_embed::{EmbedError, EmbeddingModel, EmbeddingService, MAX_TEXT_BYTES};
     use std::sync::Arc;
 
     const MODEL_KEY: &str = "all-minilm-l6-v2";
@@ -3351,7 +3380,7 @@ mod edit_inline_reembed {
                     "id": "edit-truncation-report",
                     "sections": [{
                         "section_type": "overview",
-                        "content": format!("{}tail", "x".repeat(MAX_TEXT_CHARS + 1))
+                        "content": format!("{}tail", "x".repeat(MAX_TEXT_BYTES + 1))
                     }]
                 }),
             )

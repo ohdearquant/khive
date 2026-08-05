@@ -143,6 +143,16 @@ async fn wait_for_resumed_generation_log(stderr: tokio::process::ChildStderr) {
         match tokio::time::timeout(remaining, lines.next_line()).await {
             Ok(Ok(Some(line))) => {
                 if line.contains(RESUMED_GENERATION_LOG_NEEDLE) {
+                    // Keep draining stderr for the child's lifetime instead of
+                    // dropping the pipe here. Dropping closes the read end, and
+                    // the resumed generation still logs startup lines after
+                    // this needle (e.g. the #1586 resolved-database
+                    // disclosure); a write into the closed pipe kills the
+                    // child before it can serve the second call. The closed
+                    // pipe is a harness artifact — a real operator's stderr
+                    // stays open — so the drain keeps the test about the
+                    // re-exec property rather than stderr-consumer lifetime.
+                    tokio::spawn(async move { while let Ok(Some(_)) = lines.next_line().await {} });
                     return;
                 }
             }

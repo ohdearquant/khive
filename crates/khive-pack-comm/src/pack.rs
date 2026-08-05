@@ -8,6 +8,7 @@ use khive_runtime::{KhiveRuntime, NamespaceToken, RuntimeError, SchemaPlan, Verb
 use khive_types::{HandlerDef, Pack};
 
 use crate::handlers;
+use crate::inbox_signal::InboxSignal;
 use crate::vocab::{COMM_HANDLERS, COMM_SCHEMA_PLAN_STMTS};
 
 /// Communication pack providing nine public `comm.*` verbs.
@@ -16,6 +17,7 @@ use crate::vocab::{COMM_HANDLERS, COMM_SCHEMA_PLAN_STMTS};
 /// metadata lives in the `properties` JSON column.
 pub struct CommPack {
     runtime: KhiveRuntime,
+    inbox_signal: InboxSignal,
 }
 
 impl Pack for CommPack {
@@ -29,11 +31,58 @@ impl Pack for CommPack {
 impl CommPack {
     /// Create a new `CommPack` bound to the given runtime.
     pub fn new(runtime: KhiveRuntime) -> Self {
-        Self { runtime }
+        Self {
+            runtime,
+            inbox_signal: InboxSignal::new(),
+        }
     }
     pub(crate) fn runtime(&self) -> &KhiveRuntime {
         &self.runtime
     }
+}
+
+/// Derive a `message` note's authored-by identity from the authorization
+/// token, whatever the caller supplied.
+///
+/// `comm.send` already resolves `from_actor` from `token.actor().id`
+/// (`handlers.rs::handle_send`); this is that same resolution applied at the
+/// runtime note-write, so a `message` row's `from_actor` is a function of the
+/// token on every write path rather than of caller input on some of them. The
+/// derived value therefore names the actor whose token performed the write —
+/// on the proposal-apply path that is the applying caller, not the proposer
+/// who composed the changeset.
+///
+/// Only `from_actor` is derived. `direction` and `sent_at` are equally
+/// identity-bearing (they are preserved through `merge` and refused by
+/// `update`), but neither is a function of the token: `dual_write_message`
+/// writes an inbound copy with `direction="inbound"` under the sender's own
+/// token, and `comm.ingest` carries a transport-supplied `sent_at`. Deriving
+/// either here would overwrite a value a legitimate caller must set.
+///
+/// Kinds other than `message` — including comm's own `channel_health` — pass
+/// through untouched: the runtime holds one validator slot for all packs.
+pub(crate) fn derive_message_identity(
+    kind: &str,
+    actor_id: &str,
+    properties: Option<Value>,
+) -> Result<Option<Value>, RuntimeError> {
+    if kind != "message" {
+        return Ok(properties);
+    }
+    let mut props = match properties {
+        Some(Value::Object(map)) => map,
+        Some(other) => {
+            return Err(RuntimeError::InvalidInput(format!(
+                "a `message` note's properties must be a JSON object, got: {other}"
+            )));
+        }
+        None => serde_json::Map::new(),
+    };
+    props.insert(
+        "from_actor".to_string(),
+        Value::String(actor_id.to_string()),
+    );
+    Ok(Some(Value::Object(props)))
 }
 
 struct CommPackFactory;
@@ -66,6 +115,9 @@ impl PackRuntime for CommPack {
     fn handlers(&self) -> &'static [HandlerDef] {
         &COMM_HANDLERS
     }
+    fn register_note_write_validator(&self, runtime: &KhiveRuntime) {
+        runtime.install_note_write_validator(std::sync::Arc::new(derive_message_identity));
+    }
     fn requires(&self) -> &'static [&'static str] {
         <CommPack as Pack>::REQUIRES
     }
@@ -85,14 +137,22 @@ impl PackRuntime for CommPack {
         token: &NamespaceToken,
     ) -> Result<Value, RuntimeError> {
         match verb {
-            "comm.send" => handlers::handle_send(self.runtime(), token, params).await,
+            "comm.send" => {
+                handlers::handle_send(self.runtime(), &self.inbox_signal, token, params).await
+            }
             "comm.delivered" => handlers::handle_delivered(self.runtime(), token, params).await,
-            "comm.inbox" => handlers::handle_inbox(self.runtime(), token, params).await,
+            "comm.inbox" => {
+                handlers::handle_inbox(self.runtime(), &self.inbox_signal, token, params).await
+            }
             "comm.read" => handlers::handle_read(self.runtime(), token, params).await,
             "comm.unread" => handlers::handle_unread(self.runtime(), token, params).await,
-            "comm.reply" => handlers::handle_reply(self.runtime(), token, params).await,
+            "comm.reply" => {
+                handlers::handle_reply(self.runtime(), &self.inbox_signal, token, params).await
+            }
             "comm.thread" => handlers::handle_thread(self.runtime(), token, params).await,
-            "comm.ingest" => handlers::handle_ingest(self.runtime(), token, params).await,
+            "comm.ingest" => {
+                handlers::handle_ingest(self.runtime(), &self.inbox_signal, token, params).await
+            }
             "comm.heartbeat" => handlers::handle_heartbeat(self.runtime(), token, params).await,
             "comm.health" => handlers::handle_health(self.runtime(), token, params).await,
             "comm.probe" => handlers::handle_probe(self.runtime(), token, params).await,
@@ -177,7 +237,7 @@ mod help_tests {
     }
 
     #[test]
-    fn inbox_has_optional_limit_and_status() {
+    fn inbox_has_optional_limit_status_and_wait() {
         let h = find_handler("comm.inbox");
         assert!(!h.params.is_empty(), "inbox must have non-empty params");
         let limit = h
@@ -192,6 +252,36 @@ mod help_tests {
             .find(|p| p.name == "status")
             .expect("inbox must have 'status'");
         assert!(!status.required, "inbox.status must be optional");
+        let wait_ms = h
+            .params
+            .iter()
+            .find(|p| p.name == "wait_ms")
+            .expect("inbox must have 'wait_ms'");
+        assert_eq!(wait_ms.param_type, "integer");
+        assert!(!wait_ms.required, "inbox.wait_ms must be optional");
+    }
+
+    #[test]
+    fn list_reads_declare_sent_box_and_shared_projection_contract() {
+        let inbox = find_handler("comm.inbox");
+        for name in ["box", "to_actor", "fields"] {
+            let param = inbox
+                .params
+                .iter()
+                .find(|param| param.name == name)
+                .unwrap_or_else(|| panic!("comm.inbox help must declare {name:?}"));
+            assert!(!param.required, "comm.inbox.{name} must be optional");
+        }
+
+        let thread = find_handler("comm.thread");
+        let fields = thread
+            .params
+            .iter()
+            .find(|param| param.name == "fields")
+            .expect("comm.thread help must declare the shared fields projection");
+        assert_eq!(fields.param_type, "array of string");
+        assert!(!fields.required);
+        assert!(fields.description.contains("comm.inbox"));
     }
 
     #[test]

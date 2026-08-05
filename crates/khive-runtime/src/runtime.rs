@@ -43,6 +43,23 @@ pub type NoteMutationHookFn = Arc<
         + Sync,
 >;
 
+/// Callback type for a pack-installed note-write validator.
+///
+/// The pack that owns a note kind carrying derivable identity installs one so
+/// that the identity is a function of the authorization token rather than of
+/// caller input, on every write path including direct callers that bypass the
+/// handler layer — same rationale as [`EntityTypeValidatorFn`], which exists
+/// for exactly that reason on the entity side.
+///
+/// Kinds the installing pack does not own must be returned unchanged: the slot
+/// is single-occupancy (like `note_mutation_hook`), so a validator that
+/// rewrote foreign kinds would silently govern every other pack's notes.
+pub type NoteWriteValidatorFn = Arc<
+    dyn Fn(&str, &str, Option<serde_json::Value>) -> Result<Option<serde_json::Value>, RuntimeError>
+        + Send
+        + Sync,
+>;
+
 pub use crate::config::{
     assert_captured_db_anchor_consistent, assert_db_anchor_consistent, expand_tilde,
     parse_pack_list, resolve_db_anchor, resolve_project_actor_id, runtime_config_from_khive_config,
@@ -103,6 +120,22 @@ pub struct KhiveRuntime {
     /// no pack cares about note-mutation notifications) — the call becomes a
     /// no-op check of an `Option`.
     note_mutation_hook: Arc<RwLock<Option<NoteMutationHookFn>>>,
+    /// Pack-installed note-write validator.
+    ///
+    /// When `Some`, every runtime note-materialisation site that accepts
+    /// caller-supplied `properties` routes them through this function before
+    /// the `Note` is built, so a pack-owned identity property is derived from
+    /// the authorization token instead of trusted from caller input. `None`
+    /// on a bare runtime (no packs) — the properties pass through unchanged.
+    note_write_validator: Arc<RwLock<Option<NoteWriteValidatorFn>>>,
+    /// Pack-owned note kinds — every note kind declared by a pack other than
+    /// the generic-CRUD pack, installed by the transport from the registry
+    /// (see `VerbRegistry::pack_owned_note_kinds`). Records of these kinds are
+    /// maintained by their owning pack's own verbs, so `update`'s `properties`
+    /// patch is refused on them at the runtime layer and their owned identity
+    /// properties survive a `merge` unchanged. Empty until installed (bare
+    /// runtime), which leaves both rules inert.
+    pack_owned_note_kinds: Arc<RwLock<Vec<String>>>,
     /// The config-resolved `BlobStore` (ADR-111 Amendment 2), installed by
     /// the boot path (`khive-mcp`'s single- and multi-backend startup paths)
     /// via [`install_blob_store`](Self::install_blob_store) once `khive.toml`'s
@@ -149,6 +182,8 @@ impl KhiveRuntime {
             valid_note_kinds: Arc::new(RwLock::new(Vec::new())),
             entity_type_validator: Arc::new(RwLock::new(None)),
             note_mutation_hook: Arc::new(RwLock::new(None)),
+            note_write_validator: Arc::new(RwLock::new(None)),
+            pack_owned_note_kinds: Arc::new(RwLock::new(Vec::new())),
             blob_store: Arc::new(RwLock::new(None)),
         })
     }
@@ -179,6 +214,8 @@ impl KhiveRuntime {
             valid_note_kinds: Arc::new(RwLock::new(Vec::new())),
             entity_type_validator: Arc::new(RwLock::new(None)),
             note_mutation_hook: Arc::new(RwLock::new(None)),
+            note_write_validator: Arc::new(RwLock::new(None)),
+            pack_owned_note_kinds: Arc::new(RwLock::new(Vec::new())),
             blob_store: Arc::new(RwLock::new(None)),
         })
     }
@@ -208,6 +245,8 @@ impl KhiveRuntime {
             valid_note_kinds: Arc::new(RwLock::new(Vec::new())),
             entity_type_validator: Arc::new(RwLock::new(None)),
             note_mutation_hook: Arc::new(RwLock::new(None)),
+            note_write_validator: Arc::new(RwLock::new(None)),
+            pack_owned_note_kinds: Arc::new(RwLock::new(Vec::new())),
             blob_store: Arc::new(RwLock::new(None)),
         }
     }
@@ -266,6 +305,8 @@ impl KhiveRuntime {
                     valid_note_kinds: self.valid_note_kinds.clone(),
                     entity_type_validator: self.entity_type_validator.clone(),
                     note_mutation_hook: self.note_mutation_hook.clone(),
+                    note_write_validator: self.note_write_validator.clone(),
+                    pack_owned_note_kinds: self.pack_owned_note_kinds.clone(),
                     blob_store: self.blob_store.clone(),
                 }
             }
@@ -325,13 +366,14 @@ impl KhiveRuntime {
         self.backend.ann_root()
     }
 
-    /// WAL/checkpoint diagnostics (ADR-091 operator surface): build identity,
-    /// checkpoint counters, a PASSIVE checkpoint probe, WAL file size, and
-    /// WAL-pin census. Not write-free: the PASSIVE probe may backfill WAL
-    /// frames into the database (normal checkpoint I/O). It never changes
-    /// logical state, escalates to TRUNCATE, creates a missing database file,
-    /// or deletes sidecar evidence — see `khive_db::diagnostics` for the
-    /// narrowings that make those claims hold.
+    /// Writer-contention plus WAL/checkpoint diagnostics (ADR-091/ADR-135
+    /// operator surface): pooled writer and audit-failure counters, build
+    /// identity, checkpoint counters, a PASSIVE checkpoint probe, WAL file
+    /// size, and explicitly qualified WAL-pin census. Not write-free: the
+    /// PASSIVE probe may backfill WAL frames into the database (normal
+    /// checkpoint I/O). It never changes logical state, escalates to TRUNCATE,
+    /// creates a missing database file, or deletes sidecar evidence — see
+    /// `khive_db::diagnostics` for the narrowings that make those claims hold.
     ///
     /// Always targets the *main* backend via [`Self::core`], regardless of
     /// which backend this runtime handle is bound to, so a report never
@@ -345,11 +387,16 @@ impl KhiveRuntime {
         let build =
             khive_db::diagnostics::BuildIdentity::from_env(env!("CARGO_PKG_VERSION"), build_hash);
 
-        tokio::task::spawn_blocking(move || khive_db::diagnostics::collect(&pool, build, interval))
-            .await
-            .map_err(|e| {
-                RuntimeError::Internal(format!("db_diagnostics: spawn_blocking join: {e}"))
-            })
+        tokio::task::spawn_blocking(move || {
+            khive_db::diagnostics::collect_with_audit_append_failures(
+                &pool,
+                build,
+                interval,
+                crate::pack::audit_append_failure_count(),
+            )
+        })
+        .await
+        .map_err(|e| RuntimeError::Internal(format!("db_diagnostics: spawn_blocking join: {e}")))
     }
 
     // ---- Store accessors (token-scoped) ----
@@ -654,6 +701,28 @@ impl KhiveRuntime {
         }
     }
 
+    /// Install the pack-owned note kinds aggregated from the pack registry.
+    ///
+    /// Called by the transport after the `VerbRegistry` is built, same timing
+    /// as [`install_kind_registry`](Self::install_kind_registry).
+    pub fn install_pack_owned_note_kinds(&self, kinds: Vec<String>) {
+        if let Ok(mut guard) = self.pack_owned_note_kinds.write() {
+            *guard = kinds;
+        }
+    }
+
+    /// Whether `kind` is a note kind owned by a pack (see
+    /// [`install_pack_owned_note_kinds`](Self::install_pack_owned_note_kinds)).
+    ///
+    /// Always `false` before the transport installs the list — a bare runtime
+    /// has no packs, so no kind is pack-owned there.
+    pub fn is_pack_owned_note_kind(&self, kind: &str) -> bool {
+        self.pack_owned_note_kinds
+            .read()
+            .map(|g| g.iter().any(|k| k == kind))
+            .unwrap_or(false)
+    }
+
     /// Validate that `kind` is a pack-registered entity kind.
     ///
     /// Returns `Ok(())` when no kinds are installed (bare runtime without packs).
@@ -739,6 +808,77 @@ impl KhiveRuntime {
     pub fn install_note_mutation_hook(&self, f: NoteMutationHookFn) {
         if let Ok(mut guard) = self.note_mutation_hook.write() {
             *guard = Some(f);
+        }
+    }
+
+    /// Install a pack-owned note-write validator.
+    ///
+    /// Called during pack registration (`PackRuntime::register_note_write_validator`)
+    /// so that the covered note-write sites carrying caller-supplied
+    /// `properties` derive the owning pack's identity properties from the
+    /// authorization token, closing the gap where a direct Rust caller, the
+    /// generic `create` verb, or the proposal-apply path (which dispatches no
+    /// pack hooks) writes them unchecked. Single-slot semantics, same as
+    /// [`install_note_mutation_hook`](Self::install_note_mutation_hook): a
+    /// second installing pack overwrites the first, so a validator must return
+    /// kinds it does not own unchanged.
+    ///
+    /// Covered sites — each calls `derive_note_write_properties`
+    /// before the write: `create_note_inner` (`operations.rs`, the generic
+    /// `create` verb funnel and every other public `create_note*` variant),
+    /// `atomic_prepare::prepare_add_note` (the proposal-apply add-note path),
+    /// and `atomic_message::create_notes_atomic_with_report` (the atomic
+    /// multi-note writer).
+    ///
+    /// NOT covered: `try_create_note` (`operations.rs`), and the raw
+    /// `try_insert_note` / `upsert_note` methods on the [`NoteStore`] returned
+    /// by [`notes`](Self::notes). `try_create_note` is deliberately excluded —
+    /// its only caller path is `comm.ingest`, where `properties.from_actor` is
+    /// the external transport sender named by the `from` parameter, not the
+    /// authenticated caller; deriving it from the token here would stamp
+    /// every inbound message as the ingesting daemon and destroy inbound
+    /// attribution. The `NoteStore` accessors are a lower-level storage
+    /// escape hatch with no properties-derivation contract of their own; a
+    /// caller reaching storage directly is expected to have already decided
+    /// what `properties` to write.
+    pub fn install_note_write_validator(&self, f: NoteWriteValidatorFn) {
+        if let Ok(mut guard) = self.note_write_validator.write() {
+            *guard = Some(f);
+        }
+    }
+
+    /// Whether a note-write validator is installed on this runtime.
+    ///
+    /// Exists so a transport's own tests can assert, per boot path, that the
+    /// documented startup sequence actually filled the slot. A missing install
+    /// fails open and silently — an empty slot passes caller-supplied
+    /// properties straight through, which no write site can distinguish from a
+    /// validator that approved them — so occupancy is asserted, never assumed.
+    pub fn has_note_write_validator(&self) -> bool {
+        self.note_write_validator
+            .read()
+            .map(|g| g.is_some())
+            .unwrap_or(false)
+    }
+
+    /// Run caller-supplied note `properties` through the installed note-write
+    /// validator, returning the properties to store.
+    ///
+    /// Returns them unchanged when no validator is installed (bare runtime).
+    pub(crate) fn derive_note_write_properties(
+        &self,
+        kind: &str,
+        token: &NamespaceToken,
+        properties: Option<serde_json::Value>,
+    ) -> RuntimeResult<Option<serde_json::Value>> {
+        let validator = self
+            .note_write_validator
+            .read()
+            .map_err(|_| RuntimeError::Internal("note write validator lock poisoned".into()))?
+            .clone();
+        match validator {
+            None => Ok(properties),
+            Some(validate) => validate(kind, &token.actor().id, properties),
         }
     }
 
@@ -1059,6 +1199,35 @@ mod tests {
     fn memory_runtime_creates_successfully() {
         let rt = KhiveRuntime::memory().expect("memory runtime should create");
         assert!(rt.config().db_path.is_none());
+    }
+
+    #[tokio::test]
+    async fn runtime_db_diagnostics_supplies_both_contention_counter_sources() {
+        let rt = KhiveRuntime::memory().expect("memory runtime should create");
+
+        let report = rt.db_diagnostics().await.expect("diagnostics succeed");
+
+        assert!(
+            report.writer_contention.writer_acquisitions >= 1,
+            "runtime construction runs migrations through the finite-wait pooled writer"
+        );
+        assert_eq!(
+            report.writer_contention.writer_acquisitions,
+            report
+                .writer_contention
+                .pooled_writer_acquisitions
+                .saturating_add(report.writer_contention.standalone_writer_acquisitions)
+                .saturating_add(report.writer_contention.writer_task_acquisitions),
+            "the public aggregate must equal the class-specific snapshot"
+        );
+        assert!(
+            report.writer_contention.audit_append_failures.is_some(),
+            "the runtime path must supply its process-wide swallowed-audit counter"
+        );
+        assert!(report
+            .writer_contention
+            .audit_append_failures_unavailable_reason
+            .is_none());
     }
 
     #[test]

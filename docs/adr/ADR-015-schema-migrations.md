@@ -142,6 +142,8 @@ above remains the historical pre-consolidation record.
 |     V12 | ADR-118            | ann_write_log_model_seq_index      | shipped |
 |     V13 | #1424 / #1462      | list_cursor_sequences              | shipped |
 |     V14 | #1424 / #1462      | graph_edges_id_unique              | shipped |
+|     V15 | #1597              | serve_ledger_attribution           | shipped |
+|     V16 | ADR-019 / #1474    | gtd_dependency_cycle_guards        | shipped |
 
 > **V9 record (2026-07-18)**: `entities_name_ci_index` (ADR-104) ships in the `MIGRATIONS`
 > array as `009-entities-name-ci-index.sql`; its status here was `claimed`, stale from ADR-104,
@@ -152,10 +154,19 @@ above remains the historical pre-consolidation record.
 > column, khive#292) shipped in the `MIGRATIONS` array but was not recorded here; it is
 > backfilled so the live sequence remains contiguous through the later shipped migrations.
 
-> **V11–V13 record (2026-08-01)**: V11 and V12 record the shipped ANN write-log
+> **V11–V14 record (2026-08-01)**: V11 and V12 record the shipped ANN write-log
 > table and model-leading tail index. V13 adds durable insertion-sequence ledgers,
 > ordered upgrade backfills, and atomic insert triggers for stable entity, note,
-> and edge list cursors. These entries align the live ledger with `MIGRATIONS`.
+> and edge list cursors. V14 adds the graph-edge identifier compatibility guard.
+> These entries align the live ledger with `MIGRATIONS`.
+
+> **V16 record (2026-08-01, ADR-019 / #1474)**:
+> `gtd_dependency_cycle_guards` installs narrowly predicated transaction-time triggers on
+> the core `notes` and `graph_edges` tables. They reject only live task property cycles and
+> live task-to-task `depends_on` edge cycles. Pack `KindHook` validation remains the typed,
+> bounded early-error path; V16 is the cross-process race-safe backstop shared by canonical,
+> direct-storage, and atomic-unit writers. The migration does not rewrite or reject existing
+> rows while installing the triggers.
 
 > **Invariant**: ADR number order and migration version order are independent. Migration versions reflect schema ledger assignment order. A migration may only depend on schema created by earlier versions.
 
@@ -191,6 +202,16 @@ the core ledger already versions rather than in a boot-time pack declaration of 
 exception is narrow: it applies only to evolving a table's shape that a core migration already owns,
 never to introducing a wholly new pack-auxiliary table through the core lane, which remains the pack's
 own boot-time declaration to make.
+
+**The core-row invariant-trigger exception.** V16
+(`gtd_dependency_cycle_guards`, ADR-019 / #1474) records a second narrow case: a
+pack-owned invariant may use a versioned trigger on a core table when correctness requires
+validation in the same SQLite writer transaction as every mutation. An async pack hook alone
+cannot close the cross-process check/write race or see earlier statements in one atomic unit.
+Such a trigger MUST be limited to rows and relations owned by the pack, MUST ignore unrelated
+core writes, MUST treat soft-deleted rows consistently with live-store reads, and MUST ship
+with migration, fresh-start, atomic-unit, and unrelated-write regression coverage. This does
+not authorize pack `SchemaPlan` DDL against core tables; those plans remain auxiliary-only.
 
 ### Versioned migration model
 

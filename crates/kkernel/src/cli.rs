@@ -612,7 +612,12 @@ fn init_tracing(level: &str) {
     // model vocab sizes differ" — the multilingual paraphrase model carries a
     // handful of extra reserved tokens) while honoring the caller's level for
     // everything else.
-    let filter = format!("{level},lattice_inference=error");
+    //
+    // Force-enable `khive.boot` at INFO: the resolved-database disclosure
+    // (issue #1586) is emitted on that target at startup, and the global
+    // default level is `warn` — without this pin the disclosure would be
+    // silently filtered for every operator who never sets KHIVE_LOG.
+    let filter = format!("{level},khive.boot=info,lattice_inference=error");
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .with_env_filter(filter)

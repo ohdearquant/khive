@@ -2,6 +2,14 @@
 
 Architecture Decision Records (ADRs) for khive v1. These are **desired-state specifications** — the contract that code must implement. ADRs use closed taxonomies and bear normative weight; changes require explicit ADR amendments.
 
+## ADR lifecycle
+
+An ADR merges in whatever state its ratification had reached at merge time; the merge itself never changes the status field. `Proposed` is a legitimate resting state on `main`: it means the record is awaiting either a conformant implementation or an explicit adoption decision. A record ratified before its merge lands already reading `accepted`, carrying its ratification date in the header.
+
+A `Proposed` ADR becomes `accepted` only through an explicit ratification event, recorded by a dedicated status-flip PR. That PR's body must name three things: the immutable ratifying artifact with its event type and ISO timestamp; the 40-hex SHA of the commit containing the final ratified ADR text, with that commit's landing timestamp; and the explicit comparison `ratified_at > final_text_merged_at`. A sign-off issued against an earlier revision, followed by further edits, cannot be cited for the flip. The postdating requirement governs the flip itself: an amendment landing on an already-`accepted` ADR does not reset its status — an amendment is its own decision change and carries its own review. This rule applies prospectively from its adoption; status records that predate it stand as written. Contract-level ADRs scoped to one subsystem may be ratified by maintainer design review; cross-cutting or strategic ADRs require a project-owner decision. A conformant implementation landing is the usual trigger for seeking ratification.
+
+The same head-binding governs review: a verdict authorizes only the exact commit it names. A sibling catalog-row merge does not move an open PR's branch head, but it does change the base underneath it and therefore the merge result that would land — so a verdict taken at the old head no longer covers what merging would produce. Catalog-touching PRs therefore serialize: after a sibling row lands, bring the branch up to the current base, take one narrow review at the resulting final head, and merge before the next catalog row lands.
+
 ## ADR catalog
 
 <!-- BEGIN GENERATED ADR CATALOG -->
@@ -134,6 +142,14 @@ Architecture Decision Records (ADRs) for khive v1. These are **desired-state spe
 | [ADR-133](ADR-133-incidental-writes-off-the-request-hot-path.md)        | Reduce writer acquisitions on the request path                                                             |
 | [ADR-134](ADR-134-store-durability-posture.md)                          | Store durability posture, and the obligation it carries for accounting records                             |
 | [ADR-135](ADR-135-write-scaling-demand-before-ownership.md)             | Scale SQLite writes by reducing writer demand before changing ownership                                    |
+| [ADR-136](ADR-136-fair-write-admission-default.md)                      | Fair write admission — execute the queue default-on pathway with production evidence                       |
+| [ADR-137](ADR-137-tailnet-wire-transport.md)                            | Tailnet Wire Transport for the khive Frame Protocol                                                        |
+| [ADR-138](ADR-138-blob-enumeration.md)                                  | Add read-only blob enumeration to the blob-store contract                                                  |
+| [ADR-139](ADR-139-code-map-read-access.md)                              | Read access to registered code map databases                                                               |
+| [ADR-140](ADR-140-context-graph-payload.md)                             | Add a bounded graph payload to context responses                                                           |
+| [ADR-141](ADR-141-store-backup-runner.md)                               | Executable store backup runner                                                                             |
+| [ADR-142](ADR-142-agentic-process-runtime.md)                           | Agentic Process Runtime                                                                                    |
+| [ADR-143](ADR-143-store-held-caller-grants.md)                          | Store-held caller grants and hierarchical subactor identity                                                |
 
 <!-- END GENERATED ADR CATALOG -->
 

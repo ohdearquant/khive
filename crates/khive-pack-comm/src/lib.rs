@@ -1,6 +1,7 @@
 //! pack-comm — Communication pack providing nine public `comm.*` verbs.
 
 pub mod handlers;
+pub(crate) mod inbox_signal;
 pub(crate) mod message;
 pub(crate) mod pack;
 pub(crate) mod params;

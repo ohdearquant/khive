@@ -3080,6 +3080,13 @@ async fn update_edge_to_supports_on_disallowed_entity_pair_rejected() {
         msg.contains("supports"),
         "error message must name the relation 'supports'; got: {msg}"
     );
+    assert!(
+        msg.contains(
+            "currently legal relations for person -> concept under the loaded endpoint rules: instance_of"
+        ),
+        "error message must expose the derived legal-relations set from the shared validator \
+         update_edge reaches at operations.rs; got: {msg}"
+    );
 }
 
 /// (c) update_edge note→entity annotates edge → Supports: rejected (cross-substrate).
