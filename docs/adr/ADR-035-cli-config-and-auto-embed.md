@@ -295,7 +295,7 @@ The shipped behavior has two parts:
 Examples using only shipped flags:
 
 ```bash
-# Re-embed entities, notes, and knowledge with every configured engine.
+# Re-embed entities and notes with every configured engine; knowledge uses the default.
 kkernel reindex --db ~/.khive/khive.db --namespace local
 
 # Repair only the graph substrate and keep vectors that already exist.

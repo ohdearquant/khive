@@ -17,7 +17,10 @@ use uuid::Uuid;
 
 use khive_mcp::serve::{resolve_runtime_config, RuntimeConfigInputs};
 use khive_runtime::retrieval::EmbeddingTruncationReport;
-use khive_runtime::{entity_fts_document, note_fts_document, KhiveRuntime, Namespace};
+use khive_runtime::{
+    entity_embedding_text, entity_fts_document, note_embedding_text, note_fts_document,
+    KhiveRuntime, Namespace,
+};
 use khive_storage::entity::Entity;
 use khive_storage::error::StorageError;
 use khive_storage::note::Note;
@@ -245,6 +248,18 @@ impl ReindexReport {
             || self.knowledge_sections_failed > 0
             || self.epoch_bump_failed
     }
+}
+
+fn entity_has_embedding_text(entity: &Entity) -> bool {
+    !entity.name.trim().is_empty()
+        || entity
+            .description
+            .as_deref()
+            .is_some_and(|description| !description.trim().is_empty())
+}
+
+fn note_has_embedding_text(note: &Note) -> bool {
+    !note.content.trim().is_empty()
 }
 
 /// Embed `staged` with every model in `model_names` and store one vector record
@@ -550,32 +565,36 @@ pub async fn run_reindex(args: ReindexArgs) -> Result<()> {
                 break;
             }
 
-            let mut staged: Vec<(Uuid, String)> = Vec::with_capacity(n);
-            for entity in &batch {
-                let text = match &entity.description {
-                    Some(d) if !d.is_empty() => format!("{} {}", entity.name, d),
-                    _ => entity.name.clone(),
-                };
-                if !text.trim().is_empty() {
-                    staged.push((entity.id, text));
+            let embeddable = if model_names.is_empty() {
+                batch
+                    .iter()
+                    .filter(|entity| entity_has_embedding_text(entity))
+                    .count()
+            } else {
+                let mut staged = Vec::with_capacity(n);
+                for entity in &batch {
+                    if entity_has_embedding_text(entity) {
+                        staged.push((entity.id, entity_embedding_text(entity)));
+                    }
                 }
-            }
 
-            if !staged.is_empty() {
-                errors_skipped += embed_and_store_batch(
-                    &rt,
-                    &token,
-                    &model_names,
-                    &ns_str,
-                    &staged,
-                    SubstrateKind::Entity,
-                    "entity.body",
-                    drop_existing,
-                    &mut truncation_by_model,
-                )
-                .await;
-                entities_processed += staged.len() as u64;
-            }
+                if !staged.is_empty() {
+                    errors_skipped += embed_and_store_batch(
+                        &rt,
+                        &token,
+                        &model_names,
+                        &ns_str,
+                        &staged,
+                        SubstrateKind::Entity,
+                        "entity.body",
+                        drop_existing,
+                        &mut truncation_by_model,
+                    )
+                    .await;
+                }
+                staged.len()
+            };
+            entities_processed += embeddable as u64;
 
             // FTS backfill: index every entity in this batch regardless of whether
             // it had content to embed. Mirrors the upsert_document call in
@@ -607,29 +626,36 @@ pub async fn run_reindex(args: ReindexArgs) -> Result<()> {
                 break;
             }
 
-            let mut staged: Vec<(Uuid, String)> = Vec::with_capacity(n);
-            for note in &batch {
-                let text = note.content.clone();
-                if !text.trim().is_empty() {
-                    staged.push((note.id, text));
+            let embeddable = if model_names.is_empty() {
+                batch
+                    .iter()
+                    .filter(|note| note_has_embedding_text(note))
+                    .count()
+            } else {
+                let mut staged = Vec::with_capacity(n);
+                for note in &batch {
+                    if note_has_embedding_text(note) {
+                        staged.push((note.id, note_embedding_text(note)));
+                    }
                 }
-            }
 
-            if !staged.is_empty() {
-                errors_skipped += embed_and_store_batch(
-                    &rt,
-                    &token,
-                    &model_names,
-                    &ns_str,
-                    &staged,
-                    SubstrateKind::Note,
-                    "note.content",
-                    drop_existing,
-                    &mut truncation_by_model,
-                )
-                .await;
-                notes_processed += staged.len() as u64;
-            }
+                if !staged.is_empty() {
+                    errors_skipped += embed_and_store_batch(
+                        &rt,
+                        &token,
+                        &model_names,
+                        &ns_str,
+                        &staged,
+                        SubstrateKind::Note,
+                        "note.content",
+                        drop_existing,
+                        &mut truncation_by_model,
+                    )
+                    .await;
+                }
+                staged.len()
+            };
+            notes_processed += embeddable as u64;
 
             // FTS backfill: index every note in this batch regardless of whether
             // it had content to embed. Mirrors the upsert_document call in
@@ -1258,6 +1284,32 @@ mod tests {
     use clap::Parser;
     use khive_storage::types::{SqlStatement, SqlValue};
     use serial_test::serial;
+
+    #[test]
+    fn allocation_free_embedding_eligibility_matches_canonical_text() {
+        let entities = [
+            Entity::new("eligibility", "concept", "named"),
+            Entity::new("eligibility", "concept", "").with_description("description only"),
+            Entity::new("eligibility", "concept", "   ").with_description("\t"),
+        ];
+        for entity in &entities {
+            assert_eq!(
+                entity_has_embedding_text(entity),
+                !entity_embedding_text(entity).trim().is_empty()
+            );
+        }
+
+        let notes = [
+            Note::new("eligibility", "observation", "content"),
+            Note::new("eligibility", "observation", "  \n\t"),
+        ];
+        for note in &notes {
+            assert_eq!(
+                note_has_embedding_text(note),
+                !note_embedding_text(note).trim().is_empty()
+            );
+        }
+    }
 
     #[tokio::test]
     async fn test_reindex_invalidates_vamana_snapshots() {

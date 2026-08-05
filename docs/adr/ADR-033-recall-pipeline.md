@@ -345,10 +345,10 @@ When `recall` is called without an explicit `embedding_model` parameter:
 3. `RecallCandidateSet.vector_hits_per_model` collects `(model_name, Vec<VectorSearchHit>)`
    tuples — one per model.
 4. `fuse_candidates` builds N vector sources (one per model) plus 1 text source and passes all
-   sources to `khive_retrieval::fuse_search_results`. For N=0 models an empty placeholder
-   source is prepended to maintain the 2-source layout required for consistent fusion
-   strategy behavior (RRF and Weighted do not apply their full algorithm to a single-source
-   input — `fuse_search_results` returns raw scores when `sources.len() == 1`).
+   sources to `khive_retrieval::fuse_search_results`. RRF and Union transform a singleton
+   source exactly as configured; there is no raw-score bypass. For N=0 models an empty vector
+   placeholder is still prepended so the two-arm `[vector, keyword]` positions remain explicit
+   for `VectorOnly`, `KeywordOnly`, and Weighted behavior instead of rebinding text to slot 0.
 
 **Wire shape:** `recall` always returns `[{id, score, ...}]`. The
 per-model vector breakdown is only exposed via the `recall.candidates` sub-handler's
@@ -361,7 +361,9 @@ vector store (single-model path). `recall.candidates` will not include
 **Strategy guidance for N > 1 models:** The shipped weighted fusion path first unions
 per-model vector hits into one combined vector source, then fuses `[combined_vector, text]`
 with the configured vector/text weights. `"rrf"` and `"union"` still accept N separate
-vector sources; `"weighted"` operates on the combined-vector plus text layout.
+vector sources in `vector_hits_per_model` order followed by text; `"weighted"` operates
+on the combined-vector plus text layout. This N-engine ordering is distinct from the
+dual-index router's `[primary, legacy]` migration contract.
 
 ### 7. Calibration protocol
 

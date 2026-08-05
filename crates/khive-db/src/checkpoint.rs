@@ -1,14 +1,27 @@
-//! Periodic WAL checkpoint task for the connection pool (ADR-091).
+//! Periodic WAL checkpoint task for the connection pool (ADR-091; dedicated
+//! checkpoint connection amendment, see below).
 //!
 //! Issues `PRAGMA wal_checkpoint(PASSIVE)` on every tick — non-blocking, never
 //! waits for readers. A rare, separately-gated escalation may additionally run
 //! `PRAGMA wal_checkpoint(TRUNCATE)` once WAL pressure crosses
 //! `truncate_high_water_pages` and `truncate_min_interval` has elapsed since
-//! the last attempt (Plank 2); both run under the single writer checkout
-//! `checkpoint_once` holds for that tick. `checkpoint_once` uses
-//! `try_writer_nowait` (zero-wait `try_lock`) so a tick is skipped immediately
-//! when the writer mutex is held, rather than blocking — a skipped tick is
-//! always preferable to stalling write traffic.
+//! the last attempt (Plank 2); both run on the task's own dedicated
+//! standalone connection (`CheckpointConnection`), opened once at task
+//! startup and reused for every tick — `checkpoint_once` never checks out the
+//! pool's writer mutex at all, so a concurrent `pool.writer()` checkout can
+//! never queue behind a checkpoint tick's ADMISSION. That guarantee is
+//! admission-only: PASSIVE takes SQLite's CKPT lock, not the WRITE lock, so
+//! it never blocks writers at the SQLite level either — but TRUNCATE
+//! additionally acquires SQLite's writer lock and can still block a
+//! concurrent write transaction, on any connection, for up to
+//! `truncate_busy_timeout` while it waits on a pinning reader, exactly as
+//! before this connection split.
+//!
+//! If the dedicated connection is unavailable (never opened yet, or dropped
+//! after a prior tick's connection-level pragma failure), the tick reports
+//! `CheckpointTick::Skipped` and the next tick lazily reopens it — this is
+//! now the ONLY source of a Skipped tick; a busy pool writer no longer causes
+//! one.
 //!
 //! `warn_pages` / `high_water_pages` WARNs fire at most once per below→above
 //! crossing; a skipped tick leaves crossing state unchanged. An age-based
@@ -20,7 +33,7 @@
 //!
 //! See crates/khive-db/docs/api/checkpoint.md#module-overview-adr-091-planks-012
 //! for full ADR-091 Plank 0/1/2 design rationale (why TRUNCATE is excluded
-//! from ordinary ticks, the single-writer-checkout invariant, and why Plank 1
+//! from ordinary ticks, the dedicated-connection invariant, and why Plank 1
 //! is a sweep rather than the ADR's originally-described per-statement guard).
 
 use std::path::{Path, PathBuf};
@@ -28,7 +41,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crate::pool::{ConnectionPool, WriterGuard};
+use crate::pool::ConnectionPool;
 
 // ── metrics read-surface (load/perf harness) ─────────────────────────────
 // Read-only process-wide gauges (never reset outside #[cfg(test)]). See
@@ -49,14 +62,17 @@ static TRUNCATE_ATTEMPTS: AtomicU64 = AtomicU64::new(0);
 /// gauge every time `note_truncate_outcome` runs.
 static TRUNCATE_CONSECUTIVE_FAILURES: AtomicU64 = AtomicU64::new(0);
 
-/// Count of checkpoint ticks skipped because the writer mutex was already
-/// held (ADR-091 checkpoint-pressure telemetry), across this process's
-/// lifetime. Never reset outside `#[cfg(test)]`.
+/// Count of checkpoint ticks skipped because the task's dedicated
+/// `CheckpointConnection` was unavailable that tick (never opened yet, or
+/// dropped after a prior connection-level pragma failure — ADR-091
+/// checkpoint-pressure telemetry), across this process's lifetime. Never
+/// reset outside `#[cfg(test)]`.
 static CHECKPOINT_SKIPPED_TICKS: AtomicU64 = AtomicU64::new(0);
 
 /// Current run-length of consecutive skipped ticks. Reset to 0 the next time
-/// a tick is actually observed (writer free), so a sustained skip streak is
-/// visible even between two successful observations.
+/// a tick is actually observed (dedicated connection available), so a
+/// sustained skip streak is visible even between two successful
+/// observations.
 static CHECKPOINT_CONSECUTIVE_SKIPS: AtomicU64 = AtomicU64::new(0);
 
 /// WAL page count as of the most recent *observed* tick, snapshotted at the
@@ -83,7 +99,8 @@ pub fn truncate_consecutive_failures() -> u64 {
     TRUNCATE_CONSECUTIVE_FAILURES.load(Ordering::Relaxed)
 }
 
-/// Total checkpoint ticks skipped (writer busy) in this process's lifetime.
+/// Total checkpoint ticks skipped (dedicated connection unavailable) in this
+/// process's lifetime.
 pub fn checkpoint_skipped_ticks() -> u64 {
     CHECKPOINT_SKIPPED_TICKS.load(Ordering::Relaxed)
 }
@@ -102,9 +119,10 @@ pub fn checkpoint_last_skip_wal_pages() -> Option<u64> {
     }
 }
 
-/// A tick's writer checkout was skipped (mutex busy): bump the lifetime and
-/// consecutive-skip counters and snapshot the last-known WAL pressure so an
-/// operator can see how bad the WAL was heading into the skip streak.
+/// A tick's dedicated checkpoint connection was unavailable: bump the
+/// lifetime and consecutive-skip counters and snapshot the last-known WAL
+/// pressure so an operator can see how bad the WAL was heading into the skip
+/// streak.
 fn note_checkpoint_skipped() {
     CHECKPOINT_SKIPPED_TICKS.fetch_add(1, Ordering::Relaxed);
     CHECKPOINT_CONSECUTIVE_SKIPS.fetch_add(1, Ordering::Relaxed);
@@ -133,14 +151,18 @@ pub(crate) fn reset_checkpoint_metrics_for_tests() {
 
 /// Outcome of a single checkpoint attempt.
 ///
-/// `Skipped` is returned when the writer mutex is already held (the tick is a
-/// no-op). `Observed` carries the WAL page count read during the tick. The
-/// distinction matters for threshold-crossing WARN rate-limiting: a skipped tick
-/// must leave the above/below state unchanged so that a busy tick cannot
-/// spuriously re-arm the rate limit while WAL pressure is still elevated.
+/// `Skipped` is returned when the task's dedicated `CheckpointConnection`
+/// is unavailable that tick (the tick is a no-op) — never because a
+/// concurrent pool writer was busy; a checkpoint tick no longer checks out
+/// the pool's writer mutex at all. `Observed` carries the WAL page count read
+/// during the tick. The distinction matters for threshold-crossing WARN
+/// rate-limiting: a skipped tick must leave the above/below state unchanged
+/// so that it cannot spuriously re-arm the rate limit while WAL pressure is
+/// still elevated.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CheckpointTick {
-    /// The writer mutex was busy; no checkpoint was issued this tick.
+    /// The dedicated checkpoint connection was unavailable; no checkpoint
+    /// was issued this tick.
     Skipped,
     /// A checkpoint was issued; the value is the observed WAL page count.
     Observed(u64),
@@ -202,10 +224,11 @@ pub struct CheckpointConfig {
 
     /// Minimum spacing between TRUNCATE *attempts* (not successes).
     ///
-    /// A skipped tick (writer busy, below threshold, or interval not yet
-    /// elapsed) never advances the "last attempt" clock, so the next tick
-    /// where the writer is free and the threshold is still crossed is
-    /// immediately eligible rather than waiting out the full interval again.
+    /// A skipped tick (dedicated connection unavailable, below threshold, or
+    /// interval not yet elapsed) never advances the "last attempt" clock, so
+    /// the next tick where the connection is available and the threshold is
+    /// still crossed is immediately eligible rather than waiting out the
+    /// full interval again.
     ///
     /// Overridable via `KHIVE_WAL_TRUNCATE_MIN_INTERVAL_SECS`.
     /// Default: 300 seconds (5 minutes).
@@ -1343,6 +1366,116 @@ impl Drop for CheckpointLifecycleEmitter {
     }
 }
 
+/// The checkpoint task's dedicated, long-lived standalone connection to the
+/// same database file — opened once at task startup and reused for every
+/// tick's PASSIVE (and, when armed, TRUNCATE) pragma. NEVER the pool's writer
+/// mutex, which is what removes the pool-mutex ADMISSION path: a concurrent
+/// `pool.writer()` checkout no longer queues behind a checkpoint tick.
+///
+/// That removal is scoped to admission, not to SQLite-level blocking in
+/// general. `PRAGMA wal_checkpoint(PASSIVE)` takes only SQLite's CKPT lock,
+/// not the WRITE lock, so a concurrent writer can commit while a PASSIVE pass
+/// runs on this connection — true of PASSIVE specifically, not of TRUNCATE.
+/// TRUNCATE inherits RESTART semantics and additionally acquires SQLite's
+/// writer lock, so it can still block a concurrent write transaction, on any
+/// connection, for up to `truncate_busy_timeout` while it waits on a pinning
+/// reader — the same bounded cost that existed pre-fix, now paid on this
+/// dedicated connection instead of the pool writer. Serializing checkpoint
+/// admission behind the pool's writer mutex (the pre-fix design) imposed
+/// contention SQLite itself does not require; TRUNCATE's own SQLite-level
+/// write-blocking window is unaffected by that removal.
+///
+/// `None` between ticks means the connection is unavailable (never opened
+/// yet, or dropped after a prior tick's connection-level pragma failure) —
+/// the caller must report that tick `Skipped` and retry the open on the next
+/// one. This is now the ONLY source of a `Skipped` tick.
+///
+/// ADR-136 D1 gate 5 classification: **checkpoint writer**. Explicitly
+/// exempt from `WriterTask`/queue routing by design (see the admission-path
+/// note above), never `SqlAccess`-reachable, never counted as a
+/// `direct_route_violation` — see the classification table in
+/// `writer_task`'s module doc.
+struct CheckpointConnection {
+    conn: Option<rusqlite::Connection>,
+    /// Consecutive failed `open_standalone_writer` attempts since the last
+    /// successful open (or since task startup). Drives the WARN-once /
+    /// debug-thereafter log rate-limiting in `ensure_open`: a file-backed
+    /// pool that transiently loses its dedicated connection would otherwise
+    /// log a WARN on every tick (default 500ms) for as long as the outage
+    /// lasts, which for a read-only or in-memory pool — where the open can
+    /// never succeed — means permanent per-tick WARN spam.
+    consecutive_open_failures: u32,
+}
+
+impl CheckpointConnection {
+    fn new() -> Self {
+        Self {
+            conn: None,
+            consecutive_open_failures: 0,
+        }
+    }
+
+    /// Ensure a usable connection is open, lazily (re)opening from `pool`
+    /// when the current one is absent. Reuses the crate's existing untracked
+    /// standalone-connection open path (`ConnectionPool::open_standalone_writer_untracked`),
+    /// which applies the same pragmas (including `busy_timeout` from the pool
+    /// config) as any other standalone connection, without counting this
+    /// infrastructure connection as write-operation traffic. Returns `None` if
+    /// opening fails — an in-memory pool (no on-disk file to open a second
+    /// connection against), a read-only pool, or a transient filesystem error.
+    ///
+    /// Logging is rate-limited across a failure streak: the FIRST failure of
+    /// a streak logs at `warn!`, every subsequent identical failure (while
+    /// still failing) logs at `debug!` instead, and a successful open that
+    /// ends a streak logs one `info!` recovery line. Without this, a
+    /// permanently-unopenable pool (read-only or in-memory, selected by
+    /// `checkpoint_pool_for`) would WARN on every tick forever.
+    fn ensure_open(&mut self, pool: &ConnectionPool) -> Option<&rusqlite::Connection> {
+        if self.conn.is_none() {
+            match pool.open_standalone_writer_untracked() {
+                Ok(conn) => {
+                    if self.consecutive_open_failures > 0 {
+                        tracing::info!(
+                            prior_consecutive_failures = self.consecutive_open_failures,
+                            "dedicated checkpoint connection opened successfully, ending a \
+                             failure streak"
+                        );
+                    }
+                    self.consecutive_open_failures = 0;
+                    self.conn = Some(conn);
+                }
+                Err(e) => {
+                    if self.consecutive_open_failures == 0 {
+                        tracing::warn!(
+                            error = %e,
+                            "failed to open the dedicated checkpoint connection; \
+                             this tick is skipped and the open retried next tick"
+                        );
+                    } else {
+                        tracing::debug!(
+                            error = %e,
+                            consecutive_failures = self.consecutive_open_failures,
+                            "dedicated checkpoint connection still unavailable; \
+                             this tick is skipped and the open retried next tick"
+                        );
+                    }
+                    self.consecutive_open_failures =
+                        self.consecutive_open_failures.saturating_add(1);
+                    return None;
+                }
+            }
+        }
+        self.conn.as_ref()
+    }
+
+    /// Drop the current connection after a connection-level pragma failure so
+    /// the next tick's `ensure_open` reopens it fresh rather than repeatedly
+    /// retrying a connection already known to be broken.
+    fn drop_connection(&mut self) {
+        self.conn = None;
+    }
+}
+
 /// Run the WAL checkpoint background task.
 ///
 /// Long-running async task — spawn with `tokio::spawn`. Loops until
@@ -1352,10 +1485,14 @@ impl Drop for CheckpointLifecycleEmitter {
 /// reaching zero; a sibling owner (e.g. `event_store`) holding its own clone
 /// makes that check unreachable (issue #774).
 ///
-/// Issues `PRAGMA wal_checkpoint(PASSIVE)` every tick via `try_writer_nowait`
-/// (zero-wait try-lock): a busy writer skips the tick rather than stalling
-/// write traffic. A WARNING fires once per below→above threshold crossing,
-/// not every tick.
+/// Issues `PRAGMA wal_checkpoint(PASSIVE)` every tick on the task's dedicated
+/// `CheckpointConnection` — never the pool's writer mutex, so a concurrent
+/// `pool.writer()` checkout can never queue behind a checkpoint tick. That
+/// guarantee is admission-only: an armed TRUNCATE still takes SQLite's writer
+/// lock and can block new write transactions, on any connection, for up to
+/// `truncate_busy_timeout` (see `CheckpointConnection`'s contract). A tick is
+/// `Skipped` only when that dedicated connection is itself unavailable. A
+/// WARNING fires once per below→above threshold crossing, not every tick.
 ///
 /// `lifecycle_owner` (ADR-094): exactly one task in a multi-backend fan-out
 /// should receive `Some`. That task appends a best-effort
@@ -1424,6 +1561,12 @@ pub async fn run_checkpoint_task(
         sidecar.register_beacon().await;
     }
 
+    // Opened once here, at task startup; `ensure_open` is a no-op in steady
+    // state and only reopens after a connection-level failure or (for an
+    // in-memory/read-only pool) retries the open on every subsequent tick.
+    let mut checkpoint_conn = CheckpointConnection::new();
+    checkpoint_conn.ensure_open(&pool);
+
     loop {
         // A closed sender (the daemon returning without an explicit send)
         // makes `changed()` resolve with `Err` immediately, which `select!`
@@ -1434,21 +1577,38 @@ pub async fn run_checkpoint_task(
             _ = shutdown_rx.changed() => break,
         }
 
-        let tick = checkpoint_once(&pool, &config, &mut truncate_state);
+        let tick = match checkpoint_conn.ensure_open(&pool) {
+            None => {
+                note_checkpoint_skipped();
+                CheckpointTick::Skipped
+            }
+            Some(conn) => match checkpoint_once(&pool, conn, &config, &mut truncate_state) {
+                Ok(wal_pages) => CheckpointTick::Observed(wal_pages),
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "dedicated checkpoint connection failed a pragma; \
+                         dropping it for a fresh reopen next tick"
+                    );
+                    checkpoint_conn.drop_connection();
+                    note_checkpoint_skipped();
+                    CheckpointTick::Skipped
+                }
+            },
+        };
 
         // ADR-091 Plank 1: age-based sweep over the registry's oldest entry
         // MUST run on every tick, including a Skipped one — deliberately
-        // BEFORE the Skipped early-continue below. A registered
-        // `WriterGuard::transaction` span (`pool.rs`) holds the writer mutex
-        // for its entire registered lifetime, so exactly the long-running
-        // transaction this sweep exists to name is the one that makes an
-        // ordinary checkpoint tick observe `Skipped` — gating the sweep on
-        // `Observed` would silence it for precisely that scenario, defeating
-        // the WAL-independent diagnostic the ADR specifies. Independent of
-        // WAL page pressure by the same design: a registered span can go
-        // stale (KHIVE_TX_WARN_SECS / KHIVE_TX_MAX_AGE_SECS) while
-        // wal_pages sits well under warn_pages, or isn't sampled at all this
-        // tick. Edge-triggered per rung, same debounce idiom as the severity
+        // BEFORE the Skipped early-continue below. Since the dedicated
+        // checkpoint connection amendment, a `Skipped` tick means that
+        // connection was itself unavailable, not that some registered span
+        // was holding the pool's writer mutex (a checkpoint tick no longer
+        // touches it at all) — but the sweep still must not go blind for the
+        // duration of that outage, and the two failure surfaces are
+        // independent: a registry span can go stale
+        // (KHIVE_TX_WARN_SECS / KHIVE_TX_MAX_AGE_SECS) while wal_pages sits
+        // well under warn_pages, or while the checkpoint connection itself is
+        // down. Edge-triggered per rung, same debounce idiom as the severity
         // ladder below, so a sustained stale span logs once per rung rather
         // than once per tick.
         let oldest_tx = tx_filter
@@ -1619,58 +1779,50 @@ fn log_tx_registry_snapshot_warn(wal_pages: u64) {
     }
 }
 
-/// Issue one checkpoint cycle against the writer connection.
+/// Issue one checkpoint cycle against the task's dedicated checkpoint
+/// connection (`conn` — see `CheckpointConnection`; NEVER the pool's writer
+/// mutex).
 ///
-/// Returns [`CheckpointTick::Skipped`] when the writer mutex is already held
-/// (the tick is a no-op) and [`CheckpointTick::Observed`] with the WAL page
-/// count otherwise. All checkpoint errors are logged at warn level and treated
-/// as non-fatal; the next tick retries.
+/// Returns the observed WAL page count on success. Returns `Err` only for a
+/// connection-level pragma failure (the PASSIVE pragma itself erroring) — the
+/// caller (`run_checkpoint_task`) treats that as a signal to drop `conn` and
+/// lazily reopen a fresh one next tick, reporting the tick `Skipped`. Every
+/// other error (e.g. a TRUNCATE attempt failing) is logged at warn level and
+/// treated as non-fatal; the next tick retries against the same connection.
 ///
-/// Uses `try_writer_nowait` so that a busy active writer causes this tick to
-/// be skipped immediately rather than stalling for up to `checkout_timeout`.
-/// The caller (`run_checkpoint_task`) owns all threshold-crossing WARN logging
-/// so that warnings fire at most once per crossing, not every tick.
+/// The caller owns all threshold-crossing WARN logging so that warnings fire
+/// at most once per crossing, not every tick.
 ///
 /// ADR-091 Plank 2: after the PASSIVE pass, this is also the single point
-/// that may escalate to TRUNCATE (`maybe_truncate`) — under the SAME writer
-/// guard acquired above, never a second checkout. A busy writer (`Skipped`)
-/// short-circuits before either PASSIVE or TRUNCATE run.
+/// that may escalate to TRUNCATE (`maybe_truncate`) — on the SAME dedicated
+/// connection, never a second connection or a pool checkout.
 pub fn checkpoint_once(
     pool: &ConnectionPool,
+    conn: &rusqlite::Connection,
     config: &CheckpointConfig,
     truncate_state: &mut TruncateState,
-) -> CheckpointTick {
-    let writer = match pool.try_writer_nowait() {
-        Ok(w) => w,
-        Err(_) => {
-            note_checkpoint_skipped();
-            return CheckpointTick::Skipped;
-        }
-    };
+) -> Result<u64, rusqlite::Error> {
+    let wal_pages = query_wal_pages(conn);
 
-    let wal_pages = query_wal_pages(writer.conn());
-
-    if let Err(e) = writer
-        .conn()
-        .execute_batch("PRAGMA wal_checkpoint(PASSIVE)")
-    {
+    if let Err(e) = conn.execute_batch("PRAGMA wal_checkpoint(PASSIVE)") {
         tracing::warn!(error = %e, "WAL checkpoint failed");
-    } else {
-        tracing::debug!(wal_pages, "WAL checkpoint issued");
+        return Err(e);
     }
+    tracing::debug!(wal_pages, "WAL checkpoint issued");
 
-    maybe_truncate(pool, &writer, config, wal_pages, truncate_state);
+    maybe_truncate(pool, conn, config, wal_pages, truncate_state);
 
-    CheckpointTick::Observed(wal_pages)
+    Ok(wal_pages)
 }
 
-/// Evaluate and, if due, attempt a TRUNCATE escalation under the writer
-/// guard the caller already holds (never its own checkout). `last_attempt`
+/// Evaluate and, if due, attempt a TRUNCATE escalation on the same dedicated
+/// checkpoint connection the caller already holds (never its own checkout —
+/// there is no pool writer involved on this path at all). `last_attempt`
 /// is stamped ONLY on an actual attempt, never on a skip. See
 /// crates/khive-db/docs/api/checkpoint.md#maybe_truncate--truncate-attempt-gating-plank-2
 fn maybe_truncate(
     pool: &ConnectionPool,
-    writer: &WriterGuard<'_>,
+    conn: &rusqlite::Connection,
     config: &CheckpointConfig,
     wal_pages_before: u64,
     truncate_state: &mut TruncateState,
@@ -1689,7 +1841,6 @@ fn maybe_truncate(
     // it is available even if the attempt itself succeeds.
     log_tx_registry_snapshot_warn(wal_pages_before);
 
-    let conn = writer.conn();
     let original_busy_timeout = pool.config().busy_timeout;
 
     if let Err(e) = conn.busy_timeout(config.truncate_busy_timeout) {
@@ -2322,6 +2473,14 @@ mod tests {
         Arc::new(ConnectionPool::new(cfg).expect("pool open"))
     }
 
+    /// Test helper: open the same dedicated standalone connection
+    /// `run_checkpoint_task` opens in production, for tests that drive
+    /// `checkpoint_once` directly.
+    fn checkpoint_conn(pool: &ConnectionPool) -> rusqlite::Connection {
+        pool.open_standalone_writer()
+            .expect("open dedicated checkpoint connection")
+    }
+
     struct TruncateReportHookGuard;
 
     impl Drop for TruncateReportHookGuard {
@@ -2453,6 +2612,7 @@ mod tests {
         let buffer = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let thread_buffer = std::sync::Arc::clone(&buffer);
         let checkpoint_pool = Arc::clone(&pool);
+        let dedicated_conn = checkpoint_conn(&checkpoint_pool);
         let checkpoint = std::thread::spawn(move || {
             let subscriber = CaptureSubscriber {
                 events: thread_buffer,
@@ -2460,6 +2620,7 @@ mod tests {
             tracing::subscriber::with_default(subscriber, || {
                 checkpoint_once(
                     &checkpoint_pool,
+                    &dedicated_conn,
                     &CheckpointConfig {
                         truncate_high_water_pages: 0,
                         truncate_min_interval: Duration::ZERO,
@@ -2484,7 +2645,7 @@ mod tests {
         proceed_tx
             .send(())
             .expect("allow no-progress reporting to continue");
-        checkpoint.join().expect("checkpoint thread");
+        let _ = checkpoint.join().expect("checkpoint thread");
 
         let events = buffer.lock().expect("captured events");
         assert!(
@@ -2523,26 +2684,65 @@ mod tests {
                 .unwrap();
         }
 
+        let conn = checkpoint_conn(&pool);
         checkpoint_once(
             &pool,
+            &conn,
             &CheckpointConfig::default(),
             &mut TruncateState::default(),
-        );
+        )
+        .expect("checkpoint_once must succeed against a healthy dedicated connection");
     }
 
+    /// In-memory pools have no on-disk file to open a second, dedicated
+    /// standalone connection against — this is exactly the precondition that
+    /// makes `CheckpointConnection::ensure_open` return `None` and
+    /// `run_checkpoint_task` report the tick `Skipped`, so `checkpoint_once`
+    /// is never even called for one.
     #[test]
-    #[serial(checkpoint_skip_metrics)]
-    fn checkpoint_once_is_noop_on_in_memory_pool() {
-        // In-memory databases do not use WAL; checkpoint_once must not panic.
+    fn open_standalone_writer_fails_on_in_memory_pool() {
         let cfg = PoolConfig {
             path: None,
             ..PoolConfig::default()
         };
         let pool = Arc::new(ConnectionPool::new(cfg).expect("in-memory pool"));
-        checkpoint_once(
-            &pool,
-            &CheckpointConfig::default(),
-            &mut TruncateState::default(),
+        assert!(
+            pool.open_standalone_writer().is_err(),
+            "an in-memory pool must not be able to open a dedicated checkpoint connection"
+        );
+    }
+
+    /// `CheckpointConnection::ensure_open` must open its dedicated connection
+    /// through the untracked standalone boundary, both on the initial open
+    /// and on a reopen after the connection is dropped — the checkpoint task
+    /// is exempt infrastructure, not a request-traffic writer acquisition
+    /// (ADR-136 D1 gate 5).
+    #[test]
+    fn ensure_open_does_not_move_writer_acquisition_counters() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("checkpoint_ensure_open.db");
+        let pool = file_pool(&path);
+
+        let before_first_open = pool.writer_acquisition_snapshot();
+        let mut checkpoint_conn = CheckpointConnection::new();
+        checkpoint_conn
+            .ensure_open(&pool)
+            .expect("dedicated checkpoint connection must open against a file-backed pool");
+        assert_eq!(
+            pool.writer_acquisition_snapshot(),
+            before_first_open,
+            "the checkpoint connection's initial open must not count as a writer acquisition"
+        );
+
+        checkpoint_conn.conn = None;
+        let before_reopen = pool.writer_acquisition_snapshot();
+        checkpoint_conn
+            .ensure_open(&pool)
+            .expect("dedicated checkpoint connection must reopen after invalidation");
+        assert_eq!(
+            pool.writer_acquisition_snapshot(),
+            before_reopen,
+            "reopening the checkpoint connection must not count as a writer acquisition either"
         );
     }
 
@@ -2749,12 +2949,15 @@ mod tests {
                 .unwrap();
         }
 
+        let conn = checkpoint_conn(&pool);
         let start = std::time::Instant::now();
         checkpoint_once(
             &pool,
+            &conn,
             &CheckpointConfig::default(),
             &mut TruncateState::default(),
-        );
+        )
+        .expect("checkpoint_once must succeed against a healthy dedicated connection");
         let elapsed = start.elapsed();
 
         // Commit and release the read snapshot only after checkpoint_once returns.
@@ -2992,8 +3195,9 @@ mod tests {
             "precondition: no attempt has run yet"
         );
 
-        let tick = checkpoint_once(&pool, &config, &mut state);
-        assert!(matches!(tick, CheckpointTick::Observed(_)));
+        let conn = checkpoint_conn(&pool);
+        checkpoint_once(&pool, &conn, &config, &mut state)
+            .expect("checkpoint_once must succeed against a healthy dedicated connection");
         assert!(
             state.last_attempt.is_some(),
             "an attempt must be stamped once the high-water threshold is crossed"
@@ -3026,7 +3230,9 @@ mod tests {
         };
         let mut state = TruncateState::default();
 
-        checkpoint_once(&pool, &config, &mut state);
+        let conn = checkpoint_conn(&pool);
+        checkpoint_once(&pool, &conn, &config, &mut state)
+            .expect("checkpoint_once must succeed against a healthy dedicated connection");
 
         assert!(
             state.last_attempt.is_none(),
@@ -3060,14 +3266,18 @@ mod tests {
             ..CheckpointConfig::default()
         };
         let mut state = TruncateState::default();
+        let conn = checkpoint_conn(&pool);
 
-        checkpoint_once(&pool, &config, &mut state);
+        checkpoint_once(&pool, &conn, &config, &mut state)
+            .expect("checkpoint_once must succeed against a healthy dedicated connection");
         let first_attempt = state.last_attempt.expect("first tick must attempt");
 
-        // Second tick, immediately after: still above threshold, but the
-        // min-interval has clearly not elapsed — must skip and leave
-        // last_attempt exactly as it was.
-        checkpoint_once(&pool, &config, &mut state);
+        // Second tick, immediately after, on the SAME dedicated connection
+        // (mirroring how `run_checkpoint_task` reuses one connection across
+        // ticks): still above threshold, but the min-interval has clearly
+        // not elapsed — must skip and leave last_attempt exactly as it was.
+        checkpoint_once(&pool, &conn, &config, &mut state)
+            .expect("checkpoint_once must succeed against a healthy dedicated connection");
         let second_attempt = state.last_attempt.expect("attempt timestamp must persist");
 
         assert_eq!(
@@ -3076,15 +3286,20 @@ mod tests {
         );
     }
 
-    /// Busy fallback: when the writer mutex is already held, `checkpoint_once`
-    /// must return `Skipped` and never touch the TRUNCATE state at all — both
-    /// PASSIVE and any due TRUNCATE are skipped together (one writer checkout
-    /// per tick). Also asserts #646 checkpoint-pressure telemetry: a skipped
-    /// tick must bump the skipped/consecutive-skip counters and snapshot the
-    /// last-known WAL pressure.
+    /// The fix this module exists to prove: holding the POOL's writer mutex
+    /// (via `pool.try_writer()`, exactly like a concurrent write in
+    /// progress) must NOT cause `checkpoint_once` to skip — PASSIVE (and, if
+    /// armed, TRUNCATE) run on the task's own dedicated connection, which
+    /// never contends with the pool writer at all. Before the dedicated-
+    /// connection fix, this same setup made `checkpoint_once` return
+    /// `Skipped` via `try_writer_nowait()`. See also the standalone
+    /// integration reproducer in `tests/checkpoint_dedicated_connection.rs`,
+    /// which demonstrates the converse: a fat WAL held busy by
+    /// `checkpoint_once` no longer blocks a concurrent `pool.writer()`
+    /// admission either.
     #[test]
     #[serial(tx_registry, checkpoint_skip_metrics)]
-    fn busy_writer_skips_both_passive_and_truncate() {
+    fn checkpoint_once_proceeds_and_can_attempt_truncate_while_pool_writer_held() {
         reset_checkpoint_metrics_for_tests();
 
         let dir = tempfile::tempdir().unwrap();
@@ -3101,22 +3316,11 @@ mod tests {
                 .unwrap();
         }
 
-        // An observed tick first, so the skip below has a last-known WAL
-        // pressure snapshot to carry forward.
-        let mut warmup_state = TruncateState::default();
-        let warmup_tick = checkpoint_once(&pool, &CheckpointConfig::default(), &mut warmup_state);
-        let observed_pages = match warmup_tick {
-            CheckpointTick::Observed(n) => n,
-            CheckpointTick::Skipped => panic!("warmup tick must observe, not skip"),
-        };
-        assert_eq!(
-            checkpoint_consecutive_skips(),
-            0,
-            "an observed tick must not itself count as a skip"
-        );
+        let conn = checkpoint_conn(&pool);
 
-        // Hold the writer mutex for the duration of the checkpoint_once call so
-        // try_writer_nowait() fails, exactly like a concurrent write in progress.
+        // Hold the POOL's writer mutex for the duration of the checkpoint_once
+        // call, acquired BEFORE the call so the dedicated connection cannot
+        // possibly race a still-free writer.
         let _held = pool.try_writer().unwrap();
 
         let config = CheckpointConfig {
@@ -3125,33 +3329,25 @@ mod tests {
         };
         let mut state = TruncateState::default();
 
-        let tick = checkpoint_once(&pool, &config, &mut state);
-
-        assert_eq!(
-            tick,
-            CheckpointTick::Skipped,
-            "a busy writer must skip the tick entirely"
+        checkpoint_once(&pool, &conn, &config, &mut state).expect(
+            "checkpoint_once must observe normally on its own dedicated connection even \
+             while a concurrent caller holds the pool's writer mutex",
         );
+
         assert!(
-            state.last_attempt.is_none(),
-            "a skipped tick (writer busy) must never stamp last_attempt, \
-             even with a threshold that would otherwise arm immediately"
+            state.last_attempt.is_some(),
+            "a threshold-armed tick must still evaluate (and attempt) TRUNCATE even while \
+             the pool writer is held — the dedicated connection is unaffected by it"
         );
-
         assert_eq!(
             checkpoint_skipped_ticks(),
-            1,
-            "one skipped tick must bump the lifetime skipped-tick counter"
+            0,
+            "a busy pool writer must no longer count as a skipped checkpoint tick"
         );
         assert_eq!(
             checkpoint_consecutive_skips(),
-            1,
-            "one skipped tick must bump the consecutive-skip run length"
-        );
-        assert_eq!(
-            checkpoint_last_skip_wal_pages(),
-            Some(observed_pages),
-            "the skip must snapshot the last-observed WAL pressure"
+            0,
+            "a busy pool writer must not bump the consecutive-skip run length"
         );
     }
 
@@ -3228,9 +3424,14 @@ mod tests {
         );
     }
 
-    /// Observation branch: a checkpoint tick that is actually observed (writer
-    /// free) must close out a prior skip streak, resetting the
-    /// consecutive-skip counter to 0 without touching the lifetime total.
+    /// Observation branch: a checkpoint tick that is actually observed
+    /// (dedicated connection available) must close out a prior skip streak,
+    /// resetting the consecutive-skip counter to 0 without touching the
+    /// lifetime total. Drives `note_checkpoint_skipped()` directly for the
+    /// skipped ticks — exactly what `run_checkpoint_task` calls when
+    /// `CheckpointConnection::ensure_open` returns `None` — rather than
+    /// through pool-writer contention, which (since the dedicated-connection
+    /// fix) no longer produces a skipped tick at all.
     #[test]
     #[serial(tx_registry, checkpoint_skip_metrics)]
     fn observed_tick_resets_consecutive_skips_but_not_lifetime_total() {
@@ -3250,22 +3451,18 @@ mod tests {
                 .unwrap();
         }
 
-        // Two consecutive skipped ticks.
-        {
-            let _held = pool.try_writer().unwrap();
-            let mut state = TruncateState::default();
-            for _ in 0..2 {
-                let tick = checkpoint_once(&pool, &CheckpointConfig::default(), &mut state);
-                assert_eq!(tick, CheckpointTick::Skipped);
-            }
-        }
+        // Two consecutive skipped ticks (dedicated connection unavailable).
+        note_checkpoint_skipped();
+        note_checkpoint_skipped();
         assert_eq!(checkpoint_skipped_ticks(), 2);
         assert_eq!(checkpoint_consecutive_skips(), 2);
 
-        // Now the writer is free: an observed tick must reset the streak.
+        // Now the dedicated connection is available: an observed tick must
+        // reset the streak.
+        let conn = checkpoint_conn(&pool);
         let mut state = TruncateState::default();
-        let tick = checkpoint_once(&pool, &CheckpointConfig::default(), &mut state);
-        assert!(matches!(tick, CheckpointTick::Observed(_)));
+        checkpoint_once(&pool, &conn, &CheckpointConfig::default(), &mut state)
+            .expect("checkpoint_once must succeed against a healthy dedicated connection");
 
         assert_eq!(
             checkpoint_skipped_ticks(),
@@ -3846,11 +4043,9 @@ mod tests {
             }
         }
 
-        let tick = checkpoint_once(&pool, &config, &mut TruncateState::default());
-        let wal_pages = match tick {
-            CheckpointTick::Observed(n) => n,
-            CheckpointTick::Skipped => panic!("writer must not be busy in this test"),
-        };
+        let conn = checkpoint_conn(&pool);
+        let wal_pages = checkpoint_once(&pool, &conn, &config, &mut TruncateState::default())
+            .expect("checkpoint_once must succeed against a healthy dedicated connection");
         assert!(
             wal_pages >= config.high_water_pages,
             "test setup must actually drive wal_pages ({wal_pages}) past high_water_pages \
@@ -4519,28 +4714,51 @@ mod tests {
         );
     }
 
-    /// (3) High-finding regression: a writer-busy tick must NOT silence the
-    /// age sweep. Holds the pool's writer mutex (via `pool.try_writer()`,
-    /// never released for the task's entire run) across several checkpoint
-    /// intervals alongside a stale registered entry, and asserts the age
-    /// alert still fires even though `checkpoint_once` observes
-    /// `CheckpointTick::Skipped` on every single tick. Before the fix, the
-    /// sweep call sat after the `Skipped` early-continue and never ran here.
+    /// (3) High-finding regression: a Skipped tick must NOT silence the age
+    /// sweep. Since the dedicated-connection fix, holding the pool's writer
+    /// mutex no longer produces a Skipped tick at all (see
+    /// `checkpoint_once_proceeds_and_can_attempt_truncate_while_pool_writer_held`),
+    /// so this drives Skipped the way it now actually happens in production:
+    /// a read-only pool, on which `ConnectionPool::open_standalone_writer`
+    /// always fails, so `CheckpointConnection::ensure_open` can never open a
+    /// dedicated connection and every tick reports `Skipped`. Asserts the age
+    /// alert still fires across several such ticks alongside a stale
+    /// registered entry. Before the original fix (#845 predecessor), the
+    /// sweep call sat after the `Skipped` early-continue and never ran here;
+    /// this regression must keep holding under the new skip mechanism too.
     #[tokio::test]
     #[serial(tx_registry, checkpoint_skip_metrics)]
-    async fn checkpoint_task_sweeps_stale_entry_even_when_writer_is_busy_every_tick() {
+    async fn checkpoint_task_sweeps_stale_entry_even_when_dedicated_connection_is_unavailable_every_tick(
+    ) {
         reset_checkpoint_metrics_for_tests();
 
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("tx_age_sweep_task_writer_busy.db");
-        let pool = file_pool(&path);
+        let path = dir.path().join("tx_age_sweep_task_conn_unavailable.db");
         {
-            let writer = pool.try_writer().unwrap();
+            // Seed the schema with an ordinary read-write pool, then drop it
+            // (releasing its connections) before reopening the same file
+            // read-only below.
+            let seed_pool = file_pool(&path);
+            let writer = seed_pool.try_writer().unwrap();
             writer
                 .conn()
                 .execute_batch("CREATE TABLE IF NOT EXISTS t (x INTEGER);")
                 .unwrap();
         }
+
+        let pool = Arc::new(
+            ConnectionPool::new(PoolConfig {
+                path: Some(path.clone()),
+                read_only: true,
+                ..PoolConfig::default()
+            })
+            .expect("read-only pool open"),
+        );
+        assert!(
+            pool.open_standalone_writer().is_err(),
+            "test precondition: a read-only pool must never be able to open a dedicated \
+             checkpoint connection"
+        );
 
         let buffer = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let subscriber = CaptureSubscriber {
@@ -4549,13 +4767,8 @@ mod tests {
         let _tracing_guard = tracing::subscriber::set_default(subscriber);
 
         let _tx_handle = khive_storage::tx_registry::register(Some(
-            "checkpoint_task_writer_busy_sweep_test".to_string(),
+            "checkpoint_task_conn_unavailable_sweep_test".to_string(),
         ));
-
-        // Held for the checkpoint task's entire run, acquired BEFORE spawn
-        // (and with no `.await` in between) so the task cannot possibly
-        // observe a free writer on any tick.
-        let _writer_guard = pool.try_writer().expect("acquire writer for busy hold");
 
         let cfg = CheckpointConfig {
             interval: Duration::from_millis(10),
@@ -4573,9 +4786,9 @@ mod tests {
             true,
         ));
 
-        // Wait until the task has actually recorded a writer-busy Skipped
-        // tick rather than sleeping a fixed real-time budget: each tick also
-        // does registry queries and sidecar filesystem writes, so under
+        // Wait until the task has actually recorded a Skipped tick rather
+        // than sleeping a fixed real-time budget: each tick also does
+        // registry queries and sidecar filesystem writes, so under
         // instrumented (coverage) or loaded runners a fixed sleep races the
         // first completed tick. Bounded, fail-loud.
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
@@ -4591,7 +4804,7 @@ mod tests {
         loop {
             let events = buffer.lock().unwrap().clone();
             if events.iter().any(|e| {
-                e.tx_label.as_deref() == Some("checkpoint_task_writer_busy_sweep_test")
+                e.tx_label.as_deref() == Some("checkpoint_task_conn_unavailable_sweep_test")
                     && e.message
                         .as_deref()
                         .is_some_and(|m| m.contains("stale-op cap"))
@@ -4600,8 +4813,8 @@ mod tests {
             }
             assert!(
                 tokio::time::Instant::now() < deadline,
-                "expected the age sweep to fire even though every tick's writer checkout \
-                 was skipped within 10s, got: {events:?}"
+                "expected the age sweep to fire even though every tick's dedicated \
+                 connection was unavailable within 10s, got: {events:?}"
             );
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
@@ -4611,8 +4824,6 @@ mod tests {
             .await
             .expect("checkpoint task should exit within 1s")
             .expect("checkpoint task panicked");
-
-        drop(_writer_guard);
         drop(_tx_handle);
     }
 

@@ -35,3 +35,22 @@ If `TASK_SCAN_MAX_ROWS + 1` rows come back, the function returns
 callers must narrow the filters (e.g. add an `assignee` filter) so the
 result set stays complete rather than silently dropping matching tasks past
 the row cap.
+
+## Dependency diagnostics
+
+Every task returned by `gtd.tasks` carries `dependency_state`, `actionable`,
+and `blocked_by`. A dependency state is `ready` when every blocker is done,
+`blocked` when at least one live blocker is still pending, and `broken` when a
+blocker is cancelled, soft-deleted, missing after hard deletion, malformed, or
+no longer a compatible task. Each `blocked_by` entry names the blocker id and
+its structural state, so a task does not remain an unexplained plain `next`
+record after its blocker becomes terminal or disappears.
+
+`gtd.next` remains actionable-only by default. Set `include_blocked=true` to
+include blocked and broken `next`/`active` tasks in the same array; ready work
+sorts first, and every returned task's `actionable` field distinguishes work
+that can be scheduled from dependency diagnostics.
+
+The query path batches live blocker reads and probes only unresolved ids for a
+soft-deleted row. A hard-deleted blocker therefore classifies as `missing`,
+while a tombstone classifies as `soft_deleted` without resurrecting it.

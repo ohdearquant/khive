@@ -121,6 +121,14 @@ It runs, in order:
    update whose embedding input was bounded carries the same per-result `warnings` advisory as
    the canonical non-atomic handler.
 
+Before prepare, the atomic runtime installs the same aggregate pack edge rules as canonical
+server startup. After each task-note `update` or dependency `link` plan is built, the boundary
+also invokes `VerbRegistry`'s shared `KindHook` validator for typed parity with canonical KG
+dispatch. Since every plan is still prepared before any write, core migration V15 supplies the
+transaction-time task dependency cycle triggers: a later statement sees earlier writes in the
+unit, and a trigger error rolls the entire unit back. The same triggers serialize opposite
+concurrent writers, while leaving unrelated notes and edge relations untouched.
+
 **Verbs without a prepare implementation.** `propose`/`review`/`withdraw` are listed in
 `khive_types::pack::ATOMIC_ADMISSIBLE_VERBS` (ADR-099 D3 intends them to eventually gain a
 seam) but have none yet; the B3 fix rejects them at the same pre-runtime

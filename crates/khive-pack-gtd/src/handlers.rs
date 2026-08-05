@@ -177,6 +177,8 @@ struct NextParams {
     limit: Option<u32>,
     #[serde(default)]
     assignee: Option<String>,
+    #[serde(default)]
+    include_blocked: Option<bool>,
 }
 
 /// `handle_complete`'s deserialization target. `pub` with private fields:
@@ -897,98 +899,34 @@ impl GtdPack {
         }
         let notes = fetch_all_matching_tasks(self.runtime(), token, property_filters).await?;
 
-        // Build a quick lookup map of task UUID → GTD status so dependency
-        // filtering can check blocker states in O(1). Every
-        // note here already passed the actionable(+assignee) SQL filter above
-        // (and `deleted_at IS NULL`, enforced unconditionally by
-        // `query_notes_filtered`).
-        use std::collections::HashMap;
-        let mut status_by_id: HashMap<uuid::Uuid, String> = notes
+        let diagnostics = crate::dependency::diagnose_tasks(self.runtime(), token, &notes).await?;
+        let include_blocked = p.include_blocked.unwrap_or(false);
+        let mut actionable: Vec<_> = notes
             .iter()
-            .map(|n| (n.id, task_status(n.properties.as_ref())))
-            .collect();
-
-        let candidates: Vec<&khive_storage::note::Note> = notes.iter().collect();
-
-        // Gather all dependency UUIDs referenced by candidates that are not
-        // already in status_by_id — these are blockers whose status isn't
-        // `next`/`active` (the common case: a `done` blocker).  Fetch them in
-        // one batch so the dependency filter below can evaluate their status
-        // correctly regardless of scan-page position.
-        let missing_dep_ids: Vec<uuid::Uuid> = candidates
-            .iter()
-            .flat_map(|n| {
-                n.properties
-                    .as_ref()
-                    .and_then(|p| p.get("depends_on"))
-                    .and_then(|v| v.as_array())
-                    .map(|arr| {
-                        arr.iter()
-                            .filter_map(|v| uuid::Uuid::parse_str(v.as_str().unwrap_or("")).ok())
-                            .collect::<Vec<_>>()
-                    })
-                    .unwrap_or_default()
-            })
-            .filter(|id| !status_by_id.contains_key(id))
-            .collect();
-
-        if !missing_dep_ids.is_empty() {
-            let ns = token.namespace().as_str();
-            let fetched = self
-                .runtime()
-                .notes(token)?
-                .get_notes_batch(&missing_dep_ids)
-                .await
-                .map_err(|e| RuntimeError::Internal(format!("get_notes_batch: {e}")))?;
-            for n in fetched {
-                // Enforce namespace isolation: ignore notes from other tenants.
-                if n.namespace == ns {
-                    status_by_id.insert(n.id, task_status(n.properties.as_ref()));
-                }
-            }
-        }
-
-        // exclude tasks whose `depends_on` contains any
-        // blocker that is NOT in the `done` terminal state.
-        // Dangling UUIDs (not found in status_by_id even after batch fetch)
-        // are treated as incomplete (blocker unknown = not done → keep blocked).
-        let mut actionable: Vec<&khive_storage::note::Note> = candidates
-            .into_iter()
-            .filter(|n| {
-                let deps = n
-                    .properties
-                    .as_ref()
-                    .and_then(|p| p.get("depends_on"))
-                    .and_then(|v| v.as_array());
-                match deps {
-                    None => true, // no dependencies → not blocked
-                    Some(arr) if arr.is_empty() => true,
-                    Some(arr) => arr.iter().all(|dep| {
-                        let dep_str = dep.as_str().unwrap_or("");
-                        let dep_uuid = uuid::Uuid::parse_str(dep_str).ok();
-                        match dep_uuid.and_then(|id| status_by_id.get(&id)) {
-                            Some(s) => s == "done",
-                            // Dep not found or non-UUID → treat as blocked.
-                            None => false,
-                        }
-                    }),
-                }
-            })
+            .zip(diagnostics)
+            .filter(|(_, diagnostic)| include_blocked || diagnostic.is_ready())
             .collect();
 
         // Sort: priority ascending (p0 first), then created_at descending (recent first),
         // then UUID ascending as a deterministic tie-breaker for equal-priority equal-timestamp
         // tasks so callers always observe a stable ordering.
-        actionable.sort_by(|a, b| {
+        actionable.sort_by(|(a, a_diagnostic), (b, b_diagnostic)| {
+            let a_blocked = !a_diagnostic.is_ready();
+            let b_blocked = !b_diagnostic.is_ready();
             let ap = priority_rank(a.properties.as_ref());
             let bp = priority_rank(b.properties.as_ref());
-            ap.cmp(&bp)
+            a_blocked
+                .cmp(&b_blocked)
+                .then(ap.cmp(&bp))
                 .then(b.created_at.cmp(&a.created_at))
                 .then(a.id.cmp(&b.id))
         });
         actionable.truncate(limit as usize);
 
-        let result: Vec<Value> = actionable.iter().map(|n| render_task(n)).collect();
+        let result: Vec<Value> = actionable
+            .iter()
+            .map(|(note, diagnostic)| diagnostic.render(note))
+            .collect();
         Ok(Value::Array(result))
     }
 
@@ -1209,7 +1147,14 @@ impl GtdPack {
             .await
             .map_err(|e| RuntimeError::Internal(format!("query_notes_filtered: {e}")))?;
 
-        let result: Vec<Value> = page.items.iter().map(render_task).collect();
+        let diagnostics =
+            crate::dependency::diagnose_tasks(self.runtime(), token, &page.items).await?;
+        let result: Vec<Value> = page
+            .items
+            .iter()
+            .zip(diagnostics.iter())
+            .map(|(note, diagnostic)| diagnostic.render(note))
+            .collect();
 
         // #96: a bare `[]` is indistinguishable from "no such task" when the
         // *default* terminal-status exclusion is what emptied the result —

@@ -3,6 +3,7 @@
 //! Adds the `task` note kind and five verbs (`assign`, `next`, `complete`, `tasks`,
 //! `transition`) with GTD lifecycle semantics over the notes substrate.
 
+pub(crate) mod dependency;
 pub mod handlers;
 pub mod hook;
 mod pack;

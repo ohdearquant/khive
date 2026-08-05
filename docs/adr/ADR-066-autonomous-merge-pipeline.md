@@ -4,7 +4,7 @@
 **Date**: 2026-06-23 (revised; original 2026-06-22)
 **Supersedes**: ADR-066 draft dated 2026-06-22 (two-lane model with CODEOWNERS hold)
 **Relates to**: CI workflow (`.github/workflows/ci.yml`, `.github/workflows/release.yml`),
-`scripts/apply-autonomous-merge.sh`, repository ruleset 17362266
+repository ruleset 17362266
 
 ---
 
@@ -49,10 +49,13 @@ A non-automatable floor (section 4) is never delegated to automation.
 
 ### 1. Required gate wall (required status checks)
 
-Branch protection on `main` (ruleset 17362266) requires all of the following status contexts.
-Context strings are matched by exact name; the canonical list lives in
-`scripts/apply-autonomous-merge.sh`, which is the source of truth for the exact strings and
-must be kept in sync with this ADR.
+Branch protection on `main` (ruleset 17362266) is what makes the gates below blocking. Context
+strings are matched by exact name, and the ruleset itself is the source of truth for them: read
+it with `gh api repos/<owner>/<repo>/rulesets/17362266`. The ruleset requires two contexts,
+`Secret scan (gitleaks)` and `CI gate`. `CI gate` is an aggregate job defined in
+`.github/workflows/ci.yml`; it runs `if: always()` over a `needs` list covering the other jobs,
+so it is skip-aware and a skipped dependency cannot silently satisfy protection. The individual
+gates named below are those dependencies rather than separately required contexts.
 
 Each gate in the wall replaces a category of defect that a human reviewer would otherwise be
 responsible for catching.
@@ -106,9 +109,10 @@ actually bumps and the check is green-able: the release gate (section 3).
   where they run. The `ann-ci-gate` job re-runs post-merge on every push to `main` as defense
   in depth.
 
-The full, authoritative context list and the exact strings used in the ruleset are maintained in
-`scripts/apply-autonomous-merge.sh`. When a new gate is introduced and its context name is
-established, that script is updated first, and this ADR's prose is updated to match.
+The authoritative list is the ruleset itself for the required context strings, and the `needs`
+list of the `CI gate` job in `.github/workflows/ci.yml` for the gates behind the aggregate. When
+a new gate is introduced it is added to that `needs` list, and this ADR's prose is updated to
+match; the required context set changes only if the new gate is also to be required directly.
 
 ### 2. Auto-merge mechanics
 
@@ -142,6 +146,24 @@ The gate-defining path routing in section 3 documents this risk and the structur
 ### 3. Release gate (human approval on publish)
 
 Merging to `main` is not a release. Publishing is a separate step, gated on human approval.
+
+> **Implementation status (2026-08-04): this gate is not in force.** The `publish` environment
+> exists but carries no protection rules and no deployment-branch policy. Read it with
+> `gh api repos/<owner>/<repo>/environments/publish --jq '{protection_rules, deployment_branch_policy}'`;
+> it returns an empty rule list and a null policy. The environment auto-created unprotected on
+> first use, and step 2 of the activation order below, which adds the required reviewer and
+> validates that the gate fires, was never completed.
+>
+> Everything in this section describing a required reviewer, a pinned deployment-branch policy,
+> or a human approving each deployment describes the intended design, not the current state.
+> The same applies to the backstop claim later in this section and to the publishing bullet
+> under Consequences.
+>
+> What is actually true today: `release.yml` triggers only on `workflow_dispatch`, so there is
+> no tag-push publish path, and the reachable exposure is that an actor with write access can
+> publish from any ref without a second person approving. Whether to activate the gate or to
+> amend this record to match how releases are actually run is an open decision; this note states
+> the measured state and does not settle it.
 
 `release.yml` triggers only on `workflow_dispatch` (the `v*` tag-push trigger was removed in
 #222). It builds platform binaries and publishes the npm packages; the crates.io library publish is the separate
@@ -226,8 +248,9 @@ These properties are enforced at all times and are never relaxed:
   change after a dependent change has landed can break the build. The dependency chain is
   foundation to platform to features. Post-merge monitoring and fast revert discipline are the
   operational backstops.
-- Publishing stays human-gated. The npm release is held by the `publish` environment's required
-  reviewer (section 3); the crates.io library publish is a maintainer-run `make publish` with no
+- Publishing is intended to stay human-gated, held by the `publish` environment's required
+  reviewer (section 3). That protection is not currently configured; see the implementation-status
+  note in section 3. the crates.io library publish is a maintainer-run `make publish` with no
   autonomous CI path. A published version cannot be unpublished after the registry retains it.
 
 ## Activation order

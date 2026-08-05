@@ -42,3 +42,11 @@ The pack depends on `kg`, registers the finding hook and vocabulary, and contrib
 database. `findings.json` ingestion is an admin CLI path through `kkernel code-ingest`, not an
 MCP operation. Unknown dispatch attempts fail
 with `RuntimeError::InvalidInput` rather than silently succeeding.
+
+The dedicated map is an ordinary khive database, not a private code-pack format. Every
+non-blocked entity upsert also updates its FTS document, and `code.ingest` reports the completed
+count as `fts_indexed`; a failed FTS write fails the ingest instead of returning an unqualified
+success for an unsearchable map. Point a normal `kkernel` process at the map through a
+`[[backends]]` entry in a selected config to use generic KG reads such as `search`, `resolve`,
+`neighbors`, `traverse`, and `context`. `kkernel code-audit` remains the separate policy-driven,
+read-only report surface for the same database.

@@ -9,7 +9,7 @@ over the notes substrate.
 | Verb             | What it does                                                                  |
 | ---------------- | ----------------------------------------------------------------------------- |
 | `gtd.assign`     | Create a task (note with `kind=task`); defaults `status=inbox`, `priority=p2` |
-| `gtd.next`       | List actionable tasks (`status` in `next`/`active`), priority-sorted          |
+| `gtd.next`       | List actionable tasks; optionally include blocked/broken dependency states    |
 | `gtd.complete`   | Mark a task `done` (or `cancelled`) with an optional result note              |
 | `gtd.tasks`      | Filtered task listing by status, assignee, priority                           |
 | `gtd.transition` | Explicit lifecycle change, validated against the state machine below          |
@@ -45,7 +45,10 @@ The pack also extends the base `depends_on` edge endpoint contract
 ([ADR-002](https://github.com/ohdearquant/khive/blob/main/docs/adr/ADR-002-edge-ontology.md))
 to allow `task`→`task` edges (`GTD_EDGE_RULES`), so task blockers are
 graph-traversable even though the base contract restricts `depends_on` to
-entity→entity.
+entity→entity. Dependency writes reject direct and transitive cycles. Task query
+results include `dependency_state`, `actionable`, and structural `blocked_by`
+diagnostics; `gtd.next(include_blocked=true)` includes blocked or broken candidates
+after ready work for triage.
 
 ## Usage
 

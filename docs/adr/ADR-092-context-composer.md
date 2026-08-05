@@ -228,9 +228,10 @@ the least-event-volume design that still gives ADR-081 per-target — and theref
 
 **Feedback path.** The response lists every slice with `{id, source_pack, score_semantics}` and the
 assembly-level `served_by_profile_id`, so the caller (or the ADR-081 out-of-band scorer) emits
-`brain.auto_feedback(query=…, results=[{id}], served_by_profile_id=…)` per served target — the
-existing recall→auto_feedback pattern, unchanged (`brain.auto_feedback` credits the first object's id
-per call, so this means one call per slice id, not a batch call).
+`brain.auto_feedback(query=…, results=[{id}], target_id=id, signal=…,
+served_by_profile_id=…)` per judged target. Automatic feedback never derives utility from rank:
+omitting `signal` abstains, and a supplied signal must identify exactly one result (#1588). This
+still means one call per judged slice id, not a batch call.
 
 **Reject one-record-per-slice as a separate design axis.** It is in fact what the ledger schema
 requires (one row per target); what this ADR avoids multiplying is the _dispatch_, not the row: one

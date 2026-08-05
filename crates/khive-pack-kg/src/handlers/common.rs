@@ -443,26 +443,17 @@ pub(crate) fn valid_relations_for_entity_pair(
     tgt_kind: &str,
     tgt_entity_type: Option<&str>,
 ) -> Vec<&'static str> {
-    let mut relations: Vec<&'static str> = khive_runtime::operations::base_entity_endpoint_rules()
-        .iter()
-        .filter(|(src, _rel, tgt)| (*src == "*" || *src == src_kind) && *tgt == tgt_kind)
-        .map(|(_src, rel, _tgt)| rel.as_str())
-        .collect();
-
     let pack_rules = runtime.pack_edge_rules();
-    for rel in khive_runtime::operations::accepted_pack_relations_for_entities(
+    khive_runtime::operations::accepted_entity_relations_for_entities(
         &pack_rules,
         src_kind,
         src_entity_type,
         tgt_kind,
         tgt_entity_type,
-    ) {
-        relations.push(rel.as_str());
-    }
-
-    relations.sort_unstable();
-    relations.dedup();
-    relations
+    )
+    .into_iter()
+    .map(|relation| relation.as_str())
+    .collect()
 }
 
 pub(crate) async fn enrich_allowlist_error(

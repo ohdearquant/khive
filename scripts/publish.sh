@@ -53,8 +53,8 @@ CRATES=(
     khive-vamana
     khive-fold
     khive-storage
+    khive-text          # khive-bm25 depends on it (normal dep); the old dev-dep cycle is gone
     khive-bm25
-    khive-text          # dev-dep on khive-bm25 (versioned), so publish after it
     khive-fusion
     khive-db
     khive-hnsw

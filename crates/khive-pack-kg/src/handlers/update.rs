@@ -221,13 +221,13 @@ impl KgPack {
                     .get_note(id)
                     .await
                     .map_err(RuntimeError::Storage)?;
-                if note
-                    .as_ref()
-                    .is_none_or(|n| specific.as_ref().is_some_and(|k| n.kind != *k))
-                {
+                let Some(note) = note else {
+                    return Err(RuntimeError::NotFound(format!("note {}", p.id)));
+                };
+                if specific.as_ref().is_some_and(|kind| note.kind != *kind) {
                     return Err(RuntimeError::NotFound(format!("note {}", p.id)));
                 }
-                if note.as_ref().is_some_and(|n| n.kind == "scheduled_event") {
+                if note.kind == "scheduled_event" {
                     return Err(RuntimeError::InvalidInput(
                         "scheduled_event notes are not editable via `update` — their creator \
                          identity and action payload are a trust boundary for replay dispatch; \
@@ -235,6 +235,9 @@ impl KgPack {
                             .into(),
                     ));
                 }
+                registry
+                    .validate_note_update_hook(&self.runtime, token, &note, p.properties.as_ref())
+                    .await?;
                 let patch = NotePatch::new(
                     optional_string_patch(p.name, "name")?,
                     p.content,
