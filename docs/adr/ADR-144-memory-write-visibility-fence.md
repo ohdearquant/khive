@@ -14,7 +14,7 @@ model source before fusion. That merge is deliberately silent — a result list
 can contain both ANN-served and exactly-scored hits with no per-hit marker, and
 nothing in the response distinguishes them.
 
-What the surface does not offer is any way for a caller to *prove* that a
+What the surface does not offer is any way for a caller to _prove_ that a
 specific write is visible to a subsequent recall:
 
 - `memory.remember` returns `id`, `kind`, `salience`, `decay_factor`,
