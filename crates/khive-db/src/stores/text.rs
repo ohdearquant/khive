@@ -44,7 +44,7 @@ fn refuse_direct_route_if_strict(
                 .into(),
         });
     }
-    if pool.config().write_queue_enabled.unwrap_or(false) && pool.config().path.is_some() {
+    if pool.write_queue_active() {
         // In-memory pools never spawn a writer task by documented design
         // (explicit `Some(true)` degrades), so a violation row there would
         // be noise, not signal.

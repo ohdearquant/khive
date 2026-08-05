@@ -387,10 +387,56 @@ where
     // out (success or error); dropping the runtime here closes the queue.
     // Then await the task's exit with a bounded, loud timeout — on BOTH
     // paths, so an early error return cannot leave the file still moving.
-    let writer_join = runtime.backend().pool().take_writer_task_join();
+    let writer_join = take_writer_task_join_or_warn(runtime.backend().pool());
     drop(runtime);
+
+    settle_writer_drain(ingest_result, writer_join, WRITER_DRAIN_TIMEOUT).await
+}
+
+/// Take the pool's writer-task JoinHandle for the drain, warning loudly when
+/// the pool is file-backed with the write queue resolved ON but no handle is
+/// available at take time.
+///
+/// Absence has two causes: (1) the writer task never spawned during this
+/// ingest — no queue-routed write ever touched the pool (e.g. an all-skipped
+/// re-ingest), or spawn degraded with its own logged warning — in which case
+/// there is nothing to drain; or (2) a double drain: `take_writer_task_join`
+/// is one-shot (pool.rs), so another caller already took ownership of the
+/// task-exit await, and this call's "return implies settled" contract now
+/// rides on THAT drain instead of its own. Either way this call does not
+/// await the task's exit itself — say so loudly rather than silently
+/// skipping the drain.
+fn take_writer_task_join_or_warn(
+    pool: &khive_db::ConnectionPool,
+) -> Option<tokio::task::JoinHandle<()>> {
+    let writer_join = pool.take_writer_task_join();
+    if writer_join.is_none() && pool.write_queue_active() {
+        tracing::warn!(
+            "writer-task JoinHandle absent on a file-backed, write-queue-enabled pool \
+             (already taken by another drain owner, or the task never spawned); \
+             'return implies settled' is not enforced by this call"
+        );
+    }
+    writer_join
+}
+
+/// Await the taken writer-task JoinHandle and reconcile the drain outcome
+/// with the ingest outcome — the "return implies settled" contract's
+/// enforcement point (extracted from `code_ingest_batch_with_runtime_setup`
+/// so each outcome arm is unit-testable with a synthetic handle).
+///
+/// `timeout` bounds the drain wait (production passes [`WRITER_DRAIN_TIMEOUT`]).
+/// Returns the ingest result unchanged on a clean drain, and — when the
+/// ingest itself failed — also unchanged on a drain problem (the ingest error
+/// is primary; a drain problem is logged, never masks it). Bails when the
+/// ingest succeeded but the drain did not settle.
+async fn settle_writer_drain(
+    ingest_result: Result<CodeIngestReport>,
+    writer_join: Option<tokio::task::JoinHandle<()>>,
+    timeout: std::time::Duration,
+) -> Result<CodeIngestReport> {
     if let Some(join) = writer_join {
-        let drained = tokio::time::timeout(WRITER_DRAIN_TIMEOUT, join).await;
+        let drained = tokio::time::timeout(timeout, join).await;
         match (&ingest_result, drained) {
             (_, Ok(Ok(()))) => {}
             // The ingest itself failed: that error is the primary one. A
@@ -401,20 +447,26 @@ where
             }
             (Err(_), Err(_elapsed)) => {
                 tracing::warn!(
-                    timeout = ?WRITER_DRAIN_TIMEOUT,
+                    timeout = ?timeout,
                     "writer task did not drain after failed ingest; database file state may still be unsettled"
                 );
             }
             (Ok(_), Ok(Err(join_err))) => anyhow::bail!(
                 "writer task terminated abnormally after ingest completed: {join_err}"
             ),
+            // Pinned behavior (fail-loud is the deliberate choice): the ingest
+            // reported success, so some or all of its writes may already be in
+            // the file; we bail anyway because "return implies settled" cannot
+            // be proven until the writer task has exited. The JoinHandle is
+            // consumed by `timeout()` above, so the task DETACHES and keeps
+            // running after this bail — its close-time WAL checkpoint may
+            // still move the database bytes after this function returns.
             (Ok(_), Err(_elapsed)) => anyhow::bail!(
-                "writer task did not drain within {WRITER_DRAIN_TIMEOUT:?} after ingest; \
+                "writer task did not drain within {timeout:?} after ingest; \
                  database file state may still be unsettled"
             ),
         }
     }
-
     ingest_result
 }
 
@@ -1177,6 +1229,256 @@ mod tests {
              {:?}",
             report.truncation_by_model
         );
+    }
+
+    /// The drain-finalization matrix, tested through the extracted
+    /// `settle_writer_drain` with synthetic JoinHandles: the real writer
+    /// task never produces a join ERROR (every documented failure mode —
+    /// op panic, commit failure, poisoned connection — is caught inside the
+    /// request wrapper or exits the task normally; see writer_task.rs's
+    /// `run_writer_task`), and a real drain TIMEOUT would need to exceed the
+    /// 30s production bound, so those two success-path arms are not
+    /// constructible end-to-end with standing infra. The arms below pin the
+    /// contract the production drain relies on.
+    fn ok_report() -> CodeIngestReport {
+        CodeIngestReport {
+            dry_run: false,
+            ..CodeIngestReport::default()
+        }
+    }
+
+    /// 3(b): a join ERROR after a successful ingest surfaces as a bail whose
+    /// message names the writer task.
+    #[tokio::test]
+    async fn settle_writer_drain_join_error_after_success_bails_naming_writer_task() {
+        let join = tokio::spawn(async {
+            panic!("synthetic writer task explosion");
+        });
+        let err = settle_writer_drain(
+            Ok(ok_report()),
+            Some(join),
+            std::time::Duration::from_secs(5),
+        )
+        .await
+        .expect_err("a panicked writer task must fail the settled-file contract");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("writer task terminated abnormally after ingest completed"),
+            "the error must name the writer task: {msg}"
+        );
+    }
+
+    /// 3(c): a drain TIMEOUT after a successful ingest bails — pinning the
+    /// current fail-loud behavior (report discarded, JoinHandle consumed by
+    /// `timeout()` so the task detaches; see the bail-site doc comment).
+    #[tokio::test]
+    async fn settle_writer_drain_timeout_after_success_bails() {
+        let join = tokio::spawn(std::future::pending::<()>());
+        let err = settle_writer_drain(
+            Ok(ok_report()),
+            Some(join),
+            std::time::Duration::from_millis(50),
+        )
+        .await
+        .expect_err("an undrained writer task must fail the settled-file contract");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("did not drain within"),
+            "the error must name the drain timeout: {msg}"
+        );
+    }
+
+    /// 3(a) unit half: when the ingest itself failed, the PRIMARY ingest
+    /// error is what surfaces — a join error on the drain is logged, not
+    /// substituted.
+    #[tokio::test]
+    async fn settle_writer_drain_failed_ingest_error_survives_join_error() {
+        let join = tokio::spawn(async {
+            panic!("synthetic writer task explosion");
+        });
+        let primary: Result<CodeIngestReport> = Err(anyhow::anyhow!("primary ingest failure"));
+        let err = settle_writer_drain(primary, Some(join), std::time::Duration::from_secs(5))
+            .await
+            .expect_err("the primary ingest error must surface");
+        assert_eq!(err.to_string(), "primary ingest failure");
+    }
+
+    /// 3(a) unit half: same for a drain timeout on the failure path — the
+    /// ingest error is primary, the timeout is logged only.
+    #[tokio::test]
+    async fn settle_writer_drain_failed_ingest_error_survives_timeout() {
+        let join = tokio::spawn(std::future::pending::<()>());
+        let primary: Result<CodeIngestReport> = Err(anyhow::anyhow!("primary ingest failure"));
+        let err = settle_writer_drain(primary, Some(join), std::time::Duration::from_millis(50))
+            .await
+            .expect_err("the primary ingest error must surface");
+        assert_eq!(err.to_string(), "primary ingest failure");
+    }
+
+    /// Clean-drain passthrough: a settled task returns the report unchanged,
+    /// and a missing handle (queue off / never spawned) is a no-op.
+    #[tokio::test]
+    async fn settle_writer_drain_clean_passes_report_through() {
+        let join = tokio::spawn(async {});
+        let out = settle_writer_drain(
+            Ok(ok_report()),
+            Some(join),
+            std::time::Duration::from_secs(5),
+        )
+        .await
+        .expect("clean drain must pass the report through");
+        assert!(!out.dry_run);
+        let out = settle_writer_drain(Ok(ok_report()), None, std::time::Duration::from_secs(5))
+            .await
+            .expect("no handle means nothing to await");
+        assert!(!out.dry_run);
+    }
+
+    /// 2: the already-taken arm of `take_writer_task_join_or_warn` — a
+    /// file-backed, queue-enabled pool whose JoinHandle was already taken
+    /// must get `None` back AND a loud warning naming the contract gap.
+    #[serial]
+    #[tokio::test]
+    async fn take_writer_task_join_or_warn_already_taken_warns_loudly() {
+        // The helper reads the resolved config only, but the pool's
+        // `PoolConfig::default()` reads KHIVE_WRITE_QUEUE at construction, so
+        // pin the variable unset to get the file-backed queue-ON default.
+        let previous_write_queue = std::env::var_os("KHIVE_WRITE_QUEUE");
+        std::env::remove_var("KHIVE_WRITE_QUEUE");
+
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let pool = khive_db::ConnectionPool::new(khive_db::PoolConfig {
+            path: Some(dir.path().join("already_taken.db")),
+            ..khive_db::PoolConfig::default()
+        })
+        .expect("file-backed pool should open");
+        assert!(
+            pool.write_queue_active(),
+            "unset preference on a file-backed pool must resolve the queue ON"
+        );
+        pool.writer_task_handle()
+            .expect("runtime is present")
+            .expect("queue-ON file-backed pool must spawn");
+        let taken = pool
+            .take_writer_task_join()
+            .expect("the first take must return the handle");
+
+        // Capture the tracing output of the second (already-taken) attempt.
+        #[derive(Clone, Default)]
+        struct Capture(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Capture {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        struct MakeCapture(Capture);
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for MakeCapture {
+            type Writer = Capture;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.0.clone()
+            }
+        }
+        let capture = Capture::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(MakeCapture(capture.clone()))
+            .with_ansi(false)
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+        let second = take_writer_task_join_or_warn(&pool);
+        drop(guard);
+
+        assert!(
+            second.is_none(),
+            "the one-shot take must yield None once the handle is gone"
+        );
+        let log = String::from_utf8_lossy(&capture.0.lock().unwrap()).to_string();
+        assert!(
+            log.contains("JoinHandle absent"),
+            "the already-taken arm must warn loudly about the drain contract gap: {log}"
+        );
+
+        // Clean exit: await the taken handle (drop the pool first so the
+        // writer task's last handle clone goes and the task can exit).
+        drop(pool);
+        tokio::time::timeout(std::time::Duration::from_secs(5), taken)
+            .await
+            .expect("writer task must exit once every handle clone is dropped")
+            .expect("writer task must not panic");
+
+        match previous_write_queue {
+            Some(v) => std::env::set_var("KHIVE_WRITE_QUEUE", v),
+            None => std::env::remove_var("KHIVE_WRITE_QUEUE"),
+        }
+    }
+
+    /// 3(a) end-to-end half: a real ingest that fails mid-write still drains
+    /// the writer task before returning, and the PRIMARY ingest error — not
+    /// any drain outcome — is what surfaces. A `BEFORE INSERT` trigger on
+    /// `notes` is installed in `runtime_setup` so the entity writes land
+    /// (spawning the writer task) and the finding-note upsert then fails.
+    /// (A trigger, not `DROP TABLE`: `notes_for_namespace` re-runs
+    /// `ensure_notes_schema` on every store acquisition, which would silently
+    /// heal a dropped table — see crates/khive-db/src/backend.rs:229-230.)
+    #[serial]
+    #[tokio::test]
+    async fn code_ingest_failed_ingest_still_drains_and_surfaces_primary_error() {
+        let previous_write_queue = std::env::var_os("KHIVE_WRITE_QUEUE");
+        std::env::remove_var("KHIVE_WRITE_QUEUE");
+
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let findings = write_valid_findings(tmp.path());
+        let db = tmp.path().join("failed_ingest_drain.db");
+
+        let err =
+            code_ingest_batch_with_runtime_setup(base_args(findings, db.clone()), |runtime| {
+                // Sabotage AFTER migrations but BEFORE any store is acquired:
+                // entity writes succeed through the writer task, then the
+                // finding-note INSERT trips the trigger and fails the ingest.
+                let writer = runtime
+                    .backend()
+                    .pool()
+                    .try_writer()
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                writer
+                    .execute_batch(
+                        "CREATE TRIGGER code_ingest_test_block_notes \
+                     BEFORE INSERT ON notes \
+                     BEGIN SELECT RAISE(ABORT, 'synthetic notes insert failure'); END",
+                    )
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                Ok(())
+            })
+            .await
+            .expect_err("ingest into a trigger-blocked notes table must fail");
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains("synthetic notes insert failure"),
+            "the PRIMARY ingest error (the notes write) must surface, got: {msg}"
+        );
+        assert!(
+            !msg.contains("writer task did not drain")
+                && !msg.contains("writer task terminated abnormally"),
+            "a drain problem must not mask the primary ingest error: {msg}"
+        );
+
+        // Drain proof: every connection — the pool's and the writer task's —
+        // is closed by return time, so SQLite's last-close checkpoint has
+        // removed the WAL sidecar even though the ingest failed mid-batch.
+        assert!(
+            !wal_sidecar_path(&db).exists(),
+            "a failed ingest must still drain the writer task and settle the file"
+        );
+        assert!(!shm_sidecar_path(&db).exists());
+
+        match previous_write_queue {
+            Some(v) => std::env::set_var("KHIVE_WRITE_QUEUE", v),
+            None => std::env::remove_var("KHIVE_WRITE_QUEUE"),
+        }
     }
 
     /// Query the persisted `finding` note count for a scratch db, independent

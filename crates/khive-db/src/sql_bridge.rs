@@ -1075,10 +1075,7 @@ impl khive_storage::SqlAccess for SqlBridge {
                         .into(),
                 });
             }
-            if writer_task.is_none()
-                && self.pool.config().write_queue_enabled.unwrap_or(false)
-                && self.pool.config().path.is_some()
-            {
+            if writer_task.is_none() && self.pool.write_queue_active() {
                 // The queue is enabled but this call didn't get a handle
                 // (spawn/runtime degrade) — a direct-route violation in the
                 // making once this writer's execute*/query* methods run.
@@ -1150,10 +1147,7 @@ impl khive_storage::SqlAccess for SqlBridge {
                         .into(),
                 });
             }
-            if handle.is_none()
-                && self.pool.config().write_queue_enabled.unwrap_or(false)
-                && self.pool.config().path.is_some()
-            {
+            if handle.is_none() && self.pool.write_queue_active() {
                 crate::timeout_sink::emit_direct_route_violation(
                     &crate::timeout_sink::db_label(&self.pool),
                     crate::timeout_sink::Site::DirectRouteAtomicUnit,
