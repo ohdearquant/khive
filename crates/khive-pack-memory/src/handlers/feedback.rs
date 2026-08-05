@@ -753,4 +753,95 @@ mod tests {
             "tier-3 path must not produce an emitted key: {r:?}"
         );
     }
+
+    /// Brain-tier (route_to_brain): with an active bound profile, a braced,
+    /// uppercase target_id must be canonicalized to the lowercase dashed form
+    /// BEFORE the registry dispatch, and brain.feedback's ack must echo that
+    /// same canonical form — not the caller's spelling.
+    #[tokio::test]
+    async fn feedback_brain_tier_echoes_canonical_target_id() {
+        use khive_pack_brain::BrainPack;
+
+        let rt = build_full_rt(None);
+        let ns = Namespace::parse("local").expect("ns");
+        let token = rt.authorize(ns.clone()).expect("token");
+
+        let note_id = rt
+            .create_note_with_decay_for_embedding_model(
+                &token,
+                "memory",
+                None,
+                "brain-tier canonical ack note",
+                Some(0.7),
+                0.01,
+                None,
+                vec![],
+                None,
+            )
+            .await
+            .expect("create note");
+        let canonical = note_id.id.as_hyphenated().to_string();
+
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(KgPack::new(rt.clone()));
+        builder.register(crate::MemoryPack::new(rt.clone()));
+        builder.register(BrainPack::new(rt.clone()));
+        let registry = builder.build().expect("registry");
+
+        registry
+            .dispatch(
+                "brain.create_profile",
+                serde_json::json!({
+                    "namespace": ns.as_str(),
+                    "name": "canonical-ack-recall",
+                    "consumer_kind": "recall",
+                }),
+            )
+            .await
+            .expect("create profile");
+        registry
+            .dispatch(
+                "brain.activate",
+                serde_json::json!({
+                    "namespace": ns.as_str(),
+                    "profile_id": "canonical-ack-recall",
+                }),
+            )
+            .await
+            .expect("activate profile");
+        registry
+            .dispatch(
+                "brain.bind",
+                serde_json::json!({
+                    "namespace": ns.as_str(),
+                    "profile_id": "canonical-ack-recall",
+                    "consumer_kind": "recall",
+                }),
+            )
+            .await
+            .expect("bind profile");
+
+        // Braced + uppercase input must still be recognized as the full UUID.
+        let r = registry
+            .dispatch(
+                "memory.feedback",
+                serde_json::json!({
+                    "namespace": ns.as_str(),
+                    "target_id": format!("{{{}}}", canonical.to_uppercase()),
+                    "signal": "useful",
+                }),
+            )
+            .await
+            .expect("brain-tier feedback must succeed with a full-UUID variant");
+
+        assert_eq!(
+            r["emitted"], true,
+            "bound active profile must route feedback to the brain pack: {r:?}"
+        );
+        assert_eq!(
+            r["target_id"], canonical,
+            "the brain-tier ack must echo the canonical lowercase dashed UUID, \
+             not the braced/uppercase input"
+        );
+    }
 }

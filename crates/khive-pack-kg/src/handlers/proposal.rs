@@ -101,13 +101,24 @@ impl KgPack {
         khive_runtime::secret_gate::check_tags(&p.reviewers)?;
         khive_runtime::secret_gate::check_json(&p.changeset)?;
 
+        // Error-shape split: only identifier-validation failures carry the
+        // full-UUID hint (Id128 serde errors surface ParseIdError's "UUID"
+        // wording). Generic shape errors — missing field, wrong type, unknown
+        // variant, non-identifier parse failures — surface serde's own
+        // message so the hint never misleads a caller whose identifiers were
+        // already well-formed.
         let changeset: ProposalChangeset =
             serde_json::from_value(p.changeset.clone()).map_err(|e| {
-                RuntimeError::InvalidInput(format!(
-                    "invalid changeset: {e}; every changeset identifier must be a full UUID \
-                     because resolving a short prefix could miss, be ambiguous, or change the \
-                     proposal's stable intent"
-                ))
+                let serde_message = e.to_string();
+                if serde_message.contains("UUID") {
+                    RuntimeError::InvalidInput(format!(
+                        "invalid changeset: {serde_message}; every changeset identifier must be \
+                         a full UUID because resolving a short prefix could miss, be ambiguous, \
+                         or change the proposal's stable intent"
+                    ))
+                } else {
+                    RuntimeError::InvalidInput(format!("invalid changeset: {serde_message}"))
+                }
             })?;
         if has_multi_step_compound(&changeset) {
             return Err(RuntimeError::InvalidInput(

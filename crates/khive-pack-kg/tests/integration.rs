@@ -6765,6 +6765,60 @@ async fn propose_with_nonexistent_parent_id_returns_error() {
     );
 }
 
+/// Changeset error-shape split, identifier arm: a malformed identifier inside
+/// the changeset keeps the full-UUID resolution hint.
+#[tokio::test]
+async fn propose_changeset_bad_identifier_keeps_full_uuid_hint() {
+    let f = pack_with_events();
+    let err = f
+        .dispatch(
+            "propose",
+            json!({
+                "title": "identifier hint arm",
+                "description": "short-prefix identifier must carry the hint",
+                "changeset": {
+                    "kind": "update_entity",
+                    "id": "not-a-uuid",
+                    "patch": {"description": "x"}
+                },
+            }),
+        )
+        .await
+        .expect_err("a non-UUID changeset identifier must be rejected");
+    let msg = invalid_input_message(&err);
+    assert!(
+        msg.contains("every changeset identifier must be a full UUID"),
+        "identifier failures keep the full-UUID hint; got: {msg}"
+    );
+}
+
+/// Changeset error-shape split, generic arm: a wrong-typed field surfaces
+/// serde's own message WITHOUT the misleading identifier hint.
+#[tokio::test]
+async fn propose_changeset_wrong_type_omits_identifier_hint() {
+    let f = pack_with_events();
+    let err = f
+        .dispatch(
+            "propose",
+            json!({
+                "title": "generic parse arm",
+                "description": "wrong-typed field must not carry the identifier hint",
+                "changeset": {"kind": "add_entity", "entity": "nope"},
+            }),
+        )
+        .await
+        .expect_err("a wrong-typed changeset field must be rejected");
+    let msg = invalid_input_message(&err);
+    assert!(
+        msg.contains("invalid changeset"),
+        "generic failures still name the changeset; got: {msg}"
+    );
+    assert!(
+        !msg.contains("every changeset identifier must be a full UUID"),
+        "generic parse failures must not carry the identifier hint; got: {msg}"
+    );
+}
+
 /// BUG-4 regression: two concurrent `withdraw` calls on the same proposal must
 /// result in exactly one success and one error (CAS enforcement).
 /// Note: SQLite in WAL mode is effectively single-writer; this test exercises

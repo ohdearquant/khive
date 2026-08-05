@@ -99,16 +99,33 @@ async fn resolve_message_thread_filter(
         .await
         .map_err(RuntimeError::Storage)?;
 
+    // Exact-match precedence for legacy stored labels: an all-hex >=8-char
+    // label like "deadbeef" is not a UUID, but it may be stored verbatim as a
+    // thread_id by pre-v1 rows. If any stored value equals the filter string
+    // byte-for-byte, it is an exact label match — not a UUID-prefix query —
+    // and must resolve to itself even when a UUID in the namespace happens to
+    // carry the same hex prefix. Case-only variants are collected too: when no
+    // UUID prefix matches, the stored spelling is returned so downstream
+    // filtering stays exact-string coherent.
+    let mut case_variant_label: Option<String> = None;
     let mut resolved: Option<uuid::Uuid> = None;
-    for row in rows {
-        let Some(candidate) = row
-            .get("thread_id")
-            .and_then(|value| match value {
-                SqlValue::Text(value) => Some(value.as_str()),
-                _ => None,
-            })
-            .and_then(|value| value.parse::<uuid::Uuid>().ok())
-        else {
+    for row in &rows {
+        let Some(stored) = row.get("thread_id").and_then(|value| match value {
+            SqlValue::Text(value) => Some(value.as_str()),
+            _ => None,
+        }) else {
+            continue;
+        };
+        if stored == raw {
+            return Ok(raw.to_string());
+        }
+        if case_variant_label.is_none()
+            && stored.len() == raw.len()
+            && stored.eq_ignore_ascii_case(raw)
+        {
+            case_variant_label = Some(stored.to_string());
+        }
+        let Ok(candidate) = stored.parse::<uuid::Uuid>() else {
             continue;
         };
         if !candidate
@@ -130,14 +147,18 @@ async fn resolve_message_thread_filter(
         }
     }
 
-    resolved
-        .map(|id| id.as_hyphenated().to_string())
-        .ok_or_else(|| {
-            RuntimeError::InvalidInput(format!(
-                "list: no message thread matches prefix {raw:?} in the caller's primary \
-                 namespace; a prefix can miss, so use the full thread UUID"
-            ))
-        })
+    if let Some(id) = resolved {
+        return Ok(id.as_hyphenated().to_string());
+    }
+
+    if let Some(stored) = case_variant_label {
+        return Ok(stored);
+    }
+
+    Err(RuntimeError::InvalidInput(format!(
+        "list: no message thread matches prefix {raw:?} in the caller's primary \
+         namespace; a prefix can miss, so use the full thread UUID"
+    )))
 }
 
 fn note_matches_message_filters(note: &Note, params: &ListParams) -> bool {

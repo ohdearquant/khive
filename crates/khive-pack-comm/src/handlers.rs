@@ -1782,21 +1782,36 @@ pub(crate) async fn handle_ingest(
                     "comm.ingest: duplicate external_id {external_id:?} has no existing row"
                 ))
             })?;
+            // Ack schema boundary: `thread_id` is a free-form string here, so a
+            // stored legacy label (non-UUID) is echoed verbatim. Fabricating
+            // `duplicate.id` instead would point the caller at a DIFFERENT
+            // thread if it fed the value back into comm.send. Only when the
+            // stored row genuinely has no thread_id (pre-v1 row) do we fall
+            // back to the duplicate's note UUID as the thread root (#479b,
+            // ADR-040) — and then flag it so a strict caller knows the value
+            // is derived, not stored.
             let existing_thread_id = duplicate
                 .properties
                 .as_ref()
                 .and_then(|properties| properties.get("thread_id"))
                 .and_then(Value::as_str)
-                .and_then(|raw| raw.parse::<Uuid>().ok())
-                .unwrap_or(duplicate.id)
-                .as_hyphenated()
-                .to_string();
-            return Ok(json!({
+                .filter(|raw| !raw.is_empty())
+                .map(str::to_string);
+            let mut ack = json!({
                 "ok": true,
                 "deduplicated": true,
                 "external_id": p.external_id,
-                "thread_id": existing_thread_id,
-            }));
+                "thread_id": existing_thread_id
+                    .clone()
+                    .unwrap_or_else(|| duplicate.id.as_hyphenated().to_string()),
+            });
+            if existing_thread_id.is_none() {
+                ack["thread_id_warning"] = json!(
+                    "stored duplicate has no thread_id (legacy row); echoed the message's \
+                     own note UUID as the thread root"
+                );
+            }
+            return Ok(ack);
         }
     };
 

@@ -4954,6 +4954,184 @@ async fn ingest_dedup_returns_existing_canonical_thread_id() {
     assert_eq!(duplicate["thread_id"].as_str().unwrap().len(), 36);
 }
 
+/// Dedup ack for a legacy row whose stored thread_id is a non-UUID label must
+/// echo the literal stored value — not fabricate the duplicate's note UUID
+/// (which would route a caller into a DIFFERENT thread on a later send).
+#[tokio::test]
+async fn ingest_dedup_echoes_stored_non_uuid_thread_label() {
+    let (registry, rt) = build_registry_for_ns("local");
+    let external_id = format!("legacy-label-dedup-{}", uuid::Uuid::new_v4());
+
+    let token = rt
+        .authorize(khive_runtime::Namespace::local())
+        .expect("authorize local");
+    let created = rt
+        .try_create_note(
+            &token,
+            "message",
+            None,
+            "legacy row with a non-UUID thread label",
+            Some(serde_json::json!({
+                "external_id": external_id,
+                "thread_id": "legacy-thread-label",
+                "direction": "inbound",
+            })),
+        )
+        .await
+        .expect("seed write")
+        .expect("seed insert must not be deduplicated");
+    assert_ne!(
+        created.id.as_hyphenated().to_string(),
+        "legacy-thread-label"
+    );
+
+    let duplicate = registry
+        .dispatch(
+            "comm.ingest",
+            serde_json::json!({
+                "from": "external:sender",
+                "to": "local",
+                "content": "retry of the legacy row",
+                "external_id": external_id,
+            }),
+        )
+        .await
+        .expect("duplicate ingest is an acknowledged no-op");
+
+    assert_eq!(duplicate["deduplicated"], true);
+    assert_eq!(
+        duplicate["thread_id"], "legacy-thread-label",
+        "ack must echo the literal stored thread_id, not the note UUID"
+    );
+    assert!(
+        duplicate.get("thread_id_warning").is_none(),
+        "no warning when a stored thread_id is present: {duplicate:?}"
+    );
+}
+
+/// Dedup ack for a legacy row with NO stored thread_id falls back to the
+/// duplicate's note UUID as thread root (#479b) and flags the derivation.
+#[tokio::test]
+async fn ingest_dedup_without_stored_thread_id_falls_back_with_warning() {
+    let (registry, rt) = build_registry_for_ns("local");
+    let external_id = format!("no-thread-dedup-{}", uuid::Uuid::new_v4());
+
+    let token = rt
+        .authorize(khive_runtime::Namespace::local())
+        .expect("authorize local");
+    let created = rt
+        .try_create_note(
+            &token,
+            "message",
+            None,
+            "legacy row with no thread_id property",
+            Some(serde_json::json!({
+                "external_id": external_id,
+                "direction": "inbound",
+            })),
+        )
+        .await
+        .expect("seed write")
+        .expect("seed insert must not be deduplicated");
+
+    let duplicate = registry
+        .dispatch(
+            "comm.ingest",
+            serde_json::json!({
+                "from": "external:sender",
+                "to": "local",
+                "content": "retry of the threadless legacy row",
+                "external_id": external_id,
+            }),
+        )
+        .await
+        .expect("duplicate ingest is an acknowledged no-op");
+
+    assert_eq!(duplicate["deduplicated"], true);
+    assert_eq!(
+        duplicate["thread_id"],
+        created.id.as_hyphenated().to_string(),
+        "with no stored thread_id the note UUID is the only honest thread root"
+    );
+    assert!(
+        duplicate["thread_id_warning"].as_str().is_some(),
+        "fallback must be flagged as derived, not stored: {duplicate:?}"
+    );
+}
+
+// ── list(kind=message) thread filter: legacy all-hex labels vs. UUID prefixes ──
+
+/// Regression (PR #1623 round 2): an all-hex >=8-char stored thread label
+/// that is NOT a UUID (e.g. "deadbeef") must still be matched exactly — the
+/// UUID-prefix arm in the resolver must not swallow it and error "no message
+/// thread matches prefix". A genuine UUID prefix must still resolve.
+#[tokio::test]
+async fn list_message_thread_filter_matches_legacy_hex_label_and_uuid_prefix() {
+    let (registry, rt) = build_registry_for_ns("local");
+    let token = rt
+        .authorize(khive_runtime::Namespace::local())
+        .expect("authorize local");
+
+    // Legacy row: an all-hex, 8-char, non-UUID thread label stored verbatim.
+    rt.create_note(
+        &token,
+        "message",
+        None,
+        "legacy hex-labeled message",
+        None,
+        Some(serde_json::json!({"thread_id": "deadbeef"})),
+        vec![],
+    )
+    .await
+    .expect("create legacy hex-labeled message");
+
+    // Arm 1: the legacy all-hex label must resolve exactly, not error as an
+    // unmatched UUID prefix.
+    let legacy = registry
+        .dispatch(
+            "list",
+            serde_json::json!({"kind": "message", "thread_id": "deadbeef"}),
+        )
+        .await
+        .expect("legacy all-hex label must match exactly, not error");
+    let legacy = legacy.as_array().expect("list result array");
+    assert_eq!(
+        legacy.len(),
+        1,
+        "exact stored legacy label must return its message"
+    );
+    assert_eq!(legacy[0]["properties"]["thread_id"], "deadbeef");
+
+    // Arm 2: a genuine UUID prefix must still resolve to its thread.
+    let thread = "bbbbcccc-1111-2222-3333-444455556666";
+    rt.create_note(
+        &token,
+        "message",
+        None,
+        "uuid-threaded message",
+        None,
+        Some(serde_json::json!({"thread_id": thread})),
+        vec![],
+    )
+    .await
+    .expect("create uuid-threaded message");
+
+    let prefixed = registry
+        .dispatch(
+            "list",
+            serde_json::json!({"kind": "message", "thread_id": "bbbbcccc"}),
+        )
+        .await
+        .expect("genuine UUID prefix must still resolve");
+    let prefixed = prefixed.as_array().expect("list result array");
+    assert_eq!(
+        prefixed.len(),
+        1,
+        "UUID prefix must return exactly its thread's message"
+    );
+    assert_eq!(prefixed[0]["properties"]["thread_id"], thread);
+}
+
 /// (a) Reply with correlation matching an outbound note whose from_actor=lambda:khive
 /// → ingested note to_actor=lambda:khive.
 #[tokio::test]
