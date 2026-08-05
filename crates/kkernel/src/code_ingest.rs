@@ -394,26 +394,20 @@ where
 }
 
 /// Take the pool's writer-task JoinHandle for the drain, warning loudly when
-/// the pool is file-backed with the write queue resolved ON but no handle is
-/// available at take time.
+/// a previously stored handle is unavailable at take time.
 ///
-/// Absence has two causes: (1) the writer task never spawned during this
-/// ingest — no queue-routed write ever touched the pool (e.g. an all-skipped
-/// re-ingest), or spawn degraded with its own logged warning — in which case
-/// there is nothing to drain; or (2) a double drain: `take_writer_task_join`
-/// is one-shot (pool.rs), so another caller already took ownership of the
-/// task-exit await, and this call's "return implies settled" contract now
-/// rides on THAT drain instead of its own. Either way this call does not
-/// await the task's exit itself — say so loudly rather than silently
-/// skipping the drain.
+/// A missing handle is benign when no writer-task handle was ever stored: no
+/// queue-routed write occurred, or writer-task setup degraded before a handle
+/// could be stored. It is a drain-ownership problem only when a handle was
+/// stored and another caller already consumed the one-shot slot.
 fn take_writer_task_join_or_warn(
     pool: &khive_db::ConnectionPool,
 ) -> Option<tokio::task::JoinHandle<()>> {
     let writer_join = pool.take_writer_task_join();
-    if writer_join.is_none() && pool.write_queue_active() {
+    if writer_join.is_none() && pool.write_queue_active() && pool.writer_task_join_was_stored() {
         tracing::warn!(
-            "writer-task JoinHandle absent on a file-backed, write-queue-enabled pool \
-             (already taken by another drain owner, or the task never spawned); \
+            "writer-task JoinHandle was stored but is absent at drain time; \
+             another caller may have taken the one-shot drain handle, so \
              'return implies settled' is not enforced by this call"
         );
     }
@@ -635,6 +629,51 @@ mod tests {
 
     use super::*;
 
+    struct WriteQueueEnvGuard {
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl WriteQueueEnvGuard {
+        fn unset() -> Self {
+            let previous = std::env::var_os("KHIVE_WRITE_QUEUE");
+            std::env::remove_var("KHIVE_WRITE_QUEUE");
+            Self { previous }
+        }
+    }
+
+    impl Drop for WriteQueueEnvGuard {
+        fn drop(&mut self) {
+            match &self.previous {
+                Some(value) => std::env::set_var("KHIVE_WRITE_QUEUE", value),
+                None => std::env::remove_var("KHIVE_WRITE_QUEUE"),
+            }
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct Capture(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Capture {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct MakeCapture(Capture);
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for MakeCapture {
+        type Writer = Capture;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.0.clone()
+        }
+    }
+
     struct FixedEmbeddingService {
         dimensions: usize,
     }
@@ -751,6 +790,39 @@ mod tests {
         assert_eq!(second.notes_skipped_existing, 1);
         assert_eq!(second.entities_skipped_existing, 1);
         assert_eq!(second.edges_skipped_existing, 1);
+    }
+
+    #[serial]
+    #[tokio::test]
+    async fn code_ingest_with_no_queue_writes_does_not_warn_on_drain() {
+        let _write_queue_env = WriteQueueEnvGuard::unset();
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let findings = write_valid_findings(tmp.path());
+        let db = tmp.path().join("no_queue_writes.db");
+
+        code_ingest_batch(base_args(findings.clone(), db.clone()))
+            .await
+            .expect("initial ingest must succeed");
+
+        let capture = Capture::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(MakeCapture(capture.clone()))
+            .with_ansi(false)
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+        let report = code_ingest_batch(base_args(findings, db))
+            .await
+            .expect("all-skipped ingest must succeed");
+        drop(guard);
+
+        assert_eq!(report.entities_created, 0);
+        assert_eq!(report.notes_created, 0);
+        assert_eq!(report.edges_created, 0);
+        let log = String::from_utf8_lossy(&capture.0.lock().unwrap()).to_string();
+        assert!(
+            !log.contains("writer-task JoinHandle"),
+            "an ingest with no queue-routed writes must not warn at drain time: {log}"
+        );
     }
 
     #[serial]
@@ -885,11 +957,8 @@ mod tests {
         // resolves the write queue ON, so this test exercises the writer-task
         // drain rather than silently passing through the queue-off path an
         // ambient KHIVE_WRITE_QUEUE=0 would select. (#[serial] guards the
-        // env mutation.) Save the prior value so the restore at the end of
-        // the test leaves the process environment exactly as this test
-        // found it.
-        let previous_write_queue = std::env::var_os("KHIVE_WRITE_QUEUE");
-        std::env::remove_var("KHIVE_WRITE_QUEUE");
+        // env mutation.)
+        let _write_queue_env = WriteQueueEnvGuard::unset();
         let tmp = tempfile::TempDir::new().expect("temp dir");
         let findings = write_valid_findings(tmp.path());
         let db = tmp.path().join("settled.db");
@@ -925,11 +994,6 @@ mod tests {
             bytes_at_return, bytes_later,
             "no byte of the database may move after code_ingest_batch has returned"
         );
-
-        match previous_write_queue {
-            Some(v) => std::env::set_var("KHIVE_WRITE_QUEUE", v),
-            None => std::env::remove_var("KHIVE_WRITE_QUEUE"),
-        }
     }
 
     /// The `-shm` sidecar path SQLite uses alongside a WAL-mode database file.
@@ -1343,8 +1407,7 @@ mod tests {
         // The helper reads the resolved config only, but the pool's
         // `PoolConfig::default()` reads KHIVE_WRITE_QUEUE at construction, so
         // pin the variable unset to get the file-backed queue-ON default.
-        let previous_write_queue = std::env::var_os("KHIVE_WRITE_QUEUE");
-        std::env::remove_var("KHIVE_WRITE_QUEUE");
+        let _write_queue_env = WriteQueueEnvGuard::unset();
 
         let dir = tempfile::TempDir::new().expect("temp dir");
         let pool = khive_db::ConnectionPool::new(khive_db::PoolConfig {
@@ -1364,24 +1427,6 @@ mod tests {
             .expect("the first take must return the handle");
 
         // Capture the tracing output of the second (already-taken) attempt.
-        #[derive(Clone, Default)]
-        struct Capture(Arc<std::sync::Mutex<Vec<u8>>>);
-        impl std::io::Write for Capture {
-            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-                self.0.lock().unwrap().extend_from_slice(buf);
-                Ok(buf.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-        struct MakeCapture(Capture);
-        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for MakeCapture {
-            type Writer = Capture;
-            fn make_writer(&'a self) -> Self::Writer {
-                self.0.clone()
-            }
-        }
         let capture = Capture::default();
         let subscriber = tracing_subscriber::fmt()
             .with_writer(MakeCapture(capture.clone()))
@@ -1397,7 +1442,7 @@ mod tests {
         );
         let log = String::from_utf8_lossy(&capture.0.lock().unwrap()).to_string();
         assert!(
-            log.contains("JoinHandle absent"),
+            log.contains("JoinHandle was stored but is absent"),
             "the already-taken arm must warn loudly about the drain contract gap: {log}"
         );
 
@@ -1408,11 +1453,6 @@ mod tests {
             .await
             .expect("writer task must exit once every handle clone is dropped")
             .expect("writer task must not panic");
-
-        match previous_write_queue {
-            Some(v) => std::env::set_var("KHIVE_WRITE_QUEUE", v),
-            None => std::env::remove_var("KHIVE_WRITE_QUEUE"),
-        }
     }
 
     /// 3(a) end-to-end half: a real ingest that fails mid-write still drains
@@ -1426,8 +1466,7 @@ mod tests {
     #[serial]
     #[tokio::test]
     async fn code_ingest_failed_ingest_still_drains_and_surfaces_primary_error() {
-        let previous_write_queue = std::env::var_os("KHIVE_WRITE_QUEUE");
-        std::env::remove_var("KHIVE_WRITE_QUEUE");
+        let _write_queue_env = WriteQueueEnvGuard::unset();
 
         let tmp = tempfile::TempDir::new().expect("temp dir");
         let findings = write_valid_findings(tmp.path());
@@ -1474,11 +1513,6 @@ mod tests {
             "a failed ingest must still drain the writer task and settle the file"
         );
         assert!(!shm_sidecar_path(&db).exists());
-
-        match previous_write_queue {
-            Some(v) => std::env::set_var("KHIVE_WRITE_QUEUE", v),
-            None => std::env::remove_var("KHIVE_WRITE_QUEUE"),
-        }
     }
 
     /// Query the persisted `finding` note count for a scratch db, independent

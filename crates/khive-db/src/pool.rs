@@ -77,9 +77,10 @@ pub struct PoolConfig {
     /// pools and `false` for in-memory ones. `Some(_)` is an explicit
     /// preference and always wins, in both directions, over that default.
     /// An explicit `Some(true)` on an in-memory pool is accepted DELIBERATELY
-    /// and degrades silently to the legacy path — an in-memory pool cannot
-    /// host a writer task (`writer_task::spawn`'s standalone-connection open
-    /// fails); see `ConnectionPool::writer_task_handle` and the
+    /// and emits a warning before degrading to the legacy path — an in-memory
+    /// pool cannot host a writer task (`writer_task::spawn`'s
+    /// standalone-connection open fails); see
+    /// `ConnectionPool::writer_task_handle` and the
     /// `explicit_true_stays_on_for_memory_backed_pool` test.
     ///
     /// Overridable via `KHIVE_WRITE_QUEUE` (`"1"` or `"true"`,
@@ -484,8 +485,16 @@ impl ConnectionPool {
         // file-backed pools, off for in-memory ones. An explicit `Some(_)`
         // preference is left untouched and always wins.
         let mut config = config;
+        let inert_memory_queue_request =
+            config.path.is_none() && config.write_queue_enabled == Some(true);
         config.write_queue_enabled =
             Some(config.write_queue_enabled.unwrap_or(config.path.is_some()));
+        if inert_memory_queue_request {
+            tracing::warn!(
+                "write queue explicitly requested for an in-memory pool; it is inert because \
+                 in-memory pools cannot host a writer task"
+            );
+        }
 
         let writer = open_writer_connection(&config)?;
         let wal_enabled = configure_writer_connection(&writer, &config)?;
@@ -722,6 +731,15 @@ impl ConnectionPool {
              before any write_queue_active read"
         );
         self.config.write_queue_enabled.unwrap_or(false) && self.config.path.is_some()
+    }
+
+    /// Whether a writer-task JoinHandle has been stored at least once.
+    ///
+    /// Unlike [`Self::take_writer_task_join`], this remains true after the
+    /// one-shot handle slot is emptied, distinguishing a task that never
+    /// spawned from a handle another caller already consumed.
+    pub fn writer_task_join_was_stored(&self) -> bool {
+        self.writer_task_join_stored.load(Ordering::SeqCst)
     }
 
     /// Return the pool-wide ADR-067 Component A writer task, spawning it
@@ -1256,6 +1274,50 @@ mod tests {
     use super::*;
     use serial_test::serial;
 
+    struct WarningCapture {
+        messages: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl tracing::Subscriber for WarningCapture {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            struct Visitor(Option<String>);
+
+            impl tracing::field::Visit for Visitor {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    if field.name() == "message" {
+                        self.0 = Some(format!("{value:?}"));
+                    }
+                }
+            }
+
+            let mut visitor = Visitor(None);
+            event.record(&mut visitor);
+            if let Some(message) = visitor.0 {
+                self.messages.lock().unwrap().push(message);
+            }
+        }
+
+        fn enter(&self, _: &tracing::span::Id) {}
+
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
     /// Restores the process CWD on drop — including on panic — so a mid-test
     /// assertion failure (or an unexpected panic from the code under test)
     /// can never leave the process chdir'd into a `tempfile::tempdir()` that
@@ -1440,16 +1502,12 @@ mod tests {
     #[serial]
     fn pool_config_env_override_write_queue_non_unicode_value_is_explicit_off() {
         use std::os::unix::ffi::OsStrExt;
-        let previous = std::env::var_os("KHIVE_WRITE_QUEUE");
+        let _pool_env = clear_pool_env();
         std::env::set_var(
             "KHIVE_WRITE_QUEUE",
             std::ffi::OsStr::from_bytes(b"\xff\xfe"),
         );
         let cfg = PoolConfig::default();
-        match previous {
-            Some(v) => std::env::set_var("KHIVE_WRITE_QUEUE", v),
-            None => std::env::remove_var("KHIVE_WRITE_QUEUE"),
-        }
         assert_eq!(cfg.write_queue_enabled, Some(false));
     }
 
@@ -1638,6 +1696,55 @@ mod tests {
         assert!(
             pool.take_writer_task_join().is_none(),
             "a degraded spawn stores no JoinHandle to drain"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn explicit_true_on_memory_pool_warns_but_false_and_none_do_not() {
+        let _pool_env = clear_pool_env();
+        let messages = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = WarningCapture {
+            messages: Arc::clone(&messages),
+        };
+
+        tracing::subscriber::with_default(subscriber, || {
+            let _explicit_true = ConnectionPool::new(PoolConfig {
+                path: None,
+                write_queue_enabled: Some(true),
+                ..PoolConfig::default()
+            })
+            .expect("in-memory pool should open");
+            let _explicit_false = ConnectionPool::new(PoolConfig {
+                path: None,
+                write_queue_enabled: Some(false),
+                ..PoolConfig::default()
+            })
+            .expect("in-memory pool should open");
+            let _unset = ConnectionPool::new(PoolConfig {
+                path: None,
+                write_queue_enabled: None,
+                ..PoolConfig::default()
+            })
+            .expect("in-memory pool should open");
+        });
+
+        let messages = messages.lock().unwrap();
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|message| message.contains("write queue explicitly requested"))
+                .count(),
+            1,
+            "only an explicit in-memory queue request should warn: {messages:?}"
+        );
+        let warning = messages
+            .iter()
+            .find(|message| message.contains("write queue explicitly requested"))
+            .expect("explicit in-memory queue warning should be captured");
+        assert!(
+            warning.contains("in-memory pools cannot host a writer task"),
+            "warning must explain why the request is inert: {messages:?}"
         );
     }
 
@@ -1848,9 +1955,11 @@ mod tests {
             pool.take_writer_task_join().is_none(),
             "before spawn there is no JoinHandle to take"
         );
+        assert!(!pool.writer_task_join_was_stored());
         pool.writer_task_handle()
             .expect("runtime is present")
             .expect("write queue enabled must spawn a writer task");
+        assert!(pool.writer_task_join_was_stored());
 
         let join = pool
             .take_writer_task_join()
