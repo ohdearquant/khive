@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
+use tokio::sync::Semaphore;
 
 use crate::error::SqliteError;
 use crate::writer_task::WriterTaskHandle;
@@ -264,6 +265,8 @@ pub struct ConnectionPool {
     readers: ArrayQueue<Connection>,
     max_readers: usize,
     config: PoolConfig,
+    sql_bridge_reader_slots: Arc<Semaphore>,
+    sql_bridge_writer_slots: Arc<Semaphore>,
     /// The pool-wide ADR-067 Component A writer task, spawned lazily and at
     /// most once per pool (per DB file) via [`Self::writer_task_handle`] —
     /// see that method's doc comment for why this lives here rather than on
@@ -516,6 +519,8 @@ impl ConnectionPool {
             readers,
             max_readers,
             config,
+            sql_bridge_reader_slots: Arc::new(Semaphore::new(max_readers.max(1))),
+            sql_bridge_writer_slots: Arc::new(Semaphore::new(1)),
             writer_task: OnceLock::new(),
             writer_task_join: Mutex::new(None),
             writer_task_join_stored: AtomicBool::new(false),
@@ -693,6 +698,16 @@ impl ConnectionPool {
     /// Return the pool configuration.
     pub fn config(&self) -> &PoolConfig {
         &self.config
+    }
+
+    /// Pool-wide permits for file-backed raw-SQL reader handles.
+    pub(crate) fn sql_bridge_reader_slots(&self) -> Arc<Semaphore> {
+        Arc::clone(&self.sql_bridge_reader_slots)
+    }
+
+    /// Pool-wide permit for a file-backed raw-SQL writer handle.
+    pub(crate) fn sql_bridge_writer_slots(&self) -> Arc<Semaphore> {
+        Arc::clone(&self.sql_bridge_writer_slots)
     }
 
     /// This pool's ADR-091 backend-scoped attribution origin (ADR-091,
