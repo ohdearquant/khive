@@ -1054,6 +1054,10 @@ async fn load_events_since_with_window(
 
     let mut events = Vec::with_capacity(rows.len());
     let mut quarantined: Vec<QuarantinedRow> = Vec::new();
+    // Running count of policy-excluded rows already pushed, kept beside the
+    // vec so the per-row log-cap check is O(1) instead of rescanning
+    // `quarantined` for every skipped row of a thousands-size cohort.
+    let mut policy_excluded_seen: usize = 0;
 
     for row in &rows {
         let row_id = match row.get("id") {
@@ -1086,21 +1090,20 @@ async fn load_events_since_with_window(
             // Policy-excluded rows can number in the thousands (open-ended
             // window over a historical cohort), so per-row detail stops after
             // the first few; the end-of-replay summary carries the full count.
-            let policy_detail_logged = quarantined
-                .iter()
-                .filter(|row| row.category == ReplaySkipCategory::PolicyExcluded)
-                .count();
             let log_row = category == ReplaySkipCategory::Quarantine
-                || policy_detail_logged < POLICY_EXCLUDED_LOG_DETAIL_CAP;
+                || policy_excluded_seen < POLICY_EXCLUDED_LOG_DETAIL_CAP;
             if log_row {
                 eprintln!(
                     "[brain] event-log replay: {label} row id={row_id} profile={profile_id:?}: {reason}"
                 );
-            } else if policy_detail_logged == POLICY_EXCLUDED_LOG_DETAIL_CAP {
+            } else if policy_excluded_seen == POLICY_EXCLUDED_LOG_DETAIL_CAP {
                 eprintln!(
                     "[brain] event-log replay: further policy-excluded rows elided from per-row \
                      logging (cap {POLICY_EXCLUDED_LOG_DETAIL_CAP}); see the summary line for totals"
                 );
+            }
+            if category == ReplaySkipCategory::PolicyExcluded {
+                policy_excluded_seen += 1;
             }
             quarantined.push(QuarantinedRow {
                 id: row_id,
@@ -2163,6 +2166,70 @@ mod replay_policy_exclusion {
         assert!(
             matches!(count, Some(SqlValue::Integer(1))),
             "row must remain in the audit log; got {count:?}"
+        );
+    }
+
+    /// Pins which clock the policy predicate reads when a row's `created_at`
+    /// COLUMN and its payload's `created_at` diverge (possible only through
+    /// out-of-band writes — import, manual repair, a second writer; the
+    /// `brain.feedback` write path stamps both from one `commit_at_us`).
+    /// Authority is the PAYLOAD: the payload is the event that would be
+    /// re-folded, so its own timestamp decides class membership. The column
+    /// governs only row candidacy (the SQL `since` filter) and the audit
+    /// record's `created_at` field.
+    #[tokio::test]
+    async fn policy_predicate_reads_payload_clock_when_column_diverges() {
+        let rt = KhiveRuntime::memory().expect("memory runtime");
+        let token = rt.authorize(Namespace::local()).expect("token");
+        let ns = token.namespace().as_str();
+        let sql = rt.sql();
+        let start = POLICY_EXCLUSION_WINDOW_START_US;
+
+        // Row A: payload clock BEFORE the window, column clock inside it.
+        // Payload authority ⇒ not a class member ⇒ must replay.
+        let payload_out = make_implicit_positive_event_json(
+            ns,
+            "implicit_positive",
+            Some("balanced-recall-v1"),
+            start - 1_000,
+        );
+        insert_raw_payload_at(&rt, ns, &payload_out, start + 1_000).await;
+
+        // Row B: payload clock inside the window, column clock far before it
+        // (but past `since`, so the row is still read). Payload authority ⇒
+        // class member ⇒ must be policy-excluded.
+        let payload_in = make_implicit_positive_event_json(
+            ns,
+            "implicit_positive",
+            Some("balanced-recall-v1"),
+            start + 2_000,
+        );
+        insert_raw_payload_at(&rt, ns, &payload_in, 1_000).await;
+
+        let result = load_events_since(sql.as_ref(), ns, 0)
+            .await
+            .expect("load must not fail");
+
+        assert_eq!(result.events.len(), 1, "payload-out row must replay");
+        assert_eq!(
+            result.events[0].created_at,
+            start - 1_000,
+            "replayed event carries the payload clock"
+        );
+        assert_eq!(result.quarantine_count(), 0);
+        assert_eq!(
+            result.policy_excluded_count(),
+            1,
+            "payload-in row must be excluded despite its out-of-window column clock"
+        );
+        let entry = result
+            .quarantined
+            .iter()
+            .find(|r| r.category == ReplaySkipCategory::PolicyExcluded)
+            .expect("policy-excluded entry");
+        assert_eq!(
+            entry.created_at, 1_000,
+            "audit record keeps the COLUMN clock for the excluded row"
         );
     }
 
