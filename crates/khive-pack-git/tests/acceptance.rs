@@ -676,6 +676,24 @@ async fn ingest_skips_ambiguous_snapshot_path_bindings() {
         report.code_module_ambiguous_path_skips, 1,
         "only the commit-touched ambiguous key counts; the untouched one does not: {report:?}"
     );
+    let skip_warnings: Vec<&str> = report
+        .warnings
+        .iter()
+        .map(String::as_str)
+        .filter(|w| w.contains("skipped code-module annotation"))
+        .collect();
+    assert_eq!(
+        skip_warnings.len(),
+        1,
+        "one bounded skip warning per run: {:?}",
+        report.warnings
+    );
+    assert!(
+        skip_warnings[0].contains("src/lib.rs"),
+        "the bounded warning names the first skipped path so the count is \
+         actionable: {}",
+        skip_warnings[0]
+    );
     assert!(incoming_annotating_ids(&registry, first).await.is_empty());
     assert!(incoming_annotating_ids(&registry, second).await.is_empty());
 }
@@ -909,6 +927,19 @@ async fn ingest_records_both_sides_of_a_rename() {
 /// fabricated `[]`: the run warns naming the commit, stalls the cursor at
 /// the last contiguous successful commit, and still completes (see
 /// docs/api/ingest.md#changed-paths-and-code-module-annotations).
+///
+/// The shim below builds the REAL orphan-token shape, not a whole-record
+/// deletion: its `tr '\0' '\n'` round-trip splits git's combined
+/// `<header>\n<first-path>` token into two lines, so `grep -av` removes
+/// only the middle commit's header LINE while its path token survives in
+/// the stream. Because the `--name-only` walk is newest-first, the parser
+/// attaches that orphan token to the most recent header — the NEWER (third)
+/// commit — and the walk-commits pass (unshimmed) still walks all three
+/// shas. Containment is therefore per-record, not per-stream: the middle
+/// commit never lands (no path-set entry), the cursor stalls, but the
+/// orphaned token pollutes the stored newer commit's immutable
+/// `changed_paths` — asserted explicitly below, because commit notes are
+/// immutable and the pollution persists until re-ingest.
 #[tokio::test]
 async fn ingest_stalls_cursor_for_commit_missing_touched_paths() {
     let _guard = ENV_MUTEX.lock().await;
@@ -933,10 +964,13 @@ async fn ingest_stalls_cursor_for_commit_missing_touched_paths() {
     let third_sha = head_sha(repo);
 
     // The `--name-only` pass is the sole authority for touched paths. This
-    // PATH-shadowing shim deletes the middle commit's header from that one
-    // stream so the two snapshot passes disagree exactly the way the
-    // degradation branch handles; every other invocation delegates to the
-    // real git binary (same technique as `src/recovery_tests.rs`).
+    // PATH-shadowing shim deletes ONLY the middle commit's header line from
+    // that one stream — the `tr` round-trip puts the header and its first
+    // path on separate lines, so `grep -av` strips just the header and the
+    // middle commit's path token stays in the stream as an orphan — making
+    // the two snapshot passes disagree exactly the way the degradation
+    // branch handles; every other invocation delegates to the real git
+    // binary (same technique as `src/recovery_tests.rs`).
     let real_git = resolve_real_git();
     let bin_dir = dir.path().join("bin");
     std::fs::create_dir_all(&bin_dir).expect("create bin dir");
@@ -1033,8 +1067,22 @@ exec "$REAL_GIT" "$@"
     assert_eq!(
         first_note["properties"]["changed_paths"],
         json!(["first.rs"]),
-        "the deleted middle header must not pollute the previous commit's \
-         path set with the deleted commit's own paths"
+        "the newest-first walk attaches the orphan token to the most \
+         recent header (the NEWER commit), so the older commit keeps \
+         exactly its own paths"
+    );
+    let third_note = commit_notes
+        .iter()
+        .find(|note| note["properties"]["sha"].as_str() == Some(third_sha.as_str()))
+        .expect("the newer commit is stored");
+    assert_eq!(
+        third_note["properties"]["changed_paths"],
+        json!(["second.rs", "third.rs"]),
+        "the orphaned path token of the deleted header rides into the \
+         stored NEWER commit's changed_paths: containment is per-record \
+         (the missing sha never lands, the cursor stalls), never \
+         per-stream — commit notes are immutable, so the pollution \
+         persists (a re-ingest skips the stored sha)"
     );
 }
 
@@ -1177,6 +1225,12 @@ async fn ingest_filters_noncanonical_changed_paths_but_keeps_commit() {
         "the warning carries the dropped count: {}",
         filter_warnings[0]
     );
+    assert!(
+        filter_warnings[0].contains("NUL"),
+        "the warning names every rejected shape the predicate enforces, \
+         including the NUL byte: {}",
+        filter_warnings[0]
+    );
 
     let commits = registry
         .dispatch("list", json!({"kind": "commit", "limit": 10}))
@@ -1196,6 +1250,67 @@ async fn ingest_filters_noncanonical_changed_paths_but_keeps_commit() {
         cursor,
         head_sha(repo),
         "the cursor advances past the commit: filtered paths never stall a run"
+    );
+}
+
+/// The canonical filter runs on the RAW path, never the masked one: a
+/// secret-shaped token can itself contain a rejected byte (the masker's
+/// tokens are whitespace-delimited, so a backslash inside the token is
+/// redacted along with it), and filtering after masking would flip the
+/// verdict from reject to accept — storing `src/***MASKED***` for a file
+/// whose real name is non-canonical. The defect must be dropped and
+/// counted, not laundered into a canonical-looking masked path.
+#[cfg(unix)]
+#[tokio::test]
+async fn ingest_filters_noncanonical_path_even_when_masking_hides_the_defect() {
+    let _guard = ENV_MUTEX.lock().await;
+    let (rt, token, registry) = fixture().await;
+    let project_id = create(
+        &registry,
+        json!({"kind": "project", "name": "masked-defect-path-repo"}),
+    )
+    .await;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_repo(repo);
+    write(repo, "good.rs", "pub fn good() {}\n");
+    // Secret-shaped (github-token: `ghp_` + 36 base62 chars) AND
+    // non-canonical (a `\` byte inside the token).
+    let fake_token = "ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+    let rel = format!("src/{fake_token}\\back.rs");
+    write(repo, &rel, "pub fn secret_defect() {}\n");
+    commit(repo, &["good.rs", rel.as_str()], "Mixed paths");
+
+    let report = run_ingest(
+        &rt,
+        &token,
+        &registry,
+        IngestOptions::unbounded(repo.to_path_buf(), project_id.to_string()),
+    )
+    .await
+    .expect("ingest ok");
+    assert_eq!(report.commits_ingested, 1, "{report:?}");
+    assert_eq!(
+        report.changed_paths_filtered_noncanonical, 1,
+        "the raw path's backslash rejects it even though masking would \
+         redact that byte away: {report:?}"
+    );
+
+    let commits = registry
+        .dispatch("list", json!({"kind": "commit", "limit": 10}))
+        .await
+        .expect("list commits");
+    let stored = &commits.as_array().expect("commit array")[0];
+    assert_eq!(
+        stored["properties"]["changed_paths"],
+        json!(["good.rs"]),
+        "the non-canonical path must be dropped, not stored as a \
+         canonical-looking masked residue: {stored:?}"
+    );
+    assert!(
+        !format!("{stored}").contains(fake_token),
+        "the raw token must not survive anywhere in the stored record"
     );
 }
 

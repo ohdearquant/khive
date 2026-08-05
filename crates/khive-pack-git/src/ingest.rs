@@ -199,10 +199,13 @@ pub struct IngestReport {
     /// crates/khive-pack-git/docs/api/ingest.md#changed-paths-and-code-module-annotations.
     pub changed_paths_filtered_noncanonical: u64,
     /// Changed paths whose `(source_revision, source_path)` module binding
-    /// was ambiguous (more than one live row, at most one with a parseable
-    /// id) and therefore received no code-module annotation — counted only
-    /// when an ingested commit's path actually hits the ambiguous key, so
-    /// ambiguous keys untouched by this pass never inflate the count.
+    /// was unusable and therefore received no code-module annotation. Two
+    /// shapes fold into this counter: an ambiguous key (more than one live
+    /// row, at most one with a parseable id) and the single-row sub-case
+    /// whose one row's id does not parse (not ambiguous — just no bindable
+    /// candidate). Counted only when an ingested commit's path actually
+    /// hits the key, so unusable keys untouched by this pass never inflate
+    /// the count.
     pub code_module_ambiguous_path_skips: u64,
 }
 
@@ -610,9 +613,14 @@ async fn find_document_for_path(
 /// module's `source_revision` to equal the snapshot HEAD keeps unrelated maps
 /// out; a path with more than one matching live row remains ambiguous and is
 /// deliberately represented by `None` rather than selecting or annotating an
-/// arbitrary candidate. A row whose `id` does not parse as a UUID still
-/// counts toward that ambiguity — it is evidence of a second live row for
-/// the same key — but can never itself serve as a binding target.
+/// arbitrary candidate. That `None` folds two distinct shapes, both
+/// counted in the same skip counter: (a) two or more rows of which at most
+/// one has a parseable id (true ambiguity), and (b) exactly ONE row whose
+/// id does not parse — a key that is not ambiguous but has no bindable
+/// candidate, so it must skip for the same reason. Shape (b) is a live row
+/// for the key exactly like any other; it occupies the slot (a second row
+/// for the same key marks the pair ambiguous under shape (a)) but can never
+/// itself serve as a binding target.
 ///
 /// A reader/query failure returns `Err` carrying the underlying error text;
 /// the caller degrades to no module annotation with a warning that includes
@@ -887,14 +895,21 @@ fn touched_files(repo: &Path) -> Result<HashMap<String, Vec<String>>> {
 /// of a parser/git-output mismatch.
 ///
 /// One ambiguity this layer cannot resolve: a non-header token is
-/// indistinguishable from a real path of the most recent header's commit, so
-/// a header that goes missing mid-stream (with its NUL separator) leaves the
-/// deleted record's paths attached to the previous commit. Detecting that
-/// would require judging path content against a commit the parse never saw,
-/// so the parser deliberately does not try; the containment is upstream —
-/// `ingest_commits` finds no path-set entry for the missing sha, warns, and
-/// stalls the cursor (`ingest_stalls_cursor_for_commit_missing_touched_paths`
-/// also pins that the previous commit keeps exactly its own paths).
+/// indistinguishable from a real path of the most recent header's commit.
+/// The `--name-only` walk is newest-first, so a header lost mid-stream (with
+/// its NUL separator) leaves the deleted record's path tokens attached to
+/// that NEWER commit — the commit already walked in the same stream — never
+/// to an older one. Containment is partial and per-record, not per-stream:
+/// the missing sha has no path-set entry, so `ingest_commits` skips it,
+/// warns, and stalls the cursor
+/// (`ingest_stalls_cursor_for_commit_missing_touched_paths` pins both), but
+/// the polluted NEWER commit is created as usual — the orphaned tokens ride
+/// into its `changed_paths`, and commit notes are immutable, so the
+/// pollution persists (a re-ingest skips the already-stored sha; repair
+/// requires deleting the note and re-ingesting). The fixture asserts
+/// exactly that pollution.
+/// The parser deliberately does not try to detect it: that would require
+/// judging path content against a commit the parse never saw.
 fn parse_touched_files(bytes: &[u8]) -> Result<HashMap<String, Vec<String>>> {
     let mut map: HashMap<String, Vec<String>> = HashMap::new();
     // With `-z`, git emits paths verbatim and NUL-terminates each one. Git
@@ -1225,7 +1240,13 @@ async fn ingest_commits(
 
     // `walk_commits` is oldest-first and includes HEAD whenever this phase
     // has work, so the last record is the exact repository snapshot against
-    // which ADR-085 `source_revision` must bind.
+    // which ADR-085 `source_revision` must bind. The walk itself is never
+    // truncated: it issues one unbounded `git log {since}..HEAD`, and
+    // `max_items` bounds only the create loop below (a budget check AFTER
+    // this point), never the snapshot. `snapshot_head` is therefore always
+    // the true repository HEAD of this pass, and the module index anchors to
+    // modules-as-of-HEAD regardless of how many commits the budget lets this
+    // pass create.
     let snapshot_head = commits
         .last()
         .expect("non-empty commit snapshot checked above")
@@ -1258,6 +1279,12 @@ async fn ingest_commits(
     // sha natural key), so a retried pass never double-creates them.
     let mut last_sha: Option<String> = since;
     let mut cursor_stalled = false;
+    // Bounded detail for the per-run ambiguous-module-skip warning: the
+    // masked skipped paths in encounter order, capped so one pathological
+    // run cannot bloat the report (the full count is always exact).
+    const AMBIGUOUS_SKIP_DETAIL_CAP: usize = 5;
+    const AMBIGUOUS_SKIP_PATH_DISPLAY_CHARS: usize = 80;
+    let mut ambiguous_module_skip_paths: Vec<String> = Vec::new();
     // Parent SHA -> note id for commits created earlier THIS pass (walked
     // oldest-first) — combined with `find_commit_by_sha`'s DB lookup below,
     // this resolves parent edges regardless of which pass the parent landed
@@ -1303,13 +1330,18 @@ async fn ingest_commits(
         // them, which would fail the whole commit create and stall the
         // cursor on every pass). Filter them here, against the same
         // predicate the hook enforces, and surface the per-run count below.
-        // Only actual predicate rejections count as drops: BTreeSet dedup
-        // and post-masking collisions are not drops and are neither counted
+        // The predicate runs on the RAW path, not the masked one: a secret
+        // token can itself contain a rejected byte (the masker's tokens are
+        // whitespace-delimited, so a backslash or NUL inside a token is
+        // redacted along with it), and filtering post-masking would then
+        // flip the verdict from reject to accept. Masking is applied only
+        // to the paths that survive the raw filter, for storage. Only
+        // actual predicate rejections count as drops: BTreeSet dedup and
+        // post-masking collisions are not drops and are neither counted
         // nor warned.
         let mut noncanonical = 0_u64;
         let changed_paths: Vec<String> = touched_paths
             .iter()
-            .map(|path| secret_gate::mask_secrets(path).into_owned())
             .filter(|path| {
                 let canonical = hook::is_repo_relative_path(path);
                 if !canonical {
@@ -1317,6 +1349,7 @@ async fn ingest_commits(
                 }
                 canonical
             })
+            .map(|path| secret_gate::mask_secrets(path).into_owned())
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect();
@@ -1340,12 +1373,17 @@ async fn ingest_commits(
                 Some(Some(module_id)) => {
                     annotates.insert(module_id.to_string());
                 }
-                // More than one live row binds this `(source_revision,
-                // source_path)` key (at most one of them with a parseable
-                // id — an unparsable-id row only ever occupies the slot):
-                // no candidate is annotated, and the skip is counted once
-                // per commit path that actually hit the ambiguous key.
-                Some(None) => report.code_module_ambiguous_path_skips += 1,
+                // The key is unusable — either more than one live row binds
+                // it (at most one with a parseable id) or its single row's
+                // id does not parse — so no candidate is annotated. Both
+                // shapes count once per commit path that hits the key (the
+                // path is also remembered for the bounded per-run warning
+                // below); see `load_code_modules_by_snapshot_path` for the
+                // fold.
+                Some(None) => {
+                    report.code_module_ambiguous_path_skips += 1;
+                    ambiguous_module_skip_paths.push(path.clone());
+                }
                 None => {}
             }
             if path.starts_with("docs/adr/") {
@@ -1469,15 +1507,43 @@ async fn ingest_commits(
         write_cursor(runtime, project_id, "commits", &sha).await?;
     }
     // One bounded line per run (never one per path): filenames are
-    // attacker/repo-controlled and may be long, so the count alone is
-    // surfaced; the paths themselves remain recoverable from the raw
-    // `git log -z --name-only` stream if an operator needs them.
+    // attacker/repo-controlled and may be long, so the count is the
+    // load-bearing fact; a bounded masked path sample rides along so the
+    // count is actionable, and the full set remains recoverable from the
+    // raw `git log -z --name-only` stream if an operator needs it.
     if report.changed_paths_filtered_noncanonical > 0 {
         report.warnings.push(format!(
             "{} touched path(s) dropped from changed_paths: outside the \
-             canonical repo-relative shape (backslash, `X:` drive prefix, \
-             leading `/`, or empty/`.`/`..` component)",
+             canonical repo-relative shape (NUL byte, backslash, `X:` \
+             drive prefix, leading `/`, or empty/`.`/`..` component)",
             report.changed_paths_filtered_noncanonical
+        ));
+    }
+    if report.code_module_ambiguous_path_skips > 0 {
+        // Every skip records its masked path above, so the vec length is the
+        // exact count; only the displayed sample is capped.
+        let shown = ambiguous_module_skip_paths
+            .len()
+            .min(AMBIGUOUS_SKIP_DETAIL_CAP);
+        let detail = ambiguous_module_skip_paths[..shown]
+            .iter()
+            .map(|path| {
+                let display = refs::truncate_chars(path, AMBIGUOUS_SKIP_PATH_DISPLAY_CHARS);
+                format!("{display:?}")
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        let remaining = ambiguous_module_skip_paths.len() - shown;
+        let suffix = if remaining > 0 {
+            format!(", +{remaining} more")
+        } else {
+            String::new()
+        };
+        report.warnings.push(format!(
+            "{} changed path(s) skipped code-module annotation: no usable \
+             (source_revision, source_path) binding (first {shown}: \
+             [{detail}]{suffix})",
+            report.code_module_ambiguous_path_skips
         ));
     }
     if let Some(warning) = recovery_warning {

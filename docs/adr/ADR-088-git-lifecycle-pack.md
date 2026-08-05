@@ -61,8 +61,12 @@ New pack crate `khive-pack-git`, `REQUIRES = ["kg"]`, following `khive-pack-form
    `committed_at`, `parents` (array of parent SHA strings — a plain property, not a graph
    edge; see Alternatives A2 for why commit-to-commit lineage is deliberately not an edge
    in v1), and optional `changed_paths` (a sorted, deduplicated array of non-empty,
-   repository-relative `/`-separated path strings; the git ingester always supplies it,
-   including an empty array for an empty commit). No lifecycle — commits are immutable
+   repository-relative `/`-separated path strings; the git ingester always supplies that
+   canonical shape, including an empty array for an empty commit, except that the property
+   is omitted when the raw touched set was non-empty but every path was filtered as
+   non-canonical — the all-filtered third state named by
+   `crates/khive-pack-git/docs/api/ingest.md#changed-paths-and-code-module-annotations`,
+   whose evidence is the run's drop count and warning). No lifecycle — commits are immutable
    once created, so `commit` carries no `kind_status`.
 
 3. **`issue` properties**: `number`, `title`, `author`, `created_at`, `closed_at`

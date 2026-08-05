@@ -21,8 +21,13 @@ absent property. When present, it must be an array of non-empty,
 repository-relative `/`-separated strings without empty, `.` or `..`
 components, and the array must already be sorted and deduplicated. The git
 ingester always supplies that canonical shape, including `[]` for an empty
-commit. POSIX-absolute paths, any path containing a backslash, and any `X:`
-drive prefix (absolute or drive-relative) are rejected.
+commit, except that the property is omitted when the raw touched set was
+non-empty but every path was filtered as non-canonical — the all-filtered
+third state named by
+`docs/api/ingest.md#changed-paths-and-code-module-annotations` (the hook's
+optional treatment above is what keeps the omitted shape valid). POSIX-absolute
+paths, any path containing a backslash, and any `X:` drive prefix (absolute or
+drive-relative) are rejected.
 
 ## `IssueLikeHook`
 

@@ -323,10 +323,14 @@ governed by `CommitHook`'s canonical repo-relative shape (see
 docs/api/hooks.md): a valid Unix filename containing a `\` byte or starting
 with an `X:` drive prefix can never round-trip through it. Before create,
 the ingester filters exactly those elements out of the array (the same
-predicate the hook enforces), keeps the canonical remainder, stores the
-commit, and counts the dropped paths in
+predicate the hook enforces: a NUL byte, a backslash, an `X:` drive prefix,
+a leading `/`, or an empty/`.`/`..` component), keeps the canonical
+remainder, stores the commit, and counts the dropped paths in
 `IngestReport.changed_paths_filtered_noncanonical` with one bounded warning
-per run. Only actual predicate rejections count as drops: the BTreeSet
+per run. The predicate runs on the RAW path, not the masked one: a secret
+token can itself contain a rejected byte (the masker's tokens are
+whitespace-delimited), and filtering after masking would flip the verdict
+from reject to accept; masking applies only to the paths that survive. Only actual predicate rejections count as drops: the BTreeSet
 dedup and post-masking collisions the sorted array also performs are not
 drops and are neither counted nor warned. Rename detection is
 pinned off (`--no-renames`) so a rename always surfaces as the delete + add
@@ -334,7 +338,8 @@ pair `--name-only` reports without it; because Git does not mark which entry
 is the rename source, leaving detection on could silently swap one side of
 the pair away from the exact path facts that join against ADR-085 modules.
 A merge commit carries one canonical path set: its diff against the first
-parent. Paths are secret-masked, sorted, and deduplicated before storage.
+parent. Paths that survive the canonical filter are secret-masked, sorted,
+and deduplicated before storage.
 The stored property has exactly three states: `[]` for a genuinely empty
 commit — and only for one; the canonical remainder array when at least one
 touched path survives the filter; and an omitted `changed_paths` (the hook
@@ -346,24 +351,42 @@ stream fails the phase (retried on the next pass via the cursor contract),
 and a walked commit with no recorded path set is skipped with a warning and
 a stalled cursor rather than stored with a fabricated `[]`. One residual
 parser ambiguity is deliberate: a non-header token is indistinguishable from
-a real path of the most recent header's commit, so a header lost mid-stream
-attaches its record's paths to the previous commit. The parser does not
-guess at path content; the containment is that the missing sha has no
-path-set entry, so the run warns and stalls the cursor.
+a real path of the most recent header's commit. The `--name-only` walk is
+newest-first, so a header lost mid-stream attaches its record's path tokens
+to that NEWER commit — the commit already walked in the same stream — never
+to an older one. The parser does not guess at path content; containment is
+per-record, not per-stream: the missing sha has no path-set entry, so the
+run warns and stalls the cursor, but the polluted newer commit is created as
+usual — the orphaned tokens ride into its `changed_paths`, and commit notes
+are immutable, so the pollution persists (a re-ingest skips the stored sha;
+repair requires deleting the note and re-ingesting).
+`ingest_stalls_cursor_for_commit_missing_touched_paths` pins both halves:
+its shim's `tr` round-trip splits git's combined `<header>\n<first-path>`
+token into two lines, so `grep -av` removes only the header line and the
+deleted commit's path token survives in the stream as the orphan.
 
 Before walking commits, the ingester loads the same-namespace live ADR-085
-module index once for the repository snapshot HEAD. A module is eligible only
+module index once for the repository snapshot HEAD. That snapshot is never
+truncated: `walk_commits` issues one unbounded `git log {since}..HEAD`, and
+`max_items` bounds only the create loop (a budget check after the snapshot
+loads), never the walk — so the snapshot HEAD is always the true repository
+HEAD of this pass, and the index anchors to modules-as-of-HEAD regardless of
+how many commits the budget lets this pass create. A module is eligible only
 when both `properties.source_revision` equals that HEAD and
 `properties.source_path` exactly equals the changed path. Requiring the
 revision prevents an identically named path in another repository snapshot
 from receiving a fabricated annotation. If more than one live module still
 has the same `(source_revision, source_path)`, the binding is ambiguous and no
-candidate is annotated (a row whose `id` does not parse as a UUID counts
-toward that ambiguity — it is a second live row for the key — but can never
-itself be the annotated candidate). Each skip is counted in
-`IngestReport.code_module_ambiguous_path_skips` only when an ingested
-commit's path actually hits the ambiguous key, so ambiguous keys untouched
-by the pass never inflate the count. There is no suffix match, inferred rename, entity
+candidate is annotated. The skip folds two shapes into one counter,
+`IngestReport.code_module_ambiguous_path_skips`: an ambiguous key (more than
+one live row, at most one with a parseable id — a row whose `id` does not
+parse as a UUID is still a live row for the key, so it marks the pair
+ambiguous, but can never itself be the annotated candidate) and the
+single-row sub-case whose one row's id does not parse (not ambiguous — just
+no bindable candidate). Each skip is counted only when an ingested commit's
+path actually hits the key, so unusable keys untouched by the pass never
+inflate the count, and the run's bounded warning names the first skipped
+paths (masked, truncated) so the count is actionable. There is no suffix match, inferred rename, entity
 creation, or arbitrary winner. A failure to load the module index degrades
 the pass to no module annotation with a warning instead of aborting it,
 because the annotation is best-effort enrichment while `changed_paths` is
