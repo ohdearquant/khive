@@ -326,18 +326,30 @@ the ingester filters exactly those elements out of the array (the same
 predicate the hook enforces), keeps the canonical remainder, stores the
 commit, and counts the dropped paths in
 `IngestReport.changed_paths_filtered_noncanonical` with one bounded warning
-per run. Rename detection is
+per run. Only actual predicate rejections count as drops: the BTreeSet
+dedup and post-masking collisions the sorted array also performs are not
+drops and are neither counted nor warned. Rename detection is
 pinned off (`--no-renames`) so a rename always surfaces as the delete + add
 pair `--name-only` reports without it; because Git does not mark which entry
 is the rename source, leaving detection on could silently swap one side of
 the pair away from the exact path facts that join against ADR-085 modules.
 A merge commit carries one canonical path set: its diff against the first
 parent. Paths are secret-masked, sorted, and deduplicated before storage.
-Every ingested commit carries the array, including an empty array for a
-genuinely empty commit — and only for one: a malformed `--name-only` token
+The stored property has exactly three states: `[]` for a genuinely empty
+commit — and only for one; the canonical remainder array when at least one
+touched path survives the filter; and an omitted `changed_paths` (the hook
+treats it as optional) when the raw touched set was non-empty but every
+path was filtered — the all-filtered third state, whose evidence is the
+run's `changed_paths_filtered_noncanonical` count and bounded warning. A
+malformed `--name-only` token
 stream fails the phase (retried on the next pass via the cursor contract),
 and a walked commit with no recorded path set is skipped with a warning and
-a stalled cursor rather than stored with a fabricated `[]`.
+a stalled cursor rather than stored with a fabricated `[]`. One residual
+parser ambiguity is deliberate: a non-header token is indistinguishable from
+a real path of the most recent header's commit, so a header lost mid-stream
+attaches its record's paths to the previous commit. The parser does not
+guess at path content; the containment is that the missing sha has no
+path-set entry, so the run warns and stalls the cursor.
 
 Before walking commits, the ingester loads the same-namespace live ADR-085
 module index once for the repository snapshot HEAD. A module is eligible only
@@ -346,9 +358,12 @@ when both `properties.source_revision` equals that HEAD and
 revision prevents an identically named path in another repository snapshot
 from receiving a fabricated annotation. If more than one live module still
 has the same `(source_revision, source_path)`, the binding is ambiguous and no
-candidate is annotated; each such skipped binding is counted in
-`IngestReport.code_module_ambiguous_path_skips` so the deliberate skip is
-visible per run. There is no suffix match, inferred rename, entity
+candidate is annotated (a row whose `id` does not parse as a UUID counts
+toward that ambiguity — it is a second live row for the key — but can never
+itself be the annotated candidate). Each skip is counted in
+`IngestReport.code_module_ambiguous_path_skips` only when an ingested
+commit's path actually hits the ambiguous key, so ambiguous keys untouched
+by the pass never inflate the count. There is no suffix match, inferred rename, entity
 creation, or arbitrary winner. A failure to load the module index degrades
 the pass to no module annotation with a warning instead of aborting it,
 because the annotation is best-effort enrichment while `changed_paths` is

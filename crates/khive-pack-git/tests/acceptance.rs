@@ -611,6 +611,29 @@ async fn ingest_skips_ambiguous_snapshot_path_bindings() {
     commit(repo, &["src/lib.rs"], "Shared snapshot");
     let revision = head_sha(repo);
 
+    // An ambiguous key (two live rows, one `source_path`) NO ingested
+    // commit touches must not inflate the skip count: only a commit path
+    // that actually hits the ambiguous key counts.
+    for name in [
+        "untouched_ambiguous_module_a",
+        "untouched_ambiguous_module_b",
+    ] {
+        create(
+            &registry,
+            json!({
+                "kind": "concept",
+                "entity_type": "module",
+                "name": name,
+                "properties": {
+                    "source_project": "untouched-project",
+                    "source_path": "src/untouched.rs",
+                    "source_revision": revision.clone()
+                }
+            }),
+        )
+        .await;
+    }
+
     let first = create(
         &registry,
         json!({
@@ -649,6 +672,10 @@ async fn ingest_skips_ambiguous_snapshot_path_bindings() {
     .await
     .expect("ingest ok");
     assert_eq!(report.commits_ingested, 1, "{report:?}");
+    assert_eq!(
+        report.code_module_ambiguous_path_skips, 1,
+        "only the commit-touched ambiguous key counts; the untouched one does not: {report:?}"
+    );
     assert!(incoming_annotating_ids(&registry, first).await.is_empty());
     assert!(incoming_annotating_ids(&registry, second).await.is_empty());
 }
@@ -986,9 +1013,8 @@ exec "$REAL_GIT" "$@"
         .dispatch("list", json!({"kind": "commit", "limit": 10}))
         .await
         .expect("list commits");
-    let stored_shas: Vec<&str> = commits
-        .as_array()
-        .expect("commit array")
+    let commit_notes = commits.as_array().expect("commit array");
+    let stored_shas: Vec<&str> = commit_notes
         .iter()
         .map(|note| note["properties"]["sha"].as_str().expect("sha"))
         .collect();
@@ -999,6 +1025,88 @@ exec "$REAL_GIT" "$@"
     assert!(
         stored_shas.contains(&third_sha.as_str()),
         "a commit after the gap is still attempted and lands: {stored_shas:?}"
+    );
+    let first_note = commit_notes
+        .iter()
+        .find(|note| note["properties"]["sha"].as_str() == Some(first_sha.as_str()))
+        .expect("the first commit is stored");
+    assert_eq!(
+        first_note["properties"]["changed_paths"],
+        json!(["first.rs"]),
+        "the deleted middle header must not pollute the previous commit's \
+         path set with the deleted commit's own paths"
+    );
+}
+
+/// A commit whose raw touched paths are ALL noncanonical is the third
+/// stored state: not a genuinely empty commit (`[]`), so `changed_paths`
+/// is omitted entirely and the run's
+/// `changed_paths_filtered_noncanonical` count carries the evidence.
+#[cfg(unix)]
+#[tokio::test]
+async fn ingest_omits_changed_paths_when_all_paths_filtered() {
+    let _guard = ENV_MUTEX.lock().await;
+    let (rt, token, registry) = fixture().await;
+    let project_id = create(
+        &registry,
+        json!({"kind": "project", "name": "all-filtered-path-repo"}),
+    )
+    .await;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_repo(repo);
+    // Both shapes the canonical contract can never carry: a `\\` byte and
+    // an `X:` drive prefix.
+    write(repo, "src/back\\slash.rs", "pub fn backslash() {}\n");
+    write(repo, "X:drive.rs", "pub fn drive() {}\n");
+    commit(
+        repo,
+        &["src/back\\slash.rs", "X:drive.rs"],
+        "Only non-canonical paths",
+    );
+
+    let report = run_ingest(
+        &rt,
+        &token,
+        &registry,
+        IngestOptions {
+            repo: repo.to_path_buf(),
+            project: project_id.to_string(),
+            max_items: None,
+            include: IngestInclude {
+                commits: true,
+                issues: false,
+                pull_requests: false,
+            },
+        },
+    )
+    .await
+    .expect("an all-filtered commit must not fail the pass");
+    assert_eq!(report.commits_ingested, 1, "{report:?}");
+    assert_eq!(
+        report.changed_paths_filtered_noncanonical, 2,
+        "both noncanonical paths are counted as drops: {report:?}"
+    );
+
+    let commits = registry
+        .dispatch("list", json!({"kind": "commit", "limit": 10}))
+        .await
+        .expect("list commits");
+    let stored = &commits.as_array().expect("commit array")[0];
+    assert!(
+        stored["properties"].get("changed_paths").is_none(),
+        "an all-filtered commit omits changed_paths rather than storing the \
+         [] reserved for a genuinely empty commit: {stored:?}"
+    );
+
+    let cursor = read_git_cursor(&rt, project_id, "commits")
+        .await
+        .expect("cursor must be written");
+    assert_eq!(
+        cursor,
+        head_sha(repo),
+        "the cursor advances: an all-filtered commit is still ingested"
     );
 }
 
