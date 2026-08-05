@@ -38,6 +38,12 @@ impl std::fmt::Display for ProtocolVersion {
 /// The current protocol version implemented by this crate.
 pub const CURRENT_VERSION: ProtocolVersion = ProtocolVersion(1);
 
+// Version 0 does not exist in this protocol: the range floor is 1
+// ([`SupportedVersions::new`] rejects a zero `min`). Pin the invariant at
+// compile time so a future edit setting `CURRENT_VERSION` to 0 fails the
+// build instead of silently producing an all-zero supported range.
+const _: () = assert!(CURRENT_VERSION.0 >= 1, "CURRENT_VERSION must be >= 1");
+
 /// The set of protocol versions a server built against this crate accepts.
 ///
 /// ADR-137's compatibility policy requires a server to support the current
@@ -64,18 +70,26 @@ impl SupportedVersions {
     /// Construct an explicit `[min, max]` inclusive supported range, for a
     /// server that intentionally narrows or widens the default policy.
     ///
-    /// # Panics
+    /// Fails with [`SupportedVersionsError`] rather than panicking on an
+    /// unusable range:
     ///
-    /// If `min > max`: an inverted range would silently reject every
-    /// handshake (no version satisfies it), which is always a
-    /// configuration bug, so the constructor fails loudly instead of
-    /// constructing an unusable policy.
-    pub const fn new(min: ProtocolVersion, max: ProtocolVersion) -> Self {
-        assert!(
-            min.0 <= max.0,
-            "SupportedVersions::new: min must not exceed max — an inverted range rejects every handshake"
-        );
-        Self { min, max }
+    /// - [`SupportedVersionsError::MinVersionZero`] if `min` is version 0 —
+    ///   version 0 does not exist in this protocol, and a range admitting
+    ///   it would accept handshakes no conforming client would send.
+    /// - [`SupportedVersionsError::InvertedRange`] if `min > max` — an
+    ///   inverted range would silently reject every handshake (no version
+    ///   satisfies it), which is always a configuration bug.
+    pub const fn new(
+        min: ProtocolVersion,
+        max: ProtocolVersion,
+    ) -> Result<Self, SupportedVersionsError> {
+        if min.0 < 1 {
+            return Err(SupportedVersionsError::MinVersionZero);
+        }
+        if min.0 > max.0 {
+            return Err(SupportedVersionsError::InvertedRange);
+        }
+        Ok(Self { min, max })
     }
 
     pub const fn min(self) -> ProtocolVersion {
@@ -97,36 +111,74 @@ impl Default for SupportedVersions {
     }
 }
 
+/// Why an explicit [`SupportedVersions::new`] range was rejected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum SupportedVersionsError {
+    /// The range's lower bound was version 0; this protocol has no
+    /// version 0, and the floor is 1.
+    #[error("supported-version range floor must be >= 1 (version 0 does not exist)")]
+    MinVersionZero,
+    /// The range's lower bound exceeded its upper bound; no version
+    /// satisfies it, so it would reject every handshake.
+    #[error("supported-version range is inverted: min must not exceed max")]
+    InvertedRange,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn new_accepts_a_valid_range() {
-        let supported = SupportedVersions::new(ProtocolVersion::new(2), ProtocolVersion::new(5));
+        let supported =
+            SupportedVersions::new(ProtocolVersion::new(2), ProtocolVersion::new(5)).unwrap();
         assert_eq!(supported.min(), ProtocolVersion::new(2));
         assert_eq!(supported.max(), ProtocolVersion::new(5));
     }
 
     #[test]
     fn new_accepts_a_single_version_range() {
-        let supported = SupportedVersions::new(ProtocolVersion::new(3), ProtocolVersion::new(3));
+        let supported =
+            SupportedVersions::new(ProtocolVersion::new(3), ProtocolVersion::new(3)).unwrap();
         assert!(supported.contains(ProtocolVersion::new(3)));
         assert!(!supported.contains(ProtocolVersion::new(2)));
         assert!(!supported.contains(ProtocolVersion::new(4)));
     }
 
     #[test]
-    #[should_panic(expected = "min must not exceed max")]
     fn new_rejects_an_inverted_range() {
-        let _ = SupportedVersions::new(ProtocolVersion::new(5), ProtocolVersion::new(2));
+        let err =
+            SupportedVersions::new(ProtocolVersion::new(5), ProtocolVersion::new(2)).unwrap_err();
+        assert_eq!(err, SupportedVersionsError::InvertedRange);
+    }
+
+    #[test]
+    fn new_rejects_a_zero_min_version() {
+        // Version 0 does not exist in this protocol; the floor is 1.
+        // Checked before the ordering check, so a doubly-broken range
+        // reports the zero floor first.
+        let err =
+            SupportedVersions::new(ProtocolVersion::new(0), ProtocolVersion::new(1)).unwrap_err();
+        assert_eq!(err, SupportedVersionsError::MinVersionZero);
+        let err =
+            SupportedVersions::new(ProtocolVersion::new(0), ProtocolVersion::new(0)).unwrap_err();
+        assert_eq!(err, SupportedVersionsError::MinVersionZero);
+    }
+
+    #[test]
+    fn current_version_is_at_least_one() {
+        // The test mirror of the compile-time `const _: () = assert!` in
+        // this module: the invariant gets an explicit, greppable failure
+        // either way.
+        assert!(CURRENT_VERSION.get() >= 1);
     }
 
     #[test]
     fn contains_is_inclusive_at_both_bounds() {
         // Boundary inclusion: min and max themselves are supported; one
         // below min and one above max are not.
-        let supported = SupportedVersions::new(ProtocolVersion::new(2), ProtocolVersion::new(4));
+        let supported =
+            SupportedVersions::new(ProtocolVersion::new(2), ProtocolVersion::new(4)).unwrap();
         assert!(!supported.contains(ProtocolVersion::new(1)));
         assert!(supported.contains(ProtocolVersion::new(2)));
         assert!(supported.contains(ProtocolVersion::new(3)));

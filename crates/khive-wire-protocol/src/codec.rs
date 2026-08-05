@@ -9,11 +9,20 @@
 //! is responsible for reading/writing those bytes from a socket and for
 //! buffering partial reads until a complete frame is available.
 
-use crate::error::TerminalScope;
 use crate::frame::Frame;
 
 /// Length of the big-endian `u32` frame-length prefix, in bytes.
 pub const LENGTH_PREFIX_BYTES: usize = 4;
+
+/// The fixed wording every id/scope rejection carries, whichever decode
+/// path produced it: the serde visitor in [`crate::frame`] (which
+/// [`decode_payload`] drives, and which a direct
+/// `serde_json::from_str::<Frame>` reaches too) reports the rule through
+/// the deserializer's error type, and [`decode_payload`] re-classifies a
+/// message carrying this prefix into
+/// [`CodecError::InconsistentErrorScope`]. Keeping one wording lets both
+/// decode paths enforce the ADR-137 rule without duplicating its logic.
+pub(crate) const INCONSISTENT_SCOPE_ERROR_PREFIX: &str = "error frame violates the id/scope rule: ";
 
 /// Default maximum frame size: 8 MiB.
 ///
@@ -90,10 +99,28 @@ pub enum CodecError {
     /// terminal scope (ADR-137, "Operation correlation"): a
     /// connection-terminal code carries no operation id, and a
     /// request-terminal code echoes the one it terminates. Enforced at
-    /// decode ([`decode_payload`]) AND at encode
+    /// decode — inside [`crate::frame::Frame`]'s serde visitor, so BOTH
+    /// the codec's `decode_payload` and a direct
+    /// `serde_json::from_str::<Frame>` reject it (the codec re-classifies
+    /// the visitor's message into this typed variant) — AND at encode
     /// ([`encode_frame_with_max`]).
     #[error("error frame violates the id/scope rule: {detail}")]
     InconsistentErrorScope { detail: String },
+
+    /// Encode side: the frame is a decoded unknown-code fallback — a
+    /// [`crate::frame::Frame::Error`] carrying a `Some`
+    /// `unrecognized_code`, which only a decode path sets when the wire
+    /// carried a code outside the closed set. Fallback frames are
+    /// TERMINAL FOR RELAY: re-encoding one would emit the fallback code
+    /// (`internal`) and silently discard the newer code the peer sent, so
+    /// the encode path rejects the frame outright rather than corrupt it.
+    /// If a relay must pass unknown codes through, it has to operate on
+    /// the raw frame bytes, not on a decoded-and-re-encoded frame.
+    #[error(
+        "fallback error frame (unrecognized code {code:?}) is not re-encodable: \
+         re-encoding would emit \"internal\" and discard the newer wire code"
+    )]
+    FallbackFrameNotEncodable { code: String },
 }
 
 impl CodecError {
@@ -118,7 +145,8 @@ impl CodecError {
             | CodecError::MissingKind
             | CodecError::UnknownFrameKind(_)
             | CodecError::InvalidFields { .. }
-            | CodecError::InconsistentErrorScope { .. } => {
+            | CodecError::InconsistentErrorScope { .. }
+            | CodecError::FallbackFrameNotEncodable { .. } => {
                 crate::error::WireErrorCode::MalformedFrame
             }
         }
@@ -208,10 +236,12 @@ pub fn encode_frame(frame: &Frame) -> Result<Vec<u8>, CodecError> {
 ///
 /// Before serializing, the frame is validated against the same wire rules
 /// the decode side enforces ([`validate_frame_for_wire`]): an empty
-/// operation id in any id field ([`CodecError::InvalidFields`]) and an
+/// operation id in any id field ([`CodecError::InvalidFields`]), an
 /// `error` frame whose id presence contradicts its code's terminal scope
-/// ([`CodecError::InconsistentErrorScope`]) are rejected here, so a frame
-/// this function accepts is one any conforming decoder accepts. This keeps
+/// ([`CodecError::InconsistentErrorScope`]), and a decoded unknown-code
+/// fallback `error` frame ([`CodecError::FallbackFrameNotEncodable`]) are
+/// all rejected here, so a frame this function accepts is one any
+/// conforming decoder accepts. This keeps
 /// encode and decode symmetric: a locally constructed frame that violates
 /// the grammar can never leave this crate as wire bytes.
 ///
@@ -248,6 +278,12 @@ pub fn encode_frame_with_max(frame: &Frame, max_frame_bytes: usize) -> Result<Ve
 ///    [`decode_payload`] enforces via [`CodecError::InconsistentErrorScope`].
 ///    Every [`crate::error::WireErrorCode`] variant is in the closed set,
 ///    so the decode side's unknown-code exemption never applies here.
+/// 3. An `error` frame carrying a `Some` `unrecognized_code` — the
+///    decoded unknown-code fallback marker, which only a decode path sets
+///    — is rejected with [`CodecError::FallbackFrameNotEncodable`].
+///    Fallback frames are terminal for relay: re-encoding one would emit
+///    the fallback code (`internal`) and silently discard the newer code
+///    the peer sent, so this crate refuses to corrupt it.
 fn validate_frame_for_wire(frame: &Frame) -> Result<(), CodecError> {
     use crate::error::TerminalScope;
 
@@ -270,7 +306,18 @@ fn validate_frame_for_wire(frame: &Frame) -> Result<(), CodecError> {
         Frame::SubscribeAck { id, .. } => check_id("subscribe_ack", id)?,
         Frame::Unsubscribe { id, .. } => check_id("unsubscribe", id)?,
         Frame::UnsubscribeAck { id, .. } => check_id("unsubscribe_ack", id)?,
-        Frame::Error { id, code, .. } => {
+        Frame::Error {
+            id,
+            code,
+            unrecognized_code,
+            ..
+        } => {
+            // A decoded-fallback frame is terminal for relay; see rule 3.
+            if let Some(raw_code) = unrecognized_code {
+                return Err(CodecError::FallbackFrameNotEncodable {
+                    code: raw_code.clone(),
+                });
+            }
             if let Some(id) = id {
                 check_id("error", id)?;
             }
@@ -340,6 +387,13 @@ pub fn decode_frame(buf: &[u8], max_frame_bytes: usize) -> Result<Frame, CodecEr
 /// function with the consumed count discarded.
 ///
 /// `max_frame_bytes` is PAYLOAD-ONLY, as in [`decode_frame`].
+///
+/// **Decode errors are connection-terminal.** An error from this function
+/// carries NO consumed count: once a frame fails to decode, this crate
+/// cannot say where the failed frame ends, so the stream position is
+/// unrecoverable. A transport must map the error through
+/// [`CodecError::wire_code`], send the corresponding wire error, and close
+/// the connection — never attempt to resynchronize and keep reading.
 pub fn decode_frame_with_consumed(
     buf: &[u8],
     max_frame_bytes: usize,
@@ -375,26 +429,27 @@ pub fn decode_frame_with_consumed(
 
 /// Decode one frame's JSON payload (without the length prefix).
 ///
-/// Split out from [`decode_frame`] so a caller that already has the exact
-/// payload bytes (for example, from fixture files that store payload-only
-/// JSON) does not have to synthesize a length prefix first.
-///
-/// **Size guard:** this function applies NO `max_frame_bytes` check — the
-/// bound is enforced only in [`decode_frame`] / [`FrameCodec::decode`],
-/// which is where the length prefix is read. Callers with untrusted payload
-/// bytes must check `payload.len()` against their bound before calling, or
-/// go through [`decode_frame`] with a synthesized prefix.
+/// Crate-internal split of [`decode_frame`]'s payload half; the public
+/// surface is the length-prefixed [`decode_frame`] / [`FrameCodec::decode`],
+/// which apply the `max_frame_bytes` size guard. Visible to unit tests in
+/// this module only. This function applies NO
+/// size check of its own: its only caller inside the crate is
+/// [`decode_frame_with_consumed`], which has already enforced the bound
+/// against the declared length before handing the payload over.
 ///
 /// Enforces, beyond serde: the closed `"kind"` set
-/// ([`CodecError::UnknownFrameKind`]), and — after the frame parses — the
-/// ADR-137 id/scope consistency rule for `error` frames
-/// ([`CodecError::InconsistentErrorScope`]). Strict field rejection (no
+/// ([`CodecError::UnknownFrameKind`]). The ADR-137 id/scope consistency
+/// rule for `error` frames and the unknown-code fallback diagnostic are
+/// enforced inside [`crate::frame::Frame`]'s serde visitor — the same
+/// visitor a direct serde decode drives — so both decode paths agree; this
+/// function re-classifies the visitor's id/scope rejection into the typed
+/// [`CodecError::InconsistentErrorScope`]. Strict field rejection (no
 /// unknown fields) is carried by the per-kind payload structs in
 /// [`crate::frame`]. For an `error` frame whose wire code is outside the
 /// closed set, the raw code string is preserved in
 /// [`Frame::Error`](crate::frame::Frame)'s `unrecognized_code` diagnostic
 /// field.
-pub fn decode_payload(payload: &[u8]) -> Result<Frame, CodecError> {
+pub(crate) fn decode_payload(payload: &[u8]) -> Result<Frame, CodecError> {
     let value: serde_json::Value =
         serde_json::from_slice(payload).map_err(|e| CodecError::InvalidJson(e.to_string()))?;
 
@@ -409,65 +464,18 @@ pub fn decode_payload(payload: &[u8]) -> Result<Frame, CodecError> {
         return Err(CodecError::UnknownFrameKind(kind));
     }
 
-    // For an `error` frame, capture the raw code string before `value` is
-    // consumed: the scope/id consistency check applies only to codes in the
-    // closed set (see `WIRE_ERROR_CODES`).
-    let raw_error_code = value
-        .as_object()
-        .and_then(|obj| obj.get("code"))
-        .and_then(|c| c.as_str())
-        .map(str::to_string);
-
-    let mut frame: Frame =
-        serde_json::from_value(value).map_err(|e| CodecError::InvalidFields {
-            kind,
-            detail: e.to_string(),
-        })?;
-
-    // ADR-137, "Operation correlation": a connection-terminal error carries
-    // no operation id, and a request-terminal error echoes the one it
-    // terminates. An `error` frame violating that pairing is an inconsistent
-    // wire state, rejected at decode rather than represented. Enforcement
-    // covers the codes in the closed set — the table fixes their scopes. A
-    // code outside the set fell back to `Internal` (its true scope is
-    // unknown to this version), and ADR-137 directs the client to treat it
-    // as `internal` rather than reject the frame; the raw code string is
-    // preserved in the frame's `unrecognized_code` diagnostic field so the
-    // information is not silently discarded.
-    if let Frame::Error {
-        id,
-        code,
-        unrecognized_code,
-        ..
-    } = &mut frame
-    {
-        let code_in_closed_set = raw_error_code
-            .as_deref()
-            .is_some_and(|c| crate::error::WIRE_ERROR_CODES.contains(&c));
-        if !code_in_closed_set {
-            *unrecognized_code = raw_error_code;
-            return Ok(frame);
+    serde_json::from_value(value).map_err(|e| {
+        // The visitor reports an id/scope violation through the
+        // deserializer's error type; lift it back into the typed variant
+        // so callers can branch on the specific failure.
+        let detail = e.to_string();
+        match detail.strip_prefix(INCONSISTENT_SCOPE_ERROR_PREFIX) {
+            Some(scope_detail) => CodecError::InconsistentErrorScope {
+                detail: scope_detail.to_string(),
+            },
+            None => CodecError::InvalidFields { kind, detail },
         }
-        match (code.terminal_scope(), id.as_ref()) {
-            (TerminalScope::Connection, Some(id)) => {
-                return Err(CodecError::InconsistentErrorScope {
-                    detail: format!(
-                        "connection-terminal code {code} must not carry an operation id, got {id}"
-                    ),
-                });
-            }
-            (TerminalScope::Request, None) => {
-                return Err(CodecError::InconsistentErrorScope {
-                    detail: format!(
-                        "request-terminal code {code} must echo the operation id it terminates"
-                    ),
-                });
-            }
-            (TerminalScope::Connection, None) | (TerminalScope::Request, Some(_)) => {}
-        }
-    }
-
-    Ok(frame)
+    })
 }
 
 #[cfg(test)]
@@ -1052,6 +1060,75 @@ mod tests {
         }
     }
 
+    #[test]
+    fn decode_scope_rejection_detail_is_reclassified_without_the_shared_prefix() {
+        // The visitor reports the id/scope rule with a fixed prefix so
+        // every decode path uses one wording; `decode_payload` must strip
+        // that prefix when re-classifying into the typed variant.
+        let payload =
+            br#"{"kind":"error","id":"op-1","code":"frame_too_large","message":"too big"}"#;
+        match decode_payload(payload).unwrap_err() {
+            CodecError::InconsistentErrorScope { detail } => {
+                assert!(
+                    !detail.contains(INCONSISTENT_SCOPE_ERROR_PREFIX),
+                    "detail must not repeat the shared prefix: {detail}"
+                );
+                assert!(detail.starts_with("connection-terminal code"));
+            }
+            other => panic!("expected InconsistentErrorScope, got {other:?}"),
+        }
+    }
+
+    // ── fallback frames are terminal for relay (item 2) ──
+
+    #[test]
+    fn encode_rejects_a_fallback_frame_with_an_id() {
+        // A decoded unknown-code fallback re-encoded as-is would emit
+        // `internal` and silently discard the newer code the peer sent —
+        // silent code loss. The encode path must reject it outright, in
+        // both id shapes. Here: WITH an id (the request-terminal fallback
+        // shape a newer peer would send).
+        let payload =
+            br#"{"kind":"error","id":"op-7","code":"future_code_xyz","message":"from newer peer"}"#;
+        let frame = decode_payload(payload).unwrap();
+        match encode_frame(&frame).unwrap_err() {
+            CodecError::FallbackFrameNotEncodable { code } => {
+                assert_eq!(code, "future_code_xyz");
+            }
+            other => panic!("expected FallbackFrameNotEncodable, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn encode_rejects_a_fallback_frame_without_an_id() {
+        // Same rule for the id-less fallback shape: decode accepts it (the
+        // pairing is not enforced for an unknown code), encode rejects it.
+        let payload = br#"{"kind":"error","code":"future_code_xyz","message":"from newer peer"}"#;
+        let frame = decode_payload(payload).unwrap();
+        match encode_frame(&frame).unwrap_err() {
+            CodecError::FallbackFrameNotEncodable { code } => {
+                assert_eq!(code, "future_code_xyz");
+            }
+            other => panic!("expected FallbackFrameNotEncodable, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn encode_accepts_an_honest_internal_error_frame() {
+        // The rejection keys on the `unrecognized_code` MARKER, not on the
+        // `internal` code: a locally constructed (or closed-set-decoded)
+        // `internal` frame has `unrecognized_code: None` and encodes fine.
+        let frame = Frame::Error {
+            id: Some(OperationId::from("op-1")),
+            code: crate::error::WireErrorCode::Internal,
+            message: "boom".to_string(),
+            unrecognized_code: None,
+        };
+        let wire = encode_frame(&frame).expect("honest internal must encode");
+        let decoded = decode_frame(&wire, DEFAULT_MAX_FRAME_BYTES).unwrap();
+        assert_eq!(decoded, frame);
+    }
+
     // ── decode_with_consumed (item 4) ──
 
     #[test]
@@ -1175,6 +1252,12 @@ mod tests {
             (
                 CodecError::InconsistentErrorScope {
                     detail: "x".to_string(),
+                },
+                WireErrorCode::MalformedFrame,
+            ),
+            (
+                CodecError::FallbackFrameNotEncodable {
+                    code: "future_code_xyz".to_string(),
                 },
                 WireErrorCode::MalformedFrame,
             ),

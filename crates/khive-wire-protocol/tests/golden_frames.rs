@@ -25,9 +25,24 @@ fn fixture(name: &str) -> Vec<u8> {
     let path = format!("{}/tests/fixtures/{name}.hex", env!("CARGO_MANIFEST_DIR"));
     let hex = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("reading {path}: {e}"));
     let hex = hex.trim();
+    if hex.len() % 2 != 0 {
+        panic!(
+            "fixture {path}: hex string has {} characters; a hex-encoded fixture \
+             must have an even length (one byte per two hex digits)",
+            hex.len()
+        );
+    }
     (0..hex.len())
         .step_by(2)
-        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+        .map(|i| {
+            let pair = &hex[i..i + 2];
+            u8::from_str_radix(pair, 16).unwrap_or_else(|e| {
+                panic!(
+                    "fixture {path}: invalid hex byte {pair:?} at offset {i} \
+                     (fixtures are lowercase hex, one byte per two digits): {e}"
+                )
+            })
+        })
         .collect()
 }
 
@@ -125,8 +140,12 @@ fn connection_terminal_error_carries_no_id() {
     let payload_len = wire.len() - khive_wire_protocol::codec::LENGTH_PREFIX_BYTES;
     assert_eq!(decode_frame(&wire, payload_len).unwrap(), frame);
 
-    // Decoding a raw payload that lacks the `id` field yields `id: None`.
-    let decoded = khive_wire_protocol::codec::decode_payload(payload).unwrap();
+    // Decoding a payload that lacks the `id` field yields `id: None`.
+    // `decode_payload` is crate-internal; drive the same path through the
+    // public length-prefixed entry point with a synthesized prefix.
+    let mut prefixed = (payload.len() as u32).to_be_bytes().to_vec();
+    prefixed.extend_from_slice(payload);
+    let decoded = decode_frame(&prefixed, payload_len).unwrap();
     assert_eq!(decoded, frame);
 }
 

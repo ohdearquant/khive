@@ -47,6 +47,13 @@
 //! prefix and then the declared number of payload bytes before calling
 //! into this crate.
 //!
+//! **Decode errors are connection-terminal.** A decode error carries NO
+//! consumed byte count: once a frame fails to decode, the stream position
+//! is unrecoverable and the transport cannot find the next frame's start.
+//! A transport must map the error through [`codec::CodecError::wire_code`],
+//! send the corresponding wire error, and close the connection — never
+//! attempt to resynchronize and keep reading.
+//!
 //! ## The JSON payload: frame kind and fields
 //!
 //! Every payload is a JSON object with a `"kind"` string field naming one
@@ -198,16 +205,34 @@
 //!
 //! A **connection-terminal** error is followed by connection close and
 //! carries no operation id. A **request-terminal** error terminates only
-//! the operation id it echoes; the connection stays usable. The codec
-//! enforces that pairing at encode AND decode time
-//! ([`codec::CodecError::InconsistentErrorScope`]): an `error` frame whose
-//! id presence contradicts its code's terminal scope is rejected, never
-//! represented and never emitted. The check covers the codes in the closed
-//! set ([`error::WIRE_ERROR_CODES`]); an unrecognized code falls back to
-//! `internal` and is processed per the fallback rule above (its true scope
-//! is unknown to this version, so the pairing is not enforced for it), but
-//! the raw code string is preserved in the decoded frame's
-//! `unrecognized_code` diagnostic field rather than discarded.
+//! the operation id it echoes; the connection stays usable. That pairing
+//! is enforced at encode AND decode time: an `error` frame whose id
+//! presence contradicts its code's terminal scope is rejected, never
+//! represented and never emitted. The check lives in
+//! [`frame::Frame`]'s serde visitor, so EVERY decode path agrees — the
+//! codec's `decode_payload` path (which re-classifies the
+//! rejection into the typed [`codec::CodecError::InconsistentErrorScope`])
+//! AND a direct `serde_json::from_str::<Frame>`. The check covers the
+//! codes in the closed set ([`error::WIRE_ERROR_CODES`]); an unrecognized
+//! code falls back to `internal` and is processed per the fallback rule
+//! above (its true scope is unknown to this version, so the pairing is
+//! not enforced for it), but the raw code string is preserved in the
+//! decoded frame's `unrecognized_code` diagnostic field rather than
+//! discarded.
+//!
+//! **Fallback frames are terminal for relay.** A decoded frame carrying
+//! `unrecognized_code` can be inspected locally, but the encode path
+//! rejects it with [`codec::CodecError::FallbackFrameNotEncodable`]:
+//! re-encoding would emit `internal` and silently discard the newer code
+//! the peer sent, so this crate never corrupts it. A relay that must pass
+//! unknown codes through has to operate on the raw frame bytes, not on a
+//! decoded-and-re-encoded frame. The one decode-only guarantee the codec
+//! path holds over a direct serde decode is the finer-grained
+//! [`codec::CodecError::UnknownFrameKind`] classification for a `"kind"`
+//! outside the closed set; every other decode-time rule — strict field
+//! rejection, the id/scope pairing, and the unknown-code diagnostic — is
+//! enforced identically on both paths.
+//!
 //! The set is
 //! closed within a protocol version: adding a code requires a version bump,
 //! and a client that decodes a code it does not recognize treats it as
@@ -247,4 +272,4 @@ pub use codec::{
 pub use error::{TerminalScope, WireErrorCode, WIRE_ERROR_CODES};
 pub use frame::{Cursor, Frame, OperationId, CLIENT_TO_SERVER_KINDS, FRAME_KINDS};
 pub use handshake::{HandshakeGate, HandshakeOutcome, HandshakeSequenceError};
-pub use version::{ProtocolVersion, SupportedVersions, CURRENT_VERSION};
+pub use version::{ProtocolVersion, SupportedVersions, SupportedVersionsError, CURRENT_VERSION};

@@ -261,7 +261,12 @@ pub struct EventPayload {
 /// carries `#[serde(deny_unknown_fields)]`. A payload with any field its
 /// kind does not declare is therefore rejected — never silently ignored —
 /// and a missing or non-string `"kind"` is rejected before any kind is
-/// matched. Encoding writes `"kind"` first, then the kind's fields in
+/// matched. The visitor likewise enforces the ADR-137 id/scope rule for
+/// `error` frames and captures the unknown-code fallback's raw string
+/// ([`Frame::Error`](Frame)'s `unrecognized_code`), so a DIRECT serde
+/// decode of `Frame` — not just the codec — can never represent an
+/// inconsistent error frame. Encoding writes `"kind"` first, then the
+/// kind's fields in
 /// declaration order, skipping absent optional fields; this is the exact
 /// byte layout the golden fixtures pin.
 #[derive(Debug, Clone, PartialEq)]
@@ -329,8 +334,12 @@ pub enum Frame {
         /// [`crate::error::WireErrorCode::Internal`]; `None` for every
         /// recognized code, and for every frame this crate produced by
         /// encoding or by in-memory construction. Diagnostic only: it is
-        /// never serialized, and [`crate::codec::decode_payload`] is the
-        /// only path that ever fills it.
+        /// never serialized, and only DECODE paths fill it — this type's
+        /// serde visitor, whether driven by the codec's `decode_payload`
+        /// or by a direct serde decode. A frame carrying it is a decoded
+        /// fallback and is TERMINAL FOR RELAY: the encode path rejects it
+        /// ([`crate::codec::CodecError::FallbackFrameNotEncodable`]) rather
+        /// than emit `internal` and silently discard the newer code.
         unrecognized_code: Option<String>,
     },
 
@@ -548,10 +557,28 @@ impl Serialize for Frame {
 
 /// The decode half of the closed grammar; see the type-level docs and the
 /// crate documentation's "Strict field rejection" section. The codec's
-/// [`crate::codec::decode_payload`] drives this via
-/// `serde_json::from_value::<Frame>` after its own closed-set `"kind"`
-/// check (which produces the finer-grained
-/// [`crate::codec::CodecError::UnknownFrameKind`]).
+/// `decode_payload` drives this via `serde_json::from_value::<Frame>`
+/// after its own closed-set `"kind"` check (which produces the
+/// finer-grained [`crate::codec::CodecError::UnknownFrameKind`]).
+///
+/// The visitor enforces every decode-time rule that only needs the fields
+/// of one frame, so a DIRECT serde decode of `Frame` (e.g.
+/// `serde_json::from_str::<Frame>`) agrees with the codec path:
+///
+/// - the ADR-137 id/scope pairing for `error` frames — a
+///   connection-terminal code must carry no operation id, and a
+///   request-terminal code must echo the one it terminates
+///   ([`crate::codec::CodecError::InconsistentErrorScope`] is the codec's
+///   typed form of this rejection; a direct serde decode reports the same
+///   rule through its deserializer's error type); and
+/// - the unknown-code fallback diagnostic: an `error` frame whose wire
+///   code is outside the closed set ([`crate::error::WIRE_ERROR_CODES`])
+///   carries the raw string in `unrecognized_code`.
+///
+/// The one guarantee only the codec path provides is the finer-grained
+/// [`crate::codec::CodecError::UnknownFrameKind`] classification for a
+/// `"kind"` outside [`FRAME_KINDS`]; this visitor rejects unknown kinds
+/// too, with the deserializer's own error type.
 impl<'de> Deserialize<'de> for Frame {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         struct FrameVisitor;
@@ -619,17 +646,70 @@ impl<'de> Deserialize<'de> for Frame {
                         })
                     }
                     "error" => {
+                        // Capture the raw code string BEFORE payload
+                        // parsing: serde's `#[serde(other)]` fallback maps
+                        // every code outside the closed set
+                        // ([`crate::error::WIRE_ERROR_CODES`]) to
+                        // [`crate::error::WireErrorCode::Internal`] and
+                        // erases which of the two the wire carried. Both
+                        // the id/scope check and the fallback diagnostic
+                        // below need the pre-fallback string.
+                        let raw_code = object
+                            .get("code")
+                            .and_then(|c| c.as_str())
+                            .map(str::to_string);
                         let payload: ErrorPayload = parse(&object).map_err(A::Error::custom)?;
-                        // `unrecognized_code` starts `None`; the codec's
-                        // [`crate::codec::decode_payload`] fills it when the
-                        // wire code fell back to `Internal` via
-                        // `#[serde(other)]`. A direct serde decode of
-                        // `Frame` leaves it `None`.
+
+                        // ADR-137, "Operation correlation": a
+                        // connection-terminal code carries no operation id,
+                        // and a request-terminal code echoes the one it
+                        // terminates. Enforced HERE — inside the visitor —
+                        // so every decode path agrees: a direct
+                        // `serde_json::from_str::<Frame>` can never
+                        // represent an inconsistent error frame, and
+                        // [`crate::codec::decode_payload`] (which drives
+                        // this same visitor) re-classifies the rejection
+                        // into its typed
+                        // [`crate::codec::CodecError::InconsistentErrorScope`].
+                        // The check covers closed-set codes only: an unknown
+                        // code's true scope is unknowable to this protocol
+                        // version, and the ADR directs the fallback-to-
+                        // `internal` treatment rather than rejection.
+                        let code_in_closed_set = raw_code
+                            .as_deref()
+                            .is_some_and(|c| crate::error::WIRE_ERROR_CODES.contains(&c));
+                        if code_in_closed_set {
+                            match (payload.code.terminal_scope(), payload.id.as_ref()) {
+                                (crate::error::TerminalScope::Connection, Some(id)) => {
+                                    return Err(A::Error::custom(format!(
+                                        "{}connection-terminal code {code} must not carry an operation id, got {id}",
+                                        crate::codec::INCONSISTENT_SCOPE_ERROR_PREFIX,
+                                        code = payload.code
+                                    )));
+                                }
+                                (crate::error::TerminalScope::Request, None) => {
+                                    return Err(A::Error::custom(format!(
+                                        "{}request-terminal code {code} must echo the operation id it terminates",
+                                        crate::codec::INCONSISTENT_SCOPE_ERROR_PREFIX,
+                                        code = payload.code
+                                    )));
+                                }
+                                (crate::error::TerminalScope::Connection, None)
+                                | (crate::error::TerminalScope::Request, Some(_)) => {}
+                            }
+                        }
+
                         Ok(Frame::Error {
                             id: payload.id,
                             code: payload.code,
                             message: payload.message,
-                            unrecognized_code: None,
+                            // The decoded-fallback marker, filled on EVERY
+                            // decode path (codec or direct serde): the raw
+                            // string when the code fell back to `Internal`,
+                            // `None` for every closed-set code — including a
+                            // literal `"internal"`, which is a closed-set
+                            // member, not a fallback.
+                            unrecognized_code: if code_in_closed_set { None } else { raw_code },
                         })
                     }
                     "cancel" => {
@@ -719,5 +799,106 @@ mod tests {
     fn unknown_kind_through_direct_serde_is_rejected() {
         let err = serde_json::from_str::<Frame>(r#"{"kind":"ping"}"#).unwrap_err();
         assert!(err.to_string().contains("unknown frame kind"));
+    }
+
+    #[test]
+    fn direct_serde_rejects_connection_terminal_error_carrying_an_id() {
+        // The id/scope rule is enforced inside the visitor itself, so a
+        // DIRECT serde decode — bypassing `decode_payload` entirely —
+        // cannot represent an inconsistent error frame either.
+        let err = serde_json::from_str::<Frame>(
+            r#"{"kind":"error","id":"op-1","code":"frame_too_large","message":"too big"}"#,
+        )
+        .unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains("id/scope rule"),
+            "unexpected error: {message}"
+        );
+        assert!(message.contains("frame_too_large"), "error: {message}");
+        assert!(message.contains("op-1"), "error: {message}");
+    }
+
+    #[test]
+    fn direct_serde_rejects_request_terminal_error_without_an_id() {
+        let err = serde_json::from_str::<Frame>(
+            r#"{"kind":"error","code":"cancelled","message":"cancelled"}"#,
+        )
+        .unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains("id/scope rule"),
+            "unexpected error: {message}"
+        );
+        assert!(message.contains("cancelled"), "error: {message}");
+    }
+
+    #[test]
+    fn direct_serde_accepts_both_consistent_error_scopes() {
+        let connection_terminal: Frame = serde_json::from_str(
+            r#"{"kind":"error","code":"unsupported_version","message":"no common version"}"#,
+        )
+        .unwrap();
+        assert!(matches!(connection_terminal, Frame::Error { id: None, .. }));
+
+        let request_terminal: Frame = serde_json::from_str(
+            r#"{"kind":"error","id":"op-9","code":"deadline_exceeded","message":"too slow"}"#,
+        )
+        .unwrap();
+        match request_terminal {
+            Frame::Error {
+                id,
+                code,
+                unrecognized_code,
+                ..
+            } => {
+                assert_eq!(id, Some(OperationId::from("op-9")));
+                assert_eq!(code, crate::error::WireErrorCode::DeadlineExceeded);
+                assert!(unrecognized_code.is_none());
+            }
+            other => panic!("expected an error frame, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn direct_serde_fills_unrecognized_code_for_an_unknown_wire_code() {
+        // The fallback diagnostic is filled by the visitor, on every
+        // decode path — not only by the codec. The id/scope pairing is NOT
+        // enforced for an unknown code (its true scope is unknown), so
+        // both id shapes decode.
+        for json in [
+            r#"{"kind":"error","id":"op-7","code":"future_code_xyz","message":"from newer peer"}"#,
+            r#"{"kind":"error","code":"future_code_xyz","message":"from newer peer"}"#,
+        ] {
+            let frame: Frame = serde_json::from_str(json).unwrap();
+            match frame {
+                Frame::Error {
+                    code,
+                    unrecognized_code,
+                    ..
+                } => {
+                    assert_eq!(code, crate::error::WireErrorCode::Internal);
+                    assert_eq!(unrecognized_code.as_deref(), Some("future_code_xyz"));
+                }
+                other => panic!("expected an error frame, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn direct_serde_leaves_unrecognized_code_none_for_a_literal_internal() {
+        // `"internal"` is a closed-set member, not a fallback: the
+        // diagnostic must stay `None` so the encode side does not mistake
+        // an honest `internal` for a decoded-fallback frame.
+        let frame: Frame = serde_json::from_str(
+            r#"{"kind":"error","id":"op-1","code":"internal","message":"boom"}"#,
+        )
+        .unwrap();
+        match frame {
+            Frame::Error {
+                unrecognized_code, ..
+            } => assert!(unrecognized_code.is_none()),
+            other => panic!("expected an error frame, got {other:?}"),
+        }
     }
 }

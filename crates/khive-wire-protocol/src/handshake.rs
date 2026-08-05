@@ -16,6 +16,34 @@ use crate::error::WireErrorCode;
 use crate::frame::Frame;
 use crate::version::{ProtocolVersion, SupportedVersions};
 
+/// Why a gate moved to the terminal [`State::Closed`]. Stored at the
+/// moment of closure so the Closed-state rejection can report the ACTUAL
+/// cause instead of always blaming a handshake failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CloseReason {
+    /// The handshake named no mutually supported version
+    /// ([`HandshakeOutcome::Rejected`]).
+    UnsupportedVersion,
+    /// A non-`handshake` frame arrived before the handshake completed.
+    NonHandshakeFirst,
+    /// A second `handshake` arrived after one already completed.
+    DuplicateHandshake,
+    /// A server→client-only frame kind arrived on this inbound gate.
+    ServerOnlyKind,
+}
+
+impl CloseReason {
+    /// The human-readable cause used in the Closed-state rejection message.
+    const fn phrase(self) -> &'static str {
+        match self {
+            CloseReason::UnsupportedVersion => "a rejected handshake (unsupported version)",
+            CloseReason::NonHandshakeFirst => "a frame before the handshake",
+            CloseReason::DuplicateHandshake => "a duplicate handshake",
+            CloseReason::ServerOnlyKind => "a server-to-client frame on an inbound gate",
+        }
+    }
+}
+
 /// The gate's current state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum State {
@@ -25,8 +53,8 @@ enum State {
     Completed(ProtocolVersion),
     /// A connection-terminal outcome was already produced (rejected
     /// handshake, or a protocol violation). The gate accepts no further
-    /// frames.
-    Closed,
+    /// frames; the carried reason records what closed it.
+    Closed(CloseReason),
 }
 
 /// The outcome of feeding one frame to [`HandshakeGate::admit`].
@@ -126,7 +154,7 @@ impl HandshakeGate {
                         version: *version,
                     })
                 } else {
-                    self.state = State::Closed;
+                    self.state = State::Closed(CloseReason::UnsupportedVersion);
                     Ok(HandshakeOutcome::Rejected {
                         error: Frame::Error {
                             id: None,
@@ -142,7 +170,7 @@ impl HandshakeGate {
                 }
             }
             (State::AwaitingHandshake, _) => {
-                self.state = State::Closed;
+                self.state = State::Closed(CloseReason::NonHandshakeFirst);
                 Err(HandshakeSequenceError {
                     error: Box::new(Frame::Error {
                         id: None,
@@ -156,7 +184,7 @@ impl HandshakeGate {
                 })
             }
             (State::Completed(_), Frame::Handshake { .. }) => {
-                self.state = State::Closed;
+                self.state = State::Closed(CloseReason::DuplicateHandshake);
                 Err(HandshakeSequenceError {
                     error: Box::new(Frame::Error {
                         id: None,
@@ -174,7 +202,7 @@ impl HandshakeGate {
                 if crate::frame::CLIENT_TO_SERVER_KINDS.contains(&frame.kind()) {
                     Ok(HandshakeOutcome::Admitted)
                 } else {
-                    self.state = State::Closed;
+                    self.state = State::Closed(CloseReason::ServerOnlyKind);
                     Err(HandshakeSequenceError {
                         error: Box::new(Frame::Error {
                             id: None,
@@ -188,11 +216,11 @@ impl HandshakeGate {
                     })
                 }
             }
-            (State::Closed, _) => Err(HandshakeSequenceError {
+            (State::Closed(reason), _) => Err(HandshakeSequenceError {
                 error: Box::new(Frame::Error {
                     id: None,
                     code: WireErrorCode::MalformedFrame,
-                    message: "connection already closed by a prior handshake failure".to_string(),
+                    message: format!("connection already closed by {}", reason.phrase()),
                     unrecognized_code: None,
                 }),
             }),
@@ -408,7 +436,9 @@ mod tests {
     fn stays_closed_after_a_rejected_handshake() {
         // A rejected handshake produces a connection-terminal
         // `unsupported_version` error; the gate must stay closed to every
-        // later frame, reporting the sequence-violation code.
+        // later frame, reporting the sequence-violation code AND the
+        // preserved closure reason (a rejected handshake — not some other
+        // cause).
         let mut gate = HandshakeGate::default();
         let outcome = gate
             .admit(&Frame::Handshake {
@@ -435,12 +465,93 @@ mod tests {
                 Frame::Error { code, message, .. } => {
                     assert_eq!(*code, WireErrorCode::MalformedFrame);
                     assert!(
-                        message.contains("closed by a prior handshake failure"),
+                        message.contains("closed by a rejected handshake"),
                         "message: {message}"
                     );
                 }
                 other => panic!("expected an error frame, got {other:?}"),
             }
+        }
+    }
+
+    #[test]
+    fn closed_state_reports_a_sequence_violation_reason_not_handshake() {
+        // Closure caused by a non-handshake first frame: the Closed-state
+        // rejection must report THAT cause, not blame a handshake failure.
+        let mut gate = HandshakeGate::default();
+        gate.admit(&Frame::Cancel {
+            id: crate::frame::OperationId::from("op-1"),
+        })
+        .unwrap_err();
+
+        let err = gate
+            .admit(&Frame::Handshake {
+                version: CURRENT_VERSION,
+            })
+            .unwrap_err();
+        match err.error.as_ref() {
+            Frame::Error { code, message, .. } => {
+                assert_eq!(*code, WireErrorCode::MalformedFrame);
+                assert!(
+                    message.contains("closed by a frame before the handshake"),
+                    "message: {message}"
+                );
+                assert!(
+                    !message.contains("handshake failure")
+                        && !message.contains("rejected handshake"),
+                    "sequence-violation closure must not blame a handshake: {message}"
+                );
+            }
+            other => panic!("expected an error frame, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn closed_state_reports_a_duplicate_handshake_reason() {
+        let mut gate = completed_gate();
+        gate.admit(&Frame::Handshake {
+            version: CURRENT_VERSION,
+        })
+        .unwrap_err();
+
+        let err = gate
+            .admit(&Frame::Cancel {
+                id: crate::frame::OperationId::from("op-1"),
+            })
+            .unwrap_err();
+        match err.error.as_ref() {
+            Frame::Error { message, .. } => {
+                assert!(
+                    message.contains("closed by a duplicate handshake"),
+                    "message: {message}"
+                );
+            }
+            other => panic!("expected an error frame, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn closed_state_reports_a_server_only_kind_reason() {
+        let mut gate = completed_gate();
+        gate.admit(&Frame::Response {
+            id: crate::frame::OperationId::from("op-1"),
+            result: serde_json::json!({}),
+        })
+        .unwrap_err();
+
+        let err = gate
+            .admit(&Frame::Cancel {
+                id: crate::frame::OperationId::from("op-1"),
+            })
+            .unwrap_err();
+        match err.error.as_ref() {
+            Frame::Error { message, .. } => {
+                assert!(
+                    message.contains("closed by a server-to-client frame"),
+                    "message: {message}"
+                );
+            }
+            other => panic!("expected an error frame, got {other:?}"),
         }
     }
 }
