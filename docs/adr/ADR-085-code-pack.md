@@ -1498,8 +1498,9 @@ Future L2 containment nodes and symbols inherit the same ownership rule.
 Every module produced by L1.5 carries:
 
 - `properties.source_path`: a `/`-separated source-file path relative to the
-  enclosing git repository root, or relative to the ingested folder when no
-  git repository can be resolved; and
+  enclosing git repository root, or relative to the ingested folder when the
+  canonical repository-relative path is unavailable (including the no-git-
+  repository case); and
 - `properties.source_revision`: the repository's `HEAD` object id observed at
   ingest, or the explicit sentinel `unversioned` when no committed revision is
   available.

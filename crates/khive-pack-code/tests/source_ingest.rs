@@ -1030,3 +1030,274 @@ async fn gitless_fixture_reports_unversioned_source_revision() {
     assert_eq!(module.len(), 1);
     assert_eq!(module[0]["source_revision"].as_str(), Some("unversioned"));
 }
+
+#[tokio::test]
+async fn alias_form_import_resolves_to_package_project_entity() {
+    // `mock = { package = "mock-dep" }` — Rust imports the renamed
+    // dependency under the ALIAS (`use mock::…`); the real crate name never
+    // appears in source. The import edge must target the `mock-dep` project
+    // entity (the identity the dependency's own manifest ingest creates),
+    // never a phantom `mock` project.
+    let root = TempDir::new().expect("tempdir");
+    for package in ["pkg_a", "mock_dep"] {
+        std::fs::create_dir_all(root.path().join(package).join("src")).unwrap();
+    }
+    std::fs::write(
+        root.path().join("pkg_a/src/lib.rs"),
+        "use mock::stub;\n\npub fn pkg_a() { stub(); }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.path().join("mock_dep/src/lib.rs"),
+        "pub fn stub() {}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.path().join("pkg_a/Cargo.toml"),
+        "[package]\nname = \"pkg-a\"\n\n[dev-dependencies]\nmock = { package = \"mock-dep\", path = \"../mock_dep\" }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.path().join("mock_dep/Cargo.toml"),
+        "[package]\nname = \"mock-dep\"\n",
+    )
+    .unwrap();
+
+    let rt = rt_at(&root.path().join("alias.db"));
+    let token = rt.authorize(Namespace::local()).expect("token");
+    let report = run_code_ingest(
+        &rt,
+        &token,
+        CodeSourceIngestOptions {
+            path: root.path(),
+            languages: all_languages(),
+            sweep_time: Utc::now(),
+        },
+    )
+    .await
+    .expect("alias fixture ingests");
+
+    // Alias-targeted edges must not exist: no `mock` project entity.
+    let names = entity_names(&rt).await;
+    assert!(
+        !names.contains(&"mock".to_string()),
+        "the alias must never become a project entity: {names:?}"
+    );
+
+    // The import edge lands on the package identity with the declared scope.
+    let edges = edge_fingerprints(&rt).await;
+    assert!(
+        edges
+            .iter()
+            .any(|(relation, source, target, kinds, scopes)| {
+                relation == "depends_on"
+                    && source == "pkg-a"
+                    && target == "mock-dep"
+                    && kinds.contains("import")
+                    && kinds.contains("dev-dependencies")
+                    && scopes == "dev"
+            }),
+        "alias-form import must fold onto the pkg-a -> mock-dep edge with the declared dev scope: {edges:?}"
+    );
+
+    // The import resolved (module fully scanned) and no unresolved spec
+    // survived on the project entity.
+    let pkg_a_module = module_properties_for_path(&rt, "pkg-a", "pkg_a/src/lib.rs").await;
+    assert_eq!(pkg_a_module.len(), 1);
+    assert_eq!(pkg_a_module[0]["import_scan_status"], "scanned");
+    assert_eq!(pkg_a_module[0]["unresolved_import_count"], 0);
+    let sql = rt.sql();
+    let mut reader = sql.reader().await.expect("reader");
+    let row = reader
+        .query_row(SqlStatement {
+            sql: "SELECT json_extract(properties,'$.unresolved_specifiers') AS u FROM entities \
+                  WHERE deleted_at IS NULL AND kind='project' AND name='pkg-a'"
+                .into(),
+            params: vec![],
+            label: Some("test_alias_unresolved".into()),
+        })
+        .await
+        .expect("query");
+    let leftover = match row.and_then(|r| r.get("u").cloned()) {
+        None | Some(SqlValue::Null) => None,
+        Some(SqlValue::Text(s)) => Some(s),
+        other => panic!("unexpected unresolved column value: {other:?}"),
+    };
+    assert!(
+        leftover.is_none(),
+        "every alias/package spec must resolve this pass, none may linger: {leftover:?}"
+    );
+    assert_eq!(report.coverage_stamps_missed, 0);
+}
+
+#[tokio::test]
+async fn binary_root_crate_import_lands_on_sibling_module() {
+    // `use crate::helper::run` FROM `src/main.rs` must resolve to the
+    // sibling `helper` module — not a phantom `crate::main::helper` and not
+    // the lib root (`crate`).
+    let root = TempDir::new().expect("tempdir");
+    std::fs::create_dir_all(root.path().join("src")).unwrap();
+    std::fs::write(
+        root.path().join("Cargo.toml"),
+        "[package]\nname = \"bin_fixture\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.path().join("src/main.rs"),
+        "mod helper;\n\nuse crate::helper::run;\n\nfn main() {\n    run();\n}\n",
+    )
+    .unwrap();
+    std::fs::write(root.path().join("src/helper.rs"), "pub fn run() {}\n").unwrap();
+
+    let rt = rt_at(&root.path().join("binroot.db"));
+    let token = rt.authorize(Namespace::local()).expect("token");
+    run_code_ingest(
+        &rt,
+        &token,
+        CodeSourceIngestOptions {
+            path: root.path(),
+            languages: all_languages(),
+            sweep_time: Utc::now(),
+        },
+    )
+    .await
+    .expect("binary-root fixture ingests");
+
+    // No phantom module identities.
+    let names = entity_names(&rt).await;
+    for phantom in ["crate::main::helper", "crate::helper"] {
+        assert!(
+            !names.contains(&phantom.to_string()),
+            "phantom module identity {phantom} must not exist: {names:?}"
+        );
+    }
+
+    // The import edge is module crate::main -> module helper, import-scoped.
+    let edges = edge_fingerprints(&rt).await;
+    assert!(
+        edges
+            .iter()
+            .any(|(relation, source, target, kinds, scopes)| {
+                relation == "depends_on"
+                    && source == "crate::main"
+                    && target == "helper"
+                    && kinds == "import"
+                    && scopes == "build"
+            }),
+        "crate:: import from the binary root must land on the helper module: {edges:?}"
+    );
+    assert!(
+        !edges
+            .iter()
+            .any(|(relation, _source, target, _kinds, _scopes)| {
+                relation == "depends_on" && target == "crate"
+            }),
+        "the binary-root import must not land on the lib root: {edges:?}"
+    );
+
+    let main = module_properties_for_path(&rt, "bin_fixture", "src/main.rs").await;
+    assert_eq!(main.len(), 1);
+    assert_eq!(main[0]["module_path"], "crate::main");
+    assert_eq!(main[0]["import_scan_status"], "scanned");
+    assert_eq!(main[0]["unresolved_import_count"], 0);
+}
+
+#[tokio::test]
+async fn import_only_scope_is_order_independent() {
+    // Two modules importing the same UNDECLARED project fold two identical
+    // import specs onto ONE edge. With no manifest-declared kinds, the
+    // edge's scope derives solely from the import scope — which is a
+    // deterministic function of the (source, target) pair against the
+    // sweep's fixed manifest index (here the constant `build` fallback),
+    // never of spec arrival order (see `scopes_for_dependency_kinds`'s
+    // invariant comment). Re-ingesting must leave the metadata unchanged.
+    let root = TempDir::new().expect("tempdir");
+    for package in ["two_importers", "external_dep"] {
+        std::fs::create_dir_all(root.path().join(package).join("src")).unwrap();
+    }
+    std::fs::write(
+        root.path().join("two_importers/Cargo.toml"),
+        "[package]\nname = \"two-importers\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.path().join("two_importers/src/lib.rs"),
+        "pub mod alpha;\npub mod beta;\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.path().join("two_importers/src/alpha.rs"),
+        "use external_dep::thing_a;\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.path().join("two_importers/src/beta.rs"),
+        "use external_dep::thing_b;\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.path().join("external_dep/Cargo.toml"),
+        "[package]\nname = \"external_dep\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.path().join("external_dep/src/lib.rs"),
+        "pub fn thing_a() {}\npub fn thing_b() {}\n",
+    )
+    .unwrap();
+
+    let rt = rt_at(&root.path().join("scope_order.db"));
+    let token = rt.authorize(Namespace::local()).expect("token");
+    run_code_ingest(
+        &rt,
+        &token,
+        CodeSourceIngestOptions {
+            path: root.path(),
+            languages: all_languages(),
+            sweep_time: Utc::now(),
+        },
+    )
+    .await
+    .expect("first pass ingests");
+
+    let edges = edge_fingerprints(&rt).await;
+    let matching: Vec<_> = edges
+        .iter()
+        .filter(|(relation, source, target, _, _)| {
+            relation == "depends_on" && source == "two-importers" && target == "external_dep"
+        })
+        .collect();
+    assert_eq!(
+        matching.len(),
+        1,
+        "both import specs must fold onto one edge: {edges:?}"
+    );
+    let (_, _, _, kinds, scopes) = matching[0];
+    assert_eq!(
+        kinds, "import",
+        "undeclared import carries only import evidence"
+    );
+    assert_eq!(
+        scopes, "build",
+        "import-only scope must be the build default"
+    );
+
+    // Second pass over the same tree: metadata must be unchanged — no
+    // last-writer-wins drift.
+    run_code_ingest(
+        &rt,
+        &token,
+        CodeSourceIngestOptions {
+            path: root.path(),
+            languages: all_languages(),
+            sweep_time: Utc::now(),
+        },
+    )
+    .await
+    .expect("second pass ingests");
+    assert_eq!(
+        edge_fingerprints(&rt).await,
+        edges,
+        "re-ingest must not change the import-only scope"
+    );
+}

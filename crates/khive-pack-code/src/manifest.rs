@@ -39,8 +39,16 @@ pub(crate) struct ManifestProject {
     pub manifest_path: PathBuf,
     pub name: String,
     pub language: &'static str,
-    /// `(dependency_name, dependency_kind, dependency_scope)`.
+    /// `(dependency_name, dependency_kind, dependency_scope)`. A renamed
+    /// Cargo dependency appears under BOTH the alias and the `package`
+    /// name (see `renames`).
     pub dependencies: Vec<(String, String, String)>,
+    /// `(alias, package)` for renamed Cargo dependencies
+    /// (`alias = { package = "…" }`). Rust source imports a renamed
+    /// dependency under the alias — the real crate name never appears in
+    /// source — so the alias must resolve to the package's project
+    /// identity before a dependency edge target is recorded.
+    pub renames: Vec<(String, String)>,
 }
 
 /// Walk `path` recursively and parse every governing manifest found
@@ -119,13 +127,18 @@ pub(crate) fn parse_cargo_toml(root: &Path, text: &str) -> Option<ManifestProjec
         ("dev-dependencies", "dev"),
         ("build-dependencies", "build"),
     ];
-    // A renamed dependency (`alias = { package = "real" }`) is keyed by the
-    // alias, but Rust `use` statements name the real crate: index both so
-    // the declared scope survives either lookup key.
+    // A renamed dependency (`alias = { package = "real" }`) is imported in
+    // source under the alias — the real crate name never appears in source.
+    // Both names are indexed: the package key names the dependency's own
+    // project identity and carries its declared scope for lookups (import
+    // specifiers are canonicalized alias->package via `renames` before any
+    // lookup), while the alias key preserves the declaration evidence.
+    let mut renames: Vec<(String, String)> = Vec::new();
     let push_declared = |table: &toml::map::Map<String, TomlValue>,
                          section: &str,
                          scope: &str,
-                         dependencies: &mut Vec<(String, String, String)>| {
+                         dependencies: &mut Vec<(String, String, String)>,
+                         renames: &mut Vec<(String, String)>| {
         for dep_name in table.keys() {
             dependencies.push((dep_name.clone(), section.to_string(), scope.to_string()));
             if let Some(package) = table
@@ -140,13 +153,14 @@ pub(crate) fn parse_cargo_toml(root: &Path, text: &str) -> Option<ManifestProjec
                         section.to_string(),
                         scope.to_string(),
                     ));
+                    renames.push((dep_name.clone(), package.to_string()));
                 }
             }
         }
     };
     for (section, scope) in sections {
         if let Some(TomlValue::Table(table)) = doc.get(section) {
-            push_declared(table, section, scope, &mut dependencies);
+            push_declared(table, section, scope, &mut dependencies, &mut renames);
         }
     }
     if let Some(TomlValue::Table(targets)) = doc.get("target") {
@@ -156,7 +170,7 @@ pub(crate) fn parse_cargo_toml(root: &Path, text: &str) -> Option<ManifestProjec
             };
             for (section, scope) in sections {
                 if let Some(TomlValue::Table(table)) = target.get(section) {
-                    push_declared(table, section, scope, &mut dependencies);
+                    push_declared(table, section, scope, &mut dependencies, &mut renames);
                 }
             }
         }
@@ -168,6 +182,7 @@ pub(crate) fn parse_cargo_toml(root: &Path, text: &str) -> Option<ManifestProjec
         name,
         language: "rust",
         dependencies,
+        renames,
     })
 }
 
@@ -227,6 +242,7 @@ pub(crate) fn parse_pyproject_toml(root: &Path, text: &str) -> Option<ManifestPr
         name,
         language: "python",
         dependencies,
+        renames: Vec::new(),
     })
 }
 
@@ -255,6 +271,7 @@ pub(crate) fn parse_package_json(root: &Path, text: &str) -> Option<ManifestProj
         name,
         language: "typescript",
         dependencies,
+        renames: Vec::new(),
     })
 }
 
@@ -350,19 +367,23 @@ mock = { package = "real-mock", version = "1" }
 unix_alias = { package = "real_unix", version = "2" }
 "#;
         let project = parse_cargo_toml(Path::new("/tmp"), text).expect("governing");
-        // Alias key stays for manifest-edge evidence.
+        // Alias key catches source-level `use mock::…` imports (Rust
+        // imports a renamed dependency under the alias).
         assert!(project.dependencies.contains(&(
             "mock".to_string(),
             "dev-dependencies".to_string(),
             "dev".to_string()
         )));
-        // Rename target is indexed too: Rust `use real_mock::…` names the
-        // real crate, and its declared `dev` scope must survive the lookup.
+        // Package key is indexed too: it is the dependency's own project
+        // identity, and its declared `dev` scope must survive the lookup.
         assert!(project.dependencies.contains(&(
             "real-mock".to_string(),
             "dev-dependencies".to_string(),
             "dev".to_string()
         )));
+        assert!(project
+            .renames
+            .contains(&("mock".to_string(), "real-mock".to_string())));
         assert!(project.dependencies.contains(&(
             "real_unix".to_string(),
             "dependencies".to_string(),

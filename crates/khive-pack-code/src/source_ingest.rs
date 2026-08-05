@@ -59,6 +59,14 @@ pub struct CodeSourceIngestReport {
     pub edges_updated: u64,
     pub unresolved_recorded: u64,
     pub unresolved_resolved: u64,
+    /// Modules from this sweep's scan map whose entity was missing at stamp
+    /// time — an F2 contract violation (every scanned module must carry
+    /// coverage stamps), counted separately so it is machine-visible.
+    pub coverage_stamps_missed: u64,
+    /// Files dropped from the sweep because no source path could be derived
+    /// for them at all (see the `source_path` fallback arm) — counted so a
+    /// vanished module is visible instead of silent.
+    pub files_dropped_without_source_path: u64,
     pub languages: Vec<String>,
     /// Per-manifest / per-file failures that did not abort the pass (fail
     /// loud without silently dropping the rest of the run).
@@ -155,6 +163,9 @@ fn source_path(file: &Path, source_root: &Path) -> Option<String> {
     let components: Vec<String> = relative
         .components()
         .filter_map(|component| match component {
+            // to_string_lossy is deliberate: `source_path` is provenance
+            // metadata only (module identity is the uuid5 triple), so a
+            // replacement character in a non-UTF-8 component is acceptable.
             std::path::Component::Normal(value) => Some(value.to_string_lossy().to_string()),
             _ => None,
         })
@@ -242,6 +253,15 @@ fn is_dependency_scope(scope: &str) -> bool {
     matches!(scope, "normal" | "dev" | "build")
 }
 
+/// Import-only scope for a given project pair is a deterministic function
+/// of the current manifest index: within one run every spec for the same
+/// pair derives its scope from the same `manifest_scopes` snapshot (or the
+/// constant `build` fallback), and `reresolve_pass` repairs stored legacy
+/// import scopes against the current index before any edge upsert — so the
+/// "last writer" for a pair always writes the same scope, and two distinct
+/// import-only scopes never merge onto one edge (no union needed; ADR-085
+/// Amendment 5 F1's multi-scope arm is only reachable via manifest-declared
+/// kinds).
 fn scopes_for_dependency_kinds(kinds: &BTreeSet<String>, import_scope: &str) -> BTreeSet<String> {
     let declared: BTreeSet<String> = kinds
         .iter()
@@ -265,6 +285,32 @@ fn preferred_import_scope(scopes: &BTreeSet<String>) -> &'static str {
     } else {
         IMPORT_DEPENDENCY_SCOPE
     }
+}
+
+/// `(source_project, language, alias)` -> `package` for renamed Cargo
+/// dependencies. Rust source imports a renamed dependency under its alias —
+/// the real crate name never appears in source — so an alias-form import
+/// must resolve to the package's project identity: that is the entity the
+/// dependency's own manifest ingest creates.
+type ProjectRenames = HashMap<(String, String, String), String>;
+
+/// Rewrite an import's target name alias->package when the governing
+/// manifest renamed that dependency (see [`ProjectRenames`]); every other
+/// name passes through unchanged.
+fn canonical_project_target(
+    project_renames: &ProjectRenames,
+    source_project: &str,
+    language: &str,
+    target_project: &str,
+) -> String {
+    project_renames
+        .get(&(
+            source_project.to_string(),
+            language.to_string(),
+            target_project.to_string(),
+        ))
+        .cloned()
+        .unwrap_or_else(|| target_project.to_string())
 }
 
 fn declared_project_import_target_and_scope(
@@ -299,17 +345,15 @@ fn declared_project_import_target_and_scope(
 
 fn project_import_target_and_scope(
     manifest_scopes: &ManifestScopeIndex,
+    project_renames: &ProjectRenames,
     source_project: &str,
     language: &str,
     target_project: &str,
 ) -> (String, &'static str) {
-    declared_project_import_target_and_scope(
-        manifest_scopes,
-        source_project,
-        language,
-        target_project,
-    )
-    .unwrap_or_else(|| (target_project.to_string(), IMPORT_DEPENDENCY_SCOPE))
+    let canonical =
+        canonical_project_target(project_renames, source_project, language, target_project);
+    declared_project_import_target_and_scope(manifest_scopes, source_project, language, &canonical)
+        .unwrap_or((canonical, IMPORT_DEPENDENCY_SCOPE))
 }
 
 async fn get_entity_opt(
@@ -639,6 +683,13 @@ fn target_ids_for(source_project: &str, spec: &UnresolvedSpec) -> Vec<Uuid> {
 /// complete evidence set. Manifest evidence is authoritative over `import`,
 /// so re-ingest can repair an older import-default scope without retaining a
 /// false production scope.
+///
+/// The three rebuilt fields — `dependency_kinds`, `dependency_scopes`, and
+/// `language` — are the COMPLETE metadata set these edges carry: this
+/// function (and its Amendment-2 predecessor `merge_dependency_kinds`,
+/// which wrote the subset `{dependency_kinds, language}`) is the only
+/// writer of `depends_on` edge metadata in this pipeline, and B7 dedicates
+/// the map database to it, so no unknown fields exist to preserve.
 fn merge_dependency_metadata(
     existing_metadata: Option<&Value>,
     new_kind: &str,
@@ -729,6 +780,7 @@ async fn reresolve_pass(
     rt: &KhiveRuntime,
     token: &NamespaceToken,
     manifest_scopes: &ManifestScopeIndex,
+    project_renames: &ProjectRenames,
     now: DateTime<Utc>,
     report: &mut CodeSourceIngestReport,
 ) -> Result<(), CodeSourceIngestError> {
@@ -781,16 +833,30 @@ async fn reresolve_pass(
         let mut still_unresolved = Vec::new();
         let mut changed = false;
         for mut spec in list.drain(..) {
-            if spec.target_kind == "project" && spec.dependency_kind == IMPORT_DEPENDENCY_KIND {
-                if let Some((target, scope)) = declared_project_import_target_and_scope(
-                    manifest_scopes,
+            if spec.target_kind == "project" {
+                // Alias-form imports (and legacy alias-row manifest specs)
+                // resolve to the package identity, never the alias.
+                let canonical = canonical_project_target(
+                    project_renames,
                     &source_project,
                     &spec.language,
                     &spec.specifier,
-                ) {
-                    changed |= spec.specifier != target || spec.dependency_scope != scope;
-                    spec.specifier = target;
-                    spec.dependency_scope = scope.to_string();
+                );
+                if canonical != spec.specifier {
+                    spec.specifier = canonical;
+                    changed = true;
+                }
+                if spec.dependency_kind == IMPORT_DEPENDENCY_KIND {
+                    if let Some((target, scope)) = declared_project_import_target_and_scope(
+                        manifest_scopes,
+                        &source_project,
+                        &spec.language,
+                        &spec.specifier,
+                    ) {
+                        changed |= spec.specifier != target || spec.dependency_scope != scope;
+                        spec.specifier = target;
+                        spec.dependency_scope = scope.to_string();
+                    }
                 }
             }
             let mut resolved_target = None;
@@ -874,6 +940,14 @@ async fn stamp_import_scan_coverage(
         }
 
         let Some(mut module) = get_entity_opt(rt, token, module_id).await? else {
+            // F2 contract: every module from a completed scan must carry
+            // coverage stamps. A scan-map module missing here is a contract
+            // violation — report it instead of silently skipping.
+            report.warnings.push(format!(
+                "module {module_id} from this sweep's scan map was missing at stamp time; \
+                 coverage stamps skipped (F2 contract violation)"
+            ));
+            report.coverage_stamps_missed += 1;
             continue;
         };
         let source_label = module
@@ -883,11 +957,19 @@ async fn stamp_import_scan_coverage(
             .and_then(Value::as_str)
             .map(str::to_string)
             .unwrap_or_else(|| module_id.to_string());
-        let mut props = module
-            .properties
-            .clone()
-            .and_then(|value| value.as_object().cloned())
-            .unwrap_or_default();
+        let mut props = match module.properties.clone() {
+            Some(Value::Object(map)) => map,
+            _ => {
+                // `upsert_module` always writes an object; anything else
+                // means the row drifted outside this pipeline — fail loud
+                // rather than silently rebuilding from nothing.
+                report.warnings.push(format!(
+                    "module {module_id} has missing or non-object properties at stamp time; \
+                     rebuilding coverage stamps from scratch (F2 contract violation)"
+                ));
+                serde_json::Map::new()
+            }
+        };
         props.insert(
             "import_scan_status".into(),
             json!(if unresolved_count == 0 {
@@ -967,6 +1049,7 @@ pub async fn run_code_ingest(
         .map_err(|e| CodeSourceIngestError::InvalidPath(opts.path.join(e.to_string())))?;
 
     let mut manifest_scopes = ManifestScopeIndex::new();
+    let mut project_renames = ProjectRenames::new();
     for manifest in &manifests {
         for (dependency, _kind, scope) in &manifest.dependencies {
             manifest_scopes
@@ -977,6 +1060,16 @@ pub async fn run_code_ingest(
                 ))
                 .or_default()
                 .insert(scope.clone());
+        }
+        for (alias, package) in &manifest.renames {
+            project_renames.insert(
+                (
+                    manifest.name.clone(),
+                    manifest.language.to_string(),
+                    alias.clone(),
+                ),
+                package.clone(),
+            );
         }
     }
 
@@ -1011,8 +1104,15 @@ pub async fn run_code_ingest(
         };
         let file_label = m.root.display().to_string();
         for (dep_name, dep_kind, dep_scope) in &m.dependencies {
+            // A renamed dependency's alias row and package row both index
+            // the same declared fact; canonicalizing the alias to the
+            // package at record time makes the two rows produce one
+            // identical spec (deduped by `record_unresolved`) targeting the
+            // package's project identity — never a phantom alias project.
+            let specifier =
+                canonical_project_target(&project_renames, &m.name, m.language, dep_name);
             let spec = UnresolvedSpec {
-                specifier: dep_name.clone(),
+                specifier,
                 target_kind: "project".to_string(),
                 dependency_kind: dep_kind.clone(),
                 dependency_scope: dep_scope.clone(),
@@ -1037,6 +1137,7 @@ pub async fn run_code_ingest(
             opts.path,
             &snapshot,
             &manifest_scopes,
+            &project_renames,
             opts.sweep_time,
             &mut project_ids,
             &mut module_scans,
@@ -1045,7 +1146,15 @@ pub async fn run_code_ingest(
         .await?;
     }
 
-    reresolve_pass(rt, token, &manifest_scopes, opts.sweep_time, &mut report).await?;
+    reresolve_pass(
+        rt,
+        token,
+        &manifest_scopes,
+        &project_renames,
+        opts.sweep_time,
+        &mut report,
+    )
+    .await?;
     stamp_import_scan_coverage(rt, token, module_scans, &mut report).await?;
 
     Ok(report)
@@ -1068,6 +1177,7 @@ async fn run_import_scan(
     ingest_root: &Path,
     snapshot: &SourceSnapshot,
     manifest_scopes: &ManifestScopeIndex,
+    project_renames: &ProjectRenames,
     sweep_time: DateTime<Utc>,
     project_ids: &mut HashMap<String, Uuid>,
     module_scans: &mut HashMap<Uuid, ModuleScan>,
@@ -1107,6 +1217,12 @@ async fn run_import_scan(
                 // Best-effort provenance fallback: keep the module in the
                 // sweep under its ingest-root-relative path (with a
                 // warning) instead of dropping it — see `source_path`.
+                // Reachable even with a resolved git root: `source_path`
+                // canonicalizes both ends independently, so a walked path
+                // whose canonical form does not extend the canonical
+                // repository root (a symlinked ingest path, or one side's
+                // canonicalize racing and failing) makes `strip_prefix`
+                // fail and lands here.
                 report.warnings.push(format!(
                     "canonical repository-relative path unavailable for {}; \
                      falling back to the ingest-relative path",
@@ -1116,6 +1232,8 @@ async fn run_import_scan(
                 let components: Vec<String> = fallback
                     .components()
                     .filter_map(|component| match component {
+                        // to_string_lossy is deliberate: provenance
+                        // metadata only, never part of module identity.
                         std::path::Component::Normal(value) => {
                             Some(value.to_string_lossy().to_string())
                         }
@@ -1123,6 +1241,15 @@ async fn run_import_scan(
                     })
                     .collect();
                 if components.is_empty() {
+                    // Practically unreachable — `file` was walked under
+                    // `ingest_root`, so the relative path always carries at
+                    // least the file name — but if it ever fires, a real
+                    // module would vanish; count it and warn.
+                    report.warnings.push(format!(
+                        "no derivable source path for {}; module dropped from the sweep",
+                        file.display()
+                    ));
+                    report.files_dropped_without_source_path += 1;
                     continue;
                 }
                 components.join("/")
@@ -1230,6 +1357,7 @@ async fn run_import_scan(
                 Resolved::ExternalProject(target_name) => {
                     let (target_name, dependency_scope) = project_import_target_and_scope(
                         manifest_scopes,
+                        project_renames,
                         &proj_name,
                         language,
                         &target_name,
