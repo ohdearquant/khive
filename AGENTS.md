@@ -142,7 +142,7 @@ Composite scores are always in [0,1]. Typical production floor: 0.3-0.7.
 
 | Verb                     | What it does                                                                             | When to use                                                     |
 | ------------------------ | ---------------------------------------------------------------------------------------- | --------------------------------------------------------------- |
-| `brain.event_counts`     | Windowed event counts by kind/actor/verb (+ feedback by_profile split, cost_unit totals) | Flywheel metrics, feedback-coverage reporting, cost attribution |
+| `brain.event_counts`     | Windowed event counts by kind/actor/verb (+ feedback profile/origin splits, cost totals) | Flywheel metrics, feedback-coverage reporting, cost attribution |
 | `brain.profiles`         | List profiles (optionally filtered by lifecycle)                                         | See what profiles exist                                         |
 | `brain.profile`          | Full detail: metadata, snapshot, state summary                                           | Inspect a specific profile                                      |
 | `brain.create_profile`   | Create a new profile with optional seed priors                                           | Custom tuning for a new consumer                                |
@@ -152,7 +152,7 @@ Composite scores are always in [0,1]. Typical production floor: 0.3-0.7.
 | `brain.archive`          | Read-only, audit-retained                                                                | Retire a profile permanently                                    |
 | `brain.reset`            | Reset posteriors to priors (preserves event history)                                     | Start tuning fresh                                              |
 | `brain.feedback`         | Emit explicit feedback event                                                             | Rate a recall result as useful/not_useful/wrong                 |
-| `brain.auto_feedback`    | Emit implicit feedback for recall results                                                | Convenience: agents call after memory.recall                    |
+| `brain.auto_feedback`    | Emit caller-attributed feedback for one recall result                                    | Name the judged result and signal after memory.recall           |
 | `brain.mark_turn`        | Emit a per-actor `actor_turn` work-unit marker (best-effort)                             | Once per wake/turn — denominator for discipline ratios          |
 | `brain.bind`             | Bind a profile to an actor + consumer                                                    | Route a specific caller to a specific profile                   |
 | `brain.unbind`           | Remove a binding                                                                         | Stop routing                                                    |
@@ -161,6 +161,8 @@ Composite scores are always in [0,1]. Typical production floor: 0.3-0.7.
 
 `brain.auto_feedback(namespace=...)` writes and folds feedback only in that exact namespace;
 it does not train the default/live namespace's posterior state.
+Omitting `signal` is an abstention and emits no feedback event. When `signal` is present, `target_id`
+must exactly match one `results[].id`; rank position never supplies a judgment.
 
 ### Comm pack — 9 verbs (`comm.` prefix)
 

@@ -960,7 +960,9 @@ caller. Optional; load with `KHIVE_PACKS=kg,brain`.
 
 Windowed event counts grouped by kind, actor, and verb over the event plane (ADR-103
 Stage 1, #724 Ask A). `feedback_explicit` events are additionally split by
-`served_by_profile_id`. Events carrying a `work_class` (today:
+`served_by_profile_id`, signal, and `payload.originating_verb` (direct
+`brain.feedback` versus `brain.auto_feedback`). Legacy feedback rows without the origin
+marker fall back to their stored event verb. Events carrying a `work_class` (today:
 `phase_started`/`phase_completed`/`phase_cancelled` payloads, or `payload.resource.work_class`
 on a dispatch audit row) split by `counts_by_work_class`. Events carrying
 `payload.resource.cost_unit` (ADR-103 Amendment 1, stamped on every successful verb dispatch
@@ -1088,26 +1090,29 @@ request(ops="brain.feedback(target_id=\"<uuid>\", signal=\"useful\")")
 
 ### `brain.auto_feedback` — Commissive
 
-Emit implicit feedback for recall results supplied by an agent — the convenience verb
-to call right after `memory.recall` instead of hand-building `brain.feedback`.
+Emit caller-attributed feedback for one recall result — the convenience verb to call
+right after `memory.recall` instead of hand-building `brain.feedback`.
 
-| Param                  | Type   | Required | Notes                                                                  |
-| ---------------------- | ------ | -------- | ---------------------------------------------------------------------- |
-| `query`                | string | yes      | The recall query that produced the results.                            |
-| `results`              | array  | yes      | Recall result objects; the first object's `id` is credited.            |
-| `signal`               | string | no       | Defaults to `implicit_positive`.                                       |
-| `served_by_profile_id` | string | no       | Profile that served the recall.                                        |
-| `serve_attribution`    | string | no       | Serve-time tri-state; otherwise copied from the first result.          |
-| `scorer_run_id`        | string | no       | Forwarded verbatim to `brain.feedback`; pairs with `serve_ledger_id`.  |
-| `serve_ledger_id`      | string | no       | Forwarded verbatim to `brain.feedback`; pairs with `scorer_run_id`.    |
-| `namespace`            | string | no       | Exact namespace for the event and posterior fold; invalid values fail. |
+| Param                  | Type   | Required    | Notes                                                                  |
+| ---------------------- | ------ | ----------- | ---------------------------------------------------------------------- |
+| `query`                | string | yes         | The recall query that produced the results.                            |
+| `results`              | array  | yes         | Recall result objects retained as candidate context.                   |
+| `target_id`            | string | with signal | Full UUID or compact id; must exactly equal one `results[].id`.        |
+| `signal`               | string | no          | Omission abstains: no feedback event or posterior update.              |
+| `served_by_profile_id` | string | no          | Profile that served the recall.                                        |
+| `serve_attribution`    | string | no          | Serve-time tri-state; otherwise copied from the selected result.       |
+| `scorer_run_id`        | string | no          | Forwarded verbatim to `brain.feedback`; pairs with `serve_ledger_id`.  |
+| `serve_ledger_id`      | string | no          | Forwarded verbatim to `brain.feedback`; pairs with `scorer_run_id`.    |
+| `namespace`            | string | no          | Exact namespace for the event and posterior fold; invalid values fail. |
 
-Top-level serve-attribution fields are one pair and take precedence over the first
+Top-level serve-attribution fields are one pair and take precedence over the selected
 result's pair. If neither top-level field is supplied, both fields are copied from the
-first result together.
+selected result together. Feedback events retain the canonical event verb
+`brain.feedback` and record the originating feedback handler in
+`payload.originating_verb`.
 
 ```
-request(ops="memory.recall(query=\"x\", limit=5) | brain.auto_feedback(query=\"x\", results=[{\"id\": \"$prev.items[0].id\"}])")
+request(ops="memory.recall(query=\"x\", limit=5) | brain.auto_feedback(query=\"x\", results=[{\"id\": $prev[0].id}], target_id=$prev[0].id, signal=\"implicit_positive\")")
 ```
 
 ### `brain.mark_turn` — Commissive

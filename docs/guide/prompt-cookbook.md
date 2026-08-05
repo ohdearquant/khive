@@ -288,11 +288,11 @@ request(ops="brain.feedback(target_id=\"<full_uuid>\", signal=\"useful\")")
 ### Auto-feedback after recall
 
 ```
-request(ops="brain.auto_feedback(results=[{\"id\": \"<uuid>\", \"used\": true}])")
+request(ops="brain.auto_feedback(query=\"<recall query>\", results=[{\"id\": \"<uuid>\"}], target_id=\"<uuid>\", signal=\"implicit_positive\")")
 ```
 
-Convenience verb: call after `memory.recall` to automatically feed back which
-results you actually used.
+Convenience verb: call after `memory.recall` and explicitly name the result and
+signal you are judging. Omitting `signal` records no judgment.
 
 ### Check which profile serves you
 

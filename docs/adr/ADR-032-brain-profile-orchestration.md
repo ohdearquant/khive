@@ -1378,6 +1378,20 @@ default exactly as before.
 
 ---
 
+## Amendment 3 — Feedback emitter provenance (2026-08-01, #1587)
+
+`FeedbackExplicit` keeps the canonical stored event verb `brain.feedback`, which is the
+stable replay vocabulary. Every newly emitted payload additionally carries
+`originating_verb`: `brain.feedback` for a direct call and `brain.auto_feedback` for the
+automatic wrapper; the deprecated alias records `brain.emit`. The value is supplied by the
+internal dispatch path rather than parsed from public parameters, so callers cannot forge it.
+
+Per-origin measurement reads that payload marker. `brain.event_counts` reports
+`feedback_by_originating_verb`, falling back to the stored event verb for pre-amendment
+events. Profile attribution, fold weights, and replay interpretation are unchanged.
+
+---
+
 ## References
 
 - ADR-006 — Deterministic Scoring (`DeterministicScore`, i64 fixed-point, canonical ordering)
