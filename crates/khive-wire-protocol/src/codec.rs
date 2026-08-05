@@ -61,9 +61,9 @@ pub enum CodecError {
     FrameTooLarge { declared: usize, max: usize },
 
     /// The serialized payload exceeds the 4-byte length prefix's inherent
-    /// `u32::MAX` byte capacity. Distinct from [`FrameTooLarge`]: this arm
+    /// `u32::MAX` byte capacity. Distinct from [`FrameTooLarge`](Self::FrameTooLarge): this arm
     /// can only fire when the configured maximum is at least the payload
-    /// length (otherwise [`FrameTooLarge`] fires first), so the configured
+    /// length (otherwise [`FrameTooLarge`](Self::FrameTooLarge) fires first), so the configured
     /// maximum was NOT the binding limit — the prefix capacity was, and
     /// the error names it.
     #[error("frame of {declared} bytes exceeds the u32 length prefix's {max} byte capacity")]
@@ -235,7 +235,7 @@ pub fn encode_frame(frame: &Frame) -> Result<Vec<u8>, CodecError> {
 /// checks against.
 ///
 /// Before serializing, the frame is validated against the same wire rules
-/// the decode side enforces ([`validate_frame_for_wire`]): an empty
+/// the decode side enforces (`validate_frame_for_wire`, private): an empty
 /// operation id in any id field ([`CodecError::InvalidFields`]), an
 /// `error` frame whose id presence contradicts its code's terminal scope
 /// ([`CodecError::InconsistentErrorScope`]), and a decoded unknown-code
