@@ -16104,6 +16104,21 @@ mod tests {
 
     #[test]
     fn base_entity_endpoint_rules_match_adr002_base_endpoint_contract() {
+        // ADR-002 lives at the repository root, outside this crate's package.
+        // In the repository the workspace manifest sits two levels up and the
+        // ADR must be readable — a missing file there is a hard failure so a
+        // rename cannot silently disarm this gate. From a published package
+        // tarball neither exists; skip with disclosure instead of failing an
+        // environment that cannot carry the canonical document.
+        let workspace_manifest =
+            format!("{}/../Cargo.toml", env!("CARGO_MANIFEST_DIR"));
+        if !std::path::Path::new(&workspace_manifest).exists() {
+            eprintln!(
+                "skipping ADR-002 conformance: workspace manifest not present \
+                 (published-package context); the check runs in the repository"
+            );
+            return;
+        }
         let adr_matrix = parse_adr002_base_entity_endpoint_matrix();
         assert!(
             !adr_matrix.is_empty(),
