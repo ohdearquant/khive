@@ -4546,7 +4546,11 @@ mod tests {
             touch_heartbeat(&dir, pid).expect("touch of an existing heartbeat must succeed");
 
             let after = fs::metadata(&path).unwrap().modified().unwrap();
-            assert!(after >= before, "touch must not move mtime backward");
+            assert!(
+                after > before,
+                "touch must advance the mtime; an unchanged timestamp means the \
+                 refresh was a no-op (before {before:?}, after {after:?})"
+            );
             let content_after: WalpinHeartbeat =
                 serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
             assert_eq!(
@@ -4578,7 +4582,15 @@ mod tests {
 
             write_beacon(&dir, &b).expect("beacon create must succeed");
             assert!(path.exists());
+            let before = fs::metadata(&path).unwrap().modified().unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(50));
             touch_beacon(&dir, pid).expect("beacon touch must succeed");
+            let after = fs::metadata(&path).unwrap().modified().unwrap();
+            assert!(
+                after > before,
+                "beacon touch must advance the mtime; an unchanged timestamp means \
+                 the refresh was a no-op (before {before:?}, after {after:?})"
+            );
             remove_beacon(&dir, pid).expect("beacon remove must succeed");
             assert!(!path.exists());
         }
