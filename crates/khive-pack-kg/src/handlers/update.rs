@@ -185,8 +185,13 @@ impl KgPack {
         match spec {
             KindSpec::Entity { specific } => {
                 let entity = self.runtime.get_entity(token, id).await?;
-                if specific.as_ref().is_some_and(|k| entity.kind != *k) {
-                    return Err(RuntimeError::NotFound(format!("entity {}", p.id)));
+                if let Some(k) = specific.as_ref() {
+                    if entity.kind != *k {
+                        return Err(RuntimeError::InvalidInput(format!(
+                            "kind mismatch: {} exists with kind '{}', not '{}'",
+                            p.id, entity.kind, k
+                        )));
+                    }
                 }
                 let patch = EntityPatch {
                     name: string_value(p.name, "name")?,
@@ -224,8 +229,13 @@ impl KgPack {
                 let Some(note) = note else {
                     return Err(RuntimeError::NotFound(format!("note {}", p.id)));
                 };
-                if specific.as_ref().is_some_and(|kind| note.kind != *kind) {
-                    return Err(RuntimeError::NotFound(format!("note {}", p.id)));
+                if let Some(kind) = specific.as_ref() {
+                    if note.kind != *kind {
+                        return Err(RuntimeError::InvalidInput(format!(
+                            "kind mismatch: {} exists with kind '{}', not '{}'",
+                            p.id, note.kind, kind
+                        )));
+                    }
                 }
                 if note.kind == "scheduled_event" {
                     return Err(RuntimeError::InvalidInput(
@@ -330,7 +340,10 @@ impl KgPack {
                         self.runtime.get_entity(token, id).await?
                     };
                     if entity.kind != *expected {
-                        return Err(RuntimeError::NotFound(format!("{} {}", expected, p.id)));
+                        return Err(RuntimeError::InvalidInput(format!(
+                            "kind mismatch: {} exists with kind '{}', not '{}'",
+                            p.id, entity.kind, expected
+                        )));
                     }
                 }
                 let deleted = self.runtime.delete_entity(token, id, hard).await?;
@@ -359,7 +372,10 @@ impl KgPack {
                             })?
                     };
                     if note.kind != *expected {
-                        return Err(RuntimeError::NotFound(format!("{} {}", expected, p.id)));
+                        return Err(RuntimeError::InvalidInput(format!(
+                            "kind mismatch: {} exists with kind '{}', not '{}'",
+                            p.id, note.kind, expected
+                        )));
                     }
                 }
                 let deleted = self.runtime.delete_note(token, id, hard).await?;

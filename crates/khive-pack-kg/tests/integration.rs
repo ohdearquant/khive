@@ -3835,6 +3835,167 @@ async fn update_nonexistent_uuid_without_kind_returns_not_found() {
     );
 }
 
+// ---- #1660: kind-discriminant mismatch returns InvalidInput, not NotFound ----
+
+#[tokio::test]
+async fn update_entity_kind_mismatch_returns_invalid_input() {
+    let pack = pack();
+    let created = pack
+        .dispatch(
+            "create",
+            json!({"kind": "entity", "name": "MismatchTarget", "entity_kind": "service"}),
+        )
+        .await
+        .expect("create must succeed");
+    let id = created
+        .get("id")
+        .and_then(Value::as_str)
+        .unwrap()
+        .to_string();
+
+    let err = pack
+        .dispatch(
+            "update",
+            json!({"id": id, "kind": "concept", "description": "x"}),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        is_invalid_input(&err),
+        "kind mismatch on update must be InvalidInput, got: {err:?}"
+    );
+    let msg = invalid_input_message(&err);
+    assert!(
+        msg.contains("service") && msg.contains("concept"),
+        "message must name both stored and expected kind, got: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn update_entity_correct_kind_succeeds() {
+    let pack = pack();
+    let created = pack
+        .dispatch(
+            "create",
+            json!({"kind": "entity", "name": "MatchTarget", "entity_kind": "service"}),
+        )
+        .await
+        .expect("create must succeed");
+    let id = created
+        .get("id")
+        .and_then(Value::as_str)
+        .unwrap()
+        .to_string();
+
+    let result = pack
+        .dispatch(
+            "update",
+            json!({"id": id, "kind": "service", "description": "updated"}),
+        )
+        .await;
+    assert!(
+        result.is_ok(),
+        "update with matching kind discriminant must succeed: {:?}",
+        result
+    );
+}
+
+#[tokio::test]
+async fn delete_entity_kind_mismatch_returns_invalid_input() {
+    let pack = pack();
+    let created = pack
+        .dispatch(
+            "create",
+            json!({"kind": "entity", "name": "DeleteMismatch", "entity_kind": "service"}),
+        )
+        .await
+        .expect("create must succeed");
+    let id = created
+        .get("id")
+        .and_then(Value::as_str)
+        .unwrap()
+        .to_string();
+
+    let err = pack
+        .dispatch("delete", json!({"id": id, "kind": "concept"}))
+        .await
+        .unwrap_err();
+    assert!(
+        is_invalid_input(&err),
+        "kind mismatch on delete must be InvalidInput, got: {err:?}"
+    );
+    let msg = invalid_input_message(&err);
+    assert!(
+        msg.contains("service") && msg.contains("concept"),
+        "message must name both stored and expected kind, got: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn update_note_kind_mismatch_returns_invalid_input() {
+    let pack = pack();
+    let created = pack
+        .dispatch(
+            "create",
+            json!({"kind": "note", "content": "note body", "note_kind": "observation"}),
+        )
+        .await
+        .expect("create must succeed");
+    let id = created
+        .get("id")
+        .and_then(Value::as_str)
+        .unwrap()
+        .to_string();
+
+    let err = pack
+        .dispatch(
+            "update",
+            json!({"id": id, "kind": "insight", "content": "updated body"}),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        is_invalid_input(&err),
+        "kind mismatch on note update must be InvalidInput, got: {err:?}"
+    );
+    let msg = invalid_input_message(&err);
+    assert!(
+        msg.contains("observation") && msg.contains("insight"),
+        "message must name both stored and expected kind, got: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn delete_note_kind_mismatch_returns_invalid_input() {
+    let pack = pack();
+    let created = pack
+        .dispatch(
+            "create",
+            json!({"kind": "note", "content": "note body", "note_kind": "observation"}),
+        )
+        .await
+        .expect("create must succeed");
+    let id = created
+        .get("id")
+        .and_then(Value::as_str)
+        .unwrap()
+        .to_string();
+
+    let err = pack
+        .dispatch("delete", json!({"id": id, "kind": "insight"}))
+        .await
+        .unwrap_err();
+    assert!(
+        is_invalid_input(&err),
+        "kind mismatch on note delete must be InvalidInput, got: {err:?}"
+    );
+    let msg = invalid_input_message(&err);
+    assert!(
+        msg.contains("observation") && msg.contains("insight"),
+        "message must name both stored and expected kind, got: {msg}"
+    );
+}
+
 // ---- Fix 2: traverse/neighbors exclude soft-deleted entity nodes ----
 
 /// Soft-deleted entities must not appear in `neighbors` results.
