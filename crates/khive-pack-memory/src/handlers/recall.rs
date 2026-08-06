@@ -15,14 +15,14 @@ use khive_runtime::{
     micros_to_iso, KhiveRuntime, Namespace, NamespaceToken, RequestIdentity, RuntimeError,
     SearchSource, VerbRegistry,
 };
-use khive_storage::types::{EdgeFilter, PageRequest};
+use khive_storage::types::EdgeFilter;
 use khive_storage::EdgeRelation;
 
 use crate::config::{RecallConfig, ScoreBreakdown};
 use crate::rerank::{weighted_rerank, RerankFeatures};
 use crate::scoring::{
     calculate_score, contains_cjk, extract_entity_candidates, normalize_min_score,
-    normalize_rank_fusion_scores, normalize_rrf_scores, ScoreInput,
+    normalize_rank_fusion_scores, normalize_rrf_scores, ScoreInput, ScoringConfig,
 };
 use crate::MemoryPack;
 
@@ -32,6 +32,33 @@ use super::common::{
     TextSnippetPolicy, DEFAULT_DECAY_EPISODIC, DEFAULT_DECAY_SEMANTIC, DEFAULT_SALIENCE_EPISODIC,
     DEFAULT_SALIENCE_SEMANTIC, PROF_CID, RECALL_CALL_ID, RECALL_SLOW_THRESHOLD_MS,
 };
+
+/// Bounded storage page for inbound supersession checks. This is deliberately
+/// independent of recall candidate cardinality: one candidate may have any
+/// number of superseding edges.
+const SUPERSEDES_EDGE_PAGE_SIZE: u32 = 256;
+
+fn checked_token_budget_chars(scoring_cfg: &ScoringConfig) -> Result<usize, RuntimeError> {
+    if scoring_cfg.default_token_budget == 0 {
+        return Err(RuntimeError::InvalidInput(
+            "memory.recall config.scoring.default_token_budget must be greater than zero"
+                .to_string(),
+        ));
+    }
+    if scoring_cfg.chars_per_token == 0 {
+        return Err(RuntimeError::InvalidInput(
+            "memory.recall config.scoring.chars_per_token must be greater than zero".to_string(),
+        ));
+    }
+    scoring_cfg
+        .default_token_budget
+        .checked_mul(scoring_cfg.chars_per_token)
+        .ok_or_else(|| {
+            RuntimeError::InvalidInput(
+                "memory.recall effective character budget overflows platform size".to_string(),
+            )
+        })
+}
 
 async fn load_brain_profile(
     registry: &VerbRegistry,
@@ -153,6 +180,10 @@ impl MemoryPack {
 
         let mut scoring_cfg = cfg.scoring.clone().unwrap_or_default();
         scoring_cfg.apply_dos_caps();
+        // Validate before retrieval so a degenerate caller-supplied budget
+        // cannot masquerade as a genuine recall miss, and an oversized
+        // chars-per-token value cannot wrap or panic after scoring.
+        let token_budget_chars = checked_token_budget_chars(&scoring_cfg)?;
 
         let cjk_fts_bypass = scoring_cfg.enable_cjk_fts_bypass && contains_cjk(query_trimmed);
 
@@ -659,24 +690,35 @@ impl MemoryPack {
                 }
             }
 
-            let graph = self.runtime.graph(token)?;
             let candidate_ids: Vec<Uuid> = ranked.iter().map(|sn| sn.id).collect();
             let mut superseded_by_edge: HashSet<Uuid> = HashSet::new();
-            {
-                let limit = candidate_ids.len().max(1) as u32;
-                let edges = graph
-                    .query_edges(
-                        EdgeFilter {
-                            target_ids: candidate_ids.clone(),
-                            relations: vec![EdgeRelation::Supersedes],
-                            ..EdgeFilter::default()
-                        },
-                        vec![],
-                        PageRequest { limit, offset: 0 },
-                    )
-                    .await?;
-                for edge in &edges.items {
-                    superseded_by_edge.insert(edge.target_id);
+            if !candidate_ids.is_empty() {
+                let graph = self.runtime.graph(token)?;
+                let filter = EdgeFilter {
+                    target_ids: candidate_ids,
+                    relations: vec![EdgeRelation::Supersedes],
+                    ..EdgeFilter::default()
+                };
+                let mut after = None;
+                loop {
+                    // Walk the immutable insertion sequence to exhaustion.
+                    // A single fixed-size query tied to candidate count can
+                    // omit targets when another candidate has many inbound
+                    // supersedes edges (#1749).
+                    let edges = graph
+                        .query_edges_sequence_after(
+                            filter.clone(),
+                            after,
+                            SUPERSEDES_EDGE_PAGE_SIZE,
+                        )
+                        .await?;
+                    for edge in &edges.items {
+                        superseded_by_edge.insert(edge.target_id);
+                    }
+                    let Some(next_after) = edges.next_after else {
+                        break;
+                    };
+                    after = Some(next_after);
                 }
             }
 
@@ -704,13 +746,12 @@ impl MemoryPack {
         });
         ranked.truncate(limit);
 
-        let token_budget_chars = scoring_cfg.default_token_budget * scoring_cfg.chars_per_token;
         let pre_budget_count = ranked.len();
         let mut total_chars = 0usize;
         let mut budget_cutoff: Option<usize> = None;
         for (i, sn) in ranked.iter().enumerate() {
             let entry_chars = sn.note.content.len();
-            if total_chars + entry_chars > token_budget_chars {
+            if entry_chars > token_budget_chars.saturating_sub(total_chars) {
                 budget_cutoff = Some(i);
                 break;
             }
