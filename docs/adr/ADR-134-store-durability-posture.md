@@ -72,9 +72,18 @@ that nobody had decided it.
 
 ### D2 — The target posture is a forced durable sync on the accounting path specifically
 
-The intended end state is not store-wide `FULL`. It is `NORMAL` generally with a forced durable sync
-on the accounting path, because that is the only option that serves durability and throughput at the
-same time.
+The intended end state is not store-wide `FULL`. It is `NORMAL` generally, with the accounting path
+forced to a durable sync through the same primitive the store already uses to select a posture:
+`PRAGMA synchronous=FULL`, scoped to the connection that commits the accounting-bearing row rather
+than applied to the pool as a whole. `synchronous` is a per-connection setting — SQLite does not
+require every connection open on a database to share one value — so a connection dedicated to
+accounting-bearing commits can pay the fsync on every commit it makes while every other connection
+(note, entity, vector, and non-accounting audit writes) keeps paying nothing beyond `NORMAL`.
+
+That is the trade-off this target buys against store-wide `FULL`: the fsync cost lands only on the
+commits that need the guarantee, not on the store's full write volume. It is still a real,
+per-commit cost on that one connection, and it is that cost — not the store-wide one — that D3's
+second number prices.
 
 This is a target, not an implementation, and D3 gates it.
 
@@ -100,6 +109,13 @@ whichever the D3 numbers favour.
 
 The condition is tied to the arrival of accounted usage rather than to a release or a calendar date,
 because the exposure begins when a record starts determining a resource-usage outcome and not before.
+
+**Prerequisite.** This decision is conditioned on ADR-133 INV-1 holding in the implementation, not
+merely in the record. A durable sync protects a committed row against loss after commit; it says
+nothing about whether that row was produced exactly once before the sync ran. A sync applied to a
+row ADR-133's write path could still duplicate makes the duplicate exactly as durable as the
+original. D4 is not satisfied by adding the sync alone — ADR-133 INV-1 must hold first, or the sync
+is protecting the wrong property.
 
 ### D5 — The loss direction is recorded, because it is why the interim window is tolerable
 

@@ -106,8 +106,8 @@ payload) lives at the payload level, not the kind level.
 
 ### D1 — Batch audit appends durably, and the dispatch waits for its own batch to commit
 
-Audit appends are accumulated and written as a **single transaction**. The flush is a real durable
-commit, not an in-memory retention with best-effort persistence.
+Audit appends are accumulated and written as a **single transaction**. The flush is a real
+committed (store-visible) transaction, not an in-memory retention with best-effort persistence.
 
 **A dispatch does not return before the batch carrying its audit row has committed.** This is the
 load-bearing clause of the whole record and an earlier draft left it unstated, which made the
@@ -120,8 +120,8 @@ fails it.
 
 For **pure observability rows** it binds on the success path only. The dispatch waits for the batch
 in the normal case — so observability rows are batched, share the acquisition reduction, and are
-durable at return whenever the commit succeeds — but a **persistent** commit failure releases the
-dispatch successfully and routes the failure to instrumentation.
+committed (store-visible) at return whenever the commit succeeds — but a **persistent** commit
+failure releases the dispatch successfully and routes the failure to instrumentation.
 
 That carve-out is not a durability regression, and the reason is worth stating because it is the
 only thing that makes the carve-out legitimate. The current implementation already swallows a failed
@@ -272,8 +272,8 @@ follow-on inherits the multi-daemon case.
 ### D2 — A classifier at the event-production seam decides commit-failure handling
 
 An earlier draft used the classifier to decide **routing** — which rows may be batched. Under D1
-that question no longer exists: every row rides the same durable batch, and on the success path
-every dispatch waits for it, so no row is deferred past its own return and there is nothing to
+that question no longer exists: every row rides the same committed (store-visible) batch, and on
+the success path every dispatch waits for it, so no row is deferred past its own return and there is nothing to
 route away from. The one exception is D1's carve-out — a pure-observability row whose commit fails
 persistently — and that is a failure outcome rather than a routing choice, which is exactly why the
 classifier's remaining job is failure semantics.
@@ -326,11 +326,13 @@ same shape as a check that works.
 The classifier is a total function over the classification input, implemented as an **exhaustive
 match with no wildcard arm**, so adding a variant fails to compile until its class is stated.
 
-### D3 — An accounting-bearing dispatch does not return before its accounting row is durable
+### D3 — An accounting-bearing dispatch does not return before its accounting row is committed (store-visible)
 
 A dispatch whose audit row carries an accounting payload (`resource.units` and the associated
-`cost_unit` / `cpu_us` fields per ADR-103) does not report success until that row is durably
-committed.
+`cost_unit` / `cpu_us` fields per ADR-103) does not report success until that row is committed
+(store-visible). Whether that commit also survives an OS crash or power loss is a distinct
+property, governed by the store's `synchronous` posture — see ADR-134, in particular its INV-3
+prerequisite before any consumer may depend on the row for a resource-usage outcome.
 
 Under D1 this is satisfied by the ordinary path rather than by an exemption from it: a dispatch
 already waits for its batch to commit, and for this class D1's waiting clause binds
@@ -386,8 +388,8 @@ dispatches into one and N statements into one transaction.
 is batched in the D1 sense — its statement shares a transaction with whatever else is committing —
 and it is never made asynchronous, optional, or deferred past its own return. The unread surface is
 load-bearing for other subsystems: the inbox monitor's stale check reads these flags, and a `comm.read` that
-returned before its flag was durable would make that check read stale state. This decision changes
-how many acquisitions a sweep costs, not what a read means.
+returned before its flag was committed (store-visible) would make that check read stale state. This
+decision changes how many acquisitions a sweep costs, not what a read means.
 
 ### D7 — Serve-ledger writes are batched per call
 
@@ -555,8 +557,8 @@ row is the accounting record.
 **Batch without waiting — let the dispatch return and flush behind it.** Rejected. It is the
 reading an earlier draft left open by not stating D1's waiting clause, and it is not a smaller
 version of this decision but a different one. A returned operation whose row is still in memory can
-lose a row the current implementation would have kept, since today's append is durable at dispatch
-whenever it succeeds. That violates INV-4 directly, and for an accounting-bearing row it violates
+lose a row the current implementation would have kept, since today's append is committed
+(store-visible) at dispatch whenever it succeeds. That violates INV-4 directly, and for an accounting-bearing row it violates
 INV-1. It also buys nothing this record does not already obtain: the acquisition count falls
 because rows share a transaction, not because the caller stopped waiting.
 
