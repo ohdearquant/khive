@@ -64,9 +64,9 @@ behavior isn't written there, it is an unspecified design decision → escalate,
 ┌──────────────────────────────────────────────────────────────┐
 │  12 default packs (`RuntimeConfig::built_in_packs()`):        │
 │  kg, gtd, memory, brain, comm, schedule, knowledge, session, │
-│  git, code, workspace, blob — 104 verb handlers total         │
-│  (90 public-entrypoint verbs; see verb-catalog paragraph      │
-│  below for the per-pack breakdown)                             │
+│  git, code, workspace, blob — together exposing               │
+│  90 public verbs (see the verb-catalog paragraph below        │
+│  for the per-pack breakdown)                                   │
 │  khive-vcs         — KG versioning: snapshots/branches (ADR-010)    │
 │  khive-merge       — KG merge algorithm (ADR-039, forward-deployed,  │
 │                       excluded from workspace members)               │
@@ -121,7 +121,7 @@ not shipped.
 | `crates/khive-pack-code`        | Code pack: code concept vocabulary, finding-note lifecycle, `code.ingest` ([ADR-085](docs/adr/ADR-085-code-pack.md))                                                                                                                             |
 | `crates/khive-pack-workspace`   | Workspace pack: `workspace` entity vocabulary and membership rules; zero verbs                                                                                                                                                                   |
 | `crates/khive-pack-blob`        | Blob pack: `blob.put`/`blob.get`/`blob.stat` over the `BlobStore` CAS trait ([ADR-111](docs/adr/ADR-111-blob-store.md))                                                                                                                          |
-| `crates/khive-pack-agent`       | Agent pack: spawn/resume/suspend/observe wire surface; registered but not in the default pack set ([ADR-142](docs/adr/ADR-142-agentic-process-runtime.md))                                                                                       |
+| `crates/khive-pack-agent`       | Agent pack: spawn/resume/suspend/observe wire surface; not self-registered — an embedder constructs it and registers it manually via `RegistryBuilder::register`, and it is outside the default pack set ([ADR-142](docs/adr/ADR-142-agentic-process-runtime.md))                                                                                       |
 | `crates/khive-pack-template`    | Reference scaffold for dynamically registered packs; developer-only, not in the default pack set                                                                                                                                                 |
 | `crates/khive-pack-formal`      | Formal-methods pack: typed edge endpoint rules for six formal-math concept subtypes (theorem, definition, structure, instance, axiom, goal); pure ontology, no verbs ([ADR-069](docs/adr/ADR-069-subject-model.md)); not in the default pack set |
 | `crates/khive-brain-core`       | Brain primitives: Beta posteriors, section types, profile state, weight derivation (used by `khive-pack-brain`)                                                                                                                                  |
