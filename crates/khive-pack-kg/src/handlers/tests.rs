@@ -2304,6 +2304,182 @@ async fn get_dispatch_short_prefix_with_include_deleted_returns_deleted_entity()
     );
 }
 
+// #1669: `get(include_deleted=true)` must also reach soft-deleted notes and edges.
+
+#[tokio::test]
+async fn get_dispatch_include_deleted_returns_deleted_note_full_uuid() {
+    let (rt, token, _pack, _registry) = configured_kg_pack().await;
+    let mut builder = khive_runtime::VerbRegistryBuilder::new();
+    builder.register(crate::KgPack::new(rt.clone()));
+    let registry = builder.build().expect("registry build");
+
+    let note = rt
+        .create_note(
+            &token,
+            "observation",
+            None,
+            "SoftDeleted note",
+            None,
+            None,
+            vec![],
+        )
+        .await
+        .expect("create note");
+    assert!(rt.delete_note(&token, note.id, false).await.unwrap());
+
+    let got = registry
+        .dispatch(
+            "get",
+            json!({ "id": note.id.to_string(), "include_deleted": true }),
+        )
+        .await
+        .expect("full-uuid + include_deleted must return the soft-deleted note");
+    assert_eq!(
+        got.get("id").and_then(|v| v.as_str()),
+        Some(note.id.to_string().as_str())
+    );
+    assert!(
+        got.get("deleted_at").and_then(|v| v.as_str()).is_some(),
+        "deleted_at must be populated on the returned soft-deleted note, got {got:?}"
+    );
+}
+
+#[tokio::test]
+async fn get_dispatch_short_prefix_with_include_deleted_returns_deleted_note() {
+    let (rt, token, _pack, _registry) = configured_kg_pack().await;
+    let mut builder = khive_runtime::VerbRegistryBuilder::new();
+    builder.register(crate::KgPack::new(rt.clone()));
+    let registry = builder.build().expect("registry build");
+
+    let note = rt
+        .create_note(
+            &token,
+            "observation",
+            None,
+            "SoftDeleted note",
+            None,
+            None,
+            vec![],
+        )
+        .await
+        .expect("create note");
+    assert!(rt.delete_note(&token, note.id, false).await.unwrap());
+
+    let short = note.id.to_string().replace('-', "")[..8].to_string();
+    let got = registry
+        .dispatch("get", json!({ "id": short, "include_deleted": true }))
+        .await
+        .expect("short prefix + include_deleted must return the soft-deleted note");
+    assert_eq!(
+        got.get("id").and_then(|v| v.as_str()),
+        Some(note.id.to_string().as_str())
+    );
+}
+
+#[tokio::test]
+async fn get_dispatch_deleted_note_without_include_deleted_is_not_found() {
+    let (rt, token, _pack, _registry) = configured_kg_pack().await;
+    let mut builder = khive_runtime::VerbRegistryBuilder::new();
+    builder.register(crate::KgPack::new(rt.clone()));
+    let registry = builder.build().expect("registry build");
+
+    let note = rt
+        .create_note(
+            &token,
+            "observation",
+            None,
+            "SoftDeleted note",
+            None,
+            None,
+            vec![],
+        )
+        .await
+        .expect("create note");
+    assert!(rt.delete_note(&token, note.id, false).await.unwrap());
+
+    let err = registry
+        .dispatch("get", json!({ "id": note.id.to_string() }))
+        .await
+        .expect_err("deleted note without include_deleted must miss");
+    assert!(
+        matches!(err, khive_runtime::RuntimeError::NotFound(_)),
+        "expected NotFound, got {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn get_dispatch_include_deleted_returns_deleted_edge_full_uuid() {
+    use khive_types::EdgeRelation;
+
+    let (rt, token, _pack, _registry) = configured_kg_pack().await;
+    let mut builder = khive_runtime::VerbRegistryBuilder::new();
+    builder.register(crate::KgPack::new(rt.clone()));
+    let registry = builder.build().expect("registry build");
+
+    let src = rt
+        .create_entity(&token, "concept", None, "EdgeSrc", None, None, vec![])
+        .await
+        .expect("create source entity");
+    let tgt = rt
+        .create_entity(&token, "concept", None, "EdgeTgt", None, None, vec![])
+        .await
+        .expect("create target entity");
+    let edge = rt
+        .link(&token, src.id, tgt.id, EdgeRelation::Extends, 0.8, None)
+        .await
+        .expect("create edge");
+    assert!(rt.delete_edge(&token, edge.id.into(), false).await.unwrap());
+
+    let got = registry
+        .dispatch(
+            "get",
+            json!({ "id": edge.id.to_string(), "include_deleted": true }),
+        )
+        .await
+        .expect("full-uuid + include_deleted must return the soft-deleted edge");
+    assert_eq!(
+        got.get("id").and_then(|v| v.as_str()),
+        Some(edge.id.to_string().as_str())
+    );
+    assert!(
+        got.get("annotations").is_some(),
+        "deleted-edge fallback must populate annotations like the live path, got {got:?}"
+    );
+}
+
+#[tokio::test]
+async fn get_dispatch_deleted_edge_without_include_deleted_is_not_found() {
+    use khive_types::EdgeRelation;
+
+    let (rt, token, _pack, _registry) = configured_kg_pack().await;
+    let mut builder = khive_runtime::VerbRegistryBuilder::new();
+    builder.register(crate::KgPack::new(rt.clone()));
+    let registry = builder.build().expect("registry build");
+
+    let src = rt
+        .create_entity(&token, "concept", None, "EdgeSrc2", None, None, vec![])
+        .await
+        .expect("create source entity");
+    let tgt = rt
+        .create_entity(&token, "concept", None, "EdgeTgt2", None, None, vec![])
+        .await
+        .expect("create target entity");
+    let edge = rt
+        .link(&token, src.id, tgt.id, EdgeRelation::Extends, 0.8, None)
+        .await
+        .expect("create edge");
+    assert!(rt.delete_edge(&token, edge.id.into(), false).await.unwrap());
+
+    let err = registry
+        .dispatch("get", json!({ "id": edge.id.to_string() }))
+        .await
+        .expect_err("deleted edge without include_deleted must miss");
+    assert!(
+        matches!(err, khive_runtime::RuntimeError::NotFound(_)),
+        "expected NotFound, got {err:?}"
+    );
+}
+
 #[tokio::test]
 async fn get_dispatch_on_plain_deleted_and_absent_ids_unchanged() {
     use khive_runtime::RuntimeError;
