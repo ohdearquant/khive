@@ -33,7 +33,7 @@ its full transaction closure before releasing
 There is no admission queue ahead of this mutex: a caller either acquires it
 within the fixed budget or fails.
 
-### ADR-067's WriterTask: an accepted, opt-in queue
+### ADR-067's WriterTask: an accepted queue, default for file-backed pools
 
 ADR-067 (accepted 2026-07-05, Amendment 1 dated 2026-07-06) specifies a
 three-part mechanism: Component A, a dedicated `WriterTask` that owns a
@@ -64,12 +64,13 @@ point-in-time depth snapshot that the source itself documents as racy and
 Three properties of this accepted design are not yet decided for the batch
 surface:
 
-1. **The queue is not the deployed default.** `PoolConfig::write_queue_enabled`
-   defaults to `false`, set only by the `KHIVE_WRITE_QUEUE` environment
-   variable (`crates/khive-db/src/pool.rs:113-121`). ADR-067's own migration
-   plan gated it this way "for initial rollout", pending confirmation "after
-   integration tests confirm correctness under concurrent load." Today the
-   unavailability behavior is split. A call outside an async runtime returns
+1. **The queue is the default for file-backed pools.** `PoolConfig::write_queue_enabled`
+   is `Option<bool>`; `ConnectionPool::new` resolves an unset value to
+   `Some(true)` for file-backed pools and `Some(false)` for in-memory pools,
+   with an explicit `Some(_)` always winning (`crates/khive-db/src/pool.rs:493`,
+   landed in `7114a7d7e` / #1696). The `KHIVE_WRITE_QUEUE` environment
+   variable can still force either state. Today the unavailability behavior
+   is split. A call outside an async runtime returns
    the typed error `StorageError::WriterTaskNoRuntime` before any fallback
    state is cached (`crates/khive-db/src/pool.rs:656-680`). Any other
    writer-task spawn failure caches `None` once, after which
