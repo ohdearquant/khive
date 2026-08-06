@@ -692,6 +692,79 @@ async fn list_notes_offset_returns_disjoint_pages() {
     }
 }
 
+// ---- #1658: offset-mode message-filter scan must disclose scan_incomplete ----
+//
+// Loop 2 in list.rs (offset + message filter) shares MAX_SCAN_TOTAL=10_000 with
+// loop 1 (cursor + message filter) but, before this fix, never reported
+// scan_incomplete when the scan hit that ceiling before exhausting matches.
+
+#[tokio::test]
+async fn list_notes_offset_message_filter_scan_incomplete_true() {
+    let rt = KhiveRuntime::memory().expect("in-memory runtime");
+    let token = rt.authorize(Namespace::local()).expect("authorize local");
+    let store = rt.notes(&token).expect("note store");
+
+    // 10,050 plain "message" notes with no outbound direction — the message
+    // filter (direction=outbound) never matches, so the scan must run to the
+    // full 10,000-row ceiling before giving up.
+    for i in 0..10_050u32 {
+        let note = Note::new("local", "message", format!("filler {i}"))
+            .with_properties(serde_json::json!({ "direction": "inbound" }));
+        store.upsert_note(note).await.expect("upsert filler note");
+    }
+
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(KgPack::new(rt.clone()));
+    let registry = builder.build().expect("registry builds");
+
+    let result = registry
+        .dispatch(
+            "list",
+            json!({"kind": "note", "direction": "outbound", "offset": 0, "limit": 5}),
+        )
+        .await
+        .expect("list must succeed even when scan is truncated");
+
+    assert_eq!(
+        result.get("scan_incomplete").and_then(Value::as_bool),
+        Some(true),
+        "offset-mode message-filter scan must disclose truncation at the 10,000-row \
+         ceiling; got {result}"
+    );
+}
+
+#[tokio::test]
+async fn list_notes_offset_message_filter_scan_incomplete_absent_when_not_truncated() {
+    let rt = KhiveRuntime::memory().expect("in-memory runtime");
+    let token = rt.authorize(Namespace::local()).expect("authorize local");
+    let store = rt.notes(&token).expect("note store");
+
+    for i in 0..5u32 {
+        let note = Note::new("local", "message", format!("small {i}"))
+            .with_properties(serde_json::json!({ "direction": "outbound" }));
+        store.upsert_note(note).await.expect("upsert note");
+    }
+
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(KgPack::new(rt.clone()));
+    let registry = builder.build().expect("registry builds");
+
+    let result = registry
+        .dispatch(
+            "list",
+            json!({"kind": "note", "direction": "outbound", "offset": 0, "limit": 5}),
+        )
+        .await
+        .expect("list must succeed");
+
+    assert!(
+        result.get("scan_incomplete").is_none()
+            || result.get("scan_incomplete") == Some(&Value::Bool(false)),
+        "scan_incomplete must be absent/false when the scan completes before the \
+         ceiling; got {result}"
+    );
+}
+
 #[tokio::test]
 async fn list_unknown_kind_returns_invalid_input() {
     let pack = pack();
@@ -2903,6 +2976,67 @@ async fn list_events_pagination_offset_beyond_end_returns_empty() {
     assert!(
         arr.is_empty(),
         "offset beyond total event count must return empty page"
+    );
+}
+
+// ---- #1658: event outcome-filter scan must disclose scan_incomplete ----
+//
+// Loop 3 in list.rs (event + outcome filter) computes a per-call scan ceiling
+// of (offset + limit) * 20 but, before this fix, never reported
+// scan_incomplete when that ceiling was reached before exhausting matches.
+
+#[tokio::test]
+async fn list_events_outcome_filter_scan_incomplete_true() {
+    let pack = pack_with_events();
+    // 25 create events, all outcome=success — with limit=1 the scan ceiling
+    // is (0 + 1) * 20 = 20, so a filter for an outcome that never occurs
+    // ("denied") must exhaust the ceiling before finding any match.
+    for i in 0..25u32 {
+        pack.dispatch(
+            "create",
+            json!({"kind": "concept", "name": format!("ScanFill-{i}")}),
+        )
+        .await
+        .expect("create must succeed");
+    }
+
+    let result = pack
+        .dispatch(
+            "list",
+            json!({"kind": "event", "outcome": "denied", "limit": 1}),
+        )
+        .await
+        .expect("list must succeed even when scan is truncated");
+
+    assert_eq!(
+        result.get("scan_incomplete").and_then(Value::as_bool),
+        Some(true),
+        "event outcome-filter scan must disclose truncation at its ceiling; got {result}"
+    );
+}
+
+#[tokio::test]
+async fn list_events_outcome_filter_scan_incomplete_absent_when_not_truncated() {
+    let pack = pack_with_events();
+    for name in ["SmallA", "SmallB", "SmallC"] {
+        pack.dispatch("create", json!({"kind": "concept", "name": name}))
+            .await
+            .expect("create must succeed");
+    }
+
+    let result = pack
+        .dispatch(
+            "list",
+            json!({"kind": "event", "outcome": "denied", "limit": 1}),
+        )
+        .await
+        .expect("list must succeed");
+
+    assert!(
+        result.get("scan_incomplete").is_none()
+            || result.get("scan_incomplete") == Some(&Value::Bool(false)),
+        "scan_incomplete must be absent/false when the scan completes before the \
+         ceiling; got {result}"
     );
 }
 
@@ -12338,7 +12472,9 @@ async fn list_note_limit_over_cap_truncates_with_metadata() {
         .dispatch("list", json!({"kind": "note", "limit": 300}))
         .await
         .expect("#894: list notes must succeed even when the cap binds");
-    let items = resp["items"].as_array().expect("items must be an array");
+    let items = resp["notes"]
+        .as_array()
+        .expect("clamped note envelope must contain notes");
     assert_eq!(
         items.len(),
         200,
