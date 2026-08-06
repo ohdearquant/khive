@@ -799,6 +799,14 @@ fn compile_condition_predicate(
             }
             Ok(format!("{col_expr} IS NOT NULL"))
         }
+        CompareOp::IsNull => {
+            if !matches!(cond.value, ConditionValue::Null) {
+                return Err(QueryError::Validation(
+                    "IS NULL does not accept a value".into(),
+                ));
+            }
+            Ok(format!("{col_expr} IS NULL"))
+        }
         op => {
             let op_str = match op {
                 CompareOp::Eq => "=",
@@ -811,7 +819,8 @@ fn compile_condition_predicate(
                 CompareOp::Contains
                 | CompareOp::StartsWith
                 | CompareOp::In
-                | CompareOp::IsNotNull => unreachable!(),
+                | CompareOp::IsNotNull
+                | CompareOp::IsNull => unreachable!(),
             };
             let is_string = matches!(cond.value, ConditionValue::String(_));
             let param_index = bind_condition_value(&cond.value, params)?;
@@ -2701,6 +2710,28 @@ mod tests {
                 .sql
                 .contains("e0.role IN ('candidate', 'selected') AND e0.referent_kind = 'note'"),
             "selected/candidate roles must still be guarded to note referents only; sql: {}",
+            compiled.sql
+        );
+    }
+
+    #[test]
+    fn where_is_null_compiles_to_is_null_sql() {
+        let q = gql::parse("MATCH (n:entity) WHERE n.name IS NULL RETURN n").unwrap();
+        let compiled = compile(&q, &opts()).unwrap();
+        assert!(
+            compiled.sql.contains("IS NULL") && !compiled.sql.contains("IS NOT NULL"),
+            "expected IS NULL (not IS NOT NULL) in sql: {}",
+            compiled.sql
+        );
+    }
+
+    #[test]
+    fn where_is_not_null_compiles_to_is_not_null_sql() {
+        let q = gql::parse("MATCH (n:entity) WHERE n.name IS NOT NULL RETURN n").unwrap();
+        let compiled = compile(&q, &opts()).unwrap();
+        assert!(
+            compiled.sql.contains("IS NOT NULL"),
+            "expected IS NOT NULL in sql: {}",
             compiled.sql
         );
     }
