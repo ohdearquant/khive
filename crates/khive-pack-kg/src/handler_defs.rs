@@ -572,7 +572,7 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 20] = [
                     instance_of: *->concept (any source kind), service->project. \
                     extends: concept->concept. variant_of: concept->concept, artifact->artifact. \
                     introduced_by: concept->document, concept->person, concept->org, artifact->document, document->person, document->org. \
-                    derived_from: artifact->dataset, artifact->document, artifact->project, artifact->artifact. \
+                    derived_from: artifact->dataset, artifact->document, artifact->project, artifact->artifact, document->document. \
                     precedes: document->document, dataset->dataset, artifact->artifact, service->service, project->project. \
                     depends_on: project->project, service->project, service->service, service->artifact, service->dataset, artifact->project, artifact->service, document->document. \
                     enables: concept->concept, service->concept, dataset->concept. \
