@@ -806,6 +806,21 @@ fn spawn_daemon_with_exe_and_config(
     // `mcp --daemon` (version skew) exits immediately with a clap parse
     // error; without this handle that failure was invisible to everything
     // except `khived.log`.
+    // A just-written executable can transiently fail `execve(2)` with
+    // ETXTBSY on instrumented/contended filesystems. This is especially easy
+    // to hit in the argv-forwarding tests, but it can also occur while a real
+    // installation is atomically replacing `kkernel`. Retry only that precise
+    // error, with a short finite budget; every other spawn failure remains
+    // immediate and unchanged.
+    const EXECUTABLE_BUSY_BACKOFF_MS: [u64; 3] = [5, 20, 50];
+    for delay_ms in EXECUTABLE_BUSY_BACKOFF_MS {
+        match cmd.spawn() {
+            Err(error) if error.kind() == std::io::ErrorKind::ExecutableFileBusy => {
+                std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+            }
+            outcome => return outcome,
+        }
+    }
     cmd.spawn()
 }
 
@@ -3125,6 +3140,30 @@ mod tests {
             "mcp --daemon --db /tmp/main.db",
             "the concrete override handed to the spawn seam must reach the daemon command line"
         );
+    }
+
+    /// A writer that momentarily still owns the fixture inode must not turn
+    /// the argv-forwarding family into an ETXTBSY flake. The production spawn
+    /// seam retries only ExecutableFileBusy, so holding this file open for
+    /// writing forces the exact failure class reported by coverage CI.
+    #[test]
+    fn spawn_daemon_retries_a_transient_executable_file_busy_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let exe = daemon_script_fixture(&dir, "temporarily-busy.sh", "#!/bin/sh\nexit 0\n");
+        let writer = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&exe)
+            .expect("hold executable fixture open for writing");
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(15));
+            drop(writer);
+        });
+
+        let mut child = spawn_daemon_with_exe_and_config(&exe, None, None)
+            .expect("transient ETXTBSY must be retried");
+        release.join().expect("fixture writer release thread");
+        let status = child.wait().expect("wait for executable fixture");
+        assert!(status.success(), "fixture must exit 0: {status}");
     }
 
     #[derive(Clone, Default)]
