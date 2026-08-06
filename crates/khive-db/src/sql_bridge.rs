@@ -2014,6 +2014,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let config = PoolConfig {
             path: Some(dir.path().join("sql_bridge_handle_cap.db")),
+            write_queue_enabled: Some(false),
             max_readers: 2,
             checkout_timeout: std::time::Duration::from_millis(20),
             ..PoolConfig::default()
@@ -2189,6 +2190,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let config = PoolConfig {
             path: Some(dir.path().join("sql_bridge_cancelled_writer.db")),
+            write_queue_enabled: Some(false),
             checkout_timeout: std::time::Duration::from_millis(250),
             ..PoolConfig::default()
         };
@@ -2312,6 +2314,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let config = PoolConfig {
             path: Some(dir.path().join("sql_bridge_cancelled_writer_batch.db")),
+            write_queue_enabled: Some(false),
             checkout_timeout: std::time::Duration::from_millis(250),
             ..PoolConfig::default()
         };
@@ -2461,7 +2464,7 @@ mod tests {
         let config = PoolConfig {
             path: Some(dir.path().join("sql_bridge_tx_control_reject.db")),
             checkout_timeout: std::time::Duration::from_millis(250),
-            write_queue_enabled: false,
+            write_queue_enabled: Some(false),
             ..PoolConfig::default()
         };
         let pool = Arc::new(ConnectionPool::new(config).unwrap());
@@ -2653,7 +2656,7 @@ mod tests {
         let pool = Arc::new(
             ConnectionPool::new(PoolConfig {
                 path: Some(dir.path().join("sql_bridge_multi_statement_inline.db")),
-                write_queue_enabled: true,
+                write_queue_enabled: Some(true),
                 write_routing_strict: true,
                 ..PoolConfig::default()
             })
@@ -2767,7 +2770,7 @@ mod tests {
         let config = PoolConfig {
             path: Some(dir.path().join("sql_bridge_tx_reject_queue.db")),
             checkout_timeout: std::time::Duration::from_millis(250),
-            write_queue_enabled: true,
+            write_queue_enabled: Some(true),
             write_routing_strict: true,
             ..PoolConfig::default()
         };
@@ -3112,7 +3115,7 @@ mod tests {
         let config = PoolConfig {
             path: Some(dir.path().join("sql_bridge_atomic_unit_budget.db")),
             checkout_timeout: std::time::Duration::from_millis(50),
-            write_queue_enabled: false,
+            write_queue_enabled: Some(false),
             ..PoolConfig::default()
         };
         let pool = Arc::new(ConnectionPool::new(config).unwrap());
@@ -3571,7 +3574,7 @@ mod tests {
         let path = dir.path().join("queue_backed_reader_budget.db");
         let config = PoolConfig {
             path: Some(path),
-            write_queue_enabled: true,
+            write_queue_enabled: Some(true),
             write_routing_strict: true,
             max_readers: 1,
             checkout_timeout: std::time::Duration::from_millis(250),
@@ -3674,7 +3677,7 @@ mod tests {
         let path = dir.path().join("queue_backed_inflight_cancel.db");
         let config = PoolConfig {
             path: Some(path),
-            write_queue_enabled: true,
+            write_queue_enabled: Some(true),
             write_routing_strict: true,
             max_readers: 1,
             checkout_timeout: std::time::Duration::from_millis(250),
