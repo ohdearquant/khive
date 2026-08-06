@@ -4430,4 +4430,157 @@ mod tests {
 
         assert!(census.truncated);
     }
+
+    /// #1335: the Windows FFI paths (`open_relative`/`NtCreateFile`,
+    /// `validate_owner_only_dacl`, `rename_via_handle`,
+    /// `remove_relative_if_exists`/`delete_via_handle`, mtime touch) are
+    /// exercised only through `windows_impl`'s public-to-`super` wrappers
+    /// (`ensure_sidecar_dir`/`write_heartbeat`/`touch_heartbeat`/
+    /// `remove_heartbeat`/`write_beacon`/`touch_beacon`/`remove_beacon`),
+    /// driven against a real temp directory. `windows_impl` only exists
+    /// under `cfg(windows)`, so this module compiles and runs on Windows
+    /// only; it has no effect on `cargo check`/`cargo test` for any other
+    /// target.
+    #[cfg(all(test, windows))]
+    mod windows_tests {
+        use super::*;
+        use std::fs;
+
+        #[test]
+        fn ensure_sidecar_dir_creates_directory() {
+            let root = tempfile::tempdir().unwrap();
+            let dir = root.path().join("khive.db.walpin");
+            ensure_sidecar_dir(&dir).expect("should create");
+            let meta = fs::symlink_metadata(&dir).unwrap();
+            assert!(meta.is_dir());
+        }
+
+        #[test]
+        fn ensure_sidecar_dir_is_idempotent_and_revalidates_dacl() {
+            let root = tempfile::tempdir().unwrap();
+            let dir = root.path().join("khive.db.walpin");
+            ensure_sidecar_dir(&dir).expect("first create should succeed");
+            ensure_sidecar_dir(&dir)
+                .expect("second call must re-open and re-validate the existing dir, not fail");
+        }
+
+        #[test]
+        fn ensure_sidecar_dir_refuses_preexisting_dir_with_default_acl() {
+            let root = tempfile::tempdir().unwrap();
+            let dir = root.path().join("khive.db.walpin");
+            // A plain `create_dir` inherits the parent's ACL rather than the
+            // single owner-only ACE this module writes — the DACL round-trip
+            // must refuse it rather than repair it in place.
+            fs::create_dir(&dir).unwrap();
+            let err = ensure_sidecar_dir(&dir)
+                .expect_err("a pre-existing dir without the exact owner-only DACL must be refused");
+            assert!(err.to_string().contains("owner"), "unexpected error: {err}");
+        }
+
+        #[test]
+        fn ensure_sidecar_dir_refuses_symlinked_target() {
+            let root = tempfile::tempdir().unwrap();
+            let real = root.path().join("real_dir");
+            fs::create_dir(&real).unwrap();
+            let link = root.path().join("khive.db.walpin");
+            std::os::windows::fs::symlink_dir(&real, &link).expect(
+                "creating a directory symlink requires Developer Mode or an elevated \
+                 process on the Windows CI runner",
+            );
+            let err = ensure_sidecar_dir(&link)
+                .expect_err("a reparse-point sidecar path must be refused, never followed");
+            assert!(
+                err.to_string().contains("reparse"),
+                "unexpected error: {err}"
+            );
+        }
+
+        #[test]
+        fn write_heartbeat_creates_then_replaces_then_removes() {
+            let root = tempfile::tempdir().unwrap();
+            let dir = root.path().join("khive.db.walpin");
+            let pid = std::process::id();
+            let path = dir.join(format!("{pid}.json"));
+
+            let first = heartbeat(pid);
+            write_heartbeat(&dir, &first).expect("initial create must succeed");
+            let read_back: WalpinHeartbeat =
+                serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+            assert_eq!(read_back, first);
+
+            let mut second = heartbeat(pid);
+            second.oldest_tx_label = Some("replaced".to_string());
+            write_heartbeat(&dir, &second)
+                .expect("replacing an already-existing target must succeed");
+            let read_back: WalpinHeartbeat =
+                serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+            assert_eq!(read_back, second);
+            assert_ne!(read_back, first);
+
+            remove_heartbeat(&dir, pid).expect("remove must succeed");
+            assert!(!path.exists());
+        }
+
+        #[test]
+        fn remove_heartbeat_on_missing_sidecar_dir_is_a_noop() {
+            let root = tempfile::tempdir().unwrap();
+            let dir = root.path().join("khive.db.walpin");
+            remove_heartbeat(&dir, 4242).expect("missing sidecar dir must be a no-op");
+            assert!(
+                !dir.exists(),
+                "removal must never create the sidecar dir as a side effect"
+            );
+        }
+
+        #[test]
+        fn touch_heartbeat_refreshes_mtime_without_changing_content() {
+            let root = tempfile::tempdir().unwrap();
+            let dir = root.path().join("khive.db.walpin");
+            let pid = std::process::id();
+            let hb = heartbeat(pid);
+            write_heartbeat(&dir, &hb).unwrap();
+            let path = dir.join(format!("{pid}.json"));
+            let before = fs::metadata(&path).unwrap().modified().unwrap();
+
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            touch_heartbeat(&dir, pid).expect("touch of an existing heartbeat must succeed");
+
+            let after = fs::metadata(&path).unwrap().modified().unwrap();
+            assert!(after >= before, "touch must not move mtime backward");
+            let content_after: WalpinHeartbeat =
+                serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+            assert_eq!(
+                content_after, hb,
+                "touch is metadata-only; the body must be unchanged"
+            );
+        }
+
+        #[test]
+        fn touch_heartbeat_fails_when_entry_is_absent() {
+            let root = tempfile::tempdir().unwrap();
+            let dir = root.path().join("khive.db.walpin");
+            ensure_sidecar_dir(&dir).unwrap();
+            let err = touch_heartbeat(&dir, 99999)
+                .expect_err("touching a nonexistent heartbeat must fail");
+            assert!(
+                err.to_string().contains("does not exist"),
+                "unexpected error: {err}"
+            );
+        }
+
+        #[test]
+        fn beacon_write_touch_remove_cycle() {
+            let root = tempfile::tempdir().unwrap();
+            let dir = root.path().join("khive.db.walpin");
+            let pid = std::process::id();
+            let b = beacon(pid);
+            let path = beacon_path(&dir, pid);
+
+            write_beacon(&dir, &b).expect("beacon create must succeed");
+            assert!(path.exists());
+            touch_beacon(&dir, pid).expect("beacon touch must succeed");
+            remove_beacon(&dir, pid).expect("beacon remove must succeed");
+            assert!(!path.exists());
+        }
+    }
 }
