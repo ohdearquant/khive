@@ -274,9 +274,9 @@ follow-on inherits the multi-daemon case.
 An earlier draft used the classifier to decide **routing** — which rows may be batched. Under D1
 that question no longer exists: every row rides the same committed (store-visible) batch, and on
 the success path every dispatch waits for it, so no row is deferred past its own return and there
-is nothing to route away from. The one exception is D1's carve-out — a pure-observability row whose commit fails
-persistently — and that is a failure outcome rather than a routing choice, which is exactly why the
-classifier's remaining job is failure semantics.
+is nothing to route away from. The one exception is D1's carve-out — a pure-observability row
+whose commit fails persistently — and that is a failure outcome rather than a routing choice,
+which is exactly why the classifier's remaining job is failure semantics.
 
 The classifier survives, for a sharper reason. It decides **what a failed commit does to the
 caller**:
@@ -559,8 +559,9 @@ reading an earlier draft left open by not stating D1's waiting clause, and it is
 version of this decision but a different one. A returned operation whose row is still in memory can
 lose a row the current implementation would have kept, since today's append is committed
 (store-visible) at dispatch whenever it succeeds. That violates INV-4 directly, and for an
-accounting-bearing row it violates INV-1. It also buys nothing this record does not already obtain: the acquisition count falls
-because rows share a transaction, not because the caller stopped waiting.
+accounting-bearing row it violates INV-1. It also buys nothing this record does not already
+obtain: the acquisition count falls because rows share a transaction, not because the caller
+stopped waiting.
 
 **Exempt accounting rows from batching to keep them durable.** Rejected, having been the previous
 draft's D3. Under ADR-103 the usage object rides every per-dispatch audit row, so the exemption
