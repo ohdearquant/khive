@@ -1853,3 +1853,167 @@ fn mixed_version_boot_rejects_newer_schema_under_lock() {
         "the under-lock guard, not the pre-lock guard, must fire: {msg}"
     );
 }
+
+// ── V18: divergent V13/V14 ledger repair (#1649) ────────────────────────────
+
+fn insert_v18_test_entity(conn: &Connection, id: &str, created_at: i64) {
+    conn.execute(
+        "INSERT INTO entities (id, namespace, kind, name, tags, created_at, updated_at) \
+         VALUES (?1, 'local', 'concept', ?1, '[]', ?2, ?2)",
+        rusqlite::params![id, created_at],
+    )
+    .expect("insert v18 test entity");
+}
+
+fn insert_v18_test_note(conn: &Connection, id: &str, created_at: i64) {
+    conn.execute(
+        "INSERT INTO notes \
+         (id, namespace, kind, status, name, content, created_at, updated_at) \
+         VALUES (?1, 'local', 'note', 'active', ?1, '', ?2, ?2)",
+        rusqlite::params![id, created_at],
+    )
+    .expect("insert v18 test note");
+}
+
+fn insert_v18_test_edge(conn: &Connection, id: &str, source_id: &str, target_id: &str) {
+    conn.execute(
+        "INSERT INTO graph_edges \
+         (namespace, id, source_id, target_id, relation, weight, created_at, updated_at) \
+         VALUES ('local', ?1, ?2, ?3, 'relates_to', 1.0, 1, 1)",
+        rusqlite::params![id, source_id, target_id],
+    )
+    .expect("insert v18 test edge");
+}
+
+#[test]
+fn v18_repairs_divergent_cursor_ledgers() {
+    let mut conn = open_memory();
+    run_migrations(&mut conn).expect("fresh migrate to latest (includes V18)");
+
+    // Populate rows that predate the divergence being simulated below.
+    insert_v18_test_entity(&conn, "e1", 10);
+    insert_v18_test_entity(&conn, "e2", 20);
+    insert_v18_test_note(&conn, "n1", 10);
+    insert_v18_test_edge(&conn, "edge1", "e1", "e2");
+
+    // Simulate a database that committed V13/V14 under non-canonical names,
+    // never recorded V18, and lost part of its ledger — the exact divergence
+    // V18 exists to repair.
+    conn.execute(
+        "UPDATE _schema_migrations SET name = 'legacy_v13_rename' WHERE version = 13",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE _schema_migrations SET name = 'legacy_v14_rename' WHERE version = 14",
+        [],
+    )
+    .unwrap();
+    conn.execute("DELETE FROM _schema_migrations WHERE version = 18", [])
+        .unwrap();
+    conn.execute("DELETE FROM entities_seq WHERE entity_id = 'e1'", [])
+        .unwrap();
+    conn.execute("DELETE FROM notes_seq WHERE note_id = 'n1'", [])
+        .unwrap();
+    conn.execute("DELETE FROM graph_edges_seq WHERE edge_id = 'edge1'", [])
+        .unwrap();
+
+    run_migrations(&mut conn).expect("rerun must repair the divergence");
+
+    let entity_cursor_rows: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM entities_seq \
+             CROSS JOIN entities ON entities.id = entities_seq.entity_id",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        entity_cursor_rows, 2,
+        "both entities must be cursor-joinable"
+    );
+
+    let note_cursor_rows: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM notes_seq \
+             CROSS JOIN notes ON notes.id = notes_seq.note_id",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(note_cursor_rows, 1, "the note must be cursor-joinable");
+
+    let edge_cursor_rows: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM graph_edges_seq \
+             CROSS JOIN graph_edges ON graph_edges.id = graph_edges_seq.edge_id",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(edge_cursor_rows, 1, "the edge must be cursor-joinable");
+
+    assert!(
+        index_exists(&conn, "idx_graph_edges_id_unique"),
+        "V18 must reassert the global edge-id unique index"
+    );
+
+    let (v13_name, v14_name): (String, String) = (
+        conn.query_row(
+            "SELECT name FROM _schema_migrations WHERE version = 13",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap(),
+        conn.query_row(
+            "SELECT name FROM _schema_migrations WHERE version = 14",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap(),
+    );
+    assert_eq!(v13_name, "list_cursor_sequences");
+    assert_eq!(v14_name, "graph_edges_id_unique");
+
+    let before: i64 = conn
+        .query_row("SELECT COUNT(*) FROM entities_seq", [], |row| row.get(0))
+        .unwrap();
+    run_migrations(&mut conn).expect("second rerun must be a no-op");
+    let after: i64 = conn
+        .query_row("SELECT COUNT(*) FROM entities_seq", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(
+        before, after,
+        "a second rerun must not duplicate ledger rows"
+    );
+}
+
+#[test]
+fn post_v18_name_mismatch_fails_loud() {
+    let mut conn = open_memory();
+    run_migrations(&mut conn).expect("fresh migrate to latest (includes V18)");
+
+    // An unrelated already-applied migration recorded under the wrong name —
+    // not the known V13/V14 divergence V18 repairs — must fail loudly rather
+    // than be silently accepted or trigger arbitrary re-execution.
+    conn.execute(
+        "UPDATE _schema_migrations SET name = 'wrong_name' WHERE version = 7",
+        [],
+    )
+    .unwrap();
+
+    let err = run_migrations(&mut conn).expect_err("a name mismatch must fail startup");
+    let msg = err.to_string();
+    assert!(
+        msg.contains('7'),
+        "error must name the affected version: {msg}"
+    );
+    assert!(
+        msg.contains("wrong_name"),
+        "error must name the actual recorded name: {msg}"
+    );
+    assert!(
+        msg.contains("notes_seq"),
+        "error must name the expected canonical name: {msg}"
+    );
+}

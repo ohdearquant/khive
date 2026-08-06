@@ -135,6 +135,8 @@ const V16_UP: &str = include_str!("../sql/016-gtd-dependency-cycle-guards.sql");
 
 const V17_UP: &str = include_str!("../sql/017-agents-ddl.sql");
 
+const V18_UP: &str = include_str!("../sql/018-list-cursor-backfill-repair.sql");
+
 /// DDL for the `ann_write_log` delta table.
 ///
 /// Shared between migration V11 and the belt-and-suspenders creation in
@@ -244,7 +246,48 @@ pub const MIGRATIONS: &[VersionedMigration] = &[
         name: "agents_ddl",
         up: V17_UP,
     },
+    VersionedMigration {
+        version: 18,
+        name: "list_cursor_backfill_repair",
+        up: V18_UP,
+    },
 ];
+
+/// Confirm every applied migration through `through_version` is recorded
+/// under its canonical name. A deployment-time rename of an applied
+/// migration (the divergence #1649 repairs for versions 13/14) must not be
+/// silently accepted for any other version: an unknown name mismatch means
+/// this database's history cannot be trusted to match `MIGRATIONS`, so
+/// startup fails loudly instead of treating the recorded name as
+/// informational.
+fn validate_applied_migration_names(
+    conn: &Connection,
+    through_version: u32,
+) -> Result<(), SqliteError> {
+    let mut stmt =
+        conn.prepare("SELECT version, name FROM _schema_migrations WHERE version <= ?1")?;
+    let applied = stmt
+        .query_map([through_version], |row| {
+            Ok((row.get::<_, u32>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    for (version, applied_name) in applied {
+        if let Some(migration) = MIGRATIONS.iter().find(|m| m.version == version) {
+            if migration.name != applied_name {
+                return Err(SqliteError::InvalidData(format!(
+                    "migration version {version} is recorded under name '{applied_name}', \
+                     expected '{expected}'. This database's migration history does not match \
+                     the current binary; recreate it from the current schema or repair the \
+                     specific known divergence via a dedicated migration.",
+                    expected = migration.name,
+                )));
+            }
+        }
+    }
+
+    Ok(())
+}
 
 const MIGRATION_TRACKING_TABLE: &str = include_str!("../sql/schema-migrations-table.sql");
 
@@ -381,6 +424,16 @@ fn run_migrations_locked(conn: &mut Connection) -> Result<u32, SqliteError> {
         )));
     }
 
+    // A database already at or past V18 has no known-divergence repair left
+    // to run; validate its recorded names up front rather than after
+    // fast-forwarding past migrations that will not execute again. A
+    // pre-V18 database may still carry the V13/V14 divergence V18 exists to
+    // repair, so it is validated after the loop instead, once V18 (if
+    // still pending) has had a chance to run.
+    if current_version >= 18 {
+        validate_applied_migration_names(conn, current_version)?;
+    }
+
     let mut applied_version = current_version;
     // Floor advanced when a sibling's work is observed under the write lock,
     // so a losing process skips the remaining already-applied migrations
@@ -473,6 +526,23 @@ fn run_migrations_locked(conn: &mut Connection) -> Result<u32, SqliteError> {
                 error: e.to_string(),
             })?;
 
+        // V18's repair contract includes normalizing the two known-divergent
+        // recorded names. `_schema_migrations` is created and owned by this
+        // runner (not by any migration file), so the normalization lives
+        // here, in the same transaction that applies V18's SQL. Exact,
+        // closed set — versions 13 and 14 only; any other (version, name)
+        // mismatch still fails startup via validate_applied_migration_names.
+        if migration.version == 18 {
+            tx.execute_batch(
+                "UPDATE _schema_migrations SET name = 'list_cursor_sequences' WHERE version = 13;\n\
+                 UPDATE _schema_migrations SET name = 'graph_edges_id_unique' WHERE version = 14;",
+            )
+            .map_err(|e| SqliteError::Migration {
+                version: migration.version,
+                error: e.to_string(),
+            })?;
+        }
+
         let now = chrono::Utc::now().timestamp_micros();
         tx.execute(
             "INSERT INTO _schema_migrations (version, name, applied_at) VALUES (?1, ?2, ?3) \
@@ -495,6 +565,10 @@ fn run_migrations_locked(conn: &mut Connection) -> Result<u32, SqliteError> {
         })?;
 
         applied_version = migration.version;
+    }
+
+    if current_version < 18 {
+        validate_applied_migration_names(conn, applied_version)?;
     }
 
     Ok(applied_version)
