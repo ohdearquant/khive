@@ -1364,7 +1364,7 @@ async fn collect_model_ann_hits_inner(
         }
     };
 
-    if let Some(degrade_reason) = model_ann_degrade_reason {
+    if let Some(mut degrade_reason) = model_ann_degrade_reason {
         // No serving index is available for this model within the bounded
         // wait. Rather than replace it with an O(corpus) exact scan, ADR-118
         // §3's second tier guarantees visibility of the newest
@@ -1374,7 +1374,27 @@ async fn collect_model_ann_hits_inner(
                 .await
             {
                 ann::FreshTailOutcome::Ops(ops) => ops,
-                ann::FreshTailOutcome::Replace(_) | ann::FreshTailOutcome::Skipped => Vec::new(),
+                // A `Replace` cannot arise on this tier (no serving bridge,
+                // so no watermark mismatch to re-resolve), but if one ever
+                // does, its degradation disclosure must not be dropped.
+                ann::FreshTailOutcome::Replace(_, reason) => {
+                    if let Some(reason) = reason {
+                        degrade_reason = format!(
+                            "{degrade_reason}; fresh-tail re-resolution degraded: {reason}"
+                        );
+                    }
+                    Vec::new()
+                }
+                // #1477: the capped exact leg sat out too — this is a second,
+                // exceptional degradation on top of the already-degraded
+                // ANN-not-ready path. Fold its failure-site reason into the
+                // one already surfaced rather than silently discarding it,
+                // so a caller sees why fresh-tail visibility was also lost.
+                ann::FreshTailOutcome::Skipped(reason) => {
+                    degrade_reason =
+                        format!("{degrade_reason}; fresh-tail leg also skipped: {reason}");
+                    Vec::new()
+                }
             };
         let merged = ann::merge_fresh_tail(Vec::new(), &vec, tail_ops);
         let hits: Vec<VectorSearchHit> = merged
@@ -1488,11 +1508,13 @@ async fn collect_model_ann_hits_inner(
             Some(best_seq),
         )
         .await;
-        let best_raw = match outcome {
-            ann::FreshTailOutcome::Ops(ops) => ann::merge_fresh_tail(best_raw, &vec, ops),
-            ann::FreshTailOutcome::Replace(candidates) => candidates,
-            ann::FreshTailOutcome::Skipped => best_raw,
-        };
+        // #1477: an exceptional fresh-tail skip (disabled, registration/registry
+        // failure, reader/snapshot failure, or tail-fetch failure — never an
+        // ordinary "no tail rows" outcome, which comes back as `Ops(vec![])`)
+        // still serves the warm-ANN candidates, but read-your-writes visibility
+        // was lost for this query; the caller must be able to see that.
+        let (best_raw, fresh_tail_skip_reason) =
+            ann::outcome_into_candidates(outcome, best_raw, &vec);
 
         tracing::debug!(
             model = %model_name,
@@ -1512,8 +1534,8 @@ async fn collect_model_ann_hits_inner(
         return Ok(PerModelAnnHits {
             model_name,
             hits,
-            degraded: false,
-            degraded_reason: None,
+            degraded: fresh_tail_skip_reason.is_some(),
+            degraded_reason: fresh_tail_skip_reason,
             used_sqlite_vec_fallback: false,
         });
     }

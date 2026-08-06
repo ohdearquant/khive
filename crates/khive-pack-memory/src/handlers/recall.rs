@@ -751,6 +751,13 @@ impl MemoryPack {
                 if ann_degraded {
                     // Per-result stamp keeps degradation visible without verbose output.
                     result["degraded"] = json!("ann_unavailable");
+                    // #1477: additive, non-empty failure-site reason so a
+                    // caller can distinguish why serving degraded (e.g. an
+                    // exceptional fresh-tail skip) without breaking the
+                    // load-bearing bare-array shape non-empty callers rely on.
+                    if let Some(ref reason) = ann_degraded_reason {
+                        result["degraded_reason"] = json!(reason);
+                    }
                 }
                 if budget_capped {
                     // Surviving partial results retain the per-item signal so callers
@@ -1364,6 +1371,109 @@ mod tests {
             assert!(
                 r.get("degraded").is_none(),
                 "normal recall must not carry a degraded marker, got: {r:?}"
+            );
+        }
+    }
+
+    /// Guards a mutated `KHIVE_ANN_FRESH_TAIL` value, restoring whatever value
+    /// (present or absent) it held before the guard was created, even if the
+    /// test panics.
+    struct FreshTailEnvGuard {
+        prior: Option<String>,
+    }
+
+    impl FreshTailEnvGuard {
+        fn disable() -> Self {
+            let prior = std::env::var("KHIVE_ANN_FRESH_TAIL").ok();
+            std::env::set_var("KHIVE_ANN_FRESH_TAIL", "0");
+            Self { prior }
+        }
+    }
+
+    impl Drop for FreshTailEnvGuard {
+        fn drop(&mut self) {
+            match self.prior.take() {
+                Some(v) => std::env::set_var("KHIVE_ANN_FRESH_TAIL", v),
+                None => std::env::remove_var("KHIVE_ANN_FRESH_TAIL"),
+            }
+        }
+    }
+
+    /// #1477: an exceptional fresh-tail skip (here, the exact leg disabled via
+    /// `KHIVE_ANN_FRESH_TAIL=0`) forfeits read-your-writes visibility on the
+    /// warm-index path — that is degraded serving, not an ordinary healthy
+    /// response, and must be disclosed on a non-empty response the same way
+    /// #836's bounded-wait degradation already is. Fails on `f74c5461f`, where
+    /// a skipped fresh-tail leg on the warm-index path left `degraded: false`
+    /// and no per-item marker at all.
+    #[tokio::test]
+    #[serial(adr118_fresh_tail)]
+    async fn recall_1477_skipped_fresh_tail_stamps_degraded() {
+        const MODEL: &str = "recall-1477-fresh-tail-disabled-model";
+        const DIMS: usize = 16;
+        const NOTE_TEXT: &str = "issue 1477 fresh tail disabled recall degradation note";
+
+        let _env_guard = FreshTailEnvGuard::disable();
+
+        let rt = KhiveRuntime::memory().expect("in-memory runtime");
+        rt.register_embedder(HashVecProvider {
+            model_name: MODEL.to_owned(),
+            dims: DIMS,
+        });
+
+        let ns = Namespace::parse("local").expect("local namespace");
+        let token = rt.authorize(ns).expect("authorize local");
+
+        rt.create_note(&token, "memory", None, NOTE_TEXT, Some(0.7), None, vec![])
+            .await
+            .expect("create note");
+
+        let pack = MemoryPack::new(rt.clone());
+        let ann_handle = pack.ann.clone();
+
+        // Warm the ANN bridge synchronously so the fresh-tail leg is
+        // exercised via the warm-index branch (initial_raw_hits present),
+        // not the ANN-not-ready branch.
+        crate::ann::ensure_ann_for_model(&rt, &token, &ann_handle, MODEL)
+            .await
+            .expect("warm ann build");
+
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(KgPack::new(rt.clone()));
+        builder.register(pack);
+        let registry = builder.build().expect("registry");
+
+        let result = registry
+            .dispatch(
+                "memory.recall",
+                serde_json::json!({
+                    "query": "1477 fresh tail disabled recall",
+                    "limit": 10
+                }),
+            )
+            .await
+            .expect("recall must not error when the fresh-tail leg is disabled");
+
+        let results = result.as_array().expect("recall result must be an array");
+        assert!(
+            !results.is_empty(),
+            "the seeded note must still surface via the warm-index candidates"
+        );
+        for r in results {
+            assert_eq!(
+                r.get("degraded").and_then(Value::as_str),
+                Some("ann_unavailable"),
+                "#1477 a disabled fresh-tail leg must stamp the existing \
+                 degradation marker on a non-empty response, got: {r:?}"
+            );
+            let reason = r
+                .get("degraded_reason")
+                .and_then(Value::as_str)
+                .expect("#1477 a disabled fresh-tail leg must carry a degraded_reason string");
+            assert!(
+                !reason.is_empty(),
+                "#1477 degraded_reason must be non-empty (captured at the \
+                 failure site), got: {r:?}"
             );
         }
     }
