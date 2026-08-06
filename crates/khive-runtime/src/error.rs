@@ -13,6 +13,30 @@ pub type RuntimeResult<T> = Result<T, RuntimeError>;
 /// checkout that expires before SQLite executes.
 pub const WRITER_POOL_CHECKOUT_TIMEOUT_STAGE: &str = "writer_pool_checkout_timeout";
 
+/// Stable wire code/stage for a bounded write-queue enqueue that never
+/// accepted the request within its configured deadline (#1382, #1643).
+pub const WRITER_QUEUE_SATURATED_STAGE: &str = "writer_queue_saturated";
+
+/// Structured context for a pre-execution write-admission failure: either a
+/// finite-wait pooled writer checkout timeout or a bounded write-queue
+/// enqueue timeout. Both happen before SQLite executes the request, so both
+/// are safe to classify as retryable — the request was never accepted, let
+/// alone started.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdmissionFailureContext {
+    /// Stable wire stage/code: one of [`WRITER_POOL_CHECKOUT_TIMEOUT_STAGE`]
+    /// or [`WRITER_QUEUE_SATURATED_STAGE`].
+    pub stage: &'static str,
+    /// The configured deadline that elapsed.
+    pub timeout: Duration,
+    /// Storage capability the request was scoped to, when known. The write
+    /// queue is process-local and unscoped by capability, so this is `None`
+    /// for [`WRITER_QUEUE_SATURATED_STAGE`].
+    pub capability: Option<khive_storage::StorageCapability>,
+    /// Storage operation name, when known.
+    pub operation: Option<String>,
+}
+
 /// Structured context recovered from either a direct SQLite runtime error or
 /// a typed SQLite source preserved inside a storage-driver wrapper.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -337,6 +361,30 @@ impl RuntimeError {
             capability,
             operation,
         })
+    }
+
+    /// Recover either pre-execution write-admission failure this process can
+    /// produce, by typed variant rather than rendered message text (#1643).
+    /// Both are safe to classify as retryable: the request was never
+    /// accepted, so no partial side effect can exist to roll back.
+    pub fn admission_failure_context(&self) -> Option<AdmissionFailureContext> {
+        if let Some(context) = self.writer_pool_checkout_timeout_context() {
+            return Some(AdmissionFailureContext {
+                stage: WRITER_POOL_CHECKOUT_TIMEOUT_STAGE,
+                timeout: context.timeout,
+                capability: context.capability,
+                operation: context.operation,
+            });
+        }
+        if let Self::Storage(khive_storage::StorageError::WriteQueueFull { timeout_ms }) = self {
+            return Some(AdmissionFailureContext {
+                stage: WRITER_QUEUE_SATURATED_STAGE,
+                timeout: Duration::from_millis(*timeout_ms),
+                capability: None,
+                operation: None,
+            });
+        }
+        None
     }
 }
 

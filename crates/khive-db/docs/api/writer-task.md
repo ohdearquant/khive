@@ -68,8 +68,22 @@ drained requests receive a typed error without invoking their closures.
 | Send begins after the receiver has closed                                  | `NotStarted`             | The request was not accepted and its operation closure is never invoked                        |
 | An accepted request loses its reply outside the contained request path     | `SideEffectsUnknown`     | The caller cannot prove whether the operation began or which side effects occurred             |
 
-All three handle surfaces (`send`, `send_with_timeout`, and
-`send_top_level`) use this contract. Queue backpressure and
+### Bounded enqueue admission (#1382)
+
+Production store write paths and the SQL bridge's writer requests use
+`send_bounded` / `send_top_level_bounded`, which bound only the
+enqueue-capacity wait with `PoolConfig::checkout_timeout` (captured at
+`spawn` as `WriterTaskHandle::enqueue_timeout`) before falling back to
+`StorageError::WriteQueueFull`. Once a request is accepted onto the
+channel, the reply wait is unbounded by this mechanism, identical to plain
+`send`/`send_top_level`. The raw `send`, `send_top_level`, and
+`send_with_timeout` methods remain the underlying primitives — indefinite
+channel backpressure by default, or a caller-supplied deadline — and stay
+available to callers and tests that need that behavior explicitly.
+
+All five handle surfaces (`send`, `send_with_timeout`, `send_top_level`,
+`send_bounded`, `send_top_level_bounded`) use this contract. Queue
+backpressure and
 `WriteQueueFull` remain unchanged: a timeout while waiting for capacity is
 not a writer-task termination. `WriterTaskTerminated` is deliberately not
 retryable because retrying an outcome marked `SideEffectsUnknown` could

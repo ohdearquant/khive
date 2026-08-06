@@ -73,8 +73,9 @@ pub use engine_config::{
     GitWriteEntryConfig, GitWriteSectionConfig, KhiveConfig, PackConfig, StorageSectionConfig,
 };
 pub use error::{
-    fts_text_leg_or_err, GuardedWriteFailure, RuntimeError, RuntimeResult,
+    fts_text_leg_or_err, AdmissionFailureContext, GuardedWriteFailure, RuntimeError, RuntimeResult,
     WriterPoolCheckoutTimeoutContext, WRITER_POOL_CHECKOUT_TIMEOUT_STAGE,
+    WRITER_QUEUE_SATURATED_STAGE,
 };
 pub use fusion::FusionStrategy;
 pub use graph_traversal::PathNode;

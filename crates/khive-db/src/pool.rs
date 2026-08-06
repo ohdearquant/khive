@@ -66,7 +66,8 @@ pub struct PoolConfig {
     pub read_only: bool,
     /// Route migrated store write paths through the single-writer
     /// `WriterTask` channel (ADR-067 Component A) instead of the legacy
-    /// per-call pool-mutex/standalone-connection path. Off by default.
+    /// per-call pool-mutex/standalone-connection path. Enabled by default
+    /// for file-backed pools when unset; explicit override always wins.
     ///
     /// Slice 1 wires exactly one path (`SqlEntityStore::upsert_entities`)
     /// behind this flag; enabling it does not yet claim ADR-067's

@@ -218,10 +218,12 @@ pub struct SqlNoteStore {
 impl SqlNoteStore {
     /// Create a new store.
     pub fn new(pool: Arc<ConnectionPool>, is_file_backed: bool) -> Self {
-        // Best-effort opt-in (ADR-067 Component A, mirrors entity.rs slice 1
-        // policy): a missing writer task — flag off, spawn degraded, or no
-        // Tokio runtime available at this first access — degrades to the
-        // legacy pool-mutex path rather than failing construction.
+        // Enabled by default for file-backed pools; explicit off/degraded
+        // fallback remains possible (ADR-067 Component A, mirrors
+        // entity.rs policy): a missing writer task — explicitly disabled,
+        // spawn degraded, or no Tokio runtime available at this first
+        // access — degrades to the legacy pool-mutex path rather than
+        // failing construction.
         let writer_task = pool.writer_task_handle().ok().flatten();
 
         Self {
@@ -280,7 +282,7 @@ impl SqlNoteStore {
     {
         if let Some(writer_task) = &self.writer_task {
             return writer_task
-                .send(move |conn| f(conn).map_err(|e| map_err(e, op)))
+                .send_bounded(move |conn| f(conn).map_err(|e| map_err(e, op)))
                 .await;
         }
 
@@ -312,7 +314,7 @@ impl SqlNoteStore {
     {
         if let Some(writer_task) = &self.writer_task {
             return writer_task
-                .send(move |conn| f(conn).map_err(|e| map_err(e, op)))
+                .send_bounded(move |conn| f(conn).map_err(|e| map_err(e, op)))
                 .await;
         }
 
