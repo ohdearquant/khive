@@ -1785,6 +1785,52 @@ async fn search_rejects_empty_query() {
 }
 
 #[tokio::test]
+async fn search_rejects_invalid_kind_value() {
+    let f = pack(rt());
+    let err = f
+        .dispatch(
+            "knowledge.search",
+            json!({ "query": "attention", "kind": "atoms", "rerank": false }),
+        )
+        .await
+        .expect_err("unknown kind must fail closed");
+    assert!(
+        matches!(err, RuntimeError::InvalidInput(_)),
+        "must be InvalidInput, got: {err:?}"
+    );
+    assert!(
+        err.to_string()
+            .contains("kind must be one of: atom, domain"),
+        "got: {err}"
+    );
+}
+
+#[tokio::test]
+async fn search_rejects_invalid_exclude_status_value() {
+    let f = pack(rt());
+    let err = f
+        .dispatch(
+            "knowledge.search",
+            json!({
+                "query": "attention",
+                "exclude_status": "deprectaed",
+                "rerank": false
+            }),
+        )
+        .await
+        .expect_err("unknown exclusion status must fail closed");
+    assert!(
+        matches!(err, RuntimeError::InvalidInput(_)),
+        "must be InvalidInput, got: {err:?}"
+    );
+    assert!(
+        err.to_string()
+            .contains("exclude_status must be one of: draft, reviewed, deprecated"),
+        "got: {err}"
+    );
+}
+
+#[tokio::test]
 async fn search_type_filter_returns_only_atoms() {
     let f = pack(rt());
     seed_search_corpus(&f).await;

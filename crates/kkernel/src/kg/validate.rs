@@ -204,6 +204,7 @@ fn structural_checks(
     taxonomy: &KgTaxonomy,
 ) -> Vec<RuleResult> {
     let mut results = vec![
+        check_required_input_files(entities_path, edges_path, notes_path),
         check_schema_compliance(entities_path, edges_path, notes_path),
         check_no_duplicate_uuids(entities_path),
         check_sort_order(entities_path, edges_path),
@@ -215,6 +216,70 @@ fn structural_checks(
         results.push(check_valid_note_kinds(notes_path, &taxonomy.note_kinds));
     }
     results
+}
+
+fn check_required_input_files(
+    entities_path: &Path,
+    edges_path: &Path,
+    notes_path: &Path,
+) -> RuleResult {
+    let mut violations = Vec::new();
+    for path in [entities_path, edges_path] {
+        if let Err(error) = std::fs::read_to_string(path) {
+            violations.push(Violation {
+                entity_id: None,
+                entity_name: None,
+                entity_kind: None,
+                rule_id: "required-input-files".into(),
+                severity: "error",
+                message: format!("cannot read mandatory input {}: {error}", path.display()),
+                fixable: false,
+            });
+        }
+    }
+
+    // notes.ndjson is optional only when absent. Once a path is present it is
+    // part of the validation input and must be readable UTF-8 just like the
+    // mandatory files. Use symlink_metadata so a dangling symlink is treated
+    // as a present-but-unreadable input rather than as an absent optional file.
+    match std::fs::symlink_metadata(notes_path) {
+        Ok(_) => {
+            if let Err(error) = std::fs::read_to_string(notes_path) {
+                violations.push(Violation {
+                    entity_id: None,
+                    entity_name: None,
+                    entity_kind: None,
+                    rule_id: "required-input-files".into(),
+                    severity: "error",
+                    message: format!(
+                        "cannot read optional input {} when present: {error}",
+                        notes_path.display()
+                    ),
+                    fixable: false,
+                });
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => violations.push(Violation {
+            entity_id: None,
+            entity_name: None,
+            entity_kind: None,
+            rule_id: "required-input-files".into(),
+            severity: "error",
+            message: format!(
+                "cannot inspect optional input {}: {error}",
+                notes_path.display()
+            ),
+            fixable: false,
+        }),
+    }
+
+    RuleResult {
+        id: "required-input-files".into(),
+        severity: "error",
+        passed: violations.is_empty(),
+        violations,
+    }
 }
 
 fn schema_violation(file: &str, line_no: usize, message: impl std::fmt::Display) -> Violation {
@@ -2116,6 +2181,48 @@ mod tests {
             "well-formed KG with absent notes.ndjson must pass: {:?}",
             result.violations
         );
+    }
+
+    #[test]
+    fn required_input_files_reject_missing_and_unreadable_paths() {
+        let tmp = TempDir::new().unwrap();
+        let kg_dir = make_kg_dir(&tmp);
+        let entities_path = kg_dir.join("entities.ndjson");
+        let edges_path = kg_dir.join("edges.ndjson");
+        std::fs::create_dir(&entities_path).unwrap();
+
+        let result =
+            check_required_input_files(&entities_path, &edges_path, &kg_dir.join("notes.ndjson"));
+
+        assert!(!result.passed);
+        assert_eq!(result.violations.len(), 2);
+        assert!(result
+            .violations
+            .iter()
+            .any(|violation| violation.message.contains("entities.ndjson")));
+        assert!(result
+            .violations
+            .iter()
+            .any(|violation| violation.message.contains("edges.ndjson")));
+    }
+
+    #[test]
+    fn required_input_files_rejects_unreadable_optional_notes_when_present() {
+        let tmp = TempDir::new().unwrap();
+        let kg_dir = make_kg_dir(&tmp);
+        let entities_path = kg_dir.join("entities.ndjson");
+        let edges_path = kg_dir.join("edges.ndjson");
+        let notes_path = kg_dir.join("notes.ndjson");
+        std::fs::write(&entities_path, "").unwrap();
+        std::fs::write(&edges_path, "").unwrap();
+        std::fs::write(&notes_path, [0xff, 0xfe]).unwrap();
+
+        let result = check_required_input_files(&entities_path, &edges_path, &notes_path);
+
+        assert!(!result.passed);
+        assert_eq!(result.violations.len(), 1);
+        assert!(result.violations[0].message.contains("notes.ndjson"));
+        assert!(result.violations[0].message.contains("when present"));
     }
 
     #[test]

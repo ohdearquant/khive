@@ -1288,6 +1288,13 @@ impl KnowledgeHandlers {
         let limit = p.limit.unwrap_or(10).clamp(1, 100);
         let min_score = p.min_score.unwrap_or(0.0) as f32;
         let w = Weights::from_opts(&p);
+        if let Some(kind) = p.kind.as_deref() {
+            if !matches!(kind, "atom" | "domain") {
+                return Err(RuntimeError::InvalidInput(format!(
+                    "kind must be one of: atom, domain; got {kind:?}"
+                )));
+            }
+        }
         let type_filter = p.kind.as_deref();
         let do_decompose = p.decompose.unwrap_or(false);
         let decompose_threshold = p.decompose_threshold.unwrap_or(4);
@@ -1315,6 +1322,13 @@ impl KnowledgeHandlers {
             .as_deref()
             .map(str::trim)
             .filter(|s| !s.is_empty());
+        if let Some(status) = exclude_status_normalized {
+            if !matches!(status, "draft" | "reviewed" | "deprecated") {
+                return Err(RuntimeError::InvalidInput(format!(
+                    "exclude_status must be one of: draft, reviewed, deprecated; got {status:?}"
+                )));
+            }
+        }
 
         // Precedence (highest to lowest, matches ADR-047 §Status filtering):
         //   1. explicit status=  → no exclusion; SQL handles the allowlist
