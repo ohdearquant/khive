@@ -38,5 +38,8 @@
     "tailwindcss": "^4",
     "typescript": "^5",
     "vitest": "^4.1.10"
+  },
+  "overrides": {
+    "sharp": "npm:empty-npm-package@1.0.0"
   }
 }
