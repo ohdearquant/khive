@@ -4160,6 +4160,158 @@ mod tests {
         );
     }
 
+    /// A re-resolution that assembles its candidates but then loses the SQL
+    /// leg that would prove tail completeness (reader open, snapshot begin,
+    /// registry-min re-read, tail fetch) must return a REASONED `Replace`:
+    /// the coherent re-resolved candidates are served, and the lost
+    /// read-your-writes visibility is disclosed via `Some(reason)` — never
+    /// reported healthy (`None`) and never degraded to a `Skipped` that
+    /// would resurrect the stale candidate set. Drives the earliest
+    /// post-re-resolution failure site (the registry-minimum re-read) by
+    /// removing its table while the leg is paused at the test barrier
+    /// between its segment search and that re-read.
+    #[tokio::test]
+    #[serial(adr118_fresh_tail)]
+    async fn fresh_tail_leg_post_reresolution_sql_failure_is_a_reasoned_replace() {
+        const MODEL: &str = "adr118-reresolve-reasoned-replace-test-model";
+        const DIMS: usize = 8;
+        let rt = test_runtime_with_hash_embedder(MODEL, DIMS);
+        let token = rt.authorize(Namespace::local()).expect("authorize local");
+
+        for i in 0..3u32 {
+            rt.create_note_with_decay_for_embedding_model(
+                &token,
+                "memory",
+                None,
+                &format!("reasoned replace seed note {i}"),
+                Some(0.7),
+                0.01,
+                None,
+                vec![],
+                None,
+            )
+            .await
+            .expect("create seed note");
+        }
+
+        let ann = new_shared();
+        let key = AnnKey::from_token(MODEL);
+        ensure_ann_for_model(&rt, &token, &ann, MODEL)
+            .await
+            .expect("warm");
+        let s1 = bridge_applied_seq(&ann, &key)
+            .await
+            .expect("bridge watermark after initial warm");
+
+        // A new note lands after the checkpoint; the peer checkpoint below
+        // persists it, and its presence in the outcome's candidates is the
+        // proof that the REASONED Replace still serves the re-resolved
+        // segment rather than falling back to the stale one.
+        let fresh = rt
+            .create_note_with_decay_for_embedding_model(
+                &token,
+                "memory",
+                None,
+                "reasoned replace distinctive fresh note",
+                Some(0.7),
+                0.01,
+                None,
+                vec![],
+                None,
+            )
+            .await
+            .expect("create fresh note");
+
+        let (_live, tail_before) = scope_counts(&rt, MODEL, s1)
+            .await
+            .expect("scope counts before peer checkpoint");
+        assert!(tail_before > 0, "sanity: a tail must exist above s1");
+        let s2 = s1 + tail_before;
+
+        // Peer checkpoint: persist a segment at s2, raise+compact through it
+        // — the mismatch the leg re-resolves from, exactly as in
+        // fresh_tail_leg_reresolves_to_a_newer_persisted_segment_on_mismatch.
+        let dir = ann_segment_dir(&rt, MODEL).expect("segment dir (file-backed test runtime)");
+        let mut peer_bridge = AnnBridge::load(&dir).expect("load persisted segment");
+        let (ops, new_s) = fetch_final_tail(&rt, MODEL, s1, None)
+            .await
+            .expect("fetch tail for peer replay");
+        peer_bridge
+            .apply_final_ops(ops, new_s)
+            .expect("apply peer replay");
+        peer_bridge
+            .save_atomic(&dir)
+            .expect("persist peer checkpoint");
+        raise_watermark(&rt, MODEL, s2)
+            .await
+            .expect("raise registry watermark");
+        compact_log(&rt, MODEL).await.expect("compact log");
+
+        // Pause the leg after its segment load+search, before the SQL phase
+        // whose failure this test injects.
+        ann.reresolve_race_barrier
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let paused = ann.reresolve_race_notify.notified();
+
+        let query = fnv_to_vec("reasoned replace distinctive fresh note", DIMS);
+        let handle = tokio::spawn({
+            let rt = rt.clone();
+            let ann = ann.clone();
+            let key = key.clone();
+            async move { fresh_tail_leg(&rt, &ann, &key, MODEL, &query, 10, Some(s1)).await }
+        });
+        paused.await;
+
+        // Fault injection: remove the registry table so the leg's re-read —
+        // its first post-re-resolution SQL statement — fails. (Test-fixture
+        // database, mirroring the DROP TABLE fault pattern in
+        // handlers/recall.rs's event-store acquisition test.)
+        {
+            let sql = rt.sql();
+            let mut w = sql.writer().await.expect("fault injection writer");
+            w.execute(SqlStatement {
+                sql: "DROP TABLE ann_consumer_watermark".into(),
+                params: vec![],
+                label: Some("test_drop_registry_for_reasoned_replace".into()),
+            })
+            .await
+            .expect("drop registry table");
+        }
+
+        ann.reresolve_race_barrier
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        ann.reresolve_race_release.notify_one();
+
+        let outcome = handle.await.expect("fresh_tail_leg task");
+        match outcome {
+            FreshTailOutcome::Replace(candidates, reason) => {
+                let reason = reason.expect(
+                    "a post-re-resolution SQL failure must be DISCLOSED: \
+                     Replace(_, None) reports read-your-writes visibility \
+                     the leg no longer proved",
+                );
+                assert!(
+                    reason.starts_with("fresh-tail:"),
+                    "the disclosure must name its failure site, got: {reason:?}"
+                );
+                assert!(
+                    candidates.iter().any(|(id, _)| *id == fresh.id),
+                    "a reasoned Replace must still serve the re-resolved \
+                     segment's candidates (which alone reflect the peer's \
+                     checkpoint), got: {candidates:?}"
+                );
+            }
+            FreshTailOutcome::Ops(_) => panic!(
+                "expected re-resolution to replace candidates outright, not \
+                 return ops against the stale bridge"
+            ),
+            FreshTailOutcome::Skipped(_) => panic!(
+                "a failure AFTER successful re-resolution must not discard \
+                 the coherent re-resolved candidates by skipping"
+            ),
+        }
+    }
+
     /// ADR-118 §1 "Compaction linearization" applied to re-resolution itself:
     /// a peer checkpoint can advance the registry minimum PAST the segment
     /// `fresh_tail_reresolve` just loaded, in the window between that load

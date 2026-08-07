@@ -894,10 +894,24 @@ impl MemoryPack {
             // bare [] would be indistinguishable from a genuine no-match. Non-empty
             // capped responses keep the bare-array shape (load-bearing for callers
             // that index the top-level array) with per-item truncated stamps.
-            return to_json(&json!({
+            let mut envelope = json!({
                 "results": results,
                 "truncated": true,
-            }));
+            });
+            // A budget cutoff must not silence a concurrent ANN degradation:
+            // this branch returns before the degradation envelope below, and
+            // without these fields a capped-empty degraded response would
+            // read as clean-empty-but-truncated.
+            if ann_degraded {
+                let reason = ann_degraded_reason
+                    .clone()
+                    .unwrap_or_else(|| super::common::ANN_DEGRADED_REASON.to_string());
+                envelope["degraded"] = json!(true);
+                // Captured at the failure site (see
+                // collect_model_ann_hits_inner / collect_model_ann_hits).
+                envelope["degraded_reason"] = json!(reason);
+            }
+            return to_json(&envelope);
         }
 
         if results.is_empty() && ann_degraded {
@@ -1476,6 +1490,101 @@ mod tests {
                  failure site), got: {r:?}"
             );
         }
+    }
+
+    /// A budget cutoff at the first ranked candidate and an ANN degradation
+    /// can hold at once, and the budget-cap envelope returns before the
+    /// degradation envelope: without the degraded fields on that early
+    /// return, a capped-empty degraded response reads as
+    /// clean-empty-but-truncated and the caller loses the signal that
+    /// distinguishes degraded-empty from a genuine no-match.
+    #[tokio::test]
+    #[serial(adr118_fresh_tail)]
+    async fn recall_budget_capped_empty_response_still_discloses_ann_degradation() {
+        const MODEL: &str = "recall-budget-capped-degraded-model";
+        const DIMS: usize = 16;
+        const NOTE_TEXT: &str = "budget capped degraded disclosure note body";
+
+        let _env_guard = FreshTailEnvGuard::disable();
+
+        let rt = KhiveRuntime::memory().expect("in-memory runtime");
+        rt.register_embedder(HashVecProvider {
+            model_name: MODEL.to_owned(),
+            dims: DIMS,
+        });
+
+        let ns = Namespace::parse("local").expect("local namespace");
+        let token = rt.authorize(ns).expect("authorize local");
+
+        rt.create_note(&token, "memory", None, NOTE_TEXT, Some(0.7), None, vec![])
+            .await
+            .expect("create note");
+
+        let pack = MemoryPack::new(rt.clone());
+        let ann_handle = pack.ann.clone();
+
+        // A one-character budget guarantees the first ranked candidate
+        // exceeds it, so ranking survives but serving empties: budget_capped
+        // with zero results.
+        {
+            let mut cfg = pack.config.lock().unwrap();
+            cfg.scoring = Some(crate::scoring::ScoringConfig {
+                default_token_budget: 1,
+                chars_per_token: 1,
+                ..Default::default()
+            });
+        }
+
+        // Warm the ANN bridge so the disabled fresh-tail leg is what makes
+        // the response degraded (as in the #1477 test above), not ANN
+        // unavailability.
+        crate::ann::ensure_ann_for_model(&rt, &token, &ann_handle, MODEL)
+            .await
+            .expect("warm ann build");
+
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(KgPack::new(rt.clone()));
+        builder.register(pack);
+        let registry = builder.build().expect("registry");
+
+        let result = registry
+            .dispatch(
+                "memory.recall",
+                serde_json::json!({
+                    "query": "budget capped degraded disclosure",
+                    "limit": 10
+                }),
+            )
+            .await
+            .expect("capped degraded recall must not error");
+
+        let obj = result
+            .as_object()
+            .expect("capped-empty response must be the envelope shape, not a bare array");
+        assert_eq!(
+            obj.get("truncated").and_then(Value::as_bool),
+            Some(true),
+            "budget cutoff at the first candidate must disclose truncation: {result:?}"
+        );
+        assert!(
+            obj.get("results")
+                .and_then(Value::as_array)
+                .is_some_and(Vec::is_empty),
+            "this scenario is specifically the capped-EMPTY shape: {result:?}"
+        );
+        assert_eq!(
+            obj.get("degraded").and_then(Value::as_bool),
+            Some(true),
+            "a budget cutoff must not silence the concurrent ANN degradation: {result:?}"
+        );
+        let reason = obj
+            .get("degraded_reason")
+            .and_then(Value::as_str)
+            .expect("capped-empty degraded response must carry degraded_reason");
+        assert!(
+            !reason.is_empty(),
+            "degraded_reason must be non-empty (captured at the failure site): {result:?}"
+        );
     }
 
     /// #1657: ANN timeout plus no FTS match is a third state — the response
