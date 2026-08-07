@@ -47,7 +47,7 @@
 //! control ACE for their owner, and existing directories with broader ACLs
 //! are refused rather than repaired.
 
-#[cfg(unix)]
+#[cfg(any(unix, test))]
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -3241,7 +3241,6 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
     #[test]
     fn write_then_read_heartbeat_roundtrips() {
         let root = tempfile::tempdir().unwrap();
