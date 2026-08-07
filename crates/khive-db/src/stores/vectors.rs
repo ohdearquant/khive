@@ -41,7 +41,10 @@ fn refuse_direct_route_if_strict(
                 .into(),
         });
     }
-    if pool.config().write_queue_enabled {
+    if pool.write_queue_active() {
+        // In-memory pools never spawn a writer task by documented design
+        // (explicit `Some(true)` degrades), so a violation row there would
+        // be noise, not signal.
         crate::timeout_sink::emit_direct_route_violation(
             &crate::timeout_sink::db_label(pool),
             site,
@@ -2493,7 +2496,7 @@ mod delete_subjects_atomic_tests {
         let pool = Arc::new(
             ConnectionPool::new(PoolConfig {
                 path: Some(path),
-                write_queue_enabled,
+                write_queue_enabled: Some(write_queue_enabled),
                 ..PoolConfig::default()
             })
             .expect("file-backed pool"),
@@ -2688,7 +2691,7 @@ mod delete_subjects_atomic_tests {
         let pool = Arc::new(
             ConnectionPool::new(PoolConfig {
                 path: Some(path),
-                write_queue_enabled: false,
+                write_queue_enabled: Some(false),
                 ..PoolConfig::default()
             })
             .expect("file-backed pool"),
@@ -4381,7 +4384,7 @@ mod write_queue_tests {
             .expect("create ann_write_log");
     }
 
-    /// Constructed via a `PoolConfig` literal (`write_queue_enabled: true`),
+    /// Constructed via a `PoolConfig` literal (`write_queue_enabled: Some(true)`),
     /// not the `KHIVE_WRITE_QUEUE` env var — that env var is process-global
     /// and this crate's other tests are NOT `#[serial]` against it, so a
     /// window where it is set here could leak into a
@@ -4400,7 +4403,7 @@ mod write_queue_tests {
         let pool = Arc::new(
             ConnectionPool::new(PoolConfig {
                 path: Some(path),
-                write_queue_enabled: true,
+                write_queue_enabled: Some(true),
                 ..PoolConfig::default()
             })
             .expect("file-backed pool"),
@@ -4504,7 +4507,7 @@ mod write_queue_tests {
         let pool = Arc::new(
             ConnectionPool::new(PoolConfig {
                 path: Some(path),
-                write_queue_enabled: true,
+                write_queue_enabled: Some(true),
                 ..PoolConfig::default()
             })
             .expect("file-backed pool"),
@@ -4703,7 +4706,7 @@ mod write_queue_tests {
         let pool = Arc::new(
             ConnectionPool::new(PoolConfig {
                 path: Some(path),
-                write_queue_enabled: true,
+                write_queue_enabled: Some(true),
                 ..PoolConfig::default()
             })
             .expect("file-backed pool"),
@@ -4770,7 +4773,7 @@ mod write_queue_tests {
         let pool = Arc::new(
             ConnectionPool::new(PoolConfig {
                 path: Some(path),
-                write_queue_enabled: true,
+                write_queue_enabled: Some(true),
                 ..PoolConfig::default()
             })
             .expect("file-backed pool"),
@@ -4873,7 +4876,7 @@ mod write_queue_tests {
         let pool = Arc::new(
             ConnectionPool::new(PoolConfig {
                 path: Some(path),
-                write_queue_enabled: false,
+                write_queue_enabled: Some(false),
                 write_routing_strict: true,
                 ..PoolConfig::default()
             })
@@ -4915,7 +4918,7 @@ mod write_queue_tests {
         let pool = Arc::new(
             ConnectionPool::new(PoolConfig {
                 path: Some(path),
-                write_queue_enabled: false,
+                write_queue_enabled: Some(false),
                 write_routing_strict: true,
                 ..PoolConfig::default()
             })
@@ -4988,7 +4991,7 @@ mod write_queue_tests {
         let pool = Arc::new(
             ConnectionPool::new(PoolConfig {
                 path: Some(path),
-                write_queue_enabled: true,
+                write_queue_enabled: Some(true),
                 ..PoolConfig::default()
             })
             .expect("file-backed pool"),

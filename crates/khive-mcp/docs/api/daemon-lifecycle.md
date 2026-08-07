@@ -23,7 +23,7 @@ own boot lock — before `confirm_genuinely_dead` runs, and holds it through
 kill + spawn. This makes recovery mutually exclusive across recoverers
 without risking a deadlock against a booting daemon: the daemon itself never
 acquires this lock, only `kill_and_respawn` does. A bounded, deadline-aware
-acquisition (`RECOVERER_LOCK_TIMEOUT_MS` = 8000, generous enough to cover a
+acquisition (`RECOVERER_LOCK_TIMEOUT_MS` = 16000, generous enough to cover a
 peer's full worst-case critical section) is used instead of an unbounded
 `flock` so a second recoverer never blocks forever on a wedged first one.
 
@@ -45,15 +45,31 @@ behavior as `Skipped` but reported distinctly so it is never conflated with a
 positive "confirmed alive" result. `Dead` (confirmed, recoverer lock held) →
 kill + spawn → `Spawned`.
 
-Two test-only barriers (`RECOVERY_RACE_BARRIER`, `SPAWN_COMMIT_BARRIER`)
-force concurrent recoverers under test to reach, respectively, the
-classification-complete point and the commit-to-spawn point at the same
-instant — without them, normal tokio scheduling lets one recoverer finish
-before the other's rounds even observe anything, and the two-recoverer
-regression test would pass even with the recoverer lock deleted.
-`SPAWN_COMMIT_BARRIER` falls through after its bound rather than waiting
-forever, since a recoverer still blocked on the *real* recoverer lock must
-not be forced to rendezvous.
+The test-only `RECOVERY_RACE_BARRIER` forces eight recoverers to reach the
+classification-complete point at the same instant. Without it, normal Tokio
+scheduling can let one recoverer finish before the others observe anything,
+and a nominally parallel test can pass without exercising the lock race.
+
+The recovery launcher is an explicit seam. Production closures still launch
+`current_exe() mcp --daemon` and return the owned child handle unchanged. The
+shared `daemon/test_harness.rs` fixture instead launches the real
+`run_daemon` server in-process on a multi-thread Tokio runtime, so the test can
+observe the server-side ownership fence. Its stable oracle is one responsive
+daemon, one socket/PID rendezvous, and one successful `stats()` exchange after
+quiescence. It deliberately does not require exactly one launch attempt: the
+client releases its recovery lock before a launched daemon binds, so losing
+attempts are legal as long as the server fence converges to one owner.
+Because in-process candidates share a PID, the harness uses an explicit
+fault-injection entry point that lets a responsive same-PID incumbent win;
+ordinary startup retains its PID-reuse-safe behavior. A losing candidate still
+cancels the runtime's process-wide component token, so this fixture deliberately
+uses a component-free dispatcher and makes no component-lifecycle claim.
+
+The companion eight-client ParseFailure test closes every connection only
+after all real frames have been read. Every client must return the stable
+ambiguous-forward error, while kill/spawn counters remain zero and the server
+observes no follow-up connection. `scripts/ci.sh daemon-recovery-flake` runs
+the paired scenarios 25 times on each CI operating system.
 
 ## `confirm_genuinely_dead` — closing the fork-to-flock gap (#758)
 

@@ -155,6 +155,51 @@ pub async fn mirror_file(
     .await
 }
 
+/// Dispatch-loop variant of [`mirror_file`]: identical, except that a pass
+/// which consumed bytes but parsed no events does NOT commit the cursor
+/// itself. The caller commits it via [`commit_empty_advance`] only when
+/// dispatch ends without any candidate inserting rows for the span. This
+/// keeps the empty advance's cursor commit atomic with respect to the
+/// candidate dispatch order: bytes are never skipped ahead of a later
+/// candidate that could parse them, and an interrupt between candidates
+/// cannot leave the cursor advanced past bytes no candidate inserted. The
+/// service additionally vetoes that commit when ANY candidate errors during
+/// the pass, even if another candidate returned an empty advance.
+pub async fn mirror_file_deferred(
+    runtime: &KhiveRuntime,
+    path: &Path,
+    start_offset: u64,
+    source: LineTailSource,
+    codex_session_id: Option<&str>,
+) -> Result<MirrorStats, RuntimeError> {
+    mirror_file_inner(
+        runtime,
+        path,
+        start_offset,
+        source,
+        codex_session_id,
+        MirrorLimits::production(),
+        false,
+    )
+    .await
+}
+
+/// Commit the cursor for an empty advance (bytes consumed, zero rows) that
+/// [`mirror_file_deferred`] deliberately left uncommitted. Call this only
+/// when dispatch for the span ends with no inserting candidate. The commit
+/// is a single `INSERT ... ON CONFLICT DO UPDATE` on the cursor row; on
+/// failure the error propagates and the in-memory offset is not applied, so
+/// the bytes are re-read (bounded, idempotent) on a later pass instead of
+/// being silently skipped. The service-level caller also vetoes this commit
+/// when ANY candidate errored in the dispatch pass.
+pub async fn commit_empty_advance(
+    runtime: &KhiveRuntime,
+    path: &Path,
+    new_offset: u64,
+) -> Result<(), RuntimeError> {
+    write_cursor_only(runtime, path, &None, new_offset).await
+}
+
 /// A single bounded read pass: at most `limits.max_bytes_per_pass` bytes and
 /// `limits.max_events_per_pass` parsed events, stopping on a line boundary.
 struct MirrorChunk {
@@ -360,6 +405,33 @@ async fn mirror_file_with_limits(
     codex_session_id: Option<&str>,
     limits: MirrorLimits,
 ) -> Result<MirrorStats, RuntimeError> {
+    mirror_file_inner(
+        runtime,
+        path,
+        start_offset,
+        source,
+        codex_session_id,
+        limits,
+        true,
+    )
+    .await
+}
+
+/// Implementation of [`mirror_file`]. When `commit_empty_advance` is false,
+/// a pass that consumed bytes but parsed no events does NOT commit the
+/// cursor — the dispatch loop commits it via [`commit_empty_advance`] only
+/// if no later candidate inserts rows for the same span (see
+/// `candidate_dispatch` in `service.rs`). When true (every non-dispatch
+/// caller and test), the cursor is committed immediately as before.
+async fn mirror_file_inner(
+    runtime: &KhiveRuntime,
+    path: &Path,
+    start_offset: u64,
+    source: LineTailSource,
+    codex_session_id: Option<&str>,
+    limits: MirrorLimits,
+    commit_empty_advance: bool,
+) -> Result<MirrorStats, RuntimeError> {
     let chunk =
         read_bounded_chunk(path, start_offset, source, codex_session_id, limits).map_err(|e| {
             RuntimeError::Internal(format!(
@@ -379,15 +451,22 @@ async fn mirror_file_with_limits(
     }
 
     if chunk.events.is_empty() {
-        // Apply cursor update even when there are no parseable events — e.g.
-        // a chunk made entirely of blank lines, unparseable lines, or
-        // skipped oversized lines — so we don't re-read the same bytes on
-        // the next call. `chunk.new_offset > start_offset` here (checked
-        // above), so real bytes were durably consumed even though
-        // `chunk.scanned` may be 0. A failure here must propagate — silently
-        // swallowing it would let the cursor and the already-consumed bytes
-        // drift apart.
-        write_cursor_only(runtime, path, &None, chunk.new_offset).await?;
+        // Bytes were consumed (`chunk.new_offset > start_offset` here,
+        // checked above) but nothing parsed — e.g. a chunk made entirely of
+        // blank lines, unparseable lines, or skipped oversized lines. With
+        // `commit_empty_advance`, apply the cursor update immediately so we
+        // don't re-read the same bytes on the next call. Without it (the
+        // dispatch loop), the commit is deferred to
+        // [`commit_empty_advance`], which the loop calls only when no later
+        // candidate inserted rows for the span — so the cursor never moves
+        // past bytes another provider candidate might still parse, and an
+        // interrupt between candidates cannot strand a committed empty
+        // advance ahead of unconsumed rows. A failure here must propagate —
+        // silently swallowing it would let the cursor and the
+        // already-consumed bytes drift apart.
+        if commit_empty_advance {
+            write_cursor_only(runtime, path, &None, chunk.new_offset).await?;
+        }
         return Ok(MirrorStats {
             inserted: 0,
             scanned: chunk.scanned,
@@ -911,6 +990,12 @@ async fn write_events_and_cursor_on_writer(
 /// Upsert the `session_mirror_cursor` row for `path` inside the open
 /// `atomic_unit` transaction — issues only the one cursor DML statement, no
 /// transaction control of its own.
+///
+/// The row is keyed by `path.to_string_lossy()` — the same lossy text
+/// that [`write_cursor_only`] and the mirror service's `delete_cursors`
+/// use for their DELETE, so an insert and a later delete target the same
+/// row even when the path is not valid UTF-8. Do not switch one side to a
+/// stricter keying without switching all three.
 async fn upsert_cursor_on_writer(
     writer: &mut dyn SqlWriter,
     path: &Path,
@@ -954,6 +1039,11 @@ async fn upsert_cursor_on_writer(
 /// but produced no parseable events, so the offset still advances past
 /// blank/unparseable content. A failure here must propagate — see
 /// `crates/khive-pack-session/docs/api/mirror-ingest.md#write-path-write_events_and_cursor-and-friends-adr-099-d5`.
+///
+/// The row is keyed by `path.to_string_lossy()`, the same lossy text used
+/// by [`upsert_cursor_on_writer`] (the insert path) and by the mirror
+/// service's `delete_cursors`, so insert and delete always target the same
+/// row even for non-UTF-8 paths.
 async fn write_cursor_only(
     runtime: &KhiveRuntime,
     path: &Path,
@@ -1642,6 +1732,77 @@ mod tests {
             offset, file_len,
             "all blank lines eventually consumed to EOF"
         );
+    }
+
+    /// Regression for the multi-candidate atomicity finding: the deferred
+    /// dispatch variant must NOT commit the cursor on an empty advance —
+    /// the commit is the dispatch loop's final step, vetoable until then.
+    #[tokio::test]
+    async fn deferred_empty_advance_leaves_cursor_uncommitted_until_commit_empty_advance() {
+        let (rt, _dir) = setup().await;
+
+        let mut file = NamedTempFile::new().expect("tmpfile");
+        for _ in 0..16 {
+            writeln!(file).unwrap(); // blank line: just "\n"
+        }
+        let path = file.path().to_path_buf();
+        let file_len = std::fs::metadata(&path).unwrap().len();
+
+        let stats = mirror_file_deferred(&rt, &path, 0, LineTailSource::ClaudeCode, None)
+            .await
+            .expect("deferred blank-line pass");
+        assert_eq!(stats.inserted, 0);
+        assert_eq!(
+            stats.new_offset, file_len,
+            "bytes were consumed off the file"
+        );
+        assert_eq!(
+            cursor_offset(&rt, &path.to_string_lossy()).await,
+            None,
+            "the deferred pass must not commit the cursor itself"
+        );
+
+        // Dispatch ends without an inserting candidate: the loop commits.
+        commit_empty_advance(&rt, &path, stats.new_offset)
+            .await
+            .expect("end-of-dispatch commit");
+        assert_eq!(
+            cursor_offset(&rt, &path.to_string_lossy()).await,
+            Some(file_len as i64),
+            "the commit lands exactly where the deferred pass consumed"
+        );
+    }
+
+    /// A deferred pass that DOES parse events commits rows and cursor in one
+    /// transaction, exactly like the immediate variant.
+    #[tokio::test]
+    async fn deferred_pass_with_events_commits_rows_and_cursor_together() {
+        let (rt, _dir) = setup().await;
+
+        let mut file = NamedTempFile::new().expect("tmpfile");
+        let session_id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        for index in 0..3 {
+            writeln!(
+                file,
+                "{}",
+                user_line(&format!("u{index}"), session_id, "hello")
+            )
+            .unwrap();
+        }
+        let path = file.path().to_path_buf();
+        let file_len = std::fs::metadata(&path).unwrap().len();
+
+        let stats = mirror_file_deferred(&rt, &path, 0, LineTailSource::ClaudeCode, None)
+            .await
+            .expect("deferred event pass");
+        assert_eq!(stats.inserted, 3);
+        assert_eq!(stats.new_offset, file_len);
+        assert_eq!(
+            cursor_offset(&rt, &path.to_string_lossy()).await,
+            Some(file_len as i64),
+            "an inserting pass commits its cursor inside the same atomic unit"
+        );
+        assert_eq!(count_rows(&rt, "session_messages").await, 3);
     }
 
     #[tokio::test]
@@ -2843,7 +3004,7 @@ mod tests {
     fn write_queue_pool(db_path: std::path::PathBuf) -> Arc<khive_db::ConnectionPool> {
         let pool_cfg = khive_db::PoolConfig {
             path: Some(db_path),
-            write_queue_enabled: true,
+            write_queue_enabled: Some(true),
             ..khive_db::PoolConfig::default()
         };
         let pool = Arc::new(khive_db::ConnectionPool::new(pool_cfg).expect("pool"));

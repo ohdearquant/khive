@@ -2528,6 +2528,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "khive-wire-protocol"
+version = "0.7.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "kkernel"
 version = "0.7.0"
 dependencies = [

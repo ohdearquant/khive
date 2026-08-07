@@ -4026,6 +4026,13 @@ async fn empty_walk_with_non_ancestor_cursor_refuses_completion() {
         "nothing to walk in the empty range: {report2:?}"
     );
     assert!(
+        matches!(
+            report2.sources.commits.as_ref(),
+            Some(khive_pack_git::ingest::IngestSourceState::StoppedEarly(_))
+        ),
+        "a diverged empty range records a stopped-early commit source: {report2:?}"
+    );
+    assert!(
         !report2.done,
         "an empty walk from a non-ancestor cursor is not a completion \
          (issue #1644): {report2:?}"
@@ -4609,6 +4616,1253 @@ async fn digest_verb_max_items_is_bounded_and_resumable() {
         list.as_array().expect("array").len(),
         3,
         "no duplicates across the bounded/resumed calls"
+    );
+}
+
+// ── issue #1617: per-source tri-state + history-exhaustion reporting ───────
+
+/// A clean full pass marks every included source `completed` and reports
+/// `history_exhausted: true` — "nothing walked past this point" is now
+/// distinguishable from silence (issue #1617).
+#[tokio::test]
+async fn digest_verb_sources_completed_and_history_exhausted_on_full_walk() {
+    let _guard = ENV_MUTEX.lock().await;
+    let (_rt, _token, registry) = fixture().await;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_repo(repo);
+    for i in 0..2 {
+        write(repo, "f.txt", &format!("v{i}\n"));
+        commit(repo, &["f.txt"], &format!("commit {i}"));
+    }
+
+    // No fake `gh` on PATH: issues/PRs take the gh_cli_absent skip arm.
+    let resp = registry
+        .dispatch(
+            "git.digest",
+            json!({
+                "source": repo.to_str().unwrap(),
+                "include": ["commits", "issues", "pull_requests"]
+            }),
+        )
+        .await
+        .expect("digest ok");
+
+    assert_eq!(resp["commits_ingested"].as_u64().unwrap(), 2);
+    assert_eq!(
+        resp["sources"]["commits"],
+        json!({"state": "completed"}),
+        "a walked-to-the-tip commit source completes: {resp:?}"
+    );
+    assert_eq!(
+        resp["sources"]["issues"]["state"], "skipped",
+        "gh absent must surface as a structured skip, not prose: {resp:?}"
+    );
+    assert_eq!(resp["sources"]["pull_requests"]["state"], "skipped");
+    assert!(
+        !resp["history_exhausted"].as_bool().unwrap(),
+        "skipped sources mean the walk did not cover everything requested: {resp:?}"
+    );
+
+    // A commits-only pass walks every requested source to the end.
+    let commits_only = registry
+        .dispatch(
+            "git.digest",
+            json!({
+                "source": repo.to_str().unwrap(),
+                "include": ["commits"]
+            }),
+        )
+        .await
+        .expect("digest ok");
+    assert_eq!(
+        commits_only["sources"]["commits"],
+        json!({"state": "completed"}),
+        "an idempotent empty-range walk is still a completion: {commits_only:?}"
+    );
+    assert!(
+        commits_only["history_exhausted"].as_bool().unwrap(),
+        "every requested source completed: {commits_only:?}"
+    );
+    assert!(
+        commits_only["done"].as_bool().unwrap(),
+        "done keeps its budget-cursor meaning alongside: {commits_only:?}"
+    );
+}
+
+/// Budget exhaustion marks the source `stopped_early` and
+/// `history_exhausted: false`, while `done: false` keeps its existing
+/// resume-loop meaning (issue #1617).
+#[tokio::test]
+async fn digest_verb_sources_stopped_early_on_budget_exhaustion() {
+    let _guard = ENV_MUTEX.lock().await;
+    let (_rt, _token, registry) = fixture().await;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_repo(repo);
+    for i in 0..3 {
+        write(repo, "f.txt", &format!("v{i}\n"));
+        commit(repo, &["f.txt"], &format!("commit {i}"));
+    }
+
+    let resp = registry
+        .dispatch(
+            "git.digest",
+            json!({"source": repo.to_str().unwrap(), "max_items": 1, "include": ["commits"]}),
+        )
+        .await
+        .expect("digest ok");
+
+    assert_eq!(resp["commits_ingested"].as_u64().unwrap(), 1);
+    assert!(
+        !resp["done"].as_bool().unwrap(),
+        "budget exhausted with commits unwalked: {resp:?}"
+    );
+    assert_eq!(
+        resp["sources"]["commits"]["state"], "stopped_early",
+        "budget exhaustion is a stop-early, not a completion: {resp:?}"
+    );
+    assert!(
+        resp["sources"]["commits"]["reason"]
+            .as_str()
+            .is_some_and(|r| r.contains("budget")),
+        "the reason names the budget as the cause: {resp:?}"
+    );
+    assert!(
+        !resp["history_exhausted"].as_bool().unwrap(),
+        "a budget-stopped walk is not exhaustion: {resp:?}"
+    );
+}
+
+/// A per-record write refusal on one commit skips that record and the walk
+/// continues: later commits in the same pass still land. The source is
+/// `stopped_early` (cursor frozen for retry, issue #1645 semantics) and the
+/// refusal is mechanically attributable to the commits source (issue #1617).
+/// The deterministic failure uses the design-mandated fail-once embedder
+/// (see `pr_ingest_sorts_by_updated_at_so_frozen_cursor_survives_out_of_order_listing`
+/// for why a leaked-credential fixture no longer forces a create failure).
+#[tokio::test]
+async fn digest_verb_sources_gate_refusal_skips_record_and_walk_continues() {
+    let _guard = ENV_MUTEX.lock().await;
+    let (rt, _token, registry) = fixture().await;
+    rt.register_embedder(FailOnceEmbedderProvider);
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_repo(repo);
+    // Oldest first: clean, refused (sentinel body), clean.
+    write(repo, "f.txt", "v0\n");
+    commit(repo, &["f.txt"], "commit 0");
+    let sha0 = head_sha(repo);
+    write(repo, "f.txt", "v1\n");
+    commit(
+        repo,
+        &["f.txt"],
+        &format!("commit 1\n\n{CURSOR_FAIL_SENTINEL}"),
+    );
+    write(repo, "f.txt", "v2\n");
+    commit(repo, &["f.txt"], "commit 2");
+    let sha2 = head_sha(repo);
+
+    let resp = registry
+        .dispatch(
+            "git.digest",
+            json!({"source": repo.to_str().unwrap(), "include": ["commits"]}),
+        )
+        .await
+        .expect("a per-record refusal must stay an in-band digest result");
+    let project_id = Uuid::parse_str(
+        resp["project_id"]
+            .as_str()
+            .expect("the digest response carries its project id"),
+    )
+    .expect("project id is a UUID");
+
+    assert_eq!(
+        resp["commits_ingested"].as_u64().unwrap(),
+        2,
+        "the refusal never terminates the walk — the later commit lands: {resp:?}"
+    );
+    assert_eq!(
+        resp["warnings"]
+            .as_array()
+            .expect("warnings")
+            .iter()
+            .filter(|w| w.as_str().is_some_and(|w| w.contains("create commit")))
+            .count(),
+        1,
+        "exactly one warning records the refused commit write: {resp:?}"
+    );
+    assert_eq!(
+        resp["sources"]["commits"]["state"], "stopped_early",
+        "a frozen cursor is a stop-early, distinct from budget and skip: {resp:?}"
+    );
+    assert!(
+        resp["sources"]["commits"]["reason"]
+            .as_str()
+            .is_some_and(|r| r.contains("cursor_stalled")),
+        "the reason names the frozen cursor as the cause: {resp:?}"
+    );
+    assert!(
+        !resp["history_exhausted"].as_bool().unwrap(),
+        "an unretried refused record means the history is not exhausted: {resp:?}"
+    );
+    assert!(
+        !resp["done"].as_bool().unwrap(),
+        "cursor_stalled still forces done:false beside the new fields: {resp:?}"
+    );
+
+    let cursor_after_pass1 = read_git_cursor(&rt, project_id, "commits")
+        .await
+        .expect("the successful prefix persists a cursor");
+    assert_eq!(
+        cursor_after_pass1, sha0,
+        "the cursor freezes before the refused commit and does not skip it: {resp:?}"
+    );
+
+    let resp2 = registry
+        .dispatch(
+            "git.digest",
+            json!({"source": repo.to_str().unwrap(), "include": ["commits"]}),
+        )
+        .await
+        .expect("the next pass retries the frozen commit");
+    assert_eq!(
+        resp2["commits_ingested"].as_u64().unwrap(),
+        1,
+        "the refused commit is retried and lands on the next pass: {resp2:?}"
+    );
+    assert!(!resp2["cursor_stalled"].as_bool().unwrap(), "{resp2:?}");
+    assert_eq!(
+        read_git_cursor(&rt, project_id, "commits").await,
+        Some(sha2),
+        "the cursor advances through the recovered commit after retry: {resp2:?}"
+    );
+}
+
+// ── issue #1617: PR/issue source states over a stubbed `gh` ─────
+
+/// `gh {pr,issue} list --json` field sets, mirrored from `ingest.rs`'s
+/// private constants so the fixtures below fail loudly (parse error) if the
+/// production field set ever drifts.
+fn pr_fixture(number: u64, title: &str, updated_at: &str) -> Value {
+    json!({
+        "number": number,
+        "title": title,
+        "author": {"login": "octocat"},
+        "createdAt": "2026-01-01T00:00:00Z",
+        "mergedAt": null,
+        "closedAt": null,
+        "updatedAt": updated_at,
+        "baseRefName": "main",
+        "headRefName": "feature/x",
+        "mergeCommit": null,
+        "body": format!("body of PR #{number}")
+    })
+}
+
+fn issue_fixture(number: u64, title: &str, updated_at: &str) -> Value {
+    json!({
+        "number": number,
+        "title": title,
+        "author": {"login": "octocat"},
+        "createdAt": "2026-01-01T00:00:00Z",
+        "closedAt": null,
+        "updatedAt": updated_at,
+        "labels": [],
+        "stateReason": "",
+        "body": format!("body of issue #{number}")
+    })
+}
+
+/// A happy-path pass over a PATH-shadowing fake `gh`: the PR and issue
+/// walkers report `completed`, records land, and `history_exhausted` is
+/// true — the PR/issue half of the tri-state that previously only had
+/// commit-side coverage (issue #1617).
+#[tokio::test]
+async fn digest_verb_pr_issue_sources_completed_on_happy_path() {
+    let _guard = ENV_MUTEX.lock().await;
+    let (rt, token, registry) = fixture().await;
+
+    let project_id = create(
+        &registry,
+        json!({"kind": "project", "name": "tristate-happy-repo"}),
+    )
+    .await;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo: PathBuf = dir.path().join("repo");
+    std::fs::create_dir_all(&repo).expect("mk repo dir");
+    init_repo(&repo);
+    write(&repo, "README.md", "hello\n");
+    commit(&repo, &["README.md"], "Initial commit");
+
+    let bin_dir = dir.path().join("bin");
+    std::fs::create_dir_all(&bin_dir).expect("mk bin dir");
+    let log_dir = dir.path().join("log");
+    std::fs::create_dir_all(&log_dir).expect("mk log dir");
+
+    let pr_json = json!([
+        pr_fixture(1, "Add feature", "2026-01-01T00:00:01Z"),
+        pr_fixture(2, "Fix bug", "2026-01-01T00:00:02Z"),
+    ])
+    .to_string();
+    let issue_json = json!([
+        issue_fixture(10, "Bug report", "2026-01-01T00:00:01Z"),
+        issue_fixture(11, "Feature request", "2026-01-01T00:00:02Z"),
+    ])
+    .to_string();
+
+    write_fake_gh(&bin_dir, &log_dir, &pr_json, &issue_json);
+    let _path_guard = PathGuard::install(&bin_dir);
+
+    let report = run_ingest(
+        &rt,
+        &token,
+        &registry,
+        IngestOptions::unbounded(repo.clone(), project_id.to_string()),
+    )
+    .await
+    .expect("ingest ok");
+
+    assert_eq!(report.prs_ingested, 2, "{report:?}");
+    assert_eq!(report.issues_ingested, 2, "{report:?}");
+    assert_eq!(
+        report.sources.pull_requests,
+        Some(khive_pack_git::ingest::IngestSourceState::Completed),
+        "a PR window walked to the end completes: {report:?}"
+    );
+    assert_eq!(
+        report.sources.issues,
+        Some(khive_pack_git::ingest::IngestSourceState::Completed),
+        "an issue window walked to the end completes: {report:?}"
+    );
+    assert_eq!(
+        report.sources.commits,
+        Some(khive_pack_git::ingest::IngestSourceState::Completed),
+        "{report:?}"
+    );
+    assert!(
+        report.history_exhausted,
+        "every included source completed: {report:?}"
+    );
+    assert!(report.done, "{report:?}");
+}
+
+/// With no source requested, exhaustion is vacuously true.
+#[tokio::test]
+async fn digest_history_exhausted_is_true_when_include_is_empty() {
+    let _guard = ENV_MUTEX.lock().await;
+    let (rt, token, registry) = fixture().await;
+    let project_id = create(
+        &registry,
+        json!({"kind": "project", "name": "empty-include-repo"}),
+    )
+    .await;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut opts = IngestOptions::unbounded(dir.path().to_path_buf(), project_id.to_string());
+    opts.include.commits = false;
+    opts.include.issues = false;
+    opts.include.pull_requests = false;
+
+    let report = run_ingest(&rt, &token, &registry, opts)
+        .await
+        .expect("an empty include completes without walking a source");
+
+    assert!(report.history_exhausted, "{report:?}");
+    assert!(report.done, "{report:?}");
+    assert!(report.sources.commits.is_none(), "{report:?}");
+    assert!(report.sources.issues.is_none(), "{report:?}");
+    assert!(report.sources.pull_requests.is_none(), "{report:?}");
+}
+
+/// With the budget spent mid-walk, a walker that breaks inside its record
+/// loop reports `stopped_early` (visited, not exhausted) while sources
+/// never even reached report `skipped` with the pre-reached budget reason
+/// — stopped_early and skipped side by side in one pass (issue #1617).
+/// Walk order is pull_requests → issues → commits, so `max_items: 1`
+/// lands the first PR, stops the PR walk on its second record, and skips
+/// issues and commits outright.
+#[tokio::test]
+async fn digest_verb_pr_issue_sources_stopped_early_on_budget_stop() {
+    let _guard = ENV_MUTEX.lock().await;
+    let (rt, token, registry) = fixture().await;
+
+    let project_id = create(
+        &registry,
+        json!({"kind": "project", "name": "tristate-budget-repo"}),
+    )
+    .await;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo: PathBuf = dir.path().join("repo");
+    std::fs::create_dir_all(&repo).expect("mk repo dir");
+    init_repo(&repo);
+    write(&repo, "README.md", "hello\n");
+    commit(&repo, &["README.md"], "Initial commit");
+
+    let bin_dir = dir.path().join("bin");
+    std::fs::create_dir_all(&bin_dir).expect("mk bin dir");
+    let log_dir = dir.path().join("log");
+    std::fs::create_dir_all(&log_dir).expect("mk log dir");
+
+    let pr_json = json!([
+        pr_fixture(1, "Add feature", "2026-01-01T00:00:01Z"),
+        pr_fixture(2, "Fix bug", "2026-01-01T00:00:02Z"),
+    ])
+    .to_string();
+    let issue_json = json!([
+        issue_fixture(10, "Bug report", "2026-01-01T00:00:01Z"),
+        issue_fixture(11, "Feature request", "2026-01-01T00:00:02Z"),
+    ])
+    .to_string();
+
+    write_fake_gh(&bin_dir, &log_dir, &pr_json, &issue_json);
+    let _path_guard = PathGuard::install(&bin_dir);
+
+    // max_items = 1: the first PR lands, the PR walk breaks on its second
+    // record, and issues/commits are never reached at all. (An in-walk
+    // budget break for BOTH gh walkers in one pass is unreachable with
+    // this fixture: the last budget unit is always spendable on a record
+    // — `budget.exhausted()` gates the NEXT record, not the current one —
+    // so the first walker to run consumes what the second would have
+    // needed. The issue walker's own stopped-early machinery is covered
+    // by `issue_full_page_never_leaks_raw_updated_at_into_paging_floor`
+    // and the frozen-cursor coverage.)
+    let mut opts = IngestOptions::unbounded(repo.clone(), project_id.to_string());
+    opts.max_items = Some(1);
+    let report = run_ingest(&rt, &token, &registry, opts)
+        .await
+        .expect("ingest ok");
+
+    assert_eq!(
+        report.prs_ingested, 1,
+        "the first PR lands before the budget runs out: {report:?}"
+    );
+    assert_eq!(report.issues_ingested, 0, "{report:?}");
+    assert_eq!(report.commits_ingested, 0, "{report:?}");
+    match &report.sources.pull_requests {
+        Some(khive_pack_git::ingest::IngestSourceState::StoppedEarly(reason)) => {
+            assert!(
+                reason.contains("budget exhausted"),
+                "the reason names the budget as the cause: {reason:?}"
+            );
+        }
+        other => panic!("a budget-stopped walk is stopped_early, got {other:?}"),
+    }
+    assert_eq!(
+        report.sources.issues,
+        Some(khive_pack_git::ingest::IngestSourceState::Skipped(
+            "budget exhausted before issues were reached".to_string()
+        )),
+        "issues were never reached — a genuine skip: {report:?}"
+    );
+    assert_eq!(
+        report.sources.commits,
+        Some(khive_pack_git::ingest::IngestSourceState::Skipped(
+            "budget exhausted before commits were reached".to_string()
+        )),
+        "commits were never reached — a genuine skip: {report:?}"
+    );
+    assert!(
+        !report.history_exhausted,
+        "budget-stopped sources are not exhaustion: {report:?}"
+    );
+    assert!(!report.done, "{report:?}");
+}
+
+/// The full-page paging stop: a `PAGE_LIMIT`-sized PR page forces the
+/// walker to stop with the remote window unproven — `stopped_early`, not
+/// `completed` (issue #1617; the issue walker's paging stop is
+/// already covered by
+/// `issue_full_page_never_leaks_raw_updated_at_into_paging_floor`).
+///
+/// Then the walked-then-failed arm (the walked-then-failed finding): the stub
+/// is swapped to fail, and the second pass's FIRST fetch errors. Because
+/// the walk-start marker is only written after the first page lands, a
+/// fresh pass whose first fetch fails was genuinely never walked — so
+/// `skipped` remains correct HERE, and the never-overwrite invariant is
+/// instead pinned by the cursor-write-failure test below (the one
+/// post-visit Err site reachable with the standing stub infra). A
+/// `stopped_early`-after-full-window pass is also not completable with
+/// this stub infra: the canned stub cannot honor the `updated:>=` search
+/// floor, so a resumed pass re-fetches the identical full page and the
+/// floor legitimately stalls (`StopFloorStalled`) — the `completed` state
+/// is covered by the happy-path and budget-stop tests instead.
+#[tokio::test]
+async fn digest_verb_pr_source_stopped_early_on_full_page_then_refetch_failure_stays_skipped() {
+    let _guard = ENV_MUTEX.lock().await;
+    let (rt, token, registry) = fixture().await;
+
+    let project_id = create(
+        &registry,
+        json!({"kind": "project", "name": "tristate-paging-repo"}),
+    )
+    .await;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo: PathBuf = dir.path().join("repo");
+    std::fs::create_dir_all(&repo).expect("mk repo dir");
+    init_repo(&repo);
+    write(&repo, "README.md", "hello\n");
+    commit(&repo, &["README.md"], "Initial commit");
+
+    let bin_dir = dir.path().join("bin");
+    std::fs::create_dir_all(&bin_dir).expect("mk bin dir");
+    let log_dir = dir.path().join("log");
+    std::fs::create_dir_all(&log_dir).expect("mk log dir");
+
+    // Mirrors `ingest.rs`'s private `PAGE_LIMIT`.
+    const PAGE_LIMIT: usize = 1000;
+    let prs: Vec<Value> = (1..=PAGE_LIMIT as u64)
+        .map(|i| pr_fixture(i, &format!("pr {i}"), "2026-01-01T00:16:00Z"))
+        .collect();
+    write_fake_gh(&bin_dir, &log_dir, &Value::Array(prs).to_string(), "[]");
+    let _path_guard = PathGuard::install(&bin_dir);
+
+    let mut opts = IngestOptions::unbounded(repo.clone(), project_id.to_string());
+    opts.include.commits = false;
+    opts.include.issues = false;
+    let report = run_ingest(&rt, &token, &registry, opts.clone())
+        .await
+        .expect("ingest ok");
+
+    assert_eq!(report.prs_ingested, PAGE_LIMIT as u64, "{report:?}");
+    match &report.sources.pull_requests {
+        Some(khive_pack_git::ingest::IngestSourceState::StoppedEarly(reason)) => {
+            assert!(
+                reason.contains("full page"),
+                "the reason names the full-page floor stop: {reason:?}"
+            );
+        }
+        other => panic!("a full page with an unproven window is stopped_early, got {other:?}"),
+    }
+    assert!(
+        !report.done && !report.history_exhausted,
+        "the resume loop must keep going past an unproven window: {report:?}"
+    );
+
+    // A fresh pass whose FIRST fetch fails was never walked: `skipped`
+    // stays accurate (the marker distinguishes "failed before the walk"
+    // from "failed after it").
+    let script = r#"#!/bin/sh
+case "$1" in
+  --version)
+    echo "gh version 2.0.0 (fake)"
+    ;;
+  *)
+    echo "fake gh: simulated listing outage" 1>&2
+    exit 1
+    ;;
+esac
+"#;
+    std::fs::write(bin_dir.join("gh"), script).expect("swap stub to failing");
+
+    let report2 = run_ingest(&rt, &token, &registry, opts)
+        .await
+        .expect("a gh listing failure must stay an in-band ingest result");
+    match &report2.sources.pull_requests {
+        Some(khive_pack_git::ingest::IngestSourceState::Skipped(reason)) => {
+            assert!(
+                reason.contains("gh pr list failed"),
+                "a first-fetch failure reports skipped with the cause: {reason:?}"
+            );
+        }
+        other => panic!("a never-walked source must report skipped, got {other:?}"),
+    }
+    assert!(
+        report2
+            .warnings
+            .iter()
+            .any(|w| w.contains("gh pr list failed")),
+        "the failure also surfaces as a warning: {:?}",
+        report2.warnings
+    );
+    assert!(
+        report2.done,
+        "a first-fetch listing failure leaves the budget-cursor signal unchanged: {report2:?}"
+    );
+}
+
+/// The walked-then-failed invariant (the walked-then-failed finding), driven
+/// through the one post-visit Err site the standing stub infra can reach:
+/// the cursor write at the end of the issue walk. A pass that walks the
+/// window to completion and THEN fails persisting the cursor must never
+/// regress to `skipped` ("never walked") — and must not stay `completed`
+/// either: the walk happened but the pass failed, so the state downgrades
+/// to `stopped_early` with the failure in the reason, and neither `done`
+/// nor `history_exhausted` may claim the source is finished.
+#[tokio::test]
+async fn ingest_walked_then_cursor_write_fails_never_reports_skipped() {
+    let _guard = ENV_MUTEX.lock().await;
+    let (rt, token, registry) = fixture().await;
+
+    let project_id = create(
+        &registry,
+        json!({"kind": "project", "name": "walked-then-failed-repo"}),
+    )
+    .await;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo: PathBuf = dir.path().join("repo");
+    std::fs::create_dir_all(&repo).expect("mk repo dir");
+    init_repo(&repo);
+    write(&repo, "README.md", "hello\n");
+    commit(&repo, &["README.md"], "Initial commit");
+
+    let bin_dir = dir.path().join("bin");
+    std::fs::create_dir_all(&bin_dir).expect("mk bin dir");
+    let log_dir = dir.path().join("log");
+    std::fs::create_dir_all(&log_dir).expect("mk log dir");
+
+    let issue_json = json!([issue_fixture(1, "Bug report", "2026-01-01T00:00:01Z")]).to_string();
+    write_fake_gh(&bin_dir, &log_dir, "[]", &issue_json);
+    let _path_guard = PathGuard::install(&bin_dir);
+
+    // Sabotage ONLY the cursor write: read_cursor must keep working (it is
+    // the walker's first statement, before any page fetch), so the table
+    // stays, with a trigger that aborts every INSERT. The walker then runs
+    // the full pass — records land, completion states are recorded — and
+    // fails at the final `write_cursor`, after the walk.
+    let mut writer = rt.sql().writer().await.expect("writer");
+    writer
+        .execute(SqlStatement {
+            sql: "CREATE TRIGGER fail_cursor_write BEFORE INSERT ON git_mirror_cursor \
+                  BEGIN SELECT RAISE(ABORT, 'sabotaged cursor write'); END"
+                .into(),
+            params: vec![],
+            label: Some("test_fail_cursor_write".into()),
+        })
+        .await
+        .expect("install sabotage trigger");
+
+    let mut opts = IngestOptions::unbounded(repo.clone(), project_id.to_string());
+    opts.include.commits = false;
+    opts.include.pull_requests = false;
+    let report = run_ingest(&rt, &token, &registry, opts)
+        .await
+        .expect("a post-walk cursor-write failure must stay in-band");
+
+    assert_eq!(
+        report.issues_ingested, 1,
+        "the record landed before the cursor write failed: {report:?}"
+    );
+    match &report.sources.issues {
+        Some(khive_pack_git::ingest::IngestSourceState::StoppedEarly(reason)) => {
+            assert!(
+                reason.contains("walk completed but the pass then failed")
+                    && reason.contains("sabotaged cursor write"),
+                "the completed walk downgrades to stopped-early with the cause: {reason:?}"
+            );
+        }
+        other => panic!("a walked-then-failed source is never skipped or completed: {other:?}"),
+    }
+    assert!(
+        report.warnings.iter().any(
+            |w| w.contains("gh issue list failed after walking 1 record")
+                && w.contains("stopped early, not skipped")
+        ),
+        "the warning names the walked-then-failed shape, not a skip: {:?}",
+        report.warnings
+    );
+    assert!(
+        report
+            .warnings
+            .iter()
+            .all(|w| !w.contains("skipping issues")),
+        "a walked-then-failed source must never be described as skipped: {:?}",
+        report.warnings
+    );
+    assert!(
+        !report.history_exhausted,
+        "a failed pass must not claim exhaustion: {report:?}"
+    );
+    assert!(
+        !report.done,
+        "the resume loop must re-walk a source whose pass failed: {report:?}"
+    );
+}
+
+/// The cursor-floor guard while stalled (round-2 finding 1): while a pass
+/// is stalled on a refused record, an ALREADY-EXISTING record walked after
+/// the stall point — with a strictly newer `updated_at` — must not advance
+/// the persisted floor past the refused record. The natural-key lookup
+/// proves only the existing record's own landing; advancing past it would
+/// persist a cursor strictly newer than the refused record's timestamp, so
+/// the next pass's inclusive `updated >= cursor` filter would never
+/// re-fetch the refused record — skipping it forever instead of retrying
+/// it. Without the guard, this fixture's persisted cursor would be #10's
+/// 2026-01-03, past refused #20's 2026-01-01.
+#[tokio::test]
+async fn pr_cursor_does_not_advance_past_refused_record_on_later_existing() {
+    let _guard = ENV_MUTEX.lock().await;
+    let (rt, token, registry) = fixture().await;
+    rt.register_embedder(FailOnceEmbedderProvider);
+
+    let project_id = create(
+        &registry,
+        json!({"kind": "project", "name": "stalled-floor-existing-repo"}),
+    )
+    .await;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo: PathBuf = dir.path().join("repo");
+    std::fs::create_dir_all(&repo).expect("mk repo dir");
+    init_repo(&repo);
+    write(&repo, "README.md", "hello\n");
+    commit(&repo, &["README.md"], "Initial commit");
+
+    // Pre-land PR #10 as if an earlier pass created it, with the NEWEST
+    // timestamp of the three — it is the record walked after the stall
+    // point whose timestamp the unguarded advance would persist.
+    create(
+        &registry,
+        json!({
+            "kind": "pull_request",
+            "name": "#10 pre-existing PR",
+            "content": "landed in an earlier pass",
+            "properties": {
+                "number": 10,
+                "project_id": project_id.to_string()
+            },
+            "annotates": [project_id.to_string()]
+        }),
+    )
+    .await;
+
+    let bin_dir = dir.path().join("bin");
+    std::fs::create_dir_all(&bin_dir).expect("mk bin dir");
+    let log_dir = dir.path().join("log");
+    std::fs::create_dir_all(&log_dir).expect("mk log dir");
+
+    // Ascending by updatedAt: #5 (good), #20 (refused once), #10 (existing,
+    // newest). The stall fires at #20; the guard must keep #10's newer
+    // timestamp out of the persisted floor.
+    let pr_json = json!([
+        {"number": 5, "title": "pr5-oldest-good", "author": {"login": "a"}, "createdAt": "2026-01-01T00:00:00Z", "mergedAt": null, "closedAt": null, "updatedAt": "2025-12-01T00:00:00Z", "baseRefName": "main", "headRefName": "f5", "mergeCommit": null, "body": ""},
+        {"number": 20, "title": "pr20-refused", "author": {"login": "a"}, "createdAt": "2026-01-01T00:00:00Z", "mergedAt": null, "closedAt": null, "updatedAt": "2026-01-01T00:00:00Z", "baseRefName": "main", "headRefName": "f20", "mergeCommit": null, "body": CURSOR_FAIL_SENTINEL},
+        {"number": 10, "title": "pr10-existing-newest", "author": {"login": "a"}, "createdAt": "2026-01-01T00:00:00Z", "mergedAt": null, "closedAt": null, "updatedAt": "2026-01-03T00:00:00Z", "baseRefName": "main", "headRefName": "f10", "mergeCommit": null, "body": ""}
+    ])
+    .to_string();
+
+    write_fake_gh(&bin_dir, &log_dir, &pr_json, "[]");
+    let _path_guard = PathGuard::install(&bin_dir);
+
+    let mut opts = IngestOptions::unbounded(repo.clone(), project_id.to_string());
+    opts.include.commits = false;
+    opts.include.issues = false;
+
+    let report = run_ingest(&rt, &token, &registry, opts.clone())
+        .await
+        .expect("ingest ok (pass 1)");
+
+    assert_eq!(
+        report.prs_ingested, 1,
+        "#5 lands, #20 is refused once, #10 is found by natural key: {report:?}"
+    );
+    assert_eq!(report.prs_skipped_existing, 1, "{report:?}");
+    assert!(
+        report.cursor_stalled,
+        "the refused #20 freezes the PR cursor: {report:?}"
+    );
+
+    let cursor_after_pass1 = read_git_cursor(&rt, project_id, "prs")
+        .await
+        .expect("cursor must be written (#5 landed before the stall)");
+    assert_eq!(
+        cursor_after_pass1, "2025-12-01T00:00:00Z",
+        "the stalled floor must not advance past refused #20 (2026-01-01) on \
+         the strength of later EXISTING #10's newer 2026-01-03 timestamp — \
+         that would strand #20 behind the cursor forever: {cursor_after_pass1:?}"
+    );
+
+    // The embedder's one-shot fuse is spent: pass 2 re-walks from the frozen
+    // floor, retries #20, lands it, and only then does the floor advance to
+    // the newest walked timestamp.
+    let report2 = run_ingest(&rt, &token, &registry, opts)
+        .await
+        .expect("ingest ok (pass 2)");
+    assert_eq!(
+        report2.prs_ingested, 1,
+        "the refused record is retried and lands once the upstream failure clears: {report2:?}"
+    );
+    assert_eq!(report2.prs_skipped_existing, 2, "{report2:?}");
+    assert!(!report2.cursor_stalled, "{report2:?}");
+
+    let cursor_after_pass2 = read_git_cursor(&rt, project_id, "prs")
+        .await
+        .expect("cursor must be written");
+    assert_eq!(
+        cursor_after_pass2, "2026-01-03T00:00:00Z",
+        "after recovery the floor advances to the newest walked record: {cursor_after_pass2:?}"
+    );
+}
+
+/// Issue-side mirror of `pr_cursor_does_not_advance_past_refused_record_on_later_existing`
+/// (round-2 finding 1): the refusal mechanism here is the deterministic
+/// ungoverned-`stateReason` rejection, and the pre-landed record is an
+/// issue with the newest timestamp.
+#[tokio::test]
+async fn issue_cursor_does_not_advance_past_refused_record_on_later_existing() {
+    let _guard = ENV_MUTEX.lock().await;
+    let (rt, token, registry) = fixture().await;
+
+    let project_id = create(
+        &registry,
+        json!({"kind": "project", "name": "stalled-floor-existing-issue-repo"}),
+    )
+    .await;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo: PathBuf = dir.path().join("repo");
+    std::fs::create_dir_all(&repo).expect("mk repo dir");
+    init_repo(&repo);
+    write(&repo, "README.md", "hello\n");
+    commit(&repo, &["README.md"], "Initial commit");
+
+    create(
+        &registry,
+        json!({
+            "kind": "issue",
+            "name": "#10 pre-existing issue",
+            "content": "landed in an earlier pass",
+            "properties": {
+                "number": 10,
+                "project_id": project_id.to_string()
+            },
+            "annotates": [project_id.to_string()]
+        }),
+    )
+    .await;
+
+    let bin_dir = dir.path().join("bin");
+    std::fs::create_dir_all(&bin_dir).expect("mk bin dir");
+    let log_dir = dir.path().join("log");
+    std::fs::create_dir_all(&log_dir).expect("mk log dir");
+
+    let issue_json = json!([
+        {"number": 5, "title": "issue5-oldest-good", "author": {"login": "a"}, "createdAt": "2026-01-01T00:00:00Z", "closedAt": null, "updatedAt": "2025-12-01T00:00:00Z", "labels": [], "stateReason": "", "body": ""},
+        {"number": 20, "title": "issue20-refused", "author": {"login": "a"}, "createdAt": "2026-01-01T00:00:00Z", "closedAt": null, "updatedAt": "2026-01-01T00:00:00Z", "labels": [], "stateReason": "bogus_ungoverned_value", "body": ""},
+        {"number": 10, "title": "issue10-existing-newest", "author": {"login": "a"}, "createdAt": "2026-01-01T00:00:00Z", "closedAt": null, "updatedAt": "2026-01-03T00:00:00Z", "labels": [], "stateReason": "", "body": ""}
+    ])
+    .to_string();
+
+    write_fake_gh(&bin_dir, &log_dir, "[]", &issue_json);
+    let _path_guard = PathGuard::install(&bin_dir);
+
+    let mut opts = IngestOptions::unbounded(repo.clone(), project_id.to_string());
+    opts.include.commits = false;
+    opts.include.pull_requests = false;
+
+    let report = run_ingest(&rt, &token, &registry, opts.clone())
+        .await
+        .expect("ingest ok (pass 1)");
+
+    assert_eq!(report.issues_ingested, 1, "{report:?}");
+    assert_eq!(report.issues_skipped_existing, 1, "{report:?}");
+    assert!(report.cursor_stalled, "{report:?}");
+
+    let cursor_after_pass1 = read_git_cursor(&rt, project_id, "issues")
+        .await
+        .expect("cursor must be written (#5 landed before the stall)");
+    assert_eq!(
+        cursor_after_pass1, "2025-12-01T00:00:00Z",
+        "the stalled floor must not advance past refused #20 on the strength \
+         of later EXISTING #10's newer timestamp: {cursor_after_pass1:?}"
+    );
+
+    // Upstream correction: #20's stateReason becomes governed — pass 2
+    // retries the refused record from the frozen floor and lands it.
+    let corrected = json!([
+        {"number": 5, "title": "issue5-oldest-good", "author": {"login": "a"}, "createdAt": "2026-01-01T00:00:00Z", "closedAt": null, "updatedAt": "2025-12-01T00:00:00Z", "labels": [], "stateReason": "", "body": ""},
+        {"number": 20, "title": "issue20-refused", "author": {"login": "a"}, "createdAt": "2026-01-01T00:00:00Z", "closedAt": null, "updatedAt": "2026-01-01T00:00:00Z", "labels": [], "stateReason": "completed", "body": ""},
+        {"number": 10, "title": "issue10-existing-newest", "author": {"login": "a"}, "createdAt": "2026-01-01T00:00:00Z", "closedAt": null, "updatedAt": "2026-01-03T00:00:00Z", "labels": [], "stateReason": "", "body": ""}
+    ])
+    .to_string();
+    std::fs::write(log_dir.join("issue_response.json"), corrected)
+        .expect("rewrite issue fixture with corrected stateReason");
+
+    let report2 = run_ingest(&rt, &token, &registry, opts)
+        .await
+        .expect("ingest ok (pass 2)");
+    assert_eq!(report2.issues_ingested, 1, "{report2:?}");
+    assert_eq!(report2.issues_skipped_existing, 2, "{report2:?}");
+    assert!(!report2.cursor_stalled, "{report2:?}");
+
+    let cursor_after_pass2 = read_git_cursor(&rt, project_id, "issues")
+        .await
+        .expect("cursor must be written");
+    assert_eq!(
+        cursor_after_pass2, "2026-01-03T00:00:00Z",
+        "{cursor_after_pass2:?}"
+    );
+}
+
+/// A database error during the first commit lookup is reported after the
+/// commit walk has started, not as a pre-walk hard failure.
+#[tokio::test]
+async fn ingest_commit_lookup_failure_is_reported_in_band_after_walk_start() {
+    let _guard = ENV_MUTEX.lock().await;
+    let (rt, token, registry) = fixture().await;
+    let project_id = create(
+        &registry,
+        json!({"kind": "project", "name": "commit-lookup-failure-repo"}),
+    )
+    .await;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo: PathBuf = dir.path().join("repo");
+    std::fs::create_dir_all(&repo).expect("mk repo dir");
+    init_repo(&repo);
+    write(&repo, "README.md", "hello\n");
+    commit(&repo, &["README.md"], "Initial commit");
+
+    // The comm external-id index evaluates json_extract over properties on
+    // every insert, so a malformed-JSON row cannot land while it exists.
+    // Drop it (test database only) so the sabotage row is storable; the
+    // lookup's own json_extract then fails at query time, mid-walk.
+    let mut writer = rt.sql().writer().await.expect("writer");
+    writer
+        .execute(SqlStatement {
+            sql: "DROP INDEX IF EXISTS idx_comm_message_external_id".into(),
+            params: vec![],
+            label: Some("test_drop_json_index".into()),
+        })
+        .await
+        .expect("drop json-evaluating index");
+    writer
+        .execute(SqlStatement {
+            sql: "INSERT INTO notes(id, namespace, kind, content, properties, created_at, updated_at) \
+                  VALUES(?1, ?2, 'commit', '', ?3, 0, 0)"
+                .into(),
+            params: vec![
+                SqlValue::Text(Uuid::new_v4().to_string()),
+                SqlValue::Text("local".into()),
+                SqlValue::Text("not-json".into()),
+            ],
+            label: Some("test_malformed_commit_properties".into()),
+        })
+        .await
+        .expect("insert malformed lookup row");
+    drop(writer);
+
+    let mut opts = IngestOptions::unbounded(repo, project_id.to_string());
+    opts.include.issues = false;
+    opts.include.pull_requests = false;
+    let report = run_ingest(&rt, &token, &registry, opts)
+        .await
+        .expect("a mid-walk lookup failure stays in-band");
+
+    match &report.sources.commits {
+        Some(khive_pack_git::ingest::IngestSourceState::StoppedEarly(reason)) => {
+            assert!(
+                reason.contains("walk began") && reason.contains("pass then failed after the walk"),
+                "the source records a walked-then-failed lookup: {reason:?}"
+            );
+        }
+        other => panic!("a mid-walk lookup failure must be stopped-early: {other:?}"),
+    }
+    assert!(!report.done, "{report:?}");
+    assert!(!report.history_exhausted, "{report:?}");
+}
+
+/// The commit walker's post-walk cursor-write failure (round-2 finding 4):
+/// the walk records `completed` and THEN the final cursor write fails (here
+/// via the same sabotage trigger the issue-side test uses). The call site
+/// must handle that in-band exactly like the gh walkers — downgrade to
+/// `stopped_early`, warn, force `done = false` — instead of aborting the
+/// whole ingest with an Err.
+#[tokio::test]
+async fn ingest_commit_walked_then_cursor_write_fails_stays_in_band() {
+    let _guard = ENV_MUTEX.lock().await;
+    let (rt, token, registry) = fixture().await;
+
+    let project_id = create(
+        &registry,
+        json!({"kind": "project", "name": "commit-walked-then-failed-repo"}),
+    )
+    .await;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo: PathBuf = dir.path().join("repo");
+    std::fs::create_dir_all(&repo).expect("mk repo dir");
+    init_repo(&repo);
+    write(&repo, "README.md", "hello\n");
+    commit(&repo, &["README.md"], "Initial commit");
+
+    // Sabotage ONLY the cursor write: the commit itself must land first, so
+    // the walker records `completed` before the final `write_cursor` fails.
+    let mut writer = rt.sql().writer().await.expect("writer");
+    writer
+        .execute(SqlStatement {
+            sql: "CREATE TRIGGER fail_cursor_write BEFORE INSERT ON git_mirror_cursor \
+                  BEGIN SELECT RAISE(ABORT, 'sabotaged cursor write'); END"
+                .into(),
+            params: vec![],
+            label: Some("test_fail_cursor_write".into()),
+        })
+        .await
+        .expect("install sabotage trigger");
+
+    let mut opts = IngestOptions::unbounded(repo.clone(), project_id.to_string());
+    opts.include.issues = false;
+    opts.include.pull_requests = false;
+    let report = run_ingest(&rt, &token, &registry, opts)
+        .await
+        .expect("a post-walk commit cursor failure must stay in-band, not abort the pass");
+
+    assert_eq!(
+        report.commits_ingested, 1,
+        "the commit landed before the cursor write failed: {report:?}"
+    );
+    match &report.sources.commits {
+        Some(khive_pack_git::ingest::IngestSourceState::StoppedEarly(reason)) => {
+            assert!(
+                reason.contains("walk completed but the pass then failed")
+                    && reason.contains("sabotaged cursor write"),
+                "the completed commit walk downgrades to stopped-early with the cause: {reason:?}"
+            );
+        }
+        other => {
+            panic!("a walked-then-failed commit source is never skipped or completed: {other:?}")
+        }
+    }
+    assert!(
+        !report.cursor_stalled,
+        "no PER-RECORD write failed — the cursor write did; the two signals stay distinct: {report:?}"
+    );
+    assert!(
+        report
+            .warnings
+            .iter()
+            .any(|w| w.contains("commit ingest failed after the walk")),
+        "the failure surfaces as a warning beside the downgraded state: {:?}",
+        report.warnings
+    );
+    assert!(
+        !report.done,
+        "the resume loop must re-walk a source whose pass failed: {report:?}"
+    );
+    assert!(
+        !report.history_exhausted,
+        "a failed pass must not claim exhaustion: {report:?}"
+    );
+}
+
+/// Sources not requested by `include` serialize as JSON `null` in
+/// `IngestReport.sources` (round-2 finding 6): `Option<IngestSourceState>`
+/// with serde's default `None` encoding, asserted explicitly so a future
+/// `skip_serializing_if` or repr change cannot silently drop the
+/// distinction between "not requested" and "requested but state lost".
+#[tokio::test]
+async fn digest_report_serializes_omitted_sources_as_null() {
+    let _guard = ENV_MUTEX.lock().await;
+    let (rt, token, registry) = fixture().await;
+
+    let project_id = create(
+        &registry,
+        json!({"kind": "project", "name": "null-sources-repo"}),
+    )
+    .await;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo: PathBuf = dir.path().join("repo");
+    std::fs::create_dir_all(&repo).expect("mk repo dir");
+    init_repo(&repo);
+    write(&repo, "README.md", "hello\n");
+    commit(&repo, &["README.md"], "Initial commit");
+
+    // Commits only: no gh probe, no gh fixture needed.
+    let mut opts = IngestOptions::unbounded(repo.clone(), project_id.to_string());
+    opts.include.issues = false;
+    opts.include.pull_requests = false;
+    let report = run_ingest(&rt, &token, &registry, opts)
+        .await
+        .expect("ingest ok");
+
+    let serialized = serde_json::to_value(&report).expect("report serializes");
+    assert_eq!(
+        serialized["sources"]["commits"]["state"], "completed",
+        "the requested source carries its walk state: {serialized}"
+    );
+    assert!(
+        serialized["sources"]["issues"].is_null(),
+        "an unrequested source is JSON null, not an absent key or a state: {serialized}"
+    );
+    assert!(
+        serialized["sources"]["pull_requests"].is_null(),
+        "an unrequested source is JSON null, not an absent key or a state: {serialized}"
+    );
+    assert_eq!(
+        serialized["history_exhausted"], true,
+        "a fully walked requested source exhausts the pass: {serialized}"
+    );
+}
+
+/// A local cursor read failure happens before either remote listing. It keeps
+/// the source-level failure distinct from a remote listing skip.
+#[tokio::test]
+async fn digest_verb_local_cursor_read_failure_is_not_remote_listing_skip() {
+    let _guard = ENV_MUTEX.lock().await;
+    let (rt, token, registry) = fixture().await;
+    let project_id = create(
+        &registry,
+        json!({"kind": "project", "name": "cursor-read-failure-repo"}),
+    )
+    .await;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo: PathBuf = dir.path().join("repo");
+    std::fs::create_dir_all(&repo).expect("mk repo dir");
+    init_repo(&repo);
+    let bin_dir = dir.path().join("bin");
+    std::fs::create_dir_all(&bin_dir).expect("mk bin dir");
+    let log_dir = dir.path().join("log");
+    std::fs::create_dir_all(&log_dir).expect("mk log dir");
+    write_fake_gh(&bin_dir, &log_dir, "[]", "[]");
+    let _path_guard = PathGuard::install(&bin_dir);
+
+    let mut writer = rt.sql().writer().await.expect("writer");
+    writer
+        .execute(SqlStatement {
+            sql: "DROP TABLE git_mirror_cursor".into(),
+            params: vec![],
+            label: Some("test_drop_cursor_table".into()),
+        })
+        .await
+        .expect("drop cursor table");
+    drop(writer);
+
+    let mut opts = IngestOptions::unbounded(repo, project_id.to_string());
+    opts.include.commits = false;
+    let report = run_ingest(&rt, &token, &registry, opts)
+        .await
+        .expect("a local cursor read failure stays in-band");
+
+    for (source, state) in [
+        ("pull requests", &report.sources.pull_requests),
+        ("issues", &report.sources.issues),
+    ] {
+        match state {
+            Some(khive_pack_git::ingest::IngestSourceState::Skipped(reason)) => {
+                assert!(
+                    reason.contains("local cursor/database read failed"),
+                    "{source}: local cursor failure is classified explicitly: {reason:?}"
+                );
+                assert!(
+                    !reason.contains("gh pr list failed")
+                        && !reason.contains("gh issue list failed"),
+                    "{source}: the state is not a remote listing failure: {reason:?}"
+                );
+            }
+            other => panic!("{source}: expected local cursor read classification, got {other:?}"),
+        }
+    }
+    assert!(
+        report
+            .warnings
+            .iter()
+            .all(|warning| !warning.contains("list failed, skipping")),
+        "a local cursor failure must not use the remote-skip warning: {:?}",
+        report.warnings
+    );
+}
+
+/// A `gh pr list`/`gh issue list` failure on the FIRST fetch — the stub
+/// answers the `--version` probe but exits 1 on listing — leaves both
+/// sources `skipped` with the failure in the reason: the source was never
+/// walked, which is exactly what `skipped` means (issue #1617).
+/// Commits are unaffected (ADR-088 §5 graceful absence).
+#[tokio::test]
+async fn digest_verb_pr_issue_sources_skipped_on_gh_list_failure() {
+    let _guard = ENV_MUTEX.lock().await;
+    let (_rt, _token, registry) = fixture().await;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo: PathBuf = dir.path().join("repo");
+    std::fs::create_dir_all(&repo).expect("mk repo dir");
+    init_repo(&repo);
+    write(&repo, "README.md", "hello\n");
+    commit(&repo, &["README.md"], "Initial commit");
+
+    let bin_dir = dir.path().join("bin");
+    std::fs::create_dir_all(&bin_dir).expect("mk bin dir");
+
+    // Present enough to pass the `gh --version` probe; every listing fails.
+    let script = r#"#!/bin/sh
+case "$1" in
+  --version)
+    echo "gh version 2.0.0 (fake)"
+    ;;
+  *)
+    echo "fake gh: simulated listing outage" 1>&2
+    exit 1
+    ;;
+esac
+"#;
+    let script_path = bin_dir.join("gh");
+    std::fs::write(&script_path, script).expect("write failing gh stub");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&script_path)
+            .expect("stub metadata")
+            .permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script_path, perms).expect("chmod stub");
+    }
+    let _path_guard = PathGuard::install(&bin_dir);
+
+    let resp = registry
+        .dispatch(
+            "git.digest",
+            json!({
+                "source": repo.to_str().unwrap(),
+                "include": ["commits", "issues", "pull_requests"]
+            }),
+        )
+        .await
+        .expect("a gh listing failure must stay an in-band digest result");
+
+    assert_eq!(resp["commits_ingested"].as_u64().unwrap(), 1, "{resp:?}");
+    for source in ["pull_requests", "issues"] {
+        assert_eq!(
+            resp["sources"][source]["state"], "skipped",
+            "{source}: a first-fetch failure means the source was never walked: {resp:?}"
+        );
+        let reason = resp["sources"][source]["reason"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{source}: skipped carries a reason: {resp:?}"));
+        assert!(
+            reason.contains("list failed") && reason.contains("simulated listing outage"),
+            "{source}: the reason names the failing command and gh's stderr: {reason:?}"
+        );
+    }
+    assert_eq!(
+        resp["sources"]["commits"],
+        json!({"state": "completed"}),
+        "commits are unaffected by a gh listing failure: {resp:?}"
+    );
+    assert!(
+        !resp["history_exhausted"].as_bool().unwrap(),
+        "skipped sources mean the pass did not cover everything requested: {resp:?}"
+    );
+    assert_eq!(
+        resp["done"], true,
+        "a first-fetch listing failure does not consume the budget-cursor signal: {resp:?}"
+    );
+    let warnings: Vec<&str> = resp["warnings"]
+        .as_array()
+        .expect("warnings")
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    assert!(
+        warnings.iter().any(|w| w.contains("gh pr list failed"))
+            && warnings.iter().any(|w| w.contains("gh issue list failed")),
+        "both walker failures surface as warnings: {warnings:?}"
     );
 }
 

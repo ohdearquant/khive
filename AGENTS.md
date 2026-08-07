@@ -25,7 +25,8 @@ pack contributes one verb, `code.ingest` (L1 manifest + L1.5 import-scan source 
 into a dedicated map database, ADR-085 Amendment 2); its `finding` note kind is still
 written only through the `kkernel code-ingest` admin CLI path (ADR-085 D1, Amendment 3);
 the `workspace` pack contributes zero verbs, adding only the `workspace` entity kind and
-`contains` endpoint rules to git/gtd/session notes (#873).
+`contains` endpoint rules to git/gtd/session notes (#873); the `blob` pack contributes
+three verbs, `blob.put` / `blob.get` / `blob.stat`, over content-addressed storage.
 
 If you're working on khive itself (writing code in this repo), see `CLAUDE.md` instead.
 
@@ -136,7 +137,9 @@ false, id, full_id, from, to, note: "already in target status"}` — the task fi
 `memory.recall` supports `tags` and `tag_mode` ("any"|"all") for tag-based post-filtering.
 Its optional `namespace` is an exact-match read override; absent means the caller's normal
 visible namespace set.
-Composite scores are always in [0,1]. Typical production floor: 0.3-0.7.
+The returned relevance score is normalized to [0,1]. The ranking `rank_score` is nominally
+[0,1] but can exceed 1.0 by up to 15% when a brain profile applies posterior terms. Typical
+production floor: 0.3-0.7.
 
 ### Brain pack — 16 verbs (`brain.` prefix)
 
@@ -740,9 +743,10 @@ By-ID operations (`get`, `update`, `delete`, `merge`) are namespace-agnostic. Th
 globally-unique UUID with no namespace check at any layer. Authorization is enforced at the Gate
 (ADR-018), not in storage or by-ID post-fetch checks.
 
-Multi-record operations (`list`, `search`, `recall`, `neighbors`, `traverse`, `query`) default to
-`WHERE namespace='local'`. The only way to target a different namespace is an explicit `namespace=`
-parameter in the verb call.
+Multi-record operations (`list`, `search`, `recall`, `neighbors`, `traverse`, `query`) read from
+the caller's visible namespace set, which defaults to `['local']` and can widen to
+`['local']` union `visible_namespaces` through `[actor].visible_namespaces` or actor identity.
+An explicit `namespace=` parameter in the verb call selects one namespace precisely.
 
 ---
 

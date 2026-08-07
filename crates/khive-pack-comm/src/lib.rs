@@ -1,4 +1,4 @@
-//! pack-comm — Actor-addressed communication verbs and channel subhandlers.
+//! pack-comm — Communication pack providing nine public `comm.*` verbs.
 
 pub mod handlers;
 pub(crate) mod inbox_signal;

@@ -35,7 +35,8 @@ use clap::Parser;
 use khive_mcp::serve::resolve_runtime_config;
 use khive_mcp::serve::{
     apply_env_output_format, build_server_multi_backend_with_db_anchor, config_discovery_db_anchor,
-    enforce_strict_actor_mode, install_resolved_blob_store, normalize_redundant_db_override,
+    enforce_strict_actor_mode, install_resolved_blob_store,
+    normalize_redundant_db_override_with_source, reject_conflicting_db_override_with_source,
     RuntimeConfigInputs,
 };
 #[cfg(unix)]
@@ -63,12 +64,19 @@ type ForwardFuture<'a> = std::pin::Pin<
 
 /// Function pointer type for the daemon-forwarding seam.
 #[cfg(unix)]
-type ForwardFnPtr = for<'a> fn(&'a DaemonRequestFrame) -> ForwardFuture<'a>;
+type ForwardFnPtr =
+    for<'a> fn(&'a DaemonRequestFrame, Option<PathBuf>, Option<&'a str>) -> ForwardFuture<'a>;
 
 /// Adapts the real `forward_or_spawn` to the `ForwardFnPtr` signature.
 #[cfg(unix)]
-fn forward_or_spawn_boxed(frame: &DaemonRequestFrame) -> ForwardFuture<'_> {
-    Box::pin(khive_mcp::daemon::forward_or_spawn(frame))
+fn forward_or_spawn_boxed<'a>(
+    frame: &'a DaemonRequestFrame,
+    config: Option<PathBuf>,
+    db: Option<&'a str>,
+) -> ForwardFuture<'a> {
+    Box::pin(async move {
+        khive_mcp::daemon::forward_or_spawn_with_config(frame, config.as_deref(), db).await
+    })
 }
 
 // The scheduled-event drain now lives in `khive-mcp` (ADR-106: the
@@ -761,6 +769,19 @@ struct ExecDbContext {
     config: Option<PathBuf>,
 }
 
+fn load_exec_config(db_context: &ExecDbContext) -> Result<(KhiveConfig, Option<PathBuf>)> {
+    let db_path_for_config = config_discovery_db_anchor(db_context.raw.as_deref());
+    let loaded = KhiveConfig::load_with_home_fallback_and_source(
+        db_context.config.as_deref(),
+        db_path_for_config.as_deref(),
+    )
+    .map_err(|e| anyhow::anyhow!("config error: {e}"))?;
+    Ok(match loaded {
+        Some((config, source)) => (config, Some(source)),
+        None => (KhiveConfig::default(), None),
+    })
+}
+
 async fn run_exec_inline(
     ops: String,
     cfg: RuntimeConfig,
@@ -833,8 +854,9 @@ async fn run_exec_inline_with_forward(
     // topology (further below) resolve from the identical TOML file the
     // daemon's own boot path loads (`serve.rs`'s `build_server`:
     // `KhiveConfig::load_with_home_fallback(args.config.as_deref(),
-    // config_discovery_db_anchor(args.db.as_deref()).as_deref())`. The second
-    // argument is the raw
+    // config_discovery_db_anchor(args.db.as_deref()).as_deref())` —
+    // `kkernel exec` threads its `--config` / `KHIVE_CONFIG` selection through
+    // this reload exactly like there. The second argument is the raw
     // `--db`/`KHIVE_DB` discovery anchor (`None` unless `--db` was set) rather
     // than `cfg.db_path` — `cfg.db_path` materializes the `$HOME/.khive`
     // default when `--db` is unset (#689), which would incorrectly re-anchor
@@ -848,13 +870,7 @@ async fn run_exec_inline_with_forward(
     // diverged, so a correctly-configured client was rejected as a
     // `ConfigMismatch` and silently fell back to the cold in-process path on
     // every call.
-    let db_path_for_config = config_discovery_db_anchor(db_context.raw.as_deref());
-    let khive_cfg = KhiveConfig::load_with_home_fallback(
-        db_context.config.as_deref(),
-        db_path_for_config.as_deref(),
-    )
-    .map_err(|e| anyhow::anyhow!("config error: {e}"))?
-    .unwrap_or_default();
+    let (khive_cfg, config_source) = load_exec_config(&db_context)?;
 
     // #1226: apply the same --db/[[backends]] conflict guard the in-process
     // fallback below applies, BEFORE the daemon fast-path — otherwise a warm
@@ -864,7 +880,12 @@ async fn run_exec_inline_with_forward(
     // fingerprint and captured construction anchor are normalized to the same
     // values used when no override is supplied.
     if !khive_cfg.backends.is_empty() {
-        normalize_redundant_db_override(&mut cfg, db_context.raw.as_deref(), &khive_cfg.backends)?;
+        normalize_redundant_db_override_with_source(
+            &mut cfg,
+            db_context.raw.as_deref(),
+            &khive_cfg.backends,
+            config_source.as_deref(),
+        )?;
         if matches!(db_context.raw.as_deref(), Some(path) if path != ":memory:") {
             db_context.anchor = cfg.db_path.clone();
         }
@@ -906,7 +927,50 @@ async fn run_exec_inline_with_forward(
             from_wire: false,
             request_id: None,
         };
-        if let Some(res) = forward_fn(&frame).await {
+        // Which override a daemon this call may need to SPAWN must be
+        // constructed with (the spawn seam forwards whatever it receives):
+        // - `:memory:` always: the child must stay ephemeral like the client.
+        // - A concrete override in the SINGLE-backend case (no `[[backends]]`
+        //   declared above): the fresh daemon has no config-declared database
+        //   path, so without the override it would bind `$HOME/.khive/khive.db`
+        //   and its `config_id` would never match this override-anchored frame.
+        // - A concrete override here in the MULTI-backend case is, by
+        //   construction, the redundant-main one proven and normalized above —
+        //   withhold it, because the frame's fingerprint is already normalized
+        //   to the no-override anchor and the spawned daemon's config-declared
+        //   `main` path IS the override's target; forwarding it would desync
+        //   the child's `config_id` from the normalized frame.
+        let spawn_db = match db_context.raw.as_deref() {
+            Some(":memory:") => Some(":memory:"),
+            Some(concrete) if khive_cfg.backends.is_empty() => Some(concrete),
+            _ => None,
+        };
+        // Which config file a daemon this call may need to SPAWN must be
+        // constructed with:
+        // - An explicit `--config`/`KHIVE_CONFIG` selection always: it is the
+        //   operator's choice and the frame already folds its topology.
+        // - Otherwise, in exactly the redundant-multi-backend case withheld
+        //   above: the config that declared the backend topology was
+        //   DISCOVERED (retained in `config_source` — e.g. via the db-dir
+        //   tier-3 anchor of `KhiveConfig::load_with_home_fallback_and_source`),
+        //   and the withheld override was the child's only other clue about
+        //   which database to bind. Without forwarding the resolved path as
+        //   the child's explicit `--config`, the spawned daemon re-discovers
+        //   from its own cwd/HOME, fails to reach a config anchored only
+        //   beside the database, binds `$HOME/.khive/khive.db`, and squats
+        //   the socket with a `config_id` that never matches this frame.
+        //   Forwarding the retained path makes the child fold the identical
+        //   topology, so its fingerprint matches.
+        // - Otherwise nothing: the empty-backends child gets its database
+        //   directly via the forwarded concrete override above.
+        let spawn_config = match (&db_context.config, db_context.raw.as_deref()) {
+            (Some(explicit), _) => Some(explicit.clone()),
+            (None, Some(raw)) if raw != ":memory:" && !khive_cfg.backends.is_empty() => {
+                config_source.clone()
+            }
+            _ => None,
+        };
+        if let Some(res) = forward_fn(&frame, spawn_config, spawn_db).await {
             let output = res.map_err(|e| anyhow::anyhow!("{}", e.message))?;
             println!("{output}");
             enforce_strict_batch_result(&output, strict)?;
@@ -1023,13 +1087,19 @@ async fn run_exec_ops_file(
     // `[[backends]]` multi-backend topology exactly like the daemon-fallback
     // path — see `build_local_fallback_server`.
     enforce_strict_actor_mode(cfg.actor_id.as_deref(), &cfg.packs)?;
-    let db_path_for_config = config_discovery_db_anchor(db_context.raw.as_deref());
-    let khive_cfg = KhiveConfig::load_with_home_fallback(
-        db_context.config.as_deref(),
-        db_path_for_config.as_deref(),
-    )
-    .map_err(|e| anyhow::anyhow!("config error: {e}"))?
-    .unwrap_or_default();
+    let (khive_cfg, config_source) = load_exec_config(&db_context)?;
+
+    if !khive_cfg.backends.is_empty() {
+        // Preserve the selected config path on a refusal, but leave accepted
+        // cases to their downstream owner: the non-atomic shared builder logs
+        // and normalizes them once, while `--atomic` rejects multi-backend
+        // topology before opening storage.
+        reject_conflicting_db_override_with_source(
+            db_context.raw.as_deref(),
+            &khive_cfg.backends,
+            config_source.as_deref(),
+        )?;
+    }
 
     disclose_resolved_database(&cfg, &khive_cfg);
 
@@ -1244,6 +1314,35 @@ mod tests {
         let args = ExecArgs::parse_from(["exec", "stats()"]);
         std::env::remove_var("KHIVE_DB");
         assert_eq!(args.db.as_deref(), Some("/tmp/kkernel-exec-env.db"));
+    }
+
+    #[test]
+    #[serial]
+    fn config_flag_and_env_bind_with_flag_precedence() {
+        let previous = std::env::var_os("KHIVE_CONFIG");
+        std::env::set_var("KHIVE_CONFIG", "/tmp/kkernel-exec-env-config.toml");
+
+        let from_env = ExecArgs::parse_from(["exec", "stats()"]);
+        assert_eq!(
+            from_env.config.as_deref(),
+            Some(std::path::Path::new("/tmp/kkernel-exec-env-config.toml"))
+        );
+
+        let from_flag = ExecArgs::parse_from([
+            "exec",
+            "stats()",
+            "--config",
+            "/tmp/kkernel-exec-flag-config.toml",
+        ]);
+        assert_eq!(
+            from_flag.config.as_deref(),
+            Some(std::path::Path::new("/tmp/kkernel-exec-flag-config.toml"))
+        );
+
+        match previous {
+            Some(value) => std::env::set_var("KHIVE_CONFIG", value),
+            None => std::env::remove_var("KHIVE_CONFIG"),
+        }
     }
 
     #[test]
@@ -1758,7 +1857,7 @@ id = "lambda:fallback"
     /// arms and comparing `compute_config_id` directly, per the decision
     /// criterion: does either arm break config_id parity with the daemon?
     ///
-    /// No `[actor] id` is present (an explicit nonexistent config path makes
+    /// No `[actor] id` is present (an explicit EMPTY config file makes
     /// this fully deterministic — no dependency on cwd or `$HOME`), and the
     /// namespace is a non-"local" value so the actor_id fill-when-None guard in
     /// `resolve_runtime_config` (the ONLY place `namespace_explicit` has any
@@ -1771,8 +1870,12 @@ id = "lambda:fallback"
         std::env::remove_var("KHIVE_ADDITIONAL_EMBEDDING_MODELS");
         std::env::remove_var("KHIVE_ACTOR");
 
-        let missing_config =
-            std::path::PathBuf::from("/nonexistent/khive-exec-parity-test/config.toml");
+        // A real, EMPTY config file: the explicit tier fails loud on a
+        // missing file (ADR-035), so the hermeticity trick must be a real
+        // file with no `[actor]` block.
+        let empty_config_dir = tempfile::tempdir().expect("empty config tempdir");
+        let missing_config = empty_config_dir.path().join("config.toml");
+        std::fs::write(&missing_config, "").expect("write empty config");
         let ns = Namespace::parse("lambda:custom-ns").expect("ns");
         // Pin packs so the `compute_config_id` comparison below never depends
         // on two independent `KHIVE_PACKS` env reads agreeing (#1356).
@@ -1845,11 +1948,13 @@ id = "lambda:fallback"
         std::env::remove_var("KHIVE_ADDITIONAL_EMBEDDING_MODELS");
         std::env::remove_var("KHIVE_ACTOR");
 
-        // An explicit nonexistent config path keeps this fully deterministic
-        // regardless of host state (same rationale as the sibling test above).
-        let missing_config = std::path::PathBuf::from(
-            "/nonexistent/khive-exec-parity-test/multi-backend-config.toml",
-        );
+        // An explicit EMPTY config file keeps this fully deterministic
+        // regardless of host state (same rationale as the sibling test
+        // above; the explicit tier fails loud on a MISSING file — ADR-035 —
+        // so the trick must be a real file).
+        let empty_config_dir = tempfile::tempdir().expect("empty config tempdir");
+        let missing_config = empty_config_dir.path().join("multi-backend-config.toml");
+        std::fs::write(&missing_config, "").expect("write empty config");
         let ns = Namespace::parse("local").expect("ns");
 
         let khive_cfg = KhiveConfig {
@@ -3083,7 +3188,11 @@ id = "lambda:fallback"
     }
 
     #[cfg(unix)]
-    fn spy_forward_records_call(_frame: &DaemonRequestFrame) -> super::ForwardFuture<'_> {
+    fn spy_forward_records_call<'a>(
+        _frame: &'a DaemonRequestFrame,
+        _config: Option<PathBuf>,
+        _db: Option<&'a str>,
+    ) -> super::ForwardFuture<'a> {
         SPY_WAS_CALLED.with(|c| c.set(true));
         Box::pin(async { None })
     }
@@ -3215,12 +3324,397 @@ id = "lambda:fallback"
     std::thread_local! {
         static SPY_CAPTURED_CONFIG_ID: std::cell::RefCell<Option<String>> =
             const { std::cell::RefCell::new(None) };
+        static SPY_CAPTURED_CONFIG_PATH: std::cell::RefCell<Option<PathBuf>> =
+            const { std::cell::RefCell::new(None) };
+        static SPY_CAPTURED_DB: std::cell::RefCell<Option<String>> =
+            const { std::cell::RefCell::new(None) };
     }
 
     #[cfg(unix)]
-    fn spy_capture_config_id(frame: &DaemonRequestFrame) -> super::ForwardFuture<'_> {
+    fn spy_capture_config_id<'a>(
+        frame: &'a DaemonRequestFrame,
+        config: Option<PathBuf>,
+        db: Option<&'a str>,
+    ) -> super::ForwardFuture<'a> {
         SPY_CAPTURED_CONFIG_ID.with(|c| *c.borrow_mut() = Some(frame.config_id.clone()));
+        SPY_CAPTURED_CONFIG_PATH.with(|c| *c.borrow_mut() = config);
+        SPY_CAPTURED_DB.with(|c| *c.borrow_mut() = db.map(str::to_string));
         Box::pin(async { None })
+    }
+
+    #[cfg(unix)]
+    fn spy_capture_config_and_succeed<'a>(
+        frame: &'a DaemonRequestFrame,
+        config: Option<PathBuf>,
+        db: Option<&'a str>,
+    ) -> super::ForwardFuture<'a> {
+        SPY_CAPTURED_CONFIG_ID.with(|c| *c.borrow_mut() = Some(frame.config_id.clone()));
+        SPY_CAPTURED_CONFIG_PATH.with(|c| *c.borrow_mut() = config);
+        SPY_CAPTURED_DB.with(|c| *c.borrow_mut() = db.map(str::to_string));
+        Box::pin(async {
+            Some(Ok(
+                r#"{"results":[{"ok":true,"tool":"stats","result":{}}],"summary":{"total":1,"succeeded":1,"failed":0}}"#
+                    .to_string(),
+            ))
+        })
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial]
+    async fn explicit_config_reaches_daemon_spawn_seam() {
+        std::env::remove_var("KHIVE_EMBEDDING_MODEL");
+        std::env::remove_var("KHIVE_ADDITIONAL_EMBEDDING_MODELS");
+        std::env::remove_var("KHIVE_ACTOR");
+        std::env::remove_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR");
+        SPY_CAPTURED_CONFIG_PATH.with(|c| *c.borrow_mut() = None);
+
+        let dir = tempfile::tempdir().expect("config tempdir");
+        let config_path = dir.path().join("selected.toml");
+        std::fs::write(&config_path, "[runtime]\npacks = [\"kg\"]\n")
+            .expect("write explicit config");
+
+        let cfg = resolve_runtime_config(RuntimeConfigInputs {
+            db: None,
+            config: Some(&config_path),
+            namespace: Namespace::parse("local").expect("ns"),
+            namespace_explicit: true,
+            actor_explicit: false,
+            no_embed: true,
+            packs: Some(vec!["kg".to_string()]),
+            brain_profile: None,
+        })
+        .expect("resolve exec-shaped config");
+
+        let result = run_exec_inline_with_forward(
+            "stats()".to_string(),
+            cfg,
+            None,
+            None,
+            None,
+            ExecDbContext {
+                raw: None,
+                anchor: None,
+                config: Some(config_path.clone()),
+            },
+            false,
+            spy_capture_config_and_succeed,
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "forwarded dispatch must succeed: {result:?}"
+        );
+        assert_eq!(
+            SPY_CAPTURED_CONFIG_PATH.with(|captured| captured.borrow_mut().take()),
+            Some(config_path),
+            "the daemon spawn seam must receive the same explicit config path used to resolve the exec frame"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial]
+    async fn memory_db_override_reaches_daemon_spawn_seam() {
+        std::env::remove_var("KHIVE_EMBEDDING_MODEL");
+        std::env::remove_var("KHIVE_ADDITIONAL_EMBEDDING_MODELS");
+        std::env::remove_var("KHIVE_ACTOR");
+        std::env::remove_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR");
+        std::env::remove_var("KHIVE_DB");
+        SPY_CAPTURED_DB.with(|c| *c.borrow_mut() = None);
+
+        let dir = tempfile::tempdir().expect("config tempdir");
+        let config_path = dir.path().join("selected.toml");
+        std::fs::write(&config_path, "[runtime]\npacks = [\"kg\"]\n")
+            .expect("write explicit config");
+
+        let cfg = resolve_runtime_config(RuntimeConfigInputs {
+            db: Some(":memory:"),
+            config: Some(&config_path),
+            namespace: Namespace::parse("local").expect("ns"),
+            namespace_explicit: true,
+            actor_explicit: false,
+            no_embed: true,
+            packs: Some(vec!["kg".to_string()]),
+            brain_profile: None,
+        })
+        .expect("resolve exec-shaped config");
+
+        let result = run_exec_inline_with_forward(
+            "stats()".to_string(),
+            cfg,
+            None,
+            None,
+            None,
+            ExecDbContext {
+                raw: Some(":memory:".to_string()),
+                anchor: None,
+                config: Some(config_path.clone()),
+            },
+            false,
+            spy_capture_config_and_succeed,
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "forwarded dispatch must succeed: {result:?}"
+        );
+        assert_eq!(
+            SPY_CAPTURED_DB.with(|captured| captured.borrow_mut().take()),
+            Some(":memory:".to_string()),
+            "the daemon spawn seam must receive the raw --db override so a spawned daemon \
+             can be constructed with the same ephemeral in-memory storage"
+        );
+    }
+
+    /// A CONCRETE override on a single-backend invocation (no `[[backends]]`
+    /// declared) must reach the spawn seam: the spawned daemon has no
+    /// config-declared database path and would otherwise bind
+    /// `$HOME/.khive/khive.db`, never matching the client's override-anchored
+    /// frame. (The redundant multi-backend concrete case is withheld — see
+    /// `inline_db_override_guard_normalizes_main_config_id_and_rejects_conflict`.)
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial]
+    async fn single_backend_concrete_db_override_reaches_daemon_spawn_seam() {
+        std::env::remove_var("KHIVE_EMBEDDING_MODEL");
+        std::env::remove_var("KHIVE_ADDITIONAL_EMBEDDING_MODELS");
+        std::env::remove_var("KHIVE_ACTOR");
+        std::env::remove_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR");
+        std::env::remove_var("KHIVE_DB");
+        SPY_CAPTURED_DB.with(|c| *c.borrow_mut() = None);
+
+        let dir = tempfile::tempdir().expect("config tempdir");
+        // No [[backends]] declared — the single-backend shape.
+        let config_path = dir.path().join("selected.toml");
+        std::fs::write(&config_path, "[runtime]\npacks = [\"kg\"]\n")
+            .expect("write explicit config");
+
+        let override_path = dir.path().join("override.db");
+        let cfg = resolve_runtime_config(RuntimeConfigInputs {
+            db: Some(override_path.to_str().expect("utf8")),
+            config: Some(&config_path),
+            namespace: Namespace::parse("local").expect("ns"),
+            namespace_explicit: true,
+            actor_explicit: false,
+            no_embed: true,
+            packs: Some(vec!["kg".to_string()]),
+            brain_profile: None,
+        })
+        .expect("resolve exec-shaped config");
+
+        let result = run_exec_inline_with_forward(
+            "stats()".to_string(),
+            cfg,
+            None,
+            None,
+            None,
+            ExecDbContext {
+                raw: Some(override_path.display().to_string()),
+                anchor: khive_runtime::resolve_db_anchor(override_path.to_str()),
+                config: Some(config_path),
+            },
+            false,
+            spy_capture_config_and_succeed,
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "forwarded dispatch must succeed: {result:?}"
+        );
+        assert_eq!(
+            SPY_CAPTURED_DB.with(|captured| captured.borrow_mut().take()),
+            Some(override_path.display().to_string()),
+            "the single-backend concrete override must reach the daemon spawn seam so a \
+             spawned daemon binds the operator's file instead of the default database"
+        );
+    }
+
+    /// The redundant-multi-backend spawn decision (override withheld from the
+    /// spawned daemon) has a config-side twin: when no explicit `--config`
+    /// was given, the config that declared the backend topology was
+    /// DISCOVERED (here via the db-dir tier-3 anchor of
+    /// `KhiveConfig::load_with_home_fallback_and_source`), and the withheld
+    /// override was the child's only other clue about which database to
+    /// bind. The spawn seam must receive that retained resolved path as the
+    /// child's explicit `--config`, or the spawned daemon re-discovers from
+    /// its own cwd/HOME, cannot reach a config anchored only beside the
+    /// database, binds `$HOME/.khive/khive.db`, and squats the socket with a
+    /// `config_id` that never matches the normalized frame.
+    ///
+    /// Control arms: with an explicit config the seam receives the explicit
+    /// path (never the discovered one), and in the empty-backends case the
+    /// seam receives no config at all (the concrete override supplies the
+    /// database directly).
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial]
+    async fn redundant_db_override_forwards_discovered_config_to_spawn_seam() {
+        std::env::remove_var("KHIVE_EMBEDDING_MODEL");
+        std::env::remove_var("KHIVE_ADDITIONAL_EMBEDDING_MODELS");
+        std::env::remove_var("KHIVE_ACTOR");
+        std::env::remove_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR");
+        std::env::remove_var("KHIVE_DB");
+        let (prev_home, _home_dir) = isolate_home_for_test();
+        SPY_CAPTURED_CONFIG_PATH.with(|c| *c.borrow_mut() = None);
+        SPY_CAPTURED_DB.with(|c| *c.borrow_mut() = None);
+
+        // A multi-backend config discoverable ONLY via the db-dir tier-3
+        // anchor (`project_config_anchor_dir`): it lives in
+        // `<main-db-dir>/.khive/config.toml`, not at the process cwd and not
+        // under `$HOME/.khive`.
+        let backend_dir = tempfile::tempdir().expect("backend tempdir");
+        let main_backend_path = backend_dir.path().join("main-backend.db");
+        let sessions_backend_path = backend_dir.path().join("sessions-backend.db");
+        let anchor_dir = backend_dir.path().join(".khive");
+        std::fs::create_dir_all(&anchor_dir).expect("mkdir db-dir anchor");
+        let discovered_config_path = anchor_dir.join("config.toml");
+        std::fs::write(
+            &discovered_config_path,
+            format!(
+                r#"
+[[backends]]
+name = "main"
+kind = "sqlite"
+path = "{}"
+
+[[backends]]
+name = "sessions"
+kind = "sqlite"
+path = "{}"
+"#,
+                main_backend_path.display(),
+                sessions_backend_path.display(),
+            ),
+        )
+        .expect("write tier-3 multi-backend config");
+        let canonical_config_path =
+            std::fs::canonicalize(&discovered_config_path).expect("canonicalize config path");
+
+        let cfg = resolve_runtime_config(RuntimeConfigInputs {
+            db: Some(main_backend_path.to_str().expect("utf8")),
+            config: None,
+            namespace: Namespace::parse("local").expect("ns"),
+            namespace_explicit: true,
+            actor_explicit: false,
+            no_embed: true,
+            packs: Some(vec!["kg".to_string()]),
+            brain_profile: None,
+        })
+        .expect("resolve exec-shaped config");
+
+        // ── the fix case: redundant multi-backend, no explicit config ──
+        let result = run_exec_inline_with_forward(
+            "stats()".to_string(),
+            cfg.clone(),
+            None,
+            None,
+            None,
+            ExecDbContext {
+                raw: Some(main_backend_path.display().to_string()),
+                anchor: khive_runtime::resolve_db_anchor(main_backend_path.to_str()),
+                config: None,
+            },
+            false,
+            spy_capture_config_and_succeed,
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "redundant-override dispatch must reach daemon forwarding: {result:?}"
+        );
+        assert_eq!(
+            SPY_CAPTURED_DB.with(|captured| captured.borrow_mut().take()),
+            None,
+            "the redundant override stays withheld from the spawn seam"
+        );
+        assert_eq!(
+            SPY_CAPTURED_CONFIG_PATH.with(|captured| captured.borrow_mut().take()),
+            Some(canonical_config_path.clone()),
+            "the spawn seam must receive the retained resolved config path as the \
+             child's explicit --config when the redundant override is withheld"
+        );
+
+        // ── control: explicit config wins, discovered path is not substituted ──
+        let explicit_config_path = backend_dir.path().join("explicit.toml");
+        std::fs::copy(&discovered_config_path, &explicit_config_path)
+            .expect("copy topology as explicit config");
+        SPY_CAPTURED_CONFIG_PATH.with(|c| *c.borrow_mut() = None);
+        let result = run_exec_inline_with_forward(
+            "stats()".to_string(),
+            cfg.clone(),
+            None,
+            None,
+            None,
+            ExecDbContext {
+                raw: Some(main_backend_path.display().to_string()),
+                anchor: khive_runtime::resolve_db_anchor(main_backend_path.to_str()),
+                config: Some(explicit_config_path.clone()),
+            },
+            false,
+            spy_capture_config_and_succeed,
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "explicit-config dispatch must reach daemon forwarding: {result:?}"
+        );
+        assert_eq!(
+            SPY_CAPTURED_CONFIG_PATH.with(|captured| captured.borrow_mut().take()),
+            Some(explicit_config_path),
+            "with an explicit config the seam receives the operator's path, never a discovered one"
+        );
+
+        // ── control: empty backends get no config, only the concrete override ──
+        let single_dir = tempfile::tempdir().expect("single-backend tempdir");
+        let override_path = single_dir.path().join("override.db");
+        let single_cfg = resolve_runtime_config(RuntimeConfigInputs {
+            db: Some(override_path.to_str().expect("utf8")),
+            config: None,
+            namespace: Namespace::parse("local").expect("ns"),
+            namespace_explicit: true,
+            actor_explicit: false,
+            no_embed: true,
+            packs: Some(vec!["kg".to_string()]),
+            brain_profile: None,
+        })
+        .expect("resolve single-backend exec-shaped config");
+        SPY_CAPTURED_CONFIG_PATH.with(|c| *c.borrow_mut() = None);
+        SPY_CAPTURED_DB.with(|c| *c.borrow_mut() = None);
+        let result = run_exec_inline_with_forward(
+            "stats()".to_string(),
+            single_cfg,
+            None,
+            None,
+            None,
+            ExecDbContext {
+                raw: Some(override_path.display().to_string()),
+                anchor: khive_runtime::resolve_db_anchor(override_path.to_str()),
+                config: None,
+            },
+            false,
+            spy_capture_config_and_succeed,
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "single-backend dispatch must reach daemon forwarding: {result:?}"
+        );
+        assert_eq!(
+            SPY_CAPTURED_CONFIG_PATH.with(|captured| captured.borrow_mut().take()),
+            None,
+            "the empty-backends case forwards no config — the concrete override supplies the database"
+        );
+        assert_eq!(
+            SPY_CAPTURED_DB.with(|captured| captured.borrow_mut().take()),
+            Some(override_path.display().to_string()),
+            "the single-backend concrete override still reaches the spawn seam"
+        );
+
+        restore_home(prev_home);
     }
 
     #[cfg(unix)]
@@ -3507,6 +4001,9 @@ backend = "sessions"
             .expect("no-override frame must be captured");
 
         let matching_override = main_backend_path.display().to_string();
+        // Sentinel: proves a captured None below means "the seam was called
+        // with None" (withheld override), not "the spy was never invoked".
+        SPY_CAPTURED_DB.with(|c| *c.borrow_mut() = Some("sentinel".to_string()));
         let cfg = resolve_runtime_config(RuntimeConfigInputs {
             db: Some(&matching_override),
             config: None,
@@ -3545,6 +4042,13 @@ backend = "sessions"
         let matching_config_id = SPY_CAPTURED_CONFIG_ID
             .with(|captured| captured.borrow_mut().take())
             .expect("matching-override frame must be captured");
+        assert_eq!(
+            SPY_CAPTURED_DB.with(|captured| captured.borrow_mut().take()),
+            None,
+            "the redundant multi-backend concrete override must be WITHHELD from the spawn \
+             seam: the frame's fingerprint is normalized to the no-override anchor, and the \
+             spawned daemon's config-declared main path IS the override's target"
+        );
 
         let conflicting_override = backend_dir.path().join("override.db");
         let result = run_exec_inline_with_forward(

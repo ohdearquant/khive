@@ -754,14 +754,19 @@ request(ops="db_diagnostics()")
 List all MCP-callable verbs registered on this server. Internal subhandlers are
 excluded.
 
-| Param      | Type   | Required | Notes                                                                                                    |
-| ---------- | ------ | -------- | -------------------------------------------------------------------------------------------------------- |
-| `category` | string | no       | Filter: `Assertive`\|`Commissive`\|`Declaration`\|`Directive`.                                           |
-| `pack`     | string | no       | Filter by pack name (`kg`, `gtd`, `memory`, `brain`, `comm`, `schedule`, `knowledge`, `session`, `git`). |
+| Param      | Type   | Required | Notes                                                                                                                                 |
+| ---------- | ------ | -------- | ------------------------------------------------------------------------------------------------------------------------------------- |
+| `category` | string | no       | Filter: `Assertive`\|`Commissive`\|`Declaration`\|`Directive`.                                                                        |
+| `pack`     | string | no       | Filter by pack name (`kg`, `gtd`, `memory`, `brain`, `comm`, `schedule`, `knowledge`, `session`, `git`, `code`, `workspace`, `blob`). |
 
 ```
 request(ops="verbs()")
 ```
+
+The result includes the filtered `verbs` array and `total`, plus an unfiltered
+`pack_counts` object for every loaded pack. Zero-verb packs remain present in
+`pack_counts`, so callers can distinguish an ontology-only pack from one that
+was not loaded.
 
 ---
 
@@ -1865,6 +1870,16 @@ diagnostic names the attempted `verb`, the provenance `record_kind` and natural
 `record_key`, plus the detector and a masked excerpt; rejected content is never returned.
 Because a digest continues after a per-record refusal, callers that require a clean run
 should assert `writes_refused == 0` in addition to waiting for `done == true`.
+
+Per-source coverage is machine-readable via `sources` and `history_exhausted`. Every
+source requested by `include` reports one of `completed`, `stopped_early` (with a
+`reason`: budget exhausted, incomplete `gh` paging window, or a frozen cursor), or
+`skipped` (with a `reason`: budget exhausted before the source was reached, `gh` CLI
+absent, or a `gh` failure) — so "this repo has no issues/PRs" is distinguishable from
+"issues/PRs were never reached" without parsing `warnings[]`. `history_exhausted` is
+`true` only when every requested source completed: it separates "the walk visited
+everything" from "the walk stopped before the end", a distinction `done`'s
+budget-cursor semantics do not carry.
 
 ### `git.commit` / `git.branch` / `git.push` — Commissive (ADR-108)
 

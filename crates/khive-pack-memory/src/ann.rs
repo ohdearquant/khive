@@ -1721,6 +1721,26 @@ pub(crate) fn merge_fresh_tail(
     merged
 }
 
+/// Fold a [`FreshTailOutcome`] into the candidate set a recall handler will
+/// serve, plus the degradation disclosure the caller owes when fresh-tail
+/// visibility was lost. `Ops` merges into `prior` with no disclosure;
+/// `Replace` swaps the candidate set and discloses only when the re-resolved
+/// tail could not be assembled; `Skipped` keeps `prior` and always
+/// discloses. Every recall path that consumes an outcome goes through this
+/// single mapping so no exceptional class can be silently treated as
+/// healthy.
+pub(crate) fn outcome_into_candidates(
+    outcome: FreshTailOutcome,
+    prior: Vec<(Uuid, f32)>,
+    query: &[f32],
+) -> (Vec<(Uuid, f32)>, Option<String>) {
+    match outcome {
+        FreshTailOutcome::Ops(ops) => (merge_fresh_tail(prior, query, ops), None),
+        FreshTailOutcome::Replace(candidates, reason) => (candidates, reason.map(str::to_string)),
+        FreshTailOutcome::Skipped(reason) => (prior, Some(reason.to_string())),
+    }
+}
+
 /// Outcome of [`fresh_tail_leg`].
 pub(crate) enum FreshTailOutcome {
     /// Coalesced final tail ops (ADR-118 §1/§2), valid against the
@@ -1732,11 +1752,22 @@ pub(crate) enum FreshTailOutcome {
     /// REPLACE the caller's `best_raw` outright — they are already a
     /// self-consistent (new candidates, new watermark) pair, exact-scored
     /// against that segment's own tail. Never merge them with the stale set.
-    Replace(Vec<(Uuid, f32)>),
+    ///
+    /// The second field is `Some(reason)` when the re-resolved candidates
+    /// are served WITHOUT their fresh-tail merge (reader/snapshot/registry
+    /// or tail-fetch failure after re-resolution): the candidate set is
+    /// still coherent, but read-your-writes visibility was lost, and the
+    /// caller must disclose that. `None` means the full re-resolved
+    /// (candidates, tail) pair was assembled — no degradation. Same
+    /// diagnostic-text contract as [`FreshTailOutcome::Skipped`].
+    Replace(Vec<(Uuid, f32)>, Option<&'static str>),
     /// The leg sat out this query entirely (disabled, unregistered
     /// consumer, or an unrecoverable read failure); the caller's candidates
-    /// are unaffected.
-    Skipped,
+    /// are unaffected. The payload is a non-empty, failure-site diagnostic
+    /// identifying which exceptional class caused the skip — diagnostic
+    /// text for degraded-response disclosure, not a stable public enum;
+    /// callers may depend on its presence, not its exact wording.
+    Skipped(&'static str),
 }
 
 /// The ADR-118 fresh-tail exact leg. `s = Some(watermark)` is the first
@@ -1759,7 +1790,7 @@ pub(crate) async fn fresh_tail_leg(
     s: Option<u64>,
 ) -> FreshTailOutcome {
     if !fresh_tail_enabled() {
-        return FreshTailOutcome::Skipped;
+        return FreshTailOutcome::Skipped("fresh-tail leg disabled via KHIVE_ANN_FRESH_TAIL");
     }
 
     // Registration precondition (ADR-118 §1): S = 0 (or "no bridge") proves
@@ -1772,11 +1803,11 @@ pub(crate) async fn fresh_tail_leg(
             if let Err(e) = register_consumer(rt, model).await {
                 tracing::warn!(error = %e, model, "fresh-tail: consumer re-registration failed");
             }
-            return FreshTailOutcome::Skipped;
+            return FreshTailOutcome::Skipped("fresh-tail: consumer registration absent; re-registering and sitting out this query");
         }
         Err(e) => {
             tracing::warn!(error = %e, model, "fresh-tail: registry read failed; skipping exact leg");
-            return FreshTailOutcome::Skipped;
+            return FreshTailOutcome::Skipped("fresh-tail: registry read failed");
         }
     }
 
@@ -1803,12 +1834,12 @@ async fn fresh_tail_serving(
         Ok(r) => r,
         Err(e) => {
             tracing::warn!(error = %e, model, "fresh-tail: reader open failed; skipping exact leg");
-            return FreshTailOutcome::Skipped;
+            return FreshTailOutcome::Skipped("fresh-tail: reader open failed");
         }
     };
     if let Err(e) = begin_read_snapshot(reader.as_mut()).await {
         tracing::warn!(error = %e, model, "fresh-tail: snapshot begin failed; skipping exact leg");
-        return FreshTailOutcome::Skipped;
+        return FreshTailOutcome::Skipped("fresh-tail: snapshot begin failed");
     }
 
     let registry_min = match registry_min_watermark_on(reader.as_mut(), model).await {
@@ -1816,7 +1847,7 @@ async fn fresh_tail_serving(
         Err(e) => {
             end_read_snapshot(reader.as_mut()).await;
             tracing::warn!(error = %e, model, "fresh-tail: registry-min read failed; skipping exact leg");
-            return FreshTailOutcome::Skipped;
+            return FreshTailOutcome::Skipped("fresh-tail: registry-min read failed");
         }
     };
 
@@ -1853,7 +1884,7 @@ async fn fresh_tail_serving(
                         Ok((ops, _)) => FreshTailOutcome::Ops(ops),
                         Err(e) => {
                             tracing::warn!(error = %e, model, "fresh-tail: floored tail fetch failed; skipping exact leg");
-                            FreshTailOutcome::Skipped
+                            FreshTailOutcome::Skipped("fresh-tail: floored tail fetch failed")
                         }
                     }
                 }
@@ -1867,7 +1898,7 @@ async fn fresh_tail_serving(
         Ok((ops, _new_s)) => FreshTailOutcome::Ops(ops),
         Err(e) => {
             tracing::warn!(error = %e, model, "fresh-tail: tail fetch failed; skipping exact leg");
-            FreshTailOutcome::Skipped
+            FreshTailOutcome::Skipped("fresh-tail: tail fetch failed")
         }
     }
 }
@@ -1918,14 +1949,16 @@ async fn fresh_tail_reresolve(
     for round in 1..=FRESH_TAIL_RERESOLVE_MAX_ROUNDS {
         let Some(dir) = ann_segment_dir(rt, model) else {
             bump_generation(ann, key).await;
-            return FreshTailOutcome::Skipped;
+            return FreshTailOutcome::Skipped(
+                "fresh-tail: re-resolved segment directory unavailable",
+            );
         };
         let bridge = match AnnBridge::load(&dir) {
             Ok(b) => b,
             Err(e) => {
                 tracing::warn!(error = %e, model, "fresh-tail: re-resolved segment load failed; skipping exact leg");
                 bump_generation(ann, key).await;
-                return FreshTailOutcome::Skipped;
+                return FreshTailOutcome::Skipped("fresh-tail: re-resolved segment load failed");
             }
         };
         let s_loaded = bridge.index.last_applied_seq().unwrap_or(expected_s);
@@ -1934,7 +1967,7 @@ async fn fresh_tail_reresolve(
             Err(e) => {
                 tracing::warn!(error = %e, model, "fresh-tail: re-resolved segment search failed; skipping exact leg");
                 bump_generation(ann, key).await;
-                return FreshTailOutcome::Skipped;
+                return FreshTailOutcome::Skipped("fresh-tail: re-resolved segment search failed");
             }
         };
         // Force re-adoption so the background warm path installs this segment
@@ -1964,12 +1997,18 @@ async fn fresh_tail_reresolve(
             Ok(r) => r,
             Err(e) => {
                 tracing::warn!(error = %e, model, "fresh-tail: re-resolved reader open failed; serving re-resolved candidates without further tail");
-                return FreshTailOutcome::Replace(candidates);
+                return FreshTailOutcome::Replace(
+                    candidates,
+                    Some("fresh-tail: re-resolved reader open failed"),
+                );
             }
         };
         if let Err(e) = begin_read_snapshot(reader.as_mut()).await {
             tracing::warn!(error = %e, model, "fresh-tail: re-resolved snapshot begin failed; serving re-resolved candidates without further tail");
-            return FreshTailOutcome::Replace(candidates);
+            return FreshTailOutcome::Replace(
+                candidates,
+                Some("fresh-tail: re-resolved snapshot begin failed"),
+            );
         }
 
         let registry_min = match registry_min_watermark_on(reader.as_mut(), model).await {
@@ -1977,7 +2016,10 @@ async fn fresh_tail_reresolve(
             Err(e) => {
                 end_read_snapshot(reader.as_mut()).await;
                 tracing::warn!(error = %e, model, "fresh-tail: re-resolved registry-min read failed; serving re-resolved candidates without further tail");
-                return FreshTailOutcome::Replace(candidates);
+                return FreshTailOutcome::Replace(
+                    candidates,
+                    Some("fresh-tail: re-resolved registry-min read failed"),
+                );
             }
         };
 
@@ -1992,10 +2034,15 @@ async fn fresh_tail_reresolve(
             let outcome = fetch_final_tail_on(reader.as_mut(), model, s_loaded, None).await;
             end_read_snapshot(reader.as_mut()).await;
             return match outcome {
-                Ok((ops, _)) => FreshTailOutcome::Replace(merge_fresh_tail(candidates, query, ops)),
+                Ok((ops, _)) => {
+                    FreshTailOutcome::Replace(merge_fresh_tail(candidates, query, ops), None)
+                }
                 Err(e) => {
                     tracing::warn!(error = %e, model, "fresh-tail: re-resolved tail fetch failed; serving re-resolved candidates without further tail");
-                    FreshTailOutcome::Replace(candidates)
+                    FreshTailOutcome::Replace(
+                        candidates,
+                        Some("fresh-tail: re-resolved tail fetch failed"),
+                    )
                 }
             };
         }
@@ -2019,10 +2066,15 @@ async fn fresh_tail_reresolve(
             let outcome = fetch_final_tail_on(reader.as_mut(), model, m, None).await;
             end_read_snapshot(reader.as_mut()).await;
             return match outcome {
-                Ok((ops, _)) => FreshTailOutcome::Replace(merge_fresh_tail(candidates, query, ops)),
+                Ok((ops, _)) => {
+                    FreshTailOutcome::Replace(merge_fresh_tail(candidates, query, ops), None)
+                }
                 Err(e) => {
                     tracing::warn!(error = %e, model, "fresh-tail: floored-fallback tail fetch failed; serving re-resolved candidates without further tail");
-                    FreshTailOutcome::Replace(candidates)
+                    FreshTailOutcome::Replace(
+                        candidates,
+                        Some("fresh-tail: floored-fallback tail fetch failed"),
+                    )
                 }
             };
         }
@@ -2053,14 +2105,14 @@ async fn fresh_tail_capped(rt: &KhiveRuntime, model: &str) -> FreshTailOutcome {
         Ok(true) => {}
         Err(e) => {
             tracing::warn!(error = %e, model, "fresh-tail: tail-existence read failed; skipping capped exact leg");
-            return FreshTailOutcome::Skipped;
+            return FreshTailOutcome::Skipped("fresh-tail: tail-existence read failed");
         }
     }
     match fetch_final_tail(rt, model, 0, Some(FRESH_TAIL_CAPPED_MAX_ROWS)).await {
         Ok((ops, _new_s)) => FreshTailOutcome::Ops(ops),
         Err(e) => {
             tracing::warn!(error = %e, model, "fresh-tail: capped tail fetch failed; skipping exact leg");
-            FreshTailOutcome::Skipped
+            FreshTailOutcome::Skipped("fresh-tail: capped tail fetch failed")
         }
     }
 }
@@ -2303,6 +2355,70 @@ async fn classify_and_adopt_segment(
 mod tests {
     use super::*;
     use serial_test::serial;
+
+    #[test]
+    fn outcome_into_candidates_replace_with_reason_discloses_degradation() {
+        // Re-resolution failure classes (reader open, snapshot begin,
+        // registry-min read, tail fetch, floored-fallback tail fetch)
+        // serve coherent candidates but lose read-your-writes visibility:
+        // the mapping must surface the failure-site reason, not report
+        // the response as healthy.
+        let prior = vec![(Uuid::from_u128(1), 0.9_f32)];
+        let replaced = vec![(Uuid::from_u128(2), 0.8_f32)];
+        let (candidates, disclosure) = outcome_into_candidates(
+            FreshTailOutcome::Replace(
+                replaced.clone(),
+                Some("fresh-tail: re-resolved tail fetch failed"),
+            ),
+            prior,
+            &[1.0, 0.0],
+        );
+        assert_eq!(candidates, replaced, "Replace must swap the candidate set");
+        assert_eq!(
+            disclosure.as_deref(),
+            Some("fresh-tail: re-resolved tail fetch failed"),
+            "a reasoned Replace must disclose its failure site"
+        );
+    }
+
+    #[test]
+    fn outcome_into_candidates_healthy_replace_and_ops_do_not_disclose() {
+        let prior = vec![(Uuid::from_u128(1), 0.9_f32)];
+        let replaced = vec![(Uuid::from_u128(2), 0.8_f32)];
+        let (candidates, disclosure) = outcome_into_candidates(
+            FreshTailOutcome::Replace(replaced.clone(), None),
+            prior.clone(),
+            &[1.0, 0.0],
+        );
+        assert_eq!(candidates, replaced);
+        assert!(
+            disclosure.is_none(),
+            "a fully assembled re-resolution is not degraded"
+        );
+
+        let (candidates, disclosure) = outcome_into_candidates(
+            FreshTailOutcome::Ops(Vec::new()),
+            prior.clone(),
+            &[1.0, 0.0],
+        );
+        assert_eq!(candidates, prior);
+        assert!(disclosure.is_none(), "an empty tail merge is not degraded");
+    }
+
+    #[test]
+    fn outcome_into_candidates_skipped_keeps_prior_and_discloses() {
+        let prior = vec![(Uuid::from_u128(1), 0.9_f32)];
+        let (candidates, disclosure) = outcome_into_candidates(
+            FreshTailOutcome::Skipped("fresh-tail: reader open failed"),
+            prior.clone(),
+            &[1.0, 0.0],
+        );
+        assert_eq!(candidates, prior, "Skipped must leave candidates untouched");
+        assert_eq!(
+            disclosure.as_deref(),
+            Some("fresh-tail: reader open failed")
+        );
+    }
 
     #[test]
     fn ann_key_is_model_only() {
@@ -3723,8 +3839,8 @@ mod tests {
             .expect("bridge watermark");
         let ops = match fresh_tail_leg(&rt, &ann, &key, MODEL, &query, 10, Some(s)).await {
             FreshTailOutcome::Ops(ops) => ops,
-            FreshTailOutcome::Replace(_) => panic!("fresh-tail leg unexpectedly re-resolved"),
-            FreshTailOutcome::Skipped => panic!("fresh-tail leg unexpectedly skipped"),
+            FreshTailOutcome::Replace(..) => panic!("fresh-tail leg unexpectedly re-resolved"),
+            FreshTailOutcome::Skipped(_) => panic!("fresh-tail leg unexpectedly skipped"),
         };
         let merged = merge_fresh_tail(raw, &query, ops);
         assert!(
@@ -3815,8 +3931,8 @@ mod tests {
             .expect("bridge watermark");
         let ops = match fresh_tail_leg(&rt, &ann, &key, MODEL, &query, 10, Some(s)).await {
             FreshTailOutcome::Ops(ops) => ops,
-            FreshTailOutcome::Replace(_) => panic!("fresh-tail leg unexpectedly re-resolved"),
-            FreshTailOutcome::Skipped => panic!("fresh-tail leg unexpectedly skipped"),
+            FreshTailOutcome::Replace(..) => panic!("fresh-tail leg unexpectedly re-resolved"),
+            FreshTailOutcome::Skipped(_) => panic!("fresh-tail leg unexpectedly skipped"),
         };
         let merged = merge_fresh_tail(raw, &query, ops);
 
@@ -3912,11 +4028,11 @@ mod tests {
         let outcome = fresh_tail_leg(&rt, &ann, &key, MODEL, &query, 10, Some(s1)).await;
         let ops = match outcome {
             FreshTailOutcome::Ops(ops) => ops,
-            FreshTailOutcome::Replace(_) => panic!(
+            FreshTailOutcome::Replace(..) => panic!(
                 "re-resolution must not succeed here: the only persisted \
                  segment is exactly as stale as the in-memory bridge"
             ),
-            FreshTailOutcome::Skipped => panic!(
+            FreshTailOutcome::Skipped(_) => panic!(
                 "a mismatch must never silently drop the leg — it floors at \
                  the same-snapshot registry minimum instead of skipping"
             ),
@@ -4022,12 +4138,12 @@ mod tests {
         let query = fnv_to_vec("reresolve distinctive fresh note", DIMS);
         let outcome = fresh_tail_leg(&rt, &ann, &key, MODEL, &query, 10, Some(s1)).await;
         let candidates = match outcome {
-            FreshTailOutcome::Replace(candidates) => candidates,
+            FreshTailOutcome::Replace(candidates, _) => candidates,
             FreshTailOutcome::Ops(_) => panic!(
                 "expected re-resolution to replace candidates outright, not \
                  just return ops to merge into the stale bridge's candidates"
             ),
-            FreshTailOutcome::Skipped => {
+            FreshTailOutcome::Skipped(_) => {
                 panic!("expected successful re-resolution, not a skip")
             }
         };
@@ -4042,6 +4158,158 @@ mod tests {
             "re-resolution must still force re-adoption so a future query \
              installs this segment as the served bridge"
         );
+    }
+
+    /// A re-resolution that assembles its candidates but then loses the SQL
+    /// leg that would prove tail completeness (reader open, snapshot begin,
+    /// registry-min re-read, tail fetch) must return a REASONED `Replace`:
+    /// the coherent re-resolved candidates are served, and the lost
+    /// read-your-writes visibility is disclosed via `Some(reason)` — never
+    /// reported healthy (`None`) and never degraded to a `Skipped` that
+    /// would resurrect the stale candidate set. Drives the earliest
+    /// post-re-resolution failure site (the registry-minimum re-read) by
+    /// removing its table while the leg is paused at the test barrier
+    /// between its segment search and that re-read.
+    #[tokio::test]
+    #[serial(adr118_fresh_tail)]
+    async fn fresh_tail_leg_post_reresolution_sql_failure_is_a_reasoned_replace() {
+        const MODEL: &str = "adr118-reresolve-reasoned-replace-test-model";
+        const DIMS: usize = 8;
+        let rt = test_runtime_with_hash_embedder(MODEL, DIMS);
+        let token = rt.authorize(Namespace::local()).expect("authorize local");
+
+        for i in 0..3u32 {
+            rt.create_note_with_decay_for_embedding_model(
+                &token,
+                "memory",
+                None,
+                &format!("reasoned replace seed note {i}"),
+                Some(0.7),
+                0.01,
+                None,
+                vec![],
+                None,
+            )
+            .await
+            .expect("create seed note");
+        }
+
+        let ann = new_shared();
+        let key = AnnKey::from_token(MODEL);
+        ensure_ann_for_model(&rt, &token, &ann, MODEL)
+            .await
+            .expect("warm");
+        let s1 = bridge_applied_seq(&ann, &key)
+            .await
+            .expect("bridge watermark after initial warm");
+
+        // A new note lands after the checkpoint; the peer checkpoint below
+        // persists it, and its presence in the outcome's candidates is the
+        // proof that the REASONED Replace still serves the re-resolved
+        // segment rather than falling back to the stale one.
+        let fresh = rt
+            .create_note_with_decay_for_embedding_model(
+                &token,
+                "memory",
+                None,
+                "reasoned replace distinctive fresh note",
+                Some(0.7),
+                0.01,
+                None,
+                vec![],
+                None,
+            )
+            .await
+            .expect("create fresh note");
+
+        let (_live, tail_before) = scope_counts(&rt, MODEL, s1)
+            .await
+            .expect("scope counts before peer checkpoint");
+        assert!(tail_before > 0, "sanity: a tail must exist above s1");
+        let s2 = s1 + tail_before;
+
+        // Peer checkpoint: persist a segment at s2, raise+compact through it
+        // — the mismatch the leg re-resolves from, exactly as in
+        // fresh_tail_leg_reresolves_to_a_newer_persisted_segment_on_mismatch.
+        let dir = ann_segment_dir(&rt, MODEL).expect("segment dir (file-backed test runtime)");
+        let mut peer_bridge = AnnBridge::load(&dir).expect("load persisted segment");
+        let (ops, new_s) = fetch_final_tail(&rt, MODEL, s1, None)
+            .await
+            .expect("fetch tail for peer replay");
+        peer_bridge
+            .apply_final_ops(ops, new_s)
+            .expect("apply peer replay");
+        peer_bridge
+            .save_atomic(&dir)
+            .expect("persist peer checkpoint");
+        raise_watermark(&rt, MODEL, s2)
+            .await
+            .expect("raise registry watermark");
+        compact_log(&rt, MODEL).await.expect("compact log");
+
+        // Pause the leg after its segment load+search, before the SQL phase
+        // whose failure this test injects.
+        ann.reresolve_race_barrier
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let paused = ann.reresolve_race_notify.notified();
+
+        let query = fnv_to_vec("reasoned replace distinctive fresh note", DIMS);
+        let handle = tokio::spawn({
+            let rt = rt.clone();
+            let ann = ann.clone();
+            let key = key.clone();
+            async move { fresh_tail_leg(&rt, &ann, &key, MODEL, &query, 10, Some(s1)).await }
+        });
+        paused.await;
+
+        // Fault injection: remove the registry table so the leg's re-read —
+        // its first post-re-resolution SQL statement — fails. (Test-fixture
+        // database, mirroring the DROP TABLE fault pattern in
+        // handlers/recall.rs's event-store acquisition test.)
+        {
+            let sql = rt.sql();
+            let mut w = sql.writer().await.expect("fault injection writer");
+            w.execute(SqlStatement {
+                sql: "DROP TABLE ann_consumer_watermark".into(),
+                params: vec![],
+                label: Some("test_drop_registry_for_reasoned_replace".into()),
+            })
+            .await
+            .expect("drop registry table");
+        }
+
+        ann.reresolve_race_barrier
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        ann.reresolve_race_release.notify_one();
+
+        let outcome = handle.await.expect("fresh_tail_leg task");
+        match outcome {
+            FreshTailOutcome::Replace(candidates, reason) => {
+                let reason = reason.expect(
+                    "a post-re-resolution SQL failure must be DISCLOSED: \
+                     Replace(_, None) reports read-your-writes visibility \
+                     the leg no longer proved",
+                );
+                assert!(
+                    reason.starts_with("fresh-tail:"),
+                    "the disclosure must name its failure site, got: {reason:?}"
+                );
+                assert!(
+                    candidates.iter().any(|(id, _)| *id == fresh.id),
+                    "a reasoned Replace must still serve the re-resolved \
+                     segment's candidates (which alone reflect the peer's \
+                     checkpoint), got: {candidates:?}"
+                );
+            }
+            FreshTailOutcome::Ops(_) => panic!(
+                "expected re-resolution to replace candidates outright, not \
+                 return ops against the stale bridge"
+            ),
+            FreshTailOutcome::Skipped(_) => panic!(
+                "a failure AFTER successful re-resolution must not discard \
+                 the coherent re-resolved candidates by skipping"
+            ),
+        }
     }
 
     /// ADR-118 §1 "Compaction linearization" applied to re-resolution itself:
@@ -4223,12 +4491,12 @@ mod tests {
 
         let outcome = handle.await.expect("fresh_tail_leg task");
         let candidates = match outcome {
-            FreshTailOutcome::Replace(candidates) => candidates,
+            FreshTailOutcome::Replace(candidates, _) => candidates,
             FreshTailOutcome::Ops(_) => panic!(
                 "expected re-resolution to replace candidates outright, not \
                  just return ops to merge into the stale bridge's candidates"
             ),
-            FreshTailOutcome::Skipped => {
+            FreshTailOutcome::Skipped(_) => {
                 panic!("expected the interleaved-compaction re-resolution to converge, not a skip")
             }
         };
@@ -4471,12 +4739,12 @@ mod tests {
 
         let outcome = handle.await.expect("fresh_tail_leg task");
         let candidates = match outcome {
-            FreshTailOutcome::Replace(candidates) => candidates,
+            FreshTailOutcome::Replace(candidates, _) => candidates,
             FreshTailOutcome::Ops(_) => panic!(
                 "expected the terminal round to replace candidates outright, \
                  not just return ops to merge into the stale bridge's candidates"
             ),
-            FreshTailOutcome::Skipped => {
+            FreshTailOutcome::Skipped(_) => {
                 panic!("expected the bound-exhaustion floored fallback, not a skip")
             }
         };
@@ -4575,11 +4843,24 @@ mod tests {
 
         let query = fnv_to_vec("registration precondition seed note", DIMS);
         let outcome = fresh_tail_leg(&rt, &ann, &key, MODEL, &query, 10, Some(s)).await;
-        assert!(
-            matches!(outcome, FreshTailOutcome::Skipped),
-            "the exact leg must sit out a query when this consumer's durable \
-             registration row is absent"
-        );
+        match outcome {
+            FreshTailOutcome::Skipped(reason) => {
+                assert!(
+                    !reason.is_empty(),
+                    "#1477 the exceptional skip must carry a non-empty \
+                     failure-site reason so degraded serving is disclosable"
+                );
+            }
+            other => panic!(
+                "the exact leg must sit out a query when this consumer's durable \
+                 registration row is absent, got: {}",
+                match other {
+                    FreshTailOutcome::Ops(_) => "Ops",
+                    FreshTailOutcome::Replace(..) => "Replace",
+                    FreshTailOutcome::Skipped(_) => unreachable!(),
+                }
+            ),
+        }
         assert_eq!(
             read_own_watermark(&rt, MODEL)
                 .await
