@@ -9,6 +9,8 @@
 - **Section tier** — structured subsections per atom (10-value closed enum: overview, core_model,
   boundary_conditions, formalism, operational_guidance, examples, failure_modes, expert_lens,
   references, other)
+- **Evaluation tier** — operator-triggered, draft-inclusive retrieval evaluation with summaries
+  stored in the pack-owned `knowledge_eval_runs` table
 - **KG concept tier** — `learn` / `cite` / `topic` verbs as sugar over the KG entity layer
 
 ## ADR Compliance
@@ -47,15 +49,27 @@
 - `KnowledgePackFactory` is submitted via `inventory::submit!` so the runtime can discover and
   load this pack by name without explicit wiring. `REQUIRES = ["kg"]` declares the dependency.
 
+### Retrieval Quality Measurement (ADR-082)
+
+- `knowledge.eval_retrieval` is an operator-only `Subhandler`, so it does not change the 19-verb
+  MCP surface. It searches only atoms at a fixed k of 5 and includes drafts so retrieval quality
+  remains independent of finalization coverage.
+- Query-set validation is fail-fast. Successful runs persist namespace-scoped aggregate
+  precision, recall, and MRR for `knowledge.stats`. Query-set paths must be absolute and are
+  canonicalized before reads and persistence so daemon launch directories cannot change a run.
+
 ### Edge Ontology (ADR-002)
 
 - `knowledge.cite` creates an `introduced_by` edge from a concept entity to a source entity
   (document, person, or org). The edge direction is concept → source.
 
-### Schema Migration (ADR-015)
+### Schema Ownership (ADR-015, ADR-028)
 
 - Corpus tables (`knowledge_atoms`, `knowledge_domains`) are added in V19 migration.
 - Section table (`knowledge_sections`) is added in a subsequent migration.
+- `knowledge_eval_runs` is auxiliary Knowledge-pack state declared through the pack's static and
+  runtime schema plans. Centralized startup applies its idempotent DDL to the backend assigned to
+  Knowledge; it does not claim a core migration-ledger version.
 
 ### ADR-016: Request DSL
 
@@ -64,10 +78,6 @@
 
 ## Consistency Notes
 
-- `knowledge/mod.rs` exceeds the 700-line soft limit by design. The corpus handler logic is
-  kept together to avoid requiring ~30 private helpers to become `pub(crate)` and to avoid
-  duplicating context structs across submodules. This will be revisited when the section-read
-  verb surface stabilizes.
 - `knowledge/vamana.rs` also exceeds 700 lines by design: the ANN lifecycle (SharedAnn type,
   snapshot persistence, build, search) is tightly coupled through the shared `AnnState`
   generation and warm-ownership locks and cannot be split without obscuring their ordering.
@@ -76,15 +86,17 @@
 
 ## Module Boundaries
 
-| Module                  | Responsibility                                                               |
-| ----------------------- | ---------------------------------------------------------------------------- |
-| `lib.rs`                | Pack registration, `Pack` trait impl, `PackRuntime::dispatch` shim           |
-| `vocab.rs`              | `KNOWLEDGE_HANDLERS` static array — 19 verb descriptors                      |
-| `handlers.rs`           | `learn`, `cite`, `topic` verbs (KG concept tier sugar)                       |
-| `knowledge/mod.rs`      | Corpus handler implementations (19 verbs) and all shared SQL/scoring helpers |
-| `knowledge/schema.rs`   | Param and record types for serde deserialization and SQL row mapping         |
-| `knowledge/vamana.rs`   | Shared Vamana ANN index lifecycle (warm-start, build, search, RRF fusion)    |
-| `knowledge/matching.rs` | TF-IDF term matching primitives (tokenize, exact match, count)               |
+| Module                  | Responsibility                                                              |
+| ----------------------- | --------------------------------------------------------------------------- |
+| `lib.rs`                | Public exports and the operator-facing `reindex_knowledge` library entry    |
+| `pack.rs`               | Pack registration, `Pack` trait impl, `PackRuntime::dispatch` shim          |
+| `vocab.rs`              | Pack schema statements and 20 handler descriptors (19 verbs + 1 subhandler) |
+| `handlers.rs`           | `learn`, `cite`, `topic` verbs (KG concept tier sugar)                      |
+| `knowledge/mod.rs`      | Knowledge handler module boundaries and shared exports                      |
+| `knowledge/eval.rs`     | Offline query-set validation, atom retrieval scoring, and run persistence   |
+| `knowledge/schema.rs`   | Param and record types for serde deserialization and SQL row mapping        |
+| `knowledge/vamana.rs`   | Shared Vamana ANN index lifecycle (warm-start, build, search, RRF fusion)   |
+| `knowledge/matching.rs` | TF-IDF term matching primitives (tokenize, exact match, count)              |
 
 ## Namespace Isolation
 
@@ -98,9 +110,13 @@ Nested profile dispatches preserve the authorized token's per-request actor and 
 pack calls must present a matching authorized token, whose visibility is then narrowed to the
 one explicit namespace. An absent parameter preserves the existing caller-token scope.
 Other corpus handlers continue to consume the registry's transport-level namespace routing.
+The evaluation runner derives the same token namespace for draft-inclusive search and persisted
+run summaries; `knowledge.stats` reads only summaries from that namespace.
 
 ## Test Coverage
 
 - `tests/integration.rs` — full verb surface, happy path + edge cases
 - `tests/fixes.rs` — targeted regression coverage for audit-identified invariants
+- `tests/eval_retrieval.rs` — schema routing/idempotence, validation, draft-corpus scoring,
+  persistence, and namespace isolation
 - `tests/bench.rs` — warm-latency smoke test (ignored by default; see `docs/benchmarks.md`)

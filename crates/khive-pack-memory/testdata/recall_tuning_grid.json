@@ -1,0 +1,27 @@
+{
+  "weight_triples": [
+    [0.7, 0.2, 0.1],
+    [0.6, 0.3, 0.1],
+    [0.6, 0.2, 0.2],
+    [0.8, 0.1, 0.1]
+  ],
+  "candidate_pools": [
+    { "candidate_multiplier": 20, "candidate_limit": 100 },
+    { "candidate_multiplier": 20, "candidate_limit": 150 }
+  ],
+  "fusion_configs": [
+    { "rrf": { "k": 10 } },
+    { "rrf": { "k": 20 } },
+    { "rrf": { "k": 60 } },
+    { "rrf": { "k": 100 } },
+    { "weighted": { "weights": [1.0, 0.0] } },
+    { "weighted": { "weights": [0.75, 0.25] } },
+    { "weighted": { "weights": [0.5, 0.5] } },
+    { "weighted": { "weights": [0.25, 0.75] } },
+    { "weighted": { "weights": [0.0, 1.0] } }
+  ],
+  "decay_models": ["exponential", "hyperbolic", "none"],
+  "temporal_half_life_days": [14.0, 30.0, 60.0],
+  "min_salience_values": [0.0, 0.4],
+  "fixed": { "min_score": 0.0 }
+}

@@ -44,6 +44,9 @@ RANDOM_SEED = 42
 _HERE = Path(__file__).parent
 DEFAULT_CORPUS = _HERE.parent / "fixtures" / "memories_corpus.json"
 DEFAULT_OUTPUT = _HERE
+GRID_DIMENSIONS = (
+    _HERE.parents[2] / "crates" / "khive-pack-memory" / "testdata" / "recall_tuning_grid.json"
+)
 
 # Weight constants for the combined discriminating score (v2 only)
 _MRR_WEIGHT = 0.5
@@ -75,6 +78,24 @@ def load_corpus(path: Path) -> tuple[list[dict[str, Any]], list[dict[str, Any]],
     eval_queries: list[dict[str, Any]] = data["eval_queries"]
     version = _detect_corpus_version(data)
     return memories, eval_queries, version
+
+
+def load_grid_dimensions(path: Path = GRID_DIMENSIONS) -> dict[str, Any]:
+    """Load the grid dimensions shared with the Rust default-conformance test."""
+    data = json.loads(path.read_text())
+    required = {
+        "weight_triples",
+        "candidate_pools",
+        "fusion_configs",
+        "decay_models",
+        "temporal_half_life_days",
+        "min_salience_values",
+        "fixed",
+    }
+    missing = sorted(required - data.keys())
+    if missing:
+        raise ValueError(f"grid dimensions missing required keys: {', '.join(missing)}")
+    return data
 
 
 # ---------------------------------------------------------------------------
@@ -166,7 +187,7 @@ def _resolve_relevant_ids_v2(
 
 def evaluate_config(
     session: KhiveMcpSession,
-    config_dict: dict[str, Any],
+    config_dict: dict[str, Any] | None,
     eval_queries: list[dict[str, Any]],
     note_id_map: dict[str, str],
     *,
@@ -211,10 +232,10 @@ def evaluate_config(
 
         t0 = time.perf_counter()
         try:
-            hits = session.verb(
-                "recall",
-                {"query": query, "limit": limit, "config": config_dict},
-            )
+            args: dict[str, Any] = {"query": query, "limit": limit}
+            if config_dict is not None:
+                args["config"] = config_dict
+            hits = session.verb("recall", args)
         except Exception:
             hits = []
         latency_ms = (time.perf_counter() - t0) * 1000.0
@@ -300,8 +321,8 @@ def evaluate_config(
 def generate_grid(quick: bool = False) -> list[dict[str, Any]]:
     """Generate the FTS-only RecallConfig parameter grid.
 
-    Full grid (v2): 4 × 4 × 8 × 3 × 3 × 2 = 2304 configs
-    Quick grid:     every 20th config (deterministic sort) ≈ 116 configs
+    Full grid (v2): 4 × 2 × 9 × 3 × 3 × 2 = 1296 configs
+    Quick grid:     one in ten configs, balanced by min_salience = 130 configs
 
     v2 adds min_salience variation which DOES discriminate on the v2 corpus:
     - min_salience=0.0: retrieves all items including low-salience traps
@@ -313,48 +334,24 @@ def generate_grid(quick: bool = False) -> list[dict[str, Any]]:
     weighted configs with high vector alpha will score poorly — this is
     expected and meaningful for the grid.
     """
-    weight_triples = [
-        # (relevance_weight, salience_weight, temporal_weight)
-        (0.70, 0.20, 0.10),  # default
-        (0.60, 0.30, 0.10),
-        (0.60, 0.20, 0.20),
-        (0.80, 0.10, 0.10),
-    ]
-
-    candidate_pools = [
-        # (candidate_multiplier, candidate_limit)
-        (10, None),
-        (20, None),   # default
-        (40, None),
-        (20, 100),
-    ]
-
-    # 3 RRF + 5 weighted = 8 fusion configs
-    fusion_configs: list[dict[str, Any]] = [
-        {"rrf": {"k": 20}},
-        {"rrf": {"k": 60}},   # default
-        {"rrf": {"k": 100}},
-        {"weighted": {"weights": [1.0, 0.0]}},    # text-only
-        {"weighted": {"weights": [0.75, 0.25]}},
-        {"weighted": {"weights": [0.5, 0.5]}},
-        {"weighted": {"weights": [0.25, 0.75]}},
-        {"weighted": {"weights": [0.0, 1.0]}},    # vector-only
-    ]
-
-    decay_models = ["exponential", "hyperbolic", "none"]
-    half_lives = [14.0, 30.0, 60.0]
-
-    # min_salience variation: the key discriminating dimension for v2 corpus.
-    # 0.0 includes all items (even low-salience traps).
-    # 0.40 filters out importance_trap memories (salience 0.26-0.35) from results,
-    # which FAILS importance_trap queries (those expected items have salience < 0.40).
-    # This creates measurable discrimination: configs with min_salience=0.0 find trap
-    # items; configs with min_salience=0.40 do not.
-    min_salience_values = [0.0, 0.40]
+    dimensions = load_grid_dimensions()
+    weight_triples = dimensions["weight_triples"]
+    candidate_pools = dimensions["candidate_pools"]
+    fusion_configs = dimensions["fusion_configs"]
+    decay_models = dimensions["decay_models"]
+    half_lives = dimensions["temporal_half_life_days"]
+    min_salience_values = dimensions["min_salience_values"]
+    min_score = dimensions["fixed"]["min_score"]
 
     configs: list[dict[str, Any]] = []
     for rw, iw, tw in weight_triples:
-        for cm, cl in candidate_pools:
+        for pool in candidate_pools:
+            cm = pool["candidate_multiplier"]
+            cl = pool["candidate_limit"]
+            if cl is None:
+                raise ValueError(
+                    "candidate_limit must be explicit so tuned TOML can reproduce the candidate"
+                )
             for fuse in fusion_configs:
                 for decay in decay_models:
                     for hl in half_lives:
@@ -364,26 +361,19 @@ def generate_grid(quick: bool = False) -> list[dict[str, Any]]:
                                 "salience_weight": iw,
                                 "temporal_weight": tw,
                                 "candidate_multiplier": cm,
+                                "candidate_limit": cl,
                                 "fuse_strategy": fuse,
                                 "decay_model": decay,
                                 "temporal_half_life_days": hl,
-                                "min_score": 0.0,
+                                "min_score": min_score,
                                 "min_salience": ms,
                             }
-                            if cl is not None:
-                                cfg["candidate_limit"] = cl
                             configs.append(cfg)
 
     if quick:
-        # Sample the grid to get ~116 configs while preserving both min_salience values.
-        # Because min_salience alternates as the innermost dimension, we take every 10th
-        # config from the even positions (ms=0.0 group) and every 10th from the odd
-        # positions (ms=0.4 group), then interleave them. This ensures both values appear.
-        ms0_configs = configs[::2]   # every even index = min_salience=0.0
-        ms04_configs = configs[1::2] # every odd index = min_salience=0.40
-        sampled_ms0 = ms0_configs[::10]    # ~58 configs
-        sampled_ms04 = ms04_configs[::10]  # ~58 configs
-        configs = sampled_ms0 + sampled_ms04  # ~116 total
+        ms0_configs = configs[::2]
+        ms04_configs = configs[1::2]
+        configs = ms0_configs[::10] + ms04_configs[::10]
 
     return configs
 
@@ -486,11 +476,9 @@ def write_results(
     toml_filename = "tuned-config.toml" if version == "v1" else "tuned-config-v2.toml"
     fuse_toml = _fuse_to_toml(cfg["fuse_strategy"])
     decay_model_str = cfg["decay_model"] if isinstance(cfg["decay_model"], str) else json.dumps(cfg["decay_model"])
-    cl_line = (
-        f"candidate_limit = {cfg['candidate_limit']}"
-        if cfg.get("candidate_limit") is not None
-        else "# candidate_limit = null  (use multiplier only)"
-    )
+    candidate_limit = cfg.get("candidate_limit")
+    if candidate_limit is None:
+        raise ValueError("winning candidate_limit must be explicit so tuned TOML can reproduce it")
     score_comment = (
         f"# combined_score = {winner['combined_score']:.4f}  "
         f"(mrr_expected={winner['mrr_expected']:.4f} precision_at_k={winner['precision_at_k']:.4f} "
@@ -512,7 +500,7 @@ temporal_weight = {cfg['temporal_weight']}
 temporal_half_life_days = {cfg['temporal_half_life_days']}
 decay_model = "{decay_model_str}"
 candidate_multiplier = {cfg['candidate_multiplier']}
-{cl_line}
+candidate_limit = {candidate_limit}
 fuse_strategy = {fuse_toml}
 min_score = {cfg['min_score']}
 min_salience = {cfg['min_salience']}
@@ -536,9 +524,10 @@ min_salience = {cfg['min_salience']}
             fuse_str = str(fuse)
         decay_str = c["decay_model"] if isinstance(c["decay_model"], str) else json.dumps(c["decay_model"])
         ms = c.get("min_salience", 0.0)
+        candidate_limit = c.get("candidate_limit")
         return (
             f"rel={c['relevance_weight']} sal={c['salience_weight']} "
-            f"tmp={c['temporal_weight']} cand={c['candidate_multiplier']} "
+            f"tmp={c['temporal_weight']} cand={c['candidate_multiplier']}/{candidate_limit} "
             f"fuse={fuse_str} decay={decay_str} hl={c['temporal_half_life_days']} "
             f"ms={ms}"
         )
@@ -583,7 +572,7 @@ min_salience = {cfg['min_salience']}
 | recall_at_10 | {default_config_metrics['recall_at_10']:.4f} | {winner['recall_at_10']:.4f} | {winner['recall_at_10'] - default_config_metrics['recall_at_10']:+.4f} |
 | mean latency | {default_config_metrics['mean_latency_ms']:.1f}ms | {winner['mean_latency_ms']:.1f}ms | {winner['mean_latency_ms'] - default_config_metrics['mean_latency_ms']:+.1f}ms |
 
-Default config: relevance=0.70 salience=0.20 temporal=0.10 candidate_multiplier=20 fuse=rrf(k=60) decay=exponential half_life=30.0
+Default config: runtime `RecallConfig::default()` (evaluated without a request override).
 """
         else:
             default_section = f"""
@@ -595,7 +584,7 @@ Default config: relevance=0.70 salience=0.20 temporal=0.10 candidate_multiplier=
 | MRR | {default_config_metrics['mrr']:.4f} | {winner['mrr']:.4f} | {winner['mrr'] - default_config_metrics['mrr']:+.4f} |
 | mean latency | {default_config_metrics['mean_latency_ms']:.1f}ms | {winner['mean_latency_ms']:.1f}ms | {winner['mean_latency_ms'] - default_config_metrics['mean_latency_ms']:+.1f}ms |
 
-Default config: relevance=0.70 salience=0.20 temporal=0.10 candidate_multiplier=20 fuse=rrf(k=60) decay=exponential half_life=30.0
+Default config: runtime `RecallConfig::default()` (evaluated without a request override).
 """
 
     if version == "v2":
@@ -669,18 +658,6 @@ Parameters: `{_cfg_summary(winner)}`
 # CLI entry point
 # ---------------------------------------------------------------------------
 
-_DEFAULT_CONFIG = {
-    "relevance_weight": 0.70,
-    "salience_weight": 0.20,
-    "temporal_weight": 0.10,
-    "candidate_multiplier": 20,
-    "fuse_strategy": {"rrf": {"k": 60}},
-    "decay_model": "exponential",
-    "temporal_half_life_days": 30.0,
-    "min_score": 0.0,
-    "min_salience": 0.0,
-}
-
 
 def main() -> None:
     parser = argparse.ArgumentParser(
@@ -721,9 +698,9 @@ def main() -> None:
     t_start = time.perf_counter()
     session, note_id_map = setup_session(memories, version=version)
     try:
-        # Evaluate default config for the comparison table
+        # Omitting config exercises the runtime's actual RecallConfig::default().
         default_metrics = evaluate_config(
-            session, _DEFAULT_CONFIG, eval_queries, note_id_map, version=version
+            session, None, eval_queries, note_id_map, version=version
         )
         if version == "v2":
             print(

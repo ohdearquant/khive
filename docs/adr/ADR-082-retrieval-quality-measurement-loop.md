@@ -1,10 +1,10 @@
 # ADR-082: Retrieval Quality Measurement Loop
 
-**Status**: proposed
+**Status**: accepted (implemented 2026-08-07)
 **Date**: 2026-07-02
 **Authors**: khive maintainers
 **Depends on**: [ADR-015](ADR-015-schema-migrations.md) (Schema Migrations), [ADR-023](ADR-023-declarative-pack-format.md) (Pack Verb Surface, Visibility, and Composition — `Visibility::Subhandler`), [ADR-047](ADR-047-knowledge-pack.md) (Knowledge Pack)
-**GitHub**: #80
+**GitHub**: #80 (original report), #1487 (public implementation issue)
 **Note**: this number was previously used by a retired v0-series draft ("Engine
 Configuration Schema") consolidated into [ADR-031](ADR-031-multi-engine-retrieval.md);
 that draft was archived at the 2026-05-23 v0→v1 ADR renumbering and does not refer to
@@ -19,10 +19,10 @@ observes that `knowledge.stats()` reports `eval_coverage: 0.0` and reads this as
 that retrieval quality on the 68k-atom production corpus is unmeasured — "faith-based."
 
 The diagnosis of the underlying problem is correct; the field it names is not the field
-at fault. `eval_coverage` is computed in
-`crates/khive-pack-knowledge/src/knowledge/crud.rs` (`stats`, lines 604-680) as
-`finalized_atoms / total_atoms` (lines 631-638, 658, 667-668), where `finalized_atoms`
-counts rows with `finalized = 1` in `knowledge_atoms`. It is a **finalization-coverage**
+at fault. `eval_coverage` is computed by `KnowledgeHandlers::stats` in
+`crates/khive-pack-knowledge/src/knowledge/crud.rs` as
+`finalized_atoms / total_atoms`, where `finalized_atoms` counts rows with
+`finalized = 1` in `knowledge_atoms`. It is a **finalization-coverage**
 metric — what fraction of atoms have passed a human review gate — not a
 **retrieval-quality** metric. The production corpus was ingested without
 `finalized: true`, so `0.0` is an honest finalization reading, not a broken retrieval
@@ -66,16 +66,27 @@ expansion. This ADR formalizes the 2026-07-02 decisions on the two escalations
 (D1, D2 below) and fixes the normative shape of slice-1. It does not reopen the forks;
 it records the decisions and specifies what ships.
 
+### Acceptance correction for #1487
+
+D1 and D2 below explicitly correct and supersede #1487's generic acceptance wording.
+In particular, a completed retrieval run does **not** redefine the existing
+`eval_coverage` finalization metric, and the evaluation handler is an operator-only
+`Subhandler`, not a new MCP verb. A pull request claiming to close #1487 MUST call out
+those corrected criteria and identify `retrieval_eval_coverage`,
+`retrieval_eval_run_count`, and the returned precision/recall/MRR fields as the shipped
+retrieval-quality contract; it must not claim that `eval_coverage` changed semantics or
+that agents gained a new MCP-callable verb.
+
 ## Decision
 
 ### Scope — slice-1
 
 This ADR specifies the smallest increment that moves retrieval-quality measurement off
-"nonexistent" with an honest number: a versioned `knowledge_eval_runs` table, a labeled
+"nonexistent" with an honest number: a pack-owned `knowledge_eval_runs` table, a labeled
 query-set format (synthetic and public by default, path-overridable), a CLI-only eval
 runner that reuses `knowledge.search` as its retrieval path with its own expected-set
-metric contract (§"Eval runner mechanics"), hit-rate/MRR persisted per run, and
-`knowledge.stats()` reading the most recent run. Feedback-grown query-set expansion
+metric contract (§"Eval runner mechanics"), precision-at-5/recall-at-5/MRR persisted per
+run, and `knowledge.stats()` reading the most recent run. Feedback-grown query-set expansion
 (issue #80's optional third bullet: accumulating labeled pairs from `brain.feedback`-style
 signals emitted by agents) is explicitly **out of scope** for this ADR. It requires its
 own accumulation-table design, its own OSS/private data-policy enforcement, and its own
@@ -84,11 +95,11 @@ ADR, and is deferred to a future slice.
 ### D1 — Additive field; `eval_coverage` is not renamed or redefined
 
 `eval_coverage` in `knowledge.stats()` keeps its current name and its current semantics:
-`finalized_atoms / total_atoms`, exactly as implemented today at
-`crud.rs:667-668`. It is a legitimate metric and stays exactly as it is. No wire-shape
-change, no consumer of the existing field is affected, and the existing integration-test
-assertion (`crates/khive-pack-knowledge/tests/integration.rs:1125-1129`, `eval_coverage
-== 0.5` for 1 of 2 finalized atoms) continues to hold unmodified.
+`finalized_atoms / total_atoms`, exactly as implemented by `KnowledgeHandlers::stats`.
+It is a legitimate metric and stays exactly as it is. No existing field's shape or
+semantics changes, no consumer of the existing field is affected, and the existing
+`stats_reflects_current_corpus` integration assertion (`eval_coverage == 0.5` for 1 of 2
+finalized atoms) continues to hold unmodified.
 
 Retrieval quality is reported through **new, additive** fields on the same response:
 
@@ -107,7 +118,8 @@ Retrieval quality is reported through **new, additive** fields on the same respo
 }
 ```
 
-`retrieval_eval_coverage` reports the most recent run's `precision_at_5` (§7). Before any
+`retrieval_eval_coverage` reports the most recent run's `precision_at_5`
+(§"Eval runner mechanics"). Before any
 run has ever executed, all four `retrieval_eval_*` fields report their zero/null
 sentinels (`0.0` / `0` / `null` / `null`) — a state distinguishable from "measured and
 scored zero" by `retrieval_eval_run_count == 0`. `finalization` and `retrieval quality`
@@ -122,7 +134,7 @@ in `crates/khive-pack-knowledge/src/vocab.rs` with `visibility: Visibility::Subh
 kkernel CLI's verb-DSL `exec` subcommand:
 
 ```bash
-kkernel exec 'knowledge.eval_retrieval(query_set="crates/khive-pack-knowledge/tests/fixtures/eval_set.toml")'
+kkernel exec 'knowledge.eval_retrieval(query_set="/absolute/path/to/eval_set.toml")'
 ```
 
 This is the same pattern already shipped for `memory.recall_embed` and
@@ -145,26 +157,25 @@ if usage ever justifies it, needs its own ADR-023 amendment and `AGENTS.md` sync
 its own justification. The broader verb-count convention question is a separate,
 unrelated open thread and this ADR does not couple to it in either direction.
 
-### Schema — `knowledge_eval_runs`
+### Schema — pack-owned `knowledge_eval_runs`
 
-A new table, versioned per the standard migration mechanism (ADR-015: append a new
-`VersionedMigration` with `version = <current ceiling> + 1`, backed by a new
-`crates/khive-db/sql/NNN-<name>.sql` file; `V1` is never edited). As of this writing the
-live migration ceiling is `V5` (`unique_comm_message_external_id`,
-`crates/khive-db/sql/005-unique-comm-external-id.sql`), so this table is expected to land
-at `V6`; the implementer verifies the exact next version against
-`crates/khive-db/src/migrations.rs` at merge time, since other migrations may land first.
-The migration file itself — the literal `.sql` and its `VersionedMigration` registration
-— is authored in the implementation PR, per repository convention; this ADR fixes the
-schema:
+`knowledge_eval_runs` is a Knowledge-pack auxiliary table, not a core substrate table.
+Per ADR-015's non-overlapping schema ownership rule, its table and index are declared as
+idempotent statements in `KNOWLEDGE_SCHEMA_PLAN_STMTS`, exposed through both
+`KnowledgePack::SCHEMA_PLAN` and `KnowledgePack::schema_plan()`. Runtime boot therefore
+applies them to the backend assigned to the Knowledge pack, including multi-backend
+deployments. No `khive-db` versioned migration or canonical migration-ledger claim is made
+for this table. Direct `VerbRegistry` fixtures and embedders that bypass production server
+boot must call `apply_schema_plans` after `build` before dispatching Knowledge handlers.
+The schema-plan statements are:
 
 ```sql
--- 006-knowledge-eval-runs.sql (illustrative filename; exact version per migrations.rs at merge time)
+-- KNOWLEDGE_SCHEMA_PLAN_STMTS (table statement followed by index statement)
 CREATE TABLE IF NOT EXISTS knowledge_eval_runs (
     id              TEXT PRIMARY KEY,
     namespace       TEXT NOT NULL,
     run_at          INTEGER NOT NULL,   -- unix ms
-    query_set       TEXT NOT NULL,      -- filesystem path used for this run
+    query_set       TEXT NOT NULL,      -- canonical absolute path used for this run
     total_queries   INTEGER NOT NULL,
     precision_at_5  REAL NOT NULL,
     recall_at_5     REAL NOT NULL,
@@ -176,8 +187,9 @@ CREATE INDEX IF NOT EXISTS idx_knowledge_eval_runs_ns_run_at
     ON knowledge_eval_runs(namespace, run_at DESC);
 ```
 
-Purely additive: no existing table, column, or index is touched, and no data migration
-runs against `knowledge_atoms` or any other table.
+Purely additive and idempotent: repeated boot is a no-op after the first application. No
+existing table, column, or index is touched, and no data migration runs against
+`knowledge_atoms` or any other table.
 
 ### Labeled query-set format
 
@@ -202,22 +214,27 @@ per-run parameter; a future ADR may add configurable search depth alongside the
 dynamic-`k` metric storage that would require.
 
 The shipped public fixture, `crates/khive-pack-knowledge/tests/fixtures/eval_set.toml`,
-is synthetic: 10-15 queries built over the same domain vocabulary already seeded in the
-integration test corpus (`rag`, `lora`, `flash-attention`, `gqa`, `rope`, `agent`,
-`chain-of-thought`, `speculative`, `quantization`, `dpo` —
-`crates/khive-pack-knowledge/tests/integration.rs:1216-1225`). It is safe for the public
-repository.
+is synthetic: 10-15 queries built over the same domain vocabulary already seeded by
+`search_and_compose_workflow` in the integration corpus (`rag`, `lora`,
+`flash-attention`, `gqa`, `rope`, `agent`, `chain-of-thought`, `speculative`,
+`quantization`, `dpo`). It is safe for the public repository.
 
 Real-usage query sets — including the 2026-06-10 12-probe study and any future set
 derived from production corpus topics or agent feedback — are **excluded from the OSS
 repository** by data policy. Committing them would expose what topics live in private
-operator corpora, leaking corpus composition. `query_set` accepts an arbitrary filesystem
-path, so operators point it at a private, gitignored location such as `.khive/eval/` to
-run against their own labeled data without touching the repository.
+operator corpora, leaking corpus composition. `query_set` accepts an arbitrary absolute
+filesystem path, so operators point it at a private, gitignored location outside the
+repository to run against their own labeled data without touching the repository.
 
 ### Eval runner mechanics
 
 `knowledge.eval_retrieval(query_set: <path>)`:
+
+**The path is absolute and canonical.** Relative `query_set` values fail before file I/O,
+retrieval, or persistence. The runner canonicalizes an absolute input before reading it
+and stores that canonical absolute path in `knowledge_eval_runs`. This keeps both the
+file selected by `kkernel exec` and the audit record independent of the persistent
+daemon's launch directory.
 
 **Namespace is derived, not a parameter.** The runner takes no `namespace` argument. It
 derives its namespace from the dispatch token exactly the way `knowledge.stats` and
@@ -236,26 +253,36 @@ schema above hard-codes `precision_at_5`/`recall_at_5` columns precisely because
 fixes the contract at one k — and is out of scope here; a future ADR may add configurable
 k alongside the storage change it requires.
 
-1. Parse the TOML query set at `query_set`, and validate every `[[queries]]` entry before
-   running anything. **Fail-fast contract**: if the file fails to parse, or any entry is
-   invalid (empty/missing `query` text, or an empty `expected_slugs` list), the run
-   **aborts** — no `knowledge_eval_runs` row is written — and `knowledge.eval_retrieval`
-   returns a validation error naming the file path and the 0-indexed position of the
-   offending entry in the `[[queries]]` array. Partial runs are never recorded, so
+1. Require an absolute `query_set`, canonicalize it, parse the TOML file at that canonical
+   path, and validate every `[[queries]]` entry before running anything. **Fail-fast
+   contract**: a relative or unresolvable path aborts with a path-specific validation error
+   before file reading. If TOML syntax fails to parse, the run **aborts** — no
+   `knowledge_eval_runs` row is written — and the validation error names the canonical
+   file path plus the parser's line and column. Once syntax has parsed, an invalid
+   entry (empty/missing `query` text, or an empty `expected_slugs` list) also aborts before
+   retrieval and names the file path plus the offending entry's 0-indexed position in the
+   `[[queries]]` array. A syntactically valid file with no query entries, including an
+   empty or comment-only file, is a whole-file validation error and names the file path.
+   Partial runs are never recorded, so
    `retrieval_eval_run_count` (introduced in D1 above) only ever counts complete, valid
    runs.
-2. For each query, invoke the existing `knowledge.search` runtime path with `limit = 5`
-   and `type = "atom"` (scoped to the runner's namespace, above), collecting the returned
-   atom slugs in rank order (`search` already returns a `slug` field per hit —
-   `crates/khive-pack-knowledge/src/knowledge/search.rs`). Pinning the result type is
-   required, not optional: `search` defaults to `type = "both"`
-   (`crates/khive-pack-knowledge/src/vocab.rs:180-184`), and under that default, domain
-   mirror rows (`"kind": "domain"`,
-   `crates/khive-pack-knowledge/src/knowledge/search.rs:1102-1110`) can occupy top-5
-   slots. Slice 1 is atom-level evaluation — `expected_slugs` are atom slugs by the
-   step-1 contract — so the runner requests atoms at the search call rather than
-   filtering domains out of a mixed top 5 afterwards, which would silently hand the
-   metrics fewer than 5 atom candidates. Call this ordered list
+2. For each query, invoke the existing `knowledge.search` runtime path with `limit = 5`,
+   `type = "atom"`, and `include_drafts = true` (scoped to the runner's namespace, above),
+   collecting the returned atom slugs in rank order (`search` already returns a `slug`
+   field per hit in `crates/khive-pack-knowledge/src/knowledge/search.rs`). Pinning the
+   result type is required, not optional: `search` defaults to `type = "both"`, under
+   which domain mirror rows can occupy top-5 slots. Slice 1 is atom-level evaluation —
+   `expected_slugs` are atom slugs by the step-1 contract — so the runner requests atoms
+   at the search call rather than filtering domains out of a mixed top 5 afterwards,
+   which would silently hand the metrics fewer than 5 atom candidates.
+
+   The draft override is likewise deliberate and fixed, not caller-configurable. Normal
+   agent search excludes draft atoms as its quality-serving default (ADR-047), but the
+   corpus that motivated this ADR was imported without `finalized: true`. Offline
+   evaluation measures retrieval over the complete non-deprecated corpus so retrieval
+   quality does not collapse to zero merely because finalization coverage is zero. This
+   preserves D1's separation between finalization and retrieval quality; it does not
+   change the public `knowledge.search` default. Call this ordered list
    `top_5_returned_slugs`; it may have fewer than 5 entries if the corpus has fewer than 5
    matches.
 3. Score the query directly against `expected_slugs` by set intersection — no
@@ -292,7 +319,7 @@ k alongside the storage change it requires.
 
 ### `knowledge.stats()` reads the last run
 
-`stats()` (`crud.rs:604`) gains two additional reads against `knowledge_eval_runs`, both
+`KnowledgeHandlers::stats` gains two additional reads against `knowledge_eval_runs`, both
 filtered to the token's namespace. Two reads are required by the storage API's shapes:
 `query_scalar` returns the first column of the first row as one `Option<SqlValue>`
 (`crates/khive-storage/src/sql.rs`), so no single scalar read can supply both an
@@ -300,7 +327,7 @@ aggregate count and the latest row's metric columns.
 
 1. A `query_scalar` `COUNT(*)` over the namespace's rows supplies
    `retrieval_eval_run_count`, following the same pattern as the existing
-   `finalized_count` query at `crud.rs:631-638`. Every stored row is a complete valid
+   `finalized_count` query. Every stored row is a complete valid
    run (the fail-fast contract in §"Eval runner mechanics" writes no partial rows), so
    the row count is the run count.
 2. A `query_row` read selecting the most recent row (`ORDER BY run_at DESC LIMIT 1`)
@@ -361,7 +388,7 @@ produces the zero/null sentinel values described above.
 | Alternative                                                                                   | Why rejected                                                                                                                                                                                                                          |
 | --------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | MCP-exposed `knowledge.eval` verb now (Fork 1, Option A)                                      | No demonstrated agent-side demand for triggering evaluation mid-session; would force an immediate ADR-023 amendment and `AGENTS.md` verb-count sync ahead of any measured need. Ruled against (D2); revisit only if usage demands it. |
-| Redefine or rename `eval_coverage` to mean retrieval precision (Fork 3, Option A/rename path) | Breaking change to a legitimate, already-correct finalization metric; breaks the existing `integration.rs:1125` assertion; conflates two orthogonal signals in one field name. Ruled against (D1).                                    |
+| Redefine or rename `eval_coverage` to mean retrieval precision (Fork 3, Option A/rename path) | Breaking change to a legitimate, already-correct finalization metric; breaks the existing `stats_reflects_current_corpus` assertion; conflates two orthogonal signals in one field name. Ruled against (D1).                          |
 | Fold evaluation into `knowledge.index` behind an `--eval` flag (Fork 1, Option C)             | Overloads a verb whose contract is embedding backfill with unrelated evaluation semantics; harder to test the two concerns in isolation.                                                                                              |
 | Async auto-refresh of retrieval-quality on a schedule or post-index hook (Fork 3, Option C)   | Couples eval cadence to indexing/daemon lifecycle; real scope increase (daemon changes) with no corresponding need established for slice-1. Deferred, not rejected outright.                                                          |
 | Feedback-grown query set from `brain.feedback` signals now (Fork 4)                           | Requires a new accumulation table, a labeling contract for `knowledge.search` callers, and its own OSS/private data-policy enforcement — a distinct feature with its own design surface. Deferred to a future ADR.                    |
@@ -369,11 +396,12 @@ produces the zero/null sentinel values described above.
 ## References
 
 - GitHub #80 — retrieval quality measurement loop
+- GitHub #1487 — public implementation issue for the retrieval quality loop
 - Local issue-80 scoping notes — design forks and escalations this ADR resolves
-- [ADR-015](ADR-015-schema-migrations.md) — schema migration mechanism; append-only `VersionedMigration` convention used by §"Schema"
+- [ADR-015](ADR-015-schema-migrations.md) — non-overlapping schema ownership; the pack-owned `SchemaPlan` mechanism used by §"Schema"
 - [ADR-023](ADR-023-declarative-pack-format.md) — `Visibility::{Verb, Subhandler}`; kkernel `exec` CLI verb-DSL; the mechanism D2 relies on
 - [ADR-047](ADR-047-knowledge-pack.md) — Knowledge Pack; `knowledge.stats`, `knowledge.search`, and the 19-verb baseline this ADR extends
 - `crates/khive-retrieval/src/eval/engine_eval.rs` — existing label-based retrieval eval library (`RetrievalLabel`, `LabeledResult`, `recall_at_k`, `precision_at_k`, `ndcg_at_k`, `mrr`, `compute_all`); referenced for contrast in §"Eval runner mechanics" — not called by the runner
-- `crates/khive-pack-knowledge/src/knowledge/crud.rs` — `stats()` (lines 604-680), the `eval_coverage` computation this ADR leaves unchanged
+- `crates/khive-pack-knowledge/src/knowledge/crud.rs` — `KnowledgeHandlers::stats`, including the `eval_coverage` computation this ADR leaves unchanged
 - `crates/khive-pack-knowledge/src/knowledge/search.rs` — atom search result shape (`slug` field) consumed by the eval runner
-- `crates/khive-pack-knowledge/tests/integration.rs` — existing `eval_coverage` assertion (line 1125) and domain-vocabulary fixture corpus (lines 1216-1225)
+- `crates/khive-pack-knowledge/tests/integration.rs` — existing `stats_reflects_current_corpus` assertion and `search_and_compose_workflow` domain-vocabulary fixture corpus
