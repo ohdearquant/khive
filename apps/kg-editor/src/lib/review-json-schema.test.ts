@@ -28,7 +28,16 @@ describe("normative khive.review.v1 JSON Schema", () => {
   });
 
   it("rejects fields and claims outside the first-slice contract", () => {
-    expect(validate({ ...changesetGolden, repository: { invented: true } })).toBe(false);
+    const inventedTopLevel = { ...changesetGolden, repository: { invented: true } };
+    expect(validate(inventedTopLevel)).toBe(false);
+    expect(() => parseReviewInput(inventedTopLevel)).toThrow();
+
+    const inventedNested = {
+      ...changesetGolden,
+      capability: { ...changesetGolden.capability, invented: true },
+    };
+    expect(validate(inventedNested)).toBe(false);
+    expect(() => parseReviewInput(inventedNested)).toThrow();
 
     const missingLabel = {
       ...atlasReviewFixture,
@@ -56,5 +65,37 @@ describe("normative khive.review.v1 JSON Schema", () => {
     };
     expect(validate(unavailableWithHashes)).toBe(false);
     expect(() => parseReviewInput(unavailableWithHashes)).toThrow();
+  });
+
+  it("maps current-algorithm output to an unavailable identity with null hashes (ADR-145 D4)", () => {
+    const unratifiedProducerIdentity = {
+      ...atlasReviewFixture,
+      capability: { ...atlasReviewFixture.capability, source: "import" },
+      snapshot_identity: {
+        ...atlasReviewFixture.snapshot_identity,
+        hash_status: "unavailable",
+        algorithm: null,
+        base_hash: null,
+        head_hash: null,
+      },
+    };
+    expect(validate(unratifiedProducerIdentity), JSON.stringify(validate.errors)).toBe(true);
+    expect(() => parseReviewInput(unratifiedProducerIdentity)).not.toThrow();
+
+    for (const carried of [
+      { algorithm: atlasReviewFixture.snapshot_identity.algorithm },
+      { base_hash: atlasReviewFixture.snapshot_identity.base_hash },
+      { head_hash: atlasReviewFixture.snapshot_identity.head_hash },
+    ]) {
+      const unavailableCarryingValue = {
+        ...unratifiedProducerIdentity,
+        snapshot_identity: {
+          ...unratifiedProducerIdentity.snapshot_identity,
+          ...carried,
+        },
+      };
+      expect(validate(unavailableCarryingValue)).toBe(false);
+      expect(() => parseReviewInput(unavailableCarryingValue)).toThrow();
+    }
   });
 });

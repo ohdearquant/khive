@@ -11,14 +11,14 @@ export const REVIEW_CORE_MAX_ITEMS = 500;
 export const REVIEW_IMPORT_MAX_BYTES = 2 * 1024 * 1024;
 
 function pageSchema<T extends z.ZodType>(item: T) {
-  return z.object({
+  return z.strictObject({
     items: z.array(item).max(REVIEW_PAGE_MAX_ITEMS),
     next_cursor: z.string().nullable(),
     truncated: z.boolean(),
   });
 }
 
-const operationSchema = z.object({
+const operationSchema = z.strictObject({
   index: z.number().int().nonnegative(),
   id: z.string().min(1),
   op: z.enum(["create", "link", "update", "delete", "merge"]),
@@ -32,7 +32,7 @@ const operationSchema = z.object({
   after: recordSchema.optional(),
 });
 
-const envelopeSchema = z.object({
+const envelopeSchema = z.strictObject({
   schema_version: z.number().int().positive(),
   producer: z.string().min(1),
   producer_model_family: z.string().min(1),
@@ -40,7 +40,7 @@ const envelopeSchema = z.object({
   batch_id: z.string().min(1).optional(),
 });
 
-const coreCapabilitySchema = z.object({
+const coreCapabilitySchema = z.strictObject({
   source: z.string().min(1),
   mutability: z.string().min(1),
   no_writes: z.literal(true),
@@ -52,7 +52,7 @@ const coreCapabilitySchema = z.object({
   unavailable_actions: z.array(z.string()).length(5),
 });
 
-const tierSummarySchema = z.object({
+const tierSummarySchema = z.strictObject({
   operations: z.number().int().nonnegative(),
   tier_1: z.number().int().nonnegative(),
   tier_2: z.number().int().nonnegative(),
@@ -61,7 +61,7 @@ const tierSummarySchema = z.object({
   policy: z.string(),
 });
 
-const validationSchema = z.object({
+const validationSchema = z.strictObject({
   scope: z.string(),
   rules_evaluated: z.number().int().nonnegative(),
   failed_rules: z.number().int().nonnegative(),
@@ -71,7 +71,7 @@ const validationSchema = z.object({
   passed: z.boolean(),
 });
 
-const findingSchema = z.object({
+const findingSchema = z.strictObject({
   rule_id: z.string(),
   severity: z.string(),
   message: z.string(),
@@ -81,7 +81,7 @@ const findingSchema = z.object({
   fixable: z.boolean(),
 });
 
-const reviewGateSchema = z.object({
+const reviewGateSchema = z.strictObject({
   required: z.boolean(),
   producer_model_family: z.string(),
   reviewer_model_family: z.string().nullable(),
@@ -92,7 +92,7 @@ const reviewGateSchema = z.object({
   persisted: z.literal(false),
 });
 
-const changeSchema = z.object({
+const changeSchema = z.strictObject({
   id: z.string(),
   substrate: substrateSchema,
   change: z.enum(["added", "modified", "removed"]),
@@ -100,7 +100,7 @@ const changeSchema = z.object({
   subtitle: z.string(),
   tier: tierSchema,
   fields: z.array(
-    z.object({
+    z.strictObject({
       path: z.string(),
       before: z.unknown().optional(),
       after: z.unknown().optional(),
@@ -109,7 +109,7 @@ const changeSchema = z.object({
   evidence_ids: z.array(z.string()),
 });
 
-const graphNodeSchema = z.object({
+const graphNodeSchema = z.strictObject({
   id: z.string(),
   label: z.string(),
   kind: z.string(),
@@ -120,11 +120,11 @@ const graphNodeSchema = z.object({
 });
 
 /** Minimal shared report emitted by `khive kg review --format json`. */
-export const reviewReportSchema = z.object({
+export const reviewReportSchema = z.strictObject({
   schema_version: z.literal("khive.review.v1"),
   review_kind: z.literal("changeset"),
   capability: coreCapabilitySchema,
-  change_set: z.object({
+  change_set: z.strictObject({
     envelope: envelopeSchema,
     operations: z.array(operationSchema).max(REVIEW_CORE_MAX_ITEMS),
   }),
@@ -143,7 +143,7 @@ export const reviewReportSchema = z.object({
 });
 
 /** Pull-request enrichment of the exact same shared report core. */
-export const reviewBundleSchema = z.object({
+export const reviewBundleSchema = z.strictObject({
   schema_version: z.literal("khive.review.v1"),
   review_kind: z.literal("pull_request"),
   generated_at: z.iso.datetime(),
@@ -151,7 +151,7 @@ export const reviewBundleSchema = z.object({
     source: z.enum(["fixture", "import"]),
     label: z.string(),
   }),
-  repository: z.object({
+  repository: z.strictObject({
     owner: z.string(),
     name: z.string(),
     visibility: z.enum(["public", "private"]),
@@ -160,8 +160,8 @@ export const reviewBundleSchema = z.object({
     base_sha: z.string().regex(/^[0-9a-f]{40}$/),
     head_sha: z.string().regex(/^[0-9a-f]{40}$/),
   }),
-  snapshot_identity: z.object({
-    coverage: z.object({
+  snapshot_identity: z.strictObject({
+    coverage: z.strictObject({
       entities: z.literal(true),
       edges: z.literal(true),
       notes: z.literal(false),
@@ -171,7 +171,7 @@ export const reviewBundleSchema = z.object({
     base_hash: z.string().regex(/^sha256:[0-9a-f]{64}$/).nullable(),
     head_hash: z.string().regex(/^sha256:[0-9a-f]{64}$/).nullable(),
   }),
-  pull_request: z.object({
+  pull_request: z.strictObject({
     number: z.number().int().positive(),
     title: z.string(),
     body: z.string(),
@@ -180,8 +180,8 @@ export const reviewBundleSchema = z.object({
     created_at: z.iso.datetime(),
     head_sha: z.string().regex(/^[0-9a-f]{40}$/),
   }),
-  live_proposal: z.object({ proposal_id: z.uuid() }).nullable(),
-  enrichment_status: z.object({
+  live_proposal: z.strictObject({ proposal_id: z.uuid() }).nullable(),
+  enrichment_status: z.strictObject({
     semantic_changes: z.enum(["available", "unavailable"]),
     evidence: z.enum(["available", "unavailable"]),
     affected_graph: z.enum(["available", "unavailable"]),
@@ -189,7 +189,7 @@ export const reviewBundleSchema = z.object({
     activity: z.enum(["available", "unavailable"]),
     retrieval: z.enum(["captured", "live", "unavailable"]),
   }),
-  change_set: z.object({
+  change_set: z.strictObject({
     envelope: envelopeSchema,
     operations: z.array(operationSchema).max(REVIEW_CORE_MAX_ITEMS),
   }),
@@ -197,7 +197,7 @@ export const reviewBundleSchema = z.object({
   validation: validationSchema,
   findings: z.array(findingSchema).max(REVIEW_CORE_MAX_ITEMS),
   review_gate: reviewGateSchema,
-  summary: z.object({
+  summary: z.strictObject({
     entities_added: z.number().int().nonnegative(),
     entities_modified: z.number().int().nonnegative(),
     entities_removed: z.number().int().nonnegative(),
@@ -208,7 +208,7 @@ export const reviewBundleSchema = z.object({
     tier_2: z.number().int().nonnegative(),
   }),
   checks: pageSchema(
-    z.object({
+    z.strictObject({
       id: z.string(),
       label: z.string(),
       status: statusSchema,
@@ -218,7 +218,7 @@ export const reviewBundleSchema = z.object({
   ),
   changes: pageSchema(changeSchema),
   evidence: pageSchema(
-    z.object({
+    z.strictObject({
       id: z.string(),
       title: z.string(),
       source: z.string(),
@@ -227,10 +227,10 @@ export const reviewBundleSchema = z.object({
       captured_at: z.iso.datetime(),
     }),
   ),
-  graph: z.object({
+  graph: z.strictObject({
     nodes: pageSchema(graphNodeSchema),
     edges: pageSchema(
-      z.object({
+      z.strictObject({
         id: z.string(),
         source: z.string(),
         target: z.string(),
@@ -241,7 +241,7 @@ export const reviewBundleSchema = z.object({
     ),
   }),
   commits: pageSchema(
-    z.object({
+    z.strictObject({
       sha: z.string(),
       subject: z.string(),
       author: z.string(),
@@ -250,7 +250,7 @@ export const reviewBundleSchema = z.object({
     }),
   ),
   activity: pageSchema(
-    z.object({
+    z.strictObject({
       id: z.string(),
       actor: z.string(),
       action: z.string(),
@@ -259,9 +259,9 @@ export const reviewBundleSchema = z.object({
       tone: z.enum(["neutral", "positive", "warning"]),
     }),
   ),
-  retrieval: z.object({
+  retrieval: z.strictObject({
     search: pageSchema(
-      z.object({
+      z.strictObject({
         id: z.string(),
         title: z.string(),
         kind: z.string(),
@@ -270,7 +270,7 @@ export const reviewBundleSchema = z.object({
       }),
     ),
     recall: pageSchema(
-      z.object({
+      z.strictObject({
         id: z.string(),
         score: z.number(),
         content: z.string(),
@@ -278,7 +278,7 @@ export const reviewBundleSchema = z.object({
       }),
     ),
     traversal: pageSchema(
-      z.object({
+      z.strictObject({
         depth: z.number().int().nonnegative(),
         id: z.string(),
         name: z.string(),
