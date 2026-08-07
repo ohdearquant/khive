@@ -139,9 +139,11 @@ upper bound, not as the normal trigger.
 
 The consequences of the waiting clause, all of which follow from it directly:
 
-- **Durability is unchanged at the moment of return.** A row that is committed today before the
-  dispatch returns is still committed before the dispatch returns. INV-4 holds by construction
-  rather than by assertion.
+- **Store visibility is unchanged at the moment of return.** A row that is committed today before
+  the dispatch returns is still committed before the dispatch returns. INV-4 holds by construction
+  rather than by assertion. "Committed" here is write-path store visibility under the store's
+  configured posture; whether a committed row survives an OS crash is the store's durability
+  posture, which is ADR-134's subject, not this clause's.
 - **Acquisitions stop scaling with request rate.** Under concurrency the acquisition rate is
   bounded by one per commit cycle instead of one per dispatch. This is the entire objective.
 - **Under contention this reduces latency rather than adding it.** Today each dispatch queues for
@@ -252,8 +254,17 @@ repeated work while believing it was preventing duplication.
 
 ### D1b — This is intra-process group commit, and the scope is load-bearing
 
-The batching in D1 is one daemon process committing, on **one connection**, rows produced by the
-many concurrent dispatches it is serving. Those dispatches are tasks inside one process, so
+**Lane note (ADR-134 D2a).** "One connection" describes the mechanism's scope, not a global
+count: once ADR-134's posture target lands, obligation-bearing rows commit on a second,
+pool-owned connection running a durable-sync posture, and this shared connection carries pure
+observability rows only. Lane selection rides D1's classification at enqueue, so a batch on
+either connection is single-lane by construction — a mixed batch on the shared writer would
+bypass ADR-134's durability guarantee while passing every invariant here, which is why the
+split is stated in both records. Each lane runs this same group-commit mechanism on its own
+connection.
+
+The batching in D1 is one daemon process committing, on **one connection per lane**, rows
+produced by the many concurrent dispatches it is serving. Those dispatches are tasks inside one process, so
 sharing a transaction between them is ordinary intra-process group commit and it is available.
 
 It is **not** group commit across client processes. SQLite has no cross-process commit
