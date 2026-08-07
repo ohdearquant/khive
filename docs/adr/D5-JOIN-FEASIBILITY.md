@@ -24,9 +24,9 @@ marked `origin: "derived"` with derivation method
 `changed_path_source_path_exact`; neither source database is represented as
 having ingested that edge.
 
-| Repository | Language | Files | Derived keys | Entity keys | Matched | Resolution |
-| --- | --- | ---: | ---: | ---: | ---: | ---: |
-| `ohdearquant/khive` | Rust | 658 | 658 | 658 | 658 | 100.0% |
+| Repository          | Language | Files | Derived keys | Entity keys | Matched | Resolution |
+| ------------------- | -------- | ----: | -----------: | ----------: | ------: | ---------: |
+| `ohdearquant/khive` | Rust     |   658 |          658 |         658 |     658 |     100.0% |
 
 Current-snapshot path residuals: none. Current-snapshot entity residuals: none.
 The checked-out corpus also contains 86 tracked TypeScript/TSX files and 57
@@ -39,9 +39,9 @@ zero rate.
 Applying the earlier proposed path-to-module table literally to the same 658
 tracked Rust files produces a different result:
 
-| Repository | Language | Files | Derived keys | Entity keys | Matched | Resolution |
-| --- | --- | ---: | ---: | ---: | ---: | ---: |
-| `ohdearquant/khive` | Rust | 658 | 656 | 658 | 654 | 99.4% |
+| Repository          | Language | Files | Derived keys | Entity keys | Matched | Resolution |
+| ------------------- | -------- | ----: | -----------: | ----------: | ------: | ---------: |
+| `ohdearquant/khive` | Rust     |   658 |          656 |         658 |     654 |      99.4% |
 
 The residuals are:
 
@@ -89,8 +89,8 @@ history. Deleted and renamed Rust paths therefore remain legitimate historical
 residuals rather than current-map failures.
 
 | Changed paths | Rust in scope | Matched Rust events | Out of scope | Unresolved Rust events |
-| ---: | ---: | ---: | ---: | ---: |
-| 7,558 | 4,344 | 4,309 | 3,214 | 35 |
+| ------------: | ------------: | ------------------: | -----------: | ---------------------: |
+|         7,558 |         4,344 |               4,309 |        3,214 |                     35 |
 
 All 4,309 emitted commit-to-module edges use the exact-path derived provenance.
 The 35 unresolved events are retained in the bundle with their commit SHA and
