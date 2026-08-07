@@ -25,9 +25,10 @@ from tune.grid_search import (
     write_results,
 )
 
-# Bare verb name, matching both the sibling modules' convention and the call
-# this suite actually asserts at the RecordingSession call site.
-VERBS_UNDER_TEST = {"recall"}
+# Dotted pack.verb form: `memory.recall` is the product wire verb (the bare
+# `recall` name is not on the memory pack's dispatch surface), matching the
+# sibling corpus contract's declaration and the name the live harness sends.
+VERBS_UNDER_TEST = {"memory.recall"}
 
 
 class RecordingSession:
@@ -88,4 +89,4 @@ def test_runtime_default_baseline_omits_request_config() -> None:
     )
 
     assert metrics["recall_at_10"] == 0.0
-    assert session.calls == [("recall", {"query": "runtime default", "limit": 10})]
+    assert session.calls == [("memory.recall", {"query": "runtime default", "limit": 10})]

@@ -140,7 +140,7 @@ def setup_session(
         if mem.get("tags"):
             args["tags"] = mem["tags"]
 
-        result = session.verb("remember", args)
+        result = session.verb("memory.remember", args)
         note_id = result["id"] if result else None
         if not note_id:
             raise RuntimeError(f"remember() returned no id for memory {i}: {result!r}")
@@ -235,7 +235,7 @@ def evaluate_config(
             args: dict[str, Any] = {"query": query, "limit": limit}
             if config_dict is not None:
                 args["config"] = config_dict
-            hits = session.verb("recall", args)
+            hits = session.verb("memory.recall", args)
         except Exception:
             hits = []
         latency_ms = (time.perf_counter() - t0) * 1000.0
