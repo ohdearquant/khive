@@ -152,6 +152,7 @@ The same head-binding governs review: a verdict authorizes only the exact commit
 | [ADR-143](ADR-143-store-held-caller-grants.md)                          | Store-held caller grants and hierarchical subactor identity                                                |
 | [ADR-144](ADR-144-memory-write-visibility-fence.md)                     | Operation-Level Write-Visibility Fence for Memory Recall                                                   |
 | [ADR-145](ADR-145-local-first-kg-workbench.md)                          | Local-First KG Workbench — GitHub-Backed Semantic Review                                                   |
+| [ADR-146](ADR-146-forge-native-kg-review.md)                            | Forge-Native KG Review — Pull Requests and Issues as the Collaboration Surface                             |
 
 <!-- END GENERATED ADR CATALOG -->
 
