@@ -390,6 +390,10 @@ async fn delivered_rejects_short_or_malformed_ids() {
             error.to_string().contains("full outbound UUID"),
             "error must explain the stable correlation requirement: {error}"
         );
+        assert!(
+            error.to_string().contains("scoped resolution"),
+            "error must explain why a display prefix is insufficient: {error}"
+        );
     }
 }
 
@@ -3499,6 +3503,69 @@ async fn send_rejects_malformed_thread_id() {
     );
 }
 
+#[tokio::test]
+async fn send_rejects_thread_prefix_with_resolution_consequence() {
+    let (registry, _rt) = build_registry_for_ns("local");
+    let err = registry
+        .dispatch(
+            "comm.send",
+            serde_json::json!({ "to": "local", "content": "hi", "thread_id": "deadbeef" }),
+        )
+        .await
+        .expect_err("thread prefixes are not stable roots");
+    let message = err.to_string();
+
+    assert!(message.contains("scoped resolution"), "{message}");
+    assert!(message.contains("explicit stable reference"), "{message}");
+}
+
+/// `comm.send` reports the persisted thread root so a continuation send can
+/// reuse it without fetching the message first (#1482). A root send reports
+/// the note's own UUID; a continuation send echoes the caller-supplied root.
+#[tokio::test]
+async fn send_response_thread_id_round_trips_root_and_continuation() {
+    let (registry, _rt) = build_registry_for_ns("local");
+
+    let root = registry
+        .dispatch(
+            "comm.send",
+            serde_json::json!({ "to": "local", "content": "root message" }),
+        )
+        .await
+        .expect("root send succeeds");
+    assert_eq!(
+        root["thread_id"], root["full_id"],
+        "a root send must report its own UUID as the thread root: {root}"
+    );
+    assert_eq!(
+        root["thread_id"].as_str().map(str::len),
+        Some(36),
+        "the reported root thread_id must be a full canonical UUID: {root}"
+    );
+
+    let supplied = root["thread_id"].as_str().unwrap();
+    let continuation = registry
+        .dispatch(
+            "comm.send",
+            serde_json::json!({
+                "to": "local",
+                "content": "continuation",
+                "thread_id": supplied,
+            }),
+        )
+        .await
+        .expect("continuation send succeeds");
+    assert_eq!(
+        continuation["thread_id"], supplied,
+        "a continuation send must echo the caller-supplied thread root so the \
+         caller can keep the thread going: {continuation}"
+    );
+    assert_ne!(
+        continuation["thread_id"], continuation["full_id"],
+        "the continuation note must not be reported as its own thread root: {continuation}"
+    );
+}
+
 /// send with a UUID-shaped but unresolvable thread_id must fail closed (issue
 /// #1673): the error names the unresolvable id and no message row is persisted.
 #[tokio::test]
@@ -5420,6 +5487,412 @@ async fn ingest_and_get_props(
         .expect("get_note ok")
         .expect("note exists");
     note.properties.expect("note has properties")
+}
+
+#[tokio::test]
+async fn ingest_dedup_returns_existing_canonical_thread_id() {
+    let (registry, _rt) = build_registry_for_ns("local");
+    let original_thread = uuid::Uuid::new_v4();
+    let competing_thread = uuid::Uuid::new_v4();
+    let external_id = format!("roundtrip-dedup-{original_thread}");
+
+    let first = registry
+        .dispatch(
+            "comm.ingest",
+            serde_json::json!({
+                "from": "external:sender",
+                "to": "local",
+                "content": "first delivery",
+                "external_id": external_id,
+                "thread_id": original_thread.simple().to_string(),
+            }),
+        )
+        .await
+        .expect("first ingest");
+    assert_eq!(
+        first["thread_id"],
+        original_thread.as_hyphenated().to_string()
+    );
+
+    let duplicate = registry
+        .dispatch(
+            "comm.ingest",
+            serde_json::json!({
+                "from": "external:sender",
+                "to": "local",
+                "content": "retry with a different proposed root",
+                "external_id": external_id,
+                "thread_id": competing_thread,
+            }),
+        )
+        .await
+        .expect("duplicate ingest is an acknowledged no-op");
+
+    assert_eq!(duplicate["deduplicated"], true);
+    assert_eq!(
+        duplicate["thread_id"],
+        original_thread.as_hyphenated().to_string(),
+        "the acknowledgement must identify the persisted thread, not the retry's proposed root"
+    );
+    assert_eq!(duplicate["thread_id"].as_str().unwrap().len(), 36);
+    assert!(
+        duplicate.get("thread_id_canonical").is_none(),
+        "a UUID-valued stored thread_id must not carry the non-canonical flag: {duplicate:?}"
+    );
+}
+
+/// Dedup ack for a legacy row whose stored thread_id is a non-UUID label must
+/// echo the literal stored value — not fabricate the duplicate's note UUID
+/// (which would route a caller into a DIFFERENT thread on a later send).
+#[tokio::test]
+async fn ingest_dedup_echoes_stored_non_uuid_thread_label() {
+    let (registry, rt) = build_registry_for_ns("local");
+    let external_id = format!("legacy-label-dedup-{}", uuid::Uuid::new_v4());
+
+    let token = rt
+        .authorize(khive_runtime::Namespace::local())
+        .expect("authorize local");
+    let created = rt
+        .try_create_note(
+            &token,
+            "message",
+            None,
+            "legacy row with a non-UUID thread label",
+            Some(serde_json::json!({
+                "external_id": external_id,
+                "thread_id": "legacy-thread-label",
+                "direction": "inbound",
+            })),
+        )
+        .await
+        .expect("seed write")
+        .expect("seed insert must not be deduplicated");
+    assert_ne!(
+        created.id.as_hyphenated().to_string(),
+        "legacy-thread-label"
+    );
+
+    let duplicate = registry
+        .dispatch(
+            "comm.ingest",
+            serde_json::json!({
+                "from": "external:sender",
+                "to": "local",
+                "content": "retry of the legacy row",
+                "external_id": external_id,
+            }),
+        )
+        .await
+        .expect("duplicate ingest is an acknowledged no-op");
+
+    assert_eq!(duplicate["deduplicated"], true);
+    assert_eq!(
+        duplicate["thread_id"], "legacy-thread-label",
+        "ack must echo the literal stored thread_id, not the note UUID"
+    );
+    assert!(
+        duplicate.get("thread_id_warning").is_none(),
+        "no warning when a stored thread_id is present: {duplicate:?}"
+    );
+    assert_eq!(
+        duplicate["thread_id_canonical"], false,
+        "a non-UUID stored thread_id must be flagged non-canonical: {duplicate:?}"
+    );
+}
+
+/// Dedup ack for a legacy row with NO stored thread_id falls back to the
+/// duplicate's note UUID as thread root (#479b) and flags the derivation.
+#[tokio::test]
+async fn ingest_dedup_without_stored_thread_id_falls_back_with_warning() {
+    let (registry, rt) = build_registry_for_ns("local");
+    let external_id = format!("no-thread-dedup-{}", uuid::Uuid::new_v4());
+
+    let token = rt
+        .authorize(khive_runtime::Namespace::local())
+        .expect("authorize local");
+    let created = rt
+        .try_create_note(
+            &token,
+            "message",
+            None,
+            "legacy row with no thread_id property",
+            Some(serde_json::json!({
+                "external_id": external_id,
+                "direction": "inbound",
+            })),
+        )
+        .await
+        .expect("seed write")
+        .expect("seed insert must not be deduplicated");
+
+    let duplicate = registry
+        .dispatch(
+            "comm.ingest",
+            serde_json::json!({
+                "from": "external:sender",
+                "to": "local",
+                "content": "retry of the threadless legacy row",
+                "external_id": external_id,
+            }),
+        )
+        .await
+        .expect("duplicate ingest is an acknowledged no-op");
+
+    assert_eq!(duplicate["deduplicated"], true);
+    assert_eq!(
+        duplicate["thread_id"],
+        created.id.as_hyphenated().to_string(),
+        "with no stored thread_id the note UUID is the only honest thread root"
+    );
+    assert!(
+        duplicate["thread_id_warning"].as_str().is_some(),
+        "fallback must be flagged as derived, not stored: {duplicate:?}"
+    );
+    assert!(
+        duplicate.get("thread_id_canonical").is_none(),
+        "the derived note-UUID fallback is a parseable UUID and must not carry the \
+         non-canonical flag: {duplicate:?}"
+    );
+}
+
+// ── list(kind=message) thread filter: legacy all-hex labels vs. UUID prefixes ──
+
+/// Regression (PR #1623 round 2): an all-hex >=8-char stored thread label
+/// that is NOT a UUID (e.g. "deadbeef") must still be matched exactly — the
+/// UUID-prefix arm in the resolver must not swallow it and error "no message
+/// thread matches prefix". A genuine UUID prefix must still resolve.
+#[tokio::test]
+async fn list_message_thread_filter_matches_legacy_hex_label_and_uuid_prefix() {
+    let (registry, rt) = build_registry_for_ns("local");
+    let token = rt
+        .authorize(khive_runtime::Namespace::local())
+        .expect("authorize local");
+
+    // Legacy row: an all-hex, 8-char, non-UUID thread label stored verbatim.
+    rt.create_note(
+        &token,
+        "message",
+        None,
+        "legacy hex-labeled message",
+        None,
+        Some(serde_json::json!({"thread_id": "deadbeef"})),
+        vec![],
+    )
+    .await
+    .expect("create legacy hex-labeled message");
+
+    // Arm 1: the legacy all-hex label must resolve exactly, not error as an
+    // unmatched UUID prefix.
+    let legacy = registry
+        .dispatch(
+            "list",
+            serde_json::json!({"kind": "message", "thread_id": "deadbeef"}),
+        )
+        .await
+        .expect("legacy all-hex label must match exactly, not error");
+    let legacy = legacy.as_array().expect("list result array");
+    assert_eq!(
+        legacy.len(),
+        1,
+        "exact stored legacy label must return its message"
+    );
+    assert_eq!(legacy[0]["properties"]["thread_id"], "deadbeef");
+
+    // Arm 2: a genuine UUID prefix must still resolve to its thread.
+    let thread = "bbbbcccc-1111-2222-3333-444455556666";
+    rt.create_note(
+        &token,
+        "message",
+        None,
+        "uuid-threaded message",
+        None,
+        Some(serde_json::json!({"thread_id": thread})),
+        vec![],
+    )
+    .await
+    .expect("create uuid-threaded message");
+
+    let prefixed = registry
+        .dispatch(
+            "list",
+            serde_json::json!({"kind": "message", "thread_id": "bbbbcccc"}),
+        )
+        .await
+        .expect("genuine UUID prefix must still resolve");
+    let prefixed = prefixed.as_array().expect("list result array");
+    assert_eq!(
+        prefixed.len(),
+        1,
+        "UUID prefix must return exactly its thread's message"
+    );
+    assert_eq!(prefixed[0]["properties"]["thread_id"], thread);
+}
+
+/// Regression (PR #1623 round 3): the thread-prefix resolver must scan ONLY
+/// `message` notes. A non-message note carrying a `thread_id` property that
+/// shares the queried prefix must not inject a second candidate (which would
+/// surface as a false "ambiguous thread_id prefix" error) when the caller
+/// lists with the substrate-level kind that leaves the note kind unbound.
+#[tokio::test]
+async fn list_thread_prefix_resolution_ignores_non_message_notes() {
+    let (registry, rt) = build_registry_for_ns("local");
+    let token = rt
+        .authorize(khive_runtime::Namespace::local())
+        .expect("authorize local");
+
+    let message_thread = "aaaa0000-1111-4000-8000-000000000001";
+    rt.create_note(
+        &token,
+        "message",
+        None,
+        "uuid-threaded message",
+        None,
+        Some(serde_json::json!({"thread_id": message_thread})),
+        vec![],
+    )
+    .await
+    .expect("create uuid-threaded message");
+
+    // Decoy: a non-message note carrying a thread_id whose first 8 hex chars
+    // collide with the message thread's prefix.
+    rt.create_note(
+        &token,
+        "observation",
+        None,
+        "non-message note with a colliding thread_id",
+        None,
+        Some(serde_json::json!({"thread_id": "aaaa0000-9999-4000-8000-000000000002"})),
+        vec![],
+    )
+    .await
+    .expect("create decoy observation");
+
+    // list(kind="note") leaves the note-kind filter unbound, so pre-fix the
+    // DISTINCT scan saw both UUIDs and errored "ambiguous thread_id prefix".
+    let result = registry
+        .dispatch(
+            "list",
+            serde_json::json!({"kind": "note", "thread_id": "aaaa0000"}),
+        )
+        .await
+        .expect("prefix resolution must ignore non-message notes");
+    let notes = result.as_array().expect("list result array");
+    assert_eq!(
+        notes.len(),
+        1,
+        "only the message carrying the resolved thread must match: {notes:?}"
+    );
+    assert_eq!(notes[0]["kind"], "message");
+    assert_eq!(notes[0]["properties"]["thread_id"], message_thread);
+}
+
+/// Regression (PR #1623 round 4): thread-prefix resolution must use the SAME
+/// visibility scope as the list read (`['local'] ∪ visible_namespaces`). A
+/// thread stored only in a configured visible namespace is returned by the
+/// list path, so its prefix must resolve rather than error "no message
+/// thread matches".
+#[tokio::test]
+async fn list_thread_prefix_resolves_across_configured_visible_namespaces() {
+    let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+    let team_ns = khive_runtime::Namespace::parse("thread-team-ns").expect("valid namespace");
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(khive_pack_kg::KgPack::new(runtime.clone()));
+    builder.register(CommPack::new(runtime.clone()));
+    builder.with_default_namespace("local");
+    builder.with_visible_namespaces(vec![team_ns.clone()]);
+    let registry = builder.build().expect("registry builds");
+
+    let team_token = runtime.authorize(team_ns).expect("authorize team ns");
+    let thread = "ccccdddd-1111-4000-8000-000000000001";
+    runtime
+        .create_note(
+            &team_token,
+            "message",
+            None,
+            "visible-namespace threaded message",
+            None,
+            Some(serde_json::json!({"thread_id": thread})),
+            vec![],
+        )
+        .await
+        .expect("create message in visible namespace");
+
+    let result = registry
+        .dispatch(
+            "list",
+            serde_json::json!({"kind": "message", "thread_id": "ccccdddd"}),
+        )
+        .await
+        .expect("a prefix of a thread in a visible namespace must resolve");
+    let messages = result.as_array().expect("list result array");
+    assert_eq!(
+        messages.len(),
+        1,
+        "the visible-namespace thread's message must be returned: {messages:?}"
+    );
+    assert_eq!(messages[0]["properties"]["thread_id"], thread);
+}
+
+/// Regression (PR #1623 round 4): when the same prefix matches two DIFFERENT
+/// thread UUIDs — one in the primary namespace, one in a configured visible
+/// namespace — the resolver must report the ambiguity instead of silently
+/// resolving to the primary row and omitting the visible one.
+#[tokio::test]
+async fn list_thread_prefix_collision_across_visible_namespaces_is_ambiguous() {
+    let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+    let team_ns = khive_runtime::Namespace::parse("thread-collide-ns").expect("valid namespace");
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(khive_pack_kg::KgPack::new(runtime.clone()));
+    builder.register(CommPack::new(runtime.clone()));
+    builder.with_default_namespace("local");
+    builder.with_visible_namespaces(vec![team_ns.clone()]);
+    let registry = builder.build().expect("registry builds");
+
+    let local_token = runtime
+        .authorize(khive_runtime::Namespace::local())
+        .expect("authorize local");
+    runtime
+        .create_note(
+            &local_token,
+            "message",
+            None,
+            "primary-namespace thread",
+            None,
+            Some(serde_json::json!({"thread_id": "eeeeffff-1111-4000-8000-000000000001"})),
+            vec![],
+        )
+        .await
+        .expect("create primary-namespace message");
+    let team_token = runtime.authorize(team_ns).expect("authorize team ns");
+    runtime
+        .create_note(
+            &team_token,
+            "message",
+            None,
+            "visible-namespace thread sharing the prefix",
+            None,
+            Some(serde_json::json!({"thread_id": "eeeeffff-2222-4000-8000-000000000002"})),
+            vec![],
+        )
+        .await
+        .expect("create visible-namespace message");
+
+    let error = registry
+        .dispatch(
+            "list",
+            serde_json::json!({"kind": "message", "thread_id": "eeeeffff"}),
+        )
+        .await
+        .expect_err("a cross-namespace prefix collision must be reported, not silently resolved");
+    let message = error.to_string();
+    assert!(
+        message.contains("ambiguous thread_id prefix"),
+        "unexpected error: {message}"
+    );
+    assert!(
+        message.contains("visible"),
+        "the error must name the visibility scope it searched: {message}"
+    );
 }
 
 /// (a) Reply with correlation matching an outbound note whose from_actor=lambda:khive

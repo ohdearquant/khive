@@ -254,7 +254,9 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
                 name: "target_id",
                 param_type: "uuid",
                 required: true,
-                description: "UUID of the memory note or entity the feedback applies to.",
+                description: "Complete UUID or globally unique 8+ hex prefix of the memory note \
+                              or entity the feedback applies to. Prefix resolution is \
+                              namespace-unfiltered under ADR-007.",
             },
             khive_types::ParamDef {
                 name: "signal",
@@ -599,7 +601,9 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
                 name: "target_id",
                 param_type: "uuid",
                 required: true,
-                description: "UUID of the record the feedback applies to.",
+                description: "Complete UUID or globally unique 8+ hex prefix of the record the \
+                              feedback applies to. Prefix resolution is namespace-unfiltered \
+                              under ADR-007.",
             },
             khive_types::ParamDef {
                 name: "signal",

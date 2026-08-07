@@ -25,6 +25,18 @@ fn properties_obj(args: &Value) -> Result<&serde_json::Map<String, Value>, Runti
         })
 }
 
+fn properties_obj_mut(
+    args: &mut Value,
+) -> Result<&mut serde_json::Map<String, Value>, RuntimeError> {
+    args.get_mut("properties")
+        .and_then(Value::as_object_mut)
+        .ok_or_else(|| {
+            RuntimeError::InvalidInput(
+                "kind=commit|issue|pull_request requires a `properties` object".into(),
+            )
+        })
+}
+
 /// `KindHook` for the immutable `commit` note kind.
 ///
 /// Validates `properties.sha` (required, 40-hex) and, when present,
@@ -117,7 +129,7 @@ impl KindHook for IssueLikeHook {
         _runtime: &KhiveRuntime,
         args: &mut Value,
     ) -> Result<(), RuntimeError> {
-        let props = properties_obj(args)?;
+        let props = properties_obj_mut(args)?;
 
         let number = props.get("number").ok_or_else(|| {
             RuntimeError::InvalidInput(format!("{} requires properties.number", self.kind))
@@ -135,12 +147,14 @@ impl KindHook for IssueLikeHook {
             .ok_or_else(|| {
                 RuntimeError::InvalidInput(format!("{} requires properties.project_id", self.kind))
             })?;
-        if Uuid::parse_str(project_id).is_err() {
-            return Err(RuntimeError::InvalidInput(format!(
-                "{} properties.project_id {project_id:?} must be a UUID",
+        let project_uuid = Uuid::parse_str(project_id).map_err(|error| {
+            RuntimeError::InvalidInput(format!(
+                "{} properties.project_id must be a full UUID because short-prefix \
+                 resolution can miss or be ambiguous, while provenance must identify one \
+                 exact project; got {project_id:?}: {error}",
                 self.kind
-            )));
-        }
+            ))
+        })?;
 
         if let Some(reason) = props.get("state_reason").and_then(Value::as_str) {
             // The raw value is never interpolated into this error: it is
@@ -159,6 +173,11 @@ impl KindHook for IssueLikeHook {
                 )));
             }
         }
+
+        props.insert(
+            "project_id".to_string(),
+            Value::String(project_uuid.as_hyphenated().to_string()),
+        );
 
         Ok(())
     }

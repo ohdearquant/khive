@@ -540,6 +540,16 @@ pub(crate) fn parse_event_kind(raw: &str) -> Result<EventKind, RuntimeError> {
         .map_err(|e| RuntimeError::InvalidInput(format!("unknown event_kind {raw:?}: {e}")))
 }
 
+fn parse_exact_event_filter_id(field: &str, raw: &str) -> Result<Uuid, RuntimeError> {
+    Uuid::from_str(raw).map_err(|error| {
+        RuntimeError::InvalidInput(format!(
+            "list: {field} must contain a full UUID because a short-prefix resolution can miss \
+             or be ambiguous, while an event filter must identify the exact stable record; \
+             got {raw:?}: {error}"
+        ))
+    })
+}
+
 pub(crate) fn event_filter_from_params(
     p: &ListParams,
 ) -> Result<(EventFilter, Option<EventOutcome>), RuntimeError> {
@@ -571,10 +581,7 @@ pub(crate) fn event_filter_from_params(
     let session_id = p
         .session_id
         .as_deref()
-        .map(|s| {
-            Uuid::from_str(s)
-                .map_err(|e| RuntimeError::InvalidInput(format!("invalid session_id {s:?}: {e}")))
-        })
+        .map(|s| parse_exact_event_filter_id("session_id", s))
         .transpose()?;
 
     let observed = p
@@ -582,10 +589,7 @@ pub(crate) fn event_filter_from_params(
         .as_deref()
         .unwrap_or(&[])
         .iter()
-        .map(|s| {
-            Uuid::from_str(s)
-                .map_err(|e| RuntimeError::InvalidInput(format!("invalid observed id {s:?}: {e}")))
-        })
+        .map(|s| parse_exact_event_filter_id("observed", s))
         .collect::<Result<Vec<_>, _>>()?;
 
     let selected = p
@@ -593,10 +597,7 @@ pub(crate) fn event_filter_from_params(
         .as_deref()
         .unwrap_or(&[])
         .iter()
-        .map(|s| {
-            Uuid::from_str(s)
-                .map_err(|e| RuntimeError::InvalidInput(format!("invalid selected id {s:?}: {e}")))
-        })
+        .map(|s| parse_exact_event_filter_id("selected", s))
         .collect::<Result<Vec<_>, _>>()?;
 
     Ok((

@@ -1810,6 +1810,72 @@ async fn issue_hook_rejects_ungoverned_state_reason() {
     );
 }
 
+#[tokio::test]
+async fn issue_hook_requires_exact_project_id_and_canonicalizes_complete_spelling() {
+    let (rt, token, registry) = fixture().await;
+    let project_id = create(
+        &registry,
+        json!({"kind": "project", "name": "roundtrip-hook-repo"}),
+    )
+    .await;
+
+    let created = registry
+        .dispatch(
+            "create",
+            json!({
+                "kind": "issue",
+                "content": "canonical project anchor",
+                "properties": {
+                    "number": 1482,
+                    "project_id": format!("{{{}}}", project_id),
+                },
+            }),
+        )
+        .await
+        .expect("complete alternate UUID spelling is accepted");
+    let issue_id = created["id"]
+        .as_str()
+        .expect("created issue id")
+        .parse::<Uuid>()
+        .expect("created issue UUID");
+    let stored = rt
+        .notes(&token)
+        .expect("notes store")
+        .get_note(issue_id)
+        .await
+        .expect("read issue")
+        .expect("issue exists");
+    let canonical_project_id = project_id.as_hyphenated().to_string();
+    assert_eq!(
+        stored
+            .properties
+            .as_ref()
+            .and_then(|properties| properties.get("project_id"))
+            .and_then(Value::as_str),
+        Some(canonical_project_id.as_str()),
+        "the persisted strict provenance handle is canonical lowercase dashed form"
+    );
+
+    let project_prefix = project_id.to_string()[..8].to_string();
+    let error = registry
+        .dispatch(
+            "create",
+            json!({
+                "kind": "pull_request",
+                "content": "prefix is not an exact project anchor",
+                "properties": {
+                    "number": 1483,
+                    "project_id": project_prefix,
+                },
+            }),
+        )
+        .await
+        .expect_err("project prefix must be rejected");
+    let message = error.to_string();
+    assert!(message.contains("can miss or be ambiguous"), "{message}");
+    assert!(message.contains("one exact project"), "{message}");
+}
+
 /// Before this fix, the masking boundary only
 /// lowercased `stateReason` -- validation against the governed enum was left
 /// entirely to `IssueLikeHook::prepare_create`, whose error interpolated the

@@ -168,9 +168,10 @@
 ### Verb Response Presentation (ADR-045)
 
 - `micros_to_iso` is the single conversion point from internal `i64` microsecond timestamps to ISO-8601
-- `Agent` mode: short UUIDs (8-char), relative timestamps within 24h, lifecycle nulls preserved, scores truncated to 3 sig-figs
+- `Agent` mode: short UUIDs (8-char) except strict round-trip fields, relative timestamps within 24h, lifecycle nulls preserved, scores truncated to 3 sig-figs
 - `Human` mode at the MCP layer is identical to `Verbose`; terminal formatting is applied by the CLI layer
-- `full_id` is explicitly excluded from UUID shortening in Agent mode to preserve chaining handles
+- `full_id`, `context_entity_id`, `thread_id`, `outbound_ref`, `parent_id`, `session_id`, and `project_id` are explicitly excluded from UUID shortening in Agent mode to preserve strict chaining, correlation, ancestry, filtering, and provenance handles
+- `memory.feedback` and `comm.delivered` are `AlwaysVerbose` because their generic `target_id` / `id` fields are exact strict-verb inputs
 
 ### Stable Edge Identity (ADR-020)
 

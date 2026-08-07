@@ -391,6 +391,24 @@ const LIFECYCLE_NULL_PRESERVE: &[&str] = &[
 /// `parse_due` already normalizes to full RFC 3339.
 const PAYLOAD_TIMESTAMP_FIELDS: &[&str] = &["trigger_at", "due"];
 
+/// UUID fields whose canonical value is itself a strict-verb input.
+///
+/// Shortening these would make a successful response fail when submitted back
+/// to the verb that produced or consumes it. `context_entity_id` and
+/// `thread_id` are explicit stable references rather than prefix searches;
+/// `outbound_ref` is the exact correlation key consumed by `comm.delivered`;
+/// `parent_id` is the explicit ancestry reference consumed by `propose`;
+/// `session_id` is an exact event-list filter; and `project_id` is the exact
+/// provenance anchor required by git issue and pull-request creation.
+const ROUND_TRIP_FULL_UUID_FIELDS: &[&str] = &[
+    "context_entity_id",
+    "thread_id",
+    "outbound_ref",
+    "parent_id",
+    "session_id",
+    "project_id",
+];
+
 /// Score field names that are truncated to 3 significant figures in Agent mode.
 const SCORE_FIELDS: &[&str] = &[
     "score",
@@ -409,11 +427,11 @@ const UUID_CANONICAL_LEN: usize = 36;
 /// Agent mode. Content-like fields are intentionally excluded even when their
 /// value happens to be UUID-shaped.
 ///
-/// `full_id` is explicitly excluded: its purpose is to give callers a
-/// stable chaining handle, so shortening it makes it identical to `id` and
-/// defeats the field entirely.
+/// `full_id` and strict round-trip fields are explicitly excluded: their
+/// purpose is to give callers a stable chaining handle, so shortening them
+/// would produce a value that the corresponding strict verb rejects.
 fn should_shorten_uuid_field(key: &str) -> bool {
-    if key == "full_id" {
+    if key == "full_id" || ROUND_TRIP_FULL_UUID_FIELDS.contains(&key) {
         return false;
     }
     key == "id" || key.ends_with("_id") || matches!(key, "superseded_by" | "replaced_by")
@@ -1041,6 +1059,38 @@ mod tests {
         assert_eq!(out["note_id"], json!("a1b2c3d4"));
         assert_eq!(out["source_id"], json!("a1b2c3d4"));
         assert_eq!(out["target_id"], json!("a1b2c3d4"));
+    }
+
+    #[test]
+    fn agent_preserves_strict_round_trip_uuid_fields() {
+        let uuid = "a1b2c3d4-e5f6-7890-abcd-ef1234567890";
+        let out = agent(json!({
+            "context_entity_id": uuid,
+            "thread_id": uuid,
+            "session_id": uuid,
+            "project_id": uuid,
+            "properties": {
+                "context_entity_id": uuid,
+                "thread_id": uuid,
+                "outbound_ref": uuid,
+                "parent_id": uuid,
+                "session_id": uuid,
+                "project_id": uuid,
+            },
+            "parent_id": uuid,
+        }));
+
+        assert_eq!(out["context_entity_id"], json!(uuid));
+        assert_eq!(out["thread_id"], json!(uuid));
+        assert_eq!(out["session_id"], json!(uuid));
+        assert_eq!(out["project_id"], json!(uuid));
+        assert_eq!(out["properties"]["context_entity_id"], json!(uuid));
+        assert_eq!(out["properties"]["thread_id"], json!(uuid));
+        assert_eq!(out["properties"]["outbound_ref"], json!(uuid));
+        assert_eq!(out["properties"]["parent_id"], json!(uuid));
+        assert_eq!(out["properties"]["session_id"], json!(uuid));
+        assert_eq!(out["properties"]["project_id"], json!(uuid));
+        assert_eq!(out["parent_id"], json!(uuid));
     }
 
     // ── ADR-078: OutputFormat tests ───────────────────────────────────────────

@@ -424,6 +424,28 @@ async fn assign_rejects_malformed_context_entity_id() {
     );
 }
 
+#[tokio::test]
+async fn assign_rejects_context_prefix_with_resolution_consequence() {
+    let pack = pack(rt());
+    let err = pack
+        .dispatch(
+            "gtd.assign",
+            json!({"title": "ambiguous context", "context_entity_id": "deadbeef"}),
+        )
+        .await
+        .unwrap_err();
+
+    let msg = err.to_string();
+    assert!(
+        msg.contains("primary-namespace resolution"),
+        "error must explain what a short prefix means; got: {msg}"
+    );
+    assert!(
+        msg.contains("explicit stable entity reference"),
+        "error must explain why this field requires direct identity; got: {msg}"
+    );
+}
+
 // ---- #625/#626: gtd.assign / create(kind="note", note_kind="task") parity ----
 //
 // Both verbs now route through `task_create::prepare_task_create` and
