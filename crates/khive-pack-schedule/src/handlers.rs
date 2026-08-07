@@ -401,6 +401,11 @@ fn validate_conditional_requirements(
 
     match classify_create_kind(kind_str, registry)? {
         CreateKindClass::Entity { specific } => {
+            if args.contains_key("salience") {
+                return Err(RuntimeError::InvalidInput(
+                    "schedule.action: verb \"create\": salience is only valid for notes".into(),
+                ));
+            }
             if args.contains_key("external_id") {
                 return Err(RuntimeError::InvalidInput(
                     "schedule.action: verb \"create\": external_id is only valid for kind=note"
@@ -763,7 +768,8 @@ struct ScheduleBulkCreateEntryCheck {
     description: Option<Value>,
     properties: Option<Value>,
     tags: Option<Vec<String>>,
-    salience: Option<f64>,
+    #[serde(default, deserialize_with = "present_bulk_json_value")]
+    salience: Option<Value>,
     #[serde(default, deserialize_with = "present_bulk_json_value")]
     external_id: Option<Value>,
     #[serde(default, deserialize_with = "present_bulk_json_value")]
@@ -1034,7 +1040,14 @@ fn validate_create_bulk_items(
                         "schedule.action: verb \"create\": items[{idx}] note creation requires `content`"
                     )));
                 }
-                if let Some(salience) = entry.salience {
+                if let Some(salience_value) =
+                    entry.salience.as_ref().filter(|value| !value.is_null())
+                {
+                    let salience = salience_value.as_f64().ok_or_else(|| {
+                        RuntimeError::InvalidInput(format!(
+                            "schedule.action: verb \"create\": items[{idx}] salience must be a number"
+                        ))
+                    })?;
                     if !salience.is_finite() || !(0.0..=1.0).contains(&salience) {
                         return Err(RuntimeError::InvalidInput(format!(
                             "schedule.action: verb \"create\": items[{idx}] salience must be a finite value in [0.0, 1.0]"

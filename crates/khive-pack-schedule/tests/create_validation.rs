@@ -1758,7 +1758,9 @@ async fn schedule_and_live_bulk_accept_loaded_task_hook_fields() {
 
     for action in [
         r#"create(kind="task", title="derived salience", salience=0.9)"#,
+        r#"create(kind="task", title="derived salience", salience=null)"#,
         r#"create(items=[{"kind":"task","title":"derived salience","salience":0.9}])"#,
+        r#"create(items=[{"kind":"task","title":"derived salience","salience":null}])"#,
     ] {
         let error = registry
             .dispatch(
@@ -1771,6 +1773,38 @@ async fn schedule_and_live_bulk_accept_loaded_task_hook_fields() {
             .to_string()
             .contains("salience is derived from priority"));
     }
+
+    for action in [
+        r#"create(kind="concept", name="entity salience", salience=null)"#,
+        r#"create(items=[{"kind":"concept","name":"entity salience","salience":null}])"#,
+    ] {
+        let error = registry
+            .dispatch(
+                "schedule.schedule",
+                serde_json::json!({"action": action, "at": "2099-06-01T10:00:00Z"}),
+            )
+            .await
+            .expect_err("entity salience fails before replay is stored");
+        assert!(error.to_string().contains("salience"));
+    }
+
+    let ordinary_null_action = r#"create(items=[{"kind":"observation","content":"null salience is absence","salience":null}])"#;
+    registry
+        .dispatch(
+            "schedule.schedule",
+            serde_json::json!({"action": ordinary_null_action, "at": "2099-06-01T10:00:00Z"}),
+        )
+        .await
+        .expect("ordinary-note null salience remains schedulable");
+    let ordinary_null_live = registry
+        .dispatch(
+            "create",
+            serde_json::json!({"items": [{"kind": "observation", "content": "null salience is absence", "salience": null}]}),
+        )
+        .await
+        .expect("ordinary-note null salience remains live-dispatchable");
+    assert_eq!(ordinary_null_live["created"], 1);
+    assert_eq!(ordinary_null_live["failed"], 0);
 
     for action in [
         r#"create(kind="task", title="bad dependencies", depends_on=42)"#,

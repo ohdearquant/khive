@@ -907,6 +907,11 @@ impl KgPack {
             || (matches!(&spec, KindSpec::Note { .. })
                 && sub_kind.as_deref() == Some("finding")
                 && hook.is_some());
+        if matches!(&spec, KindSpec::Entity { .. }) && params.get("salience").is_some() {
+            return Err(RuntimeError::InvalidInput(
+                "salience is only valid for notes".into(),
+            ));
+        }
         if task_hook && params.get("salience").is_some() {
             return Err(RuntimeError::InvalidInput(
                 "task salience is derived from priority; use priority instead".into(),

@@ -544,27 +544,61 @@ async fn task_singleton_and_bulk_share_hook_fields_and_context_edges() {
         .to_string()
         .contains("priority must be a string"));
 
-    let invalid_salience = pack
+    for salience in [json!(0.9), Value::Null] {
+        let invalid_salience = pack
+            .dispatch(
+                "create",
+                json!({"items": [{"kind": "task", "title": "derived salience", "salience": salience.clone()}]}),
+            )
+            .await
+            .expect("best-effort bulk reports task salience conflicts in-band");
+        assert_eq!(invalid_salience["failed"], 1);
+        assert!(invalid_salience["results"][0]["error"]
+            .as_str()
+            .is_some_and(|message| message.contains("salience is derived from priority")));
+        let singleton_salience_error = pack
+            .dispatch(
+                "create",
+                json!({"kind": "task", "title": "derived salience", "salience": salience}),
+            )
+            .await
+            .expect_err("singleton rejects explicit task salience before its hook overwrites it");
+        assert!(singleton_salience_error
+            .to_string()
+            .contains("salience is derived from priority"));
+    }
+
+    for salience in [json!(0.9), Value::Null] {
+        let singleton_error = pack
+            .dispatch(
+                "create",
+                json!({"kind": "concept", "name": "entity salience", "salience": salience.clone()}),
+            )
+            .await
+            .expect_err("singleton entity rejects note-only salience");
+        assert!(singleton_error.to_string().contains("salience"));
+        let bulk_error = pack
+            .dispatch(
+                "create",
+                json!({"items": [{"kind": "concept", "name": "entity salience", "salience": salience}]}),
+            )
+            .await
+            .expect("best-effort bulk reports entity salience in-band");
+        assert_eq!(bulk_error["failed"], 1);
+        assert!(bulk_error["results"][0]["error"]
+            .as_str()
+            .is_some_and(|message| message.contains("salience")));
+    }
+
+    let ordinary_null = pack
         .dispatch(
             "create",
-            json!({"items": [{"kind": "task", "title": "derived salience", "salience": 0.9}]}),
+            json!({"items": [{"kind": "observation", "content": "null salience is absence", "salience": null}]}),
         )
         .await
-        .expect("best-effort bulk reports task salience conflicts in-band");
-    assert_eq!(invalid_salience["failed"], 1);
-    assert!(invalid_salience["results"][0]["error"]
-        .as_str()
-        .is_some_and(|message| message.contains("salience is derived from priority")));
-    let singleton_salience_error = pack
-        .dispatch(
-            "create",
-            json!({"kind": "task", "title": "derived salience", "salience": 0.9}),
-        )
-        .await
-        .expect_err("singleton rejects task salience that its hook would overwrite");
-    assert!(singleton_salience_error
-        .to_string()
-        .contains("salience is derived from priority"));
+        .expect("ordinary-note null salience retains absence semantics");
+    assert_eq!(ordinary_null["created"], 1);
+    assert_eq!(ordinary_null["failed"], 0);
 }
 
 #[tokio::test]

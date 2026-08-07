@@ -37,8 +37,15 @@ pub(crate) struct BulkCreateEntry {
     pub(crate) properties: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) tags: Option<Vec<String>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) salience: Option<f64>,
+    /// Preserve explicit null so substrate- and hook-specific validation can
+    /// distinguish a supplied field from omission. Ordinary notes retain the
+    /// singleton convention that null means no salience override.
+    #[serde(
+        default,
+        deserialize_with = "present_json_value",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub(crate) salience: Option<Value>,
     /// Note-only explicit natural key. Preserve explicit JSON null so the
     /// handler can reject it with the same deliberate error as singleton
     /// `external_id`, rather than collapsing it into absence.
