@@ -4136,9 +4136,7 @@ id = "lambda:fallback"
         };
         let raw = server.dispatch_request_local(params).await.unwrap();
         let resp: serde_json::Value = serde_json::from_str(&raw).unwrap();
-        // Agent presentation: `{"results":[{"ok":true,"result":[...],"tool":"list"}],...}`.
-        // The `list` verb returns an array of entities directly under `result`.
-        let count = resp["results"][0]["result"]
+        let count = resp["results"][0]["result"]["items"]
             .as_array()
             .map(|a| a.len())
             .unwrap_or(0);
@@ -6803,7 +6801,13 @@ backend = "sessions"
             );
             let server = isolated_server(&db_path);
             let resp = dispatch_json(&server, r#"list(kind="entity")"#).await;
-            assert_eq!(resp["results"][0]["result"].as_array().unwrap().len(), 0);
+            assert_eq!(
+                resp["results"][0]["result"]["items"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                0
+            );
         }
 
         // (b) read verb.
@@ -6904,7 +6908,10 @@ backend = "sessions"
             let server = isolated_server(&db_path);
             let resp = dispatch_json(&server, r#"list(kind="entity")"#).await;
             assert_eq!(
-                resp["results"][0]["result"].as_array().unwrap().len(),
+                resp["results"][0]["result"]["items"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
                 0,
                 "no write must have landed for {verb:?}"
             );
@@ -6938,7 +6945,10 @@ backend = "sessions"
             let server = isolated_server(&db_path);
             let resp = dispatch_json(&server, r#"list(kind="entity")"#).await;
             assert_eq!(
-                resp["results"][0]["result"].as_array().unwrap().len(),
+                resp["results"][0]["result"]["items"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
                 0,
                 "no write must have landed for merge"
             );

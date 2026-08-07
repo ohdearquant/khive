@@ -223,7 +223,7 @@ List records with optional filtering.
 | `entity_kind`                | string                   | no       | Filter when `kind="entity"`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
 | `entity_type`                | string                   | no       | Filter by type field when `kind="entity"`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
 | `note_kind`                  | string                   | no       | Filter when `kind="note"`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
-| `tags`                       | array\<string\>          | no       | OR-match, `kind="entity"` only.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| `tags`                       | array\<string\>          | no       | Case-insensitive OR-match over entity tags or note `properties.tags`; valid for `kind="entity"` and `kind="note"`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
 | `source_id` / `target_id`    | uuid                     | no       | Edge endpoint filters, `kind="edge"` only.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
 | `relations`                  | array\<string\>          | no       | Edge relation filter, `kind="edge"` only.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
 | `min_weight` / `max_weight`  | number                   | no       | Edge weight bounds, `kind="edge"` only.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
@@ -241,13 +241,13 @@ List records with optional filtering.
 request(ops="list(kind=\"entity\", entity_kind=\"concept\", limit=20)")
 ```
 
-Requests within the kind's server-side row cap keep the existing array response. If `limit`
-exceeds the cap, the response is `{"items": [...], "requested_limit": N,
-"effective_limit": CAP, "limit_clamped": true}`. This lets offset-based clients advance by
-the effective limit instead of silently skipping rows. The caps are entity 500, note 200, edge
-1000, event 1000, and proposal 500. Entity, note, and edge cursor modes return
+Offset-mode responses always use `{"items": [...], "requested_limit": N,
+"effective_limit": M, "limit_clamped": bool}`. The shape is identical whether or not the
+server-side cap binds, so clients can always advance by `effective_limit` without a production-only
+shape change or skipped rows. The caps are entity 500, note 200, edge 1000, event 1000, and
+proposal 500. Entity, note, and edge cursor modes return
 `{"entities": [...], "next_after": ...}`, `{"notes": [...], "next_after": ...}`, or
-`{"edges": [...], "next_after": ...}` and add the same limit metadata when clamped.
+`{"edges": [...], "next_after": ...}` and always include the same limit metadata.
 
 Set `after=""` to begin a stable cursor walk, then pass each non-null `next_after` value into the
 next request with the same filters. The cursor's public value is a UUID; storage resolves it to an
@@ -260,11 +260,12 @@ extend the walk. After a substrate/namespace query returns `next_after: null`, r
 that terminal query require a new walk from `after=""`. Updates and deletes can change whether an
 unvisited row matches the filters. A cursor that was hard-deleted, is outside the caller's visible
 namespaces, or otherwise cannot be resolved returns an error instead of silently restarting. Cursor
-mode and `offset` are mutually exclusive. Filtered message walks may additionally return
-`scan_incomplete: true` with a continuation cursor when their 10,000-row safety ceiling is reached
-before another matching message is proven.
+mode and `offset` are mutually exclusive. Filtered note and event lists additionally return
+`scan_incomplete: true` when their bounded post-filter scan reaches its safety ceiling before
+exhaustion can be proven. Cursor-mode note responses also provide the last safe continuation
+cursor.
 
-Row shape (each item in the array or cursor/clamp envelope) depends on `kind`.
+Row shape (each item in the offset or cursor envelope) depends on `kind`.
 For `kind="entity"`, `"note"`, `"edge"`, and `"event"`, the row is the **full stored record**
 for that substrate, listed below in its **verbose** form (the shape returned with
 `presentation="verbose"`, which is also the default for `kkernel exec` and the `khive` CLI).

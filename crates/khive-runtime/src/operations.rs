@@ -5046,8 +5046,9 @@ impl KhiveRuntime {
                 .await?;
             results.extend(page.items);
         }
-        results.sort_by_key(|e| Uuid::from(e.id));
-        results.dedup_by_key(|e| Uuid::from(e.id));
+        results.sort_by_key(|edge| (edge.created_at, Uuid::from(edge.id)));
+        let mut seen = std::collections::HashSet::new();
+        results.retain(|edge| seen.insert(Uuid::from(edge.id)));
         let start = (offset as usize).min(results.len());
         let end = (start + limit as usize).min(results.len());
         Ok(results[start..end].to_vec())

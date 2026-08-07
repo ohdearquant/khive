@@ -173,6 +173,11 @@ in-memory filters until `limit` matches are collected. To bound worst-case cost 
 stores (e.g. 1 M+ messages), the scan stops after at most **10 000 unfiltered rows**
 (`MAX_SCAN_TOTAL` in `khive-pack-kg/src/handlers.rs`).
 
+The generic list envelope sets `scan_incomplete: true` when this ceiling binds before the
+requested filtered page is filled. Cursor mode also returns the last safe `next_after` boundary;
+offset mode discloses the incomplete scan but cannot manufacture a safe cursor for an
+offset-counted filtered population.
+
 Callers with deep mailboxes should prefer the dedicated comm verbs, which are not subject to
 this cap:
 

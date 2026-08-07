@@ -669,6 +669,13 @@ Message-property filters remain a bounded post-filter scan. In cursor mode, reac
 10,000-row safety ceiling returns `scan_incomplete: true` plus the last safe scan boundary,
 so callers can continue instead of mistaking a bounded scan for corpus exhaustion.
 
+Offset-mode `list` responses use one stable envelope on both sides of every row cap:
+`items`, `requested_limit`, `effective_limit`, and `limit_clamped`. Cursor-mode responses keep
+their substrate-specific item key and `next_after`, with the same three limit fields always
+present. Any bounded note or event post-filter scan that reaches its safety ceiling before it can
+prove exhaustion sets `scan_incomplete: true`; a short page without that field is terminal for the
+requested filter and offset.
+
 ## Amendment: bounded traversal surface (2026-08-01)
 
 The `traverse` row above adopts ADR-091 Amendment 4's finite shape and execution

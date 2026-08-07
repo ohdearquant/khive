@@ -309,9 +309,9 @@ async fn create_then_list_across_separate_request_calls() -> anyhow::Result<()> 
     .await?;
 
     let listed = ok_one(&client, r#"list(kind="entity")"#).await?;
-    let entities = listed
+    let entities = listed["items"]
         .as_array()
-        .expect("entities array (list returns array directly)");
+        .expect("entity list items envelope");
     let names: Vec<&str> = entities.iter().filter_map(|e| e["name"].as_str()).collect();
     assert!(names.contains(&"A"), "entity A missing: {names:?}");
     assert!(names.contains(&"B"), "entity B missing: {names:?}");
@@ -844,7 +844,9 @@ async fn event_session_id_round_trips_in_agent_mode() -> anyhow::Result<()> {
         ),
     )
     .await?;
-    let events = first.as_array().expect("event list result");
+    let events = first["items"]
+        .as_array()
+        .expect("event list items envelope");
     assert_eq!(events.len(), 1, "session filter must select the fixture");
     let returned = events[0]["session_id"]
         .as_str()
@@ -860,7 +862,7 @@ async fn event_session_id_round_trips_in_agent_mode() -> anyhow::Result<()> {
     )
     .await?;
     assert_eq!(
-        second.as_array().map(Vec::len),
+        second["items"].as_array().map(Vec::len),
         Some(1),
         "the returned session_id must be accepted unchanged"
     );
@@ -1219,7 +1221,9 @@ async fn kg_create_note_kind_task_rejects_non_task_depends_on_before_write() -> 
 
     // And there should be no task with the supplied title — write was prevented.
     let listed = ok_one(&client, r#"list(kind="note", note_kind="task")"#).await?;
-    let notes = listed.as_array().expect("note list");
+    let notes = listed["items"]
+        .as_array()
+        .expect("note list items envelope");
     let titles: Vec<&str> = notes.iter().filter_map(|n| n["name"].as_str()).collect();
     assert!(
         !titles.contains(&"depends on entity"),
@@ -1349,7 +1353,7 @@ async fn list_with_granular_entity_kind_filters_results() -> anyhow::Result<()> 
     ok_one(&client, r#"create(kind="document", name="GranularListB")"#).await?;
 
     let listed = ok_one(&client, r#"list(kind="concept")"#).await?;
-    let arr = listed.as_array().expect("array");
+    let arr = listed["items"].as_array().expect("list items envelope");
     let names: Vec<&str> = arr.iter().filter_map(|n| n["name"].as_str()).collect();
     assert!(
         names.contains(&"GranularListA"),
@@ -1373,7 +1377,7 @@ async fn list_with_granular_task_kind_lists_only_tasks() -> anyhow::Result<()> {
     .await?;
 
     let listed = ok_one(&client, r#"list(kind="task")"#).await?;
-    let arr = listed.as_array().expect("array");
+    let arr = listed["items"].as_array().expect("list items envelope");
     let titles: Vec<&str> = arr.iter().filter_map(|n| n["name"].as_str()).collect();
     assert!(
         titles.contains(&"GranularTaskA"),
@@ -3729,11 +3733,10 @@ async fn list_proposals_without_status_returns_all_rows() -> anyhow::Result<()> 
     );
 
     // list(kind=proposal) without status — must return BOTH rows (open + withdrawn).
-    // The list result is a bare JSON array (same shape as other list verbs).
     let list_result = ok_one(&client, r#"list(kind="proposal")"#).await?;
-    let items = list_result
+    let items = list_result["items"]
         .as_array()
-        .expect("list(kind=proposal) must return a JSON array");
+        .expect("list(kind=proposal) must return an items envelope");
     assert!(
         items.len() >= 2,
         "list(kind=proposal) without status must include all rows (audit trail); \
@@ -3754,9 +3757,9 @@ async fn list_proposals_without_status_returns_all_rows() -> anyhow::Result<()> 
 
     // list(kind=proposal, status=open) — must return only the open one.
     let list_open = ok_one(&client, r#"list(kind="proposal", status="open")"#).await?;
-    let open_items = list_open
+    let open_items = list_open["items"]
         .as_array()
-        .expect("list(kind=proposal, status=open) must return a JSON array");
+        .expect("list(kind=proposal, status=open) must return an items envelope");
     assert!(
         open_items
             .iter()
@@ -4352,9 +4355,9 @@ async fn entity_list_returns_iso8601_timestamps() -> anyhow::Result<()> {
     .await?;
 
     let result = ok_one(&client, r#"list(kind="entity", limit=3)"#).await?;
-    let items = result
+    let items = result["items"]
         .as_array()
-        .expect("list(kind=entity) returns array of entities");
+        .expect("list(kind=entity) returns an items envelope");
     assert!(!items.is_empty(), "list must return at least one entity");
 
     for item in items {
@@ -4587,7 +4590,9 @@ async fn send_returns_iso8601_timestamps() -> anyhow::Result<()> {
         json!(true),
         "list(kind=note) must succeed: {first}"
     );
-    let items = first["result"].as_array().expect("list returns array");
+    let items = first["result"]["items"]
+        .as_array()
+        .expect("list returns an items envelope");
     assert!(!items.is_empty(), "must have at least one message note");
     let created_at = items[0]["created_at"].as_str().unwrap_or("");
     assert!(
@@ -4708,9 +4713,9 @@ async fn proposal_list_returns_iso8601_timestamps() -> anyhow::Result<()> {
     .await?;
 
     let result = ok_one(&client, r#"list(kind="proposal")"#).await?;
-    let proposals = result
+    let proposals = result["items"]
         .as_array()
-        .expect("list(kind=proposal) returns array");
+        .expect("list(kind=proposal) returns an items envelope");
     assert!(!proposals.is_empty(), "must have at least one proposal");
     let created_at = proposals[0]["created_at"].as_str().unwrap_or("");
     assert!(
@@ -5635,21 +5640,12 @@ async fn dispatch_honors_explicit_namespace_else_local_adr007() {
     }
 
     fn list_ids(result: &Value) -> Vec<String> {
-        match result["result"].as_array() {
-            Some(arr) => arr
-                .iter()
-                .filter_map(|e| e.get("id").and_then(|v| v.as_str()).map(str::to_string))
-                .collect(),
-            None => match result["result"]["items"].as_array() {
-                Some(arr) => arr
-                    .iter()
-                    .filter_map(|e| e.get("id").and_then(|v| v.as_str()).map(str::to_string))
-                    .collect(),
-                None => {
-                    panic!("list result must be a JSON array or object with items; got: {result}")
-                }
-            },
-        }
+        result["result"]["items"]
+            .as_array()
+            .unwrap_or_else(|| panic!("list result must contain an items array; got: {result}"))
+            .iter()
+            .filter_map(|e| e.get("id").and_then(|v| v.as_str()).map(str::to_string))
+            .collect()
     }
 
     // ── (a) DEFAULT CREATE: lands in "local" ─────────────────────────────────

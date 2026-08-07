@@ -34,6 +34,12 @@ fn rt() -> KhiveRuntime {
     KhiveRuntime::memory().expect("memory runtime")
 }
 
+fn list_items(response: &Value) -> &[Value] {
+    response["items"]
+        .as_array()
+        .expect("list response must contain an items array")
+}
+
 /// `PATH` (and, transitively, which `gh`/`git` binaries `Command::new` resolves
 /// to) is process-global state. Every test that calls `run_ingest` — whether
 /// or not it installs a fake `gh` fixture — must serialize on this mutex, or a
@@ -570,9 +576,7 @@ async fn ingest_records_changed_paths_and_links_code_modules() {
         .dispatch("list", json!({"kind": "commit", "limit": 10}))
         .await
         .expect("list commits");
-    let paths_by_sha: std::collections::HashMap<String, Vec<String>> = commits
-        .as_array()
-        .expect("commit array")
+    let paths_by_sha: std::collections::HashMap<String, Vec<String>> = list_items(&commits)
         .iter()
         .map(|note| {
             let sha = note["properties"]["sha"].as_str().expect("sha").to_string();
@@ -777,7 +781,7 @@ async fn ingest_preserves_unicode_and_delimiter_bearing_changed_paths() {
         .await
         .expect("list commits");
     assert_eq!(
-        commits.as_array().expect("commit array")[0]["properties"]["changed_paths"],
+        list_items(&commits)[0]["properties"]["changed_paths"],
         json!([unusual_path])
     );
     assert_eq!(
@@ -833,9 +837,7 @@ async fn ingest_records_first_parent_paths_for_merge_commits() {
         .dispatch("list", json!({"kind": "commit", "limit": 10}))
         .await
         .expect("list commits");
-    let merge = commits
-        .as_array()
-        .expect("commit array")
+    let merge = list_items(&commits)
         .iter()
         .find(|note| note["properties"]["sha"] == merge_sha)
         .expect("merge commit");
@@ -885,9 +887,7 @@ async fn ingest_records_empty_changed_paths_for_empty_commits() {
         .dispatch("list", json!({"kind": "commit", "limit": 10}))
         .await
         .expect("list commits");
-    let empty = commits
-        .as_array()
-        .expect("commit array")
+    let empty = list_items(&commits)
         .iter()
         .find(|note| note["properties"]["sha"] == empty_sha)
         .expect("empty commit");
@@ -932,9 +932,7 @@ async fn ingest_records_both_sides_of_a_rename() {
         .dispatch("list", json!({"kind": "commit", "limit": 10}))
         .await
         .expect("list commits");
-    let rename = commits
-        .as_array()
-        .expect("commit array")
+    let rename = list_items(&commits)
         .iter()
         .find(|note| note["properties"]["sha"] == rename_sha)
         .expect("rename commit");
@@ -1078,7 +1076,7 @@ exec "$REAL_GIT" "$@"
         .dispatch("list", json!({"kind": "commit", "limit": 10}))
         .await
         .expect("list commits");
-    let commit_notes = commits.as_array().expect("commit array");
+    let commit_notes = list_items(&commits);
     let stored_shas: Vec<&str> = commit_notes
         .iter()
         .map(|note| note["properties"]["sha"].as_str().expect("sha"))
@@ -1173,7 +1171,7 @@ async fn ingest_omits_changed_paths_when_all_paths_filtered() {
         .dispatch("list", json!({"kind": "commit", "limit": 10}))
         .await
         .expect("list commits");
-    let stored = &commits.as_array().expect("commit array")[0];
+    let stored = &list_items(&commits)[0];
     assert!(
         stored["properties"].get("changed_paths").is_none(),
         "an all-filtered commit omits changed_paths rather than storing the \
@@ -1269,7 +1267,7 @@ async fn ingest_filters_noncanonical_changed_paths_but_keeps_commit() {
         .dispatch("list", json!({"kind": "commit", "limit": 10}))
         .await
         .expect("list commits");
-    let stored = &commits.as_array().expect("commit array")[0];
+    let stored = &list_items(&commits)[0];
     assert_eq!(
         stored["properties"]["changed_paths"],
         json!(["good.rs"]),
@@ -1334,7 +1332,7 @@ async fn ingest_filters_noncanonical_path_even_when_masking_hides_the_defect() {
         .dispatch("list", json!({"kind": "commit", "limit": 10}))
         .await
         .expect("list commits");
-    let stored = &commits.as_array().expect("commit array")[0];
+    let stored = &list_items(&commits)[0];
     assert_eq!(
         stored["properties"]["changed_paths"],
         json!(["good.rs"]),
@@ -1424,9 +1422,7 @@ async fn ingest_repeat_pass_after_stall_creates_no_duplicates() {
         .dispatch("list", json!({"kind": "commit", "limit": 10}))
         .await
         .expect("list commits");
-    let mut shas: Vec<&str> = commits
-        .as_array()
-        .expect("commit array")
+    let mut shas: Vec<&str> = list_items(&commits)
         .iter()
         .map(|note| note["properties"]["sha"].as_str().expect("sha"))
         .collect();
@@ -1474,7 +1470,7 @@ async fn ingest_masks_secrets_in_commit_message() {
         .dispatch("list", json!({"kind": "commit", "limit": 10}))
         .await
         .expect("list ok");
-    let items = list.as_array().expect("list returns a plain array");
+    let items = list_items(&list);
     assert_eq!(items.len(), 1);
     let stored_content = items[0]["content"].as_str().expect("content is string");
     assert!(
@@ -1520,7 +1516,7 @@ async fn ingest_masks_secret_shaped_changed_paths() {
         .dispatch("list", json!({"kind": "commit", "limit": 10}))
         .await
         .expect("list commits");
-    let commit = &commits.as_array().expect("commit array")[0];
+    let commit = &list_items(&commits)[0];
     let stored_path = commit["properties"]["changed_paths"][0]
         .as_str()
         .expect("changed path");
@@ -1598,7 +1594,7 @@ async fn ingest_masks_pr_body_hash_near_token_without_dropping_note() {
         .dispatch("list", json!({"kind": "pull_request", "limit": 10}))
         .await
         .expect("list prs ok");
-    let items = prs_list.as_array().expect("array");
+    let items = list_items(&prs_list);
     assert_eq!(items.len(), 1);
     let content = items[0]["content"].as_str().expect("content is string");
     assert!(
@@ -1685,7 +1681,7 @@ async fn ingest_masks_credential_shaped_pr_title_without_dropping_note() {
         .dispatch("list", json!({"kind": "pull_request", "limit": 10}))
         .await
         .expect("list prs ok");
-    let items = prs_list.as_array().expect("array");
+    let items = list_items(&prs_list);
     assert_eq!(items.len(), 1);
     let item = &items[0];
     let stored_name = item["name"].as_str().expect("name is string");
@@ -1775,7 +1771,7 @@ async fn ingest_masks_credential_shaped_issue_title_without_dropping_note() {
         .dispatch("list", json!({"kind": "issue", "limit": 10}))
         .await
         .expect("list issues ok");
-    let items = issues_list.as_array().expect("array");
+    let items = list_items(&issues_list);
     assert_eq!(items.len(), 1);
     let item = &items[0];
     let stored_name = item["name"].as_str().expect("name is string");
@@ -1863,7 +1859,7 @@ async fn ingest_does_not_block_issue_with_credential_word_in_title_and_uuid_in_b
         .dispatch("list", json!({"kind": "issue", "limit": 10}))
         .await
         .expect("list issues ok");
-    let items = issues_list.as_array().expect("array");
+    let items = list_items(&issues_list);
     assert_eq!(items.len(), 1);
     let stored_content = items[0]["content"].as_str().expect("content is string");
     assert!(
@@ -1941,7 +1937,7 @@ async fn ingest_masks_credential_word_and_uuid_co_occurring_in_issue_body() {
         .dispatch("list", json!({"kind": "issue", "limit": 10}))
         .await
         .expect("list issues ok");
-    let items = issues_list.as_array().expect("array");
+    let items = list_items(&issues_list);
     assert_eq!(items.len(), 1);
     let stored_content = items[0]["content"].as_str().expect("content is string");
     assert!(
@@ -2011,7 +2007,7 @@ async fn ingest_leaves_clean_issue_title_unmasked() {
         .dispatch("list", json!({"kind": "issue", "limit": 10}))
         .await
         .expect("list issues ok");
-    let items = issues_list.as_array().expect("array");
+    let items = list_items(&issues_list);
     assert_eq!(items.len(), 1);
     let item = &items[0];
     assert_eq!(
@@ -2091,7 +2087,7 @@ async fn ingest_masks_credential_shaped_issue_label_without_dropping_note() {
         .dispatch("list", json!({"kind": "issue", "limit": 10}))
         .await
         .expect("list issues ok");
-    let items = issues_list.as_array().expect("array");
+    let items = list_items(&issues_list);
     assert_eq!(items.len(), 1);
     let item = &items[0];
     let stored_labels = item["properties"]["labels"]
@@ -2175,7 +2171,7 @@ async fn ingest_masks_credential_shaped_issue_author_login_without_dropping_note
         .dispatch("list", json!({"kind": "issue", "limit": 10}))
         .await
         .expect("list issues ok");
-    let items = issues_list.as_array().expect("array");
+    let items = list_items(&issues_list);
     assert_eq!(items.len(), 1);
     let item = &items[0];
     let stored_author = item["properties"]["author"]
@@ -2258,7 +2254,7 @@ async fn ingest_rejects_credential_shaped_issue_created_at_without_dropping_note
         .dispatch("list", json!({"kind": "issue", "limit": 10}))
         .await
         .expect("list issues ok");
-    let items = issues_list.as_array().expect("array");
+    let items = list_items(&issues_list);
     assert_eq!(items.len(), 1);
     let item = &items[0];
     assert!(
@@ -2333,7 +2329,7 @@ async fn ingest_rejects_credential_shaped_issue_closed_at_without_dropping_note(
         .dispatch("list", json!({"kind": "issue", "limit": 10}))
         .await
         .expect("list issues ok");
-    let items = issues_list.as_array().expect("array");
+    let items = list_items(&issues_list);
     assert_eq!(items.len(), 1);
     let item = &items[0];
     assert!(
@@ -2593,7 +2589,7 @@ async fn ingest_masks_multiple_credential_spans_in_pr_title_and_body() {
         .dispatch("list", json!({"kind": "pull_request", "limit": 10}))
         .await
         .expect("list prs ok");
-    let items = prs_list.as_array().expect("array");
+    let items = list_items(&prs_list);
     assert_eq!(items.len(), 1, "no duplicate PR notes: {items:?}");
     let item = &items[0];
     let stored_name = item["name"].as_str().expect("name is string");
@@ -2691,7 +2687,7 @@ async fn ingest_leaves_clean_pr_title_and_null_body_unmasked() {
         .dispatch("list", json!({"kind": "pull_request", "limit": 10}))
         .await
         .expect("list prs ok");
-    let items = prs_list.as_array().expect("array");
+    let items = list_items(&prs_list);
     assert_eq!(items.len(), 1);
     let item = &items[0];
     let stored_name = item["name"].as_str().expect("name is string");
@@ -2818,7 +2814,7 @@ async fn ingest_masks_pr_title_before_truncating_name_to_max_chars() {
         .dispatch("list", json!({"kind": "pull_request", "limit": 10}))
         .await
         .expect("list prs ok");
-    let items = prs_list.as_array().expect("array");
+    let items = list_items(&prs_list);
     assert_eq!(items.len(), 1);
     let item = &items[0];
     let stored_name = item["name"].as_str().expect("name is string");
@@ -2924,7 +2920,7 @@ async fn ingest_masks_pr_body_credential_without_breaking_fixes_reference() {
         .dispatch("list", json!({"kind": "pull_request", "limit": 10}))
         .await
         .expect("list prs ok");
-    let items = prs_list.as_array().expect("array");
+    let items = list_items(&prs_list);
     assert_eq!(items.len(), 1);
     let content = items[0]["content"].as_str().expect("content is string");
     assert!(
@@ -3156,7 +3152,7 @@ async fn issue_ingest_never_echoes_credential_shaped_state_reason() {
         .dispatch("list", json!({"kind": "issue", "limit": 10}))
         .await
         .expect("list issues ok");
-    let items = issues_list.as_array().expect("array");
+    let items = list_items(&issues_list);
     assert!(
         items.is_empty(),
         "the ungoverned record must never land: {items:?}"
@@ -3593,7 +3589,7 @@ async fn gh_boundary_contract_and_partial_ingest_failure() {
         .dispatch("list", json!({"kind": "issue", "limit": 20}))
         .await
         .expect("list issues ok");
-    let issue_items = issues_list.as_array().expect("array");
+    let issue_items = list_items(&issues_list);
     let issue_by_number = |n: u64| -> &Value {
         issue_items
             .iter()
@@ -3630,7 +3626,7 @@ async fn gh_boundary_contract_and_partial_ingest_failure() {
         .dispatch("list", json!({"kind": "pull_request", "limit": 10}))
         .await
         .expect("list prs ok");
-    let pr_items = prs_list.as_array().expect("array");
+    let pr_items = list_items(&prs_list);
     let pr99 = pr_items
         .iter()
         .find(|i| i["properties"]["number"].as_u64() == Some(99))
@@ -3795,19 +3791,8 @@ async fn issue_full_page_never_leaks_raw_updated_at_into_paging_floor() {
         "the persisted paging cursor must never contain the raw credential value: {cursor}"
     );
 
-    // `list` clamps over-cap requests and returns an envelope with
-    // `effective_limit` instead of a bare array (#894), so scan every persisted
-    // issue by paging. Which key the envelope uses is a contract, not an
-    // incidental detail: `issue` is a note kind, so a listing of it is routed
-    // through the note branch, which renders its rows under `notes`. Every
-    // other branch renders under `items`. Requiring `notes` and rejecting
-    // `items` is therefore what makes this loop notice the day an issue listing
-    // stops being routed as a note listing. Accepting either key would leave
-    // this loop with nothing of its own to say about the envelope: it would
-    // scan whatever shape it was handed and defer to the row-count assertion
-    // below, which stays satisfied whenever the rows are still served, however
-    // they are keyed. A response carrying both keys would likewise satisfy a
-    // bare `notes` lookup.
+    // `list` uses the same `{items, effective_limit, ..}` envelope on both
+    // sides of the cap, so scan every persisted issue by paging.
     let mut scanned = 0usize;
     let mut offset = 0u64;
     loop {
@@ -3818,23 +3803,7 @@ async fn issue_full_page_never_leaks_raw_updated_at_into_paging_floor() {
             )
             .await
             .expect("list issues ok");
-        let items = match page.as_array() {
-            Some(items) => items.clone(),
-            None => {
-                assert!(
-                    page.get("items").is_none(),
-                    "an issue listing is a note listing, so its clamped envelope must \
-                     render rows under `notes`; an `items` key means the kind is no \
-                     longer routed through the note branch: {page}"
-                );
-                page.get("notes")
-                    .and_then(Value::as_array)
-                    .unwrap_or_else(|| {
-                        panic!("clamped issue listing must carry a notes array: {page}")
-                    })
-                    .clone()
-            }
-        };
+        let items = list_items(&page);
         assert!(
             items.iter().all(|i| !i.to_string().contains(CREDENTIAL)),
             "no persisted issue record may contain the raw credential value"
@@ -4152,9 +4121,7 @@ async fn issue_ingest_sorts_by_updated_at_so_frozen_cursor_survives_out_of_order
         .dispatch("list", json!({"kind": "issue", "limit": 20}))
         .await
         .expect("list issues ok");
-    let numbers: Vec<u64> = issues_list
-        .as_array()
-        .expect("array")
+    let numbers: Vec<u64> = list_items(&issues_list)
         .iter()
         .filter_map(|i| i["properties"]["number"].as_u64())
         .collect();
@@ -4300,9 +4267,7 @@ async fn pr_ingest_sorts_by_updated_at_so_frozen_cursor_survives_out_of_order_li
         .dispatch("list", json!({"kind": "pull_request", "limit": 20}))
         .await
         .expect("list prs ok");
-    let numbers: Vec<u64> = prs_list
-        .as_array()
-        .expect("array")
+    let numbers: Vec<u64> = list_items(&prs_list)
         .iter()
         .filter_map(|i| i["properties"]["number"].as_u64())
         .collect();
@@ -4535,9 +4500,7 @@ async fn issue_ingest_retries_tie_at_cursor_timestamp() {
         .dispatch("list", json!({"kind": "issue", "limit": 20}))
         .await
         .expect("list issues ok");
-    let numbers: Vec<u64> = issues_list
-        .as_array()
-        .expect("array")
+    let numbers: Vec<u64> = list_items(&issues_list)
         .iter()
         .filter_map(|i| i["properties"]["number"].as_u64())
         .collect();
@@ -4652,9 +4615,7 @@ async fn pr_ingest_retries_tie_at_cursor_timestamp() {
         .dispatch("list", json!({"kind": "pull_request", "limit": 20}))
         .await
         .expect("list prs ok");
-    let numbers: Vec<u64> = prs_list
-        .as_array()
-        .expect("array")
+    let numbers: Vec<u64> = list_items(&prs_list)
         .iter()
         .filter_map(|i| i["properties"]["number"].as_u64())
         .collect();
@@ -4817,7 +4778,7 @@ async fn digest_verb_auto_creates_project_and_enriches_references() {
         .dispatch("list", json!({"kind": "commit", "limit": 10}))
         .await
         .expect("list ok");
-    let items = commit_note.as_array().expect("array");
+    let items = list_items(&commit_note);
     let closing = items
         .iter()
         .find(|c| c["properties"]["sha"] == commit2_sha)
@@ -5267,9 +5228,7 @@ async fn digest_verb_counts_and_describes_partial_secret_gate_refusals() {
         .dispatch("list", json!({"kind": "pull_request", "limit": 10}))
         .await
         .expect("list pull requests");
-    let numbers: Vec<u64> = stored
-        .as_array()
-        .expect("list result array")
+    let numbers: Vec<u64> = list_items(&stored)
         .iter()
         .filter_map(|item| item["properties"]["number"].as_u64())
         .collect();
@@ -5320,7 +5279,7 @@ async fn digest_verb_max_items_is_bounded_and_resumable() {
         .await
         .expect("list ok");
     assert_eq!(
-        list.as_array().expect("array").len(),
+        list_items(&list).len(),
         3,
         "no duplicates across the bounded/resumed calls"
     );
@@ -7026,7 +6985,7 @@ async fn ingest_truncates_over_cap_commit_embedding_and_reports_it() {
         .dispatch("list", json!({"kind": "commit", "limit": 10}))
         .await
         .expect("list ok");
-    let items = list.as_array().expect("array");
+    let items = list_items(&list);
     assert_eq!(items.len(), 1);
     let stored_content = items[0]["content"].as_str().expect("content is string");
     assert!(stored_content.contains("head-term-unique"));
@@ -7250,7 +7209,7 @@ async fn ingest_over_cap_commit_with_failing_embedder_creates_nothing_and_warns(
         .await
         .expect("list ok");
     assert_eq!(
-        list.as_array().expect("array").len(),
+        list_items(&list).len(),
         0,
         "a compensated create must leave no commit note row behind"
     );
@@ -7393,7 +7352,7 @@ async fn ingest_over_cap_commit_embedding_is_semantically_retrievable() {
         .dispatch("list", json!({"kind": "commit", "limit": 10}))
         .await
         .expect("list ok");
-    let items = list.as_array().expect("array");
+    let items = list_items(&list);
     assert_eq!(items.len(), 1);
     let commit_note_id =
         Uuid::parse_str(items[0]["id"].as_str().expect("commit id")).expect("commit id is uuid");
@@ -7862,7 +7821,7 @@ async fn ingest_masks_credential_shaped_commit_subject_in_name_without_dropping_
         .dispatch("list", json!({"kind": "commit", "limit": 10}))
         .await
         .expect("list ok");
-    let items = list.as_array().expect("array");
+    let items = list_items(&list);
     assert_eq!(items.len(), 1);
     let stored_name = items[0]["name"].as_str().expect("name is string");
     assert!(
@@ -7921,7 +7880,7 @@ async fn ingest_masks_credential_shaped_commit_author_without_dropping_note() {
         .dispatch("list", json!({"kind": "commit", "limit": 10}))
         .await
         .expect("list ok");
-    let items = list.as_array().expect("array");
+    let items = list_items(&list);
     assert_eq!(items.len(), 1);
     let stored_author = items[0]["properties"]["author"]
         .as_str()
@@ -7985,7 +7944,7 @@ async fn ingest_masks_credential_shaped_commit_author_email_without_dropping_not
         .dispatch("list", json!({"kind": "commit", "limit": 10}))
         .await
         .expect("list ok");
-    let items = list.as_array().expect("array");
+    let items = list_items(&list);
     assert_eq!(items.len(), 1);
     let stored_email = items[0]["properties"]["author_email"]
         .as_str()
@@ -8036,7 +7995,7 @@ async fn ingest_leaves_clean_commit_author_and_subject_unmasked() {
         .dispatch("list", json!({"kind": "commit", "limit": 10}))
         .await
         .expect("list ok");
-    let items = list.as_array().expect("array");
+    let items = list_items(&list);
     assert_eq!(items.len(), 1);
     let item = &items[0];
     let stored_author = item["properties"]["author"]
@@ -8135,7 +8094,7 @@ async fn ingest_masks_credential_shaped_pr_author_login_without_dropping_note() 
         .dispatch("list", json!({"kind": "pull_request", "limit": 10}))
         .await
         .expect("list prs ok");
-    let items = prs_list.as_array().expect("array");
+    let items = list_items(&prs_list);
     assert_eq!(items.len(), 1);
     let stored_author = items[0]["properties"]["author"]
         .as_str()
@@ -8217,7 +8176,7 @@ async fn ingest_masks_credential_shaped_pr_base_ref_without_dropping_note() {
         .dispatch("list", json!({"kind": "pull_request", "limit": 10}))
         .await
         .expect("list prs ok");
-    let items = prs_list.as_array().expect("array");
+    let items = list_items(&prs_list);
     assert_eq!(items.len(), 1);
     let stored_base_ref = items[0]["properties"]["base_ref"]
         .as_str()
@@ -8300,7 +8259,7 @@ async fn ingest_masks_credential_shaped_pr_head_ref_without_dropping_note() {
         .dispatch("list", json!({"kind": "pull_request", "limit": 10}))
         .await
         .expect("list prs ok");
-    let items = prs_list.as_array().expect("array");
+    let items = list_items(&prs_list);
     assert_eq!(items.len(), 1);
     let stored_head_ref = items[0]["properties"]["head_ref"]
         .as_str()
@@ -8372,7 +8331,7 @@ async fn ingest_leaves_clean_pr_author_and_refs_unmasked() {
         .dispatch("list", json!({"kind": "pull_request", "limit": 10}))
         .await
         .expect("list prs ok");
-    let items = prs_list.as_array().expect("array");
+    let items = list_items(&prs_list);
     assert_eq!(items.len(), 1);
     let item = &items[0];
     let stored_author = item["properties"]["author"]
