@@ -1465,6 +1465,8 @@ fn runtime_error_value(error: RuntimeError) -> Value {
                 "timeout_ms": timeout_ms,
                 "capability": capability,
                 "operation": context.operation,
+                "scope": context.scope,
+                "retry_after_ms": context.retry_after_ms,
             })
         }
     }

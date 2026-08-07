@@ -326,9 +326,24 @@ pub struct WriterTaskHandle {
     slow_write_threshold: Option<std::time::Duration>,
     /// Default enqueue-capacity deadline for [`Self::send_bounded`] /
     /// [`Self::send_top_level_bounded`], captured from
-    /// `PoolConfig::checkout_timeout` at [`spawn`]. Bounds ONLY the wait for
-    /// channel capacity, the same boundary `send_with_timeout` already
-    /// documents — never the reply wait after acceptance (#1382).
+    /// `PoolConfig::write_admission_deadline_ms` at [`spawn`] (ADR-131
+    /// Decision 2). Bounds ONLY the wait for channel capacity, the same
+    /// boundary `send_with_timeout` already documents — never the reply wait
+    /// after acceptance (#1382).
+    ///
+    /// This is a dedicated admission authority, distinct from
+    /// `PoolConfig::checkout_timeout` (reader/pool checkout). The two used
+    /// to be conflated here before ADR-131 Decision 2 (#1382, #1643).
+    ///
+    /// ADR-131:242's outer-request-budget clamp ("when the caller's outer
+    /// request deadline leaves less time remaining than the configured
+    /// admission deadline, the admission deadline applied to that operation
+    /// is the remaining outer budget instead") is explicitly DEFERRED: no
+    /// outer request deadline is plumbed to `send_bounded` /
+    /// `send_top_level_bounded`'s call sites as of #1737, so there is no
+    /// budget to clamp against. When an outer deadline reaches this call
+    /// path, clamp here rather than faking a shorter deadline against a
+    /// nonexistent budget.
     enqueue_timeout: std::time::Duration,
 }
 
@@ -446,8 +461,9 @@ impl WriterTaskHandle {
     }
 
     /// Like [`Self::send`], but bounds the enqueue-capacity wait with this
-    /// handle's configured `enqueue_timeout` (`PoolConfig::checkout_timeout`
-    /// at spawn time) instead of waiting indefinitely (#1382).
+    /// handle's configured `enqueue_timeout`
+    /// (`PoolConfig::write_admission_deadline_ms` at spawn time, ADR-131
+    /// Decision 2) instead of waiting indefinitely (#1382).
     ///
     /// Once the request is accepted onto the channel, the reply wait is
     /// unbounded by this method, identical to [`Self::send`] — this bounds
@@ -610,7 +626,9 @@ pub fn spawn(pool: &ConnectionPool, capacity: usize) -> Result<WriterTaskHandle,
         tx,
         db,
         slow_write_threshold: crate::timeout_sink::slow_write_threshold(),
-        enqueue_timeout: pool.config().checkout_timeout,
+        enqueue_timeout: std::time::Duration::from_millis(
+            pool.config().write_admission_deadline_ms,
+        ),
     })
 }
 
@@ -1027,14 +1045,14 @@ mod tests {
     #[tokio::test]
     async fn configured_enqueue_timeout_rejects_only_unaccepted_request() {
         // A real file-backed writer task: `send_bounded` reuses
-        // `PoolConfig::checkout_timeout` as its enqueue deadline, captured at
-        // `spawn`, so this must exercise the actual spawn path rather than a
-        // hand-built channel (#1382).
+        // `PoolConfig::write_admission_deadline_ms` (ADR-131 Decision 2) as
+        // its enqueue deadline, captured at `spawn`, so this must exercise
+        // the actual spawn path rather than a hand-built channel (#1382).
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("configured_enqueue_timeout.db");
         let cfg = PoolConfig {
             path: Some(path.clone()),
-            checkout_timeout: Duration::from_millis(80),
+            write_admission_deadline_ms: 100,
             ..PoolConfig::default()
         };
         let pool = ConnectionPool::new(cfg).unwrap();
@@ -1073,7 +1091,7 @@ mod tests {
 
         // Request C: the channel is now full (A draining, B queued behind
         // it) — `send_bounded` must reject C on the configured
-        // `checkout_timeout` without ever running its closure.
+        // `write_admission_deadline_ms` without ever running its closure.
         let c_ran = Arc::new(AtomicBool::new(false));
         let c_ran_in_op = Arc::clone(&c_ran);
         let c_result = handle

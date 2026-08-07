@@ -7,21 +7,33 @@ channel of typed write requests, issuing `BEGIN IMMEDIATE` once per request.
 This is the function-specific technical reference for its migration scope
 and failure modes.
 
-## Migration-slice scope
+## Migration-slice scope (historical) — current routed-call inventory and admission mode live elsewhere
 
-Slice 1 builds the mechanism and wires exactly one write path
-(`SqlEntityStore::upsert_entities`, gated behind `KHIVE_WRITE_QUEUE=1` /
-`PoolConfig::write_queue_enabled`) through it. It commits one request per
-`BEGIN IMMEDIATE` — Component B's batched-commit window and three-level
-SAVEPOINT hierarchy, Component C's checkpoint coordination signal, and
-Component D's transaction watchdog are later slices. With only one store
-migrated, other write paths still open their own writer connections via the
-pool's Mutex-guarded `writer()` connection, so this slice does not yet
-reduce contention or claim the ADR's single-writer guarantee on its own — it
-proves the mechanism works and that the flag-off path is unchanged.
+This section originally described Slice 1, when only
+`SqlEntityStore::upsert_entities` was wired through the queue behind
+`KHIVE_WRITE_QUEUE=1`. That single-path scope is superseded: the current
+per-writer routing inventory — which callers reach `WriterTaskHandle`
+queue-first, which are exempt by design (checkpointing, startup/schema
+migrations, recovery bookkeeping), and which route through the same handle
+without the per-request transaction wrap (top-level maintenance) — is
+maintained as a single table in `crates/khive-db/src/writer_task.rs`'s
+module-level doc comment ("ADR-136 D1 gate 5: writer classification"), not
+duplicated here. The current admission mode — one shared admission authority
+keyed by canonical database identity, a bounded per-operation admission
+deadline, and a caller-visible `writer_queue_saturated` result — is
+[ADR-131](../../../../docs/adr/ADR-131-batch-write-admission-control.md)'s
+contract; whether `write_queue_enabled` defaults on for a given deployment is
+governed by [ADR-135](../../../../docs/adr/ADR-135-write-scaling-demand-before-ownership.md)
+Amendment 1 and [ADR-136](../../../../docs/adr/ADR-136-fair-write-admission-default.md)'s
+strict-routing gates, not by this document.
 
-`spawn` opens a dedicated standalone writer connection independent of that
-Mutex-guarded connection. The lifetime connection is an infrastructure open
+Component B's batched-commit window and three-level SAVEPOINT hierarchy and
+Component D's transaction watchdog remain unshipped: the drain loop still
+commits one request per `BEGIN IMMEDIATE`.
+
+`spawn` opens a dedicated standalone writer connection independent of the
+pool's Mutex-guarded `writer()` connection used by any exempt or unrouted
+path. The lifetime connection is an infrastructure open
 and does not enter write-traffic counters; the drain loop increments the
 writer-task acquisition class once per dequeued top-level request or successful
 `BEGIN IMMEDIATE`. `capacity` bounds the channel (ADR-067 recommends 256;
@@ -72,9 +84,12 @@ drained requests receive a typed error without invoking their closures.
 
 Production store write paths and the SQL bridge's writer requests use
 `send_bounded` / `send_top_level_bounded`, which bound only the
-enqueue-capacity wait with `PoolConfig::checkout_timeout` (captured at
-`spawn` as `WriterTaskHandle::enqueue_timeout`) before falling back to
-`StorageError::WriteQueueFull`. Once a request is accepted onto the
+enqueue-capacity wait with `PoolConfig::write_admission_deadline_ms`
+(ADR-131 Decision 2; default 2000 ms, validated range [100, 10000] ms,
+captured at `spawn` as `WriterTaskHandle::enqueue_timeout`) before falling
+back to `StorageError::WriteQueueFull`. This is a dedicated admission
+authority distinct from `PoolConfig::checkout_timeout` (reader/pool
+checkout). Once a request is accepted onto the
 channel, the reply wait is unbounded by this mechanism, identical to plain
 `send`/`send_top_level`. The raw `send`, `send_top_level`, and
 `send_with_timeout` methods remain the underlying primitives — indefinite

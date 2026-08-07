@@ -1504,6 +1504,8 @@ async fn writer_pool_timeout_survives_storage_runtime_and_mcp_wire() -> anyhow::
             "timeout_ms": 175,
             "capability": "notes",
             "operation": "append_note",
+            "scope": serde_json::Value::Null,
+            "retry_after_ms": serde_json::Value::Null,
         }),
         "the exact wire contract must preserve stage, deadline, retryability, and storage context"
     );
@@ -1540,8 +1542,10 @@ async fn write_queue_full_survives_storage_runtime_and_mcp_wire() -> anyhow::Res
             "timeout_ms": 175,
             "capability": serde_json::Value::Null,
             "operation": serde_json::Value::Null,
+            "scope": "writer_admission",
+            "retry_after_ms": 175,
         }),
-        "the exact wire contract must preserve stage, deadline, and retryability for queue saturation"
+        "the exact wire contract must preserve stage, deadline, retryability, and ADR-131:251's scope/retry_after_ms for queue saturation"
     );
 
     Ok(())

@@ -104,7 +104,25 @@ pub struct PoolConfig {
     /// Overridable via `KHIVE_WRITE_ROUTING` (value `"strict"`,
     /// case-insensitive; anything else, or unset, leaves this `false`).
     pub write_routing_strict: bool,
+    /// Dedicated admission deadline (ADR-131 Decision 2) bounding ONLY the
+    /// wait for capacity on the `WriterTask` write queue —
+    /// [`WriterTaskHandle::send_bounded`]/`send_top_level_bounded`'s default
+    /// timeout. Distinct from `checkout_timeout`, which bounds reader/pool
+    /// checkout instead; the two authorities used to be conflated (#1382,
+    /// #1643) before this field existed.
+    ///
+    /// Default: 2000 ms. Validated at [`ConnectionPool::new`] to fall in
+    /// `[100, 10000]` ms; a value outside that range is a configuration
+    /// error (`SqliteError::InvalidConfig`), never silently clamped into
+    /// range.
+    ///
+    /// Overridable via `KHIVE_WRITE_ADMISSION_DEADLINE_MS`.
+    pub write_admission_deadline_ms: u64,
 }
+
+/// ADR-131 Decision 2's validated range for `write_admission_deadline_ms`.
+const WRITE_ADMISSION_DEADLINE_MS_RANGE: std::ops::RangeInclusive<u64> = 100..=10_000;
+const DEFAULT_WRITE_ADMISSION_DEADLINE_MS: u64 = 2000;
 
 impl Default for PoolConfig {
     fn default() -> Self {
@@ -152,6 +170,10 @@ impl Default for PoolConfig {
             write_routing_strict: std::env::var("KHIVE_WRITE_ROUTING")
                 .map(|v| v.eq_ignore_ascii_case("strict"))
                 .unwrap_or(false),
+            write_admission_deadline_ms: std::env::var("KHIVE_WRITE_ADMISSION_DEADLINE_MS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(DEFAULT_WRITE_ADMISSION_DEADLINE_MS),
         }
     }
 }
@@ -243,6 +265,21 @@ fn canonicalize_deepest_existing(path: &Path) -> Result<PathBuf, SqliteError> {
     Err(SqliteError::InvalidData(format!(
         "database path has no canonicalizable ancestor: {}",
         absolute.display()
+    )))
+}
+
+/// Enforce ADR-131 Decision 2's `write_admission_deadline_ms` bound at
+/// configuration load: `[100, 10000]` ms, rejected rather than clamped when
+/// out of range so a misconfiguration is never silently reinterpreted as a
+/// different deadline than the operator asked for.
+fn validate_write_admission_deadline(deadline_ms: u64) -> Result<(), SqliteError> {
+    if WRITE_ADMISSION_DEADLINE_MS_RANGE.contains(&deadline_ms) {
+        return Ok(());
+    }
+    Err(SqliteError::InvalidConfig(format!(
+        "write_admission_deadline_ms must be in [{}, {}] ms, got {deadline_ms}",
+        WRITE_ADMISSION_DEADLINE_MS_RANGE.start(),
+        WRITE_ADMISSION_DEADLINE_MS_RANGE.end()
     )))
 }
 
@@ -484,6 +521,7 @@ impl ConnectionPool {
     /// mode.
     pub fn new(config: PoolConfig) -> Result<Self, SqliteError> {
         refuse_home_data_store_in_tests(&config)?;
+        validate_write_admission_deadline(config.write_admission_deadline_ms)?;
 
         // Resolve "no preference" (`None`) now that `path` is known: on for
         // file-backed pools, off for in-memory ones. An explicit `Some(_)`

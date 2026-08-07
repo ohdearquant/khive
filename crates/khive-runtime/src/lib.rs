@@ -74,7 +74,7 @@ pub use engine_config::{
 };
 pub use error::{
     fts_text_leg_or_err, AdmissionFailureContext, GuardedWriteFailure, RuntimeError, RuntimeResult,
-    WriterPoolCheckoutTimeoutContext, WRITER_POOL_CHECKOUT_TIMEOUT_STAGE,
+    WriterPoolCheckoutTimeoutContext, WRITER_ADMISSION_SCOPE, WRITER_POOL_CHECKOUT_TIMEOUT_STAGE,
     WRITER_QUEUE_SATURATED_STAGE,
 };
 pub use fusion::FusionStrategy;

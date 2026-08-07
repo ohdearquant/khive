@@ -17,6 +17,14 @@ pub const WRITER_POOL_CHECKOUT_TIMEOUT_STAGE: &str = "writer_pool_checkout_timeo
 /// accepted the request within its configured deadline (#1382, #1643).
 pub const WRITER_QUEUE_SATURATED_STAGE: &str = "writer_queue_saturated";
 
+/// Stable ADR-131:251 `scope` discriminator carried on a
+/// [`WRITER_QUEUE_SATURATED_STAGE`] failure — distinguishes write-queue
+/// admission saturation from other `unavailable` failure kinds that share
+/// the same `retryable: true` shape but are not bounded by the admission
+/// deadline (e.g. [`WRITER_POOL_CHECKOUT_TIMEOUT_STAGE`], which has no
+/// ADR-131-defined scope and carries `None`).
+pub const WRITER_ADMISSION_SCOPE: &str = "writer_admission";
+
 /// Structured context for a pre-execution write-admission failure: either a
 /// finite-wait pooled writer checkout timeout or a bounded write-queue
 /// enqueue timeout. Both happen before SQLite executes the request, so both
@@ -35,6 +43,17 @@ pub struct AdmissionFailureContext {
     pub capability: Option<khive_storage::StorageCapability>,
     /// Storage operation name, when known.
     pub operation: Option<String>,
+    /// ADR-131:251 `scope` discriminator. `Some(`[`WRITER_ADMISSION_SCOPE`]`)`
+    /// for [`WRITER_QUEUE_SATURATED_STAGE`]; `None` for
+    /// [`WRITER_POOL_CHECKOUT_TIMEOUT_STAGE`], which ADR-131 does not define a
+    /// scope for.
+    pub scope: Option<&'static str>,
+    /// ADR-131:251 `retry_after_ms` hint — set equal to the admission
+    /// deadline actually applied to the rejected operation, so a retrying
+    /// caller waits at least one full admission window before retrying.
+    /// `Some(timeout_ms)` for [`WRITER_QUEUE_SATURATED_STAGE`]; `None`
+    /// otherwise.
+    pub retry_after_ms: Option<u64>,
 }
 
 /// Structured context recovered from either a direct SQLite runtime error or
@@ -374,6 +393,8 @@ impl RuntimeError {
                 timeout: context.timeout,
                 capability: context.capability,
                 operation: context.operation,
+                scope: None,
+                retry_after_ms: None,
             });
         }
         if let Self::Storage(khive_storage::StorageError::WriteQueueFull { timeout_ms }) = self {
@@ -382,6 +403,8 @@ impl RuntimeError {
                 timeout: Duration::from_millis(*timeout_ms),
                 capability: None,
                 operation: None,
+                scope: Some(WRITER_ADMISSION_SCOPE),
+                retry_after_ms: Some(*timeout_ms),
             });
         }
         None
