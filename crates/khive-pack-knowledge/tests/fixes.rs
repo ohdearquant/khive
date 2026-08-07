@@ -66,6 +66,7 @@ fn pack(rt: KhiveRuntime) -> Fixture {
     builder.register(KgPack::new(rt.clone()));
     builder.register(KnowledgePack::new(rt.clone()));
     let registry = builder.build().expect("registry builds");
+    registry.apply_schema_plans(rt.backend());
     rt.install_edge_rules(registry.all_edge_rules());
     Fixture {
         registry,
@@ -3054,6 +3055,7 @@ fn pack_with_events(rt: KhiveRuntime) -> Fixture {
     builder.register(KgPack::new(rt.clone()));
     builder.register(KnowledgePack::new(rt.clone()));
     let registry = builder.build().expect("registry builds");
+    registry.apply_schema_plans(rt.backend());
     rt.install_edge_rules(registry.all_edge_rules());
     Fixture {
         registry,

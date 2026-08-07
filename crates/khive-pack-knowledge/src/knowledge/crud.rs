@@ -743,6 +743,26 @@ impl KnowledgeHandlers {
             .await
             .map_err(|e| sql_err("stats events", e))?;
 
+        let retrieval_eval_run_count = reader
+            .query_scalar(SqlStatement {
+                sql: "SELECT COUNT(*) FROM knowledge_eval_runs WHERE namespace = ?1".into(),
+                params: vec![SqlValue::Text(ns.clone())],
+                label: Some("knowledge.stats.eval_run_count".into()),
+            })
+            .await
+            .map_err(|e| sql_err("stats eval run count", e))?;
+
+        let latest_retrieval_eval = reader
+            .query_row(SqlStatement {
+                sql: "SELECT run_at, precision_at_5, mrr FROM knowledge_eval_runs \
+                      WHERE namespace = ?1 ORDER BY run_at DESC, rowid DESC LIMIT 1"
+                    .into(),
+                params: vec![SqlValue::Text(ns.clone())],
+                label: Some("knowledge.stats.latest_eval_run".into()),
+            })
+            .await
+            .map_err(|e| sql_err("stats latest eval run", e))?;
+
         let total_atoms = match atom_count {
             Some(SqlValue::Integer(n)) => n,
             _ => 0,
@@ -759,6 +779,33 @@ impl KnowledgeHandlers {
             Some(SqlValue::Integer(n)) => n,
             _ => 0,
         };
+        let retrieval_eval_run_count = match retrieval_eval_run_count {
+            Some(SqlValue::Integer(n)) => n,
+            _ => 0,
+        };
+        let retrieval_eval_coverage = latest_retrieval_eval
+            .as_ref()
+            .and_then(|row| match row.get("precision_at_5") {
+                Some(SqlValue::Float(value)) => Some(*value),
+                Some(SqlValue::Integer(value)) => Some(*value as f64),
+                _ => None,
+            })
+            .unwrap_or(0.0);
+        let retrieval_eval_last_run_at =
+            latest_retrieval_eval
+                .as_ref()
+                .and_then(|row| match row.get("run_at") {
+                    Some(SqlValue::Integer(value)) => Some(*value),
+                    _ => None,
+                });
+        let retrieval_eval_last_mrr =
+            latest_retrieval_eval
+                .as_ref()
+                .and_then(|row| match row.get("mrr") {
+                    Some(SqlValue::Float(value)) => Some(*value),
+                    Some(SqlValue::Integer(value)) => Some(*value as f64),
+                    _ => None,
+                });
 
         let eval_coverage = if total_atoms > 0 {
             finalized as f64 / total_atoms as f64
@@ -775,6 +822,10 @@ impl KnowledgeHandlers {
             "total_events": total_events,
             "eval_coverage": eval_coverage,
             "embedding_coverage": embedding_coverage,
+            "retrieval_eval_coverage": retrieval_eval_coverage,
+            "retrieval_eval_run_count": retrieval_eval_run_count,
+            "retrieval_eval_last_run_at": retrieval_eval_last_run_at,
+            "retrieval_eval_last_mrr": retrieval_eval_last_mrr,
             "namespace": ns,
         }))
     }

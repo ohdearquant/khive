@@ -21,8 +21,8 @@ harness spawns it via stdio).
 
 ```bash
 cd tests/khive-contract
-uv run python -m tune --quick                    # ~10 sec, every 10th config
-uv run python -m tune                            # ~2 min, all 116 configs
+uv run python -m tune --quick                    # balanced 130-config sample
+uv run python -m tune                            # full 1,296-config grid
 uv run python -m tune --output-dir /tmp/my-run   # custom output location
 ```
 
@@ -32,6 +32,17 @@ uv run python -m tune --output-dir /tmp/my-run   # custom output location
 - `tuned-config.toml` — recommended config (synthesized from the best-scoring
   set; see REPORT.md for honesty about how meaningful this is)
 - `REPORT.md` — analysis writeup
+
+Grid dimensions live in
+`crates/khive-pack-memory/testdata/recall_tuning_grid.json`. The Python runner
+and a Rust conformance test consume that same file, and the default comparison
+omits the request-level config so it measures the runtime's actual
+`RecallConfig::default()`.
+
+Every candidate uses an explicit `candidate_limit`. TOML cannot distinguish
+`candidate_limit = None` from an omitted field, and omission restores the
+runtime default of 150, so multiplier-only candidates are excluded to keep the
+generated `tuned-config.toml` reproducible.
 
 ## Known limitation
 

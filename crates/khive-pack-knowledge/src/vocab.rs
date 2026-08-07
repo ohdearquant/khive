@@ -1,8 +1,29 @@
-//! Static verb descriptor table for the knowledge pack (19 verbs).
+//! Static handler descriptor table for the knowledge pack (19 verbs + 1 subhandler).
 
 use khive_types::{HandlerDef, ParamDef, VerbCategory, Visibility};
 
-pub(crate) static KNOWLEDGE_HANDLERS: [HandlerDef; 19] = [
+/// Pack-owned schema for persisted retrieval-evaluation summaries.
+///
+/// These statements stay in the Knowledge pack's schema plan rather than the
+/// core migration ledger so multi-backend boot applies them to Knowledge's
+/// assigned backend. Both statements are idempotent for repeated startup.
+pub(crate) static KNOWLEDGE_SCHEMA_PLAN_STMTS: [&str; 2] = [
+    "CREATE TABLE IF NOT EXISTS knowledge_eval_runs (\
+        id              TEXT PRIMARY KEY,\
+        namespace       TEXT NOT NULL,\
+        run_at          INTEGER NOT NULL,\
+        query_set       TEXT NOT NULL,\
+        total_queries   INTEGER NOT NULL,\
+        precision_at_5  REAL NOT NULL,\
+        recall_at_5     REAL NOT NULL,\
+        mrr             REAL NOT NULL,\
+        notes           TEXT\
+    )",
+    "CREATE INDEX IF NOT EXISTS idx_knowledge_eval_runs_ns_run_at \
+        ON knowledge_eval_runs(namespace, run_at DESC)",
+];
+
+pub(crate) static KNOWLEDGE_HANDLERS: [HandlerDef; 20] = [
     // ── corpus tier ──────────────────────────────────────────────────────────
     HandlerDef {
         name: "knowledge.upsert_atoms",
@@ -120,6 +141,18 @@ pub(crate) static KNOWLEDGE_HANDLERS: [HandlerDef; 19] = [
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,
         params: &[],
+    },
+    HandlerDef {
+        name: "knowledge.eval_retrieval",
+        description: "Run a labeled, draft-inclusive atom-retrieval query set and persist aggregate quality metrics",
+        visibility: Visibility::Subhandler,
+        category: VerbCategory::Commissive,
+        params: &[ParamDef {
+            name: "query_set",
+            param_type: "string",
+            required: true,
+            description: "Absolute path to a TOML query set containing query and expected_slugs entries",
+        }],
     },
     HandlerDef {
         name: "knowledge.index",
@@ -662,6 +695,7 @@ mod tests {
             ),
             ("knowledge.delete_atoms", &["ids", "cascade"]),
             ("knowledge.stats", &[]),
+            ("knowledge.eval_retrieval", &["query_set"]),
             (
                 "knowledge.index",
                 &["ids", "batch_size", "insert_only", "rebuild_ann"],

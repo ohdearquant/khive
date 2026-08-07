@@ -364,11 +364,11 @@ impl RecallFtsGatherConfig {
     }
 }
 
-// Tuning artifact: tests/khive-contract/tune/ swept 116 configs but the synthetic corpus
+// The historical 2026-05-25 tuning artifact swept 116 configs, but the synthetic corpus
 // produced an identical recall@10 = 0.9333 for every config — i.e. a flat landscape that
 // cannot empirically distinguish these parameters. Defaults below stay at the prior values
 // until a harder corpus (embed-enabled, synonym queries, partial matches) provides signal.
-// See tests/khive-contract/tune/REPORT.md for the analysis.
+// See tests/khive-contract/tune/README.md for the retained limitation.
 //
 // Default strategy: RRF k=10 (restored 2026-07-21). CC-6 flipped this to
 // Weighted [0.7, 0.3] to let salience act as a tiebreaker, but the live golden-suite
@@ -573,6 +573,7 @@ pub struct WeightedContributions {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde::Deserialize;
 
     // ── DecayModel ────────────────────────────────────────────────────────────
 
@@ -815,6 +816,53 @@ mod tests {
             cfg.fuse_strategy
         );
         assert!(!cfg.include_breakdown);
+    }
+
+    #[test]
+    fn tuning_grid_contains_the_runtime_default() {
+        #[derive(Deserialize)]
+        struct CandidatePool {
+            candidate_multiplier: u32,
+            candidate_limit: u32,
+        }
+
+        #[derive(Deserialize)]
+        struct FixedDimensions {
+            min_score: f64,
+        }
+
+        #[derive(Deserialize)]
+        struct TuningGrid {
+            weight_triples: Vec<[f64; 3]>,
+            candidate_pools: Vec<CandidatePool>,
+            fusion_configs: Vec<FusionStrategy>,
+            decay_models: Vec<DecayModel>,
+            temporal_half_life_days: Vec<f64>,
+            min_salience_values: Vec<f64>,
+            fixed: FixedDimensions,
+        }
+
+        let grid: TuningGrid =
+            serde_json::from_str(include_str!("../testdata/recall_tuning_grid.json"))
+                .expect("recall tuning grid must be valid JSON");
+        let cfg = RecallConfig::default();
+
+        assert!(grid.weight_triples.iter().any(|weights| {
+            (weights[0] - cfg.relevance_weight).abs() < 1e-12
+                && (weights[1] - cfg.salience_weight).abs() < 1e-12
+                && (weights[2] - cfg.temporal_weight).abs() < 1e-12
+        }));
+        assert!(grid.candidate_pools.iter().any(|pool| {
+            pool.candidate_multiplier == cfg.candidate_multiplier
+                && Some(pool.candidate_limit) == cfg.candidate_limit
+        }));
+        assert!(grid.fusion_configs.contains(&cfg.fuse_strategy));
+        assert!(grid.decay_models.contains(&cfg.decay_model));
+        assert!(grid
+            .temporal_half_life_days
+            .contains(&cfg.temporal_half_life_days));
+        assert!(grid.min_salience_values.contains(&cfg.min_salience));
+        assert!((grid.fixed.min_score - cfg.min_score).abs() < 1e-12);
     }
 
     #[test]
