@@ -321,3 +321,54 @@ Convergence is complete: each release builds one binary per platform (`kkernel`)
 Rationale: the kkernel unification absorbed `khive-mcp` as a library crate, reducing the
 shipped artifact to a single binary per platform. Build pipelines and subpackage manifests
 should reference `kkernel` only.
+
+## Amendment 2 (2026-08-06): pre-install local artifact verification
+
+Issue #1745 identified a fail-open ordering defect in the source-build install path. The
+`make local` recipe previously installed `kkernel`, replaced the running daemon, and only
+then ran `verbs()` against the installed binary. A successful Rust build does not prove that
+inventory-linked packs registered in the resulting runtime, so a reduced verb surface was
+first detected after the previous known-good binary and daemon were already unavailable.
+
+The local install contract is now build, verify, then install:
+
+1. `build-local` builds `kkernel` with the same `channel-email,channel-telegram` feature set
+   used by the developer install. Cargo runs with JSON artifact messages; the build gate
+   accepts exactly one `kkernel` binary `compiler-artifact` event and atomically records its
+   canonical executable path, SHA-256, and a fresh build identifier in
+   `crates/target/khive-local-build.json`. Cargo therefore remains authoritative when
+   configuration changes the target directory or adds a target-triple subdirectory; the gate
+   never guesses `${target-dir}/release/kkernel`.
+2. `verify-local-artifact` depends on `build-local`, validates that receipt, and executes its
+   exact artifact. The probe runs `verbs()` with daemon and embeddings disabled, an in-memory
+   database, an empty
+   explicit config, an isolated home/current directory, and the Makefile-owned full pack
+   selection. It never reads the installed `kkernel`, touches `~/.cargo/bin`, or stops the
+   daemon. A configured cross-target artifact that cannot execute on the developer host fails
+   closed at this probe rather than falling back to a stale host artifact. The MCP client waits
+   for and validates a successful `initialize` response before sending the initialized
+   notification and `tools/call`; one absolute deadline covers initialization, the verb-catalog
+   call, and process shutdown.
+3. The probe is fail-closed. A missing or non-executable artifact, launch failure, timeout,
+   nonzero exit, malformed JSON or response shape, inconsistent `total` / catalog /
+   `pack_counts`, missing requested pack (including a zero-verb pack), or a total below the
+   **90-verb floor** fails verification. The floor is deliberately a minimum rather than a
+   version string or equality assertion: it witnesses runtime registration, permits additive
+   verbs, and makes a surface reduction an explicit reviewed contract change.
+4. Success records the build identifier, canonical artifact path, SHA-256, and observed verb
+   count in an atomic, canonical JSON stamp beside the build receipt. The count is a bounded
+   JSON integer, never a shell integer expression. `local` asks the verifier to revalidate the
+   receipt/stamp pair and current artifact, then re-hashes the source before staging and verifies
+   the unsigned staging copy has the same SHA-256. Only then may codesigning, installation, or
+   daemon interruption occur. A changed artifact, mismatched receipt, or stale/noncanonical/
+   malformed stamp fails before those side effects.
+
+The existing install-copy integrity check remains: the MD5 of the codesigned staging file
+must equal the installed destination after the atomic move. This amendment adds a runtime
+provenance gate before that copy check; it does not replace it.
+
+A zero-downtime daemon cut-over remains outside this amendment. `make local` still replaces
+the installed binary and stops the old daemon after verification so bridges can respawn the
+new artifact under ADR-049. The ordering guarantee is narrower: no install or daemon
+interruption is reachable unless the exact artifact being staged has passed the pack/verb
+surface probe.

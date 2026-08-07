@@ -1,10 +1,14 @@
 # The full pack set the installed daemon must serve. `make local` verifies the
-# INSTALLED binary registers the whole set by positive artifact (a verbs()
-# count from the binary itself) — a build that silently drops a pack's
-# inventory registration fails here instead of shipping.
+# freshly built artifact before installation by running verbs() against that
+# exact binary. The floor is the current 90-verb production surface: additions
+# pass without a Makefile change, while any loss remains fail-closed.
 FULL_PACKS := kg,gtd,memory,comm,schedule,session,workspace,blob,git,knowledge,brain,code,formal
+LOCAL_VERB_FLOOR := 90
+CARGO ?= cargo
+LOCAL_BUILD_RECEIPT := crates/target/khive-local-build.json
+LOCAL_VERIFY_STAMP := $(LOCAL_BUILD_RECEIPT).verified
 
-.PHONY: check clippy test contract-test fmt fmt-check build clean ci docs-check publish publish-dry local check-fwd bench-1m bench-1m-ci hold-time-gate
+.PHONY: check clippy test contract-test fmt fmt-check build build-local verify-local-artifact clean ci docs-check publish publish-dry local check-fwd bench-1m bench-1m-ci hold-time-gate
 
 check:
 	cd crates && cargo check --workspace
@@ -28,6 +32,22 @@ fmt-check:
 
 build:
 	cd crates && cargo build --workspace --release
+
+build-local:
+	@echo "==> Building kkernel (release, channel-email, channel-telegram)..."
+	@python3 scripts/build_local_artifact.py \
+		--cargo "$(CARGO)" \
+		--manifest-path crates/Cargo.toml \
+		--package kkernel \
+		--features channel-email,channel-telegram \
+		--receipt "$(LOCAL_BUILD_RECEIPT)"
+
+verify-local-artifact: build-local
+	@python3 scripts/verify_local_artifact.py \
+		--build-receipt "$(LOCAL_BUILD_RECEIPT)" \
+		--packs "$(FULL_PACKS)" \
+		--min-verbs "$(LOCAL_VERB_FLOOR)" \
+		--stamp "$(LOCAL_VERIFY_STAMP)"
 
 clean:
 	cd crates && cargo clean
@@ -63,17 +83,35 @@ hold-time-gate:
 	@echo "==> ADR-135 F4 release gate: per-shape writer hold-time regression coverage..."
 	cd crates && cargo test -p khive-pack-comm --test hold_time_regression -- --nocapture
 
-local:
-	@echo "==> Building kkernel (release, channel-email, channel-telegram)..."
-	@cargo build --release -p kkernel --features channel-email,channel-telegram --manifest-path crates/Cargo.toml
-	@SRC=$${CARGO_TARGET_DIR:-crates/target}/release/kkernel; \
+local: verify-local-artifact
+	@if ! VERIFIED_ASSIGNMENTS=$$(python3 scripts/verify_local_artifact.py \
+	  --build-receipt "$(LOCAL_BUILD_RECEIPT)" \
+	  --inspect-stamp "$(LOCAL_VERIFY_STAMP)" \
+	  --min-verbs "$(LOCAL_VERB_FLOOR)"); then \
+	  exit 1; \
+	fi; \
+	if ! eval "$$VERIFIED_ASSIGNMENTS"; then \
+	  echo "==> ERROR: could not load verified-artifact fields"; \
+	  exit 1; \
+	fi; \
 	DEST=$$HOME/.cargo/bin/kkernel; \
 	if [ ! -f "$$SRC" ]; then echo "==> ERROR: build artifact $$SRC missing"; exit 1; fi; \
+	SRC_SHA256=$$({ shasum -a 256 "$$SRC" 2>/dev/null || sha256sum "$$SRC"; } | awk '{print $$1}'); \
+	if [ "$$VERIFIED_SHA256" != "$$SRC_SHA256" ]; then \
+	  echo "==> ERROR: build artifact changed after verification! verified=$$VERIFIED_SHA256 current=$$SRC_SHA256"; \
+	  exit 1; \
+	fi; \
 	SRC_HASH=$$(md5 -q "$$SRC"); \
 	SRC_SIZE=$$(stat -f '%z' "$$SRC"); \
-	echo "==> Source:  $$SRC ($$SRC_HASH, $$SRC_SIZE bytes)"; \
+	echo "==> Source:  $$SRC ($$SRC_HASH, $$SRC_SIZE bytes, $$VERIFIED_VERBS verified verbs)"; \
 	echo "==> Staging + codesigning $$DEST.new..."; \
 	cp "$$SRC" "$$DEST.new"; \
+	COPIED_SHA256=$$({ shasum -a 256 "$$DEST.new" 2>/dev/null || sha256sum "$$DEST.new"; } | awk '{print $$1}'); \
+	if [ "$$VERIFIED_SHA256" != "$$COPIED_SHA256" ]; then \
+	  echo "==> ERROR: staged bytes differ from the verified build artifact! verified=$$VERIFIED_SHA256 staged=$$COPIED_SHA256"; \
+	  rm -f "$$DEST.new"; \
+	  exit 1; \
+	fi; \
 	codesign -s - -f "$$DEST.new" 2>/dev/null || true; \
 	STAGED_HASH=$$(md5 -q "$$DEST.new"); \
 	echo "==> Atomically moving into place..."; \
@@ -95,19 +133,6 @@ local:
 	  echo "==> ERROR: post-mv hash drift! staged=$$STAGED_HASH dest=$$DEST_HASH"; \
 	  exit 1; \
 	fi; \
-	echo "==> Verifying installed binary loads the full pack set..."; \
-	PROBE_OUT=$$(mktemp); \
-	if KHIVE_NO_DAEMON=1 KHIVE_PACKS="$(FULL_PACKS)" \
-	  perl -e 'alarm 120; exec @ARGV or die' -- "$$DEST" exec --output-format json 'verbs()' > "$$PROBE_OUT" 2>/dev/null; then \
-	  VERBS=$$(python3 -c 'import json,sys; r=json.load(sys.stdin); e=r["results"][0]; v=e["result"]["verbs"]; sys.exit(1) if (e.get("ok") is not True or not isinstance(v, list)) else print(len(v))' < "$$PROBE_OUT" 2>/dev/null || echo 0); \
-	else \
-	  VERBS=0; \
-	fi; \
-	rm -f "$$PROBE_OUT"; \
-	if [ "$$VERBS" -lt 80 ]; then \
-	  echo "==> ERROR: installed binary registered $$VERBS verbs (expected >= 80) — full pack set did not load"; \
-	  exit 1; \
-	fi; \
-	echo "==> Installed: $$DEST ($$DEST_HASH, $$DEST_SIZE bytes, $$DEST_MTIME, $$VERBS verbs)"; \
+	echo "==> Installed: $$DEST ($$DEST_HASH, $$DEST_SIZE bytes, $$DEST_MTIME, $$VERIFIED_VERBS verified verbs)"; \
 	"$$DEST" --version
 	@echo "==> Done. Run /mcp in Claude Code to reconnect."

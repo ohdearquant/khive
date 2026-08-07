@@ -36,6 +36,9 @@ phase_lint() {
 
     echo "=== ADR Reference Lint Self-Test ==="
     sh "$SCRIPT_DIR/lint-adr-refs.sh" --self-test
+
+    echo "=== Local Build Artifact Verification Tests ==="
+    python3 "$SCRIPT_DIR/tests/test_verify_local_artifact.py"
 }
 
 phase_no_stubs_scan() {

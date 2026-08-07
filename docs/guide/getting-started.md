@@ -44,6 +44,26 @@ cargo build --release -p kkernel
 # Binary at target/release/kkernel (relative to crates/)
 ```
 
+For the guarded developer install, run from the repository root:
+
+```bash
+make verify-local-artifact  # build + verify only
+# or
+make local                  # build + verify + install
+```
+
+`verify-local-artifact` builds the same feature set as `local`, takes the exact
+binary path from Cargo's `compiler-artifact` event (including configured target
+directories or target triples), then runs a daemonless `verbs()` probe against
+that receipt-bound artifact with an in-memory database and isolated
+configuration. It fails on probe errors, malformed output, a missing requested
+pack, or fewer than the documented 90-verb floor, without touching
+`~/.cargo/bin` or stopping the running daemon.
+If Cargo reports a cross-target binary that the host cannot execute, the probe
+fails instead of falling back to an older host artifact.
+`local` depends on that gate and rechecks the verified SHA-256 before staging;
+installation and daemon replacement are unreachable unless the artifact passes.
+
 ## Connect to your MCP client
 
 ### Claude Code
