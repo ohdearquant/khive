@@ -160,9 +160,20 @@ state.
 
 ## Implementation Status
 
-`git.digest` and `code.ingest` are live verbs. To build: the bundle exporter, the
-one-shot pipeline entry point, the JSON Schema plus golden vector produced from a real
-repository, and the frontend. The first golden bundle target is this repository itself.
+`git.digest` and `code.ingest` are live verbs, with two measured granularity facts the
+contract must respect. `code.ingest` today emits the manifest tier and the
+import-scan tier (projects, packages/modules, and their dependency edges); the
+symbol tier (functions, datatypes) is in the pack vocabulary but not yet produced by
+the ingest call. The v1 bundle and every D3 analysis are therefore specified at module
+granularity; the symbol-level views (structure drill-down below modules, symbol-level
+de-facto API) activate when symbol-tier ingest lands, without a schema break, because
+the graph section already types its nodes. Second, `code.ingest` writes to a dedicated
+map database and `git.digest` to a graph store, so the bundle exporter reads two
+stores and merges at export time.
+
+To build: the bundle exporter, the one-shot pipeline entry point, the JSON Schema plus
+golden vector produced from a real repository, and the frontend. The first golden
+bundle target is this repository itself.
 
 ## References
 
