@@ -4880,7 +4880,8 @@ mod tests {
         let pid = std::process::id();
         state.register_beacon().await;
         let beacon_path = sidecar_dir.join(format!("{pid}.beacon"));
-        if !beacon_path.exists() {
+        let production_write_landed = beacon_path.exists();
+        if !production_write_landed {
             // Windows diagnosis aid: `WalpinSidecarState::register_beacon`
             // swallows a failed `write_beacon` behind a `tracing::warn`
             // (fail-open logging), so the `metadata()` call below would
@@ -4904,10 +4905,38 @@ mod tests {
                 "windows diagnosis: direct write_beacon call also failed (see error for OS code)",
             );
         }
-        let before = std::fs::metadata(&beacon_path)
-            .expect("beacon registered")
-            .modified()
-            .unwrap();
+        // Windows diagnosis aid, second stage: a prior run showed the write
+        // path REPORT success while the file stayed unobservable at the
+        // expected path. On failure, enumerate what actually exists so the
+        // next log distinguishes wrong-location from never-written from
+        // vanished.
+        let before = match std::fs::metadata(&beacon_path) {
+            Ok(meta) => meta.modified().unwrap(),
+            Err(error) => {
+                let list = |p: &std::path::Path| -> String {
+                    match std::fs::read_dir(p) {
+                        Ok(rd) => rd
+                            .filter_map(|e| {
+                                e.ok().map(|e| e.file_name().to_string_lossy().into_owned())
+                            })
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                        Err(e) => format!("<read_dir failed: {e}>"),
+                    }
+                };
+                panic!(
+                    "beacon not observable at {beacon_path:?}: {error}; \
+                     production_write_landed={production_write_landed}; \
+                     sidecar_dir {sidecar_dir:?} contents: [{}]; \
+                     parent contents: [{}]",
+                    list(&sidecar_dir),
+                    sidecar_dir
+                        .parent()
+                        .map(list)
+                        .unwrap_or_else(|| "<no parent>".to_string()),
+                );
+            }
+        };
 
         // Force the heartbeat write to fail without touching directory
         // permissions (which would confound with the dir-mode validation):
