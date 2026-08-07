@@ -426,9 +426,10 @@ pub struct SymbolPage {
 
 impl SymbolPage {
     pub fn empty() -> Self {
+        let reason = "symbol-tier ingest is deferred in khive.repo.v1".to_string();
         Self {
             items: Vec::new(),
-            total_count: Availability::available(0),
+            total_count: Availability::unavailable(reason.clone()),
             bound: PageBound {
                 kind: BoundKind::All,
                 max_items: 0,
@@ -437,8 +438,8 @@ impl SymbolPage {
             next_cursor: None,
             truncated: false,
             disclosure: Disclosure {
-                status: DisclosureStatus::Complete,
-                reason: Some("symbol-tier ingest is deferred in khive.repo.v1".into()),
+                status: DisclosureStatus::Unavailable,
+                reason: Some(reason),
             },
         }
     }

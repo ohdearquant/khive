@@ -268,10 +268,18 @@ fn symbol_pages_and_unavailable_issue_facets_are_explicit() {
     assert!(bundle.graph.functions.items.is_empty());
     assert!(bundle.graph.datatypes.items.is_empty());
     assert!(bundle.graph.interfaces.items.is_empty());
-    assert_eq!(
-        bundle.graph.functions.disclosure.status,
-        DisclosureStatus::Complete
-    );
+    // A deferred tier is not a measured zero. Every symbol page reports the same
+    // way an unrequested history facet does, on both fields: an unavailable count
+    // and an unavailable disclosure. Asserting only one of the two is how the
+    // earlier `complete` + `available(0)` pairing survived this test.
+    for page in [
+        &bundle.graph.functions,
+        &bundle.graph.datatypes,
+        &bundle.graph.interfaces,
+    ] {
+        assert_eq!(page.disclosure.status, DisclosureStatus::Unavailable);
+        assert!(matches!(page.total_count, Availability::Unavailable { .. }));
+    }
     assert!(matches!(
         bundle.graph.issues.total_count,
         Availability::Unavailable { .. }
