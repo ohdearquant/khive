@@ -282,15 +282,18 @@ follow-on inherits the multi-daemon case.
 
 ### D2 — A classifier at the event-production seam decides commit-failure handling
 
-An earlier draft used the classifier to decide **routing** — which rows may be batched. Under D1
-that question no longer exists: every row rides the same committed (store-visible) batch, and on
-the success path every dispatch waits for it, so no row is deferred past its own return and there
-is nothing to route away from. The one exception is D1's carve-out — a pure-observability row
-whose commit fails persistently — and that is a failure outcome rather than a routing choice,
-which is exactly why the classifier's remaining job is failure semantics.
+An earlier draft used the classifier to decide **routing** in the sense of which rows may be
+batched at all. That question is gone under D1 — every row is batched, and no row is deferred
+past its own return — but a narrower routing decision exists again under ADR-134 D2a:
+classification selects the **lane**, and with it the committing connection, at enqueue
+(obligation-bearing rows to the durable-sync writer, pure observability rows to the shared
+writer). Within a lane there is still nothing to route away from: every row in the lane rides
+that lane's committed (store-visible) batch, and on the success path every dispatch waits for
+it. D1's carve-out — a pure-observability row whose commit fails persistently — remains a
+failure outcome rather than a routing choice.
 
-The classifier survives, for a sharper reason. It decides **what a failed commit does to the
-caller**:
+The classifier therefore has exactly two jobs, decided at the same seam: lane selection
+(ADR-134 D2a) and **what a failed commit does to the caller**:
 
 - **Accounting-, authorization-, and security-audit-bearing rows.** A dispatch must not report
   success when the record that accounts for, authorizes, or audits it did not commit. Reporting
@@ -489,9 +492,10 @@ of this record, and the read-your-own-audit caveat it carried is withdrawn.
 It claims writer _acquisitions_ fall. Whether any verb reaches zero writes is a question the
 revised census answers, not something this record asserts.
 
-**Not addressed here.** Remaining genuine writes still serialize on one writer. Raising that
-ceiling is the group-commit work, sequenced after this record so it is designed against the
-post-change profile.
+**Not addressed here.** Remaining genuine writes still serialize on one writer within each lane,
+and the two lane writers (ADR-134 D2a) additionally contend on SQLite's write lock between
+themselves. Raising that ceiling is the group-commit work, sequenced after this record so it is
+designed against the post-change profile.
 
 ## Acceptance
 
