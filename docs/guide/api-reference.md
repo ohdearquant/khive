@@ -1505,7 +1505,7 @@ Create a time-triggered reminder.
 | --------- | ------ | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `content` | string | yes      | Non-empty reminder message.                                                                                                                      |
 | `at`      | string | yes      | RFC 3339 trigger time, e.g. `"2026-06-01T09:00:00Z"`.                                                                                            |
-| `repeat`  | string | no       | `daily`\|`weekly`\|`monthly`, or a limited 5-field cron form using only `*` or one in-range integer per field (steps/ranges/lists not accepted). |
+| `repeat`  | string | no       | `daily`\|`weekly`\|`monthly`. Cron expressions are rejected because the executor cannot advance them. |
 
 ```
 request(ops="schedule.remind(content=\"check PR #600 CI\", at=\"2026-07-05T09:00:00Z\")")
@@ -1517,7 +1517,7 @@ Schedule a future verb dispatch.
 
 | Param    | Type   | Required | Notes                                                               |
 | -------- | ------ | -------- | ------------------------------------------------------------------- |
-| `action` | string | yes      | Verb dispatch payload, e.g. `"schedule.remind(content=\"hello\")"`. |
+| `action` | string | yes      | One replayable verb call, e.g. `"gtd.assign(title=\"follow up\")"`.  |
 | `at`     | string | yes      | RFC 3339 trigger time.                                              |
 | `repeat` | string | no       | Same recurrence grammar as `schedule.remind`.                       |
 

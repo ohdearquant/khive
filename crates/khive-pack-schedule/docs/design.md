@@ -74,21 +74,10 @@ the creator.
 | `"daily"`            | Repeat every 24 hours from `trigger_at`                                 |
 | `"weekly"`           | Repeat every 7 days                                                     |
 | `"monthly"`          | Repeat on the same day-of-month each month                              |
-| limited 5-field form | Each field is `*` or one in-range integer: `"0 9 * * 1"` (Monday 09:00) |
 
-Field ranges:
-
-- $\text{MIN} \in [0, 59]$
-- $\text{HOUR} \in [0, 23]$
-- $\text{DOM} \in [1, 31]$
-- $\text{MON} \in [1, 12]$
-- $\text{DOW} \in [0, 7]$
-
-This is **not** standard cron: operators such as steps (`*/15`), ranges
-(`9-17`), and lists (`0,30`) are rejected (issue #481). `kkernel`'s
-pending-events runner also does not yet compute next-fire times for the
-5-field form — it is stored and validated, but fires one-shot rather than
-advancing to its next occurrence, until next-occurrence computation lands.
+Five-field cron is rejected at creation because the pending-events runner does
+not compute cron next-fire times. The write boundary never accepts recurrence
+syntax that would degrade to a one-shot at execution time.
 
 **`action` payload security and replayability (issue #461).** The `action`
 string accepted by `schedule` is validated at write time in two stages, not

@@ -606,36 +606,40 @@ explicit `--config` / `KHIVE_CONFIG` tier, then calls
 
 "Pending events" are **notes of kind `scheduled_event`** (the same `notes` substrate as everything
 else, created by the `schedule` pack's `remind`/`schedule` verbs), each carrying `trigger_at`,
-`status` (`pending`/`firing`/`fired`/cancelled), `event_type` (`remind` default, or `schedule`),
+`status` (`pending`/`firing`/`fired`/`failed`/`missed`/`cancelled`), `event_type` (`remind` default, or `schedule`),
 and, for `schedule`-type events, a `payload` DSL action string. Despite taking a `--namespace`
 flag, the scan itself is **global across all namespaces**; the flag only sets the drain's home
 namespace for authorization; `discover_pending_namespaces` finds every namespace with due events
 first.
 
-What actually fires: for `event_type="remind"` (the default), **nothing**, the drain only marks
-the note fired to acknowledge the trigger; the module's own comment states the notification
-channel itself is out of scope for this drain. For `event_type="schedule"`, the stored `payload`
-DSL string is re-parsed and dispatched through the same verb registry `exec` uses, with the
-event's own namespace injected into every op so writes land where the event was created, not in
-the drain's namespace.
+For `event_type="remind"`, the drain delivers through `comm.send` to the immutable
+creator-provenance actor (with the documented legacy fallback). For `event_type="schedule"`, the
+stored `payload` DSL is re-parsed and dispatched through the live registry with the event namespace
+and provenance-verified actor. Mutable note metadata never grants replay authority.
 
-Delivery is claim-based, not naive at-least-once: each event is claimed with a conditional
-`UPDATE ... WHERE status='pending'` (a CAS), then finalized with a second CAS bound to that
-specific claim token; a stale claimant can never clobber a fresh reclaim of the same row. Rows
-stuck in `firing` for more than 5 minutes are reclaimed back to `pending` on every drain pass
-before the scan. **Dispatch failures are terminal, not retried**: if the DSL action itself fails,
-the event is still marked `fired` so a permanently broken action doesn't retry forever; only a
-claim-checkout timeout (contention on the writer pool) leaves a row `pending` and retryable.
-Repeat events (`daily`/`weekly`/`monthly`) advance `trigger_at` and reset to `pending` instead of
-firing terminally; 5-field cron expressions are stored but **not** advanced by this drain (logged
-as a warning, treated as one-shot); full cron support is tracked separately.
+Delivery is claim- and receipt-based. The pending CAS durably records deterministic occurrence
+identity, a fresh invocation id, and a renewable lease before the action begins. The lease defaults
+to 300 seconds (`KHIVE_SCHEDULE_LEASE_SECS`) and renews through durable outcome persistence. Outcome and
+lifecycle finalization are separate claim-bound writes: an expired durable success resumes
+finalization without reinvocation; an expired `invoking` receipt becomes indeterminate and is not
+automatically replayed. A known failed one-shot returns to `pending`; a failed named repeat advances
+to its next occurrence. A structured ambiguous action result such as `side_effects_unknown` is
+terminally indeterminate rather than retryable, and its receipt retains the original
+`error_payload` (including `details.outbound_id` when supplied) for reconciliation. A claim that
+expires before invocation is recorded `not_invoked`, returned to `pending`, and is not counted as
+an action failure. Recovery isolates each expired-row write failure so one poisoned row is counted
+and logged without blocking later rows or newly due work. Legacy pre-receipt claims retain the
+historical five-minute reclaim path.
+Repeat creation accepts only `daily`/`weekly`/`monthly`; five-field cron is rejected because it
+cannot be advanced safely.
 
 There is no `--limit`/batch-size flag for the drain (pagination is a hardcoded internal constant)
 and no dry-run mode. **Exit code caveat**: per-event failures accumulate into the printed JSON
 summary's `failed` count but do not cause a nonzero process exit; `run_pending_events` only
 returns `Err` for structural failures (bad namespace, runtime-open failure). A cron wrapper that
 wants to alert on drain failures must parse `failed` out of the JSON summary
-(`{scanned, fired, advanced, failed, skipped_not_due, skipped_race, reclaimed}`), not rely on the
+(`{scanned, invoked, outcomes_persisted, finalized, fired, advanced, failed, retry_pending,
+indeterminate, skipped_not_due, skipped_race, reclaimed, missed_count, missed_ids}`), not rely on the
 exit code.
 
 ### `pack list` / `pack handler <name>`
