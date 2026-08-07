@@ -32,6 +32,7 @@ use super::KnowledgeHandlers;
 
 // ─── scored hit (internal) ────────────────────────────────────────────────────
 
+#[derive(Clone)]
 struct ScoredHit {
     id: String,
     slug: String,
@@ -53,6 +54,15 @@ enum AnnAvailability {
 struct AnnSearchState {
     hits: Vec<(Uuid, f32)>,
     availability: AnnAvailability,
+    /// Whether the ANN source itself returned fewer than `k` entries.
+    /// Fresh-tail deletes may shrink `hits` afterward without proving that
+    /// deeper ANN candidates do not exist.
+    source_exhausted: bool,
+}
+
+struct FreshTailSearchState {
+    hits: Vec<(Uuid, f32)>,
+    source_exhausted: bool,
 }
 
 async fn merge_fresh_tail_for_search(
@@ -62,17 +72,30 @@ async fn merge_fresh_tail_for_search(
     query_embedding: &[f32],
     k: usize,
     loaded: Option<(Vec<(Uuid, f32)>, u64)>,
-) -> Vec<(Uuid, f32)> {
-    let (candidates, watermark) = match loaded {
-        Some((candidates, watermark)) => (candidates, Some(watermark)),
-        None => (Vec::new(), None),
+) -> FreshTailSearchState {
+    let (candidates, watermark, source_exhausted) = match loaded {
+        Some((candidates, watermark)) => {
+            let source_exhausted = candidates.len() < k;
+            (candidates, Some(watermark), source_exhausted)
+        }
+        None => (Vec::new(), None, true),
     };
     match vamana::fresh_tail_leg(runtime, ann, key, query_embedding, k, watermark).await {
-        vamana::FreshTailOutcome::Ops(ops) => {
-            vamana::merge_fresh_tail(candidates, query_embedding, ops)
-        }
-        vamana::FreshTailOutcome::Replace(replacement) => replacement,
-        vamana::FreshTailOutcome::Skipped => candidates,
+        vamana::FreshTailOutcome::Ops(ops) => FreshTailSearchState {
+            hits: vamana::merge_fresh_tail(candidates, query_embedding, ops),
+            source_exhausted,
+        },
+        vamana::FreshTailOutcome::Replace {
+            candidates,
+            source_exhausted,
+        } => FreshTailSearchState {
+            hits: candidates,
+            source_exhausted,
+        },
+        vamana::FreshTailOutcome::Skipped => FreshTailSearchState {
+            hits: candidates,
+            source_exhausted,
+        },
     }
 }
 
@@ -86,17 +109,20 @@ async fn search_ann_with_warm_wait(
     k: usize,
 ) -> AnnSearchState {
     if let Some(loaded) = vamana::search_loaded_with_seq(ann, key, query_embedding, k).await {
+        let tail =
+            merge_fresh_tail_for_search(runtime, ann, key, query_embedding, k, Some(loaded)).await;
         return AnnSearchState {
-            hits: merge_fresh_tail_for_search(runtime, ann, key, query_embedding, k, Some(loaded))
-                .await,
+            hits: tail.hits,
             availability: AnnAvailability::Ready,
+            source_exhausted: tail.source_exhausted,
         };
     }
     if !vamana::is_warming_not_loaded(ann, key) {
-        let hits = merge_fresh_tail_for_search(runtime, ann, key, query_embedding, k, None).await;
+        let tail = merge_fresh_tail_for_search(runtime, ann, key, query_embedding, k, None).await;
         return AnnSearchState {
-            hits,
+            hits: tail.hits,
             availability: AnnAvailability::Absent,
+            source_exhausted: tail.source_exhausted,
         };
     }
     if vamana::wait_ready(
@@ -113,8 +139,12 @@ async fn search_ann_with_warm_wait(
         } else {
             AnnAvailability::Absent
         };
-        let hits = merge_fresh_tail_for_search(runtime, ann, key, query_embedding, k, loaded).await;
-        return AnnSearchState { hits, availability };
+        let tail = merge_fresh_tail_for_search(runtime, ann, key, query_embedding, k, loaded).await;
+        return AnnSearchState {
+            hits: tail.hits,
+            availability,
+            source_exhausted: tail.source_exhausted,
+        };
     }
 
     let corpus_non_empty =
@@ -122,10 +152,11 @@ async fn search_ann_with_warm_wait(
             .await
             .map(|fingerprint| fingerprint.vector_count > 0)
             .unwrap_or(false);
-    let hits = merge_fresh_tail_for_search(runtime, ann, key, query_embedding, k, None).await;
+    let tail = merge_fresh_tail_for_search(runtime, ann, key, query_embedding, k, None).await;
     AnnSearchState {
-        hits,
+        hits: tail.hits,
         availability: AnnAvailability::WarmingTimedOut { corpus_non_empty },
+        source_exhausted: tail.source_exhausted,
     }
 }
 
@@ -141,7 +172,7 @@ fn normalize_rrf_score(raw: f32, source_count: usize, k: usize) -> f32 {
     (raw / theoretical_max).clamp(0.0, 1.0)
 }
 
-fn fuse_ann_hits(fts_hits: &mut Vec<ScoredHit>, ann_hits: &[(Uuid, f32)], min_score: f32) {
+fn fuse_ann_hits(fts_hits: &mut Vec<ScoredHit>, ann_hits: &[ScoredHit], min_score: f32) {
     let drained: Vec<ScoredHit> = std::mem::take(fts_hits);
 
     let fts_source: Vec<(String, DeterministicScore)> = drained
@@ -154,8 +185,11 @@ fn fuse_ann_hits(fts_hits: &mut Vec<ScoredHit>, ann_hits: &[(Uuid, f32)], min_sc
         .collect();
     let ann_source: Vec<(String, DeterministicScore)> = ann_hits
         .iter()
-        .map(|(uuid, score)| (uuid.to_string(), DeterministicScore::from_f32(*score)))
+        .map(|hit| (hit.id.clone(), DeterministicScore::from_f32(hit.score)))
         .collect();
+    for hit in ann_hits {
+        by_id.entry(hit.id.clone()).or_insert_with(|| hit.clone());
+    }
 
     let source_count = usize::from(!fts_source.is_empty()) + usize::from(!ann_source.is_empty());
     let fused = khive_fusion::reciprocal_rank_fusion(vec![fts_source, ann_source], RRF_K);
@@ -170,18 +204,6 @@ fn fuse_ann_hits(fts_hits: &mut Vec<ScoredHit>, ann_hits: &[(Uuid, f32)], min_sc
         if let Some(mut hit) = by_id.remove(&id) {
             hit.score = score;
             fts_hits.push(hit);
-        } else {
-            fts_hits.push(ScoredHit {
-                id,
-                slug: String::new(),
-                name: String::new(),
-                content: None,
-                tags: None,
-                finalized: false,
-                is_domain: false,
-                status: None,
-                score,
-            });
         }
     }
 }
@@ -189,10 +211,6 @@ fn fuse_ann_hits(fts_hits: &mut Vec<ScoredHit>, ann_hits: &[(Uuid, f32)], min_sc
 // ─── status filtering (post-hydration) ───────────────────────────────────────
 
 /// Remove hits whose `status` is in `exclude_statuses` after hydration.
-///
-/// This is the shared gate for both the SQL path (where exclusion is enforced
-/// in the query) and the ANN-only path (where hydration happens after fusion
-/// and the SQL predicate was never applied to the ANN-sourced IDs).
 fn filter_by_excluded_statuses(hits: &mut Vec<ScoredHit>, exclude_statuses: &[&str]) {
     if exclude_statuses.is_empty() {
         return;
@@ -201,6 +219,36 @@ fn filter_by_excluded_statuses(hits: &mut Vec<ScoredHit>, exclude_statuses: &[&s
         let status = hit.status.as_deref().unwrap_or("");
         !exclude_statuses.contains(&status)
     });
+}
+
+/// Apply the complete public status contract to hydrated hits.
+///
+/// An explicit `status=` is an allowlist, not merely a request to disable the
+/// default exclusions. This distinction is load-bearing for ANN candidates,
+/// which do not pass through the FTS SQL predicate.
+fn filter_hits_by_status(
+    hits: &mut Vec<ScoredHit>,
+    statuses: &[String],
+    exclude_statuses: &[&str],
+) {
+    if statuses.is_empty() {
+        filter_by_excluded_statuses(hits, exclude_statuses);
+        return;
+    }
+
+    hits.retain(|hit| {
+        hit.status
+            .as_deref()
+            .is_some_and(|status| statuses.iter().any(|allowed| allowed == status))
+    });
+}
+
+fn deprecated_allowed_by_status_policy(statuses: &[String], exclude_statuses: &[&str]) -> bool {
+    if statuses.is_empty() {
+        !exclude_statuses.contains(&"deprecated")
+    } else {
+        explicitly_requested_status(statuses, "deprecated")
+    }
 }
 
 // ─── type filtering (post-hydration) ─────────────────────────────────────────
@@ -213,8 +261,8 @@ fn filter_by_excluded_statuses(hits: &mut Vec<ScoredHit>, exclude_statuses: &[&s
 /// - `Some(other)` where other is non-empty keeps only non-domain hits.
 /// - `None` or `Some("")` is a no-op.
 ///
-/// Applied after ANN fusion + hydration so that ANN-sourced hits go through
-/// the same kind gate as SQL-sourced candidates.
+/// Applied to hydrated ANN candidates before fusion/refill and again to the
+/// fused pool as a final shared-source guard.
 fn filter_hits_by_type(hits: &mut Vec<ScoredHit>, type_filter: Option<&str>) {
     let filt = match type_filter {
         Some(f) if !f.is_empty() => f,
@@ -262,11 +310,58 @@ fn enforce_min_score_floor(hits: &mut Vec<ScoredHit>, min_score: f32) {
     hits.retain(|hit| hit.score >= min_score);
 }
 
-// ─── FTS5 phrase quoting ─────────────────────────────────────────────────────
+// ─── FTS5 candidate expression ───────────────────────────────────────────────
 
 fn quote_fts5_phrase(raw_query: &str) -> String {
     let escaped = raw_query.replace('"', "\"\"");
     format!("\"{escaped}\"")
+}
+
+/// Build a recall-oriented FTS expression from the same lexical terms the
+/// in-memory scorer consumes.
+///
+/// FTS is only the candidate generator; TF-IDF remains the ranker. Requiring
+/// the whole raw query as one phrase drops candidates whose matching terms are
+/// separated in the document. OR-ing the de-duplicated, non-stop terms keeps
+/// those non-contiguous matches in the pool for the scorer to judge. Queries
+/// with no scoreable term retain the exact-phrase fallback used by the
+/// exact-name-only path.
+fn fts5_candidate_expression(raw_query: &str) -> String {
+    let mut seen = HashSet::new();
+    let mut terms: Vec<String> = matching::tokenize_field(raw_query)
+        .into_iter()
+        .filter(|term| term.len() >= MIN_TERM_LEN && !is_stop(term))
+        .filter(|term| seen.insert(term.clone()))
+        .collect();
+
+    if terms.is_empty() {
+        quote_fts5_phrase(raw_query)
+    } else {
+        // Candidate recall observes the same singular/plural expansion as the
+        // scorer. The returned set is used by IDF weighting later; expansion's
+        // mutation of `terms` is the only result needed here.
+        let _ = expand_terms(&mut terms);
+        terms
+            .iter()
+            .map(|term| quote_fts5_phrase(term))
+            .collect::<Vec<_>>()
+            .join(" OR ")
+    }
+}
+
+/// SQL eligibility predicate for the public atom/domain kind filter.
+///
+/// Domain mirrors are atoms carrying the exact `type:domain` tag. Applying
+/// this predicate in the FTS/full-scan query is load-bearing: filtering after
+/// `LIMIT` lets the wrong kind consume every candidate slot.
+fn type_eligibility_sql(type_filter: Option<&str>, atom_alias: &str) -> String {
+    match type_filter {
+        Some("domain") => format!(" AND {atom_alias}.tags LIKE '%\"type:domain\"%'"),
+        Some(filter) if !filter.is_empty() => {
+            format!(" AND {atom_alias}.tags NOT LIKE '%\"type:domain\"%'")
+        }
+        _ => String::new(),
+    }
 }
 
 // ─── FTS5 candidate pool fetch ────────────────────────────────────────────────
@@ -286,30 +381,70 @@ async fn fetch_fts_candidates(
         .await
         .map_err(|e| sql_err("search fts reader", e))?;
 
-    let match_expr = quote_fts5_phrase(raw_query);
+    let match_expr = fts5_candidate_expression(raw_query);
+    let (status_clause, status_params) = status_sql_clause(statuses, exclude_statuses, 4);
+    let type_clause = type_eligibility_sql(type_filter, "a");
+    let mut params = vec![
+        SqlValue::Text(match_expr.clone()),
+        SqlValue::Text(ns.to_owned()),
+        SqlValue::Integer(fetch_limit as i64),
+    ];
+    params.extend(status_params);
+
+    // Join the canonical atom row before LIMIT so deleted, status-ineligible,
+    // and wrong-kind FTS rows cannot consume the bounded candidate window.
+    // bm25 orders the eligible matches before the cap; slug is the stable tie
+    // break for equal lexical rank.
     let fts_rows = reader
         .query_all(SqlStatement {
-            sql: "SELECT id FROM fts_knowledge WHERE fts_knowledge MATCH ?1 AND namespace = ?2 LIMIT ?3".into(),
-            params: vec![
-                SqlValue::Text(match_expr),
-                SqlValue::Text(ns.to_owned()),
-                SqlValue::Integer(fetch_limit as i64),
-            ],
+            sql: format!(
+                "SELECT a.* FROM fts_knowledge \
+                 JOIN knowledge_atoms AS a ON a.rowid = fts_knowledge.rowid \
+                 WHERE fts_knowledge MATCH ?1 \
+                   AND fts_knowledge.namespace = ?2 \
+                   AND a.namespace = ?2 \
+                   AND a.deleted_at IS NULL{status_clause}{type_clause} \
+                 ORDER BY bm25(fts_knowledge), a.slug \
+                 LIMIT ?3"
+            ),
+            params,
             label: None,
         })
         .await
         .map_err(|e| sql_err("search fts query", e))?;
 
     if fts_rows.is_empty() {
-        // FTS returned nothing — fall back to full scan (small corpora) capped at CANDIDATE_POOL.
+        // Preserve the fallback's established meaning: it is for a lexical
+        // miss, not for a lexical match whose rows were all ineligible. In the
+        // latter case an empty result is correct; a full scan could otherwise
+        // admit unrelated zero-score rows when min_score is the default 0.
+        let raw_fts_match = reader
+            .query_row(SqlStatement {
+                sql: "SELECT 1 AS present FROM fts_knowledge \
+                      WHERE fts_knowledge MATCH ?1 AND namespace = ?2 LIMIT 1"
+                    .to_string(),
+                params: vec![SqlValue::Text(match_expr), SqlValue::Text(ns.to_owned())],
+                label: None,
+            })
+            .await
+            .map_err(|e| sql_err("search fts eligibility probe", e))?;
+        if raw_fts_match.is_some() {
+            return Ok(Vec::new());
+        }
+
+        // FTS returned nothing — fall back to a bounded full scan. Eligibility
+        // remains inside SQL so the cap is filled from rows the caller can
+        // actually receive.
         let (status_clause, status_params) = status_sql_clause(statuses, exclude_statuses, 3);
+        let type_clause = type_eligibility_sql(type_filter, "a");
         let sql_str = format!(
-            "SELECT * FROM knowledge_atoms WHERE namespace = ?1 AND deleted_at IS NULL{} ORDER BY created_at DESC LIMIT ?2",
-            status_clause
+            "SELECT a.* FROM knowledge_atoms AS a \
+             WHERE a.namespace = ?1 AND a.deleted_at IS NULL{status_clause}{type_clause} \
+             ORDER BY a.created_at DESC, a.slug LIMIT ?2"
         );
         let mut params = vec![
             SqlValue::Text(ns.to_owned()),
-            SqlValue::Integer(CANDIDATE_POOL as i64),
+            SqlValue::Integer(fetch_limit as i64),
         ];
         params.extend(status_params);
 
@@ -322,48 +457,10 @@ async fn fetch_fts_candidates(
             .await
             .map_err(|e| sql_err("search full scan", e))?;
 
-        let mut atoms: Vec<Atom> = rows.iter().filter_map(atom_from_row).collect();
-        if let Some(filt) = type_filter {
-            let want_domain = filt == "domain";
-            atoms.retain(|a| {
-                let tags_arr: Vec<String> = serde_json::from_str(&a.tags).unwrap_or_default();
-                let is_domain = tags_arr.iter().any(|t| t == "type:domain");
-                if want_domain {
-                    is_domain
-                } else {
-                    !is_domain
-                }
-            });
-        }
-        return Ok(atoms);
+        return Ok(rows.iter().filter_map(atom_from_row).collect());
     }
 
-    let ids: Vec<String> = fts_rows.iter().filter_map(|r| row_str(r, "id")).collect();
-    let placeholders: String = ids
-        .iter()
-        .enumerate()
-        .map(|(i, _)| format!("?{}", i + 2))
-        .collect::<Vec<_>>()
-        .join(",");
-
-    let (status_clause, status_params) =
-        status_sql_clause(statuses, exclude_statuses, ids.len() + 2);
-    let mut params: Vec<SqlValue> = vec![SqlValue::Text(ns.to_owned())];
-    params.extend(ids.iter().map(|id| SqlValue::Text(id.clone())));
-    params.extend(status_params);
-
-    let rows = reader
-        .query_all(SqlStatement {
-            sql: format!(
-                "SELECT * FROM knowledge_atoms WHERE namespace = ?1 AND id IN ({placeholders}) AND deleted_at IS NULL{status_clause}"
-            ),
-            params,
-            label: None,
-        })
-        .await
-        .map_err(|e| sql_err("search load atoms", e))?;
-
-    Ok(rows.iter().filter_map(atom_from_row).collect())
+    Ok(fts_rows.iter().filter_map(atom_from_row).collect())
 }
 
 // ─── search context ───────────────────────────────────────────────────────────
@@ -653,41 +750,73 @@ fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
 
 // ─── hit hydration ────────────────────────────────────────────────────────────
 
-async fn hydrate_empty_hits(runtime: &KhiveRuntime, ns: &str, hits: &mut Vec<ScoredHit>) {
+// Keep one namespace bind plus the ID binds comfortably below SQLite's
+// portable 999-variable ceiling.
+const HYDRATION_ID_CHUNK: usize = 900;
+
+/// Hydrate ANN-only hit shells from the canonical corpus tables.
+///
+/// Returns the number of candidate rows that could not be hydrated. Missing
+/// rows (for example a stale ANN id) and storage-read failures both degrade the
+/// candidate pool instead of failing an otherwise-useful lexical response, but
+/// unresolved shells are always removed and the count is surfaced to callers.
+async fn hydrate_empty_hits(runtime: &KhiveRuntime, ns: &str, hits: &mut Vec<ScoredHit>) -> usize {
     let ids: Vec<String> = hits
         .iter()
         .filter(|hit| hit.slug.is_empty())
         .map(|hit| hit.id.clone())
         .collect();
     if ids.is_empty() {
-        return;
+        return 0;
     }
 
     let sql = runtime.sql();
     let mut reader = match sql.reader().await {
         Ok(r) => r,
-        Err(_) => return,
+        Err(error) => {
+            tracing::warn!(
+                namespace = ns,
+                requested = ids.len(),
+                error = %error,
+                "knowledge candidate hydration could not acquire a reader"
+            );
+            hits.retain(|hit| !hit.slug.is_empty());
+            return ids.len();
+        }
     };
 
-    let placeholders = ids
-        .iter()
-        .enumerate()
-        .map(|(i, _)| format!("?{}", i + 2))
-        .collect::<Vec<_>>()
-        .join(",");
-    let mut params = vec![SqlValue::Text(ns.to_owned())];
-    params.extend(ids.iter().cloned().map(SqlValue::Text));
+    let mut atom_rows = Vec::new();
+    for chunk in ids.chunks(HYDRATION_ID_CHUNK) {
+        let placeholders = chunk
+            .iter()
+            .enumerate()
+            .map(|(i, _)| format!("?{}", i + 2))
+            .collect::<Vec<_>>()
+            .join(",");
+        let mut params = vec![SqlValue::Text(ns.to_owned())];
+        params.extend(chunk.iter().cloned().map(SqlValue::Text));
 
-    let atom_rows = reader
-        .query_all(SqlStatement {
-            sql: format!(
-                "SELECT id, slug, name, content, tags, finalized, status FROM knowledge_atoms WHERE namespace = ?1 AND id IN ({placeholders}) AND deleted_at IS NULL"
-            ),
-            params,
-            label: None,
-        })
-        .await
-        .unwrap_or_default();
+        match reader
+            .query_all(SqlStatement {
+                sql: format!(
+                    "SELECT id, slug, name, content, tags, finalized, status FROM knowledge_atoms WHERE namespace = ?1 AND id IN ({placeholders}) AND deleted_at IS NULL"
+                ),
+                params,
+                label: None,
+            })
+            .await
+        {
+            Ok(rows) => atom_rows.extend(rows),
+            Err(error) => {
+                tracing::warn!(
+                    namespace = ns,
+                    requested = chunk.len(),
+                    error = %error,
+                    "knowledge atom candidate hydration chunk degraded"
+                );
+            }
+        }
+    }
 
     let mut atom_rows_by_id: HashMap<String, khive_storage::types::SqlRow> = HashMap::new();
     for row in atom_rows {
@@ -719,28 +848,41 @@ async fn hydrate_empty_hits(runtime: &KhiveRuntime, ns: &str, hits: &mut Vec<Sco
         .map(|hit| hit.id.clone())
         .collect();
     if missing_ids.is_empty() {
-        return;
+        return 0;
     }
 
-    let placeholders = missing_ids
-        .iter()
-        .enumerate()
-        .map(|(i, _)| format!("?{}", i + 2))
-        .collect::<Vec<_>>()
-        .join(",");
-    let mut params = vec![SqlValue::Text(ns.to_owned())];
-    params.extend(missing_ids.iter().cloned().map(SqlValue::Text));
+    let mut domain_rows = Vec::new();
+    for chunk in missing_ids.chunks(HYDRATION_ID_CHUNK) {
+        let placeholders = chunk
+            .iter()
+            .enumerate()
+            .map(|(i, _)| format!("?{}", i + 2))
+            .collect::<Vec<_>>()
+            .join(",");
+        let mut params = vec![SqlValue::Text(ns.to_owned())];
+        params.extend(chunk.iter().cloned().map(SqlValue::Text));
 
-    let domain_rows = reader
-        .query_all(SqlStatement {
-            sql: format!(
-                "SELECT id, slug, name, description, tags FROM knowledge_domains WHERE namespace = ?1 AND id IN ({placeholders}) AND deleted_at IS NULL"
-            ),
-            params,
-            label: None,
-        })
-        .await
-        .unwrap_or_default();
+        match reader
+            .query_all(SqlStatement {
+                sql: format!(
+                    "SELECT id, slug, name, description, tags, status FROM knowledge_domains WHERE namespace = ?1 AND id IN ({placeholders}) AND deleted_at IS NULL"
+                ),
+                params,
+                label: None,
+            })
+            .await
+        {
+            Ok(rows) => domain_rows.extend(rows),
+            Err(error) => {
+                tracing::warn!(
+                    namespace = ns,
+                    requested = chunk.len(),
+                    error = %error,
+                    "knowledge domain candidate hydration chunk degraded"
+                );
+            }
+        }
+    }
 
     let mut domain_rows_by_id: HashMap<String, khive_storage::types::SqlRow> = HashMap::new();
     for row in domain_rows {
@@ -757,10 +899,118 @@ async fn hydrate_empty_hits(runtime: &KhiveRuntime, ns: &str, hits: &mut Vec<Sco
             hit.tags = row_str(row, "tags");
             hit.finalized = false;
             hit.is_domain = true;
+            hit.status = row_str(row, "status");
         }
     }
 
+    let failed = hits.iter().filter(|hit| hit.slug.is_empty()).count();
     hits.retain(|hit| !hit.slug.is_empty());
+    if failed > 0 {
+        tracing::warn!(
+            namespace = ns,
+            requested = ids.len(),
+            failed,
+            "knowledge candidate hydration returned a degraded pool"
+        );
+    }
+    failed
+}
+
+/// Add hydration degradation to a response without disturbing another
+/// degradation diagnostic (for example suggest's ANN-unavailable object).
+fn attach_hydration_degradation(out: &mut Value, hydration_failures: usize) {
+    if hydration_failures == 0 {
+        return;
+    }
+
+    if !out
+        .get("degraded")
+        .is_some_and(serde_json::Value::is_object)
+    {
+        out["degraded"] = json!({});
+    }
+    out["degraded"]["hydration_failures"] = json!(hydration_failures);
+}
+
+struct EligibleAnnSearchState {
+    hits: Vec<ScoredHit>,
+    availability: AnnAvailability,
+    hydration_failures: usize,
+}
+
+/// Retrieve an ANN pool whose bounded, rank-preserving truncation happens only
+/// after canonical hydration and caller eligibility.
+///
+/// Vamana has no metadata predicate, so a selective status/kind filter may
+/// consume the first raw top-k. Widen exponentially and re-evaluate the full
+/// deterministic prefix until the eligible target is filled or the vector
+/// corpus is exhausted. The common case performs one ANN search and one
+/// hydration pass; only filtered/invalid prefixes pay for widening.
+async fn search_eligible_ann_with_refill(
+    ctx: &SearchCtx<'_>,
+    token: &NamespaceToken,
+    ann: &vamana::SharedAnn,
+    key: &vamana::AnnKey,
+    query_embedding: &[f32],
+    target_eligible: usize,
+    initial_k: usize,
+) -> EligibleAnnSearchState {
+    let runtime = ctx.runtime;
+    let target_eligible = target_eligible.max(1);
+    let mut request_k = initial_k.max(target_eligible).max(1);
+
+    loop {
+        let AnnSearchState {
+            hits: raw_hits,
+            availability,
+            source_exhausted,
+        } = search_ann_with_warm_wait(runtime, token, ann, key, query_embedding, request_k).await;
+
+        let mut seen = HashSet::with_capacity(raw_hits.len());
+        let mut hits: Vec<ScoredHit> = raw_hits
+            .into_iter()
+            .filter(|(id, _)| seen.insert(*id))
+            .map(|(id, score)| ScoredHit {
+                id: id.to_string(),
+                slug: String::new(),
+                name: String::new(),
+                content: None,
+                tags: None,
+                finalized: false,
+                is_domain: false,
+                status: None,
+                score,
+            })
+            .collect();
+
+        let hydration_failures = hydrate_empty_hits(runtime, ctx.ns, &mut hits).await;
+        filter_hits_by_status(&mut hits, ctx.statuses, ctx.exclude_statuses);
+        filter_hits_by_type(&mut hits, ctx.type_filter);
+
+        if hits.len() >= target_eligible || source_exhausted {
+            hits.truncate(target_eligible);
+            return EligibleAnnSearchState {
+                hits,
+                availability,
+                hydration_failures,
+            };
+        }
+
+        // The live vector-store count is not a sound upper bound for a serving
+        // bridge: a fresh delete removes the canonical vector before its tail
+        // tombstone is merged into that older bridge. Widen until the ANN
+        // source itself proves exhaustion.
+        let next_k = request_k.saturating_mul(2);
+        if next_k == request_k {
+            hits.truncate(target_eligible);
+            return EligibleAnnSearchState {
+                hits,
+                availability,
+                hydration_failures,
+            };
+        }
+        request_k = next_k;
+    }
 }
 
 // ─── compose helpers ──────────────────────────────────────────────────────────
@@ -1304,7 +1554,6 @@ impl KnowledgeHandlers {
 
         let ns = token.namespace().as_str().to_owned();
         let requested_statuses = status_values(p.status.as_ref());
-        let include_deprecated = explicitly_requested_status(&requested_statuses, "deprecated");
 
         // Normalize exclude_status once: trim whitespace, treat blank as absent.
         // This single normalized value feeds both the SQL predicate (via SearchCtx)
@@ -1317,12 +1566,12 @@ impl KnowledgeHandlers {
             .filter(|s| !s.is_empty());
 
         // Precedence (highest to lowest, matches ADR-047 §Status filtering):
-        //   1. explicit status=  → no exclusion; SQL handles the allowlist
+        //   1. explicit status=  → no exclusion; SQL and hydrated ANN use the allowlist
         //   2. no status=, explicit exclude_status= (non-blank) → use that exclusion
         //   3. no status=, include_drafts=true → exclude only deprecated
         //   4. default (no status params / blank exclude_status) → exclude draft and deprecated
-        let exclude_statuses_buf: Vec<&str> = if !requested_statuses.is_empty() {
-            // Caller specified exact status; no exclusion needed — SQL allowlist wins.
+        let effective_exclude_statuses: Vec<&str> = if !requested_statuses.is_empty() {
+            // Caller specified exact status; the shared allowlist wins.
             vec![]
         } else if let Some(ex) = exclude_status_normalized {
             vec![ex]
@@ -1334,6 +1583,12 @@ impl KnowledgeHandlers {
                 vec!["draft", "deprecated"]
             }
         };
+        // The zero multiplier for deprecated is also a final eligibility gate.
+        // Resolve its override from the same precedence policy used before FTS
+        // caps and ANN refill; otherwise explicit exclude_status can admit a
+        // row early only for the multiplier stage to remove it later.
+        let allow_deprecated =
+            deprecated_allowed_by_status_policy(&requested_statuses, &effective_exclude_statuses);
 
         let ctx = SearchCtx {
             runtime,
@@ -1344,7 +1599,7 @@ impl KnowledgeHandlers {
             w: &w,
             fetch_limit,
             statuses: &requested_statuses,
-            exclude_statuses: &exclude_statuses_buf,
+            exclude_statuses: &effective_exclude_statuses,
         };
 
         let mut hits = if do_decompose && non_stop_count >= decompose_threshold {
@@ -1357,21 +1612,21 @@ impl KnowledgeHandlers {
         vamana::ensure_ann_background(runtime, token, ann);
 
         let mut ann_unavailable = false;
+        let mut hydration_failures = 0usize;
         if let Ok(query_emb) = runtime.embed_query(&raw_query).await {
             let ann_k = fetch_limit.max(20);
             let model = runtime.default_embedder_name();
             let key = vamana::AnnKey::new(&ns, model);
-            let AnnSearchState {
+            let EligibleAnnSearchState {
                 hits: ann_hits,
                 availability,
-            } = search_ann_with_warm_wait(runtime, token, ann, &key, &query_emb, ann_k).await;
+                hydration_failures: ann_hydration_failures,
+            } = search_eligible_ann_with_refill(&ctx, token, ann, &key, &query_emb, ann_k, ann_k)
+                .await;
+            hydration_failures += ann_hydration_failures;
 
             if !ann_hits.is_empty() {
                 fuse_ann_hits(&mut hits, &ann_hits, min_score);
-                hydrate_empty_hits(runtime, &ns, &mut hits).await;
-                // ANN-sourced hits bypass the SQL status predicate; apply the
-                // same exclusion policy here so all result sources are consistent.
-                filter_by_excluded_statuses(&mut hits, &exclude_statuses_buf);
             }
             // FTS hits remain valid partial results. Preserve the existing
             // advisory only for a non-empty corpus with no lexical fallback.
@@ -1385,17 +1640,16 @@ impl KnowledgeHandlers {
                 ann_unavailable = true;
             }
         }
-        // Apply the kind gate unconditionally — both FTS-sourced and ANN-sourced
-        // hits must pass the type filter regardless of whether ANN ran.
-        // Previously this was inside the ANN block, so FTS atom hits were never
-        // filtered when ANN was warming or returned no results.
+        // Apply shared eligibility unconditionally so every source observes the
+        // same final status and kind contract even when ANN did not run.
+        filter_hits_by_status(&mut hits, &requested_statuses, &effective_exclude_statuses);
         filter_hits_by_type(&mut hits, type_filter);
 
         if do_rerank && !hits.is_empty() {
             rerank_with_embeddings(runtime, &raw_query, &mut hits, rerank_alpha).await?;
         }
 
-        apply_status_multipliers(&mut hits, include_deprecated);
+        apply_status_multipliers(&mut hits, allow_deprecated);
         enforce_min_score_floor(&mut hits, min_score);
         hits.truncate(limit);
 
@@ -1421,6 +1675,7 @@ impl KnowledgeHandlers {
         if ann_unavailable {
             out["ann_unavailable"] = json!(true);
         }
+        attach_hydration_degradation(&mut out, hydration_failures);
         Ok(out)
     }
 
@@ -1466,6 +1721,7 @@ impl KnowledgeHandlers {
 
         vamana::ensure_ann_background(runtime, token, ann);
         let mut ann_unavailable = false;
+        let mut hydration_failures = 0usize;
         if let Ok(query_emb) = runtime.embed_query(&raw_query).await {
             // Over-fetch aggressively: the corpus is ~27% domains / ~73% atoms, so
             // limit*3 would return mostly atoms that all get dropped after type filtering.
@@ -1474,19 +1730,24 @@ impl KnowledgeHandlers {
             let ann_k = (limit * 50).max(200);
             let model = runtime.default_embedder_name();
             let key = vamana::AnnKey::new(&ns, model);
-            let AnnSearchState {
+            let EligibleAnnSearchState {
                 hits: ann_hits,
                 availability,
-            } = search_ann_with_warm_wait(runtime, token, ann, &key, &query_emb, ann_k).await;
+                hydration_failures: ann_hydration_failures,
+            } = search_eligible_ann_with_refill(
+                &ctx,
+                token,
+                ann,
+                &key,
+                &query_emb,
+                ctx.fetch_limit,
+                ann_k,
+            )
+            .await;
+            hydration_failures += ann_hydration_failures;
 
             if !ann_hits.is_empty() {
                 fuse_ann_hits(&mut hits, &ann_hits, 0.0);
-                hydrate_empty_hits(runtime, &ns, &mut hits).await;
-                // Apply the same status exclusion to ANN-sourced domain hits.
-                filter_by_excluded_statuses(&mut hits, SUGGEST_EXCLUDE);
-                // Drop non-domain ANN hits before rerank/truncate so atom hits do
-                // not crowd out domain hits in the final ranking.
-                filter_hits_by_type(&mut hits, Some("domain"));
             }
             // Suggest always reports degraded candidate recall for a
             // non-empty corpus, even when lexical candidates survived.
@@ -1494,6 +1755,9 @@ impl KnowledgeHandlers {
                 ann_unavailable = corpus_non_empty;
             }
         }
+
+        filter_hits_by_status(&mut hits, &[], SUGGEST_EXCLUDE);
+        filter_hits_by_type(&mut hits, Some("domain"));
 
         let fresh_rerank_applied =
             rerank_with_embeddings(runtime, &raw_query, &mut hits, D_SUGGEST_RERANK_ALPHA).await?;
@@ -1561,6 +1825,7 @@ impl KnowledgeHandlers {
                 "note": note,
             });
         }
+        attach_hydration_degradation(&mut out, hydration_failures);
         Ok(out)
     }
 
@@ -1622,6 +1887,7 @@ impl KnowledgeHandlers {
         let atom_ids_only = domain_ids.is_empty() && !atom_ids.is_empty();
         let blend_kg = p.blend_kg.unwrap_or(true) && !atom_ids_only;
         let mut suggest_ann_unavailable = false;
+        let mut suggest_hydration_failures = 0usize;
         if is_auto {
             let word_count = raw_query.split_whitespace().count();
             if word_count < 10 {
@@ -1670,6 +1936,11 @@ impl KnowledgeHandlers {
                         .get("ann_unavailable")
                         .and_then(|f| f.as_bool())
                         .unwrap_or(false);
+                    suggest_hydration_failures = v
+                        .pointer("/degraded/hydration_failures")
+                        .and_then(Value::as_u64)
+                        .and_then(|count| usize::try_from(count).ok())
+                        .unwrap_or(0);
                     v
                 }
                 Err(e) => {
@@ -1707,6 +1978,7 @@ impl KnowledgeHandlers {
                 if suggest_ann_unavailable {
                     data["ann_unavailable"] = json!(true);
                 }
+                attach_hydration_degradation(&mut data, suggest_hydration_failures);
                 let response = json!({ "status": "ok", "data": data });
                 timing.finish(0);
                 return Ok(response);
@@ -1754,16 +2026,18 @@ impl KnowledgeHandlers {
         }
 
         if ordered_atoms.is_empty() {
-            let response = json!({
-                "status": "ok",
-                "data": {
-                    "query": raw_query,
-                    "markdown": "# Knowledge Briefing\n\nNo atoms found.",
-                    "domains": [],
-                    "atoms": [],
-                    "count": 0,
-                },
+            let mut data = json!({
+                "query": raw_query,
+                "markdown": "# Knowledge Briefing\n\nNo atoms found.",
+                "domains": [],
+                "atoms": [],
+                "count": 0,
             });
+            if suggest_ann_unavailable {
+                data["ann_unavailable"] = json!(true);
+            }
+            attach_hydration_degradation(&mut data, suggest_hydration_failures);
+            let response = json!({ "status": "ok", "data": data });
             timing.finish(0);
             return Ok(response);
         }
@@ -2008,6 +2282,7 @@ impl KnowledgeHandlers {
         if suggest_ann_unavailable {
             data["ann_unavailable"] = json!(true);
         }
+        attach_hydration_degradation(&mut data, suggest_hydration_failures);
 
         let response = json!({
             "status": "ok",
@@ -2045,6 +2320,119 @@ mod tests {
             matches!(err, RuntimeError::InvalidInput(ref msg) if msg.contains("does not match authorized token namespace")),
             "unexpected error: {err:?}"
         );
+    }
+
+    #[test]
+    fn fts_candidate_expression_recalls_non_contiguous_terms() {
+        assert_eq!(
+            fts5_candidate_expression("alpha beta alpha and"),
+            "\"alpha\" OR \"alphas\" OR \"beta\" OR \"betas\""
+        );
+        assert_eq!(fts5_candidate_expression("RAG"), "\"rag\" OR \"rags\"");
+        assert_eq!(
+            fts5_candidate_expression("the and"),
+            "\"the and\"",
+            "stop-only queries retain the exact-phrase fallback"
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_ann_hydration_is_dropped_and_reported() {
+        let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+        let mut hits = vec![ScoredHit {
+            id: "00000000-0000-0000-0000-000000001763".to_string(),
+            slug: String::new(),
+            name: String::new(),
+            content: None,
+            tags: None,
+            finalized: false,
+            is_domain: false,
+            status: None,
+            score: 0.8,
+        }];
+
+        let failures = hydrate_empty_hits(&runtime, "local", &mut hits).await;
+        assert_eq!(failures, 1);
+        assert!(hits.is_empty(), "unhydrated shells must never be returned");
+
+        let mut response = json!({"results": [], "total": 0});
+        attach_hydration_degradation(&mut response, failures);
+        assert_eq!(response["degraded"]["hydration_failures"], 1);
+    }
+
+    #[test]
+    fn zero_hydration_failures_do_not_change_the_response() {
+        let mut response = json!({"results": [], "total": 0});
+        attach_hydration_degradation(&mut response, 0);
+        assert!(response.get("degraded").is_none());
+    }
+
+    #[test]
+    fn hydration_degradation_preserves_existing_diagnostics() {
+        let mut response = json!({
+            "results": [],
+            "total": 0,
+            "degraded": {
+                "reason": "ann_unavailable",
+                "cache_safe": false,
+            }
+        });
+        attach_hydration_degradation(&mut response, 7);
+        assert_eq!(response["degraded"]["reason"], "ann_unavailable");
+        assert_eq!(response["degraded"]["cache_safe"], false);
+        assert_eq!(response["degraded"]["hydration_failures"], 7);
+    }
+
+    #[tokio::test]
+    async fn hydration_chunks_candidate_sets_above_sqlite_bind_ceiling() {
+        let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+        {
+            let access = runtime.sql();
+            let mut writer = access.writer().await.expect("writer");
+            writer
+                .execute(SqlStatement {
+                    sql: "WITH RECURSIVE x(n) AS ( \
+                              VALUES(0) UNION ALL SELECT n + 1 FROM x WHERE n < 20 \
+                          ), y(n) AS ( \
+                              VALUES(0) UNION ALL SELECT n + 1 FROM y WHERE n < 49 \
+                          ) \
+                          INSERT INTO knowledge_atoms ( \
+                              id, namespace, slug, name, content, tags, properties, finalized, \
+                              status, source_uri, source_type, created_at, updated_at, deleted_at \
+                          ) \
+                          SELECT \
+                              printf('70000000-0000-0000-0000-%012d', x.n * 50 + y.n), \
+                              'local', printf('hydrate-%04d', x.n * 50 + y.n), \
+                              printf('Hydrate %04d', x.n * 50 + y.n), 'hydration content', \
+                              '[]', NULL, 1, 'reviewed', NULL, NULL, \
+                              x.n * 50 + y.n, x.n * 50 + y.n, NULL \
+                          FROM x CROSS JOIN y WHERE x.n * 50 + y.n < 1005"
+                        .to_string(),
+                    params: Vec::new(),
+                    label: None,
+                })
+                .await
+                .expect("seed hydration rows");
+        }
+
+        let mut hits: Vec<ScoredHit> = (0..1005)
+            .map(|i| ScoredHit {
+                id: format!("70000000-0000-0000-0000-{i:012}"),
+                slug: String::new(),
+                name: String::new(),
+                content: None,
+                tags: None,
+                finalized: false,
+                is_domain: false,
+                status: None,
+                score: 1.0,
+            })
+            .collect();
+
+        let failures = hydrate_empty_hits(&runtime, "local", &mut hits).await;
+        assert_eq!(failures, 0);
+        assert_eq!(hits.len(), 1005);
+        assert!(hits.iter().all(|hit| hit.slug.starts_with("hydrate-")));
     }
 
     // ── embed-intent regression ───────────────────────────────────────────────
@@ -2098,6 +2486,37 @@ mod tests {
             status: status.map(str::to_string),
             score,
         }
+    }
+
+    #[test]
+    fn explicit_status_is_an_exact_allowlist_for_hydrated_hits() {
+        let mut hits = vec![
+            make_hit("reviewed", Some("reviewed"), 0.9),
+            make_hit("draft", Some("draft"), 0.8),
+            make_hit("deprecated", Some("deprecated"), 0.7),
+            make_hit("missing-status", None, 0.6),
+        ];
+        filter_hits_by_status(&mut hits, &["draft".to_string()], &[]);
+        let ids: Vec<&str> = hits.iter().map(|hit| hit.id.as_str()).collect();
+        assert_eq!(ids, ["draft"]);
+    }
+
+    #[test]
+    fn deprecated_multiplier_gate_uses_resolved_status_policy() {
+        assert!(!deprecated_allowed_by_status_policy(
+            &[],
+            &["draft", "deprecated"]
+        ));
+        assert!(!deprecated_allowed_by_status_policy(&[], &["deprecated"]));
+        assert!(deprecated_allowed_by_status_policy(&[], &["reviewed"]));
+        assert!(!deprecated_allowed_by_status_policy(
+            &["reviewed".to_string()],
+            &[]
+        ));
+        assert!(deprecated_allowed_by_status_policy(
+            &["deprecated".to_string()],
+            &[]
+        ));
     }
 
     #[test]
