@@ -335,7 +335,7 @@ pub struct WriterTaskHandle {
     /// `PoolConfig::checkout_timeout` (reader/pool checkout). The two used
     /// to be conflated here before ADR-131 Decision 2 (#1382, #1643).
     ///
-    /// ADR-131:242's outer-request-budget clamp ("when the caller's outer
+    /// ADR-131 Decision 2's outer-request-budget clamp ("when the caller's outer
     /// request deadline leaves less time remaining than the configured
     /// admission deadline, the admission deadline applied to that operation
     /// is the remaining outer budget instead") is explicitly DEFERRED: no

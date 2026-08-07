@@ -46,12 +46,14 @@ See `crates/khive-db/src/writer_task.rs` — private fn `run_writer_task`.
 
 A `BEGIN IMMEDIATE` failure (for example, `SQLITE_BUSY` from lock
 contention with an unmigrated writer path still holding the pool's writer
-mutex — reachable while only `entity.rs` is routed through this channel in
-this slice) replies the request's error via `AnyWriteRequest::reply_error`
-without ever invoking the request's operation closure via
-`AnyWriteRequest::execute_and_reply`. Slice 1 has no watchdog/retry story
-for a failed `BEGIN` (Component D is a later slice); the connection simply
-tries `BEGIN IMMEDIATE` fresh on the next request.
+mutex — reachable while any write path outside the routed-call
+classification table in `writer_task.rs`'s module docs still opens its own
+writer; strict routing per ADR-136 D1 has not landed) replies the request's
+error via `AnyWriteRequest::reply_error` without ever invoking the
+request's operation closure via `AnyWriteRequest::execute_and_reply`.
+There is no watchdog/retry story for a failed `BEGIN` (ADR-067
+Component D remains future work); the connection simply tries
+`BEGIN IMMEDIATE` fresh on the next request.
 
 Exits normally when every `WriterTaskHandle` clone is dropped and the channel
 closes (`rx.recv()` returns `None`). A panic while executing a request, a failed

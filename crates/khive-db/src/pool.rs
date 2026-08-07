@@ -68,11 +68,14 @@ pub struct PoolConfig {
     /// `WriterTask` channel (ADR-067 Component A) instead of the legacy
     /// per-call pool-mutex/standalone-connection path. Enabled by default
     /// for file-backed pools when unset; explicit override always wins.
+    /// That default is a compatibility-routing posture subordinate to
+    /// ADR-135 Amendment 1 and ADR-136 D1/D2 — the strict-routing default
+    /// flip has NOT happened.
     ///
-    /// Slice 1 wires exactly one path (`SqlEntityStore::upsert_entities`)
-    /// behind this flag; enabling it does not yet claim ADR-067's
-    /// single-writer guarantee — other write paths still open their own
-    /// writers until later slices migrate them.
+    /// The set of routed write paths is the classification table in
+    /// `writer_task.rs` (module docs), not any single store; routing does
+    /// not yet claim ADR-067's single-writer guarantee — unmigrated write
+    /// paths still open their own writers until strict routing lands.
     ///
     /// `None` means the caller expressed no preference: [`ConnectionPool::new`]
     /// resolves it once `path` is known, defaulting to `true` for file-backed
