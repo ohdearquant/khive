@@ -146,6 +146,12 @@ records what's connected, in which direction, and why.
 │  khive-pack-knowledge: atom KB + embedding rerank (19 verbs)  │
 │  khive-pack-session:   session record persistence (4 verbs)   │
 │  khive-pack-git:       provenance ingest + writes (4 verbs)   │
+│  khive-pack-code:      source ingest (L1 manifest + L1.5      │
+│                        import-scan; 1 verb)                   │
+│  khive-pack-workspace: workspace entity + contains endpoint   │
+│                        rules (0 verbs)                        │
+│  khive-pack-blob:      content-addressed object storage       │
+│                        (3 verbs)                              │
 └──────────────────────────────────────────────────────────────┘
                             ↕ in-process
 ┌──────────────────────────────────────────────────────────────┐
@@ -217,6 +223,11 @@ must follow the [cache-state and warm-up protocol](scripts/perf/README.md#benchm
 | `khive-pack-comm`      | Comm pack: threaded messaging with inbox                                                                 |
 | `khive-pack-schedule`  | Schedule pack: reminders and scheduled verb execution                                                    |
 | `khive-pack-knowledge` | Knowledge pack: atom-based KB with embedding rerank search                                               |
+| `khive-pack-session`   | Session pack: session record persistence                                                                 |
+| `khive-pack-git`       | Git pack: provenance ingest and git write verbs                                                          |
+| `khive-pack-code`      | Code pack: L1 manifest + L1.5 import-scan source ingestion                                               |
+| `khive-pack-workspace` | Workspace pack: workspace entity kind + contains endpoint rules                                          |
+| `khive-pack-blob`      | Blob pack: content-addressed object storage                                                              |
 | `khive-mcp`            | MCP server library: single `request` tool dispatching through the VerbRegistry (served by `kkernel mcp`) |
 | `kkernel`              | The single shipped binary: `kkernel mcp` serves MCP; admin subcommands (exec, reindex, db, …)            |
 
@@ -230,7 +241,7 @@ touching consumers.
 
 ## Quick start
 
-**1. Install** (from [crates.io](https://crates.io/crates/khive-mcp), currently at `0.4.0`; `0.5.0` publishes with this release):
+**1. Install** (from [crates.io](https://crates.io/crates/khive-mcp); this repository's workspace release is `0.7.0`):
 
 ```bash
 cargo install kkernel
@@ -380,9 +391,9 @@ Docs: [ohdearquant.github.io/khive](https://ohdearquant.github.io/khive/) (agent
 
 ## Status
 
-**v0.5.0 (publication pending; crates.io currently serves 0.4.0).** 90 verbs across 12
-packs, 9 entity kinds, 17 edge relations, daemon warm startup (ADR-049), knowledge search with
-embedding rerank, Bayesian brain profiles, threaded messaging, scheduled verb execution.
+**v0.7.0.** 90 verbs across 12 packs, 9 entity kinds, 17 edge relations, daemon warm startup
+(ADR-049), knowledge search with embedding rerank, Bayesian brain profiles, threaded messaging,
+scheduled verb execution.
 Ready for use with Claude Code and any MCP-compatible agent.
 
 ## License
