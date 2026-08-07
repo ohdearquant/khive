@@ -113,6 +113,13 @@ A failure in a parallel batch does not stop its siblings. In a chain, entries
 after the failure are returned as `{ "ok": false, "tool": "...", "aborted": true }`;
 the summary records their count in `aborted`.
 
+A successful multi-backend search can still be incomplete when one backend is
+unavailable. In that case the search entry includes `"partial": true` and a
+`"missing_backends": [...]` list beside `result`. Check this operation-level
+advisory even when `ok` and the aggregate request `status` report success. It
+survives batch/chain execution, presentation modes, and daemon frame-budget
+omission.
+
 The inline `results`/`summary` envelope is the default. Set the optional
 `save_to` parameter to sink the full results to a JSONL file instead; `request`
 then returns a small manifest (the file path, row count, and integrity fields)

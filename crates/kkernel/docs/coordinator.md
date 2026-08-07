@@ -37,9 +37,17 @@ populates the cache on first hit.
 
 ### D3 — Fan-out search (shipped)
 
-`fan_out_search(query, namespace, limit)` broadcasts `hybrid_search` to all registered backends in
-parallel. Results are merged with Reciprocal Rank Fusion (unweighted, k=60). Per-backend errors are
-captured in `BackendSearchResult::error` — a single failing backend does NOT abort the fan-out.
+`fan_out_search(&ValidatedSearchRequest, namespace)` broadcasts entity or note search to all
+registered backends in parallel. The request is constructed by the KG pack's canonical validator
+and carries the resolved substrate plus `entity_kind`/`entity_type`,
+`note_kind`/`include_superseded`, `properties`, `tags`, `limit`, and `min_score`. Applicable storage
+filters reach every backend; compatibility kind spellings are reconciled before this boundary, so
+the coordinator cannot accidentally accept a public filter that its signature has nowhere to put.
+
+Results are merged with Reciprocal Rank Fusion (unweighted, k=60). Per-backend errors — including
+spawned-task join failures — are captured in `BackendSearchResult::error`; a single failing backend
+does NOT abort the fan-out or disappear from diagnostics. The MCP service derives the operation's
+`partial`/`missing_backends` advisory from these typed per-backend results.
 
 When `is_single_backend()` is true the fan-out degenerates to a single backend call.
 
@@ -72,7 +80,10 @@ via `khive.toml` (ADR-028).
 - `BackendRegistry` is append-only after boot; no backend is removed at runtime.
 - The primary backend is always the first registered.
 - `LocatorCache` entries are immutable once inserted (backend affinity is stable per entity).
-- `fan_out_search` never panics on per-backend errors; errors are captured in the result.
+- `fan_out_search` never silently drops a backend error; ordinary errors and task-join failures are
+  captured in the result.
+- Every public search filter is validated once and either forwarded to its substrate runtime or
+  rejected before fan-out.
 
 ## `kkernel main.rs` — `-e`/subcommand dispatch
 
