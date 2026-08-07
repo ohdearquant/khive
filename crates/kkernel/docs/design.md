@@ -105,8 +105,11 @@
 `atomic_apply.rs` is the CLI-boundary orchestrator for `kkernel exec --ops-file --atomic`.
 It runs, in order:
 
-1. Parse-time admissibility (`khive_request::atomic::check_atomic_admissible`, B1) plus the
-   op-count guard — both run BEFORE building any runtime or touching the database.
+1. Parse-time admissibility (`khive_request::atomic::check_atomic_admissible`, B1), loaded-verb
+   resolution against a metadata-only in-memory registry for the configured pack set, and the
+   op-count guard. This may build an ephemeral in-memory runtime for authoritative pack metadata,
+   but runs BEFORE opening or touching the target database. Unknown/unloaded verbs are therefore
+   distinguishable from loaded verbs that are merely atomic-ineligible without scraping prose.
 2. The async prepare pass: KG-substrate verbs via `khive_runtime::atomic_prepare::prepare_op`;
    `gtd.transition`/`gtd.complete` via two `prepare_gtd_*` adapters in this module that wrap
    the SAME decide functions (`khive_pack_gtd::handlers::prepare_transition`/
@@ -121,6 +124,12 @@ It runs, in order:
    update whose embedding input was bounded carries the same per-result `warnings` advisory as
    the canonical non-atomic handler.
 
+Preflight and prepare failures cross back to `exec.rs` as a typed `AtomicExecFailure` containing
+the unchanged terminal message plus a result envelope over the real ops-file entries. The shared
+refusal annotator emits `verb-refused` for unknown/unloaded preflight entries,
+`gate-refusal` for typed secret-gate prepare failures, and `strict-op-failure` for otherwise
+unclassified rollback entries when the operator supplied `--strict`.
+
 Before prepare, the atomic runtime installs the same aggregate pack edge rules as canonical
 server startup. After each task-note `update` or dependency `link` plan is built, the boundary
 also invokes `VerbRegistry`'s shared `KindHook` validator for typed parity with canonical KG
@@ -131,9 +140,9 @@ concurrent writers, while leaving unrelated notes and edge relations untouched.
 
 **Verbs without a prepare implementation.** `propose`/`review`/`withdraw` are listed in
 `khive_types::pack::ATOMIC_ADMISSIBLE_VERBS` (ADR-099 D3 intends them to eventually gain a
-seam) but have none yet; the B3 fix rejects them at the same pre-runtime
+seam) but have none yet; the B3 fix rejects them at the same pre-target-runtime
 `check_atomic_admissible` guard, as `AtomicRejectionReason::KnownUnimplemented`, before they
-ever reach `KhiveRuntime::new`/`prepare_one`. `prepare_op`'s own
+ever reach the target `KhiveRuntime::new`/`prepare_one` path. `prepare_op`'s own
 `prepare_governance_unimplemented` fallback is unreachable through this CLI path and remains
 only as defense-in-depth for other `prepare_op` callers.
 
@@ -223,20 +232,23 @@ The observable failure contract stays mode-specific:
 
 - `--save-file` may carry read or write verbs. A contended op's error detail is written to that
   op's JSONL result row; stdout carries the save manifest, whose `summary` reports the failure
-  counts. `--strict` makes any failed op a non-zero exit; a fully failed invocation is non-zero
-  even without `--strict`.
+  counts. Under `--strict`, otherwise-unclassified failures receive their stable refusal reason
+  before the JSONL rows are serialized and checksummed, so the manifest failure projection and
+  saved rows agree. `--strict` makes any failed op a non-zero exit; a fully failed invocation is
+  non-zero even without `--strict`.
 - Non-atomic `--ops-file` preserves per-op commits and continues collecting results. A contended
   op can fail after earlier ops committed; the final summary identifies every failed op.
   `--strict` makes any failure a non-zero exit, while a fully failed file is always non-zero.
 - `--ops-file --atomic` holds one bounded, DML-only `BEGIN IMMEDIATE` during its commit pass, per
   ADR-099. Daemon writes wait behind that unit and can fail if its hold exceeds their own busy
-  timeout. Admissibility, prepare, and atomic-unit seam errors return a top-level error and a
-  non-zero exit before an atomic result envelope is printed. A plan-level guard or SQL failure
-  instead prints the additive envelope with `atomic.committed=false` and
-  `atomic.rolled_back=true`; the CLI currently exits zero for that rolled-back outcome, and
-  `--strict` is ignored because it is not meaningful in atomic mode. Callers must inspect
-  `atomic.committed`. The op-count guard bounds the unit; operators should run a large atomic file
-  against an idle daemon or in a maintenance window.
+  timeout. Admissibility and prepare failures print a typed per-op result envelope over the real
+  ops-file entries before returning their established non-zero exit. A plan-level guard or SQL
+  failure likewise prints the additive envelope with `atomic.committed=false` and
+  `atomic.rolled_back=true`; the CLI preserves the existing atomic exit semantics for that
+  outcome. Under `--strict`, otherwise-unclassified not-committed rows receive the stable
+  `strict-op-failure` reason, but the flag does not alter the atomic process-exit behavior. Callers
+  must inspect `atomic.committed`. The op-count guard bounds the unit; operators should run a
+  large atomic file against an idle daemon or in a maintenance window.
 
 Routing these modes through the daemon remains rejected. `--save-file` is a trusted local output
 sink not represented in `DaemonRequestFrame`; bulk apply deliberately avoids the daemon frame cap,
