@@ -22,7 +22,7 @@ import {
   TrendingUp,
   Users,
 } from "lucide-react";
-import { useState } from "react";
+import { useMemo, useState } from "react";
 
 import type {
   RepoBundle,
@@ -34,6 +34,7 @@ import type {
 type Labels = RepoBundle["capability"]["labels"];
 type ViewCapability = RepoBundle["capability"]["views"][ViewId];
 type Icon = typeof Network;
+type ModuleMap = Map<string, RepoModule>;
 
 const viewOrder: readonly ViewId[] = [
   "structure_graph",
@@ -83,8 +84,8 @@ function shortSha(value: string): string {
   return value.slice(0, 8);
 }
 
-function moduleName(modules: readonly RepoModule[], id: string): string {
-  const moduleNode = modules.find((candidate) => candidate.id === id);
+function moduleName(moduleById: ModuleMap, id: string): string {
+  const moduleNode = moduleById.get(id);
   return moduleNode?.module_path ?? moduleNode?.name ?? id;
 }
 
@@ -193,7 +194,7 @@ function ViewFrame({
   );
 }
 
-function StructureGraph({ bundle }: { bundle: RepoBundle }) {
+function StructureGraph({ bundle, moduleById }: { bundle: RepoBundle; moduleById: ModuleMap }) {
   const { graph, capability } = bundle;
   const labels = capability.labels;
   const [subtreeId, setSubtreeId] = useState(graph.repository.id);
@@ -404,7 +405,7 @@ function HistoryFacet({
   );
 }
 
-function HistoryStructure({ bundle }: { bundle: RepoBundle }) {
+function HistoryStructure({ bundle, moduleById }: { bundle: RepoBundle; moduleById: ModuleMap }) {
   const { graph, capability } = bundle;
   const labels = capability.labels;
   const view = capability.views.history_structure_navigation;
@@ -531,7 +532,7 @@ function HistoryStructure({ bundle }: { bundle: RepoBundle }) {
   );
 }
 
-function DependencyTopology({ bundle }: { bundle: RepoBundle }) {
+function DependencyTopology({ bundle, moduleById }: { bundle: RepoBundle; moduleById: ModuleMap }) {
   const analysis = bundle.aggregates.dependency_topology;
   const labels = bundle.capability.labels;
   const moduleRows = analysis.modules.items.slice(0, UI_ROW_LIMIT);
@@ -541,14 +542,14 @@ function DependencyTopology({ bundle }: { bundle: RepoBundle }) {
       <section className="repo-card repo-table-wrap">
         <table className="repo-table">
           <thead><tr><th>{labels.node_types.module}</th><th>{labels.metrics.fan_in}</th><th>{labels.metrics.fan_out}</th><th>{labels.metrics.cycle_count}</th></tr></thead>
-          <tbody>{moduleRows.map((row) => <tr key={row.module_id}><td><strong>{moduleName(bundle.graph.modules.items, row.module_id)}</strong></td><td>{formatNumber(row.fan_in)}</td><td>{formatNumber(row.fan_out)}</td><td>{formatNumber(row.cycle_ids.length)}</td></tr>)}</tbody>
+          <tbody>{moduleRows.map((row) => <tr key={row.module_id}><td><strong>{moduleName(moduleById, row.module_id)}</strong></td><td>{formatNumber(row.fan_in)}</td><td>{formatNumber(row.fan_out)}</td><td>{formatNumber(row.cycle_ids.length)}</td></tr>)}</tbody>
         </table>
         <LocalSliceDisclosure shown={moduleRows.length} total={analysis.modules.items.length} label={labels.node_types.module} labels={labels} />
         <BoundDisclosure page={analysis.modules} labels={labels} />
       </section>
       <section className="repo-card">
         <div className="repo-card-heading"><h3>{labels.metrics.cycle_count}</h3><p>{formatNumber(analysis.cycles.items.length)}</p></div>
-        <div className="repo-list">{cycleRows.map((cycle) => <div className="repo-list-row" key={cycle.id}><GitFork aria-hidden="true" /><div><strong>{cycle.id}</strong><span>{cycle.module_ids.map((id) => moduleName(bundle.graph.modules.items, id)).join(" → ")}</span></div></div>)}</div>
+        <div className="repo-list">{cycleRows.map((cycle) => <div className="repo-list-row" key={cycle.id}><GitFork aria-hidden="true" /><div><strong>{cycle.id}</strong><span>{cycle.module_ids.map((id) => moduleName(moduleById, id)).join(" → ")}</span></div></div>)}</div>
         {analysis.cycles.items.length === 0 && <div className="repo-empty"><ShieldCheck aria-hidden="true" /><strong>0</strong><span>{labels.metrics.cycle_count}</span></div>}
         <LocalSliceDisclosure shown={cycleRows.length} total={analysis.cycles.items.length} label={labels.metrics.cycle_count} labels={labels} />
         <BoundDisclosure page={analysis.cycles} labels={labels} />
@@ -557,7 +558,7 @@ function DependencyTopology({ bundle }: { bundle: RepoBundle }) {
   );
 }
 
-function HotspotQuadrantView({ bundle }: { bundle: RepoBundle }) {
+function HotspotQuadrantView({ bundle, moduleById }: { bundle: RepoBundle; moduleById: ModuleMap }) {
   const analysis = bundle.aggregates.hotspot_quadrant;
   const labels = bundle.capability.labels;
   const rows = analysis.data.items.slice(0, UI_ROW_LIMIT);
@@ -575,12 +576,12 @@ function HotspotQuadrantView({ bundle }: { bundle: RepoBundle }) {
           {rows.map((row) => {
             const x = 8 + (row.fan_in / maxFanIn) * 86;
             const y = 64 - (row.commit_count / maxChanges) * 58;
-            return <circle key={row.module_id} className={`repo-chart-dot ${row.quadrant === "high_churn_high_fan_in" ? "hot" : ""}`} cx={x} cy={y} r="2.3"><title>{moduleName(bundle.graph.modules.items, row.module_id)} · {labels.metrics.change_frequency}: {row.commit_count} · {labels.metrics.fan_in}: {row.fan_in} · {labels.hotspot_quadrants[row.quadrant]}</title></circle>;
+            return <circle key={row.module_id} className={`repo-chart-dot ${row.quadrant === "high_churn_high_fan_in" ? "hot" : ""}`} cx={x} cy={y} r="2.3"><title>{moduleName(moduleById, row.module_id)} · {labels.metrics.change_frequency}: {row.commit_count} · {labels.metrics.fan_in}: {row.fan_in} · {labels.hotspot_quadrants[row.quadrant]}</title></circle>;
           })}
         </svg>
       </div>
       <section className="repo-card repo-table-wrap">
-        <table className="repo-table"><thead><tr><th>{labels.node_types.module}</th><th>{labels.metrics.change_frequency}</th><th>{labels.metrics.fan_in}</th><th>{bundle.capability.views.hotspot_quadrant.label}</th></tr></thead><tbody>{rows.map((row) => <tr key={row.module_id}><td><strong>{moduleName(bundle.graph.modules.items, row.module_id)}</strong></td><td>{row.commit_count}</td><td>{row.fan_in}</td><td>{labels.hotspot_quadrants[row.quadrant]}</td></tr>)}</tbody></table>
+        <table className="repo-table"><thead><tr><th>{labels.node_types.module}</th><th>{labels.metrics.change_frequency}</th><th>{labels.metrics.fan_in}</th><th>{bundle.capability.views.hotspot_quadrant.label}</th></tr></thead><tbody>{rows.map((row) => <tr key={row.module_id}><td><strong>{moduleName(moduleById, row.module_id)}</strong></td><td>{row.commit_count}</td><td>{row.fan_in}</td><td>{labels.hotspot_quadrants[row.quadrant]}</td></tr>)}</tbody></table>
         <LocalSliceDisclosure shown={rows.length} total={analysis.data.items.length} label={bundle.capability.views.hotspot_quadrant.label} labels={labels} />
         <BoundDisclosure page={analysis.data} labels={labels} />
       </section>
@@ -588,14 +589,14 @@ function HotspotQuadrantView({ bundle }: { bundle: RepoBundle }) {
   );
 }
 
-function HiddenCouplingView({ bundle }: { bundle: RepoBundle }) {
+function HiddenCouplingView({ bundle, moduleById }: { bundle: RepoBundle; moduleById: ModuleMap }) {
   const analysis = bundle.aggregates.hidden_coupling;
   const labels = bundle.capability.labels;
   const rows = analysis.data.items.slice(0, UI_ROW_LIMIT);
   return (
     <div className="repo-view-body">
       <section className="repo-card repo-table-wrap">
-        <table className="repo-table"><thead><tr><th>{labels.node_types.module}</th><th>{labels.node_types.module}</th><th>{labels.metrics.cochange_count}</th><th>{labels.metrics.support}</th></tr></thead><tbody>{rows.map((row) => <tr key={`${row.left_module_id}-${row.right_module_id}`}><td><strong>{moduleName(bundle.graph.modules.items, row.left_module_id)}</strong></td><td><strong>{moduleName(bundle.graph.modules.items, row.right_module_id)}</strong></td><td>{formatNumber(row.cochange_count)}</td><td><div className="repo-bar violet" aria-label={`${labels.metrics.support} ${formatPercent(row.support)}`}><span style={{ width: `${Math.min(100, row.support * 100)}%` }} /></div></td></tr>)}</tbody></table>
+        <table className="repo-table"><thead><tr><th>{labels.node_types.module}</th><th>{labels.node_types.module}</th><th>{labels.metrics.cochange_count}</th><th>{labels.metrics.support}</th></tr></thead><tbody>{rows.map((row) => <tr key={`${row.left_module_id}-${row.right_module_id}`}><td><strong>{moduleName(moduleById, row.left_module_id)}</strong></td><td><strong>{moduleName(moduleById, row.right_module_id)}</strong></td><td>{formatNumber(row.cochange_count)}</td><td><div className="repo-bar violet" aria-label={`${labels.metrics.support} ${formatPercent(row.support)}`}><span style={{ width: `${Math.min(100, row.support * 100)}%` }} /></div></td></tr>)}</tbody></table>
         {analysis.data.items.length === 0 && <div className="repo-empty"><Braces aria-hidden="true" /><strong>0</strong><span>{bundle.capability.views.hidden_coupling.label}</span></div>}
         <LocalSliceDisclosure shown={rows.length} total={analysis.data.items.length} label={bundle.capability.views.hidden_coupling.label} labels={labels} />
         <BoundDisclosure page={analysis.data} labels={labels} />
@@ -604,7 +605,7 @@ function HiddenCouplingView({ bundle }: { bundle: RepoBundle }) {
   );
 }
 
-function TreemapView({ bundle }: { bundle: RepoBundle }) {
+function TreemapView({ bundle, moduleById }: { bundle: RepoBundle; moduleById: ModuleMap }) {
   const analysis = bundle.aggregates.structure_treemap;
   const labels = bundle.capability.labels;
   const rows = analysis.data.items.slice(0, UI_TREEMAP_LIMIT);
@@ -616,7 +617,7 @@ function TreemapView({ bundle }: { bundle: RepoBundle }) {
         {rows.map((row) => {
           const activity = row.recent_commit_count.status === "available" ? row.recent_commit_count.value : 0;
           const span = Math.min(6, Math.max(2, row.source_file_count));
-          return <div role="listitem" style={{ gridColumn: `span ${span}` }} key={row.module_id}><article className={activity > maxActivity * 0.55 ? "hot" : ""}><strong>{moduleName(bundle.graph.modules.items, row.module_id)}</strong><span>{labels.metrics.source_files}: {row.source_file_count}</span><span>{labels.metrics.recent_activity}: {availabilityText(row.recent_commit_count, labels, formatNumber)}</span></article></div>;
+          return <div role="listitem" style={{ gridColumn: `span ${span}` }} key={row.module_id}><article className={activity > maxActivity * 0.55 ? "hot" : ""}><strong>{moduleName(moduleById, row.module_id)}</strong><span>{labels.metrics.source_files}: {row.source_file_count}</span><span>{labels.metrics.recent_activity}: {availabilityText(row.recent_commit_count, labels, formatNumber)}</span></article></div>;
         })}
       </div>
       <LocalSliceDisclosure shown={rows.length} total={analysis.data.items.length} label={bundle.capability.views.structure_treemap.label} labels={labels} />
@@ -646,7 +647,7 @@ function CadenceSeries({ id, page, label, labels }: { id: CadenceSeriesId; page:
   );
 }
 
-function CadenceView({ bundle }: { bundle: RepoBundle }) {
+function CadenceView({ bundle, moduleById }: { bundle: RepoBundle; moduleById: ModuleMap }) {
   const analysis = bundle.aggregates.cadence_timeline;
   const labels = bundle.capability.labels;
   const commitRows = analysis.commits.items.slice(0, UI_ROW_LIMIT);
@@ -683,7 +684,7 @@ function CadenceView({ bundle }: { bundle: RepoBundle }) {
   );
 }
 
-function OwnershipView({ bundle }: { bundle: RepoBundle }) {
+function OwnershipView({ bundle, moduleById }: { bundle: RepoBundle; moduleById: ModuleMap }) {
   const analysis = bundle.aggregates.ownership;
   const labels = bundle.capability.labels;
   const moduleRows = analysis.modules.items.slice(0, UI_ROW_LIMIT);
@@ -708,7 +709,7 @@ function OwnershipView({ bundle }: { bundle: RepoBundle }) {
         </section>
       </div>
       <section className="repo-card repo-table-wrap">
-        {analysis.modules.disclosure.status === "unavailable" ? <div className="repo-empty"><Info aria-hidden="true" /><strong>{labels.unavailable}</strong><span>{analysis.modules.disclosure.reason}</span></div> : <table className="repo-table"><thead><tr><th>{labels.node_types.module}</th><th>{labels.metrics.commits}</th><th>{labels.metrics.author_concentration}</th><th>{labels.metrics.bus_factor}</th></tr></thead><tbody>{moduleRows.map((row) => <tr key={row.module_id}><td><strong>{moduleName(bundle.graph.modules.items, row.module_id)}</strong><div>{row.authors.items.slice(0, 8).map((author) => `${author.author} ${formatPercent(author.share)}`).join(" · ")}</div><InlineLocalSlice shown={Math.min(8, row.authors.items.length)} total={row.authors.items.length} labels={labels} /><InlinePageState page={row.authors} labels={labels} /></td><td>{row.commit_count}</td><td>{row.author_concentration.status === "available" ? <div className="repo-bar" aria-label={`${labels.metrics.author_concentration} ${formatPercent(row.author_concentration.value)}`}><span style={{ width: `${Math.min(100, row.author_concentration.value * 100)}%` }} /></div> : availabilityText(row.author_concentration, labels)}</td><td>{availabilityText(row.bus_factor, labels, formatNumber)}</td></tr>)}</tbody></table>}
+        {analysis.modules.disclosure.status === "unavailable" ? <div className="repo-empty"><Info aria-hidden="true" /><strong>{labels.unavailable}</strong><span>{analysis.modules.disclosure.reason}</span></div> : <table className="repo-table"><thead><tr><th>{labels.node_types.module}</th><th>{labels.metrics.commits}</th><th>{labels.metrics.author_concentration}</th><th>{labels.metrics.bus_factor}</th></tr></thead><tbody>{moduleRows.map((row) => <tr key={row.module_id}><td><strong>{moduleName(moduleById, row.module_id)}</strong><div>{row.authors.items.slice(0, 8).map((author) => `${author.author} ${formatPercent(author.share)}`).join(" · ")}</div><InlineLocalSlice shown={Math.min(8, row.authors.items.length)} total={row.authors.items.length} labels={labels} /><InlinePageState page={row.authors} labels={labels} /></td><td>{row.commit_count}</td><td>{row.author_concentration.status === "available" ? <div className="repo-bar" aria-label={`${labels.metrics.author_concentration} ${formatPercent(row.author_concentration.value)}`}><span style={{ width: `${Math.min(100, row.author_concentration.value * 100)}%` }} /></div> : availabilityText(row.author_concentration, labels)}</td><td>{availabilityText(row.bus_factor, labels, formatNumber)}</td></tr>)}</tbody></table>}
         <LocalSliceDisclosure shown={moduleRows.length} total={analysis.modules.items.length} label={labels.node_types.module} labels={labels} />
         <BoundDisclosure page={analysis.modules} labels={labels} />
       </section>
@@ -716,13 +717,13 @@ function OwnershipView({ bundle }: { bundle: RepoBundle }) {
   );
 }
 
-function ApiSurfaceView({ bundle }: { bundle: RepoBundle }) {
+function ApiSurfaceView({ bundle, moduleById }: { bundle: RepoBundle; moduleById: ModuleMap }) {
   const analysis = bundle.aggregates.api_surface;
   const labels = bundle.capability.labels;
   const rows = analysis.data.items.slice(0, UI_ROW_LIMIT);
   const max = Math.max(1, ...rows.map((row) => row.dependent_count));
   return (
-    <div className="repo-view-body"><section className="repo-card repo-table-wrap"><table className="repo-table"><thead><tr><th>{labels.node_types.module}</th><th>{labels.metrics.dependent_count}</th><th>{labels.metrics.dependent_count}</th></tr></thead><tbody>{rows.map((row) => <tr key={row.module_id}><td><strong>{moduleName(bundle.graph.modules.items, row.module_id)}</strong></td><td>{formatNumber(row.dependent_count)}</td><td><div className="repo-bar"><span style={{ width: `${(row.dependent_count / max) * 100}%` }} /></div></td></tr>)}</tbody></table><LocalSliceDisclosure shown={rows.length} total={analysis.data.items.length} label={bundle.capability.views.api_surface.label} labels={labels} /><BoundDisclosure page={analysis.data} labels={labels} /></section></div>
+    <div className="repo-view-body"><section className="repo-card repo-table-wrap"><table className="repo-table"><thead><tr><th>{labels.node_types.module}</th><th>{labels.metrics.dependent_count}</th><th>{labels.metrics.dependent_count}</th></tr></thead><tbody>{rows.map((row) => <tr key={row.module_id}><td><strong>{moduleName(moduleById, row.module_id)}</strong></td><td>{formatNumber(row.dependent_count)}</td><td><div className="repo-bar"><span style={{ width: `${(row.dependent_count / max) * 100}%` }} /></div></td></tr>)}</tbody></table><LocalSliceDisclosure shown={rows.length} total={analysis.data.items.length} label={bundle.capability.views.api_surface.label} labels={labels} /><BoundDisclosure page={analysis.data} labels={labels} /></section></div>
   );
 }
 
@@ -740,7 +741,7 @@ function scoreLabel(labels: Labels, key: RepoBundle["aggregates"]["scorecard"]["
   return keys[key];
 }
 
-function scoreValue(field: RepoBundle["aggregates"]["scorecard"]["fields"][number], labels: Labels, modules: readonly RepoModule[]): string {
+function scoreValue(field: RepoBundle["aggregates"]["scorecard"]["fields"][number], labels: Labels, moduleById: ModuleMap): string {
   if (field.value.status === "unavailable") return labels.unavailable;
   const value = field.value.value;
   if (value.value_kind === "count") return formatNumber(value.value);
@@ -748,19 +749,19 @@ function scoreValue(field: RepoBundle["aggregates"]["scorecard"]["fields"][numbe
   if (value.value_kind === "module_ids") {
     return value.value.items.length === 0
       ? "0"
-      : value.value.items.slice(0, 8).map((id) => moduleName(modules, id)).join(", ");
+      : value.value.items.slice(0, 8).map((id) => moduleName(moduleById, id)).join(", ");
   }
   return value.value;
 }
 
-function ScorecardView({ bundle }: { bundle: RepoBundle }) {
+function ScorecardView({ bundle, moduleById }: { bundle: RepoBundle; moduleById: ModuleMap }) {
   const analysis = bundle.aggregates.scorecard;
   const labels = bundle.capability.labels;
   const fields = analysis.fields.slice(0, UI_ROW_LIMIT);
   return (
     <div className="repo-view-body">
       <div className="repo-score-grid">{fields.map((field) => {
-        const value = scoreValue(field, labels, bundle.graph.modules.items);
+        const value = scoreValue(field, labels, moduleById);
         const moduleIds = field.value.status === "available" && field.value.value.value_kind === "module_ids" ? field.value.value.value : null;
         return <article className="repo-score-card" key={field.key}><span>{scoreLabel(labels, field.key)}</span><div className="repo-score-value">{field.value.status === "unavailable" ? <AlertTriangle aria-hidden="true" /> : <TrendingUp aria-hidden="true" />}<strong>{value}</strong></div>{field.value.status === "unavailable" && <p>{field.value.reason}</p>}{moduleIds && <><InlineLocalSlice shown={Math.min(8, moduleIds.items.length)} total={moduleIds.items.length} labels={labels} /><InlinePageState page={moduleIds} labels={labels} /></>}<div className="repo-score-tags"><i>{field.granularity}</i><i>{field.join}</i></div></article>;
       })}</div>
@@ -769,25 +770,36 @@ function ScorecardView({ bundle }: { bundle: RepoBundle }) {
   );
 }
 
-function ActiveView({ id, bundle }: { id: ViewId; bundle: RepoBundle }) {
+const viewComponents: Record<ViewId, React.ComponentType<{ bundle: RepoBundle; moduleById: ModuleMap }>> = {
+  structure_graph: StructureGraph,
+  history_structure_navigation: HistoryStructure,
+  dependency_topology: DependencyTopology,
+  hotspot_quadrant: HotspotQuadrantView,
+  hidden_coupling: HiddenCouplingView,
+  structure_treemap: TreemapView,
+  cadence_timeline: CadenceView,
+  ownership: OwnershipView,
+  api_surface: ApiSurfaceView,
+  scorecard: ScorecardView,
+};
+
+function ActiveView({ id, bundle, moduleById }: { id: ViewId; bundle: RepoBundle; moduleById: ModuleMap }) {
   const capability = bundle.capability.views[id];
   const labels = bundle.capability.labels;
-  let content: React.ReactNode;
-  if (id === "structure_graph") content = <StructureGraph bundle={bundle} />;
-  else if (id === "history_structure_navigation") content = <HistoryStructure bundle={bundle} />;
-  else if (id === "dependency_topology") content = <DependencyTopology bundle={bundle} />;
-  else if (id === "hotspot_quadrant") content = <HotspotQuadrantView bundle={bundle} />;
-  else if (id === "hidden_coupling") content = <HiddenCouplingView bundle={bundle} />;
-  else if (id === "structure_treemap") content = <TreemapView bundle={bundle} />;
-  else if (id === "cadence_timeline") content = <CadenceView bundle={bundle} />;
-  else if (id === "ownership") content = <OwnershipView bundle={bundle} />;
-  else if (id === "api_surface") content = <ApiSurfaceView bundle={bundle} />;
-  else content = <ScorecardView bundle={bundle} />;
-  return <ViewFrame capability={capability} labels={labels} allowPartial={id === "ownership"}>{content}</ViewFrame>;
+  const ViewComponent = viewComponents[id];
+  return (
+    <ViewFrame capability={capability} labels={labels} allowPartial={id === "ownership"}>
+      <ViewComponent bundle={bundle} moduleById={moduleById} />
+    </ViewFrame>
+  );
 }
 
 export function RepoShowcase({ bundle }: { bundle: RepoBundle }) {
   const [activeView, setActiveView] = useState<ViewId>("structure_graph");
+  const moduleById = useMemo(
+    () => new Map(bundle.graph.modules.items.map((module) => [module.id, module])),
+    [bundle.graph.modules.items],
+  );
   const { repository, snapshot, producer } = bundle.meta;
   const { capability } = bundle;
   return (
@@ -810,7 +822,7 @@ export function RepoShowcase({ bundle }: { bundle: RepoBundle }) {
           })}
         </nav>
         <section className="repo-view-panel" aria-label={capability.views[activeView].label}>
-          <ActiveView key={`${snapshot.head_sha}-${activeView}`} id={activeView} bundle={bundle} />
+          <ActiveView key={`${snapshot.head_sha}-${activeView}`} id={activeView} bundle={bundle} moduleById={moduleById} />
         </section>
       </div>
     </article>
