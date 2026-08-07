@@ -179,6 +179,9 @@ struct RunParsedContext<'a> {
     /// Operation-local write conflicts precomputed by an enclosing parallel
     /// group. Indices are relative to this nested request.
     conflict_indices: Option<Arc<std::collections::HashSet<usize>>>,
+    /// Flattened request index of this request's first operation. Nested chain
+    /// groups use this to keep diagnostics aligned with the outer response.
+    operation_index_offset: usize,
 }
 
 /// Typed failure crossing the dispatch/envelope seam.
@@ -1086,6 +1089,7 @@ impl KhiveMcpServer {
             from_wire,
             identity,
             conflict_indices: inherited_conflict_indices,
+            operation_index_offset,
         } = context;
         let response_budget = if mode == ExecutionMode::Parallel && enforce_response_budget {
             BATCH_RESPONSE_BUDGET_BYTES
@@ -1175,6 +1179,7 @@ impl KhiveMcpServer {
                                                 conflict_indices: (!group_conflict_indices
                                                     .is_empty())
                                                 .then(|| Arc::new(group_conflict_indices)),
+                                                operation_index_offset: group.start,
                                             },
                                         ),
                                     )
@@ -1399,6 +1404,7 @@ impl KhiveMcpServer {
                         // was never attempted), so the failure to debug lives at the
                         // earlier op, not here.
                         let failed_index = failed_at - 1;
+                        let displayed_failed_index = operation_index_offset + failed_index;
                         let failed_tool = results
                             .get(failed_index)
                             .and_then(|r| r.get("tool"))
@@ -1409,9 +1415,9 @@ impl KhiveMcpServer {
                             "tool": op.tool,
                             "aborted": true,
                             "message": format!(
-                                "not executed: op #{failed_index} ({failed_tool:?}) failed \
+                                "not executed: op #{displayed_failed_index} ({failed_tool:?}) failed \
                                  earlier in this chain, so the chain aborted before reaching \
-                                 this op. Fix op #{failed_index} — this op's own arguments, \
+                                 this op. Fix op #{displayed_failed_index} — this op's own arguments, \
                                  including any $prev reference, were never evaluated."
                             ),
                         }));
@@ -2653,6 +2659,7 @@ impl KhiveMcpServer {
                     from_wire,
                     identity: identity.as_ref(),
                     conflict_indices: None,
+                    operation_index_offset: 0,
                 },
             )
             .await;
@@ -4355,6 +4362,7 @@ mod tests {
                     from_wire: false,
                     identity: None,
                     conflict_indices: None,
+                    operation_index_offset: 0,
                 },
             )
             .await;
@@ -4413,6 +4421,7 @@ mod tests {
                     from_wire: false,
                     identity: None,
                     conflict_indices: None,
+                    operation_index_offset: 0,
                 },
             )
             .await;
@@ -4483,6 +4492,7 @@ mod tests {
                     from_wire: false,
                     identity: None,
                     conflict_indices: None,
+                    operation_index_offset: 0,
                 },
             )
             .await;
@@ -4527,6 +4537,7 @@ mod tests {
                     from_wire: false,
                     identity: None,
                     conflict_indices: None,
+                    operation_index_offset: 0,
                 },
             )
             .await;
@@ -4545,6 +4556,7 @@ mod tests {
                     from_wire: false,
                     identity: None,
                     conflict_indices: None,
+                    operation_index_offset: 0,
                 },
             )
             .await;
@@ -4591,6 +4603,7 @@ mod tests {
                     from_wire: false,
                     identity: None,
                     conflict_indices: None,
+                    operation_index_offset: 0,
                 },
             )
             .await;
@@ -4607,6 +4620,7 @@ mod tests {
                     from_wire: false,
                     identity: None,
                     conflict_indices: None,
+                    operation_index_offset: 0,
                 },
             )
             .await;
@@ -4653,6 +4667,7 @@ mod tests {
                     from_wire: false,
                     identity: None,
                     conflict_indices: None,
+                    operation_index_offset: 0,
                 },
             )
             .await;
@@ -4665,6 +4680,56 @@ mod tests {
         assert_eq!(results[0]["ok"], false);
         assert_eq!(results[1]["aborted"], true);
         assert_eq!(results[2]["ok"], true);
+    }
+
+    #[tokio::test]
+    async fn later_parallel_chain_failure_reports_flattened_operation_index() {
+        let config = RuntimeConfig {
+            db_path: None,
+            default_namespace: Namespace::local(),
+            embedding_model: None,
+            additional_embedding_models: vec![],
+            packs: vec!["kg".to_string()],
+            ..RuntimeConfig::default()
+        };
+        let runtime = KhiveRuntime::new(config).expect("in-memory runtime");
+        let server = KhiveMcpServer::new(runtime).expect("server builds with kg");
+        let parsed =
+            parse_request(r#"[stats(), get(id="00000000-0000-0000-0000-000000000000") | stats()]"#)
+                .expect("parallel chain parses");
+
+        let response = server
+            .run_parsed(
+                parsed,
+                PresentationMode::Verbose,
+                None,
+                RunParsedContext {
+                    enforce_response_budget: true,
+                    from_wire: false,
+                    identity: None,
+                    conflict_indices: None,
+                    operation_index_offset: 0,
+                },
+            )
+            .await;
+
+        assert_eq!(
+            response["summary"],
+            json!({"total": 3, "succeeded": 1, "failed": 1, "aborted": 1})
+        );
+        let results = response["results"].as_array().expect("results array");
+        assert_eq!(results[0]["ok"], true);
+        assert_eq!(results[1]["ok"], false);
+        assert_eq!(results[2]["aborted"], true);
+        let message = results[2]["message"].as_str().expect("abort diagnostic");
+        assert!(
+            message.contains("op #1 (\"get\")") && message.contains("Fix op #1"),
+            "later-group diagnostic must use flattened indices: {message}"
+        );
+        assert!(
+            !message.contains("Fix op #0"),
+            "later-group diagnostic must not identify the successful sibling: {message}"
+        );
     }
 
     #[tokio::test]
@@ -4695,6 +4760,7 @@ mod tests {
                     from_wire: false,
                     identity: None,
                     conflict_indices: None,
+                    operation_index_offset: 0,
                 },
             )
             .await;
@@ -4770,6 +4836,7 @@ mod tests {
                     from_wire: false,
                     identity: None,
                     conflict_indices: None,
+                    operation_index_offset: 0,
                 },
             )
             .await;
