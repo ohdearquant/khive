@@ -1,4 +1,35 @@
-# khive KG Studio
+# khive repository atlas + KG Studio
+
+The default route is ADR-147's static-first repository showcase. Entering a public
+repository URL performs a local lookup against the curated set; a hit renders the exact
+checked-in `khive.repo.v1` golden bytes, and a miss performs no clone, forge request, or
+server-side execution. The original ADR-145 semantic review workbench remains available
+at `/review`.
+
+The repository showcase renders all ten ADR-147 views at their declared granularity:
+structure, history navigation, dependency topology, hotspots, hidden coupling, treemap,
+cadence, ownership, de-facto API surface, and scorecard. Join-dependent views consume
+only exporter-derived edges and aggregates. Symbol collections remain typed and empty;
+unavailable, empty, derived, and truncated states are never collapsed.
+
+Its browser boundary is a closed Zod model matching
+`docs/schemas/khive-repo-v1.schema.json`. The public static asset is mechanically copied
+from `docs/schemas/examples/khive-repo-v1-khive.json`, and tests assert byte identity.
+The browser fetches only registry-owned same-origin assets, rejects bundles over 8 MiB,
+and applies disclosed local display limits to large precomputed sections.
+
+## Reproduce the showcase bundle
+
+From the repository root:
+
+```bash
+scripts/generate-repo-showcase.sh
+```
+
+The underlying one-shot pipeline is `khive repo build`: pinned clone → cursor-exhausted
+`git.digest` → separate `code.ingest` map → cross-store export.
+
+## KG review workbench
 
 KG Studio is the first read-only vertical slice of khive's local-first semantic review
 workbench. It presents an attributed KG change-set as graph changes, rule findings, evidence,
@@ -32,9 +63,10 @@ npm ci
 npm run dev
 ```
 
-Open <http://localhost:3000>.
+Open <http://localhost:3000> for the repository showcase or
+<http://localhost:3000/review> for KG review.
 
-Generate a headless report with the npm-distributed CLI, then use **Import JSON** in the editor:
+Generate a headless report with the npm-distributed CLI, then use **Import JSON** at `/review`:
 
 ```bash
 khive kg review changes.ndjson --rules rules.toml --format json > review.json
@@ -49,6 +81,7 @@ review gate blocks approval.
 npm run lint
 npm run typecheck
 npm test
+npm run test:e2e
 npm run build
 ```
 
@@ -57,9 +90,10 @@ or deployment configuration in this open-source slice.
 
 ## Adapter boundary
 
-`ReviewInput` in `src/lib/review-bundle.ts` is the browser boundary. Its closed Zod model, the
-checked-in Draft 2020-12 schema, and the Rust-produced golden report are tested together. Future
-adapters stay server-only:
+`RepoBundle` in `src/lib/repo-bundle.ts` and `ReviewInput` in
+`src/lib/review-bundle.ts` are deliberately independent browser boundaries. Their closed
+Zod models, checked-in schemas, and Rust-produced golden values are tested together. Future
+review adapters stay server-only:
 
 - Git reads canonical `.khive/kg/*.ndjson` and repository refs;
 - khive is invoked as the npm-distributed executable using argv arrays without a shell;

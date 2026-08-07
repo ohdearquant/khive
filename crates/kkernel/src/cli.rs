@@ -17,7 +17,7 @@ use clap::{Parser, Subcommand};
 use crate::{
     code_audit, code_ingest,
     coordinator::{BackendRegistry, SubstrateCoordinator, SubstrateCoordinatorService},
-    engine, exec, git_ingest, kg, pack_introspect, reindex, sync, vector,
+    engine, exec, git_ingest, kg, pack_introspect, reindex, repo, sync, vector,
 };
 use khive_runtime::{BackendId, KhiveConfig, KhiveRuntime, RuntimeConfig};
 
@@ -62,6 +62,10 @@ enum Command {
     /// KG validation, init, and hook management.
     #[command(subcommand)]
     Kg(kg::KgCommand),
+
+    /// Build and export offline repository showcase bundles (ADR-147).
+    #[command(subcommand)]
+    Repo(repo::RepoCommand),
 
     /// Schema migration lifecycle: migrate and check.
     #[command(subcommand)]
@@ -252,6 +256,7 @@ pub async fn cli_main() -> Result<()> {
         Command::Sync(s) => cmd_sync(s).await,
         Command::Pack(p) => cmd_pack(p),
         Command::Kg(k) => kg::run_kg(k).await,
+        Command::Repo(r) => repo::run_repo(r).await,
         Command::Db(d) => cmd_db(d).await,
         Command::Engine(e) => engine::run_engine(e).await,
         Command::Vector(v) => vector::run_vector(v),

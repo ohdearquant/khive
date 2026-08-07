@@ -40,6 +40,7 @@ members = [
     "khive-vcs-adapters",
     "kkernel",
     "khive-retrieval",
+    "khive-repo-showcase",
     "khive-channel",
     "khive-channel-email",
     "khive-channel-telegram",
@@ -69,6 +70,8 @@ categories = ["database", "command-line-utilities"]
 inventory = "0.3"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+schemars = "1.2"
+jsonschema = "0.46.10"
 tokio = { version = "1.40", features = ["full"] }
 tokio-util = { version = "0.7", features = ["rt", "compat"] }
 lettre = { version = "0.11", default-features = false, features = ["tokio1-rustls-tls", "smtp-transport", "builder"] }

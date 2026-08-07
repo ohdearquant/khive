@@ -1,11 +1,12 @@
 import type { Metadata, Viewport } from "next";
 import "./globals.css";
+import "./showcase.css";
 
 export const metadata: Metadata = {
-  title: "KG Studio · Semantic review for khive",
+  title: "khive · Repository atlas",
   description:
-    "Inspect attributed knowledge-graph changes, evidence, checks, and affected context before they land.",
-  applicationName: "khive KG Studio",
+    "Explore repository structure, history, hotspots, coupling, and ownership from a reproducible khive graph bundle.",
+  applicationName: "khive",
   icons: {
     icon: "/favicon.ico",
   },

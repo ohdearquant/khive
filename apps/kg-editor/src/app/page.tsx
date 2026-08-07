@@ -1,8 +1,5 @@
-import { Studio } from "@/components/studio";
-import { fixtureReviewSource } from "@/lib/adapters/fixture-review-source";
+import { Showcase } from "@/components/showcase/showcase";
 
-export default async function Home() {
-  const bundle = await fixtureReviewSource.load();
-
-  return <Studio initialBundle={bundle} />;
+export default function Home() {
+  return <Showcase />;
 }

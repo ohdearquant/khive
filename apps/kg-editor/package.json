@@ -7,13 +7,19 @@
     "node": ">=20.19.0"
   },
   "scripts": {
+    "predev": "npm run sync:showcase",
     "dev": "next dev",
+    "prebuild": "npm run sync:showcase",
     "build": "next build",
     "start": "next start",
     "lint": "eslint .",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "test:e2e": "playwright test",
+    "pretest:e2e": "npm run build",
+    "sync:showcase": "node scripts/sync-showcase-assets.mjs",
+    "check:showcase": "node scripts/sync-showcase-assets.mjs --check"
   },
   "dependencies": {
     "lucide-react": "^1.30.0",
@@ -23,6 +29,7 @@
     "zod": "^4.4.3"
   },
   "devDependencies": {
+    "@playwright/test": "^1.62.1",
     "@tailwindcss/postcss": "^4",
     "@testing-library/jest-dom": "^6.6.3",
     "@testing-library/react": "^16.3.2",

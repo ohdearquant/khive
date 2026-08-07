@@ -12,6 +12,7 @@ pub mod git_ingest;
 pub mod kg;
 pub mod pack_introspect;
 pub mod reindex;
+pub mod repo;
 pub mod sync;
 pub mod vector;
 

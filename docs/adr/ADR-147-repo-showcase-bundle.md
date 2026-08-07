@@ -1,6 +1,6 @@
 # ADR-147: Repository Showcase Bundle — `khive.repo.v1`
 
-**Status**: proposed\
+**Status**: accepted\
 **Date**: 2026-08-07\
 **Authors**: khive maintainers
 
@@ -8,9 +8,9 @@
 
 The git pack ingests repository history (`git.digest`: commits, issues, pull requests as
 note kinds with lifecycle and precedence edges) and the code pack ingests codebase
-structure (`code.ingest`, under a 22-rule edge vocabulary). Together they place a
-repository's history and structure in one typed graph. Nothing yet consumes that fusion
-as a product surface.
+structure (`code.ingest`, under a 22-rule edge vocabulary). They write separate graph
+databases with independently minted identifiers. The exporter is the first place those
+stores are reconciled into one typed graph and consumed as a product surface.
 
 The code pack's vocabulary spans two tiers, and only one of them is emitted today.
 `code.ingest` currently produces the **module tier**: projects, packages, and modules
@@ -55,7 +55,7 @@ Top-level sections, each independently bounded:
 
 | Section      | Contents                                                                                                                                                                                                                                                                                                                                                                                    |
 | ------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `meta`       | Repository identity (owner, name, default branch), ingest provenance: HEAD commit SHA, ingest timestamp, producing tool versions, and an explicit truncation disclosure per bounded section                                                                                                                                                                                                 |
+| `meta`       | Repository identity (owner, name, explicitly supplied default branch or an unavailable reason), ingest provenance: HEAD commit SHA, ingest timestamp, producing tool versions, and an explicit truncation disclosure per bounded section                                                                                                                                                       |
 | `graph`      | The entity/edge slice at module granularity: project, packages, modules; contains and depends_on edges; history notes (commits, issues, pull requests) and the exporter-derived commit-to-module linking edges (D5), each typed as derived rather than ingested, bounded and paged. Symbol-tier node types (function, datatype) are typed in the schema and carry an empty collection in v1 |
 | `aggregates` | Precomputed, chart-ready data (D3); every aggregate names its time window and its truncation rule                                                                                                                                                                                                                                                                                           |
 | `capability` | Static declaration: read-only, no writes, no live queries; renderers drive labeling from these fields, never from hardcoded strings                                                                                                                                                                                                                                                         |
@@ -71,17 +71,18 @@ are cheap and expected.
 
 Every view below is tagged with what it consumes, along two independent axes.
 
-The first axis is ingest tier. **Module** views are fully specified and rendered in v1.
-**Module (symbol-tier drill-down deferred)** views render in v1 at module granularity
-and gain a deeper level when symbol-tier ingest lands, with no schema break, because the
-graph section already types its nodes.
+The first axis is granularity. **Repository** views consume repository-wide history and
+do not pretend to be module analyses. **Module** views are fully specified and rendered
+in v1. **Module (symbol-tier drill-down deferred)** views render in v1 at module
+granularity and gain a deeper level when symbol-tier ingest lands, with no schema break,
+because the graph section already types its nodes.
 
 The second axis is the history-structure join, and it is the one that decides whether a
-view can exist at all. `git.digest` records a commit's author, timestamp, message,
-parents, and SHA, but **not the set of files the commit touched**, so nothing it emits
-connects a commit to a module. Views tagged **join** therefore depend on linkage that
-the exporter derives, per D5; views tagged **history only** or **structure only** need
-no join and are computable from one store alone.
+view can exist at all. `git.digest` records each commit's changed paths, but neither
+ingest emits a commit-to-module edge. Views tagged **join** therefore depend on linkage
+that the exporter derives from those paths and the code map's pinned `source_path`
+facts, per D5; views tagged **history only** or **structure only** need no join and are
+computable from one store alone.
 
 **Graph views** (rendered from `graph`):
 
@@ -89,9 +90,11 @@ no join and are computable from one store alone.
    packages → modules with typed edges, zoom and filter by subtree, node degree
    available for sizing. Drill-down below a module activates with the symbol tier.
 2. **History-structure navigation** _(module; join)_ — selecting a module surfaces the
-   commits, pull requests, and issues that touched it; selecting a commit highlights
-   the subgraph it touched. Both directions read the exporter-derived linking edges
-   (D5), top-N per entity with full counts disclosed.
+   commits that touched it; selecting a commit highlights the subgraph it touched.
+   Pull-request and issue facets are available only when the ingested history contains
+   an explicit evidence chain to a linked commit; otherwise each facet is marked
+   unavailable rather than inferred from text or repository membership. Both directions
+   read exporter-derived linking edges (D5), top-N per entity with full counts disclosed.
 3. **Dependency topology** _(module; structure only)_ — module-level depends_on adjacency with cycle
    detection (cycles precomputed and listed), fan-in and fan-out per module.
 
@@ -101,11 +104,15 @@ no join and are computable from one store alone.
    by window) against fan-in. The high-churn, high-fan-in quadrant is the risk surface.
 5. **Hidden coupling** _(module; join)_ — top-N module pairs that co-change in the same
    commits but share no structural edge, with co-change count and support window.
-6. **Structure treemap** _(module; structure only, activity coloring needs join; symbol-tier sizing deferred)_ — module tree sized by
-   contained source-file count from the manifest tier, colored by recent activity.
-   Sizing by contained symbol count activates with the symbol tier.
-7. **Cadence timeline** _(history only)_ — commit counts per week, release tags,
-   pull-request lead-time percentiles, issue open/close series.
+6. **Structure treemap** _(module; structure only, activity coloring is a field-level join;
+   symbol-tier sizing deferred)_ — module tree sized by contained source-file count from
+   the manifest tier. Recent-activity color is emitted only when the join is available;
+   otherwise that field is explicitly unavailable and the structure-only treemap still
+   renders. Sizing by contained symbol count activates with the symbol tier.
+7. **Cadence timeline** _(repository; history only)_ — commit counts per week, release tags,
+   pull-request lead-time percentiles, issue open/close series. Each series owns its
+   availability and bound; in particular, tag data omitted for a reproducible build is
+   unavailable rather than an empty release history.
 8. **Ownership** _(module; join)_ — per-module author concentration and a bus-factor
    indicator derived from commit authorship. Repository-wide author concentration
    needs no join and is reported in v1 regardless.
@@ -113,7 +120,7 @@ no join and are computable from one store alone.
    by dependent count, which is the module-granularity reading of "what the rest of the
    repository actually relies on." Ranking individual functions and datatypes activates
    with the symbol tier.
-10. **Scorecard** _(module; mixed — each field carries its own tag)_ — a derived header: repository age, package and module
+10. **Scorecard** _(field-tagged — each field carries its own granularity and join tag)_ — a derived header: repository age, package and module
     counts, activity trend, top hotspots, dependency-cycle count, ownership warnings.
     A symbol count is reported as unavailable in v1 rather than as zero, per the
     absence rule in D2.
@@ -135,33 +142,34 @@ state.
 
 ### D5 — The history-structure join is the exporter's job
 
-The fusion the showcase sells does not exist in either store. Measured on a full
-pipeline run against this repository: `git.digest` produced one project entity, 2688
-history notes, 926 `precedes` edges forming the commit DAG, and 5975 `annotates` edges
-that all point at the same single project entity, meaning "this note belongs to this
-repository." No edge relates a commit to a file or a module. Separately, `code.ingest`
-produced 843 structure entities with 788 `contains` and 904 `depends_on` edges in its
-own database, whose identifiers are minted independently of the history store's.
+The fusion the showcase sells does not exist in either store. `git.digest` persists
+repository-relative `changed_paths` on commit notes, while `code.ingest` persists
+repository-relative `source_path` plus `source_revision` on module entities in its own
+database. Their identifiers are minted independently, and no ingested edge relates a
+commit to a module. The exporter therefore derives that edge while reconciling both
+identifier spaces into deterministic bundle identifiers.
 
 So two things have to happen at export time, and the exporter owns both:
 
-1. **Commit-to-path linkage.** The pipeline already has the clone, which is the cheapest
-   correct source: enumerate each commit's touched paths from the working repository
-   rather than asking the digest for something it does not record.
-2. **Path-to-module resolution and cross-store identity.** Touched paths are mapped onto
-   the module entities from the structure store, and the two stores' identifier spaces
-   are reconciled into the single identifier space the bundle publishes.
+1. **Commit-to-path linkage.** Consume the durable `changed_paths` facts from
+   `git.digest`. The pinned clone is the verification and fallback source when a legacy
+   commit note lacks that field; fallback use is disclosed in edge provenance.
+2. **Path-to-module resolution and cross-store identity.** Resolve a changed path against
+   the current module whose `source_revision` equals the bundle HEAD and whose
+   `source_path` is an exact match. Reconcile both stores into deterministic natural
+   bundle identifiers; never publish either store's random row identifier as wire
+   identity.
 
 The resulting linking edges are a **bundle-level construct**, not a claim that either
 pack emits them. They are typed and disclosed as derived, so a reader can tell which
 edges came from an ingest verb and which the exporter computed.
 
 Two consequences worth stating rather than discovering later. Resolution is imperfect —
-a path may map to no module, and the bundle reports unresolved-path counts instead of
-dropping them silently, because a join that quietly discards its misses inflates every
-metric built on it. And if a future `git.digest` emits touched paths directly, the
-exporter's derivation becomes a fallback rather than the primary source; the bundle
-shape does not change, only the provenance recorded against those edges.
+a changed path may be outside the declared language capability, may name a deleted file,
+or may map to no current module. The bundle separates those classes and reports residual
+paths and unreached module identities instead of dropping them silently, because a join
+that quietly discards its misses inflates every metric built on it. The bundle shape does
+not change when path provenance changes; only the derivation recorded on the edge does.
 
 An alternative worth naming: teaching `git.digest` to emit path edges natively would
 serve every consumer, not just this one, and is the better long-term home. It is not a
@@ -170,23 +178,34 @@ product surface on a pack enhancement trades a shippable slice for a dependency.
 
 ### D6 — Honesty constraints carried from the ingest layer
 
-- `code.ingest` map output is traversable but not text-searchable today; the bundle
-  contract does not depend on full-text search anywhere.
+- `code.ingest` indexes every accepted project and module into the map database's
+  full-text store. The static bundle nevertheless has no live-query dependency:
+  search is neither required by the export contract nor exposed by the slice-1
+  renderer.
 - Every bounded listing in the bundle discloses its own truncation, and every
   aggregate names the window it was computed over. A chart whose input was truncated
   says so in the bundle, so the renderer can label it.
 - Ingest provenance pins the HEAD commit SHA; a bundle is a statement about one
-  commit, not about "the repository."
+  commit, not about "the repository." Mutable forge issue and pull-request state is a
+  separately timestamped observation and is never claimed to be frozen by that SHA.
+  Tags and a forge's default-branch pointer are mutable too: a byte-reproducible build
+  either omits tags and supplies the intended default-branch label explicitly, or
+  records those fields as separately observed inputs. Neither is inferred from a
+  mutable remote ref while claiming pinned-SHA reproducibility.
 
 ## Non-Goals
 
 - No LLM-generated narratives or summaries in v1; every number in the bundle is
-  mechanically derived and reproducible from the repository at the pinned SHA.
+  mechanically derived and reproducible from the complete declared input set. The
+  pinned SHA freezes commit and tree data; any included forge or tag observation is
+  named separately and is not represented as SHA-frozen state.
 - No write surface of any kind, and no live graph queries from the browser.
 - Not the review lane: ADR-146 (forge-native KG review, in flight) covers KG review;
   this ADR shares rendering components with it but binds none of its decisions.
-- No forge API dependency in slice 1 beyond what `git.digest` already ingests from the
-  cloned repository.
+- No forge API dependency in slice 1 beyond what `git.digest` already ingests. Legacy
+  changed-path fallback is read from the pinned clone. Release tags are an optional,
+  explicitly selected clone-ref observation and are omitted from the reproducible
+  golden vector.
 
 ## Alternatives Considered
 
@@ -212,8 +231,9 @@ product surface on a pack enhancement trades a shippable slice for a dependency.
 
 - Showcase freshness is manual until slice 2: bundles age with their pinned SHA and
   must be re-produced to advance.
-- The one-shot pipeline command does not exist yet; composing clone, digest, ingest,
-  and export into one entry point is new (thin) implementation work.
+- A full static bundle is large enough that producer bounds, compact serialization,
+  and client-side byte limits are part of the product contract rather than optional
+  optimizations.
 
 ### Neutral
 
@@ -223,40 +243,41 @@ product surface on a pack enhancement trades a shippable slice for a dependency.
 
 ## Implementation Status
 
-`git.digest` and `code.ingest` are live verbs. Two measured facts about them shape the
-contract, and both are load-bearing rather than caveats.
+Implemented in the open-source repository:
 
-The first is the tier fact stated in Context and carried through the normative text:
-`code.ingest` today emits the manifest and import-scan tiers (projects, packages and
-modules with their dependency edges) and not the symbol tier. Every place this ADR
-would otherwise have specified symbols is scoped in situ — the D2 `graph` row types
-symbol node types and gives them an empty collection in v1, and D3 tags each of the ten
-views with the tier it consumes, three of which (#1, #6, #9) name what activates when
-the symbol tier lands. That activation needs no schema break, because the graph section
-already types its nodes.
+- `khive repo build` composes a bounded public clone, an exhaustive cursor loop over
+  `git.digest`, Rust-only `code.ingest` into a separate map database, and atomic export.
+  `khive repo export` exposes the read-only two-store export seam independently.
+- `khive-repo-showcase` owns the closed Rust model, deterministic natural identities,
+  derived history-structure join, precomputed analyses, canonical serialization, and
+  validation. The checked JSON Schema and the TypeScript closed model validate the same
+  golden bytes.
+- The slice-1 Next.js renderer resolves only curated repository URLs to same-origin
+  static assets. It implements all ten module/repository views, renders per-section
+  availability and truncation, and preserves the review workbench at `/review`.
 
-The second is that `code.ingest` writes to a dedicated map database while `git.digest`
-writes to a graph store, so the bundle exporter reads two stores and merges at export
-time.
+The first golden target is this repository at
+`c2979d2443738a075e55a170c772d1dc86cf0f91`. The producer exhausted 938 commits,
+ingested 658 Rust modules across 43 package/project nodes, and resolved all 658 current
+Rust source paths to module entities. Historical coverage records 7,558 changed-path
+events: 4,344 Rust paths were in scope, 4,309 matched the current map, 3,214 non-Rust
+events were out of scope, and 35 historical Rust events were unresolved and named in
+the bundle. Functions, datatypes, and interfaces remain typed empty pages; the four
+forge cadence series are unavailable in the commits-only reproducible golden rather
+than represented as zero.
 
-The third is the absence that D5 exists to answer, and it was found by running the
-pipeline rather than by reading the verb schemas: neither store contains any relation
-between a commit and a module, so the exporter derives that linkage. The counts behind
-that statement, from a full run against this repository, are in D5. Had the contract
-been written from the schemas alone it would have specified four analyses on edges that
-are never emitted, and the omission would have surfaced during implementation instead of
-during design.
-
-That run also fixes two operational properties the exporter has to carry: the history
-digest is cursor-bounded and returns a done flag, so a caller loops it to exhaustion
-rather than issuing one call, and the two verbs land in separate databases as described
-above.
-
-To build: the bundle exporter, the one-shot pipeline entry point, the JSON Schema plus
-golden vector produced from a real repository, and the frontend. The first golden
-bundle target is this repository itself.
+The implementation confirmed the two-store and cursor-bounded properties above and
+also corrected assumptions that did not survive contact with current producers:
+`git.digest` already persists changed paths, `code.ingest` already persists exact
+repository-relative source paths and indexes accepted entities for text search, and
+the producer's Rust module-path rules differ from the earlier illustrative table for
+`src/main.rs`, nested `mod.rs`, and `build.rs`.
 
 ## References
+
+- [D5 join feasibility exhibit](D5-JOIN-FEASIBILITY.md)
+- [`khive.repo.v1` JSON Schema](../schemas/khive-repo-v1.schema.json)
+- [Repository showcase CLI](../../crates/kkernel/docs/repo-showcase.md)
 
 - [ADR-085](ADR-085-code-pack.md): Code pack — structure ingestion
 - [ADR-101](ADR-101-kg-changeset-model.md): Change-set model (contrast: D3 alternative)
