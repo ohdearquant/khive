@@ -22,6 +22,15 @@ portable policy contract in `metadata.dependency_scopes` (`normal`, `dev`, or `b
 imports default to `build`; project imports inherit a matching manifest declaration's scope and
 otherwise default to `build`. An edge is dev-only only when its scope set is exactly `{dev}`.
 
+L1.5 import edges are a **static lexical-coupling signal**, not a runtime import graph. The
+coverage-floor scanner is regex-based and does not classify block or guard scope: it includes
+Python imports under `if TYPE_CHECKING:`, function-local imports, and equivalently indented or
+nested matches in the other supported languages. Consequently, a `depends_on` cycle derived from
+L1.5 says that the source texts reference one another; it does not by itself establish a
+module-initialization or runtime dependency cycle. The current edge metadata does not distinguish
+these cases, so consumers needing runtime-cycle claims must confirm scope from source or wait for a
+scope-aware scanner tier.
+
 L2 reuses the closed edge vocabulary: modules `contains` their current declarations, symbols
 `depends_on` other declarations for resolved path calls and supported type references, and
 datatypes `implements` interfaces for positive trait implementations. L2-derived edges are limited

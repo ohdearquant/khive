@@ -393,17 +393,23 @@ Fail-closed in this direction because the cost of wrongly strict is a caller see
 could have been spared, and the cost of wrongly lenient is an accounting or authorization record
 silently lost while its operation reports success.
 
-### D6 — Read-flag mutation is batched; its semantics are unchanged
+### D6 — Read-flag mutation is batched; acknowledgement remains best-effort
 
 A bulk form taking a list of ids becomes the primary surface for sweeping an inbox, collapsing N
 dispatches into one and N statements into one transaction.
 
-**Plain `comm.read` continues to write the flag, and continues to write it before returning.** It
-is batched in the D1 sense — its statement shares a transaction with whatever else is committing —
-and it is never made asynchronous, optional, or deferred past its own return. The unread surface is
-load-bearing for other subsystems: the inbox monitor's stale check reads these flags, and a `comm.read` that
-returned before its flag was committed (store-visible) would make that check read stale state. This
-decision changes how many acquisitions a sweep costs, not what a read means.
+**Plain `comm.read` attempts the flag write before returning, but the patch is best-effort.** A
+successful patch returns `read: true`. Writer contention, a storage error, or a row that disappears
+between fetch and patch does not discard the successful fetch: the response instead returns
+`read: false` plus `mark_error`, and the message remains unread. This is the contract established by
+ADR-040's 2026-08-01 `comm.read` amendment and implemented by
+`crates/khive-pack-comm/src/handlers.rs::read_response`; batching does not strengthen that
+acknowledgement into an unconditional durability guarantee.
+
+The unread surface remains load-bearing for the inbox monitor's stale check. Consequently, an inbox
+sweep MUST count only per-item responses with `read == true` as acknowledged and SHOULD retry rows
+that carry `mark_error`; dispatch success alone does not establish that the flag became
+store-visible. A bulk form preserves these per-item outcomes while reducing acquisitions.
 
 ### D7 — Serve-ledger writes are batched per call
 
