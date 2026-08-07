@@ -243,6 +243,11 @@ WHERE e.relation = 'depends_on' AND e.deleted_at IS NULL
 ORDER BY e.source_id, e.target_id, e.id;
 ";
 
+// `import` is the only evidence kind the import scanner emits; every other
+// `dependency_kinds` value is a manifest declaration section name (Cargo
+// sections, npm `devDependencies`/`peerDependencies`/`optionalDependencies`,
+// Python `optional-dependencies:<group>` — the group suffix is open-ended,
+// so declarations cannot be enumerated in a fixed allowlist).
 const SQL_MANIFEST_IMPORT_MISMATCH: &str = "
 SELECT e.id AS id, s.name AS source_name, t.name AS target_name
 FROM graph_edges e
@@ -253,8 +258,7 @@ WHERE e.relation = 'depends_on' AND e.deleted_at IS NULL
     SELECT 1 FROM json_each(e.metadata, '$.dependency_kinds') WHERE value = 'import'
   )
   AND NOT EXISTS (
-    SELECT 1 FROM json_each(e.metadata, '$.dependency_kinds')
-    WHERE value IN ('dependencies', 'build-dependencies', 'dev-dependencies')
+    SELECT 1 FROM json_each(e.metadata, '$.dependency_kinds') WHERE value <> 'import'
   )
 ORDER BY e.source_id, e.target_id, e.id;
 ";
@@ -1951,6 +1955,119 @@ crate-b = 1
             json_a, json_c,
             "two runs over the same fixture must produce byte-identical JSON"
         );
+    }
+
+    #[tokio::test]
+    async fn manifest_import_mismatch_treats_every_declaration_kind_as_declared() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db = tmp.path().join("map.db");
+        let backend = StorageBackend::sqlite(&db).expect("open fixture backend");
+        {
+            let mut writer = backend.pool().writer().expect("writer guard");
+            khive_db::run_migrations(writer.conn_mut()).expect("run core migrations");
+        }
+        let sql = backend.sql();
+        let mut writer = sql.writer().await.expect("sql writer");
+
+        let projects = [
+            ("11111111-1111-1111-1111-11111111aaaa", "app"),
+            ("22222222-2222-2222-2222-22222222aaaa", "npm-dev-dep"),
+            ("33333333-3333-3333-3333-33333333aaaa", "npm-optional-dep"),
+            ("44444444-4444-4444-4444-44444444aaaa", "py-extra-dep"),
+            ("55555555-5555-5555-5555-55555555aaaa", "cargo-dev-dep"),
+            ("66666666-6666-6666-6666-66666666aaaa", "undeclared-dep"),
+        ];
+        for (id, name) in projects {
+            seed(
+                writer.as_mut(),
+                id,
+                "project",
+                None,
+                name,
+                json!({"source_project": name, "last_seen_at": "2026-07-16T00:00:00Z"}),
+            )
+            .await
+            .unwrap();
+        }
+
+        // Each ecosystem's declaration vocabulary alongside import evidence:
+        // none of these may be flagged. The last edge is the must-match
+        // control — import evidence with no declaration at all.
+        let edges = [
+            (
+                "aaaaaaaa-1111-1111-1111-aaaaaaaaaaaa",
+                "22222222-2222-2222-2222-22222222aaaa",
+                json!({"dependency_kinds": ["devDependencies", "import"]}),
+            ),
+            (
+                "aaaaaaaa-2222-2222-2222-aaaaaaaaaaaa",
+                "33333333-3333-3333-3333-33333333aaaa",
+                json!({"dependency_kinds": ["optionalDependencies", "import"]}),
+            ),
+            (
+                "aaaaaaaa-3333-3333-3333-aaaaaaaaaaaa",
+                "44444444-4444-4444-4444-44444444aaaa",
+                json!({"dependency_kinds": ["optional-dependencies:test", "import"]}),
+            ),
+            (
+                "aaaaaaaa-4444-4444-4444-aaaaaaaaaaaa",
+                "55555555-5555-5555-5555-55555555aaaa",
+                json!({"dependency_kinds": ["dev-dependencies", "import"]}),
+            ),
+            (
+                "aaaaaaaa-5555-5555-5555-aaaaaaaaaaaa",
+                "66666666-6666-6666-6666-66666666aaaa",
+                json!({"dependency_kinds": ["import"]}),
+            ),
+        ];
+        for (id, target, metadata) in edges {
+            seed_edge(
+                writer.as_mut(),
+                id,
+                "11111111-1111-1111-1111-11111111aaaa",
+                target,
+                metadata,
+            )
+            .await
+            .unwrap();
+        }
+        drop(writer);
+
+        let policy = write_policy(
+            tmp.path(),
+            "policy.toml",
+            r#"
+policy_version = 1
+coverage_floor = 0.0
+denied_pairs = []
+
+[crate_ranks]
+app = 0
+npm-dev-dep = 1
+npm-optional-dep = 1
+py-extra-dep = 1
+cargo-dev-dep = 1
+undeclared-dep = 1
+"#,
+        );
+        let report = generate_report(&base_request(db, policy)).await.unwrap();
+
+        let flagged: Vec<&Signal> = report
+            .signals
+            .iter()
+            .filter(|s| s.id == "manifest_import_mismatch")
+            .collect();
+        assert_eq!(
+            flagged.len(),
+            1,
+            "only the declaration-free edge may be flagged: {flagged:?}"
+        );
+        assert_eq!(
+            flagged[0].evidence_ids,
+            vec!["aaaaaaaa-5555-5555-5555-aaaaaaaaaaaa".to_string()],
+            "the flagged evidence must be the import-only edge"
+        );
+        assert_eq!(flagged[0].subject_id, "app->undeclared-dep");
     }
 
     #[tokio::test]

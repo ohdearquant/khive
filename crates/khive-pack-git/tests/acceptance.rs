@@ -1020,7 +1020,14 @@ exec "$REAL_GIT" "$@"
     )
     .await
     .expect("the run completes despite the touched-path gap");
-    assert!(report.done, "an unbounded pass still finishes: {report:?}");
+    assert!(
+        !report.done,
+        "a touched-path gap stalls the cursor, so the pass must not report done: {report:?}"
+    );
+    assert!(
+        report.cursor_stalled,
+        "the touched-path gap must surface as a cursor stall: {report:?}"
+    );
     assert!(
         report.warnings.iter().any(|w| {
             w.contains("no touched-path set recorded")
