@@ -90,7 +90,7 @@
 | ----------------------- | --------------------------------------------------------------------------- |
 | `lib.rs`                | Public exports and the operator-facing `reindex_knowledge` library entry    |
 | `pack.rs`               | Pack registration, `Pack` trait impl, `PackRuntime::dispatch` shim          |
-| `vocab.rs`              | Pack schema statements and 20 handler descriptors (19 verbs + 1 subhandler) |
+| `vocab.rs`              | Pack schema statements and the handler descriptor table (19 public verbs + 1 subhandler) |
 | `handlers.rs`           | `learn`, `cite`, `topic` verbs (KG concept tier sugar)                      |
 | `knowledge/mod.rs`      | Knowledge handler module boundaries and shared exports                      |
 | `knowledge/eval.rs`     | Offline query-set validation, atom retrieval scoring, and run persistence   |
