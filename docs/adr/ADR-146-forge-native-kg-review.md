@@ -92,19 +92,39 @@ context. No new note kinds are introduced.
 ### D5 — Write-back ladder
 
 Review actions gain capability in slices, and each capability is declared in the
-bundle's capability block rather than assumed by the UI:
+bundle's capability block rather than assumed by the UI. The Rollout column names the
+[ADR-145](ADR-145-local-first-kg-workbench.md) Rollout step each slice corresponds to,
+so the two documents describe one ladder rather than two:
 
-| Slice | Capability                                                           | Persistence              |
-| ----- | -------------------------------------------------------------------- | ------------------------ |
-| 1     | Local-only decisions (ADR-145 first slice, shipped)                  | Browser session only     |
-| 2     | Forge read: live PR metadata, comments, check states via adapter     | Read-only                |
-| 3     | Forge write-back: approve, request changes, comment, behind explicit | Forge is the record      |
-|       | per-action capability and never on by default                        |                          |
-| 4     | Merge remains forge-side under branch protection; post-merge         | Repository is the record |
-|       | `kg sync` rebuilds the working database (ADR-020 §11 hooks)          |                          |
+| Slice | ADR-145 Rollout step                | Capability                                                                                                         | Persistence              |
+| ----- | ----------------------------------- | ------------------------------------------------------------------------------------------------------------------ | ------------------------ |
+| 1     | 1 (read-only vertical slice)        | Local-only decisions (shipped)                                                                                     | Browser session only     |
+| 2     | 3 (authenticated repository reads)  | Forge read: live PR metadata, comments, check states via adapter                                                   | Read-only                |
+| 3     | 4 (governed writes)                 | Forge write-back: approve, request changes, comment — **gated, see below**                                         | Forge is the record      |
+| 4     | 5 (editing and conflict resolution) | Merge remains forge-side under branch protection; post-merge `kg sync` rebuilds the working database (ADR-020 §11) | Repository is the record |
 
-Slice numbering here is a dependency order, not a schedule. Skipping a slice is not
-permitted: write-back without live read has no stale-detection substrate.
+ADR-145 Rollout step 2 (shared pure core: stable diff and rule crates, normative schema
+plus golden vectors, native/WASM parity, strict committed-state Git adapters) has no
+slice here because it is prerequisite engineering rather than a review capability. It
+still gates slice 2, and ADR-145 governs it unchanged.
+
+**Slice 3 is gated by ADR-145, and this ADR does not open that gate.** ADR-145 D5
+states that the workbench MUST NOT translate an approval in one system into an apply or
+approval in another "until a later ADR defines identity mapping, authorization,
+idempotency, partial-failure recovery, and audit events," and its Rollout step 4 repeats
+the requirement as ratified decisions on outbound publication, authorization,
+idempotency, hygiene, and audit. Those five named subjects govern slice 3 in full.
+
+ADR-146 defines none of them and is not the later ADR that ADR-145 reserves. Slice 3
+therefore remains blocked until a subsequent ADR discharges that precondition set
+explicitly. A per-action capability toggle, default off, is an implementation property
+of slice 3 once it is unblocked; it is not a substitute for the ratified decisions, and
+nothing in this ADR should be read as amending or weakening ADR-145 D5.
+
+Slice numbering is a dependency order, not a schedule. Skipping a slice is not
+permitted: write-back without live read has no stale-detection substrate. Reaching
+slice 2 does not make slice 3 available, because slice 3's gate is a decision gate, not
+an ordering one.
 
 ### D6 — Gates are checks, not UI decorations
 
