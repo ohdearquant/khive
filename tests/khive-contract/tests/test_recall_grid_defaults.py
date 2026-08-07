@@ -1,3 +1,17 @@
+"""Recall tuning-grid defaults contract tests.
+
+ADR: ADR-033
+section: 1. RecallConfig — all weights are parameters
+
+Pins the tuning grid to the shipped `RecallConfig` defaults, so a grid that no
+longer covers what production actually serves cannot silently report a tuning
+result for a configuration space the runtime never occupies. Specifically:
+`fuse_strategy` default `Rrf { k: 10 }`, `candidate_multiplier` default 20, and
+an explicit `candidate_limit` on every candidate pool. Also covers that a tuned
+config round-trips `candidate_limit`, and that the runtime-default baseline
+sends no request-level config at all.
+"""
+
 from __future__ import annotations
 
 import tomllib
@@ -10,6 +24,10 @@ from tune.grid_search import (
     load_grid_dimensions,
     write_results,
 )
+
+# Bare verb name, matching both the sibling modules' convention and the call
+# this suite actually asserts at the RecordingSession call site.
+VERBS_UNDER_TEST = {"recall"}
 
 
 class RecordingSession:
