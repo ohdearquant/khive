@@ -91,7 +91,9 @@ MATCH (a:concept)-[e:introduced_by]->(b:paper)
 SELECT ... FROM entities a
 JOIN graph_edges e ON e.source_id = a.id
 JOIN entities b ON b.id = e.target_id
-WHERE ... LIMIT ?
+WHERE ...
+ORDER BY <bound substrate and UUID identities>
+LIMIT ? OFFSET ?
 ```
 
 ### Variable-length (any edge `*N..M` where M > 1)
@@ -107,7 +109,9 @@ WITH RECURSIVE traverse(...) AS (
       JOIN entities next_node ...
     WHERE t.depth < ?max_depth AND ... NOT LIKE ...
 )
-SELECT DISTINCT ... FROM traverse t JOIN entities r ... WHERE ... LIMIT ?
+SELECT DISTINCT ... FROM traverse t JOIN entities r ... WHERE ...
+ORDER BY <depth, weight, every distinct projected output>
+LIMIT ? OFFSET ?
 ```
 
 ## Deliberate limitations
@@ -116,6 +120,8 @@ SELECT DISTINCT ... FROM traverse t JOIN entities r ... WHERE ... LIMIT ?
   starts at depth 1 and cannot emit a depth-0 row.
 - Repeated node variables are rejected at validation. Supporting them requires
   alias-equality predicates not yet implemented.
+- GQL supports deterministic offset paging through `SKIP`; SPARQL `OFFSET`
+  remains outside the supported dialect.
 - The `parse_auto` fallback for unrecognized prefixes uses the GQL parser.
 
-Last reviewed: 2026-07-10
+Last reviewed: 2026-08-06

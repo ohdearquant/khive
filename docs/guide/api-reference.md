@@ -626,15 +626,34 @@ rejected — use `create`/`update`/`link`/`merge`/`delete` to mutate the graph. 
 that mix fixed-length and variable-length chains are not compiled in one call; split
 them into separate `query()` calls. GQL string equality uses SQLite `COLLATE NOCASE`,
 so `WHERE e.name = "LoRA"` matches both `LoRA` and ASCII case variants such as `lora`.
+GQL results have a deterministic identity order. When a response has `has_more: true`,
+repeat the same query with `SKIP` set to its `next_offset`; keep `page_size` unchanged.
+SPARQL `OFFSET` is not part of the supported dialect.
 
-| Param   | Type    | Required | Notes                                    |
-| ------- | ------- | -------- | ---------------------------------------- |
-| `query` | string  | yes      | GQL or SPARQL pattern string, read-only. |
-| `limit` | integer | no       | Default 500, hard cap 10,000.            |
+| Param       | Type    | Required | Notes                                                                     |
+| ----------- | ------- | -------- | ------------------------------------------------------------------------- |
+| `query`     | string  | yes      | GQL or SPARQL pattern string, read-only. GQL supports `SKIP n [LIMIT m]`. |
+| `page_size` | integer | no       | Rows per call; minimum 1, default 500, clamped to hard cap 10,000.        |
+| `limit`     | integer | no       | Deprecated alias for `page_size`; supplying both is an error.             |
 
 ```
 request(ops="query(query=\"MATCH (c:concept)-[:extends]->(d:concept) RETURN c, d LIMIT 20\")")
 ```
+
+For an exhaustive audit, omit query-text `LIMIT` so the server can report whether another
+page exists. An explicit `LIMIT` at or below `page_size` is a terminal caller-chosen bound.
+
+```text
+request(ops="query(query=\"MATCH (a)-[r:depends_on]->(b) RETURN a, r, b\", page_size=500)")
+# {"rows":[...],"offset":0,"page_size":500,"has_more":true,
+#  "next_offset":500,"truncated":true,...}
+
+request(ops="query(query=\"MATCH (a)-[r:depends_on]->(b) RETURN a, r, b SKIP 500\", page_size=500)")
+```
+
+`next_offset` is `offset + rows.length` and appears only on GQL pages with `has_more: true`.
+`truncated` remains as a compatibility alias for `has_more`. Offset paging is stable while
+the matched graph is unchanged; concurrent inserts or deletes can shift later pages.
 
 ### `propose` — Commissive
 

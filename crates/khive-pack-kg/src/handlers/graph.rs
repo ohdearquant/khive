@@ -147,8 +147,22 @@ impl KgPack {
         params: Value,
     ) -> Result<Value, RuntimeError> {
         let p: QueryParams = deser(params)?;
+        let requested_page_size = match (p.page_size, p.limit) {
+            (Some(_), Some(_)) => {
+                return Err(RuntimeError::InvalidInput(
+                    "query accepts either `page_size` or deprecated `limit`, not both".into(),
+                ));
+            }
+            (Some(page_size), None) | (None, Some(page_size)) => page_size,
+            (None, None) => 500,
+        };
+        if requested_page_size == 0 {
+            return Err(RuntimeError::InvalidInput(
+                "query page_size must be at least 1".into(),
+            ));
+        }
         let opts = khive_query::CompileOptions {
-            max_limit: p.limit.unwrap_or(500).min(HARD_CAP),
+            max_limit: requested_page_size.min(HARD_CAP),
             ..Default::default()
         };
         let result = self
