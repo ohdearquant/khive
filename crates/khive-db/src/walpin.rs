@@ -1570,19 +1570,22 @@ mod windows_impl {
         Ok(())
     }
 
-    /// Handle-bound rename within the file's own parent directory: with a
-    /// null `RootDirectory` and a bare (single-component) new name, the
-    /// rename resolves against the directory the open handle already lives
-    /// in — the same directory `open_relative` proved real and non-reparse
-    /// when it created the file, so the `renameat`-like anchoring holds by
-    /// construction. An explicit directory handle is NOT an option here:
-    /// `SetFileInformationByHandle` rejects a non-null `RootDirectory` with
-    /// `ERROR_INVALID_PARAMETER` (87) for the classic `FileRenameInfo`
-    /// class AND for `FileRenameInfoEx` (both measured on Windows Server
-    /// 2022 CI); directory-relative `RootDirectory` renames exist only at
-    /// the `NtSetInformationFile` layer.
-    fn rename_via_handle(file: &fs::File, target_name: &str) -> io::Result<()> {
-        let wide: Vec<u16> = OsStr::new(target_name).encode_wide().collect();
+    /// Handle-bound rename to a full destination path with a null
+    /// `RootDirectory`. Both indirect forms are refused on this API
+    /// (measured on Windows Server 2022 CI, one round each): a non-null
+    /// `RootDirectory` fails with `ERROR_INVALID_PARAMETER` (87) on the
+    /// classic `FileRenameInfo` class AND on `FileRenameInfoEx`
+    /// (directory-relative `RootDirectory` renames exist only at the
+    /// `NtSetInformationFile` layer), and a bare relative name with a null
+    /// `RootDirectory` resolves against the process working directory, not
+    /// the file's parent — `ERROR_NOT_SAME_DEVICE` (17) when cwd and temp
+    /// sit on different drives. The caller therefore supplies the fully
+    /// qualified destination; `write_atomic` builds it from the validated
+    /// directory plus the single-component target name, so the rename
+    /// cannot escape the directory the caller already proved real and
+    /// non-reparse.
+    fn rename_via_handle(file: &fs::File, target_path: &Path) -> io::Result<()> {
+        let wide: Vec<u16> = target_path.as_os_str().encode_wide().collect();
         let name_bytes = wide.len() * 2;
         // The real field offset, not an approximation — `FileRenameInfoEx`
         // validates the reported buffer size against this exact offset plus
@@ -1639,7 +1642,7 @@ mod windows_impl {
         tmp_file.write_all(body)?;
         tmp_file.sync_all()?;
         remove_relative_if_exists(&dir_handle, target_name)?;
-        rename_via_handle(&tmp_file, target_name)
+        rename_via_handle(&tmp_file, &dir.join(target_name))
     }
 
     pub(super) fn remove_checked(dir: &Path, name: &str) -> io::Result<()> {
