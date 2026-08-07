@@ -112,7 +112,21 @@ local: verify-local-artifact
 	  rm -f "$$DEST.new"; \
 	  exit 1; \
 	fi; \
-	codesign -s - -f "$$DEST.new" 2>/dev/null || true; \
+	if ! codesign -s - -f "$$DEST.new"; then \
+	  echo "==> ERROR: codesign failed on $$DEST.new — refusing to install"; \
+	  rm -f "$$DEST.new"; \
+	  exit 1; \
+	fi; \
+	echo "==> Re-verifying the SIGNED artifact (codesign rewrites the file, so the pre-sign verification does not cover the bytes that get installed)..."; \
+	if ! python3 scripts/verify_local_artifact.py \
+	  --artifact "$$DEST.new" \
+	  --packs "$(FULL_PACKS)" \
+	  --min-verbs "$(LOCAL_VERB_FLOOR)" >/dev/null; then \
+	  echo "==> ERROR: signed artifact failed verification — refusing to install"; \
+	  rm -f "$$DEST.new"; \
+	  exit 1; \
+	fi; \
+	SIGNED_SHA256=$$({ shasum -a 256 "$$DEST.new" 2>/dev/null || sha256sum "$$DEST.new"; } | awk '{print $$1}'); \
 	STAGED_HASH=$$(md5 -q "$$DEST.new"); \
 	echo "==> Atomically moving into place..."; \
 	mv "$$DEST.new" "$$DEST"; \
@@ -131,6 +145,11 @@ local: verify-local-artifact
 	DEST_MTIME=$$(stat -f '%Sm' "$$DEST"); \
 	if [ "$$STAGED_HASH" != "$$DEST_HASH" ]; then \
 	  echo "==> ERROR: post-mv hash drift! staged=$$STAGED_HASH dest=$$DEST_HASH"; \
+	  exit 1; \
+	fi; \
+	DEST_SHA256=$$({ shasum -a 256 "$$DEST" 2>/dev/null || sha256sum "$$DEST"; } | awk '{print $$1}'); \
+	if [ "$$SIGNED_SHA256" != "$$DEST_SHA256" ]; then \
+	  echo "==> ERROR: installed bytes differ from the verified signed artifact! signed=$$SIGNED_SHA256 installed=$$DEST_SHA256"; \
 	  exit 1; \
 	fi; \
 	echo "==> Installed: $$DEST ($$DEST_HASH, $$DEST_SIZE bytes, $$DEST_MTIME, $$VERIFIED_VERBS verified verbs)"; \

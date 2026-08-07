@@ -838,6 +838,37 @@ class MakefileGateContractTests(unittest.TestCase):
         self.assertLess(staged_check, install)
         self.assertLess(install, daemon_stop)
 
+    def test_signing_cannot_slip_unverified_bytes_past_the_install_gate(self) -> None:
+        """`codesign` rewrites the staged file, so every pre-sign check is void
+        for the bytes that actually get installed. The gate must therefore fail
+        closed on a signing error and re-probe the SIGNED artifact before the
+        move, then bind the installed path to the post-sign digest."""
+        local_recipe = self.makefile[self.makefile.index("local: verify-local-artifact") :]
+
+        # A mutating step inside the install gate may never be ignored.
+        self.assertNotIn('codesign -s - -f "$$DEST.new" 2>/dev/null || true', local_recipe)
+        self.assertNotIn("codesign -s - -f \"$$DEST.new\" || true", local_recipe)
+        self.assertIn('if ! codesign -s - -f "$$DEST.new"; then', local_recipe)
+
+        staged_check = local_recipe.index('if [ "$$VERIFIED_SHA256" != "$$COPIED_SHA256" ]')
+        sign = local_recipe.index('codesign -s - -f "$$DEST.new"')
+        resign_verify = local_recipe.index('--artifact "$$DEST.new"')
+        signed_digest = local_recipe.index("SIGNED_SHA256=")
+        install = local_recipe.index('mv "$$DEST.new" "$$DEST"')
+        installed_check = local_recipe.index(
+            'if [ "$$SIGNED_SHA256" != "$$DEST_SHA256" ]'
+        )
+
+        # The signed artifact is re-probed with the full pack set and the same
+        # verb floor, not merely re-hashed: a hash cannot show the binary still
+        # loads every pack.
+        self.assertIn('--packs "$(FULL_PACKS)"', local_recipe)
+        self.assertLess(staged_check, sign)
+        self.assertLess(sign, resign_verify)
+        self.assertLess(resign_verify, signed_digest)
+        self.assertLess(signed_digest, install)
+        self.assertLess(install, installed_check)
+
     def test_cargo_receipt_drives_verifier_and_ci_runs_regression_suite(self) -> None:
         self.assertIn("scripts/build_local_artifact.py", self.makefile)
         self.assertIn("scripts/verify_local_artifact.py", self.makefile)
