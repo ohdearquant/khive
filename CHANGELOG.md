@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Deterministic GQL `SKIP` paging with structured `has_more`/`next_offset`
+  continuation metadata for result sets beyond the query page bound (#1601).
 - `whoami` verb (kg pack, bare name): reports the caller's actor reference,
   write namespace, and read-visible namespace set already resolved by the
   runtime for the current request.

@@ -745,6 +745,7 @@ fn core_tables_exist() {
         "knowledge_atoms",
         "knowledge_domains",
         "knowledge_sections",
+        "ann_consumer_pending",
     ] {
         assert!(table_exists(&conn, t), "missing table: {t}");
     }
@@ -1683,6 +1684,63 @@ fn v14_index_rejects_new_cross_namespace_duplicate_edge_id() {
     );
 }
 
+// ── V18: distinguish never-activated ANN consumers from active S=0 ──────────
+
+#[test]
+fn v18_moves_legacy_zero_watermark_into_timestamped_pending_state() {
+    let mut conn = open_memory();
+    conn.execute_batch(MIGRATION_TRACKING_TABLE).unwrap();
+    for migration in MIGRATIONS
+        .iter()
+        .filter(|migration| migration.version <= 16)
+    {
+        let tx = conn.transaction().unwrap();
+        tx.execute_batch(migration.up).unwrap();
+        tx.execute(
+            "INSERT INTO _schema_migrations (version, name, applied_at) VALUES (?1, ?2, 0)",
+            rusqlite::params![migration.version, migration.name],
+        )
+        .unwrap();
+        tx.commit().unwrap();
+    }
+    conn.execute(
+        "INSERT INTO ann_consumer_watermark \
+         (consumer, namespace, embedding_model, watermark) \
+         VALUES ('legacy-zero', 'local', 'model', 0), \
+                ('active', 'local', 'model', 17), \
+                ('recovering', 'local', 'model', -1)",
+        [],
+    )
+    .unwrap();
+
+    assert_eq!(run_migrations(&mut conn).unwrap(), 19);
+    assert!(table_exists(&conn, "ann_consumer_pending"));
+    let legacy: (i64, i64) = conn
+        .query_row(
+            "SELECT watermark, pending.registered_at_us \
+             FROM ann_consumer_watermark watermark \
+             JOIN ann_consumer_pending pending USING \
+               (consumer, namespace, embedding_model) \
+             WHERE watermark.consumer = 'legacy-zero'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(legacy.0, -2);
+    assert!(legacy.1 > 0);
+    let protected: Vec<i64> = conn
+        .prepare(
+            "SELECT watermark FROM ann_consumer_watermark \
+             WHERE consumer IN ('active', 'recovering') ORDER BY watermark",
+        )
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(protected, vec![-1, 17]);
+}
+
 #[test]
 fn read_schema_version_missing_ledger_is_zero() {
     let conn = open_memory();
@@ -1854,51 +1912,51 @@ fn mixed_version_boot_rejects_newer_schema_under_lock() {
     );
 }
 
-// ── V18: divergent V13/V14 ledger repair (#1649) ────────────────────────────
+// ── V19: divergent V13/V14 ledger repair (#1649) ────────────────────────────
 
-fn insert_v18_test_entity(conn: &Connection, id: &str, created_at: i64) {
+fn insert_v19_test_entity(conn: &Connection, id: &str, created_at: i64) {
     conn.execute(
         "INSERT INTO entities (id, namespace, kind, name, tags, created_at, updated_at) \
          VALUES (?1, 'local', 'concept', ?1, '[]', ?2, ?2)",
         rusqlite::params![id, created_at],
     )
-    .expect("insert v18 test entity");
+    .expect("insert v19 test entity");
 }
 
-fn insert_v18_test_note(conn: &Connection, id: &str, created_at: i64) {
+fn insert_v19_test_note(conn: &Connection, id: &str, created_at: i64) {
     conn.execute(
         "INSERT INTO notes \
          (id, namespace, kind, status, name, content, created_at, updated_at) \
          VALUES (?1, 'local', 'note', 'active', ?1, '', ?2, ?2)",
         rusqlite::params![id, created_at],
     )
-    .expect("insert v18 test note");
+    .expect("insert v19 test note");
 }
 
-fn insert_v18_test_edge(conn: &Connection, id: &str, source_id: &str, target_id: &str) {
+fn insert_v19_test_edge(conn: &Connection, id: &str, source_id: &str, target_id: &str) {
     conn.execute(
         "INSERT INTO graph_edges \
          (namespace, id, source_id, target_id, relation, weight, created_at, updated_at) \
          VALUES ('local', ?1, ?2, ?3, 'relates_to', 1.0, 1, 1)",
         rusqlite::params![id, source_id, target_id],
     )
-    .expect("insert v18 test edge");
+    .expect("insert v19 test edge");
 }
 
 #[test]
-fn v18_repairs_divergent_cursor_ledgers() {
+fn v19_repairs_divergent_cursor_ledgers() {
     let mut conn = open_memory();
-    run_migrations(&mut conn).expect("fresh migrate to latest (includes V18)");
+    run_migrations(&mut conn).expect("fresh migrate to latest (includes V19)");
 
     // Populate rows that predate the divergence being simulated below.
-    insert_v18_test_entity(&conn, "e1", 10);
-    insert_v18_test_entity(&conn, "e2", 20);
-    insert_v18_test_note(&conn, "n1", 10);
-    insert_v18_test_edge(&conn, "edge1", "e1", "e2");
+    insert_v19_test_entity(&conn, "e1", 10);
+    insert_v19_test_entity(&conn, "e2", 20);
+    insert_v19_test_note(&conn, "n1", 10);
+    insert_v19_test_edge(&conn, "edge1", "e1", "e2");
 
     // Simulate a database that committed V13/V14 under non-canonical names,
-    // never recorded V18, and lost part of its ledger — the exact divergence
-    // V18 exists to repair.
+    // never recorded V19, and lost part of its ledger — the exact divergence
+    // V19 exists to repair.
     conn.execute(
         "UPDATE _schema_migrations SET name = 'legacy_v13_rename' WHERE version = 13",
         [],
@@ -1909,7 +1967,7 @@ fn v18_repairs_divergent_cursor_ledgers() {
         [],
     )
     .unwrap();
-    conn.execute("DELETE FROM _schema_migrations WHERE version = 18", [])
+    conn.execute("DELETE FROM _schema_migrations WHERE version = 19", [])
         .unwrap();
     conn.execute("DELETE FROM entities_seq WHERE entity_id = 'e1'", [])
         .unwrap();
@@ -1955,7 +2013,7 @@ fn v18_repairs_divergent_cursor_ledgers() {
 
     assert!(
         index_exists(&conn, "idx_graph_edges_id_unique"),
-        "V18 must reassert the global edge-id unique index"
+        "V19 must reassert the global edge-id unique index"
     );
 
     let (v13_name, v14_name): (String, String) = (
@@ -1989,12 +2047,12 @@ fn v18_repairs_divergent_cursor_ledgers() {
 }
 
 #[test]
-fn post_v18_name_mismatch_fails_loud() {
+fn post_v19_name_mismatch_fails_loud() {
     let mut conn = open_memory();
-    run_migrations(&mut conn).expect("fresh migrate to latest (includes V18)");
+    run_migrations(&mut conn).expect("fresh migrate to latest (includes V19)");
 
     // An unrelated already-applied migration recorded under the wrong name —
-    // not the known V13/V14 divergence V18 repairs — must fail loudly rather
+    // not the known V13/V14 divergence V19 repairs — must fail loudly rather
     // than be silently accepted or trigger arbitrary re-execution.
     conn.execute(
         "UPDATE _schema_migrations SET name = 'wrong_name' WHERE version = 7",

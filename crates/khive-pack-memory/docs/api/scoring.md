@@ -84,6 +84,6 @@ The score is `sum(weight * feature) / sum(positive weights)`. Unknown names are 
 
 ## DoS caps and MMR
 
-`ScoringConfig::apply_dos_caps` clamps candidates to 500, token budget to 16,000, and result limit to 200. Defaults are 200 candidates, 4,000 tokens, and 10 results. MMR applies a default `0.1` penalty when the first 100 characters duplicate an earlier result.
+`ScoringConfig::apply_dos_caps` clamps candidates to 500, token budget to 16,000, and result limit to 200. Defaults are 200 candidates, 4,000 tokens, and 10 results. `default_token_budget` and `chars_per_token` must both be positive; recall rejects a configuration whose effective character-budget product cannot be represented instead of wrapping it or treating it as an empty-result budget. MMR applies a default `0.1` penalty when the first 100 characters duplicate an earlier result.
 
 Supersedes suppression is enabled by default. Recall always fans out across every registered embedding engine and fuses the results (issue #1115) — there is no per-query engine selection to configure.

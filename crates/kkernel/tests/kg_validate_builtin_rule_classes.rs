@@ -213,3 +213,94 @@ fn kg_validate_no_rules_flag_skips_all_builtin_rule_classes() {
         "structural checks must still fail under --no-rules"
     );
 }
+
+#[test]
+fn kg_validate_fails_when_a_mandatory_input_file_is_missing() {
+    let tmp = TempDir::new().expect("create temp dir");
+    let kg_dir = tmp.path().join(".khive/kg");
+    std::fs::create_dir_all(&kg_dir).expect("create .khive/kg");
+    std::fs::write(kg_dir.join("edges.ndjson"), "").expect("write edges.ndjson");
+
+    let output = Command::new(kkernel_bin())
+        .args([
+            "kg",
+            "validate",
+            "--repo",
+            tmp.path().to_str().expect("utf8 tmp path"),
+            "--format",
+            "json",
+            "--no-rules",
+        ])
+        .output()
+        .expect("run kkernel kg validate");
+
+    assert!(
+        !output.status.success(),
+        "missing entities.ndjson must fail validation; stdout={}, stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .expect("failed validation still returns the JSON report");
+    let required = report["rules"]
+        .as_array()
+        .and_then(|rules| {
+            rules
+                .iter()
+                .find(|rule| rule["id"] == "required-input-files")
+        })
+        .expect("required-input-files rule");
+    assert_eq!(required["passed"], false);
+    assert!(required["violations"][0]["message"]
+        .as_str()
+        .is_some_and(|message| message.contains("entities.ndjson")));
+}
+
+#[test]
+fn kg_validate_fails_when_present_optional_notes_are_not_utf8() {
+    let tmp = TempDir::new().expect("create temp dir");
+    let kg_dir = tmp.path().join(".khive/kg");
+    std::fs::create_dir_all(&kg_dir).expect("create .khive/kg");
+    std::fs::write(kg_dir.join("entities.ndjson"), "").expect("write entities.ndjson");
+    std::fs::write(kg_dir.join("edges.ndjson"), "").expect("write edges.ndjson");
+    std::fs::write(kg_dir.join("notes.ndjson"), [0xff, 0xfe])
+        .expect("write invalid UTF-8 notes.ndjson");
+
+    let output = Command::new(kkernel_bin())
+        .args([
+            "kg",
+            "validate",
+            "--repo",
+            tmp.path().to_str().expect("utf8 tmp path"),
+            "--format",
+            "json",
+            "--no-rules",
+        ])
+        .output()
+        .expect("run kkernel kg validate");
+
+    assert!(
+        !output.status.success(),
+        "unreadable present notes.ndjson must fail validation; stdout={}, stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .expect("failed validation still returns the JSON report");
+    let required = report["rules"]
+        .as_array()
+        .and_then(|rules| {
+            rules
+                .iter()
+                .find(|rule| rule["id"] == "required-input-files")
+        })
+        .expect("required-input-files rule");
+    assert_eq!(required["passed"], false);
+    assert!(required["violations"]
+        .as_array()
+        .is_some_and(|violations| violations.iter().any(|violation| {
+            violation["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("notes.ndjson"))
+        })));
+}

@@ -97,7 +97,7 @@ handler. Handlers MUST NOT inspect or branch on the mode.
 
 | Field type                           | Verbose form                                        | Agent form                                                                                                                                              |
 | ------------------------------------ | --------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| UUID                                 | `"a1b2c3d4-e5f6-7890-abcd-ef1234567890"` (36 chars) | `"a1b2c3d4"` (8 chars — first segment)                                                                                                                  |
+| UUID                                 | `"a1b2c3d4-e5f6-7890-abcd-ef1234567890"` (36 chars) | `"a1b2c3d4"` (8 chars — first segment), except strict round-trip fields remain canonical                                                                |
 | Timestamp (ISO-8601)                 | `"2026-05-23T16:18:15.234567Z"` (27 chars)          | `"2026-05-23T16:18"` (16 chars — minute granularity) OR relative `"3m ago"` if < 24h (sampled once per `present_response()` call — see §Implementation) |
 | Empty string `""`                    | included                                            | dropped                                                                                                                                                 |
 | Empty array `[]`                     | included                                            | dropped                                                                                                                                                 |
@@ -131,10 +131,14 @@ pass through canonical. Pack authors declare additional truncated fields via
 `PackPresentationPolicy::truncated_score_fields()`. Type-based truncation is
 forbidden.
 
-Short UUIDs in Agent mode echo back the same form the caller could pass on
-input (ADR-016 short-UUID-prefix resolution) — the canonical form is also
-included as `full_id` if the caller needs disambiguation, but is NOT included
-by default.
+Short UUIDs in Agent mode echo back the same form the corresponding parameter
+accepts on input (ADR-016 short-prefix resolution). A field consumed by a
+full-UUID-only parameter is never shortened. Field-level exceptions keep
+`context_entity_id`, `thread_id`, `outbound_ref`, `parent_id`, `session_id`, and
+`project_id` canonical at every nesting level; verb-level `AlwaysVerbose` policy keeps
+`memory.feedback.target_id` and `comm.delivered.id` canonical. The canonical
+record identifier is also included as `full_id` if the caller needs
+disambiguation, but is NOT included by default.
 
 ### `include_full_id` override (envelope-level)
 
@@ -300,6 +304,9 @@ table for a NEW pack verb as a CI failure during pack registration.
 | `traverse`               | AlwaysVerbose  | Path UUIDs needed for follow-up                               |
 | `neighbors`              | AlwaysVerbose  | Same as traverse                                              |
 | `link` (create response) | AlwaysVerbose  | Edge IDs needed for follow-up                                 |
+| `brain.feedback`         | AlwaysVerbose  | Feedback target acknowledgement must remain chainable         |
+| `memory.feedback`        | AlwaysVerbose  | Exact feedback target acknowledgement must remain canonical   |
+| `comm.delivered`         | AlwaysVerbose  | `id` is an exact outbound correlation key                     |
 | `kg.export` (future)     | AlwaysVerbose  | Byte-fidelity for snapshots                                   |
 | `kg.snapshot` (future)   | AlwaysVerbose  | Same                                                          |
 | `kg.commit` (future)     | AlwaysVerbose  | Same                                                          |
@@ -409,10 +416,12 @@ Three reasons:
 
 ### Why short-UUID first 8 chars (not 12, not 16)
 
-ADR-016's short-UUID-prefix resolution requires 8+ hex chars. The output side
-matches the input side — agents that copy a `"a1b2c3d4"` back into a verb call
-get the same record. Longer prefixes (12, 16) add tokens without strengthening
-the round-trip contract.
+ADR-016's short-UUID-prefix resolution requires 8+ hex chars. For parameters
+that accept prefix resolution, the output side matches the input side within
+that parameter's declared resolution scope — agents that copy a `"a1b2c3d4"`
+back into a verb call get the same record when the prefix remains unique in
+that scope. Strict fields stay full because shortening them would break,
+rather than strengthen, the round-trip contract.
 
 ### Why "3m ago" (not always absolute timestamps)
 

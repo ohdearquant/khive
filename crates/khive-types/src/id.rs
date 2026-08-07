@@ -95,11 +95,25 @@ pub enum ParseIdError {
     InvalidHex,
 }
 
+impl ParseIdError {
+    /// Exact `Display` text for [`ParseIdError::InvalidLength`].
+    ///
+    /// Callers that classify parse failures by message text (e.g. the
+    /// `propose` changeset error-shape split) match on this constant rather
+    /// than on prose heuristics. The pinning test in this module fails loudly
+    /// if the wording ever changes.
+    pub const INVALID_LENGTH_TEXT: &'static str = "expected UUID: 32 hex chars or 36 with hyphens";
+
+    /// Exact `Display` text for [`ParseIdError::InvalidHex`]. See
+    /// [`ParseIdError::INVALID_LENGTH_TEXT`] for the matching contract.
+    pub const INVALID_HEX_TEXT: &'static str = "invalid hex character in UUID";
+}
+
 impl fmt::Display for ParseIdError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::InvalidLength => f.write_str("expected UUID: 32 hex chars or 36 with hyphens"),
-            Self::InvalidHex => f.write_str("invalid hex character in UUID"),
+            Self::InvalidLength => f.write_str(Self::INVALID_LENGTH_TEXT),
+            Self::InvalidHex => f.write_str(Self::INVALID_HEX_TEXT),
         }
     }
 }
@@ -183,6 +197,7 @@ impl<'de> serde::Deserialize<'de> for Id128 {
 mod tests {
     use super::*;
     use alloc::format;
+    use alloc::string::ToString;
 
     #[test]
     fn nil() {
@@ -236,6 +251,22 @@ mod tests {
         assert_eq!(
             "abcdef01-2345-6789-abcd-ef012345678".parse::<Id128>(),
             Err(ParseIdError::InvalidLength)
+        );
+    }
+
+    /// Pin the `ParseIdError` Display wording: downstream error-shape
+    /// classification (propose changeset identifier failures) matches on
+    /// these exact strings, so a wording change must break this test at the
+    /// source rather than silently drift a caller's heuristic.
+    #[test]
+    fn parse_error_display_is_pinned() {
+        assert_eq!(
+            ParseIdError::InvalidLength.to_string(),
+            ParseIdError::INVALID_LENGTH_TEXT
+        );
+        assert_eq!(
+            ParseIdError::InvalidHex.to_string(),
+            ParseIdError::INVALID_HEX_TEXT
         );
     }
 

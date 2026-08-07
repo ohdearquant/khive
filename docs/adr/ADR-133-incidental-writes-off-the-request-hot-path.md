@@ -104,10 +104,10 @@ payload) lives at the payload level, not the kind level.
 
 ## Decision
 
-### D1 — Batch audit appends durably, and the dispatch waits for its own batch to commit
+### D1 — Batch audit appends share one transaction, and the dispatch waits for its own batch to commit
 
-Audit appends are accumulated and written as a **single transaction**. The flush is a real durable
-commit, not an in-memory retention with best-effort persistence.
+Audit appends are accumulated and written as a **single transaction**. The flush is a real
+committed (store-visible) transaction, not an in-memory retention with best-effort persistence.
 
 **A dispatch does not return before the batch carrying its audit row has committed.** This is the
 load-bearing clause of the whole record and an earlier draft left it unstated, which made the
@@ -120,8 +120,8 @@ fails it.
 
 For **pure observability rows** it binds on the success path only. The dispatch waits for the batch
 in the normal case — so observability rows are batched, share the acquisition reduction, and are
-durable at return whenever the commit succeeds — but a **persistent** commit failure releases the
-dispatch successfully and routes the failure to instrumentation.
+committed (store-visible) at return whenever the commit succeeds — but a **persistent** commit
+failure releases the dispatch successfully and routes the failure to instrumentation.
 
 That carve-out is not a durability regression, and the reason is worth stating because it is the
 only thing that makes the carve-out legitimate. The current implementation already swallows a failed
@@ -139,9 +139,11 @@ upper bound, not as the normal trigger.
 
 The consequences of the waiting clause, all of which follow from it directly:
 
-- **Durability is unchanged at the moment of return.** A row that is committed today before the
-  dispatch returns is still committed before the dispatch returns. INV-4 holds by construction
-  rather than by assertion.
+- **Store visibility is unchanged at the moment of return.** A row that is committed today before
+  the dispatch returns is still committed before the dispatch returns. INV-4 holds by construction
+  rather than by assertion. "Committed" here is write-path store visibility under the store's
+  configured posture; whether a committed row survives an OS crash is the store's durability
+  posture, which is ADR-134's subject, not this clause's.
 - **Acquisitions stop scaling with request rate.** Under concurrency the acquisition rate is
   bounded by one per commit cycle instead of one per dispatch. This is the entire objective.
 - **Under contention this reduces latency rather than adding it.** Today each dispatch queues for
@@ -252,8 +254,17 @@ repeated work while believing it was preventing duplication.
 
 ### D1b — This is intra-process group commit, and the scope is load-bearing
 
-The batching in D1 is one daemon process committing, on **one connection**, rows produced by the
-many concurrent dispatches it is serving. Those dispatches are tasks inside one process, so
+**Lane note (ADR-134 D2a).** "One connection" describes the mechanism's scope, not a global
+count: once ADR-134's posture target lands, obligation-bearing rows commit on a second,
+pool-owned connection running a durable-sync posture, and this shared connection carries pure
+observability rows only. Lane selection rides D1's classification at enqueue, so a batch on
+either connection is single-lane by construction — a mixed batch on the shared writer would
+bypass ADR-134's durability guarantee while passing every invariant here, which is why the
+split is stated in both records. Each lane runs this same group-commit mechanism on its own
+connection.
+
+The batching in D1 is one daemon process committing, on **one connection per lane**, rows
+produced by the many concurrent dispatches it is serving. Those dispatches are tasks inside one process, so
 sharing a transaction between them is ordinary intra-process group commit and it is available.
 
 It is **not** group commit across client processes. SQLite has no cross-process commit
@@ -271,15 +282,18 @@ follow-on inherits the multi-daemon case.
 
 ### D2 — A classifier at the event-production seam decides commit-failure handling
 
-An earlier draft used the classifier to decide **routing** — which rows may be batched. Under D1
-that question no longer exists: every row rides the same durable batch, and on the success path
-every dispatch waits for it, so no row is deferred past its own return and there is nothing to
-route away from. The one exception is D1's carve-out — a pure-observability row whose commit fails
-persistently — and that is a failure outcome rather than a routing choice, which is exactly why the
-classifier's remaining job is failure semantics.
+An earlier draft used the classifier to decide **routing** in the sense of which rows may be
+batched at all. That question is gone under D1 — every row is batched, and no row is deferred
+past its own return — but a narrower routing decision exists again under ADR-134 D2a:
+classification selects the **lane**, and with it the committing connection, at enqueue
+(obligation-bearing rows to the durable-sync writer, pure observability rows to the shared
+writer). Within a lane there is still nothing to route away from: every row in the lane rides
+that lane's committed (store-visible) batch, and on the success path every dispatch waits for
+it. D1's carve-out — a pure-observability row whose commit fails persistently — remains a
+failure outcome rather than a routing choice.
 
-The classifier survives, for a sharper reason. It decides **what a failed commit does to the
-caller**:
+The classifier therefore has exactly two jobs, decided at the same seam: lane selection
+(ADR-134 D2a) and **what a failed commit does to the caller**:
 
 - **Accounting-, authorization-, and security-audit-bearing rows.** A dispatch must not report
   success when the record that accounts for, authorizes, or audits it did not commit. Reporting
@@ -326,11 +340,13 @@ same shape as a check that works.
 The classifier is a total function over the classification input, implemented as an **exhaustive
 match with no wildcard arm**, so adding a variant fails to compile until its class is stated.
 
-### D3 — An accounting-bearing dispatch does not return before its accounting row is durable
+### D3 — An accounting-bearing dispatch does not return before its accounting row is committed (store-visible)
 
 A dispatch whose audit row carries an accounting payload (`resource.units` and the associated
-`cost_unit` / `cpu_us` fields per ADR-103) does not report success until that row is durably
-committed.
+`cost_unit` / `cpu_us` fields per ADR-103) does not report success until that row is committed
+(store-visible). Whether that commit also survives an OS crash or power loss is a distinct
+property, governed by the store's `synchronous` posture — see ADR-134, in particular its INV-3
+prerequisite before any consumer may depend on the row for a resource-usage outcome.
 
 Under D1 this is satisfied by the ordinary path rather than by an exemption from it: a dispatch
 already waits for its batch to commit, and for this class D1's waiting clause binds
@@ -386,8 +402,8 @@ dispatches into one and N statements into one transaction.
 is batched in the D1 sense — its statement shares a transaction with whatever else is committing —
 and it is never made asynchronous, optional, or deferred past its own return. The unread surface is
 load-bearing for other subsystems: the inbox monitor's stale check reads these flags, and a `comm.read` that
-returned before its flag was durable would make that check read stale state. This decision changes
-how many acquisitions a sweep costs, not what a read means.
+returned before its flag was committed (store-visible) would make that check read stale state. This
+decision changes how many acquisitions a sweep costs, not what a read means.
 
 ### D7 — Serve-ledger writes are batched per call
 
@@ -476,9 +492,10 @@ of this record, and the read-your-own-audit caveat it carried is withdrawn.
 It claims writer _acquisitions_ fall. Whether any verb reaches zero writes is a question the
 revised census answers, not something this record asserts.
 
-**Not addressed here.** Remaining genuine writes still serialize on one writer. Raising that
-ceiling is the group-commit work, sequenced after this record so it is designed against the
-post-change profile.
+**Not addressed here.** Remaining genuine writes still serialize on one writer within each lane,
+and the two lane writers (ADR-134 D2a) additionally contend on SQLite's write lock between
+themselves. Raising that ceiling is the group-commit work, sequenced after this record so it is
+designed against the post-change profile.
 
 ## Acceptance
 
@@ -555,10 +572,11 @@ row is the accounting record.
 **Batch without waiting — let the dispatch return and flush behind it.** Rejected. It is the
 reading an earlier draft left open by not stating D1's waiting clause, and it is not a smaller
 version of this decision but a different one. A returned operation whose row is still in memory can
-lose a row the current implementation would have kept, since today's append is durable at dispatch
-whenever it succeeds. That violates INV-4 directly, and for an accounting-bearing row it violates
-INV-1. It also buys nothing this record does not already obtain: the acquisition count falls
-because rows share a transaction, not because the caller stopped waiting.
+lose a row the current implementation would have kept, since today's append is committed
+(store-visible) at dispatch whenever it succeeds. That violates INV-4 directly, and for an
+accounting-bearing row it violates INV-1. It also buys nothing this record does not already
+obtain: the acquisition count falls because rows share a transaction, not because the caller
+stopped waiting.
 
 **Exempt accounting rows from batching to keep them durable.** Rejected, having been the previous
 draft's D3. Under ADR-103 the usage object rides every per-dispatch audit row, so the exemption

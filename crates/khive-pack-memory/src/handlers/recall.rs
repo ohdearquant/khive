@@ -15,14 +15,14 @@ use khive_runtime::{
     micros_to_iso, KhiveRuntime, Namespace, NamespaceToken, RequestIdentity, RuntimeError,
     SearchSource, VerbRegistry,
 };
-use khive_storage::types::{EdgeFilter, PageRequest};
+use khive_storage::types::EdgeFilter;
 use khive_storage::EdgeRelation;
 
 use crate::config::{RecallConfig, ScoreBreakdown};
 use crate::rerank::{weighted_rerank, RerankFeatures};
 use crate::scoring::{
     calculate_score, contains_cjk, extract_entity_candidates, normalize_min_score,
-    normalize_rank_fusion_scores, normalize_rrf_scores, ScoreInput,
+    normalize_rank_fusion_scores, normalize_rrf_scores, ScoreInput, ScoringConfig,
 };
 use crate::MemoryPack;
 
@@ -32,6 +32,33 @@ use super::common::{
     TextSnippetPolicy, DEFAULT_DECAY_EPISODIC, DEFAULT_DECAY_SEMANTIC, DEFAULT_SALIENCE_EPISODIC,
     DEFAULT_SALIENCE_SEMANTIC, PROF_CID, RECALL_CALL_ID, RECALL_SLOW_THRESHOLD_MS,
 };
+
+/// Bounded storage page for inbound supersession checks. This is deliberately
+/// independent of recall candidate cardinality: one candidate may have any
+/// number of superseding edges.
+const SUPERSEDES_EDGE_PAGE_SIZE: u32 = 256;
+
+fn checked_token_budget_chars(scoring_cfg: &ScoringConfig) -> Result<usize, RuntimeError> {
+    if scoring_cfg.default_token_budget == 0 {
+        return Err(RuntimeError::InvalidInput(
+            "memory.recall config.scoring.default_token_budget must be greater than zero"
+                .to_string(),
+        ));
+    }
+    if scoring_cfg.chars_per_token == 0 {
+        return Err(RuntimeError::InvalidInput(
+            "memory.recall config.scoring.chars_per_token must be greater than zero".to_string(),
+        ));
+    }
+    scoring_cfg
+        .default_token_budget
+        .checked_mul(scoring_cfg.chars_per_token)
+        .ok_or_else(|| {
+            RuntimeError::InvalidInput(
+                "memory.recall effective character budget overflows platform size".to_string(),
+            )
+        })
+}
 
 async fn load_brain_profile(
     registry: &VerbRegistry,
@@ -153,6 +180,10 @@ impl MemoryPack {
 
         let mut scoring_cfg = cfg.scoring.clone().unwrap_or_default();
         scoring_cfg.apply_dos_caps();
+        // Validate before retrieval so a degenerate caller-supplied budget
+        // cannot masquerade as a genuine recall miss, and an oversized
+        // chars-per-token value cannot wrap or panic after scoring.
+        let token_budget_chars = checked_token_budget_chars(&scoring_cfg)?;
 
         let cjk_fts_bypass = scoring_cfg.enable_cjk_fts_bypass && contains_cjk(query_trimmed);
 
@@ -659,24 +690,35 @@ impl MemoryPack {
                 }
             }
 
-            let graph = self.runtime.graph(token)?;
             let candidate_ids: Vec<Uuid> = ranked.iter().map(|sn| sn.id).collect();
             let mut superseded_by_edge: HashSet<Uuid> = HashSet::new();
-            {
-                let limit = candidate_ids.len().max(1) as u32;
-                let edges = graph
-                    .query_edges(
-                        EdgeFilter {
-                            target_ids: candidate_ids.clone(),
-                            relations: vec![EdgeRelation::Supersedes],
-                            ..EdgeFilter::default()
-                        },
-                        vec![],
-                        PageRequest { limit, offset: 0 },
-                    )
-                    .await?;
-                for edge in &edges.items {
-                    superseded_by_edge.insert(edge.target_id);
+            if !candidate_ids.is_empty() {
+                let graph = self.runtime.graph(token)?;
+                let filter = EdgeFilter {
+                    target_ids: candidate_ids,
+                    relations: vec![EdgeRelation::Supersedes],
+                    ..EdgeFilter::default()
+                };
+                let mut after = None;
+                loop {
+                    // Walk the immutable insertion sequence to exhaustion.
+                    // A single fixed-size query tied to candidate count can
+                    // omit targets when another candidate has many inbound
+                    // supersedes edges (#1749).
+                    let edges = graph
+                        .query_edges_sequence_after(
+                            filter.clone(),
+                            after,
+                            SUPERSEDES_EDGE_PAGE_SIZE,
+                        )
+                        .await?;
+                    for edge in &edges.items {
+                        superseded_by_edge.insert(edge.target_id);
+                    }
+                    let Some(next_after) = edges.next_after else {
+                        break;
+                    };
+                    after = Some(next_after);
                 }
             }
 
@@ -704,13 +746,12 @@ impl MemoryPack {
         });
         ranked.truncate(limit);
 
-        let token_budget_chars = scoring_cfg.default_token_budget * scoring_cfg.chars_per_token;
         let pre_budget_count = ranked.len();
         let mut total_chars = 0usize;
         let mut budget_cutoff: Option<usize> = None;
         for (i, sn) in ranked.iter().enumerate() {
             let entry_chars = sn.note.content.len();
-            if total_chars + entry_chars > token_budget_chars {
+            if entry_chars > token_budget_chars.saturating_sub(total_chars) {
                 budget_cutoff = Some(i);
                 break;
             }
@@ -751,6 +792,13 @@ impl MemoryPack {
                 if ann_degraded {
                     // Per-result stamp keeps degradation visible without verbose output.
                     result["degraded"] = json!("ann_unavailable");
+                    // #1477: additive, non-empty failure-site reason so a
+                    // caller can distinguish why serving degraded (e.g. an
+                    // exceptional fresh-tail skip) without breaking the
+                    // load-bearing bare-array shape non-empty callers rely on.
+                    if let Some(ref reason) = ann_degraded_reason {
+                        result["degraded_reason"] = json!(reason);
+                    }
                 }
                 if budget_capped {
                     // Surviving partial results retain the per-item signal so callers
@@ -887,10 +935,24 @@ impl MemoryPack {
             // bare [] would be indistinguishable from a genuine no-match. Non-empty
             // capped responses keep the bare-array shape (load-bearing for callers
             // that index the top-level array) with per-item truncated stamps.
-            return to_json(&json!({
+            let mut envelope = json!({
                 "results": results,
                 "truncated": true,
-            }));
+            });
+            // A budget cutoff must not silence a concurrent ANN degradation:
+            // this branch returns before the degradation envelope below, and
+            // without these fields a capped-empty degraded response would
+            // read as clean-empty-but-truncated.
+            if ann_degraded {
+                let reason = ann_degraded_reason
+                    .clone()
+                    .unwrap_or_else(|| super::common::ANN_DEGRADED_REASON.to_string());
+                envelope["degraded"] = json!(true);
+                // Captured at the failure site (see
+                // collect_model_ann_hits_inner / collect_model_ann_hits).
+                envelope["degraded_reason"] = json!(reason);
+            }
+            return to_json(&envelope);
         }
 
         if results.is_empty() && ann_degraded {
@@ -1366,6 +1428,204 @@ mod tests {
                 "normal recall must not carry a degraded marker, got: {r:?}"
             );
         }
+    }
+
+    /// Guards a mutated `KHIVE_ANN_FRESH_TAIL` value, restoring whatever value
+    /// (present or absent) it held before the guard was created, even if the
+    /// test panics.
+    struct FreshTailEnvGuard {
+        prior: Option<String>,
+    }
+
+    impl FreshTailEnvGuard {
+        fn disable() -> Self {
+            let prior = std::env::var("KHIVE_ANN_FRESH_TAIL").ok();
+            std::env::set_var("KHIVE_ANN_FRESH_TAIL", "0");
+            Self { prior }
+        }
+    }
+
+    impl Drop for FreshTailEnvGuard {
+        fn drop(&mut self) {
+            match self.prior.take() {
+                Some(v) => std::env::set_var("KHIVE_ANN_FRESH_TAIL", v),
+                None => std::env::remove_var("KHIVE_ANN_FRESH_TAIL"),
+            }
+        }
+    }
+
+    /// #1477: an exceptional fresh-tail skip (here, the exact leg disabled via
+    /// `KHIVE_ANN_FRESH_TAIL=0`) forfeits read-your-writes visibility on the
+    /// warm-index path — that is degraded serving, not an ordinary healthy
+    /// response, and must be disclosed on a non-empty response the same way
+    /// #836's bounded-wait degradation already is. Fails on `f74c5461f`, where
+    /// a skipped fresh-tail leg on the warm-index path left `degraded: false`
+    /// and no per-item marker at all.
+    #[tokio::test]
+    #[serial(adr118_fresh_tail)]
+    async fn recall_1477_skipped_fresh_tail_stamps_degraded() {
+        const MODEL: &str = "recall-1477-fresh-tail-disabled-model";
+        const DIMS: usize = 16;
+        const NOTE_TEXT: &str = "issue 1477 fresh tail disabled recall degradation note";
+
+        let _env_guard = FreshTailEnvGuard::disable();
+
+        let rt = KhiveRuntime::memory().expect("in-memory runtime");
+        rt.register_embedder(HashVecProvider {
+            model_name: MODEL.to_owned(),
+            dims: DIMS,
+        });
+
+        let ns = Namespace::parse("local").expect("local namespace");
+        let token = rt.authorize(ns).expect("authorize local");
+
+        rt.create_note(&token, "memory", None, NOTE_TEXT, Some(0.7), None, vec![])
+            .await
+            .expect("create note");
+
+        let pack = MemoryPack::new(rt.clone());
+        let ann_handle = pack.ann.clone();
+
+        // Warm the ANN bridge synchronously so the fresh-tail leg is
+        // exercised via the warm-index branch (initial_raw_hits present),
+        // not the ANN-not-ready branch.
+        crate::ann::ensure_ann_for_model(&rt, &token, &ann_handle, MODEL)
+            .await
+            .expect("warm ann build");
+
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(KgPack::new(rt.clone()));
+        builder.register(pack);
+        let registry = builder.build().expect("registry");
+
+        let result = registry
+            .dispatch(
+                "memory.recall",
+                serde_json::json!({
+                    "query": "1477 fresh tail disabled recall",
+                    "limit": 10
+                }),
+            )
+            .await
+            .expect("recall must not error when the fresh-tail leg is disabled");
+
+        let results = result.as_array().expect("recall result must be an array");
+        assert!(
+            !results.is_empty(),
+            "the seeded note must still surface via the warm-index candidates"
+        );
+        for r in results {
+            assert_eq!(
+                r.get("degraded").and_then(Value::as_str),
+                Some("ann_unavailable"),
+                "#1477 a disabled fresh-tail leg must stamp the existing \
+                 degradation marker on a non-empty response, got: {r:?}"
+            );
+            let reason = r
+                .get("degraded_reason")
+                .and_then(Value::as_str)
+                .expect("#1477 a disabled fresh-tail leg must carry a degraded_reason string");
+            assert!(
+                !reason.is_empty(),
+                "#1477 degraded_reason must be non-empty (captured at the \
+                 failure site), got: {r:?}"
+            );
+        }
+    }
+
+    /// A budget cutoff at the first ranked candidate and an ANN degradation
+    /// can hold at once, and the budget-cap envelope returns before the
+    /// degradation envelope: without the degraded fields on that early
+    /// return, a capped-empty degraded response reads as
+    /// clean-empty-but-truncated and the caller loses the signal that
+    /// distinguishes degraded-empty from a genuine no-match.
+    #[tokio::test]
+    #[serial(adr118_fresh_tail)]
+    async fn recall_budget_capped_empty_response_still_discloses_ann_degradation() {
+        const MODEL: &str = "recall-budget-capped-degraded-model";
+        const DIMS: usize = 16;
+        const NOTE_TEXT: &str = "budget capped degraded disclosure note body";
+
+        let _env_guard = FreshTailEnvGuard::disable();
+
+        let rt = KhiveRuntime::memory().expect("in-memory runtime");
+        rt.register_embedder(HashVecProvider {
+            model_name: MODEL.to_owned(),
+            dims: DIMS,
+        });
+
+        let ns = Namespace::parse("local").expect("local namespace");
+        let token = rt.authorize(ns).expect("authorize local");
+
+        rt.create_note(&token, "memory", None, NOTE_TEXT, Some(0.7), None, vec![])
+            .await
+            .expect("create note");
+
+        let pack = MemoryPack::new(rt.clone());
+        let ann_handle = pack.ann.clone();
+
+        // A one-character budget guarantees the first ranked candidate
+        // exceeds it, so ranking survives but serving empties: budget_capped
+        // with zero results.
+        {
+            let mut cfg = pack.config.lock().unwrap();
+            cfg.scoring = Some(crate::scoring::ScoringConfig {
+                default_token_budget: 1,
+                chars_per_token: 1,
+                ..Default::default()
+            });
+        }
+
+        // Warm the ANN bridge so the disabled fresh-tail leg is what makes
+        // the response degraded (as in the #1477 test above), not ANN
+        // unavailability.
+        crate::ann::ensure_ann_for_model(&rt, &token, &ann_handle, MODEL)
+            .await
+            .expect("warm ann build");
+
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(KgPack::new(rt.clone()));
+        builder.register(pack);
+        let registry = builder.build().expect("registry");
+
+        let result = registry
+            .dispatch(
+                "memory.recall",
+                serde_json::json!({
+                    "query": "budget capped degraded disclosure",
+                    "limit": 10
+                }),
+            )
+            .await
+            .expect("capped degraded recall must not error");
+
+        let obj = result
+            .as_object()
+            .expect("capped-empty response must be the envelope shape, not a bare array");
+        assert_eq!(
+            obj.get("truncated").and_then(Value::as_bool),
+            Some(true),
+            "budget cutoff at the first candidate must disclose truncation: {result:?}"
+        );
+        assert!(
+            obj.get("results")
+                .and_then(Value::as_array)
+                .is_some_and(Vec::is_empty),
+            "this scenario is specifically the capped-EMPTY shape: {result:?}"
+        );
+        assert_eq!(
+            obj.get("degraded").and_then(Value::as_bool),
+            Some(true),
+            "a budget cutoff must not silence the concurrent ANN degradation: {result:?}"
+        );
+        let reason = obj
+            .get("degraded_reason")
+            .and_then(Value::as_str)
+            .expect("capped-empty degraded response must carry degraded_reason");
+        assert!(
+            !reason.is_empty(),
+            "degraded_reason must be non-empty (captured at the failure site): {result:?}"
+        );
     }
 
     /// #1657: ANN timeout plus no FTS match is a third state — the response

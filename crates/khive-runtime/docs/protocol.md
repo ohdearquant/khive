@@ -51,11 +51,29 @@ The `describe_verb` response shape (issue #287):
   "pack": "<pack-name>",
   "description": "...",
   "category": "<VerbCategory>",
+  "identifier_resolution": {
+    "full_uuid": "A complete UUID spelling accepted by the consuming parameter directly names one globally unique record; ...",
+    "short_prefix": "A short UUID prefix is at least 8 undashed hexadecimal characters that do not parse as a complete UUID; ...",
+    "parameter_rule": "A parameter that requires a full UUID rejects prefixes and explains the resolution consequence; ..."
+  },
   "params": [
     { "name": "...", "type": "...", "required": true, "description": "..." }
   ]
 }
 ```
+
+`identifier_resolution` is the shared ID contract for every verb. A complete UUID
+directly identifies a record without a namespace search. Alternate complete spellings
+are parameter/parser-specific; accepted forms normalize to canonical lowercase dashed
+UUIDs in strict responses. Thirty-two undashed hexadecimal characters are complete
+compact input, not a prefix. A short prefix has at least eight undashed hexadecimal
+characters, does not parse as a complete UUID, and can miss or be ambiguous.
+Its scope belongs to the consuming
+parameter: operations governed by ADR-007's by-ID contract resolve without a
+namespace filter (Rule 2), while other resolvers may search only in the caller's
+primary namespace. Full-UUID-only parameters reject prefixes with the consequence
+explained, and their response fields remain canonical so callers can submit them
+back unchanged.
 
 For subhandlers, the envelope additionally carries `"visibility": "internal"` and
 `"callable_via_mcp": false`.

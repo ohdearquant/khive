@@ -1,7 +1,7 @@
 # KG Rule Configuration
 
 **ADRs**: ADR-034 (KG validation), ADR-035 (kg init and vcs status)
-**Last reviewed**: 2026-06-06
+**Last reviewed**: 2026-08-06
 
 ## Overview
 
@@ -45,12 +45,17 @@ message = "Edges must not be self-loops"
 
 ## Built-in Checks
 
-The following structural checks run before configurable rules and cannot be disabled:
+Seven structural checks run unconditionally before configurable rules and cannot be disabled:
 
-- **Duplicate UUIDs** — each entity and edge ID must be unique within its NDJSON file.
-- **Referential integrity** — every edge `source_id` and `target_id` must reference a known entity.
-- **Valid entity kinds** — entity `kind` must be one of the 8 closed kinds (ADR-001).
-- **Valid edge relations** — edge `relation` must be one of the 15 closed relations (ADR-002).
+- **Required input files** (`error`) — `entities.ndjson` and `edges.ndjson` must be readable UTF-8; `notes.ndjson` is optional when absent but must also be readable UTF-8 when present.
+- **Schema compliance** (`error`) — every nonblank NDJSON line must be valid JSON and carry the substrate's required string fields.
+- **No duplicate UUIDs** (`error`) — each entity ID must be unique in `entities.ndjson`.
+- **Sort order** (`warning`) — entity IDs and edge `(source_id, target_id, relation)` tuples must be in canonical order.
+- **Referential integrity** (`error`) — every edge `source_id` and `target_id` must resolve to an entity, note, or edge record in the repository inputs.
+- **Valid entity kinds** (`error`) — entity `kind` must belong to the taxonomy merged from all registered packs.
+- **Valid edge relations** (`error`) — edge `relation` must belong to the compile-time `EdgeRelation` vocabulary (ADR-002).
+
+When `notes.ndjson` is present, an eighth **valid note kinds** check runs at `error` severity against the note-kind taxonomy merged from all registered packs. The optional file's absence does not add that rule to the report.
 
 ## CLI Options
 

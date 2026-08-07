@@ -108,6 +108,12 @@ Message properties follow the versioned
 origin set `KHIVE_PROCESS_REF`, its exact Unicode value is copied to
 `sent_by_process` on both delivery copies as attribution-only metadata.
 
+The response includes the canonical full `thread_id` persisted on both copies.
+For a root send it is the outbound message's full UUID; for a continuation it
+is the canonicalized caller-supplied root. Because `comm.send(thread_id=...)`
+requires a full UUID, Agent presentation preserves this field so it can be
+submitted to a later send unchanged.
+
 ### Self-send collapse guard (#820)
 
 A resolved target that equals the sender's own actor identity is, outside the
@@ -151,6 +157,8 @@ confirmation only, not external channel delivery status. If the caller loses
 the complete MCP response rather than receiving the structured ambiguous
 error, it also loses the server-generated outbound UUID; that case requires a
 future caller-supplied idempotency/correlation contract and is out of scope.
+Agent presentation keeps this response's `id` canonical, so the returned exact
+correlation key can be submitted to `comm.delivered` again unchanged.
 
 ## `handlers.rs::handle_inbox`
 
@@ -444,6 +452,16 @@ Deduplication: when `external_id` is supplied, `try_create_note` uses a
 verify-after-insert check on the durable unique index on `external_id`. A
 confirmed duplicate returns `Ok(None)` without error; only an external_id
 collision is treated as dedup, other constraint violations surface as errors.
+The acknowledgement returns the `thread_id` read from the existing row — the
+canonical 36-character hyphenated UUID for v1 rows — never the new root
+proposed by the duplicate delivery. Exception: a pre-v1 row may store a
+non-UUID legacy thread label; the ack echoes that stored value verbatim
+(fabricating the duplicate's note UUID instead would route a caller echoing
+the ack into a DIFFERENT thread) and flags it with `thread_id_canonical:
+false` so a strict caller can detect the non-canonical shape without
+re-parsing the string. A row with NO stored `thread_id` falls back to the
+duplicate's note UUID as the thread root (#479b, ADR-040) and is flagged with
+`thread_id_warning` instead. See ADR-056 §Amendment 2026-08-04.
 
 Generic transport-layer metadata passthrough (issue #448, `IngestParams::metadata`):
 merged additively so it can never clobber a key already present. Names in the

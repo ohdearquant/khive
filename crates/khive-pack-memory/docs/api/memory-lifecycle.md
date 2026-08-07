@@ -23,6 +23,8 @@ After persistence, every affected embedding model's generation is bumped before 
 
 Feedback validates its signal before routing. Accepted legacy signals are `useful`, `not_useful`, and `wrong`; semantic signals include explicit/implicit positive and negative plus correction.
 
+`target_id` is a full UUID because feedback must identify one exact recalled record; short-prefix resolution can miss or be ambiguous and is rejected with that consequence. Accepted complete spellings are normalized once, forwarded to the brain tier canonically, and acknowledged as a lowercase dashed `target_id` that can be submitted again unchanged.
+
 Serving profile resolution has three tiers:
 
 1. explicit configured profile;

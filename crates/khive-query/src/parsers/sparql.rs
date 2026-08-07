@@ -513,6 +513,9 @@ fn triples_to_ast(
         pattern: MatchPattern { elements },
         where_clause: where_conditions,
         return_items,
+        // SPARQL OFFSET is intentionally outside the current dialect. Issue #1601
+        // adds paging to the GQL surface without silently widening SPARQL syntax.
+        offset: 0,
         limit,
     })
 }
@@ -603,6 +606,7 @@ mod tests {
                 ReturnItem::Variable("b".into())
             ]
         );
+        assert_eq!(q.offset, 0);
         assert_eq!(q.limit, Some(10));
 
         let nodes: Vec<_> = q.pattern.nodes().collect();
@@ -706,6 +710,15 @@ mod tests {
         assert!(
             err.to_string().contains("unexpected trailing input"),
             "expected trailing-input parse error, got {err}"
+        );
+    }
+
+    #[test]
+    fn sparql_offset_remains_outside_the_dialect() {
+        let err = parse("SELECT ?a WHERE { ?a :extends ?b . } LIMIT 10 OFFSET 10").unwrap_err();
+        assert!(
+            err.to_string().contains("unexpected trailing input"),
+            "SPARQL OFFSET must not leak in through the shared AST, got {err}"
         );
     }
 

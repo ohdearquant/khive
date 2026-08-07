@@ -135,7 +135,9 @@ const V16_UP: &str = include_str!("../sql/016-gtd-dependency-cycle-guards.sql");
 
 const V17_UP: &str = include_str!("../sql/017-agents-ddl.sql");
 
-const V18_UP: &str = include_str!("../sql/018-list-cursor-backfill-repair.sql");
+const V18_UP: &str = include_str!("../sql/018-ann-consumer-pending.sql");
+
+const V19_UP: &str = include_str!("../sql/019-list-cursor-backfill-repair.sql");
 
 /// DDL for the `ann_write_log` delta table.
 ///
@@ -151,6 +153,14 @@ pub const ANN_WRITE_LOG_DDL: &str = V11_UP;
 /// in `StorageBackend::vectors_for_namespace` for the same reason as
 /// [`ANN_WRITE_LOG_DDL`].
 pub const ANN_WRITE_LOG_MODEL_SEQ_INDEX_DDL: &str = V12_UP;
+
+/// Idempotent DDL for pending ANN-consumer lifecycle metadata (#1479).
+///
+/// The V18 migration additionally translates legacy zero-watermark rows once.
+/// This constant deliberately contains only idempotent DDL: vector-store open
+/// paths may execute it repeatedly and must never demote a valid active
+/// checkpoint at sequence zero back to pending.
+pub const ANN_CONSUMER_PENDING_DDL: &str = include_str!("../sql/ann-consumer-pending-ddl.sql");
 
 /// DDL for the `_embedding_models` registry table.
 ///
@@ -248,8 +258,13 @@ pub const MIGRATIONS: &[VersionedMigration] = &[
     },
     VersionedMigration {
         version: 18,
-        name: "list_cursor_backfill_repair",
+        name: "ann_consumer_pending",
         up: V18_UP,
+    },
+    VersionedMigration {
+        version: 19,
+        name: "list_cursor_backfill_repair",
+        up: V19_UP,
     },
 ];
 
@@ -424,13 +439,13 @@ fn run_migrations_locked(conn: &mut Connection) -> Result<u32, SqliteError> {
         )));
     }
 
-    // A database already at or past V18 has no known-divergence repair left
+    // A database already at or past V19 has no known-divergence repair left
     // to run; validate its recorded names up front rather than after
     // fast-forwarding past migrations that will not execute again. A
-    // pre-V18 database may still carry the V13/V14 divergence V18 exists to
-    // repair, so it is validated after the loop instead, once V18 (if
+    // pre-V19 database may still carry the V13/V14 divergence V19 exists to
+    // repair, so it is validated after the loop instead, once V19 (if
     // still pending) has had a chance to run.
-    if current_version >= 18 {
+    if current_version >= 19 {
         validate_applied_migration_names(conn, current_version)?;
     }
 
@@ -526,13 +541,13 @@ fn run_migrations_locked(conn: &mut Connection) -> Result<u32, SqliteError> {
                 error: e.to_string(),
             })?;
 
-        // V18's repair contract includes normalizing the two known-divergent
+        // V19's repair contract includes normalizing the two known-divergent
         // recorded names. `_schema_migrations` is created and owned by this
         // runner (not by any migration file), so the normalization lives
-        // here, in the same transaction that applies V18's SQL. Exact,
+        // here, in the same transaction that applies V19's SQL. Exact,
         // closed set — versions 13 and 14 only; any other (version, name)
         // mismatch still fails startup via validate_applied_migration_names.
-        if migration.version == 18 {
+        if migration.version == 19 {
             tx.execute_batch(
                 "UPDATE _schema_migrations SET name = 'list_cursor_sequences' WHERE version = 13;\n\
                  UPDATE _schema_migrations SET name = 'graph_edges_id_unique' WHERE version = 14;",

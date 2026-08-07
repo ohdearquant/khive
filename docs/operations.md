@@ -63,7 +63,8 @@ effect of listing backends.
   writes an archive file rather than emitting a JSON summary line; and the pending-events drain
   prints its summary as pretty-printed (multi-line) JSON, not a single line
   (`pending_events.rs:731-745`). Logs (tracing) always go to stderr, so piping stdout never mixes
-  log noise into the JSON (`main.rs:449-461`).
+  log noise into the JSON (`kkernel/src/cli.rs:init_tracing`). Stderr logging is best-effort: a
+  failed or closed stderr consumer does not terminate the stdin/stdout MCP serving loop.
 - **Log level**: `--log <level>` or `KHIVE_LOG` (global arg, default `warn`,
   `main.rs:41-43`). The `lattice_inference` tokenizer-size warning is filtered to `error`
   regardless of the requested level (`main.rs:456`).
@@ -206,16 +207,19 @@ kkernel kg validate --repo . [--strict] [--format text|json|github] [--fix] [--r
 ```
 
 Bails immediately (not just a warning) if `.khive/kg/` doesn't exist: "run `kkernel kg init`
-first" (`kg/validate.rs:76-81`). Runs seven built-in structural checks, always at `error`
-severity, that `--no-rules` cannot silence: `schema-compliance` (every NDJSON line must parse and
-carry required fields, malformed lines are reported, not skipped, "so corrupt NDJSON cannot pass
-`kg validate` only to fail later in `kkernel sync`/`kg import`"), `no-duplicate-uuids`,
-`sort-order`, `referential-integrity` (every edge `source_id`/`target_id` must resolve, note this
-is the NDJSON wire field name, distinct from the `source`/`target` Rust struct fields used by the
-export/import archive types), `valid-entity-kinds` (against the merged pack taxonomy),
-`valid-edge-relations` (against the closed `EdgeRelation` enum, not the pack registry, edge
-relations are compile-time closed per ADR-002), and `valid-note-kinds` (only if `notes.ndjson`
-exists).
+first" (`kg/validate.rs:76-81`). Runs seven unconditional built-in structural checks: six at
+`error` severity and `sort-order` at `warning` severity. An eighth error-severity check,
+`valid-note-kinds`, runs only when `notes.ndjson` exists. `--no-rules` cannot silence any
+applicable structural check: `schema-compliance` (every NDJSON line must parse and carry required
+fields, malformed lines are reported, not skipped, "so corrupt NDJSON cannot pass `kg validate`
+only to fail later in `kkernel sync`/`kg import`"), `no-duplicate-uuids`, `sort-order`,
+`referential-integrity` (every edge `source_id`/`target_id` must resolve, note this is the NDJSON
+wire field name, distinct from the `source`/`target` Rust struct fields used by the export/import
+archive types), `valid-entity-kinds` (against the merged pack taxonomy), `valid-edge-relations`
+(against the closed `EdgeRelation` enum, not the pack registry, edge relations are compile-time
+closed per ADR-002), and conditional `valid-note-kinds`. `required-input-files` runs first and
+fails closed when mandatory `entities.ndjson` or `edges.ndjson` cannot be read. `notes.ndjson` is
+optional when absent, but if present it must also be readable UTF-8.
 
 On top of those, an optional `rules.toml` (default `.khive/kg/rules.toml`, override with
 `--rules`, skip entirely with `--no-rules`) adds configurable `warning`/`info`/`error` rules;

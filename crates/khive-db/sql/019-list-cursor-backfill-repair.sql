@@ -1,4 +1,4 @@
--- V18: repair the known V13/V14 list-cursor ledger divergence (khive #1649).
+-- V19: repair the known V13/V14 list-cursor ledger divergence (khive #1649).
 --
 -- Some databases recorded V13 and V14 in `_schema_migrations` under names
 -- other than the canonical `list_cursor_sequences` / `graph_edges_id_unique`

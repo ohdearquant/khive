@@ -137,6 +137,20 @@ in scope for this amendment:
 2. **Readable names.** Provenance notes currently carry `name=null`, so neighbors/GQL
    render placeholders and force a `get()` per hop. Set `name` at ingest: issues/PRs
    `"#<number> <title>"` (truncated), commits `"<short-sha> <subject>"` (truncated).
+3. **Changed-path and code-map enrichment.** Persist each commit's sorted, deduplicated,
+   repository-relative touched paths in `properties.changed_paths`. Read paths from Git's
+   NUL-delimited raw output, applying ADR-085's lossy UTF-8 filesystem-path normalization;
+   for merges, use the diff against the first parent as the single canonical path set.
+   When ADR-085 modules with an exact `(source_revision=repository snapshot HEAD,
+   source_path=changed path)` match already exist in the same database and namespace,
+   include the uniquely matching module in the commit note's `annotates` targets. Multiple
+   live matches are ambiguous and therefore annotate none. The existing document
+   enrichment remains unchanged. A missing or ambiguous module match is best-effort and
+   never creates a code entity; path properties remain sufficient for later graph-side
+   joins. Touched paths pass through the same secret-masking boundary as other
+   repository-authored commit fields before they enter properties or path resolution.
+   This rider relies on ADR-085 Amendment 5 and adds neither a storage column nor an edge
+   relation.
 
 Data-fidelity checks from the same evidence run were verified clean: `closed_at` values
 that cluster at one instant reflect real GitHub bulk-close events (confirmed against

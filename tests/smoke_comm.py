@@ -183,22 +183,17 @@ def test_reply_and_thread(proc):
     # Send root message
     root = call_verb(proc, "comm.send", {"to": "local", "content": "root message"})
     root_full_id = root["full_id"]
-    root_short_id = root["id"]  # 8-char
 
     # Reply to it
     reply = call_verb(proc, "comm.reply", {"id": root_full_id, "content": "first reply"})
     assert reply.get("id"), f"reply must return id: {reply}"
 
-    # The presentation layer (Agent mode) shortens all *_id fields to 8 chars.
-    # thread_id ends with "_id" → it gets shortened. So compare against the
-    # short prefix of the root's full_id.
-    # BUG NOTE: this is expected behavior by design (ADR-045 Agent mode presentation),
-    # but callers that need the full thread_id for chaining should use verbose mode.
+    # thread_id is a strict round-trip field and remains canonical even in
+    # Agent mode so callers can submit it to comm.send unchanged.
     reply_thread_id = reply.get("thread_id", "")
     assert reply_thread_id, f"reply must have a thread_id: {reply}"
-    # Agent mode shortens UUIDs with _id suffix to 8 chars
-    assert root_full_id.startswith(reply_thread_id), (
-        f"reply thread_id must be a prefix of root full_id; "
+    assert reply_thread_id == root_full_id and len(reply_thread_id) == 36, (
+        f"reply thread_id must equal the canonical root full_id; "
         f"root_full_id={root_full_id!r} reply_thread_id={reply_thread_id!r}"
     )
     reply_full_id = reply["full_id"]
@@ -209,11 +204,11 @@ def test_reply_and_thread(proc):
     assert thread.get("count", 0) >= 2, (
         f"thread must return root + reply (>=2); got count={thread.get('count')}"
     )
-    # thread_id in thread response is also shortened by Agent mode
+    # The thread summary exposes the same reusable canonical root.
     thread_tid = thread.get("thread_id", "")
     assert thread_tid, f"thread must return thread_id: {thread}"
-    assert root_full_id.startswith(thread_tid), (
-        f"thread thread_id must be a prefix of root full_id; "
+    assert thread_tid == root_full_id and len(thread_tid) == 36, (
+        f"thread thread_id must equal the canonical root full_id; "
         f"root_full_id={root_full_id!r} thread_tid={thread_tid!r}"
     )
 
