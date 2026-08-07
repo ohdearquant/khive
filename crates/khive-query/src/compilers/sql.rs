@@ -85,14 +85,14 @@ pub struct CompiledQuery {
     pub return_vars: Vec<ReturnItem>,
     /// Non-fatal validation or compilation diagnostics.
     pub warnings: Vec<String>,
-    /// Sentinel metadata when SQL fetches `max_limit + 1` to detect real truncation.
+    /// Sentinel metadata when SQL fetches `max_limit + 1` to detect another page.
     pub truncation_check: Option<TruncationCheck>,
 }
 
 /// Instructions for stripping a row-cap sentinel after execution.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TruncationCheck {
-    /// Server cap to enforce after detecting and removing the sentinel.
+    /// Effective page size to enforce after detecting and removing the sentinel.
     pub max_limit: usize,
     /// Explicit caller limit, retained for diagnostics.
     pub requested_limit: Option<usize>,
@@ -102,7 +102,10 @@ pub struct TruncationCheck {
 pub struct CompileOptions {
     /// Namespace scope; empty means all namespaces.
     pub scopes: Vec<String>,
-    /// Hard server row cap applied against any explicit query limit.
+    /// Effective server page size applied against any explicit query limit.
+    ///
+    /// The public handler clamps its requested `page_size` to the hard cap before
+    /// constructing these compiler options.
     pub max_limit: usize,
 }
 
@@ -116,18 +119,39 @@ impl Default for CompileOptions {
 }
 
 /// Chooses the SQL limit and optional cap-sentinel check (issue #777).
+///
+/// An explicit query-text `LIMIT` is a TOTAL bound across every `SKIP` page, not a
+/// page-local one (ADR-008 §"query LIMIT and page_size composition", docs/guide/api-reference.md).
+/// `offset` is the page's `SKIP` value; the SQL bound is `min(limit - offset, max_limit)`,
+/// and the cap sentinel (`max_limit + 1`) is requested only when another page could still
+/// exist within the query's own limit. An offset at or beyond the limit yields SQL `LIMIT 0`
+/// — a terminal empty page, never an error.
 /// See `crates/khive-query/docs/api/sql-compilation.md` for lifecycle details.
 fn effective_limit(
     requested_limit: Option<usize>,
+    offset: usize,
     max_limit: usize,
 ) -> (usize, Option<TruncationCheck>) {
     match requested_limit {
-        Some(limit) if limit <= max_limit => (limit, None),
-        requested => (
+        Some(limit) => {
+            let remaining = limit.saturating_sub(offset);
+            if remaining <= max_limit {
+                (remaining, None)
+            } else {
+                (
+                    max_limit.saturating_add(1),
+                    Some(TruncationCheck {
+                        max_limit,
+                        requested_limit: Some(limit),
+                    }),
+                )
+            }
+        }
+        None => (
             max_limit.saturating_add(1),
             Some(TruncationCheck {
                 max_limit,
-                requested_limit: requested,
+                requested_limit: None,
             }),
         ),
     }
@@ -308,9 +332,9 @@ fn compile_fixed_length(
     let mut join_parts: Vec<String> = Vec::new();
     let mut where_parts: Vec<String> = Vec::new();
     let mut select_parts: Vec<String> = Vec::new();
+    let mut order_parts: Vec<String> = Vec::new();
 
     let mut node_aliases: Vec<String> = Vec::new();
-    let mut edge_aliases: Vec<String> = Vec::new();
     let mut var_to_alias: std::collections::HashMap<String, (String, VarKind)> =
         std::collections::HashMap::new();
 
@@ -329,6 +353,19 @@ fn compile_fixed_length(
 
                 let is_event_source = event_source_indices.contains(&node_idx);
                 let is_observation_target = observation_target_indices.contains(&node_idx);
+
+                // Paging requires a total order over match identities, not caller
+                // projections. UUIDs can overlap across unioned substrates, so keep
+                // each union's discriminator ahead of its ID.
+                if is_event_source {
+                    order_parts.push(format!("{alias}.id"));
+                } else if is_observation_target {
+                    order_parts.push(format!("{alias}.referent_kind"));
+                    order_parts.push(format!("{alias}.id"));
+                } else {
+                    order_parts.push(format!("{alias}.substrate_kind"));
+                    order_parts.push(format!("{alias}.id"));
+                }
 
                 if node_idx == 0 {
                     if is_event_source {
@@ -449,8 +486,6 @@ fn compile_fixed_length(
                 let prev_node = &node_aliases[node_aliases.len() - 1];
                 let next_alias = format!("n{}", node_idx);
 
-                edge_aliases.push(e_alias.clone());
-
                 // The synthetic and canonical backing tables have no meaningful shared join key.
                 let has_synthetic = ep.relations.iter().any(|r| is_synthetic(r));
                 let has_canonical = ep.relations.iter().any(|r| !is_synthetic(r));
@@ -463,6 +498,10 @@ fn compile_fixed_length(
                 }
 
                 if has_synthetic {
+                    // `(event_id, role, position)` is the observation primary key.
+                    order_parts.push(format!("{e_alias}.event_id"));
+                    order_parts.push(format!("{e_alias}.role"));
+                    order_parts.push(format!("{e_alias}.position"));
                     // Synthetic projections are always event-to-referent.
                     if !matches!(ep.direction, EdgeDirection::Out) {
                         return Err(QueryError::Compile(
@@ -504,6 +543,7 @@ fn compile_fixed_length(
                           OR ({e_alias}.role = 'signal' AND {e_alias}.referent_kind IN ('entity', 'note')))"
                     ));
                 } else {
+                    order_parts.push(format!("{e_alias}.id"));
                     let (source_join, target_join) = match ep.direction {
                         EdgeDirection::Out => (
                             format!("{e_alias}.source_id = {prev_node}.id"),
@@ -636,18 +676,26 @@ fn compile_fixed_length(
         }
     }
 
-    let (limit, truncation_check) = effective_limit(query.limit, opts.max_limit);
+    let offset_i64 = i64::try_from(query.offset)
+        .map_err(|_| QueryError::InvalidInput("SKIP exceeds i64::MAX".into()))?;
+    params.push(QueryValue::Integer(offset_i64));
+    let offset_param = params.len();
+
+    let (limit, truncation_check) = effective_limit(query.limit, query.offset, opts.max_limit);
     let limit_i64 = i64::try_from(limit)
         .map_err(|_| QueryError::InvalidInput("limit exceeds i64::MAX".into()))?;
     params.push(QueryValue::Integer(limit_i64));
+    let limit_param = params.len();
 
     let sql = format!(
-        "SELECT {} FROM {} {} WHERE {} LIMIT ?{}",
+        "SELECT {} FROM {} {} WHERE {} ORDER BY {} LIMIT ?{} OFFSET ?{}",
         select_parts.join(", "),
         from_parts.join(", "),
         join_parts.join(" "),
         where_parts.join(" AND "),
-        params.len(),
+        order_parts.join(", "),
+        limit_param,
+        offset_param,
     );
 
     Ok(CompiledQuery {
@@ -1185,7 +1233,12 @@ fn compile_variable_length(
         end_conditions.push(format!("t.depth >= ?{}", params.len()));
     }
 
-    let (limit, truncation_check) = effective_limit(query.limit, opts.max_limit);
+    let offset_i64 = i64::try_from(query.offset)
+        .map_err(|_| QueryError::InvalidInput("SKIP exceeds i64::MAX".into()))?;
+    params.push(QueryValue::Integer(offset_i64));
+    let offset_param = params.len();
+
+    let (limit, truncation_check) = effective_limit(query.limit, query.offset, opts.max_limit);
     let limit_i64 = i64::try_from(limit)
         .map_err(|_| QueryError::InvalidInput("limit exceeds i64::MAX".into()))?;
     params.push(QueryValue::Integer(limit_i64));
@@ -1287,6 +1340,23 @@ fn compile_variable_length(
     select_parts.push("t.depth AS _depth".to_string());
     select_parts.push("t.total_weight AS _total_weight".to_string());
 
+    // This path uses SELECT DISTINCT, so ordering by hidden path identities can
+    // pick an arbitrary representative for collapsed rows. Ordering by every
+    // projected alias instead gives a total order over the rows that survive
+    // DISTINCT while retaining depth/weight as the leading traversal order.
+    let projection_order = select_parts
+        .iter()
+        .flat_map(|group| group.split(", "))
+        .filter_map(|projection| projection.rsplit_once(" AS ").map(|(_, alias)| alias))
+        .filter(|alias| !matches!(*alias, "_depth" | "_total_weight"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let projection_order_suffix = if projection_order.is_empty() {
+        String::new()
+    } else {
+        format!(", {projection_order}")
+    };
+
     // `r` is required by end filters; `s` is needed only for a start projection.
     let join_start = if has_start {
         "JOIN primary_nodes s ON s.id = t.start_id"
@@ -1325,8 +1395,8 @@ fn compile_variable_length(
          FROM traverse t \
          {join_start} {join_end} \
          WHERE {end_where} \
-         ORDER BY t.depth, t.total_weight DESC, t.start_id, t.current_id \
-         LIMIT ?{limit_param}",
+         ORDER BY _depth, _total_weight DESC{projection_order_suffix} \
+         LIMIT ?{limit_param} OFFSET ?{offset_param}",
         primary_nodes = PRIMARY_NODE_SQL,
         seed_next = seed_next,
         seed_join = seed_join,
@@ -1341,7 +1411,9 @@ fn compile_variable_length(
         join_start = join_start,
         join_end = join_end,
         end_where = end_conditions.join(" AND "),
+        projection_order_suffix = projection_order_suffix,
         limit_param = limit_param,
+        offset_param = offset_param,
     );
 
     Ok(CompiledQuery {
@@ -1704,6 +1776,63 @@ mod tests {
         assert!(
             matches!(limit_param, QueryValue::Integer(501)),
             "expected sentinel LIMIT 501, got {limit_param:?}"
+        );
+    }
+
+    #[test]
+    fn fixed_length_skip_is_bound_after_a_total_identity_order() {
+        let q = gql::parse("MATCH (a:concept)-[e]->(b) RETURN a SKIP 500").unwrap();
+        let compiled = compile(&q, &opts()).unwrap();
+        assert!(
+            compiled
+                .sql
+                .contains("ORDER BY n0.substrate_kind, n0.id, e0.id, n1.substrate_kind, n1.id"),
+            "fixed-length pages need a deterministic total identity order: {}",
+            compiled.sql
+        );
+        assert!(compiled.sql.contains("LIMIT ?") && compiled.sql.contains("OFFSET ?"));
+        assert!(
+            compiled
+                .params
+                .iter()
+                .any(|p| matches!(p, QueryValue::Integer(500))),
+            "SKIP must be a bound integer parameter: {:?}",
+            compiled.params
+        );
+    }
+
+    #[test]
+    fn variable_length_skip_totally_orders_distinct_projected_rows() {
+        let q = gql::parse("MATCH (a)-[:extends*1..3]->(b) RETURN b SKIP 25").unwrap();
+        let compiled = compile(&q, &opts()).unwrap();
+        assert!(
+            compiled.sql.contains(
+                "ORDER BY _depth, _total_weight DESC, b_id, b_namespace, b_kind, \
+                 b_entity_type, b_name"
+            ),
+            "recursive DISTINCT pages need a total projected-row order: {}",
+            compiled.sql
+        );
+        assert!(compiled.sql.contains("LIMIT ?") && compiled.sql.contains("OFFSET ?"));
+        assert!(
+            compiled
+                .params
+                .iter()
+                .any(|p| matches!(p, QueryValue::Integer(25))),
+            "SKIP must be a bound integer parameter: {:?}",
+            compiled.params
+        );
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn skip_over_sql_integer_range_is_rejected() {
+        let too_large = (i64::MAX as u64) + 1;
+        let q = gql::parse(&format!("MATCH (a:concept) RETURN a SKIP {too_large}")).unwrap();
+        let err = compile(&q, &opts()).unwrap_err();
+        assert!(
+            matches!(err, QueryError::InvalidInput(_)) && err.to_string().contains("SKIP"),
+            "unrepresentable SKIP must fail before SQL execution, got {err:?}"
         );
     }
 
@@ -2454,6 +2583,7 @@ mod tests {
             },
             where_clause: WhereExpr::True,
             return_items: vec![],
+            offset: 0,
             limit: None,
         };
         let result = compile(&q, &opts());

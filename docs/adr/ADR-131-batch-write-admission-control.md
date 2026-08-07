@@ -10,6 +10,14 @@
   undecided: one shared admission authority for the full write-serialization
   domain, a caller-visible saturation result, and an interim numeric cap for
   the batch surface (Decisions 1, 2, and 5 below).
+- Amended by: [ADR-135](ADR-135-write-scaling-demand-before-ownership.md)
+  (accepted), whose Amendment 1 defers Decision 1's default-on flip until
+  routing is strict, and [ADR-136](ADR-136-fair-write-admission-default.md)
+  (accepted), which executes that flip pathway through its D1 strict-routing
+  gates and D2 A/B-then-flip clause. Decision 1's default-on language below
+  states this record's target compatibility-slice contract; it does not by
+  itself authorize the default — see the qualification at the head of
+  Decision 1.
 
 ## Context
 
@@ -33,7 +41,7 @@ its full transaction closure before releasing
 There is no admission queue ahead of this mutex: a caller either acquires it
 within the fixed budget or fails.
 
-### ADR-067's WriterTask: an accepted, opt-in queue
+### ADR-067's WriterTask: an accepted queue, default for file-backed pools
 
 ADR-067 (accepted 2026-07-05, Amendment 1 dated 2026-07-06) specifies a
 three-part mechanism: Component A, a dedicated `WriterTask` that owns a
@@ -64,12 +72,13 @@ point-in-time depth snapshot that the source itself documents as racy and
 Three properties of this accepted design are not yet decided for the batch
 surface:
 
-1. **The queue is not the deployed default.** `PoolConfig::write_queue_enabled`
-   defaults to `false`, set only by the `KHIVE_WRITE_QUEUE` environment
-   variable (`crates/khive-db/src/pool.rs:113-121`). ADR-067's own migration
-   plan gated it this way "for initial rollout", pending confirmation "after
-   integration tests confirm correctness under concurrent load." Today the
-   unavailability behavior is split. A call outside an async runtime returns
+1. **The queue is the default for file-backed pools.** `PoolConfig::write_queue_enabled`
+   is `Option<bool>`; `ConnectionPool::new` resolves an unset value to
+   `Some(true)` for file-backed pools and `Some(false)` for in-memory pools,
+   with an explicit `Some(_)` always winning (`crates/khive-db/src/pool.rs:493`,
+   landed in `7114a7d7e` / #1696). The `KHIVE_WRITE_QUEUE` environment
+   variable can still force either state. Today the unavailability behavior
+   is split. A call outside an async runtime returns
    the typed error `StorageError::WriterTaskNoRuntime` before any fallback
    state is cached (`crates/khive-db/src/pool.rs:656-680`). Any other
    writer-task spawn failure caches `None` once, after which
@@ -181,6 +190,21 @@ and in what order, not on how the drain loop then executes them. Nothing in
 Decisions 1 through 5 requires revision if Components B or D land later.
 
 ### 1. One shared admission authority, keyed by canonical database identity, for every write call; a per-batch cap is defense in depth, not the mechanism
+
+**Interim status:** this decision's default-on language is this record's
+target compatibility-slice contract, subordinate to the gating conditions
+[ADR-135](ADR-135-write-scaling-demand-before-ownership.md) and
+[ADR-136](ADR-136-fair-write-admission-default.md) place on it. ADR-135
+Amendment 1 defers the default flip described below until ADR-136's D1
+strict-routing gates — queue-first `SqlBridge::writer` routing, retirement of
+`with_writer_unmanaged` on runtime paths, fail-closed behavior on queue spawn
+or runtime failure, a test-failing direct-writer-violation fixture, and
+explicit classification of startup/migration/checkpoint/recovery/maintenance
+writers — and its D2 A/B-then-flip clause (production evidence that queue-on
+lowers caller errors with no hidden fallback) are satisfied. Until then, the
+effective default for `write_queue_enabled` is whatever ADR-135/ADR-136
+authorize, not the paragraph below on its own; no maintainer should read the
+text that follows as already-decided default-on behavior.
 
 Every write call in the serialization domain, single-operation or
 multi-operation, admits through ADR-067's `WriterTask` queue by default, not
@@ -356,8 +380,9 @@ diagnostics but never in an aggregate metric label.
 
 ### 5. Interim per-batch caps of 20 and 15, retired only by measured criteria
 
-Until Decisions 1 through 4 are in force by default in production, the batch
-surface enforces:
+Until Decisions 1 through 4 are in force by default in production — an event
+that ADR-135 Amendment 1 and ADR-136 D1/D2 gate, per the qualification at the
+head of Decision 1 — the batch surface enforces:
 
 1. A parallel batch containing any write operation must contain no more than
    20 total operations.
@@ -441,7 +466,9 @@ observing a single clean batch does not satisfy retirement.
 - Enabling the writer queue by default (Decision 1) exercises a code path
   ADR-067 shipped but gated behind `KHIVE_WRITE_QUEUE` for initial rollout;
   the retirement criteria in Decision 5 are the confirmation ADR-067's
-  migration plan deferred.
+  migration plan deferred. That default enablement is itself subordinate to
+  ADR-135 Amendment 1 and ADR-136's D1/D2 gates, per Decision 1's
+  qualification — it is not authorized by this record alone.
 - The interim caps (Decision 5) constrain the public batch API in the
   meantime. A workload that legitimately needs a larger batch has no relief
   until the mechanism is proven and defaulted on.

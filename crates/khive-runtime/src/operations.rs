@@ -806,6 +806,9 @@ pub const BASE_ENTITY_ENDPOINT_RULES: &[(&str, EdgeRelation, &str)] = &[
     ("artifact", EdgeRelation::DerivedFrom, "document"),
     ("artifact", EdgeRelation::DerivedFrom, "project"),
     ("artifact", EdgeRelation::DerivedFrom, "artifact"),
+    // ADR-002 amendment 2026-07-27: publication provenance — a curated or
+    // filtered publication copy points at the canonical source document.
+    ("document", EdgeRelation::DerivedFrom, "document"),
     // Temporal
     ("document", EdgeRelation::Precedes, "document"),
     ("dataset", EdgeRelation::Precedes, "dataset"),
@@ -4604,10 +4607,16 @@ pub struct QueryResult {
     pub rows: Vec<SqlRow>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<String>,
-    /// `true` when the server-side row cap bound this result — `rows` is a
-    /// prefix of the true match set, not the whole thing (#1168, #1247). A
-    /// structural flag so a caller can detect an incomplete result without
-    /// parsing the human-oriented `warnings` text.
+    /// Zero-based offset of this deterministic result page.
+    pub offset: usize,
+    /// Effective payload bound after composing query `LIMIT` and server page size.
+    pub page_size: usize,
+    /// `true` when at least one additional match exists after this page.
+    pub has_more: bool,
+    /// GQL continuation offset. Present exactly when GQL has another page.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_offset: Option<usize>,
+    /// Backward-compatible alias for `has_more` (#1168, #1247, #1601).
     pub truncated: bool,
 }
 
@@ -4637,6 +4646,13 @@ impl KhiveRuntime {
         use khive_storage::types::SqlValue;
 
         let (language, ast) = khive_query::language::parse_auto_with_language(query)?;
+        if opts.max_limit == 0 {
+            return Err(RuntimeError::InvalidInput(
+                "query page size must be at least 1".into(),
+            ));
+        }
+        let offset = ast.offset;
+        let page_size = ast.limit.unwrap_or(opts.max_limit).min(opts.max_limit);
         opts.scopes = token
             .visible_namespaces()
             .iter()
@@ -4672,42 +4688,76 @@ impl KhiveRuntime {
         };
         let mut rows = reader.query_all(stmt).await?;
 
-        // When the server-side cap was the binding constraint, the compiled
+        // When the effective page size was the binding constraint, the compiled
         // SQL asked for one extra (sentinel) row. Its presence in the actual
-        // result set — not the requested LIMIT — is the truncation signal
-        // (a `LIMIT 1000` that only matches 20 rows must not warn, and a
-        // query with no `LIMIT` that matches 501+ rows must).
+        // result set — not the requested LIMIT — is the continuation signal.
         let mut truncated = false;
         if let Some(check) = truncation_check {
             if rows.len() > check.max_limit {
                 rows.truncate(check.max_limit);
                 truncated = true;
-                // GQL has no SKIP/OFFSET/ORDER BY today (#1168) — the prior
-                // wording here recommended a paging path that does not exist.
-                // `truncated` is the structural signal (#1247); this message
-                // stays prose-only context for a human reader.
-                warnings.push(match check.requested_limit {
-                    Some(requested) => format!(
-                        "result set capped at {} rows; requested limit {requested} exceeds the \
-                         cap. This query language does not support SKIP/OFFSET paging yet — \
-                         check the `truncated` field, not this message, to detect an incomplete \
-                         result programmatically.",
-                        check.max_limit
-                    ),
-                    None => format!(
-                        "result set capped at {} rows; more than {} rows matched with no LIMIT \
-                         clause. This query language does not support SKIP/OFFSET paging yet — \
-                         check the `truncated` field, not this message, to detect an incomplete \
-                         result programmatically.",
-                        check.max_limit, check.max_limit
-                    ),
-                });
             }
+        }
+
+        let next_offset = if truncated && language == khive_query::QueryLanguage::Gql {
+            let next = offset.checked_add(rows.len()).ok_or_else(|| {
+                RuntimeError::InvalidInput("GQL next_offset exceeds usize::MAX".into())
+            })?;
+            if next == offset {
+                return Err(RuntimeError::InvalidInput(
+                    "query page did not advance; page size must be at least 1".into(),
+                ));
+            }
+            i64::try_from(next).map_err(|_| {
+                RuntimeError::InvalidInput("GQL next_offset exceeds i64::MAX".into())
+            })?;
+            Some(next)
+        } else {
+            None
+        };
+
+        if truncated {
+            let Some(check) = truncation_check else {
+                return Err(RuntimeError::Internal(
+                    "truncated query result is missing sentinel metadata".into(),
+                ));
+            };
+            let bound = match check.requested_limit {
+                Some(requested) => {
+                    format!("requested query LIMIT {requested} exceeds the effective page size")
+                }
+                None => "the query has no explicit LIMIT".to_string(),
+            };
+            let warning = match language {
+                khive_query::QueryLanguage::Gql => {
+                    let Some(next) = next_offset else {
+                        return Err(RuntimeError::Internal(
+                            "truncated GQL result is missing its continuation offset".into(),
+                        ));
+                    };
+                    format!(
+                        "result page capped at {} rows because {bound}; more matches exist. \
+                         Continue the same GQL query with `SKIP {next}` (the machine-readable \
+                         `next_offset`) and keep the same page size.",
+                        check.max_limit
+                    )
+                }
+                khive_query::QueryLanguage::Sparql => format!(
+                    "result page capped at {} rows because {bound}; more matches exist. \
+                     SPARQL OFFSET paging is not part of the supported dialect.",
+                    check.max_limit
+                ),
+            };
+            warnings.push(warning);
         }
 
         Ok(QueryResult {
             rows,
             warnings,
+            offset,
+            page_size,
+            has_more: truncated,
+            next_offset,
             truncated,
         })
     }
@@ -16005,5 +16055,136 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(count, 0, "a rejected create must leave no note behind");
+    }
+
+    // ── ADR-002 base endpoint contract conformance (issue #1715) ────────────
+    // Parses the "### Base endpoint contract" tables straight out of
+    // docs/adr/ADR-002-edge-ontology.md and asserts set-equality against
+    // `BASE_ENTITY_ENDPOINT_RULES`. The ADR and the runtime allowlist are
+    // maintained by hand in two places with nothing else comparing them; this
+    // is the comparator, so a future amendment landing in only one of the two
+    // fails CI instead of shipping a silent false refusal (or a silent
+    // over-grant).
+
+    /// Subsections of the "Base endpoint contract" that are intentionally
+    /// excluded from `BASE_ENTITY_ENDPOINT_RULES`:
+    /// - "Annotation relation": `Note -> any substrate UUID` is a substrate-level
+    ///   rule (source is always a note), not an entity-kind pair.
+    /// - "KG pack extensions": additive rows declared via the KG pack's
+    ///   `EDGE_RULES`, not part of the runtime's base allowlist.
+    const ADR002_EXCLUDED_SUBSECTIONS: &[&str] = &["Annotation relation", "KG pack extensions"];
+
+    /// Parse the ADR-002 "Base endpoint contract" markdown tables into the same
+    /// `(source_kind, relation, target_kind)` shape as `BASE_ENTITY_ENDPOINT_RULES`.
+    fn parse_adr002_base_entity_endpoint_matrix(
+    ) -> std::collections::HashSet<(String, EdgeRelation, String)> {
+        let adr_path = format!(
+            "{}/../../docs/adr/ADR-002-edge-ontology.md",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let text = std::fs::read_to_string(&adr_path)
+            .unwrap_or_else(|e| panic!("failed to read {adr_path}: {e}"));
+        let lines: Vec<&str> = text.lines().collect();
+
+        let start = lines
+            .iter()
+            .position(|l| l.trim() == "### Base endpoint contract")
+            .expect("ADR-002 must contain a '### Base endpoint contract' heading");
+        let end = lines[start + 1..]
+            .iter()
+            .position(|l| l.starts_with("## "))
+            .map(|i| start + 1 + i)
+            .unwrap_or(lines.len());
+        let section = &lines[start..end];
+
+        let mut triples = std::collections::HashSet::new();
+        let mut excluded = false;
+
+        for line in section {
+            let trimmed = line.trim();
+            if let Some(title) = trimmed.strip_prefix("#### ") {
+                excluded = ADR002_EXCLUDED_SUBSECTIONS
+                    .iter()
+                    .any(|ex| title.starts_with(ex));
+                continue;
+            }
+            if excluded || !trimmed.starts_with('|') {
+                continue;
+            }
+
+            let cells: Vec<&str> = trimmed
+                .trim_matches('|')
+                .split('|')
+                .map(|c| c.trim())
+                .collect();
+            if cells.len() != 3 {
+                continue;
+            }
+            let is_header = cells[0].eq_ignore_ascii_case("Source");
+            let is_separator = cells
+                .iter()
+                .all(|c| !c.is_empty() && c.chars().all(|ch| ch == '-'));
+            if is_header || is_separator {
+                continue;
+            }
+
+            let src_raw = cells[0].trim_matches('`');
+            let rel_raw = cells[1].trim_matches('`');
+            let tgt_raw = cells[2].trim_matches('`');
+
+            let relation: EdgeRelation = rel_raw.parse().unwrap_or_else(|_| {
+                panic!("ADR-002 base endpoint contract row has unparseable relation: {trimmed:?}")
+            });
+
+            let src = if src_raw.eq_ignore_ascii_case("any entity") {
+                "*".to_string()
+            } else {
+                src_raw.to_ascii_lowercase()
+            };
+            let tgt = tgt_raw.to_ascii_lowercase();
+
+            triples.insert((src, relation, tgt));
+        }
+
+        triples
+    }
+
+    #[test]
+    fn base_entity_endpoint_rules_match_adr002_base_endpoint_contract() {
+        // ADR-002 lives at the repository root, outside this crate's package.
+        // In the repository the workspace manifest sits two levels up and the
+        // ADR must be readable — a missing file there is a hard failure so a
+        // rename cannot silently disarm this gate. From a published package
+        // tarball neither exists; skip with disclosure instead of failing an
+        // environment that cannot carry the canonical document.
+        let workspace_manifest = format!("{}/../Cargo.toml", env!("CARGO_MANIFEST_DIR"));
+        if !std::path::Path::new(&workspace_manifest).exists() {
+            eprintln!(
+                "skipping ADR-002 conformance: workspace manifest not present \
+                 (published-package context); the check runs in the repository"
+            );
+            return;
+        }
+        let adr_matrix = parse_adr002_base_entity_endpoint_matrix();
+        assert!(
+            !adr_matrix.is_empty(),
+            "parsed zero rows from ADR-002's base endpoint contract — parser or heading drift"
+        );
+
+        let runtime_rules: std::collections::HashSet<(String, EdgeRelation, String)> =
+            base_entity_endpoint_rules()
+                .iter()
+                .map(|(src, rel, tgt)| (src.to_string(), *rel, tgt.to_string()))
+                .collect();
+
+        let missing_from_runtime: Vec<_> = adr_matrix.difference(&runtime_rules).collect();
+        let extra_in_runtime: Vec<_> = runtime_rules.difference(&adr_matrix).collect();
+
+        assert!(
+            missing_from_runtime.is_empty() && extra_in_runtime.is_empty(),
+            "BASE_ENTITY_ENDPOINT_RULES has drifted from ADR-002's base endpoint contract.\n\
+             In the ADR but not enforced by the runtime: {missing_from_runtime:#?}\n\
+             Enforced by the runtime but not in the ADR: {extra_in_runtime:#?}"
+        );
     }
 }

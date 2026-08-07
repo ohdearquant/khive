@@ -17,6 +17,18 @@ operational pattern (cursor table, secret masking on ingest, cursor
 advances only on success) — NOT a daemon loop, NOT a webhook, NOT a poller:
 one pass per invocation.
 
+When issues or pull requests are requested, capability detection is
+source-bound: `probe_gh_repository` derives the expected `owner/repo` from
+the canonical source or configured `origin`, runs `gh repo view
+<owner/repo> --json nameWithOwner,url`, validates that exact returned identity
+and github.com URL, and every walker then passes it explicitly as `--repo`.
+Argument-less repository selection is never used, so `gh repo set-default`
+cannot redirect a digest. A successful
+`gh --version` is not evidence that the checkout is usable. Probe failures
+set `gh_available=false` and mark each requested remote source `skipped`; a
+commits-only pass does not probe and leaves `gh_available` unset. Public
+reasons are stable and omit both origin URLs and `gh` stderr.
+
 ## `Budget`
 
 Bounds the number of new-record creation attempts across a `run_ingest`
@@ -56,9 +68,10 @@ time:
   window, or a per-record write failure that froze the cursor — the same
   events that force `done = false` / `cursor_stalled`).
 - `skipped` — the source was never walked; `reason` names the cause (budget
-  exhausted before an earlier-ordered source finished, `gh` CLI absent, a
-  `gh` listing failure, or a local cursor/database read failure before remote
-  listing). A gate refusal therefore never terminates the walk:
+  exhausted before an earlier-ordered source finished, the source-bound `gh`
+  probe could not resolve an authenticated GitHub repository, a `gh` listing
+  failure, or a local cursor/database read failure before remote listing). A
+  gate refusal therefore never terminates the walk:
   it is recorded on the source and the pass continues to the remaining
   sources.
 
@@ -74,6 +87,19 @@ Budget exhaustion and cursor stalls continue to force `done` to `false`; a
 first-fetch remote failure or a pre-listing local cursor read failure does not,
 because no source walk consumed the budget. Consumers using `done` as a resume
 signal must handle these newly reported false values.
+
+## Durable `git.digest` receipt
+
+`run_ingest` itself returns an `IngestReport` without a receipt because it is
+also used by the administrative CLI. When invoked through `git.digest`, the
+runtime dispatch seam adds `receipt_id` only after the complete serialized
+report has been durably stored in a schema-v2 audit event. The event id and
+`receipt_id` are identical, its target is `project_id`, and its
+`payload.result` is the exact caller-visible report. `git.digest` is
+`AlwaysVerbose`, so default MCP Agent presentation cannot shorten the receipt
+UUID or otherwise make the returned result differ from the stored result. See
+ADR-088 Amendment 1's 2026-08-07 operational rider for bounded,
+namespace-aware query/recovery and failure semantics.
 
 Two edge semantics, stated explicitly:
 
@@ -92,7 +118,7 @@ Two edge semantics, stated explicitly:
 
 A newly created note this pass, retained so the post-ingestion
 reference-extraction sweep (`link_references`) can resolve cross-references
-between records created in the *same* pass regardless of ingestion order
+between records created in the _same_ pass regardless of ingestion order
 (PRs and issues are ingested before commits) without re-reading them from
 storage.
 
@@ -128,7 +154,7 @@ namespace (matches the by-ID resolution contract used by `get`/`update`).
 ## `link_references`
 
 Post-ingestion sweep (ADR-088 Amendment 1 ingest enrichment): extracts
-GitHub reference-grammar mentions from every note created *this pass*
+GitHub reference-grammar mentions from every note created _this pass_
 (commits, issues, PRs — order-independent, since all three are already in
 `new_records` by the time this runs) and materializes `annotates` edges to
 the referenced issue/PR note, carrying `ref_kind` ("closes" | "mentions")
@@ -223,7 +249,7 @@ available), and any other error (including an unclassified `GitLogError` or
 a non-`GitLogError` failure) is returned immediately without ever calling
 `recover`. A later repair attempt's strategy replaces the pending warning
 rather than accumulating one per attempt, so exactly one success warning is
-ever returned — describing the *last* repair that was needed, not every
+ever returned — describing the _last_ repair that was needed, not every
 one tried.
 
 ## Masking boundaries (`MaskedCommitFields`, `MaskedIssueFields`, `MaskedPrFields`)
@@ -245,11 +271,13 @@ and go through the same `mask_secrets` gate `content` already used —
 closing the gap where the commit note `name` (built from the raw subject)
 and its `author`/`author_email` properties skipped masking entirely.
 
-For `MaskedPrFields`: `number`, the four timestamp fields, and
+For `MaskedPrFields`: `number`, `created_at`, `merged_at`, `closed_at`, and
 `merge_commit`'s `oid` are GitHub-generated (not attacker-authored free
-text) and pass through unchanged. `title`, `body`, the author login, and
-both ref names are contributor-controlled prose and go through the same
-`mask_secrets` gate.
+text) and pass through unchanged. `updated_at` is special because it crosses
+the paging cursor/argv boundary: it is parsed and canonicalized before page
+sorting, and an invalid value is dropped with a value-free warning. `title`,
+`body`, the author login, and both ref names are contributor-controlled prose
+and go through the same `mask_secrets` gate.
 
 `StateReasonField` is the classified outcome of parsing a raw `stateReason`
 string against the governed enum (`hook::ISSUE_STATE_REASONS`, ADR-088 §3)
@@ -322,16 +350,18 @@ exactly the tie reason: a successful and a failing record sharing one
 `updated_at` must both be re-examined next pass until the cursor moves past
 that tie.
 
-In `ingest_issues`, the entire fetched page is classified (masked strings,
-canonicalized timestamps, governed-enum `state_reason`) before anything
-else — including the sort and the paging cursor derivation — touches it. A
-raw `GhIssue.updated_at` must never reach the sort comparator,
+In both `ingest_issues` and `ingest_prs`, the entire fetched page is
+classified before anything else—including the sort and paging-cursor
+derivation—touches it. A raw `GhIssue.updated_at` or `GhPr.updated_at` must
+never reach the sort comparator,
 `last_updated_at`, or (via `decide_page_outcome`'s `Continue`) a future `gh
 --search updated:>=` argument (a credential-shaped `updatedAt` could
 otherwise sort last and leak into process arguments through the paging
-floor). An ungoverned `stateReason` is rejected before the record is ever
-built or dispatched — the warning names only the field, never the raw
-(possibly credential-shaped) value, matching ADR-088's
+floor). Issues additionally classify masked strings, every timestamp, and
+the governed-enum `state_reason`; PRs canonicalize the cursor-bearing
+`updated_at` and mask their prose fields. An ungoverned `stateReason` is
+rejected before the issue is ever built or dispatched—the warning names only
+the field, never the raw (possibly credential-shaped) value, matching ADR-088's
 fail-closed/no-silent-coercion contract.
 
 Reported `done = false` whenever the remote window is not proven complete
@@ -367,3 +397,89 @@ not a complete signal.
   Resolution now happens in one query/snapshot: both candidates are
   visible to the same `SELECT`, and the `ORDER BY` — not read ordering —
   decides the exact match wins.
+
+## Changed paths and code-module annotations
+
+The commit snapshot's `git log -z --name-only --no-renames
+--diff-merges=first-parent` pass is the authority for
+`commit.properties.changed_paths`. NUL-delimited paths bypass Git's quoted
+display encoding and are decoded with the same lossy UTF-8 normalization as
+ADR-085's filesystem path producer. At this parse stage tabs, newlines,
+quotes, backslashes, and non-ASCII text retain their path identity — but
+parsing identity is not storage identity. `changed_paths` storage is
+governed by `CommitHook`'s canonical repo-relative shape (see
+docs/api/hooks.md): a valid Unix filename containing a `\` byte or starting
+with an `X:` drive prefix can never round-trip through it. Before create,
+the ingester filters exactly those elements out of the array (the same
+predicate the hook enforces: a NUL byte, a backslash, an `X:` drive prefix,
+a leading `/`, or an empty/`.`/`..` component), keeps the canonical
+remainder, stores the commit, and counts the dropped paths in
+`IngestReport.changed_paths_filtered_noncanonical` with one bounded warning
+per run. The predicate runs on the RAW path, not the masked one: a secret
+token can itself contain a rejected byte (the masker's tokens are
+whitespace-delimited), and filtering after masking would flip the verdict
+from reject to accept; masking applies only to the paths that survive. Only actual predicate rejections count as drops: the BTreeSet
+dedup and post-masking collisions the sorted array also performs are not
+drops and are neither counted nor warned. Rename detection is
+pinned off (`--no-renames`) so a rename always surfaces as the delete + add
+pair `--name-only` reports without it; because Git does not mark which entry
+is the rename source, leaving detection on could silently swap one side of
+the pair away from the exact path facts that join against ADR-085 modules.
+A merge commit carries one canonical path set: its diff against the first
+parent. Paths that survive the canonical filter are secret-masked, sorted,
+and deduplicated before storage.
+The stored property has exactly three states: `[]` for a genuinely empty
+commit — and only for one; the canonical remainder array when at least one
+touched path survives the filter; and an omitted `changed_paths` (the hook
+treats it as optional) when the raw touched set was non-empty but every
+path was filtered — the all-filtered third state, whose evidence is the
+run's `changed_paths_filtered_noncanonical` count and bounded warning. A
+malformed `--name-only` token
+stream fails the phase (retried on the next pass via the cursor contract),
+and a walked commit with no recorded path set is skipped with a warning and
+a stalled cursor rather than stored with a fabricated `[]`. One residual
+parser ambiguity is deliberate: a non-header token is indistinguishable from
+a real path of the most recent header's commit. The `--name-only` walk is
+newest-first, so a header lost mid-stream attaches its record's path tokens
+to that NEWER commit — the commit already walked in the same stream — never
+to an older one. The parser does not guess at path content; containment is
+per-record, not per-stream: the missing sha has no path-set entry, so the
+run warns and stalls the cursor, but the polluted newer commit is created as
+usual — the orphaned tokens ride into its `changed_paths`, and commit notes
+are immutable, so the pollution persists (a re-ingest skips the stored sha;
+repair requires deleting the note and re-ingesting).
+`ingest_stalls_cursor_for_commit_missing_touched_paths` pins both halves:
+its shim's `tr` round-trip splits git's combined `<header>\n<first-path>`
+token into two lines, so `grep -av` removes only the header line and the
+deleted commit's path token survives in the stream as the orphan.
+
+Before walking commits, the ingester loads the same-namespace live ADR-085
+module index once for the repository snapshot HEAD. That snapshot is never
+truncated: `walk_commits` issues one unbounded `git log {since}..HEAD`, and
+`max_items` bounds only the create loop (a budget check after the snapshot
+loads), never the walk — so the snapshot HEAD is always the true repository
+HEAD of this pass, and the index anchors to modules-as-of-HEAD regardless of
+how many commits the budget lets this pass create. A module is eligible only
+when both `properties.source_revision` equals that HEAD and
+`properties.source_path` exactly equals the changed path. Requiring the
+revision prevents an identically named path in another repository snapshot
+from receiving a fabricated annotation. If more than one live module still
+has the same `(source_revision, source_path)`, the binding is ambiguous and no
+candidate is annotated. The skip folds two shapes into one counter,
+`IngestReport.code_module_ambiguous_path_skips`: an ambiguous key (two or
+more live rows, including the simplest case where both rows have parseable
+ids, or the case where at most one has a parseable id — a row whose `id` does
+not parse as a UUID is still a live row for the key, so it marks the pair
+ambiguous, but can never itself be the annotated candidate) and the
+single-row sub-case whose one row's id does not parse (not ambiguous — just
+no bindable candidate). Each skip is counted only when an ingested commit's
+path actually hits the key, so unusable keys untouched by the pass never
+inflate the count, and the run's bounded warning names the first skipped
+paths (masked, truncated) so the count is actionable. There is no suffix match, inferred rename, entity
+creation, or arbitrary winner. A failure to load the module index degrades
+the pass to no module annotation with a warning instead of aborting it,
+because the annotation is best-effort enrichment while `changed_paths` is
+the durable fact. This makes module churn and repeated
+cross-project co-change derivable from incoming `annotates` graph reads while
+retaining `changed_paths` as a durable path fact when no matching code map
+exists.

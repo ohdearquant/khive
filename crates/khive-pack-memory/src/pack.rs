@@ -145,9 +145,9 @@ static MEMORY_HANDLERS: [HandlerDef; 10] = [
         params: &[
             ParamDef {
                 name: "target_id",
-                param_type: "string",
+                param_type: "uuid",
                 required: true,
-                description: "UUID of the recalled entity or memory being rated.",
+                description: "Full UUID of the recalled entity or memory being rated. A short-prefix resolution can miss or be ambiguous and is rejected because feedback must identify one exact recalled record.",
             },
             ParamDef {
                 name: "signal",

@@ -101,8 +101,31 @@ impl KgPack {
         khive_runtime::secret_gate::check_tags(&p.reviewers)?;
         khive_runtime::secret_gate::check_json(&p.changeset)?;
 
-        let changeset: ProposalChangeset = serde_json::from_value(p.changeset.clone())
-            .map_err(|e| RuntimeError::InvalidInput(format!("invalid changeset: {e}")))?;
+        // Error-shape split: only identifier-validation failures carry the
+        // full-UUID hint. Detection matches on Id128's OWN ParseIdError
+        // Display constants (pinned by a unit test in khive-types), not on a
+        // prose substring like "UUID": serde surfaces a custom Deserialize
+        // error's Display text verbatim in its message, so an identifier
+        // failure always contains one of these exact strings while generic
+        // shape errors (missing field, wrong type, unknown variant) do not.
+        // Generic failures surface serde's own message so the hint never
+        // misleads a caller whose identifiers were already well-formed.
+        let changeset: ProposalChangeset =
+            serde_json::from_value(p.changeset.clone()).map_err(|e| {
+                let serde_message = e.to_string();
+                let is_identifier_failure = serde_message
+                    .contains(khive_types::ParseIdError::INVALID_LENGTH_TEXT)
+                    || serde_message.contains(khive_types::ParseIdError::INVALID_HEX_TEXT);
+                if is_identifier_failure {
+                    RuntimeError::InvalidInput(format!(
+                        "invalid changeset: {serde_message}; every changeset identifier must be \
+                         a full UUID because resolving a short prefix could miss, be ambiguous, \
+                         or change the proposal's stable intent"
+                    ))
+                } else {
+                    RuntimeError::InvalidInput(format!("invalid changeset: {serde_message}"))
+                }
+            })?;
         if has_multi_step_compound(&changeset) {
             return Err(RuntimeError::InvalidInput(
                 "multi-step Compound proposals are not supported until atomic proposal apply is available"
@@ -119,11 +142,18 @@ impl KgPack {
             .as_deref()
             .map(|s| -> Result<khive_types::Id128, RuntimeError> {
                 let parent_uuid = Uuid::from_str(s).map_err(|e| {
-                    RuntimeError::InvalidInput(format!("invalid parent_id {s:?}: {e}"))
+                    RuntimeError::InvalidInput(format!(
+                        "parent_id must be a full UUID because a short prefix would require \
+                         proposal-namespace resolution and ancestry is an explicit stable \
+                         reference; got {s:?}: {e}"
+                    ))
                 })?;
                 Ok(khive_types::Id128::from_u128(parent_uuid.as_u128()))
             })
             .transpose()?;
+        let response_parent_id = validated_parent_id
+            .as_ref()
+            .map(|id| Uuid::from_u128(id.to_u128()).as_hyphenated().to_string());
 
         if let Some(ref parent_id128) = validated_parent_id {
             let parent_uuid = Uuid::from_u128(parent_id128.to_u128());
@@ -189,6 +219,8 @@ impl KgPack {
 
         to_json(&serde_json::json!({
             "id": proposal_id.to_string(),
+            "full_id": proposal_id.to_string(),
+            "parent_id": response_parent_id,
             "status": "open",
             "proposer": actor,
             "title": p.title,
@@ -496,7 +528,13 @@ impl KgPack {
         }
 
         sql_str.push_str(&format!(
-            " ORDER BY updated_at DESC LIMIT ?{param_idx} OFFSET ?{}",
+            // #1671: `proposal_id` tiebreak makes the offset page order a
+            // deterministic total order across rows that share an
+            // `updated_at` timestamp. Offset paging can still duplicate or
+            // skip rows under concurrent inserts/deletes/updates — the
+            // tiebreak only removes tie-order instability, same caveat as
+            // the entity/graph/note sweeps.
+            " ORDER BY updated_at DESC, proposal_id DESC LIMIT ?{param_idx} OFFSET ?{}",
             param_idx + 1
         ));
         sql_params.push(SqlValue::Integer(limit));

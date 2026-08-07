@@ -57,7 +57,7 @@ live read-only checks against a production knowledge graph.
 | Deduplication candidates  | Which pairs share a name or a similar description?                  | PARTIAL                      | A literal-name lookup works. Variable-to-variable comparison, grouping, and similarity scoring do not — use `search` to surface candidates instead.              |
 | Orphan detection          | Which records have no graph edges?                                  | NO                           | No negative pattern, `NOT EXISTS`, optional match, or anti-join exists. Approximate outside `query` with `list` plus `neighbors`.                                |
 | Edge-density audit        | Which entities have fewer than four edges?                          | PARTIAL                      | `stats()` gives a global `edges_by_relation` breakdown and `query` lists rows, but `COUNT`, `GROUP BY`, `HAVING`, and degree projection are all absent.          |
-| Aggregate inventory       | How many concepts exist, by type?                                   | PARTIAL                      | Filtered row listing works. Aggregate functions, grouping, distinct projection, ordering, and offset are absent.                                                 |
+| Aggregate inventory       | How many concepts exist, by type?                                   | PARTIAL                      | Filtered row listing and GQL `SKIP` paging work. Aggregate functions, grouping, distinct projection, and caller-defined ordering are absent.                     |
 | Cycle / self-reachability | Which entities are in an `extends` cycle?                           | NO                           | Repeated node-variable bindings are rejected, so cycles and self-reachability cannot be expressed.                                                               |
 | Branching join            | Which parent has both an `extends` child and an `implements` child? | NO                           | GQL supports one alternating path; SPARQL rejects branched or disconnected `WHERE` blocks.                                                                       |
 | Cross-namespace audit     | What belongs to another namespace?                                  | NO (caller-controlled scope) | Namespace is a runtime `CompileOptions` input, not query text — a query that references `namespace` in its body is rejected.                                     |
@@ -84,11 +84,11 @@ MATCH (a)-[e:extends|implements]->(b) RETURN a.name, e.relation, b.name LIMIT 10
   through 5 hops, not zero-or-more.
 - A query that mixes a fixed hop with a variable-length hop in the same chain
   is rejected outright, not silently approximated. Split it into two queries.
-- The server enforces an outer row cap independent of the language `LIMIT`.
-  Requesting more rows than the cap allows returns a warning and truncated
-  results; page with `LIMIT`/`OFFSET` — though `OFFSET` is not yet part of
-  the GQL grammar, so paging past the cap currently has no in-language
-  workaround.
+- The query verb's `page_size` has minimum 1, defaults to 500, and is clamped
+  to a hard cap of 10,000. GQL `SKIP` advances through deterministically ordered matches. Omit
+  query-text `LIMIT` for an exhaustive audit; a `LIMIT` at or below `page_size`
+  is a terminal caller-chosen bound. The legacy outer `limit` argument remains
+  a deprecated, mutually exclusive alias for `page_size`.
 - Result columns are projection-derived and variable-prefixed (for example
   `a_name`, `e_relation`). Returning a whole node variable expands it into
   its supported substrate columns. Variable-length paths add `_depth` and
@@ -100,7 +100,28 @@ MATCH (a)-[e:extends|implements]->(b) RETURN a.name, e.relation, b.name LIMIT 10
   surface and is not a GQL field. Both forms remain restricted to the caller's authorized
   namespace scopes.
 - SPARQL variables project as whole nodes (full column expansion), unlike
-  GQL's dotted per-field projection.
+  GQL's dotted per-field projection. SPARQL `OFFSET` is not supported.
+
+## Paging broad GQL results
+
+The response always includes `offset`, effective `page_size`, `has_more`, and
+the compatibility alias `truncated`. A non-terminal GQL page also includes
+`next_offset`; set the next query's `SKIP` to that exact value and keep the same
+`page_size`:
+
+```text
+query(query="MATCH (a)-[r:depends_on]->(b) RETURN a.id, r.id, b.id", page_size=500)
+# ... "has_more": true, "next_offset": 500
+
+query(query="MATCH (a)-[r:depends_on]->(b) RETURN a.id, r.id, b.id SKIP 500", page_size=500)
+```
+
+`next_offset` advances by the number of rows actually emitted. It is omitted
+when `has_more` is false. The compiler orders fixed matches by their complete bound
+identities (including synthetic observation primary keys); recursive `DISTINCT` rows
+are ordered by depth, weight, and their complete projected value tuple. Repeated reads
+of unchanged data are therefore stable. This is offset paging, not a cross-call database
+snapshot: inserts or deletes that match the query can shift later pages.
 
 ## Verified GQL idioms
 
@@ -124,7 +145,7 @@ counts only — no graph content is reproduced here.
 | 12 | Multi-value filter                    | `MATCH (n) WHERE n.kind IN ["concept", "project"] RETURN n.name, n.kind LIMIT 2`         | Live-verified: 2 rows; `n_kind, n_name`. `IN` requires a scalar list; `null` is illegal.                                                                               |
 | 13 | Indexed entity-type filter            | `MATCH (n) WHERE n.entity_type IS NOT NULL RETURN n.entity_type LIMIT 2`                 | 2 rows; `n_entity_type`. `IS NOT NULL` takes no right-hand literal.                                                                                                    |
 | 14 | `WHERE ... OR ...`                    | `MATCH (n) WHERE n.kind = "concept" OR n.kind = "project" RETURN n.name, n.kind LIMIT 2` | 2 rows; `n_kind, n_name`. `AND` binds tighter than `OR`; parentheses are not available to force grouping.                                                              |
-| 15 | Outer cap vs. language `LIMIT`        | `query(query="MATCH (n) RETURN n.name LIMIT 5", limit=2)`                                | 2 rows; warning: result set capped at 2 rows; requested limit 5 exceeds the cap. The outer `limit` argument is a hard server cap independent of the language `LIMIT`.  |
+| 15 | Page size vs. query `LIMIT`           | `query(query="MATCH (n) RETURN n.name LIMIT 5", page_size=2)`                            | 2 rows plus `has_more: true` and `next_offset: 2`; query `LIMIT` exceeds the effective page size, so the +1 sentinel detects another page.                             |
 
 ## Parser-diagnosed dialect boundaries
 
@@ -172,14 +193,13 @@ returns rows on the live MCP tool.
   unaliased projections; group returned rows client-side where needed.
 - Mixed fixed-plus-variable-length paths are rejected; split the query into
   separate calls instead.
-- No anti-join, optional match, aggregate, `GROUP BY`, `DISTINCT`, ordering,
-  or `OFFSET` exists. Orphan-detection and edge-density questions cannot be
-  expressed in a single query.
+- No anti-join, optional match, aggregate, `GROUP BY`, `DISTINCT`, or
+  caller-defined ordering exists. GQL uses `SKIP` rather than an `OFFSET`
+  keyword; SPARQL `OFFSET` remains unsupported. Orphan-detection and
+  edge-density questions cannot be expressed in a single query.
 - A repeated node-variable binding is rejected, which blocks cycle and
   self-reachability queries.
 - SPARQL is single-path only; a branched `WHERE` block is rejected.
-- The row-cap warning recommends `LIMIT`/`OFFSET` paging, but `OFFSET` is not
-  yet part of the GQL grammar.
 
 ## See also
 

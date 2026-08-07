@@ -309,7 +309,9 @@ pub(crate) async fn resolve_context_entity_id(
 ) -> Result<Uuid, RuntimeError> {
     let uuid = Uuid::from_str(raw).map_err(|_| {
         RuntimeError::InvalidInput(format!(
-            "context_entity_id must be a full UUID; got {raw:?}"
+            "context_entity_id must be a full UUID because a short prefix would require a \
+             primary-namespace resolution and this field stores an explicit stable entity \
+             reference; got {raw:?}"
         ))
     })?;
 

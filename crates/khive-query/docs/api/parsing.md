@@ -14,7 +14,8 @@ The unified guard recognizes GQL/Cypher mutations and SPARQL Update forms, inclu
 
 ```text
 query       = "MATCH" path ["WHERE" where_expr]
-              "RETURN" return_item ("," return_item)* ["LIMIT" integer]
+              "RETURN" return_item ("," return_item)*
+              ["SKIP" integer] ["LIMIT" integer]
 path        = node (edge node)*
 node        = "(" [identifier] [":" identifier] [property_map] ")"
 property_map = "{" [property ("," property)*] "}"
@@ -26,9 +27,9 @@ hop_range   = "*" | "*" integer | "*" integer ".." integer
 return_item = identifier ["." identifier]
 ```
 
-The four edge spellings represent outgoing, incoming, and the two accepted undirected forms. An omitted relation matches any supported edge relation. A bare `*` means one through five hops; explicit ranges are inclusive and validation caps the maximum at ten. `LIMIT` is terminal and takes a non-negative integer.
+The four edge spellings represent outgoing, incoming, and the two accepted undirected forms. An omitted relation matches any supported edge relation. A bare `*` means one through five hops; explicit ranges are inclusive and validation caps the maximum at ten. `SKIP` and `LIMIT` take non-negative integers; when both are present, `SKIP` precedes `LIMIT`.
 
-Only unaliased variables and `variable.property` projections are supported. `AS`, expressions, aggregates, `DISTINCT`, ordering, and `OFFSET` are outside this dialect. Result column names are derived from their variables, such as `a_id` and `e_relation`.
+Only unaliased variables and `variable.property` projections are supported. `AS`, expressions, aggregates, `DISTINCT`, caller-defined ordering, and `OFFSET` are outside this dialect. The compiler supplies a deterministic identity order so `SKIP` pages do not overlap while the matched data is unchanged. Result column names are derived from their variables, such as `a_id` and `e_relation`.
 
 ### One-path boundary and parallel-edge alternative
 
@@ -78,7 +79,7 @@ Digits are required on both sides of a float's decimal point, so `.5`, `1.`, and
 
 ## SPARQL parser
 
-`parsers::sparql::parse` accepts the crate's SPARQL-inspired `SELECT ... WHERE { ... } LIMIT ...` subset and converts triples into the same alternating path AST. Predicate paths support one hop, `+`, and explicit inclusive ranges.
+`parsers::sparql::parse` accepts the crate's SPARQL-inspired `SELECT ... WHERE { ... } LIMIT ...` subset and converts triples into the same alternating path AST. Predicate paths support one hop, `+`, and explicit inclusive ranges. SPARQL `OFFSET` remains unsupported; its shared AST offset is always zero. Issue #1601 intentionally adds paging only to the GQL surface.
 
 A numeric predicate condition targets a JSON property explicitly, even when its predicate name matches a dedicated field. This matches string-valued predicate properties and removes the prior value-type-dependent field ambiguity.
 

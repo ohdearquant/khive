@@ -12,13 +12,15 @@ As defense in depth, the final statement must begin with `SELECT` or `WITH`. Par
 
 `scopes` supplies namespace filters. An empty vector means cross-namespace; otherwise every applicable table is filtered with bound parameters. Query text cannot supply this value.
 
-`max_limit` is the server-side row cap. The effective limit is the lesser of the explicit query limit and the cap, subject to checked `usize`-to-`i64` conversion.
+`max_limit` is the effective per-call page size supplied by the runtime after applying its hard cap. The payload bound is the lesser of an explicit query `LIMIT` and `max_limit`, subject to checked `usize`-to-`i64` conversion. Query-verb callers normally set this through `page_size`; its public range is 1 through 10,000 rows.
+
+`GqlQuery.offset` is emitted as a bound SQL `OFFSET`. It must fit SQLite's signed integer range. A negative GQL `SKIP` is rejected by the parser, and a hand-built or platform-sized value above `i64::MAX` is rejected before execution.
 
 ## Truncation sentinel
 
-When an explicit `LIMIT` is at or below `max_limit`, the cap is not binding and the compiler fetches exactly that number. When there is no explicit limit or it exceeds the cap, SQL fetches `max_limit + 1` rows and sets `CompiledQuery.truncation_check`.
+When an explicit `LIMIT` is at or below `max_limit`, the caller's limit is terminal and the compiler fetches exactly that number. When there is no explicit limit or it exceeds the page size, SQL fetches `max_limit + 1` rows and sets `CompiledQuery.truncation_check`.
 
-The execution site removes the sentinel and truncates to `TruncationCheck.max_limit`. `requested_limit` retains the caller's explicit value for diagnostics. Inspecting the extra row avoids both false warnings when a large limit matches few rows and silent truncation when an unbounded query matches more than the cap (issue #777).
+The execution site removes the sentinel and truncates to `TruncationCheck.max_limit`. `requested_limit` retains the caller's explicit value for diagnostics. Inspecting the extra row avoids both false warnings when a large limit matches few rows and silent truncation when an unbounded query matches more than the page size (issue #777). For GQL, a sentinel produces `has_more: true`, retains `truncated: true` for compatibility, and returns `next_offset = current offset + emitted rows`; terminal pages omit `next_offset`.
 
 ## Parameter and property binding
 
@@ -39,7 +41,7 @@ not a query field. Runtime-supplied namespace scopes still apply to every union 
 
 Canonical edges bind through `graph_edges`, while endpoint nodes bind through a union of entities, notes, events, and graph edges. This substrate-agnostic source is necessary because relations such as `annotates` can target several substrates and epistemic relations can connect notes (issue #467).
 
-The compiler preserves edge direction, filters soft-deleted rows, applies namespace scope to every bound substrate, preserves `AND`/`OR` grouping, and resolves WHERE predicates and RETURN projections against the bound variable's substrate.
+The compiler preserves edge direction, filters soft-deleted rows, applies namespace scope to every bound substrate, preserves `AND`/`OR` grouping, and resolves WHERE predicates and RETURN projections against the bound variable's substrate. Fixed-length results are ordered by every bound node and edge identity before applying `LIMIT`/`OFFSET`; substrate discriminators precede UUIDs so equal IDs in different union members remain distinct, and synthetic observations use their `(event_id, role, position)` primary key.
 
 ## Synthetic observation edges
 
@@ -58,7 +60,7 @@ Synthetic edges must be outbound and fixed-length. Mixing synthetic and canonica
 
 Variable-length compilation currently accepts exactly one `start -[*N..M]-> end` pattern. Mixed fixed/variable chains, trailing elements, and synthetic edges return `Unsupported`.
 
-The recursive seed starts at depth one. The CTE binds maximum and minimum depth as parameters, records visited IDs in a path string to prevent cycles, filters deleted and out-of-scope intermediate nodes, accumulates edge weight, and orders by depth, descending total weight, start ID, then current ID.
+The recursive seed starts at depth one. The CTE binds maximum and minimum depth as parameters, records visited IDs in a path string to prevent cycles, filters deleted and out-of-scope intermediate nodes, and accumulates edge weight. Because the final projection uses `DISTINCT`, results order first by depth and descending total weight, then by every projected output alias. That tuple is total over the rows that survive `DISTINCT` and avoids choosing an arbitrary hidden path as the representative for a collapsed row.
 
 The end-node union is always joined because end filters apply even when the end variable is not projected. A start-node join is emitted only when its columns are returned.
 

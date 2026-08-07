@@ -4,7 +4,7 @@ use serde_json::Value;
 
 use khive_runtime::{KhiveRuntime, NamespaceToken, RuntimeError, VerbRegistry};
 use khive_storage::note::Note;
-use khive_storage::types::PageRequest;
+use khive_storage::types::{PageRequest, SqlStatement, SqlValue};
 use khive_storage::EntityFilter;
 
 use khive_runtime::EdgeListFilter;
@@ -75,8 +75,129 @@ fn parse_after_cursor(raw: &str) -> Result<Option<uuid::Uuid>, RuntimeError> {
         return Ok(None);
     }
     uuid::Uuid::parse_str(raw).map(Some).map_err(|error| {
-        RuntimeError::InvalidInput(format!("after: invalid UUID {raw:?}: {error}"))
+        RuntimeError::InvalidInput(format!(
+            "after must be a full UUID because a short-prefix resolution can miss or be \
+             ambiguous, while keyset pagination needs the exact stable insertion boundary; \
+             got {raw:?}: {error}"
+        ))
     })
+}
+
+async fn resolve_message_thread_filter(
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+    raw: &str,
+) -> Result<String, RuntimeError> {
+    // Message-scope invariant: this resolver ONLY serves the message thread
+    // filter, so the DISTINCT scan binds kind='message' unconditionally. The
+    // caller's kind_filter can legitimately be None (list(kind="note")), and
+    // scanning every note kind would let a non-message note carrying a
+    // `thread_id` property inject candidates — producing false ambiguity
+    // errors or resolutions against rows the message filter can never return.
+    if let Ok(thread_id) = raw.parse::<uuid::Uuid>() {
+        return Ok(thread_id.as_hyphenated().to_string());
+    }
+    if raw.len() < 8 || !raw.chars().all(|character| character.is_ascii_hexdigit()) {
+        // Legacy non-UUID thread labels were historically accepted by this
+        // filter. Preserve their exact-match behavior without treating them as
+        // UUID prefixes.
+        return Ok(raw.to_string());
+    }
+
+    let normalized_prefix = raw.to_ascii_lowercase();
+    // Resolve over the SAME visibility scope the subsequent note listing
+    // reads (`['local'] ∪ visible_namespaces`): resolving against only the
+    // primary namespace rejects prefixes of threads the list itself would
+    // return, and silently hides a cross-namespace prefix collision.
+    let visible = token.visible_namespace_strs();
+    let placeholders = (1..=visible.len())
+        .map(|index| format!("?{index}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        "SELECT DISTINCT json_extract(properties, '$.thread_id') AS thread_id \
+                   FROM notes WHERE namespace IN ({placeholders}) AND deleted_at IS NULL \
+                   AND json_type(properties, '$.thread_id') = 'text' \
+                   AND kind = 'message'"
+    );
+    let params = visible
+        .into_iter()
+        .map(|namespace| SqlValue::Text(namespace.to_string()))
+        .collect();
+    let mut reader = runtime
+        .sql()
+        .reader()
+        .await
+        .map_err(RuntimeError::Storage)?;
+    let rows = reader
+        .query_all(SqlStatement {
+            sql,
+            params,
+            label: Some("list.resolve_message_thread_filter".to_string()),
+        })
+        .await
+        .map_err(RuntimeError::Storage)?;
+
+    // Exact-match precedence for legacy stored labels: an all-hex >=8-char
+    // label like "deadbeef" is not a UUID, but it may be stored verbatim as a
+    // thread_id by pre-v1 rows. If any stored value equals the filter string
+    // byte-for-byte, it is an exact label match — not a UUID-prefix query —
+    // and must resolve to itself even when a UUID in the namespace happens to
+    // carry the same hex prefix. Case-only variants are collected too: when no
+    // UUID prefix matches, the stored spelling is returned so downstream
+    // filtering stays exact-string coherent.
+    let mut case_variant_label: Option<String> = None;
+    let mut resolved: Option<uuid::Uuid> = None;
+    for row in &rows {
+        let Some(stored) = row.get("thread_id").and_then(|value| match value {
+            SqlValue::Text(value) => Some(value.as_str()),
+            _ => None,
+        }) else {
+            continue;
+        };
+        if stored == raw {
+            return Ok(raw.to_string());
+        }
+        if case_variant_label.is_none()
+            && stored.len() == raw.len()
+            && stored.eq_ignore_ascii_case(raw)
+        {
+            case_variant_label = Some(stored.to_string());
+        }
+        let Ok(candidate) = stored.parse::<uuid::Uuid>() else {
+            continue;
+        };
+        if !candidate
+            .simple()
+            .to_string()
+            .starts_with(&normalized_prefix)
+        {
+            continue;
+        }
+        match resolved {
+            None => resolved = Some(candidate),
+            Some(existing) if existing == candidate => {}
+            Some(_) => {
+                return Err(RuntimeError::InvalidInput(format!(
+                    "list: ambiguous thread_id prefix {raw:?} across the caller's visible \
+                     namespaces; use a full UUID to identify one exact thread"
+                )))
+            }
+        }
+    }
+
+    if let Some(id) = resolved {
+        return Ok(id.as_hyphenated().to_string());
+    }
+
+    if let Some(stored) = case_variant_label {
+        return Ok(stored);
+    }
+
+    Err(RuntimeError::InvalidInput(format!(
+        "list: no message thread matches prefix {raw:?} in the caller's visible \
+         namespaces; a prefix can miss, so use the full thread UUID"
+    )))
 }
 
 fn note_matches_message_filters(note: &Note, params: &ListParams) -> bool {
@@ -89,11 +210,12 @@ fn note_matches_message_filters(note: &Note, params: &ListParams) -> bool {
         else {
             return false;
         };
-        let matches = stored == wanted_thread
-            || matches!(
-                (stored.get(..8), wanted_thread.get(..8)),
-                (Some(left), Some(right)) if left == right
-            );
+        let matches = match wanted_thread.parse::<uuid::Uuid>() {
+            Ok(wanted) => stored
+                .parse::<uuid::Uuid>()
+                .is_ok_and(|stored| stored == wanted),
+            Err(_) => stored == wanted_thread,
+        };
         if !matches {
             return false;
         }
@@ -162,7 +284,7 @@ impl KgPack {
             return self.handle_list_proposals(token, params).await;
         }
 
-        let p: ListParams = deser(params)?;
+        let mut p: ListParams = deser(params)?;
         if p.after.is_some() && p.offset.is_some() {
             return Err(RuntimeError::InvalidInput(
                 "after and offset are mutually exclusive pagination modes".into(),
@@ -343,6 +465,11 @@ impl KgPack {
                     |s| canonical_note_kind(s, registry),
                     "note_kind",
                 )?;
+                if let Some(raw_thread_id) = p.thread_id.clone() {
+                    p.thread_id = Some(
+                        resolve_message_thread_filter(&self.runtime, token, &raw_thread_id).await?,
+                    );
+                }
                 let requested = p.limit.unwrap_or(20);
                 let limit = effective_list_limit(requested, NOTE_LIST_CAP);
                 let has_msg_filter = p.thread_id.is_some()
@@ -612,6 +739,42 @@ impl KgPack {
                     limit,
                 ))
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_after_cursor;
+    use crate::handlers::common::{event_filter_from_params, ListParams};
+
+    #[test]
+    fn after_cursor_rejects_prefix_with_keyset_consequence() {
+        let error = parse_after_cursor("deadbeef").expect_err("prefix is not an exact cursor");
+        let message = error.to_string();
+        assert!(message.contains("can miss or be ambiguous"), "{message}");
+        assert!(
+            message.contains("exact stable insertion boundary"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn event_filters_reject_prefixes_with_exact_record_consequence() {
+        for (field, value) in [
+            ("session_id", serde_json::json!("deadbeef")),
+            ("observed", serde_json::json!(["deadbeef"])),
+            ("selected", serde_json::json!(["deadbeef"])),
+        ] {
+            let mut args = serde_json::json!({"kind": "event"});
+            args[field] = value;
+            let params: ListParams = serde_json::from_value(args).expect("list params");
+            let error = event_filter_from_params(&params)
+                .expect_err("prefix is not an exact event-filter identifier");
+            let message = error.to_string();
+            assert!(message.contains(field), "{message}");
+            assert!(message.contains("can miss or be ambiguous"), "{message}");
+            assert!(message.contains("exact stable record"), "{message}");
         }
     }
 }

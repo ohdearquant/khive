@@ -14,6 +14,7 @@ use khive_runtime::{
     Gate, GateDecision, GateError, GateRequest, KhiveRuntime, PackRegistry, RequestIdentity,
     RuntimeError, VerbRegistry, VerbRegistryBuilder,
 };
+use khive_storage::{SqlStatement, SqlValue};
 use serde_json::{json, Value};
 use std::sync::{Arc, Mutex};
 
@@ -343,6 +344,53 @@ async fn cite_accepts_org_source() {
 
     assert_eq!(resp["relation"], "introduced_by");
     assert_eq!(resp["source_id"], source_id);
+}
+
+/// Regression (PR #1623 round 3): the vocab promises unique 8+ hex prefix
+/// resolution for `concept_id` and `source_id`. Both must resolve through
+/// `resolve_uuid`'s prefix arm and return canonical full UUIDs.
+#[tokio::test]
+async fn cite_resolves_concept_and_source_by_unique_prefix() {
+    let f = pack(rt());
+
+    let concept = f
+        .dispatch(
+            "knowledge.learn",
+            json!({ "name": "QuaRot", "domain": "quantization" }),
+        )
+        .await
+        .expect("learn concept");
+    let paper = f
+        .dispatch(
+            "create",
+            json!({
+                "kind": "document",
+                "name": "Ashkboos et al. 2024",
+                "description": "QuaRot paper — covering concepts techniques algorithms implementations applications use cases and design patterns in detail — covering"
+            }),
+        )
+        .await
+        .expect("create document");
+
+    let concept_full = concept["full_id"].as_str().unwrap();
+    let source_full = paper["id"].as_str().unwrap();
+    let concept_prefix = &concept_full[..8];
+    let source_prefix = &source_full[..8];
+
+    let resp = f
+        .dispatch(
+            "knowledge.cite",
+            json!({
+                "concept_id": concept_prefix,
+                "source_id": source_prefix,
+                "weight": 0.7
+            }),
+        )
+        .await
+        .expect("prefixes must resolve on both cite parameters");
+
+    assert_eq!(resp["concept_id"], concept_full);
+    assert_eq!(resp["source_id"], source_full);
 }
 
 #[tokio::test]
@@ -1278,6 +1326,343 @@ async fn list_respects_limit_and_offset() {
     );
 }
 
+/// #1671: a full offset sweep over `knowledge.list` must enumerate every atom
+/// exactly once — no duplicates, no misses across page boundaries — even when
+/// all atoms share one `created_at` value (the column the primary sort key
+/// uses), which this test forces via a direct SQL update.
+///
+/// The sweep also asserts the concatenated pages follow the documented
+/// `created_at DESC, id DESC` order: with one shared `created_at` that is
+/// `id DESC`, and uniqueness alone would still pass with a wrong tiebreak
+/// direction.
+#[tokio::test]
+async fn list_offset_sweep_covers_all_atoms_exactly_once() {
+    let rt = rt();
+    let f = pack(rt.clone());
+    let content = "dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity";
+    for chunk in 0..7 {
+        let atoms: Vec<Value> = (0..17)
+            .map(|i| {
+                let n = chunk * 17 + i;
+                json!({ "slug": format!("sweep-{n:03}"), "name": format!("Sweep {n}"), "content": content })
+            })
+            .collect();
+        f.dispatch("knowledge.upsert_atoms", json!({ "atoms": atoms }))
+            .await
+            .expect("upsert");
+    }
+
+    // Force every atom onto one shared `created_at` so the sweep exercises the
+    // tiebreak path; otherwise unique microsecond timestamps would let the
+    // test pass even without the `id` tiebreak.
+    let shared_created_at = 1_750_000_000_000_000_i64;
+    {
+        let sql = rt.sql();
+        let mut writer = sql.writer().await.expect("sql writer must open");
+        writer
+            .execute(SqlStatement {
+                sql: "UPDATE knowledge_atoms SET created_at = ?1".into(),
+                params: vec![SqlValue::Integer(shared_created_at)],
+                label: None,
+            })
+            .await
+            .expect("force shared created_at");
+    }
+
+    let mut seen = std::collections::HashSet::new();
+    let mut ordered_ids: Vec<String> = Vec::new();
+    let mut offset = 0_u64;
+    let page_size = 13_u64;
+    loop {
+        let page = f
+            .dispatch(
+                "knowledge.list",
+                json!({ "limit": page_size, "offset": offset }),
+            )
+            .await
+            .expect("list page");
+        let results = page["results"].as_array().expect("results array");
+        if results.is_empty() {
+            break;
+        }
+        for row in results {
+            let id = row["id"].as_str().expect("atom id").to_string();
+            assert!(seen.insert(id.clone()), "duplicate id across pages: {id}");
+            ordered_ids.push(id);
+        }
+        offset += results.len() as u64;
+    }
+    assert_eq!(
+        seen.len(),
+        7 * 17,
+        "sweep must cover every atom exactly once"
+    );
+    // With one shared `created_at` the documented `created_at DESC, id DESC`
+    // order is exactly `id DESC`, so the pages concatenated must be the id
+    // list sorted descending.
+    let mut expected_order: Vec<String> = seen.iter().cloned().collect();
+    expected_order.sort_unstable_by(|a, b| b.cmp(a));
+    assert_eq!(
+        ordered_ids, expected_order,
+        "sweep pages must appear in created_at DESC, id DESC order"
+    );
+}
+
+/// #1671: `knowledge.list(kind="domain")` pages over
+/// `created_at DESC, id DESC`. Seed domains, force one shared `created_at`
+/// via direct SQL so the `id` tiebreak is load-bearing, then sweep with a
+/// small limit and assert no duplicates, no misses, AND the exact
+/// `id DESC` order (one shared timestamp reduces the documented order to it).
+#[tokio::test]
+async fn list_domains_offset_sweep_covers_equal_created_at_in_order() {
+    let rt = rt();
+    let f = pack(rt.clone());
+    let content = "dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity";
+    for n in 0..37 {
+        f.dispatch(
+            "knowledge.upsert_domains",
+            json!({ "domains": [{ "slug": format!("dom-{n:03}"), "name": format!("Domain {n}"), "description": content }] }),
+        )
+        .await
+        .expect("upsert domain");
+    }
+
+    // Force every domain onto one shared `created_at` so the sweep exercises
+    // the tiebreak path; otherwise unique microsecond timestamps would let
+    // the test pass even without the `id` tiebreak.
+    let shared_created_at = 1_750_000_000_000_000_i64;
+    {
+        let sql = rt.sql();
+        let mut writer = sql.writer().await.expect("sql writer must open");
+        writer
+            .execute(SqlStatement {
+                sql: "UPDATE knowledge_domains SET created_at = ?1".into(),
+                params: vec![SqlValue::Integer(shared_created_at)],
+                label: None,
+            })
+            .await
+            .expect("force shared created_at");
+    }
+
+    let mut seen = std::collections::HashSet::new();
+    let mut ordered_ids: Vec<String> = Vec::new();
+    let mut offset = 0_u64;
+    let page_size = 9_u64;
+    loop {
+        let page = f
+            .dispatch(
+                "knowledge.list",
+                json!({ "kind": "domain", "limit": page_size, "offset": offset }),
+            )
+            .await
+            .expect("list domains page");
+        let results = page["results"].as_array().expect("results array");
+        if results.is_empty() {
+            break;
+        }
+        for row in results {
+            let id = row["id"].as_str().expect("domain id").to_string();
+            assert!(seen.insert(id.clone()), "duplicate id across pages: {id}");
+            ordered_ids.push(id);
+        }
+        offset += results.len() as u64;
+    }
+    assert_eq!(
+        seen.len(),
+        37,
+        "domain sweep must cover every domain exactly once"
+    );
+    // One shared `created_at` reduces the documented `created_at DESC,
+    // id DESC` order to `id DESC`, so the pages concatenated must be the id
+    // list sorted descending.
+    let mut expected_order: Vec<String> = seen.iter().cloned().collect();
+    expected_order.sort_unstable_by(|a, b| b.cmp(a));
+    assert_eq!(
+        ordered_ids, expected_order,
+        "domain sweep pages must appear in created_at DESC, id DESC order"
+    );
+}
+
+/// #1671: the batch re-embed sweep in `knowledge.index` pages the full atom
+/// table with `created_at ASC, id ASC`. A recording embedder captures the
+/// texts in the order the pages deliver them; with every atom forced onto
+/// one shared `created_at` (so the `id` tiebreak is load-bearing), the
+/// recorded sequence must equal every atom exactly once in `id ASC` order —
+/// no duplicates, no misses, and the exact documented order.
+#[tokio::test]
+async fn index_reembed_paging_sweep_covers_equal_created_at_in_order() {
+    use async_trait::async_trait;
+    use khive_runtime::{AllowAllGate, BackendId, EmbedderProvider, RuntimeConfig};
+    use khive_types::Namespace;
+    use lattice_embed::{EmbedError, EmbeddingModel, EmbeddingService};
+
+    const MODEL_KEY: &str = "all-minilm-l6-v2";
+    const DIM: usize = 384;
+
+    /// Records every text it is asked to embed, in call order, and returns a
+    /// fixed vector per text so the vector write succeeds.
+    struct RecordingEmbedService {
+        recorded: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[async_trait]
+    impl EmbeddingService for RecordingEmbedService {
+        async fn embed(
+            &self,
+            texts: &[String],
+            _model: EmbeddingModel,
+        ) -> std::result::Result<Vec<Vec<f32>>, EmbedError> {
+            self.recorded
+                .lock()
+                .expect("recorded lock")
+                .extend(texts.iter().cloned());
+            Ok(texts.iter().map(|_| vec![0.5f32; DIM]).collect())
+        }
+
+        fn supports_model(&self, _model: EmbeddingModel) -> bool {
+            true
+        }
+
+        fn name(&self) -> &'static str {
+            "recording-embed-service"
+        }
+    }
+
+    struct RecordingEmbedProvider {
+        recorded: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[async_trait]
+    impl EmbedderProvider for RecordingEmbedProvider {
+        fn name(&self) -> &str {
+            MODEL_KEY
+        }
+
+        fn dimensions(&self) -> usize {
+            DIM
+        }
+
+        async fn build(
+            &self,
+        ) -> std::result::Result<Arc<dyn EmbeddingService>, khive_runtime::RuntimeError> {
+            Ok(Arc::new(RecordingEmbedService {
+                recorded: Arc::clone(&self.recorded),
+            }))
+        }
+    }
+
+    let recorded = Arc::new(Mutex::new(Vec::<String>::new()));
+    let rt = KhiveRuntime::new(RuntimeConfig {
+        git_write: Default::default(),
+        db_path: None,
+        default_namespace: Namespace::local(),
+        embedding_model: Some(EmbeddingModel::AllMiniLmL6V2),
+        additional_embedding_models: vec![],
+        gate: Arc::new(AllowAllGate),
+        packs: vec!["kg".to_string(), "knowledge".to_string()],
+        backend_id: BackendId::main(),
+        brain_profile: None,
+        visible_namespaces: vec![],
+        allowed_outbound_namespaces: vec![],
+        actor_id: None,
+    })
+    .expect("runtime");
+    rt.register_embedder(RecordingEmbedProvider {
+        recorded: Arc::clone(&recorded),
+    });
+    let f = pack(rt.clone());
+
+    let content = "dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity";
+    for n in 0..31 {
+        f.dispatch(
+            "knowledge.upsert_atoms",
+            json!({ "atoms": [{ "slug": format!("reembed-{n:03}"), "name": format!("ReEmbed {n:03}"), "content": content }] }),
+        )
+        .await
+        .expect("upsert atom");
+    }
+
+    // Force every atom onto one shared `created_at` so the paging sweep
+    // exercises the tiebreak path; otherwise unique microsecond timestamps
+    // would let the test pass even without the `id` tiebreak.
+    let shared_created_at = 1_750_000_000_000_000_i64;
+    {
+        let sql = rt.sql();
+        let mut writer = sql.writer().await.expect("sql writer must open");
+        writer
+            .execute(SqlStatement {
+                sql: "UPDATE knowledge_atoms SET created_at = ?1".into(),
+                params: vec![SqlValue::Integer(shared_created_at)],
+                label: None,
+            })
+            .await
+            .expect("force shared created_at");
+    }
+    // One shared `created_at` reduces the documented `created_at ASC,
+    // id ASC` page order to `id ASC`; read (name, id) straight from the
+    // table and sort by id in Rust rather than re-deriving with SQL. The
+    // writer guard above is dropped before this reader opens.
+    let expected_names: Vec<String> = {
+        let sql = rt.sql();
+        let mut reader = sql.reader().await.expect("sql reader must open");
+        let rows = reader
+            .query_all(SqlStatement {
+                sql: "SELECT id, name FROM knowledge_atoms WHERE deleted_at IS NULL".into(),
+                params: vec![],
+                label: None,
+            })
+            .await
+            .expect("read atom rows");
+        let mut pairs: Vec<(String, String)> = rows
+            .iter()
+            .map(|row| {
+                let id = match row.get("id") {
+                    Some(SqlValue::Text(s)) => s.clone(),
+                    other => panic!("unexpected id {other:?}"),
+                };
+                let name = match row.get("name") {
+                    Some(SqlValue::Text(s)) => s.clone(),
+                    other => panic!("unexpected name {other:?}"),
+                };
+                (id, name)
+            })
+            .collect();
+        pairs.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        pairs.into_iter().map(|(_, name)| name).collect()
+    };
+    assert_eq!(expected_names.len(), 31, "all atoms must be seeded");
+
+    let result = f
+        .dispatch("knowledge.index", json!({ "batch_size": 7 }))
+        .await
+        .expect("index ok");
+    assert_eq!(
+        result["indexed"].as_u64(),
+        Some(31),
+        "every atom must be indexed by the default engine: {result:?}"
+    );
+
+    // `atom_embed_text` puts the atom name first, so the first line of each
+    // recorded text is the atom name; the concatenated pages must deliver
+    // every atom exactly once in the documented page order.
+    let recorded_names: Vec<String> = recorded
+        .lock()
+        .expect("recorded lock")
+        .iter()
+        .map(|text| {
+            text.lines()
+                .next()
+                .expect("embed text carries the atom name")
+                .to_string()
+        })
+        .collect();
+    assert_eq!(
+        recorded_names, expected_names,
+        "re-embed paging sweep must embed every atom exactly once in \
+         created_at ASC, id ASC order"
+    );
+}
+
 // ── delete_atoms ──────────────────────────────────────────────────────────────
 
 #[tokio::test]
@@ -1733,6 +2118,52 @@ async fn search_rejects_empty_query() {
         .unwrap_err();
     assert!(
         err.to_string().contains("query must not be empty"),
+        "got: {err}"
+    );
+}
+
+#[tokio::test]
+async fn search_rejects_invalid_kind_value() {
+    let f = pack(rt());
+    let err = f
+        .dispatch(
+            "knowledge.search",
+            json!({ "query": "attention", "kind": "atoms", "rerank": false }),
+        )
+        .await
+        .expect_err("unknown kind must fail closed");
+    assert!(
+        matches!(err, RuntimeError::InvalidInput(_)),
+        "must be InvalidInput, got: {err:?}"
+    );
+    assert!(
+        err.to_string()
+            .contains("kind must be one of: atom, domain"),
+        "got: {err}"
+    );
+}
+
+#[tokio::test]
+async fn search_rejects_invalid_exclude_status_value() {
+    let f = pack(rt());
+    let err = f
+        .dispatch(
+            "knowledge.search",
+            json!({
+                "query": "attention",
+                "exclude_status": "deprectaed",
+                "rerank": false
+            }),
+        )
+        .await
+        .expect_err("unknown exclusion status must fail closed");
+    assert!(
+        matches!(err, RuntimeError::InvalidInput(_)),
+        "must be InvalidInput, got: {err:?}"
+    );
+    assert!(
+        err.to_string()
+            .contains("exclude_status must be one of: draft, reviewed, deprecated"),
         "got: {err}"
     );
 }

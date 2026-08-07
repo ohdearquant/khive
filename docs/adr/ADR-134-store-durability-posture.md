@@ -10,8 +10,8 @@
 ### What was found
 
 The store runs `synchronous=NORMAL` under WAL. It is set in the pool
-(`crates/khive-db/src/pool.rs:762`, `:787`, `:1102`) and again per store
-(`crates/khive-db/src/stores/note.rs:211`, `entity.rs:183`, `vectors.rs:250`). Every setting found
+(`crates/khive-db/src/pool.rs:956`, `:979`, `:1200`) and again per store
+(`crates/khive-db/src/stores/entity.rs:184`, `note.rs:253`, `vectors.rs:363`). Every setting found
 was `NORMAL`; no `FULL` was found, which is a search result and not a proof of absence.
 
 Under WAL, `synchronous=NORMAL` means a commit returns **without** fsyncing the WAL. The two
@@ -70,13 +70,71 @@ windows. This record fixes the posture; ADR-091 fixes how long the exposure last
 This costs no throughput and closes the part of the exposure that was genuinely alarming, which was
 that nobody had decided it.
 
-### D2 — The target posture is a forced durable sync on the accounting path specifically
+### D2 — The target posture is a forced durable sync on the obligation lane, not store-wide `FULL`
 
-The intended end state is not store-wide `FULL`. It is `NORMAL` generally with a forced durable sync
-on the accounting path, because that is the only option that serves durability and throughput at the
-same time.
+The intended end state is not store-wide `FULL`. It is `NORMAL` generally, with the accounting path
+forced to a durable sync through the same primitive the store already uses to select a posture:
+`PRAGMA synchronous=FULL`, scoped to the connection that commits the accounting-bearing row rather
+than applied to the pool as a whole. `synchronous` is a per-connection setting — SQLite does not
+require every connection open on a database to share one value — so the connection dedicated to
+obligation-lane commits (D2a) can pay the fsync on every commit it makes while every other
+connection (note, entity, vector, and the observability lane's audit writes) keeps paying nothing
+beyond `NORMAL`. Accounting is the row class whose loss creates the exposure this record exists
+for; authorization and security-audit rows share the lane as co-tenants (D2a) and receive the same
+sync as a consequence of the lane topology, not as a separately analyzed requirement.
+
+That is the trade-off this target buys against store-wide `FULL`: the fsync cost lands only on the
+commits that need the guarantee, not on the store's full write volume. It is still a real,
+per-commit cost on that one connection, and it is that cost — not the store-wide one — that D3's
+second number prices.
 
 This is a target, not an implementation, and D3 gates it.
+
+### D2a — Routing split: which connection commits an obligation-bearing row
+
+D2's target is reachable only if the rows it covers never ride the shared writer's
+transactions. ADR-133 D1/D1b commits incidental rows in contention-formed batches on **one**
+pooled writer connection, and a batch there mixes obligation-bearing and observability rows.
+A mixed batch committed at `NORMAL` would satisfy every ADR-133 write-path invariant while
+silently bypassing this record's durability target, and no reader of either ADR alone would
+see the gap. The split is therefore normative:
+
+- **Classification decides the connection, at enqueue.** ADR-133 already classifies every row
+  (obligation-bearing vs pure observability, D1; unclassified resolves strictly, D5/INV-2).
+  That classification gains a second consequence: an obligation-bearing row routes to the
+  durable-sync connection, a pure observability row to the shared writer. The match stays
+  exhaustive and wildcard-free, and an unclassified row resolves to the durable-sync
+  connection — the stricter posture — for the same reason it already resolves to the stricter
+  failure handling.
+- **The lane is the obligation class, not accounting alone — but the requirement is
+  accounting's.** The lane covers everything ADR-133 marks obligation-bearing (accounting,
+  authorization, security audit) because that classification already exists at the enqueue seam
+  and splitting the class across postures would force a third lane for no measured benefit.
+  The durable-sync **requirement** this record establishes is analyzed for accounting only
+  (D1/D4); authorization and security-audit rows ride the lane as co-tenants and receive the
+  sync as a consequence, which is the stricter direction and costs nothing beyond what the
+  lane's commit volume already pays. D3's pricing therefore measures the lane's whole commit
+  volume — the cost the connection actually pays — never accounting's share alone.
+- **The durable-sync connection is a distinct pool-owned writer**, opened with
+  `PRAGMA synchronous=FULL`, carrying no other traffic. Ownership sits with the pool, beside
+  the shared writer, so the posture is set once at open. Toggling `synchronous` around
+  individual commits on the shared connection is rejected: the setting is per-connection, a
+  toggle races with in-flight batches, and a missed reset silently re-prices every later
+  commit.
+- **Batching survives, per lane.** Obligation-bearing rows batch with obligation-bearing rows
+  under the same contention-formed rule (ADR-133 D1b's intra-process group commit, on this
+  connection); one fsync covers the whole batch commit, which is the guarantee — durable at
+  commit — not a dilution of it. Mixed batches are prevented by construction: the two lanes
+  have disjoint queues, and lane selection happens at classification, before enqueue, never
+  at commit time.
+- **The two writers serialise on SQLite's write lock.** A second writer connection is a real
+  contention cost inside one process, and it is part of what D3's measurement must price at a
+  stated concurrency level; the split is not exempt from the gate.
+
+This resolves the apparent conflict between ADR-133's one-connection description and this
+record's per-connection posture: ADR-133 D1b's mechanism is the shared lane, and the
+obligation lane is a second instance of the same mechanism on its own connection. ADR-133
+carries the matching cross-reference at D1b.
 
 ### D3 — The posture change is gated on measurement, not on argument
 
@@ -84,7 +142,10 @@ Two numbers are required before any posture change:
 
 1. Throughput delta between `NORMAL` and `FULL` on a **file-backed** store at a **stated
    concurrency level**.
-2. The cost of a forced durable sync on the accounting path alone.
+2. The commit-volume cost of the durable-sync lane — the whole obligation class (D2a), of
+   which accounting is the analyzed component — at a stated concurrency level. The lane's
+   connection pays per commit regardless of which class the batch carries, so a number
+   measured on accounting traffic alone under-prices the lane.
 
 Both must be measured on a file-backed store. An in-memory backend cannot exercise this at all, and
 a single-writer number does not transfer, because contention is the whole question.
@@ -100,6 +161,13 @@ whichever the D3 numbers favour.
 
 The condition is tied to the arrival of accounted usage rather than to a release or a calendar date,
 because the exposure begins when a record starts determining a resource-usage outcome and not before.
+
+**Prerequisite.** This decision is conditioned on ADR-133 INV-1 holding in the implementation, not
+merely in the record. A durable sync protects a committed row against loss after commit; it says
+nothing about whether that row was produced exactly once before the sync ran. A sync applied to a
+row ADR-133's write path could still duplicate makes the duplicate exactly as durable as the
+original. D4 is not satisfied by adding the sync alone — ADR-133 INV-1 must hold first, or the sync
+is protecting the wrong property.
 
 ### D5 — The loss direction is recorded, because it is why the interim window is tolerable
 
@@ -163,12 +231,16 @@ record rather than inherited from this one.
    what** — process crash and OS crash/power loss stated separately, never merged into "a crash".
 2. A measured throughput comparison between the current setting and `FULL`, on a file-backed store,
    at a stated concurrency level, so D2 is chosen against numbers.
-3. A measured cost for the targeted accounting-path sync, so the two options are compared rather
-   than one being assumed cheaper.
-4. If the accounting path is treated differently from the general path, a test asserts the
-   accounting write is durable under the configured posture — with a fixture that configures it
-   wrongly on purpose and must make the test fail. A durability test that passes against a
-   misconfigured store is measuring nothing.
+3. A measured cost for the targeted obligation-lane sync (D2a's lane, priced at its whole
+   commit volume per D3), so the two options are compared rather than one being assumed
+   cheaper.
+4. If the obligation lane is treated differently from the general path, a test asserts an
+   obligation-lane write — the accounting row as the exemplar — is durable under the configured
+   posture, with a fixture that configures it wrongly on purpose and must make the test fail. A
+   durability test that passes against a misconfigured store is measuring nothing. The test
+   also asserts lane routing: an accounting-bearing row committed through the shared writer's
+   connection must make it fail, because a correct posture on an unused connection protects
+   nothing.
 5. A check that fails when a store holding INV-1 records has an unrecorded posture, so this class is
    caught by construction rather than by an ad-hoc configuration comparison.
 

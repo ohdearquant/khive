@@ -41,6 +41,27 @@ use crate::validation::ValidationRule;
 /// [`VerbRegistry::pack_owned_note_kinds`].
 pub const GENERIC_CRUD_PACK: &str = "kg";
 
+const FULL_UUID_IDENTIFIER_HELP: &str = "A complete UUID spelling accepted by the consuming \
+    parameter directly names one globally unique record; direct UUID lookup is not a namespace \
+    search. Strict identifier responses use canonical lowercase dashed UUIDs.";
+const SHORT_PREFIX_IDENTIFIER_HELP: &str = "A short UUID prefix is at least 8 hexadecimal \
+    characters without dashes that do not parse as a complete UUID. It is a resolution, not a \
+    direct identifier; a 32-character compact UUID is complete input instead. Its lookup scope belongs to the consuming parameter: \
+    operations governed by ADR-007's by-ID contract resolve without a namespace filter, while \
+    other resolvers may search only the caller's primary namespace. A prefix can be missing or \
+    ambiguous.";
+const IDENTIFIER_PARAMETER_HELP: &str = "A parameter that requires a full UUID rejects prefixes \
+    and explains the resolution consequence. Its corresponding response field remains a \
+    canonical full UUID so the value can be submitted again.";
+
+fn identifier_resolution_help() -> Value {
+    serde_json::json!({
+        "full_uuid": FULL_UUID_IDENTIFIER_HELP,
+        "short_prefix": SHORT_PREFIX_IDENTIFIER_HELP,
+        "parameter_rule": IDENTIFIER_PARAMETER_HELP,
+    })
+}
+
 /// Pack-auxiliary schema plan.
 ///
 /// Declares `CREATE TABLE IF NOT EXISTS` statements for pack-owned tables that
@@ -525,7 +546,8 @@ impl VerbRegistryBuilder {
     /// the `tracing::info!` emission that was already present in v0.2.
     ///
     /// Callers that do not set this field continue to use tracing-only emission
-    /// (the v0.2 default). There is no behavior change for them.
+    /// (the v0.2 default), except `git.digest`: its successful response carries
+    /// a durable receipt and therefore fails safely when no store is configured.
     pub fn with_event_store(&mut self, store: Arc<dyn EventStore>) -> &mut Self {
         self.event_store = Some(store);
         self
@@ -841,6 +863,27 @@ pub struct VerbRegistry {
     reference_ring: Arc<crate::reference_ring::ReferenceRing>,
 }
 
+/// Result of an operation handled outside normal pack dispatch, paired with
+/// typed transport metadata that must survive the gate/audit boundary.
+///
+/// The canonical `result` remains the value used for audit accounting. The
+/// metadata is returned to the intercepting transport without being smuggled
+/// through a mutex side channel or folded into the verb's public result shape.
+#[derive(Debug, Clone, PartialEq)]
+pub struct InterceptedDispatchResult<M> {
+    /// Canonical verb result used for audit and resource accounting.
+    pub result: Value,
+    /// Transport-owned metadata that must accompany the canonical result.
+    pub metadata: M,
+}
+
+impl<M> InterceptedDispatchResult<M> {
+    /// Pair a canonical result with its typed transport metadata.
+    pub fn new(result: Value, metadata: M) -> Self {
+        Self { result, metadata }
+    }
+}
+
 /// Per-request identity context that overrides a [`VerbRegistry`]'s
 /// construction-baked `default_namespace` / `actor_id` / `visible_namespaces`
 /// for exactly one [`VerbRegistry::dispatch_with_identity`] call (ADR-096
@@ -877,10 +920,12 @@ pub struct RequestIdentity {
     /// never participates in the gate or token authority.
     pub process_ref: Option<String>,
     /// Caller-supplied correlation id for this request (khive#948), carried
-    /// unchanged from the daemon frame's `request_id` field. Stamped into the
-    /// audit event's `resource.request_id` on every outcome (success, error,
-    /// and denied) so a client can join its own pre-send sample to the
-    /// server-side audit row for the same request. `None` means the caller
+    /// unchanged from the daemon frame's `request_id` field. Every operation
+    /// in one batch or chain receives the same value: it is a request-group
+    /// selector, never an operation-unique id. Stamped into the audit event's
+    /// `resource.request_id` on every outcome (success, error, and denied) so
+    /// a client can join its own pre-send sample to all server-side audit rows
+    /// for that request. `None` means the caller
     /// supplied no id (a pre-#948 client, or an internal/non-benchmark
     /// caller) — the audit row then carries no `request_id` key at all.
     pub request_id: Option<u64>,
@@ -1144,6 +1189,7 @@ impl VerbRegistry {
     ///
     /// Walks registered packs for the first matching `HandlerDef` and returns a
     /// structured JSON envelope. Subhandlers carry `callable_via_mcp: false`.
+    /// Every envelope carries the shared `identifier_resolution` contract.
     /// `link`'s envelope additionally carries `endpoint_rules` — the composed
     /// per-relation source/target allowlist (issue #964) — so batch callers can
     /// defer to the kernel's own table instead of re-implementing it locally.
@@ -1177,6 +1223,7 @@ impl VerbRegistry {
                             "description": handler.description,
                             "category": category,
                             "params": params_arr,
+                            "identifier_resolution": identifier_resolution_help(),
                             "visibility": "internal",
                             "callable_via_mcp": false,
                             "note": "This is an internal subhandler. Calling it via the MCP \
@@ -1190,6 +1237,7 @@ impl VerbRegistry {
                         "description": handler.description,
                         "category": category,
                         "params": params_arr,
+                        "identifier_resolution": identifier_resolution_help(),
                     });
                     if verb == "link" {
                         envelope["endpoint_rules"] = Value::Array(edge_endpoint_table(&self.packs));
@@ -1237,7 +1285,9 @@ impl VerbRegistry {
     /// coordinator while retaining [`Self::dispatch_with_identity`]'s gate and
     /// audit lifecycle. Deny is authoritative, gate errors fail open, and an
     /// allowed audit is persisted after the intercepted operation resolves so
-    /// its outcome and duration reflect the operation result.
+    /// its outcome and duration reflect the operation result. Successful
+    /// `git.digest` interception uses the same strict durable-receipt exception
+    /// as normal pack dispatch.
     pub async fn dispatch_intercepted_with_identity<F, Fut>(
         &self,
         verb: &str,
@@ -1249,9 +1299,40 @@ impl VerbRegistry {
         F: FnOnce(Namespace) -> Fut,
         Fut: std::future::Future<Output = Result<Value, RuntimeError>>,
     {
+        self.dispatch_intercepted_with_metadata_with_identity(
+            verb,
+            params,
+            identity,
+            |namespace| async move {
+                dispatch(namespace)
+                    .await
+                    .map(|result| InterceptedDispatchResult::new(result, ()))
+            },
+        )
+        .await
+        .map(|outcome| outcome.result)
+    }
+
+    /// Gate and execute an intercepted operation whose transport needs typed
+    /// metadata in addition to the canonical verb result.
+    ///
+    /// Audit accounting always receives `outcome.result`; `outcome.metadata`
+    /// crosses the dispatch seam unchanged for the transport to place beside
+    /// that result in its own envelope.
+    pub async fn dispatch_intercepted_with_metadata_with_identity<M, F, Fut>(
+        &self,
+        verb: &str,
+        params: &Value,
+        identity: Option<&RequestIdentity>,
+        dispatch: F,
+    ) -> Result<InterceptedDispatchResult<M>, RuntimeError>
+    where
+        F: FnOnce(Namespace) -> Fut,
+        Fut: std::future::Future<Output = Result<InterceptedDispatchResult<M>, RuntimeError>>,
+    {
         let request_id = identity.and_then(|id| id.request_id);
         let gate_req = self.gate_request_with_identity(verb, params, identity)?;
-        let deferred_audit = match self.gate.check(&gate_req) {
+        let mut deferred_audit = match self.gate.check(&gate_req) {
             Ok(decision) => {
                 let audit = AuditEvent::from_check(&gate_req, &decision, self.gate.impl_name());
                 tracing::info!(
@@ -1283,18 +1364,61 @@ impl VerbRegistry {
         };
 
         let started = Instant::now();
-        let result = dispatch(gate_req.namespace.clone()).await;
+        let mut result = dispatch(gate_req.namespace.clone()).await;
         let duration_us = started.elapsed().as_micros() as i64;
-        if let Some(audit) = deferred_audit {
-            self.persist_intercepted_audit(
-                verb,
+        let receipt_outcome = if verb == "git.digest" && result.is_ok() {
+            let resource = result.as_ref().ok().map(|outcome| {
+                crate::cost_unit::resource_payload(
+                    verb,
+                    &gate_req.args,
+                    &outcome.result,
+                    || 0,
+                    request_id,
+                )
+            });
+            // The receipt helper operates on the canonical verb result. Move
+            // that value out temporarily so it can turn receipt failures into
+            // the outer dispatch error without discarding successful typed
+            // transport metadata.
+            let mut receipt_result: Result<Value, RuntimeError> = match result.as_mut() {
+                Ok(outcome) => Ok(std::mem::take(&mut outcome.result)),
+                Err(_) => unreachable!("git.digest receipt path is guarded by result.is_ok()"),
+            };
+            let outcome = persist_git_digest_receipt(
+                self.event_store.as_ref(),
                 &gate_req,
-                audit,
-                &result,
+                deferred_audit.as_ref(),
+                &mut receipt_result,
                 duration_us,
-                request_id,
+                resource,
             )
             .await;
+            match receipt_result {
+                Ok(receipted_result) => {
+                    if let Ok(intercepted) = &mut result {
+                        intercepted.result = receipted_result;
+                    }
+                }
+                Err(error) => result = Err(error),
+            }
+            Some(outcome)
+        } else {
+            None
+        };
+        if receipt_outcome.is_none()
+            || receipt_outcome == Some(GitDigestReceiptOutcome::BuildRejected)
+        {
+            if let Some(audit) = deferred_audit.take() {
+                self.persist_intercepted_audit(
+                    verb,
+                    &gate_req,
+                    audit,
+                    result.as_ref().map(|outcome| &outcome.result),
+                    duration_us,
+                    request_id,
+                )
+                .await;
+            }
         }
         result
     }
@@ -1304,7 +1428,7 @@ impl VerbRegistry {
         verb: &str,
         gate_req: &GateRequest,
         audit: AuditEvent,
-        result: &Result<Value, RuntimeError>,
+        result: Result<&Value, &RuntimeError>,
         duration_us: i64,
         request_id: Option<u64>,
     ) {
@@ -1500,10 +1624,12 @@ impl VerbRegistry {
                 // have no dispatch to wait for and keep the immediate v1
                 // append below.
                 //
-                // Accepted trade-off: a crash between this Allow decision and
-                // the deferred append below (post-dispatch, further down this
-                // function) loses that dispatch's audit row entirely: a
-                // deliberate choice, not an oversight.
+                // Accepted trade-off for ordinary verbs: a crash between this
+                // Allow decision and the deferred append loses the audit row.
+                // `git.digest` narrows the caller-visible contract below: it
+                // never returns success until the deferred receipt append is
+                // confirmed, though a process crash can still leave committed
+                // ingest writes with no response and no completed receipt.
                 let defer_audit = !is_deny;
 
                 // Persist to EventStore immediately only for denied calls.
@@ -1634,8 +1760,39 @@ impl VerbRegistry {
                     params
                 };
                 let dispatch_start = Instant::now();
-                let result = pack.dispatch(verb, params, self, &token).await;
+                let mut result = pack.dispatch(verb, params, self, &token).await;
                 let dispatch_us = dispatch_start.elapsed().as_micros() as i64;
+
+                // Unlike ordinary audit rows, a successful `git.digest`
+                // response is returned only after its complete report has
+                // been durably persisted as a schema-v2 audit receipt. The
+                // receipt helper borrows the deferred audit row so malformed
+                // handler output can still fall back to one generic Error
+                // audit. Handler errors use that same ordinary path below.
+                let git_digest_receipt_outcome = if verb == "git.digest" && result.is_ok() {
+                    let resource = result.as_ref().ok().map(|value| {
+                        crate::cost_unit::resource_payload(
+                            verb,
+                            &gate_req.args,
+                            value,
+                            || pack.registered_embedding_model_names().len() as i64,
+                            request_id,
+                        )
+                    });
+                    Some(
+                        persist_git_digest_receipt(
+                            self.event_store.as_ref(),
+                            &gate_req,
+                            deferred_audit.as_ref(),
+                            &mut result,
+                            dispatch_us,
+                            resource,
+                        )
+                        .await,
+                    )
+                } else {
+                    None
+                };
 
                 // Append the deferred Allow-outcome audit row now that
                 // dispatch has resolved, so `duration_us` carries the
@@ -1645,7 +1802,9 @@ impl VerbRegistry {
                 // cannot be enriched, or is not a singleton `link` call,
                 // falls back to the generic v1 audit shape so no audit row
                 // is ever dropped for the deferred path.
-                if let Some(audit) = deferred_audit.take() {
+                let needs_generic_audit = git_digest_receipt_outcome.is_none()
+                    || git_digest_receipt_outcome == Some(GitDigestReceiptOutcome::BuildRejected);
+                if let (true, Some(audit)) = (needs_generic_audit, deferred_audit.take()) {
                     if let Some(store) = &self.event_store {
                         let is_link_singleton =
                             verb == "link" && gate_req.args.get("links").is_none();
@@ -2708,11 +2867,146 @@ pub(crate) fn audit_append_failure_count() -> u64 {
     AUDIT_APPEND_FAILURES.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+const GIT_DIGEST_RECEIPT_FAILURE: &str =
+    "git_digest_receipt_persist_failed: git.digest writes may have committed, but no durable \
+     success receipt was confirmed; inspect ingest state before retrying";
+
+/// Tells the dispatch seam whether it should consume the deferred audit or
+/// reuse it for the ordinary generic Error row.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GitDigestReceiptOutcome {
+    /// The schema-v2 receipt landed; no second audit row may be appended.
+    Persisted,
+    /// The handler's nominal success could not be shaped into a receipt. The
+    /// helper has converted it to an error, and the original audit remains
+    /// available for one generic Error row.
+    BuildRejected,
+    /// Persistence could not be attempted or its append failed. A second
+    /// best-effort append would either be impossible or duplicate the same
+    /// known store failure, so the caller must not retry it here.
+    PersistenceUnavailable,
+}
+
+/// Persist the complete successful `git.digest` report as a schema-v2 audit
+/// event and add that event's UUID to the returned report as `receipt_id`.
+///
+/// This is intentionally strict while every other dispatch audit remains
+/// best-effort: a caller must never receive an unqualified digest success if
+/// response loss would leave it unable to recover the exact per-pass report.
+/// Missing audit/store configuration, an invalid handler report, or an append
+/// failure therefore replaces the handler success with a stable safe error.
+/// The error does not expose storage paths, source URLs, or command stderr and
+/// explicitly warns that ingest writes may already have committed.
+async fn persist_git_digest_receipt(
+    store: Option<&Arc<dyn EventStore>>,
+    gate_req: &GateRequest,
+    audit: Option<&AuditEvent>,
+    result: &mut Result<Value, RuntimeError>,
+    duration_us: i64,
+    resource: Option<Value>,
+) -> GitDigestReceiptOutcome {
+    let Ok(report) = result else {
+        return GitDigestReceiptOutcome::PersistenceUnavailable;
+    };
+    let Some(store) = store else {
+        tracing::error!(
+            verb = "git.digest",
+            "durable receipt store is not configured"
+        );
+        *result = Err(RuntimeError::Internal(GIT_DIGEST_RECEIPT_FAILURE.into()));
+        return GitDigestReceiptOutcome::PersistenceUnavailable;
+    };
+    let Some(audit) = audit else {
+        tracing::error!(
+            verb = "git.digest",
+            "durable receipt cannot be built because the gate produced no audit decision"
+        );
+        *result = Err(RuntimeError::Internal(GIT_DIGEST_RECEIPT_FAILURE.into()));
+        return GitDigestReceiptOutcome::PersistenceUnavailable;
+    };
+
+    let Some(report_object) = report.as_object_mut() else {
+        tracing::error!(
+            verb = "git.digest",
+            "digest handler returned a non-object report"
+        );
+        *result = Err(RuntimeError::Internal(GIT_DIGEST_RECEIPT_FAILURE.into()));
+        return GitDigestReceiptOutcome::BuildRejected;
+    };
+    let Some(project_id) = report_object
+        .get("project_id")
+        .and_then(Value::as_str)
+        .and_then(|raw| raw.parse::<uuid::Uuid>().ok())
+    else {
+        tracing::error!(
+            verb = "git.digest",
+            "digest handler report omitted a valid project_id"
+        );
+        *result = Err(RuntimeError::Internal(GIT_DIGEST_RECEIPT_FAILURE.into()));
+        return GitDigestReceiptOutcome::BuildRejected;
+    };
+
+    // Allocate the event first so the exact durable key can be embedded in
+    // both the caller-visible report and the report snapshot stored in it.
+    let mut event = Event::new(
+        gate_req.namespace.as_str(),
+        gate_req.verb.as_str(),
+        EventKind::Audit,
+        SubstrateKind::Event,
+        format!("{}:{}", gate_req.actor.kind, gate_req.actor.id),
+    )
+    .with_outcome(EventOutcome::Success)
+    .with_target(project_id)
+    .with_payload_schema_version(2)
+    .with_duration_us(duration_us);
+    let receipt_id = event.id;
+    report_object.insert(
+        "receipt_id".to_string(),
+        Value::String(receipt_id.to_string()),
+    );
+
+    let mut payload = serde_json::to_value(audit).unwrap_or_else(|serialize_err| {
+        tracing::error!(
+            verb = "git.digest",
+            error = %serialize_err,
+            "failed to serialize gate audit for durable digest receipt"
+        );
+        Value::Null
+    });
+    let Value::Object(payload_object) = &mut payload else {
+        tracing::error!(
+            verb = "git.digest",
+            "gate audit serialization did not produce an object"
+        );
+        *result = Err(RuntimeError::Internal(GIT_DIGEST_RECEIPT_FAILURE.into()));
+        return GitDigestReceiptOutcome::BuildRejected;
+    };
+    if let Some(resource) = resource {
+        payload_object.insert("resource".to_string(), resource);
+    }
+    payload_object.insert("result".to_string(), report.clone());
+    event.payload = payload;
+
+    if let Err(store_err) = store.append_event(event).await {
+        AUDIT_APPEND_FAILURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        tracing::error!(
+            verb = "git.digest",
+            error = %store_err,
+            receipt_id = %receipt_id,
+            "durable digest receipt append failed"
+        );
+        *result = Err(RuntimeError::Internal(GIT_DIGEST_RECEIPT_FAILURE.into()));
+        return GitDigestReceiptOutcome::PersistenceUnavailable;
+    }
+    GitDigestReceiptOutcome::Persisted
+}
+
 /// Append an audit event, logging and swallowing store failures.
 ///
-/// Audit persistence is best-effort everywhere in the dispatch path: a store
-/// write failure must never fail the verb call it is auditing. Every swallowed
-/// failure increments the process-wide diagnostics counter above.
+/// Ordinary audit persistence is best-effort: a store write failure must not
+/// fail the verb call it is auditing. `git.digest` success receipts use the
+/// strict helper above instead. Every swallowed failure increments the
+/// process-wide diagnostics counter above.
 async fn append_audit_event_best_effort(store: &Arc<dyn EventStore>, event: Event, verb: &str) {
     if let Err(store_err) = store.append_event(event).await {
         AUDIT_APPEND_FAILURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -4342,6 +4636,114 @@ mod tests {
     };
     use khive_types::EventOutcome;
 
+    /// Minimal stand-in for the Git pack: the receipt contract belongs to the
+    /// runtime dispatch seam, so these tests do not need a git repository or
+    /// any Git-pack dependency.
+    struct GitDigestResultPack {
+        project_id: uuid::Uuid,
+    }
+
+    impl Pack for GitDigestResultPack {
+        const NAME: &'static str = "git";
+        const NOTE_KINDS: &'static [&'static str] = &[];
+        const ENTITY_KINDS: &'static [&'static str] = &[];
+        const HANDLERS: &'static [HandlerDef] = &[HandlerDef {
+            name: "git.digest",
+            description: "return a deterministic digest report",
+            visibility: Visibility::Verb,
+            category: VerbCategory::Assertive,
+            params: &[],
+        }];
+    }
+
+    #[async_trait]
+    impl PackRuntime for GitDigestResultPack {
+        fn name(&self) -> &str {
+            Self::NAME
+        }
+        fn note_kinds(&self) -> &'static [&'static str] {
+            Self::NOTE_KINDS
+        }
+        fn entity_kinds(&self) -> &'static [&'static str] {
+            Self::ENTITY_KINDS
+        }
+        fn handlers(&self) -> &'static [HandlerDef] {
+            Self::HANDLERS
+        }
+        async fn dispatch(
+            &self,
+            _verb: &str,
+            _params: Value,
+            _registry: &VerbRegistry,
+            _token: &NamespaceToken,
+        ) -> Result<Value, RuntimeError> {
+            Ok(serde_json::json!({
+                "project_id": self.project_id,
+                "project_created": false,
+                "commits_ingested": 2,
+                "commits_skipped_existing": 1,
+                "issues_ingested": 3,
+                "issues_skipped_existing": 4,
+                "prs_ingested": 5,
+                "prs_skipped_existing": 6,
+                "done": true,
+                "history_exhausted": true,
+                "sources": {
+                    "commits": {"state": "completed"},
+                    "issues": {"state": "completed"},
+                    "pull_requests": {"state": "completed"}
+                },
+                "warnings": []
+            }))
+        }
+    }
+
+    /// A nominally successful handler with an invalid receipt identity. The
+    /// runtime must turn this into an error without consuming its generic
+    /// audit fallback.
+    struct MalformedGitDigestResultPack;
+
+    impl Pack for MalformedGitDigestResultPack {
+        const NAME: &'static str = "malformed-git";
+        const NOTE_KINDS: &'static [&'static str] = &[];
+        const ENTITY_KINDS: &'static [&'static str] = &[];
+        const HANDLERS: &'static [HandlerDef] = &[HandlerDef {
+            name: "git.digest",
+            description: "return a malformed digest report",
+            visibility: Visibility::Verb,
+            category: VerbCategory::Assertive,
+            params: &[],
+        }];
+    }
+
+    #[async_trait]
+    impl PackRuntime for MalformedGitDigestResultPack {
+        fn name(&self) -> &str {
+            Self::NAME
+        }
+        fn note_kinds(&self) -> &'static [&'static str] {
+            Self::NOTE_KINDS
+        }
+        fn entity_kinds(&self) -> &'static [&'static str] {
+            Self::ENTITY_KINDS
+        }
+        fn handlers(&self) -> &'static [HandlerDef] {
+            Self::HANDLERS
+        }
+        async fn dispatch(
+            &self,
+            _verb: &str,
+            _params: Value,
+            _registry: &VerbRegistry,
+            _token: &NamespaceToken,
+        ) -> Result<Value, RuntimeError> {
+            Ok(serde_json::json!({
+                "project_id": "not-a-uuid",
+                "done": true,
+            }))
+        }
+    }
+
     /// In-memory EventStore for unit tests — avoids file-backed SQLite.
     #[derive(Default, Debug)]
     struct MemoryEventStore {
@@ -4398,6 +4800,286 @@ mod tests {
         async fn count_events(&self, _filter: EventFilter) -> khive_storage::StorageResult<u64> {
             Ok(self.events.lock().unwrap().len() as u64)
         }
+    }
+
+    fn only_git_digest_event(store: &MemoryEventStore) -> Event {
+        let events: Vec<Event> = store
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|event| event.verb == "git.digest")
+            .cloned()
+            .collect();
+        assert_eq!(
+            events.len(),
+            1,
+            "expected exactly one git.digest receipt event"
+        );
+        events[0].clone()
+    }
+
+    #[tokio::test]
+    async fn git_digest_success_returns_complete_durable_receipt() {
+        let project_id = uuid::Uuid::new_v4();
+        let store = Arc::new(MemoryEventStore::default());
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(GitDigestResultPack { project_id });
+        builder.with_event_store(store.clone());
+        let registry = builder.build().expect("registry builds");
+
+        let result = registry
+            .dispatch_with_identity(
+                "git.digest",
+                serde_json::json!({
+                    "source": "https://user:SECRET@example.invalid/org/repo",
+                }),
+                Some(RequestIdentity {
+                    namespace: Namespace::local().as_str().to_string(),
+                    request_id: Some(1_510),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .expect("durably receipted digest succeeds");
+        let receipt_id = result["receipt_id"]
+            .as_str()
+            .and_then(|raw| raw.parse::<uuid::Uuid>().ok())
+            .expect("response has UUID receipt_id");
+
+        let event = only_git_digest_event(&store);
+        assert_eq!(event.id, receipt_id);
+        assert_eq!(event.target_id, Some(project_id));
+        assert_eq!(event.verb, "git.digest");
+        assert_eq!(event.outcome, EventOutcome::Success);
+        assert_eq!(event.payload_schema_version, 2);
+        assert_eq!(event.payload["result"], result);
+        assert_eq!(event.payload["resource"]["request_id"], 1_510);
+        assert_eq!(event.payload["result"]["commits_ingested"], 2);
+        assert_eq!(event.payload["result"]["issues_ingested"], 3);
+        assert_eq!(event.payload["result"]["prs_ingested"], 5);
+        assert!(
+            !event.payload.to_string().contains("SECRET"),
+            "receipt must not persist the caller's source URL or credentials"
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_git_digest_report_appends_one_generic_error_audit() {
+        let store = Arc::new(MemoryEventStore::default());
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(MalformedGitDigestResultPack);
+        builder.with_event_store(store.clone());
+        let registry = builder.build().expect("registry builds");
+
+        let err = registry
+            .dispatch("git.digest", serde_json::json!({}))
+            .await
+            .expect_err("malformed receipt identity must fail the response");
+        assert!(matches!(
+            err,
+            RuntimeError::Internal(ref message)
+                if message.starts_with("git_digest_receipt_persist_failed:")
+        ));
+
+        let event = only_git_digest_event(&store);
+        assert_eq!(event.outcome, EventOutcome::Error);
+        assert_eq!(event.payload_schema_version, 1);
+        assert!(
+            event.payload.get("result").is_none(),
+            "a generic Error audit must not masquerade as a success receipt"
+        );
+        let audit: AuditEvent =
+            serde_json::from_value(event.payload).expect("generic payload remains an AuditEvent");
+        assert_eq!(audit.verb, "git.digest");
+        assert_eq!(audit.decision, AuditDecision::Allow);
+    }
+
+    #[tokio::test]
+    #[serial(audit_append_failures)]
+    async fn git_digest_receipt_append_failure_never_returns_unqualified_success() {
+        let before = audit_append_failure_count();
+        let store = Arc::new(MemoryEventStore {
+            fail_appends: true,
+            ..MemoryEventStore::default()
+        });
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(GitDigestResultPack {
+            project_id: uuid::Uuid::new_v4(),
+        });
+        builder.with_event_store(store);
+        let registry = builder.build().expect("registry builds");
+
+        let err = registry
+            .dispatch("git.digest", serde_json::json!({}))
+            .await
+            .expect_err("receipt persistence failure must fail the response");
+        assert!(
+            matches!(&err, RuntimeError::Internal(message)
+                if message.starts_with("git_digest_receipt_persist_failed:")
+                    && message.contains("writes may have committed")),
+            "error is stable, safe, and retry-aware: {err}"
+        );
+        assert_eq!(audit_append_failure_count(), before + 1);
+    }
+
+    #[tokio::test]
+    async fn git_digest_without_event_store_fails_safe_after_handler_success() {
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(GitDigestResultPack {
+            project_id: uuid::Uuid::new_v4(),
+        });
+        let registry = builder.build().expect("registry builds");
+
+        let err = registry
+            .dispatch("git.digest", serde_json::json!({}))
+            .await
+            .expect_err("a successful digest needs a durable store");
+        assert!(matches!(
+            err,
+            RuntimeError::Internal(ref message)
+                if message.starts_with("git_digest_receipt_persist_failed:")
+        ));
+    }
+
+    #[tokio::test]
+    async fn git_digest_gate_fail_open_cannot_bypass_the_receipt_contract() {
+        #[derive(Debug)]
+        struct FailingGate;
+        impl Gate for FailingGate {
+            fn check(&self, _req: &GateRequest) -> Result<GateDecision, khive_gate::GateError> {
+                Err(khive_gate::GateError::Internal(
+                    "injected gate failure".into(),
+                ))
+            }
+        }
+
+        let store = Arc::new(MemoryEventStore::default());
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(GitDigestResultPack {
+            project_id: uuid::Uuid::new_v4(),
+        });
+        builder.with_gate(Arc::new(FailingGate));
+        builder.with_event_store(store.clone());
+        let registry = builder.build().expect("registry builds");
+
+        let err = registry
+            .dispatch("git.digest", serde_json::json!({}))
+            .await
+            .expect_err("no gate audit means no complete receipt");
+        assert!(matches!(
+            err,
+            RuntimeError::Internal(ref message)
+                if message.starts_with("git_digest_receipt_persist_failed:")
+        ));
+        assert!(
+            store.events.lock().unwrap().is_empty(),
+            "a missing gate decision must not fabricate an audit receipt"
+        );
+    }
+
+    #[tokio::test]
+    async fn intercepted_git_digest_uses_the_same_receipt_contract() {
+        let project_id = uuid::Uuid::new_v4();
+        let store = Arc::new(MemoryEventStore::default());
+        let mut builder = VerbRegistryBuilder::new();
+        builder.with_event_store(store.clone());
+        let registry = builder.build().expect("registry builds");
+
+        let result = registry
+            .dispatch_intercepted_with_identity(
+                "git.digest",
+                &serde_json::json!({}),
+                Some(&RequestIdentity {
+                    namespace: Namespace::local().as_str().to_string(),
+                    request_id: Some(1_647),
+                    ..Default::default()
+                }),
+                |_namespace| async move {
+                    Ok(serde_json::json!({
+                        "project_id": project_id,
+                        "commits_ingested": 7,
+                        "done": true,
+                    }))
+                },
+            )
+            .await
+            .expect("intercepted digest is durably receipted");
+
+        let event = only_git_digest_event(&store);
+        assert_eq!(result["receipt_id"], serde_json::json!(event.id));
+        assert_eq!(event.payload["result"], result);
+        assert_eq!(event.payload["resource"]["request_id"], 1_647);
+    }
+
+    #[tokio::test]
+    async fn intercepted_git_digest_receipt_preserves_typed_metadata() {
+        let project_id = uuid::Uuid::new_v4();
+        let store = Arc::new(MemoryEventStore::default());
+        let mut builder = VerbRegistryBuilder::new();
+        builder.with_event_store(store.clone());
+        let registry = builder.build().expect("registry builds");
+
+        let outcome = registry
+            .dispatch_intercepted_with_metadata_with_identity(
+                "git.digest",
+                &serde_json::json!({}),
+                None,
+                |_namespace| async move {
+                    Ok(InterceptedDispatchResult::new(
+                        serde_json::json!({
+                            "project_id": project_id,
+                            "commits_ingested": 3,
+                            "done": true,
+                        }),
+                        vec!["backend-a".to_string(), "backend-b".to_string()],
+                    ))
+                },
+            )
+            .await
+            .expect("metadata-bearing digest is durably receipted");
+
+        let event = only_git_digest_event(&store);
+        assert_eq!(outcome.result["receipt_id"], serde_json::json!(event.id));
+        assert_eq!(event.payload["result"], outcome.result);
+        assert_eq!(outcome.metadata, ["backend-a", "backend-b"]);
+    }
+
+    #[tokio::test]
+    async fn intercepted_malformed_git_digest_appends_one_generic_error_audit() {
+        let store = Arc::new(MemoryEventStore::default());
+        let mut builder = VerbRegistryBuilder::new();
+        builder.with_event_store(store.clone());
+        let registry = builder.build().expect("registry builds");
+
+        let err = registry
+            .dispatch_intercepted_with_identity(
+                "git.digest",
+                &serde_json::json!({}),
+                None,
+                |_namespace| async {
+                    Ok(serde_json::json!({
+                        "project_id": "not-a-uuid",
+                        "done": true,
+                    }))
+                },
+            )
+            .await
+            .expect_err("malformed intercepted receipt must fail the response");
+        assert!(matches!(
+            err,
+            RuntimeError::Internal(ref message)
+                if message.starts_with("git_digest_receipt_persist_failed:")
+        ));
+
+        let event = only_git_digest_event(&store);
+        assert_eq!(event.outcome, EventOutcome::Error);
+        assert_eq!(event.payload_schema_version, 1);
+        assert!(event.payload.get("result").is_none());
+        let audit: AuditEvent =
+            serde_json::from_value(event.payload).expect("generic payload remains an AuditEvent");
+        assert_eq!(audit.verb, "git.digest");
+        assert_eq!(audit.decision, AuditDecision::Allow);
     }
 
     #[tokio::test]
@@ -4711,9 +5393,8 @@ mod tests {
 
     #[tokio::test]
     async fn no_event_store_configured_tracing_only() {
-        // When no event_store is configured, dispatch must succeed without error.
-        // (The tracing path is exercised in the tracing tests above; here we just
-        // verify the absence of event_store does not break dispatch.)
+        // Ordinary verbs remain tracing-only without an event store. The
+        // strict git.digest receipt exception is covered separately above.
         let mut builder = VerbRegistryBuilder::new();
         builder.register(AlphaPack);
         let reg = builder.build().expect("registry builds");
@@ -6984,6 +7665,19 @@ mod help_tests {
             "'kind' must be required"
         );
         assert_eq!(kind_param["type"], "string", "'kind' type must be 'string'");
+
+        let identifier_help = result["identifier_resolution"]
+            .as_object()
+            .expect("help=true must include the shared identifier contract");
+        assert!(identifier_help["full_uuid"]
+            .as_str()
+            .is_some_and(|text| text.contains("globally unique")));
+        assert!(identifier_help["short_prefix"]
+            .as_str()
+            .is_some_and(|text| text.contains("lookup scope belongs to the consuming parameter")));
+        assert!(identifier_help["parameter_rule"]
+            .as_str()
+            .is_some_and(|text| text.contains("submitted again")));
     }
 
     /// help=true on `recall` returns a schema envelope including the `query` param.

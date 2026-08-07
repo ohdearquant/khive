@@ -214,25 +214,28 @@ annotation discovery is namespace-agnostic under ADR-007, matching the fetched e
 
 List records with optional filtering.
 
-| Param                        | Type                     | Required | Notes                                                                         |
-| ---------------------------- | ------------------------ | -------- | ----------------------------------------------------------------------------- |
-| `kind`                       | string                   | yes      | `entity`\|`note`\|`edge`\|`event`\|`proposal`\|`message`, or a granular kind. |
-| `limit`                      | integer                  | no       | Default 20.                                                                   |
-| `offset`                     | integer                  | no       | Default 0; mutually exclusive with `after`.                                   |
-| `after`                      | string                   | no       | Entity/note/edge cursor UUID, or `""` to begin cursor mode.                   |
-| `entity_kind`                | string                   | no       | Filter when `kind="entity"`.                                                  |
-| `entity_type`                | string                   | no       | Filter by type field when `kind="entity"`.                                    |
-| `note_kind`                  | string                   | no       | Filter when `kind="note"`.                                                    |
-| `tags`                       | array\<string\>          | no       | OR-match, `kind="entity"` only.                                               |
-| `source_id` / `target_id`    | uuid                     | no       | Edge endpoint filters, `kind="edge"` only.                                    |
-| `relations`                  | array\<string\>          | no       | Edge relation filter, `kind="edge"` only.                                     |
-| `min_weight` / `max_weight`  | number                   | no       | Edge weight bounds, `kind="edge"` only.                                       |
-| `event_kind` / `event_kinds` | string / array\<string\> | no       | `kind="event"` only; additive.                                                |
-| `thread_id`                  | string                   | no       | `kind="message"` only; full UUID or 8-char prefix.                            |
-| `direction`                  | string                   | no       | `kind="message"` only: `inbound`\|`outbound`.                                 |
-| `from` / `to`                | string                   | no       | `kind="message"` only, sender/recipient filter.                               |
-| `read`                       | bool                     | no       | `kind="message"` only.                                                        |
-| `delivered`                  | bool                     | no       | `kind="message"` only.                                                        |
+| Param                        | Type                     | Required | Notes                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| ---------------------------- | ------------------------ | -------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `kind`                       | string                   | yes      | `entity`\|`note`\|`edge`\|`event`\|`proposal`\|`message`, or a granular kind.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
+| `limit`                      | integer                  | no       | Default 20.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
+| `offset`                     | integer                  | no       | Default 0; mutually exclusive with `after`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
+| `after`                      | string                   | no       | Exact full entity/note/edge cursor UUID returned as `next_after`, or `""` to begin cursor mode. Prefixes are rejected because keyset pagination needs the stable insertion boundary.                                                                                                                                                                                                                                                                                                                                                                                                      |
+| `entity_kind`                | string                   | no       | Filter when `kind="entity"`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| `entity_type`                | string                   | no       | Filter by type field when `kind="entity"`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| `note_kind`                  | string                   | no       | Filter when `kind="note"`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| `tags`                       | array\<string\>          | no       | OR-match, `kind="entity"` only.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| `source_id` / `target_id`    | uuid                     | no       | Edge endpoint filters, `kind="edge"` only.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| `relations`                  | array\<string\>          | no       | Edge relation filter, `kind="edge"` only.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| `min_weight` / `max_weight`  | number                   | no       | Edge weight bounds, `kind="edge"` only.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| `event_kind` / `event_kinds` | string / array\<string\> | no       | `kind="event"` only; additive.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| `session_id`                 | uuid                     | no       | `kind="event"` only; exact full session UUID. Prefixes are rejected because the filter needs one stable record.                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| `observed`                   | array\<uuid\>            | no       | `kind="event"` only; exact full observed-record UUIDs. Prefixes are rejected.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
+| `selected`                   | array\<uuid\>            | no       | `kind="event"` only; exact full selected-record UUIDs. Prefixes are rejected.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
+| `thread_id`                  | string                   | no       | `kind="message"` only; complete UUID or unique 8+ hex prefix resolved across stored thread roots in the caller's effective namespace. Missing or ambiguous prefixes fail explicitly. Legacy exceptions: input that is not hex, or shorter than 8 chars, is matched exactly against stored thread labels (no match → empty list, not an error); for all-hex ≥8-char input, a stored label byte-equal to the input takes precedence over any UUID-prefix match, and a stored label differing only in ASCII case is a final fallback, consulted only when no UUID-prefix candidate resolves. |
+| `direction`                  | string                   | no       | `kind="message"` only: `inbound`\|`outbound`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
+| `from` / `to`                | string                   | no       | `kind="message"` only, sender/recipient filter.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| `read`                       | bool                     | no       | `kind="message"` only.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| `delivered`                  | bool                     | no       | `kind="message"` only.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
 
 ```
 request(ops="list(kind=\"entity\", entity_kind=\"concept\", limit=20)")
@@ -389,10 +392,10 @@ Hybrid FTS + vector search with RRF fusion.
 | `kind`               | string  | yes      | Substrate or granular kind to search.                                                                                                  |
 | `query`              | string  | yes      | Free-text query.                                                                                                                       |
 | `limit`              | integer | no       | Default 10.                                                                                                                            |
-| `entity_kind`        | string  | no       | `kind="entity"` only.                                                                                                                  |
-| `entity_type`        | string  | no       | `kind="entity"` only.                                                                                                                  |
-| `note_kind`          | string  | no       | `kind="note"` only.                                                                                                                    |
-| `include_superseded` | bool    | no       | `kind="note"` only; default false excludes notes targeted by a `supersedes` edge.                                                      |
+| `entity_kind`        | string  | no       | Entity-substrate searches only.                                                                                                        |
+| `entity_type`        | string  | no       | Entity-substrate searches only.                                                                                                        |
+| `note_kind`          | string  | no       | Note-substrate searches only.                                                                                                          |
+| `include_superseded` | bool    | no       | Note-substrate searches only; default false excludes notes targeted by a `supersedes` edge.                                            |
 | `properties`         | object  | no       | Match records whose properties contain all listed key=value pairs, applied before result truncation inside a bounded candidate window. |
 | `tags`               | array   | no       | OR-match against tags; entity tags matched at the SQL level, note tags read from `properties.tags`.                                    |
 | `min_score`          | number  | no       | Score floor 0.0–1.0. No server default; RRF rank-1 scores on small corpora are typically 0.013–0.033.                                  |
@@ -400,6 +403,20 @@ Hybrid FTS + vector search with RRF fusion.
 ```
 request(ops="search(kind=\"entity\", query=\"knowledge graph runtime\", limit=10)")
 ```
+
+`entity_kind` and `note_kind` are compatibility filters for the corresponding
+substrate-level `kind`. A granular discriminator such as `kind="concept"` or
+`kind="observation"` may be paired with the same compatibility value, but a
+contradiction is rejected. Entity-only fields on a note search and note-only
+fields on an entity search are also rejected explicitly; they are never
+ignored. `properties` must be an object and `tags` must be an array of strings.
+The same validated request is used for single- and multi-backend execution.
+
+In multi-backend mode a backend failure yields the successful hits from the
+remaining backends and adds `partial: true` plus `missing_backends` to that
+operation's request envelope. These fields sit beside `result` rather than
+inside the search result array, and remain present through presentation and
+response-frame compaction.
 
 Response shape (`kind="entity"` rows, `presentation="verbose"`):
 
@@ -609,30 +626,52 @@ rejected — use `create`/`update`/`link`/`merge`/`delete` to mutate the graph. 
 that mix fixed-length and variable-length chains are not compiled in one call; split
 them into separate `query()` calls. GQL string equality uses SQLite `COLLATE NOCASE`,
 so `WHERE e.name = "LoRA"` matches both `LoRA` and ASCII case variants such as `lora`.
+GQL results have a deterministic identity order. When a response has `has_more: true`,
+repeat the same query with `SKIP` set to its `next_offset`; keep `page_size` unchanged.
+SPARQL `OFFSET` is not part of the supported dialect.
 
-| Param   | Type    | Required | Notes                                    |
-| ------- | ------- | -------- | ---------------------------------------- |
-| `query` | string  | yes      | GQL or SPARQL pattern string, read-only. |
-| `limit` | integer | no       | Default 500, hard cap 10,000.            |
+| Param       | Type    | Required | Notes                                                                     |
+| ----------- | ------- | -------- | ------------------------------------------------------------------------- |
+| `query`     | string  | yes      | GQL or SPARQL pattern string, read-only. GQL supports `SKIP n [LIMIT m]`. |
+| `page_size` | integer | no       | Rows per call; minimum 1, default 500, clamped to hard cap 10,000.        |
+| `limit`     | integer | no       | Deprecated alias for `page_size`; supplying both is an error.             |
 
 ```
 request(ops="query(query=\"MATCH (c:concept)-[:extends]->(d:concept) RETURN c, d LIMIT 20\")")
 ```
 
+For an exhaustive audit, omit query-text `LIMIT` so the server can report whether another
+page exists. An explicit `LIMIT` at or below `page_size` is a terminal caller-chosen bound.
+
+```text
+request(ops="query(query=\"MATCH (a)-[r:depends_on]->(b) RETURN a, r, b\", page_size=500)")
+# {"rows":[...],"offset":0,"page_size":500,"has_more":true,
+#  "next_offset":500,"truncated":true,...}
+
+request(ops="query(query=\"MATCH (a)-[r:depends_on]->(b) RETURN a, r, b SKIP 500\", page_size=500)")
+```
+
+`next_offset` is `offset + rows.length` and appears only on GQL pages with `has_more: true`.
+`truncated` remains as a compatibility alias for `has_more`. Offset paging is stable while
+the matched graph is unchanged; concurrent inserts or deletes can shift later pages.
+
 ### `propose` — Commissive
 
-Create an event-sourced change proposal. Returns `{id, status, proposer, title}` —
-chain with `$prev.id`, not `$prev.proposal_id`. The `changeset` field has nested
-objects and cannot be expressed in function-call DSL form; use JSON form.
+Create an event-sourced change proposal. Returns `{id, full_id, parent_id, status, proposer, title}`.
+`full_id` and a non-null `parent_id` remain canonical 36-character UUIDs in Agent mode so
+ancestry can be submitted again unchanged; `id` may be the ordinary 8-character Agent form.
+Reuse the returned `full_id` as `parent_id` in a subsequent proposal request. The `changeset`
+field has nested objects and cannot be expressed in function-call DSL form; use JSON form (whose
+operations do not support `$prev`).
 
-| Param         | Type            | Required | Notes                                                                                                                                              |
-| ------------- | --------------- | -------- | -------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `title`       | string          | yes      | Non-empty short title.                                                                                                                             |
-| `description` | string          | yes      | Non-empty full description.                                                                                                                        |
-| `changeset`   | object          | yes      | Discriminated by `kind`: `add_entity`, `update_entity`, `add_edge`, `add_note`, `merge_entities`, `supersede_entity`, `compound` (nested `steps`). |
-| `reviewers`   | array\<string\> | no       | Actor IDs requested as reviewers.                                                                                                                  |
-| `expiry`      | integer         | no       | Expiry timestamp, microseconds since epoch.                                                                                                        |
-| `parent_id`   | uuid            | no       | Parent proposal this supersedes or extends.                                                                                                        |
+| Param         | Type            | Required | Notes                                                                                                                                                                                                                                                                                           |
+| ------------- | --------------- | -------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `title`       | string          | yes      | Non-empty short title.                                                                                                                                                                                                                                                                          |
+| `description` | string          | yes      | Non-empty full description.                                                                                                                                                                                                                                                                     |
+| `changeset`   | object          | yes      | Discriminated by `kind`: `add_entity`, `update_entity`, `add_edge`, `add_note`, `merge_entities`, `supersede_entity`, `compound` (nested `steps`). Every nested identifier is a full UUID; prefixes are rejected because resolution could miss, be ambiguous, or change stable proposal intent. |
+| `reviewers`   | array\<string\> | no       | Actor IDs requested as reviewers.                                                                                                                                                                                                                                                               |
+| `expiry`      | integer         | no       | Expiry timestamp, microseconds since epoch.                                                                                                                                                                                                                                                     |
+| `parent_id`   | uuid            | no       | Full UUID of the parent proposal. Prefixes are rejected because ancestry is an explicit stable reference; responses preserve it canonically.                                                                                                                                                    |
 
 ```
 request(ops="[{\"tool\":\"propose\",\"args\":{\"title\":\"Add GQE\",\"description\":\"Register the GQE concept\",\"changeset\":{\"kind\":\"add_entity\",\"entity\":{\"kind\":\"concept\",\"name\":\"GQE\"}}}}]")
@@ -786,8 +825,8 @@ Create a GTD task (note with `kind=task`).
 | `priority`          | string          | no       | `p0`\|`p1`\|`p2`\|`p3` (default `p2`).                                                                                                                               |
 | `assignee`          | string          | no       | Assignee identifier.                                                                                                                                                 |
 | `due`               | string          | no       | ISO-8601 due date.                                                                                                                                                   |
-| `depends_on`        | array\<uuid\>   | no       | Blocking task UUIDs.                                                                                                                                                 |
-| `context_entity_id` | uuid            | no       | Full UUID of a related KG entity.                                                                                                                                    |
+| `depends_on`        | array\<uuid\>   | no       | Blocking task complete UUIDs or unique 8+ hex prefixes resolved in the caller's primary namespace.                                                                   |
+| `context_entity_id` | uuid            | no       | Full UUID of a related KG entity. Prefixes are rejected because the stored relationship is an explicit stable reference; Agent responses preserve it canonically.    |
 | `tags`              | array\<string\> | no       | Tag list.                                                                                                                                                            |
 
 ```
@@ -920,10 +959,10 @@ request(ops="memory.recall(query=\"ADR-016 DSL grammar\", limit=5, min_score=0.3
 
 Emit explicit feedback on a recalled entity; updates recall-domain posteriors.
 
-| Param       | Type   | Required | Notes                                                                                                                              |
-| ----------- | ------ | -------- | ---------------------------------------------------------------------------------------------------------------------------------- |
-| `target_id` | string | yes      | UUID of the recalled entity or memory.                                                                                             |
-| `signal`    | string | yes      | `useful`\|`not_useful`\|`wrong`\|`explicit_positive`\|`explicit_negative`\|`implicit_positive`\|`implicit_negative`\|`correction`. |
+| Param       | Type   | Required | Notes                                                                                                                                                                           |
+| ----------- | ------ | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `target_id` | uuid   | yes      | Full UUID of the recalled entity or memory. Prefixes are rejected because feedback must identify one exact record. The acknowledgement returns canonical `target_id` for reuse. |
+| `signal`    | string | yes      | `useful`\|`not_useful`\|`wrong`\|`explicit_positive`\|`explicit_negative`\|`implicit_positive`\|`implicit_negative`\|`correction`.                                              |
 
 ```
 request(ops="memory.feedback(target_id=\"<uuid>\", signal=\"useful\")")
@@ -1233,12 +1272,15 @@ embedding input is bounded, the successful response includes the standard `warni
 | `to`        | string | yes      | Actor label, e.g. `"lambda:leo"`. Both copies land in the caller's namespace; no cross-namespace write occurs.                                                                                  |
 | `content`   | string | yes      | Non-empty message body.                                                                                                                                                                         |
 | `subject`   | string | no       | Optional subject line.                                                                                                                                                                          |
-| `thread_id` | uuid   | no       | Groups the message into an existing thread.                                                                                                                                                     |
+| `thread_id` | uuid   | no       | Optional full thread UUID. Prefixes are rejected because a thread root is an explicit stable reference. Accepted complete spellings normalize to canonical lowercase dashed form.               |
 | `self_send` | bool   | no       | Default false. Required when `to` matches the configured sender actor; otherwise the send is rejected. The anonymous `local` fallback is exempt. Use true only for an intentional note to self. |
 
 ```
 request(ops="comm.send(to=\"lambda:leo\", subject=\"PR ready\", content=\"#600 is open for review\")")
 ```
+
+Returns `{id, full_id, thread_id, ...}`. `full_id` and `thread_id` remain canonical
+36-character UUIDs in Agent mode; pass the returned `thread_id` unchanged to a later send.
 
 ### `comm.delivered` — Assertive
 
@@ -1473,9 +1515,9 @@ request(ops="schedule.agenda(limit=10)")
 
 Cancel a scheduled event.
 
-| Param | Type   | Required | Notes                             |
-| ----- | ------ | -------- | --------------------------------- |
-| `id`  | string | yes      | Full UUID of the scheduled event. |
+| Param | Type   | Required | Notes                                                                                                                    |
+| ----- | ------ | -------- | ------------------------------------------------------------------------------------------------------------------------ |
+| `id`  | string | yes      | Complete UUID or unique 8+ hex prefix of the scheduled event. Prefix resolution searches the caller's primary namespace. |
 
 ```
 request(ops="schedule.cancel(id=\"<event-id>\")")
@@ -1848,17 +1890,18 @@ applies identically either way).
 ### `git.digest` — Commissive
 
 Walk a local repository path or clone/fetch a remote `https://` URL, then ingest commits
-and (when the source is a github.com repo and the `gh` CLI is available) issues and pull
-requests as provenance notes, resolving or auto-creating the repo-anchor `project` entity.
-Bounded and cursor-resumable: call again with the same `source`/`project` while the
-response's `done` field is `false`.
+and (when source-bound `gh repo view <owner/repo>` resolves the GitHub repository derived
+from the canonical source or local `origin`) issues and pull requests as provenance notes,
+resolving or auto-creating the repo-anchor
+`project` entity. Bounded and cursor-resumable: call again with the same
+`source`/`project` while the response's `done` field is `false`.
 
-| Param       | Type            | Required | Notes                                                                                                                                                                                                                                     |
-| ----------- | --------------- | -------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `source`    | string          | yes      | A local filesystem path (must contain `.git`) or an `https://` URL. Any `https` host is accepted; non-github.com hosts degrade to commits-only. `ssh://`, `git://`, `http://`, and scp-shorthand (`user@host:path`) sources are rejected. |
-| `project`   | string          | no       | UUID or 8+ hex prefix of the repo-anchor `project` entity. When absent, resolved by matching `properties.repo_url` or `name`, or created if none is found (see the response's `project_id` and `project_created`).                        |
-| `max_items` | integer         | no       | Bounded work for this call, counted across commits + issues + PRs (default 500, clamped to 1..=2000). Cursor-resumable: call again while the response's `done` field is `false`.                                                          |
-| `include`   | array\<string\> | no       | Which record kinds to ingest this call: any of `commits` \| `issues` \| `pull_requests` (default: all three).                                                                                                                             |
+| Param       | Type            | Required | Notes                                                                                                                                                                                                                                                                                                                         |
+| ----------- | --------------- | -------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `source`    | string          | yes      | A local filesystem path (must contain `.git`) or an `https://` URL. Any `https` host is accepted; issue/PR work requires a successful source-bound GitHub probe, otherwise the pass degrades to commits-only with structured skips. `ssh://`, `git://`, `http://`, and scp-shorthand (`user@host:path`) sources are rejected. |
+| `project`   | string          | no       | UUID or 8+ hex prefix of the repo-anchor `project` entity. When absent, resolved by matching `properties.repo_url` or `name`, or created if none is found (see the response's `project_id` and `project_created`).                                                                                                            |
+| `max_items` | integer         | no       | Bounded work for this call, counted across commits + issues + PRs (default 500, clamped to 1..=2000). Cursor-resumable: call again while the response's `done` field is `false`.                                                                                                                                              |
+| `include`   | array\<string\> | no       | Which record kinds to ingest this call: any of `commits` \| `issues` \| `pull_requests` (default: all three).                                                                                                                                                                                                                 |
 
 ```
 request(ops="git.digest(source=\"https://github.com/org/repo\", max_items=500)")
@@ -1880,6 +1923,62 @@ absent, or a `gh` failure) — so "this repo has no issues/PRs" is distinguishab
 `true` only when every requested source completed: it separates "the walk visited
 everything" from "the walk stopped before the end", a distinction `done`'s
 budget-cursor semantics do not carry.
+
+`gh_available` is `true` only after the probe explicitly targets and returns the
+`owner/repo` derived from the canonical source or configured `origin`; every list call
+pins that value with `--repo`. Argument-less repository selection is never used, so an
+alternate remote selected by `gh repo set-default` cannot redirect ingestion. It is `false`
+for an absent, unauthenticated, or repository-incompatible `gh`, and `null`
+when neither issues nor pull requests were requested. A failed probe marks
+each requested remote source `skipped` and does not expose `gh` stderr.
+
+Every successful response also carries `receipt_id`, the UUID of a durable
+schema-v2 audit event whose `payload.result` is the exact complete response
+and whose target is `project_id`. The runtime appends this receipt before
+returning. `git.digest` is `AlwaysVerbose`, so omitted/default MCP presentation
+still returns the full UUID and exact stored result. If persistence cannot be
+confirmed, the call returns `git_digest_receipt_persist_failed` and warns that
+writes may already have committed instead of returning an unqualified success. If malformed handler
+output prevents receipt construction, the runtime still appends one generic
+Error audit when the gate audit and event store are available.
+
+For response-loss recovery, record `request_started_at_us` before dispatch. One recovery
+attempt freezes `since=request_started_at_us.saturating_sub(1)` and
+`until=recovery_query_time_us + 1`; event-list bounds are strict
+`created_at > since AND created_at < until`. Query with top-level
+`presentation="verbose"` and otherwise-identical filters at offsets 0, 1000, 2000, …:
+
+```text
+request(
+  presentation="verbose",
+  ops="list(namespace=\"<original namespace>\", kind=\"event\", event_kind=\"audit\", verb=\"git.digest\", since=<since>, until=<frozen until>, limit=1000, offset=<offset>)"
+)
+```
+
+Advance by the returned row count and stop only on a page shorter than 1000. The frozen
+upper bound prevents newly completed receipts from shifting newest-first offsets. Match
+`payload.result.project_id` and, when available, `payload.resource.request_id`; the exact
+report is `payload.result`. Explicit namespace constrains this multi-record discovery to
+the digest's attribution namespace. Under `AllowAllGate`, `get(id=<event id>)` remains
+namespace-agnostic per ADR-007; repeating namespace can provide Gate/routing context but
+does not make the by-ID storage lookup namespace-filtered. A namespace-less `list` uses
+the caller's configured visible-namespace scope, not an isolation guarantee.
+
+`request_id` groups an entire request, not an individual operation. Batch and chain
+members therefore share it. Enumerate all matching receipt rows and treat each event's
+`receipt_id` plus `payload.result` as the operation-unique recovery record. If one request
+contains multiple digests for the same project, event order does not identify their input
+positions; inspect every result, or issue one digest per request when one-to-one mapping is
+required. If the client timed out before the daemon finished,
+the receipt appears only when that pass completes; restart at offset zero with a newly
+frozen `until` on a later attempt rather than
+treating temporary absence as proof that nothing committed.
+
+There is no 300-second `git.digest` or daemon-side dispatch deadline. The
+observed 300,000 ms bound is the MCP client's request default, so large
+`max_items` values can outlive a particular caller's wait while the daemon
+continues the pass. The durable receipt is the recovery contract; the item
+bound is not silently clamped to a transport-specific duration.
 
 ### `git.commit` / `git.branch` / `git.push` — Commissive (ADR-108)
 

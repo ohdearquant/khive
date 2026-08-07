@@ -21,9 +21,10 @@ use khive_runtime::{
     KhiveRuntime, Namespace, NamespaceToken, PackRuntime, RuntimeConfig, RuntimeError,
     VerbRegistry, VerbRegistryBuilder,
 };
+use khive_storage::Event;
 use khive_types::{
-    Details, ErrorCode as KhiveErrorCode, ErrorDomain, HandlerDef, KhiveError, Pack, VerbCategory,
-    Visibility,
+    Details, ErrorCode as KhiveErrorCode, ErrorDomain, EventKind, HandlerDef, KhiveError, Pack,
+    SubstrateKind, VerbCategory, Visibility,
 };
 use rmcp::{
     model::{CallToolRequestParams, CallToolResult, ClientInfo, ErrorCode},
@@ -110,6 +111,22 @@ async fn ok_one(
         first["ok"],
         json!(true),
         "expected op to succeed, got: {first}"
+    );
+    Ok(first["result"].clone())
+}
+
+/// Run one op with the MCP default Agent presentation and return its result.
+async fn agent_one(
+    client: &impl std::ops::Deref<Target = rmcp::service::Peer<rmcp::RoleClient>>,
+    ops: &str,
+) -> anyhow::Result<Value> {
+    let result = call(client, "request", json!({"ops": ops})).await?;
+    let body: Value = serde_json::from_str(&first_text(&result))?;
+    let first = body["results"].get(0).cloned().unwrap_or(Value::Null);
+    assert_eq!(
+        first["ok"],
+        json!(true),
+        "expected Agent-mode op to succeed, got: {first}"
     );
     Ok(first["result"].clone())
 }
@@ -522,6 +539,256 @@ async fn assign_then_next_then_complete() -> anyhow::Result<()> {
     )
     .await?;
     assert_eq!(completed["to"], "done");
+    Ok(())
+}
+
+#[tokio::test]
+async fn gtd_context_entity_id_round_trips_in_agent_mode() -> anyhow::Result<()> {
+    let client = connect().await?;
+    let context = ok_one(&client, r#"create(kind="concept", name="Agent Context")"#).await?;
+    let context_id = context["id"]
+        .as_str()
+        .expect("create must expose a full chaining id");
+
+    let assigned = agent_one(
+        &client,
+        &format!(r#"gtd.assign(title="strict context one", context_entity_id="{context_id}")"#),
+    )
+    .await?;
+    let returned = assigned["context_entity_id"]
+        .as_str()
+        .expect("Agent response must retain context_entity_id");
+    assert_eq!(returned, context_id);
+    assert_eq!(assigned["properties"]["context_entity_id"], context_id);
+    assert_eq!(
+        returned.len(),
+        36,
+        "strict response id must remain canonical"
+    );
+
+    agent_one(
+        &client,
+        &format!(r#"gtd.assign(title="strict context two", context_entity_id="{returned}")"#),
+    )
+    .await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn memory_feedback_target_id_round_trips_in_agent_mode() -> anyhow::Result<()> {
+    let client = connect_full().await?;
+    let remembered = ok_one(
+        &client,
+        r#"memory.remember(content="strict feedback target", salience=0.7)"#,
+    )
+    .await?;
+    let target_id = remembered["id"]
+        .as_str()
+        .expect("remember must expose a full chaining id");
+
+    let feedback = agent_one(
+        &client,
+        &format!(r#"memory.feedback(target_id="{target_id}", signal="useful")"#),
+    )
+    .await?;
+    let returned = feedback["target_id"]
+        .as_str()
+        .expect("feedback must acknowledge its exact target");
+    assert_eq!(returned, target_id);
+    assert_eq!(returned.len(), 36, "feedback target must stay canonical");
+
+    agent_one(
+        &client,
+        &format!(r#"memory.feedback(target_id="{returned}", signal="useful")"#),
+    )
+    .await?;
+    Ok(())
+}
+
+/// `brain.auto_feedback` acknowledges the canonical target it credited; that
+/// acknowledgement feeds the strict `memory.feedback`/`brain.feedback`
+/// target_id parameter, so the default Agent transform must not shorten it
+/// (the verb is AlwaysVerbose for the same reason `brain.feedback` is).
+#[tokio::test]
+async fn brain_auto_feedback_target_id_round_trips_in_agent_mode() -> anyhow::Result<()> {
+    let client = connect_full().await?;
+    let remembered = ok_one(
+        &client,
+        r#"memory.remember(content="auto feedback strict target", salience=0.7)"#,
+    )
+    .await?;
+    let target_id = remembered["id"]
+        .as_str()
+        .expect("remember must expose a full chaining id");
+
+    let ops = serde_json::to_string(&json!([{
+        "tool": "brain.auto_feedback",
+        "args": {
+            "query": "auto feedback strict target round trip",
+            "results": [{"id": target_id}],
+            "signal": "useful",
+            "target_id": target_id,
+        }
+    }]))?;
+    // No `presentation` key — defaults to Agent; AlwaysVerbose must override.
+    let result = call(&client, "request", json!({ "ops": ops })).await?;
+    let body: Value = serde_json::from_str(&first_text(&result))?;
+    let first = &body["results"][0];
+    assert_eq!(first["ok"], true, "auto_feedback must succeed: {first}");
+    let returned = first["result"]["target_id"]
+        .as_str()
+        .expect("auto_feedback must acknowledge its credited target");
+    assert_eq!(
+        returned.len(),
+        36,
+        "auto_feedback target_id must stay canonical in Agent mode; got {returned:?}"
+    );
+    assert_eq!(returned, target_id);
+
+    agent_one(
+        &client,
+        &format!(r#"memory.feedback(target_id="{returned}", signal="useful")"#),
+    )
+    .await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn proposal_identifiers_round_trip_in_agent_mode() -> anyhow::Result<()> {
+    let client = connect_full().await?;
+
+    let root_ops = serde_json::to_string(&json!([{
+        "tool": "propose",
+        "args": {
+            "title": "strict proposal root",
+            "description": "root for identifier round-trip coverage",
+            "changeset": {
+                "kind": "add_entity",
+                "entity": {"kind": "concept", "name": "strict proposal root entity"}
+            }
+        }
+    }]))?;
+    let root = agent_one(&client, &root_ops).await?;
+    assert_eq!(
+        root["id"].as_str().map(str::len),
+        Some(8),
+        "ordinary Agent identifiers may stay compact"
+    );
+    let root_full_id = root["full_id"]
+        .as_str()
+        .expect("proposal must expose its canonical chaining id");
+    assert_eq!(root_full_id.len(), 36);
+
+    let child_ops = serde_json::to_string(&json!([{
+        "tool": "propose",
+        "args": {
+            "title": "strict proposal child",
+            "description": "child carrying the exact ancestry handle",
+            "changeset": {
+                "kind": "add_entity",
+                "entity": {"kind": "concept", "name": "strict proposal child entity"}
+            },
+            "parent_id": root_full_id
+        }
+    }]))?;
+    let child = agent_one(&client, &child_ops).await?;
+    let returned_parent = child["parent_id"]
+        .as_str()
+        .expect("Agent response must retain exact proposal ancestry");
+    assert_eq!(returned_parent, root_full_id);
+    assert_eq!(returned_parent.len(), 36);
+
+    let grandchild_ops = serde_json::to_string(&json!([{
+        "tool": "propose",
+        "args": {
+            "title": "strict proposal grandchild",
+            "description": "reuses the returned parent handle unchanged",
+            "changeset": {
+                "kind": "add_entity",
+                "entity": {"kind": "concept", "name": "strict proposal grandchild entity"}
+            },
+            "parent_id": returned_parent
+        }
+    }]))?;
+    agent_one(&client, &grandchild_ops).await?;
+
+    for invalid_args in [
+        json!({
+            "title": "short proposal parent",
+            "description": "must reject a parent prefix",
+            "changeset": {
+                "kind": "add_entity",
+                "entity": {"kind": "concept", "name": "invalid parent prefix entity"}
+            },
+            "parent_id": root["id"],
+        }),
+        json!({
+            "title": "short nested changeset id",
+            "description": "must reject a nested identifier prefix",
+            "changeset": {
+                "kind": "update_entity",
+                "id": "deadbeef",
+                "patch": {"name": "not applied"}
+            },
+        }),
+    ] {
+        let invalid_ops = serde_json::to_string(&json!([{
+            "tool": "propose",
+            "args": invalid_args,
+        }]))?;
+        let response = call(&client, "request", json!({"ops": invalid_ops})).await?;
+        let body: Value = serde_json::from_str(&first_text(&response))?;
+        let failure = &body["results"][0];
+        assert_eq!(failure["ok"], false, "{failure}");
+        let error = &failure["error"];
+        let message = error["message"]
+            .as_str()
+            .or_else(|| error.as_str())
+            .or_else(|| failure["message"].as_str())
+            .unwrap_or("");
+        assert!(
+            message.contains("short prefix") || message.contains("short-prefix"),
+            "rejection must explain prefix-resolution consequence: {message}"
+        );
+        assert!(
+            message.contains("stable"),
+            "rejection must explain why exact identity matters: {message}"
+        );
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn event_session_id_round_trips_in_agent_mode() -> anyhow::Result<()> {
+    let (client, session_id) = connect_with_session_event().await?;
+    let first = agent_one(
+        &client,
+        &format!(
+            r#"list(kind="event", namespace="eventroundtrip", session_id="{session_id}", limit=10)"#
+        ),
+    )
+    .await?;
+    let events = first.as_array().expect("event list result");
+    assert_eq!(events.len(), 1, "session filter must select the fixture");
+    let returned = events[0]["session_id"]
+        .as_str()
+        .expect("Agent event must retain its exact session filter handle");
+    assert_eq!(returned, session_id.as_hyphenated().to_string());
+    assert_eq!(returned.len(), 36);
+
+    let second = agent_one(
+        &client,
+        &format!(
+            r#"list(kind="event", namespace="eventroundtrip", session_id="{returned}", limit=10)"#
+        ),
+    )
+    .await?;
+    assert_eq!(
+        second.as_array().map(Vec::len),
+        Some(1),
+        "the returned session_id must be accepted unchanged"
+    );
     Ok(())
 }
 
@@ -1323,6 +1590,13 @@ impl khive_types::Pack for ErrorInjectPack {
             category: VerbCategory::Assertive,
             params: &[],
         },
+        HandlerDef {
+            name: "write_queue_full",
+            description: "returns a typed write-queue saturation error",
+            visibility: Visibility::Verb,
+            category: VerbCategory::Assertive,
+            params: &[],
+        },
     ];
 }
 
@@ -1360,6 +1634,11 @@ impl PackRuntime for ErrorInjectPack {
                 },
             );
             return Err(RuntimeError::Storage(storage));
+        }
+        if verb == "write_queue_full" {
+            return Err(RuntimeError::Storage(
+                khive_storage::StorageError::WriteQueueFull { timeout_ms: 175 },
+            ));
         }
         let err = KhiveError::unavailable("downstream service offline")
             .with_code(KhiveErrorCode::new(ErrorDomain::Runtime, 10))
@@ -1488,11 +1767,52 @@ async fn writer_pool_timeout_survives_storage_runtime_and_mcp_wire() -> anyhow::
             "code": "writer_pool_checkout_timeout",
             "stage": "writer_pool_checkout_timeout",
             "message": "storage: backend driver error in Notes during append_note: invalid data: timed out after 175ms waiting for sqlite writer connection",
+            "retryable": true,
             "timeout_ms": 175,
             "capability": "notes",
             "operation": "append_note",
+            "scope": serde_json::Value::Null,
+            "retry_after_ms": serde_json::Value::Null,
         }),
-        "the exact wire contract must preserve stage, deadline, and storage context"
+        "the exact wire contract must preserve stage, deadline, retryability, and storage context"
+    );
+
+    Ok(())
+}
+
+/// A bounded write-queue enqueue timeout (#1382's `send_bounded` /
+/// `send_top_level_bounded`) must remain structurally classifiable and marked
+/// retryable after `RuntimeError::Storage` wraps it, then crosses the real
+/// MCP request transport (#1643). The request was never accepted onto the
+/// queue, so retrying is safe.
+#[tokio::test]
+async fn write_queue_full_survives_storage_runtime_and_mcp_wire() -> anyhow::Result<()> {
+    let client = connect_error_inject().await?;
+    let result = call(
+        &client,
+        "request",
+        serde_json::json!({"ops": "write_queue_full()"}),
+    )
+    .await?;
+    let body: serde_json::Value = serde_json::from_str(&first_text(&result))?;
+    let first = &body["results"][0];
+
+    assert_eq!(first["ok"], false, "expected op failure: {first}");
+    assert_eq!(
+        first["error"],
+        serde_json::json!({
+            "kind": "unavailable",
+            "code": "writer_queue_saturated",
+            "stage": "writer_queue_saturated",
+            "message": "storage: write queue full: timed out after 175ms waiting for writer task capacity",
+            "retryable": true,
+            "timeout_ms": 175,
+            "capability": serde_json::Value::Null,
+            "operation": serde_json::Value::Null,
+            "scope": "writer_admission",
+            "retry_after_ms": 175,
+        }),
+        "the exact wire contract must preserve stage, deadline, retryability, and ADR-131:251's scope/retry_after_ms for queue saturation"
     );
 
     Ok(())
@@ -2281,6 +2601,47 @@ async fn connect_full(
     Ok(client)
 }
 
+async fn connect_with_session_event() -> anyhow::Result<(
+    impl std::ops::Deref<Target = rmcp::service::Peer<rmcp::RoleClient>>,
+    uuid::Uuid,
+)> {
+    disable_daemon();
+    let namespace = Namespace::parse("eventroundtrip")?;
+    let runtime = KhiveRuntime::new(RuntimeConfig {
+        db_path: None,
+        default_namespace: namespace.clone(),
+        embedding_model: None,
+        additional_embedding_models: vec![],
+        packs: vec!["kg".to_string()],
+        ..RuntimeConfig::default()
+    })?;
+    let token = runtime.authorize(namespace)?;
+    let session_id = uuid::Uuid::new_v4();
+    runtime
+        .events(&token)?
+        .append_event(
+            Event::new(
+                token.namespace().as_str(),
+                "session_roundtrip_fixture",
+                EventKind::Audit,
+                SubstrateKind::Entity,
+                "test",
+            )
+            .with_session_id(session_id),
+        )
+        .await?;
+
+    let (server_transport, client_transport) = tokio::io::duplex(65536);
+    let server = KhiveMcpServer::new(runtime)?;
+    tokio::spawn(async move {
+        if let Ok(server_service) = server.serve(server_transport).await {
+            let _ = server_service.waiting().await;
+        }
+    });
+    let client = DummyClient.serve(client_transport).await?;
+    Ok((client, session_id))
+}
+
 /// Helper: call `verb(help=true)` through the MCP surface and return the
 /// parsed result. Asserts the op succeeded and returns the schema envelope.
 async fn help_schema(
@@ -2297,6 +2658,24 @@ async fn help_schema(
         "{verb}(help=true) must succeed, got: {first}"
     );
     Ok(first["result"].clone())
+}
+
+#[tokio::test]
+async fn help_includes_shared_identifier_resolution_contract() -> anyhow::Result<()> {
+    let client = connect_full().await?;
+    let schema = help_schema(&client, "gtd.assign").await?;
+    let contract = &schema["identifier_resolution"];
+
+    assert!(contract["full_uuid"]
+        .as_str()
+        .is_some_and(|text| text.contains("globally unique")));
+    assert!(contract["short_prefix"]
+        .as_str()
+        .is_some_and(|text| text.contains("lookup scope belongs to the consuming parameter")));
+    assert!(contract["parameter_rule"]
+        .as_str()
+        .is_some_and(|text| text.contains("corresponding response field")));
+    Ok(())
 }
 
 #[tokio::test]
@@ -4036,6 +4415,39 @@ async fn connect_comm_only(
     });
     let client = DummyClient.serve(client_transport).await?;
     Ok(client)
+}
+
+#[tokio::test]
+async fn comm_strict_identifiers_round_trip_in_agent_mode() -> anyhow::Result<()> {
+    let client = connect_comm_only().await?;
+    let sent = agent_one(
+        &client,
+        r#"comm.send(to="commtest", content="strict root")"#,
+    )
+    .await?;
+    let thread_id = sent["thread_id"]
+        .as_str()
+        .expect("send must return its canonical thread root");
+    assert_eq!(thread_id.len(), 36, "thread_id must not be shortened");
+
+    agent_one(
+        &client,
+        &format!(r#"comm.send(to="commtest", content="same thread", thread_id="{thread_id}")"#),
+    )
+    .await?;
+
+    let outbound_id = sent["full_id"]
+        .as_str()
+        .expect("send must return its full outbound id");
+    let delivered = agent_one(&client, &format!(r#"comm.delivered(id="{outbound_id}")"#)).await?;
+    let returned = delivered["id"]
+        .as_str()
+        .expect("delivery confirmation must echo its correlation id");
+    assert_eq!(returned, outbound_id);
+    assert_eq!(returned.len(), 36, "delivery correlation id must stay full");
+
+    agent_one(&client, &format!(r#"comm.delivered(id="{returned}")"#)).await?;
+    Ok(())
 }
 
 /// `inbox` returns message notes; `created_at` and `updated_at` must be ISO-8601

@@ -228,6 +228,21 @@ jobs:
       - name: Channel-email feature tests
         if: env.CI_SUITE == 'full' && matrix.shard == 1
         run: ../scripts/ci.sh channel-email
+      # Gated like every other shard-1 phase in this job: the introducing
+      # commit (cad6479dc) left no rationale for the lone ungated condition,
+      # and the macos-pr lane already runs the whole khive-mcp suite once via
+      # macos-pr-tests, so the focused portability lane keeps one serial run
+      # of the pair while push/nightly/manual full lanes repeat it 25x per OS
+      # (ADR-049 Amendment 3). timeout-minutes: a warm iteration measures
+      # Observed on ubuntu-latest runners: ~24s per iteration (2 tests,
+      # serial, plus per-iteration cargo overhead), so 25 iterations need
+      # ~10 minutes of test time alone before the initial build. Budget
+      # accordingly; a timeout here means the gate ran out of wall clock,
+      # not that a recovery flake was caught.
+      - name: Daemon recovery flake gate
+        if: env.CI_SUITE == 'full' && matrix.shard == 1
+        timeout-minutes: 25
+        run: ../scripts/ci.sh daemon-recovery-flake
       - name: No-default-features check
         if: env.CI_SUITE == 'full' && matrix.shard == 1
         run: ../scripts/ci.sh no-default-features

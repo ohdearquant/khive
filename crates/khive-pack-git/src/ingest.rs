@@ -4,7 +4,7 @@
 //! the standard `create` verb. See crates/khive-pack-git/docs/api/ingest.md for
 //! the full module overview.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -19,6 +19,7 @@ use khive_storage::types::{SqlStatement, SqlValue};
 
 use crate::hook;
 use crate::refs;
+use crate::source::remote_url_to_slug;
 
 /// Which record kinds a `run_ingest` pass processes. `Default` selects all
 /// three — the CLI's historical behavior and the `git.digest` verb's default
@@ -45,6 +46,12 @@ impl Default for IngestInclude {
 pub struct IngestOptions {
     /// Local path to the git repository to walk.
     pub repo: PathBuf,
+    /// Expected GitHub `owner/repo` derived from the caller's canonical
+    /// remote source. Local-path and administrative callers leave this
+    /// unset, and the ingest core derives the same identity from the
+    /// checkout's configured `origin`. The value is an identity constraint,
+    /// never a capability hint: `gh` is always invoked with it explicitly.
+    pub expected_github_repo: Option<String>,
     /// The repo-anchor `project` entity — full UUID or an 8+ hex prefix.
     pub project: String,
     /// Bounded work per call, counted across commits + issues + PRs
@@ -61,6 +68,7 @@ impl IngestOptions {
     pub fn unbounded(repo: PathBuf, project: String) -> Self {
         Self {
             repo,
+            expected_github_repo: None,
             project,
             max_items: None,
             include: IngestInclude::default(),
@@ -129,14 +137,11 @@ pub enum IngestSourceState {
     StoppedEarly(String),
     /// The source was never walked this pass. The reason names the cause:
     /// the budget was already exhausted before the source was reached, or
-    /// the `gh` CLI was unusable — absent from PATH (a repo whose remote is
-    /// not github.com takes this same arm: `gh_available` probes only
-    /// `gh --version`, so such a repo skips only when `gh` is absent, and
-    /// when `gh` IS present it takes the walker-failure path, whose reason
-    /// carries `gh`'s own stderr) — or `gh` itself failed before the walk
-    /// began. A local cursor/database read failure before remote listing is
-    /// also `Skipped`, with a distinct local-failure reason. A failure after
-    /// the walk began is `StoppedEarly`, never `Skipped`.
+    /// the source-bound `gh repo view` probe could not resolve an authenticated
+    /// GitHub repository for this checkout, or `gh` itself failed before the
+    /// walk began. A local cursor/database read failure before remote listing
+    /// is also `Skipped`, with a distinct local-failure reason. A failure
+    /// after the walk began is `StoppedEarly`, never `Skipped`.
     Skipped(String),
 }
 
@@ -155,15 +160,23 @@ pub struct IngestSourceStatus {
 /// Outcome of one ingest pass. Serializable so CLI callers can emit it as JSON.
 #[derive(Debug, Default, Serialize)]
 pub struct IngestReport {
+    /// Durable audit-event receipt for this exact successful `git.digest`
+    /// response. The runtime dispatch seam fills this after the ingest report
+    /// has been serialized and before returning it to the caller; direct
+    /// `run_ingest` users do not receive a receipt.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub receipt_id: Option<String>,
     pub commits_ingested: u64,
     pub commits_skipped_existing: u64,
     pub issues_ingested: u64,
     pub issues_skipped_existing: u64,
     pub prs_ingested: u64,
     pub prs_skipped_existing: u64,
-    /// `Some(false)` when the `gh` CLI probe ran and gh was unusable —
-    /// issues/PRs were skipped but commits still ingested (ADR-088 §5
-    /// graceful-absence rule). `Some(true)` when the probe succeeded. `None`
+    /// `Some(false)` when the source-bound `gh repo view` probe ran but could
+    /// not resolve an authenticated GitHub repository — issues/PRs were
+    /// skipped but commits still ingested (ADR-088 §5 graceful-absence rule).
+    /// `Some(true)` only when that probe returned a usable `owner/repo`, which
+    /// is then passed explicitly to every `gh ... list --repo` call. `None`
     /// when this pass never probed: the probe runs only when `include`
     /// requests issues or pull requests, and a commits-only pass says nothing
     /// about `gh` either way (issue #1645).
@@ -238,6 +251,24 @@ pub struct IngestReport {
     /// to compare directly against an independent source of truth (e.g.
     /// `git rev-list --count <ref>`).
     pub commits_total_in_db: u64,
+    /// Touched paths the `--name-only` pass recorded but `changed_paths`
+    /// storage cannot carry: valid Unix filenames that violate the hook's
+    /// canonical shape (a `\` byte, an `X:` drive prefix, a leading `/`,
+    /// or an empty/`.`/`..` component). Only actual predicate rejections
+    /// count — dedup/post-masking collisions in the stored array are not
+    /// drops. Dropped before create rather than failing the whole commit —
+    /// see
+    /// crates/khive-pack-git/docs/api/ingest.md#changed-paths-and-code-module-annotations.
+    pub changed_paths_filtered_noncanonical: u64,
+    /// Changed paths whose `(source_revision, source_path)` module binding
+    /// was unusable and therefore received no code-module annotation. Two
+    /// shapes fold into this counter: an ambiguous key (two or more live
+    /// rows, whether two or more have parseable ids or at most one has a
+    /// parseable id) and the single-row sub-case whose one row's id does not
+    /// parse (not ambiguous — just no bindable candidate). Counted only when
+    /// an ingested commit's path actually hits the key, so unusable keys
+    /// untouched by this pass never inflate the count.
+    pub code_module_ambiguous_path_skips: u64,
     /// Per-source ingest coverage for this pass (issue #1617): each
     /// included source reports `completed`, `stopped_early { reason }`, or
     /// `skipped { reason }`, so a gate refusal, budget exhaustion, and a
@@ -359,12 +390,14 @@ pub(crate) async fn run_ingest_with_commit_recovery(
     let mut gh_walk_failed_after_walk = false;
 
     // Graceful degradation covers both "gh is not on PATH" and "gh is present
-    // but this repo has no usable GitHub remote" (e.g. a synthetic/local-only
-    // repo) — either way, issues/PRs are skipped with a warning and commits
-    // still ingest (ADR-088 §5). A hard `gh` failure must never abort the
-    // whole pass.
+    // but cannot resolve an authenticated GitHub repository for this checkout"
+    // (e.g. a non-GitHub or local-only repo). Either way, requested issues/PRs
+    // are skipped with a structured reason and commits still ingest (ADR-088
+    // §5). The successful probe returns the exact owner/repo later passed via
+    // `--repo`, so PATH presence is never mistaken for remote usability.
     if opts.include.issues || opts.include.pull_requests {
-        if gh_available(&opts.repo) {
+        let gh_probe = probe_gh_repository(&opts.repo, opts.expected_github_repo.as_deref());
+        if let Ok(gh_repo) = &gh_probe {
             report.gh_available = Some(true);
             if opts.include.pull_requests && !budget.exhausted() {
                 match ingest_prs(
@@ -372,6 +405,7 @@ pub(crate) async fn run_ingest_with_commit_recovery(
                     token,
                     registry,
                     &opts.repo,
+                    gh_repo,
                     project_id,
                     &mut report,
                     &mut merge_sha_to_pr,
@@ -465,6 +499,7 @@ pub(crate) async fn run_ingest_with_commit_recovery(
                     token,
                     registry,
                     &opts.repo,
+                    gh_repo,
                     project_id,
                     &mut report,
                     &mut budget,
@@ -534,20 +569,18 @@ pub(crate) async fn run_ingest_with_commit_recovery(
                 ));
             }
         } else {
+            let reason = gh_probe
+                .as_ref()
+                .expect_err("successful probe handled in the preceding branch");
             report.gh_available = Some(false);
-            report.warnings.push(
-                "gh CLI not found on PATH; skipped issues and pull requests — commits still ingest"
-                    .to_string(),
-            );
+            report.warnings.push(format!(
+                "{reason}; skipped requested GitHub sources — commits still ingest"
+            ));
             if opts.include.pull_requests {
-                report.sources.pull_requests = Some(IngestSourceState::Skipped(
-                    "gh CLI not found on PATH".to_string(),
-                ));
+                report.sources.pull_requests = Some(IngestSourceState::Skipped(reason.to_string()));
             }
             if opts.include.issues {
-                report.sources.issues = Some(IngestSourceState::Skipped(
-                    "gh CLI not found on PATH".to_string(),
-                ));
+                report.sources.issues = Some(IngestSourceState::Skipped(reason.to_string()));
             }
         }
     }
@@ -789,17 +822,18 @@ async fn link_references(
                 // that quotes its own number) — not a real cross-reference.
                 continue;
             }
-            match registry
-                .dispatch(
-                    "link",
-                    json!({
+            match crate::dispatch_from_token(
+                registry,
+                token,
+                "link",
+                json!({
                         "source_id": record.id.to_string(),
                         "target_id": target.to_string(),
                         "relation": "annotates",
                         "metadata": { "ref_kind": mention.kind.as_str() },
-                    }),
-                )
-                .await
+                }),
+            )
+            .await
             {
                 Ok(_) => report.reference_edges_created += 1,
                 Err(e) => report.warnings.push(format!(
@@ -811,14 +845,190 @@ async fn link_references(
     }
 }
 
-/// `true` when `gh` is on PATH and can run inside `repo`.
-fn gh_available(repo: &Path) -> bool {
-    Command::new("gh")
-        .arg("--version")
+/// Resolve the exact GitHub `owner/repo` that `gh` can access for this
+/// checkout. The target is derived from the canonical remote source when the
+/// verb has one, otherwise from the checkout's configured `origin`. It is
+/// passed to `gh repo view` explicitly: argument-less repository selection is
+/// forbidden because `gh repo set-default` or an alternate remote could
+/// otherwise redirect ingestion into a different repository.
+///
+/// Failure strings are stable and credential-safe. Neither the origin URL nor
+/// `gh` stderr is copied into the public ingest report.
+fn probe_gh_repository(
+    repo: &Path,
+    expected: Option<&str>,
+) -> std::result::Result<String, &'static str> {
+    let expected = match expected {
+        Some(expected) => validate_owner_repo(expected)?,
+        None => github_repository_from_origin(repo)?,
+    };
+    let output = Command::new("gh")
+        .args([
+            "repo",
+            "view",
+            expected.as_str(),
+            "--json",
+            "nameWithOwner,url",
+        ])
         .current_dir(repo)
+        // Process-global GH_REPO/GH_HOST overrides could otherwise make this
+        // checkout appear usable by probing a different repo or host.
+        .env_remove("GH_REPO")
+        .env_remove("GH_HOST")
+        .env("GH_PROMPT_DISABLED", "1")
         .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+        .map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                "gh CLI not found on PATH"
+            } else {
+                "gh CLI could not be started"
+            }
+        })?;
+    if !output.status.success() {
+        return Err(
+            "gh CLI could not resolve an authenticated GitHub repository for this checkout",
+        );
+    }
+    parse_gh_repository_identity(&output.stdout, &expected)
+}
+
+/// Derive a GitHub `owner/repo` from the checkout's fetch identity. Only the
+/// configured `origin` is authoritative: another remote, or `gh`'s own local
+/// default, must never select the issue/PR source for this ingest.
+fn github_repository_from_origin(repo: &Path) -> std::result::Result<String, &'static str> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["remote", "get-url", "origin"])
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .output()
+        .map_err(|_| "git CLI could not resolve this checkout's origin repository")?;
+    if !output.status.success() {
+        return Err("checkout has no usable github.com origin repository");
+    }
+    let origin = std::str::from_utf8(&output.stdout)
+        .map(str::trim)
+        .map_err(|_| "checkout has no usable github.com origin repository")?;
+    let slug =
+        remote_url_to_slug(origin).ok_or("checkout has no usable github.com origin repository")?;
+    let mut segments = slug.split('/');
+    let (Some(host), Some(owner), Some(name), None) = (
+        segments.next(),
+        segments.next(),
+        segments.next(),
+        segments.next(),
+    ) else {
+        return Err("checkout has no usable github.com origin repository");
+    };
+    if !host.eq_ignore_ascii_case("github.com") {
+        return Err("checkout has no usable github.com origin repository");
+    }
+    validate_owner_repo(&format!("{owner}/{name}"))
+}
+
+fn validate_owner_repo(slug: &str) -> std::result::Result<String, &'static str> {
+    let Some((owner, name)) = slug.split_once('/') else {
+        return Err("invalid expected GitHub repository identity");
+    };
+    if owner.is_empty()
+        || name.is_empty()
+        || name.contains('/')
+        || slug.chars().any(|c| c.is_whitespace() || c.is_control())
+    {
+        return Err("invalid expected GitHub repository identity");
+    }
+    Ok(slug.to_string())
+}
+
+/// Validate the repository identity returned by `gh repo view` without
+/// trusting either field in isolation. Keeping this pure makes the
+/// non-GitHub and mismatched-identity boundaries deterministic to test.
+fn parse_gh_repository_identity(
+    stdout: &[u8],
+    expected: &str,
+) -> std::result::Result<String, &'static str> {
+    let payload: serde_json::Value = serde_json::from_slice(stdout)
+        .map_err(|_| "gh CLI returned an invalid repository identity")?;
+    let slug = payload
+        .get("nameWithOwner")
+        .and_then(serde_json::Value::as_str)
+        .ok_or("gh CLI returned an invalid repository identity")?;
+    if validate_owner_repo(slug).is_err() {
+        return Err("gh CLI returned an invalid repository identity");
+    }
+    let url = payload
+        .get("url")
+        .and_then(serde_json::Value::as_str)
+        .ok_or("gh CLI returned an invalid repository identity")?;
+    let url_slug =
+        remote_url_to_slug(url).ok_or("gh CLI returned an invalid repository identity")?;
+    if !url_slug.eq_ignore_ascii_case(&format!("github.com/{slug}")) {
+        return Err("gh CLI did not resolve a github.com repository for this checkout");
+    }
+    if !slug.eq_ignore_ascii_case(expected) {
+        return Err("gh CLI resolved a different repository than the digest source");
+    }
+    Ok(slug.to_string())
+}
+
+#[cfg(test)]
+mod gh_repository_identity_tests {
+    use super::parse_gh_repository_identity;
+
+    #[test]
+    fn accepts_matching_github_identity() {
+        assert_eq!(
+            parse_gh_repository_identity(
+                br#"{"nameWithOwner":"Fixture/Repository","url":"https://github.com/Fixture/Repository"}"#,
+                "fixture/repository",
+            ),
+            Ok("Fixture/Repository".to_string())
+        );
+    }
+
+    #[test]
+    fn rejects_successful_non_github_identity() {
+        assert_eq!(
+            parse_gh_repository_identity(
+                br#"{"nameWithOwner":"fixture/repository","url":"https://gitlab.com/fixture/repository"}"#,
+                "fixture/repository",
+            ),
+            Err("gh CLI did not resolve a github.com repository for this checkout")
+        );
+    }
+
+    #[test]
+    fn rejects_mismatched_slug_and_url() {
+        assert_eq!(
+            parse_gh_repository_identity(
+                br#"{"nameWithOwner":"fixture/repository","url":"https://github.com/other/repository"}"#,
+                "fixture/repository",
+            ),
+            Err("gh CLI did not resolve a github.com repository for this checkout")
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_identity() {
+        assert_eq!(
+            parse_gh_repository_identity(
+                br#"{"nameWithOwner":"fixture/repository"}"#,
+                "fixture/repository",
+            ),
+            Err("gh CLI returned an invalid repository identity")
+        );
+    }
+
+    #[test]
+    fn rejects_self_consistent_but_unexpected_repository() {
+        assert_eq!(
+            parse_gh_repository_identity(
+                br#"{"nameWithOwner":"other/repository","url":"https://github.com/other/repository"}"#,
+                "fixture/repository",
+            ),
+            Err("gh CLI resolved a different repository than the digest source")
+        );
+    }
 }
 
 /// Look up an existing `commit` note by its `properties.sha` (natural-key
@@ -940,6 +1150,75 @@ async fn find_document_for_path(
     Ok(row.and_then(|r| row_uuid(&r)))
 }
 
+/// Load the live code-map module index for the exact repository snapshot
+/// being digested. ADR-085's `source_path` is relative to a repository root,
+/// so path alone is not a safe cross-repository join key. Requiring the
+/// module's `source_revision` to equal the snapshot HEAD keeps unrelated maps
+/// out; a path with more than one matching live row remains ambiguous and is
+/// deliberately represented by `None` rather than selecting or annotating an
+/// arbitrary candidate. That `None` folds two distinct shapes, both
+/// counted in the same skip counter: (a) two or more rows, including two or
+/// more rows with parseable ids and the case where at most one has a
+/// parseable id (true ambiguity), and (b) exactly ONE row whose id does not
+/// parse — a key that is not ambiguous but has no bindable candidate, so it
+/// must skip for the same reason. Shape (b) is a live row for the key exactly
+/// like any other; it occupies the slot (a second row for the same key marks
+/// the pair ambiguous under shape (a)) but can never itself serve as a
+/// binding target.
+///
+/// A reader/query failure returns `Err` carrying the underlying error text;
+/// the caller degrades to no module annotation with a warning that includes
+/// it rather than aborting the pass: module annotation is best-effort
+/// enrichment (ADR-088 Amendment 1), while the durable `changed_paths` fact
+/// must still be recorded.
+///
+/// The map alone is returned; the caller counts a skip only when a commit
+/// path actually hits an ambiguous (`None`) key, so ambiguous keys no
+/// ingested commit touches never inflate
+/// `IngestReport.code_module_ambiguous_path_skips`.
+async fn load_code_modules_by_snapshot_path(
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+    source_revision: &str,
+) -> Result<HashMap<String, Option<Uuid>>> {
+    let sql = runtime.sql();
+    let mut r = sql.reader().await.map_err(|e| anyhow!("{e}"))?;
+    let rows = r
+        .query_all(SqlStatement {
+            sql: "SELECT id, json_extract(properties,'$.source_path') AS source_path \
+                  FROM entities WHERE kind='concept' AND entity_type='module' \
+                  AND namespace=?1 AND deleted_at IS NULL \
+                  AND json_type(properties,'$.source_path')='text' \
+                  AND json_extract(properties,'$.source_revision')=?2 \
+                  ORDER BY source_path, id"
+                .into(),
+            params: vec![
+                SqlValue::Text(token.namespace().as_str().to_string()),
+                SqlValue::Text(source_revision.to_string()),
+            ],
+            label: Some("git_ingest_load_code_modules_by_snapshot_path".into()),
+        })
+        .await
+        .map_err(|e| anyhow!("{e}"))?;
+
+    let mut modules: HashMap<String, Option<Uuid>> = HashMap::new();
+    for row in rows {
+        let Some(SqlValue::Text(path)) = row.get("source_path") else {
+            continue;
+        };
+        // A row whose id does not parse is still a live row for its
+        // `(source_revision, source_path)` key: it occupies the slot (so any
+        // second row for the same key marks the pair ambiguous) but can
+        // never bind as an annotation target itself.
+        let id = row_uuid(&row);
+        modules
+            .entry(path.clone())
+            .and_modify(|candidate| *candidate = None)
+            .or_insert(id);
+    }
+    Ok(modules)
+}
+
 /// Read the last-ingested cursor value for `(project_id, kind)`, if any.
 async fn read_cursor(
     runtime: &KhiveRuntime,
@@ -1001,6 +1280,7 @@ async fn write_cursor(
 
 const RECORD_SEP: char = '\u{1e}';
 const FIELD_SEP: char = '\u{1f}';
+const TOUCHED_HEADER_PREFIX: &[u8] = b"/\x1e";
 
 struct RawCommit {
     sha: String,
@@ -1118,14 +1398,27 @@ fn walk_commits(repo: &Path, since_sha: Option<&str>) -> Result<Vec<RawCommit>> 
 }
 
 /// `sha -> \[touched paths\]` for every commit in `repo`'s history, via a
-/// separate `--name-only` pass.
+/// separate NUL-delimited `--name-only` pass. Merge commits use their
+/// first-parent diff as the one canonical path set. The resulting paths drive
+/// document/module annotations and the durable
+/// `commit.properties.changed_paths` fact. Rename detection is pinned off so
+/// a rename always surfaces as the delete + add pair `--name-only` reports
+/// without it: those exact path facts are the ADR-085 module join keys, and
+/// Git does not mark which entry is the rename source, so an inferred rename
+/// could otherwise silently swap one side of the pair away.
 fn touched_files(repo: &Path) -> Result<HashMap<String, Vec<String>>> {
     let output = Command::new("git")
         .arg("-C")
         .arg(repo)
         .arg("log")
+        .arg("-z")
         .arg("--name-only")
-        .arg(format!("--pretty=format:{RECORD_SEP}%H"))
+        .arg("--no-renames")
+        .arg("--diff-merges=first-parent")
+        // Git paths are always repository-relative, so no tracked path token
+        // can start with `/`. This absolute-looking prefix is therefore an
+        // unambiguous header sentinel in the NUL-delimited token stream.
+        .arg(format!("--pretty=format:/{RECORD_SEP}%H"))
         .output()
         .context("spawning git log --name-only")?;
     if !output.status.success() {
@@ -1134,15 +1427,205 @@ fn touched_files(repo: &Path) -> Result<HashMap<String, Vec<String>>> {
             stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
         }));
     }
-    let text = String::from_utf8_lossy(&output.stdout);
+    parse_touched_files(&output.stdout)
+}
+
+/// Decode the `-z --name-only` stream [`touched_files`] produces. The stream
+/// is unambiguous only when every token is either a `/\x1e<40-hex-sha>`
+/// header (optionally followed by one newline and the commit's first path)
+/// or a path belonging to the most recent header; anything else fails the
+/// phase rather than storing a silently partial path set. A bare `[]` is
+/// therefore meaningful: it is a genuinely empty commit, never the residue
+/// of a parser/git-output mismatch.
+///
+/// One ambiguity this layer cannot resolve: a non-header token is
+/// indistinguishable from a real path of the most recent header's commit.
+/// The `--name-only` walk is newest-first, so a header lost mid-stream (with
+/// its NUL separator) leaves the deleted record's path tokens attached to
+/// that NEWER commit — the commit already walked in the same stream — never
+/// to an older one. Containment is partial and per-record, not per-stream:
+/// the missing sha has no path-set entry, so `ingest_commits` skips it,
+/// warns, and stalls the cursor
+/// (`ingest_stalls_cursor_for_commit_missing_touched_paths` pins both), but
+/// the polluted NEWER commit is created as usual — the orphaned tokens ride
+/// into its `changed_paths`, and commit notes are immutable, so the
+/// pollution persists (a re-ingest skips the already-stored sha; repair
+/// requires deleting the note and re-ingesting). The fixture asserts
+/// exactly that pollution.
+/// The parser deliberately does not try to detect it: that would require
+/// judging path content against a commit the parse never saw.
+fn parse_touched_files(bytes: &[u8]) -> Result<HashMap<String, Vec<String>>> {
     let mut map: HashMap<String, Vec<String>> = HashMap::new();
-    for block in text.split(RECORD_SEP) {
-        let mut lines = block.lines().filter(|l| !l.trim().is_empty());
-        let Some(sha) = lines.next() else { continue };
-        let files: Vec<String> = lines.map(str::to_string).collect();
-        map.insert(sha.trim().to_string(), files);
+    // With `-z`, git emits paths verbatim and NUL-terminates each one. Git
+    // may place either one or two NULs between adjacent commit sections, so
+    // parse individual tokens and recognize only the impossible-path header
+    // prefix above. The header and its first path share a token, separated by
+    // one newline; removing exactly that one byte preserves a filename whose
+    // own first byte is a newline.
+    let mut current_sha: Option<String> = None;
+    for token in bytes.split(|byte| *byte == 0) {
+        if token.is_empty() {
+            continue;
+        }
+        if let Some(header) = token.strip_prefix(TOUCHED_HEADER_PREFIX) {
+            if header.len() < 40 || !header[..40].iter().all(u8::is_ascii_hexdigit) {
+                let lossy = String::from_utf8_lossy(header);
+                let masked = secret_gate::mask_secrets(lossy.as_ref());
+                let display = refs::truncate_chars(masked.as_ref(), 80);
+                return Err(anyhow!(
+                    "git log --name-only output contains a malformed commit header {:?}",
+                    display
+                ));
+            }
+            let sha = String::from_utf8_lossy(&header[..40]).into_owned();
+            let files = map.entry(sha.clone()).or_default();
+            if let Some(first_path) = header[40..].strip_prefix(b"\n") {
+                if !first_path.is_empty() {
+                    files.push(String::from_utf8_lossy(first_path).into_owned());
+                }
+            } else if !header[40..].is_empty() {
+                // Anything after the SHA that does not start with the one
+                // newline separator is a shape git never emits; guessing at
+                // it could drop or fabricate a first path.
+                return Err(anyhow!(
+                    "git log --name-only header for commit {sha} carries a \
+                     malformed first-path separator"
+                ));
+            }
+            current_sha = Some(sha);
+            continue;
+        }
+        let Some(sha) = &current_sha else {
+            // Path bytes are attacker/repo-controlled, so the error snippet
+            // is secret-masked the same way stored changed_paths are —
+            // never raw token bytes in a log/error path.
+            let lossy = String::from_utf8_lossy(token);
+            let masked = secret_gate::mask_secrets(lossy.as_ref());
+            let display = refs::truncate_chars(masked.as_ref(), 80);
+            return Err(anyhow!(
+                "git log --name-only output contains a path token before any \
+                 commit header: {display:?}"
+            ));
+        };
+        map.get_mut(sha)
+            .expect("current SHA was inserted with its header")
+            .push(String::from_utf8_lossy(token).into_owned());
     }
     Ok(map)
+}
+
+#[cfg(test)]
+mod touched_file_parser_tests {
+    use super::parse_touched_files;
+
+    #[test]
+    fn accepts_single_or_double_nul_commit_boundaries() {
+        let sha_a = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let sha_b = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let sha_c = "cccccccccccccccccccccccccccccccccccccccc";
+        let raw =
+            format!("/\x1e{sha_a}\nfirst.rs\0second.rs\0/\x1e{sha_b}\nthird.rs\0\0/\x1e{sha_c}\0");
+
+        let parsed = parse_touched_files(raw.as_bytes()).expect("well-formed stream");
+        assert_eq!(
+            parsed[sha_a],
+            vec!["first.rs".to_string(), "second.rs".to_string()]
+        );
+        assert_eq!(parsed[sha_b], vec!["third.rs".to_string()]);
+        assert!(parsed[sha_c].is_empty());
+    }
+
+    #[test]
+    fn preserves_delimiters_and_uses_lossy_utf8_path_normalization() {
+        let sha = "dddddddddddddddddddddddddddddddddddddddd";
+        let mut raw = format!("/\x1e{sha}\n").into_bytes();
+        raw.extend_from_slice(b"src/caf\xc3\xa9\t\"quoted\"\\leaf\nline.rs\0bad-\xff.rs\0");
+
+        let parsed = parse_touched_files(&raw).expect("well-formed stream");
+        assert_eq!(
+            parsed[sha],
+            vec![
+                "src/café\t\"quoted\"\\leaf\nline.rs".to_string(),
+                "bad-�.rs".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn rejects_a_path_token_before_any_header() {
+        // Silently dropping this token could store `[]` for a commit that
+        // touched files; failing the phase preserves the retry contract.
+        let sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let raw = format!("orphan.rs\0/\x1e{sha}\nfirst.rs\0");
+
+        let err = parse_touched_files(raw.as_bytes()).expect_err("orphan path must fail");
+        assert!(
+            format!("{err}").contains("before any commit header"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn masks_a_secret_shaped_orphan_token_in_the_error() {
+        // The error snippet is a log path: it must carry the same masking as
+        // stored changed_paths, never raw token bytes.
+        let fake_token = "ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let raw = format!("src/{fake_token}.rs\0");
+
+        let err = parse_touched_files(raw.as_bytes()).expect_err("orphan path must fail");
+        let text = format!("{err}");
+        assert!(!text.contains(fake_token), "{text}");
+        assert!(text.contains("MASKED"), "{text}");
+    }
+
+    #[test]
+    fn masks_a_secret_shaped_malformed_header_in_the_error() {
+        let fake_token = "ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let raw = format!("/\x1e{fake_token}\0");
+
+        let err = parse_touched_files(raw.as_bytes()).expect_err("bad header must fail");
+        let text = format!("{err}");
+        assert!(!text.contains(fake_token), "{text}");
+        assert!(text.contains("MASKED"), "{text}");
+    }
+
+    #[test]
+    fn masks_an_orphan_secret_before_truncating_the_error() {
+        let fake_token = "ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        // The credential crosses the old byte-80 cut, so masking only the
+        // prefix would leave the raw secret in the error path.
+        let token = format!("{} {fake_token}", "x".repeat(59));
+        assert!(token.len() > 80);
+        let raw = format!("{token}\0");
+
+        let err = parse_touched_files(raw.as_bytes()).expect_err("orphan path must fail");
+        let text = format!("{err}");
+        assert!(!text.contains(fake_token), "{text}");
+        assert!(text.contains("MASKED"), "{text}");
+    }
+
+    #[test]
+    fn rejects_a_malformed_header_sha() {
+        let raw = "/\x1enot-hex-at-all\nfirst.rs\0second.rs\0";
+
+        let err = parse_touched_files(raw.as_bytes()).expect_err("bad header must fail");
+        assert!(
+            format!("{err}").contains("malformed commit header"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn rejects_a_header_remainder_without_the_newline_separator() {
+        // A header remainder that does not start with exactly one newline is
+        // a shape git never emits; silently discarding it could lose the
+        // first path or misread it as a leading-newline path.
+        let sha = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let raw = format!("/\x1e{sha}XXfirst.rs\0");
+
+        let err = parse_touched_files(raw.as_bytes()).expect_err("bad separator must fail");
+        assert!(format!("{err}").contains("first-path separator"), "{err}");
+    }
 }
 
 /// The two `git log` passes a commit-ingest phase needs, loaded together so
@@ -1380,6 +1863,35 @@ async fn ingest_commits(
     report.sources.commits = Some(IngestSourceState::StoppedEarly(
         COMMIT_WALK_SEED_REASON.into(),
     ));
+    // `walk_commits` is oldest-first and includes HEAD whenever this phase
+    // has work, so the last record is the exact repository snapshot against
+    // which ADR-085 `source_revision` must bind. The walk itself is never
+    // truncated: it issues one unbounded `git log {since}..HEAD`, and
+    // `max_items` bounds only the create loop below (a budget check AFTER
+    // this point), never the snapshot. `snapshot_head` is therefore always
+    // the true repository HEAD of this pass, and the module index anchors to
+    // modules-as-of-HEAD regardless of how many commits the budget lets this
+    // pass create.
+    let snapshot_head = commits
+        .last()
+        .expect("non-empty commit snapshot checked above")
+        .sha
+        .clone();
+    // Module annotation is best-effort enrichment: a failed index load
+    // degrades to no module annotation with a warning carrying the load
+    // error's text rather than aborting the pass that records the durable
+    // `changed_paths` facts.
+    let code_modules_by_source_path =
+        match load_code_modules_by_snapshot_path(runtime, token, &snapshot_head).await {
+            Ok(modules) => modules,
+            Err(e) => {
+                report.warnings.push(format!(
+                    "code module index load failed for snapshot {snapshot_head}: {e}; \
+                     commits ingest without code-module annotation"
+                ));
+                HashMap::new()
+            }
+        };
 
     // `cursor_stalled` freezes `last_sha` at the last contiguous successfully
     // processed commit: once a record fails to create, later records in this
@@ -1392,6 +1904,12 @@ async fn ingest_commits(
     // sha natural key), so a retried pass never double-creates them.
     let mut last_sha: Option<String> = since;
     let mut cursor_stalled = false;
+    // Bounded detail for the per-run ambiguous-module-skip warning: the
+    // masked skipped paths in encounter order, capped so one pathological
+    // run cannot bloat the report (the full count is always exact).
+    const AMBIGUOUS_SKIP_DETAIL_CAP: usize = 5;
+    const AMBIGUOUS_SKIP_PATH_DISPLAY_CHARS: usize = 80;
+    let mut ambiguous_module_skip_paths: Vec<String> = Vec::new();
     // Parent SHA -> note id for commits created earlier THIS pass (walked
     // oldest-first) — combined with `find_commit_by_sha`'s DB lookup below,
     // this resolves parent edges regardless of which pass the parent landed
@@ -1429,15 +1947,104 @@ async fn ingest_commits(
             format!("{}\n\n{}", masked.subject, masked.body)
         };
 
-        let mut annotates = vec![project_id.to_string()];
-
-        if let Some(paths) = files_by_sha.get(&c.sha) {
-            for p in paths {
-                if !p.starts_with("docs/adr/") {
-                    continue;
+        // Both `git log` passes walk the same history, so every walked
+        // commit should have a path-set entry. A missing entry means the two
+        // passes disagree; surface it instead of silently storing the `[]`
+        // the contract reserves for a genuinely empty commit.
+        let Some(touched_paths) = files_by_sha.get(&c.sha) else {
+            cursor_stalled = true;
+            let recipient_detail = commits
+                .iter()
+                .position(|candidate| candidate.sha == c.sha)
+                .and_then(|index| {
+                    commits
+                        .iter()
+                        .skip(index + 1)
+                        .find(|candidate| files_by_sha.contains_key(&candidate.sha))
+                })
+                .map(|recipient| {
+                    format!(
+                        "; orphaned paths may have been absorbed by newer commit {}",
+                        recipient.sha
+                    )
+                })
+                .unwrap_or_else(|| {
+                    "; no newer path-set recipient was identifiable from this snapshot".to_string()
+                });
+            report.warnings.push(format!(
+                "create commit {}: no touched-path set recorded by the \
+                 --name-only pass; not ingested{}",
+                c.sha, recipient_detail
+            ));
+            continue;
+        };
+        // The `-z` stream is verbatim: a Unix filename may legitimately
+        // contain `\` or start `X:`, and the hook's canonical
+        // `changed_paths` shape can never carry those (CommitHook rejects
+        // them, which would fail the whole commit create and stall the
+        // cursor on every pass). Filter them here, against the same
+        // predicate the hook enforces, and surface the per-run count below.
+        // The predicate runs on the RAW path, not the masked one: a secret
+        // token can itself contain a rejected byte (the masker's tokens are
+        // whitespace-delimited, so a backslash or NUL inside a token is
+        // redacted along with it), and filtering post-masking would then
+        // flip the verdict from reject to accept. Masking is applied only
+        // to the paths that survive the raw filter, for storage. Only
+        // actual predicate rejections count as drops: BTreeSet dedup and
+        // post-masking collisions are not drops and are neither counted
+        // nor warned.
+        let mut noncanonical = 0_u64;
+        let changed_paths: Vec<String> = touched_paths
+            .iter()
+            .filter(|path| {
+                let canonical = hook::is_repo_relative_path(path);
+                if !canonical {
+                    noncanonical += 1;
                 }
-                if let Some(doc_id) = find_document_for_path(runtime, token, p).await? {
-                    annotates.push(doc_id.to_string());
+                canonical
+            })
+            .map(|path| secret_gate::mask_secrets(path).into_owned())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        report.changed_paths_filtered_noncanonical += noncanonical;
+        // Distinguish the three stored states the contract defines: a
+        // genuinely empty commit stores `[]`; a commit whose raw touched
+        // paths were ALL rejected omits `changed_paths` entirely (the drop
+        // count in `changed_paths_filtered_noncanonical` and the per-run
+        // warning carry the evidence); anything else stores the canonical
+        // remainder. The hook treats a missing `changed_paths` as optional,
+        // so the omitted shape still validates.
+        let changed_paths_property = if touched_paths.is_empty() || !changed_paths.is_empty() {
+            Some(changed_paths.clone())
+        } else {
+            None
+        };
+        let mut annotates = BTreeSet::from([project_id.to_string()]);
+
+        for path in &changed_paths {
+            match code_modules_by_source_path.get(path) {
+                Some(Some(module_id)) => {
+                    annotates.insert(module_id.to_string());
+                }
+                // The key is unusable — either more than one live row binds
+                // it (including the two-parseable-row case) or its single
+                // row's id does not parse — so no candidate is annotated.
+                // Both shapes count once per commit path that hits the key (the
+                // path is also remembered for the bounded per-run warning
+                // below); see `load_code_modules_by_snapshot_path` for the
+                // fold.
+                Some(None) => {
+                    report.code_module_ambiguous_path_skips += 1;
+                    if ambiguous_module_skip_paths.len() < AMBIGUOUS_SKIP_DETAIL_CAP {
+                        ambiguous_module_skip_paths.push(path.clone());
+                    }
+                }
+                None => {}
+            }
+            if path.starts_with("docs/adr/") {
+                if let Some(doc_id) = find_document_for_path(runtime, token, path).await? {
+                    annotates.insert(doc_id.to_string());
                 }
             }
         }
@@ -1458,10 +2065,10 @@ async fn ingest_commits(
             },
         };
         if let Some(pr_id) = pr_id {
-            annotates.push(pr_id.to_string());
+            annotates.insert(pr_id.to_string());
         }
 
-        let properties = json!({
+        let mut properties = json!({
             "sha": masked.sha,
             "short_sha": masked.short_sha,
             "author": masked.author,
@@ -1469,6 +2076,9 @@ async fn ingest_commits(
             "committed_at": masked.committed_at,
             "parents": masked.parents,
         });
+        if let Some(paths) = changed_paths_property {
+            properties["changed_paths"] = json!(paths);
+        }
 
         let name = refs::truncate_chars(
             &format!("{} {}", masked.short_sha, masked.subject),
@@ -1481,14 +2091,14 @@ async fn ingest_commits(
             "name": name,
             "content": content,
             "properties": properties,
-            "annotates": annotates,
+            "annotates": annotates.into_iter().collect::<Vec<_>>(),
         });
         if let Some(head) = embedding_head {
             create_request["embedding_content"] = json!(head);
         }
 
         budget.try_consume();
-        match registry.dispatch("create", create_request).await {
+        match crate::dispatch_from_token(registry, token, "create", create_request).await {
             Ok(v) => {
                 report.commits_ingested += 1;
                 if embedding_head.is_some() {
@@ -1522,16 +2132,17 @@ async fn ingest_commits(
                         if parent_id == id {
                             continue;
                         }
-                        match registry
-                            .dispatch(
-                                "link",
-                                json!({
+                        match crate::dispatch_from_token(
+                            registry,
+                            token,
+                            "link",
+                            json!({
                                     "source_id": parent_id.to_string(),
                                     "target_id": id.to_string(),
                                     "relation": "precedes",
-                                }),
-                            )
-                            .await
+                            }),
+                        )
+                        .await
                         {
                             Ok(_) => report.parent_edges_created += 1,
                             Err(e) => report.warnings.push(format!(
@@ -1579,6 +2190,48 @@ async fn ingest_commits(
         // downgrades the pass to stopped-early in-band (never a hard
         // abort of the whole ingest).
         write_cursor(runtime, project_id, "commits", &sha).await?;
+    }
+    // One bounded line per run (never one per path): filenames are
+    // attacker/repo-controlled and may be long, so the count is the
+    // load-bearing fact; a bounded masked path sample rides along so the
+    // count is actionable, and the full set remains recoverable from the
+    // raw `git log -z --name-only` stream if an operator needs it.
+    if report.changed_paths_filtered_noncanonical > 0 {
+        report.warnings.push(format!(
+            "{} touched path(s) dropped from changed_paths: outside the \
+             canonical repo-relative shape (NUL byte, backslash, `X:` \
+             drive prefix, leading `/`, or empty/`.`/`..` component)",
+            report.changed_paths_filtered_noncanonical
+        ));
+    }
+    if report.code_module_ambiguous_path_skips > 0 {
+        // Every skip increments the exact counter above; only the retained
+        // masked path sample is capped at AMBIGUOUS_SKIP_DETAIL_CAP.
+        let shown = ambiguous_module_skip_paths
+            .len()
+            .min(AMBIGUOUS_SKIP_DETAIL_CAP);
+        let detail = ambiguous_module_skip_paths[..shown]
+            .iter()
+            .map(|path| {
+                let display = refs::truncate_chars(path, AMBIGUOUS_SKIP_PATH_DISPLAY_CHARS);
+                format!("{display:?}")
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        let remaining = report
+            .code_module_ambiguous_path_skips
+            .saturating_sub(shown as u64);
+        let suffix = if remaining > 0 {
+            format!(", +{remaining} more")
+        } else {
+            String::new()
+        };
+        report.warnings.push(format!(
+            "{} changed path(s) skipped code-module annotation: no usable \
+             (source_revision, source_path) binding (first {shown}: \
+             [{detail}]{suffix})",
+            report.code_module_ambiguous_path_skips
+        ));
     }
     if let Some(warning) = recovery_warning {
         report.warnings.push(warning);
@@ -1791,19 +2444,22 @@ fn canonical_issue_timestamp(
     }
 }
 
-fn gh_json(repo: &Path, args: &[&str]) -> Result<String> {
-    // gh has no `-C` flag (unlike git) — repo targeting is via working directory.
+fn gh_json(repo: &Path, gh_repo: &str, args: &[&str]) -> Result<String> {
+    // gh has no `-C` flag (unlike git). Keep cwd for local git configuration,
+    // but target the repository explicitly so later remote/cwd drift cannot
+    // redirect a resumed digest to a different repository.
     let output = Command::new("gh")
         .current_dir(repo)
         .args(args)
+        .args(["--repo", gh_repo])
+        .env_remove("GH_REPO")
+        .env_remove("GH_HOST")
+        .env("GH_PROMPT_DISABLED", "1")
         .output()
         .context("spawning gh")?;
     if !output.status.success() {
-        return Err(anyhow!(
-            "gh {:?} failed: {}",
-            args,
-            String::from_utf8_lossy(&output.stderr)
-        ));
+        let operation = args.get(0..2).unwrap_or(args).join(" ");
+        return Err(anyhow!("gh {operation} failed"));
     }
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
@@ -1864,10 +2520,11 @@ const PR_FIELDS: &str = "number,title,author,createdAt,mergedAt,closedAt,updated
 const ISSUE_FIELDS: &str =
     "number,title,author,createdAt,closedAt,updatedAt,labels,stateReason,body";
 
-fn fetch_pr_page(repo: &Path, floor: Option<&str>) -> Result<Vec<GhPr>> {
+fn fetch_pr_page(repo: &Path, gh_repo: &str, floor: Option<&str>) -> Result<Vec<GhPr>> {
     let search = search_query(floor);
     let raw = gh_json(
         repo,
+        gh_repo,
         &[
             "pr",
             "list",
@@ -1884,10 +2541,11 @@ fn fetch_pr_page(repo: &Path, floor: Option<&str>) -> Result<Vec<GhPr>> {
     serde_json::from_str(&raw).context("parsing gh pr list --json")
 }
 
-fn fetch_issue_page(repo: &Path, floor: Option<&str>) -> Result<Vec<GhIssue>> {
+fn fetch_issue_page(repo: &Path, gh_repo: &str, floor: Option<&str>) -> Result<Vec<GhIssue>> {
     let search = search_query(floor);
     let raw = gh_json(
         repo,
+        gh_repo,
         &[
             "issue",
             "list",
@@ -1905,8 +2563,10 @@ fn fetch_issue_page(repo: &Path, floor: Option<&str>) -> Result<Vec<GhIssue>> {
 }
 
 /// Every `GhPr` field funnels through this constructor before it can reach
-/// `properties`/`content`/the note `name`/the in-memory PR-linking maps,
-/// masking secrets in contributor-controlled prose fields. See
+/// `properties`/`content`/the note `name`/the in-memory PR-linking maps or
+/// the paging cursor. Contributor-controlled prose fields are masked, and
+/// `updatedAt` is canonicalized before it can affect sorting or a later
+/// `gh --search` argument. See
 /// crates/khive-pack-git/docs/api/ingest.md#masking-boundaries-maskedcommitfields-maskedissuefields-maskedprfields.
 struct MaskedPrFields {
     number: u64,
@@ -1923,7 +2583,7 @@ struct MaskedPrFields {
 }
 
 impl MaskedPrFields {
-    fn new(pr: GhPr) -> Self {
+    fn new(pr: GhPr, warnings: &mut Vec<String>) -> Self {
         let GhPr {
             number,
             title,
@@ -1947,10 +2607,33 @@ impl MaskedPrFields {
             created_at,
             merged_at,
             closed_at,
-            updated_at,
+            updated_at: canonical_pr_updated_at(number, updated_at, warnings),
             base_ref_name: base_ref_name.map(|r| secret_gate::mask_secrets(&r).into_owned()),
             head_ref_name: head_ref_name.map(|r| secret_gate::mask_secrets(&r).into_owned()),
             merge_commit_oid: merge_commit.and_then(|m| m.oid),
+        }
+    }
+}
+
+/// Parses a GitHub pull-request `updatedAt` into canonical RFC3339 form.
+/// Invalid values are dropped before page sorting so raw remote data can
+/// never become a persisted cursor or a later `gh --search` argument.
+fn canonical_pr_updated_at(
+    number: u64,
+    raw: Option<String>,
+    warnings: &mut Vec<String>,
+) -> Option<String> {
+    let raw = raw?;
+    match chrono::DateTime::parse_from_rfc3339(&raw) {
+        Ok(dt) => Some(
+            dt.with_timezone(&Utc)
+                .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        ),
+        Err(_) => {
+            warnings.push(format!(
+                "pull request #{number}: updatedAt is not a valid RFC3339 timestamp, field dropped"
+            ));
+            None
         }
     }
 }
@@ -1961,6 +2644,7 @@ async fn ingest_prs(
     token: &NamespaceToken,
     registry: &VerbRegistry,
     repo: &Path,
+    gh_repo: &str,
     project_id: Uuid,
     report: &mut IngestReport,
     merge_sha_to_pr: &mut HashMap<String, Uuid>,
@@ -1998,7 +2682,7 @@ async fn ingest_prs(
         // leaving the loop before the window completes IS stopping early,
         // and the arms below specialize the reason when they fire.
         let first_page = report.sources.pull_requests.is_none();
-        let mut page = match fetch_pr_page(repo, floor.as_deref()) {
+        let page = match fetch_pr_page(repo, gh_repo, floor.as_deref()) {
             Ok(page) => {
                 if first_page {
                     report.sources.pull_requests = Some(IngestSourceState::StoppedEarly(
@@ -2010,6 +2694,13 @@ async fn ingest_prs(
             Err(e) => return Err(e),
         };
         let page_len = page.len();
+        // Mask/canonicalize the complete remote page before either sorting
+        // or selecting its continuation floor. In particular, raw
+        // `updatedAt` must never enter the cursor/argv boundary.
+        let mut page: Vec<MaskedPrFields> = page
+            .into_iter()
+            .map(|pr| MaskedPrFields::new(pr, &mut report.warnings))
+            .collect();
         // Each page is already `sort:updated-asc` server-side, but `--search`
         // makes no hard ordering guarantee across ties — re-sort defensively
         // so the frozen-cursor invariant (records walked in nondecreasing
@@ -2021,12 +2712,12 @@ async fn ingest_prs(
         page.sort_by(|a, b| a.updated_at.cmp(&b.updated_at));
         let last_updated_at = page.last().and_then(|pr| pr.updated_at.clone());
 
-        for pr in page {
+        for masked in page {
             if let Some(existing) =
-                find_by_number(runtime, token, "pull_request", project_id, pr.number).await?
+                find_by_number(runtime, token, "pull_request", project_id, masked.number).await?
             {
-                number_to_pr.insert(pr.number, existing);
-                if let Some(oid) = pr.merge_commit.as_ref().and_then(|m| m.oid.clone()) {
+                number_to_pr.insert(masked.number, existing);
+                if let Some(oid) = masked.merge_commit_oid.as_ref().cloned() {
                     merge_sha_to_pr.insert(oid, existing);
                 }
                 report.prs_skipped_existing += 1;
@@ -2042,7 +2733,7 @@ async fn ingest_prs(
                 // all-existing pass (the common resumed-pass shape) still
                 // advances normally and never re-fetches its window twice.
                 if !cursor_stalled {
-                    if let Some(u) = &pr.updated_at {
+                    if let Some(u) = &masked.updated_at {
                         if max_updated
                             .as_deref()
                             .map(|m| u.as_str() > m)
@@ -2060,7 +2751,7 @@ async fn ingest_prs(
             // must not freeze the cursor at the pass floor.
             let is_new = since
                 .as_deref()
-                .zip(pr.updated_at.as_deref())
+                .zip(masked.updated_at.as_deref())
                 .map(|(cursor, updated)| updated >= cursor)
                 .unwrap_or(true);
             if !is_new {
@@ -2079,8 +2770,6 @@ async fn ingest_prs(
                 stop_reason = Some("budget exhausted before the pull request window completed");
                 break;
             }
-
-            let masked = MaskedPrFields::new(pr);
             let content = masked.body;
             let properties = json!({
                 "number": masked.number,
@@ -2099,18 +2788,19 @@ async fn ingest_prs(
             );
 
             budget.try_consume();
-            let result = match registry
-                .dispatch(
-                    "create",
-                    json!({
+            let result = match crate::dispatch_from_token(
+                registry,
+                token,
+                "create",
+                json!({
                         "kind": "pull_request",
                         "name": name,
                         "content": content,
                         "properties": properties,
                         "annotates": [project_id.to_string()],
-                    }),
-                )
-                .await
+                }),
+            )
+            .await
             {
                 Ok(v) => v,
                 Err(e) => {
@@ -2226,6 +2916,7 @@ async fn ingest_issues(
     token: &NamespaceToken,
     registry: &VerbRegistry,
     repo: &Path,
+    gh_repo: &str,
     project_id: Uuid,
     report: &mut IngestReport,
     budget: &mut Budget,
@@ -2259,7 +2950,7 @@ async fn ingest_issues(
         // the walk-start marker also pre-seeds the stopped-early state that
         // leaving the loop early implies.
         let first_page = report.sources.issues.is_none();
-        let page = match fetch_issue_page(repo, floor.as_deref()) {
+        let page = match fetch_issue_page(repo, gh_repo, floor.as_deref()) {
             Ok(page) => {
                 if first_page {
                     report.sources.issues = Some(IngestSourceState::StoppedEarly(
@@ -2371,18 +3062,19 @@ async fn ingest_issues(
             let name = refs::truncate_chars(&format!("#{number} {safe_title}"), NAME_MAX_CHARS);
 
             budget.try_consume();
-            let result = match registry
-                .dispatch(
-                    "create",
-                    json!({
+            let result = match crate::dispatch_from_token(
+                registry,
+                token,
+                "create",
+                json!({
                         "kind": "issue",
                         "name": name,
                         "content": content,
                         "properties": properties,
                         "annotates": [project_id.to_string()],
-                    }),
-                )
-                .await
+                }),
+            )
+            .await
             {
                 Ok(v) => v,
                 Err(e) => {
@@ -2852,6 +3544,171 @@ mod find_document_for_path_tests {
             Some(exact_id),
             "a single query covering both exact and broadened candidates \
              must still rank the exact match first, regardless of insertion order"
+        );
+    }
+}
+
+/// `load_code_modules_by_snapshot_path` ambiguity and error-surface
+/// regression tests. See
+/// crates/khive-pack-git/docs/api/ingest.md#test-module-notes.
+#[cfg(test)]
+mod module_index_loader_tests {
+    use super::*;
+    use khive_runtime::Namespace;
+
+    const REVISION: &str = "1111111111111111111111111111111111111111";
+    const AMBIGUOUS_PATH: &str = "crates/ambig/src/lib.rs";
+
+    fn rt_and_token() -> (KhiveRuntime, NamespaceToken) {
+        let rt = KhiveRuntime::memory().unwrap();
+        let token = rt.authorize(Namespace::local()).unwrap();
+        (rt, token)
+    }
+
+    async fn create_module(
+        rt: &KhiveRuntime,
+        token: &NamespaceToken,
+        name: &str,
+        path: &str,
+    ) -> Uuid {
+        rt.create_entity(
+            token,
+            "concept",
+            Some("module"),
+            name,
+            None,
+            Some(json!({
+                "source_path": path,
+                "source_revision": REVISION
+            })),
+            vec![],
+        )
+        .await
+        .unwrap()
+        .id
+    }
+
+    /// A live module row whose `id` does not parse as a UUID — a shape the
+    /// normal `create` path never writes, inserted raw to prove the loader
+    /// still counts it toward ambiguity.
+    async fn insert_unparsable_module_row(
+        rt: &KhiveRuntime,
+        token: &NamespaceToken,
+        name: &str,
+        path: &str,
+    ) {
+        let mut writer = rt.sql().writer().await.unwrap();
+        writer
+            .execute(SqlStatement {
+                sql: "INSERT INTO entities \
+                      (id, namespace, kind, entity_type, name, properties, created_at, updated_at) \
+                      VALUES (?1, ?2, 'concept', 'module', ?3, ?4, 0, 0)"
+                    .into(),
+                params: vec![
+                    SqlValue::Text("not-a-parseable-uuid".to_string()),
+                    SqlValue::Text(token.namespace().as_str().to_string()),
+                    SqlValue::Text(name.to_string()),
+                    SqlValue::Text(
+                        json!({
+                            "source_path": path,
+                            "source_revision": REVISION
+                        })
+                        .to_string(),
+                    ),
+                ],
+                label: Some("test_insert_unparsable_module_row".into()),
+            })
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn single_valid_module_row_binds() {
+        let (rt, token) = rt_and_token();
+        let id = create_module(&rt, &token, "solo_module", AMBIGUOUS_PATH).await;
+
+        let index = load_code_modules_by_snapshot_path(&rt, &token, REVISION)
+            .await
+            .unwrap();
+        assert_eq!(index.get(AMBIGUOUS_PATH), Some(&Some(id)));
+    }
+
+    /// Contract: more than one live module with the same
+    /// `(source_revision, source_path)` is ambiguous and annotates none. An
+    /// unparsable-id row is still a live row for that key, so it must mark
+    /// the pair ambiguous even though it can never bind itself.
+    #[tokio::test]
+    async fn unparsable_module_row_counts_toward_ambiguity() {
+        let (rt, token) = rt_and_token();
+        let valid_id = create_module(&rt, &token, "valid_module", AMBIGUOUS_PATH).await;
+        insert_unparsable_module_row(&rt, &token, "malformed_module", AMBIGUOUS_PATH).await;
+
+        let index = load_code_modules_by_snapshot_path(&rt, &token, REVISION)
+            .await
+            .unwrap();
+        assert_eq!(
+            index.get(AMBIGUOUS_PATH),
+            Some(&None),
+            "a malformed row is evidence of a second live module for \
+             {AMBIGUOUS_PATH}; the valid row {valid_id} must not be selected"
+        );
+    }
+
+    #[tokio::test]
+    async fn two_parseable_module_rows_fold_to_ambiguity() {
+        let (rt, token) = rt_and_token();
+        let first_id = create_module(&rt, &token, "first_module", AMBIGUOUS_PATH).await;
+        let second_id = create_module(&rt, &token, "second_module", AMBIGUOUS_PATH).await;
+
+        let index = load_code_modules_by_snapshot_path(&rt, &token, REVISION)
+            .await
+            .unwrap();
+        assert_eq!(
+            index.get(AMBIGUOUS_PATH),
+            Some(&None),
+            "two live parseable rows ({first_id}, {second_id}) must not select a winner"
+        );
+    }
+
+    #[tokio::test]
+    async fn unparsable_module_row_alone_never_binds() {
+        let (rt, token) = rt_and_token();
+        insert_unparsable_module_row(&rt, &token, "lonely_malformed", AMBIGUOUS_PATH).await;
+
+        let index = load_code_modules_by_snapshot_path(&rt, &token, REVISION)
+            .await
+            .unwrap();
+        assert_eq!(
+            index.get(AMBIGUOUS_PATH),
+            Some(&None),
+            "an unparsable id can never serve as an annotation target"
+        );
+    }
+
+    /// A failed index load must surface its cause: the caller includes this
+    /// error text in the degradation warning, so persistent SQL/schema
+    /// problems stay diagnosable.
+    #[tokio::test]
+    async fn load_failure_surfaces_error_text() {
+        let (rt, token) = rt_and_token();
+        // Break the substrate directly: the index query then fails with a
+        // real SQL error that must reach the caller.
+        let mut writer = rt.sql().writer().await.unwrap();
+        writer
+            .execute(SqlStatement {
+                sql: "DROP TABLE entities".into(),
+                params: vec![],
+                label: Some("test_drop_entities".into()),
+            })
+            .await
+            .unwrap();
+
+        let err = load_code_modules_by_snapshot_path(&rt, &token, REVISION)
+            .await
+            .expect_err("a failed index load must return Err");
+        assert!(
+            format!("{err}").contains("no such table"),
+            "the error must carry the underlying SQL cause: {err}"
         );
     }
 }

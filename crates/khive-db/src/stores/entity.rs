@@ -144,15 +144,17 @@ impl SqlEntityStore {
     /// over the same pool never spawns more than one writer task; see
     /// `ConnectionPool::writer_task_handle`'s doc comment for why that
     /// matters. `None` (falling back to the legacy path for every write)
-    /// if the flag is off, or if the writer task failed to spawn (for
-    /// example, an in-memory pool, which has no standalone-connection
-    /// support) — the flag is a best-effort opt-in, not a hard requirement.
+    /// if the resolved flag is off, or if the writer task failed to spawn
+    /// (for example, an in-memory pool, which has no standalone-connection
+    /// support) — enabled by default for file-backed pools; explicit
+    /// off/degraded fallback remains possible.
     pub fn new(pool: Arc<ConnectionPool>, is_file_backed: bool) -> Self {
-        // Best-effort opt-in (slice 1 policy, unchanged): a missing writer
-        // task — whether the flag is off, spawn degraded (e.g. in-memory
-        // pool), or no Tokio runtime was available at this first access
-        // (ADR-067 Component A runtime-handle guard) — degrades to the
-        // legacy pool-mutex path rather than failing construction.
+        // Enabled by default for file-backed pools; explicit off/degraded
+        // fallback remains possible: a missing writer task — whether
+        // explicitly disabled, spawn degraded (e.g. in-memory pool), or no
+        // Tokio runtime was available at this first access (ADR-067
+        // Component A runtime-handle guard) — degrades to the legacy
+        // pool-mutex path rather than failing construction.
         let writer_task = pool.writer_task_handle().ok().flatten();
 
         Self {
@@ -210,7 +212,7 @@ impl SqlEntityStore {
     {
         if let Some(writer_task) = &self.writer_task {
             return writer_task
-                .send(move |conn| f(conn).map_err(|e| map_err(e, op)))
+                .send_bounded(move |conn| f(conn).map_err(|e| map_err(e, op)))
                 .await;
         }
 
@@ -594,14 +596,14 @@ impl EntityStore for SqlEntityStore {
         // closure would violate SQLite's nested-transaction rule).
         if let Some(writer_task) = &self.writer_task {
             return writer_task
-                .send(move |conn| {
+                .send_bounded(move |conn| {
                     batch_upsert_entities(conn, &entities, attempted)
                         .map_err(|e| map_err(e, "upsert_entities"))
                 })
                 .await;
         }
 
-        // Flag-off (default) path: byte-for-byte unchanged from pre-ADR-067
+        // Explicitly disabled or degraded fallback path: byte-for-byte unchanged from pre-ADR-067
         // behavior — the closure owns its own BEGIN IMMEDIATE/COMMIT/ROLLBACK
         // via the pool-mutex writer.
         let origin = self.pool.origin();
@@ -744,11 +746,18 @@ impl EntityStore for SqlEntityStore {
             let order_by = if let Some(ref prefix) = filter.name_prefix {
                 data_params.push(Box::new(prefix.to_ascii_lowercase()));
                 format!(
-                    "CASE WHEN LOWER(name) = ?{} THEN 0 ELSE 1 END, created_at DESC",
+                    "CASE WHEN LOWER(name) = ?{} THEN 0 ELSE 1 END, created_at DESC, id DESC",
                     data_params.len()
                 )
             } else {
-                "created_at DESC".to_string()
+                // #1671: append `id` as the final tiebreak in the primary
+                // key's direction so equal-`created_at` rows keep a fixed
+                // order across page boundaries. The deterministic total order
+                // removes tie-order instability only — offset paging can still
+                // duplicate or skip rows under concurrent inserts/deletes or
+                // sort-key updates (that would need snapshot isolation or
+                // keyset pagination).
+                "created_at DESC, id DESC".to_string()
             };
 
             data_params.push(Box::new(limit_i64));
@@ -822,12 +831,22 @@ impl EntityStore for SqlEntityStore {
 
             let columns = "id, namespace, kind, entity_type, name, description, properties, tags, \
                            created_at, updated_at, deleted_at, merged_into, merge_event_id, content_ref";
-            // CROSS JOIN is load-bearing: SQLite must drive the query from the
-            // sequence INTEGER PRIMARY KEY range instead of scanning the
-            // namespace index and sorting all matches into a temp B-tree.
+            // CROSS JOIN is load-bearing for the unfiltered walk: SQLite must
+            // drive the query from the sequence INTEGER PRIMARY KEY range
+            // instead of scanning the namespace index and sorting all matches
+            // into a temp B-tree. When a kind filter is active, forcing that
+            // same seq-first plan prevents SQLite from using
+            // idx_entities_kind(namespace, kind) as the driving index, so a
+            // plain JOIN is used instead and left to the query planner — the
+            // cursor's page order is still entities_seq.seq, unchanged.
+            let join_kind = if filter.kinds.is_empty() {
+                "CROSS JOIN"
+            } else {
+                "JOIN"
+            };
             let sql = format!(
                 "SELECT {columns}, entities_seq.seq FROM entities_seq \
-                 CROSS JOIN entities ON entities.id = entities_seq.entity_id{where_sql} \
+                 {join_kind} entities ON entities.id = entities_seq.entity_id{where_sql} \
                  ORDER BY entities_seq.seq ASC LIMIT ?{limit_idx}"
             );
             let mut stmt = conn.prepare(&sql)?;
