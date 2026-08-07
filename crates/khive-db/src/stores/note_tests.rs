@@ -828,7 +828,7 @@ async fn query_notes_offset_sweep_covers_equal_created_at_exactly_once() {
         expected_ids.push(note.id);
         store.upsert_note(note).await.unwrap();
     }
-    expected_ids.sort_unstable_by(|a, b| b.cmp(a));
+    expected_ids.sort_unstable();
 
     let mut actual_ids = Vec::new();
     let page_size = 37_u32;
