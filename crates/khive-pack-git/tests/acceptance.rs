@@ -3966,13 +3966,26 @@ async fn pr_full_page_never_leaks_raw_updated_at_into_paging_floor() {
             )
             .await
             .expect("list PRs ok");
+        // Same contract as the issue-listing scan above: `pull_request` is a
+        // note kind, so its clamped envelope renders rows under `notes`, and an
+        // `items` key means the kind is no longer routed through the note
+        // branch.
         let items = match page.as_array() {
             Some(items) => items.clone(),
-            None => page
-                .get("items")
-                .and_then(Value::as_array)
-                .expect("clamped list response must carry an items array")
-                .clone(),
+            None => {
+                assert!(
+                    page.get("items").is_none(),
+                    "a pull_request listing is a note listing, so its clamped envelope \
+                     must render rows under `notes`; an `items` key means the kind is \
+                     no longer routed through the note branch: {page}"
+                );
+                page.get("notes")
+                    .and_then(Value::as_array)
+                    .unwrap_or_else(|| {
+                        panic!("clamped pull_request listing must carry a notes array: {page}")
+                    })
+                    .clone()
+            }
         };
         assert!(
             items
