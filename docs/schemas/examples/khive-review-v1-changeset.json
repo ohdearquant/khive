@@ -1,0 +1,125 @@
+{
+  "schema_version": "khive.review.v1",
+  "review_kind": "changeset",
+  "capability": {
+    "source": "local_changeset",
+    "mutability": "read_only",
+    "no_writes": true,
+    "git_reads": false,
+    "khive_reads": false,
+    "github_writes": false,
+    "wasm": false,
+    "persistence": false,
+    "unavailable_actions": [
+      "stage",
+      "apply",
+      "commit",
+      "push",
+      "publish"
+    ]
+  },
+  "change_set": {
+    "envelope": {
+      "schema_version": 1,
+      "producer": "lambda:atlas",
+      "producer_model_family": "family:atlas",
+      "staged_at": 2000000,
+      "batch_id": "atlas-batch-7"
+    },
+    "operations": [
+      {
+        "index": 0,
+        "id": "10000000-0000-4000-8000-000000000001",
+        "op": "create",
+        "target": "entity",
+        "tier": "tier_1",
+        "summary": "Create concept entity “Alpha”",
+        "reason": "Create is additive and Tier 1-eligible under the ADR-102 floor.",
+        "tier_reasons": [
+          "adr102.create"
+        ],
+        "entity_ids": [
+          "10000000-0000-4000-8000-000000000001"
+        ],
+        "after": {
+          "kind": "entity",
+          "entity_kind": "concept",
+          "name": "Alpha",
+          "properties": {},
+          "tags": []
+        }
+      },
+      {
+        "index": 1,
+        "id": "10000000-0000-4000-8000-000000000002",
+        "op": "create",
+        "target": "entity",
+        "tier": "tier_1",
+        "summary": "Create concept entity “Beta”",
+        "reason": "Create is additive and Tier 1-eligible under the ADR-102 floor.",
+        "tier_reasons": [
+          "adr102.create"
+        ],
+        "entity_ids": [
+          "10000000-0000-4000-8000-000000000002"
+        ],
+        "after": {
+          "kind": "entity",
+          "entity_kind": "concept",
+          "name": "Beta",
+          "properties": {},
+          "tags": []
+        }
+      },
+      {
+        "index": 2,
+        "id": "10000000-0000-4000-8000-000000000003",
+        "op": "link",
+        "target": "edge",
+        "tier": "tier_2",
+        "summary": "Link 10000000-0000-4000-8000-000000000001 supports 10000000-0000-4000-8000-000000000002",
+        "reason": "supports is judgment-bearing and requires Tier 2 review.",
+        "tier_reasons": [
+          "adr102.judgment_relation"
+        ],
+        "entity_ids": [
+          "10000000-0000-4000-8000-000000000001",
+          "10000000-0000-4000-8000-000000000002"
+        ],
+        "after": {
+          "properties": {},
+          "relation": "supports",
+          "weight": 0.9
+        }
+      }
+    ]
+  },
+  "tier_summary": {
+    "operations": 3,
+    "tier_1": 2,
+    "tier_2": 1,
+    "highest_tier": "tier_2",
+    "requires_independent_review": true,
+    "policy": "adr_102_floor"
+  },
+  "validation": {
+    "scope": "commit_time_partial_view",
+    "rules_evaluated": 3,
+    "failed_rules": 0,
+    "errors": 0,
+    "warnings": 0,
+    "info": 0,
+    "passed": true
+  },
+  "findings": [],
+  "review_gate": {
+    "required": true,
+    "producer_model_family": "family:atlas",
+    "reviewer_model_family": "family:independent",
+    "eligible": true,
+    "approval_ready": true,
+    "status": "eligible",
+    "reason": "The reviewer model family differs from the producer model family.",
+    "persisted": false
+  }
+}

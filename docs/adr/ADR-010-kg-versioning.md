@@ -72,10 +72,10 @@ transport, or canonical hash algorithm in detail. Those are owned by implementat
 | Custom `khive-vcs` commands         | Superseded                | [ADR-020](ADR-020-git-native-kg-implementation.md)                              |
 | Custom `khive-sync` HTTP server     | Superseded for v1         | [ADR-020](ADR-020-git-native-kg-implementation.md)                              |
 | Custom merge engine                 | Superseded for v1         | [ADR-020](ADR-020-git-native-kg-implementation.md); conflict taxonomy retained  |
-| Conflict resolution UX              | Future                    | Future conflict resolution ADR                                                  |
+| Conflict resolution UX              | Future                    | New conflict classification and resolution ADR                                 |
 | Federated snapshots                 | Future                    | New federation ADR                                                              |
 | Notes versioning                    | Future (v2)               | New note export/versioning ADR                                                  |
-| Semantic review / PR enrichment     | Future (v2)               | New review ADR                                                                  |
+| Semantic review / PR enrichment     | Proposed                  | [ADR-145](ADR-145-local-first-kg-workbench.md)                                  |
 
 ### Authority chain
 
@@ -84,6 +84,7 @@ ADR-010: strategic root (this ADR)
   └── ADR-020: current implementation contract (git-native versioning)
       ├── KgArchive representation + current snapshot-hash floor
       └── git merge behavior + retained conflict taxonomy
+  └── ADR-145: proposed semantic review and workbench presentation contract
 ```
 
 [ADR-020](ADR-020-git-native-kg-implementation.md) is the current authority for all three child

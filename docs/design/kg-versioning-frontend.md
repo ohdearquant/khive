@@ -1,6 +1,12 @@
 # KG Versioning — Frontend Design
 
-**Status**: draft\
+> **Historical draft — do not implement.**
+> Proposed [ADR-145](../adr/ADR-145-local-first-kg-workbench.md) is the candidate replacement. Git and GitHub own
+> commits, branches, pull requests, and merges; khive supplies semantic review enrichment. The ADR
+> also corrects this document's stale ADR references and direct-browser backend assumptions. This
+> file remains only as historical context.
+
+**Status**: historical draft; candidate supersession is proposed\
 **Date**: 2026-05-19\
 **Authors**: khive maintainers
 **Target**: Next.js 15 + React 19 (PR #25 scaffold)

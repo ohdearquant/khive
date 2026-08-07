@@ -265,6 +265,31 @@ jobs:
         if: env.CI_SUITE == 'full' && matrix.shard == 1
         run: ../scripts/ci.sh contract-suite
 
+  kg-editor:
+    name: KG Studio (Next.js)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: apps/kg-editor
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: apps/kg-editor/package-lock.json
+      - name: Install locked dependencies
+        run: npm ci --no-audit --no-fund
+      - name: Lint
+        run: npm run lint
+      - name: Typecheck
+        run: npm run typecheck
+      - name: Unit and interaction tests
+        run: npm test
+      - name: Production build
+        run: npm run build
+
   supply-chain:
     name: Supply-chain (cargo-deny)
     runs-on: ubuntu-latest
@@ -671,6 +696,7 @@ jobs:
     needs:
       - automerge-push-guard
       - ci
+      - kg-editor
       - supply-chain
       - data-leak-guard
       - secret-scan
