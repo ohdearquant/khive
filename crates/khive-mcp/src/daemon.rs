@@ -812,16 +812,30 @@ fn spawn_daemon_with_exe_and_config(
     // installation is atomically replacing `kkernel`. Retry only that precise
     // error, with a short finite budget; every other spawn failure remains
     // immediate and unchanged.
-    const EXECUTABLE_BUSY_BACKOFF_MS: [u64; 3] = [5, 20, 50];
-    for delay_ms in EXECUTABLE_BUSY_BACKOFF_MS {
-        match cmd.spawn() {
+    spawn_retrying_executable_busy(&EXECUTABLE_BUSY_BACKOFF_MS, || cmd.spawn())
+}
+
+/// Short finite backoff budget for a transient `ExecutableFileBusy` spawn
+/// failure — see the call site in [`spawn_daemon_with_exe_and_config`].
+const EXECUTABLE_BUSY_BACKOFF_MS: [u64; 3] = [5, 20, 50];
+
+/// Retry `spawn` up to `delays_ms.len()` extra times, sleeping the
+/// corresponding delay between attempts, but only when the failure is
+/// `ErrorKind::ExecutableFileBusy`. Any other error — or the final attempt
+/// after the backoff budget is exhausted — is returned immediately.
+fn spawn_retrying_executable_busy<T>(
+    delays_ms: &[u64],
+    mut spawn: impl FnMut() -> std::io::Result<T>,
+) -> std::io::Result<T> {
+    for delay_ms in delays_ms {
+        match spawn() {
             Err(error) if error.kind() == std::io::ErrorKind::ExecutableFileBusy => {
-                std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+                std::thread::sleep(std::time::Duration::from_millis(*delay_ms));
             }
             outcome => return outcome,
         }
     }
-    cmd.spawn()
+    spawn()
 }
 
 /// Return `true` if `args` (the full `ps -o args=` output for a process)
@@ -3164,6 +3178,55 @@ mod tests {
         release.join().expect("fixture writer release thread");
         let status = child.wait().expect("wait for executable fixture");
         assert!(status.success(), "fixture must exit 0: {status}");
+    }
+
+    /// The helper behind the retry above must actually retry the exact
+    /// number of times ETXTBSY is injected, then succeed on the next
+    /// attempt — a fixture that merely holds a file open (as the test above
+    /// does) never proves an initial ETXTBSY was observed or counts
+    /// attempts, so it passes even against a no-retry implementation on a
+    /// filesystem that permits executing a writable-open file.
+    #[test]
+    fn spawn_retrying_executable_busy_retries_exact_count_then_succeeds() {
+        let attempts = std::sync::atomic::AtomicUsize::new(0);
+        let result: std::io::Result<()> =
+            spawn_retrying_executable_busy(&EXECUTABLE_BUSY_BACKOFF_MS, || {
+                let n = attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if n < 2 {
+                    Err(std::io::Error::from(std::io::ErrorKind::ExecutableFileBusy))
+                } else {
+                    Ok(())
+                }
+            });
+
+        assert!(result.is_ok(), "must succeed once ETXTBSY stops recurring");
+        assert_eq!(
+            attempts.load(std::sync::atomic::Ordering::SeqCst),
+            3,
+            "must retry exactly until success: 2 injected ETXTBSY failures + 1 success"
+        );
+    }
+
+    /// A non-ETXTBSY error must never be retried, even though the backoff
+    /// budget has room left.
+    #[test]
+    fn spawn_retrying_executable_busy_does_not_retry_other_errors() {
+        let attempts = std::sync::atomic::AtomicUsize::new(0);
+        let result: std::io::Result<()> =
+            spawn_retrying_executable_busy(&EXECUTABLE_BUSY_BACKOFF_MS, || {
+                attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+            });
+
+        assert!(
+            result.is_err(),
+            "a non-ETXTBSY error must surface, not be swallowed"
+        );
+        assert_eq!(
+            attempts.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a non-ETXTBSY error must not retry"
+        );
     }
 
     #[derive(Clone, Default)]
