@@ -22,8 +22,12 @@ decisions and rationale.
   callers must not infer full success solely from the absence of an RPC-level error.
 - Per-op failures do not abort siblings in Parallel mode; they do abort remaining
   ops in Chain mode (reported as `{"ok": false, "aborted": true}`).
-- Invalid DSL (parse/lex failure) returns an RPC-level `invalid_params` error.
-  Per-verb validation failure returns a per-op `{ok: false, error: "..."}` entry.
+- Invalid DSL (parse/lex failure) is preflighted before warm-daemon forwarding
+  and returns an RPC-level `invalid_params` error; its error data carries
+  `reason: "parse-error"` on both local and daemon-available paths. Per-verb
+  failures retain the canonical `{ok: false, error: ...}` fields and may add a
+  sibling stable `reason` classification. The closed vocabulary is documented
+  once in `crates/kkernel/docs/usage.md`.
 
 ### Pack Standard — Vocabulary, Visibility, and Schema Plans (ADR-017)
 

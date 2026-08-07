@@ -46,6 +46,160 @@ use khive_mcp::tools::request::RequestParams;
 #[cfg(unix)]
 use khive_runtime::{daemon::PROTOCOL_VERSION, DaemonRequestFrame};
 use khive_runtime::{KhiveConfig, KhiveRuntime, Namespace, RuntimeConfig};
+use khive_types::RefusalReason;
+
+/// Stable stderr prefix for machine-classifiable exec refusals.
+const REFUSAL_PREFIX: &str = "kkernel-refusal: ";
+
+#[derive(Debug)]
+struct ExecRefusal {
+    reason: RefusalReason,
+    message: String,
+}
+
+impl std::fmt::Display for ExecRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for ExecRefusal {}
+
+fn refusal_error(reason: RefusalReason, message: impl Into<String>) -> anyhow::Error {
+    anyhow::Error::new(ExecRefusal {
+        reason,
+        message: message.into(),
+    })
+}
+
+fn emit_refusal(reason: RefusalReason) {
+    eprintln!("{REFUSAL_PREFIX}{reason}");
+}
+
+fn refusal_envelope_for_tools(
+    tools: Vec<String>,
+    chain: bool,
+    reason: RefusalReason,
+    message: &str,
+) -> serde_json::Value {
+    debug_assert!(
+        !tools.is_empty(),
+        "per-operation refusal envelopes require at least one parsed operation"
+    );
+    let total = tools.len();
+    let results: Vec<serde_json::Value> = tools
+        .into_iter()
+        .enumerate()
+        .map(|(index, tool)| {
+            if chain && index > 0 {
+                serde_json::json!({
+                    "ok": false,
+                    "tool": tool,
+                    "aborted": true,
+                    "message": message,
+                    "reason": reason.as_str(),
+                })
+            } else {
+                serde_json::json!({
+                    "ok": false,
+                    "tool": tool,
+                    "error": message,
+                    "reason": reason.as_str(),
+                })
+            }
+        })
+        .collect();
+    let aborted = if chain { total.saturating_sub(1) } else { 0 };
+    let failed = total - aborted;
+    serde_json::json!({
+        "results": results,
+        "summary": {
+            "total": total,
+            "succeeded": 0,
+            "failed": failed,
+            "aborted": aborted,
+        },
+        "status": "partial",
+    })
+}
+
+/// Build the CLI's structured invocation-level error shape.
+///
+/// A failure that occurs before an operation can be identified must not be
+/// represented as a fabricated per-op result. This mirrors the existing
+/// database-override refusal shape and preserves ADR-016's parse-before-
+/// envelope boundary: `results` exists only after a real operation list does.
+fn invocation_refusal_envelope(reason: RefusalReason, message: &str) -> serde_json::Value {
+    let code = if reason == RefusalReason::ParseError {
+        "invalid_params"
+    } else {
+        "invocation_refused"
+    };
+    serde_json::json!({
+        "error": {
+            "code": code,
+            "message": message,
+            "reason": reason.as_str(),
+        },
+        "invocation": {"started": false},
+    })
+}
+
+/// Emit the stable stderr token and structured invocation-level error for a
+/// refusal that has no parsed operation list.
+fn report_unscoped_refusal(reason: RefusalReason, message: impl Into<String>) -> anyhow::Error {
+    let message = message.into();
+    emit_refusal(reason);
+    println!(
+        "{}",
+        serde_json::to_string(&invocation_refusal_envelope(reason, &message))
+            .expect("invocation refusal envelope is serializable")
+    );
+    anyhow::anyhow!(message)
+}
+
+/// Emit a per-operation refusal envelope when the supplied DSL parses. If it
+/// does not parse, retain the invocation-level boundary instead of inventing a
+/// synthetic operation name.
+fn report_invocation_refusal(
+    raw_ops: Option<&str>,
+    reason: RefusalReason,
+    error: impl std::fmt::Display,
+) -> anyhow::Error {
+    let message = error.to_string();
+    let (tools, chain) = raw_ops
+        .and_then(|ops| khive_request::parse_request(ops).ok())
+        .map(|parsed| {
+            let chain = parsed.mode == khive_request::ExecutionMode::Chain;
+            let tools: Vec<String> = parsed.ops.into_iter().map(|op| op.tool).collect();
+            (tools, chain)
+        })
+        .unwrap_or_default();
+    if tools.is_empty() {
+        report_unscoped_refusal(reason, message)
+    } else {
+        report_tools_refusal(tools, chain, reason, message)
+    }
+}
+
+fn report_tools_refusal(
+    tools: Vec<String>,
+    chain: bool,
+    reason: RefusalReason,
+    message: impl Into<String>,
+) -> anyhow::Error {
+    let message = message.into();
+    if tools.is_empty() {
+        return report_unscoped_refusal(reason, message);
+    }
+    emit_refusal(reason);
+    let envelope = refusal_envelope_for_tools(tools, chain, reason, &message);
+    println!(
+        "{}",
+        serde_json::to_string(&envelope).expect("refusal envelope is serializable")
+    );
+    anyhow::anyhow!(message)
+}
 
 // ── daemon-forward seam (Unix only) ─────────────────────────────────────────
 //
@@ -260,8 +414,9 @@ pub struct ExecArgs {
     /// Write results as JSONL to this path and print a self-describing manifest.
     ///
     /// The manifest (`{path, rows, per_column_null_counts, schema_fingerprint,
-    /// checksum}`) is printed to stdout instead of the raw results.  Parent
-    /// directories are created if absent.
+    /// checksum, summary, failures?}`) is printed to stdout instead of the raw
+    /// results. Optional `failures` entries project each failed row's error and
+    /// any stable reason. Parent directories are created if absent.
     ///
     /// Note: `--save-file` always runs in-process and bypasses the warm daemon,
     /// so ANN-dependent verbs (e.g. `knowledge.suggest`, `knowledge.compose`) may
@@ -315,8 +470,10 @@ pub struct ExecArgs {
     /// batch still exits 0 — the per-op `results` entries and the
     /// `summary`/`status` fields in the printed output are the signal
     /// (#1220). A batch in which *every* op failed always exits non-zero,
-    /// with or without this flag (#1339). Not meaningful with `--atomic`,
-    /// which already fails the whole file on any rejected op.
+    /// with or without this flag (#1339). With `--atomic`, this flag does not
+    /// change the established atomic exit semantics, but it does annotate
+    /// otherwise-unclassified not-committed result rows with the stable
+    /// `strict-op-failure` reason.
     #[arg(long)]
     pub strict: bool,
 }
@@ -352,13 +509,20 @@ pub(crate) fn parse_ops_file(path: &PathBuf) -> Result<Vec<OpsFileEntry>> {
         }
 
         // Parse as a JSON object.
-        let obj: serde_json::Value = serde_json::from_str(trimmed)
-            .map_err(|e| anyhow::anyhow!("ops-file line {line_num}: invalid JSON: {e}"))?;
+        let obj: serde_json::Value = serde_json::from_str(trimmed).map_err(|e| {
+            refusal_error(
+                RefusalReason::ParseError,
+                format!("ops-file line {line_num}: invalid JSON: {e}"),
+            )
+        })?;
 
         let obj = obj.as_object().ok_or_else(|| {
-            anyhow::anyhow!(
-                "ops-file line {line_num}: expected a JSON object {{\"tool\":...,\"args\":...}}, \
-                 got a non-object value"
+            refusal_error(
+                RefusalReason::ParseError,
+                format!(
+                    "ops-file line {line_num}: expected a JSON object \
+                     {{\"tool\":...,\"args\":...}}, got a non-object value"
+                ),
             )
         })?;
 
@@ -367,7 +531,10 @@ pub(crate) fn parse_ops_file(path: &PathBuf) -> Result<Vec<OpsFileEntry>> {
             .get("tool")
             .and_then(|v| v.as_str())
             .ok_or_else(|| {
-                anyhow::anyhow!("ops-file line {line_num}: missing or non-string \"tool\" field")
+                refusal_error(
+                    RefusalReason::ParseError,
+                    format!("ops-file line {line_num}: missing or non-string \"tool\" field"),
+                )
             })?
             .to_owned();
 
@@ -376,9 +543,12 @@ pub(crate) fn parse_ops_file(path: &PathBuf) -> Result<Vec<OpsFileEntry>> {
             None => serde_json::Value::Object(serde_json::Map::new()),
             Some(v) => {
                 if !v.is_object() {
-                    anyhow::bail!(
-                        "ops-file line {line_num}: \"args\" must be a JSON object, got {v}"
-                    );
+                    return Err(refusal_error(
+                        RefusalReason::ParseError,
+                        format!(
+                            "ops-file line {line_num}: \"args\" must be a JSON object, got {v}"
+                        ),
+                    ));
                 }
                 v.clone()
             }
@@ -391,7 +561,7 @@ pub(crate) fn parse_ops_file(path: &PathBuf) -> Result<Vec<OpsFileEntry>> {
 }
 
 /// Extract the failed entries of one dispatched chunk as `{op_index, tool,
-/// error}` objects, with `op_index` global across chunks. A failure summary
+/// error, reason?}` objects, with `op_index` global across chunks. A failure summary
 /// without the per-op reason strings is unactionable: a gate rejection, a
 /// schema error, and a transient failure all look identical, and pipelines
 /// that trust the counts alone lose records silently.
@@ -411,11 +581,15 @@ fn collect_op_failures(
                 serde_json::Value::Null => serde_json::Value::from("unknown error"),
                 other => other.clone(),
             };
-            serde_json::json!({
+            let mut failure = serde_json::json!({
                 "op_index": applied_before + i,
                 "tool": entry["tool"].as_str().unwrap_or("?"),
                 "error": error,
-            })
+            });
+            if let Some(reason) = entry["reason"].as_str().and_then(RefusalReason::from_token) {
+                failure["reason"] = serde_json::json!(reason.as_str());
+            }
+            failure
         })
         .collect()
 }
@@ -463,8 +637,9 @@ async fn apply_ops_file(
             .await
             .map_err(|e| anyhow::anyhow!("dispatch chunk {}: {}", chunk_idx + 1, e))?;
 
-        let parsed: serde_json::Value =
+        let mut parsed: serde_json::Value =
             serde_json::from_str(&raw).context("parse dispatch result")?;
+        annotate_and_emit_refusals(&mut parsed, strict);
 
         let chunk_succeeded = parsed["summary"]["succeeded"].as_u64().unwrap_or(0) as usize;
         let chunk_failed = parsed["summary"]["failed"].as_u64().unwrap_or(0) as usize;
@@ -562,6 +737,12 @@ pub async fn run_exec(args: ExecArgs) -> Result<()> {
         (None, Some(path)) => ExecMode::OpsFile(path.clone()),
     };
 
+    // Parsing is the invocation boundary, before identity/configuration guards
+    // choose a competing refusal. This makes malformed inline DSL and malformed
+    // JSONL deterministically report `parse-error` regardless of whether strict
+    // actor mode or `--expect-actor` would also reject a valid invocation.
+    preflight_exec_mode(&mode)?;
+
     // Resolve through the SAME TOML-aware path `kkernel mcp` and `kkernel reindex`
     // use (`resolve_runtime_config`), so `kkernel exec`'s config_id and actor
     // identity agree with the daemon's. Previously this built `cfg` from
@@ -607,11 +788,16 @@ pub async fn run_exec(args: ExecArgs) -> Result<()> {
     // Keeping the selected identity in `cfg` also sends every execution mode
     // through its existing gate seam: daemon request identity, local registry
     // dispatch, ops-file dispatch, or atomic apply's pre-write authorization.
-    apply_actor_pin_and_expectation(
+    if let Err(error) = apply_actor_pin_and_expectation(
         &mut cfg,
         args.actor.as_deref(),
         args.expect_actor.as_deref(),
-    )?;
+    ) {
+        if let Some(refusal) = error.downcast_ref::<ExecRefusal>() {
+            return Err(report_mode_refusal(&mode, refusal.reason, &refusal.message));
+        }
+        return Err(error);
+    }
 
     // Regression fence: `cfg.db_path` must agree with the canonical anchor for
     // this same `--db`/`KHIVE_DB` input, or `compute_config_id` would silently
@@ -694,11 +880,14 @@ fn apply_actor_pin_and_expectation(
             .map_err(|e| anyhow::anyhow!("invalid --expect-actor {raw_expected:?}: {e}"))?;
         let actual = khive_runtime::resolve_actor(cfg.actor_id.as_deref());
         if actual.id != expected.as_str() {
-            anyhow::bail!(
-                "--expect-actor mismatch: expected {:?}, resolved {:?}",
-                expected.as_str(),
-                actual.id
-            );
+            return Err(refusal_error(
+                RefusalReason::ExpectActorMismatch,
+                format!(
+                    "--expect-actor mismatch: expected {:?}, resolved {:?}",
+                    expected.as_str(),
+                    actual.id
+                ),
+            ));
         }
     }
 
@@ -724,8 +913,16 @@ fn enforce_strict_batch_result(raw: &str, strict: bool) -> Result<()> {
         return Ok(());
     };
     let succeeded = parsed["summary"]["succeeded"].as_u64().unwrap_or(0);
-    let failed = parsed["summary"]["failed"].as_u64().unwrap_or(0);
-    let aborted = parsed["summary"]["aborted"].as_u64().unwrap_or(0);
+    let failed = parsed
+        .get("summary")
+        .and_then(|summary| summary.get("failed"))
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let aborted = parsed
+        .get("summary")
+        .and_then(|summary| summary.get("aborted"))
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
     if succeeded == 0 && (failed > 0 || aborted > 0) {
         anyhow::bail!(
             "every op failed: {failed} failed, {aborted} aborted, 0 succeeded (see printed output above)"
@@ -739,9 +936,153 @@ fn enforce_strict_batch_result(raw: &str, strict: bool) -> Result<()> {
     Ok(())
 }
 
+/// Emit stable classifications already attached by the dispatch layer. Under
+/// `--strict`, otherwise-unclassified failed or aborted entries receive
+/// `strict-op-failure`; a more specific server-owned reason always wins.
+/// Returns whether the JSON value changed.
+fn annotate_and_emit_refusals(parsed: &mut serde_json::Value, strict: bool) -> bool {
+    // Invocation-level errors produced by other CLI guards have no per-op
+    // result array. Preserve their shape while still honoring a known token.
+    if let Some(reason) = parsed
+        .get("error")
+        .and_then(|error| error.get("reason"))
+        .and_then(serde_json::Value::as_str)
+        .and_then(RefusalReason::from_token)
+    {
+        emit_refusal(reason);
+        return false;
+    }
+
+    let failed = parsed["summary"]["failed"].as_u64().unwrap_or(0);
+    let aborted = parsed["summary"]["aborted"].as_u64().unwrap_or(0);
+    let strict_refusal = strict && (failed > 0 || aborted > 0);
+    // Save manifests preserve compact failure metadata instead of the full
+    // result payload. Treat that projection exactly like canonical results.
+    let entries = parsed.as_object_mut().and_then(|object| {
+        if object
+            .get("results")
+            .is_some_and(serde_json::Value::is_array)
+        {
+            object
+                .get_mut("results")
+                .and_then(serde_json::Value::as_array_mut)
+        } else {
+            object
+                .get_mut("failures")
+                .and_then(serde_json::Value::as_array_mut)
+        }
+    });
+
+    let mut changed = false;
+    let mut emitted = 0usize;
+    if let Some(entries) = entries {
+        for entry in entries {
+            if entry["ok"].as_bool() == Some(true) {
+                continue;
+            }
+
+            let specific = entry["reason"].as_str().and_then(RefusalReason::from_token);
+            let reason = specific.or(strict_refusal.then_some(RefusalReason::StrictOpFailure));
+            if let Some(reason) = reason {
+                if specific.is_none() {
+                    if let Some(object) = entry.as_object_mut() {
+                        object.insert("reason".to_string(), serde_json::json!(reason.as_str()));
+                        changed = true;
+                    }
+                }
+                emit_refusal(reason);
+                emitted += 1;
+            }
+        }
+    }
+
+    // A legacy aggregate can report failures without retaining per-op rows.
+    // Keep strict mode machine-classifiable without inventing missing rows.
+    if strict_refusal && emitted == 0 {
+        emit_refusal(RefusalReason::StrictOpFailure);
+    }
+    changed
+}
+
+/// Prepare the exact string printed by inline exec. Existing JSON stays
+/// byte-for-byte unchanged unless strict-mode annotation added a reason.
+fn prepare_exec_output(raw: &str, strict: bool) -> String {
+    let Ok(mut parsed) = serde_json::from_str::<serde_json::Value>(raw) else {
+        return raw.to_owned();
+    };
+    if annotate_and_emit_refusals(&mut parsed, strict) {
+        serde_json::to_string(&parsed).expect("serde_json::Value is serializable")
+    } else {
+        raw.to_owned()
+    }
+}
+
 enum ExecMode {
     Inline(String),
     OpsFile(PathBuf),
+}
+
+fn preflight_inline_ops(ops: &str) -> Result<()> {
+    if let Err(error) = khive_request::parse_request(ops) {
+        // Keep the CLI's established rendered prose byte-for-byte unchanged;
+        // the invocation-level error object carries the structured reason.
+        let error = rmcp::ErrorData::invalid_params(error.to_string(), None);
+        return Err(report_unscoped_refusal(
+            RefusalReason::ParseError,
+            error.to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// Validate the selected carrier before any actor expectation or dispatch gate.
+/// The operation list remains authoritative only after this succeeds.
+fn preflight_exec_mode(mode: &ExecMode) -> Result<()> {
+    match mode {
+        ExecMode::Inline(ops) => preflight_inline_ops(ops),
+        ExecMode::OpsFile(path) => match parse_ops_file(path) {
+            Ok(_) => Ok(()),
+            Err(error) => {
+                if let Some(refusal) = error.downcast_ref::<ExecRefusal>() {
+                    Err(report_unscoped_refusal(
+                        refusal.reason,
+                        refusal.message.as_str(),
+                    ))
+                } else {
+                    Err(error)
+                }
+            }
+        },
+    }
+}
+
+/// Report an invocation-level refusal against the real operation set whenever
+/// that set can be parsed without dispatch. In particular, `--expect-actor`
+/// mismatches happen before execution but a valid ops-file is still safe to
+/// read and parse for its tool names; reporting one synthetic operation would
+/// make `summary.total` and per-op correlation false.
+fn report_mode_refusal(
+    mode: &ExecMode,
+    reason: RefusalReason,
+    error: impl std::fmt::Display,
+) -> anyhow::Error {
+    let message = error.to_string();
+    let parsed = match mode {
+        ExecMode::Inline(raw) => khive_request::parse_request(raw).ok().map(|request| {
+            let chain = request.mode == khive_request::ExecutionMode::Chain;
+            let tools = request.ops.into_iter().map(|op| op.tool).collect();
+            (tools, chain)
+        }),
+        ExecMode::OpsFile(path) => parse_ops_file(path)
+            .ok()
+            .map(|ops| (ops.into_iter().map(|op| op.tool).collect::<Vec<_>>(), false)),
+    };
+    match parsed {
+        Some((tools, chain)) if !tools.is_empty() => {
+            report_tools_refusal(tools, chain, reason, message)
+        }
+        _ => report_unscoped_refusal(reason, message),
+    }
 }
 
 /// Issue #1586: disclose the resolved database target(s) once, before any
@@ -840,6 +1181,11 @@ async fn run_exec_inline_with_forward(
     strict: bool,
     #[cfg(unix)] forward_fn: ForwardFnPtr,
 ) -> Result<()> {
+    // Keep this local preflight even though `run_exec` already performs it:
+    // tests and internal callers exercise this seam directly, and no caller may
+    // let an identity refusal mask malformed DSL.
+    preflight_inline_ops(&ops)?;
+
     // ── strict-actor gate (before any forwarding) ─────────────────────────────
     // Must run BEFORE the daemon fast-path so that a comm-capable anonymous daemon
     // already running cannot be used to bypass KHIVE_REQUIRE_ATTRIBUTED_ACTOR=1.
@@ -847,7 +1193,13 @@ async fn run_exec_inline_with_forward(
     // same tenant-isolation risk as in-process dispatch.  Checking only in the
     // in-process fallback (as was the case before this fix) allowed a strict-mode
     // client to silently forward through a pre-existing anonymous daemon and exit 0.
-    enforce_strict_actor_mode(cfg.actor_id.as_deref(), &cfg.packs)?;
+    if let Err(error) = enforce_strict_actor_mode(cfg.actor_id.as_deref(), &cfg.packs) {
+        return Err(report_invocation_refusal(
+            Some(&ops),
+            RefusalReason::AnonymousActor,
+            error,
+        ));
+    }
 
     // Load the resolved `KhiveConfig` ONCE, up front, so both the daemon
     // forward-frame `config_id` below and the in-process fallback's backend
@@ -972,6 +1324,7 @@ async fn run_exec_inline_with_forward(
         };
         if let Some(res) = forward_fn(&frame, spawn_config, spawn_db).await {
             let output = res.map_err(|e| anyhow::anyhow!("{}", e.message))?;
+            let output = prepare_exec_output(&output, strict);
             println!("{output}");
             enforce_strict_batch_result(&output, strict)?;
             return Ok(());
@@ -1005,9 +1358,10 @@ async fn run_exec_inline_with_forward(
     };
 
     let output = server
-        .dispatch_request_local(params)
+        .dispatch_request_local_for_exec(params, strict)
         .await
         .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let output = prepare_exec_output(&output, strict);
     println!("{output}");
     enforce_strict_batch_result(&output, strict)?;
     Ok(())
@@ -1057,7 +1411,18 @@ async fn run_exec_ops_file(
     strict: bool,
 ) -> Result<()> {
     // Parse the whole file first — fail before any writes if any line is bad.
-    let ops = parse_ops_file(&path)?;
+    let ops = match parse_ops_file(&path) {
+        Ok(ops) => ops,
+        Err(error) => {
+            if let Some(refusal) = error.downcast_ref::<ExecRefusal>() {
+                return Err(report_unscoped_refusal(
+                    refusal.reason,
+                    refusal.message.as_str(),
+                ));
+            }
+            return Err(error);
+        }
+    };
 
     if ops.is_empty() {
         anyhow::bail!("ops-file is empty (no non-blank lines): {}", path.display());
@@ -1086,7 +1451,14 @@ async fn run_exec_ops_file(
     // the round-trip overhead of socket forwarding per chunk). Honors
     // `[[backends]]` multi-backend topology exactly like the daemon-fallback
     // path — see `build_local_fallback_server`.
-    enforce_strict_actor_mode(cfg.actor_id.as_deref(), &cfg.packs)?;
+    if let Err(error) = enforce_strict_actor_mode(cfg.actor_id.as_deref(), &cfg.packs) {
+        return Err(report_tools_refusal(
+            ops.iter().map(|op| op.tool.clone()).collect(),
+            false,
+            RefusalReason::AnonymousActor,
+            error.to_string(),
+        ));
+    }
     let (khive_cfg, config_source) = load_exec_config(&db_context)?;
 
     if !khive_cfg.backends.is_empty() {
@@ -1105,9 +1477,26 @@ async fn run_exec_ops_file(
 
     if atomic {
         let max_ops = atomic_max_ops.unwrap_or(khive_types::pack::ATOMIC_MAX_OPS_DEFAULT);
-        let envelope = crate::atomic_apply::execute_atomic_ops_file(ops, cfg, &khive_cfg, max_ops)
-            .await
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let mut envelope =
+            match crate::atomic_apply::execute_atomic_ops_file(ops, cfg, &khive_cfg, max_ops).await
+            {
+                Ok(envelope) => envelope,
+                Err(error) => {
+                    if let Some(failure) =
+                        error.downcast_ref::<crate::atomic_apply::AtomicExecFailure>()
+                    {
+                        let mut envelope = failure.envelope();
+                        annotate_and_emit_refusals(&mut envelope, strict);
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&envelope)
+                                .expect("serialize atomic refusal envelope")
+                        );
+                    }
+                    return Err(error);
+                }
+            };
+        annotate_and_emit_refusals(&mut envelope, strict);
         println!(
             "{}",
             serde_json::to_string_pretty(&envelope).expect("serialize atomic envelope")
@@ -1174,6 +1563,24 @@ mod tests {
             serde_json::json!({"kind": "invalid_input", "message": "content rejected"}),
             "structured KhiveError payloads pass through as JSON, not a placeholder"
         );
+    }
+
+    #[test]
+    fn collect_op_failures_preserves_stable_refusal_reason() {
+        let parsed = serde_json::json!({
+            "results": [
+                {
+                    "ok": false,
+                    "tool": "not_loaded",
+                    "error": "unknown verb",
+                    "reason": "verb-refused"
+                },
+            ],
+            "summary": {"total": 1, "succeeded": 0, "failed": 1}
+        });
+        let failures = collect_op_failures(&parsed, 9);
+        assert_eq!(failures[0]["reason"], "verb-refused");
+        assert_eq!(failures[0]["op_index"], 9);
     }
 
     #[test]
@@ -2554,6 +2961,10 @@ id = "lambda:fallback"
         f.write_all(b"{\"tool\":\"stats\",\"args\":{}}\n").unwrap();
         f.write_all(b"not-json\n").unwrap(); // line 2 is bad
         let err = parse_ops_file(&f.path().to_path_buf()).unwrap_err();
+        assert_eq!(
+            err.downcast_ref::<ExecRefusal>().map(|error| error.reason),
+            Some(RefusalReason::ParseError)
+        );
         let msg = format!("{err:#}");
         assert!(
             msg.contains("line 2"),
@@ -2567,6 +2978,10 @@ id = "lambda:fallback"
         let mut f = NamedTempFile::new().unwrap();
         f.write_all(b"{\"notool\":\"x\",\"args\":{}}\n").unwrap();
         let err = parse_ops_file(&f.path().to_path_buf()).unwrap_err();
+        assert_eq!(
+            err.downcast_ref::<ExecRefusal>().map(|error| error.reason),
+            Some(RefusalReason::ParseError)
+        );
         let msg = format!("{err:#}");
         assert!(msg.contains("line 1"), "should report line number: {msg}");
     }
@@ -2618,6 +3033,33 @@ id = "lambda:fallback"
     }
 
     // ── #1220: --strict exit-code signal for partially-failed batches ─────────
+
+    #[test]
+    fn prepare_exec_output_preserves_specific_reasons_and_fills_strict_failures() {
+        let raw = serde_json::json!({
+            "results": [
+                {"ok": true, "tool": "stats", "result": {}},
+                {"ok": false, "tool": "get", "error": "missing id"},
+                {
+                    "ok": false,
+                    "tool": "not_loaded",
+                    "error": "unknown verb",
+                    "reason": "verb-refused"
+                },
+                {"ok": false, "tool": "update", "aborted": true},
+            ],
+            "summary": {"total": 4, "succeeded": 1, "failed": 2, "aborted": 1},
+            "status": "partial",
+        })
+        .to_string();
+
+        let parsed: serde_json::Value =
+            serde_json::from_str(&prepare_exec_output(&raw, true)).unwrap();
+        assert_eq!(parsed["results"][1]["reason"], "strict-op-failure");
+        assert_eq!(parsed["results"][2]["reason"], "verb-refused");
+        assert_eq!(parsed["results"][3]["reason"], "strict-op-failure");
+        assert!(parsed["results"][0].get("reason").is_none());
+    }
 
     #[test]
     fn enforce_strict_batch_result_ok_when_strict_off_and_partially_failed() {
@@ -4166,9 +4608,11 @@ backend = "sessions"
             embedding_model: None,
             additional_embedding_models: vec![],
             // Pin the pack list explicitly rather than inheriting `KHIVE_PACKS`
-            // from the ambient environment (#1276) — every atomic-apply test
-            // using this helper only dispatches `kg` verbs.
-            packs: vec!["kg".to_string()],
+            // from the ambient environment (#1276). This shared helper covers
+            // both base KG operations and GTD-aware atomic updates/lifecycle
+            // verbs, so its registry must install the same GTD hooks those
+            // assertions exercise.
+            packs: vec!["kg".to_string(), "gtd".to_string()],
             ..Default::default()
         }
     }
