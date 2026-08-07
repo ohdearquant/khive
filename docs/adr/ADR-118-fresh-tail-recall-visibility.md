@@ -185,8 +185,15 @@ it counts the live, join-filtered vector corpus and caps its scan at
 log (the newest raw writes, before final-state coalescing) so the freshest writes stay visible
 while FTS covers the rest, and otherwise
 defers to the existing Cold-path behavior (FTS-only serving while the rebuild runs). The leg
-restores freshness on a serving index; it is not a general exact-search fallback. This is
-the second tier of the §"Decision" guarantee stated precisely: with no serving index, a
+restores freshness on a serving index; it is not a general exact-search fallback. The no-index
+path has an intentionally asymmetric cost boundary. An empty-tail existence probe returns before
+any corpus count. Once that probe finds retained rows, however, each Cold/Empty query pays an
+O(live-vector-corpus) `COUNT` over the vector-to-note join, followed by at most
+`ceil(KHIVE_ANN_REBUILD_THRESHOLD × live_vector_count)` newest raw-log point reads and exact
+scores. Only the suffix and scoring work are threshold-bounded; the live-corpus count/join is
+not. This remaining no-index cost is accepted to keep the bound corpus-relative without adding
+a separately maintained count. This is the second tier of the §"Decision" guarantee stated
+precisely: with no serving index, a
 committed write is visible to the vector legs **iff its `ann_write_log` row is still
 retained — compaction has not passed it — and fewer than
 `ceil(KHIVE_ANN_REBUILD_THRESHOLD × live_vector_count)` retained raw log rows committed after
@@ -267,10 +274,12 @@ deletes that write no log rows — see ADR-079's rule 5 qualification).
   the overwhelmingly common state — matching the pre-Vamana behavior and the synchronous
   write path's implicit promise; the Cold/Empty window keeps the newest-suffix guarantee
   only (§3).
-- Recall pays a small per-query cost (log-tail scan + registry-minimum coverage check +
-  exact scoring) that is near zero when the tail is empty. The Cold/Empty fallback is bounded
-  by the corpus-relative rebuild threshold; the serving-index path scans the full suffix to
-  preserve read-your-writes and has no separate hard row cap.
+- Recall's serving-index path pays a small per-query cost (log-tail scan + registry-minimum
+  coverage check + exact scoring) that is near zero when the tail is empty. A non-empty
+  Cold/Empty fallback additionally pays an O(live-vector-corpus) count/join; only its newest
+  raw-log suffix reads and scoring are bounded by the corpus-relative rebuild threshold. The
+  serving-index path scans the full suffix to preserve read-your-writes and has no separate hard
+  row cap.
 - The tail query adds read traffic on `ann_write_log`; its index must serve
   `(embedding_model, seq)`-shaped scans efficiently (the existing namespace-first index
   shape is a known follow-up).
