@@ -59,7 +59,7 @@ pub(crate) static KNOWLEDGE_HANDLERS: [HandlerDef; 20] = [
     },
     HandlerDef {
         name: "knowledge.get",
-        description: "Fetch a single atom or domain by UUID, unique short prefix, or slug",
+        description: "Fetch a single atom or domain by UUID, exact slug, or unique short prefix",
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,
         params: &[
@@ -67,7 +67,7 @@ pub(crate) static KNOWLEDGE_HANDLERS: [HandlerDef; 20] = [
                 name: "id",
                 param_type: "string",
                 required: true,
-                description: "Atom/domain full UUID, unique 8+ hex UUID prefix, or slug. UUID and prefix forms are namespace-agnostic by-ID reads; slug lookup uses the caller namespace.",
+                description: "Atom/domain full UUID, exact slug, or unique 8+ hex UUID prefix. Resolution order is full UUID, exact caller-namespace slug, then prefix. UUID and prefix forms are namespace-agnostic by-ID reads.",
             },
             ParamDef {
                 name: "include_sections",

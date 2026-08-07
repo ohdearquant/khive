@@ -7,13 +7,13 @@
 ## Amendment (2026-08-06): identifier parity for `knowledge.get`
 
 `knowledge.get(id=...)` follows the shared identifier ladder: a complete UUID is parsed
-first, an undashed hexadecimal string of at least eight characters resolves as a unique
-short UUID prefix, and other strings resolve as slugs. UUID and prefix forms are
-namespace-agnostic by-ID reads under ADR-007 Rule 2; slug lookup remains scoped to the
-caller's namespace. Prefix resolution deduplicates a domain and its same-UUID FTS mirror
-atom before deciding ambiguity, while distinct matching UUIDs fail closed. Atom section
-loading follows the resolved atom's stored namespace so `include_sections=true` preserves
-the same by-ID contract.
+first; for non-UUID input, an exact registered slug in the caller's namespace wins before
+an undashed hexadecimal string of at least eight characters is interpreted as a unique
+short UUID prefix. UUID and prefix forms are namespace-agnostic by-ID reads under ADR-007
+Rule 2, while slug lookup remains scoped to the caller's namespace. Prefix resolution
+deduplicates a domain and its same-UUID FTS mirror atom before deciding ambiguity, while
+distinct matching UUIDs fail closed. Atom section loading follows the resolved atom's
+stored namespace so `include_sections=true` preserves the same by-ID contract.
 
 ## Amendment (2026-08-06): fail-closed search filter values
 
@@ -135,7 +135,7 @@ they do not introduce new ones.
 | -------------------------- | ------- | ---------- | ---------------------------------------------------------------------------- |
 | `knowledge.upsert_atoms`   | Corpus  | Commissive | Bulk insert/update slug-keyed knowledge atoms                                |
 | `knowledge.upsert_domains` | Corpus  | Commissive | Bulk insert/update domain groupings of atoms                                 |
-| `knowledge.get`            | Corpus  | Assertive  | Fetch one atom or domain by ID or slug                                       |
+| `knowledge.get`            | Corpus  | Assertive  | Fetch one atom or domain by ID, exact slug, or short prefix                   |
 | `knowledge.list`           | Corpus  | Assertive  | Paginated listing of atoms or domains                                        |
 | `knowledge.delete_atoms`   | Corpus  | Commissive | Soft-delete atoms by slug                                                    |
 | `knowledge.stats`          | Corpus  | Assertive  | Corpus statistics (counts, coverage)                                         |
@@ -198,15 +198,16 @@ upsert_domains(domains: [{slug, name, description?, tags?, members?}, ...]) → 
 Inserts or updates domains by `(namespace, slug)` key. Members is a JSON array of
 atom slugs.
 
-#### `knowledge.get` — fetch by ID, short prefix, or slug
+#### `knowledge.get` — fetch by ID, exact slug, or short prefix
 
 ```
-get(id: <uuid|short-prefix|slug>) → {type: "atom"|"domain", ...fields}
+get(id: <uuid|slug|short-prefix>) → {type: "atom"|"domain", ...fields}
 ```
 
-Resolves by complete UUID first, then by unique 8+ hex UUID prefix, then by slug against
-both `knowledge_atoms` and `knowledge_domains`. UUID and prefix reads are
-namespace-agnostic; slug reads use the caller namespace. Returns 404 if not found.
+Resolves by complete UUID first. For non-UUID input, it tries an exact slug against both
+`knowledge_atoms` and `knowledge_domains` in the caller namespace, then interprets a
+remaining 8+ hex string as a unique UUID prefix. UUID and prefix reads are
+namespace-agnostic. Returns 404 if not found.
 
 #### `knowledge.list` — paginated listing
 

@@ -1013,6 +1013,73 @@ async fn get_resolves_atom_by_compact_prefix_longer_than_eight_chars() {
 }
 
 #[tokio::test]
+async fn get_exact_all_hex_slug_wins_over_uuid_prefix_collision() {
+    let f = pack(rt());
+    f.dispatch(
+        "knowledge.upsert_atoms",
+        json!({ "atoms": [{
+            "slug": "hex-prefix-source",
+            "name": "Hex Prefix Source",
+            "content": "dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity"
+        }] }),
+    )
+    .await
+    .expect("upsert prefix source");
+
+    let source = f
+        .dispatch("knowledge.get", json!({ "id": "hex-prefix-source" }))
+        .await
+        .expect("get prefix source");
+    let source_id = source["id"].as_str().expect("source id").to_string();
+    let hex_slug = source_id.replace('-', "")[..16].to_string();
+
+    f.dispatch(
+        "knowledge.upsert_atoms",
+        json!({ "atoms": [{
+            "slug": hex_slug.clone(),
+            "name": "Exact Hex Slug",
+            "content": "exact hexadecimal slug retrieval must precede compact identifier prefix interpretation across knowledge corpus reads and preserve deterministic registered slug addressing"
+        }] }),
+    )
+    .await
+    .expect("upsert exact all-hex slug");
+
+    let by_slug = f
+        .dispatch("knowledge.get", json!({ "id": hex_slug.clone() }))
+        .await
+        .expect("exact all-hex slug must win over UUID prefix collision");
+    assert_eq!(by_slug["slug"], hex_slug);
+    assert_eq!(by_slug["name"], "Exact Hex Slug");
+    assert_ne!(
+        by_slug["id"], source_id,
+        "prefix interpretation must not return the colliding source record"
+    );
+}
+
+#[tokio::test]
+async fn get_exact_all_hex_slug_wins_when_uuid_prefix_matches_nothing() {
+    const HEX_SLUG: &str = "fffffffffffffffffffffffffffffffff";
+    let f = pack(rt());
+    f.dispatch(
+        "knowledge.upsert_atoms",
+        json!({ "atoms": [{
+            "slug": HEX_SLUG,
+            "name": "Overlong Hex Slug",
+            "content": "overlong hexadecimal slug lookup remains exact and addressable even though no canonical UUID can match a prefix longer than thirty two hexadecimal characters"
+        }] }),
+    )
+    .await
+    .expect("upsert overlong all-hex slug");
+
+    let by_slug = f
+        .dispatch("knowledge.get", json!({ "id": HEX_SLUG }))
+        .await
+        .expect("exact all-hex slug must resolve before a guaranteed prefix miss");
+    assert_eq!(by_slug["slug"], HEX_SLUG);
+    assert_eq!(by_slug["name"], "Overlong Hex Slug");
+}
+
+#[tokio::test]
 async fn get_domain_prefix_deduplicates_same_uuid_mirror_atom() {
     let f = pack(rt());
     f.dispatch(
@@ -1123,6 +1190,7 @@ async fn get_by_id_is_namespace_agnostic_and_loads_sections_from_stored_namespac
         .await
         .expect("get foreign atom by scoped slug");
     let full_id = foreign["id"].as_str().expect("foreign atom id").to_string();
+    let compact_prefix = full_id.replace('-', "")[..12].to_string();
 
     f.dispatch("knowledge.get", json!({ "id": "foreign-prefix-atom" }))
         .await
@@ -1131,7 +1199,7 @@ async fn get_by_id_is_namespace_agnostic_and_loads_sections_from_stored_namespac
     let by_id = f
         .dispatch(
             "knowledge.get",
-            json!({ "id": full_id, "include_sections": true }),
+            json!({ "id": full_id.clone(), "include_sections": true }),
         )
         .await
         .expect("full UUID read must be namespace-agnostic");
@@ -1140,6 +1208,24 @@ async fn get_by_id_is_namespace_agnostic_and_loads_sections_from_stored_namespac
         by_id["sections"].as_array().expect("sections array").len(),
         1,
         "section lookup must use the resolved atom's stored namespace"
+    );
+
+    let by_prefix = f
+        .dispatch(
+            "knowledge.get",
+            json!({ "id": compact_prefix, "include_sections": true }),
+        )
+        .await
+        .expect("unique prefix read must be namespace-agnostic");
+    assert_eq!(by_prefix["id"], full_id);
+    assert_eq!(by_prefix["namespace"], foreign_namespace);
+    assert_eq!(
+        by_prefix["sections"]
+            .as_array()
+            .expect("prefix sections array")
+            .len(),
+        1,
+        "prefix section lookup must use the resolved atom's stored namespace"
     );
 }
 

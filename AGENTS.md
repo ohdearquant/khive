@@ -235,7 +235,7 @@ caller receives the server-generated UUID.
 | -------------------------- | ------------------------------------------------------- | -------------------------------------------- |
 | `knowledge.upsert_atoms`   | Bulk insert/update atoms by slug                        | Ingesting knowledge corpus                   |
 | `knowledge.upsert_domains` | Bulk insert/update domain groupings                     | Organizing atoms into domains                |
-| `knowledge.get`            | Fetch atom/domain by UUID, unique short prefix, or slug | Read a specific knowledge entry              |
+| `knowledge.get`            | Fetch atom/domain by UUID, exact slug, or short prefix  | Read a specific knowledge entry              |
 | `knowledge.list`           | Paginated listing of atoms or domains                   | Browse the corpus                            |
 | `knowledge.search`         | TF-IDF search with embedding rerank (default on)        | Finding relevant knowledge                   |
 | `knowledge.suggest`        | Orient query against domains for composition            | "Which domains cover topic X?"               |
@@ -258,6 +258,9 @@ cases). Scores are normalized to [0,1] when `rerank` is active (default).
 `knowledge.compose(namespace=...)` uses that exact namespace for corpus, section, KG-blend, and
 brain-profile weight reads, including its namespace-keyed Tier-3 fallback; absent preserves the
 caller-token default.
+`knowledge.get` resolves a full UUID first; for non-UUID input, an exact slug in the caller
+namespace wins before unique 8+ hex-prefix resolution. UUID and prefix reads are
+namespace-agnostic under ADR-007.
 Pass `kind=` (`"atom"` or `"domain"`) to filter by result type; `type=` is accepted as a legacy
 alias. `knowledge.list` accepts the same `kind=`/`type=` discriminant.
 

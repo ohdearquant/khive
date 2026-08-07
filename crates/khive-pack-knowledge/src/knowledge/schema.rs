@@ -138,7 +138,7 @@ pub(crate) struct UpsertDomainsParams {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct GetParams {
-    /// Full UUID, unique 8+ hexadecimal UUID prefix, or namespace-scoped slug.
+    /// Full UUID, exact namespace-scoped slug, or unique 8+ hexadecimal UUID prefix.
     pub id: String,
     /// When `true`, include the atom's sections in the response under a `sections` key.
     /// Defaults to `false`; domains ignore this flag (they have no sections).
