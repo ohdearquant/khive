@@ -374,6 +374,30 @@ pub trait NoteStore: Send + Sync + 'static {
         value: Value,
         updated_at: i64,
     ) -> StorageResult<bool>;
+    /// Atomically patch one JSON property on every supplied note.
+    ///
+    /// Each target is rechecked against `namespace` and `filter` inside the
+    /// same transaction. The operation commits only when every distinct id
+    /// matches exactly one live object-valued row; a missing, soft-deleted, or
+    /// no-longer-eligible target rolls the entire unit back. Other property
+    /// keys are preserved by the same storage-side `json_set` operation as
+    /// [`Self::try_patch_note_property`]. Backends without a transactional
+    /// multi-note implementation retain the default `Unsupported` result.
+    async fn patch_note_property_atomic(
+        &self,
+        _ids: Vec<Uuid>,
+        _namespace: &str,
+        _filter: &NoteFilter,
+        _json_path: &str,
+        _value: Value,
+        _updated_at: i64,
+    ) -> StorageResult<()> {
+        Err(crate::StorageError::Unsupported {
+            capability: crate::StorageCapability::Notes,
+            operation: "patch_note_property_atomic".into(),
+            message: "this backend does not implement atomic multi-note property patches".into(),
+        })
+    }
     /// Query notes by namespace and optional kind with pagination.
     /// The returned total and page items must come from one consistent
     /// backend snapshot.

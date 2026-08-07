@@ -1,7 +1,7 @@
 # Message lifecycle
 
 Technical reference for the `comm` pack's message write, threading, and read path —
-`comm.send` / `comm.delivered` / `comm.inbox` / `comm.read` / `comm.reply` /
+`comm.send` / `comm.delivered` / `comm.inbox` / `comm.read` / `comm.mark_read` / `comm.reply` /
 `comm.thread` / `comm.ingest` —
 spanning `message.rs`, `handlers.rs`, `params.rs`, and the inbox/thread indexes in
 `vocab.rs`.
@@ -301,6 +301,26 @@ the read. There is no retry loop; a caller polling unread counts simply
 sees the message still unread and can re-issue `comm.read` (self-healing).
 Every validation error that runs before the patch (not found, wrong kind,
 outbound, wrong addressee) is unaffected and stays a hard error.
+
+## `handlers.rs::handle_mark_read`
+
+`comm.mark_read` is the canonical named bulk mutation; message bodies are retrieved through
+`comm.inbox` or `comm.thread`. It requires `ids` (1-500) and accepts optional `atomic` (default
+false). Resolution, namespace/message-kind checks, inbound-direction enforcement, addressee
+authorization, legacy-row compatibility, deduplication, response ordering, and aggregate counts
+are shared with `handle_read` rather than reimplemented.
+
+The default path calls the same best-effort target loop documented above. `atomic=true` instead
+passes the unique target UUIDs and the same live eligibility `NoteFilter` to
+`NoteStore::patch_note_property_atomic`. The SQLite implementation executes every guarded
+`json_set(..., '$.read', true)` inside one writer transaction. Every statement must affect exactly
+one row; a missing, soft-deleted, non-object, or newly ineligible target aborts the transaction, so
+an earlier mark cannot survive a later failure. On commit, the handler returns the ordinary bulk
+summary with `read=true` for every unique target. Both the writer-task and legacy pool-mutex
+executors verify that finalization restored autocommit mode. An unverified rollback, an indeterminate
+commit, or any other poisoned-connection state returns `side_effects_unknown`. Any transaction-body
+panic also retires its writer (reporting `transaction_rolled_back` only when rollback was verified),
+rather than allowing another request to reuse a terminal connection.
 
 ## `handlers.rs::handle_reply`
 
