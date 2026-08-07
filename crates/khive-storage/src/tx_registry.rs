@@ -176,6 +176,26 @@ pub fn oldest_for(filter: &TxOriginFilter) -> Option<OldestSpan> {
         })
 }
 
+/// Whether an attribution view currently observes an open span carrying
+/// `label`.
+///
+/// [`oldest_for`] cannot answer this. It reports the oldest span on the
+/// backend, so any other span opened earlier on the same backend masks the
+/// one the caller is asking about — a caller reasoning about the lifetime of
+/// *its own* span reads a different span's presence as its own. Callers that
+/// need "is this span still open" need this predicate; callers that need
+/// "how long has this backend held a read open" need [`oldest_for`].
+///
+/// Recovers a poisoned lock via `into_inner()` (see [`register_scoped`]).
+pub fn any_open_labeled(filter: &TxOriginFilter, label: &str) -> bool {
+    let registry = REGISTRY
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    registry
+        .values()
+        .any(|meta| filter.matches(&meta.origin) && meta.label.as_deref() == Some(label))
+}
+
 /// Age and label of every currently-open registry entry. Recovers a poisoned
 /// lock via `into_inner()` (see [`register`]) instead of returning an empty
 /// `Vec` — see `crates/khive-storage/docs/api/tx-registry.md`.

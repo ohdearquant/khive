@@ -1392,11 +1392,19 @@ async fn graph_traverse_read_span_scoped_to_secondary_backend_visible_only_in_it
         khive_storage::tx_registry::TxOriginFilter::Secondary(secondary_identity.clone());
     let main_view = khive_storage::tx_registry::TxOriginFilter::Main(other_identity);
 
-    let span = khive_storage::tx_registry::oldest_for(&secondary_view)
-        .expect("statement-scoped traversal span must be visible while its seam is held");
-    assert_eq!(span.label.as_deref(), Some("graph_traverse_read"));
+    // Ask about the traversal span by label rather than through `oldest_for`.
+    // Writes on this same pool open their own `writer_task_tx` spans, and the
+    // writer task replies to its caller *before* dropping that handle, so an
+    // acknowledged write can still hold an open span on this backend. Such a
+    // span is unrelated to what this test asserts, but it is older than the
+    // traversal's, so `oldest_for` returns it and the assertion reads a
+    // different span's lifetime as the traversal's.
     assert!(
-        khive_storage::tx_registry::oldest_for(&main_view).is_none(),
+        khive_storage::tx_registry::any_open_labeled(&secondary_view, "graph_traverse_read"),
+        "statement-scoped traversal span must be visible while its seam is held"
+    );
+    assert!(
+        !khive_storage::tx_registry::any_open_labeled(&main_view, "graph_traverse_read"),
         "a secondary-origin graph_traverse_read span must never be visible through a different backend's Main view"
     );
 
@@ -1414,7 +1422,7 @@ async fn graph_traverse_read_span_scoped_to_secondary_backend_visible_only_in_it
         .expect("the next frontier statement must see the concurrent commit");
     assert_eq!(grandchild_node.depth, 2);
     assert!(
-        khive_storage::tx_registry::oldest_for(&secondary_view).is_none(),
+        !khive_storage::tx_registry::any_open_labeled(&secondary_view, "graph_traverse_read"),
         "the statement-scoped traversal span must be gone when its bounded query returns"
     );
 }
@@ -2719,7 +2727,7 @@ async fn traverse_work_budget_boundary_and_error_are_deterministic() {
     }
     assert_eq!(ctx.snapshot()["graph_hops"], 4);
     assert!(
-        khive_storage::tx_registry::oldest_for(&origin_view).is_none(),
+        !khive_storage::tx_registry::any_open_labeled(&origin_view, "graph_traverse_read"),
         "an over-budget return must drop its statement-scoped registry span"
     );
 }
@@ -2785,7 +2793,7 @@ async fn traverse_progress_handler_interrupts_statement_and_is_cleared() {
         "the test must enter SQLite's VM progress callback"
     );
     assert!(
-        khive_storage::tx_registry::oldest_for(&origin_view).is_none(),
+        !khive_storage::tx_registry::any_open_labeled(&origin_view, "graph_traverse_read"),
         "the interrupted statement must drop its graph_traverse_read span"
     );
 
