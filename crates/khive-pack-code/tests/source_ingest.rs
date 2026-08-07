@@ -1,4 +1,4 @@
-//! `code.ingest` L1 + L1.5 pipeline tests (ADR-085 Amendments 2 and 5).
+//! `code.ingest` L1 + L1.5 pipeline tests (ADR-085 Amendments 2, 5, and 6).
 //!
 //! Exercises `khive_pack_code::source_ingest::run_code_ingest` directly
 //! against on-disk fixtures — no MCP/VerbRegistry wiring needed since the
@@ -879,6 +879,11 @@ async fn manifestless_rust_folder_uses_basename_fallback() {
     )
     .await
     .expect("manifestless ingest succeeds");
+    assert_eq!(
+        report.languages,
+        vec!["rust".to_string()],
+        "the response must report the source language actually discovered, not all candidates"
+    );
     // Re-ingest so the synchronous re-resolve pass materializes the
     // module -> module edge regardless of file-walk order.
     run_code_ingest(
@@ -914,6 +919,40 @@ async fn manifestless_rust_folder_uses_basename_fallback() {
                 && kinds == "import"
                 && scopes == "build"),
         "expected one crate -> util build-scope import edge, got: {edges:?}"
+    );
+}
+
+/// A governing manifest is L1 language evidence even when the project has no
+/// source file yet. Absent candidate languages must not be echoed into the
+/// response merely because the caller allowed them.
+#[tokio::test]
+async fn report_languages_include_manifest_evidence_without_echoing_candidates() {
+    let root = TempDir::new().expect("tempdir");
+    std::fs::write(
+        root.path().join("pyproject.toml"),
+        "[project]\nname = \"manifest_only_python\"\n",
+    )
+    .unwrap();
+
+    let db = root.path().join("manifest-language-report.db");
+    let rt = rt_at(&db);
+    let token = rt.authorize(Namespace::local()).expect("token");
+    let report = run_code_ingest(
+        &rt,
+        &token,
+        CodeSourceIngestOptions {
+            path: root.path(),
+            languages: all_languages(),
+            sweep_time: Utc::now(),
+        },
+    )
+    .await
+    .expect("manifest-only ingest succeeds");
+
+    assert_eq!(
+        report.languages,
+        vec!["python".to_string()],
+        "only the parsed Python manifest is language evidence"
     );
 }
 

@@ -6058,6 +6058,27 @@ async fn digest_verb_rejects_non_integer_max_items() {
     );
 }
 
+#[tokio::test]
+async fn digest_verb_rejects_unknown_arguments_before_source_access() {
+    let _guard = ENV_MUTEX.lock().await;
+    let (_rt, _token, registry) = fixture().await;
+
+    let err = registry
+        .dispatch(
+            "git.digest",
+            json!({
+                "source": "relative-path-that-must-not-be-opened",
+                "zzz_not_a_real_param": "banana",
+            }),
+        )
+        .await
+        .expect_err("unknown public-verb arguments must fail closed");
+    let message = err.to_string();
+    assert!(message.contains("unknown field"), "{message}");
+    assert!(message.contains("zzz_not_a_real_param"), "{message}");
+    assert!(message.contains("max_items"), "{message}");
+}
+
 // ── #764: over-cap commit payload truncation ────────────────────────────────
 
 /// Test-only [`EmbeddingService`] that records every text it is asked to

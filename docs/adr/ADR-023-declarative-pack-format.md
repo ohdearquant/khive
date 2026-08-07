@@ -567,6 +567,7 @@ working crate. Reference impl: `crates/khive-pack-kg/`.
 | Substrate verb with kind-owning pack registering KindHook      | `create(kind=X, ...)` routes through prepare_create         |
 | Subhandler invoked via MCP `request("pack.subhandler_x(...)")` | `RuntimeError::HandlerNotExposed`                           |
 | Subhandler visible through operator introspection              | Listed as `Visibility::Subhandler`, not MCP-callable        |
+| Public verb receives an undeclared argument                    | `InvalidInput` before requested side effects; field named   |
 | Future `verbs_disabled` config policy                          | Deferred; requires parser, validation, and capability tests |
 | Pack template-generated crate compiles + passes smoke test     | Yes                                                         |
 
@@ -677,3 +678,19 @@ defaults an omitted result limit to 100, and returns no partial paths when the
 shared work or deadline budget is exceeded. These are verb semantics, so they
 belong in the generated handler help and public API reference as well as the
 storage contract; they do not add a new verb or change its speech act.
+
+## Amendment: closed public verb argument objects (2026-08-07)
+
+Public verb argument objects are closed. Every `Visibility::Verb` handler MUST
+deserialize the complete business-argument object through a verb-specific parameter
+struct carrying `#[serde(deny_unknown_fields)]` before the requested operation performs
+an external read, write, or process invocation. A field absent from the handler's
+`ParamDef` list is a per-op `InvalidInput` error that names the unknown field; it is never
+ignored. Mandatory denial auditing may still persist the rejected attempt. The registry
+may remove transport-owned metadata such as `namespace` before this deserialization when
+the handler does not declare that name.
+
+This rule does not impose a closed shape on `Visibility::Subhandler` inputs. An internal
+producer/consumer contract may remain forward-compatible when its governing pack
+documentation says so. The distinction keeps the discoverable public surface exact
+without breaking composed handlers whose inputs are not caller-authored wire contracts.

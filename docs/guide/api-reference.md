@@ -64,6 +64,10 @@ a second hand-maintained total here.
 Verb names in the `kg` pack are bare (`create`, `search`, `link`, …). Every other pack
 namespaces its verbs with a `pack.` prefix (`gtd.assign`, `memory.recall`,
 `brain.feedback`, `comm.send`, `schedule.remind`, `knowledge.search`, `session.store`).
+Public verb argument objects are closed: any parameter not listed for that verb is a
+per-operation validation error naming the unknown field, never a silently ignored hint.
+Validation happens before the requested operation accesses external state or mutates it;
+mandatory denial auditing may still record the rejected call.
 
 ---
 
@@ -1988,13 +1992,16 @@ becomes known.
 | ----------- | --------------- | -------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `path`      | string          | yes      | Folder to ingest — a monorepo subtree (a single crate/package) is first-class, not a special case of whole-repo ingest.                                                                                                                      |
 | `db`        | string          | no       | Target map database path. Defaults to `<path>/.khive/code-map.db`. The shared production database — its default `$HOME/.khive/khive.db` location and the calling server's actual configured database — is always rejected, with no override. |
-| `languages` | array\<string\> | no       | Restrict ingest to a subset of `rust` \| `python` \| `typescript`. Defaults to all three (auto-detected from manifests found under `path`).                                                                                                  |
+| `languages` | array\<string\> | no       | Restrict detection and ingest to a subset of `rust` \| `python` \| `typescript`. Omitted considers all three; the response reports only the observed subset.                                                                                 |
 
 ```
 request(ops="code.ingest(path=\"/repo/crates/my-crate\")")
 ```
 
-The success report includes `fts_indexed`, the number of entity documents written to the map's
+The success report's `languages` field is the sorted, deduplicated set evidenced by a parsed
+governing manifest or a source file found during the pass, within the caller-selected candidate
+set. It is empty when no selected language is observed and never echoes unobserved candidates.
+The report also includes `fts_indexed`, the number of entity documents written to the map's
 full-text index. Entity and FTS writes are a single success postcondition for this verb: an FTS
 failure makes the ingest fail rather than returning a structurally populated but unsearchable map.
 

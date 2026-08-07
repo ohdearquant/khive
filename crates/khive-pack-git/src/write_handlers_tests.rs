@@ -86,6 +86,69 @@ async fn pack_and_token_with_policy(git_write: GitWriteSectionConfig) -> (GitPac
     (GitPack::new(rt), token)
 }
 
+#[tokio::test]
+async fn every_git_write_verb_rejects_unknown_arguments_and_audits_denial() {
+    let _env_guard = crate::cache::ENV_MUTEX.lock().await;
+    let (repo, _remote) = init_repo_with_remote();
+    let (pack, token) = pack_and_token_with_policy(policy(repo.path(), &["main", "feat/*"])).await;
+    let repo_path = repo.path().to_str().expect("utf-8 temp path");
+
+    for (verb, result, allowed_field) in [
+        (
+            "git.commit",
+            pack.handle_commit(
+                &token,
+                json!({
+                    "repo": repo_path,
+                    "message": "must not commit",
+                    "zzz_not_a_real_param": true,
+                }),
+            )
+            .await,
+            "message",
+        ),
+        (
+            "git.branch",
+            pack.handle_branch(
+                &token,
+                json!({
+                    "repo": repo_path,
+                    "name": "feat/must-not-exist",
+                    "zzz_not_a_real_param": true,
+                }),
+            )
+            .await,
+            "name",
+        ),
+        (
+            "git.push",
+            pack.handle_push(
+                &token,
+                json!({
+                    "repo": repo_path,
+                    "branch": "main",
+                    "zzz_not_a_real_param": true,
+                }),
+            )
+            .await,
+            "branch",
+        ),
+    ] {
+        let err = result.expect_err("unknown public-verb arguments must fail closed");
+        let message = err.to_string();
+        assert!(message.contains("unknown field"), "{verb}: {message}");
+        assert!(
+            message.contains("zzz_not_a_real_param"),
+            "{verb}: {message}"
+        );
+        assert!(message.contains(allowed_field), "{verb}: {message}");
+
+        let audit = audit_event(&pack, &token, verb).await;
+        assert_eq!(audit.outcome, EventOutcome::Denied, "{verb}");
+        assert_eq!(audit.payload["decision"], "deny", "{verb}");
+    }
+}
+
 async fn audit_event(
     pack: &GitPack,
     token: &NamespaceToken,

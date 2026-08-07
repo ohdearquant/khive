@@ -91,6 +91,54 @@ async fn code_pack_declares_adr085_metadata() {
     assert!(registry.all_note_kinds().contains(&"finding"));
 }
 
+#[tokio::test]
+async fn code_ingest_rejects_unknown_arguments_before_path_validation() {
+    let reg = registry(rt());
+    let root = tempfile::tempdir().expect("tempdir");
+    let missing = root.path().join("missing-source-tree");
+
+    let err = dispatch(
+        &reg,
+        "code.ingest",
+        json!({
+            "path": missing,
+            "zzz_not_a_real_param": "banana",
+        }),
+    )
+    .await
+    .expect_err("unknown public-verb arguments must fail closed");
+    let message = err.to_string();
+    assert!(message.contains("unknown field"), "{message}");
+    assert!(message.contains("zzz_not_a_real_param"), "{message}");
+    assert!(message.contains("languages"), "{message}");
+}
+
+#[tokio::test]
+async fn code_ingest_response_reports_observed_languages_instead_of_candidates() {
+    let reg = registry(rt());
+    let root = tempfile::tempdir().expect("tempdir");
+    let source = root.path().join("rust-only-source");
+    std::fs::create_dir_all(source.join("src")).expect("source directory");
+    std::fs::write(source.join("src/lib.rs"), "pub fn observed() {}\n").expect("Rust source");
+
+    let response = dispatch(
+        &reg,
+        "code.ingest",
+        json!({
+            "path": source,
+            "db": root.path().join("code-map.db"),
+        }),
+    )
+    .await
+    .expect("Rust-only ingest succeeds");
+
+    assert_eq!(
+        response["languages"],
+        json!(["rust"]),
+        "the public response must not echo unobserved Python or TypeScript candidates"
+    );
+}
+
 /// End-to-end (not merely unit-level) proof that the four code concept
 /// subtypes and their aliases registered in `khive-pack-kg`'s `BUILTIN_DEFS`
 /// are reachable through the full `create` verb dispatch path, canonicalizing

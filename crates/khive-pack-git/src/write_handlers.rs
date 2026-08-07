@@ -33,6 +33,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 
+use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::sync::Mutex as AsyncMutex;
 
@@ -53,6 +54,74 @@ fn to_invalid_input(e: GitArgError) -> RuntimeError {
 
 fn to_policy_denied(e: GitWritePolicyError) -> RuntimeError {
     RuntimeError::InvalidInput(e.to_string())
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CommitParams {
+    repo: String,
+    message: String,
+    #[serde(default)]
+    paths: Option<Vec<String>>,
+    #[serde(default)]
+    author: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BranchParams {
+    repo: String,
+    name: String,
+    #[serde(default)]
+    from: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PushParams {
+    repo: String,
+    branch: String,
+    #[serde(default)]
+    remote: Option<String>,
+    #[serde(default)]
+    force: Option<bool>,
+}
+
+fn deserialize_write_params<T: serde::de::DeserializeOwned>(
+    params: &Value,
+    verb: &str,
+) -> Result<T, RuntimeError> {
+    serde_json::from_value(params.clone())
+        .map_err(|e| RuntimeError::InvalidInput(format!("{verb}: invalid params: {e}")))
+}
+
+fn parse_commit_params(params: &Value) -> Result<CommitParams, RuntimeError> {
+    params
+        .get("message")
+        .and_then(Value::as_str)
+        .ok_or_else(|| RuntimeError::InvalidInput("git.commit requires message".into()))?;
+    parse_paths_param(params)?;
+    parse_optional_string(params, "author")?;
+    deserialize_write_params(params, "git.commit")
+}
+
+fn parse_branch_params(params: &Value) -> Result<BranchParams, RuntimeError> {
+    params
+        .get("name")
+        .and_then(Value::as_str)
+        .ok_or_else(|| RuntimeError::InvalidInput("git.branch requires name".into()))?;
+    parse_optional_string(params, "from")?;
+    deserialize_write_params(params, "git.branch")
+}
+
+fn parse_push_params(params: &Value) -> Result<PushParams, RuntimeError> {
+    params
+        .get("branch")
+        .and_then(Value::as_str)
+        .ok_or_else(|| RuntimeError::InvalidInput("git.push requires branch".into()))?;
+    parse_optional_string(params, "remote")?;
+    parse_force_param(params)?;
+    deserialize_write_params(params, "git.push")
 }
 
 /// Process-wide per-repo advisory lock registry, keyed by canonical repo
@@ -218,30 +287,25 @@ struct CommitPreflight {
     commit_argv: Vec<String>,
 }
 
-fn prepare_commit(repo: &Path, params: &Value) -> Result<CommitPreflight, WritePreflightError> {
+fn prepare_commit(
+    repo: &Path,
+    params: &CommitParams,
+) -> Result<CommitPreflight, WritePreflightError> {
     validate_repo_path(repo)
         .map_err(to_invalid_input)
         .map_err(|e| WritePreflightError::denied(e, None))?;
     let branch = current_branch(repo).map_err(WritePreflightError::runtime)?;
-    let message = params
-        .get("message")
-        .and_then(Value::as_str)
-        .ok_or_else(|| RuntimeError::InvalidInput("git.commit requires message".into()))
-        .map_err(|e| WritePreflightError::denied(e, Some(&branch)))?;
-    let paths =
-        parse_paths_param(params).map_err(|e| WritePreflightError::denied(e, Some(&branch)))?;
-    let author = parse_optional_string(params, "author")
-        .map_err(|e| WritePreflightError::denied(e, Some(&branch)))?;
+    let paths = params.paths.as_deref().unwrap_or_default();
     let add_argv = if paths.is_empty() {
         None
     } else {
         Some(
-            build_add_argv(&paths)
+            build_add_argv(paths)
                 .map_err(to_invalid_input)
                 .map_err(|e| WritePreflightError::denied(e, Some(&branch)))?,
         )
     };
-    let commit_argv = build_commit_argv(message, &paths, author)
+    let commit_argv = build_commit_argv(&params.message, paths, params.author.as_deref())
         .map_err(to_invalid_input)
         .map_err(|e| WritePreflightError::denied(e, Some(&branch)))?;
     Ok(CommitPreflight {
@@ -257,23 +321,19 @@ struct BranchPreflight {
     argv: Vec<String>,
 }
 
-fn prepare_branch(repo: &Path, params: &Value) -> Result<BranchPreflight, WritePreflightError> {
+fn prepare_branch(
+    repo: &Path,
+    params: &BranchParams,
+) -> Result<BranchPreflight, WritePreflightError> {
     validate_repo_path(repo)
         .map_err(to_invalid_input)
         .map_err(|e| WritePreflightError::denied(e, None))?;
-    let name = params
-        .get("name")
-        .and_then(Value::as_str)
-        .ok_or_else(|| RuntimeError::InvalidInput("git.branch requires name".into()))
-        .map_err(|e| WritePreflightError::denied(e, None))?;
-    let from = parse_optional_string(params, "from")
-        .map_err(|e| WritePreflightError::denied(e, Some(name)))?;
-    let argv = build_branch_argv(name, from)
+    let argv = build_branch_argv(&params.name, params.from.as_deref())
         .map_err(to_invalid_input)
-        .map_err(|e| WritePreflightError::denied(e, Some(name)))?;
+        .map_err(|e| WritePreflightError::denied(e, Some(&params.name)))?;
     Ok(BranchPreflight {
-        name: name.to_string(),
-        from: from.map(str::to_string),
+        name: params.name.clone(),
+        from: params.from.clone(),
         argv,
     })
 }
@@ -284,28 +344,19 @@ struct PushPreflight {
     argv: Vec<String>,
 }
 
-fn prepare_push(repo: &Path, params: &Value) -> Result<PushPreflight, WritePreflightError> {
+fn prepare_push(repo: &Path, params: &PushParams) -> Result<PushPreflight, WritePreflightError> {
     validate_repo_path(repo)
         .map_err(to_invalid_input)
         .map_err(|e| WritePreflightError::denied(e, None))?;
-    let branch = params
-        .get("branch")
-        .and_then(Value::as_str)
-        .ok_or_else(|| RuntimeError::InvalidInput("git.push requires branch".into()))
-        .map_err(|e| WritePreflightError::denied(e, None))?;
-    let remote = parse_optional_string(params, "remote")
-        .map_err(|e| WritePreflightError::denied(e, Some(branch)))?
-        .unwrap_or("origin");
-    let force =
-        parse_force_param(params).map_err(|e| WritePreflightError::denied(e, Some(branch)))?;
-    reject_force(force)
+    let remote = params.remote.as_deref().unwrap_or("origin");
+    reject_force(params.force)
         .map_err(to_invalid_input)
-        .map_err(|e| WritePreflightError::denied(e, Some(branch)))?;
-    let argv = build_push_argv(remote, branch)
+        .map_err(|e| WritePreflightError::denied(e, Some(&params.branch)))?;
+    let argv = build_push_argv(remote, &params.branch)
         .map_err(to_invalid_input)
-        .map_err(|e| WritePreflightError::denied(e, Some(branch)))?;
+        .map_err(|e| WritePreflightError::denied(e, Some(&params.branch)))?;
     Ok(PushPreflight {
-        branch: branch.to_string(),
+        branch: params.branch.clone(),
         remote: remote.to_string(),
         argv,
     })
@@ -378,6 +429,22 @@ impl GitPack {
         let repo = self
             .parse_audited_repo(token, "git.commit", &params)
             .await?;
+        let params = match parse_commit_params(&params) {
+            Ok(params) => params,
+            Err(error) => {
+                return Err(self
+                    .audit_early_failure(
+                        token,
+                        "git.commit",
+                        &repo,
+                        None,
+                        EventOutcome::Denied,
+                        error,
+                    )
+                    .await);
+            }
+        };
+        let repo = PathBuf::from(&params.repo);
         let lock = repo_write_lock(&repo);
         let _guard = lock.lock().await;
         let CommitPreflight {
@@ -396,7 +463,7 @@ impl GitPack {
                         failure.outcome,
                         failure.error,
                     )
-                    .await)
+                    .await);
             }
         };
 
@@ -472,6 +539,26 @@ impl GitPack {
         let repo = self
             .parse_audited_repo(token, "git.branch", &params)
             .await?;
+        let params = match parse_branch_params(&params) {
+            Ok(params) => params,
+            Err(error) => {
+                let branch = params
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                return Err(self
+                    .audit_early_failure(
+                        token,
+                        "git.branch",
+                        &repo,
+                        branch.as_deref(),
+                        EventOutcome::Denied,
+                        error,
+                    )
+                    .await);
+            }
+        };
+        let repo = PathBuf::from(&params.repo);
         let lock = repo_write_lock(&repo);
         let _guard = lock.lock().await;
         let BranchPreflight { name, from, argv } = match prepare_branch(&repo, &params) {
@@ -547,6 +634,26 @@ impl GitPack {
         params: Value,
     ) -> Result<Value, RuntimeError> {
         let repo = self.parse_audited_repo(token, "git.push", &params).await?;
+        let params = match parse_push_params(&params) {
+            Ok(params) => params,
+            Err(error) => {
+                let branch = params
+                    .get("branch")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                return Err(self
+                    .audit_early_failure(
+                        token,
+                        "git.push",
+                        &repo,
+                        branch.as_deref(),
+                        EventOutcome::Denied,
+                        error,
+                    )
+                    .await);
+            }
+        };
+        let repo = PathBuf::from(&params.repo);
         let lock = repo_write_lock(&repo);
         let _guard = lock.lock().await;
         let PushPreflight {

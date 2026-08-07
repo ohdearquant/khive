@@ -1,5 +1,5 @@
 //! `code.ingest` L1 (manifest edges) + L1.5 (import-scan edges) core pipeline
-//! (ADR-085 Amendment 2 B3-B6 and Amendment 5 F1-F3). L2
+//! (ADR-085 Amendment 2 B3-B6, Amendment 5 F1-F3, and Amendment 6). L2
 //! Scanner/Extractor is out of scope (PR-2).
 //!
 //! Every entity write in this pipeline runs through the runtime secret gate
@@ -75,6 +75,10 @@ pub struct CodeSourceIngestReport {
     /// A successful ingest indexes every non-blocked entity upsert, so generic
     /// KG `search` and query-anchored `context` can read the resulting map.
     pub fts_indexed: u64,
+    /// Sorted languages actually evidenced during this pass by a parsed
+    /// governing manifest or a source file found by the L1.5 walk. This is
+    /// the observed subset of the caller-selected candidates, never an echo
+    /// of the requested filter.
     pub languages: Vec<String>,
     /// Per-manifest / per-file failures that did not abort the pass (fail
     /// loud without silently dropping the rest of the run).
@@ -1140,7 +1144,6 @@ pub async fn run_code_ingest(
 
     let snapshot = source_snapshot(opts.path).await;
     let mut report = CodeSourceIngestReport {
-        languages: opts.languages.iter().map(|s| s.to_string()).collect(),
         source_revision: snapshot.revision.clone(),
         ..Default::default()
     };
@@ -1153,6 +1156,8 @@ pub async fn run_code_ingest(
 
     let manifests = manifest::discover_manifests(opts.path, &opts.languages)
         .map_err(|e| CodeSourceIngestError::InvalidPath(opts.path.join(e.to_string())))?;
+    let mut observed_languages: BTreeSet<&'static str> =
+        manifests.iter().map(|manifest| manifest.language).collect();
 
     let mut manifest_scopes = ManifestScopeIndex::new();
     let mut project_renames = ProjectRenames::new();
@@ -1236,7 +1241,7 @@ pub async fn run_code_ingest(
     // skipped for lack of a governing manifest.
     let mut module_scans = HashMap::new();
     for language in opts.languages.iter().copied() {
-        run_import_scan(
+        let source_files_observed = run_import_scan(
             rt,
             token,
             language,
@@ -1250,6 +1255,9 @@ pub async fn run_code_ingest(
             &mut report,
         )
         .await?;
+        if source_files_observed {
+            observed_languages.insert(language);
+        }
     }
 
     reresolve_pass(
@@ -1262,6 +1270,7 @@ pub async fn run_code_ingest(
     )
     .await?;
     stamp_import_scan_coverage(rt, token, module_scans, &mut report).await?;
+    report.languages = observed_languages.into_iter().map(str::to_string).collect();
 
     Ok(report)
 }
@@ -1288,18 +1297,19 @@ async fn run_import_scan(
     project_ids: &mut HashMap<String, Uuid>,
     module_scans: &mut HashMap<Uuid, ModuleScan>,
     report: &mut CodeSourceIngestReport,
-) -> Result<(), CodeSourceIngestError> {
+) -> Result<bool, CodeSourceIngestError> {
     let Some(ext) = imports::extension_for_language(language) else {
-        return Ok(());
+        return Ok(false);
     };
     let mut files = Vec::new();
     if let Err(e) = collect_source_files(ingest_root, ext, &mut files) {
         report
             .warnings
             .push(format!("walking {}: {e}", ingest_root.display()));
-        return Ok(());
+        return Ok(false);
     }
     files.sort();
+    let source_files_observed = !files.is_empty();
 
     for file in files {
         let Some(file_dir) = file.parent() else {
@@ -1501,7 +1511,7 @@ async fn run_import_scan(
         });
         scan.imports.extend(scan_imports);
     }
-    Ok(())
+    Ok(source_files_observed)
 }
 
 #[cfg(test)]

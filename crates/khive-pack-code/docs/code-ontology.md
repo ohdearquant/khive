@@ -46,7 +46,8 @@ with `RuntimeError::InvalidInput` rather than silently succeeding.
 The dedicated map is an ordinary khive database, not a private code-pack format. Every
 non-blocked entity upsert also updates its FTS document, and `code.ingest` reports the completed
 count as `fts_indexed`; a failed FTS write fails the ingest instead of returning an unqualified
-success for an unsearchable map. Point a normal `kkernel` process at the map through a
-`[[backends]]` entry in a selected config to use generic KG reads such as `search`, `resolve`,
-`neighbors`, `traverse`, and `context`. `kkernel code-audit` remains the separate policy-driven,
-read-only report surface for the same database.
+success for an unsearchable map. Its `languages` field is the sorted set actually evidenced by
+parsed governing manifests or source files during the pass, not an echo of the input filter.
+Point a normal `kkernel` process at the map through a `[[backends]]` entry in a selected config to
+use generic KG reads such as `search`, `resolve`, `neighbors`, `traverse`, and `context`. `kkernel
+code-audit` remains the separate policy-driven, read-only report surface for the same database.

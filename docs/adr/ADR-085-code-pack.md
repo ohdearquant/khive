@@ -1546,3 +1546,30 @@ one identity.
    advances.
 4. Both endpoints of every fixture `project contains module` edge expose the
    same non-empty `source_project` value.
+
+## Amendment 6 (2026-08-07): observed languages in the ingest report
+
+Amendment 2 B1 defines `languages` as a detection/ingest filter: an explicit
+list restricts the sweep, while omission considers every supported language.
+The success report's field of the same name MUST describe observation, not
+repeat that candidate set.
+
+The response `languages` value is a lexically sorted, deduplicated list drawn
+from the caller-selected candidates. A language is observed when either:
+
+1. L1 discovery returns at least one successfully parsed governing manifest
+   for that language; or
+2. a successful L1.5 language-specific walk finds at least one supported
+   source file under `path`.
+
+Manifest-only and manifestless-source projects therefore both report their
+language. A file remains observation evidence when a later read, secret-gate,
+or persistence step warns or refuses that item; the field describes source
+discovery, not write success. A failed language-specific walk contributes no
+file evidence, though parsed manifest evidence for that language remains.
+When no selected language has either kind of evidence, the response is `[]`.
+
+Acceptance requires a manifestless folder containing only `.rs` files and an
+omitted filter to report exactly `["rust"]`, never every supported language.
+A manifest-only Python fixture reports exactly `["python"]`. Neither case may
+echo unobserved candidates into the response.

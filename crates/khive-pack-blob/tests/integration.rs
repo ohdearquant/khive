@@ -157,10 +157,9 @@ async fn put_rejects_missing_bytes() {
 
 // Security regression guard: `path` was removed from `blob.put` because reading
 // a server-local file is an exfiltration surface for any caller reaching the
-// verb. A `path` field must be inert (treated as absent, never read), so a put
-// carrying only `path` fails the missing-`bytes` check instead of reading it.
+// verb. It must be rejected as an unknown argument before any file is read.
 #[tokio::test]
-async fn put_does_not_read_a_server_local_path() {
+async fn put_rejects_a_server_local_path_as_an_unknown_argument() {
     let (registry, _rt, _dir) = build_registry();
 
     let mut src = tempfile::NamedTempFile::new().expect("named temp file");
@@ -175,10 +174,67 @@ async fn put_does_not_read_a_server_local_path() {
         )
         .await
         .unwrap_err();
+    let message = err.to_string();
     assert!(
-        err.to_string().contains("requires"),
-        "path-only put must fail as missing bytes, got: {err}"
+        message.contains("unknown field") && message.contains("path"),
+        "path-only put must fail closed as an unknown argument, got: {message}"
     );
+}
+
+#[tokio::test]
+async fn every_blob_verb_rejects_unknown_arguments_before_store_access() {
+    let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(BlobPack::new(runtime));
+    let registry = builder.build().expect("registry builds");
+
+    for (verb, args, allowed_field) in [
+        (
+            "blob.put",
+            serde_json::json!({"bytes": "not-base64", "zzz_not_a_real_param": true}),
+            "bytes",
+        ),
+        (
+            "blob.get",
+            serde_json::json!({"content_ref": "not-a-ref", "zzz_not_a_real_param": true}),
+            "content_ref",
+        ),
+        (
+            "blob.stat",
+            serde_json::json!({"content_ref": "not-a-ref", "zzz_not_a_real_param": true}),
+            "content_ref",
+        ),
+    ] {
+        let err = registry
+            .dispatch(verb, args)
+            .await
+            .expect_err("unknown public-verb arguments must fail closed");
+        let message = err.to_string();
+        assert!(message.contains("unknown field"), "{verb}: {message}");
+        assert!(
+            message.contains("zzz_not_a_real_param"),
+            "{verb}: {message}"
+        );
+        assert!(message.contains(allowed_field), "{verb}: {message}");
+    }
+}
+
+#[tokio::test]
+async fn blob_get_rejects_unknown_nested_range_arguments() {
+    let (registry, _rt, _dir) = build_registry();
+    let err = registry
+        .dispatch(
+            "blob.get",
+            serde_json::json!({
+                "content_ref": "not-a-ref",
+                "range": {"offset": 0, "end": 1},
+            }),
+        )
+        .await
+        .expect_err("unknown range arguments must fail closed");
+    let message = err.to_string();
+    assert!(message.contains("unknown field"), "{message}");
+    assert!(message.contains("end"), "{message}");
 }
 
 #[tokio::test]

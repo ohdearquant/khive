@@ -9,6 +9,7 @@ use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 use chrono::Utc;
+use serde::Deserialize;
 use serde_json::Value;
 
 use khive_runtime::{KhiveRuntime, Namespace, RuntimeConfig, RuntimeError};
@@ -18,50 +19,61 @@ use crate::manifest::LANGUAGES;
 use crate::source_ingest::{run_code_ingest, CodeSourceIngestOptions};
 use crate::CodePack;
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct IngestParams {
+    #[serde(default)]
+    path: Option<String>,
+    #[serde(default)]
+    db: Option<String>,
+    #[serde(default)]
+    languages: Option<Vec<String>>,
+}
+
+fn deserialize_params(params: Value) -> Result<IngestParams, RuntimeError> {
+    serde_json::from_value(params)
+        .map_err(|e| RuntimeError::InvalidInput(format!("code.ingest: invalid params: {e}")))
+}
+
 impl CodePack {
     pub(crate) async fn handle_ingest(&self, params: Value) -> Result<Value, RuntimeError> {
-        let path_raw = params
-            .get("path")
-            .and_then(Value::as_str)
+        let IngestParams {
+            path: path_raw,
+            db,
+            languages,
+        } = deserialize_params(params)?;
+        let path_raw = path_raw
             .ok_or_else(|| RuntimeError::InvalidInput("code.ingest requires path".into()))?;
-        let path = PathBuf::from(path_raw);
+        let path = PathBuf::from(&path_raw);
         if !path.is_dir() {
             return Err(RuntimeError::InvalidInput(format!(
                 "path {path_raw:?} does not exist or is not a directory"
             )));
         }
 
-        let languages: BTreeSet<&'static str> = match params.get("languages") {
-            None | Some(Value::Null) => LANGUAGES.iter().copied().collect(),
-            Some(v) => {
-                let arr = v.as_array().ok_or_else(|| {
-                    RuntimeError::InvalidInput("languages must be an array of strings".into())
-                })?;
+        let languages: BTreeSet<&'static str> = match languages {
+            None => LANGUAGES.iter().copied().collect(),
+            Some(values) => {
                 let mut set = BTreeSet::new();
-                for entry in arr {
-                    let s = entry.as_str().ok_or_else(|| {
-                        RuntimeError::InvalidInput("languages entries must be strings".into())
-                    })?;
-                    let canonical =
-                        LANGUAGES
-                            .iter()
-                            .find(|l| **l == s)
-                            .copied()
-                            .ok_or_else(|| {
-                                RuntimeError::InvalidInput(format!(
-                                    "unknown language {s:?}; valid: {}",
-                                    LANGUAGES.join(", ")
-                                ))
-                            })?;
+                for language in values {
+                    let canonical = LANGUAGES
+                        .iter()
+                        .find(|candidate| **candidate == language.as_str())
+                        .copied()
+                        .ok_or_else(|| {
+                            RuntimeError::InvalidInput(format!(
+                                "unknown language {language:?}; valid: {}",
+                                LANGUAGES.join(", ")
+                            ))
+                        })?;
                     set.insert(canonical);
                 }
                 set
             }
         };
 
-        let db_param = params.get("db").and_then(Value::as_str);
         let runtime_db_path = self.runtime.config().db_path.clone();
-        let db_path = resolve_target_db(db_param, &path, runtime_db_path.as_deref())
+        let db_path = resolve_target_db(db.as_deref(), &path, runtime_db_path.as_deref())
             .map_err(RuntimeError::InvalidInput)?;
 
         let config = RuntimeConfig {

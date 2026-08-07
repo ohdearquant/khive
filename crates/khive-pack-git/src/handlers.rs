@@ -8,6 +8,7 @@
 use std::path::Path;
 
 use anyhow::anyhow;
+use serde::Deserialize;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
@@ -99,6 +100,35 @@ const DEFAULT_MAX_ITEMS: i64 = 500;
 const MIN_MAX_ITEMS: i64 = 1;
 const MAX_MAX_ITEMS: i64 = 2000;
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DigestParams {
+    source: String,
+    #[serde(default)]
+    project: Option<String>,
+    #[serde(default)]
+    max_items: Option<i64>,
+    #[serde(default)]
+    include: Option<Vec<String>>,
+}
+
+fn deserialize_digest_params(params: Value) -> Result<DigestParams, RuntimeError> {
+    if params.get("source").and_then(Value::as_str).is_none() {
+        return Err(RuntimeError::InvalidInput(
+            "git.digest requires source".into(),
+        ));
+    }
+    if let Some(value) = params.get("max_items").filter(|value| !value.is_null()) {
+        if value.as_i64().is_none() {
+            return Err(RuntimeError::InvalidInput(format!(
+                "max_items must be an integer, got {value:?}"
+            )));
+        }
+    }
+    serde_json::from_value(params)
+        .map_err(|e| RuntimeError::InvalidInput(format!("git.digest: invalid params: {e}")))
+}
+
 impl GitPack {
     pub(crate) async fn handle_digest(
         &self,
@@ -106,12 +136,9 @@ impl GitPack {
         registry: &VerbRegistry,
         params: Value,
     ) -> Result<Value, RuntimeError> {
-        let source_raw = params
-            .get("source")
-            .and_then(Value::as_str)
-            .ok_or_else(|| RuntimeError::InvalidInput("git.digest requires source".into()))?;
+        let params = deserialize_digest_params(params)?;
         let source =
-            parse_source(source_raw).map_err(|e| RuntimeError::InvalidInput(e.to_string()))?;
+            parse_source(&params.source).map_err(|e| RuntimeError::InvalidInput(e.to_string()))?;
 
         // Parsed as i64 (not u64) so an out-of-range negative value clamps to
         // MIN_MAX_ITEMS instead of failing `as_u64` and silently falling
@@ -119,17 +146,14 @@ impl GitPack {
         // legal budget, not an unrequested 500-item pass. A non-integer
         // value (string, float, bool, array, object) is rejected outright
         // rather than silently defaulted.
-        let max_items = match params.get("max_items") {
-            None | Some(Value::Null) => DEFAULT_MAX_ITEMS,
-            Some(v) => v.as_i64().ok_or_else(|| {
-                RuntimeError::InvalidInput(format!("max_items must be an integer, got {v:?}"))
-            })?,
-        }
-        .clamp(MIN_MAX_ITEMS, MAX_MAX_ITEMS) as u64;
+        let max_items = params
+            .max_items
+            .unwrap_or(DEFAULT_MAX_ITEMS)
+            .clamp(MIN_MAX_ITEMS, MAX_MAX_ITEMS) as u64;
 
-        let include = match params.get("include") {
-            None | Some(Value::Null) => IngestInclude::default(),
-            Some(v) => parse_include(v)?,
+        let include = match params.include.as_deref() {
+            None => IngestInclude::default(),
+            Some(values) => parse_include(values)?,
         };
 
         let mut warnings: Vec<String> = Vec::new();
@@ -157,7 +181,7 @@ impl GitPack {
         };
 
         // Resolve or auto-create the repo-anchor `project` entity.
-        let resolution = match params.get("project").and_then(Value::as_str) {
+        let resolution = match params.project.as_deref() {
             Some(raw) => {
                 let id = resolve_project_id(self.runtime(), raw)
                     .await
@@ -233,20 +257,14 @@ impl GitPack {
     }
 }
 
-fn parse_include(v: &Value) -> Result<IngestInclude, RuntimeError> {
-    let arr = v
-        .as_array()
-        .ok_or_else(|| RuntimeError::InvalidInput("include must be an array of strings".into()))?;
+fn parse_include(values: &[String]) -> Result<IngestInclude, RuntimeError> {
     let mut include = IngestInclude {
         commits: false,
         issues: false,
         pull_requests: false,
     };
-    for entry in arr {
-        let s = entry
-            .as_str()
-            .ok_or_else(|| RuntimeError::InvalidInput("include entries must be strings".into()))?;
-        match s {
+    for value in values {
+        match value.as_str() {
             "commits" => include.commits = true,
             "issues" => include.issues = true,
             "pull_requests" => include.pull_requests = true,

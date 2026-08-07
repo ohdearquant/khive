@@ -33,8 +33,9 @@ pub(crate) static CODE_HANDLERS: [HandlerDef; 1] = [HandlerDef {
             name: "languages",
             param_type: "array of string",
             required: false,
-            description: "Restrict ingest to a subset of rust | python | typescript. Defaults \
-                           to all three (auto-detected from manifests found under path).",
+            description: "Restrict detection and ingest to a subset of rust | python | \
+                           typescript. When omitted, all three are candidates and the response \
+                           reports only languages observed in parsed manifests or source files.",
         },
     ],
 }];
