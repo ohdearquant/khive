@@ -52,6 +52,18 @@ pub struct SubstrateCoordinator {
     pub(super) fail_backend_id: Option<String>,
     #[cfg(test)]
     pub(super) panic_backend_id: Option<String>,
+    /// Test-only: named backend's fan-out search task never resolves,
+    /// simulating a hung backend (MAJ-2 timeout regression coverage).
+    #[cfg(test)]
+    pub(super) hang_backend_id: Option<String>,
+    /// Test-only: when set, a backend's entity fan-out task returns this
+    /// list verbatim instead of calling `hybrid_search`, so RRF-merge
+    /// regression tests can pin exact ranks/UUIDs (MAJ-4).
+    #[cfg(test)]
+    pub(super) entity_hits_override: Option<HashMap<String, Vec<SearchHit>>>,
+    /// Test-only: same as `entity_hits_override`, for the note substrate.
+    #[cfg(test)]
+    pub(super) note_hits_override: Option<HashMap<String, Vec<NoteSearchHit>>>,
 }
 
 impl SubstrateCoordinator {
@@ -64,6 +76,12 @@ impl SubstrateCoordinator {
             fail_backend_id: None,
             #[cfg(test)]
             panic_backend_id: None,
+            #[cfg(test)]
+            hang_backend_id: None,
+            #[cfg(test)]
+            entity_hits_override: None,
+            #[cfg(test)]
+            note_hits_override: None,
         }
     }
 
@@ -76,6 +94,12 @@ impl SubstrateCoordinator {
             fail_backend_id: None,
             #[cfg(test)]
             panic_backend_id: None,
+            #[cfg(test)]
+            hang_backend_id: None,
+            #[cfg(test)]
+            entity_hits_override: None,
+            #[cfg(test)]
+            note_hits_override: None,
         }
     }
 
@@ -90,6 +114,12 @@ impl SubstrateCoordinator {
             fail_backend_id: None,
             #[cfg(test)]
             panic_backend_id: None,
+            #[cfg(test)]
+            hang_backend_id: None,
+            #[cfg(test)]
+            entity_hits_override: None,
+            #[cfg(test)]
+            note_hits_override: None,
         }
     }
 
@@ -104,6 +134,33 @@ impl SubstrateCoordinator {
     #[cfg(test)]
     pub fn with_panicking_backend(mut self, backend_id: &str) -> Self {
         self.panic_backend_id = Some(backend_id.to_string());
+        self
+    }
+
+    /// Test-only: force a named backend's fan-out search task to hang forever
+    /// (never resolves), simulating an unresponsive backend.
+    #[cfg(test)]
+    pub fn with_hanging_backend(mut self, backend_id: &str) -> Self {
+        self.hang_backend_id = Some(backend_id.to_string());
+        self
+    }
+
+    /// Test-only: pin a named backend's entity fan-out contribution to an
+    /// exact, caller-supplied ranked list instead of querying storage.
+    #[cfg(test)]
+    pub fn with_entity_hits_override(mut self, overrides: HashMap<String, Vec<SearchHit>>) -> Self {
+        self.entity_hits_override = Some(overrides);
+        self
+    }
+
+    /// Test-only: pin a named backend's note fan-out contribution to an
+    /// exact, caller-supplied ranked list instead of querying storage.
+    #[cfg(test)]
+    pub fn with_note_hits_override(
+        mut self,
+        overrides: HashMap<String, Vec<NoteSearchHit>>,
+    ) -> Self {
+        self.note_hits_override = Some(overrides);
         self
     }
 
@@ -395,13 +452,40 @@ impl SubstrateCoordinator {
     ///
     /// Per-backend errors are captured in [`BackendSearchResult::error`] — a single
     /// failing backend does NOT abort the fan-out.
+    ///
+    /// Authorizes each backend token against `namespace` alone (visible set
+    /// `[namespace]`) — see [`Self::fan_out_search_with_visibility`] for the
+    /// caller-widened-visibility variant the MCP coordinator boundary uses.
     pub async fn fan_out_search(
         &self,
         request: &ValidatedSearchRequest,
         namespace: &Namespace,
     ) -> (Vec<SearchHit>, Vec<NoteSearchHit>, Vec<BackendSearchResult>) {
+        self.fan_out_search_with_visibility(request, namespace, &[])
+            .await
+    }
+
+    /// Same as [`Self::fan_out_search`], but authorizes each backend token
+    /// with an explicit extra read-visibility set (MAJ-3 fix).
+    ///
+    /// `extra_visible` mirrors the normal registry dispatch path's
+    /// `['local'] ∪ visible_namespaces` widening
+    /// (`khive_runtime::pack::VerbRegistry::dispatch_with_identity`) — pass
+    /// `&[]` (equivalent to [`Self::fan_out_search`]) to authorize against
+    /// `namespace` alone, or the caller's resolved extra-visible set to widen
+    /// read visibility the same way the single-backend registry path does.
+    /// An explicit `namespace=` request parameter intentionally narrows
+    /// visibility and must be passed as `&[]` by the caller — this method
+    /// does not itself distinguish explicit from default namespace
+    /// resolution.
+    pub async fn fan_out_search_with_visibility(
+        &self,
+        request: &ValidatedSearchRequest,
+        namespace: &Namespace,
+        extra_visible: &[Namespace],
+    ) -> (Vec<SearchHit>, Vec<NoteSearchHit>, Vec<BackendSearchResult>) {
         let search_notes = request.substrate() == SearchSubstrate::Note;
-        let search_limit = request.candidate_limit();
+        let search_limit = rrf_fanout_search_limit(request);
         let limit = request.limit();
         let props_filter_owned = request.properties().cloned();
         let tags_owned = request.tags().to_vec();
@@ -421,7 +505,9 @@ impl SubstrateCoordinator {
 
         if entries.len() == 1 {
             let (backend_id, runtime) = &entries[0];
-            let token = match runtime.authorize(namespace.clone()) {
+            let token = match runtime
+                .authorize_with_visibility(namespace.clone(), extra_visible.to_vec())
+            {
                 Ok(t) => t,
                 Err(e) => {
                     tracing::warn!(error = %e, "fan_out_search: authorization denied for namespace");
@@ -508,6 +594,7 @@ impl SubstrateCoordinator {
 
         let query = request.query().to_string();
         let ns = namespace.clone();
+        let extra_visible_owned = extra_visible.to_vec();
 
         #[cfg(test)]
         let fail_id: Option<String> = self.fail_backend_id.clone();
@@ -517,17 +604,21 @@ impl SubstrateCoordinator {
         let panic_id: Option<String> = self.panic_backend_id.clone();
         #[cfg(not(test))]
         let panic_id: Option<String> = None;
+        #[cfg(test)]
+        let hang_id: Option<String> = self.hang_backend_id.clone();
+        #[cfg(not(test))]
+        let hang_id: Option<String> = None;
 
         let mut handles = Vec::with_capacity(entries.len());
         for (backend_id, runtime) in entries {
             let q = query.clone();
             let ns = ns.clone();
+            let extra_visible_task = extra_visible_owned.clone();
             let kf = kind_filter_owned.clone();
             let et = entity_type_owned.clone();
             let pf = props_filter_owned.clone();
             let tg = tags_owned.clone();
             let sl = search_limit;
-            let lim = limit;
             let should_fail = fail_id
                 .as_deref()
                 .map(|id| id == backend_id.as_str())
@@ -536,10 +627,35 @@ impl SubstrateCoordinator {
                 .as_deref()
                 .map(|id| id == backend_id.as_str())
                 .unwrap_or(false);
+            let should_hang = hang_id
+                .as_deref()
+                .map(|id| id == backend_id.as_str())
+                .unwrap_or(false);
+            #[cfg(test)]
+            let entity_override: Option<Vec<SearchHit>> = self
+                .entity_hits_override
+                .as_ref()
+                .and_then(|m| m.get(backend_id.as_str()))
+                .cloned();
+            #[cfg(not(test))]
+            let entity_override: Option<Vec<SearchHit>> = None;
+            #[cfg(test)]
+            let note_override: Option<Vec<NoteSearchHit>> = self
+                .note_hits_override
+                .as_ref()
+                .and_then(|m| m.get(backend_id.as_str()))
+                .cloned();
+            #[cfg(not(test))]
+            let note_override: Option<Vec<NoteSearchHit>> = None;
             let joined_backend_id = backend_id.clone();
             let handle = tokio::spawn(async move {
                 if should_panic {
                     panic!("injected backend search panic");
+                }
+                if should_hang {
+                    // Never resolves — exercises the fan-out timeout (MAJ-2).
+                    std::future::pending::<()>().await;
+                    unreachable!("a pending future never resolves");
                 }
                 if should_fail {
                     return (
@@ -550,7 +666,14 @@ impl SubstrateCoordinator {
                         None::<Vec<NoteSearchHit>>,
                     );
                 }
-                let token = match runtime.authorize(ns) {
+                if search_notes {
+                    if let Some(hits) = note_override {
+                        return (backend_id, Ok(vec![]), Some(hits));
+                    }
+                } else if let Some(hits) = entity_override {
+                    return (backend_id, Ok(hits), None);
+                }
+                let token = match runtime.authorize_with_visibility(ns, extra_visible_task) {
                     Ok(t) => t,
                     Err(e) => {
                         tracing::warn!(error = %e, "fan_out_search: authorization denied for namespace");
@@ -571,11 +694,12 @@ impl SubstrateCoordinator {
                         )
                         .await;
                     match result {
-                        Ok(note_hits) => {
-                            let note_hits: Vec<NoteSearchHit> =
-                                note_hits.into_iter().take(lim as usize).collect();
-                            (backend_id, Ok(vec![]), Some(note_hits))
-                        }
+                        // Full search_limit-bounded window is retained here —
+                        // truncating to the caller's limit per backend (MAJ-4)
+                        // would remove candidates the RRF merge needs to fairly
+                        // rank a hit that only places #2+ on any single backend.
+                        // `rrf_merge_note_hits` applies `limit` once, after merge.
+                        Ok(note_hits) => (backend_id, Ok(vec![]), Some(note_hits)),
                         Err(e) => (backend_id, Err(e), None),
                     }
                 } else {
@@ -592,14 +716,9 @@ impl SubstrateCoordinator {
                         )
                         .await;
                     match result {
-                        Ok(hits) => {
-                            // Truncate to the user limit after filtering so each
-                            // backend contributes at most `limit` ranked hits to
-                            // the RRF merge (not the widened search_limit).
-                            let hits: Vec<SearchHit> =
-                                hits.into_iter().take(lim as usize).collect();
-                            (backend_id, Ok(hits), None)
-                        }
+                        // See the note-substrate arm above: no per-backend
+                        // truncation before RRF merge (MAJ-4).
+                        Ok(hits) => (backend_id, Ok(hits), None),
                         Err(e) => (backend_id, Err(e), None),
                     }
                 }
@@ -610,10 +729,13 @@ impl SubstrateCoordinator {
         let mut per_backend: Vec<BackendSearchResult> = Vec::new();
         let mut entity_ranked_lists: Vec<Vec<SearchHit>> = Vec::new();
         let mut note_ranked_lists: Vec<Vec<NoteSearchHit>> = Vec::new();
+        let timeout_ms = backend_search_timeout_ms();
+        let timeout_dur = Duration::from_millis(timeout_ms);
 
         for (joined_backend_id, handle) in handles {
-            match handle.await {
-                Ok((backend_id, Ok(hits), note_hits_opt)) => {
+            let abort_handle = handle.abort_handle();
+            match tokio::time::timeout(timeout_dur, handle).await {
+                Ok(Ok((backend_id, Ok(hits), note_hits_opt))) => {
                     let note_hits = note_hits_opt.unwrap_or_default();
                     if !hits.is_empty() {
                         entity_ranked_lists.push(hits.clone());
@@ -628,7 +750,7 @@ impl SubstrateCoordinator {
                         error: None,
                     });
                 }
-                Ok((backend_id, Err(e), _)) => {
+                Ok(Ok((backend_id, Err(e), _))) => {
                     per_backend.push(BackendSearchResult {
                         backend_id,
                         hits: vec![],
@@ -636,7 +758,7 @@ impl SubstrateCoordinator {
                         error: Some(e.to_string()),
                     });
                 }
-                Err(join_err) => {
+                Ok(Err(join_err)) => {
                     let error = khive_runtime::RuntimeError::Internal(format!(
                         "backend search task join failed: {join_err}"
                     ));
@@ -648,6 +770,23 @@ impl SubstrateCoordinator {
                         error: Some(error.to_string()),
                     });
                 }
+                Err(_elapsed) => {
+                    // The task keeps running detached — `abort()` best-effort
+                    // cancels it so a hung backend doesn't burn resources
+                    // forever, but the response does not wait on that.
+                    abort_handle.abort();
+                    tracing::warn!(
+                        backend = %joined_backend_id,
+                        timeout_ms,
+                        "backend search task timed out"
+                    );
+                    per_backend.push(BackendSearchResult {
+                        backend_id: joined_backend_id,
+                        hits: vec![],
+                        note_hits: vec![],
+                        error: Some(format!("backend search timed out after {timeout_ms}ms")),
+                    });
+                }
             }
         }
 
@@ -655,6 +794,53 @@ impl SubstrateCoordinator {
         let merged_notes = rrf_merge_note_hits(note_ranked_lists, limit as usize);
         (merged_entities, merged_notes, per_backend)
     }
+}
+
+/// Per-backend fan-out search timeout (MAJ-2 fix): bounds how long a single
+/// backend's search task may run before the coordinator gives up on it and
+/// reports a timeout-specific error for that backend, so one hung backend
+/// cannot block the whole fan-out from returning healthy siblings' results.
+const DEFAULT_BACKEND_SEARCH_TIMEOUT_MS: u64 = 5_000;
+
+/// Return the cached per-backend fan-out search timeout in milliseconds.
+/// See `KHIVE_COORDINATOR_SEARCH_TIMEOUT_MS` in
+/// `crates/kkernel/docs/api/configuration.md`.
+fn backend_search_timeout_ms() -> u64 {
+    static TIMEOUT_MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *TIMEOUT_MS.get_or_init(|| {
+        let ms = std::env::var("KHIVE_COORDINATOR_SEARCH_TIMEOUT_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(DEFAULT_BACKEND_SEARCH_TIMEOUT_MS);
+        khive_runtime::config_ledger::record_config_locked(
+            "KHIVE_COORDINATOR_SEARCH_TIMEOUT_MS",
+            ms.to_string(),
+        );
+        ms
+    })
+}
+
+/// Per-backend fan-out over-fetch bound for RRF merge fairness (MAJ-4 fix).
+///
+/// Each backend must contribute more than just the caller's `limit` worth of
+/// ranked candidates, or a candidate that ranks #2+ on multiple backends can
+/// never out-fuse a rank-1 singleton that only one backend saw — truncating
+/// to `limit` per backend removes it before the merge ever sees it.
+/// `request.candidate_limit()` already widens the per-backend fetch for
+/// property/tag filter recall; this widens further (bounded) so unfiltered
+/// fan-out searches get the same fairness. The caller's `limit` is applied
+/// exactly once, after the RRF merge (`rrf_merge_entity_hits` /
+/// `rrf_merge_note_hits`).
+const RRF_FANOUT_MULTIPLIER: u32 = 10;
+/// Same cap shape as `FILTERED_SCAN_CAP` in khive-pack-kg's search handler,
+/// applied to the fan-out-wide candidate window.
+const RRF_FANOUT_CAP: u32 = 500;
+
+fn rrf_fanout_search_limit(request: &ValidatedSearchRequest) -> u32 {
+    request
+        .candidate_limit()
+        .max(request.limit().saturating_mul(RRF_FANOUT_MULTIPLIER))
+        .min(RRF_FANOUT_CAP)
 }
 
 // ---- RRF merge ----

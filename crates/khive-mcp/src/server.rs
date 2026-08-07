@@ -42,13 +42,42 @@ use khive_storage::EdgeRelation;
 use crate::coordinator::{CoordSearchResult, CoordinatorService};
 use crate::tools::request::RequestParams;
 
+/// Per-operation completeness discriminator for the `search` verb (ADR-130
+/// §1). `SearchDegradation::status == None` means "not a search op" — no
+/// `status` field is emitted on that operation's envelope.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SearchStatus {
+    Complete,
+    Partial,
+}
+
+impl SearchStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Complete => "complete",
+            Self::Partial => "partial",
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 struct SearchDegradation {
-    partial: bool,
+    status: Option<SearchStatus>,
     missing_backends: Vec<String>,
 }
 
 impl SearchDegradation {
+    /// A search op that ran to completion: single-backend/no-coordinator
+    /// registry dispatch, or (in principle) a coordinator fan-out where
+    /// every selected backend succeeded — `from_result` is used for the
+    /// latter instead, since it also has to compute `missing_backends`.
+    fn complete() -> Self {
+        Self {
+            status: Some(SearchStatus::Complete),
+            missing_backends: Vec::new(),
+        }
+    }
+
     fn from_result(result: &CoordSearchResult) -> Self {
         let mut missing_backends: Vec<String> = result
             .per_backend
@@ -58,10 +87,19 @@ impl SearchDegradation {
             .collect();
         missing_backends.sort();
         missing_backends.dedup();
+        let status = if result.partial || !missing_backends.is_empty() {
+            SearchStatus::Partial
+        } else {
+            SearchStatus::Complete
+        };
         Self {
-            partial: result.partial || !missing_backends.is_empty(),
+            status: Some(status),
             missing_backends,
         }
+    }
+
+    fn is_partial(&self) -> bool {
+        self.status == Some(SearchStatus::Partial)
     }
 }
 
@@ -77,6 +115,38 @@ impl OpSuccess {
             degradation: SearchDegradation::default(),
         }
     }
+}
+
+/// `OpSuccess` for an op dispatched through the plain registry path
+/// (single-backend deployment, or no coordinator attached). A `search` op
+/// (excluding `help=true`, which returns a schema rather than a result
+/// array) carries `status="complete"` (ADR-130 §1); every other verb keeps
+/// the untagged `OpSuccess::complete` — no `status` field on its envelope.
+fn op_success_from_registry_result(tool: &str, is_help: bool, result: Value) -> OpSuccess {
+    if tool == "search" && !is_help {
+        OpSuccess {
+            result,
+            degradation: SearchDegradation::complete(),
+        }
+    } else {
+        OpSuccess::complete(result)
+    }
+}
+
+/// Structured error for a search whose selected backends failed such that no
+/// hit survived server-side filtering (ADR-130 §1 `search_incomplete`).
+///
+/// Distinguishes a degraded read from a genuine no-match: a genuine no-match
+/// keeps `ok=true` with an empty `result`; this is `ok=false` — a caller
+/// doing `if response.ok && response.result.is_empty()` sees the two cases
+/// differently, instead of concluding "no match" in both.
+fn search_incomplete_error(missing_backends: Vec<String>) -> Value {
+    json!({
+        "kind": "search_incomplete",
+        "message": "no-match was not established because selected backends failed",
+        "retryable": false,
+        "missing_backends": missing_backends,
+    })
 }
 
 /// Per-request parallelism stays bounded even when the parser accepts 100 ops; must be nonzero.
@@ -894,7 +964,8 @@ impl KhiveMcpServer {
                     result,
                     self.schedule_ticker_last_tick_micros.as_ref(),
                 );
-                chain_ok_envelope_or_depth_error(tool, OpSuccess::complete(result))
+                let success = op_success_from_registry_result(&tool, is_help, result);
+                chain_ok_envelope_or_depth_error(tool, success)
             }
             Err(RuntimeError::Khive(k)) => {
                 let error_payload = serde_json::to_value(&k)
@@ -918,9 +989,14 @@ impl KhiveMcpServer {
     /// substitution uses canonical (verbose) handler output; the transform runs
     /// only at the final response-envelope boundary.
     ///
-    /// Aggregate `status` describes failed or aborted operations. A successful
-    /// but incomplete coordinator search remains a success and carries its
-    /// typed `partial` / `missing_backends` advisory on that operation entry.
+    /// Aggregate `status` describes failed or aborted operations — distinct
+    /// from a `search` op's own per-operation `status` field ("complete" /
+    /// "partial", ADR-130 §1), which lives inside that op's `results` entry,
+    /// never at this top level. A successful but incomplete coordinator
+    /// search remains a success (`status="partial"` on that entry) and
+    /// carries a typed `missing_backends` advisory plus the deprecated
+    /// `partial` alias; a search where no hit survives a backend failure is
+    /// instead a failed op (`ok: false`, `error.kind: "search_incomplete"`).
     ///
     /// Response envelope:
     /// ```json
@@ -1132,9 +1208,11 @@ impl KhiveMcpServer {
                                     result,
                                     schedule_ticker_last_tick_micros.as_ref(),
                                 );
+                                let success =
+                                    op_success_from_registry_result(&tool, is_help, result);
                                 present_ok_envelope_or_depth_error(
                                     tool,
-                                    OpSuccess::complete(result),
+                                    success,
                                     effective_mode,
                                     now_unix,
                                 )
@@ -1345,6 +1423,9 @@ async fn dispatch_via_coordinator_inner(
             if let Some(fields) = handler_args.as_object_mut() {
                 fields.remove("namespace");
             }
+            // MAJ-3: widen the fan-out's read-visibility scope to match the
+            // normal registry dispatch path — see `coordinator_search_visibility`.
+            let extra_visible = coordinator_search_visibility(registry, args_value, identity);
             let result = registry
                 .dispatch_intercepted_with_metadata_with_identity(
                     tool,
@@ -1355,15 +1436,17 @@ async fn dispatch_via_coordinator_inner(
                         // already authorized this namespace before handler-level
                         // search validation runs inside the intercepted closure.
                         let request = ValidatedSearchRequest::from_value(handler_args, registry)?;
-                        let coord_result = coord.fan_out_search(&request, &namespace).await;
+                        let coord_result = coord
+                            .fan_out_search(&request, &namespace, &extra_visible)
+                            .await;
                         let degradation = SearchDegradation::from_result(&coord_result);
 
-                        // Preserve the coordinator search response's compatibility fields.
-                        // Entity hits: [{id, entity_kind, score, title, snippet}]
-                        //   - entity_kind: real kind string fetched from the owning backend
-                        //   - score: RRF-merged, subject to min_score floor
-                        // Note hits:   [{id, note_kind, score, title, snippet}]
-                        //   - note_kind: real kind string fetched from the owning backend
+                        // Preserve the coordinator search response's compatibility
+                        // fields, and add the KG single-backend handler's canonical
+                        // row fields for shape parity (MIN-1): `kind` (duplicates
+                        // entity_kind/note_kind), `name`, and `created_at`.
+                        // Entity hits: [{id, kind, entity_kind, name, score, source, title, snippet, created_at}]
+                        // Note hits:   [{id, kind, note_kind, name, score, source, title, snippet, created_at}]
                         let result_val = if request.substrate() == SearchSubstrate::Note {
                             let items: Vec<Value> = coord_result
                                 .note_hits
@@ -1371,13 +1454,22 @@ async fn dispatch_via_coordinator_inner(
                                 .filter(|h| h.score.to_f64() >= request.min_score())
                                 .map(|h| {
                                     let note_kind = coord_result.note_kinds.get(&h.note_id);
+                                    let name =
+                                        coord_result.note_names.get(&h.note_id).cloned().flatten();
+                                    let created_at = coord_result
+                                        .note_created_at
+                                        .get(&h.note_id)
+                                        .map(|micros| khive_runtime::micros_to_iso(*micros));
                                     json!({
                                         "id": h.note_id.to_string(),
+                                        "kind": note_kind,
                                         "note_kind": note_kind,
+                                        "name": name,
                                         "score": h.score.to_f64(),
                                         "source": h.source.as_str(),
                                         "title": h.title,
                                         "snippet": h.snippet,
+                                        "created_at": created_at,
                                     })
                                 })
                                 .collect();
@@ -1389,13 +1481,20 @@ async fn dispatch_via_coordinator_inner(
                                 .filter(|h| h.score.to_f64() >= request.min_score())
                                 .map(|h| {
                                     let entity_kind = coord_result.entity_kinds.get(&h.entity_id);
+                                    let created_at = coord_result
+                                        .entity_created_at
+                                        .get(&h.entity_id)
+                                        .map(|micros| khive_runtime::micros_to_iso(*micros));
                                     json!({
                                         "id": h.entity_id.to_string(),
+                                        "kind": entity_kind,
                                         "entity_kind": entity_kind,
+                                        "name": h.title,
                                         "score": h.score.to_f64(),
                                         "source": h.source.as_str(),
                                         "title": h.title,
                                         "snippet": h.snippet,
+                                        "created_at": created_at,
                                     })
                                 })
                                 .collect();
@@ -1406,17 +1505,81 @@ async fn dispatch_via_coordinator_inner(
                     },
                 )
                 .await;
-            Some(
-                result
-                    .map(|outcome| OpSuccess {
-                        result: outcome.result,
-                        degradation: outcome.metadata,
-                    })
-                    .map_err(|error| runtime_error_payload(tool, error)),
-            )
+            Some(match result {
+                Ok(outcome) => {
+                    let is_empty = outcome
+                        .result
+                        .as_array()
+                        .map(|items| items.is_empty())
+                        .unwrap_or(true);
+                    // ADR-130 §1: a backend failure with zero surviving hits
+                    // (post server-side filtering, min_score included) is a
+                    // failed operation, not a successful empty result — the
+                    // "no match" reading is not established when the answer
+                    // may be sitting on the backend that never responded.
+                    if outcome.metadata.is_partial() && is_empty {
+                        Err((
+                            tool.to_string(),
+                            search_incomplete_error(outcome.metadata.missing_backends),
+                        ))
+                    } else {
+                        Ok(OpSuccess {
+                            result: outcome.result,
+                            degradation: outcome.metadata,
+                        })
+                    }
+                }
+                Err(error) => Err(runtime_error_payload(tool, error)),
+            })
         }
         _ => None,
     }
+}
+
+/// Resolve the coordinator search boundary's extra read-visibility set
+/// (MAJ-3 fix), mirroring the normal registry dispatch path's default-case
+/// widening to `['local'] ∪ visible_namespaces`
+/// (`khive_runtime::pack::VerbRegistry::dispatch_with_identity`,
+/// `crates/khive-runtime/src/pack.rs`). Without this, `fan_out_search`
+/// authorizes each backend token against the resolved primary namespace
+/// alone, so a namespace visible only through `visible_namespaces` silently
+/// drops out of coordinator search results even though the same caller's
+/// non-coordinator (single-backend) search would see it.
+///
+/// An explicit `namespace=` request parameter intentionally narrows
+/// visibility to that one namespace — this returns an empty set in that
+/// case, unwidened, exactly like the registry path's `explicit_namespace`
+/// branch.
+fn coordinator_search_visibility(
+    registry: &VerbRegistry,
+    args_value: &Value,
+    identity: Option<&khive_runtime::RequestIdentity>,
+) -> Vec<khive_runtime::Namespace> {
+    let explicit_namespace = args_value.get("namespace").is_some();
+    if explicit_namespace {
+        return Vec::new();
+    }
+    let mut extra_visible: Vec<khive_runtime::Namespace> = match identity {
+        Some(id) => id
+            .visible_namespaces
+            .iter()
+            .filter_map(|s| match khive_runtime::Namespace::parse(s) {
+                Ok(parsed) => Some(parsed),
+                Err(e) => {
+                    tracing::warn!(
+                        namespace = %s,
+                        error = %e,
+                        "coordinator_search_visibility: skipping invalid visible_namespace \
+                         entry from per-request identity"
+                    );
+                    None
+                }
+            })
+            .collect(),
+        None => registry.visible_namespaces().to_vec(),
+    };
+    extra_visible.push(khive_runtime::Namespace::local());
+    extra_visible
 }
 
 fn runtime_error_payload(tool: &str, error: RuntimeError) -> (String, Value) {
@@ -1461,11 +1624,23 @@ fn ok_envelope(tool: String, success: OpSuccess) -> Value {
         result,
         degradation,
     } = success;
-    let mut map = serde_json::Map::with_capacity(if degradation.partial { 5 } else { 3 });
+    let is_partial = degradation.is_partial();
+    let extra_fields = usize::from(degradation.status.is_some()) + if is_partial { 2 } else { 0 };
+    let mut map = serde_json::Map::with_capacity(3 + extra_fields);
     map.insert("ok".to_string(), Value::Bool(true));
     map.insert("tool".to_string(), Value::String(tool));
     map.insert("result".to_string(), result);
-    if degradation.partial {
+    // ADR-130 §1: `status` is present on every successful search envelope
+    // (complete or partial); absent for every other verb.
+    if let Some(status) = degradation.status {
+        map.insert(
+            "status".to_string(),
+            Value::String(status.as_str().to_string()),
+        );
+    }
+    // Legacy `partial`/`missing_backends` alias, compatibility-release only
+    // (ADR-130 §Compatibility) — omitted for `status="complete"`.
+    if is_partial {
         map.insert("partial".to_string(), Value::Bool(true));
         map.insert(
             "missing_backends".to_string(),
@@ -1717,9 +1892,15 @@ Response shape:
 Parallel: a failed op does NOT abort siblings. Chain: failure aborts remaining
 ops (reported as {"ok": false, "aborted": true}). Committed ops are not rolled back.
 `status` is "partial" whenever summary.failed or summary.aborted is non-zero — check
-it (or summary) rather than relying on the absence of a top-level error. A successful
-degraded search keeps status="success" and adds partial=true plus missing_backends to
-that operation entry.
+it (or summary) rather than relying on the absence of a top-level error.
+
+`search` carries its own per-op `status` ("complete" | "partial") inside that
+op's `result` entry, separate from the top-level batch `status` above. A
+degraded-but-answered search stays ok:true with status="partial" plus a
+missing_backends list (and the deprecated partial:true alias). When a backend
+failure leaves no hit standing after filtering, the op instead fails outright
+with ok:false and error.kind="search_incomplete" — that case must not be read
+as "no results found."
 
 Verb discovery: install the `kg` / `gtd` plugins for usage skills. The verbs
 currently registered on this server (pack-derived) are listed below. Argument
@@ -2394,6 +2575,7 @@ fn frame_budget_omission(entry: &Value) -> Value {
         "tool",
         "usage",
         "aborted",
+        "status",
         "partial",
         "missing_backends",
     ] {
@@ -2407,10 +2589,25 @@ fn frame_budget_omission(entry: &Value) -> Value {
             json!("operation succeeded; result omitted because the response frame budget was exceeded"),
         );
     } else {
-        omitted.insert(
-            "error".to_string(),
-            json!("operation failed; error details omitted because the response frame budget was exceeded"),
-        );
+        // ADR-130 §Compatibility (MCP envelope builder): `search_incomplete`
+        // is small and typed — it must survive omission untransformed rather
+        // than collapse to the generic omitted-error string every other
+        // (potentially large) error payload gets.
+        let is_search_incomplete = entry
+            .get("error")
+            .and_then(|error| error.get("kind"))
+            .and_then(Value::as_str)
+            == Some("search_incomplete");
+        if is_search_incomplete {
+            if let Some(error) = entry.get("error") {
+                omitted.insert("error".to_string(), error.clone());
+            }
+        } else {
+            omitted.insert(
+                "error".to_string(),
+                json!("operation failed; error details omitted because the response frame budget was exceeded"),
+            );
+        }
     }
     Value::Object(omitted)
 }
@@ -2836,15 +3033,70 @@ mod tests {
             "ok": true,
             "tool": "search",
             "result": "oversized",
+            "status": "partial",
             "partial": true,
             "missing_backends": ["archive"],
         }));
 
         assert_eq!(omitted["ok"], json!(true));
+        assert_eq!(omitted["status"], json!("partial"));
         assert_eq!(omitted["partial"], json!(true));
         assert_eq!(omitted["missing_backends"], json!(["archive"]));
         assert!(omitted.get("result").is_none());
         assert!(omitted.get("result_omitted").is_some());
+    }
+
+    #[test]
+    fn frame_budget_omission_preserves_complete_search_status() {
+        let omitted = frame_budget_omission(&json!({
+            "ok": true,
+            "tool": "search",
+            "result": "oversized",
+            "status": "complete",
+        }));
+
+        assert_eq!(omitted["ok"], json!(true));
+        assert_eq!(omitted["status"], json!("complete"));
+        assert!(omitted.get("partial").is_none());
+        assert!(omitted.get("result").is_none());
+    }
+
+    /// ADR-130 §Compatibility: the `search_incomplete` error is small and
+    /// typed — it must survive frame-budget omission untransformed, not
+    /// collapse to the generic omitted-error string.
+    #[test]
+    fn frame_budget_omission_preserves_search_incomplete_error_untransformed() {
+        let error = json!({
+            "kind": "search_incomplete",
+            "message": "no-match was not established because selected backends failed",
+            "retryable": false,
+            "missing_backends": ["archive"],
+        });
+        let omitted = frame_budget_omission(&json!({
+            "ok": false,
+            "tool": "search",
+            "error": error,
+        }));
+
+        assert_eq!(omitted["ok"], json!(false));
+        assert_eq!(omitted["error"], error);
+    }
+
+    #[test]
+    fn frame_budget_omission_still_collapses_other_large_errors() {
+        let omitted = frame_budget_omission(&json!({
+            "ok": false,
+            "tool": "create",
+            "error": { "kind": "invalid_input", "message": "x".repeat(10_000) },
+        }));
+
+        assert_eq!(omitted["ok"], json!(false));
+        assert_eq!(
+            omitted["error"],
+            json!(
+                "operation failed; error details omitted because the response frame budget was exceeded"
+            )
+        );
     }
 
     #[tokio::test]
@@ -3417,7 +3669,7 @@ mod tests {
         let success = OpSuccess {
             result: json!([{"id": "11111111-1111-1111-1111-111111111111"}]),
             degradation: SearchDegradation {
-                partial: true,
+                status: Some(SearchStatus::Partial),
                 missing_backends: vec!["archive".to_string()],
             },
         };
@@ -3429,6 +3681,7 @@ mod tests {
         );
 
         assert_eq!(envelope["ok"], json!(true));
+        assert_eq!(envelope["status"], json!("partial"));
         assert_eq!(envelope["partial"], json!(true));
         assert_eq!(envelope["missing_backends"], json!(["archive"]));
         assert!(envelope.get("result").is_some());
@@ -4090,6 +4343,159 @@ mod tests {
         };
         let runtime = KhiveRuntime::new(config).expect("in-memory runtime");
         KhiveMcpServer::new(runtime).expect("server builds with kg")
+    }
+
+    /// ADR-130 §1: the KG single-backend (no coordinator) envelope must also
+    /// carry `status="complete"` on every successful `search` — both for a
+    /// genuine no-match and a populated result — with no possible "partial"
+    /// state for a lone backend. Other verbs must not gain a `status` field.
+    #[tokio::test]
+    async fn single_backend_search_reports_status_complete() {
+        let server = in_memory_kg_server();
+
+        let resp = server
+            .dispatch_request_local(RequestParams {
+                ops: r#"search(kind="entity", query="nothing here")"#.to_string(),
+                presentation: None,
+                presentation_per_op: None,
+                save_to: None,
+                format: None,
+                format_per_op: None,
+                request_id: None,
+            })
+            .await
+            .expect("search dispatch must succeed");
+        let parsed: Value = serde_json::from_str(&resp).expect("envelope must be JSON");
+        let search = &parsed["results"][0];
+        assert_eq!(search["ok"], json!(true), "unexpected response: {search}");
+        assert_eq!(search["status"], json!("complete"));
+        assert_eq!(search["result"], json!([]));
+        assert!(search.get("partial").is_none());
+
+        // Chain (`|`), not a parallel batch: `search` must observe the
+        // preceding `create`, which an independent-ops batch does not
+        // guarantee (bounded-concurrency ops have no relative ordering).
+        let resp = server
+            .dispatch_request_local(RequestParams {
+                ops: "create(kind=\"entity\", entity_kind=\"concept\", name=\"kg-search-status\") \
+                       | search(kind=\"entity\", query=\"kg-search-status\")"
+                    .to_string(),
+                presentation: None,
+                presentation_per_op: None,
+                save_to: None,
+                format: None,
+                format_per_op: None,
+                request_id: None,
+            })
+            .await
+            .expect("chain dispatch must succeed");
+        let parsed: Value = serde_json::from_str(&resp).expect("envelope must be JSON");
+        let create = &parsed["results"][0];
+        let search = &parsed["results"][1];
+        assert!(
+            create.get("status").is_none(),
+            "non-search verbs must not gain a status field: {create}"
+        );
+        assert_eq!(search["ok"], json!(true), "unexpected response: {search}");
+        assert_eq!(search["status"], json!("complete"));
+        assert!(
+            search["result"]
+                .as_array()
+                .map(|items| !items.is_empty())
+                .unwrap_or(false),
+            "unexpected response: {search}"
+        );
+    }
+
+    // ── MAJ-3: explicit-namespace narrowing arm of `coordinator_search_visibility` ──
+
+    fn registry_with_visible_namespaces(ns: Vec<khive_runtime::Namespace>) -> VerbRegistry {
+        let mut builder = VerbRegistryBuilder::new();
+        builder.with_visible_namespaces(ns);
+        builder.build().expect("build registry with no packs")
+    }
+
+    fn request_identity_with_visible_namespaces(ns: Vec<&str>) -> khive_runtime::RequestIdentity {
+        khive_runtime::RequestIdentity {
+            namespace: "local".to_string(),
+            actor_id: None,
+            visible_namespaces: ns.into_iter().map(str::to_string).collect(),
+            process_ref: None,
+            request_id: None,
+        }
+    }
+
+    /// No per-request identity: falls back to the registry's operator-baked
+    /// `visible_namespaces`, widened with `local` — mirrors the normal
+    /// registry dispatch path's default-case widening.
+    #[test]
+    fn coordinator_search_visibility_widens_to_registry_defaults_when_no_identity() {
+        let registry =
+            registry_with_visible_namespaces(vec![
+                khive_runtime::Namespace::parse("tenant-a").unwrap()
+            ]);
+        let extra = coordinator_search_visibility(&registry, &json!({}), None);
+        assert!(
+            extra.contains(&khive_runtime::Namespace::parse("tenant-a").unwrap()),
+            "must widen to the registry's baked visible_namespaces: {extra:?}"
+        );
+        assert!(
+            extra.contains(&khive_runtime::Namespace::local()),
+            "must always include local: {extra:?}"
+        );
+    }
+
+    /// A per-request identity's `visible_namespaces` overrides the registry's
+    /// baked defaults entirely (ADR-096 Fork 1) — the registry's "tenant-a"
+    /// must NOT leak into a request identity scoped to "tenant-b" only.
+    #[test]
+    fn coordinator_search_visibility_widens_to_identity_visible_namespaces() {
+        let registry =
+            registry_with_visible_namespaces(vec![
+                khive_runtime::Namespace::parse("tenant-a").unwrap()
+            ]);
+        let identity = request_identity_with_visible_namespaces(vec!["tenant-b"]);
+        let extra = coordinator_search_visibility(&registry, &json!({}), Some(&identity));
+        assert!(
+            extra.contains(&khive_runtime::Namespace::parse("tenant-b").unwrap()),
+            "must widen to the per-request identity's visible_namespaces: {extra:?}"
+        );
+        assert!(
+            !extra.contains(&khive_runtime::Namespace::parse("tenant-a").unwrap()),
+            "must NOT fall back to the registry's baked defaults when an identity is \
+             present: {extra:?}"
+        );
+        assert!(
+            extra.contains(&khive_runtime::Namespace::local()),
+            "must always include local: {extra:?}"
+        );
+    }
+
+    /// An explicit `namespace=` request argument intentionally narrows
+    /// visibility to that one namespace — the coordinator boundary must
+    /// return an unwidened empty extra-visibility set in that case, exactly
+    /// like the normal registry dispatch path's `explicit_namespace` branch.
+    ///
+    /// RED before the fix: an explicit namespace still widened visibility to
+    /// the caller's full `visible_namespaces` set, silently overriding the
+    /// caller's intended narrowing.
+    #[test]
+    fn coordinator_search_visibility_narrows_to_empty_when_namespace_explicit() {
+        let registry =
+            registry_with_visible_namespaces(vec![
+                khive_runtime::Namespace::parse("tenant-a").unwrap()
+            ]);
+        let identity = request_identity_with_visible_namespaces(vec!["tenant-b"]);
+        let extra = coordinator_search_visibility(
+            &registry,
+            &json!({"namespace": "tenant-c"}),
+            Some(&identity),
+        );
+        assert!(
+            extra.is_empty(),
+            "an explicit namespace= argument must narrow to an empty extra-visible \
+             set, not widen: {extra:?}"
+        );
     }
 
     #[tokio::test]

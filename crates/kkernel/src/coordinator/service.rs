@@ -97,56 +97,58 @@ impl CoordinatorService for SubstrateCoordinatorService {
         &self,
         request: &ValidatedSearchRequest,
         namespace: &Namespace,
+        extra_visible: &[Namespace],
     ) -> CoordSearchResult {
-        let (entity_hits, note_hits, per_backend) =
-            self.inner.fan_out_search(request, namespace).await;
+        let (entity_hits, note_hits, per_backend) = self
+            .inner
+            .fan_out_search_with_visibility(request, namespace, extra_visible)
+            .await;
 
         let partial = per_backend.iter().any(|r| r.error.is_some());
 
-        // Batch-fetch entity kinds for each merged entity hit.
+        // Batch-fetch entity kind + created_at for each merged entity hit.
         // We locate each hit's owning backend and call get_entity on it.
-        let entity_kinds: HashMap<Uuid, String> = if entity_hits.is_empty() {
-            HashMap::new()
-        } else {
-            let mut map = HashMap::new();
-            for hit in &entity_hits {
-                let backend_id = self.inner.locate(hit.entity_id, namespace).await;
-                if let Some(bid) = backend_id {
-                    if let Some(entry) = self.inner.registry().get(&bid) {
-                        let rt = &entry.runtime;
-                        if let Ok(token) = rt.authorize(namespace.clone()) {
-                            if let Ok(entity) = rt.get_entity(&token, hit.entity_id).await {
-                                map.insert(hit.entity_id, entity.kind);
-                            }
+        // By-ID (locate/get_entity) is namespace-agnostic (ADR-007 Rev 6), so
+        // `extra_visible` does not apply here — only the fan-out search above
+        // is namespace-filtered.
+        let mut entity_kinds: HashMap<Uuid, String> = HashMap::new();
+        let mut entity_created_at: HashMap<Uuid, i64> = HashMap::new();
+        for hit in &entity_hits {
+            let backend_id = self.inner.locate(hit.entity_id, namespace).await;
+            if let Some(bid) = backend_id {
+                if let Some(entry) = self.inner.registry().get(&bid) {
+                    let rt = &entry.runtime;
+                    if let Ok(token) = rt.authorize(namespace.clone()) {
+                        if let Ok(entity) = rt.get_entity(&token, hit.entity_id).await {
+                            entity_created_at.insert(hit.entity_id, entity.created_at);
+                            entity_kinds.insert(hit.entity_id, entity.kind);
                         }
                     }
                 }
             }
-            map
-        };
+        }
 
-        // Batch-fetch note kinds for each merged note hit.
-        let note_kinds: HashMap<Uuid, String> = if note_hits.is_empty() {
-            HashMap::new()
-        } else {
-            let mut map = HashMap::new();
-            for hit in &note_hits {
-                let backend_id = self.inner.locate(hit.note_id, namespace).await;
-                if let Some(bid) = backend_id {
-                    if let Some(entry) = self.inner.registry().get(&bid) {
-                        let rt = &entry.runtime;
-                        if let Ok(token) = rt.authorize(namespace.clone()) {
-                            if let Ok(store) = rt.notes(&token) {
-                                if let Ok(Some(note)) = store.get_note(hit.note_id).await {
-                                    map.insert(hit.note_id, note.kind);
-                                }
+        // Batch-fetch note kind + name + created_at for each merged note hit.
+        let mut note_kinds: HashMap<Uuid, String> = HashMap::new();
+        let mut note_created_at: HashMap<Uuid, i64> = HashMap::new();
+        let mut note_names: HashMap<Uuid, Option<String>> = HashMap::new();
+        for hit in &note_hits {
+            let backend_id = self.inner.locate(hit.note_id, namespace).await;
+            if let Some(bid) = backend_id {
+                if let Some(entry) = self.inner.registry().get(&bid) {
+                    let rt = &entry.runtime;
+                    if let Ok(token) = rt.authorize(namespace.clone()) {
+                        if let Ok(store) = rt.notes(&token) {
+                            if let Ok(Some(note)) = store.get_note(hit.note_id).await {
+                                note_created_at.insert(hit.note_id, note.created_at);
+                                note_names.insert(hit.note_id, note.name.clone());
+                                note_kinds.insert(hit.note_id, note.kind);
                             }
                         }
                     }
                 }
             }
-            map
-        };
+        }
 
         let coord_per_backend: Vec<CoordBackendResult> = per_backend
             .into_iter()
@@ -165,6 +167,9 @@ impl CoordinatorService for SubstrateCoordinatorService {
             partial,
             entity_kinds,
             note_kinds,
+            entity_created_at,
+            note_created_at,
+            note_names,
         }
     }
 

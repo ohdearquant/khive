@@ -453,6 +453,295 @@ async fn fan_out_search_caps_merged_note_hits_at_limit() {
     );
 }
 
+// ---- MAJ-2: per-backend fan-out search timeout ----
+
+/// A hung backend's search task must not block the fan-out from returning a
+/// healthy sibling's results, and must surface a timeout-specific error for
+/// itself in its `BackendSearchResult`.
+///
+/// `start_paused` runs the tokio clock virtually — the real backend's search
+/// resolves immediately, and the hung backend's timeout fires on the first
+/// idle-clock advance, so this test does not block on a real multi-second
+/// wait.
+///
+/// RED before the fix: the fan-out await loop had no timeout, so a single
+/// hung backend's `tokio::spawn`'d task blocked the whole fan-out forever.
+#[tokio::test(start_paused = true)]
+async fn fan_out_search_hung_backend_times_out_sibling_still_returns() {
+    let mut registry = BackendRegistry::new();
+    let rt_main = memory_runtime();
+    let rt_hung = memory_runtime();
+    registry.register(BackendId::new("main"), Arc::clone(&rt_main));
+    registry.register(BackendId::new("hung"), Arc::clone(&rt_hung));
+    let coord = SubstrateCoordinator::new(registry).with_hanging_backend("hung");
+    let ns = Namespace::local();
+
+    let token = rt_main.authorize(ns.clone()).unwrap();
+    rt_main
+        .create_entity(
+            &token,
+            "concept",
+            None,
+            "TimeoutProbeHealthySibling",
+            Some("must still be returned despite the hung backend"),
+            None,
+            vec![],
+        )
+        .await
+        .expect("create entity on healthy backend");
+
+    let request = validated_kg_search(serde_json::json!({
+        "kind": "entity",
+        "query": "TimeoutProbeHealthySibling",
+        "limit": 10,
+    }));
+
+    let (hits, _note_hits, per_backend) = coord.fan_out_search(&request, &ns).await;
+
+    assert_eq!(per_backend.len(), 2, "both backends must report");
+    let hung_report = per_backend
+        .iter()
+        .find(|r| r.backend_id.as_str() == "hung")
+        .expect("hung backend must have a report entry");
+    let err = hung_report
+        .error
+        .as_deref()
+        .expect("hung backend must carry an error");
+    assert!(
+        err.contains("timed out"),
+        "hung backend error must be timeout-specific, got: {err:?}"
+    );
+
+    let healthy_report = per_backend
+        .iter()
+        .find(|r| r.backend_id.as_str() == "main")
+        .expect("healthy backend must have a report entry");
+    assert!(
+        healthy_report.error.is_none(),
+        "healthy backend must not error"
+    );
+
+    assert!(
+        !hits.is_empty(),
+        "the healthy sibling's hit must still be present in the merged result \
+         despite the hung backend"
+    );
+}
+
+// ---- MAJ-3: caller visibility scope must reach the fan-out authorization ----
+
+/// Single-backend coordinator path: a row stored under a namespace visible
+/// to the caller only through `extra_visible` (not the primary namespace)
+/// must still be found. Also asserts the inverse — with no extra visibility,
+/// the same row is invisible — to show the widening is load-bearing rather
+/// than a pre-existing default.
+///
+/// RED before the fix: `fan_out_search`'s single-backend branch authorized
+/// against `namespace` alone, discarding `extra_visible` entirely.
+#[tokio::test]
+async fn fan_out_search_with_visibility_single_backend_finds_extra_namespace_row() {
+    let coord = SubstrateCoordinator::single(memory_runtime());
+    let runtime = coord.primary_runtime().unwrap();
+    let tenant_ns = Namespace::parse("tenant-a").expect("valid namespace");
+
+    let token = runtime.authorize(tenant_ns.clone()).unwrap();
+    runtime
+        .create_entity(
+            &token,
+            "concept",
+            None,
+            "VisibilityProbeSingleBackend",
+            Some("only visible via extra_visible"),
+            None,
+            vec![],
+        )
+        .await
+        .expect("create entity in tenant-a");
+
+    let request = validated_kg_search(serde_json::json!({
+        "kind": "entity",
+        "query": "VisibilityProbeSingleBackend",
+        "limit": 10,
+    }));
+
+    let (widened_hits, _notes, per_backend) = coord
+        .fan_out_search_with_visibility(
+            &request,
+            &Namespace::local(),
+            std::slice::from_ref(&tenant_ns),
+        )
+        .await;
+    assert!(
+        per_backend.iter().all(|r| r.error.is_none()),
+        "no backend errors: {per_backend:?}"
+    );
+    assert!(
+        !widened_hits.is_empty(),
+        "widened visibility must find the tenant-a row on the single-backend path"
+    );
+
+    let (narrow_hits, _notes, _per_backend) = coord
+        .fan_out_search_with_visibility(&request, &Namespace::local(), &[])
+        .await;
+    assert!(
+        narrow_hits.is_empty(),
+        "primary-only visibility (no widening) must not see the tenant-a row"
+    );
+}
+
+/// Spawned multi-backend path: same guarantee as the single-backend test
+/// above, but for a row that lives on the non-primary backend, reached
+/// through the `tokio::spawn` fan-out branch rather than the early-return
+/// single-entry branch.
+///
+/// RED before the fix: the spawned branch authorized each backend token
+/// against `namespace` alone, discarding `extra_visible` entirely.
+#[tokio::test]
+async fn fan_out_search_with_visibility_multi_backend_finds_extra_namespace_row() {
+    let mut registry = BackendRegistry::new();
+    let rt_main = memory_runtime();
+    let rt_lore = memory_runtime();
+    registry.register(BackendId::new("main"), Arc::clone(&rt_main));
+    registry.register(BackendId::new("lore"), Arc::clone(&rt_lore));
+    let coord = SubstrateCoordinator::new(registry);
+    let tenant_ns = Namespace::parse("tenant-b").expect("valid namespace");
+
+    let token = rt_lore.authorize(tenant_ns.clone()).unwrap();
+    rt_lore
+        .create_entity(
+            &token,
+            "concept",
+            None,
+            "VisibilityProbeMultiBackend",
+            Some("only visible via extra_visible, on the second backend"),
+            None,
+            vec![],
+        )
+        .await
+        .expect("create entity in tenant-b on the lore backend");
+
+    let request = validated_kg_search(serde_json::json!({
+        "kind": "entity",
+        "query": "VisibilityProbeMultiBackend",
+        "limit": 10,
+    }));
+
+    let (widened_hits, _notes, per_backend) = coord
+        .fan_out_search_with_visibility(
+            &request,
+            &Namespace::local(),
+            std::slice::from_ref(&tenant_ns),
+        )
+        .await;
+    assert!(
+        per_backend.iter().all(|r| r.error.is_none()),
+        "no backend errors: {per_backend:?}"
+    );
+    assert!(
+        !widened_hits.is_empty(),
+        "widened visibility must find the tenant-b row on the spawned multi-backend path"
+    );
+
+    let (narrow_hits, _notes, _per_backend) = coord
+        .fan_out_search_with_visibility(&request, &Namespace::local(), &[])
+        .await;
+    assert!(
+        narrow_hits.is_empty(),
+        "primary-only visibility (no widening) must not see the tenant-b row"
+    );
+}
+
+// ---- MAJ-4: RRF merge must see each backend's full candidate window ----
+
+/// `alpha` ranks `[X, W, Y]` (`Y` at #3); `beta` ranks `[Z, V, Y]` (`Y` at
+/// #3). `Y`'s fused RRF score (2×1/63 ≈ 0.03175, appearing on both backends)
+/// beats every singleton, including the #1-ranked `X`/`Z` (1/61 ≈ 0.01639
+/// each) — so with `limit=2` the merge must return `[Y, X]` (tie between `X`
+/// and `Z` broken by ascending `entity_id`).
+///
+/// RED before the fix: a per-backend `.take(limit)` (limit=2) applied before
+/// the merge would keep only `alpha`'s top 2 (`[X, W]`) and `beta`'s top 2
+/// (`[Z, V]`) — `Y` never reaches the merge at all, and the old result is
+/// `[X, Z]` instead of `[Y, X]`. This is checked directly below by
+/// re-deriving the old (buggy) per-backend-truncated result from the same
+/// override lists and asserting it differs from the actual (fixed) result.
+#[tokio::test]
+async fn fan_out_search_rrf_merge_uses_full_candidate_window_not_per_backend_limit() {
+    let mut registry = BackendRegistry::new();
+    let rt_a = memory_runtime();
+    let rt_b = memory_runtime();
+    registry.register(BackendId::new("alpha"), Arc::clone(&rt_a));
+    registry.register(BackendId::new("beta"), Arc::clone(&rt_b));
+
+    let y = Uuid::from_u128(1);
+    let x = Uuid::from_u128(2);
+    let w = Uuid::from_u128(3);
+    let z = Uuid::from_u128(4);
+    let v = Uuid::from_u128(5);
+
+    let alpha_list = vec![
+        search_hit(x, SearchSource::Text),
+        search_hit(w, SearchSource::Text),
+        search_hit(y, SearchSource::Text),
+    ];
+    let beta_list = vec![
+        search_hit(z, SearchSource::Text),
+        search_hit(v, SearchSource::Text),
+        search_hit(y, SearchSource::Text),
+    ];
+
+    let mut overrides = std::collections::HashMap::new();
+    overrides.insert("alpha".to_string(), alpha_list.clone());
+    overrides.insert("beta".to_string(), beta_list.clone());
+
+    let coord = SubstrateCoordinator::new(registry).with_entity_hits_override(overrides);
+    let ns = Namespace::local();
+    let request = validated_kg_search(serde_json::json!({
+        "kind": "entity",
+        "query": "irrelevant, hits are overridden",
+        "limit": 2,
+    }));
+
+    let (hits, _note_hits, per_backend) = coord.fan_out_search(&request, &ns).await;
+    assert!(
+        per_backend.iter().all(|r| r.error.is_none()),
+        "no backend errors: {per_backend:?}"
+    );
+
+    let ids: Vec<Uuid> = hits.iter().map(|h| h.entity_id).collect();
+    assert_eq!(
+        ids,
+        vec![y, x],
+        "Y (rank-3 on both backends, fused score 2/63) must outrank the rank-1 \
+         singletons X and Z (score 1/61 each); tie between X and Z is broken by \
+         ascending entity_id, got {ids:?}"
+    );
+
+    // Mutation control: re-derive what the pre-fix per-backend `.take(limit)`
+    // truncation would have produced from these same override lists, and
+    // assert it disagrees with the fixed result above — pinning that the fix
+    // is load-bearing without needing a separate manual code revert.
+    let old_buggy_result = super::dispatch::rrf_merge_entity_hits(
+        vec![
+            alpha_list.into_iter().take(2).collect(),
+            beta_list.into_iter().take(2).collect(),
+        ],
+        2,
+    );
+    let old_ids: Vec<Uuid> = old_buggy_result.iter().map(|h| h.entity_id).collect();
+    assert_eq!(
+        old_ids,
+        vec![x, z],
+        "sanity: the pre-fix per-backend-truncated merge should have produced \
+         [X, Z] (Y dropped before ever reaching RRF), got {old_ids:?}"
+    );
+    assert_ne!(
+        ids, old_ids,
+        "the fixed full-candidate-window result must differ from the pre-fix \
+         per-backend-truncated result — otherwise this test cannot distinguish them"
+    );
+}
+
 /// The canonical search request reuses `SearchParams` deny-unknown-fields
 /// deserialization on every dispatch path, so an unknown wire field must be
 /// rejected rather than silently ignored.
