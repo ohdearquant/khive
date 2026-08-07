@@ -16110,8 +16110,7 @@ mod tests {
         // rename cannot silently disarm this gate. From a published package
         // tarball neither exists; skip with disclosure instead of failing an
         // environment that cannot carry the canonical document.
-        let workspace_manifest =
-            format!("{}/../Cargo.toml", env!("CARGO_MANIFEST_DIR"));
+        let workspace_manifest = format!("{}/../Cargo.toml", env!("CARGO_MANIFEST_DIR"));
         if !std::path::Path::new(&workspace_manifest).exists() {
             eprintln!(
                 "skipping ADR-002 conformance: workspace manifest not present \
