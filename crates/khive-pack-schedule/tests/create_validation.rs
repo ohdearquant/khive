@@ -975,6 +975,88 @@ async fn schedule_schedule_rejects_create_bulk_item_with_contradicting_kind_and_
 }
 
 #[tokio::test]
+async fn schedule_schedule_runs_real_git_hook_for_bulk_commit_before_persisting() {
+    let (registry, runtime) = build_registry_with_git();
+
+    let schedule_error = registry
+        .dispatch(
+            "schedule.schedule",
+            serde_json::json!({
+                "action": "create(items=[{\"kind\":\"commit\",\"content\":\"missing provenance\"}])",
+                "at": "2099-06-01T10:00:00Z"
+            }),
+        )
+        .await
+        .expect_err("commit without properties.sha is guaranteed to fail its owning hook");
+    let message = schedule_error.to_string();
+    assert!(
+        message.contains("items[0]") && message.contains("properties.sha"),
+        "schedule-time validation must preserve item context and the real hook error: {message}"
+    );
+
+    let live_result = registry
+        .dispatch(
+            "create",
+            serde_json::json!({
+                "items": [{"kind": "commit", "content": "missing provenance"}]
+            }),
+        )
+        .await
+        .expect("best-effort bulk reports the item-local hook failure in-band");
+    assert_eq!(live_result["failed"], 1);
+    assert!(live_result["results"][0]["error"]
+        .as_str()
+        .is_some_and(|error| error.contains("properties.sha")));
+
+    let token = runtime
+        .authorize(khive_runtime::Namespace::local())
+        .expect("authorize");
+    assert!(
+        runtime
+            .list_notes(&token, Some("scheduled_event"), 100, 0)
+            .await
+            .expect("list scheduled events")
+            .is_empty(),
+        "a guaranteed hook failure must not persist replay intent"
+    );
+}
+
+#[tokio::test]
+async fn schedule_schedule_runs_real_gtd_hook_for_bulk_task_before_persisting() {
+    let (registry, _runtime) = build_registry_with_gtd();
+
+    let schedule_error = registry
+        .dispatch(
+            "schedule.schedule",
+            serde_json::json!({
+                "action": "create(items=[{\"kind\":\"task\",\"title\":\"invalid task\",\"priority\":\"urgent\"}])",
+                "at": "2099-06-01T10:00:00Z"
+            }),
+        )
+        .await
+        .expect_err("invalid task priority is guaranteed to fail the GTD hook");
+    assert!(
+        schedule_error.to_string().contains("items[0]")
+            && schedule_error.to_string().contains("priority"),
+        "schedule-time validation must run the owning task hook: {schedule_error}"
+    );
+
+    let live_result = registry
+        .dispatch(
+            "create",
+            serde_json::json!({
+                "items": [{"kind": "task", "title": "invalid task", "priority": "urgent"}]
+            }),
+        )
+        .await
+        .expect("best-effort bulk reports the item-local task failure in-band");
+    assert_eq!(live_result["failed"], 1);
+    assert!(live_result["results"][0]["error"]
+        .as_str()
+        .is_some_and(|error| error.contains("priority")));
+}
+
+#[tokio::test]
 async fn schedule_schedule_rejects_non_boolean_bulk_options_with_live_parity_and_no_persist() {
     let (registry, runtime) = build_registry();
     let token = runtime

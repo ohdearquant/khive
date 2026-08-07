@@ -899,6 +899,45 @@ mod note_mutation_hook_tests {
         );
     }
 
+    #[tokio::test]
+    #[serial(background_tasks)]
+    async fn kg_best_effort_bulk_create_invalidates_warm_ann() {
+        let rt = KhiveRuntime::memory().expect("in-memory runtime");
+        let (registry, ann) = build_note_hook_registry(&rt);
+
+        seed_and_warm_ann(
+            &rt,
+            &registry,
+            &ann,
+            "fr1 bulk mutation baseline content",
+            0.7,
+        )
+        .await;
+        let key = mutation_hook_ann_key();
+        let generation_before = ann::generation_for_test(&ann, &key).await;
+
+        // `atomic` defaults to false. This exercises the outcome-bearing
+        // per-note runtime API used by best-effort bulk create, rather than
+        // the atomic planner (which owns its mutation hooks separately).
+        let created = registry
+            .dispatch(
+                "create",
+                json!({
+                    "items": [{
+                        "kind": "memory",
+                        "content": "fr1 best-effort bulk-created memory"
+                    }]
+                }),
+            )
+            .await
+            .expect("best-effort bulk create");
+        assert_eq!(created["created"], 1, "bulk response: {created:?}");
+        assert!(
+            ann::generation_for_test(&ann, &key).await > generation_before,
+            "a best-effort bulk-created memory note must invalidate the warm ANN generation"
+        );
+    }
+
     /// A real merge invalidates an index warmed only after both notes were seeded.
     /// See `crates/khive-pack-memory/docs/recall-reliability.md`.
     #[tokio::test]

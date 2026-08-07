@@ -156,8 +156,9 @@ its siblings (chain failures do abort the remainder of the chain):
 }
 ```
 
-`aborted` counts ops skipped after an earlier failure in a `|` chain; it is always 0 for
-parallel batches, since parallel failures do not cascade.
+`aborted` counts ops skipped after an earlier failure in a `|` chain. It is always 0 for a
+flat parallel batch of independent operations. A parallel batch containing chain groups may
+report aborted tails within a failed group; sibling groups continue independently.
 
 ---
 
@@ -200,7 +201,7 @@ warning is derived from the embedding outcome, not from a separate registry pred
 | `skip_dedup_check`  | bool            | no          | Singleton retrieval hint; it does not change create semantics.                                                                                                                                                                                                                             |
 | `edges`             | array\<object\> | no          | Singleton created-record outgoing edge specifications.                                                                                                                                                                                                                                     |
 | `external_id`       | string          | no          | Note-only natural key; retries in the same namespace and note kind return the canonical UUID. May instead be supplied as `properties.external_id`.                                                                                                                                         |
-| `items`             | array\<object\> | no          | Mixed bulk create. Each item requires `kind`; entities require `name`, ordinary notes require `content`, loaded task hooks accept task fields, and finding accepts `title` (other finding metadata stays in `properties`). Capped at 1000/request.                                        |
+| `items`             | array\<object\> | no          | Mixed bulk create. Each item requires `kind`; entities require `name`, ordinary notes require `content`, loaded task hooks accept task fields, and finding accepts `title` (other finding metadata stays in `properties`). Capped at 1000/request. Entity vectors are deferred until reindex; newly created notes are indexed after commit.                                        |
 | `atomic`            | bool            | no          | Bulk path. Default false = ordered per-item best effort; true = one all-or-nothing mixed row/FTS transaction. A present non-boolean value, including null, is rejected before any item write.                                                                                             |
 | `verbose`           | bool            | no          | Bulk path. When true, response includes full `entities` and `notes` arrays. A present non-boolean value, including null, is rejected before any item write.                                                                                                                               |
 

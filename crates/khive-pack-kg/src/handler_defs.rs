@@ -184,7 +184,9 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 20] = [
                               `note_kind`, `salience`, or `external_id`. Loaded task hooks \
                               accept task fields; finding accepts `title` (other finding metadata \
                               remains in `properties`); task salience is derived from priority. When present, \
-                              top-level `kind` is not required. Capped at 1000 entries.",
+                              top-level `kind` is not required. Capped at 1000 entries. Entity \
+                              vectors are deferred until reindex; newly created notes are indexed \
+                              after commit.",
             },
             ParamDef {
                 name: "atomic",

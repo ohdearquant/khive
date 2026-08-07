@@ -151,9 +151,11 @@ fn validate_action(action: &str) -> Result<khive_request::ParsedRequest, Runtime
 /// only, all required params present, and no handler that treats
 /// `namespace` as a business arg (issue #461/#462). See
 /// `docs/api/replay-validation.md#validate_replayable_single_action`.
-fn validate_replayable_single_action(
+async fn validate_replayable_single_action(
     parsed: &khive_request::ParsedRequest,
     registry: &VerbRegistry,
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
 ) -> Result<(), RuntimeError> {
     if parsed.mode != khive_request::ExecutionMode::Single {
         return Err(RuntimeError::InvalidInput(
@@ -218,7 +220,7 @@ fn validate_replayable_single_action(
     }
 
     validate_args_against_help(&op.tool, &op.args, &help)?;
-    validate_conditional_requirements(&op.tool, &op.args, registry)
+    validate_conditional_requirements(&op.tool, &op.args, registry, runtime, token).await
 }
 
 /// Persist immutable creator provenance, then make a staged scheduled-event
@@ -274,10 +276,12 @@ async fn activate_with_creator_provenance(
 /// alternatives `required:true` (issue #461) — hard-codes the `create`
 /// kind/name/content cases. See
 /// `docs/api/replay-validation.md#validate_conditional_requirements`.
-fn validate_conditional_requirements(
+async fn validate_conditional_requirements(
     tool: &str,
     args: &std::collections::BTreeMap<String, khive_request::ArgValue>,
     registry: &VerbRegistry,
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
 ) -> Result<(), RuntimeError> {
     if tool != "create" {
         return Ok(());
@@ -351,7 +355,7 @@ fn validate_conditional_requirements(
             .and_then(khive_request::ArgValue::as_value)
             .cloned()
             .unwrap_or(Value::Null);
-        return validate_create_bulk_items(&items_value, registry);
+        return validate_create_bulk_items(&items_value, registry, runtime, token).await;
     }
 
     for option in ["atomic", "verbose"] {
@@ -464,6 +468,16 @@ fn validate_conditional_requirements(
             validate_entity_type_for_replay(&canonical, entity_type_arg, registry).map_err(
                 |e| RuntimeError::InvalidInput(format!("schedule.action: verb \"create\": {e}")),
             )?;
+            validate_create_hook_for_replay(
+                literal_args_as_json(args),
+                "entity",
+                &canonical,
+                "schedule.action: verb \"create\":",
+                registry,
+                runtime,
+                token,
+            )
+            .await?;
         }
         CreateKindClass::Note { specific } => {
             let canonical = reconcile_specific_for_replay(
@@ -561,10 +575,71 @@ fn validate_conditional_requirements(
                     .and_then(khive_request::ArgValue::as_value),
                 "schedule.action: verb \"create\":",
             )?;
+            validate_create_hook_for_replay(
+                literal_args_as_json(args),
+                "note",
+                &canonical,
+                "schedule.action: verb \"create\":",
+                registry,
+                runtime,
+                token,
+            )
+            .await?;
         }
     }
 
     Ok(())
+}
+
+/// Rebuild the literal argument object that the replay dispatcher will pass
+/// to the target handler. `validate_replayable_single_action` has already
+/// rejected every non-literal `$prev` reference before this helper is called.
+fn literal_args_as_json(
+    args: &std::collections::BTreeMap<String, khive_request::ArgValue>,
+) -> Value {
+    Value::Object(
+        args.iter()
+            .filter_map(|(name, value)| {
+                value.as_value().cloned().map(|value| (name.clone(), value))
+            })
+            .collect(),
+    )
+}
+
+/// Run the owning pack's real pre-create hook against the exact scheduled
+/// payload. The structural mirror above catches substrate-level failures;
+/// this boundary catches pack-owned invariants (for example git commit SHA
+/// provenance, workspace schema versions, and GTD lifecycle values) without
+/// duplicating another inevitably drifting copy in the schedule pack.
+async fn validate_create_hook_for_replay(
+    mut params: Value,
+    substrate: &str,
+    canonical_kind: &str,
+    context: &str,
+    registry: &VerbRegistry,
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+) -> Result<(), RuntimeError> {
+    let Some(hook) = registry.find_kind_hook(canonical_kind) else {
+        return Ok(());
+    };
+    let root = params.as_object_mut().ok_or_else(|| {
+        RuntimeError::InvalidInput(format!("{context} create arguments must be an object"))
+    })?;
+    root.insert("kind".into(), json!(substrate));
+    root.insert(
+        if substrate == "entity" {
+            "entity_kind"
+        } else {
+            "note_kind"
+        }
+        .into(),
+        json!(canonical_kind),
+    );
+    root.insert("namespace".into(), json!(token.namespace().as_str()));
+    hook.prepare_create(runtime, &mut params)
+        .await
+        .map_err(|error| RuntimeError::InvalidInput(format!("{context} {error}")))
 }
 
 /// Resolved shape of a `create(kind=...)` discriminator, mirroring
@@ -879,9 +954,11 @@ fn validate_note_external_id_for_replay(
 /// bulk path would: `items` must parse into the same shape as
 /// `BulkCreateEntry` (required `kind`, deny-unknown-fields), with the
 /// substrate-specific `name`/`content` requirement checked below.
-fn validate_create_bulk_items(
+async fn validate_create_bulk_items(
     items_value: &Value,
     registry: &VerbRegistry,
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
 ) -> Result<(), RuntimeError> {
     let entries: Vec<ScheduleBulkCreateEntryCheck> = serde_json::from_value(items_value.clone())
         .map_err(|e| {
@@ -896,7 +973,10 @@ fn validate_create_bulk_items(
                 .into(),
         ));
     }
-    for (idx, entry) in entries.iter().enumerate() {
+    let raw_entries = items_value
+        .as_array()
+        .expect("successful Vec deserialization requires a JSON array");
+    for (idx, (entry, raw_entry)) in entries.iter().zip(raw_entries).enumerate() {
         for (field, value) in [
             ("description", entry.description.as_ref()),
             ("title", entry.title.as_ref()),
@@ -962,6 +1042,16 @@ fn validate_create_bulk_items(
                         "schedule.action: verb \"create\": items[{idx}] entity creation requires `name`"
                     )));
                 }
+                validate_create_hook_for_replay(
+                    raw_entry.clone(),
+                    "entity",
+                    &canonical,
+                    &format!("schedule.action: verb \"create\": items[{idx}]:"),
+                    registry,
+                    runtime,
+                    token,
+                )
+                .await?;
             }
             CreateKindClass::Note { specific } => {
                 if entry.entity_kind.is_some() || entry.entity_type.is_some() {
@@ -1059,6 +1149,16 @@ fn validate_create_bulk_items(
                     entry.properties.as_ref(),
                     &format!("schedule.action: verb \"create\": items[{idx}]"),
                 )?;
+                validate_create_hook_for_replay(
+                    raw_entry.clone(),
+                    "note",
+                    &canonical,
+                    &format!("schedule.action: verb \"create\": items[{idx}]:"),
+                    registry,
+                    runtime,
+                    token,
+                )
+                .await?;
             }
         }
     }
@@ -1243,7 +1343,7 @@ pub(crate) async fn handle_schedule(
     // shorthand (e.g. "remind(...)") is rejected: it is not the verb name
     // that gets stored and replayed, so accepting it here would let a
     // trigger-time replay fail as an unknown verb.
-    validate_replayable_single_action(&parsed, registry)?;
+    validate_replayable_single_action(&parsed, registry, runtime, token).await?;
 
     // Validate RFC 3339 and reject past timestamps.
     // Preserve the caller's original string as `trigger_at` so the

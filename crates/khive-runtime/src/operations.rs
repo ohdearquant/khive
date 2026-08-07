@@ -3616,6 +3616,13 @@ impl KhiveRuntime {
                     }
                 }
             }
+            // The outcome-bearing API is the generic bulk-create funnel. Its
+            // successfully committed winner must invalidate pack-owned
+            // derived state just like atomic bulk does; a natural-key loser
+            // returned above and therefore never reaches this hook.
+            if natural_key_outcome {
+                self.fire_note_mutation_hook(&note.kind, note.id).await;
+            }
             return Ok((note, embedding_report, true, post_commit_failures));
         }
 
@@ -3936,6 +3943,13 @@ impl KhiveRuntime {
             }
         }
 
+        // Record-only public APIs pass `natural_key_outcome=false` and retain
+        // their existing mutation-hook ownership. The outcome-bearing API is
+        // used by best-effort bulk create, so fire once for its durable
+        // winner after every compensating failure point has been cleared.
+        if natural_key_outcome {
+            self.fire_note_mutation_hook(&note.kind, note.id).await;
+        }
         Ok((note, embedding_report, true, post_commit_failures))
     }
 

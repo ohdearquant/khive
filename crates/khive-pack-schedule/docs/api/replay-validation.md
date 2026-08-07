@@ -88,6 +88,13 @@ task-only lifecycle fields are accepted only for a loaded task hook, while
 `atomic`/`verbose` options are rejected when `items` is absent. It also validates
 `entity_type` against the KG entity-type/subtype
 registry when present — see `validate_entity_type_for_replay` below.
+After structural classification, a hook-owned entity or note is passed through the
+owning pack's real `KindHook::prepare_create` with the firing namespace injected,
+exactly as live KG create does before persistence. This catches pack-owned invariants
+such as commit provenance, workspace schema versions, and GTD lifecycle values at
+schedule time instead of maintaining a second semantic copy here. `prepare_create`
+is the pre-write normalization/validation phase; `after_create` is deliberately not
+run while merely validating replay intent.
 `khive-pack-schedule` does not depend on `khive-pack-kg` in production (only as a
 dev-dependency for tests), so this reimplements the classification using
 `VerbRegistry::all_entity_kinds`/`all_note_kinds` — the same data `resolve_kind_spec`
@@ -189,5 +196,10 @@ non-object-merge forms are rejected when the schedule is written, and entity
 creates reject the note-only top-level field. A bulk action also rejects a
 top-level `external_id` before its `items` early return; natural keys belong on
 the individual note entries, matching live KG dispatch even for an empty batch.
+Each structurally valid entry owned by a kind hook is then passed through that
+hook's real `prepare_create` phase with its item index retained in any error. Thus a
+best-effort action whose only item is guaranteed to become an in-band live hook
+failure is rejected before a `scheduled_event` is stored, even though live
+best-effort bulk would represent the item failure in its result envelope.
 
 Source: `crates/khive-pack-schedule/src/handlers.rs`.
