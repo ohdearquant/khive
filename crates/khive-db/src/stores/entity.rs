@@ -829,12 +829,22 @@ impl EntityStore for SqlEntityStore {
 
             let columns = "id, namespace, kind, entity_type, name, description, properties, tags, \
                            created_at, updated_at, deleted_at, merged_into, merge_event_id, content_ref";
-            // CROSS JOIN is load-bearing: SQLite must drive the query from the
-            // sequence INTEGER PRIMARY KEY range instead of scanning the
-            // namespace index and sorting all matches into a temp B-tree.
+            // CROSS JOIN is load-bearing for the unfiltered walk: SQLite must
+            // drive the query from the sequence INTEGER PRIMARY KEY range
+            // instead of scanning the namespace index and sorting all matches
+            // into a temp B-tree. When a kind filter is active, forcing that
+            // same seq-first plan prevents SQLite from using
+            // idx_entities_kind(namespace, kind) as the driving index, so a
+            // plain JOIN is used instead and left to the query planner — the
+            // cursor's page order is still entities_seq.seq, unchanged.
+            let join_kind = if filter.kinds.is_empty() {
+                "CROSS JOIN"
+            } else {
+                "JOIN"
+            };
             let sql = format!(
                 "SELECT {columns}, entities_seq.seq FROM entities_seq \
-                 CROSS JOIN entities ON entities.id = entities_seq.entity_id{where_sql} \
+                 {join_kind} entities ON entities.id = entities_seq.entity_id{where_sql} \
                  ORDER BY entities_seq.seq ASC LIMIT ?{limit_idx}"
             );
             let mut stmt = conn.prepare(&sql)?;
