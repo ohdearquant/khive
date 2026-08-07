@@ -1112,6 +1112,9 @@ mod tests {
 
     fn base_multi_backend_runtime_config() -> RuntimeConfig {
         use khive_runtime::Namespace;
+        // Callers that construct a server with no explicit DB override must be
+        // `#[serial]`: both this resolver and the construction guard read the
+        // process-wide HOME, which another CLI test deliberately mutates.
         RuntimeConfig {
             // Matches what `resolve_runtime_config` would set for a `--db`-unset
             // invocation (the `cli_db_override: None` every call site below
@@ -1148,6 +1151,7 @@ mod tests {
     /// File-backed main: both boot paths must agree on every `WiringSurface`
     /// field — in particular, both must wire a checkpoint pool (#601/#604).
     #[test]
+    #[serial]
     fn multi_backend_boot_paths_share_identical_wiring_surface_file_backed() {
         let dir = TempDir::new().expect("temp dir");
         let main_path = dir.path().join("main.db");
@@ -1185,6 +1189,7 @@ mod tests {
     /// In-memory main: both paths must agree that no checkpoint pool is wired
     /// (checkpoint_once must never run on a non-WAL connection).
     #[test]
+    #[serial]
     fn multi_backend_boot_paths_share_identical_wiring_surface_in_memory() {
         let khive_cfg = single_main_backend_config(khive_runtime::BackendKind::Memory, None);
 
@@ -1396,6 +1401,7 @@ mod tests {
     /// Regression for #674 — see
     /// `crates/kkernel/docs/coordinator.md#kkernel-mainrs--coordinator-attached-boot-path`.
     #[tokio::test]
+    #[serial]
     async fn coordinator_link_annotates_resolves_edge_target_like_get() {
         use khive_mcp::tools::request::RequestParams;
         use khive_runtime::PackConfig;
