@@ -192,6 +192,7 @@ pub enum CompareOp {
     StartsWith,
     In,
     IsNotNull,
+    IsNull,
 }
 
 /// A typed condition value; integer and decimal forms remain distinct.

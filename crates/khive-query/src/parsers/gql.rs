@@ -438,9 +438,13 @@ impl Parser {
                 } else if self.try_keyword("IN") {
                     Ok(CompareOp::In)
                 } else if self.try_keyword("IS") {
-                    self.expect_keyword("NOT")?;
-                    self.expect_keyword("NULL")?;
-                    Ok(CompareOp::IsNotNull)
+                    if self.try_keyword("NOT") {
+                        self.expect_keyword("NULL")?;
+                        Ok(CompareOp::IsNotNull)
+                    } else {
+                        self.expect_keyword("NULL")?;
+                        Ok(CompareOp::IsNull)
+                    }
                 } else {
                     Err(self.err("expected comparison operator"))
                 }
@@ -477,7 +481,7 @@ impl Parser {
         let op = self.parse_compare_op()?;
         let value = match op {
             CompareOp::In => ConditionValue::List(self.parse_list_literal()?),
-            CompareOp::IsNotNull => ConditionValue::Null,
+            CompareOp::IsNotNull | CompareOp::IsNull => ConditionValue::Null,
             CompareOp::Contains | CompareOp::StartsWith => {
                 let value = self.parse_value()?;
                 if !matches!(value, ConditionValue::String(_)) {
@@ -815,6 +819,27 @@ mod tests {
         );
         assert_eq!(conds[3].op, CompareOp::IsNotNull);
         assert_eq!(conds[3].value, ConditionValue::Null);
+    }
+
+    #[test]
+    fn where_clause_is_null() {
+        let q = parse("MATCH (n:entity) WHERE n.properties.domain IS NULL RETURN n").unwrap();
+        let conds: Vec<_> = q.where_clause.conditions().collect();
+        assert_eq!(conds.len(), 1);
+        assert_eq!(conds[0].op, CompareOp::IsNull);
+        assert_eq!(conds[0].value, ConditionValue::Null);
+    }
+
+    #[test]
+    fn where_clause_is_null_and_is_not_null_together() {
+        let q = parse(
+            "MATCH (n:entity) WHERE n.name IS NOT NULL AND n.properties.domain IS NULL RETURN n",
+        )
+        .unwrap();
+        let conds: Vec<_> = q.where_clause.conditions().collect();
+        assert_eq!(conds.len(), 2);
+        assert_eq!(conds[0].op, CompareOp::IsNotNull);
+        assert_eq!(conds[1].op, CompareOp::IsNull);
     }
 
     #[test]
