@@ -7,21 +7,33 @@ channel of typed write requests, issuing `BEGIN IMMEDIATE` once per request.
 This is the function-specific technical reference for its migration scope
 and failure modes.
 
-## Migration-slice scope
+## Migration-slice scope (historical) — current routed-call inventory and admission mode live elsewhere
 
-Slice 1 builds the mechanism and wires exactly one write path
-(`SqlEntityStore::upsert_entities`, gated behind `KHIVE_WRITE_QUEUE=1` /
-`PoolConfig::write_queue_enabled`) through it. It commits one request per
-`BEGIN IMMEDIATE` — Component B's batched-commit window and three-level
-SAVEPOINT hierarchy, Component C's checkpoint coordination signal, and
-Component D's transaction watchdog are later slices. With only one store
-migrated, other write paths still open their own writer connections via the
-pool's Mutex-guarded `writer()` connection, so this slice does not yet
-reduce contention or claim the ADR's single-writer guarantee on its own — it
-proves the mechanism works and that the flag-off path is unchanged.
+This section originally described Slice 1, when only
+`SqlEntityStore::upsert_entities` was wired through the queue behind
+`KHIVE_WRITE_QUEUE=1`. That single-path scope is superseded: the current
+per-writer routing inventory — which callers reach `WriterTaskHandle`
+queue-first, which are exempt by design (checkpointing, startup/schema
+migrations, recovery bookkeeping), and which route through the same handle
+without the per-request transaction wrap (top-level maintenance) — is
+maintained as a single table in `crates/khive-db/src/writer_task.rs`'s
+module-level doc comment ("ADR-136 D1 gate 5: writer classification"), not
+duplicated here. The current admission mode — one shared admission authority
+keyed by canonical database identity, a bounded per-operation admission
+deadline, and a caller-visible `writer_queue_saturated` result — is
+[ADR-131](../../../../docs/adr/ADR-131-batch-write-admission-control.md)'s
+contract; whether `write_queue_enabled` defaults on for a given deployment is
+governed by [ADR-135](../../../../docs/adr/ADR-135-write-scaling-demand-before-ownership.md)
+Amendment 1 and [ADR-136](../../../../docs/adr/ADR-136-fair-write-admission-default.md)'s
+strict-routing gates, not by this document.
 
-`spawn` opens a dedicated standalone writer connection independent of that
-Mutex-guarded connection. The lifetime connection is an infrastructure open
+Component B's batched-commit window and three-level SAVEPOINT hierarchy and
+Component D's transaction watchdog remain unshipped: the drain loop still
+commits one request per `BEGIN IMMEDIATE`.
+
+`spawn` opens a dedicated standalone writer connection independent of the
+pool's Mutex-guarded `writer()` connection used by any exempt or unrouted
+path. The lifetime connection is an infrastructure open
 and does not enter write-traffic counters; the drain loop increments the
 writer-task acquisition class once per dequeued top-level request or successful
 `BEGIN IMMEDIATE`. `capacity` bounds the channel (ADR-067 recommends 256;
@@ -34,12 +46,14 @@ See `crates/khive-db/src/writer_task.rs` — private fn `run_writer_task`.
 
 A `BEGIN IMMEDIATE` failure (for example, `SQLITE_BUSY` from lock
 contention with an unmigrated writer path still holding the pool's writer
-mutex — reachable while only `entity.rs` is routed through this channel in
-this slice) replies the request's error via `AnyWriteRequest::reply_error`
-without ever invoking the request's operation closure via
-`AnyWriteRequest::execute_and_reply`. Slice 1 has no watchdog/retry story
-for a failed `BEGIN` (Component D is a later slice); the connection simply
-tries `BEGIN IMMEDIATE` fresh on the next request.
+mutex — reachable while any write path outside the routed-call
+classification table in `writer_task.rs`'s module docs still opens its own
+writer; strict routing per ADR-136 D1 has not landed) replies the request's
+error via `AnyWriteRequest::reply_error` without ever invoking the
+request's operation closure via `AnyWriteRequest::execute_and_reply`.
+There is no watchdog/retry story for a failed `BEGIN` (ADR-067
+Component D remains future work); the connection simply tries
+`BEGIN IMMEDIATE` fresh on the next request.
 
 Exits normally when every `WriterTaskHandle` clone is dropped and the channel
 closes (`rx.recv()` returns `None`). A panic while executing a request, a failed
@@ -68,8 +82,25 @@ drained requests receive a typed error without invoking their closures.
 | Send begins after the receiver has closed                                  | `NotStarted`             | The request was not accepted and its operation closure is never invoked                        |
 | An accepted request loses its reply outside the contained request path     | `SideEffectsUnknown`     | The caller cannot prove whether the operation began or which side effects occurred             |
 
-All three handle surfaces (`send`, `send_with_timeout`, and
-`send_top_level`) use this contract. Queue backpressure and
+### Bounded enqueue admission (#1382)
+
+Production store write paths and the SQL bridge's writer requests use
+`send_bounded` / `send_top_level_bounded`, which bound only the
+enqueue-capacity wait with `PoolConfig::write_admission_deadline_ms`
+(ADR-131 Decision 2; default 2000 ms, validated range [100, 10000] ms,
+captured at `spawn` as `WriterTaskHandle::enqueue_timeout`) before falling
+back to `StorageError::WriteQueueFull`. This is a dedicated admission
+authority distinct from `PoolConfig::checkout_timeout` (reader/pool
+checkout). Once a request is accepted onto the
+channel, the reply wait is unbounded by this mechanism, identical to plain
+`send`/`send_top_level`. The raw `send`, `send_top_level`, and
+`send_with_timeout` methods remain the underlying primitives — indefinite
+channel backpressure by default, or a caller-supplied deadline — and stay
+available to callers and tests that need that behavior explicitly.
+
+All five handle surfaces (`send`, `send_with_timeout`, `send_top_level`,
+`send_bounded`, `send_top_level_bounded`) use this contract. Queue
+backpressure and
 `WriteQueueFull` remain unchanged: a timeout while waiting for capacity is
 not a writer-task termination. `WriterTaskTerminated` is deliberately not
 retryable because retrying an outcome marked `SideEffectsUnknown` could

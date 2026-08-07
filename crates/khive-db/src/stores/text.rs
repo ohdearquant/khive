@@ -160,9 +160,11 @@ impl Fts5TextSearch {
     /// The FTS5 virtual table must already exist (created by `StorageBackend::text()`).
     pub(crate) fn new(pool: Arc<ConnectionPool>, is_file_backed: bool, table_key: String) -> Self {
         let table_name = format!("fts_{}", table_key);
-        // Best-effort opt-in (ADR-067 Component A, mirrors entity.rs slice 1
-        // policy): a missing writer task degrades to the legacy pool-mutex /
-        // standalone-connection path rather than failing construction.
+        // Enabled by default for file-backed pools; explicit off/degraded
+        // fallback remains possible (ADR-067 Component A, mirrors
+        // entity.rs policy): a missing writer task degrades to the legacy
+        // pool-mutex / standalone-connection path rather than failing
+        // construction.
         let writer_task = pool.writer_task_handle().ok().flatten();
         Self {
             pool,
@@ -212,7 +214,7 @@ impl Fts5TextSearch {
     {
         if let Some(writer_task) = self.current_writer_task() {
             return writer_task
-                .send(move |conn| f(conn).map_err(|e| map_err(e, op)))
+                .send_bounded(move |conn| f(conn).map_err(|e| map_err(e, op)))
                 .await;
         }
 
@@ -809,14 +811,14 @@ impl TextSearch for Fts5TextSearch {
         if let Some(writer_task) = self.current_writer_task() {
             let table2 = table.clone();
             return writer_task
-                .send(move |conn| {
+                .send_bounded(move |conn| {
                     upsert_document_dml(conn, &table2, &document)
                         .map_err(|e| map_err(e, "fts_upsert"))
                 })
                 .await;
         }
 
-        // Flag-off (default) path: byte-for-byte unchanged from pre-ADR-067
+        // Explicitly disabled or degraded fallback path: byte-for-byte unchanged from pre-ADR-067
         // behavior — the closure owns its own BEGIN IMMEDIATE/COMMIT/ROLLBACK.
         let origin = self.pool.origin();
         self.with_writer("fts_upsert", move |conn| {
@@ -854,14 +856,14 @@ impl TextSearch for Fts5TextSearch {
         if let Some(writer_task) = self.current_writer_task() {
             let table2 = table.clone();
             return writer_task
-                .send(move |conn| {
+                .send_bounded(move |conn| {
                     batch_upsert_documents_dml(conn, &table2, &documents, attempted)
                         .map_err(|e| map_err(e, "fts_upsert_batch"))
                 })
                 .await;
         }
 
-        // Flag-off (default) path: byte-for-byte unchanged from pre-ADR-067
+        // Explicitly disabled or degraded fallback path: byte-for-byte unchanged from pre-ADR-067
         // behavior — the closure owns its own BEGIN IMMEDIATE/COMMIT.
         let origin = self.pool.origin();
         self.with_writer("fts_upsert_batch", move |conn| {
@@ -1486,7 +1488,7 @@ impl Fts5TextSearch {
         if let Some(writer_task) = &self.writer_task {
             let table2 = table.clone();
             return writer_task
-                .send(move |conn| {
+                .send_bounded(move |conn| {
                     rename_namespace_dml(conn, &table2, &old_ns, &new_ns)
                         .map_err(|e| map_err(e, "fts_rename_namespace"))
                 })

@@ -324,6 +324,27 @@ pub struct WriterTaskHandle {
     /// and tests get a deterministic value by setting the override before
     /// spawning their own writer task.
     slow_write_threshold: Option<std::time::Duration>,
+    /// Default enqueue-capacity deadline for [`Self::send_bounded`] /
+    /// [`Self::send_top_level_bounded`], captured from
+    /// `PoolConfig::write_admission_deadline_ms` at [`spawn`] (ADR-131
+    /// Decision 2). Bounds ONLY the wait for channel capacity, the same
+    /// boundary `send_with_timeout` already documents — never the reply wait
+    /// after acceptance (#1382).
+    ///
+    /// This is a dedicated admission authority, distinct from
+    /// `PoolConfig::checkout_timeout` (reader/pool checkout). The two used
+    /// to be conflated here before ADR-131 Decision 2 (#1382, #1643).
+    ///
+    /// ADR-131 Decision 2's outer-request-budget clamp ("when the caller's outer
+    /// request deadline leaves less time remaining than the configured
+    /// admission deadline, the admission deadline applied to that operation
+    /// is the remaining outer budget instead") is explicitly DEFERRED: no
+    /// outer request deadline is plumbed to `send_bounded` /
+    /// `send_top_level_bounded`'s call sites as of #1737, so there is no
+    /// budget to clamp against. When an outer deadline reaches this call
+    /// path, clamp here rather than faking a shorter deadline against a
+    /// nonexistent budget.
+    enqueue_timeout: std::time::Duration,
 }
 
 impl WriterTaskHandle {
@@ -439,6 +460,24 @@ impl WriterTaskHandle {
         result
     }
 
+    /// Like [`Self::send`], but bounds the enqueue-capacity wait with this
+    /// handle's configured `enqueue_timeout`
+    /// (`PoolConfig::write_admission_deadline_ms` at spawn time, ADR-131
+    /// Decision 2) instead of waiting indefinitely (#1382).
+    ///
+    /// Once the request is accepted onto the channel, the reply wait is
+    /// unbounded by this method, identical to [`Self::send`] — this bounds
+    /// only queue-capacity admission, never SQLite execution or reply
+    /// latency. Callers that need a non-default deadline should use
+    /// [`Self::send_with_timeout`] directly.
+    pub async fn send_bounded<R, F>(&self, op: F) -> Result<R, StorageError>
+    where
+        R: Send + 'static,
+        F: FnOnce(&Connection) -> Result<R, StorageError> + Send + 'static,
+    {
+        self.send_with_timeout(op, self.enqueue_timeout).await
+    }
+
     /// Send a write operation that MUST run outside any open transaction
     /// (e.g. `VACUUM`, which SQLite forbids inside `BEGIN`/`COMMIT`) and
     /// await its typed reply.
@@ -457,6 +496,34 @@ impl WriterTaskHandle {
     {
         let observation = self.begin_latency_observation();
         let reply_rx = self.enqueue_inner(op, true).await?;
+        let result = reply_rx
+            .await
+            .map_err(|_| writer_task_terminated(WriterTaskRequestState::SideEffectsUnknown))?;
+        self.finish_latency_observation(observation);
+        result
+    }
+
+    /// Like [`Self::send_top_level`], but bounds the enqueue-capacity wait
+    /// with this handle's configured `enqueue_timeout`, mirroring
+    /// [`Self::send_bounded`] for top-level (transaction-skipping) requests
+    /// (#1382).
+    pub async fn send_top_level_bounded<R, F>(&self, op: F) -> Result<R, StorageError>
+    where
+        R: Send + 'static,
+        F: FnOnce(&Connection) -> Result<R, StorageError> + Send + 'static,
+    {
+        let observation = self.begin_latency_observation();
+        let reply_rx =
+            match tokio::time::timeout(self.enqueue_timeout, self.enqueue_inner(op, true)).await {
+                Ok(Ok(reply_rx)) => reply_rx,
+                Ok(Err(e)) => return Err(e),
+                Err(_elapsed) => {
+                    let timeout_ms = self.enqueue_timeout.as_millis() as u64;
+                    crate::timeout_sink::emit_queue_saturation(&self.db, timeout_ms);
+                    return Err(StorageError::WriteQueueFull { timeout_ms });
+                }
+            };
+
         let result = reply_rx
             .await
             .map_err(|_| writer_task_terminated(WriterTaskRequestState::SideEffectsUnknown))?;
@@ -559,6 +626,9 @@ pub fn spawn(pool: &ConnectionPool, capacity: usize) -> Result<WriterTaskHandle,
         tx,
         db,
         slow_write_threshold: crate::timeout_sink::slow_write_threshold(),
+        enqueue_timeout: std::time::Duration::from_millis(
+            pool.config().write_admission_deadline_ms,
+        ),
     })
 }
 
@@ -907,6 +977,7 @@ mod tests {
             tx,
             db: "test".to_string(),
             slow_write_threshold: None,
+            enqueue_timeout: Duration::from_secs(5),
         };
 
         // First send fills the sole channel slot. Its reply never arrives
@@ -945,6 +1016,7 @@ mod tests {
             tx,
             db: "test".to_string(),
             slow_write_threshold: None,
+            enqueue_timeout: Duration::from_secs(5),
         };
 
         let first = tokio::spawn({
@@ -968,6 +1040,84 @@ mod tests {
         }
 
         first.abort();
+    }
+
+    #[tokio::test]
+    async fn configured_enqueue_timeout_rejects_only_unaccepted_request() {
+        // A real file-backed writer task: `send_bounded` reuses
+        // `PoolConfig::write_admission_deadline_ms` (ADR-131 Decision 2) as
+        // its enqueue deadline, captured at `spawn`, so this must exercise
+        // the actual spawn path rather than a hand-built channel (#1382).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("configured_enqueue_timeout.db");
+        let cfg = PoolConfig {
+            path: Some(path.clone()),
+            write_admission_deadline_ms: 100,
+            ..PoolConfig::default()
+        };
+        let pool = ConnectionPool::new(cfg).unwrap();
+        let handle = spawn(&pool, 1).expect("writer task should spawn on a file-backed pool");
+
+        // Request A: dequeued and running (inside `spawn_blocking`), blocked
+        // on a test-controlled channel so the writer task's single drain
+        // slot stays occupied deterministically — no sleeps.
+        let (started_tx, started_rx) = oneshot::channel::<()>();
+        let (release_tx, release_rx) = std_mpsc::channel::<()>();
+        let handle_a = handle.clone();
+        let a_task = tokio::spawn(async move {
+            handle_a
+                .send(move |_conn| {
+                    let _ = started_tx.send(());
+                    release_rx.recv().expect("test must release request A");
+                    Ok::<(), StorageError>(())
+                })
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(5), started_rx)
+            .await
+            .expect("request A did not start")
+            .expect("request A dropped its start signal");
+
+        // Request B: A has been dequeued (freeing the one channel slot), so
+        // the private `enqueue` helper proves B is accepted and now occupies
+        // that slot, without waiting for A to finish.
+        let b_reply_rx = tokio::time::timeout(
+            Duration::from_secs(5),
+            handle.enqueue(|_conn| Ok::<(), StorageError>(())),
+        )
+        .await
+        .expect("B must be accepted promptly")
+        .expect("B must be accepted: the one channel slot is free while A drains");
+
+        // Request C: the channel is now full (A draining, B queued behind
+        // it) — `send_bounded` must reject C on the configured
+        // `write_admission_deadline_ms` without ever running its closure.
+        let c_ran = Arc::new(AtomicBool::new(false));
+        let c_ran_in_op = Arc::clone(&c_ran);
+        let c_result = handle
+            .send_bounded(move |_conn| {
+                c_ran_in_op.store(true, Ordering::SeqCst);
+                Ok::<(), StorageError>(())
+            })
+            .await;
+        match c_result {
+            Err(StorageError::WriteQueueFull { .. }) => {}
+            other => panic!("expected WriteQueueFull, got {other:?}"),
+        }
+        assert!(!c_ran.load(Ordering::SeqCst), "C must never run");
+
+        // Release A; both A and B must then complete normally.
+        release_tx.send(()).expect("release request A");
+        tokio::time::timeout(Duration::from_secs(5), a_task)
+            .await
+            .expect("A did not complete")
+            .expect("A task join")
+            .expect("A must complete successfully");
+        tokio::time::timeout(Duration::from_secs(5), b_reply_rx)
+            .await
+            .expect("B did not reply")
+            .expect("B's reply channel must not be dropped")
+            .expect("B must complete successfully");
     }
 
     // `#[serial(tx_registry)]`: this test deliberately keeps a request (and
@@ -1670,6 +1820,7 @@ mod tests {
             tx,
             db: "test".to_string(),
             slow_write_threshold: None,
+            enqueue_timeout: Duration::from_secs(5),
         };
         let send_result = handle.send(|_conn| Ok::<(), StorageError>(())).await;
         assert_writer_task_terminal_state(send_result, WriterTaskRequestState::NotStarted);
@@ -1695,6 +1846,7 @@ mod tests {
             tx,
             db: "test".to_string(),
             slow_write_threshold: None,
+            enqueue_timeout: Duration::from_secs(5),
         };
         let request_ran = Arc::new(AtomicBool::new(false));
         let request_ran_in_op = Arc::clone(&request_ran);

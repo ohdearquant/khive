@@ -144,15 +144,17 @@ impl SqlEntityStore {
     /// over the same pool never spawns more than one writer task; see
     /// `ConnectionPool::writer_task_handle`'s doc comment for why that
     /// matters. `None` (falling back to the legacy path for every write)
-    /// if the flag is off, or if the writer task failed to spawn (for
-    /// example, an in-memory pool, which has no standalone-connection
-    /// support) — the flag is a best-effort opt-in, not a hard requirement.
+    /// if the resolved flag is off, or if the writer task failed to spawn
+    /// (for example, an in-memory pool, which has no standalone-connection
+    /// support) — enabled by default for file-backed pools; explicit
+    /// off/degraded fallback remains possible.
     pub fn new(pool: Arc<ConnectionPool>, is_file_backed: bool) -> Self {
-        // Best-effort opt-in (slice 1 policy, unchanged): a missing writer
-        // task — whether the flag is off, spawn degraded (e.g. in-memory
-        // pool), or no Tokio runtime was available at this first access
-        // (ADR-067 Component A runtime-handle guard) — degrades to the
-        // legacy pool-mutex path rather than failing construction.
+        // Enabled by default for file-backed pools; explicit off/degraded
+        // fallback remains possible: a missing writer task — whether
+        // explicitly disabled, spawn degraded (e.g. in-memory pool), or no
+        // Tokio runtime was available at this first access (ADR-067
+        // Component A runtime-handle guard) — degrades to the legacy
+        // pool-mutex path rather than failing construction.
         let writer_task = pool.writer_task_handle().ok().flatten();
 
         Self {
@@ -210,7 +212,7 @@ impl SqlEntityStore {
     {
         if let Some(writer_task) = &self.writer_task {
             return writer_task
-                .send(move |conn| f(conn).map_err(|e| map_err(e, op)))
+                .send_bounded(move |conn| f(conn).map_err(|e| map_err(e, op)))
                 .await;
         }
 
@@ -594,14 +596,14 @@ impl EntityStore for SqlEntityStore {
         // closure would violate SQLite's nested-transaction rule).
         if let Some(writer_task) = &self.writer_task {
             return writer_task
-                .send(move |conn| {
+                .send_bounded(move |conn| {
                     batch_upsert_entities(conn, &entities, attempted)
                         .map_err(|e| map_err(e, "upsert_entities"))
                 })
                 .await;
         }
 
-        // Flag-off (default) path: byte-for-byte unchanged from pre-ADR-067
+        // Explicitly disabled or degraded fallback path: byte-for-byte unchanged from pre-ADR-067
         // behavior — the closure owns its own BEGIN IMMEDIATE/COMMIT/ROLLBACK
         // via the pool-mutex writer.
         let origin = self.pool.origin();

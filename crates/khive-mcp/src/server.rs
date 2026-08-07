@@ -34,7 +34,7 @@ use khive_request::{parse_request, ArgValue, DslError, ExecutionMode, ParsedOp, 
 use khive_runtime::{
     present, render_format, InterceptedDispatchResult, KhiveRuntime, OutputFormat, PackLoadError,
     PackRegistry, PresentationMode, RuntimeConfig, RuntimeError, VerbPresentationPolicy,
-    VerbRegistry, VerbRegistryBuilder, WRITER_POOL_CHECKOUT_TIMEOUT_STAGE,
+    VerbRegistry, VerbRegistryBuilder,
 };
 
 use khive_storage::{EdgeRelation, StorageCapability};
@@ -1590,26 +1590,32 @@ fn runtime_error_payload(tool: &str, error: RuntimeError) -> (String, Value) {
 }
 
 /// Preserve the established flat-string payload for ordinary runtime errors,
-/// while carrying the ADR-135 F6 writer-pool stage structurally through every
-/// MCP execution mode.
+/// while carrying pre-execution write-admission failures (ADR-135 F6 writer-
+/// pool checkout timeout; #1382/#1643 write-queue saturation) structurally,
+/// and marked retryable, through every MCP execution mode. Both admission
+/// failures happen before SQLite executes the request, so retrying is safe:
+/// there is no partial side effect to roll back.
 fn runtime_error_value(error: RuntimeError) -> Value {
     match error {
         RuntimeError::Khive(k) => serde_json::to_value(&k)
             .unwrap_or_else(|_| json!({"kind": "internal", "message": k.to_string()})),
         other => {
-            let Some(context) = other.writer_pool_checkout_timeout_context() else {
+            let Some(context) = other.admission_failure_context() else {
                 return json!(other.to_string());
             };
             let timeout_ms = u64::try_from(context.timeout.as_millis()).unwrap_or(u64::MAX);
             let capability = context.capability.map(storage_capability_wire_name);
             json!({
                 "kind": "unavailable",
-                "code": WRITER_POOL_CHECKOUT_TIMEOUT_STAGE,
-                "stage": WRITER_POOL_CHECKOUT_TIMEOUT_STAGE,
+                "code": context.stage,
+                "stage": context.stage,
                 "message": other.to_string(),
+                "retryable": true,
                 "timeout_ms": timeout_ms,
                 "capability": capability,
                 "operation": context.operation,
+                "scope": context.scope,
+                "retry_after_ms": context.retry_after_ms,
             })
         }
     }
@@ -1929,6 +1935,13 @@ Parallel: a failed op does NOT abort siblings. Chain: failure aborts remaining
 ops (reported as {"ok": false, "aborted": true}). Committed ops are not rolled back.
 `status` is "partial" whenever summary.failed or summary.aborted is non-zero — check
 it (or summary) rather than relying on the absence of a top-level error.
+
+A parallel write-heavy batch is best-effort, not atomic: `results` ordering is
+not a commit prefix (an earlier entry succeeding implies nothing about a later
+one, or vice versa), and one entry's admission failure (e.g. `retryable:
+true`, `code: "writer_pool_checkout_timeout"` or `"writer_queue_saturated"`)
+never rolls back a sibling that already committed. Inspect each result
+entry's own `ok` field rather than assuming batch-level atomicity.
 
 `search` carries its own per-op `status` ("complete" | "partial") inside that
 op's `result` entry, separate from the top-level batch `status` above. A
