@@ -32,6 +32,15 @@ pub use khive_types::VerbDef;
 
 use crate::validation::ValidationRule;
 
+/// Name of the pack providing the shared CRUD verbs and the general-purpose
+/// note kinds those verbs exist to serve.
+///
+/// Its note kinds are the ones any caller may author freely through `create`
+/// and `update`; every other pack's note kinds are records maintained by that
+/// pack's own verbs. Used by
+/// [`VerbRegistry::pack_owned_note_kinds`].
+pub const GENERIC_CRUD_PACK: &str = "kg";
+
 const FULL_UUID_IDENTIFIER_HELP: &str = "A complete UUID spelling accepted by the consuming \
     parameter directly names one globally unique record; direct UUID lookup is not a namespace \
     search. Strict identifier responses use canonical lowercase dashed UUIDs.";
@@ -244,6 +253,18 @@ pub trait PackRuntime: Send + Sync {
     /// `KhiveRuntime::install_note_mutation_hook`. Default no-op leaves the hook absent.
     /// See `docs/api/pack.md#register_note_mutation_hook` for cross-pack notification rationale.
     fn register_note_mutation_hook(&self, _runtime: &KhiveRuntime) {}
+
+    /// Install a note-write validator on the runtime, called at pack
+    /// initialisation with the same timing as `register_note_mutation_hook`.
+    ///
+    /// A pack owning a note kind whose properties carry identity that the
+    /// runtime can derive from the authorization token implements this and
+    /// calls `KhiveRuntime::install_note_write_validator`, so the identity is
+    /// derived at every note-write site rather than trusted from caller input
+    /// on the write paths that reach no pack verb. Default no-op leaves the
+    /// slot absent. The slot holds one validator, so an implementation must
+    /// return properties for kinds it does not own unchanged.
+    fn register_note_write_validator(&self, _runtime: &KhiveRuntime) {}
 
     /// Warm up any in-memory state from persisted snapshots (optional). Called after
     /// all packs are registered but before serving the first request. Must be
@@ -2067,6 +2088,33 @@ impl VerbRegistry {
             .collect()
     }
 
+    /// Note kinds owned by a pack, i.e. every kind in [`all_note_kinds`] that
+    /// is not one of the generic-CRUD pack's own kinds.
+    ///
+    /// [`GENERIC_CRUD_PACK`] declares the general-purpose note kinds the shared
+    /// CRUD verbs exist to serve (`observation`, `insight`, …); every other
+    /// pack's kinds are records that pack's own verbs create and maintain.
+    /// Derived from the packs' `NOTE_KINDS` constants, so a pack that adds or
+    /// drops a kind moves this set with it — nothing is hardcoded here but the
+    /// name of the generic pack itself.
+    ///
+    /// [`all_note_kinds`]: Self::all_note_kinds
+    pub fn pack_owned_note_kinds(&self) -> Vec<&'static str> {
+        let generic: std::collections::HashSet<&'static str> = self
+            .packs
+            .iter()
+            .filter(|p| p.name() == GENERIC_CRUD_PACK)
+            .flat_map(|p| p.note_kinds().iter().copied())
+            .collect();
+        let mut seen = std::collections::HashSet::new();
+        self.packs
+            .iter()
+            .filter(|p| p.name() != GENERIC_CRUD_PACK)
+            .flat_map(|p| p.note_kinds().iter().copied())
+            .filter(|k| !generic.contains(k) && seen.insert(*k))
+            .collect()
+    }
+
     /// Merged set of entity kinds across all registered packs (deduplicated,
     /// first-seen order preserved).
     pub fn all_entity_kinds(&self) -> Vec<&'static str> {
@@ -2240,6 +2288,19 @@ impl VerbRegistry {
     pub fn call_register_note_mutation_hooks(&self, runtime: &KhiveRuntime) {
         for pack in self.packs.iter() {
             pack.register_note_mutation_hook(runtime);
+        }
+    }
+
+    /// Invoke `PackRuntime::register_note_write_validator` on every registered pack.
+    ///
+    /// Called by the transport during startup with the same timing as
+    /// `call_register_note_mutation_hooks`, so note-write validation is active
+    /// at the runtime layer for every write path — the generic `create` verb,
+    /// direct Rust callers, and proposal apply, none of which dispatch a pack
+    /// hook of their own on the note-write.
+    pub fn call_register_note_write_validators(&self, runtime: &KhiveRuntime) {
+        for pack in self.packs.iter() {
+            pack.register_note_write_validator(runtime);
         }
     }
 
@@ -2665,12 +2726,20 @@ fn build_audit_storage_event(
     storage_event
 }
 
+static AUDIT_APPEND_FAILURES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub(crate) fn audit_append_failure_count() -> u64 {
+    AUDIT_APPEND_FAILURES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Append an audit event, logging and swallowing store failures.
 ///
 /// Audit persistence is best-effort everywhere in the dispatch path: a store
-/// write failure must never fail the verb call it is auditing.
+/// write failure must never fail the verb call it is auditing. Every swallowed
+/// failure increments the process-wide diagnostics counter above.
 async fn append_audit_event_best_effort(store: &Arc<dyn EventStore>, event: Event, verb: &str) {
     if let Err(store_err) = store.append_event(event).await {
+        AUDIT_APPEND_FAILURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         tracing::warn!(
             verb,
             error = %store_err,
@@ -4301,11 +4370,17 @@ mod tests {
     #[derive(Default, Debug)]
     struct MemoryEventStore {
         events: std::sync::Mutex<Vec<Event>>,
+        fail_appends: bool,
     }
 
     #[async_trait]
     impl EventStore for MemoryEventStore {
         async fn append_event(&self, event: Event) -> khive_storage::StorageResult<()> {
+            if self.fail_appends {
+                return Err(khive_storage::StorageError::Internal(
+                    "injected audit append failure".to_string(),
+                ));
+            }
             self.events.lock().unwrap().push(event);
             Ok(())
         }
@@ -4470,6 +4545,46 @@ mod tests {
         assert_eq!(ev.namespace, "test-ns");
         assert_eq!(ev.substrate, SubstrateKind::Event);
         assert_eq!(ev.outcome, EventOutcome::Success);
+    }
+
+    #[tokio::test]
+    #[serial(audit_append_failures)]
+    async fn swallowed_audit_append_failure_is_counted_without_failing_dispatch() {
+        let before = audit_append_failure_count();
+
+        let successful_store = Arc::new(MemoryEventStore::default());
+        let mut successful_builder = VerbRegistryBuilder::new();
+        successful_builder.register(AlphaPack);
+        successful_builder.with_event_store(successful_store);
+        let successful_registry = successful_builder.build().expect("registry builds");
+        successful_registry
+            .dispatch("list", Value::Null)
+            .await
+            .expect("successful audit append must not affect dispatch");
+        assert_eq!(
+            audit_append_failure_count(),
+            before,
+            "successful audit appends must not increment the failure counter"
+        );
+
+        let failing_store = Arc::new(MemoryEventStore {
+            fail_appends: true,
+            ..MemoryEventStore::default()
+        });
+        let mut failing_builder = VerbRegistryBuilder::new();
+        failing_builder.register(AlphaPack);
+        failing_builder.with_event_store(failing_store);
+        let failing_registry = failing_builder.build().expect("registry builds");
+        failing_registry
+            .dispatch("list", Value::Null)
+            .await
+            .expect("best-effort audit failure must preserve dispatch success");
+
+        assert_eq!(
+            audit_append_failure_count(),
+            before + 1,
+            "the swallowed append failure must remain visible to diagnostics"
+        );
     }
 
     #[tokio::test]

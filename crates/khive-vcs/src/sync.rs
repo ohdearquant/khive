@@ -2530,7 +2530,7 @@ mod tests {
 // `memory.vacuum` regression test in khive-pack-memory's `prune.rs` — this
 // drives the underlying mechanism directly at the `SqlBridge` level: the same
 // `execute_script_top_level("PRAGMA wal_checkpoint(TRUNCATE);")` call that
-// `checkpoint_wal` makes, over a `PoolConfig { write_queue_enabled: true, .. }`
+// `checkpoint_wal` makes, over a `PoolConfig { write_queue_enabled: Some(true), .. }`
 // literal (no env var mutation, no cross-test race).
 #[cfg(test)]
 mod checkpoint_wal_write_queue_tests {
@@ -2540,7 +2540,7 @@ mod checkpoint_wal_write_queue_tests {
         let db_path = dir.path().join("vcs-checkpoint-write-queue.db");
         let pool_cfg = khive_db::PoolConfig {
             path: Some(db_path),
-            write_queue_enabled: true,
+            write_queue_enabled: Some(true),
             ..khive_db::PoolConfig::default()
         };
         let pool = std::sync::Arc::new(khive_db::ConnectionPool::new(pool_cfg).expect("pool"));
@@ -2576,7 +2576,7 @@ mod checkpoint_wal_write_queue_tests {
         let db_path = dir.path().join("vcs-checkpoint-write-queue-regression.db");
         let pool_cfg = khive_db::PoolConfig {
             path: Some(db_path),
-            write_queue_enabled: true,
+            write_queue_enabled: Some(true),
             ..khive_db::PoolConfig::default()
         };
         let pool = std::sync::Arc::new(khive_db::ConnectionPool::new(pool_cfg).expect("pool"));

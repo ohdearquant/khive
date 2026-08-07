@@ -148,6 +148,20 @@ pub async fn run_pending_events(
     namespace: &str,
     verbose: bool,
 ) -> Result<DrainSummary> {
+    run_pending_events_with_config(db, None, namespace, verbose).await
+}
+
+/// One-shot drain with an explicit configuration-file selection.
+///
+/// This is the `kkernel exec --pending-events --config …` entrypoint. The
+/// compatibility wrapper above retains the original discovery behavior for
+/// callers that do not carry a config path.
+pub async fn run_pending_events_with_config(
+    db: Option<&str>,
+    config: Option<&std::path::Path>,
+    namespace: &str,
+    verbose: bool,
+) -> Result<DrainSummary> {
     // Resolve through the SAME multi-backend-aware construction the daemon
     // boot path uses (`khive-mcp::serve::build_server_with_explicit_namespace`),
     // rather than a throwaway `RuntimeConfig::default()` (PR #782):
@@ -162,10 +176,9 @@ pub async fn run_pending_events(
     // (single- or multi-backend), so replayed actions route through the
     // correct per-pack backend exactly like the daemon tick now does — not a
     // single runtime standing in for every pack (the same issue this fix
-    // closes for the daemon-resident tick). `kkernel exec` has no
-    // `--config` flag today (see `kkernel::exec::run_exec`'s own
-    // `resolve_runtime_config` call), so this mirrors that: `config: None`
-    // still triggers `khive.toml`'s standard cwd/home search order inside
+    // closes for the daemon-resident tick). An explicit `kkernel exec
+    // --config` path is forwarded unchanged; otherwise `config: None` still
+    // triggers `khive.toml`'s standard cwd/home search order inside
     // `resolve_runtime_config`.
     //
     // This does NOT call `crate::serve::build_server` directly (PR #782):
@@ -201,16 +214,31 @@ pub async fn run_pending_events(
         namespace: None,
         no_embed: false,
         pack: Vec::new(),
-        config: None,
+        config: config.map(std::path::Path::to_path_buf),
         daemon: false,
         transport: None,
         bind: None,
         brain_profile: None,
         resumed_generation: None,
     };
+    // A `DatabaseOverrideConflict` raised by the builder must pass through
+    // unchanged so `kkernel exec`'s caller receives it as the top-level error
+    // and `db_override_refusal_envelope`'s `downcast_ref` recognizes it,
+    // emitting the documented JSON refusal envelope. Every other build
+    // failure keeps the generic "pending-events: build server" provenance.
     let (server, schedule_rt) =
-        crate::serve::build_server_with_explicit_namespace(&args, ns, true, false)
-            .map_err(|e| anyhow::anyhow!("pending-events: build server: {e}"))?;
+        match crate::serve::build_server_with_explicit_namespace(&args, ns, true, false) {
+            Ok(built) => built,
+            Err(error) => {
+                if error
+                    .downcast_ref::<crate::serve::DatabaseOverrideConflict>()
+                    .is_some()
+                {
+                    return Err(error);
+                }
+                return Err(error.context("pending-events: build server"));
+            }
+        };
     let rt = schedule_rt.ok_or_else(|| {
         anyhow::anyhow!(
             "pending-events: resolved pack set does not include \"schedule\"; nothing to drain"
@@ -4184,6 +4212,128 @@ mod tests {
             format!("[actor]\nid = \"{actor_id}\"\n"),
         )
         .expect("write project actor config");
+    }
+
+    /// Regression: a `DatabaseOverrideConflict` raised by the builder must
+    /// leave `run_pending_events_with_config` as the top-level error so
+    /// `kkernel exec`'s refusal-envelope downcast recognizes it.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn run_pending_events_keeps_db_override_conflict_top_level() {
+        std::env::remove_var("KHIVE_DB");
+        std::env::remove_var("KHIVE_PACKS");
+        std::env::remove_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR");
+
+        let seat_dir = tempfile::tempdir().expect("seat tempdir");
+        let _seat_env = SeatEnv::enter(seat_dir.path());
+        let config_dir = tempfile::tempdir().expect("config tempdir");
+        let config_path = config_dir.path().join("backends.toml");
+        std::fs::write(
+            &config_path,
+            "[[backends]]\nname = \"main\"\n\n[[backends]]\nname = \"sessions\"\n",
+        )
+        .expect("write multi-backend config");
+
+        let error = run_pending_events_with_config(
+            Some("/tmp/definitely-not-the-main.db"),
+            Some(&config_path),
+            "local",
+            false,
+        )
+        .await
+        .expect_err("a divergent concrete --db override must be refused");
+
+        assert!(
+            error
+                .downcast_ref::<crate::serve::DatabaseOverrideConflict>()
+                .is_some(),
+            "the conflict must remain the top-level error for the refusal envelope: {error:?}"
+        );
+        assert!(
+            crate::serve::db_override_refusal_envelope(&error).is_some(),
+            "the documented JSON refusal envelope must be derivable: {error:?}"
+        );
+    }
+
+    /// Sibling regression for the provenance half of the same seam: build
+    /// failures that are NOT the typed conflict keep the generic
+    /// "pending-events: build server" context (an invalid explicit config
+    /// surfaces as `config error: ...` underneath).
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn run_pending_events_wraps_non_conflict_build_errors_with_context() {
+        std::env::remove_var("KHIVE_DB");
+        std::env::remove_var("KHIVE_PACKS");
+        std::env::remove_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR");
+
+        let seat_dir = tempfile::tempdir().expect("seat tempdir");
+        let _seat_env = SeatEnv::enter(seat_dir.path());
+        let config_dir = tempfile::tempdir().expect("config tempdir");
+        let config_path = config_dir.path().join("broken.toml");
+        std::fs::write(&config_path, "this is not [valid toml\n").expect("write malformed config");
+
+        let error = run_pending_events_with_config(None, Some(&config_path), "local", false)
+            .await
+            .expect_err("an invalid explicit config must fail the build");
+
+        assert!(
+            error
+                .downcast_ref::<crate::serve::DatabaseOverrideConflict>()
+                .is_none(),
+            "not a database-override conflict: {error:?}"
+        );
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains("pending-events: build server"),
+            "non-conflict build failures keep the generic provenance: {rendered}"
+        );
+        assert!(
+            rendered.contains("config error"),
+            "the underlying config failure must remain in the chain: {rendered}"
+        );
+    }
+
+    /// Sibling regression for the explicit-tier half of the same seam: an
+    /// explicit `--config` naming a MISSING file must fail loud, not run the
+    /// drain with defaults. The loader enforces the explicit tier
+    /// (`KhiveConfig::load_with_home_fallback_and_source` returns
+    /// `ExplicitConfigMissing`), and the error surfaces wrapped in the
+    /// generic build context — it is NOT a `DatabaseOverrideConflict`.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn run_pending_events_fails_loud_for_missing_explicit_config() {
+        std::env::remove_var("KHIVE_DB");
+        std::env::remove_var("KHIVE_PACKS");
+        std::env::remove_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR");
+
+        let seat_dir = tempfile::tempdir().expect("seat tempdir");
+        let _seat_env = SeatEnv::enter(seat_dir.path());
+        let config_dir = tempfile::tempdir().expect("config tempdir");
+        let missing_config = config_dir.path().join("does-not-exist.toml");
+
+        let error = run_pending_events_with_config(None, Some(&missing_config), "local", false)
+            .await
+            .expect_err("a missing explicit config must fail loud, not run with defaults");
+
+        assert!(
+            error
+                .downcast_ref::<crate::serve::DatabaseOverrideConflict>()
+                .is_none(),
+            "not a database-override conflict: {error:?}"
+        );
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains("pending-events: build server"),
+            "non-conflict build failures keep the generic provenance: {rendered}"
+        );
+        assert!(
+            rendered.contains("does not exist"),
+            "the underlying missing-file failure must name the selected path: {rendered}"
+        );
+        assert!(
+            rendered.contains("does-not-exist.toml"),
+            "the error must name the missing file the operator selected: {rendered}"
+        );
     }
 
     /// The wrapper seam (`build_server_with_explicit_namespace`, called by

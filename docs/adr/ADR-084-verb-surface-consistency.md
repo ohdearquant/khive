@@ -58,7 +58,9 @@ capabilities that already ship. Callers believed the surface could not do things
 3. **`recall | auto_feedback` chaining.** Believed impossible ("`$prev` cannot address a
    bare array result"); `$prev[N].field` addressing is specified in ADR-016 and works,
    including nested inside an array-of-objects argument literal. Verified live:
-   `memory.recall(...) | brain.auto_feedback(results=[{"id": $prev[0].id}])` succeeds.
+   `memory.recall(...) | brain.auto_feedback(query="...", results=[{"id":
+   $prev[0].id}], target_id=$prev[0].id, signal="implicit_positive")` succeeds. The explicit
+   target and signal are required to emit feedback; omission now means abstention (#1588).
 
 The lesson is uniform: when the surface cannot describe itself, agents substitute folklore
 for the contract, and folklore decays into false limitations. Prose discipline has not

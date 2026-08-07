@@ -21,6 +21,8 @@ pub mod pool;
 pub mod sql_bridge;
 /// Per-substrate store implementations (entity, note, graph, event, text, vectors, sparse).
 pub mod stores;
+/// Append-only NDJSON writer-timeout event sink (crate-internal).
+mod timeout_sink;
 /// Cross-process WAL-pin attribution sidecar (ADR-091 Amendment 2 Plank B).
 /// The sidecar write path (heartbeat/beacon) and identity primitives are
 /// portable; directory enumeration (`enumerate_live`) is Unix-only — its

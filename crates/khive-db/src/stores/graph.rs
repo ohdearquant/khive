@@ -541,9 +541,19 @@ impl SqlGraphStore {
 
         if self.is_file_backed {
             let conn = self.open_standalone_writer()?;
-            tokio::task::spawn_blocking(move || f(&conn).map_err(|e| map_err(e, op)))
-                .await
-                .map_err(|e| StorageError::driver(StorageCapability::Graph, op, e))?
+            let db = crate::timeout_sink::db_label(&self.pool);
+            tokio::task::spawn_blocking(move || {
+                f(&conn).map_err(|e| {
+                    crate::timeout_sink::maybe_emit_busy(
+                        &db,
+                        crate::timeout_sink::Site::StandaloneGraph,
+                        &e,
+                    );
+                    map_err(e, op)
+                })
+            })
+            .await
+            .map_err(|e| StorageError::driver(StorageCapability::Graph, op, e))?
         } else {
             let pool = Arc::clone(&self.pool);
             tokio::task::spawn_blocking(move || {

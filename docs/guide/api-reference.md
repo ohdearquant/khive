@@ -214,28 +214,28 @@ annotation discovery is namespace-agnostic under ADR-007, matching the fetched e
 
 List records with optional filtering.
 
-| Param                        | Type                     | Required | Notes                                                                                                                                                                                |
-| ---------------------------- | ------------------------ | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `kind`                       | string                   | yes      | `entity`\|`note`\|`edge`\|`event`\|`proposal`\|`message`, or a granular kind.                                                                                                        |
-| `limit`                      | integer                  | no       | Default 20.                                                                                                                                                                          |
-| `offset`                     | integer                  | no       | Default 0; mutually exclusive with `after`.                                                                                                                                          |
-| `after`                      | string                   | no       | Exact full entity/note/edge cursor UUID returned as `next_after`, or `""` to begin cursor mode. Prefixes are rejected because keyset pagination needs the stable insertion boundary. |
-| `entity_kind`                | string                   | no       | Filter when `kind="entity"`.                                                                                                                                                         |
-| `entity_type`                | string                   | no       | Filter by type field when `kind="entity"`.                                                                                                                                           |
-| `note_kind`                  | string                   | no       | Filter when `kind="note"`.                                                                                                                                                           |
-| `tags`                       | array\<string\>          | no       | OR-match, `kind="entity"` only.                                                                                                                                                      |
-| `source_id` / `target_id`    | uuid                     | no       | Edge endpoint filters, `kind="edge"` only.                                                                                                                                           |
-| `relations`                  | array\<string\>          | no       | Edge relation filter, `kind="edge"` only.                                                                                                                                            |
-| `min_weight` / `max_weight`  | number                   | no       | Edge weight bounds, `kind="edge"` only.                                                                                                                                              |
-| `event_kind` / `event_kinds` | string / array\<string\> | no       | `kind="event"` only; additive.                                                                                                                                                       |
-| `session_id`                 | uuid                     | no       | `kind="event"` only; exact full session UUID. Prefixes are rejected because the filter needs one stable record.                                                                      |
-| `observed`                   | array\<uuid\>            | no       | `kind="event"` only; exact full observed-record UUIDs. Prefixes are rejected.                                                                                                        |
-| `selected`                   | array\<uuid\>            | no       | `kind="event"` only; exact full selected-record UUIDs. Prefixes are rejected.                                                                                                        |
+| Param                        | Type                     | Required | Notes                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| ---------------------------- | ------------------------ | -------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `kind`                       | string                   | yes      | `entity`\|`note`\|`edge`\|`event`\|`proposal`\|`message`, or a granular kind.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
+| `limit`                      | integer                  | no       | Default 20.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
+| `offset`                     | integer                  | no       | Default 0; mutually exclusive with `after`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
+| `after`                      | string                   | no       | Exact full entity/note/edge cursor UUID returned as `next_after`, or `""` to begin cursor mode. Prefixes are rejected because keyset pagination needs the stable insertion boundary.                                                                                                                                                                                                                                                                                                                                                                                                      |
+| `entity_kind`                | string                   | no       | Filter when `kind="entity"`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| `entity_type`                | string                   | no       | Filter by type field when `kind="entity"`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| `note_kind`                  | string                   | no       | Filter when `kind="note"`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| `tags`                       | array\<string\>          | no       | OR-match, `kind="entity"` only.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| `source_id` / `target_id`    | uuid                     | no       | Edge endpoint filters, `kind="edge"` only.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| `relations`                  | array\<string\>          | no       | Edge relation filter, `kind="edge"` only.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| `min_weight` / `max_weight`  | number                   | no       | Edge weight bounds, `kind="edge"` only.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| `event_kind` / `event_kinds` | string / array\<string\> | no       | `kind="event"` only; additive.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| `session_id`                 | uuid                     | no       | `kind="event"` only; exact full session UUID. Prefixes are rejected because the filter needs one stable record.                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| `observed`                   | array\<uuid\>            | no       | `kind="event"` only; exact full observed-record UUIDs. Prefixes are rejected.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
+| `selected`                   | array\<uuid\>            | no       | `kind="event"` only; exact full selected-record UUIDs. Prefixes are rejected.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
 | `thread_id`                  | string                   | no       | `kind="message"` only; complete UUID or unique 8+ hex prefix resolved across stored thread roots in the caller's effective namespace. Missing or ambiguous prefixes fail explicitly. Legacy exceptions: input that is not hex, or shorter than 8 chars, is matched exactly against stored thread labels (no match → empty list, not an error); for all-hex ≥8-char input, a stored label byte-equal to the input takes precedence over any UUID-prefix match, and a stored label differing only in ASCII case is a final fallback, consulted only when no UUID-prefix candidate resolves. |
-| `direction`                  | string                   | no       | `kind="message"` only: `inbound`\|`outbound`.                                                                                                                                        |
-| `from` / `to`                | string                   | no       | `kind="message"` only, sender/recipient filter.                                                                                                                                      |
-| `read`                       | bool                     | no       | `kind="message"` only.                                                                                                                                                               |
-| `delivered`                  | bool                     | no       | `kind="message"` only.                                                                                                                                                               |
+| `direction`                  | string                   | no       | `kind="message"` only: `inbound`\|`outbound`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
+| `from` / `to`                | string                   | no       | `kind="message"` only, sender/recipient filter.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| `read`                       | bool                     | no       | `kind="message"` only.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| `delivered`                  | bool                     | no       | `kind="message"` only.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
 
 ```
 request(ops="list(kind=\"entity\", entity_kind=\"concept\", limit=20)")
@@ -705,16 +705,51 @@ request(ops="whoami()")
 
 ### `db_diagnostics` — Assertive
 
-Report WAL/checkpoint diagnostics for the main database: build identity, the checkpoint
-counters, a single PASSIVE checkpoint probe, the `-wal` sidecar file size, and a WAL-pin
-holder census. Takes no parameters.
+Report writer-contention and WAL/checkpoint diagnostics for the main database: build identity,
+the checkpoint counters, a single PASSIVE checkpoint probe, the `-wal` sidecar file size, and a
+WAL-pin holder census. Takes no parameters.
+
+`writer_contention` contains monotonic counters captured once per request:
+`writer_acquisitions` is the total of `pooled_writer_acquisitions`,
+`standalone_writer_acquisitions`, and `writer_task_acquisitions`. The first counts successful
+finite-wait main-pool mutex checkouts, the second counts successful per-operation file-backed
+standalone writer opens, and the third counts dequeued writer-task requests that acquired its
+dedicated connection (or successfully completed `BEGIN IMMEDIATE`).
+`writer_acquisition_timeouts` remains specific to the finite-wait main-pool mutex before SQLite
+executes; SQLite `BEGIN`/statement failures are separate stages. `audit_append_failures` counts
+process-wide best-effort audit appends whose storage error was logged and swallowed. Zero-wait
+checkpoint skips, the diagnostics probe connection, the writer task's one-time lifetime
+connection, and the checkpoint task's dedicated long-lived connection (opened once at startup
+and reused across ticks) do not inflate the write-traffic acquisition total.
+
+A finite-wait pooled checkout failure retains its compatibility display text in `message`, but
+the MCP error is a stable object rather than a string:
+
+```json
+{
+  "kind": "unavailable",
+  "code": "writer_pool_checkout_timeout",
+  "stage": "writer_pool_checkout_timeout",
+  "message": "storage: ... timed out ... waiting for sqlite writer connection",
+  "timeout_ms": 5000,
+  "capability": "notes",
+  "operation": "append_note"
+}
+```
+
+`capability` and `operation` are `null` when the typed SQLite error reaches runtime directly
+rather than through a storage capability wrapper. Callers should branch on `code` or `stage`,
+never on `message`.
 
 The PASSIVE probe may backfill WAL frames into the database — that is normal checkpoint
 I/O and is what the reported `checkpointed_frames` counts. It never changes logical
 state, never escalates to TRUNCATE, never creates a missing database file, and never
-deletes WAL-pin sidecar evidence. Sections that cannot be collected (in-memory backend,
-missing file, unsupported platform) carry explicit `unavailable_reason` strings rather
-than being silently omitted.
+deletes WAL-pin sidecar evidence. `wal_pin.status` reports `complete`, `degraded`, or
+`unavailable`; its tagged `census.status` is independently `complete`, `incomplete`, or
+`unavailable`. An incomplete OS walk retains partial PID evidence but states why additional
+holders cannot be ruled out. The legacy sibling booleans and PID arrays remain for compatibility.
+Sections that cannot be collected (in-memory backend, missing file, unsupported platform) carry
+explicit reasons rather than being silently omitted.
 
 ```
 request(ops="db_diagnostics()")
@@ -725,14 +760,19 @@ request(ops="db_diagnostics()")
 List all MCP-callable verbs registered on this server. Internal subhandlers are
 excluded.
 
-| Param      | Type   | Required | Notes                                                                                                    |
-| ---------- | ------ | -------- | -------------------------------------------------------------------------------------------------------- |
-| `category` | string | no       | Filter: `Assertive`\|`Commissive`\|`Declaration`\|`Directive`.                                           |
-| `pack`     | string | no       | Filter by pack name (`kg`, `gtd`, `memory`, `brain`, `comm`, `schedule`, `knowledge`, `session`, `git`). |
+| Param      | Type   | Required | Notes                                                                                                                                 |
+| ---------- | ------ | -------- | ------------------------------------------------------------------------------------------------------------------------------------- |
+| `category` | string | no       | Filter: `Assertive`\|`Commissive`\|`Declaration`\|`Directive`.                                                                        |
+| `pack`     | string | no       | Filter by pack name (`kg`, `gtd`, `memory`, `brain`, `comm`, `schedule`, `knowledge`, `session`, `git`, `code`, `workspace`, `blob`). |
 
 ```
 request(ops="verbs()")
 ```
+
+The result includes the filtered `verbs` array and `total`, plus an unfiltered
+`pack_counts` object for every loaded pack. Zero-verb packs remain present in
+`pack_counts`, so callers can distinguish an ontology-only pack from one that
+was not loaded.
 
 ---
 
@@ -931,7 +971,9 @@ caller. Optional; load with `KHIVE_PACKS=kg,brain`.
 
 Windowed event counts grouped by kind, actor, and verb over the event plane (ADR-103
 Stage 1, #724 Ask A). `feedback_explicit` events are additionally split by
-`served_by_profile_id`. Events carrying a `work_class` (today:
+`served_by_profile_id`, signal, and `payload.originating_verb` (direct
+`brain.feedback` versus `brain.auto_feedback`). Legacy feedback rows without the origin
+marker fall back to their stored event verb. Events carrying a `work_class` (today:
 `phase_started`/`phase_completed`/`phase_cancelled` payloads, or `payload.resource.work_class`
 on a dispatch audit row) split by `counts_by_work_class`. Events carrying
 `payload.resource.cost_unit` (ADR-103 Amendment 1, stamped on every successful verb dispatch
@@ -1059,26 +1101,29 @@ request(ops="brain.feedback(target_id=\"<uuid>\", signal=\"useful\")")
 
 ### `brain.auto_feedback` — Commissive
 
-Emit implicit feedback for recall results supplied by an agent — the convenience verb
-to call right after `memory.recall` instead of hand-building `brain.feedback`.
+Emit caller-attributed feedback for one recall result — the convenience verb to call
+right after `memory.recall` instead of hand-building `brain.feedback`.
 
-| Param                  | Type   | Required | Notes                                                                  |
-| ---------------------- | ------ | -------- | ---------------------------------------------------------------------- |
-| `query`                | string | yes      | The recall query that produced the results.                            |
-| `results`              | array  | yes      | Recall result objects; the first object's `id` is credited.            |
-| `signal`               | string | no       | Defaults to `implicit_positive`.                                       |
-| `served_by_profile_id` | string | no       | Profile that served the recall.                                        |
-| `serve_attribution`    | string | no       | Serve-time tri-state; otherwise copied from the first result.          |
-| `scorer_run_id`        | string | no       | Forwarded verbatim to `brain.feedback`; pairs with `serve_ledger_id`.  |
-| `serve_ledger_id`      | string | no       | Forwarded verbatim to `brain.feedback`; pairs with `scorer_run_id`.    |
-| `namespace`            | string | no       | Exact namespace for the event and posterior fold; invalid values fail. |
+| Param                  | Type   | Required    | Notes                                                                  |
+| ---------------------- | ------ | ----------- | ---------------------------------------------------------------------- |
+| `query`                | string | yes         | The recall query that produced the results.                            |
+| `results`              | array  | yes         | Recall result objects retained as candidate context.                   |
+| `target_id`            | string | with signal | Full UUID or compact id; must exactly equal one `results[].id`.        |
+| `signal`               | string | no          | Omission abstains: no feedback event or posterior update.              |
+| `served_by_profile_id` | string | no          | Profile that served the recall.                                        |
+| `serve_attribution`    | string | no          | Serve-time tri-state; otherwise copied from the selected result.       |
+| `scorer_run_id`        | string | no          | Forwarded verbatim to `brain.feedback`; pairs with `serve_ledger_id`.  |
+| `serve_ledger_id`      | string | no          | Forwarded verbatim to `brain.feedback`; pairs with `scorer_run_id`.    |
+| `namespace`            | string | no          | Exact namespace for the event and posterior fold; invalid values fail. |
 
-Top-level serve-attribution fields are one pair and take precedence over the first
+Top-level serve-attribution fields are one pair and take precedence over the selected
 result's pair. If neither top-level field is supplied, both fields are copied from the
-first result together.
+selected result together. Feedback events retain the canonical event verb
+`brain.feedback` and record the originating feedback handler in
+`payload.originating_verb`.
 
 ```
-request(ops="memory.recall(query=\"x\", limit=5) | brain.auto_feedback(query=\"x\", results=[{\"id\": \"$prev.items[0].id\"}])")
+request(ops="memory.recall(query=\"x\", limit=5) | brain.auto_feedback(query=\"x\", results=[{\"id\": $prev[0].id}], target_id=$prev[0].id, signal=\"implicit_positive\")")
 ```
 
 ### `brain.mark_turn` — Commissive
@@ -1229,25 +1274,38 @@ request(ops="comm.delivered(id=\"<full-outbound-uuid>\")")
 
 ### `comm.inbox` — Assertive
 
-List and page through filtered inbound messages for the caller.
+List and page through the caller's filtered inbound messages (default) or sent
+history (`box="sent"`).
+The response keeps the inbox envelope; `unread_count` is zero for sent rows.
+With `wait_ms`, an initially empty fully filtered page waits for a newly
+committed matching message and otherwise returns at the deadline.
 
 | Param                | Type    | Required | Notes                                                                     |
 | -------------------- | ------- | -------- | ------------------------------------------------------------------------- |
 | `limit`              | integer | no       | Default 20, max 200.                                                      |
+| `box`                | string  | no       | `inbox` (default)\|`sent`. Sent rows are scoped to the caller.            |
 | `offset`             | integer | no       | Default 0; offset after every supplied filter.                            |
-| `status`             | string  | no       | `unread` (default)\|`read`\|`all`.                                        |
+| `status`             | string  | no       | Inbox-only: `unread` (default)\|`read`\|`all`.                            |
+| `wait_ms`            | integer | no       | Long-poll only when the initial page is empty; default 0, max 30,000.     |
 | `from_actor`         | string  | no       | Exact sender; mutually exclusive with `from_prefix`.                      |
 | `from_prefix`        | string  | no       | Sender prefix; mutually exclusive with `from_actor`.                      |
 | `exclude_from_actor` | string  | no       | Exclude an exact sender actor label.                                      |
+| `to_actor`           | string  | no       | Sent-only exact recipient actor filter.                                   |
 | `since`              | string  | no       | Inclusive RFC 3339 lower bound on top-level `created_at`.                 |
 | `before`             | string  | no       | Exclusive RFC 3339 upper bound on top-level `created_at`.                 |
 | `subject_contains`   | string  | no       | Case-insensitive non-empty subject substring; null subjects do not match. |
 | `content_contains`   | string  | no       | Case-insensitive non-empty content substring.                             |
+| `fields`             | array   | no       | Non-empty message-field projection shared with `comm.thread`.             |
 
 ```
 request(ops="comm.inbox(limit=10)")
 request(ops="comm.inbox(status=\"all\", content_contains=\"timeout\", offset=200)")
+request(ops="comm.inbox(box=\"sent\", to_actor=\"lambda:leo\", since=\"2026-08-01T00:00:00Z\", fields=[\"id\",\"subject\",\"sent_at\"])")
+request(ops="comm.inbox(limit=10, wait_ms=30000)")
 ```
+
+The long-poll wake is process-local and carries no payload. Every wake re-runs
+the same scoped query, and the response shape is identical to an immediate inbox call.
 
 Every returned message uses the hyphenated full UUID for `id`, so the value is
 always accepted unchanged by `comm.read`, `comm.reply`, or `comm.thread`, even
@@ -1257,6 +1315,11 @@ Responses also carry `offset`, `has_more`, and `next_offset`; repeat the same
 filtered call with each non-null `next_offset` to enumerate every match without
 marking it read. All filters are ANDed. Time bounds use response `created_at`,
 not optional transport `sent_at` metadata.
+
+`fields` accepts the ordinary top-level message keys plus stable property
+aliases (`comm_schema_version`, `from_actor`, `to_actor`, `thread_id`,
+`sent_at`, `outbound_ref`, `sent_by_process`). Unknown names and an empty list
+are errors. Omit it for the existing full-body response.
 
 ### `comm.unread` — Assertive
 
@@ -1310,13 +1373,17 @@ request(ops="comm.reply(id=\"<message-id>\", content=\"On it.\")")
 
 Retrieve all messages in a conversation thread, ordered chronologically.
 
-| Param   | Type    | Required | Notes                                                               |
-| ------- | ------- | -------- | ------------------------------------------------------------------- |
-| `id`    | string  | yes      | Thread root: 8-char prefix or full UUID of the originating message. |
-| `limit` | integer | no       | Default 100, max 500.                                               |
+| Param    | Type    | Required | Notes                                                               |
+| -------- | ------- | -------- | ------------------------------------------------------------------- |
+| `id`     | string  | yes      | Thread root: 8-char prefix or full UUID of the originating message. |
+| `limit`  | integer | no       | Default 100, max 500.                                               |
+| `order`  | string  | no       | `asc` (default)\|`desc`.                                            |
+| `after`  | string  | no       | Message-id or RFC 3339 cursor in the chosen order.                  |
+| `fields` | array   | no       | Same strict message-field projection as `comm.inbox`.               |
 
 ```
 request(ops="comm.thread(id=\"<thread-root-id>\")")
+request(ops="comm.thread(id=\"<thread-root-id>\", fields=[\"id\",\"from_actor\",\"sent_at\"])")
 ```
 
 ### `comm.probe` — Assertive
@@ -1813,6 +1880,16 @@ diagnostic names the attempted `verb`, the provenance `record_kind` and natural
 Because a digest continues after a per-record refusal, callers that require a clean run
 should assert `writes_refused == 0` in addition to waiting for `done == true`.
 
+Per-source coverage is machine-readable via `sources` and `history_exhausted`. Every
+source requested by `include` reports one of `completed`, `stopped_early` (with a
+`reason`: budget exhausted, incomplete `gh` paging window, or a frozen cursor), or
+`skipped` (with a `reason`: budget exhausted before the source was reached, `gh` CLI
+absent, or a `gh` failure) — so "this repo has no issues/PRs" is distinguishable from
+"issues/PRs were never reached" without parsing `warnings[]`. `history_exhausted` is
+`true` only when every requested source completed: it separates "the walk visited
+everything" from "the walk stopped before the end", a distinction `done`'s
+budget-cursor semantics do not carry.
+
 ### `git.commit` / `git.branch` / `git.push` — Commissive (ADR-108)
 
 Thin write verbs that shell to system git (`std::process::Command::args`, no shell
@@ -1883,6 +1960,34 @@ becomes known.
 ```
 request(ops="code.ingest(path=\"/repo/crates/my-crate\")")
 ```
+
+The success report includes `fts_indexed`, the number of entity documents written to the map's
+full-text index. Entity and FTS writes are a single success postcondition for this verb: an FTS
+failure makes the ingest fail rather than returning a structurally populated but unsearchable map.
+
+The map database uses the ordinary khive schema. To explore it with the generic KG read verbs,
+select it as a backend in a dedicated config:
+
+```toml
+[[backends]]
+name = "main"
+kind = "sqlite"
+path = "/absolute/path/to/code-map.db"
+```
+
+```sh
+kkernel exec --config /absolute/path/to/code-map.toml \
+  'search(kind="entity", query="my-crate")'
+kkernel exec --config /absolute/path/to/code-map.toml \
+  'resolve(refs=["my-crate"])'
+```
+
+Use `--config` without `--db` for this read path. With `[[backends]]` configured, a conflicting
+concrete `--db` override is refused; `:memory:` remains an explicit ephemeral override, and a path
+that canonically matches the declared `main` backend is normalized as a no-op. A warning that a
+daemon has a different configuration and local fallback is required is expected and prevents
+accidentally serving the production database. `kkernel code-audit` is the distinct policy-driven
+reporting surface over a code-map database.
 
 ---
 

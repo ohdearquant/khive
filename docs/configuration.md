@@ -25,8 +25,11 @@ first file that exists:
 1. **Explicit override**: the path given by `--config <path>` or the
    `KHIVE_CONFIG` env var. `--config` wins if both are set.
 2. **`./khive.toml`**: in the current working directory (project root).
-3. **`./.khive/config.toml`**: in the current working directory (hidden
-   project-local dir).
+3. **`<db-dir>/.khive/config.toml`**: anchored beside an explicit resolved
+   database path; when no database is explicit, this is
+   `./.khive/config.toml` in the current working directory. If the database
+   itself lives in a directory named `.khive`, the file is directly beside it
+   as `<db-dir>/config.toml`.
 4. **`~/.khive/config.toml`**: user-global, under `$HOME`.
 
 If none of the four exist, khive starts with no config file. Embedding engines
@@ -48,27 +51,23 @@ trips people up:
 
 - **Project root** (tier 2) only looks for a file literally named
   `khive.toml`. `./config.toml` at the project root is not read.
-- **Both the project-local hidden dir (tier 3) and the user-global dir (tier
-  4)** only look for a file named `config.toml`, i.e. `.khive/config.toml`
-  and `~/.khive/config.toml`. `.khive/khive.toml` is not read.
+- **Both the database-anchored/project-local hidden dir (tier 3) and the
+  user-global dir (tier 4)** only look for a file named `config.toml`.
+  `.khive/khive.toml` is not read.
 
 So the common global file in practice is `~/.khive/config.toml`, not
-`~/.khive/khive.toml`, even though most doc comments and error messages in
-the source refer to the config generically as "khive.toml" (the annotated
-reference file is literally named `docs/khive-config-example.toml`, and code
-comments say things like "the resolved config file (`khive.toml`)" regardless
-of which tier actually supplied it). When you see "khive.toml" in an error
-message or a comment, treat it as shorthand for "your resolved config file,"
-not as a literal filename requirement outside tier 2.
+`~/.khive/khive.toml`. Database-override refusals report the exact selected
+file path. A source comment that uses "khive.toml" generically still means
+"the selected config file," not a literal filename outside tier 2.
 
 ### Daemon working-directory sensitivity
 
 `kkernel mcp --daemon` (the warm daemon auto-spawned behind stdio clients,
-ADR-049) resolves its config the same way, from its own working directory.
-Tiers 2 and 3 are relative to _the daemon's_ cwd, not the client's. If the
-daemon is spawned from an unexpected directory it can pick up a different
-project-local config than you expect, or none. The reliable ways to pin this
-down:
+ADR-049) resolves its config the same way. Tier 2 is relative to _the daemon's_
+cwd. Tier 3 is database-anchored when a database is explicit and cwd-anchored
+otherwise. A daemon started from an unexpected directory can therefore select
+a different project config when neither an explicit config nor an explicit
+database anchors discovery. The reliable ways to pin this down:
 
 - Pass `--config <absolute-path>` explicitly on the `kkernel mcp` invocation.
 - Rely on tier 4 (`~/.khive/config.toml`), which is found regardless of
@@ -128,37 +127,66 @@ This is the default for anyone who has never touched `[[backends]]`. `--db`
 kkernel mcp                                # ~/.khive/khive.db (default)
 kkernel mcp --db /path/to/my.db            # custom path
 KHIVE_DB=/path/to/my.db kkernel mcp        # same, via env
-kkernel mcp --db :memory:                  # ephemeral, in-process only
+kkernel mcp --db :memory:                  # ephemeral in-memory storage
 ```
 
 ### `[[backends]]` declared
 
 Once one or more `[[backends]]` entries exist in the resolved config, the
 backend topology and every backend's file path are considered authoritative.
-Two cases:
+Three cases:
 
 - **`--db :memory:` / `KHIVE_DB=:memory:`**: accepted as a deliberate,
   documented escape hatch. It forces _every_ declared backend to an in-memory
   database for that invocation, logged loudly at `warn` level. This is for
   ephemeral test runs where you want the declared pack-to-backend topology
-  exercised without touching any real file on disk.
+  exercised without touching any real file on disk. `kkernel exec` forwards
+  `:memory:` (and an explicit `--config`) to a warm daemon it spawns, so the
+  daemon it binds is just as ephemeral; it never reuses a daemon already
+  bound to the persistent files, because `:memory:` produces a distinct
+  `config_id` that no persistent-storage daemon can match. A concrete `--db`
+  override on a single-backend invocation (no `[[backends]]` declared) is
+  likewise forwarded to the spawned daemon, so the child binds the operator's
+  file instead of the default database.
 
-- **Any other concrete `--db` path**: rejected at startup, fail-loud, with:
+- **A concrete path equal to the declared `main` backend path**: accepted as
+  a redundant no-op after canonical path comparison. It does not collapse or
+  replace any backend.
+
+- **Any other concrete `--db` path**: rejected at startup, fail-loud, with an
+  error that names the exact selected config file when one was loaded:
 
   ```
   --db "<path>" (or KHIVE_DB) cannot be combined with [[backends]]: N
-  backend(s) are already declared in khive.toml, so applying this override
+  backend(s) are already declared in the selected config, so applying this override
   here is ambiguous (it could silently collapse distinct declared backends
-  onto a single file). Edit khive.toml directly to change backend paths, or
-  pass --db :memory: to force all backends in-memory for this invocation.
+  onto a single file). Edit the selected config file at <resolved-path> to
+  change persistent backend paths. Use --config <path> or
+  KHIVE_CONFIG=<path> to select a different config, or use --db :memory: only
+  for an ephemeral all-in-memory invocation.
   ```
 
-  (Representative message: `<path>` and `N` stand in for the source template's
-  `{other:?}` and `{backend_count}` placeholders, and line breaks are rewrapped
-  here. Source: `build_registry_for_multi_backend`,
-  `crates/khive-mcp/src/serve.rs`. Verified live against the 0.3.0 binary: a
-  config declaring two `[[backends]]` entries plus a concrete `--db`/`KHIVE_DB`
-  override exits with this message and process exit code 1.)
+  `kkernel exec` additionally writes a compact JSON refusal envelope to stdout:
+
+  ```json
+  {
+    "ok": false,
+    "invocation": { "started": false },
+    "error": {
+      "code": "database_override_conflict",
+      "message": "...",
+      "db_override": "/path/to/scratch.db",
+      "declared_backends": 2,
+      "config_path": "/path/to/config.toml"
+    }
+  }
+  ```
+
+  The process remains nonzero, but automation can distinguish a no-run
+  configuration refusal from a dispatched batch whose operations all failed.
+  MCP startup keeps stdout protocol-clean and reports the actionable message on
+  stderr only. The reported `config_path` is the canonicalized selected file
+  path; under symlinks it can differ from the path you typed.
 
 **Why this fails loud instead of silently applying `--db` to `main` only, or
 to every backend:** with two or more distinct declared backend files, a
@@ -168,7 +196,8 @@ separated substrates back together, defeating the entire point of declaring
 them) or "just override `main`, leave the others alone" (a different,
 unstated, and equally plausible interpretation). Rather than guess and risk
 silent data mis-routing, khive refuses to start and tells you to either edit
-`khive.toml` directly or use the explicit `:memory:` escape hatch.
+the selected config, select another one with `--config` / `KHIVE_CONFIG`, or
+use the explicit `:memory:` escape hatch.
 
 **If your config previously had no `[[backends]]` and you now add some:** the
 first thing to check for any client config that still passes a concrete
@@ -182,8 +211,9 @@ line.
 
 `kkernel mcp` (or, in multi-backend mode, the same command backed by a config
 file) is the entry point for every MCP client. When your config declares
-`[[backends]]`, do not pass `--db`/`KHIVE_DB` at all. The config file is
-authoritative for backend paths.
+`[[backends]]`, omit `--db`/`KHIVE_DB` unless it canonically names the
+declared `main` backend or is the explicit `:memory:` escape hatch. The config
+file is authoritative for backend paths.
 
 ### Claude Code (`.mcp.json` or `.claude/settings.json`)
 
@@ -207,7 +237,7 @@ above), pin it explicitly:
   "mcpServers": {
     "khive": {
       "command": "kkernel",
-      "args": ["mcp", "--config", "/absolute/path/to/khive.toml"]
+      "args": ["mcp", "--config", "/absolute/path/to/config.toml"]
     }
   }
 }
@@ -276,6 +306,11 @@ invocation. A startup failure (like the `--db` + `[[backends]]` conflict
 above) prints its full error message to stderr and exits with a non-zero
 status before the `initialize` response is ever produced. That message is
 the actual root cause, whatever opaque code the client showed you.
+
+For direct scripted execution, `kkernel exec --config <path> ...` and
+`KHIVE_CONFIG=<path> kkernel exec ...` use the same explicit-config tier as
+`kkernel mcp`. A database-override conflict also emits the structured no-run
+envelope documented above before returning nonzero.
 
 If the probe succeeds (you get back a JSON-RPC `initialize` response), the
 server itself is healthy and the problem is elsewhere in the client's

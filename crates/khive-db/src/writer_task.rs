@@ -13,15 +13,40 @@
 //! See `crates/khive-db/docs/api/writer-task.md` for migration-slice scope
 //! (which write paths currently route through this vs. the legacy
 //! pool-mutex path) and the ADR-067 component breakdown.
+//!
+//! ## ADR-136 D1 gate 5: writer classification
+//!
+//! Every connection that issues writes against a khive-db file falls into
+//! exactly one of the rows below. `SqlAccess`-reachable is the dividing
+//! line: only requests reachable through `khive_storage::SqlAccess`
+//! (`SqlBridge::writer`/`atomic_unit`, and the `stores::*` methods built on
+//! them) are subject to `PoolConfig::write_queue_enabled` /
+//! `write_routing_strict` routing at all. Everything else here is an
+//! explicit, intentional exemption — not an implicit gap left over from an
+//! incomplete migration.
+//!
+//! | Writer | Connection | `SqlAccess`-reachable | Routing |
+//! | --- | --- | --- | --- |
+//! | Request-path writes (`create`, `update`, batch upserts, …) | `WriterTaskHandle` (queue-first) or a standalone/pool-mutex connection on degrade | Yes | Queue-first (ADR-136 D1 gate 1); strict routing fails closed on degrade |
+//! | Startup / schema migrations (`migrations::run_migrations`, `apply_schema_plan`) | The pool's own writer-mutex connection (`ConnectionPool::new`, before the `WriterTask` is ever spawned) | No | Exempt — runs once at boot, before any queue handle exists to route through |
+//! | Checkpointing (`checkpoint::CheckpointConnection`) | Dedicated standalone connection, opened once at task startup (ADR-091 Amendment 5, #1652) | No | Exempt by design — the whole point of that fix was moving checkpoint I/O OFF the pool writer's admission path; routing it back through the write queue would reintroduce the contention it removed |
+//! | Recovery (`walpin` beacon/sidecar bookkeeping) | None — file-level bookkeeping (PID beacons, heartbeats) alongside the database, not a SQL connection against it | No | N/A — never acquires a database writer connection |
+//! | Top-level maintenance (`VACUUM` via `execute_script_top_level`/`WriterTaskHandle::send_top_level`) | `WriterTaskHandle`, skipping the per-request `BEGIN IMMEDIATE`/`COMMIT` wrap only | Yes | Routed through the SAME single writer owner as every other queued request — only the transaction wrap is skipped, never the queue |
+//!
+//! A `direct_route_violation` sink row (`timeout_sink::emit_direct_route_violation`,
+//! ADR-136 D1 gate 6c) is emitted ONLY for the first row's degrade path — a
+//! `SqlAccess`-reachable write that bypassed an enabled queue. The other four
+//! rows are exempt by design and never emit that row.
 
 use rusqlite::Connection;
 use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
 
 use khive_storage::error::{StorageError, WriterTaskRequestState};
 
 use crate::error::SqliteError;
-use crate::pool::ConnectionPool;
+use crate::pool::{ConnectionPool, WriterAcquisitionCounters};
 
 /// Closure signature for a write operation executed against the writer
 /// task's dedicated connection.
@@ -288,6 +313,17 @@ fn writer_task_terminated(request_state: WriterTaskRequestState) -> StorageError
 #[derive(Clone, Debug)]
 pub struct WriterTaskHandle {
     tx: mpsc::Sender<Box<dyn AnyWriteRequest + Send>>,
+    /// This handle's pool's writer-timeout sink identity (`timeout_sink::db_label`),
+    /// captured at spawn so `send_with_timeout`'s `WriteQueueFull` path can
+    /// report a `queue_saturation` sink row (ADR-136 D1 gate 6a) without
+    /// needing a `&ConnectionPool` reference.
+    db: String,
+    /// Slow-write latency bound (`timeout_sink::slow_write_threshold`),
+    /// resolved once at spawn. `None` disables slow-write rows. Captured
+    /// here rather than read per send so the caller path pays no env lookup
+    /// and tests get a deterministic value by setting the override before
+    /// spawning their own writer task.
+    slow_write_threshold: Option<std::time::Duration>,
 }
 
 impl WriterTaskHandle {
@@ -353,10 +389,13 @@ impl WriterTaskHandle {
         R: Send + 'static,
         F: FnOnce(&Connection) -> Result<R, StorageError> + Send + 'static,
     {
+        let observation = self.begin_latency_observation();
         let reply_rx = self.enqueue(op).await?;
-        reply_rx
+        let result = reply_rx
             .await
-            .map_err(|_| writer_task_terminated(WriterTaskRequestState::SideEffectsUnknown))?
+            .map_err(|_| writer_task_terminated(WriterTaskRequestState::SideEffectsUnknown))?;
+        self.finish_latency_observation(observation);
+        result
     }
 
     /// Like [`Self::send`], but bounds the wait for the bounded channel to
@@ -382,19 +421,22 @@ impl WriterTaskHandle {
         R: Send + 'static,
         F: FnOnce(&Connection) -> Result<R, StorageError> + Send + 'static,
     {
+        let observation = self.begin_latency_observation();
         let reply_rx = match tokio::time::timeout(timeout, self.enqueue(op)).await {
             Ok(Ok(reply_rx)) => reply_rx,
             Ok(Err(e)) => return Err(e),
             Err(_elapsed) => {
-                return Err(StorageError::WriteQueueFull {
-                    timeout_ms: timeout.as_millis() as u64,
-                })
+                let timeout_ms = timeout.as_millis() as u64;
+                crate::timeout_sink::emit_queue_saturation(&self.db, timeout_ms);
+                return Err(StorageError::WriteQueueFull { timeout_ms });
             }
         };
 
-        reply_rx
+        let result = reply_rx
             .await
-            .map_err(|_| writer_task_terminated(WriterTaskRequestState::SideEffectsUnknown))?
+            .map_err(|_| writer_task_terminated(WriterTaskRequestState::SideEffectsUnknown))?;
+        self.finish_latency_observation(observation);
+        result
     }
 
     /// Send a write operation that MUST run outside any open transaction
@@ -413,10 +455,44 @@ impl WriterTaskHandle {
         R: Send + 'static,
         F: FnOnce(&Connection) -> Result<R, StorageError> + Send + 'static,
     {
+        let observation = self.begin_latency_observation();
         let reply_rx = self.enqueue_inner(op, true).await?;
-        reply_rx
+        let result = reply_rx
             .await
-            .map_err(|_| writer_task_terminated(WriterTaskRequestState::SideEffectsUnknown))?
+            .map_err(|_| writer_task_terminated(WriterTaskRequestState::SideEffectsUnknown))?;
+        self.finish_latency_observation(observation);
+        result
+    }
+
+    /// Snapshot the start instant and the queue backlog for one send, if
+    /// slow-write observation is enabled for this handle. The depth is
+    /// captured at send START — after completion the drain loop has already
+    /// consumed this request, so a completion-time read would systematically
+    /// understate the backlog the caller actually waited behind.
+    fn begin_latency_observation(&self) -> Option<(std::time::Instant, usize)> {
+        self.slow_write_threshold
+            .map(|_| (std::time::Instant::now(), self.queue_depth()))
+    }
+
+    /// Emit a `slow_write` sink row if this send's whole span met the
+    /// threshold. Called on the reply path — success or typed error alike,
+    /// since the caller experienced the latency either way. Never called
+    /// when the reply channel itself is severed (writer-task terminated),
+    /// which is reported through its own retirement row.
+    fn finish_latency_observation(&self, observation: Option<(std::time::Instant, usize)>) {
+        let (Some(threshold), Some((start, depth_at_entry))) =
+            (self.slow_write_threshold, observation)
+        else {
+            return;
+        };
+        let elapsed = start.elapsed();
+        if elapsed >= threshold {
+            crate::timeout_sink::emit_slow_write(
+                &self.db,
+                elapsed.as_millis() as u64,
+                depth_at_entry,
+            );
+        }
     }
 
     /// Current write-queue backlog depth: requests enqueued but not yet
@@ -441,12 +517,13 @@ impl WriterTaskHandle {
 /// Spawn the write-owner task (ADR-067 Component A) on the current Tokio
 /// runtime.
 ///
-/// Opens a dedicated standalone writer connection
-/// ([`ConnectionPool::open_standalone_writer`]), independent of the pool's
-/// Mutex-guarded `writer()` connection used by unmigrated paths. Returns the
-/// cloneable [`WriterTaskHandle`] sender half. The task normally runs until
-/// every handle clone is dropped and the channel closes; a request panic,
-/// failed rollback, or poisoned connection puts it into the permanent
+/// Opens a dedicated standalone writer connection independent of the pool's
+/// Mutex-guarded `writer()` connection used by unmigrated paths. That one-time
+/// infrastructure open is uncounted; every dequeued top-level request or
+/// successful `BEGIN IMMEDIATE` increments the writer-task acquisition class.
+/// Returns the cloneable [`WriterTaskHandle`] sender half. The task normally
+/// runs until every handle clone is dropped and the channel closes; a request
+/// panic, failed rollback, or poisoned connection puts it into the permanent
 /// terminal state documented below.
 ///
 /// `capacity` bounds the channel (`PoolConfig::write_queue_capacity` /
@@ -459,11 +536,30 @@ impl WriterTaskHandle {
 /// support). See `crates/khive-db/docs/api/writer-task.md` for the
 /// migration-slice scope this commits per `BEGIN IMMEDIATE`.
 pub fn spawn(pool: &ConnectionPool, capacity: usize) -> Result<WriterTaskHandle, SqliteError> {
-    let conn = pool.open_standalone_writer()?;
+    // The lifetime connection is infrastructure, not one acquisition per
+    // write. Each dequeued request is counted below at the task's actual
+    // ownership boundary instead.
+    let conn = pool.open_standalone_writer_untracked()?;
+    let acquisition_counters = pool.writer_acquisition_counters();
     let origin = pool.origin();
+    let db = crate::timeout_sink::db_label(pool);
     let (tx, rx) = mpsc::channel(capacity.max(1));
-    tokio::spawn(run_writer_task(conn, rx, origin));
-    Ok(WriterTaskHandle { tx })
+    let join = tokio::spawn(run_writer_task(
+        conn,
+        rx,
+        origin,
+        db.clone(),
+        acquisition_counters,
+    ));
+    // Stored on the pool (not returned) so the handle's clone-and-share
+    // contract stays untouched; see ConnectionPool::take_writer_task_join
+    // for who awaits it and why.
+    pool.set_writer_task_join(join);
+    Ok(WriterTaskHandle {
+        tx,
+        db,
+        slow_write_threshold: crate::timeout_sink::slow_write_threshold(),
+    })
 }
 
 /// Permanently close admission, then reply to every request that was already
@@ -497,9 +593,12 @@ async fn run_writer_task(
     mut conn: Connection,
     mut rx: mpsc::Receiver<Box<dyn AnyWriteRequest + Send>>,
     origin: khive_storage::tx_registry::TxOrigin,
+    db: String,
+    acquisition_counters: Arc<WriterAcquisitionCounters>,
 ) {
     while let Some(request) = rx.recv().await {
         let origin = origin.clone();
+        let acquisition_counters = Arc::clone(&acquisition_counters);
         let outcome = tokio::task::spawn_blocking(move || {
             // A top-level request deliberately skips BEGIN, so it would
             // silently join any transaction leaked by an earlier request.
@@ -523,6 +622,7 @@ async fn run_writer_task(
                 // connection and still serialized one-request-at-a-time by
                 // this same drain loop, so the single-writer guarantee
                 // holds; only the transaction wrap is skipped.
+                acquisition_counters.record_writer_task_acquisition();
                 sealed::Sealed::execute_and_reply_top_level_reporting_terminal(request, &conn)
             } else {
                 let _tx_handle = khive_storage::tx_registry::register_scoped(
@@ -530,7 +630,10 @@ async fn run_writer_task(
                     origin,
                 );
                 match conn.execute_batch("BEGIN IMMEDIATE") {
-                    Ok(()) => sealed::Sealed::execute_and_reply_reporting_terminal(request, &conn),
+                    Ok(()) => {
+                        acquisition_counters.record_writer_task_acquisition();
+                        sealed::Sealed::execute_and_reply_reporting_terminal(request, &conn)
+                    }
                     Err(e) => {
                         // Do NOT run the request's operation: `conn` never
                         // entered a transaction, so executing the op's DML
@@ -562,6 +665,10 @@ async fn run_writer_task(
                     "writer task reached a terminal request or connection state; closing and \
                      failing the queue without restarting"
                 );
+                crate::timeout_sink::emit_writer_task_retirement(
+                    &db,
+                    &format!("terminal request state: {request_state}"),
+                );
                 close_and_fail_queued_requests(&mut rx).await;
                 return;
             }
@@ -570,6 +677,10 @@ async fn run_writer_task(
                     error = %join_err,
                     "writer task blocking closure failed outside the request \
                      panic boundary; closing and failing the queue without restarting"
+                );
+                crate::timeout_sink::emit_writer_task_retirement(
+                    &db,
+                    &format!("blocking closure join failure: {join_err}"),
                 );
                 close_and_fail_queued_requests(&mut rx).await;
                 return;
@@ -757,12 +868,19 @@ mod tests {
             .query_row("SELECT v FROM t WHERE id = 1", [], |row| row.get(0))
             .expect("row must be committed and visible to a reader");
         assert_eq!(v, "hello");
+
+        let counters = pool.writer_acquisition_snapshot();
+        assert_eq!(counters.acquisitions, 2);
+        assert_eq!(counters.pooled_acquisitions, 1);
+        assert_eq!(counters.standalone_acquisitions, 0);
+        assert_eq!(counters.writer_task_acquisitions, 1);
+        assert_eq!(counters.timeouts, 0);
     }
 
     #[test]
     fn spawn_fails_on_in_memory_pool() {
         // In-memory pools have no standalone-connection support
-        // (`ConnectionPool::open_standalone_writer`) — `spawn` must surface
+        // (the infrastructure-only standalone open) — `spawn` must surface
         // that as an error rather than panicking. Deliberately a plain
         // `#[test]` (no Tokio runtime): `spawn` fails before it ever reaches
         // `tokio::spawn`, so no runtime is required for this path.
@@ -785,7 +903,11 @@ mod tests {
         // channel is full" instead of racing a real writer task's
         // processing speed.
         let (tx, _rx) = mpsc::channel::<Box<dyn AnyWriteRequest + Send>>(1);
-        let handle = WriterTaskHandle { tx };
+        let handle = WriterTaskHandle {
+            tx,
+            db: "test".to_string(),
+            slow_write_threshold: None,
+        };
 
         // First send fills the sole channel slot. Its reply never arrives
         // since nothing drains `_rx`, so run it in the background.
@@ -819,7 +941,11 @@ mod tests {
     #[tokio::test]
     async fn send_with_timeout_maps_full_channel_to_write_queue_full() {
         let (tx, _rx) = mpsc::channel::<Box<dyn AnyWriteRequest + Send>>(1);
-        let handle = WriterTaskHandle { tx };
+        let handle = WriterTaskHandle {
+            tx,
+            db: "test".to_string(),
+            slow_write_threshold: None,
+        };
 
         let first = tokio::spawn({
             let handle = handle.clone();
@@ -1309,7 +1435,7 @@ mod tests {
         let path = dir.path().join("writer_task_wrapped_panic.db");
         let cfg = PoolConfig {
             path: Some(path),
-            write_queue_enabled: true,
+            write_queue_enabled: Some(true),
             write_queue_capacity: 8,
             ..PoolConfig::default()
         };
@@ -1540,7 +1666,11 @@ mod tests {
         let (tx, rx) = mpsc::channel::<Box<dyn AnyWriteRequest + Send>>(4);
         drop(rx);
 
-        let handle = WriterTaskHandle { tx };
+        let handle = WriterTaskHandle {
+            tx,
+            db: "test".to_string(),
+            slow_write_threshold: None,
+        };
         let send_result = handle.send(|_conn| Ok::<(), StorageError>(())).await;
         assert_writer_task_terminal_state(send_result, WriterTaskRequestState::NotStarted);
 
@@ -1561,7 +1691,11 @@ mod tests {
         // The handle cannot prove whether its closure ran, so the oneshot
         // fallback must conservatively report SideEffectsUnknown.
         let (tx, mut rx) = mpsc::channel::<Box<dyn AnyWriteRequest + Send>>(1);
-        let handle = WriterTaskHandle { tx };
+        let handle = WriterTaskHandle {
+            tx,
+            db: "test".to_string(),
+            slow_write_threshold: None,
+        };
         let request_ran = Arc::new(AtomicBool::new(false));
         let request_ran_in_op = Arc::clone(&request_ran);
 

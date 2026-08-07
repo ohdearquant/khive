@@ -23,6 +23,92 @@ pub(crate) const COMM_STABLE_PROPERTY_KEYS: &[&str] = &[
     "sent_by_process",
 ];
 
+/// Closed field vocabulary accepted by list-read message projections.
+///
+/// The first group is the ordinary top-level message view. The second group
+/// exposes stable property keys as top-level aliases only when a caller opts
+/// into projection, so callers can request routing/timestamp metadata without
+/// paying for the entire `properties` object.
+pub(crate) const MESSAGE_PROJECTION_FIELDS: &[&str] = &[
+    "id",
+    "short_id",
+    "full_id",
+    "kind",
+    "from",
+    "to",
+    "subject",
+    "read",
+    "direction",
+    "preview",
+    "content",
+    "namespace",
+    "properties",
+    "created_at",
+    "updated_at",
+    "comm_schema_version",
+    "from_actor",
+    "to_actor",
+    "thread_id",
+    "sent_at",
+    "outbound_ref",
+    "sent_by_process",
+];
+
+pub(crate) fn validate_message_projection_fields(
+    verb: &str,
+    fields: Option<&[String]>,
+) -> Result<(), RuntimeError> {
+    let Some(fields) = fields else {
+        return Ok(());
+    };
+    if fields.is_empty() {
+        return Err(RuntimeError::InvalidInput(format!(
+            "{verb}: `fields` must contain at least one field"
+        )));
+    }
+    if let Some(unknown) = fields
+        .iter()
+        .find(|field| !MESSAGE_PROJECTION_FIELDS.contains(&field.as_str()))
+    {
+        return Err(RuntimeError::InvalidInput(format!(
+            "{verb}: unknown projection field {unknown:?}; expected one of: {}",
+            MESSAGE_PROJECTION_FIELDS.join(", ")
+        )));
+    }
+    Ok(())
+}
+
+pub(crate) fn project_message_json(message: Value, fields: Option<&[String]>) -> Value {
+    let Some(fields) = fields else {
+        return message;
+    };
+
+    let mut projected = serde_json::Map::new();
+    for field in fields {
+        let value = message.get(field).cloned().unwrap_or_else(|| {
+            message
+                .get("properties")
+                .and_then(|properties| properties.get(field))
+                .cloned()
+                .or_else(|| match field.as_str() {
+                    "from_actor" => message.get("from").cloned(),
+                    "to_actor" => message.get("to").cloned(),
+                    // `id` is the round-trippable form of the same UUID; keep the
+                    // compatibility aliases consistent with it rather than null.
+                    "short_id" => message
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .map(|id| Value::String(id.chars().take(8).collect())),
+                    "full_id" => message.get("id").cloned(),
+                    _ => None,
+                })
+                .unwrap_or(Value::Null)
+        });
+        projected.insert(field.clone(), value);
+    }
+    Value::Object(projected)
+}
+
 pub(crate) fn short_id(uuid: Uuid) -> String {
     uuid.as_hyphenated().to_string().chars().take(8).collect()
 }
@@ -920,6 +1006,31 @@ mod tests {
         let v = note_to_message_json(&note);
         assert_eq!(v["content"], json!("body text"));
         assert_eq!(v["properties"]["custom"], json!(42));
+    }
+
+    #[test]
+    fn projection_derives_id_aliases_from_id_field() {
+        let note = make_note("local", "projection fixture", None);
+        let view = note_to_message_json(&note);
+        let mut bare = view.clone();
+        bare.as_object_mut()
+            .expect("message view is an object")
+            .retain(|key, _| key != "short_id" && key != "full_id");
+        assert!(
+            bare.get("short_id").is_none() && bare.get("full_id").is_none(),
+            "fixture must actually drop the alias keys"
+        );
+
+        let fields = vec![
+            "id".to_string(),
+            "short_id".to_string(),
+            "full_id".to_string(),
+        ];
+        let projected = project_message_json(bare, Some(&fields));
+        let id = view["id"].as_str().expect("id is a string");
+        assert_eq!(projected["id"], view["id"]);
+        assert_eq!(projected["full_id"], json!(id));
+        assert_eq!(projected["short_id"], json!(&id[..8]));
     }
 
     #[test]

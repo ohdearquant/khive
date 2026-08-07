@@ -17,6 +17,7 @@ members = [
     "khive-hnsw",
     "khive-vamana",
     "khive-runtime",
+    "khive-wire-protocol",
     "khive-request",
     "khive-pack-kg",
     "khive-pack-gtd",
@@ -29,6 +30,7 @@ members = [
     "khive-pack-code",
     "khive-pack-blob",
     "khive-pack-template",
+    "khive-pack-agent",
     "khive-pack-knowledge",
     "khive-pack-session",
     "khive-pack-git",
@@ -51,9 +53,9 @@ exclude = ["khive-merge"]
 # keep this exclusion from members.
 
 [workspace.package]
-version = "0.5.0"
+version = "0.7.0"
 edition = "2021"
-# lattice-embed and lattice-fann 0.6 require Rust 1.93, setting the workspace MSRV.
+# lattice-embed and lattice-fann require Rust 1.93, setting the workspace MSRV.
 # The previous 1.91 floor came from floor_char_boundary use (issue #398).
 rust-version = "1.93.0"
 authors = ["Ocean <ocean@lionagi.ai>"]
@@ -83,8 +85,8 @@ chrono = { version = "0.4", default-features = false, features = ["serde", "cloc
 async-trait = "0.1"
 clap = { version = "4.5", features = ["derive", "env"] }
 dotenvy = "0.15"
-lattice-embed = "0.6.0"
-lattice-fann = "0.6.0"
+lattice-embed = "0.7.1"
+lattice-fann = "0.7.1"
 parking_lot = "0.12"
 rand = "0.8"
 rand_distr = "0.4"
@@ -124,7 +126,11 @@ object_store = { version = "=0.14.1", default-features = false, features = ["aws
 opt-level = 3
 lto = "thin"
 codegen-units = 1
-strip = "symbols"
+# Keep function symbol names so production profilers (sample/atos) can resolve
+# frames on release binaries; drop only the DWARF debug sections. With
+# strip = "symbols" a live-process sample yields anonymous offsets, which makes
+# post-hoc analysis of a stall or contention window impossible.
+strip = "debuginfo"
 
 # lattice 0.3.0 published — use crates.io directly. Restore [patch.crates-io]
 # block below to point at local lattice when iterating on lattice-side fixes.

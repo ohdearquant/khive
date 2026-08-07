@@ -147,11 +147,11 @@ recalling memories, you can feed back which results were useful:
 ### Auto-feedback (recommended)
 
 ```
-request(ops="brain.auto_feedback(results=[{\"id\": \"<mem1_uuid>\", \"used\": true}, {\"id\": \"<mem2_uuid>\", \"used\": false}])")
+request(ops="brain.auto_feedback(query=\"<recall query>\", results=[{\"id\": \"<mem1_uuid>\"}, {\"id\": \"<mem2_uuid>\"}], target_id=\"<mem1_uuid>\", signal=\"implicit_positive\")")
 ```
 
-Call this after `memory.recall` to automatically signal which results you
-actually used. The brain profile adjusts its tuning over time.
+Call this after `memory.recall` with the exact result you judged and the signal
+you intend. Omit `signal` to abstain without writing a feedback event.
 
 ### Manual feedback
 

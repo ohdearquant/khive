@@ -68,6 +68,7 @@ cargo install kkernel@{VERSION}
 
 - [ ] All workspace tests pass: `make ci`
 - [ ] Smoke test passes: `python3 tests/smoke_test.py`
+- [ ] Hold-time regression gate passes (ADR-135 F4): `make hold-time-gate`
 - [ ] No secrets in crate source: grep for tokens, keys, internal URLs
 - [ ] Crate descriptions present on all workspace crates
 - [ ] Inter-crate deps have `version = "{VERSION}"` alongside `path`

@@ -261,7 +261,10 @@ order (first match wins):
 
 1. Explicit path from `--config` flag or `KHIVE_CONFIG` env var.
 2. `./khive.toml` in the current working directory (project root).
-3. `./.khive/config.toml` in the current working directory.
+3. `<db-dir>/.khive/config.toml`, anchored beside an explicit resolved
+   database path; with no explicit database this is
+   `./.khive/config.toml`. When the database directory itself is named
+   `.khive`, the file is `<db-dir>/config.toml`.
 4. `~/.khive/config.toml` (user-global).
 
 If none exist, the server starts with no config and uses the single-backend
@@ -273,10 +276,10 @@ default path.
 ### The daemon and config discovery
 
 The daemon (ADR-049) is auto-spawned as `kkernel mcp --daemon` and builds its
-server from the same config resolution logic. The daemon's working directory
-determines which of tiers 2-3 is searched. If the daemon is launched from a
-different directory than the MCP client expects, it may pick up a different
-config file (or none).
+server from the same config resolution logic. Its working directory determines
+tier 2 and tier 3 only when no explicit database anchors tier 3. If the daemon
+is launched from a different directory than the MCP client expects, it may pick
+up a different config file (or none).
 
 To avoid this, use one of:
 

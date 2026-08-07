@@ -44,6 +44,15 @@ and billing are deferred; see
 The session mirror (transcript parsing and ingestion into `session_messages`)
 is a separate, already-shipped concern — see
 [ADR-080 §6](https://github.com/ohdearquant/khive/blob/main/docs/adr/ADR-080-session-pack-oss-storage-mechanism.md#6-the-session-mirror-amendment-2026-07-02).
+After its startup discovery pass, the mirror caches directory listings, polls
+actively growing transcripts directly, and samples cold transcripts through
+fixed round-robin budgets. Quiet-tick metadata work therefore stays bounded as
+the historical transcript corpus grows; directory changes prioritize their
+cold files, with the ordinary bounded sweep covering filesystems where append
+does not update parent-directory mtime. The priority ordering is bounded but
+not fair under continuous directory churn: repeated changes can keep the
+priority queue ahead of the ordinary cold sweep, while productive cold-file
+metadata probes remain capped at 256 per tick.
 
 ## Where this sits
 

@@ -2,7 +2,7 @@
 
 **Status**: accepted
 **Date**: 2026-06-28
-**Amended**: 2026-07-02 — shipped-surface record (§3), session mirror (§6), scope revision (Context); 2026-08-01 — claude.ai export source (§6)
+**Amended**: 2026-07-02 — shipped-surface record (§3), session mirror (§6), scope revision (Context); 2026-08-01 — claude.ai export source (§6); 2026-08-02 — delta-proportional mirror polling (§6)
 **Superseded by**: [ADR-083](ADR-083-session-pack-t1-verbs.md) for §3 only; ADR-083 is
 the current authority for the public session verb surface, while the rest of this record
 remains in force.
@@ -243,7 +243,74 @@ ChatGPT and claude.ai both name this file `conversations.json`, while the cursor
 file path. Each export parser therefore rejects a document containing the other provider's
 recognizable conversation shape, and a mixed-provider array is unsupported. This leaves the
 cursor untouched instead of allowing a misconfigured overlapping root to let the wrong source
-consume that path first.
+consume that path first. Candidate dispatch claims the path only when a pass advances its
+cursor and inserts rows; an empty advance (a cursor-only pass over blank or unparseable
+lines) records its consumed offset and falls through to the next configured provider
+candidate, committing its cursor only if dispatch ends without any candidate inserting
+rows for the span and without any candidate erroring. The commit is a single cursor
+upsert at the end of dispatch, so an interrupted or partially failing dispatch can never
+strand the cursor past bytes that no candidate inserted — the bytes are re-read on a
+later pass, bounded and idempotent. A no-progress success, such as one provider's lower
+whole-file size ceiling, likewise falls through without committing.
+
+#### Delta-proportional polling (Amendment, 2026-08-02)
+
+The service performs one full discovery pass at startup, then keeps an in-memory directory
+and file index. Steady-state polling does not re-walk every transcript tree or stat every
+completed transcript:
+
+- Known directories are checked round-robin, at most 64 metadata probes per tick. A directory
+  is listed only when its `(mtime, length)` fingerprint changes, or after 30 unchanged probes
+  as a bounded fallback for coarse or unreliable filesystem timestamps. A changed directory
+  puts its directly contained cold transcripts at the front of the bounded probe schedule;
+  newly discovered transcripts enter the active set immediately.
+- A file remains active while it is growing, while ingest is catching up to its cursor, or
+  while a per-file error requires retry; once three consecutive probes end with no candidate
+  advancing the offset and at least one source candidate erroring — including a mixed probe
+  where one candidate reports a no-progress success such as its whole-file size ceiling
+  while another errors — the file is demoted to the cold sample (logged once at demotion),
+  whose ordinary cadence retries it. Once its cursor is caught up, two unchanged probes
+  and an mtime at least five minutes old make it cold. Filesystems that do not report mtime
+  use 30 unchanged probes instead.
+- Cold files are sampled through a round-robin queue capped at 256 metadata probes per tick.
+  This is a correctness fallback because appending to a file does not update its parent
+  directory mtime on every supported filesystem. Consequently a resumed cold transcript is
+  noticed within the priority sweep started by a parent-directory change, or within one
+  complete bounded cold-file sweep even without that change.
+  The priority ordering is bounded but not fair under continuous directory churn: repeated
+  changes can keep refilling the priority queue ahead of the ordinary cold sweep. The
+  productive cold-file metadata-probe cap remains 256 per tick.
+  Queue entries left behind by reactivation or removal are invalidated lazily and drained at
+  a bounded rate (at most four times the probe cap of stale pops per tick, each performing
+  no filesystem work), so residue can neither drain unbounded in one tick nor starve
+  productive probes.
+
+Once the historical corpus is cold, a quiet tick performs at most 64 directory metadata probes,
+256 cold-file metadata probes, and one metadata probe per active file; those fixed terms do not
+grow with the cold-file count. Work may still scale with the actual delta: startup discovery, a
+directory whose entry set changed, backfill, and simultaneously growing files are processed
+rather than silently dropped. Persisted cursor semantics, source selection, per-file ingest
+limits, idempotency, and the rule that errors do not advance cursors are unchanged. Configured
+roots that do not exist at startup remain in the directory schedule so later creation is
+discovered. The same pinned identity applies to a configured root nested below another source
+root: removing and recreating the ancestor cannot discard the nested root's source kinds.
+A non-pinned file is removed from tracking only after two consecutive probes report it
+missing; a single NotFound (a transient atomic replace or filesystem hiccup) keeps the file
+and its cursor for one grace probe so a promptly recreated path resumes from its old offset
+instead of being reseeded to EOF.
+A directory-difference removal deliberately bypasses that grace: a complete directory
+listing is a positive enumeration of its contents, so an absent entry is stronger evidence
+of removal than a single probe NotFound; a refresh whose listing is incomplete defers
+removals until a complete read. Children newly discovered during such a partial listing
+remain independently queued; if the parent later disappears, their NotFound probes reap
+non-pinned orphans. Pinned configured roots are intentionally retained as placeholders and
+can remain queued until they reappear. When a removal is cancelled by a same-pass reappearance,
+the in-memory offset is restored from the preserved cursor row so the next seed never
+falls back to EOF while the preserved row proves bytes were already mirrored. Cursor rows
+whose deletion fails are retried on every later tick, because a stale row reloaded after a
+restart would let a recreated same-path file silently skip bytes; the retry set is bounded,
+and evicting an entry beyond the bound logs an error naming that residual skip risk
+rather than growing the set without bound.
 
 #### Auxiliary schema
 

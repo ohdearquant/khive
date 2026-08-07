@@ -858,8 +858,106 @@ async fn load_snapshot_version(
     load_snapshot_version_on_reader(reader.as_mut(), namespace).await
 }
 
-/// A single row that was quarantined during replay, with enough metadata to
-/// diagnose and re-examine the bad entry without re-running a replay.
+// ── Replay-time policy exclusion (PR #1630 remediation) ─────────────────────
+
+/// Start of the replay-time policy-exclusion window (inclusive), epoch µs:
+/// 2026-05-01T00:00:00Z.
+///
+/// The defect fixed in PR #1630 caused `brain.auto_feedback` calls with an
+/// ABSENT signal to default to `implicit_positive`, so the event log
+/// accumulated a class of `FeedbackExplicit` rows that record the retriever's
+/// own ranking rather than a judgment. The rows are retained in
+/// `brain_event_log` for audit/telemetry; state rebuilds must not re-fold
+/// them, hence the replay-time exclusion below.
+const POLICY_EXCLUSION_WINDOW_START_US: i64 = 1_777_593_600_000_000;
+
+/// End of the policy-exclusion window (exclusive), epoch µs.
+///
+/// Open-ended (`None`) DELIBERATELY, not as an oversight: deployed binaries
+/// built before the PR #1630 fix keep minting class-member events, so any end
+/// instant chosen before that fix is verifiably serving would be false. Pin
+/// this bound to `Some(instant)` only when the deployment is verified by a
+/// positive artifact (behavior only the fixed binary emits, with a pre-state
+/// contrast), and cite that artifact in the pinning change — never a typed
+/// date. The predicate below already honours the bound, so the pin is a
+/// one-line change. Post-fix the handler abstains on omitted signals, so the
+/// predicate goes naturally quiet rather than over-excluding.
+const POLICY_EXCLUSION_WINDOW_END_US: Option<i64> = None;
+
+/// The excluded signal spelling — the same canonical string that
+/// `khive_brain_core::FeedbackEventKind::from_signal_str` accepts for the
+/// `ImplicitPositive` kind.
+const POLICY_EXCLUDED_SIGNAL: &str = "implicit_positive";
+
+/// Per-row stderr detail is emitted for at most this many policy-excluded
+/// rows per replay; the cohort can number in the thousands and the summary
+/// line carries the authoritative counts. Quarantine rows are never capped.
+const POLICY_EXCLUDED_LOG_DETAIL_CAP: usize = 10;
+
+/// Why a replay row was skipped: unreadable/invalid (quarantine) vs readable
+/// but excluded by policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplaySkipCategory {
+    /// Structural or semantic validation failure (malformed JSON, invalid
+    /// `section_signals`, missing payload column).
+    Quarantine,
+    /// Readable, valid row excluded by the replay-time policy filter
+    /// (see `POLICY_EXCLUSION_WINDOW_START_US`, private to this module).
+    PolicyExcluded,
+}
+
+/// Replay-time policy filter: `true` when `event` belongs to the
+/// miscalibrated implicit-positive class (PR #1630) and must not be re-folded
+/// during a state rebuild.
+///
+/// All four arms must hold:
+/// 1. verb is `brain.feedback` — the `FeedbackExplicit` carrier
+///    (`event.rs::interpret`);
+/// 2. payload `signal` equals `implicit_positive` (the same canonical
+///    spelling `FeedbackEventKind::from_signal_str` accepts);
+/// 3. payload `served_by_profile_id` is present and non-empty — events with
+///    no serving profile are the unaffected control population and MUST
+///    replay;
+/// 4. `created_at` lies in `[window_start_us, window_end_us)`; an end of
+///    `None` means the window is open-ended.
+///
+/// Timestamp authority: the predicate reads the PAYLOAD's `created_at`, and
+/// on the `brain.feedback` write path that is the same value as the row's
+/// `created_at` column by construction — the handler stamps `commit_at_us`
+/// into the event (`event.created_at = commit_at_us`), serializes THAT event
+/// as the row payload, and passes the same `commit_at_us` as the column
+/// value (see the `FeedbackEventWrite` arms and the
+/// `append_brain_event_on_writer` call in this file). The two clocks cannot
+/// diverge for the class this window describes.
+///
+/// The window is passed as parameters so tests can exercise both bounds
+/// without touching the production constants.
+fn is_policy_excluded(
+    event: &khive_storage::event::Event,
+    window_start_us: i64,
+    window_end_us: Option<i64>,
+) -> bool {
+    if event.verb != "brain.feedback" {
+        return false;
+    }
+    if event.payload.get("signal").and_then(|v| v.as_str()) != Some(POLICY_EXCLUDED_SIGNAL) {
+        return false;
+    }
+    let has_serving_profile = event
+        .payload
+        .get("served_by_profile_id")
+        .and_then(|v| v.as_str())
+        .is_some_and(|profile_id| !profile_id.is_empty());
+    if !has_serving_profile {
+        return false;
+    }
+    event.created_at >= window_start_us
+        && window_end_us.is_none_or(|end_us| event.created_at < end_us)
+}
+
+/// A single row skipped during replay (quarantined or policy-excluded), with
+/// enough metadata to diagnose and re-examine the entry without re-running a
+/// replay.
 pub struct QuarantinedRow {
     /// Row primary key from `brain_event_log`.
     pub id: i64,
@@ -867,24 +965,47 @@ pub struct QuarantinedRow {
     pub profile_id: String,
     /// ISO-8601 / epoch-µs created_at value as recorded in the table.
     pub created_at: i64,
-    /// Human-readable description of why the row was quarantined.
+    /// Human-readable description of why the row was skipped.
     pub reason: String,
+    /// Skip category: unreadable/invalid row (`Quarantine`) vs readable row
+    /// excluded by policy (`PolicyExcluded`).
+    pub category: ReplaySkipCategory,
     /// Leading ~200 chars of the raw payload for quick inspection (truncated with "…").
     pub payload_snippet: String,
 }
 
-/// Result of a replay load: valid events and the full quarantine manifest.
+/// Result of a replay load: valid events and the full skip manifest.
 pub struct LoadEventsResult {
     pub events: Vec<khive_storage::event::Event>,
-    /// Rows that were skipped due to structural or semantic validation failure.
-    /// The physical rows remain in `brain_event_log`; this vec makes them queryable.
+    /// All rows skipped during replay — malformed/semantically invalid rows
+    /// (quarantine) and readable rows excluded by policy — each tagged with
+    /// its [`ReplaySkipCategory`]. The physical rows remain in
+    /// `brain_event_log`; this vec makes them queryable.
+    ///
+    /// NOTE: because both categories share this vec, `quarantined.len()` is
+    /// NOT the quarantine count — use [`Self::quarantine_count`] /
+    /// [`Self::policy_excluded_count`]. (At the time this split landed the
+    /// only consumers outside this module were tests; any new consumer must
+    /// filter by category.)
     pub quarantined: Vec<QuarantinedRow>,
 }
 
 impl LoadEventsResult {
-    /// Convenience accessor: number of quarantined rows.
+    /// Number of rows skipped due to structural or semantic validation failure.
     pub fn quarantine_count(&self) -> usize {
-        self.quarantined.len()
+        self.count_category(ReplaySkipCategory::Quarantine)
+    }
+
+    /// Number of readable rows excluded by the replay-time policy filter.
+    pub fn policy_excluded_count(&self) -> usize {
+        self.count_category(ReplaySkipCategory::PolicyExcluded)
+    }
+
+    fn count_category(&self, category: ReplaySkipCategory) -> usize {
+        self.quarantined
+            .iter()
+            .filter(|row| row.category == category)
+            .count()
     }
 }
 
@@ -892,6 +1013,27 @@ pub async fn load_events_since(
     sql: &dyn SqlAccess,
     namespace: &str,
     since_us: i64,
+) -> Result<LoadEventsResult, RuntimeError> {
+    load_events_since_with_window(
+        sql,
+        namespace,
+        since_us,
+        POLICY_EXCLUSION_WINDOW_START_US,
+        POLICY_EXCLUSION_WINDOW_END_US,
+    )
+    .await
+}
+
+/// Replay loader with the policy-exclusion window as parameters. The public
+/// entry point above pins the production constants; this seam exists so the
+/// `Some(end)` arm is integration-testable through the full row path today —
+/// when the end bound is eventually pinned, the wiring is already exercised.
+async fn load_events_since_with_window(
+    sql: &dyn SqlAccess,
+    namespace: &str,
+    since_us: i64,
+    window_start_us: i64,
+    window_end_us: Option<i64>,
 ) -> Result<LoadEventsResult, RuntimeError> {
     let mut reader = sql.reader().await.map_err(|e| sql_err("reader", e))?;
     let rows = reader
@@ -912,6 +1054,10 @@ pub async fn load_events_since(
 
     let mut events = Vec::with_capacity(rows.len());
     let mut quarantined: Vec<QuarantinedRow> = Vec::new();
+    // Running count of policy-excluded rows already pushed, kept beside the
+    // vec so the per-row log-cap check is O(1) instead of rescanning
+    // `quarantined` for every skipped row of a thousands-size cohort.
+    let mut policy_excluded_seen: usize = 0;
 
     for row in &rows {
         let row_id = match row.get("id") {
@@ -927,20 +1073,43 @@ pub async fn load_events_since(
             _ => 0,
         };
 
-        let mut push_quarantine = |reason: String, payload_raw: &str| {
+        let mut push_quarantine = |category: ReplaySkipCategory,
+                                   reason: String,
+                                   payload_raw: &str| {
             let snippet = if payload_raw.len() > 200 {
                 let end = payload_raw.floor_char_boundary(200);
                 format!("{}…", &payload_raw[..end])
             } else {
                 payload_raw.to_string()
             };
-            eprintln!(
-                "[brain] event-log replay: quarantined row id={row_id} profile={profile_id:?}: {reason}"
-            );
+            let label = match category {
+                ReplaySkipCategory::Quarantine => "quarantined",
+                ReplaySkipCategory::PolicyExcluded => "policy-excluded",
+            };
+            // Quarantine rows are rare and indicate corruption — always loud.
+            // Policy-excluded rows can number in the thousands (open-ended
+            // window over a historical cohort), so per-row detail stops after
+            // the first few; the end-of-replay summary carries the full count.
+            let log_row = category == ReplaySkipCategory::Quarantine
+                || policy_excluded_seen < POLICY_EXCLUDED_LOG_DETAIL_CAP;
+            if log_row {
+                eprintln!(
+                    "[brain] event-log replay: {label} row id={row_id} profile={profile_id:?}: {reason}"
+                );
+            } else if policy_excluded_seen == POLICY_EXCLUDED_LOG_DETAIL_CAP {
+                eprintln!(
+                    "[brain] event-log replay: further policy-excluded rows elided from per-row \
+                     logging (cap {POLICY_EXCLUDED_LOG_DETAIL_CAP}); see the summary line for totals"
+                );
+            }
+            if category == ReplaySkipCategory::PolicyExcluded {
+                policy_excluded_seen += 1;
+            }
             quarantined.push(QuarantinedRow {
                 id: row_id,
                 profile_id: profile_id.clone(),
                 created_at,
+                category,
                 reason,
                 payload_snippet: snippet,
             });
@@ -949,14 +1118,22 @@ pub async fn load_events_since(
         let payload_str = match row.get("payload") {
             Some(SqlValue::Text(s)) => s,
             _ => {
-                push_quarantine("missing or non-text payload column".into(), "");
+                push_quarantine(
+                    ReplaySkipCategory::Quarantine,
+                    "missing or non-text payload column".into(),
+                    "",
+                );
                 continue;
             }
         };
         let event = match serde_json::from_str::<khive_storage::event::Event>(payload_str) {
             Ok(ev) => ev,
             Err(e) => {
-                push_quarantine(format!("malformed event JSON: {e}"), payload_str);
+                push_quarantine(
+                    ReplaySkipCategory::Quarantine,
+                    format!("malformed event JSON: {e}"),
+                    payload_str,
+                );
                 continue;
             }
         };
@@ -967,6 +1144,7 @@ pub async fn load_events_since(
             if let Some(ss) = event.payload.get("section_signals") {
                 if let Err(e) = crate::validate_section_signals(ss) {
                     push_quarantine(
+                        ReplaySkipCategory::Quarantine,
                         format!("semantically invalid section_signals: {e}"),
                         payload_str,
                     );
@@ -974,13 +1152,36 @@ pub async fn load_events_since(
                 }
             }
         }
+        // Policy exclusion (PR #1630 remediation): readable, valid rows from
+        // the miscalibrated implicit-positive window are skipped at replay
+        // time. The physical row stays in brain_event_log (audit preserved);
+        // it never reaches interpret/apply_signal.
+        if is_policy_excluded(&event, window_start_us, window_end_us) {
+            push_quarantine(
+                ReplaySkipCategory::PolicyExcluded,
+                "policy_excluded: implicit_positive feedback inside the PR #1630 window".into(),
+                payload_str,
+            );
+            continue;
+        }
         events.push(event);
     }
+    let quarantine_count = quarantined
+        .iter()
+        .filter(|row| row.category == ReplaySkipCategory::Quarantine)
+        .count();
+    // Counted explicitly (not by subtraction) so a future third
+    // ReplaySkipCategory variant cannot silently miscount this line.
+    let policy_excluded_count = quarantined
+        .iter()
+        .filter(|row| row.category == ReplaySkipCategory::PolicyExcluded)
+        .count();
     if !quarantined.is_empty() {
         eprintln!(
-            "[brain] event-log replay: {} row(s) quarantined out of {} total; \
-             replayed {} clean event(s)",
-            quarantined.len(),
+            "[brain] event-log replay: {} row(s) quarantined, {} row(s) policy-excluded \
+             out of {} total; replayed {} clean event(s)",
+            quarantine_count,
+            policy_excluded_count,
             rows.len(),
             events.len()
         );
@@ -1688,6 +1889,596 @@ mod brain_007_replay_quarantine {
     }
 }
 
+// ── PR #1630 remediation: replay-time policy exclusion of the miscalibrated
+//    implicit-positive window ─────────────────────────────────────────────────
+
+#[cfg(test)]
+mod replay_policy_exclusion {
+    use super::*;
+    use khive_brain_core::BrainState;
+    use khive_runtime::{KhiveRuntime, Namespace};
+    use khive_storage::event::Event;
+    use khive_types::{EventKind, SubstrateKind};
+    use uuid::Uuid;
+
+    async fn insert_raw_payload_at(
+        rt: &KhiveRuntime,
+        namespace: &str,
+        payload: &str,
+        created_at: i64,
+    ) {
+        let sql = rt.sql();
+        let mut writer = sql.writer().await.expect("writer");
+        writer
+            .execute(SqlStatement {
+                sql: "INSERT INTO brain_event_log (profile_id, namespace, event_kind, payload, created_at) VALUES (?1, ?2, ?3, ?4, ?5)".into(),
+                params: vec![
+                    SqlValue::Text("test-profile".to_string()),
+                    SqlValue::Text(namespace.to_string()),
+                    SqlValue::Text("brain.feedback".to_string()),
+                    SqlValue::Text(payload.to_string()),
+                    SqlValue::Integer(created_at),
+                ],
+                label: None,
+            })
+            .await
+            .expect("insert raw row");
+    }
+
+    /// Build a `brain.feedback` FeedbackExplicit carrier row (mirrors the
+    /// live-handler persist shape: verb `brain.feedback`, payload `signal` +
+    /// optional `served_by_profile_id`).
+    fn make_implicit_positive_event_json(
+        namespace: &str,
+        signal: &str,
+        served_by_profile_id: Option<&str>,
+        created_at: i64,
+    ) -> String {
+        let mut ev = Event::new(
+            namespace,
+            "brain.feedback",
+            EventKind::FeedbackExplicit,
+            SubstrateKind::Event,
+            "brain",
+        );
+        ev.target_id = Some(Uuid::new_v4());
+        ev.created_at = created_at;
+        let mut payload = serde_json::json!({ "signal": signal });
+        if let Some(profile) = served_by_profile_id {
+            payload["served_by_profile_id"] = serde_json::json!(profile);
+        }
+        ev.payload = payload;
+        serde_json::to_string(&ev).expect("serialize feedback event")
+    }
+
+    fn fold_events(result: &LoadEventsResult) -> BrainState {
+        let mut state = BrainState::new(16);
+        for event in &result.events {
+            let signal = crate::event::interpret(event);
+            state.balanced_recall.apply_signal(&signal);
+        }
+        state
+    }
+
+    // ── pure predicate unit tests (window passed as parameters) ─────────────
+
+    fn make_event(
+        verb: &str,
+        signal: Option<&str>,
+        served_by: Option<&str>,
+        created_at: i64,
+    ) -> Event {
+        let mut ev = Event::new(
+            "ns",
+            verb,
+            EventKind::FeedbackExplicit,
+            SubstrateKind::Event,
+            "brain",
+        );
+        ev.target_id = Some(Uuid::new_v4());
+        ev.created_at = created_at;
+        let mut payload = serde_json::json!({});
+        if let Some(s) = signal {
+            payload["signal"] = serde_json::json!(s);
+        }
+        if let Some(p) = served_by {
+            payload["served_by_profile_id"] = serde_json::json!(p);
+        }
+        ev.payload = payload;
+        ev
+    }
+
+    #[test]
+    fn predicate_excludes_in_window_attributed_implicit_positive() {
+        let start = POLICY_EXCLUSION_WINDOW_START_US;
+        let ev = make_event(
+            "brain.feedback",
+            Some("implicit_positive"),
+            Some("balanced-recall-v1"),
+            start + 1_000,
+        );
+        assert!(is_policy_excluded(&ev, start, None));
+    }
+
+    #[test]
+    fn predicate_replays_unattributed_control_population() {
+        let start = POLICY_EXCLUSION_WINDOW_START_US;
+        let no_profile = make_event(
+            "brain.feedback",
+            Some("implicit_positive"),
+            None,
+            start + 1_000,
+        );
+        assert!(!is_policy_excluded(&no_profile, start, None));
+        let empty_profile = make_event(
+            "brain.feedback",
+            Some("implicit_positive"),
+            Some(""),
+            start + 1_000,
+        );
+        assert!(!is_policy_excluded(&empty_profile, start, None));
+    }
+
+    #[test]
+    fn predicate_replays_explicit_and_negative_signals_in_window() {
+        let start = POLICY_EXCLUSION_WINDOW_START_US;
+        for signal in [
+            "useful",
+            "not_useful",
+            "wrong",
+            "implicit_negative",
+            "explicit_positive",
+        ] {
+            let ev = make_event(
+                "brain.feedback",
+                Some(signal),
+                Some("balanced-recall-v1"),
+                start + 1_000,
+            );
+            assert!(
+                !is_policy_excluded(&ev, start, None),
+                "signal {signal} must replay"
+            );
+        }
+    }
+
+    #[test]
+    fn predicate_replays_before_window_and_other_verbs() {
+        let start = POLICY_EXCLUSION_WINDOW_START_US;
+        let before = make_event(
+            "brain.feedback",
+            Some("implicit_positive"),
+            Some("balanced-recall-v1"),
+            start - 1,
+        );
+        assert!(!is_policy_excluded(&before, start, None));
+        let other_verb = make_event(
+            "memory.recall",
+            Some("implicit_positive"),
+            Some("balanced-recall-v1"),
+            start + 1_000,
+        );
+        assert!(!is_policy_excluded(&other_verb, start, None));
+    }
+
+    #[test]
+    fn predicate_window_bounds_are_half_open() {
+        let start = POLICY_EXCLUSION_WINDOW_START_US;
+        // Inclusive start.
+        let at_start = make_event(
+            "brain.feedback",
+            Some("implicit_positive"),
+            Some("p"),
+            start,
+        );
+        assert!(is_policy_excluded(&at_start, start, None));
+        // Exclusive end (constant flipped to Some in-test via the parameter seam).
+        let end = start + 1_000_000;
+        let just_before_end = make_event(
+            "brain.feedback",
+            Some("implicit_positive"),
+            Some("p"),
+            end - 1,
+        );
+        let at_end = make_event("brain.feedback", Some("implicit_positive"), Some("p"), end);
+        assert!(is_policy_excluded(&just_before_end, start, Some(end)));
+        assert!(!is_policy_excluded(&at_end, start, Some(end)));
+    }
+
+    #[test]
+    fn predicate_honours_production_end_constant() {
+        // With the production constant (None today), in-window events are
+        // excluded regardless of how far in the future they sit.
+        let start = POLICY_EXCLUSION_WINDOW_START_US;
+        let far_future = make_event(
+            "brain.feedback",
+            Some("implicit_positive"),
+            Some("p"),
+            start + 10_000_000_000,
+        );
+        assert_eq!(
+            is_policy_excluded(&far_future, start, POLICY_EXCLUSION_WINDOW_END_US),
+            POLICY_EXCLUSION_WINDOW_START_US <= far_future.created_at
+        );
+    }
+
+    // ── replay integration (through load_events_since) ───────────────────────
+
+    #[tokio::test]
+    async fn in_window_attributed_implicit_positive_is_policy_excluded_not_replayed() {
+        let rt = KhiveRuntime::memory().expect("memory runtime");
+        let token = rt.authorize(Namespace::local()).expect("token");
+        let ns = token.namespace().as_str();
+        let sql = rt.sql();
+
+        let created_at = POLICY_EXCLUSION_WINDOW_START_US + 1_000;
+        let row = make_implicit_positive_event_json(
+            ns,
+            "implicit_positive",
+            Some("balanced-recall-v1"),
+            created_at,
+        );
+        insert_raw_payload_at(&rt, ns, &row, created_at).await;
+
+        let result = load_events_since(sql.as_ref(), ns, 0)
+            .await
+            .expect("load must not fail");
+
+        assert!(result.events.is_empty(), "excluded event must not replay");
+        assert_eq!(result.quarantine_count(), 0, "not a malformed quarantine");
+        assert_eq!(result.policy_excluded_count(), 1, "one policy-excluded row");
+        let entry = &result.quarantined[0];
+        assert_eq!(entry.category, ReplaySkipCategory::PolicyExcluded);
+        assert!(
+            entry.reason.starts_with("policy_excluded"),
+            "reason: {:?}",
+            entry.reason
+        );
+        assert_eq!(entry.created_at, created_at);
+        assert!(entry.id > 0);
+        assert_eq!(entry.profile_id, "test-profile");
+        assert!(!entry.payload_snippet.is_empty());
+
+        // Posterior state unchanged: folding an empty replay set leaves the
+        // fresh state byte-identical.
+        let folded = fold_events(&result);
+        let baseline = BrainState::new(16);
+        assert_eq!(folded.balanced_recall.total_events, 0);
+        assert_eq!(
+            folded.balanced_recall.salience.alpha(),
+            baseline.balanced_recall.salience.alpha()
+        );
+        assert_eq!(
+            folded.balanced_recall.salience.beta(),
+            baseline.balanced_recall.salience.beta()
+        );
+
+        // Audit preserved: the physical row is still in brain_event_log.
+        let mut reader = sql.reader().await.expect("reader");
+        let count = reader
+            .query_scalar(SqlStatement {
+                sql: "SELECT COUNT(*) FROM brain_event_log WHERE namespace = ?1".into(),
+                params: vec![SqlValue::Text(ns.to_string())],
+                label: None,
+            })
+            .await
+            .expect("count query");
+        assert!(
+            matches!(count, Some(SqlValue::Integer(1))),
+            "row must remain in the audit log; got {count:?}"
+        );
+    }
+
+    /// Pins which clock the policy predicate reads when a row's `created_at`
+    /// COLUMN and its payload's `created_at` diverge (possible only through
+    /// out-of-band writes — import, manual repair, a second writer; the
+    /// `brain.feedback` write path stamps both from one `commit_at_us`).
+    /// Authority is the PAYLOAD: the payload is the event that would be
+    /// re-folded, so its own timestamp decides class membership. The column
+    /// governs only row candidacy (the SQL `since` filter) and the audit
+    /// record's `created_at` field.
+    #[tokio::test]
+    async fn policy_predicate_reads_payload_clock_when_column_diverges() {
+        let rt = KhiveRuntime::memory().expect("memory runtime");
+        let token = rt.authorize(Namespace::local()).expect("token");
+        let ns = token.namespace().as_str();
+        let sql = rt.sql();
+        let start = POLICY_EXCLUSION_WINDOW_START_US;
+
+        // Row A: payload clock BEFORE the window, column clock inside it.
+        // Payload authority ⇒ not a class member ⇒ must replay.
+        let payload_out = make_implicit_positive_event_json(
+            ns,
+            "implicit_positive",
+            Some("balanced-recall-v1"),
+            start - 1_000,
+        );
+        insert_raw_payload_at(&rt, ns, &payload_out, start + 1_000).await;
+
+        // Row B: payload clock inside the window, column clock far before it
+        // (but past `since`, so the row is still read). Payload authority ⇒
+        // class member ⇒ must be policy-excluded.
+        let payload_in = make_implicit_positive_event_json(
+            ns,
+            "implicit_positive",
+            Some("balanced-recall-v1"),
+            start + 2_000,
+        );
+        insert_raw_payload_at(&rt, ns, &payload_in, 1_000).await;
+
+        let result = load_events_since(sql.as_ref(), ns, 0)
+            .await
+            .expect("load must not fail");
+
+        assert_eq!(result.events.len(), 1, "payload-out row must replay");
+        assert_eq!(
+            result.events[0].created_at,
+            start - 1_000,
+            "replayed event carries the payload clock"
+        );
+        assert_eq!(result.quarantine_count(), 0);
+        assert_eq!(
+            result.policy_excluded_count(),
+            1,
+            "payload-in row must be excluded despite its out-of-window column clock"
+        );
+        let entry = result
+            .quarantined
+            .iter()
+            .find(|r| r.category == ReplaySkipCategory::PolicyExcluded)
+            .expect("policy-excluded entry");
+        assert_eq!(
+            entry.created_at, 1_000,
+            "audit record keeps the COLUMN clock for the excluded row"
+        );
+    }
+
+    #[tokio::test]
+    async fn unattributed_in_window_implicit_positive_replays_as_control() {
+        let rt = KhiveRuntime::memory().expect("memory runtime");
+        let token = rt.authorize(Namespace::local()).expect("token");
+        let ns = token.namespace().as_str();
+        let sql = rt.sql();
+
+        let created_at = POLICY_EXCLUSION_WINDOW_START_US + 2_000;
+        let row = make_implicit_positive_event_json(ns, "implicit_positive", None, created_at);
+        insert_raw_payload_at(&rt, ns, &row, created_at).await;
+
+        let result = load_events_since(sql.as_ref(), ns, 0).await.expect("load");
+        assert_eq!(result.events.len(), 1, "control population must replay");
+        assert_eq!(result.policy_excluded_count(), 0);
+        assert_eq!(result.quarantine_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn in_window_explicit_useful_replays() {
+        let rt = KhiveRuntime::memory().expect("memory runtime");
+        let token = rt.authorize(Namespace::local()).expect("token");
+        let ns = token.namespace().as_str();
+        let sql = rt.sql();
+
+        let created_at = POLICY_EXCLUSION_WINDOW_START_US + 3_000;
+        let row =
+            make_implicit_positive_event_json(ns, "useful", Some("balanced-recall-v1"), created_at);
+        insert_raw_payload_at(&rt, ns, &row, created_at).await;
+
+        let result = load_events_since(sql.as_ref(), ns, 0).await.expect("load");
+        assert_eq!(result.events.len(), 1, "explicit feedback must replay");
+        assert_eq!(result.policy_excluded_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn in_window_negatives_replay_because_negatives_are_evidence() {
+        let rt = KhiveRuntime::memory().expect("memory runtime");
+        let token = rt.authorize(Namespace::local()).expect("token");
+        let ns = token.namespace().as_str();
+        let sql = rt.sql();
+
+        for (offset, signal) in ["not_useful", "wrong"].iter().enumerate() {
+            let created_at = POLICY_EXCLUSION_WINDOW_START_US + 4_000 + offset as i64;
+            let row = make_implicit_positive_event_json(
+                ns,
+                signal,
+                Some("balanced-recall-v1"),
+                created_at,
+            );
+            insert_raw_payload_at(&rt, ns, &row, created_at).await;
+        }
+
+        let result = load_events_since(sql.as_ref(), ns, 0).await.expect("load");
+        assert_eq!(
+            result.events.len(),
+            2,
+            "negatives are evidence and must replay"
+        );
+        assert_eq!(result.policy_excluded_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn before_window_implicit_positive_replays() {
+        let rt = KhiveRuntime::memory().expect("memory runtime");
+        let token = rt.authorize(Namespace::local()).expect("token");
+        let ns = token.namespace().as_str();
+        let sql = rt.sql();
+
+        let created_at = POLICY_EXCLUSION_WINDOW_START_US - 1;
+        let row = make_implicit_positive_event_json(
+            ns,
+            "implicit_positive",
+            Some("balanced-recall-v1"),
+            created_at,
+        );
+        insert_raw_payload_at(&rt, ns, &row, created_at).await;
+
+        let result = load_events_since(sql.as_ref(), ns, 0).await.expect("load");
+        assert_eq!(result.events.len(), 1, "pre-window rows must replay");
+        assert_eq!(result.policy_excluded_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn end_bound_arm_replays_events_after_some_end() {
+        // The production constant is None; this test exercises the Some(t)
+        // arm through the same parameter seam the predicate exposes, then
+        // proves the wiring in load_events_since matches the predicate's
+        // decision.
+        let start = POLICY_EXCLUSION_WINDOW_START_US;
+        let end = start + 10_000;
+        let after_end = make_event(
+            "brain.feedback",
+            Some("implicit_positive"),
+            Some("p"),
+            end + 5,
+        );
+        assert!(
+            !is_policy_excluded(&after_end, start, Some(end)),
+            "event after Some(end) must replay"
+        );
+        // And the same decision flows through load_events_since for the
+        // production window: an event before any future Some(end) that is
+        // still in-window stays excluded.
+        let in_window = make_event(
+            "brain.feedback",
+            Some("implicit_positive"),
+            Some("p"),
+            start + 5,
+        );
+        assert!(is_policy_excluded(&in_window, start, Some(end)));
+    }
+
+    /// The `Some(end)` arm through the FULL row path: rows land in SQLite,
+    /// `load_events_since_with_window` reads them back, and only the
+    /// pre-end class member is excluded. This is the integration coverage
+    /// the pinning change will inherit — the wiring is exercised today,
+    /// not first on the day the constant moves.
+    #[tokio::test]
+    async fn end_bound_integration_excludes_only_pre_end_rows() {
+        let rt = KhiveRuntime::memory().expect("memory runtime");
+        let token = rt.authorize(Namespace::local()).expect("token");
+        let ns = token.namespace().as_str();
+
+        let start = POLICY_EXCLUSION_WINDOW_START_US;
+        let end = start + 10_000;
+
+        // Class member BEFORE the end bound — must be excluded.
+        let pre_end = make_implicit_positive_event_json(
+            ns,
+            "implicit_positive",
+            Some("profile-a"),
+            start + 5_000,
+        );
+        insert_raw_payload_at(&rt, ns, &pre_end, start + 5_000).await;
+        // Identical class member AFTER the end bound — must replay.
+        let post_end = make_implicit_positive_event_json(
+            ns,
+            "implicit_positive",
+            Some("profile-a"),
+            end + 5_000,
+        );
+        insert_raw_payload_at(&rt, ns, &post_end, end + 5_000).await;
+        // Unattributed control inside the window — must replay.
+        let control =
+            make_implicit_positive_event_json(ns, "implicit_positive", None, start + 6_000);
+        insert_raw_payload_at(&rt, ns, &control, start + 6_000).await;
+
+        let result = load_events_since_with_window(rt.sql().as_ref(), ns, 0, start, Some(end))
+            .await
+            .expect("windowed replay");
+
+        assert_eq!(
+            result.policy_excluded_count(),
+            1,
+            "exactly the pre-end class member is excluded"
+        );
+        assert_eq!(result.quarantine_count(), 0);
+        assert_eq!(
+            result.events.len(),
+            2,
+            "post-end class member and unattributed control both replay"
+        );
+        assert_eq!(result.quarantined[0].created_at, start + 5_000);
+    }
+
+    #[tokio::test]
+    async fn malformed_and_policy_rows_land_in_distinct_buckets_in_one_replay() {
+        let rt = KhiveRuntime::memory().expect("memory runtime");
+        let token = rt.authorize(Namespace::local()).expect("token");
+        let ns = token.namespace().as_str();
+        let sql = rt.sql();
+
+        // Row 1: malformed JSON (quarantine bucket).
+        insert_raw_payload_at(
+            &rt,
+            ns,
+            "not json at all",
+            POLICY_EXCLUSION_WINDOW_START_US + 5_000,
+        )
+        .await;
+        // Row 2: policy-excluded class member.
+        let created_at = POLICY_EXCLUSION_WINDOW_START_US + 6_000;
+        let row = make_implicit_positive_event_json(
+            ns,
+            "implicit_positive",
+            Some("balanced-recall-v1"),
+            created_at,
+        );
+        insert_raw_payload_at(&rt, ns, &row, created_at).await;
+        // Row 3: clean recall event — replays.
+        let mut clean = Event::new(ns, "recall", EventKind::Audit, SubstrateKind::Note, "brain");
+        clean.created_at = POLICY_EXCLUSION_WINDOW_START_US + 7_000;
+        let clean_json = serde_json::to_string(&clean).expect("serialize");
+        insert_raw_payload_at(
+            &rt,
+            ns,
+            &clean_json,
+            POLICY_EXCLUSION_WINDOW_START_US + 7_000,
+        )
+        .await;
+
+        let result = load_events_since(sql.as_ref(), ns, 0).await.expect("load");
+
+        assert_eq!(result.events.len(), 1, "only the clean row replays");
+        assert_eq!(result.quarantine_count(), 1, "one malformed row");
+        assert_eq!(result.policy_excluded_count(), 1, "one policy row");
+
+        let by_category = |cat: ReplaySkipCategory| -> &QuarantinedRow {
+            result
+                .quarantined
+                .iter()
+                .find(|r| r.category == cat)
+                .expect("both categories must be present")
+        };
+        let malformed = by_category(ReplaySkipCategory::Quarantine);
+        let policy = by_category(ReplaySkipCategory::PolicyExcluded);
+        assert!(
+            malformed.reason.contains("malformed")
+                || malformed.reason.contains("JSON")
+                || malformed.reason.contains("json"),
+            "quarantine reason must describe malformed JSON; got {:?}",
+            malformed.reason
+        );
+        assert!(
+            policy.reason.starts_with("policy_excluded"),
+            "policy reason must be distinct; got {:?}",
+            policy.reason
+        );
+        assert_ne!(malformed.id, policy.id, "distinct physical rows");
+
+        // No cross-contamination: folding only the replayed clean recall event
+        // must not move salience (a recall miss touches temporal only).
+        let folded = fold_events(&result);
+        let baseline = BrainState::new(16);
+        assert_eq!(
+            folded.balanced_recall.total_events, 1,
+            "exactly the clean event folded"
+        );
+        assert_eq!(
+            folded.balanced_recall.salience.beta(),
+            baseline.balanced_recall.salience.beta(),
+            "neither skipped category may move the salience posterior"
+        );
+    }
+}
+
 // ── BRAINCORE-AUD-001: entity-posterior cache-capacity enforcement on load ────
 
 #[cfg(test)]
@@ -1910,7 +2701,7 @@ mod persist_write_queue_routing {
         let db_path = dir.path().join("persist-write-queue-routing.db");
         let pool_cfg = khive_db::PoolConfig {
             path: Some(db_path),
-            write_queue_enabled: true,
+            write_queue_enabled: Some(true),
             ..khive_db::PoolConfig::default()
         };
         let pool = std::sync::Arc::new(khive_db::ConnectionPool::new(pool_cfg).expect("pool"));
