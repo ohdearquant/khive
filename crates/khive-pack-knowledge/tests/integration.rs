@@ -976,6 +976,173 @@ async fn get_by_domain_uuid_returns_canonical_domain_not_mirror_atom() {
     assert_eq!(members[0], "rag");
 }
 
+#[tokio::test]
+async fn get_resolves_atom_by_compact_prefix_longer_than_eight_chars() {
+    let f = pack(rt());
+    f.dispatch(
+        "knowledge.upsert_atoms",
+        json!({ "atoms": [{
+            "slug": "prefix-atom",
+            "name": "Prefix Atom",
+            "content": "dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity"
+        }] }),
+    )
+    .await
+    .expect("upsert atom");
+
+    let by_slug = f
+        .dispatch("knowledge.get", json!({ "id": "prefix-atom" }))
+        .await
+        .expect("get atom by slug");
+    let full_id = by_slug["id"].as_str().expect("full atom id");
+    let compact: String = full_id.chars().filter(|ch| *ch != '-').take(12).collect();
+
+    let by_prefix = f
+        .dispatch("knowledge.get", json!({ "id": compact }))
+        .await
+        .expect("get atom by unique compact prefix");
+    assert_eq!(by_prefix["id"], full_id);
+    assert_eq!(by_prefix["kind"], "atom");
+
+    let compact_uuid = full_id.replace('-', "");
+    let by_compact_uuid = f
+        .dispatch("knowledge.get", json!({ "id": compact_uuid }))
+        .await
+        .expect("32-character compact UUID is a complete identifier");
+    assert_eq!(by_compact_uuid["id"], full_id);
+}
+
+#[tokio::test]
+async fn get_domain_prefix_deduplicates_same_uuid_mirror_atom() {
+    let f = pack(rt());
+    f.dispatch(
+        "knowledge.upsert_domains",
+        json!({ "domains": [{
+            "slug": "prefix-domain",
+            "name": "Prefix Domain",
+            "description": "Retrieval concepts techniques algorithms implementations applications use cases and design patterns in sufficient detail for this deterministic domain prefix regression fixture"
+        }] }),
+    )
+    .await
+    .expect("upsert domain");
+
+    let by_slug = f
+        .dispatch("knowledge.get", json!({ "id": "prefix-domain" }))
+        .await
+        .expect("get domain by slug");
+    let full_id = by_slug["id"].as_str().expect("full domain id");
+    let prefix = &full_id[..8];
+
+    let by_prefix = f
+        .dispatch("knowledge.get", json!({ "id": prefix }))
+        .await
+        .expect("domain and mirror atom must count as one prefix match");
+    assert_eq!(by_prefix["id"], full_id);
+    assert_eq!(by_prefix["kind"], "domain");
+}
+
+#[tokio::test]
+async fn get_rejects_ambiguous_prefix_across_distinct_knowledge_records() {
+    let runtime = rt();
+    let f = pack(runtime.clone());
+    let mut writer = runtime.sql().writer().await.expect("knowledge writer");
+    writer
+        .execute_batch(vec![
+            SqlStatement {
+                sql: "INSERT INTO knowledge_atoms \
+                      (id, namespace, slug, name, content, created_at, updated_at) \
+                      VALUES (?1, 'local', 'ambiguous-a', 'Ambiguous A', 'content a', 1, 1)"
+                    .into(),
+                params: vec![SqlValue::Text(
+                    "deadbeef-0000-4000-8000-000000000001".into(),
+                )],
+                label: Some("test.knowledge_get.ambiguous_a".into()),
+            },
+            SqlStatement {
+                sql: "INSERT INTO knowledge_atoms \
+                      (id, namespace, slug, name, content, created_at, updated_at) \
+                      VALUES (?1, 'local', 'ambiguous-b', 'Ambiguous B', 'content b', 2, 2)"
+                    .into(),
+                params: vec![SqlValue::Text(
+                    "deadbeef-0000-4000-8000-000000000002".into(),
+                )],
+                label: Some("test.knowledge_get.ambiguous_b".into()),
+            },
+        ])
+        .await
+        .expect("seed colliding prefixes");
+    drop(writer);
+
+    let err = f
+        .dispatch("knowledge.get", json!({ "id": "deadbeef" }))
+        .await
+        .expect_err("distinct UUIDs sharing a prefix must be ambiguous");
+    let RuntimeError::AmbiguousPrefix { prefix, matches } = err else {
+        panic!("expected AmbiguousPrefix, got {err:?}");
+    };
+    assert_eq!(prefix, "deadbeef");
+    assert_eq!(matches.len(), 2);
+}
+
+#[tokio::test]
+async fn get_by_id_is_namespace_agnostic_and_loads_sections_from_stored_namespace() {
+    let f = pack(rt());
+    let foreign_namespace = "identifier-contract-foreign";
+    f.dispatch(
+        "knowledge.upsert_atoms",
+        json!({
+            "namespace": foreign_namespace,
+            "atoms": [{
+                "slug": "foreign-prefix-atom",
+                "name": "Foreign Prefix Atom",
+                "content": "dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity"
+            }]
+        }),
+    )
+    .await
+    .expect("upsert foreign atom");
+    f.dispatch(
+        "knowledge.edit",
+        json!({
+            "namespace": foreign_namespace,
+            "id": "foreign-prefix-atom",
+            "sections": [{
+                "section_type": "overview",
+                "content": "This section belongs to the foreign namespace atom and proves that a namespace-agnostic by-ID read loads sections using the resolved record namespace."
+            }]
+        }),
+    )
+    .await
+    .expect("add foreign section");
+
+    let foreign = f
+        .dispatch(
+            "knowledge.get",
+            json!({ "namespace": foreign_namespace, "id": "foreign-prefix-atom" }),
+        )
+        .await
+        .expect("get foreign atom by scoped slug");
+    let full_id = foreign["id"].as_str().expect("foreign atom id").to_string();
+
+    f.dispatch("knowledge.get", json!({ "id": "foreign-prefix-atom" }))
+        .await
+        .expect_err("slug lookup must remain scoped to the caller namespace");
+
+    let by_id = f
+        .dispatch(
+            "knowledge.get",
+            json!({ "id": full_id, "include_sections": true }),
+        )
+        .await
+        .expect("full UUID read must be namespace-agnostic");
+    assert_eq!(by_id["namespace"], foreign_namespace);
+    assert_eq!(
+        by_id["sections"].as_array().expect("sections array").len(),
+        1,
+        "section lookup must use the resolved atom's stored namespace"
+    );
+}
+
 // ── knowledge.get + include_sections ─────────────────────────────────────────
 
 #[tokio::test]

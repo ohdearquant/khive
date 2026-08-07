@@ -235,7 +235,7 @@ caller receives the server-generated UUID.
 | -------------------------- | ------------------------------------------------------- | -------------------------------------------- |
 | `knowledge.upsert_atoms`   | Bulk insert/update atoms by slug                        | Ingesting knowledge corpus                   |
 | `knowledge.upsert_domains` | Bulk insert/update domain groupings                     | Organizing atoms into domains                |
-| `knowledge.get`            | Fetch atom/domain by UUID or slug                       | Read a specific knowledge entry              |
+| `knowledge.get`            | Fetch atom/domain by UUID, unique short prefix, or slug | Read a specific knowledge entry              |
 | `knowledge.list`           | Paginated listing of atoms or domains                   | Browse the corpus                            |
 | `knowledge.search`         | TF-IDF search with embedding rerank (default on)        | Finding relevant knowledge                   |
 | `knowledge.suggest`        | Orient query against domains for composition            | "Which domains cover topic X?"               |

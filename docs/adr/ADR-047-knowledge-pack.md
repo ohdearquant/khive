@@ -4,6 +4,17 @@
 **Date**: 2026-05-25
 **Authors**: khive maintainers
 
+## Amendment (2026-08-06): identifier parity for `knowledge.get`
+
+`knowledge.get(id=...)` follows the shared identifier ladder: a complete UUID is parsed
+first, an undashed hexadecimal string of at least eight characters resolves as a unique
+short UUID prefix, and other strings resolve as slugs. UUID and prefix forms are
+namespace-agnostic by-ID reads under ADR-007 Rule 2; slug lookup remains scoped to the
+caller's namespace. Prefix resolution deduplicates a domain and its same-UUID FTS mirror
+atom before deciding ambiguity, while distinct matching UUIDs fail closed. Atom section
+loading follows the resolved atom's stored namespace so `include_sections=true` preserves
+the same by-ID contract.
+
 ## Amendment (2026-08-06): fail-closed search filter values
 
 `knowledge.search` accepts only `atom` or `domain` for `kind`/`type`. Its atom-status
@@ -187,14 +198,15 @@ upsert_domains(domains: [{slug, name, description?, tags?, members?}, ...]) → 
 Inserts or updates domains by `(namespace, slug)` key. Members is a JSON array of
 atom slugs.
 
-#### `knowledge.get` — fetch by ID or slug
+#### `knowledge.get` — fetch by ID, short prefix, or slug
 
 ```
-get(id: <uuid|slug>) → {type: "atom"|"domain", ...fields}
+get(id: <uuid|short-prefix|slug>) → {type: "atom"|"domain", ...fields}
 ```
 
-Resolves by UUID first, then by slug against both `knowledge_atoms` and
-`knowledge_domains`. Returns 404 if not found.
+Resolves by complete UUID first, then by unique 8+ hex UUID prefix, then by slug against
+both `knowledge_atoms` and `knowledge_domains`. UUID and prefix reads are
+namespace-agnostic; slug reads use the caller namespace. Returns 404 if not found.
 
 #### `knowledge.list` — paginated listing
 

@@ -3,7 +3,7 @@
 use serde_json::{json, Value};
 use uuid::Uuid;
 
-use khive_runtime::{KhiveRuntime, NamespaceToken, RuntimeError};
+use khive_runtime::{hex_prefix_to_uuid_pattern, KhiveRuntime, NamespaceToken, RuntimeError};
 use khive_storage::types::{SqlStatement, SqlValue};
 
 use super::schema::{
@@ -407,20 +407,65 @@ impl KnowledgeHandlers {
         let id = p.id.trim().to_string();
         let with_sections = p.include_sections.unwrap_or(false);
 
-        let is_uuid = id.parse::<Uuid>().is_ok();
-
         let mut reader = sql.reader().await.map_err(|e| sql_err("get reader", e))?;
 
-        if is_uuid {
+        // ADR-007 Rule 2: UUID and short-prefix forms are by-ID reads, so they
+        // are namespace-agnostic. Slugs remain namespace-scoped below. Parse a
+        // complete UUID before the prefix branch so 32-character compact UUIDs
+        // are complete identifiers, not prefixes (runtime protocol contract).
+        let resolved_id = if let Ok(uuid) = id.parse::<Uuid>() {
+            Some(uuid.to_string())
+        } else if id.len() >= 8 && id.chars().all(|c| c.is_ascii_hexdigit()) {
+            let pattern = format!("{}%", hex_prefix_to_uuid_pattern(&id));
+            // A domain's FTS mirror atom has the same UUID. UNION (rather than
+            // UNION ALL) deduplicates that legitimate cross-table duplicate so
+            // one domain is not reported as an ambiguous prefix.
+            let rows = reader
+                .query_all(SqlStatement {
+                    sql: "SELECT id FROM knowledge_domains \
+                          WHERE id LIKE ?1 AND deleted_at IS NULL \
+                          UNION \
+                          SELECT id FROM knowledge_atoms \
+                          WHERE id LIKE ?1 AND deleted_at IS NULL \
+                          ORDER BY id LIMIT 2"
+                        .into(),
+                    params: vec![SqlValue::Text(pattern)],
+                    label: Some("knowledge.get.resolve_prefix".into()),
+                })
+                .await
+                .map_err(|e| sql_err("get by prefix", e))?;
+            let matches: Vec<String> = rows.iter().filter_map(|row| row_str(row, "id")).collect();
+            match matches.as_slice() {
+                [] => {
+                    return Err(RuntimeError::InvalidInput(format!(
+                        "no knowledge record matches prefix: {id:?}"
+                    )))
+                }
+                [only] => Some(only.clone()),
+                _ => {
+                    return Err(RuntimeError::AmbiguousPrefix {
+                        prefix: id.clone(),
+                        matches: matches
+                            .iter()
+                            .filter_map(|matched| matched.parse::<Uuid>().ok())
+                            .collect(),
+                    })
+                }
+            }
+        } else {
+            None
+        };
+
+        if let Some(resolved_id) = resolved_id {
             // Domain-first: a domain's canonical row and its FTS mirror atom share
             // the same UUID, so the UUID branch must match the slug branch below
             // and prefer knowledge_domains — otherwise a domain UUID resolves to
             // its own mirror atom instead of the canonical domain record.
             let row = reader
                 .query_row(SqlStatement {
-                    sql: "SELECT * FROM knowledge_domains WHERE id = ?1 AND namespace = ?2 AND deleted_at IS NULL LIMIT 1".into(),
-                    params: vec![SqlValue::Text(id.clone()), SqlValue::Text(ns.clone())],
-                    label: None,
+                    sql: "SELECT * FROM knowledge_domains WHERE id = ?1 AND deleted_at IS NULL LIMIT 1".into(),
+                    params: vec![SqlValue::Text(resolved_id.clone())],
+                    label: Some("knowledge.get.domain_by_id".into()),
                 })
                 .await
                 .map_err(|e| sql_err("get domain by id", e))?;
@@ -431,9 +476,11 @@ impl KnowledgeHandlers {
             }
             let row = reader
                 .query_row(SqlStatement {
-                    sql: "SELECT * FROM knowledge_atoms WHERE id = ?1 AND namespace = ?2 AND deleted_at IS NULL LIMIT 1".into(),
-                    params: vec![SqlValue::Text(id.clone()), SqlValue::Text(ns.clone())],
-                    label: None,
+                    sql:
+                        "SELECT * FROM knowledge_atoms WHERE id = ?1 AND deleted_at IS NULL LIMIT 1"
+                            .into(),
+                    params: vec![SqlValue::Text(resolved_id)],
+                    label: Some("knowledge.get.atom_by_id".into()),
                 })
                 .await
                 .map_err(|e| sql_err("get atom by id", e))?;
@@ -441,12 +488,19 @@ impl KnowledgeHandlers {
                 let atom = atom_from_row(&r)
                     .ok_or_else(|| RuntimeError::Internal("atom row parse failed".into()))?;
                 let atom_id = atom.id.to_string();
+                let atom_namespace = atom.namespace.clone();
                 let mut out = atom_to_json(&atom);
                 if with_sections {
-                    out["sections"] = fetch_sections(runtime, &ns, &atom_id).await?;
+                    out["sections"] = fetch_sections(runtime, &atom_namespace, &atom_id).await?;
                 }
                 return Ok(out);
             }
+
+            // An ID-shaped input names one record or misses. It must not fall
+            // through and accidentally resolve a slug with the same spelling.
+            return Err(RuntimeError::NotFound(format!(
+                "atom or domain not found: {id:?}"
+            )));
         }
 
         // Slug lookup — domains first (authoritative for members), then atoms.

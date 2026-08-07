@@ -1558,11 +1558,12 @@ request(ops="[{\"tool\":\"knowledge.upsert_domains\",\"args\":{\"domains\":[{\"s
 
 ### `knowledge.get` — Assertive
 
-Fetch a single atom or domain by UUID or slug.
+Fetch a single atom or domain by UUID, unique short prefix, or slug. UUID and prefix
+forms are namespace-agnostic by-ID reads; slug lookup uses the caller namespace.
 
 | Param              | Type   | Required | Notes                                                                                                                                                                                                                                                                           |
 | ------------------ | ------ | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `id`               | string | yes      | Atom/domain UUID or slug.                                                                                                                                                                                                                                                       |
+| `id`               | string | yes      | Atom/domain full UUID, unique 8+ hex UUID prefix, or slug.                                                                                                                                                                                                                      |
 | `include_sections` | bool   | no       | Include the atom's sections under a `sections` key (ignored for domains). Each section: `id, atom_id, namespace, section_type, heading, content, content_hash, status, tokens, sort_order, created_at, updated_at`, ordered by `sort_order`, `created_at`, `id`. Default false. |
 
 ```
