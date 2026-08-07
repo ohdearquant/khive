@@ -72,8 +72,9 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
         name: "brain.event_counts",
         description: "Windowed event counts grouped by kind, actor, and verb over the event \
             plane (ADR-103 Stage 1, #724 Ask A); feedback_explicit events additionally split by \
-            served_by_profile_id (by_profile), by signal (counts_by_signal), and by profile \
-            crossed with signal (by_profile_and_signal, for per-seat negative-share); events \
+            served_by_profile_id (by_profile), originating verb \
+            (feedback_by_originating_verb), by signal (counts_by_signal), and by profile crossed \
+            with signal (by_profile_and_signal, for per-seat negative-share); events \
             carrying a work_class (today: phase_started / \
             phase_completed / phase_cancelled payloads, checked before any future \
             payload.resource.work_class) split by counts_by_work_class. Events carrying \
@@ -253,7 +254,9 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
                 name: "target_id",
                 param_type: "uuid",
                 required: true,
-                description: "UUID of the memory note or entity the feedback applies to.",
+                description: "Complete UUID or globally unique 8+ hex prefix of the memory note \
+                              or entity the feedback applies to. Prefix resolution is \
+                              namespace-unfiltered under ADR-007.",
             },
             khive_types::ParamDef {
                 name: "signal",
@@ -295,9 +298,10 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
     },
     HandlerDef {
         name: "brain.auto_feedback",
-        description: "Emit implicit feedback for recall results supplied by an agent. \
-            Convenience verb: agents call this after memory.recall instead of constructing \
-            a brain.feedback call manually. Keeps memory and brain packs decoupled (#517).",
+        description: "Emit caller-attributed feedback for one recall result. Omitting signal \
+            records no judgment and emits no feedback event; when signal is present, target_id must \
+            identify exactly one object in results. Keeps memory and brain packs decoupled \
+            (#517).",
         visibility: khive_types::Visibility::Verb,
         category: khive_types::VerbCategory::Commissive,
         params: &[
@@ -311,13 +315,19 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
                 name: "results",
                 param_type: "array",
                 required: true,
-                description: "Recall result objects; the first object's id is credited.",
+                description: "Recall result objects retained as candidate context. No result is credited by rank position.",
+            },
+            khive_types::ParamDef {
+                name: "target_id",
+                param_type: "string",
+                required: false,
+                description: "Exact full UUID or compact id value of the one result being judged. Required when signal is supplied and must occur exactly once in results.",
             },
             khive_types::ParamDef {
                 name: "signal",
                 param_type: "string",
                 required: false,
-                description: "Feedback signal. Defaults to \"implicit_positive\".",
+                description: "Feedback signal. Omission means abstain: no FeedbackExplicit event or posterior update.",
             },
             khive_types::ParamDef {
                 name: "served_by_profile_id",
@@ -329,7 +339,7 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
                 name: "serve_attribution",
                 param_type: "string",
                 required: false,
-                description: "Serve-time attribution state. Top-level attribution fields form one pair; when neither is supplied, both are copied from the first recall result.",
+                description: "Serve-time attribution state. Top-level attribution fields form one pair; when neither is supplied, both are copied from the selected recall result.",
             },
             khive_types::ParamDef {
                 name: "scorer_run_id",
@@ -591,7 +601,9 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
                 name: "target_id",
                 param_type: "uuid",
                 required: true,
-                description: "UUID of the record the feedback applies to.",
+                description: "Complete UUID or globally unique 8+ hex prefix of the record the \
+                              feedback applies to. Prefix resolution is namespace-unfiltered \
+                              under ADR-007.",
             },
             khive_types::ParamDef {
                 name: "signal",
@@ -905,6 +917,8 @@ impl BrainPack {
             std::collections::BTreeMap::new();
         let mut by_profile: std::collections::BTreeMap<String, u64> =
             std::collections::BTreeMap::new();
+        let mut feedback_by_originating_verb: std::collections::BTreeMap<String, u64> =
+            std::collections::BTreeMap::new();
         // #34: signal breakdown for `feedback_explicit`, both flat (negative-signal
         // saturation as a first-class metric) and crossed with the profile split
         // above (negative-share per seat/profile) — same source field
@@ -929,6 +943,15 @@ impl BrainPack {
             *counts_by_actor.entry(event.actor.clone()).or_insert(0) += 1;
             *counts_by_verb.entry(event.verb.clone()).or_insert(0) += 1;
             if event.kind == khive_types::EventKind::FeedbackExplicit {
+                let originating_verb = event
+                    .payload
+                    .get("originating_verb")
+                    .and_then(Value::as_str)
+                    .unwrap_or(event.verb.as_str())
+                    .to_string();
+                *feedback_by_originating_verb
+                    .entry(originating_verb)
+                    .or_insert(0) += 1;
                 let profile = event
                     .payload
                     .get("served_by_profile_id")
@@ -976,6 +999,9 @@ impl BrainPack {
         result[Self::truncatable_total_key("total", truncated)] = json!(items.len() as u64);
         if !by_profile.is_empty() {
             result["by_profile"] = json!(by_profile);
+        }
+        if !feedback_by_originating_verb.is_empty() {
+            result["feedback_by_originating_verb"] = json!(feedback_by_originating_verb);
         }
         if !counts_by_signal.is_empty() {
             result["counts_by_signal"] = json!(counts_by_signal);
@@ -1388,6 +1414,16 @@ impl BrainPack {
         token: &NamespaceToken,
         params: Value,
     ) -> Result<Value, RuntimeError> {
+        self.handle_feedback_from(token, params, "brain.feedback")
+            .await
+    }
+
+    async fn handle_feedback_from(
+        &self,
+        token: &NamespaceToken,
+        params: Value,
+        originating_verb: &'static str,
+    ) -> Result<Value, RuntimeError> {
         let feedback_start = Instant::now();
 
         #[derive(Deserialize)]
@@ -1403,9 +1439,8 @@ impl BrainPack {
             // is rejected rather than silently coerced.
             scorer_run_id: Option<String>,
             serve_ledger_id: Option<String>,
-            // #35 cheap-half: `brain.auto_feedback` receives the serving `query`
-            // and the full `results` list but previously dropped both, keeping
-            // only `results.first()`'s id as `target_id`. Persisting what
+            // #1509 cheap-half: `brain.auto_feedback` receives the serving `query`
+            // and the full `results` list. Persisting what
             // already arrives (emission-side only, no new join) unblocks
             // "what else was on the candidate list this feedback was chosen
             // from" without requiring the full RecallExecuted-linkage gap
@@ -1632,6 +1667,7 @@ impl BrainPack {
         // marker records how it was resolved.
         let mut base_data = json!({
             "signal": signal,
+            "originating_verb": originating_verb,
             "served_by_profile_id": effective_profile.as_deref(),
             "serve_attribution": serve_attribution,
             "profile_resolution": profile_resolution,
@@ -1645,10 +1681,10 @@ impl BrainPack {
             base_data["scorer_run_id"] = json!(scorer_run_id);
             base_data["serve_ledger_id"] = json!(serve_ledger_id);
         }
-        // #35 cheap-half: persist what `brain.auto_feedback` already receives
+        // #1509 cheap-half: persist what `brain.auto_feedback` already receives
         // instead of dropping it. `candidate_ids` are the raw (pre-resolution)
         // ids `auto_feedback` was handed — not necessarily equal to `target_id`
-        // (which is `results.first()`, resolved to a full UUID) — so a reader
+        // (which is caller-selected and resolved to a full UUID) — so a reader
         // can see the full candidate set the choice was made from.
         if let Some(ref query) = p.query {
             base_data["query"] = json!(query);
@@ -1912,7 +1948,7 @@ impl BrainPack {
 
     // ── brain.auto_feedback ───────────────────────────────────────────────
 
-    /// Emit implicit feedback for the first `memory.recall` result (accepts 8-char prefix or full UUID).
+    /// Emit caller-attributed feedback for one selected `memory.recall` result.
     pub(crate) async fn handle_auto_feedback(
         &self,
         token: &NamespaceToken,
@@ -1923,6 +1959,7 @@ impl BrainPack {
         struct AutoFeedbackParams {
             query: String,
             results: Vec<AutoFeedbackResult>,
+            target_id: Option<String>,
             signal: Option<String>,
             served_by_profile_id: Option<String>,
             serve_attribution: Option<ServeAttribution>,
@@ -1966,29 +2003,71 @@ impl BrainPack {
                 "auto_feedback: `query` must not be empty".into(),
             ));
         }
+        // Preserve ADR-081's malformed-pair rejection even when abstention
+        // returns before the delegated feedback handler runs.
+        if p.scorer_run_id.is_some() != p.serve_ledger_id.is_some() {
+            return Err(RuntimeError::InvalidInput(
+                "scorer_run_id and serve_ledger_id must be supplied together".to_string(),
+            ));
+        }
 
-        let Some(first) = p.results.first() else {
-            return Ok(json!({
-                "emitted": false,
-                "verb": "brain.auto_feedback",
-                "reason": "no_results",
-            }));
+        let signal = match p.signal.as_deref() {
+            Some(signal) => signal,
+            None if p.results.is_empty() => {
+                return Ok(json!({
+                    "emitted": false,
+                    "verb": "brain.auto_feedback",
+                    "reason": "no_results",
+                }));
+            }
+            None => {
+                return Ok(json!({
+                    "emitted": false,
+                    "verb": "brain.auto_feedback",
+                    "reason": "no_signal",
+                    "result_count": p.results.len(),
+                }));
+            }
         };
 
-        let target = resolve_auto_feedback_target(&self.runtime, &first.id).await?;
+        let selected_id = p.target_id.as_deref().ok_or_else(|| {
+            RuntimeError::InvalidInput(
+                "auto_feedback: `target_id` is required when `signal` is supplied; it must exactly match one results[].id"
+                    .to_string(),
+            )
+        })?;
+        let mut matching_results = p
+            .results
+            .iter()
+            .filter(|result| result.id.as_str() == selected_id);
+        let selected = matching_results.next().ok_or_else(|| {
+            RuntimeError::InvalidInput(format!(
+                "auto_feedback: target_id {selected_id:?} does not match any results[].id"
+            ))
+        })?;
+        if matching_results.next().is_some() {
+            return Err(RuntimeError::InvalidInput(format!(
+                "auto_feedback: target_id {selected_id:?} matches more than one result; the judged result must be unique"
+            )));
+        }
+
+        let target = resolve_auto_feedback_target(&self.runtime, &selected.id).await?;
 
         let mut feedback_params = json!({
             "target_id": target.to_string(),
-            "signal": p.signal.as_deref().unwrap_or("implicit_positive"),
+            "signal": signal,
         });
         // Prefer explicit top-level attribution, otherwise carry it directly
-        // from the first recall result. This makes passing the recall result
-        // objects sufficient to preserve the serve-time tri-state.
+        // from the selected recall result. Rank position never selects either
+        // the target or its serving metadata.
         let (served_by_profile_id, serve_attribution) =
             if p.served_by_profile_id.is_some() || p.serve_attribution.is_some() {
                 (p.served_by_profile_id.as_ref(), p.serve_attribution)
             } else {
-                (first.served_by_profile_id.as_ref(), first.serve_attribution)
+                (
+                    selected.served_by_profile_id.as_ref(),
+                    selected.serve_attribution,
+                )
             };
         if let Some(profile_id) = served_by_profile_id {
             feedback_params["served_by_profile_id"] = json!(profile_id);
@@ -2002,14 +2081,16 @@ impl BrainPack {
         if let Some(ref serve_ledger_id) = p.serve_ledger_id {
             feedback_params["serve_ledger_id"] = json!(serve_ledger_id);
         }
-        // #35 cheap-half: forward what already arrived instead of dropping it —
+        // #1509 cheap-half: forward what already arrived instead of dropping it —
         // the serving `query` and the raw (pre-resolution) candidate ids for
-        // every result, not just the chosen `first`.
+        // every result, not just the explicitly selected one.
         feedback_params["query"] = json!(p.query);
         feedback_params["candidate_ids"] =
             json!(p.results.iter().map(|r| r.id.clone()).collect::<Vec<_>>());
 
-        let mut out = self.handle_feedback(token, feedback_params).await?;
+        let mut out = self
+            .handle_feedback_from(token, feedback_params, "brain.auto_feedback")
+            .await?;
         out["verb"] = json!("brain.auto_feedback");
         out["feedback_verb"] = json!("brain.feedback");
         out["result_count"] = json!(p.results.len());
@@ -2146,7 +2227,7 @@ impl BrainPack {
         token: &NamespaceToken,
         params: Value,
     ) -> Result<Value, RuntimeError> {
-        self.handle_feedback(token, params).await
+        self.handle_feedback_from(token, params, "brain.emit").await
     }
 
     // ── brain.bind ────────────────────────────────────────────────────────

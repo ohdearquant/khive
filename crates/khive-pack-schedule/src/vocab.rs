@@ -132,7 +132,8 @@ pub(crate) static SCHEDULE_HANDLERS: [HandlerDef; 4] = [
             name: "id",
             param_type: "string",
             required: true,
-            description: "Full UUID of the scheduled event to cancel.",
+            description: "Complete UUID or unique 8+ hex prefix of the scheduled event to cancel. \
+                          Prefix resolution searches the caller's primary namespace.",
         }],
     },
 ];

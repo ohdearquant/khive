@@ -133,6 +133,10 @@ const V15_UP: &str = include_str!("../sql/015-serve-ledger-attribution.sql");
 
 const V16_UP: &str = include_str!("../sql/016-gtd-dependency-cycle-guards.sql");
 
+const V17_UP: &str = include_str!("../sql/017-agents-ddl.sql");
+
+const V18_UP: &str = include_str!("../sql/018-ann-consumer-pending.sql");
+
 /// DDL for the `ann_write_log` delta table.
 ///
 /// Shared between migration V11 and the belt-and-suspenders creation in
@@ -147,6 +151,14 @@ pub const ANN_WRITE_LOG_DDL: &str = V11_UP;
 /// in `StorageBackend::vectors_for_namespace` for the same reason as
 /// [`ANN_WRITE_LOG_DDL`].
 pub const ANN_WRITE_LOG_MODEL_SEQ_INDEX_DDL: &str = V12_UP;
+
+/// Idempotent DDL for pending ANN-consumer lifecycle metadata (#1479).
+///
+/// The V18 migration additionally translates legacy zero-watermark rows once.
+/// This constant deliberately contains only idempotent DDL: vector-store open
+/// paths may execute it repeatedly and must never demote a valid active
+/// checkpoint at sequence zero back to pending.
+pub const ANN_CONSUMER_PENDING_DDL: &str = include_str!("../sql/ann-consumer-pending-ddl.sql");
 
 /// DDL for the `_embedding_models` registry table.
 ///
@@ -236,6 +248,16 @@ pub const MIGRATIONS: &[VersionedMigration] = &[
         version: 16,
         name: "gtd_dependency_cycle_guards",
         up: V16_UP,
+    },
+    VersionedMigration {
+        version: 17,
+        name: "agents_ddl",
+        up: V17_UP,
+    },
+    VersionedMigration {
+        version: 18,
+        name: "ann_consumer_pending",
+        up: V18_UP,
     },
 ];
 

@@ -963,7 +963,7 @@ async fn append_events_routes_through_writer_task_when_flag_enabled() {
     let path = dir.path().join("write_queue_events.db");
     let pool_cfg = PoolConfig {
         path: Some(path.clone()),
-        write_queue_enabled: true,
+        write_queue_enabled: Some(true),
         ..PoolConfig::default()
     };
     let pool = Arc::new(ConnectionPool::new(pool_cfg).unwrap());

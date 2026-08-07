@@ -8,13 +8,13 @@ The memory pack keeps one Vamana approximate-nearest-neighbor (ANN) index per em
 
 `AnnState` owns five production coordination mechanisms:
 
-| State | Purpose |
-| --- | --- |
-| `indexes` | Installed `AnnBridge` values, keyed by model. |
-| `warming` | Synchronous fire-once guard for background rebuild tasks. |
-| `model_locks` | Async per-model single-flight locks shared by boot warm, background warm, and cold recall. |
-| `generations` | In-process monotonic write generation for each model. |
-| `last_epoch_check` | Debounce timestamps for the durable epoch query. |
+| State              | Purpose                                                                                    |
+| ------------------ | ------------------------------------------------------------------------------------------ |
+| `indexes`          | Installed `AnnBridge` values, keyed by model.                                              |
+| `warming`          | Synchronous fire-once guard for background rebuild tasks.                                  |
+| `model_locks`      | Async per-model single-flight locks shared by boot warm, background warm, and cold recall. |
+| `generations`      | In-process monotonic write generation for each model.                                      |
+| `last_epoch_check` | Debounce timestamps for the durable epoch query.                                           |
 
 `warming` deliberately uses `std::sync::Mutex`: its critical sections never await, and `WarmingGuard::drop` must release the key synchronously on success, error, or panic. The model-lock map is separate: `warming` prevents duplicate fire-and-forget tasks, while `model_locks` lets concurrent callers wait for the same actual warm attempt. The outer map lock is held only while looking up an `Arc<tokio::sync::Mutex<()>>`, so unrelated models do not contend during builds.
 
@@ -63,15 +63,39 @@ The RAII `WarmingGuard` owns guard release on every exit path. Benign shutdown c
 
 `ensure_ann_for_model` is the shared warm chokepoint for boot, background work, and cold recall. It:
 
-1. Captures the model's generation before any fast path.
-2. Returns `AlreadyLoaded` when the installed graph satisfies that floor.
-3. Acquires the per-model single-flight lock and repeats the freshness check.
+1. Reads the wildcard consumer registry before any cache fast path. An absent row is registered
+   pending at `-2`; pending or other closed state evicts the cache and forces a full rebuild.
+2. Captures the model's generation and returns `AlreadyLoaded` only when the installed graph
+   satisfies that floor **and** the durable consumer row is active (`S >= 0`).
+3. Acquires the per-model single-flight lock, re-reads durable registry state, and repeats the
+   freshness check.
 4. Emits one ANN-warm phase span for the caller that actually warms.
 5. Runs the restart classifier over the persisted v2 segment, or rebuilds from the vector store when the classifier reports Cold.
+
+A full memory corpus scan captures its publication watermark in the same SQLite statement as the
+vectors: the maximum of the retained scoped write-log sequence and this consumer's own nonnegative
+active watermark. The active floor matters after compaction has removed the retained prefix: the
+full corpus still reflects that prefix, so a later generation-only rebuild remains monotone instead
+of regressing to `S = 0`. Pending, recovery, and absent registry states contribute no floor.
 
 Only one concurrent caller emits the phase start/completion pair. Resource accounting snapshots cumulative CPU at entry and exit and reports the delta, while an RAII active-phase guard lets health reporting observe `ann_warm` during execution. The phase-start event carries no corpus count: the Hot adoption path performs zero corpus I/O, and a diagnostic COUNT on every warm would defeat that; vector counts are attributed at build completion. Phase-event append failures are best effort and never change the warm result.
 
 The function returns an `AnnEnsureStatus` distinguishing already loaded, restored snapshot, built graph, empty corpus, and a build discarded because the corpus changed during scanning.
+
+The pending row carries a durable registration timestamp. Compaction may retire it after 24 hours
+only if no checkpoint ever activated it. Retirement and log deletion share one writer transaction;
+a delayed build's conditional watermark publication then fails and its bridge is not installed.
+Active watermarks—including a real checkpoint at `S = 0`—never age out. Recall's fresh-tail guard
+also re-reads the row after capturing candidates and replaces them with an empty vector leg on
+absence or closed state, so another process cannot make a retired cache serve stale results.
+For a pathless bridge captured during the initial install-before-activation window, the guard first
+waits on the per-model publication lock and revalidates the pending row. A completed activation may
+continue; a row that remains closed, disappears, or errors still evicts the candidate. No-index
+recalls do not take this wait, preserving their bounded readiness timeout.
+File-backed checkpoint writers serialize the segment, UUID sidecar, registry transition, and mmap
+re-adoption with `<segment-dir>/.bridge-checkpoint.lock`. After acquiring that lock, a writer
+revalidates that its candidate watermark is not behind the durable row before touching the segment;
+a slower process therefore cannot overwrite a newer commit and then lose its conditional raise.
 
 ## Snapshot restore and rebuild
 
@@ -117,6 +141,9 @@ copied or relinked to the new database-scoped root:
 
 ## Ordering and atomicity guarantees
 
+- Durable consumer state is checked before any cache fast path and again after single-flight wait.
+- Pending activation and pending retirement are writer-atomic with their metadata changes; retirement
+  is writer-atomic with the compaction it enables.
 - Generation is captured before a build or fast-path decision.
 - An older generation never replaces a newer installed graph.
 - The background guard is released before chained re-enqueue.

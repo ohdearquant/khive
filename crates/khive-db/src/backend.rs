@@ -13,7 +13,7 @@ use rusqlite::OptionalExtension;
 use crate::error::SqliteError;
 use crate::pool::{ConnectionPool, PoolConfig};
 use crate::sql_bridge::SqlBridge;
-use crate::stores::{blob, entity, event, graph, note, sparse, text, vectors};
+use crate::stores::{agents, blob, entity, event, graph, note, sparse, text, vectors};
 
 /// Concrete storage backend providing capability traits.
 pub struct StorageBackend {
@@ -282,6 +282,20 @@ impl StorageBackend {
         )))
     }
 
+    /// Get the agent-process store (ADR-142 §1). Applies the agents DDL if not
+    /// already present. Idempotent — safe to call multiple times. Unlike the
+    /// other stores here, agent-process records are not namespace-scoped, so
+    /// there is no `_for_namespace` variant.
+    pub fn agents(&self) -> Result<Arc<dyn khive_storage::AgentStore>, SqliteError> {
+        let writer = self.pool.try_writer()?;
+        agents::ensure_agents_schema(writer.conn())?;
+
+        Ok(Arc::new(agents::SqlAgentStore::new(
+            Arc::clone(&self.pool),
+            self.is_file_backed,
+        )))
+    }
+
     /// Get a VectorStore for a specific embedding model, scoped to the default namespace.
     ///
     /// Creates the vec0 virtual table if it does not already exist. The `model_key`
@@ -403,6 +417,9 @@ impl StorageBackend {
         writer
             .conn()
             .execute_batch(crate::migrations::ANN_WRITE_LOG_MODEL_SEQ_INDEX_DDL)?;
+        writer
+            .conn()
+            .execute_batch(crate::migrations::ANN_CONSUMER_PENDING_DDL)?;
 
         // Create the vec0 virtual table. Idempotent on fresh databases and after the
         // old-schema rebuild above.
@@ -1236,7 +1253,7 @@ mod tests {
         let config = crate::pool::PoolConfig {
             path: Some(path.clone()),
             busy_timeout: std::time::Duration::from_millis(200),
-            write_queue_enabled,
+            write_queue_enabled: Some(write_queue_enabled),
             ..crate::pool::PoolConfig::default()
         };
         let pool = ConnectionPool::new(config).expect("fresh tenant-shaped pool should open");
@@ -1315,7 +1332,7 @@ mod tests {
     /// `OnceLock`s) opened against the SAME tenant DB file — the shape a
     /// per-store (rather than per-backend) pool construction would produce.
     /// Entity writes go through pool A, the FTS write through pool B, each
-    /// with `write_queue_enabled: true` so each independently spawns its own
+    /// with `write_queue_enabled: Some(true)` so each independently spawns its own
     /// WriterTask on first access.
     #[tokio::test]
     async fn issue_1029_two_pools_same_file_write_queue_on() {
@@ -1325,7 +1342,7 @@ mod tests {
         let cfg = |p: std::path::PathBuf| crate::pool::PoolConfig {
             path: Some(p),
             busy_timeout: std::time::Duration::from_millis(200),
-            write_queue_enabled: true,
+            write_queue_enabled: Some(true),
             ..crate::pool::PoolConfig::default()
         };
 

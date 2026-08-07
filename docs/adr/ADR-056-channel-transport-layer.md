@@ -1,15 +1,18 @@
 # ADR-056: Channel Transport Layer -- `khive-channel` and External Messaging Adapters
 
-**Status**: Accepted (amended 2026-07-02 -- inbound authentication hardening; amended 2026-07-03
+**Status**: Accepted (amended 2026-08-01 -- bounded inbox long poll; amended 2026-07-02 -- inbound authentication hardening; amended 2026-07-03
 -- Exchange Online no-authserv-id boundary; amended 2026-07-05 -- Telegram adapter
 implementation and two-way chat; amended 2026-07-09 -- durable IMAP UID cursor; amended
-2026-07-17 -- iMessage channel over an SSH bridge; see
+2026-07-17 -- iMessage channel over an SSH bridge; amended 2026-08-04 -- non-canonical thread
+identifiers in dedup acknowledgements; see
+[§Amendment 2026-08-01](#amendment-2026-08-01----bounded-inbox-long-poll),
 [§Amendment 2026-07-02](#amendment-2026-07-02----inbound-authentication-hardening),
 [§Amendment 2026-07-03](#amendment-2026-07-03----exchange-online-no-authserv-id-boundary),
 [§Amendment 2026-07-05](#amendment-2026-07-05----telegram-adapter-implementation-and-two-way-chat),
 [§Amendment 2026-07-09](#amendment-2026-07-09----durable-imap-uid-cursor),
-[§Amendment 2026-07-17](#amendment-2026-07-17----imessage-channel-over-an-ssh-bridge))\
-**Date**: 2026-06-14 (amended 2026-07-02, 2026-07-03, 2026-07-05, 2026-07-09, 2026-07-17)\
+[§Amendment 2026-07-17](#amendment-2026-07-17----imessage-channel-over-an-ssh-bridge),
+[§Amendment 2026-08-04](#amendment-2026-08-04----non-canonical-thread-identifiers-in-dedup-acknowledgements))\
+**Date**: 2026-06-14 (amended 2026-07-02, 2026-07-03, 2026-07-05, 2026-07-09, 2026-07-17, 2026-08-01, 2026-08-04)\
 **Authors**: khive maintainers
 **Amended by**: [ADR-122](ADR-122-email-outbound-delivery.md) (email outbound
 delivery now runs as an externally linked supervised component)\
@@ -20,7 +23,40 @@ ADR-108 (Git Write Surface -- hardened shell-out argv pattern reused by this ame
 statement; its SessionStore design was not carried forward\
 **Related issues**: #112 (khive-channel umbrella), #113 (Telegram adapter), #114 (email adapter),
 #448 (inbound header spoofing -- resolved by this amendment), #449 (IMAP UID progress -- resolved
-by the 2026-07-09 amendment)
+by the 2026-07-09 amendment), #1499 (inbox long poll -- resolved by the 2026-08-01 amendment)
+
+## Amendment 2026-08-01 -- Bounded inbox long poll
+
+Channel ingestion remains a gated `comm.ingest` dispatch and durable note write.
+After a successful, non-deduplicated insert, the comm handler now publishes a
+process-local wake signal; the channel loop does not interpret the response or
+own a second signaling path. This places the signal at the only point that knows
+both that the insert committed and that it was not suppressed by the durable
+`external_id` dedup constraint.
+
+`comm.inbox(wait_ms=N)` with `1 <= N <= 30000` first runs its normal scoped
+query. It returns immediately on a match, or waits on the signal until the
+deadline and re-runs the same query after each wake. Omission or zero preserves
+the immediate behavior, and `limit=0` never waits. The response shape is
+unchanged. `comm.send` and `comm.reply` publish the same signal after their
+successful atomic dual-writes, so the public long poll covers every comm-owned
+message creation path, not only external adapters.
+
+The signal is owned by the immutable `CommPack` instance constructed by
+`PackFactory::create(runtime)`. No post-construction injection is needed: both
+the waiting `comm.inbox` handler and the publishing write handlers already run
+through that instance. A generation counter paired with `tokio::sync::Notify`
+prevents a commit between query and waiter registration from being lost.
+
+This is not transport delivery state, cross-process pubsub, or an authorization
+boundary. The signal is payload-free and may wake calls for unrelated actors or
+filters; every wake re-runs the ordinary ADR-057/namespace-scoped database query
+and continues waiting if it is still empty. Durable storage remains authoritative,
+and a timeout-edge final query observes commits that arrive without this process's
+signal when they are visible before that query takes its storage snapshot; a commit
+landing after the snapshot is left to the caller's next request. The amendment
+changes wake latency only; channel lifecycle, dedup, checkpointing, and gate
+ownership are unchanged.
 
 ## Amendment 2026-07-02 -- Inbound authentication hardening
 
@@ -2755,6 +2791,52 @@ properties and is corrected here.
 - The address form (`imessage:<slug>`, normative) and the poll-interval and sender-validation
   rules are settled by this amendment text; no open items remain for design sign-off.
 
+## Amendment 2026-08-04 -- Non-canonical thread identifiers in dedup acknowledgements
+
+### Finding
+
+The dedup-response passages in §5a and §10 state that a confirmed duplicate `external_id`
+returns `{"ok": true, "deduplicated": true, "thread_id": "<canonical full UUID>"}`. That
+contract holds for rows written under the message-properties v1 schema, whose `thread_id` is
+always a canonical 36-character hyphenated UUID. It does not hold for pre-v1 rows: legacy and
+imported data may store an arbitrary non-UUID string as `properties.thread_id`.
+
+### Decision
+
+The acknowledgement echoes whatever `thread_id` the stored row carries, verbatim. Substituting
+the duplicate's note UUID when a non-UUID label is stored would be worse than the
+non-canonical shape: a caller that fed the fabricated value back into `comm.send(thread_id=...)`
+would silently root a NEW thread instead of continuing the stored one. The verbatim echo is
+the only value that keeps the round trip stable.
+
+To keep the canonical contract machine-checkable, the acknowledgement carries an explicit
+shape flag:
+
+- Stored `thread_id` parses as a UUID: the ack returns it with no extra field. The canonical
+  contract of §5a and §10 applies unchanged.
+- Stored `thread_id` is present but does NOT parse as a UUID: the ack echoes the stored string
+  and sets `thread_id_canonical: false`, so a strict caller can detect the non-canonical shape
+  without re-parsing the value.
+- Stored `thread_id` is absent (pre-v1 row with no thread field): the ack falls back to the
+  duplicate's note UUID as the thread root (ADR-040) and sets `thread_id_warning` naming the
+  value as derived, not stored.
+
+The two earlier response examples are therefore read as the v1-row case. With this amendment
+the full ack contract is: canonical UUID thread identifier for v1 rows; verbatim stored legacy
+label plus `thread_id_canonical: false` for non-UUID stored labels; derived note UUID plus
+`thread_id_warning` for rows with no stored `thread_id`.
+
+### Consequences
+
+- No change to `comm.ingest`'s dedup or write semantics; only the acknowledgement shape gains
+  the optional `thread_id_canonical` field (absent unless the stored value is non-canonical).
+- Channel adapters that echo the ack's `thread_id` into later `comm.send` calls remain correct
+  in the canonical-UUID and derived-UUID cases. The non-canonical legacy-label case is the
+  exception: `comm.send` requires a full UUID `thread_id` and refuses anything else, so an
+  adapter MUST branch on `thread_id_canonical: false` and not feed that value back into
+  `comm.send`. Thread continuity for a legacy-label thread comes from `comm.ingest`'s reply
+  correlation (In-Reply-To/References), which does not depend on echoing the stored label.
+
 ## Context
 
 The autonomous build loop blocks regularly on the maintainer. Merge approvals and ADR
@@ -3042,8 +3124,10 @@ Params:
 The handler writes exactly one `message` note with `direction=inbound` into the namespace from
 the `namespace` param. Deduplication is atomic: the handler calls `try_create_note`, which uses
 `INSERT OR IGNORE` against the durable unique index `idx_comm_message_external_id` (see §11).
-A duplicate `external_id` results in zero rows written and a `{"ok": true, "deduplicated": true}`
-response; no error is returned.
+A duplicate `external_id` results in zero rows written and a
+`{"ok": true, "deduplicated": true, "thread_id": "<canonical full UUID>"}` response;
+the thread identifier is read from the existing row rather than the duplicate attempt, and no
+error is returned.
 
 Thread resolution: when `correlation_external_id` is supplied, the handler queries for an
 existing message note whose `external_id` matches that value, reads its `thread_id`, and
@@ -3216,7 +3300,8 @@ Two layers, applied in order:
 zero rows are written, the storage layer verifies whether the suppressed insert was caused by
 an `external_id` collision (a live note in the same namespace and kind with the same non-empty
 `external_id` already exists). If confirmed, the handler returns
-`{"ok": true, "deduplicated": true}` without error. Any other ignored constraint surfaces as a
+`{"ok": true, "deduplicated": true, "thread_id": "<canonical full UUID>"}` without error. The
+thread identifier comes from the existing row. Any other ignored constraint surfaces as a
 `StorageError` so it is not misreported as deduplication. No note body is ever lost. This check
 is DB-backed and survives restarts; any re-delivered message is rejected at the storage layer.
 

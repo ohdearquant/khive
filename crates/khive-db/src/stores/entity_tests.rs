@@ -953,7 +953,7 @@ async fn page_offset_over_i64max_rejected() {
 /// the trip through the type-erased channel intact, and both rows are
 /// actually committed and independently readable back through the store.
 ///
-/// Constructed via a `PoolConfig` literal (`write_queue_enabled: true`), not
+/// Constructed via a `PoolConfig` literal (`write_queue_enabled: Some(true)`), not
 /// the `KHIVE_WRITE_QUEUE` env var — that env var is process-global and this
 /// crate's other tests are NOT `#[serial]` against it, so a window where it
 /// is set here could leak into a concurrently-scheduled test's own pool
@@ -964,7 +964,7 @@ async fn upsert_entities_routes_through_writer_task_when_flag_enabled() {
     let path = dir.path().join("write_queue_entities.db");
     let pool_cfg = PoolConfig {
         path: Some(path.clone()),
-        write_queue_enabled: true,
+        write_queue_enabled: Some(true),
         ..PoolConfig::default()
     };
     let pool = Arc::new(ConnectionPool::new(pool_cfg).unwrap());
@@ -1028,7 +1028,7 @@ async fn upsert_entities_legacy_path_unchanged_when_flag_is_off() {
 /// the writer task exactly once; every store resolves to a clone of the one
 /// pool-owned handle (`ConnectionPool::writer_task_handle`).
 ///
-/// Constructed via a `PoolConfig` literal (`write_queue_enabled: true`), not
+/// Constructed via a `PoolConfig` literal (`write_queue_enabled: Some(true)`), not
 /// the `KHIVE_WRITE_QUEUE` env var — see the sibling
 /// `upsert_entities_routes_through_writer_task_when_flag_enabled` test's doc
 /// comment for the race this avoids.
@@ -1038,7 +1038,7 @@ async fn multiple_stores_over_one_pool_share_a_single_writer_task() {
     let path = dir.path().join("write_queue_shared_writer.db");
     let pool_cfg = PoolConfig {
         path: Some(path.clone()),
-        write_queue_enabled: true,
+        write_queue_enabled: Some(true),
         ..PoolConfig::default()
     };
     let pool = Arc::new(ConnectionPool::new(pool_cfg).unwrap());
@@ -1079,7 +1079,7 @@ async fn multiple_stores_over_one_pool_share_a_single_writer_task() {
 /// caller, session-mirror ingest, converted to `atomic_unit`), so this test
 /// no longer exercises it.
 ///
-/// Constructed via a `PoolConfig` literal (`write_queue_enabled: true`), not
+/// Constructed via a `PoolConfig` literal (`write_queue_enabled: Some(true)`), not
 /// the `KHIVE_WRITE_QUEUE` env var — see the sibling
 /// `upsert_entities_routes_through_writer_task_when_flag_enabled` test's doc
 /// comment for the race this avoids.
@@ -1096,7 +1096,7 @@ async fn concurrent_writes_across_all_migrated_stores_share_one_writer_task() {
     let path = dir.path().join("write_queue_all_paths_shared_writer.db");
     let pool_cfg = PoolConfig {
         path: Some(path.clone()),
-        write_queue_enabled: true,
+        write_queue_enabled: Some(true),
         ..PoolConfig::default()
     };
     let pool = Arc::new(ConnectionPool::new(pool_cfg).unwrap());
@@ -1242,7 +1242,7 @@ async fn concurrent_writes_across_all_migrated_stores_share_one_writer_task() {
 /// take the legacy branch makes this assertion fail, see khive-db PR history
 /// for Fork C slice 2).
 ///
-/// Constructed via a `PoolConfig` literal (`write_queue_enabled: true`), not
+/// Constructed via a `PoolConfig` literal (`write_queue_enabled: Some(true)`), not
 /// the `KHIVE_WRITE_QUEUE` env var — see
 /// `upsert_entities_routes_through_writer_task_when_flag_enabled`'s doc
 /// comment for the race this avoids.
@@ -1252,7 +1252,7 @@ async fn upsert_entity_routes_through_writer_task_when_flag_enabled() {
     let path = dir.path().join("write_queue_entity_single.db");
     let pool_cfg = PoolConfig {
         path: Some(path.clone()),
-        write_queue_enabled: true,
+        write_queue_enabled: Some(true),
         ..PoolConfig::default()
     };
     let pool = Arc::new(ConnectionPool::new(pool_cfg).unwrap());

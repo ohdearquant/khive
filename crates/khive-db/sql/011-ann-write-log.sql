@@ -18,14 +18,15 @@ CREATE INDEX IF NOT EXISTS idx_ann_write_log_ns_model_seq
     ON ann_write_log (namespace, embedding_model, seq);
 
 -- Durable per-consumer watermark registry gating log compaction. A consumer
--- normally registers its row at watermark 0 (INSERT OR IGNORE) before persist
--- or serve, then raises it monotonically after each segment commit. The
+-- registers its row at the closed pending watermark -2 before its first scan,
+-- persist, or serve, then raises it to an active S >= 0 after the first segment
+-- commit. Migration V18 adds the pending timestamp/lifecycle metadata. The
 -- knowledge consumer additionally uses -1 as a closed force-rebuild sentinel:
 -- every absent row writes -1 before an authoritative scan (local first-use
 -- evidence cannot rule out a stale peer), and only that consumer's fenced full
 -- checkpoint may transition it to S >= 0. Compaction
--- deletes only seq <= MIN(watermark) over the pair's registered rows, so 0 and
--- -1 both block unsafe deletion; stale/crash-frozen rows only under-compact.
+-- deletes only seq <= MIN(watermark) over the pair's registered rows, so -2 and
+-- -1 both block unsafe deletion; active S >= 0 rows bound deletion normally.
 CREATE TABLE IF NOT EXISTS ann_consumer_watermark (
     consumer        TEXT NOT NULL,
     namespace       TEXT NOT NULL,

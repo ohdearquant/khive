@@ -1,0 +1,16 @@
+[package]
+name = "khive-wire-protocol"
+description = "Frame protocol for khive's tailnet wire transport: frame kinds, handshake state machine, wire error taxonomy, and the length-prefixed codec (ADR-137). No async I/O, no transport."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+thiserror = { workspace = true }

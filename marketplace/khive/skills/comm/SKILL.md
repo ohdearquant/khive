@@ -4,11 +4,11 @@ description: Coordinate with other agents and lambdas over khive comm — be att
 
 # Coordinate over comm
 
-khive comm is how agents and lambdas message each other. The core coordination
-surface is `comm.send`, `comm.delivered`, `comm.inbox`, `comm.reply`, and
-`comm.thread` (plus `comm.read` to clear a message), but the thing worth
-learning is the _coordination pattern_, not the verbs. Per-verb param detail is
-one call away: `request(ops="comm.send(help=true)")`.
+khive comm is how agents and lambdas message each other. The surface is nine verbs —
+`comm.send`, `comm.delivered`, `comm.inbox`, `comm.unread`, `comm.read`, `comm.reply`,
+`comm.thread`, `comm.health`, and `comm.probe` —
+but the thing worth learning is the _coordination pattern_, not the verbs. Per-verb param
+detail is one call away: `request(ops="comm.send(help=true)")`.
 
 ## The pattern
 
@@ -21,8 +21,9 @@ Two things break when you are `"local"`:
 
 - **Recipients can't tell who sent it** — every unattributed sender looks identical, and the
   reader has to guess from the content.
-- **Your inbox becomes a party line** — `comm.inbox` as `"local"` returns _every_ local
-  message, not just yours, because there is no actor to scope on.
+- **Anonymous delivery shares one mailbox** — `comm.inbox` as `"local"` returns messages
+  addressed to `"local"` (plus legacy rows without `to_actor`), so anonymous sessions cannot
+  distinguish ownership. Messages explicitly addressed to another actor remain filtered out.
 
 So set `KHIVE_ACTOR=lambda:<you>` in the MCP server env. The server logs a startup warning when
 the comm pack is loaded and the actor is still `"local"`. Attribution is the price of admission
@@ -56,6 +57,7 @@ request(ops="comm.send(to=\"lambda:leo\", subject=\"CI status\", content=\"all 7
 
 ```
 request(ops="comm.inbox(limit=10)")
+request(ops="comm.inbox(limit=10, wait_ms=30000)")
 ```
 
 The fields you triage on are surfaced at the **top level** — no digging into `properties`:
@@ -77,8 +79,17 @@ operation. Always pass a `limit` — active inboxes are large. If `next_offset` 
 the same inbox filters with `offset=<next_offset>` until it is null; pagination itself never marks
 messages read. Use `content_contains` when automated notifications omit `subject`; sender
 exact/prefix/exclusion, RFC3339 `since`/`before`, and subject/content substring filters can be
-combined. Mark writes are best-effort and cross-message updates are not atomic: inspect every
+combined. Use `box="sent"` with optional `to_actor` and `since` to inspect your own outbound
+history; omitting `box` remains inbound-only. For cheap list reads, pass the same strict
+`fields=[...]` projection to `comm.inbox` or `comm.thread` (for example
+`fields=["id","subject","from_actor","sent_at"]`); unknown fields fail rather than being
+ignored. Mark writes are best-effort and cross-message updates are not atomic: inspect every
 result's `read`/`mark_error`, and re-issue failures later.
+
+Use `wait_ms` (maximum 30,000) when you need the next message promptly without
+repeated polling. It waits only if the fully filtered page is initially empty
+and returns the ordinary paginated inbox response as soon as a matching
+message commits.
 
 ### 4. Reply to thread, don't start a new one
 

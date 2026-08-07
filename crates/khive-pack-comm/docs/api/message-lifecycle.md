@@ -57,6 +57,16 @@ When `thread_id` is already supplied, the handler first parses it and serializes
 the UUID in full-hyphenated form, then forwards that canonical value unchanged
 to both copies.
 
+A supplied `thread_id` must also resolve to an existing thread (issue #1673):
+at least one live `message` note in the caller's namespace must carry that
+`thread_id`, checked against the same spelling set `comm.thread` probes. Shape
+validation alone would accept any UUID-shaped value, and a send onto a root no
+note carries would succeed silently while no reader could ever reconstruct the
+thread — the failure would degrade the shared artifact (a reply missing from
+its conversation) rather than the caller's state. An unresolvable `thread_id`
+is therefore rejected with an invalid-input error naming the id, and no
+message row is persisted. Omit `thread_id` to start a new thread.
+
 `in_reply_to_message_id` is the parent's wire Message-ID (angle-bracketed),
 when this write is a reply to a message with a known one (issue #403). It is
 stored verbatim on both copies as `in_reply_to_message_id`; the outbox
@@ -80,9 +90,11 @@ inbound copy addressed to the actor label supplied in `to` (ADR-057).
 
 Both copies land in the caller's namespace; no cross-namespace write occurs.
 `from_actor` is set to `token.actor().id`; the caller namespace is carried separately as the routing `from`/`to` values passed to `dual_write_message`. `to_actor` is set to the
-`to` argument. When the caller's actor label is `"local"` (single-actor
-fallback), `comm.inbox` does not apply an actor filter, preserving backward
-compatibility.
+`to` argument. `comm.inbox` scopes every caller, including the anonymous
+`"local"` fallback, with `to_actor = caller OR to_actor IS NULL`. Anonymous
+callers therefore share messages addressed to `"local"` and can still read
+legacy rows without `to_actor`, but cannot read messages explicitly addressed
+to another actor.
 
 The routing `from` and `to` passed to `dual_write_message` are both set to the
 caller's namespace string so that `from == recipient_ns_str` is always true:
@@ -95,6 +107,12 @@ Message properties follow the versioned
 [`message-properties` v1 contract](message-properties.md). When the request
 origin set `KHIVE_PROCESS_REF`, its exact Unicode value is copied to
 `sent_by_process` on both delivery copies as attribution-only metadata.
+
+The response includes the canonical full `thread_id` persisted on both copies.
+For a root send it is the outbound message's full UUID; for a continuation it
+is the canonicalized caller-supplied root. Because `comm.send(thread_id=...)`
+requires a full UUID, Agent presentation preserves this field so it can be
+submitted to a later send unchanged.
 
 ### Self-send collapse guard (#820)
 
@@ -139,16 +157,27 @@ confirmation only, not external channel delivery status. If the caller loses
 the complete MCP response rather than receiving the structured ambiguous
 error, it also loses the server-generated outbound UUID; that case requires a
 future caller-supplied idempotency/correlation contract and is out of scope.
+Agent presentation keeps this response's `id` canonical, so the returned exact
+correlation key can be submitted to `comm.delivered` again unchanged.
 
 ## `handlers.rs::handle_inbox`
 
-Lists inbound messages for the caller's actor label (ADR-057).
+Lists inbound messages for the caller's actor label by default (ADR-057).
+`box="sent"` selects outbound rows authored by that caller instead; no separate
+storage format or verb is involved. An attributed caller's sent view requires
+an exact `from_actor` match. The anonymous `local` single-actor fallback also
+admits legacy outbound rows without `from_actor`. `to_actor` is an optional
+exact recipient filter for the sent box. Read `status` and sender filters are
+inbox-only and are rejected with `box="sent"`, while `to_actor` is rejected for
+the default inbox, so a misplaced filter cannot silently return the wrong box.
+The existing envelope remains stable; `unread_count` is zero for the sent box
+because outbound rows have no recipient read state.
 
-When the caller's actor label is `"local"` (single-actor fallback), no
-`to_actor` filter is applied and the inbox behaves as before (party-line).
-When the caller has a non-`"local"` actor label, only messages addressed to
-that actor are returned. Legacy messages without a `to_actor` field are
-visible regardless (Q3: OR IS NULL).
+Every caller is filtered by `to_actor = caller OR to_actor IS NULL`. A
+configured actor therefore sees messages addressed to that actor plus legacy
+rows without `to_actor`. The anonymous `"local"` fallback sees messages
+addressed to `"local"` plus the same legacy rows; it does not bypass the filter
+or expose messages explicitly addressed to another actor.
 
 `from_actor`/`from_prefix` (#493) sender filters are mutually exclusive.
 Direction + read-status + `to_actor` filters are pushed into SQL so
@@ -170,6 +199,47 @@ the top-level note `created_at` exposed in the response, not optional transport
 metadata in `properties.sent_at`. Empty substring filters are rejected, and a
 missing/non-string subject does not match `subject_contains`.
 
+`fields` is the same strict, non-empty projection used by `comm.thread`.
+Omitting it preserves the full message object. The accepted top-level names are
+`id`, `short_id`, `full_id`, `kind`, `from`, `to`, `subject`, `read`,
+`direction`, `preview`, `content`, `namespace`, `properties`, `created_at`, and
+`updated_at`. Stable property aliases `comm_schema_version`, `from_actor`,
+`to_actor`, `thread_id`, `sent_at`, `outbound_ref`, and `sent_by_process` are
+also available without returning the full `properties` map; an absent optional
+property projects as null, except `from_actor`/`to_actor`, which fall back to
+the full view's `from`/`to` values, and `short_id`/`full_id`, which fall back
+to the projected `id` value so the identifier aliases stay consistent with the
+row's UUID. Unknown names and an empty list are hard errors. Duplicate names
+are allowed and collapse to one key.
+Authorization, filtering, unread counting, pagination lookahead, and thread
+deduplication all operate on the complete internal view before projection.
+
+`wait_ms` (#1499) adds bounded long-polling without changing the response
+shape. Omission or `0` returns the first query immediately; values from 1
+through 30,000 wait only when that query is empty. `limit=0` remains a
+count-only immediate return and never waits. The deadline is established before
+the initial storage query, so query time reduces the remaining signal-wait
+budget. The timeout-edge final query and response serialization can add ordinary
+request-processing time after that deadline.
+
+One process-local `InboxSignal` belongs to each `CommPack` instance. It combines
+`tokio::sync::Notify` with a monotonically increasing generation. The handler
+captures the generation before every query, preventing a commit between the
+empty query and waiter registration from becoming a lost wakeup. A wake always
+re-runs the complete namespace, actor, status, and sender-filtered query; an
+unrelated message therefore causes only a re-query and the caller keeps waiting
+within the original deadline. A final query at deadline expiry observes any commit
+visible before that query takes its storage snapshot; a commit that lands after
+the snapshot is left to the caller's next request.
+
+`comm.send` and `comm.reply` publish after their dual-write has committed.
+`comm.ingest` publishes only after `try_create_note` returns a newly committed
+note; the deduplicated path does not publish. The signal carries no message or
+identity data and is not a delivery or authorization boundary. It is intentionally
+not cross-process pubsub: direct writes through another registry/process become
+visible on the timeout-edge final query or a subsequent call, while normal daemon
+dispatches share the same pack instance and wake immediately.
+
 ## `handlers.rs::handle_read`
 
 Marks a message as read. Rejects `read()` on outbound messages — "read" is a
@@ -190,7 +260,7 @@ back an earlier successful item.
 Patches only the `read` key via `NoteStore::try_patch_note_property`, a
 storage-side `json_set`, not a caller-side merge-then-overwrite of the whole
 `properties` column: the write re-evaluates namespace, message kind, direction,
-and addressee against the row's *current* state in the same `UPDATE`, so a
+and addressee against the row's _current_ state in the same `UPDATE`, so a
 property written by another caller between validation and this call (the bulk
 form's window can span up to 500 targets) survives untouched, and an
 eligibility change in that window degrades the mark instead of silently
@@ -325,6 +395,10 @@ embedded in the JSON. `AfterCursor::Id` carries the full tuple for
 tie-breaking; `AfterCursor::Timestamp` carries only the parsed microsecond
 value since there is no specific row to break ties against.
 
+The optional `fields` projection is identical to `comm.inbox` and is applied
+only after visibility filtering, dual-write deduplication, cursor filtering,
+ordering, and truncation. Omitting it preserves the full thread response.
+
 ## `handlers.rs::handle_ingest`
 
 Writes a single inbound message note from a channel adapter. This is a
@@ -378,6 +452,16 @@ Deduplication: when `external_id` is supplied, `try_create_note` uses a
 verify-after-insert check on the durable unique index on `external_id`. A
 confirmed duplicate returns `Ok(None)` without error; only an external_id
 collision is treated as dedup, other constraint violations surface as errors.
+The acknowledgement returns the `thread_id` read from the existing row — the
+canonical 36-character hyphenated UUID for v1 rows — never the new root
+proposed by the duplicate delivery. Exception: a pre-v1 row may store a
+non-UUID legacy thread label; the ack echoes that stored value verbatim
+(fabricating the duplicate's note UUID instead would route a caller echoing
+the ack into a DIFFERENT thread) and flags it with `thread_id_canonical:
+false` so a strict caller can detect the non-canonical shape without
+re-parsing the string. A row with NO stored `thread_id` falls back to the
+duplicate's note UUID as the thread root (#479b, ADR-040) and is flagged with
+`thread_id_warning` instead. See ADR-056 §Amendment 2026-08-04.
 
 Generic transport-layer metadata passthrough (issue #448, `IngestParams::metadata`):
 merged additively so it can never clobber a key already present. Names in the

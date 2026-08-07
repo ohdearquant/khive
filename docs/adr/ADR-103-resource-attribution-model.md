@@ -718,8 +718,8 @@ their joined child tasks.
 The remaining gaps are observable in current code and are not papered over by this status:
 
 - `ann_jobs_consumed` has no production increment site, so it is always absent/zero.
-- spawned per-model work in `memory.recall` and `knowledge.index` does not re-enter the usage
-  scope, so those child tasks can under-report `embed_calls`, `vector_passes`, and related work;
+- spawned per-model work in `memory.recall` does not re-enter the usage scope, so those child
+  tasks can under-report `embed_calls`, `vector_passes`, and related work;
 - `db_round_trips` is instrumented at graph-read seams, not as a universal counter for every SQL
   or storage call; and
 - Part 5's `[request] max_ops` deployment setting is not parsed or enforced. The shipped parser
@@ -793,11 +793,9 @@ vector-search functions, `batch_neighbors` (adjacency entries returned), the inl
 ANN consumer drain, and the event append path. Handlers do not thread a context
 parameter; the choke points are few and already centralized.
 
-Plain task-local storage is **not sufficient** as the propagation mechanism: several
-request-owned paths run their per-model work on spawned tasks that are then joined
-(`memory.recall`'s per-model embed and ANN fan-out,
-`crates/khive-pack-memory/src/handlers/common.rs`; `knowledge.index`'s per-model
-embed-and-insert, `crates/khive-pack-knowledge/src/knowledge/index_handler.rs`), and
+Plain task-local storage is **not sufficient** as the propagation mechanism: `memory.recall`
+runs its per-model embed and ANN fan-out on spawned tasks that are then joined
+(`crates/khive-pack-memory/src/handlers/common.rs`), and
 Tokio task-locals do not cross `tokio::spawn`. The context is therefore an explicitly
 propagated handle (an `Arc`-shared accumulator or equivalent) with the following
 scope contract:

@@ -19,8 +19,9 @@ call time and feed back into via explicit or implicit signals.
   consumer kinds declared by the loaded packs
 - **Feedback ingestion** (`brain.feedback`, `brain.auto_feedback`) — appends a
   `FeedbackExplicit` event to the shared event log; `brain.auto_feedback` is
-  convenience sugar so an agent can credit the top `memory.recall` hit without
-  constructing a full feedback call
+  convenience sugar for attributing a signal to one explicitly selected
+  `memory.recall` result without constructing a full feedback call. An omitted
+  signal is an abstention, and rank position never creates positive evidence
 - **Deterministic fold reducers** — `BalancedRecallFold` and
   `SectionPosteriorFold` implement pure `khive_fold::Fold<Event, S>` reducers.
   Current handlers invoke them synchronously; durable handler mutations append to
@@ -40,6 +41,7 @@ verbs through the MCP `request` DSL, not called directly as a Rust API:
 request(ops="brain.create_profile(name=\"my-profile-v1\", consumer_kind=\"recall\")")
 request(ops="brain.resolve(consumer_kind=\"recall\", actor=\"agent:docs\")")
 request(ops="brain.feedback(target_id=\"<uuid>\", signal=\"useful\")")
+request(ops="brain.auto_feedback(query=\"why\", results=[{\"id\": \"<uuid>\"}], target_id=\"<uuid>\", signal=\"implicit_positive\")")
 ```
 
 The `Fold` implementations are exposed as a Rust API for embedding a profile's
@@ -62,7 +64,7 @@ let state = fold.init(&ctx);
 | `brain.profiles` / `brain.profile`                                      | List profiles / fetch one profile's metadata and snapshot |
 | `brain.resolve`                                                         | Show which profile would serve a given caller context     |
 | `brain.activate` / `brain.deactivate` / `brain.archive` / `brain.reset` | Lifecycle transitions                                     |
-| `brain.feedback` / `brain.auto_feedback`                                | Emit explicit / implicit feedback events                  |
+| `brain.feedback` / `brain.auto_feedback`                                | Emit direct / selected-result feedback events             |
 | `brain.bind` / `brain.unbind` / `brain.bindings`                        | Manage the profile resolution table                       |
 | `brain.create_profile`                                                  | Create a new profile with optional seed priors            |
 | `brain.register_adapter`                                                | Register an adapter integrity record for router gating    |

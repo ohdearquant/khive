@@ -15,7 +15,7 @@
 
 ### Knowledge Pack Verb Surface (ADR-047)
 
-- This pack implements the 18 verb corpus surface: atoms/domains CRUD, TF-IDF search with
+- This pack implements the 19 verb corpus surface: atoms/domains CRUD, TF-IDF search with
   embedding rerank, fold, import, edit, challenge, adjudicate, and concept-tier sugar.
 - Domain matching is case-insensitive: domain values are trimmed and lowercased before storage
   and comparison. The same normalized value is used in `properties.domain`, promoted tags,
@@ -59,7 +59,7 @@
 
 ### ADR-016: Request DSL
 
-- All 18 verbs are accessible through the `request` tool. The public surface is `KnowledgePack`
+- All 19 verbs are accessible through the `request` tool. The public surface is `KnowledgePack`
   only — `handlers` and `knowledge` modules are `pub(crate)`.
 
 ## Consistency Notes
@@ -79,9 +79,9 @@
 | Module                  | Responsibility                                                               |
 | ----------------------- | ---------------------------------------------------------------------------- |
 | `lib.rs`                | Pack registration, `Pack` trait impl, `PackRuntime::dispatch` shim           |
-| `vocab.rs`              | `KNOWLEDGE_HANDLERS` static array — 18 verb descriptors                      |
+| `vocab.rs`              | `KNOWLEDGE_HANDLERS` static array — 19 verb descriptors                      |
 | `handlers.rs`           | `learn`, `cite`, `topic` verbs (KG concept tier sugar)                       |
-| `knowledge/mod.rs`      | Corpus handler implementations (18 verbs) and all shared SQL/scoring helpers |
+| `knowledge/mod.rs`      | Corpus handler implementations (19 verbs) and all shared SQL/scoring helpers |
 | `knowledge/schema.rs`   | Param and record types for serde deserialization and SQL row mapping         |
 | `knowledge/vamana.rs`   | Shared Vamana ANN index lifecycle (warm-start, build, search, RRF fusion)    |
 | `knowledge/matching.rs` | TF-IDF term matching primitives (tokenize, exact match, count)               |

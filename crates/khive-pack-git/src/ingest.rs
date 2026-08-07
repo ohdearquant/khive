@@ -4,7 +4,7 @@
 //! the standard `create` verb. See crates/khive-pack-git/docs/api/ingest.md for
 //! the full module overview.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -114,6 +114,44 @@ pub struct IngestWriteRefusal {
     pub masked: String,
 }
 
+/// Machine-readable state of one ingest source (`commits`, `issues`,
+/// `pull_requests`) after a pass — issue #1617. A reader no longer has to
+/// infer coverage from `done` (a budget-cursor statement) or parse prose
+/// out of `warnings[]`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "state", content = "reason", rename_all = "snake_case")]
+pub enum IngestSourceState {
+    /// The source was walked to the end of its history this pass.
+    Completed,
+    /// The source was visited but not exhausted: the budget ran out, a
+    /// paging window was left incomplete, or a per-record write failure
+    /// froze the cursor (`cursor_stalled`). The reason names the cause.
+    StoppedEarly(String),
+    /// The source was never walked this pass. The reason names the cause:
+    /// the budget was already exhausted before the source was reached, or
+    /// the `gh` CLI was unusable — absent from PATH (a repo whose remote is
+    /// not github.com takes this same arm: `gh_available` probes only
+    /// `gh --version`, so such a repo skips only when `gh` is absent, and
+    /// when `gh` IS present it takes the walker-failure path, whose reason
+    /// carries `gh`'s own stderr) — or `gh` itself failed before the walk
+    /// began. A local cursor/database read failure before remote listing is
+    /// also `Skipped`, with a distinct local-failure reason. A failure after
+    /// the walk began is `StoppedEarly`, never `Skipped`.
+    Skipped(String),
+}
+
+/// Per-source ingest coverage for one pass (issue #1617): which sources
+/// were walked to completion, which stopped early and why, and which were
+/// never reached. Written by the walk paths themselves, not reconstructed
+/// at report time, so the states stay truthful when a new walk path is
+/// added later.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize)]
+pub struct IngestSourceStatus {
+    pub commits: Option<IngestSourceState>,
+    pub issues: Option<IngestSourceState>,
+    pub pull_requests: Option<IngestSourceState>,
+}
+
 /// Outcome of one ingest pass. Serializable so CLI callers can emit it as JSON.
 #[derive(Debug, Default, Serialize)]
 pub struct IngestReport {
@@ -123,9 +161,13 @@ pub struct IngestReport {
     pub issues_skipped_existing: u64,
     pub prs_ingested: u64,
     pub prs_skipped_existing: u64,
-    /// `false` when the `gh` CLI was not found on PATH — issues/PRs were
-    /// skipped but commits still ingested (ADR-088 §5 graceful-absence rule).
-    pub gh_available: bool,
+    /// `Some(false)` when the `gh` CLI probe ran and gh was unusable —
+    /// issues/PRs were skipped but commits still ingested (ADR-088 §5
+    /// graceful-absence rule). `Some(true)` when the probe succeeded. `None`
+    /// when this pass never probed: the probe runs only when `include`
+    /// requests issues or pull requests, and a commits-only pass says nothing
+    /// about `gh` either way (issue #1645).
+    pub gh_available: Option<bool>,
     pub warnings: Vec<String>,
     /// Number of per-record content writes refused by the runtime secret gate
     /// during this pass. Callers can assert this is zero independently of
@@ -140,6 +182,13 @@ pub struct IngestReport {
     /// (ADR-088 Amendment 1). Always `true` for an unbounded
     /// (`max_items: None`) pass.
     pub done: bool,
+    /// `true` when a per-record write failure pinned the commits cursor at
+    /// the last contiguous success this pass. The failed record is retried
+    /// (and its warning re-surfaced) on every subsequent pass until it is
+    /// fixed upstream. `done` is forced `false` whenever this is set: commits
+    /// beyond the stall were still attempted this pass, but history cannot be
+    /// called exhausted while the cursor cannot advance (issue #1645).
+    pub cursor_stalled: bool,
     /// The repo-anchor `project` entity id this pass resolved (or the
     /// verb-level caller created).
     pub project_id: Option<String>,
@@ -189,6 +238,40 @@ pub struct IngestReport {
     /// to compare directly against an independent source of truth (e.g.
     /// `git rev-list --count <ref>`).
     pub commits_total_in_db: u64,
+    /// Touched paths the `--name-only` pass recorded but `changed_paths`
+    /// storage cannot carry: valid Unix filenames that violate the hook's
+    /// canonical shape (a `\` byte, an `X:` drive prefix, a leading `/`,
+    /// or an empty/`.`/`..` component). Only actual predicate rejections
+    /// count — dedup/post-masking collisions in the stored array are not
+    /// drops. Dropped before create rather than failing the whole commit —
+    /// see
+    /// crates/khive-pack-git/docs/api/ingest.md#changed-paths-and-code-module-annotations.
+    pub changed_paths_filtered_noncanonical: u64,
+    /// Changed paths whose `(source_revision, source_path)` module binding
+    /// was unusable and therefore received no code-module annotation. Two
+    /// shapes fold into this counter: an ambiguous key (two or more live
+    /// rows, whether two or more have parseable ids or at most one has a
+    /// parseable id) and the single-row sub-case whose one row's id does not
+    /// parse (not ambiguous — just no bindable candidate). Counted only when
+    /// an ingested commit's path actually hits the key, so unusable keys
+    /// untouched by this pass never inflate the count.
+    pub code_module_ambiguous_path_skips: u64,
+    /// Per-source ingest coverage for this pass (issue #1617): each
+    /// included source reports `completed`, `stopped_early { reason }`, or
+    /// `skipped { reason }`, so a gate refusal, budget exhaustion, and a
+    /// `gh`/remote skip are distinguishable without parsing `warnings[]`.
+    /// Additive companion to `done`/`cursor_stalled`, which keep their
+    /// existing budget-cursor meaning.
+    pub sources: IngestSourceStatus,
+    /// `true` only when every included source was walked to the end of its
+    /// history this pass — "silence means nothing left", as opposed to
+    /// "stopped before the end" (budget exhausted, incomplete paging
+    /// window, or a frozen cursor). Unlike `done`, this is a coverage
+    /// statement, not a resume-loop signal (issue #1617). Vacuously `true`
+    /// when `include` is empty: no source was requested, so nothing can
+    /// count against it — it is a statement about the REQUESTED sources,
+    /// not about the repository.
+    pub history_exhausted: bool,
 }
 
 fn record_write_failure(
@@ -211,6 +294,27 @@ fn record_write_failure(
     report
         .warnings
         .push(format!("{verb} {record_kind} {record_key}: {error}"));
+}
+
+/// Overwrite a walker's source slot with `StoppedEarly(reason)` from an
+/// end-of-walk arm. Seed invariant: every end-of-walk arm
+/// (`!window_complete` / `cursor_stalled`) is reachable only after at least
+/// one successful page fetch, and each walk seeds its slot on its FIRST
+/// successful fetch — so the slot is `Some` on every path today. The
+/// `None` arm keeps that a release-mode soft fallback: it constructs the
+/// state instead of panicking, with a debug tripwire for the
+/// instrumentation gap.
+fn pin_stopped_early(slot: &mut Option<IngestSourceState>, reason: String) {
+    match slot {
+        Some(state) => *state = IngestSourceState::StoppedEarly(reason),
+        None => {
+            debug_assert!(
+                false,
+                "walker reached an end-of-walk arm without seeding its source state"
+            );
+            *slot = Some(IngestSourceState::StoppedEarly(reason));
+        }
+    }
 }
 
 /// Run one ingest pass over `opts.repo`: issues + PRs first (via `gh`, when
@@ -257,6 +361,20 @@ pub(crate) async fn run_ingest_with_commit_recovery(
         remaining: opts.max_items,
     };
     let mut new_records: Vec<NewRecordForRef> = Vec::new();
+    // Per-source completion flags folded into `report.sources` at the end of
+    // the pass (issue #1617). The flags are seeded by the failure/walk paths
+    // themselves (`ingest_commits`/`ingest_prs`/`ingest_issues` set them
+    // false on a budget break, incomplete paging window, or frozen cursor),
+    // never reconstructed from counts at report time.
+    let mut commits_complete = false;
+    let mut prs_complete = false;
+    let mut issues_complete = false;
+    // Set when a gh walker returned Err AFTER recording a walk state
+    // (walked-then-failed): the source states stay as the walker left them
+    // (possibly `completed`), but the pass itself failed, so
+    // `history_exhausted` must not claim total coverage on their strength
+    // alone.
+    let mut gh_walk_failed_after_walk = false;
 
     // Graceful degradation covers both "gh is not on PATH" and "gh is present
     // but this repo has no usable GitHub remote" (e.g. a synthetic/local-only
@@ -265,7 +383,7 @@ pub(crate) async fn run_ingest_with_commit_recovery(
     // whole pass.
     if opts.include.issues || opts.include.pull_requests {
         if gh_available(&opts.repo) {
-            report.gh_available = true;
+            report.gh_available = Some(true);
             if opts.include.pull_requests && !budget.exhausted() {
                 match ingest_prs(
                     runtime,
@@ -278,14 +396,86 @@ pub(crate) async fn run_ingest_with_commit_recovery(
                     &mut number_to_pr,
                     &mut budget,
                     &mut new_records,
+                    &mut prs_complete,
                 )
                 .await
                 {
                     Ok(()) => {}
-                    Err(e) => report
-                        .warnings
-                        .push(format!("gh pr list failed, skipping pull requests: {e}")),
+                    Err(e) => {
+                        // The walker is fallible AFTER visiting records
+                        // (continuation-page fetches, per-record existence
+                        // lookups, and the final cursor write can all fail
+                        // mid/post-walk). Only a failure on the first page
+                        // fetch means the source was never walked; the
+                        // walker signals that case by leaving its
+                        // `pull_requests` state unset. Anything else
+                        // preserves the state the walker already wrote.
+                        let walked = matches!(
+                            report.sources.pull_requests.as_ref(),
+                            Some(IngestSourceState::Completed | IngestSourceState::StoppedEarly(_))
+                        );
+                        if walked {
+                            // Align the prose with the structured state:
+                            // the walk happened, so nothing was "skipped" —
+                            // name how far it got before the pass failed.
+                            let visited = report.prs_ingested + report.prs_skipped_existing;
+                            let noun = if visited == 1 { "record" } else { "records" };
+                            report.warnings.push(format!(
+                                "gh pr list failed after walking {visited} {noun} — \
+                                 stopped early, not skipped: {e}"
+                            ));
+                        } else if report.sources.pull_requests.is_none() {
+                            report
+                                .warnings
+                                .push(format!("gh pr list failed, skipping pull requests: {e}"));
+                        } else {
+                            report.warnings.push(format!(
+                                "pull request ingest failed before remote listing; local source failure retained: {e}"
+                            ));
+                        }
+                        if !walked && report.sources.pull_requests.is_none() {
+                            report.sources.pull_requests = Some(IngestSourceState::Skipped(
+                                format!("gh pr list failed: {e}"),
+                            ));
+                        } else if walked {
+                            match report.sources.pull_requests.as_mut() {
+                                Some(IngestSourceState::StoppedEarly(reason)) => {
+                                    reason.push_str(&format!(
+                                        "; pass then failed after the walk: {e}"
+                                    ));
+                                }
+                                // A walk that completed and then failed
+                                // (only the post-loop cursor write can do
+                                // this) is downgraded to stopped-early:
+                                // the records were walked but the pass's
+                                // durability is unproven, and `completed`
+                                // would feed `history_exhausted` a total
+                                // -coverage claim the failure contradicts.
+                                Some(state @ IngestSourceState::Completed) => {
+                                    *state = IngestSourceState::StoppedEarly(format!(
+                                        "walk completed but the pass then failed: {e}"
+                                    ));
+                                }
+                                Some(IngestSourceState::Skipped(_)) | None => {}
+                            }
+                            // Walked-then-failed leaves the walk's
+                            // durability unproven (e.g. the cursor write
+                            // never landed): the resume loop must not
+                            // treat the source as finished. A first-fetch
+                            // failure (the `!walked` arm) pins nothing —
+                            // it is deterministic (`no git remotes found`)
+                            // and `done` keeps its budget-cursor meaning
+                            // for such repos.
+                            report.done = false;
+                            gh_walk_failed_after_walk = true;
+                        }
+                        prs_complete = false;
+                    }
                 }
+            } else if opts.include.pull_requests {
+                report.sources.pull_requests = Some(IngestSourceState::Skipped(
+                    "budget exhausted before pull requests were reached".to_string(),
+                ));
             }
             if opts.include.issues && !budget.exhausted() {
                 if let Err(e) = ingest_issues(
@@ -297,25 +487,91 @@ pub(crate) async fn run_ingest_with_commit_recovery(
                     &mut report,
                     &mut budget,
                     &mut new_records,
+                    &mut issues_complete,
                 )
                 .await
                 {
-                    report
-                        .warnings
-                        .push(format!("gh issue list failed, skipping issues: {e}"));
+                    // See the PR arm above: "skipping" is only accurate for
+                    // a first-fetch failure; a walked-then-failed source
+                    // names how far the walk got.
+                    let walked = matches!(
+                        report.sources.issues.as_ref(),
+                        Some(IngestSourceState::Completed | IngestSourceState::StoppedEarly(_))
+                    );
+                    if walked {
+                        let visited = report.issues_ingested + report.issues_skipped_existing;
+                        let noun = if visited == 1 { "record" } else { "records" };
+                        report.warnings.push(format!(
+                            "gh issue list failed after walking {visited} {noun} — \
+                             stopped early, not skipped: {e}"
+                        ));
+                    } else if report.sources.issues.is_none() {
+                        report
+                            .warnings
+                            .push(format!("gh issue list failed, skipping issues: {e}"));
+                    } else {
+                        report.warnings.push(format!(
+                            "issue ingest failed before remote listing; local source failure retained: {e}"
+                        ));
+                    }
+                    // See the PR arm above: `Skipped` only when the walk
+                    // never began (the walker signals that by leaving its
+                    // state unset); a walked-then-failed source keeps the
+                    // state the walker already wrote.
+                    if !walked && report.sources.issues.is_none() {
+                        report.sources.issues = Some(IngestSourceState::Skipped(format!(
+                            "gh issue list failed: {e}"
+                        )));
+                    } else if walked {
+                        match report.sources.issues.as_mut() {
+                            Some(IngestSourceState::StoppedEarly(reason)) => {
+                                reason.push_str(&format!("; pass then failed after the walk: {e}"));
+                            }
+                            // See the PR arm above: a completed walk whose
+                            // pass then fails is downgraded to
+                            // stopped-early so the failure is never
+                            // invisible next to a `completed` claim.
+                            Some(state @ IngestSourceState::Completed) => {
+                                *state = IngestSourceState::StoppedEarly(format!(
+                                    "walk completed but the pass then failed: {e}"
+                                ));
+                            }
+                            Some(IngestSourceState::Skipped(_)) | None => {}
+                        }
+                        // See the PR arm above: walked-then-failed is not a
+                        // finished source; a first-fetch failure pins
+                        // nothing.
+                        report.done = false;
+                        gh_walk_failed_after_walk = true;
+                    }
+                    issues_complete = false;
                 }
+            } else if opts.include.issues {
+                report.sources.issues = Some(IngestSourceState::Skipped(
+                    "budget exhausted before issues were reached".to_string(),
+                ));
             }
         } else {
-            report.gh_available = false;
+            report.gh_available = Some(false);
             report.warnings.push(
                 "gh CLI not found on PATH; skipped issues and pull requests — commits still ingest"
                     .to_string(),
             );
+            if opts.include.pull_requests {
+                report.sources.pull_requests = Some(IngestSourceState::Skipped(
+                    "gh CLI not found on PATH".to_string(),
+                ));
+            }
+            if opts.include.issues {
+                report.sources.issues = Some(IngestSourceState::Skipped(
+                    "gh CLI not found on PATH".to_string(),
+                ));
+            }
         }
     }
 
     if opts.include.commits && !budget.exhausted() {
-        ingest_commits(
+        match ingest_commits(
             runtime,
             token,
             registry,
@@ -327,13 +583,126 @@ pub(crate) async fn run_ingest_with_commit_recovery(
             &mut budget,
             &mut new_records,
             &mut recover,
+            &mut commits_complete,
         )
-        .await?;
+        .await
+        {
+            Ok(()) => {}
+            Err(e) => {
+                // `ingest_commits` records its source slot at every walker
+                // exit, so a `Some` slot beside an Err means the walk ran
+                // (possibly to completion) and the pass failed AFTER it —
+                // the final cursor write is the canonical case. Handle that
+                // in-band exactly like the gh walkers: downgrade to
+                // stopped-early and report, never abort the whole ingest
+                // over a failure that leaves the walked records landed. A
+                // `None` slot is a pre-walk failure (snapshot recovery,
+                // cursor read) and stays a hard error — the recovery
+                // contract depends on those surfacing.
+                if report.sources.commits.is_some() {
+                    match report.sources.commits.as_mut() {
+                        Some(IngestSourceState::StoppedEarly(reason)) => {
+                            reason.push_str(&format!("; pass then failed after the walk: {e}"));
+                        }
+                        // See the gh arms above: a completed walk whose pass
+                        // then fails is downgraded so the failure is never
+                        // invisible next to a `completed` claim.
+                        Some(state @ IngestSourceState::Completed) => {
+                            *state = IngestSourceState::StoppedEarly(format!(
+                                "walk completed but the pass then failed: {e}"
+                            ));
+                        }
+                        Some(IngestSourceState::Skipped(_)) | None => {}
+                    }
+                    report
+                        .warnings
+                        .push(format!("commit ingest failed after the walk: {e}"));
+                    report.done = false;
+                    commits_complete = false;
+                } else {
+                    return Err(e);
+                }
+            }
+        }
+    } else if opts.include.commits {
+        report.sources.commits = Some(IngestSourceState::Skipped(
+            "budget exhausted before commits were reached".to_string(),
+        ));
     }
 
     if budget.exhausted() {
         report.done = false;
     }
+
+    // Fold the walk-recorded completion flags into the per-source tri-state
+    // (issue #1617). Every walker records its own state by the time it
+    // returns (PR/issue walkers pre-seed `stopped_early` when the walk
+    // begins and upgrade on completion; `ingest_commits` writes its state
+    // at every exit), so each arm below is a release-mode belt-and-braces
+    // fallback for a walker that returned without recording anything — an
+    // instrumentation gap, not a normal stop, and its reason says so
+    // loudly instead of dressing the gap up as one. Fabrication risk, named
+    // for the next maintainer: in release builds the `debug_assert!` is a
+    // no-op and these arms synthesize a state from the bare completion flag
+    // alone — a future walker that sets a completion flag WITHOUT recording
+    // a source state would silently report a fabricated `completed` /
+    // `stopped_early` here with no real reason behind it. Every walker exit
+    // must record its own state; these arms exist only so a gap degrades to
+    // a loud placeholder instead of leaving the slot empty.
+    if report.sources.pull_requests.is_none() && opts.include.pull_requests {
+        debug_assert!(
+            false,
+            "pull_requests walker returned without recording its source state"
+        );
+        report.sources.pull_requests = Some(if prs_complete {
+            IngestSourceState::Completed
+        } else {
+            IngestSourceState::StoppedEarly(
+                "state not recorded by walker; stopped before the PR history was exhausted".into(),
+            )
+        });
+    }
+    if report.sources.issues.is_none() && opts.include.issues {
+        debug_assert!(
+            false,
+            "issues walker returned without recording its source state"
+        );
+        report.sources.issues = Some(if issues_complete {
+            IngestSourceState::Completed
+        } else {
+            IngestSourceState::StoppedEarly(
+                "state not recorded by walker; stopped before the issue history was exhausted"
+                    .into(),
+            )
+        });
+    }
+    if report.sources.commits.is_none() && opts.include.commits {
+        debug_assert!(
+            false,
+            "commits walker returned without recording its source state"
+        );
+        report.sources.commits = Some(if commits_complete {
+            IngestSourceState::Completed
+        } else {
+            IngestSourceState::StoppedEarly(
+                "state not recorded by walker; stopped before the commit history was exhausted"
+                    .into(),
+            )
+        });
+    }
+    // A source left `None` was not requested by `include`, so it cannot
+    // count against exhaustion.
+    report.history_exhausted = !gh_walk_failed_after_walk
+        && [
+            &report.sources.commits,
+            &report.sources.issues,
+            &report.sources.pull_requests,
+        ]
+        .into_iter()
+        .all(|s| {
+            s.as_ref()
+                .is_none_or(|state| matches!(state, IngestSourceState::Completed))
+        });
 
     link_references(
         runtime,
@@ -589,6 +958,75 @@ async fn find_document_for_path(
     Ok(row.and_then(|r| row_uuid(&r)))
 }
 
+/// Load the live code-map module index for the exact repository snapshot
+/// being digested. ADR-085's `source_path` is relative to a repository root,
+/// so path alone is not a safe cross-repository join key. Requiring the
+/// module's `source_revision` to equal the snapshot HEAD keeps unrelated maps
+/// out; a path with more than one matching live row remains ambiguous and is
+/// deliberately represented by `None` rather than selecting or annotating an
+/// arbitrary candidate. That `None` folds two distinct shapes, both
+/// counted in the same skip counter: (a) two or more rows, including two or
+/// more rows with parseable ids and the case where at most one has a
+/// parseable id (true ambiguity), and (b) exactly ONE row whose id does not
+/// parse — a key that is not ambiguous but has no bindable candidate, so it
+/// must skip for the same reason. Shape (b) is a live row for the key exactly
+/// like any other; it occupies the slot (a second row for the same key marks
+/// the pair ambiguous under shape (a)) but can never itself serve as a
+/// binding target.
+///
+/// A reader/query failure returns `Err` carrying the underlying error text;
+/// the caller degrades to no module annotation with a warning that includes
+/// it rather than aborting the pass: module annotation is best-effort
+/// enrichment (ADR-088 Amendment 1), while the durable `changed_paths` fact
+/// must still be recorded.
+///
+/// The map alone is returned; the caller counts a skip only when a commit
+/// path actually hits an ambiguous (`None`) key, so ambiguous keys no
+/// ingested commit touches never inflate
+/// `IngestReport.code_module_ambiguous_path_skips`.
+async fn load_code_modules_by_snapshot_path(
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+    source_revision: &str,
+) -> Result<HashMap<String, Option<Uuid>>> {
+    let sql = runtime.sql();
+    let mut r = sql.reader().await.map_err(|e| anyhow!("{e}"))?;
+    let rows = r
+        .query_all(SqlStatement {
+            sql: "SELECT id, json_extract(properties,'$.source_path') AS source_path \
+                  FROM entities WHERE kind='concept' AND entity_type='module' \
+                  AND namespace=?1 AND deleted_at IS NULL \
+                  AND json_type(properties,'$.source_path')='text' \
+                  AND json_extract(properties,'$.source_revision')=?2 \
+                  ORDER BY source_path, id"
+                .into(),
+            params: vec![
+                SqlValue::Text(token.namespace().as_str().to_string()),
+                SqlValue::Text(source_revision.to_string()),
+            ],
+            label: Some("git_ingest_load_code_modules_by_snapshot_path".into()),
+        })
+        .await
+        .map_err(|e| anyhow!("{e}"))?;
+
+    let mut modules: HashMap<String, Option<Uuid>> = HashMap::new();
+    for row in rows {
+        let Some(SqlValue::Text(path)) = row.get("source_path") else {
+            continue;
+        };
+        // A row whose id does not parse is still a live row for its
+        // `(source_revision, source_path)` key: it occupies the slot (so any
+        // second row for the same key marks the pair ambiguous) but can
+        // never bind as an annotation target itself.
+        let id = row_uuid(&row);
+        modules
+            .entry(path.clone())
+            .and_modify(|candidate| *candidate = None)
+            .or_insert(id);
+    }
+    Ok(modules)
+}
+
 /// Read the last-ingested cursor value for `(project_id, kind)`, if any.
 async fn read_cursor(
     runtime: &KhiveRuntime,
@@ -650,6 +1088,7 @@ async fn write_cursor(
 
 const RECORD_SEP: char = '\u{1e}';
 const FIELD_SEP: char = '\u{1f}';
+const TOUCHED_HEADER_PREFIX: &[u8] = b"/\x1e";
 
 struct RawCommit {
     sha: String,
@@ -767,14 +1206,27 @@ fn walk_commits(repo: &Path, since_sha: Option<&str>) -> Result<Vec<RawCommit>> 
 }
 
 /// `sha -> \[touched paths\]` for every commit in `repo`'s history, via a
-/// separate `--name-only` pass.
+/// separate NUL-delimited `--name-only` pass. Merge commits use their
+/// first-parent diff as the one canonical path set. The resulting paths drive
+/// document/module annotations and the durable
+/// `commit.properties.changed_paths` fact. Rename detection is pinned off so
+/// a rename always surfaces as the delete + add pair `--name-only` reports
+/// without it: those exact path facts are the ADR-085 module join keys, and
+/// Git does not mark which entry is the rename source, so an inferred rename
+/// could otherwise silently swap one side of the pair away.
 fn touched_files(repo: &Path) -> Result<HashMap<String, Vec<String>>> {
     let output = Command::new("git")
         .arg("-C")
         .arg(repo)
         .arg("log")
+        .arg("-z")
         .arg("--name-only")
-        .arg(format!("--pretty=format:{RECORD_SEP}%H"))
+        .arg("--no-renames")
+        .arg("--diff-merges=first-parent")
+        // Git paths are always repository-relative, so no tracked path token
+        // can start with `/`. This absolute-looking prefix is therefore an
+        // unambiguous header sentinel in the NUL-delimited token stream.
+        .arg(format!("--pretty=format:/{RECORD_SEP}%H"))
         .output()
         .context("spawning git log --name-only")?;
     if !output.status.success() {
@@ -783,15 +1235,205 @@ fn touched_files(repo: &Path) -> Result<HashMap<String, Vec<String>>> {
             stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
         }));
     }
-    let text = String::from_utf8_lossy(&output.stdout);
+    parse_touched_files(&output.stdout)
+}
+
+/// Decode the `-z --name-only` stream [`touched_files`] produces. The stream
+/// is unambiguous only when every token is either a `/\x1e<40-hex-sha>`
+/// header (optionally followed by one newline and the commit's first path)
+/// or a path belonging to the most recent header; anything else fails the
+/// phase rather than storing a silently partial path set. A bare `[]` is
+/// therefore meaningful: it is a genuinely empty commit, never the residue
+/// of a parser/git-output mismatch.
+///
+/// One ambiguity this layer cannot resolve: a non-header token is
+/// indistinguishable from a real path of the most recent header's commit.
+/// The `--name-only` walk is newest-first, so a header lost mid-stream (with
+/// its NUL separator) leaves the deleted record's path tokens attached to
+/// that NEWER commit — the commit already walked in the same stream — never
+/// to an older one. Containment is partial and per-record, not per-stream:
+/// the missing sha has no path-set entry, so `ingest_commits` skips it,
+/// warns, and stalls the cursor
+/// (`ingest_stalls_cursor_for_commit_missing_touched_paths` pins both), but
+/// the polluted NEWER commit is created as usual — the orphaned tokens ride
+/// into its `changed_paths`, and commit notes are immutable, so the
+/// pollution persists (a re-ingest skips the already-stored sha; repair
+/// requires deleting the note and re-ingesting). The fixture asserts
+/// exactly that pollution.
+/// The parser deliberately does not try to detect it: that would require
+/// judging path content against a commit the parse never saw.
+fn parse_touched_files(bytes: &[u8]) -> Result<HashMap<String, Vec<String>>> {
     let mut map: HashMap<String, Vec<String>> = HashMap::new();
-    for block in text.split(RECORD_SEP) {
-        let mut lines = block.lines().filter(|l| !l.trim().is_empty());
-        let Some(sha) = lines.next() else { continue };
-        let files: Vec<String> = lines.map(str::to_string).collect();
-        map.insert(sha.trim().to_string(), files);
+    // With `-z`, git emits paths verbatim and NUL-terminates each one. Git
+    // may place either one or two NULs between adjacent commit sections, so
+    // parse individual tokens and recognize only the impossible-path header
+    // prefix above. The header and its first path share a token, separated by
+    // one newline; removing exactly that one byte preserves a filename whose
+    // own first byte is a newline.
+    let mut current_sha: Option<String> = None;
+    for token in bytes.split(|byte| *byte == 0) {
+        if token.is_empty() {
+            continue;
+        }
+        if let Some(header) = token.strip_prefix(TOUCHED_HEADER_PREFIX) {
+            if header.len() < 40 || !header[..40].iter().all(u8::is_ascii_hexdigit) {
+                let lossy = String::from_utf8_lossy(header);
+                let masked = secret_gate::mask_secrets(lossy.as_ref());
+                let display = refs::truncate_chars(masked.as_ref(), 80);
+                return Err(anyhow!(
+                    "git log --name-only output contains a malformed commit header {:?}",
+                    display
+                ));
+            }
+            let sha = String::from_utf8_lossy(&header[..40]).into_owned();
+            let files = map.entry(sha.clone()).or_default();
+            if let Some(first_path) = header[40..].strip_prefix(b"\n") {
+                if !first_path.is_empty() {
+                    files.push(String::from_utf8_lossy(first_path).into_owned());
+                }
+            } else if !header[40..].is_empty() {
+                // Anything after the SHA that does not start with the one
+                // newline separator is a shape git never emits; guessing at
+                // it could drop or fabricate a first path.
+                return Err(anyhow!(
+                    "git log --name-only header for commit {sha} carries a \
+                     malformed first-path separator"
+                ));
+            }
+            current_sha = Some(sha);
+            continue;
+        }
+        let Some(sha) = &current_sha else {
+            // Path bytes are attacker/repo-controlled, so the error snippet
+            // is secret-masked the same way stored changed_paths are —
+            // never raw token bytes in a log/error path.
+            let lossy = String::from_utf8_lossy(token);
+            let masked = secret_gate::mask_secrets(lossy.as_ref());
+            let display = refs::truncate_chars(masked.as_ref(), 80);
+            return Err(anyhow!(
+                "git log --name-only output contains a path token before any \
+                 commit header: {display:?}"
+            ));
+        };
+        map.get_mut(sha)
+            .expect("current SHA was inserted with its header")
+            .push(String::from_utf8_lossy(token).into_owned());
     }
     Ok(map)
+}
+
+#[cfg(test)]
+mod touched_file_parser_tests {
+    use super::parse_touched_files;
+
+    #[test]
+    fn accepts_single_or_double_nul_commit_boundaries() {
+        let sha_a = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let sha_b = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let sha_c = "cccccccccccccccccccccccccccccccccccccccc";
+        let raw =
+            format!("/\x1e{sha_a}\nfirst.rs\0second.rs\0/\x1e{sha_b}\nthird.rs\0\0/\x1e{sha_c}\0");
+
+        let parsed = parse_touched_files(raw.as_bytes()).expect("well-formed stream");
+        assert_eq!(
+            parsed[sha_a],
+            vec!["first.rs".to_string(), "second.rs".to_string()]
+        );
+        assert_eq!(parsed[sha_b], vec!["third.rs".to_string()]);
+        assert!(parsed[sha_c].is_empty());
+    }
+
+    #[test]
+    fn preserves_delimiters_and_uses_lossy_utf8_path_normalization() {
+        let sha = "dddddddddddddddddddddddddddddddddddddddd";
+        let mut raw = format!("/\x1e{sha}\n").into_bytes();
+        raw.extend_from_slice(b"src/caf\xc3\xa9\t\"quoted\"\\leaf\nline.rs\0bad-\xff.rs\0");
+
+        let parsed = parse_touched_files(&raw).expect("well-formed stream");
+        assert_eq!(
+            parsed[sha],
+            vec![
+                "src/café\t\"quoted\"\\leaf\nline.rs".to_string(),
+                "bad-�.rs".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn rejects_a_path_token_before_any_header() {
+        // Silently dropping this token could store `[]` for a commit that
+        // touched files; failing the phase preserves the retry contract.
+        let sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let raw = format!("orphan.rs\0/\x1e{sha}\nfirst.rs\0");
+
+        let err = parse_touched_files(raw.as_bytes()).expect_err("orphan path must fail");
+        assert!(
+            format!("{err}").contains("before any commit header"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn masks_a_secret_shaped_orphan_token_in_the_error() {
+        // The error snippet is a log path: it must carry the same masking as
+        // stored changed_paths, never raw token bytes.
+        let fake_token = "ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let raw = format!("src/{fake_token}.rs\0");
+
+        let err = parse_touched_files(raw.as_bytes()).expect_err("orphan path must fail");
+        let text = format!("{err}");
+        assert!(!text.contains(fake_token), "{text}");
+        assert!(text.contains("MASKED"), "{text}");
+    }
+
+    #[test]
+    fn masks_a_secret_shaped_malformed_header_in_the_error() {
+        let fake_token = "ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let raw = format!("/\x1e{fake_token}\0");
+
+        let err = parse_touched_files(raw.as_bytes()).expect_err("bad header must fail");
+        let text = format!("{err}");
+        assert!(!text.contains(fake_token), "{text}");
+        assert!(text.contains("MASKED"), "{text}");
+    }
+
+    #[test]
+    fn masks_an_orphan_secret_before_truncating_the_error() {
+        let fake_token = "ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        // The credential crosses the old byte-80 cut, so masking only the
+        // prefix would leave the raw secret in the error path.
+        let token = format!("{} {fake_token}", "x".repeat(59));
+        assert!(token.len() > 80);
+        let raw = format!("{token}\0");
+
+        let err = parse_touched_files(raw.as_bytes()).expect_err("orphan path must fail");
+        let text = format!("{err}");
+        assert!(!text.contains(fake_token), "{text}");
+        assert!(text.contains("MASKED"), "{text}");
+    }
+
+    #[test]
+    fn rejects_a_malformed_header_sha() {
+        let raw = "/\x1enot-hex-at-all\nfirst.rs\0second.rs\0";
+
+        let err = parse_touched_files(raw.as_bytes()).expect_err("bad header must fail");
+        assert!(
+            format!("{err}").contains("malformed commit header"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn rejects_a_header_remainder_without_the_newline_separator() {
+        // A header remainder that does not start with exactly one newline is
+        // a shape git never emits; silently discarding it could lose the
+        // first path or misread it as a leading-newline path.
+        let sha = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let raw = format!("/\x1e{sha}XXfirst.rs\0");
+
+        let err = parse_touched_files(raw.as_bytes()).expect_err("bad separator must fail");
+        assert!(format!("{err}").contains("first-path separator"), "{err}");
+    }
 }
 
 /// The two `git log` passes a commit-ingest phase needs, loaded together so
@@ -897,6 +1539,13 @@ const NAME_MAX_CHARS: usize = 120;
 /// stored and FTS-indexed; only the candidate vector input is capped.
 const MAX_COMMIT_EMBED_BYTES: usize = 32_768;
 
+/// Sentinel reason seeded into the commit source slot when a walk begins.
+/// A slot still holding this exact reason at the end of the pass means the
+/// walk ran to the end of its snapshot without a budget break or a stall,
+/// and is rewritten to `Completed`; any other reason was written by a real
+/// early-stop arm and is preserved.
+const COMMIT_WALK_SEED_REASON: &str = "walk began but did not report completion";
+
 /// Returns a UTF-8-valid, proper head prefix of `content` when it exceeds
 /// `MAX_COMMIT_EMBED_BYTES`, or `None` when `content` is at or under the cap
 /// (nothing to truncate — the full text is a valid embedding input as-is).
@@ -964,6 +1613,7 @@ async fn ingest_commits(
     budget: &mut Budget,
     new_records: &mut Vec<NewRecordForRef>,
     recover: &mut (dyn FnMut(&Path, &GitLogError) -> Result<Option<RecoveredRepo>> + Send),
+    walk_complete: &mut bool,
 ) -> Result<()> {
     let since = read_cursor(runtime, project_id, "commits").await?;
     let (snapshot, recovery_warning) = recover_commit_snapshot(repo, since.as_deref(), recover)?;
@@ -972,11 +1622,84 @@ async fn ingest_commits(
         files_by_sha,
     } = snapshot;
     if commits.is_empty() {
+        // An empty `{cursor}..HEAD` range is a genuine completion only when
+        // the cursor is an ancestor of the tip being walked. A cursor that is
+        // NOT an ancestor means this source's history lags or diverged from
+        // whatever advanced the cursor (measured: a scratch clone whose HEAD
+        // trailed the cursor by weeks walked nothing and reported a clean
+        // pass, issue #1644) — surface it and refuse the completion claim.
+        let cursor_not_ancestor = last_sha_of(&since).is_some_and(|since_sha| {
+            let not_ancestor = !is_ancestor_of_head(repo, since_sha);
+            if not_ancestor {
+                report.warnings.push(format!(
+                    "commits cursor {since_sha} is not an ancestor of this \
+                     source's HEAD: the walked history lags or diverged from \
+                     the history that advanced the cursor, so nothing was \
+                     walked (issue #1644)"
+                ));
+                report.done = false;
+            }
+            not_ancestor
+        });
         if let Some(warning) = recovery_warning {
             report.warnings.push(warning);
         }
+        // An empty `{cursor}..HEAD` range over an ancestor cursor means the
+        // walk genuinely reached the tip: the commit source is exhausted.
+        // The source state is recorded HERE, not left for the end-of-pass
+        // fill (whose arms are now loud instrumentation-gap tripwires): the
+        // diverged-cursor refusal is a stop-early — the walk cannot claim
+        // it covered this source's history — while the ancestor case is a
+        // genuine completion.
+        if cursor_not_ancestor {
+            report.sources.commits = Some(IngestSourceState::StoppedEarly(
+                "commits cursor is not an ancestor of this source's HEAD: the walked history \
+                 lags or diverged from the history that advanced the cursor (issue #1644)"
+                    .into(),
+            ));
+        } else {
+            report.sources.commits = Some(IngestSourceState::Completed);
+            *walk_complete = true;
+        }
         return Ok(());
     }
+
+    // A non-empty snapshot means the commit walk is now underway. Seed the
+    // source before the first natural-key lookup so a mid-walk database error
+    // is reported in-band as walked-then-failed rather than as a pre-walk
+    // hard error. Cursor and snapshot failures above remain pre-walk errors.
+    report.sources.commits = Some(IngestSourceState::StoppedEarly(
+        COMMIT_WALK_SEED_REASON.into(),
+    ));
+    // `walk_commits` is oldest-first and includes HEAD whenever this phase
+    // has work, so the last record is the exact repository snapshot against
+    // which ADR-085 `source_revision` must bind. The walk itself is never
+    // truncated: it issues one unbounded `git log {since}..HEAD`, and
+    // `max_items` bounds only the create loop below (a budget check AFTER
+    // this point), never the snapshot. `snapshot_head` is therefore always
+    // the true repository HEAD of this pass, and the module index anchors to
+    // modules-as-of-HEAD regardless of how many commits the budget lets this
+    // pass create.
+    let snapshot_head = commits
+        .last()
+        .expect("non-empty commit snapshot checked above")
+        .sha
+        .clone();
+    // Module annotation is best-effort enrichment: a failed index load
+    // degrades to no module annotation with a warning carrying the load
+    // error's text rather than aborting the pass that records the durable
+    // `changed_paths` facts.
+    let code_modules_by_source_path =
+        match load_code_modules_by_snapshot_path(runtime, token, &snapshot_head).await {
+            Ok(modules) => modules,
+            Err(e) => {
+                report.warnings.push(format!(
+                    "code module index load failed for snapshot {snapshot_head}: {e}; \
+                     commits ingest without code-module annotation"
+                ));
+                HashMap::new()
+            }
+        };
 
     // `cursor_stalled` freezes `last_sha` at the last contiguous successfully
     // processed commit: once a record fails to create, later records in this
@@ -989,10 +1712,24 @@ async fn ingest_commits(
     // sha natural key), so a retried pass never double-creates them.
     let mut last_sha: Option<String> = since;
     let mut cursor_stalled = false;
+    // Bounded detail for the per-run ambiguous-module-skip warning: the
+    // masked skipped paths in encounter order, capped so one pathological
+    // run cannot bloat the report (the full count is always exact).
+    const AMBIGUOUS_SKIP_DETAIL_CAP: usize = 5;
+    const AMBIGUOUS_SKIP_PATH_DISPLAY_CHARS: usize = 80;
+    let mut ambiguous_module_skip_paths: Vec<String> = Vec::new();
     // Parent SHA -> note id for commits created earlier THIS pass (walked
     // oldest-first) — combined with `find_commit_by_sha`'s DB lookup below,
     // this resolves parent edges regardless of which pass the parent landed
     // in.
+    //
+    // Stall guard on every `last_sha` advance below (`!cursor_stalled`):
+    // once a commit create fails, the persisted cursor must freeze at the
+    // last contiguous success — advancing it past a refused/failed record
+    // (including on a later EXISTING record, whose natural-key lookup
+    // proves only its own landing, not the failed record's) would strand
+    // the failed commit behind the floor and skip it forever instead of
+    // retrying it next pass.
     let mut local_sha_to_id: HashMap<String, Uuid> = HashMap::new();
     for c in &commits {
         if let Some(existing) = find_commit_by_sha(runtime, token, &c.sha).await? {
@@ -1005,6 +1742,9 @@ async fn ingest_commits(
         }
 
         if budget.exhausted() {
+            report.sources.commits = Some(IngestSourceState::StoppedEarly(
+                "budget exhausted before the commit history was exhausted".into(),
+            ));
             break;
         }
 
@@ -1015,15 +1755,104 @@ async fn ingest_commits(
             format!("{}\n\n{}", masked.subject, masked.body)
         };
 
-        let mut annotates = vec![project_id.to_string()];
-
-        if let Some(paths) = files_by_sha.get(&c.sha) {
-            for p in paths {
-                if !p.starts_with("docs/adr/") {
-                    continue;
+        // Both `git log` passes walk the same history, so every walked
+        // commit should have a path-set entry. A missing entry means the two
+        // passes disagree; surface it instead of silently storing the `[]`
+        // the contract reserves for a genuinely empty commit.
+        let Some(touched_paths) = files_by_sha.get(&c.sha) else {
+            cursor_stalled = true;
+            let recipient_detail = commits
+                .iter()
+                .position(|candidate| candidate.sha == c.sha)
+                .and_then(|index| {
+                    commits
+                        .iter()
+                        .skip(index + 1)
+                        .find(|candidate| files_by_sha.contains_key(&candidate.sha))
+                })
+                .map(|recipient| {
+                    format!(
+                        "; orphaned paths may have been absorbed by newer commit {}",
+                        recipient.sha
+                    )
+                })
+                .unwrap_or_else(|| {
+                    "; no newer path-set recipient was identifiable from this snapshot".to_string()
+                });
+            report.warnings.push(format!(
+                "create commit {}: no touched-path set recorded by the \
+                 --name-only pass; not ingested{}",
+                c.sha, recipient_detail
+            ));
+            continue;
+        };
+        // The `-z` stream is verbatim: a Unix filename may legitimately
+        // contain `\` or start `X:`, and the hook's canonical
+        // `changed_paths` shape can never carry those (CommitHook rejects
+        // them, which would fail the whole commit create and stall the
+        // cursor on every pass). Filter them here, against the same
+        // predicate the hook enforces, and surface the per-run count below.
+        // The predicate runs on the RAW path, not the masked one: a secret
+        // token can itself contain a rejected byte (the masker's tokens are
+        // whitespace-delimited, so a backslash or NUL inside a token is
+        // redacted along with it), and filtering post-masking would then
+        // flip the verdict from reject to accept. Masking is applied only
+        // to the paths that survive the raw filter, for storage. Only
+        // actual predicate rejections count as drops: BTreeSet dedup and
+        // post-masking collisions are not drops and are neither counted
+        // nor warned.
+        let mut noncanonical = 0_u64;
+        let changed_paths: Vec<String> = touched_paths
+            .iter()
+            .filter(|path| {
+                let canonical = hook::is_repo_relative_path(path);
+                if !canonical {
+                    noncanonical += 1;
                 }
-                if let Some(doc_id) = find_document_for_path(runtime, token, p).await? {
-                    annotates.push(doc_id.to_string());
+                canonical
+            })
+            .map(|path| secret_gate::mask_secrets(path).into_owned())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        report.changed_paths_filtered_noncanonical += noncanonical;
+        // Distinguish the three stored states the contract defines: a
+        // genuinely empty commit stores `[]`; a commit whose raw touched
+        // paths were ALL rejected omits `changed_paths` entirely (the drop
+        // count in `changed_paths_filtered_noncanonical` and the per-run
+        // warning carry the evidence); anything else stores the canonical
+        // remainder. The hook treats a missing `changed_paths` as optional,
+        // so the omitted shape still validates.
+        let changed_paths_property = if touched_paths.is_empty() || !changed_paths.is_empty() {
+            Some(changed_paths.clone())
+        } else {
+            None
+        };
+        let mut annotates = BTreeSet::from([project_id.to_string()]);
+
+        for path in &changed_paths {
+            match code_modules_by_source_path.get(path) {
+                Some(Some(module_id)) => {
+                    annotates.insert(module_id.to_string());
+                }
+                // The key is unusable — either more than one live row binds
+                // it (including the two-parseable-row case) or its single
+                // row's id does not parse — so no candidate is annotated.
+                // Both shapes count once per commit path that hits the key (the
+                // path is also remembered for the bounded per-run warning
+                // below); see `load_code_modules_by_snapshot_path` for the
+                // fold.
+                Some(None) => {
+                    report.code_module_ambiguous_path_skips += 1;
+                    if ambiguous_module_skip_paths.len() < AMBIGUOUS_SKIP_DETAIL_CAP {
+                        ambiguous_module_skip_paths.push(path.clone());
+                    }
+                }
+                None => {}
+            }
+            if path.starts_with("docs/adr/") {
+                if let Some(doc_id) = find_document_for_path(runtime, token, path).await? {
+                    annotates.insert(doc_id.to_string());
                 }
             }
         }
@@ -1044,10 +1873,10 @@ async fn ingest_commits(
             },
         };
         if let Some(pr_id) = pr_id {
-            annotates.push(pr_id.to_string());
+            annotates.insert(pr_id.to_string());
         }
 
-        let properties = json!({
+        let mut properties = json!({
             "sha": masked.sha,
             "short_sha": masked.short_sha,
             "author": masked.author,
@@ -1055,6 +1884,9 @@ async fn ingest_commits(
             "committed_at": masked.committed_at,
             "parents": masked.parents,
         });
+        if let Some(paths) = changed_paths_property {
+            properties["changed_paths"] = json!(paths);
+        }
 
         let name = refs::truncate_chars(
             &format!("{} {}", masked.short_sha, masked.subject),
@@ -1067,7 +1899,7 @@ async fn ingest_commits(
             "name": name,
             "content": content,
             "properties": properties,
-            "annotates": annotates,
+            "annotates": annotates.into_iter().collect::<Vec<_>>(),
         });
         if let Some(head) = embedding_head {
             create_request["embedding_content"] = json!(head);
@@ -1135,13 +1967,102 @@ async fn ingest_commits(
         }
     }
 
+    if cursor_stalled {
+        report.cursor_stalled = true;
+        report.done = false;
+        report.sources.commits = Some(IngestSourceState::StoppedEarly(
+            "a per-record write failure froze the commits cursor (cursor_stalled)".into(),
+        ));
+    } else {
+        let walk_ended_clean = match &report.sources.commits {
+            None => true,
+            Some(IngestSourceState::StoppedEarly(reason)) => reason == COMMIT_WALK_SEED_REASON,
+            Some(_) => false,
+        };
+        if walk_ended_clean {
+            // Neither a budget break nor a stall fired: the loop visited
+            // every commit in the snapshot, so the walk-start seed (or a
+            // `None` from an instrumentation gap) is rewritten to
+            // `Completed`. Any other reason was written by a real
+            // early-stop arm and is preserved.
+            report.sources.commits = Some(IngestSourceState::Completed);
+            *walk_complete = true;
+        }
+    }
     if let Some(sha) = last_sha {
+        // A stalled cursor has already frozen `last_sha` at the last
+        // contiguous success above; the write persists exactly that floor.
+        // A failure here surfaces at the call site, which distinguishes it
+        // from a pre-walk failure by the already-recorded source state and
+        // downgrades the pass to stopped-early in-band (never a hard
+        // abort of the whole ingest).
         write_cursor(runtime, project_id, "commits", &sha).await?;
+    }
+    // One bounded line per run (never one per path): filenames are
+    // attacker/repo-controlled and may be long, so the count is the
+    // load-bearing fact; a bounded masked path sample rides along so the
+    // count is actionable, and the full set remains recoverable from the
+    // raw `git log -z --name-only` stream if an operator needs it.
+    if report.changed_paths_filtered_noncanonical > 0 {
+        report.warnings.push(format!(
+            "{} touched path(s) dropped from changed_paths: outside the \
+             canonical repo-relative shape (NUL byte, backslash, `X:` \
+             drive prefix, leading `/`, or empty/`.`/`..` component)",
+            report.changed_paths_filtered_noncanonical
+        ));
+    }
+    if report.code_module_ambiguous_path_skips > 0 {
+        // Every skip increments the exact counter above; only the retained
+        // masked path sample is capped at AMBIGUOUS_SKIP_DETAIL_CAP.
+        let shown = ambiguous_module_skip_paths
+            .len()
+            .min(AMBIGUOUS_SKIP_DETAIL_CAP);
+        let detail = ambiguous_module_skip_paths[..shown]
+            .iter()
+            .map(|path| {
+                let display = refs::truncate_chars(path, AMBIGUOUS_SKIP_PATH_DISPLAY_CHARS);
+                format!("{display:?}")
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        let remaining = report
+            .code_module_ambiguous_path_skips
+            .saturating_sub(shown as u64);
+        let suffix = if remaining > 0 {
+            format!(", +{remaining} more")
+        } else {
+            String::new()
+        };
+        report.warnings.push(format!(
+            "{} changed path(s) skipped code-module annotation: no usable \
+             (source_revision, source_path) binding (first {shown}: \
+             [{detail}]{suffix})",
+            report.code_module_ambiguous_path_skips
+        ));
     }
     if let Some(warning) = recovery_warning {
         report.warnings.push(warning);
     }
     Ok(())
+}
+
+/// Borrow the cursor SHA out of the `Option<String>` read from the store.
+fn last_sha_of(since: &Option<String>) -> Option<&str> {
+    since.as_deref().filter(|s| !s.is_empty())
+}
+
+/// `true` when `sha` is an ancestor of (or equal to) `repo`'s HEAD. A SHA
+/// that is unknown to this repo returns `false` — for the empty-walk guard
+/// that is the correct reading: the walked source does not contain the
+/// history that advanced the cursor.
+fn is_ancestor_of_head(repo: &Path, sha: &str) -> bool {
+    Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["merge-base", "--is-ancestor", sha, "HEAD"])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
 }
 
 /// Count `commit` notes annotating `project_id`, derived fresh from the
@@ -1506,8 +2427,17 @@ async fn ingest_prs(
     number_to_pr: &mut HashMap<u64, Uuid>,
     budget: &mut Budget,
     new_records: &mut Vec<NewRecordForRef>,
+    walk_complete: &mut bool,
 ) -> Result<()> {
-    let since = read_cursor(runtime, project_id, "prs").await?;
+    let since = match read_cursor(runtime, project_id, "prs").await {
+        Ok(since) => since,
+        Err(e) => {
+            report.sources.pull_requests = Some(IngestSourceState::Skipped(format!(
+                "local cursor/database read failed before pull request listing: {e}"
+            )));
+            return Err(e);
+        }
+    };
 
     // `cursor_stalled` mirrors `ingest_commits`: once one PR fails to create,
     // later PRs in this pass are still attempted (so every failure surfaces
@@ -1518,9 +2448,27 @@ async fn ingest_prs(
     let mut cursor_stalled = false;
     let mut floor = since.clone();
     let mut window_complete = true;
+    let mut stop_reason: Option<&'static str> = None;
 
     'paging: loop {
-        let mut page = fetch_pr_page(repo, floor.as_deref())?;
+        // The FIRST fetch failing must report `skipped` (never walked);
+        // every later failure happens mid/post-walk. The call site reads
+        // that distinction off this state slot, so the marker goes up as
+        // soon as the walk begins and pre-seeds the stopped-early state:
+        // leaving the loop before the window completes IS stopping early,
+        // and the arms below specialize the reason when they fire.
+        let first_page = report.sources.pull_requests.is_none();
+        let mut page = match fetch_pr_page(repo, floor.as_deref()) {
+            Ok(page) => {
+                if first_page {
+                    report.sources.pull_requests = Some(IngestSourceState::StoppedEarly(
+                        "walk began but did not report completion".into(),
+                    ));
+                }
+                page
+            }
+            Err(e) => return Err(e),
+        };
         let page_len = page.len();
         // Each page is already `sort:updated-asc` server-side, but `--search`
         // makes no hard ordering guarantee across ties — re-sort defensively
@@ -1534,12 +2482,6 @@ async fn ingest_prs(
         let last_updated_at = page.last().and_then(|pr| pr.updated_at.clone());
 
         for pr in page {
-            let is_new = since
-                .as_deref()
-                .zip(pr.updated_at.as_deref())
-                .map(|(cursor, updated)| updated >= cursor)
-                .unwrap_or(true);
-
             if let Some(existing) =
                 find_by_number(runtime, token, "pull_request", project_id, pr.number).await?
             {
@@ -1548,6 +2490,17 @@ async fn ingest_prs(
                     merge_sha_to_pr.insert(oid, existing);
                 }
                 report.prs_skipped_existing += 1;
+                // The natural-key lookup proves THIS record landed — but
+                // while this pass is stalled, records walked after the stall
+                // point sort at/after the refused record (pages are sorted
+                // ascending by `updated_at`). Advancing the floor past them
+                // would persist a cursor strictly newer than the refused
+                // record's timestamp, so the next pass's inclusive
+                // `updated >= cursor` filter would never re-fetch it —
+                // the refusal would be skipped forever instead of retried.
+                // The guard only fires on a stalled pass: a clean
+                // all-existing pass (the common resumed-pass shape) still
+                // advances normally and never re-fetches its window twice.
                 if !cursor_stalled {
                     if let Some(u) = &pr.updated_at {
                         if max_updated
@@ -1561,10 +2514,29 @@ async fn ingest_prs(
                 }
                 continue;
             }
+            // Computed AFTER the existence lookup: a record fetched by gh
+            // because of the inclusive cursor tie (`updated >= since`) that
+            // then lands is covered by its own create — walking past it
+            // must not freeze the cursor at the pass floor.
+            let is_new = since
+                .as_deref()
+                .zip(pr.updated_at.as_deref())
+                .map(|(cursor, updated)| updated >= cursor)
+                .unwrap_or(true);
             if !is_new {
                 continue;
             }
             if budget.exhausted() {
+                // Records after this point in the window were never
+                // visited: the walk stops early even when the page itself
+                // is short (a short page only proves the REMOTE window
+                // ended, not that the local walk covered it). This is also
+                // the exact-budget boundary: the budget counter cannot
+                // distinguish "ran out exactly at the last record" from
+                // "records remained", and the conservative answer is
+                // stopped-early — a resumed pass completes idempotently.
+                window_complete = false;
+                stop_reason = Some("budget exhausted before the pull request window completed");
                 break;
             }
 
@@ -1649,8 +2621,16 @@ async fn ingest_prs(
             budget.exhausted(),
         ) {
             PageOutcome::WindowComplete => break 'paging,
-            PageOutcome::StopBudgetExhausted | PageOutcome::StopFloorStalled => {
+            PageOutcome::StopBudgetExhausted => {
                 window_complete = false;
+                stop_reason = Some("budget exhausted before the pull request window completed");
+                break 'paging;
+            }
+            PageOutcome::StopFloorStalled => {
+                window_complete = false;
+                stop_reason = Some(
+                    "full page returned but the pull request paging floor stalled before the window completed",
+                );
                 break 'paging;
             }
             PageOutcome::Continue(next_floor) => floor = Some(next_floor),
@@ -1663,6 +2643,35 @@ async fn ingest_prs(
         // not a complete signal; report `done = false` regardless of budget
         // state so the caller's resume loop keeps going.
         report.done = false;
+        // Seed invariant (see `pin_stopped_early`): this arm is reachable
+        // only after at least one successful page fetch, and the first
+        // successful fetch seeds the slot above — the helper's `None` arm
+        // is a release-mode soft fallback, never a panic.
+        pin_stopped_early(
+            &mut report.sources.pull_requests,
+            stop_reason
+                .unwrap_or("the pull request paging window was not proven complete")
+                .into(),
+        );
+    }
+    if cursor_stalled {
+        // A stalled PR cursor means records past the frozen floor were never
+        // retried; `done: true` here would tell the caller the slot is
+        // complete when it is permanently behind (issue #1645).
+        report.cursor_stalled = true;
+        report.done = false;
+        // See the `!window_complete` arm above for the seed invariant.
+        pin_stopped_early(
+            &mut report.sources.pull_requests,
+            "a per-record write failure froze the pull_requests cursor (cursor_stalled)".into(),
+        );
+    }
+    if window_complete && !cursor_stalled {
+        // Completion is recorded HERE too — every walker exit leaves the
+        // state slot final, so the end-of-pass fill is a pure
+        // instrumentation-gap fallback, not part of the normal path.
+        report.sources.pull_requests = Some(IngestSourceState::Completed);
+        *walk_complete = true;
     }
 
     if let Some(cursor) = max_updated {
@@ -1681,8 +2690,17 @@ async fn ingest_issues(
     report: &mut IngestReport,
     budget: &mut Budget,
     new_records: &mut Vec<NewRecordForRef>,
+    walk_complete: &mut bool,
 ) -> Result<()> {
-    let since = read_cursor(runtime, project_id, "issues").await?;
+    let since = match read_cursor(runtime, project_id, "issues").await {
+        Ok(since) => since,
+        Err(e) => {
+            report.sources.issues = Some(IngestSourceState::Skipped(format!(
+                "local cursor/database read failed before issue listing: {e}"
+            )));
+            return Err(e);
+        }
+    };
 
     // `cursor_stalled` mirrors `ingest_commits`/`ingest_prs`: a per-record
     // create failure is aggregated as a warning and later records in this
@@ -1693,9 +2711,25 @@ async fn ingest_issues(
     let mut cursor_stalled = false;
     let mut floor = since.clone();
     let mut window_complete = true;
+    let mut stop_reason: Option<&'static str> = None;
 
     'paging: loop {
-        let page = fetch_issue_page(repo, floor.as_deref())?;
+        // See `ingest_prs`: the first fetch failing must report `skipped`
+        // (never walked); the call site reads that off this state slot, so
+        // the walk-start marker also pre-seeds the stopped-early state that
+        // leaving the loop early implies.
+        let first_page = report.sources.issues.is_none();
+        let page = match fetch_issue_page(repo, floor.as_deref()) {
+            Ok(page) => {
+                if first_page {
+                    report.sources.issues = Some(IngestSourceState::StoppedEarly(
+                        "walk began but did not report completion".into(),
+                    ));
+                }
+                page
+            }
+            Err(e) => return Err(e),
+        };
         let page_len = page.len();
         // The ENTIRE fetched page is classified (masked strings, canonicalized
         // timestamps, governed-enum `state_reason`) before anything else --
@@ -1717,17 +2751,17 @@ async fn ingest_issues(
         let last_updated_at = masked_page.last().and_then(|i| i.updated_at.clone());
 
         for masked in masked_page {
-            let is_new = since
-                .as_deref()
-                .zip(masked.updated_at.as_deref())
-                .map(|(cursor, updated)| updated >= cursor)
-                .unwrap_or(true);
-
             if find_by_number(runtime, token, "issue", project_id, masked.number)
                 .await?
                 .is_some()
             {
                 report.issues_skipped_existing += 1;
+                // See `ingest_prs`: while this pass is stalled, advancing
+                // the floor past records walked after the stall point would
+                // persist a cursor strictly newer than the refused record's
+                // timestamp and skip it forever instead of retrying it. A
+                // clean (non-stalled) all-existing pass still advances
+                // normally.
                 if !cursor_stalled {
                     if let Some(u) = &masked.updated_at {
                         if max_updated
@@ -1741,10 +2775,23 @@ async fn ingest_issues(
                 }
                 continue;
             }
+            // Computed AFTER the existence lookup (see `ingest_prs`): a
+            // cursor-tie record that lands is covered by its own create.
+            let is_new = since
+                .as_deref()
+                .zip(masked.updated_at.as_deref())
+                .map(|(cursor, updated)| updated >= cursor)
+                .unwrap_or(true);
             if !is_new {
                 continue;
             }
             if budget.exhausted() {
+                // See `ingest_prs`: unvisited records remain, so the walk
+                // stops early even when the page is short; the
+                // exact-budget boundary resolves conservatively and a
+                // resumed pass completes idempotently.
+                window_complete = false;
+                stop_reason = Some("budget exhausted before the issue window completed");
                 break;
             }
 
@@ -1836,8 +2883,16 @@ async fn ingest_issues(
             budget.exhausted(),
         ) {
             PageOutcome::WindowComplete => break 'paging,
-            PageOutcome::StopBudgetExhausted | PageOutcome::StopFloorStalled => {
+            PageOutcome::StopBudgetExhausted => {
                 window_complete = false;
+                stop_reason = Some("budget exhausted before the issue window completed");
+                break 'paging;
+            }
+            PageOutcome::StopFloorStalled => {
+                window_complete = false;
+                stop_reason = Some(
+                    "full page returned but the issue paging floor stalled before the window completed",
+                );
                 break 'paging;
             }
             PageOutcome::Continue(next_floor) => floor = Some(next_floor),
@@ -1846,6 +2901,33 @@ async fn ingest_issues(
 
     if !window_complete {
         report.done = false;
+        // Seed invariant (see `pin_stopped_early`): this arm is reachable
+        // only after at least one successful page fetch, and the first
+        // successful fetch seeds the slot above.
+        pin_stopped_early(
+            &mut report.sources.issues,
+            stop_reason
+                .unwrap_or("the issue paging window was not proven complete")
+                .into(),
+        );
+    }
+    if cursor_stalled {
+        // Same contract as the commits and PR paths: a frozen issue cursor
+        // means unretried records exist past the floor, so the slot is not
+        // complete (issue #1645).
+        report.cursor_stalled = true;
+        report.done = false;
+        // See the `!window_complete` arm above for the seed invariant.
+        pin_stopped_early(
+            &mut report.sources.issues,
+            "a per-record write failure froze the issues cursor (cursor_stalled)".into(),
+        );
+    }
+    if window_complete && !cursor_stalled {
+        // See `ingest_prs`: completion is recorded at the exit, not left
+        // for the end-of-pass fill.
+        report.sources.issues = Some(IngestSourceState::Completed);
+        *walk_complete = true;
     }
 
     if let Some(cursor) = max_updated {
@@ -2230,6 +3312,171 @@ mod find_document_for_path_tests {
             Some(exact_id),
             "a single query covering both exact and broadened candidates \
              must still rank the exact match first, regardless of insertion order"
+        );
+    }
+}
+
+/// `load_code_modules_by_snapshot_path` ambiguity and error-surface
+/// regression tests. See
+/// crates/khive-pack-git/docs/api/ingest.md#test-module-notes.
+#[cfg(test)]
+mod module_index_loader_tests {
+    use super::*;
+    use khive_runtime::Namespace;
+
+    const REVISION: &str = "1111111111111111111111111111111111111111";
+    const AMBIGUOUS_PATH: &str = "crates/ambig/src/lib.rs";
+
+    fn rt_and_token() -> (KhiveRuntime, NamespaceToken) {
+        let rt = KhiveRuntime::memory().unwrap();
+        let token = rt.authorize(Namespace::local()).unwrap();
+        (rt, token)
+    }
+
+    async fn create_module(
+        rt: &KhiveRuntime,
+        token: &NamespaceToken,
+        name: &str,
+        path: &str,
+    ) -> Uuid {
+        rt.create_entity(
+            token,
+            "concept",
+            Some("module"),
+            name,
+            None,
+            Some(json!({
+                "source_path": path,
+                "source_revision": REVISION
+            })),
+            vec![],
+        )
+        .await
+        .unwrap()
+        .id
+    }
+
+    /// A live module row whose `id` does not parse as a UUID — a shape the
+    /// normal `create` path never writes, inserted raw to prove the loader
+    /// still counts it toward ambiguity.
+    async fn insert_unparsable_module_row(
+        rt: &KhiveRuntime,
+        token: &NamespaceToken,
+        name: &str,
+        path: &str,
+    ) {
+        let mut writer = rt.sql().writer().await.unwrap();
+        writer
+            .execute(SqlStatement {
+                sql: "INSERT INTO entities \
+                      (id, namespace, kind, entity_type, name, properties, created_at, updated_at) \
+                      VALUES (?1, ?2, 'concept', 'module', ?3, ?4, 0, 0)"
+                    .into(),
+                params: vec![
+                    SqlValue::Text("not-a-parseable-uuid".to_string()),
+                    SqlValue::Text(token.namespace().as_str().to_string()),
+                    SqlValue::Text(name.to_string()),
+                    SqlValue::Text(
+                        json!({
+                            "source_path": path,
+                            "source_revision": REVISION
+                        })
+                        .to_string(),
+                    ),
+                ],
+                label: Some("test_insert_unparsable_module_row".into()),
+            })
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn single_valid_module_row_binds() {
+        let (rt, token) = rt_and_token();
+        let id = create_module(&rt, &token, "solo_module", AMBIGUOUS_PATH).await;
+
+        let index = load_code_modules_by_snapshot_path(&rt, &token, REVISION)
+            .await
+            .unwrap();
+        assert_eq!(index.get(AMBIGUOUS_PATH), Some(&Some(id)));
+    }
+
+    /// Contract: more than one live module with the same
+    /// `(source_revision, source_path)` is ambiguous and annotates none. An
+    /// unparsable-id row is still a live row for that key, so it must mark
+    /// the pair ambiguous even though it can never bind itself.
+    #[tokio::test]
+    async fn unparsable_module_row_counts_toward_ambiguity() {
+        let (rt, token) = rt_and_token();
+        let valid_id = create_module(&rt, &token, "valid_module", AMBIGUOUS_PATH).await;
+        insert_unparsable_module_row(&rt, &token, "malformed_module", AMBIGUOUS_PATH).await;
+
+        let index = load_code_modules_by_snapshot_path(&rt, &token, REVISION)
+            .await
+            .unwrap();
+        assert_eq!(
+            index.get(AMBIGUOUS_PATH),
+            Some(&None),
+            "a malformed row is evidence of a second live module for \
+             {AMBIGUOUS_PATH}; the valid row {valid_id} must not be selected"
+        );
+    }
+
+    #[tokio::test]
+    async fn two_parseable_module_rows_fold_to_ambiguity() {
+        let (rt, token) = rt_and_token();
+        let first_id = create_module(&rt, &token, "first_module", AMBIGUOUS_PATH).await;
+        let second_id = create_module(&rt, &token, "second_module", AMBIGUOUS_PATH).await;
+
+        let index = load_code_modules_by_snapshot_path(&rt, &token, REVISION)
+            .await
+            .unwrap();
+        assert_eq!(
+            index.get(AMBIGUOUS_PATH),
+            Some(&None),
+            "two live parseable rows ({first_id}, {second_id}) must not select a winner"
+        );
+    }
+
+    #[tokio::test]
+    async fn unparsable_module_row_alone_never_binds() {
+        let (rt, token) = rt_and_token();
+        insert_unparsable_module_row(&rt, &token, "lonely_malformed", AMBIGUOUS_PATH).await;
+
+        let index = load_code_modules_by_snapshot_path(&rt, &token, REVISION)
+            .await
+            .unwrap();
+        assert_eq!(
+            index.get(AMBIGUOUS_PATH),
+            Some(&None),
+            "an unparsable id can never serve as an annotation target"
+        );
+    }
+
+    /// A failed index load must surface its cause: the caller includes this
+    /// error text in the degradation warning, so persistent SQL/schema
+    /// problems stay diagnosable.
+    #[tokio::test]
+    async fn load_failure_surfaces_error_text() {
+        let (rt, token) = rt_and_token();
+        // Break the substrate directly: the index query then fails with a
+        // real SQL error that must reach the caller.
+        let mut writer = rt.sql().writer().await.unwrap();
+        writer
+            .execute(SqlStatement {
+                sql: "DROP TABLE entities".into(),
+                params: vec![],
+                label: Some("test_drop_entities".into()),
+            })
+            .await
+            .unwrap();
+
+        let err = load_code_modules_by_snapshot_path(&rt, &token, REVISION)
+            .await
+            .expect_err("a failed index load must return Err");
+        assert!(
+            format!("{err}").contains("no such table"),
+            "the error must carry the underlying SQL cause: {err}"
         );
     }
 }

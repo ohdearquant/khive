@@ -417,6 +417,7 @@ pack owns it, exactly like the MCP `request` tool:
 
 ```bash
 kkernel exec 'knowledge.import(path="/path/to/corpus.jsonl", format="ndjson")' --db ~/.khive/khive.db
+kkernel exec 'stats()' --config /absolute/path/to/config.toml
 ```
 
 See §3 below for `exec`'s general resolution rules, and the `knowledge` pack's own docs for
@@ -428,8 +429,9 @@ binary.
 ## 3. Reindex
 
 `kkernel reindex` rebuilds embedding vectors and FTS documents for entities, notes, and (unless
-excluded) the knowledge corpus, fanning out across every embedding engine registered in the
-resolved config, the same resolution `kkernel mcp` uses (§1). Full flag reference
+excluded) the knowledge corpus. The graph entity/note pass fans out across every embedding engine
+registered in the resolved config; knowledge atoms and sections use the default engine that their
+read paths query. Engine resolution is the same one `kkernel mcp` uses (§1). Full flag reference
 (`reindex.rs:134-194`):
 
 | Flag                              | Default                                     | Effect                                                                                  |
@@ -494,19 +496,19 @@ completion epoch bump is the eighth category. What
 exists: a bad `--namespace` value, a config resolution failure, a failed runtime open, a failed
 `authorize`, or a failed page-list call abort the whole run via `?` regardless of the flag.
 
-**Engine fan-out**: omitting `--model` reindexes against `rt.registered_embedding_model_names()`,
-whatever engines the resolved runtime config actually registers, not a hardcoded list. If that
-list is empty (no embedder configured at all), a warning prints but FTS backfill for entities and
-notes still runs. Knowledge atoms use the default model for their primary success counters and
-fan out to secondary registered engines on a best-effort basis; knowledge sections use the
-default model. `--model` still restricts only the graph pass.
+**Engine fan-out**: omitting `--model` reindexes graph entities and notes against
+`rt.registered_embedding_model_names()`, whatever engines the resolved runtime config actually
+registers, not a hardcoded list. If that list is empty (no embedder configured at all), a warning
+prints but FTS backfill for entities and notes still runs. Knowledge atoms and sections use only
+the default model because every knowledge-search vector path reads only that model. `--model`
+still restricts only the graph pass.
 
 **When to reindex** (genuine in-code rationale, not doc-comment fluff): after relabeling a
 namespace (vector rows would otherwise be stranded under the wrong namespace on next write,
-`reindex.rs:239-250`); after adding or removing an embedding model in config (so on-disk vectors
-match the currently-configured engine set, `reindex.rs:483-490`); and to force a stale Vamana ANN
-snapshot rebuild, since reindex explicitly invalidates ANN snapshots so the next warm-load
-rebuilds against the freshly re-embedded vectors (`reindex.rs:627-636`).
+`reindex.rs:239-250`); after adding or removing a graph embedding model in config (so entity/note
+vectors match the currently configured engine set, `reindex.rs:483-490`); and to force a stale
+Vamana ANN snapshot rebuild, since reindex explicitly invalidates ANN snapshots so the next
+warm-load rebuilds against the freshly re-embedded vectors (`reindex.rs:627-636`).
 
 ### `kkernel engine`: read-only inspection only, today
 
@@ -593,9 +595,10 @@ kkernel exec --pending-events --db ~/.khive/khive.db --namespace local --verbose
 ```
 
 `--pending-events` is mutually exclusive with both the positional `ops` string and `--ops-file`
-(clap `conflicts_with`, `exec.rs:105-106`) and, when set, bypasses the rest of `ExecArgs` entirely
-(no `--presentation`/`--output-format`/`--save-file` handling); it calls
-`pending_events::run_pending_events` directly.
+(clap `conflicts_with`, `exec.rs`) and, when set, bypasses result-presentation and sink handling
+(no `--presentation`/`--output-format`/`--save-file` handling). It still honors `--db` and the
+explicit `--config` / `KHIVE_CONFIG` tier, then calls
+`pending_events::run_pending_events_with_config` directly.
 
 "Pending events" are **notes of kind `scheduled_event`** (the same `notes` substrate as everything
 else, created by the `schedule` pack's `remind`/`schedule` verbs), each carrying `trigger_at`,

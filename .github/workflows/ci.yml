@@ -159,6 +159,21 @@ jobs:
           deno-version: v2.x
       - uses: astral-sh/setup-uv@v5
         if: env.CI_SUITE == 'full' && matrix.shard == 1
+      # The identifier-ban contract performs a repo-wide ripgrep scan and
+      # fails (rather than skips) when CI lacks rg (#1636). ubuntu-latest does
+      # not include it, so provision the instrument in every full-suite shard
+      # that runs khive-contract.
+      - name: Install khive-contract scan dependency (Linux)
+        if: env.CI_SUITE == 'full' && matrix.shard == 1 && runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes ripgrep
+          rg --version
+      - name: Install khive-contract scan dependency (macOS)
+        if: env.CI_SUITE == 'full' && matrix.shard == 1 && runner.os == 'macOS'
+        run: |
+          brew install ripgrep
+          rg --version
       # SECURITY ORDERING (#560): the placeholder-stub scan runs before any cargo
       # phase so no PR-controlled build script or proc-macro executes before the
       # guard; it reads the pristine checkout. Keep this step ahead of every cargo
@@ -213,6 +228,21 @@ jobs:
       - name: Channel-email feature tests
         if: env.CI_SUITE == 'full' && matrix.shard == 1
         run: ../scripts/ci.sh channel-email
+      # Gated like every other shard-1 phase in this job: the introducing
+      # commit (cad6479dc) left no rationale for the lone ungated condition,
+      # and the macos-pr lane already runs the whole khive-mcp suite once via
+      # macos-pr-tests, so the focused portability lane keeps one serial run
+      # of the pair while push/nightly/manual full lanes repeat it 25x per OS
+      # (ADR-049 Amendment 3). timeout-minutes: a warm iteration measures
+      # Observed on ubuntu-latest runners: ~24s per iteration (2 tests,
+      # serial, plus per-iteration cargo overhead), so 25 iterations need
+      # ~10 minutes of test time alone before the initial build. Budget
+      # accordingly; a timeout here means the gate ran out of wall clock,
+      # not that a recovery flake was caught.
+      - name: Daemon recovery flake gate
+        if: env.CI_SUITE == 'full' && matrix.shard == 1
+        timeout-minutes: 25
+        run: ../scripts/ci.sh daemon-recovery-flake
       - name: No-default-features check
         if: env.CI_SUITE == 'full' && matrix.shard == 1
         run: ../scripts/ci.sh no-default-features

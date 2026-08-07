@@ -321,7 +321,7 @@ async fn assert_page_count_and_items_share_snapshot(query: SnapshotPageQuery) {
     let pool = Arc::new(
         ConnectionPool::new(PoolConfig {
             path: Some(path),
-            write_queue_enabled: false,
+            write_queue_enabled: Some(false),
             ..PoolConfig::default()
         })
         .unwrap(),
@@ -1197,7 +1197,7 @@ async fn page_offset_over_i64max_rejected() {
 /// routes through the WriterTask channel instead of the pool-mutex path, and
 /// both rows are actually committed and independently readable back.
 ///
-/// Constructed via a `PoolConfig` literal (`write_queue_enabled: true`), not
+/// Constructed via a `PoolConfig` literal (`write_queue_enabled: Some(true)`), not
 /// the `KHIVE_WRITE_QUEUE` env var — that env var is process-global and this
 /// crate's other tests are NOT `#[serial]` against it, so a window where it
 /// is set here could leak into a concurrently-scheduled test's own pool
@@ -1208,7 +1208,7 @@ async fn upsert_notes_routes_through_writer_task_when_flag_enabled() {
     let path = dir.path().join("write_queue_notes.db");
     let pool_cfg = PoolConfig {
         path: Some(path.clone()),
-        write_queue_enabled: true,
+        write_queue_enabled: Some(true),
         ..PoolConfig::default()
     };
     let pool = Arc::new(ConnectionPool::new(pool_cfg).unwrap());
@@ -1255,7 +1255,7 @@ async fn upsert_notes_routes_through_writer_task_when_flag_enabled() {
 /// because it runs inside the writer task's own `spawn_blocking`, not a
 /// sleep/timing race).
 ///
-/// Constructed via a `PoolConfig` literal (`write_queue_enabled: true`), not
+/// Constructed via a `PoolConfig` literal (`write_queue_enabled: Some(true)`), not
 /// the `KHIVE_WRITE_QUEUE` env var — see
 /// `upsert_notes_routes_through_writer_task_when_flag_enabled`'s doc comment
 /// for the race this avoids.
@@ -1265,7 +1265,7 @@ async fn upsert_note_routes_through_writer_task_when_flag_enabled() {
     let path = dir.path().join("write_queue_note_single.db");
     let pool_cfg = PoolConfig {
         path: Some(path.clone()),
-        write_queue_enabled: true,
+        write_queue_enabled: Some(true),
         ..PoolConfig::default()
     };
     let pool = Arc::new(ConnectionPool::new(pool_cfg).unwrap());

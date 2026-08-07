@@ -3,6 +3,8 @@
 //! Wraps `StorageBackend` and query compilation into a single Rust API surface.
 
 pub mod actor_identity;
+pub mod agent_lifecycle;
+pub mod ann_registry;
 pub mod atomic_message;
 pub mod atomic_plan;
 pub mod atomic_prepare;
@@ -36,6 +38,10 @@ pub use khive_storage::usage;
 pub mod validation;
 
 pub use actor_identity::{actor_is_unattributed, resolve_actor, should_warn_unattributed_actor};
+pub use agent_lifecycle::{
+    apply_transition, spawn_fingerprint, AgentRecord, AgentState, IllegalTransition,
+    TerminalReason, Transition, Trigger,
+};
 pub use atomic_message::{create_notes_atomic, create_notes_atomic_with_report, AtomicNoteSpec};
 pub use atomic_plan::{
     AddEntityPlan, AddNotePlan, AffectedRowGuard, DeletePlan, GovernanceOp, GovernancePlan,
@@ -67,7 +73,10 @@ pub use engine_config::{
     config_from_env, BackendConfig, BackendKind, BlobConfig, ConfigError, EngineConfig,
     GitWriteEntryConfig, GitWriteSectionConfig, KhiveConfig, PackConfig, StorageSectionConfig,
 };
-pub use error::{fts_text_leg_or_err, GuardedWriteFailure, RuntimeError, RuntimeResult};
+pub use error::{
+    fts_text_leg_or_err, GuardedWriteFailure, RuntimeError, RuntimeResult,
+    WriterPoolCheckoutTimeoutContext, WRITER_POOL_CHECKOUT_TIMEOUT_STAGE,
+};
 pub use fusion::FusionStrategy;
 pub use graph_traversal::PathNode;
 pub use khive_db::{
@@ -118,7 +127,7 @@ pub use runtime::{
     assert_captured_db_anchor_consistent, assert_db_anchor_consistent, expand_tilde,
     parse_pack_list, resolve_db_anchor, resolve_project_actor_id, runtime_config_from_khive_config,
     BackendId, EntityTypeValidatorFn, KhiveRuntime, NamespaceToken, NoteMutationHookFn,
-    RuntimeConfig,
+    NoteWriteValidatorFn, RuntimeConfig,
 };
 pub use secret_gate::SecretMatch;
 pub use validation::{

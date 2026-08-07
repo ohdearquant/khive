@@ -345,6 +345,53 @@ async fn cite_accepts_org_source() {
     assert_eq!(resp["source_id"], source_id);
 }
 
+/// Regression (PR #1623 round 3): the vocab promises unique 8+ hex prefix
+/// resolution for `concept_id` and `source_id`. Both must resolve through
+/// `resolve_uuid`'s prefix arm and return canonical full UUIDs.
+#[tokio::test]
+async fn cite_resolves_concept_and_source_by_unique_prefix() {
+    let f = pack(rt());
+
+    let concept = f
+        .dispatch(
+            "knowledge.learn",
+            json!({ "name": "QuaRot", "domain": "quantization" }),
+        )
+        .await
+        .expect("learn concept");
+    let paper = f
+        .dispatch(
+            "create",
+            json!({
+                "kind": "document",
+                "name": "Ashkboos et al. 2024",
+                "description": "QuaRot paper — covering concepts techniques algorithms implementations applications use cases and design patterns in detail — covering"
+            }),
+        )
+        .await
+        .expect("create document");
+
+    let concept_full = concept["full_id"].as_str().unwrap();
+    let source_full = paper["id"].as_str().unwrap();
+    let concept_prefix = &concept_full[..8];
+    let source_prefix = &source_full[..8];
+
+    let resp = f
+        .dispatch(
+            "knowledge.cite",
+            json!({
+                "concept_id": concept_prefix,
+                "source_id": source_prefix,
+                "weight": 0.7
+            }),
+        )
+        .await
+        .expect("prefixes must resolve on both cite parameters");
+
+    assert_eq!(resp["concept_id"], concept_full);
+    assert_eq!(resp["source_id"], source_full);
+}
+
 #[tokio::test]
 async fn cite_rejects_unknown_id() {
     let f = pack(rt());

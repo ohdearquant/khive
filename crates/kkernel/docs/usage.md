@@ -78,6 +78,7 @@ ideal for admin verb calls without standing up an MCP client. Defaults to namesp
 ```bash
 kkernel exec 'stats()'
 kkernel exec 'stats()' --db ~/.khive/khive.db
+kkernel exec 'stats()' --config /absolute/path/to/config.toml
 kkernel exec '[list(kind="entity", limit=5), stats()]'            # parallel batch
 kkernel exec '[create(kind="concept", name="X"), stats()]' --strict  # nonzero exit if any op fails
 kkernel exec 'create(kind="entity", entity_kind="concept", name="X") | link(source_id=$prev.id, target_id="<id>", relation="extends")'   # chain ($prev)
@@ -85,12 +86,18 @@ kkernel exec 'knowledge.index(help=true)'                         # param schema
 kkernel exec 'knowledge.search(query="...", rerank=true)' --presentation verbose
 ```
 
-Flags: `--db`, `--namespace`, `--actor`, `--expect-actor`,
+Flags: `--db`, `--config` (env `KHIVE_CONFIG`), `--namespace`, `--actor`, `--expect-actor`,
 `--presentation <agent|verbose|human>`, `--strict`.
 A request in which every op failed or aborted always exits nonzero after printing the full
 response. Without `--strict`, a _partially_ failed request (`status: "partial"` with at least
 one success) retains its compatibility behavior and exits zero; `--strict` converts any failed
 or aborted op into a nonzero process exit.
+
+When an explicit `--db` conflicts with a selected multi-backend config,
+dispatch does not begin. The command emits
+`error.code = "database_override_conflict"` with
+`invocation.started = false` in a JSON envelope on stdout, retains the
+actionable prose on stderr, and exits nonzero.
 
 `--actor` is a highest-precedence identity pin: it overrides project config and
 `KHIVE_ACTOR` for this invocation without changing the storage namespace, and

@@ -39,8 +39,16 @@ pub(crate) struct ManifestProject {
     pub manifest_path: PathBuf,
     pub name: String,
     pub language: &'static str,
-    /// `(dependency_name, dependency_kind)`.
-    pub dependencies: Vec<(String, String)>,
+    /// `(dependency_name, dependency_kind, dependency_scope)`. A renamed
+    /// Cargo dependency appears under BOTH the alias and the `package`
+    /// name (see `renames`).
+    pub dependencies: Vec<(String, String, String)>,
+    /// `(alias, package)` for renamed Cargo dependencies
+    /// (`alias = { package = "…" }`). Rust source imports a renamed
+    /// dependency under the alias — the real crate name never appears in
+    /// source — so the alias must resolve to the package's project
+    /// identity before a dependency edge target is recorded.
+    pub renames: Vec<(String, String)>,
 }
 
 /// Walk `path` recursively and parse every governing manifest found
@@ -114,14 +122,56 @@ pub(crate) fn parse_cargo_toml(root: &Path, text: &str) -> Option<ManifestProjec
     let name = doc.get("package")?.get("name")?.as_str()?.to_string();
 
     let mut dependencies = Vec::new();
-    for (section, kind) in [
-        ("dependencies", "dependencies"),
-        ("dev-dependencies", "dev-dependencies"),
-        ("build-dependencies", "build-dependencies"),
-    ] {
+    let sections = [
+        ("dependencies", "normal"),
+        ("dev-dependencies", "dev"),
+        ("build-dependencies", "build"),
+    ];
+    // A renamed dependency (`alias = { package = "real" }`) is imported in
+    // source under the alias — the real crate name never appears in source.
+    // Both names are indexed: the package key names the dependency's own
+    // project identity and carries its declared scope for lookups (import
+    // specifiers are canonicalized alias->package via `renames` before any
+    // lookup), while the alias key preserves the declaration evidence.
+    let mut renames: Vec<(String, String)> = Vec::new();
+    let push_declared = |table: &toml::map::Map<String, TomlValue>,
+                         section: &str,
+                         scope: &str,
+                         dependencies: &mut Vec<(String, String, String)>,
+                         renames: &mut Vec<(String, String)>| {
+        for dep_name in table.keys() {
+            dependencies.push((dep_name.clone(), section.to_string(), scope.to_string()));
+            if let Some(package) = table
+                .get(dep_name)
+                .and_then(TomlValue::as_table)
+                .and_then(|spec| spec.get("package"))
+                .and_then(TomlValue::as_str)
+            {
+                if package != dep_name {
+                    dependencies.push((
+                        package.to_string(),
+                        section.to_string(),
+                        scope.to_string(),
+                    ));
+                    renames.push((dep_name.clone(), package.to_string()));
+                }
+            }
+        }
+    };
+    for (section, scope) in sections {
         if let Some(TomlValue::Table(table)) = doc.get(section) {
-            for dep_name in table.keys() {
-                dependencies.push((dep_name.clone(), kind.to_string()));
+            push_declared(table, section, scope, &mut dependencies, &mut renames);
+        }
+    }
+    if let Some(TomlValue::Table(targets)) = doc.get("target") {
+        for target in targets.values() {
+            let Some(target) = target.as_table() else {
+                continue;
+            };
+            for (section, scope) in sections {
+                if let Some(TomlValue::Table(table)) = target.get(section) {
+                    push_declared(table, section, scope, &mut dependencies, &mut renames);
+                }
             }
         }
     }
@@ -132,6 +182,7 @@ pub(crate) fn parse_cargo_toml(root: &Path, text: &str) -> Option<ManifestProjec
         name,
         language: "rust",
         dependencies,
+        renames,
     })
 }
 
@@ -162,7 +213,7 @@ pub(crate) fn parse_pyproject_toml(root: &Path, text: &str) -> Option<ManifestPr
         for item in arr {
             if let Some(spec) = item.as_str() {
                 if let Some(dep_name) = pep508_name(spec) {
-                    dependencies.push((dep_name, "dependencies".to_string()));
+                    dependencies.push((dep_name, "dependencies".to_string(), "normal".to_string()));
                 }
             }
         }
@@ -173,7 +224,11 @@ pub(crate) fn parse_pyproject_toml(root: &Path, text: &str) -> Option<ManifestPr
                 for item in arr {
                     if let Some(spec) = item.as_str() {
                         if let Some(dep_name) = pep508_name(spec) {
-                            dependencies.push((dep_name, format!("optional-dependencies:{group}")));
+                            dependencies.push((
+                                dep_name,
+                                format!("optional-dependencies:{group}"),
+                                "normal".to_string(),
+                            ));
                         }
                     }
                 }
@@ -187,6 +242,7 @@ pub(crate) fn parse_pyproject_toml(root: &Path, text: &str) -> Option<ManifestPr
         name,
         language: "python",
         dependencies,
+        renames: Vec::new(),
     })
 }
 
@@ -196,15 +252,15 @@ pub(crate) fn parse_package_json(root: &Path, text: &str) -> Option<ManifestProj
     let name = doc.get("name")?.as_str()?.to_string();
 
     let mut dependencies = Vec::new();
-    for (section, kind) in [
-        ("dependencies", "dependencies"),
-        ("devDependencies", "devDependencies"),
-        ("peerDependencies", "peerDependencies"),
-        ("optionalDependencies", "optionalDependencies"),
+    for (section, scope) in [
+        ("dependencies", "normal"),
+        ("devDependencies", "dev"),
+        ("peerDependencies", "normal"),
+        ("optionalDependencies", "normal"),
     ] {
         if let Some(JsonValue::Object(obj)) = doc.get(section) {
             for dep_name in obj.keys() {
-                dependencies.push((dep_name.clone(), kind.to_string()));
+                dependencies.push((dep_name.clone(), section.to_string(), scope.to_string()));
             }
         }
     }
@@ -215,6 +271,7 @@ pub(crate) fn parse_package_json(root: &Path, text: &str) -> Option<ManifestProj
         name,
         language: "typescript",
         dependencies,
+        renames: Vec::new(),
     })
 }
 
@@ -263,7 +320,7 @@ mod tests {
     }
 
     #[test]
-    fn cargo_toml_with_package_collects_dependency_kinds() {
+    fn cargo_toml_with_package_collects_dependency_kinds_and_scopes() {
         let text = r#"
 [package]
 name = "foo"
@@ -273,16 +330,65 @@ serde = "1.0"
 
 [dev-dependencies]
 tempfile = "3"
+
+[target.'cfg(unix)'.build-dependencies]
+cc = "1"
 "#;
         let project = parse_cargo_toml(Path::new("/tmp"), text).expect("governing");
         assert_eq!(project.name, "foo");
         assert_eq!(project.language, "rust");
+        assert!(project.dependencies.contains(&(
+            "serde".to_string(),
+            "dependencies".to_string(),
+            "normal".to_string()
+        )));
+        assert!(project.dependencies.contains(&(
+            "tempfile".to_string(),
+            "dev-dependencies".to_string(),
+            "dev".to_string()
+        )));
+        assert!(project.dependencies.contains(&(
+            "cc".to_string(),
+            "build-dependencies".to_string(),
+            "build".to_string()
+        )));
+    }
+
+    #[test]
+    fn cargo_toml_renamed_dependency_indexes_alias_and_package() {
+        let text = r#"
+[package]
+name = "foo"
+
+[dev-dependencies]
+mock = { package = "real-mock", version = "1" }
+
+[target.'cfg(unix)'.dependencies]
+unix_alias = { package = "real_unix", version = "2" }
+"#;
+        let project = parse_cargo_toml(Path::new("/tmp"), text).expect("governing");
+        // Alias key catches source-level `use mock::…` imports (Rust
+        // imports a renamed dependency under the alias).
+        assert!(project.dependencies.contains(&(
+            "mock".to_string(),
+            "dev-dependencies".to_string(),
+            "dev".to_string()
+        )));
+        // Package key is indexed too: it is the dependency's own project
+        // identity, and its declared `dev` scope must survive the lookup.
+        assert!(project.dependencies.contains(&(
+            "real-mock".to_string(),
+            "dev-dependencies".to_string(),
+            "dev".to_string()
+        )));
         assert!(project
-            .dependencies
-            .contains(&("serde".to_string(), "dependencies".to_string())));
-        assert!(project
-            .dependencies
-            .contains(&("tempfile".to_string(), "dev-dependencies".to_string())));
+            .renames
+            .contains(&("mock".to_string(), "real-mock".to_string())));
+        assert!(project.dependencies.contains(&(
+            "real_unix".to_string(),
+            "dependencies".to_string(),
+            "normal".to_string()
+        )));
     }
 
     #[test]
@@ -294,12 +400,16 @@ dependencies = ["requests>=2.0", "click"]
 "#;
         let project = parse_pyproject_toml(Path::new("/tmp"), text).expect("governing");
         assert_eq!(project.name, "bar");
-        assert!(project
-            .dependencies
-            .contains(&("requests".to_string(), "dependencies".to_string())));
-        assert!(project
-            .dependencies
-            .contains(&("click".to_string(), "dependencies".to_string())));
+        assert!(project.dependencies.contains(&(
+            "requests".to_string(),
+            "dependencies".to_string(),
+            "normal".to_string()
+        )));
+        assert!(project.dependencies.contains(&(
+            "click".to_string(),
+            "dependencies".to_string(),
+            "normal".to_string()
+        )));
     }
 
     #[test]
@@ -307,11 +417,15 @@ dependencies = ["requests>=2.0", "click"]
         let text = r#"{"name": "baz", "dependencies": {"left-pad": "1.0.0"}, "devDependencies": {"jest": "29.0.0"}}"#;
         let project = parse_package_json(Path::new("/tmp"), text).expect("governing");
         assert_eq!(project.name, "baz");
-        assert!(project
-            .dependencies
-            .contains(&("left-pad".to_string(), "dependencies".to_string())));
-        assert!(project
-            .dependencies
-            .contains(&("jest".to_string(), "devDependencies".to_string())));
+        assert!(project.dependencies.contains(&(
+            "left-pad".to_string(),
+            "dependencies".to_string(),
+            "normal".to_string()
+        )));
+        assert!(project.dependencies.contains(&(
+            "jest".to_string(),
+            "devDependencies".to_string(),
+            "dev".to_string()
+        )));
     }
 }

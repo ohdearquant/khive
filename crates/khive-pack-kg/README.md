@@ -30,7 +30,7 @@ workspace declares it as a dependency.
 | `context`   | Entity-anchored graph context in one call (ADR-089)                             |
 | `resolve`   | Resolve natural-language references to record ids                               |
 | `whoami`    | Report the caller identity this request resolved to                             |
-| `db_diagnostics` | WAL/checkpoint diagnostics: counters, PASSIVE probe, WAL size, holder census (probe may backfill WAL frames; never TRUNCATE, never creates or deletes files) |
+| `db_diagnostics` | Writer-contention and WAL/checkpoint diagnostics: aggregate plus pooled/standalone/writer-task acquisition counters, pooled timeouts, swallowed audit failures, checkpoint counters, PASSIVE probe, WAL size, and explicitly qualified holder census (probe may backfill WAL frames; never TRUNCATE, never creates or deletes files) |
 
 `propose`/`review`/`withdraw` implement the event-sourced proposal lifecycle from
 [ADR-046](https://github.com/ohdearquant/khive/blob/main/docs/adr/ADR-046-event-sourced-proposals.md).
@@ -80,9 +80,9 @@ Over MCP, the same call is issued as a DSL string:
 request(ops="create(kind=\"entity\", entity_kind=\"concept\", name=\"RoPE\")")
 ```
 
-`khive-mcp` loads a default set of eleven packs: `kg`, `gtd`, `memory`, `brain`,
-`comm`, `schedule`, `knowledge`, `session`, `git`, `code`, `workspace`, with `kg`
-always present; `KHIVE_PACKS` / `--pack` select a subset.
+`khive-mcp` loads a default set of twelve packs: `kg`, `gtd`, `memory`, `brain`,
+`comm`, `schedule`, `knowledge`, `session`, `git`, `code`, `workspace`, `blob`,
+with `kg` always present; `KHIVE_PACKS` / `--pack` select a subset.
 
 ## Where this sits
 

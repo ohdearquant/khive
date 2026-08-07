@@ -40,12 +40,15 @@ hidden by the newer filter.
 | `to`        | string | yes      | Actor label, e.g. `"lambda:leo"`.                                                                                                                                                               |
 | `content`   | string | yes      | Message body. Must not be empty.                                                                                                                                                                |
 | `subject`   | string | no       | Optional subject line.                                                                                                                                                                          |
-| `thread_id` | uuid   | no       | Groups the message into an existing thread.                                                                                                                                                     |
+| `thread_id` | uuid   | no       | Optional full thread UUID. Prefixes are rejected because a thread root is an explicit stable reference. Accepted complete spellings normalize to canonical lowercase dashed form.               |
 | `self_send` | bool   | no       | Default false. Required when `to` matches the configured sender actor; otherwise the send is rejected. The anonymous `local` fallback is exempt. Use true only for an intentional note to self. |
 
 A configured actor that addresses itself must opt in with `self_send=true`. If the
 target was meant to be a distinct parent or sub-agent, configure distinct actor identities
 instead of opting in; the rejection is intended to expose that identity collapse.
+
+The response includes canonical 36-character `full_id` and `thread_id` handles even in
+Agent mode. Reuse the returned `thread_id` unchanged to send another message in that thread.
 
 ### Confirm an uncertain internal delivery
 
@@ -82,20 +85,26 @@ the structured error and therefore does not know the server-generated UUID.
 | Param                | Type    | Required | Notes                                                                        |
 | -------------------- | ------- | -------- | ---------------------------------------------------------------------------- |
 | `limit`              | integer | no       | Default 20, max 200.                                                         |
+| `box`                | string  | no       | `inbox` (default) \| `sent`; sent rows are scoped to the caller.             |
 | `offset`             | integer | no       | Default 0; offset in the fully-filtered newest-first result set.             |
-| `status`             | string  | no       | `"unread"` (default) \| `"read"` \| `"all"`.                                 |
+| `status`             | string  | no       | Inbox-only: `"unread"` (default) \| `"read"` \| `"all"`.                     |
+| `wait_ms`            | integer | no       | Long-poll only when the initial page is empty; default 0, max 30,000.        |
 | `from_actor`         | string  | no       | Exact sender; mutually exclusive with `from_prefix`.                         |
 | `from_prefix`        | string  | no       | Sender prefix; mutually exclusive with `from_actor`.                         |
 | `exclude_from_actor` | string  | no       | Exclude an exact sender actor label.                                         |
+| `to_actor`           | string  | no       | Sent-only exact recipient actor filter.                                      |
 | `since`              | string  | no       | Inclusive RFC 3339 lower bound on response `created_at`.                     |
 | `before`             | string  | no       | Exclusive RFC 3339 upper bound on response `created_at`.                     |
 | `subject_contains`   | string  | no       | Case-insensitive non-empty subject substring; missing subjects do not match. |
 | `content_contains`   | string  | no       | Case-insensitive non-empty body substring.                                   |
+| `fields`             | array   | no       | Non-empty message-field projection shared with `comm.thread`.                |
 
 ```
 request(ops="comm.inbox(limit=10)")
 request(ops="comm.inbox(status=\"all\")")
 request(ops="comm.inbox(status=\"all\", content_contains=\"timeout\", since=\"2026-07-31T00:00:00Z\")")
+request(ops="comm.inbox(box=\"sent\", to_actor=\"lambda:leo\", fields=[\"id\",\"subject\",\"sent_at\"])")
+request(ops="comm.inbox(limit=10, wait_ms=30000)")
 ```
 
 Responses include `offset`, `has_more`, and `next_offset`. Repeat the same call
@@ -103,6 +112,17 @@ with `offset=<next_offset>` until `next_offset` is null to enumerate every
 matching message without changing its read state. Filters are ANDed and offsets
 apply after all filters. Time bounds use the always-present top-level
 `created_at`, not optional transport `sent_at` metadata.
+
+Omit `fields` for the full message body and properties. When supplied, it is a
+strict whitelist shared with `comm.thread`; unknown fields and an empty list
+fail loudly. Stable property aliases such as `from_actor`, `to_actor`, and
+`sent_at` can be projected directly.
+
+Long-polling preserves that paginated response shape and every actor/status/
+sender/time/text filter, including the requested offset. Existing matches
+return immediately. A new committed message wakes the call and causes the full
+filtered query to run again; unrelated messages cannot leak through or end the
+wait early. `limit=0` remains immediate.
 
 ### Read
 
@@ -140,9 +160,11 @@ given the thread root's id.
 
 ```
 request(ops="comm.thread(id=\"<root_message_id_or_prefix>\", limit=50)")
+request(ops="comm.thread(id=\"<root_message_id_or_prefix>\", fields=[\"id\",\"from_actor\",\"sent_at\"])")
 ```
 
-`limit` defaults to 100 and caps at 500.
+`limit` defaults to 100 and caps at 500. `fields` uses the same strict
+projection vocabulary as `comm.inbox`; omission returns the full thread view.
 
 ### Health
 

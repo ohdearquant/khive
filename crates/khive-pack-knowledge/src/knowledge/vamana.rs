@@ -20,6 +20,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
+use khive_runtime::ann_registry::{self, CompactionScope, WatermarkAuthority};
 use khive_runtime::{KhiveRuntime, Namespace, NamespaceToken, RuntimeError};
 use khive_storage::types::{SqlStatement, SqlValue};
 use khive_vamana::{
@@ -1055,30 +1056,42 @@ fn ann_rebuild_threshold() -> f64 {
         .unwrap_or(ANN_REBUILD_THRESHOLD_DEFAULT)
 }
 
-/// Durably register this consumer's watermark row at 0 (`INSERT OR IGNORE`).
+/// Durably register this consumer's watermark row as pending (`-2`).
 ///
 /// MUST run before the consumer persists or serves any extended-format
-/// segment for the scope: a row at 0 blocks pair-wide compaction instead of
-/// hiding this consumer from the registry `MIN` (ADR-079 Amendment 1 §A
-/// step 1).
+/// segment for the scope: pending blocks pair-wide compaction instead of
+/// hiding this consumer from the registry `MIN`, but can be retired with a
+/// warning if no first checkpoint ever activates it (ADR-079 Amendment 1 §A
+/// step 1 and issue #1479).
 #[cfg(test)]
 async fn register_consumer(rt: &KhiveRuntime, ns: &str, model: &str) -> Result<(), String> {
     let sql = rt.sql();
-    let mut w = sql.writer().await.map_err(|e| e.to_string())?;
-    w.execute(SqlStatement {
-        sql: "INSERT OR IGNORE INTO ann_consumer_watermark \
-              (consumer, namespace, embedding_model, watermark) VALUES (?1, ?2, ?3, 0)"
-            .into(),
-        params: vec![
-            SqlValue::Text(ANN_CONSUMER.into()),
-            SqlValue::Text(ns.to_owned()),
-            SqlValue::Text(model.to_owned()),
-        ],
-        label: Some("ann_register_consumer".into()),
-    })
-    .await
-    .map_err(|e| e.to_string())?;
-    Ok(())
+    if ann_segment_dir(rt, ns, model).is_none() {
+        // In-memory SqlBridge atomic units cannot pin their manual transaction
+        // across PoolBackedWriter calls. Pathless consumers have no durable
+        // pending lifecycle to retire, so one closed-fence statement is enough.
+        let mut writer = sql.writer().await.map_err(|error| error.to_string())?;
+        writer
+            .execute(SqlStatement {
+                sql: "INSERT OR IGNORE INTO ann_consumer_watermark \
+                      (consumer, namespace, embedding_model, watermark) \
+                      VALUES (?1, ?2, ?3, ?4)"
+                    .into(),
+                params: vec![
+                    SqlValue::Text(ANN_CONSUMER.into()),
+                    SqlValue::Text(ns.to_owned()),
+                    SqlValue::Text(model.to_owned()),
+                    SqlValue::Integer(ann_registry::PENDING_WATERMARK),
+                ],
+                label: Some("knowledge_ann_register_pathless_consumer".into()),
+            })
+            .await
+            .map_err(|error| error.to_string())?;
+        return Ok(());
+    }
+    ann_registry::register_pending(sql.as_ref(), ANN_CONSUMER, ns, model)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 /// Durable sentinel for registry-loss recovery.  `-1` is below every legal
@@ -1087,25 +1100,31 @@ async fn register_consumer(rt: &KhiveRuntime, ns: &str, model: &str) -> Result<(
 /// authoritative full-corpus checkpoint raises the row to a normal `S >= 0`.
 async fn write_force_rebuild_sentinel_row(rt: &KhiveRuntime, key: &AnnKey) -> Result<(), String> {
     let sql = rt.sql();
-    let mut writer = sql.writer().await.map_err(|error| error.to_string())?;
-    writer
-        .execute(SqlStatement {
-            sql: "INSERT INTO ann_consumer_watermark \
-                  (consumer, namespace, embedding_model, watermark) \
-                  VALUES (?1, ?2, ?3, -1) \
-                  ON CONFLICT(consumer, namespace, embedding_model) \
-                  DO UPDATE SET watermark = -1"
-                .into(),
-            params: vec![
-                SqlValue::Text(ANN_CONSUMER.into()),
-                SqlValue::Text(key.namespace.clone()),
-                SqlValue::Text(key.model.clone()),
-            ],
-            label: Some("ann_force_authoritative_rebuild".into()),
-        })
+    if ann_segment_dir(rt, &key.namespace, &key.model).is_none() {
+        let mut writer = sql.writer().await.map_err(|error| error.to_string())?;
+        writer
+            .execute(SqlStatement {
+                sql: "INSERT INTO ann_consumer_watermark \
+                      (consumer, namespace, embedding_model, watermark) \
+                      VALUES (?1, ?2, ?3, ?4) \
+                      ON CONFLICT(consumer, namespace, embedding_model) \
+                      DO UPDATE SET watermark = excluded.watermark"
+                    .into(),
+                params: vec![
+                    SqlValue::Text(ANN_CONSUMER.into()),
+                    SqlValue::Text(key.namespace.clone()),
+                    SqlValue::Text(key.model.clone()),
+                    SqlValue::Integer(ann_registry::RECOVERING_WATERMARK),
+                ],
+                label: Some("knowledge_ann_mark_pathless_recovering".into()),
+            })
+            .await
+            .map_err(|error| error.to_string())?;
+        return Ok(());
+    }
+    ann_registry::mark_recovering(sql.as_ref(), ANN_CONSUMER, &key.namespace, &key.model)
         .await
-        .map_err(|error| error.to_string())?;
-    Ok(())
+        .map_err(|error| error.to_string())
 }
 
 async fn write_force_rebuild_sentinel(rt: &KhiveRuntime, key: &AnnKey) -> Result<(), String> {
@@ -1198,11 +1217,16 @@ pub(crate) async fn prepare_full_corpus_scan(
 ) -> Result<CheckpointAuthority, String> {
     match read_own_watermark(rt, &key.namespace, &key.model).await? {
         Some(watermark) if watermark >= 0 => Ok(CheckpointAuthority::FullRegistered),
-        Some(_) => {
+        Some(watermark) if watermark == ann_registry::RECOVERING_WATERMARK => {
             mark_force_rebuild(ann, key);
             Ok(CheckpointAuthority::FullSentinel)
         }
-        None => {
+        Some(_) | None => {
+            // Pending (`-2`) is a bounded first-checkpoint grace state, not
+            // the authoritative recovery fence this scan is allowed to
+            // clear. Direct full-reindex callers do not pass through the
+            // ordinary ensure path, so promote it to durable `-1` here
+            // before scanning rather than failing their first publication.
             prepare_authoritative_rebuild(rt, ann, key).await?;
             Ok(CheckpointAuthority::FullSentinel)
         }
@@ -1216,34 +1240,49 @@ async fn raise_watermark(
     s: u64,
     authority: CheckpointAuthority,
 ) -> Result<(), String> {
-    let predicate = match authority {
-        CheckpointAuthority::FullSentinel => "watermark = -1",
-        CheckpointAuthority::Incremental | CheckpointAuthority::FullRegistered => {
-            "watermark >= 0 AND watermark <= ?4"
-        }
+    let shared_authority = match authority {
+        CheckpointAuthority::FullSentinel => WatermarkAuthority::Recovering,
+        CheckpointAuthority::Incremental => WatermarkAuthority::Active,
+        CheckpointAuthority::FullRegistered => WatermarkAuthority::PendingOrActive,
     };
     let sql = rt.sql();
-    let mut w = sql.writer().await.map_err(|e| e.to_string())?;
-    let affected = w
-        .execute(SqlStatement {
-            sql: format!(
-                "UPDATE ann_consumer_watermark SET watermark = MAX(watermark, ?4) \
-                 WHERE consumer = ?1 AND namespace = ?2 AND embedding_model = ?3 \
-                   AND {predicate}"
-            ),
-            params: vec![
-                SqlValue::Text(ANN_CONSUMER.into()),
-                SqlValue::Text(ns.to_owned()),
-                SqlValue::Text(model.to_owned()),
-                SqlValue::Integer(s as i64),
-            ],
-            label: Some("ann_raise_watermark".into()),
-        })
-        .await
-        .map_err(|e| e.to_string())?;
-    if affected != 1 {
+    let raised = if ann_segment_dir(rt, ns, model).is_none() {
+        let watermark = i64::try_from(s)
+            .map_err(|_| format!("knowledge ANN watermark {s} exceeds SQLite INTEGER range"))?;
+        let predicate = match shared_authority {
+            WatermarkAuthority::PendingOrActive => {
+                "(watermark = -2 OR (watermark >= 0 AND watermark <= ?4))"
+            }
+            WatermarkAuthority::Active => "watermark >= 0 AND watermark <= ?4",
+            WatermarkAuthority::Recovering => "watermark = -1",
+        };
+        let mut writer = sql.writer().await.map_err(|error| error.to_string())?;
+        writer
+            .execute(SqlStatement {
+                sql: format!(
+                    "UPDATE ann_consumer_watermark SET watermark = ?4 \
+                     WHERE consumer = ?1 AND namespace = ?2 AND embedding_model = ?3 \
+                       AND {predicate}"
+                ),
+                params: vec![
+                    SqlValue::Text(ANN_CONSUMER.into()),
+                    SqlValue::Text(ns.to_owned()),
+                    SqlValue::Text(model.to_owned()),
+                    SqlValue::Integer(watermark),
+                ],
+                label: Some("knowledge_ann_raise_pathless_watermark".into()),
+            })
+            .await
+            .map_err(|error| error.to_string())?
+            == 1
+    } else {
+        ann_registry::raise_watermark(sql.as_ref(), ANN_CONSUMER, ns, model, s, shared_authority)
+            .await
+            .map_err(|e| e.to_string())?
+    };
+    if !raised {
         return Err(format!(
-            "ANN watermark publication fence rejected {authority:?}: affected {affected} rows"
+            "ANN watermark publication fence rejected {authority:?}: affected 0 rows"
         ));
     }
     Ok(())
@@ -1257,23 +1296,37 @@ async fn raise_watermark(
 /// matches nothing — an unregistered pair never compacts.
 async fn compact_log(rt: &KhiveRuntime, ns: &str, model: &str) -> Result<(), String> {
     let sql = rt.sql();
-    let mut w = sql.writer().await.map_err(|e| e.to_string())?;
-    w.execute(SqlStatement {
-        sql: "DELETE FROM ann_write_log \
-              WHERE namespace = ?1 AND embedding_model = ?2 \
-                AND seq <= (SELECT MIN(watermark) FROM ann_consumer_watermark \
-                             WHERE (namespace = ?1 OR namespace = '*') \
-                               AND embedding_model = ?2)"
-            .into(),
-        params: vec![
-            SqlValue::Text(ns.to_owned()),
-            SqlValue::Text(model.to_owned()),
-        ],
-        label: Some("ann_compact_log".into()),
-    })
+    if ann_segment_dir(rt, ns, model).is_none() {
+        let mut writer = sql.writer().await.map_err(|error| error.to_string())?;
+        writer
+            .execute(SqlStatement {
+                sql: "DELETE FROM ann_write_log \
+                      WHERE namespace = ?1 AND embedding_model = ?2 \
+                        AND seq <= (SELECT MIN(watermark.watermark) \
+                                    FROM ann_consumer_watermark watermark \
+                                    WHERE (watermark.namespace = ?1 \
+                                           OR watermark.namespace = '*') \
+                                      AND watermark.embedding_model = ?2)"
+                    .into(),
+                params: vec![
+                    SqlValue::Text(ns.to_owned()),
+                    SqlValue::Text(model.to_owned()),
+                ],
+                label: Some("knowledge_ann_compact_pathless_log".into()),
+            })
+            .await
+            .map(|_| ())
+            .map_err(|error| error.to_string())?;
+        return Ok(());
+    }
+    ann_registry::compact_write_log(
+        sql.as_ref(),
+        CompactionScope::Namespace(ns.to_owned()),
+        model,
+    )
     .await
-    .map_err(|e| e.to_string())?;
-    Ok(())
+    .map(|_| ())
+    .map_err(|e| e.to_string())
 }
 
 /// Whether any tail row exists above `s` for this consumer's scope. A pure
@@ -2617,8 +2670,8 @@ async fn classify_and_adopt_segment(
     };
 
     // Rule 2: readable but pre-amendment (no watermark) → Cold. Compaction
-    // stays blocked naturally: this consumer's registry row (0 until its
-    // first extended checkpoint) holds the pair MIN at 0.
+    // stays blocked naturally: this consumer's pending (`-2`) or recovery
+    // (`-1`) row holds the pair MIN below every log sequence.
     let Some(s) = info.last_applied_seq else {
         tracing::info!(namespace = %ns, model = %model,
             "pre-amendment v2 segment (no watermark); Cold rebuild");
@@ -4886,8 +4939,8 @@ mod tests {
         );
     }
 
-    /// Review-mandated interleaving: consumer A registers at 0, checkpoints at
-    /// S, and crashes before its raise — the pair MIN stays 0 and another
+    /// Review-mandated interleaving: consumer A registers pending, checkpoints
+    /// at S, and crashes before its raise — the pair MIN stays negative and another
     /// consumer's compaction cannot delete A's tail. After A's row is raised
     /// (or an overlapping row removed), compaction advances to the pair MIN.
     #[tokio::test]
@@ -4899,7 +4952,7 @@ mod tests {
 
         register_consumer(&rt, "local", WARM_TEST_MODEL)
             .await
-            .expect("register at 0");
+            .expect("register pending");
         // Overlapping consumer B durably checkpointed past every row.
         {
             let sql = rt.sql();
@@ -4919,16 +4972,16 @@ mod tests {
             .expect("insert B row");
         }
 
-        // A crashed before its raise: row is 0 → MIN(0, 99) = 0 → nothing deletes.
+        // A crashed before its raise: row is -2 → MIN(-2, 99) = -2 → nothing deletes.
         compact_log(&rt, "local", WARM_TEST_MODEL)
             .await
             .expect("compact");
-        let (_, tail_at_zero) = scope_counts(&rt, "local", WARM_TEST_MODEL, 0)
+        let (_, tail_while_pending) = scope_counts(&rt, "local", WARM_TEST_MODEL, 0)
             .await
             .expect("scope_counts");
         assert_eq!(
-            tail_at_zero, 4,
-            "a zero-watermark row must block pair compaction"
+            tail_while_pending, 4,
+            "a fresh pending row must block pair compaction"
         );
 
         // A raises to 2 → MIN(2, 99) = 2 → rows 1-2 compact, 3-4 remain.
@@ -4937,7 +4990,7 @@ mod tests {
             "local",
             WARM_TEST_MODEL,
             2,
-            CheckpointAuthority::Incremental,
+            CheckpointAuthority::FullRegistered,
         )
         .await
         .expect("raise");
@@ -4950,6 +5003,67 @@ mod tests {
         assert_eq!(
             tail_after, 2,
             "compaction must advance exactly to the pair MIN"
+        );
+    }
+
+    /// #1479 regression: a consumer which never published its first
+    /// checkpoint blocks during its grace window, then retires visibly so an
+    /// overlapping active consumer's watermark can bound compaction.
+    #[tokio::test]
+    async fn compact_log_retires_expired_never_activated_consumer() {
+        let dir = TempDir::new().expect("tempdir");
+        let rt = file_rt_with_embedder(dir.path().join("test.db"));
+        let token = rt.authorize(Namespace::local()).expect("authorize");
+        seed_warm_corpus(&rt, &token, 4).await;
+
+        register_consumer(&rt, "local", WARM_TEST_MODEL)
+            .await
+            .expect("register pending");
+        let sql = rt.sql();
+        let mut writer = sql.writer().await.expect("writer");
+        writer
+            .execute(SqlStatement {
+                sql: "UPDATE ann_consumer_pending SET registered_at_us = 1 \
+                      WHERE consumer = ?1 AND namespace = 'local' \
+                        AND embedding_model = ?2"
+                    .into(),
+                params: vec![
+                    SqlValue::Text(ANN_CONSUMER.into()),
+                    SqlValue::Text(WARM_TEST_MODEL.into()),
+                ],
+                label: Some("test_age_pending_ann_consumer".into()),
+            })
+            .await
+            .expect("age pending registration");
+        writer
+            .execute(SqlStatement {
+                sql: "INSERT INTO ann_consumer_watermark \
+                      (consumer, namespace, embedding_model, watermark) \
+                      VALUES ('other:test', 'local', ?1, 99)"
+                    .into(),
+                params: vec![SqlValue::Text(WARM_TEST_MODEL.into())],
+                label: None,
+            })
+            .await
+            .expect("insert active peer");
+        drop(writer);
+
+        compact_log(&rt, "local", WARM_TEST_MODEL)
+            .await
+            .expect("retire and compact");
+        assert_eq!(
+            read_own_watermark(&rt, "local", WARM_TEST_MODEL)
+                .await
+                .expect("read retired registration"),
+            None,
+            "expired pending consumer must be removed so its return is Cold"
+        );
+        let (_, retained) = scope_counts(&rt, "local", WARM_TEST_MODEL, 0)
+            .await
+            .expect("scope counts");
+        assert_eq!(
+            retained, 0,
+            "the retired pending row must no longer pin the active peer's minimum"
         );
     }
 
@@ -5008,10 +5122,26 @@ mod tests {
 
         let ann = new_shared();
         let key = AnnKey::new("local", WARM_TEST_MODEL);
+        register_consumer(&rt, "local", WARM_TEST_MODEL)
+            .await
+            .expect("register pending consumer");
+        assert_eq!(
+            read_own_watermark(&rt, "local", WARM_TEST_MODEL)
+                .await
+                .expect("read pending watermark"),
+            Some(ann_registry::PENDING_WATERMARK)
+        );
         let authority = prepare_full_corpus_scan(&rt, &ann, &key)
             .await
             .expect("establish full-scan authority");
         assert_eq!(authority, CheckpointAuthority::FullSentinel);
+        assert_eq!(
+            read_own_watermark(&rt, "local", WARM_TEST_MODEL)
+                .await
+                .expect("read recovery fence"),
+            Some(ann_registry::RECOVERING_WATERMARK),
+            "a direct full scan must promote pending to the authoritative fence before scanning"
+        );
         assert!(force_rebuild_required(&ann, &key));
 
         let bridge = load_and_build_from_vector_store(&rt, &token, WARM_TEST_MODEL)
@@ -5159,6 +5289,59 @@ mod tests {
             .expect("monotone winner");
         assert_eq!(loaded_watermark, new_watermark);
         assert!(hits.iter().any(|(subject, _)| *subject == fresh_id));
+    }
+
+    /// In-memory SqlBridge writers share one connection. Lifecycle helpers
+    /// must therefore remain single statements on pathless runtimes instead
+    /// of trying to open a nested manual atomic-unit transaction.
+    #[tokio::test]
+    async fn pathless_lifecycle_helpers_do_not_open_nested_transactions() {
+        let rt = memory_rt_with_embedder();
+        let key = AnnKey::new("local", WARM_TEST_MODEL);
+        let sql = rt.sql();
+        let mut outer = sql.writer().await.expect("outer writer");
+        outer
+            .execute(SqlStatement {
+                sql: "BEGIN IMMEDIATE".into(),
+                params: vec![],
+                label: Some("test_knowledge_pathless_outer_begin".into()),
+            })
+            .await
+            .expect("begin outer transaction");
+
+        register_consumer(&rt, "local", WARM_TEST_MODEL)
+            .await
+            .expect("register pending inside outer transaction");
+        write_force_rebuild_sentinel_row(&rt, &key)
+            .await
+            .expect("publish recovery sentinel inside outer transaction");
+        raise_watermark(
+            &rt,
+            "local",
+            WARM_TEST_MODEL,
+            0,
+            CheckpointAuthority::FullSentinel,
+        )
+        .await
+        .expect("activate sentinel inside outer transaction");
+        compact_log(&rt, "local", WARM_TEST_MODEL)
+            .await
+            .expect("compact inside outer transaction");
+        assert_eq!(
+            read_own_watermark(&rt, "local", WARM_TEST_MODEL)
+                .await
+                .expect("read pathless lifecycle state"),
+            Some(0)
+        );
+
+        outer
+            .execute(SqlStatement {
+                sql: "ROLLBACK".into(),
+                params: vec![],
+                label: Some("test_knowledge_pathless_outer_rollback".into()),
+            })
+            .await
+            .expect("rollback outer transaction");
     }
 
     #[tokio::test]

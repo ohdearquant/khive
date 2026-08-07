@@ -175,30 +175,41 @@ bracket content (negative, non-numeric, missing `]`) is NOT promoted to
 All arguments are named. Positional arguments are not supported — verbs evolve
 over time, and positional binding fragilely couples to argument order.
 
-#### UUID arguments — full or short-prefix
+#### UUID arguments — direct identity and short-prefix resolution
 
-Arguments typed as UUID (entity ids, note ids, edge ids, profile ids) accept
-either form on input:
+UUID parameters use two semantically different forms:
 
-| Form           | Pattern                 | Example                                |
-| -------------- | ----------------------- | -------------------------------------- |
-| Full canonical | 8-4-4-4-12 hex, dashed  | `a1b2c3d4-e5f6-7890-abcd-ef1234567890` |
-| Short prefix   | 8+ hex chars, no dashes | `a1b2c3d4`                             |
+| Form          | Pattern                                       | Example                                |
+| ------------- | --------------------------------------------- | -------------------------------------- |
+| Complete UUID | A complete spelling accepted by the parameter | `a1b2c3d4-e5f6-7890-abcd-ef1234567890` |
+| Short prefix  | 8+ undashed hex that is not a complete UUID   | `a1b2c3d4`                             |
 
-The runtime resolves short prefixes against the caller's namespace
-(`khive-runtime::operations::resolve_uuid_async`):
+A complete UUID directly names one globally unique record; its lookup is not a
+namespace search. Which alternate complete spellings are accepted is
+parameter/parser-specific; accepted forms normalize to the lowercase dashed
+form in strict identifier responses. In particular, 32 undashed hexadecimal
+characters are a complete compact UUID, not a short prefix. A short prefix is a resolution request, not a direct
+identifier. The lookup scope belongs to the consuming parameter: operations
+governed by ADR-007's by-ID contract resolve without a namespace filter (Rule
+2), while other resolvers may search only in the caller's primary namespace.
+In either scope:
 
 - Exactly one match → resolves to the full UUID, op proceeds.
 - Multiple matches → `RuntimeError::AmbiguousPrefix { prefix, matches: Vec<Uuid> }`,
   the op fails (the batch is not aborted in parallel mode; chain mode aborts).
 - Zero matches → `RuntimeError::NotFound { kind, id }`, same fail-isolation rule.
 
-Short prefixes apply across all substrates the verb's `id` parameter accepts;
-the resolver scans entities, notes, and edges in deterministic order. Calls that
-need disambiguation should pass the full UUID. Inputs accept full UUID or short
-form (8+ hex chars) by default; ADR-045 (Verb Response Presentation Modes)
-specifies the output-side short-form representation (8-char prefix in Agent
-mode).
+For parameters that declare prefix support, the resolver scans the substrates
+accepted by that parameter in deterministic order. Calls that need
+disambiguation should pass the full UUID. Parameters whose semantics require an
+explicit stable reference or exact correlation key declare full-UUID-only input
+in `help=true` and reject prefixes with the consequence explained in the error.
+
+Every `help=true` response carries one shared `identifier_resolution` object
+describing these semantics. A full-UUID-only parameter declares that constraint
+and explains why prefix resolution would be unsafe. ADR-045 specifies the output
+counterpart: a response field consumed by a full-UUID-only parameter remains
+canonical in Agent mode so it can be submitted again unchanged.
 
 ### Parallel semantics
 

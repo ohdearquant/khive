@@ -7,6 +7,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
+use khive_runtime::ann_registry::{self, CompactionScope, WatermarkAuthority, PENDING_WATERMARK};
 use khive_runtime::{
     is_benign_shutdown_cancellation, KhiveRuntime, Namespace, NamespaceToken, RuntimeError,
 };
@@ -79,6 +80,9 @@ pub(crate) struct AnnState {
     /// Test notification emitted when the background warming guard becomes idle.
     #[cfg(test)]
     pub(crate) warming_idle: tokio::sync::Notify,
+    /// Notified when a pathless fresh-tail reader waits for pending publication.
+    #[cfg(test)]
+    pub(crate) pathless_pending_publication_wait: tokio::sync::Notify,
     /// Arms the test-only pause in `fresh_tail_reresolve` between its
     /// segment load and its registry-minimum re-check.
     #[cfg(test)]
@@ -110,6 +114,8 @@ pub(crate) fn new_shared() -> SharedAnn {
         attempt_floor_barrier: std::sync::atomic::AtomicBool::new(false),
         #[cfg(test)]
         warming_idle: tokio::sync::Notify::new(),
+        #[cfg(test)]
+        pathless_pending_publication_wait: tokio::sync::Notify::new(),
         #[cfg(test)]
         reresolve_race_barrier: std::sync::atomic::AtomicBool::new(false),
         #[cfg(test)]
@@ -615,6 +621,13 @@ pub(crate) async fn clear_key(ann: &SharedAnn, key: &AnnKey) {
     lock_warming(ann).remove(key);
 }
 
+/// Evict only the serving bridge after durable registry protection is lost.
+/// The current warm owner keeps its fire-once guard until normal RAII release;
+/// dropping that guard here would allow duplicate rebuild tasks to overlap.
+async fn evict_unprotected_index(ann: &SharedAnn, key: &AnnKey) {
+    ann.indexes.write().await.remove(key);
+}
+
 /// Lock the synchronous warming set, recovering so one panic cannot disable future warms.
 fn lock_warming(ann: &SharedAnn) -> std::sync::MutexGuard<'_, HashSet<AnnKey>> {
     ann.warming
@@ -813,20 +826,82 @@ pub(crate) async fn ensure_ann_for_model(
     }
     let key = AnnKey::from_token(model);
 
+    // Cross-process registry state is checked before the in-memory fast path.
+    // A pending row can be retired by a peer compactor; after that point an
+    // already-loaded bridge is no longer protected by a complete write-log
+    // tail and must not be served.  Pending (`-2`) likewise means no first
+    // checkpoint has ever activated this registration, so this process joins
+    // the full-rebuild path instead of trusting a persisted or cached bridge.
+    let mut force_full_rebuild = match read_own_watermark(rt, model).await {
+        Ok(Some(watermark)) if watermark >= 0 => false,
+        Ok(Some(PENDING_WATERMARK)) => {
+            evict_unprotected_index(ann, &key).await;
+            true
+        }
+        Ok(Some(watermark)) => {
+            evict_unprotected_index(ann, &key).await;
+            tracing::warn!(
+                model,
+                watermark,
+                "memory ANN registry is in a closed recovery state; refusing stale serve"
+            );
+            return Err(RuntimeError::Internal(format!(
+                "memory ANN registry for {model} is in unsupported recovery state {watermark}"
+            )));
+        }
+        Ok(None) => {
+            evict_unprotected_index(ann, &key).await;
+            register_consumer(rt, model)
+                .await
+                .map_err(RuntimeError::Internal)?;
+            true
+        }
+        Err(error) => {
+            evict_unprotected_index(ann, &key).await;
+            return Err(RuntimeError::Internal(format!(
+                "memory ANN registry read failed before serve: {error}"
+            )));
+        }
+    };
+
     // Read generation BEFORE any fast path or corpus snapshot to close the write race.
     let target_generation = current_generation(ann, &key).await;
 
     // Fast path: no lock needed if already warm AND fresh enough.
-    if installed_is_fresh(ann, &key, target_generation).await {
+    if !force_full_rebuild && installed_is_fresh(ann, &key, target_generation).await {
         return Ok(AnnEnsureStatus::AlreadyLoaded);
     }
 
     let lock = model_warm_lock(ann, &key).await;
     let _single_flight_guard = lock.lock().await;
 
-    // A concurrent caller may have satisfied our generation while we waited.
-    if installed_is_fresh(ann, &key, target_generation).await {
-        return Ok(AnnEnsureStatus::AlreadyLoaded);
+    // A concurrent caller may have activated the pending registration and
+    // satisfied our generation while we waited. Re-read durable state before
+    // accepting its bridge; local presence alone cannot prove protection.
+    match read_own_watermark(rt, model).await {
+        Ok(Some(watermark)) if watermark >= 0 => {
+            force_full_rebuild = false;
+            if installed_is_fresh(ann, &key, target_generation).await {
+                return Ok(AnnEnsureStatus::AlreadyLoaded);
+            }
+        }
+        Ok(Some(PENDING_WATERMARK)) => force_full_rebuild = true,
+        Ok(None) => {
+            register_consumer(rt, model)
+                .await
+                .map_err(RuntimeError::Internal)?;
+            force_full_rebuild = true;
+        }
+        Ok(Some(watermark)) => {
+            return Err(RuntimeError::Internal(format!(
+                "memory ANN registry for {model} is in unsupported recovery state {watermark}"
+            )));
+        }
+        Err(error) => {
+            return Err(RuntimeError::Internal(format!(
+                "memory ANN registry revalidation failed: {error}"
+            )));
+        }
     }
 
     let phase_start = std::time::Instant::now();
@@ -851,7 +926,9 @@ pub(crate) async fn ensure_ann_for_model(
     )
     .await;
 
-    let result = ensure_ann_for_model_inner(rt, token, ann, model, target_generation).await;
+    let result =
+        ensure_ann_for_model_inner(rt, token, ann, model, target_generation, force_full_rebuild)
+            .await;
 
     let wall_us = phase_start.elapsed().as_micros() as i64;
     let cpu_us = khive_runtime::cpu_delta_us(cpu_start, khive_runtime::process_resource_usage());
@@ -939,11 +1016,12 @@ async fn ensure_ann_for_model_inner(
     ann: &SharedAnn,
     model: &str,
     target_generation: u64,
+    force_full_rebuild: bool,
 ) -> Result<AnnEnsureStatus, RuntimeError> {
     let ns = "global";
     let key = AnnKey::new(model);
 
-    if installed_is_fresh(ann, &key, target_generation).await {
+    if !force_full_rebuild && installed_is_fresh(ann, &key, target_generation).await {
         return Ok(AnnEnsureStatus::AlreadyLoaded);
     }
 
@@ -954,24 +1032,26 @@ async fn ensure_ann_for_model_inner(
     // 8-rule first-match decision table over the persisted commit record, this
     // consumer's wildcard registry row, and one same-snapshot (live, tail)
     // read. Replaces the retired JSON-snapshot content-hash gate.
-    if let Some(seg_dir) = ann_segment_dir(rt, model) {
-        match classify_and_adopt_segment(
-            rt,
-            ann,
-            &key,
-            model,
-            &seg_dir,
-            target_generation,
-            target_epoch,
-        )
-        .await
-        {
-            SegmentOutcome::Installed(status) => return Ok(status),
-            SegmentOutcome::Empty => {
-                tracing::debug!(namespace = %ns, model = %model, "memory ANN: zero live corpus");
-                return Ok(AnnEnsureStatus::EmptyCorpus);
+    if !force_full_rebuild {
+        if let Some(seg_dir) = ann_segment_dir(rt, model) {
+            match classify_and_adopt_segment(
+                rt,
+                ann,
+                &key,
+                model,
+                &seg_dir,
+                target_generation,
+                target_epoch,
+            )
+            .await
+            {
+                SegmentOutcome::Installed(status) => return Ok(status),
+                SegmentOutcome::Empty => {
+                    tracing::debug!(namespace = %ns, model = %model, "memory ANN: zero live corpus");
+                    return Ok(AnnEnsureStatus::EmptyCorpus);
+                }
+                SegmentOutcome::Cold => {}
             }
-            SegmentOutcome::Cold => {}
         }
     }
 
@@ -991,16 +1071,22 @@ async fn ensure_ann_for_model_inner(
                 return Ok(AnnEnsureStatus::DiscardedStaleBuild);
             }
             let vector_count = bridge.id_map.len();
-            checkpoint_raise_compact_readopt(
+            let installed = checkpoint_raise_compact_readopt(
                 rt,
                 ann,
                 &key,
                 model,
                 bridge,
-                target_generation,
-                target_epoch,
+                CheckpointPublication {
+                    generation: target_generation,
+                    epoch: target_epoch,
+                    authority: WatermarkAuthority::PendingOrActive,
+                },
             )
             .await;
+            if !installed {
+                return Ok(AnnEnsureStatus::DiscardedStaleBuild);
+            }
             tracing::debug!(namespace = %ns, model = %model, vectors = vector_count, "memory ANN index built");
             Ok(AnnEnsureStatus::Built {
                 vectors: vector_count,
@@ -1059,10 +1145,12 @@ async fn compute_memory_fingerprint(
     })
 }
 
-/// Build a graph from live model vectors, capturing the write-log watermark in
-/// the same statement — and therefore the same SQLite read snapshot — as the
-/// corpus rows (ADR-079 Amendment 1: watermark capture and corpus read are
-/// linearized). The corpus predicate is global-scope and join-filtered: every
+/// Build a graph from live model vectors, capturing both the retained-log high
+/// water and this consumer's nonnegative active floor in the same statement —
+/// and therefore the same SQLite read snapshot — as the corpus rows (ADR-079
+/// Amendment 1: watermark capture and corpus read are linearized). The active
+/// floor preserves monotonic publication after compaction removes the retained
+/// prefix. The corpus predicate is global-scope and join-filtered: every
 /// namespace, live notes only.
 async fn load_and_build_from_vector_store(
     rt: &KhiveRuntime,
@@ -1090,9 +1178,15 @@ async fn load_and_build_from_vector_store(
         .query_all(SqlStatement {
             sql: format!(
                 "SELECT v.subject_id, v.embedding, n.namespace, \
-                        (SELECT COALESCE(MAX(seq), 0) FROM ann_write_log \
-                          WHERE embedding_model = ?1 \
-                            AND kind = 'note' AND field = 'note.content') AS log_s \
+                        MAX( \
+                          (SELECT COALESCE(MAX(seq), 0) FROM ann_write_log \
+                            WHERE embedding_model = ?1 \
+                              AND kind = 'note' AND field = 'note.content'), \
+                          (SELECT COALESCE(MAX(watermark), 0) \
+                             FROM ann_consumer_watermark \
+                            WHERE consumer = ?2 AND namespace = ?3 \
+                              AND embedding_model = ?1 AND watermark >= 0) \
+                        ) AS log_s \
                  FROM {table_name} v \
                  JOIN notes n ON n.id = v.subject_id \
                  WHERE v.embedding_model = ?1 \
@@ -1100,7 +1194,11 @@ async fn load_and_build_from_vector_store(
                    AND n.deleted_at IS NULL \
                  ORDER BY v.subject_id"
             ),
-            params: vec![SqlValue::Text(model.to_owned())],
+            params: vec![
+                SqlValue::Text(model.to_owned()),
+                SqlValue::Text(ANN_CONSUMER.into()),
+                SqlValue::Text(ANN_WILDCARD_NS.into()),
+            ],
             label: Some("memory_ann_corpus_scan".into()),
         })
         .await?;
@@ -1182,6 +1280,34 @@ fn ann_segment_dir(rt: &KhiveRuntime, model: &str) -> Option<std::path::PathBuf>
     Some(ann_root.join(hex))
 }
 
+fn acquire_bridge_checkpoint_lock(dir: &std::path::Path) -> Result<std::fs::File, String> {
+    std::fs::create_dir_all(dir).map_err(|error| {
+        format!(
+            "create memory ANN checkpoint directory {}: {error}",
+            dir.display()
+        )
+    })?;
+    let lock_path = dir.join(".bridge-checkpoint.lock");
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .map_err(|error| format!("open memory ANN lock {}: {error}", lock_path.display()))?;
+    lock.lock()
+        .map_err(|error| format!("acquire memory ANN lock {}: {error}", lock_path.display()))?;
+    Ok(lock)
+}
+
+async fn acquire_bridge_checkpoint_lock_async(
+    dir: std::path::PathBuf,
+) -> Result<std::fs::File, String> {
+    tokio::task::spawn_blocking(move || acquire_bridge_checkpoint_lock(&dir))
+        .await
+        .map_err(|error| format!("memory ANN lock task failed: {error}"))?
+}
+
 /// Install `candidate`, replacing an equal-generation incumbent but never a
 /// strictly newer one. All install sites run under the single-flight model
 /// lock, so an equal generation means an ordered step within one warm task
@@ -1189,21 +1315,25 @@ fn ann_segment_dir(rt: &KhiveRuntime, model: &str) -> Option<std::path::PathBuf>
 /// the served stale segment) — the later product is always the right one to
 /// keep. A strictly newer incumbent means a fresher build already landed and
 /// must survive a slow candidate finishing late.
-async fn install_replacing(ann: &SharedAnn, key: &AnnKey, candidate: AnnBridge) {
+/// Returns whether `candidate` became the installed bridge.
+async fn install_replacing(ann: &SharedAnn, key: &AnnKey, candidate: AnnBridge) -> bool {
     match ann.indexes.write().await.entry(key.clone()) {
         std::collections::hash_map::Entry::Occupied(mut e)
             if e.get().generation <= candidate.generation =>
         {
             e.insert(candidate);
+            true
         }
         std::collections::hash_map::Entry::Occupied(_) => {
             tracing::debug!(
                 model = %key.model,
                 "memory ANN replace skipped: cached entry is newer than this build"
             );
+            false
         }
         std::collections::hash_map::Entry::Vacant(e) => {
             e.insert(candidate);
+            true
         }
     }
 }
@@ -1231,31 +1361,45 @@ fn ann_rebuild_threshold() -> f64 {
         .unwrap_or(ANN_REBUILD_THRESHOLD_DEFAULT)
 }
 
-/// Durably register this consumer's wildcard watermark row at 0
-/// (`INSERT OR IGNORE`). MUST run before the consumer persists or serves any
-/// extended-format segment: a row at 0 blocks compaction in every namespace
-/// instead of hiding this consumer from the registry `MIN`.
+/// Durably register this consumer's wildcard row as pending (`-2`). MUST run
+/// before the first full scan, persist, or serve: pending blocks compaction in
+/// every namespace but, unlike an active checkpoint at `S = 0`, can be retired
+/// with a visible warning if it never activates.
 async fn register_consumer(rt: &KhiveRuntime, model: &str) -> Result<(), String> {
     let sql = rt.sql();
-    let mut w = sql.writer().await.map_err(|e| e.to_string())?;
-    w.execute(SqlStatement {
-        sql: "INSERT OR IGNORE INTO ann_consumer_watermark \
-              (consumer, namespace, embedding_model, watermark) VALUES (?1, ?2, ?3, 0)"
-            .into(),
-        params: vec![
-            SqlValue::Text(ANN_CONSUMER.into()),
-            SqlValue::Text(ANN_WILDCARD_NS.into()),
-            SqlValue::Text(model.to_owned()),
-        ],
-        label: Some("memory_ann_register_consumer".into()),
-    })
-    .await
-    .map_err(|e| e.to_string())?;
-    Ok(())
+    if ann_segment_dir(rt, model).is_none() {
+        // `SqlBridge::atomic_unit` cannot keep its manual transaction pinned
+        // across calls on an in-memory pool: each PoolBackedWriter operation
+        // checks the one shared connection back out independently. A
+        // background warm could therefore leave `BEGIN IMMEDIATE` visible to
+        // an overlapping remember. Pathless runtimes have no durable consumer
+        // to age-retire, so the single-statement pending fence is sufficient.
+        let mut writer = sql.writer().await.map_err(|e| e.to_string())?;
+        writer
+            .execute(SqlStatement {
+                sql: "INSERT OR IGNORE INTO ann_consumer_watermark \
+                      (consumer, namespace, embedding_model, watermark) \
+                      VALUES (?1, ?2, ?3, ?4)"
+                    .into(),
+                params: vec![
+                    SqlValue::Text(ANN_CONSUMER.into()),
+                    SqlValue::Text(ANN_WILDCARD_NS.into()),
+                    SqlValue::Text(model.to_owned()),
+                    SqlValue::Integer(PENDING_WATERMARK),
+                ],
+                label: Some("memory_ann_register_pathless_consumer".into()),
+            })
+            .await
+            .map_err(|e| e.to_string())?;
+        return Ok(());
+    }
+    ann_registry::register_pending(sql.as_ref(), ANN_CONSUMER, ANN_WILDCARD_NS, model)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 /// Read this consumer's own wildcard registry watermark. `None` = no row
-/// (decision rule 4: Cold after re-registering at 0).
+/// (decision rule 4: Cold after re-registering as pending).
 async fn read_own_watermark(rt: &KhiveRuntime, model: &str) -> Result<Option<i64>, String> {
     let sql = rt.sql();
     let mut reader = sql.reader().await.map_err(|e| e.to_string())?;
@@ -1282,27 +1426,68 @@ async fn read_own_watermark(rt: &KhiveRuntime, model: &str) -> Result<Option<i64
         }))
 }
 
-/// Raise this consumer's registered watermark monotonically after a durable
-/// segment commit at `s`. A crash before this leaves the smaller watermark —
-/// under-compacts, never over-compacts.
-async fn raise_watermark(rt: &KhiveRuntime, model: &str, s: u64) -> Result<(), String> {
+/// Conditionally raise this consumer's registered watermark after a durable
+/// segment commit at `s`. Retirement or a newer publisher causes a fenced
+/// failure rather than installing state whose tail is no longer protected.
+async fn raise_watermark_with_authority(
+    rt: &KhiveRuntime,
+    model: &str,
+    s: u64,
+    authority: WatermarkAuthority,
+) -> Result<(), String> {
     let sql = rt.sql();
-    let mut w = sql.writer().await.map_err(|e| e.to_string())?;
-    w.execute(SqlStatement {
-        sql: "UPDATE ann_consumer_watermark SET watermark = MAX(watermark, ?4) \
-              WHERE consumer = ?1 AND namespace = ?2 AND embedding_model = ?3"
-            .into(),
-        params: vec![
-            SqlValue::Text(ANN_CONSUMER.into()),
-            SqlValue::Text(ANN_WILDCARD_NS.into()),
-            SqlValue::Text(model.to_owned()),
-            SqlValue::Integer(s as i64),
-        ],
-        label: Some("memory_ann_raise_watermark".into()),
-    })
-    .await
-    .map_err(|e| e.to_string())?;
+    let raised = if ann_segment_dir(rt, model).is_none() {
+        let watermark = i64::try_from(s)
+            .map_err(|_| format!("memory ANN watermark {s} exceeds SQLite INTEGER range"))?;
+        let predicate = match authority {
+            WatermarkAuthority::PendingOrActive => {
+                "(watermark = -2 OR (watermark >= 0 AND watermark <= ?4))"
+            }
+            WatermarkAuthority::Active => "watermark >= 0 AND watermark <= ?4",
+            WatermarkAuthority::Recovering => "watermark = -1",
+        };
+        let mut writer = sql.writer().await.map_err(|e| e.to_string())?;
+        writer
+            .execute(SqlStatement {
+                sql: format!(
+                    "UPDATE ann_consumer_watermark SET watermark = ?4 \
+                     WHERE consumer = ?1 AND namespace = ?2 AND embedding_model = ?3 \
+                       AND {predicate}"
+                ),
+                params: vec![
+                    SqlValue::Text(ANN_CONSUMER.into()),
+                    SqlValue::Text(ANN_WILDCARD_NS.into()),
+                    SqlValue::Text(model.to_owned()),
+                    SqlValue::Integer(watermark),
+                ],
+                label: Some("memory_ann_raise_pathless_watermark".into()),
+            })
+            .await
+            .map_err(|e| e.to_string())?
+            == 1
+    } else {
+        ann_registry::raise_watermark(
+            sql.as_ref(),
+            ANN_CONSUMER,
+            ANN_WILDCARD_NS,
+            model,
+            s,
+            authority,
+        )
+        .await
+        .map_err(|e| e.to_string())?
+    };
+    if !raised {
+        return Err(format!(
+            "memory ANN watermark publication fence rejected {authority:?}"
+        ));
+    }
     Ok(())
+}
+
+#[cfg(test)]
+async fn raise_watermark(rt: &KhiveRuntime, model: &str, s: u64) -> Result<(), String> {
+    raise_watermark_with_authority(rt, model, s, WatermarkAuthority::Active).await
 }
 
 /// Compact the write log for `model` across every namespace this global
@@ -1313,20 +1498,34 @@ async fn raise_watermark(rt: &KhiveRuntime, model: &str, s: u64) -> Result<(), S
 /// registered rows, and `seq <= NULL` matches nothing.
 async fn compact_log(rt: &KhiveRuntime, model: &str) -> Result<(), String> {
     let sql = rt.sql();
-    let mut w = sql.writer().await.map_err(|e| e.to_string())?;
-    w.execute(SqlStatement {
-        sql: "DELETE FROM ann_write_log \
-              WHERE embedding_model = ?1 \
-                AND seq <= (SELECT MIN(w.watermark) FROM ann_consumer_watermark w \
-                             WHERE (w.namespace = ann_write_log.namespace OR w.namespace = '*') \
-                               AND w.embedding_model = ?1)"
-            .into(),
-        params: vec![SqlValue::Text(model.to_owned())],
-        label: Some("memory_ann_compact_log".into()),
-    })
-    .await
-    .map_err(|e| e.to_string())?;
-    Ok(())
+    if ann_segment_dir(rt, model).is_none() {
+        // The ephemeral, single-process backend has no durable dormant
+        // registrations to retire. Keep its historical single-statement
+        // compaction shape so a background checkpoint cannot expose a manual
+        // multi-statement transaction between pooled writer operations.
+        let mut writer = sql.writer().await.map_err(|e| e.to_string())?;
+        writer
+            .execute(SqlStatement {
+                sql: "DELETE FROM ann_write_log \
+                      WHERE embedding_model = ?1 \
+                        AND seq <= (SELECT MIN(watermark.watermark) \
+                                    FROM ann_consumer_watermark watermark \
+                                    WHERE (watermark.namespace = ann_write_log.namespace \
+                                           OR watermark.namespace = '*') \
+                                      AND watermark.embedding_model = ?1)"
+                    .into(),
+                params: vec![SqlValue::Text(model.to_owned())],
+                label: Some("memory_ann_compact_pathless_log".into()),
+            })
+            .await
+            .map(|_| ())
+            .map_err(|e| e.to_string())?;
+        return Ok(());
+    }
+    ann_registry::compact_write_log(sql.as_ref(), CompactionScope::Model, model)
+        .await
+        .map(|_| ())
+        .map_err(|e| e.to_string())
 }
 
 /// Live corpus count and tail count for this consumer's scope, captured in ONE
@@ -1721,6 +1920,26 @@ pub(crate) fn merge_fresh_tail(
     merged
 }
 
+/// Fold a [`FreshTailOutcome`] into the candidate set a recall handler will
+/// serve, plus the degradation disclosure the caller owes when fresh-tail
+/// visibility was lost. `Ops` merges into `prior` with no disclosure;
+/// `Replace` swaps the candidate set and discloses only when the re-resolved
+/// tail could not be assembled; `Skipped` keeps `prior` and always
+/// discloses. Every recall path that consumes an outcome goes through this
+/// single mapping so no exceptional class can be silently treated as
+/// healthy.
+pub(crate) fn outcome_into_candidates(
+    outcome: FreshTailOutcome,
+    prior: Vec<(Uuid, f32)>,
+    query: &[f32],
+) -> (Vec<(Uuid, f32)>, Option<String>) {
+    match outcome {
+        FreshTailOutcome::Ops(ops) => (merge_fresh_tail(prior, query, ops), None),
+        FreshTailOutcome::Replace(candidates, reason) => (candidates, reason.map(str::to_string)),
+        FreshTailOutcome::Skipped(reason) => (prior, Some(reason.to_string())),
+    }
+}
+
 /// Outcome of [`fresh_tail_leg`].
 pub(crate) enum FreshTailOutcome {
     /// Coalesced final tail ops (ADR-118 §1/§2), valid against the
@@ -1732,11 +1951,22 @@ pub(crate) enum FreshTailOutcome {
     /// REPLACE the caller's `best_raw` outright — they are already a
     /// self-consistent (new candidates, new watermark) pair, exact-scored
     /// against that segment's own tail. Never merge them with the stale set.
-    Replace(Vec<(Uuid, f32)>),
+    ///
+    /// The second field is `Some(reason)` when the re-resolved candidates
+    /// are served WITHOUT their fresh-tail merge (reader/snapshot/registry
+    /// or tail-fetch failure after re-resolution): the candidate set is
+    /// still coherent, but read-your-writes visibility was lost, and the
+    /// caller must disclose that. `None` means the full re-resolved
+    /// (candidates, tail) pair was assembled — no degradation. Same
+    /// diagnostic-text contract as [`FreshTailOutcome::Skipped`].
+    Replace(Vec<(Uuid, f32)>, Option<&'static str>),
     /// The leg sat out this query entirely (disabled, unregistered
     /// consumer, or an unrecoverable read failure); the caller's candidates
-    /// are unaffected.
-    Skipped,
+    /// are unaffected. The payload is a non-empty, failure-site diagnostic
+    /// identifying which exceptional class caused the skip — diagnostic
+    /// text for degraded-response disclosure, not a stable public enum;
+    /// callers may depend on its presence, not its exact wording.
+    Skipped(&'static str),
 }
 
 /// The ADR-118 fresh-tail exact leg. `s = Some(watermark)` is the first
@@ -1758,26 +1988,63 @@ pub(crate) async fn fresh_tail_leg(
     k: usize,
     s: Option<u64>,
 ) -> FreshTailOutcome {
-    if !fresh_tail_enabled() {
-        return FreshTailOutcome::Skipped;
+    // Registration precondition (ADR-118 §1): a serving bridge is trusted only
+    // while its consumer is active (`S >= 0`). Pending/recovery/absence means a
+    // peer may have retired the old protection; drop the already-captured ANN
+    // candidates so even a disabled exact leg cannot leak stale state.
+    let mut registry_state = read_own_watermark(rt, model).await;
+    if s.is_some()
+        && ann_segment_dir(rt, model).is_none()
+        && matches!(registry_state, Ok(Some(PENDING_WATERMARK)))
+    {
+        // A pathless first checkpoint replaces the in-process bridge before
+        // activating its pending row. If this query observes that publication
+        // window, wait for the same per-model lock held by the checkpoint and
+        // then revalidate. Otherwise the closed-state guard could evict the
+        // just-built bridge between install and activation, leaving the
+        // successfully activated consumer with no serving index.
+        let lock = model_warm_lock(ann, key).await;
+        #[cfg(test)]
+        ann.pathless_pending_publication_wait.notify_one();
+        let _publication_guard = lock.lock().await;
+        registry_state = read_own_watermark(rt, model).await;
     }
-
-    // Registration precondition (ADR-118 §1): S = 0 (or "no bridge") proves
-    // an entire-scope tail only if no compaction has ever run for this
-    // consumer's registration. Absent row: register at 0 and sit out this
-    // query — the existing Cold classification already serves correctly.
-    match read_own_watermark(rt, model).await {
-        Ok(Some(_)) => {}
+    match registry_state {
+        Ok(Some(watermark)) if watermark >= 0 => {}
+        Ok(Some(watermark)) => {
+            evict_unprotected_index(ann, key).await;
+            tracing::warn!(
+                model,
+                watermark,
+                "fresh-tail: closed consumer registration; dropping stale ANN candidates"
+            );
+            return FreshTailOutcome::Replace(
+                Vec::new(),
+                Some("fresh-tail: closed consumer registration; dropped unprotected candidates"),
+            );
+        }
         Ok(None) => {
+            evict_unprotected_index(ann, key).await;
             if let Err(e) = register_consumer(rt, model).await {
                 tracing::warn!(error = %e, model, "fresh-tail: consumer re-registration failed");
             }
-            return FreshTailOutcome::Skipped;
+            return FreshTailOutcome::Replace(
+                Vec::new(),
+                Some("fresh-tail: consumer registration absent; dropped unprotected candidates and re-registered"),
+            );
         }
         Err(e) => {
-            tracing::warn!(error = %e, model, "fresh-tail: registry read failed; skipping exact leg");
-            return FreshTailOutcome::Skipped;
+            evict_unprotected_index(ann, key).await;
+            tracing::warn!(error = %e, model, "fresh-tail: registry read failed; dropping stale ANN candidates");
+            return FreshTailOutcome::Replace(
+                Vec::new(),
+                Some("fresh-tail: registry read failed; dropped unprotected candidates"),
+            );
         }
+    }
+
+    if !fresh_tail_enabled() {
+        return FreshTailOutcome::Skipped("fresh-tail leg disabled via KHIVE_ANN_FRESH_TAIL");
     }
 
     match s {
@@ -1803,12 +2070,12 @@ async fn fresh_tail_serving(
         Ok(r) => r,
         Err(e) => {
             tracing::warn!(error = %e, model, "fresh-tail: reader open failed; skipping exact leg");
-            return FreshTailOutcome::Skipped;
+            return FreshTailOutcome::Skipped("fresh-tail: reader open failed");
         }
     };
     if let Err(e) = begin_read_snapshot(reader.as_mut()).await {
         tracing::warn!(error = %e, model, "fresh-tail: snapshot begin failed; skipping exact leg");
-        return FreshTailOutcome::Skipped;
+        return FreshTailOutcome::Skipped("fresh-tail: snapshot begin failed");
     }
 
     let registry_min = match registry_min_watermark_on(reader.as_mut(), model).await {
@@ -1816,13 +2083,65 @@ async fn fresh_tail_serving(
         Err(e) => {
             end_read_snapshot(reader.as_mut()).await;
             tracing::warn!(error = %e, model, "fresh-tail: registry-min read failed; skipping exact leg");
-            return FreshTailOutcome::Skipped;
+            return FreshTailOutcome::Skipped("fresh-tail: registry-min read failed");
         }
     };
 
-    if let Some(m) = registry_min {
-        let m = m as u64;
+    // Negative minima are closed states which block compaction below every
+    // real log sequence. They cannot indicate that compaction outran `s` and
+    // must never be lossily cast to a huge u64 floor.
+    if let Some(m) = registry_min.and_then(|value| u64::try_from(value).ok()) {
         if m > s {
+            if ann_segment_dir(rt, model).is_none() {
+                // A pathless checkpoint installs its bridge before raising
+                // and compacting. A recall may nevertheless have captured
+                // the old bridge just before that swap. Re-resolve against
+                // the currently installed bridge while this SQL snapshot
+                // pins the observed registry/log state, then replace (never
+                // merge with) the stale candidates captured by the caller.
+                let resolved = search_loaded_with_seq(ann, key, query, k).await;
+                let outcome = match resolved {
+                    Ok(Some((candidates, resolved_s))) if resolved_s >= m => {
+                        match fetch_final_tail_on(reader.as_mut(), model, resolved_s, None).await {
+                            Ok((ops, _)) => FreshTailOutcome::Replace(
+                                merge_fresh_tail(candidates, query, ops),
+                                None,
+                            ),
+                            Err(e) => {
+                                tracing::warn!(error = %e, model, "fresh-tail: pathless re-resolved tail fetch failed; serving re-resolved candidates");
+                                FreshTailOutcome::Replace(
+                                    candidates,
+                                    Some("fresh-tail: pathless re-resolved tail fetch failed; served re-resolved candidates without fresh-tail merge"),
+                                )
+                            }
+                        }
+                    }
+                    Ok(_) => {
+                        tracing::warn!(
+                            model,
+                            floor = m,
+                            "fresh-tail: pathless mismatch has no bridge at the registry floor; \
+                             dropping stale ANN candidates"
+                        );
+                        bump_generation(ann, key).await;
+                        FreshTailOutcome::Replace(
+                            Vec::new(),
+                            Some("fresh-tail: pathless mismatch has no bridge at the registry floor; dropped stale candidates"),
+                        )
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, model, "fresh-tail: pathless re-resolution search failed; dropping stale ANN candidates");
+                        bump_generation(ann, key).await;
+                        FreshTailOutcome::Replace(
+                            Vec::new(),
+                            Some("fresh-tail: pathless re-resolution search failed; dropped stale candidates"),
+                        )
+                    }
+                };
+                end_read_snapshot(reader.as_mut()).await;
+                return outcome;
+            }
+
             // Mismatch (ADR-118 §1): the log may no longer retain every row
             // above `s`. Real re-resolution needs no DB read (a filesystem
             // commit-record read), so it can be checked before deciding
@@ -1853,7 +2172,7 @@ async fn fresh_tail_serving(
                         Ok((ops, _)) => FreshTailOutcome::Ops(ops),
                         Err(e) => {
                             tracing::warn!(error = %e, model, "fresh-tail: floored tail fetch failed; skipping exact leg");
-                            FreshTailOutcome::Skipped
+                            FreshTailOutcome::Skipped("fresh-tail: floored tail fetch failed")
                         }
                     }
                 }
@@ -1867,7 +2186,7 @@ async fn fresh_tail_serving(
         Ok((ops, _new_s)) => FreshTailOutcome::Ops(ops),
         Err(e) => {
             tracing::warn!(error = %e, model, "fresh-tail: tail fetch failed; skipping exact leg");
-            FreshTailOutcome::Skipped
+            FreshTailOutcome::Skipped("fresh-tail: tail fetch failed")
         }
     }
 }
@@ -1918,14 +2237,16 @@ async fn fresh_tail_reresolve(
     for round in 1..=FRESH_TAIL_RERESOLVE_MAX_ROUNDS {
         let Some(dir) = ann_segment_dir(rt, model) else {
             bump_generation(ann, key).await;
-            return FreshTailOutcome::Skipped;
+            return FreshTailOutcome::Skipped(
+                "fresh-tail: re-resolved segment directory unavailable",
+            );
         };
         let bridge = match AnnBridge::load(&dir) {
             Ok(b) => b,
             Err(e) => {
                 tracing::warn!(error = %e, model, "fresh-tail: re-resolved segment load failed; skipping exact leg");
                 bump_generation(ann, key).await;
-                return FreshTailOutcome::Skipped;
+                return FreshTailOutcome::Skipped("fresh-tail: re-resolved segment load failed");
             }
         };
         let s_loaded = bridge.index.last_applied_seq().unwrap_or(expected_s);
@@ -1934,7 +2255,7 @@ async fn fresh_tail_reresolve(
             Err(e) => {
                 tracing::warn!(error = %e, model, "fresh-tail: re-resolved segment search failed; skipping exact leg");
                 bump_generation(ann, key).await;
-                return FreshTailOutcome::Skipped;
+                return FreshTailOutcome::Skipped("fresh-tail: re-resolved segment search failed");
             }
         };
         // Force re-adoption so the background warm path installs this segment
@@ -1964,20 +2285,29 @@ async fn fresh_tail_reresolve(
             Ok(r) => r,
             Err(e) => {
                 tracing::warn!(error = %e, model, "fresh-tail: re-resolved reader open failed; serving re-resolved candidates without further tail");
-                return FreshTailOutcome::Replace(candidates);
+                return FreshTailOutcome::Replace(
+                    candidates,
+                    Some("fresh-tail: re-resolved reader open failed"),
+                );
             }
         };
         if let Err(e) = begin_read_snapshot(reader.as_mut()).await {
             tracing::warn!(error = %e, model, "fresh-tail: re-resolved snapshot begin failed; serving re-resolved candidates without further tail");
-            return FreshTailOutcome::Replace(candidates);
+            return FreshTailOutcome::Replace(
+                candidates,
+                Some("fresh-tail: re-resolved snapshot begin failed"),
+            );
         }
 
         let registry_min = match registry_min_watermark_on(reader.as_mut(), model).await {
-            Ok(v) => v.map(|m| m as u64),
+            Ok(v) => v.and_then(|value| u64::try_from(value).ok()),
             Err(e) => {
                 end_read_snapshot(reader.as_mut()).await;
                 tracing::warn!(error = %e, model, "fresh-tail: re-resolved registry-min read failed; serving re-resolved candidates without further tail");
-                return FreshTailOutcome::Replace(candidates);
+                return FreshTailOutcome::Replace(
+                    candidates,
+                    Some("fresh-tail: re-resolved registry-min read failed"),
+                );
             }
         };
 
@@ -1992,10 +2322,15 @@ async fn fresh_tail_reresolve(
             let outcome = fetch_final_tail_on(reader.as_mut(), model, s_loaded, None).await;
             end_read_snapshot(reader.as_mut()).await;
             return match outcome {
-                Ok((ops, _)) => FreshTailOutcome::Replace(merge_fresh_tail(candidates, query, ops)),
+                Ok((ops, _)) => {
+                    FreshTailOutcome::Replace(merge_fresh_tail(candidates, query, ops), None)
+                }
                 Err(e) => {
                     tracing::warn!(error = %e, model, "fresh-tail: re-resolved tail fetch failed; serving re-resolved candidates without further tail");
-                    FreshTailOutcome::Replace(candidates)
+                    FreshTailOutcome::Replace(
+                        candidates,
+                        Some("fresh-tail: re-resolved tail fetch failed"),
+                    )
                 }
             };
         }
@@ -2019,10 +2354,15 @@ async fn fresh_tail_reresolve(
             let outcome = fetch_final_tail_on(reader.as_mut(), model, m, None).await;
             end_read_snapshot(reader.as_mut()).await;
             return match outcome {
-                Ok((ops, _)) => FreshTailOutcome::Replace(merge_fresh_tail(candidates, query, ops)),
+                Ok((ops, _)) => {
+                    FreshTailOutcome::Replace(merge_fresh_tail(candidates, query, ops), None)
+                }
                 Err(e) => {
                     tracing::warn!(error = %e, model, "fresh-tail: floored-fallback tail fetch failed; serving re-resolved candidates without further tail");
-                    FreshTailOutcome::Replace(candidates)
+                    FreshTailOutcome::Replace(
+                        candidates,
+                        Some("fresh-tail: floored-fallback tail fetch failed"),
+                    )
                 }
             };
         }
@@ -2053,58 +2393,134 @@ async fn fresh_tail_capped(rt: &KhiveRuntime, model: &str) -> FreshTailOutcome {
         Ok(true) => {}
         Err(e) => {
             tracing::warn!(error = %e, model, "fresh-tail: tail-existence read failed; skipping capped exact leg");
-            return FreshTailOutcome::Skipped;
+            return FreshTailOutcome::Skipped("fresh-tail: tail-existence read failed");
         }
     }
     match fetch_final_tail(rt, model, 0, Some(FRESH_TAIL_CAPPED_MAX_ROWS)).await {
         Ok((ops, _new_s)) => FreshTailOutcome::Ops(ops),
         Err(e) => {
             tracing::warn!(error = %e, model, "fresh-tail: capped tail fetch failed; skipping exact leg");
-            FreshTailOutcome::Skipped
+            FreshTailOutcome::Skipped("fresh-tail: capped tail fetch failed")
         }
     }
+}
+
+#[derive(Clone, Copy)]
+struct CheckpointPublication {
+    generation: u64,
+    epoch: u64,
+    authority: WatermarkAuthority,
 }
 
 /// Persist `bridge` at its applied watermark, raise the wildcard registry row,
 /// compact the log across namespaces, then reopen the just-written segment via
 /// the mmap load path and swap it in for the Owned build product (ADR-079
-/// Amendment 1 §B). Registration precedes the persist (§A step 1). On any
-/// persist/reopen failure the Owned bridge is installed instead — correctness
-/// first, memory second.
+/// Amendment 1 §B). Pending registration precedes the full scan (§A step 1).
+/// A failed persistence or fenced watermark publication never installs the
+/// candidate; a reopen failure after a successful publication may serve the
+/// equivalent Owned bridge. In-memory backends install the Owned candidate
+/// before raising/compacting: the registry guard rejects it while pending,
+/// and that ordering ensures no old bridge remains observable after the
+/// watermark advances and its intervening tail can be deleted.
 async fn checkpoint_raise_compact_readopt(
     rt: &KhiveRuntime,
     ann: &SharedAnn,
     key: &AnnKey,
     model: &str,
     bridge: AnnBridge,
-    generation: u64,
-    epoch: u64,
-) {
+    publication: CheckpointPublication,
+) -> bool {
+    let CheckpointPublication {
+        generation,
+        epoch,
+        authority,
+    } = publication;
     let applied = bridge.index.last_applied_seq().unwrap_or(0);
     let namespace_set = bridge.namespace_set.clone();
     let stamp =
         |b: AnnBridge| -> AnnBridge { b.with_generation(generation).with_epoch_baseline(epoch) };
-    if let Err(e) = register_consumer(rt, model).await {
-        tracing::warn!(error = %e, "memory ann consumer registration failed; serving Owned, no persist");
-        install_replacing(ann, key, stamp(bridge)).await;
-        return;
+
+    let Some(dir) = ann_segment_dir(rt, model) else {
+        // There is no filesystem commit record a concurrent recall could use
+        // to re-resolve a bridge/watermark mismatch. Publish the replacement
+        // bridge first; until the conditional raise succeeds, fresh-tail's
+        // durable registry check rejects and evicts it. If retirement won,
+        // this task likewise evicts before returning.
+        if !install_replacing(ann, key, stamp(bridge)).await {
+            // A post-scan generation already installed something newer. Do
+            // not advance the registry past log rows that rejected candidate
+            // may not contain; retry from the ordinary freshness path.
+            return false;
+        }
+        if let Err(e) = raise_watermark_with_authority(rt, model, applied, authority).await {
+            tracing::warn!(error = %e, "memory ann watermark publication rejected; dropping candidate bridge");
+            evict_unprotected_index(ann, key).await;
+            return false;
+        }
+        if let Err(e) = compact_log(rt, model).await {
+            tracing::warn!(error = %e, "memory ann log compaction failed (retries next checkpoint)");
+        }
+        return true;
+    };
+
+    // Every process writing this model's segment takes the same filesystem
+    // lock. Revalidate the durable row only after acquiring it: otherwise a
+    // stale publisher could overwrite a newer segment, lose its conditional
+    // raise, and leave the registry ahead of the files that restart adopts.
+    let _publication_lock = match acquire_bridge_checkpoint_lock_async(dir.clone()).await {
+        Ok(lock) => lock,
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to acquire memory ANN checkpoint lock");
+            return false;
+        }
+    };
+    let current_watermark = match read_own_watermark(rt, model).await {
+        Ok(value) => value,
+        Err(e) => {
+            tracing::warn!(error = %e, "memory ANN checkpoint registry read failed");
+            return false;
+        }
+    };
+    let authorized = match authority {
+        WatermarkAuthority::PendingOrActive => {
+            current_watermark == Some(PENDING_WATERMARK)
+                || current_watermark.is_some_and(|watermark| {
+                    watermark >= 0 && u64::try_from(watermark).is_ok_and(|value| value <= applied)
+                })
+        }
+        WatermarkAuthority::Active => current_watermark.is_some_and(|watermark| {
+            watermark >= 0 && u64::try_from(watermark).is_ok_and(|value| value <= applied)
+        }),
+        WatermarkAuthority::Recovering => {
+            current_watermark == Some(ann_registry::RECOVERING_WATERMARK)
+        }
+    };
+    if !authorized {
+        tracing::info!(
+            model,
+            candidate_watermark = applied,
+            observed_watermark = ?current_watermark,
+            ?authority,
+            "memory ANN checkpoint lost publication race before persistence"
+        );
+        return false;
     }
-    let persisted = match ann_segment_dir(rt, model) {
-        Some(dir) => match bridge.save_atomic(&dir) {
-            Ok(()) => Some(dir),
-            Err(e) => {
-                tracing::error!(error = %e, "failed to persist memory v2 Vamana segment");
-                None
-            }
-        },
-        None => None, // in-memory backend — nothing to persist
-    };
-    let Some(dir) = persisted else {
-        install_replacing(ann, key, stamp(bridge)).await;
-        return;
-    };
-    if let Err(e) = raise_watermark(rt, model, applied).await {
-        tracing::warn!(error = %e, "memory ann watermark raise failed (under-compacts; safe)");
+
+    if let Err(e) = bridge.save_atomic(&dir) {
+        tracing::error!(error = %e, "failed to persist memory v2 Vamana segment");
+        // An ordinary active rebuild still has a registry-protected incumbent
+        // and a retained tail. Preserve that stale fallback until a complete
+        // replacement commits; pending/closed paths already evicted before
+        // entering the scan and therefore have nothing unsafe to retain.
+        return false;
+    }
+    if let Err(e) = raise_watermark_with_authority(rt, model, applied, authority).await {
+        // Retirement or a newer checkpoint won the writer race.  This build's
+        // candidates are not protected by its own registry state, so never
+        // install them; the next ensure re-resolves durable state.
+        tracing::warn!(error = %e, "memory ann watermark publication rejected; dropping candidate bridge");
+        evict_unprotected_index(ann, key).await;
+        return false;
     } else if let Err(e) = compact_log(rt, model).await {
         tracing::warn!(error = %e, "memory ann log compaction failed (retries next checkpoint)");
     }
@@ -2118,6 +2534,7 @@ async fn checkpoint_raise_compact_readopt(
             install_replacing(ann, key, stamp(bridge)).await;
         }
     }
+    true
 }
 
 /// Outcome of the v2-segment decision table for this consumer's global scope.
@@ -2176,12 +2593,12 @@ async fn classify_and_adopt_segment(
     }
 
     // Rule 4: own wildcard registry row absent for an extended-format state →
-    // Cold after re-registering at 0.
+    // Cold after re-registering as pending.
     match read_own_watermark(rt, model).await {
         Ok(Some(_)) => {}
         Ok(None) => {
             tracing::info!(model = %model,
-                "memory ann consumer registry row absent; re-registering at 0, Cold rebuild");
+                "memory ann consumer registry row absent; re-registering pending, Cold rebuild");
             if let Err(e) = register_consumer(rt, model).await {
                 tracing::warn!(error = %e, "memory ann consumer re-registration failed");
             }
@@ -2263,16 +2680,22 @@ async fn classify_and_adopt_segment(
             tracing::warn!(error = %e, "memory tail replay failed; Cold rebuild");
             return SegmentOutcome::Cold;
         }
-        checkpoint_raise_compact_readopt(
+        let installed = checkpoint_raise_compact_readopt(
             rt,
             ann,
             key,
             model,
             bridge,
-            target_generation,
-            target_epoch,
+            CheckpointPublication {
+                generation: target_generation,
+                epoch: target_epoch,
+                authority: WatermarkAuthority::Active,
+            },
         )
         .await;
+        if !installed {
+            return SegmentOutcome::Cold;
+        }
         tracing::debug!(model = %model, tail, "memory ANN adopted via Stale-tail replay");
         return SegmentOutcome::Installed(AnnEnsureStatus::LoadedSnapshot);
     }
@@ -2303,6 +2726,70 @@ async fn classify_and_adopt_segment(
 mod tests {
     use super::*;
     use serial_test::serial;
+
+    #[test]
+    fn outcome_into_candidates_replace_with_reason_discloses_degradation() {
+        // Re-resolution failure classes (reader open, snapshot begin,
+        // registry-min read, tail fetch, floored-fallback tail fetch)
+        // serve coherent candidates but lose read-your-writes visibility:
+        // the mapping must surface the failure-site reason, not report
+        // the response as healthy.
+        let prior = vec![(Uuid::from_u128(1), 0.9_f32)];
+        let replaced = vec![(Uuid::from_u128(2), 0.8_f32)];
+        let (candidates, disclosure) = outcome_into_candidates(
+            FreshTailOutcome::Replace(
+                replaced.clone(),
+                Some("fresh-tail: re-resolved tail fetch failed"),
+            ),
+            prior,
+            &[1.0, 0.0],
+        );
+        assert_eq!(candidates, replaced, "Replace must swap the candidate set");
+        assert_eq!(
+            disclosure.as_deref(),
+            Some("fresh-tail: re-resolved tail fetch failed"),
+            "a reasoned Replace must disclose its failure site"
+        );
+    }
+
+    #[test]
+    fn outcome_into_candidates_healthy_replace_and_ops_do_not_disclose() {
+        let prior = vec![(Uuid::from_u128(1), 0.9_f32)];
+        let replaced = vec![(Uuid::from_u128(2), 0.8_f32)];
+        let (candidates, disclosure) = outcome_into_candidates(
+            FreshTailOutcome::Replace(replaced.clone(), None),
+            prior.clone(),
+            &[1.0, 0.0],
+        );
+        assert_eq!(candidates, replaced);
+        assert!(
+            disclosure.is_none(),
+            "a fully assembled re-resolution is not degraded"
+        );
+
+        let (candidates, disclosure) = outcome_into_candidates(
+            FreshTailOutcome::Ops(Vec::new()),
+            prior.clone(),
+            &[1.0, 0.0],
+        );
+        assert_eq!(candidates, prior);
+        assert!(disclosure.is_none(), "an empty tail merge is not degraded");
+    }
+
+    #[test]
+    fn outcome_into_candidates_skipped_keeps_prior_and_discloses() {
+        let prior = vec![(Uuid::from_u128(1), 0.9_f32)];
+        let (candidates, disclosure) = outcome_into_candidates(
+            FreshTailOutcome::Skipped("fresh-tail: reader open failed"),
+            prior.clone(),
+            &[1.0, 0.0],
+        );
+        assert_eq!(candidates, prior, "Skipped must leave candidates untouched");
+        assert_eq!(
+            disclosure.as_deref(),
+            Some("fresh-tail: reader open failed")
+        );
+    }
 
     #[test]
     fn ann_key_is_model_only() {
@@ -2492,8 +2979,8 @@ mod tests {
         let newer_id = Uuid::new_v4();
         let older_id = Uuid::new_v4();
 
-        install_replacing(&ann, &key, tiny_bridge(newer_id, 5)).await;
-        install_replacing(&ann, &key, tiny_bridge(older_id, 2)).await;
+        assert!(install_replacing(&ann, &key, tiny_bridge(newer_id, 5)).await);
+        assert!(!install_replacing(&ann, &key, tiny_bridge(older_id, 2)).await);
 
         let installed = ann.indexes.read().await;
         let bridge = installed.get(&key).expect("an entry must be installed");
@@ -2503,6 +2990,433 @@ mod tests {
             vec![newer_id],
             "the older-generation candidate must not have replaced it"
         );
+    }
+
+    /// Pathless runtimes have no durable commit record from which recall can
+    /// re-resolve a bridge/watermark mismatch. If a post-scan generation has
+    /// already installed a newer bridge, the rejected build must not advance
+    /// its watermark or compact the intervening tail.
+    #[tokio::test]
+    async fn pathless_rejected_candidate_does_not_raise_or_compact() {
+        let rt = KhiveRuntime::memory().expect("runtime");
+        let ann = new_shared();
+        let model = "pathless-rejected-checkpoint";
+        let key = AnnKey::new(model);
+        register_consumer(&rt, model)
+            .await
+            .expect("register pending consumer");
+
+        let newer_id = Uuid::new_v4();
+        assert!(install_replacing(&ann, &key, tiny_bridge(newer_id, 5)).await);
+        let mut rejected = tiny_bridge(Uuid::new_v4(), 2);
+        rejected.set_applied_seq(2);
+
+        let sql = rt.sql();
+        let mut writer = sql.writer().await.expect("writer");
+        for seq in 1..=2 {
+            writer
+                .execute(SqlStatement {
+                    sql: "INSERT INTO ann_write_log \
+                          (seq, namespace, embedding_model, kind, field, subject_id, op) \
+                          VALUES (?1, 'local', ?2, 'note', 'note.content', ?3, 'upsert')"
+                        .into(),
+                    params: vec![
+                        SqlValue::Integer(seq),
+                        SqlValue::Text(model.into()),
+                        SqlValue::Text(format!("subject-{seq}")),
+                    ],
+                    label: Some("test_pathless_checkpoint_tail".into()),
+                })
+                .await
+                .expect("insert tail row");
+        }
+        drop(writer);
+
+        assert!(
+            !checkpoint_raise_compact_readopt(
+                &rt,
+                &ann,
+                &key,
+                model,
+                rejected,
+                CheckpointPublication {
+                    generation: 2,
+                    epoch: 0,
+                    authority: WatermarkAuthority::PendingOrActive,
+                },
+            )
+            .await,
+            "a rejected generation must abort pathless publication"
+        );
+        assert_eq!(
+            read_own_watermark(&rt, model)
+                .await
+                .expect("read watermark"),
+            Some(PENDING_WATERMARK),
+            "rejection must preserve the closed pending watermark"
+        );
+        let mut reader = sql.reader().await.expect("reader");
+        let retained = reader
+            .query_scalar(SqlStatement {
+                sql: "SELECT COUNT(*) FROM ann_write_log WHERE embedding_model = ?1".into(),
+                params: vec![SqlValue::Text(model.into())],
+                label: Some("test_pathless_checkpoint_retained_tail".into()),
+            })
+            .await
+            .expect("count retained tail");
+        match retained {
+            Some(SqlValue::Integer(2)) => {}
+            other => panic!("rejected publication must retain both tail rows, got {other:?}"),
+        }
+        let installed = ann.indexes.read().await;
+        let bridge = installed.get(&key).expect("newer bridge remains installed");
+        assert_eq!(bridge.generation, 5);
+        assert_eq!(bridge.id_map, vec![newer_id]);
+    }
+
+    /// A pathless full scan after compaction still covers the compacted
+    /// prefix even though `MAX(ann_write_log.seq)` has fallen back to zero.
+    /// Its bridge and registry publication must retain the active floor.
+    #[tokio::test]
+    async fn pathless_full_checkpoint_inherits_compacted_active_floor() {
+        const MODEL: &str = "pathless-compacted-active-floor";
+        let rt = KhiveRuntime::memory().expect("runtime");
+        rt.register_embedder(HashVecProvider {
+            model_name: MODEL.to_owned(),
+            dims: 4,
+        });
+        let token = rt.authorize(Namespace::local()).expect("authorize local");
+        let ann = new_shared();
+        let key = AnnKey::new(MODEL);
+        for seq in 1..=2 {
+            rt.create_note_with_decay_for_embedding_model(
+                &token,
+                "memory",
+                None,
+                &format!("pathless compacted-floor note {seq}"),
+                Some(0.7),
+                0.01,
+                None,
+                vec![],
+                None,
+            )
+            .await
+            .expect("create note");
+            bump_generation(&ann, &key).await;
+        }
+
+        let first = ensure_ann_for_model(&rt, &token, &ann, MODEL)
+            .await
+            .expect("first full checkpoint");
+        assert!(
+            matches!(first, AnnEnsureStatus::Built { vectors: 2 }),
+            "the first checkpoint must cover both writes, got {first:?}"
+        );
+        assert_eq!(
+            read_own_watermark(&rt, MODEL)
+                .await
+                .expect("read active watermark"),
+            Some(2)
+        );
+
+        let sql = rt.sql();
+        let mut reader = sql.reader().await.expect("reader");
+        let retained = reader
+            .query_scalar(SqlStatement {
+                sql: "SELECT COUNT(*) FROM ann_write_log WHERE embedding_model = ?1".into(),
+                params: vec![SqlValue::Text(MODEL.into())],
+                label: Some("test_pathless_compacted_floor_empty_log".into()),
+            })
+            .await
+            .expect("count retained tail");
+        assert!(
+            matches!(retained, Some(SqlValue::Integer(0))),
+            "the first checkpoint must compact its retained log, got {retained:?}"
+        );
+        drop(reader);
+
+        // Force a new full scan without appending a new log row. Its corpus
+        // still includes the entire prefix compacted through active S=2.
+        bump_generation(&ann, &key).await;
+        let second = ensure_ann_for_model(&rt, &token, &ann, MODEL)
+            .await
+            .expect("generation-only full checkpoint");
+        assert!(
+            matches!(second, AnnEnsureStatus::Built { vectors: 2 }),
+            "the later full scan must remain publishable, got {second:?}"
+        );
+        assert!(is_current(&ann, &key).await);
+
+        let (_hits, applied) = search_loaded_with_seq(&ann, &key, &[1.0, 0.0, 0.0, 0.0], 1)
+            .await
+            .expect("search installed bridge")
+            .expect("bridge remains installed");
+        assert_eq!(applied, 2, "the bridge must advertise the inherited floor");
+        assert_eq!(
+            read_own_watermark(&rt, MODEL)
+                .await
+                .expect("read retained active watermark"),
+            Some(2)
+        );
+    }
+
+    /// A recall that observes the install-before-activation window must wait
+    /// for the pathless publication lock and revalidate the now-active row,
+    /// not evict the candidate that the checkpoint is about to publish.
+    #[tokio::test]
+    async fn pathless_pending_reader_waits_for_checkpoint_activation() {
+        const MODEL: &str = "pathless-pending-publication-wait";
+        let rt = KhiveRuntime::memory().expect("runtime");
+        let ann = new_shared();
+        let key = AnnKey::new(MODEL);
+        register_consumer(&rt, MODEL)
+            .await
+            .expect("register pending consumer");
+
+        let candidate_id = Uuid::new_v4();
+        let mut candidate = tiny_bridge(candidate_id, 1);
+        candidate.set_applied_seq(2);
+        assert!(install_replacing(&ann, &key, candidate).await);
+
+        let publication_lock = model_warm_lock(&ann, &key).await;
+        let publication_guard = publication_lock.lock().await;
+        let waiting = ann.pathless_pending_publication_wait.notified();
+        let task_rt = rt.clone();
+        let task_ann = ann.clone();
+        let task_key = key.clone();
+        let reader = tokio::spawn(async move {
+            fresh_tail_leg(
+                &task_rt,
+                &task_ann,
+                &task_key,
+                MODEL,
+                &[1.0, 0.0, 0.0, 0.0],
+                1,
+                Some(2),
+            )
+            .await
+        });
+        waiting.await;
+        assert!(
+            !reader.is_finished(),
+            "the pending reader must be blocked behind checkpoint publication"
+        );
+
+        raise_watermark_with_authority(&rt, MODEL, 2, WatermarkAuthority::PendingOrActive)
+            .await
+            .expect("activate checkpoint");
+        drop(publication_guard);
+
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(1), reader)
+            .await
+            .expect("reader must resume after activation")
+            .expect("reader task must not panic");
+        assert!(matches!(outcome, FreshTailOutcome::Ops(_)));
+        let installed = ann.indexes.read().await;
+        let bridge = installed
+            .get(&key)
+            .expect("activation must preserve the installed candidate");
+        assert_eq!(bridge.id_map, vec![candidate_id]);
+    }
+
+    /// Waiting is not permission to trust a closed candidate: if publication
+    /// loses its registration while the reader is blocked, revalidation must
+    /// still evict and return an empty replacement leg.
+    #[tokio::test]
+    async fn pathless_pending_reader_evicts_after_registration_loss() {
+        const MODEL: &str = "pathless-pending-publication-loss";
+        let rt = KhiveRuntime::memory().expect("runtime");
+        let ann = new_shared();
+        let key = AnnKey::new(MODEL);
+        register_consumer(&rt, MODEL)
+            .await
+            .expect("register pending consumer");
+
+        let mut candidate = tiny_bridge(Uuid::new_v4(), 1);
+        candidate.set_applied_seq(2);
+        assert!(install_replacing(&ann, &key, candidate).await);
+
+        let publication_lock = model_warm_lock(&ann, &key).await;
+        let publication_guard = publication_lock.lock().await;
+        let waiting = ann.pathless_pending_publication_wait.notified();
+        let task_rt = rt.clone();
+        let task_ann = ann.clone();
+        let task_key = key.clone();
+        let reader = tokio::spawn(async move {
+            fresh_tail_leg(
+                &task_rt,
+                &task_ann,
+                &task_key,
+                MODEL,
+                &[1.0, 0.0, 0.0, 0.0],
+                1,
+                Some(2),
+            )
+            .await
+        });
+        waiting.await;
+        assert!(!reader.is_finished());
+
+        let sql = rt.sql();
+        let mut writer = sql.writer().await.expect("writer");
+        writer
+            .execute(SqlStatement {
+                sql: "DELETE FROM ann_consumer_watermark \
+                      WHERE consumer = ?1 AND namespace = ?2 AND embedding_model = ?3"
+                    .into(),
+                params: vec![
+                    SqlValue::Text(ANN_CONSUMER.into()),
+                    SqlValue::Text(ANN_WILDCARD_NS.into()),
+                    SqlValue::Text(MODEL.into()),
+                ],
+                label: Some("test_pathless_pending_registration_loss".into()),
+            })
+            .await
+            .expect("simulate pending registration retirement");
+        drop(writer);
+        drop(publication_guard);
+
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(1), reader)
+            .await
+            .expect("reader must resume after publication ends")
+            .expect("reader task must not panic");
+        match outcome {
+            FreshTailOutcome::Replace(hits, _) => assert!(hits.is_empty()),
+            FreshTailOutcome::Ops(_) | FreshTailOutcome::Skipped(_) => {
+                panic!("registration loss must replace captured candidates")
+            }
+        }
+        assert!(
+            !ann.indexes.read().await.contains_key(&key),
+            "registration loss must evict the unprotected candidate"
+        );
+        assert_eq!(
+            read_own_watermark(&rt, MODEL)
+                .await
+                .expect("read re-registration"),
+            Some(PENDING_WATERMARK),
+            "the returning consumer must re-register closed"
+        );
+    }
+
+    /// A slower process must check the durable watermark while holding the
+    /// cross-process segment lock, before it writes any files. Otherwise it can
+    /// overwrite a newer commit and then lose its conditional registry raise,
+    /// leaving the registry ahead of the segment restart will adopt.
+    #[tokio::test]
+    async fn file_backed_stale_checkpoint_does_not_overwrite_newer_segment() {
+        const MODEL: &str = "file-backed-stale-checkpoint";
+        let rt = test_runtime_with_hash_embedder(MODEL, 4);
+        let ann = new_shared();
+        let key = AnnKey::new(MODEL);
+        register_consumer(&rt, MODEL)
+            .await
+            .expect("register pending consumer");
+
+        let winner_id = Uuid::new_v4();
+        let mut winner = tiny_bridge(winner_id, 9);
+        winner.set_applied_seq(9);
+        assert!(
+            checkpoint_raise_compact_readopt(
+                &rt,
+                &ann,
+                &key,
+                MODEL,
+                winner,
+                CheckpointPublication {
+                    generation: 9,
+                    epoch: 0,
+                    authority: WatermarkAuthority::PendingOrActive,
+                },
+            )
+            .await,
+            "the first checkpoint must activate the pending registration"
+        );
+
+        let mut stale = tiny_bridge(Uuid::new_v4(), 3);
+        stale.set_applied_seq(3);
+        assert!(
+            !checkpoint_raise_compact_readopt(
+                &rt,
+                &ann,
+                &key,
+                MODEL,
+                stale,
+                CheckpointPublication {
+                    generation: 3,
+                    epoch: 0,
+                    authority: WatermarkAuthority::Active,
+                },
+            )
+            .await,
+            "a checkpoint behind the durable watermark must lose before persistence"
+        );
+
+        let dir = ann_segment_dir(&rt, MODEL).expect("file-backed segment directory");
+        let commit = read_commit_info(&dir)
+            .expect("read commit")
+            .expect("persisted commit");
+        assert_eq!(commit.last_applied_seq, Some(9));
+        let persisted = AnnBridge::load(&dir).expect("load winner segment");
+        assert_eq!(persisted.id_map, vec![winner_id]);
+        assert_eq!(
+            read_own_watermark(&rt, MODEL)
+                .await
+                .expect("read durable watermark"),
+            Some(9)
+        );
+    }
+
+    /// A failed replacement persist must not discard the still-protected
+    /// incumbent that stale-serving relies on while the retained tail remains.
+    #[tokio::test]
+    async fn file_backed_persist_failure_preserves_active_incumbent() {
+        const MODEL: &str = "file-backed-persist-failure-fallback";
+        let rt = test_runtime_with_hash_embedder(MODEL, 4);
+        let ann = new_shared();
+        let key = AnnKey::new(MODEL);
+        register_consumer(&rt, MODEL)
+            .await
+            .expect("register pending consumer");
+        raise_watermark_with_authority(&rt, MODEL, 1, WatermarkAuthority::PendingOrActive)
+            .await
+            .expect("activate incumbent checkpoint");
+
+        let incumbent_id = Uuid::new_v4();
+        let mut incumbent = tiny_bridge(incumbent_id, 1);
+        incumbent.set_applied_seq(1);
+        assert!(install_replacing(&ann, &key, incumbent).await);
+
+        let dir = ann_segment_dir(&rt, MODEL).expect("file-backed segment directory");
+        std::fs::create_dir_all(&dir).expect("create segment directory");
+        std::fs::create_dir(dir.join("metadata.bin"))
+            .expect("block metadata file publication with a directory");
+
+        let mut replacement = tiny_bridge(Uuid::new_v4(), 2);
+        replacement.set_applied_seq(2);
+        assert!(
+            !checkpoint_raise_compact_readopt(
+                &rt,
+                &ann,
+                &key,
+                MODEL,
+                replacement,
+                CheckpointPublication {
+                    generation: 2,
+                    epoch: 0,
+                    authority: WatermarkAuthority::Active,
+                },
+            )
+            .await,
+            "the deliberately blocked persist must fail publication"
+        );
+
+        let installed = ann.indexes.read().await;
+        let bridge = installed
+            .get(&key)
+            .expect("active incumbent must survive replacement persistence failure");
+        assert_eq!(bridge.generation, 1);
+        assert_eq!(bridge.id_map, vec![incumbent_id]);
     }
 
     /// A strictly newer candidate replaces the installed older generation.
@@ -3723,8 +4637,8 @@ mod tests {
             .expect("bridge watermark");
         let ops = match fresh_tail_leg(&rt, &ann, &key, MODEL, &query, 10, Some(s)).await {
             FreshTailOutcome::Ops(ops) => ops,
-            FreshTailOutcome::Replace(_) => panic!("fresh-tail leg unexpectedly re-resolved"),
-            FreshTailOutcome::Skipped => panic!("fresh-tail leg unexpectedly skipped"),
+            FreshTailOutcome::Replace(..) => panic!("fresh-tail leg unexpectedly re-resolved"),
+            FreshTailOutcome::Skipped(_) => panic!("fresh-tail leg unexpectedly skipped"),
         };
         let merged = merge_fresh_tail(raw, &query, ops);
         assert!(
@@ -3815,8 +4729,8 @@ mod tests {
             .expect("bridge watermark");
         let ops = match fresh_tail_leg(&rt, &ann, &key, MODEL, &query, 10, Some(s)).await {
             FreshTailOutcome::Ops(ops) => ops,
-            FreshTailOutcome::Replace(_) => panic!("fresh-tail leg unexpectedly re-resolved"),
-            FreshTailOutcome::Skipped => panic!("fresh-tail leg unexpectedly skipped"),
+            FreshTailOutcome::Replace(..) => panic!("fresh-tail leg unexpectedly re-resolved"),
+            FreshTailOutcome::Skipped(_) => panic!("fresh-tail leg unexpectedly skipped"),
         };
         let merged = merge_fresh_tail(raw, &query, ops);
 
@@ -3832,6 +4746,161 @@ mod tests {
             "the merged entry must carry the tail's exact score ({exact_score}) \
              rather than the stale segment's score ({stale_score}), got {}",
             matches[0].1
+        );
+    }
+
+    /// A pathless recall can capture an old bridge immediately before a
+    /// checkpoint installs a replacement, raises the registry, and compacts
+    /// the old tail. It must re-search the installed replacement rather than
+    /// merging a floored tail into the already-captured stale candidates.
+    #[tokio::test]
+    #[serial(adr118_fresh_tail)]
+    async fn fresh_tail_pathless_mismatch_replaces_pre_checkpoint_candidates() {
+        const MODEL: &str = "adr118-pathless-reresolve-model";
+        const DIMS: usize = 8;
+        let rt = KhiveRuntime::memory().expect("in-memory runtime");
+        rt.register_embedder(HashVecProvider {
+            model_name: MODEL.to_owned(),
+            dims: DIMS,
+        });
+        let token = rt.authorize(Namespace::local()).expect("authorize local");
+        for i in 0..3u32 {
+            rt.create_note_with_decay_for_embedding_model(
+                &token,
+                "memory",
+                None,
+                &format!("pathless baseline note {i}"),
+                Some(0.7),
+                0.01,
+                None,
+                vec![],
+                None,
+            )
+            .await
+            .expect("create baseline note");
+        }
+
+        let ann = new_shared();
+        let key = AnnKey::from_token(MODEL);
+        ensure_ann_for_model(&rt, &token, &ann, MODEL)
+            .await
+            .expect("initial warm");
+
+        const FRESH_TEXT: &str = "pathless checkpoint distinctive fresh note";
+        let fresh = rt
+            .create_note_with_decay_for_embedding_model(
+                &token,
+                "memory",
+                None,
+                FRESH_TEXT,
+                Some(0.7),
+                0.01,
+                None,
+                vec![],
+                None,
+            )
+            .await
+            .expect("create post-checkpoint note");
+        bump_generation(&ann, &key).await;
+
+        let query = fnv_to_vec(FRESH_TEXT, DIMS);
+        let (captured, s1) = search_loaded_with_seq(&ann, &key, &query, 10)
+            .await
+            .expect("search old bridge")
+            .expect("old bridge installed");
+        assert!(
+            captured.iter().all(|(id, _)| *id != fresh.id),
+            "the pre-checkpoint bridge must not contain the fresh note"
+        );
+
+        ensure_ann_for_model(&rt, &token, &ann, MODEL)
+            .await
+            .expect("publish replacement");
+        let s2 = bridge_applied_seq(&ann, &key)
+            .await
+            .expect("replacement watermark");
+        assert!(s2 > s1, "replacement must advance the applied watermark");
+        assert!(
+            !tail_exists(&rt, MODEL, s1)
+                .await
+                .expect("read compacted tail"),
+            "checkpoint compaction must remove the old bridge's intervening tail"
+        );
+
+        let outcome = fresh_tail_leg(&rt, &ann, &key, MODEL, &query, 10, Some(s1)).await;
+        let replacement = match outcome {
+            FreshTailOutcome::Replace(hits, _) => hits,
+            _ => panic!("pathless mismatch must replace stale candidates"),
+        };
+        assert!(
+            replacement.iter().any(|(id, _)| *id == fresh.id),
+            "re-resolution must recover the fresh note from the installed replacement"
+        );
+    }
+
+    /// Pending/recovering minima are below every real sequence and therefore
+    /// block compaction. They must not wrap to `u64::MAX` and suppress a real
+    /// tail that remains fully retained above the active bridge watermark.
+    #[tokio::test]
+    #[serial(adr118_fresh_tail)]
+    async fn fresh_tail_negative_peer_minimum_keeps_real_tail_visible() {
+        const MODEL: &str = "adr118-negative-minimum-model";
+        const DIMS: usize = 8;
+        let rt = test_runtime_with_hash_embedder(MODEL, DIMS);
+        let token = rt.authorize(Namespace::local()).expect("authorize local");
+        for i in 0..3u32 {
+            rt.create_note_with_decay_for_embedding_model(
+                &token,
+                "memory",
+                None,
+                &format!("negative minimum baseline note {i}"),
+                Some(0.7),
+                0.01,
+                None,
+                vec![],
+                None,
+            )
+            .await
+            .expect("create baseline note");
+        }
+
+        let ann = new_shared();
+        let key = AnnKey::from_token(MODEL);
+        ensure_ann_for_model(&rt, &token, &ann, MODEL)
+            .await
+            .expect("warm");
+        let s = bridge_applied_seq(&ann, &key)
+            .await
+            .expect("bridge watermark");
+        let fresh = rt
+            .create_note_with_decay_for_embedding_model(
+                &token,
+                "memory",
+                None,
+                "negative minimum distinctive fresh note",
+                Some(0.7),
+                0.01,
+                None,
+                vec![],
+                None,
+            )
+            .await
+            .expect("create tail note");
+        let sql = rt.sql();
+        ann_registry::register_pending(sql.as_ref(), "pending-peer", ANN_WILDCARD_NS, MODEL)
+            .await
+            .expect("register pending peer");
+
+        let query = fnv_to_vec("negative minimum distinctive fresh note", DIMS);
+        let outcome = fresh_tail_leg(&rt, &ann, &key, MODEL, &query, 10, Some(s)).await;
+        let ops = match outcome {
+            FreshTailOutcome::Ops(ops) => ops,
+            _ => panic!("negative minimum must preserve the ordinary tail scan"),
+        };
+        assert!(
+            ops.iter()
+                .any(|(id, embedding)| *id == fresh.id && embedding.is_some()),
+            "the fully retained tail must include the fresh note"
         );
     }
 
@@ -3912,11 +4981,11 @@ mod tests {
         let outcome = fresh_tail_leg(&rt, &ann, &key, MODEL, &query, 10, Some(s1)).await;
         let ops = match outcome {
             FreshTailOutcome::Ops(ops) => ops,
-            FreshTailOutcome::Replace(_) => panic!(
+            FreshTailOutcome::Replace(..) => panic!(
                 "re-resolution must not succeed here: the only persisted \
                  segment is exactly as stale as the in-memory bridge"
             ),
-            FreshTailOutcome::Skipped => panic!(
+            FreshTailOutcome::Skipped(_) => panic!(
                 "a mismatch must never silently drop the leg — it floors at \
                  the same-snapshot registry minimum instead of skipping"
             ),
@@ -4022,12 +5091,12 @@ mod tests {
         let query = fnv_to_vec("reresolve distinctive fresh note", DIMS);
         let outcome = fresh_tail_leg(&rt, &ann, &key, MODEL, &query, 10, Some(s1)).await;
         let candidates = match outcome {
-            FreshTailOutcome::Replace(candidates) => candidates,
+            FreshTailOutcome::Replace(candidates, _) => candidates,
             FreshTailOutcome::Ops(_) => panic!(
                 "expected re-resolution to replace candidates outright, not \
                  just return ops to merge into the stale bridge's candidates"
             ),
-            FreshTailOutcome::Skipped => {
+            FreshTailOutcome::Skipped(_) => {
                 panic!("expected successful re-resolution, not a skip")
             }
         };
@@ -4042,6 +5111,158 @@ mod tests {
             "re-resolution must still force re-adoption so a future query \
              installs this segment as the served bridge"
         );
+    }
+
+    /// A re-resolution that assembles its candidates but then loses the SQL
+    /// leg that would prove tail completeness (reader open, snapshot begin,
+    /// registry-min re-read, tail fetch) must return a REASONED `Replace`:
+    /// the coherent re-resolved candidates are served, and the lost
+    /// read-your-writes visibility is disclosed via `Some(reason)` — never
+    /// reported healthy (`None`) and never degraded to a `Skipped` that
+    /// would resurrect the stale candidate set. Drives the earliest
+    /// post-re-resolution failure site (the registry-minimum re-read) by
+    /// removing its table while the leg is paused at the test barrier
+    /// between its segment search and that re-read.
+    #[tokio::test]
+    #[serial(adr118_fresh_tail)]
+    async fn fresh_tail_leg_post_reresolution_sql_failure_is_a_reasoned_replace() {
+        const MODEL: &str = "adr118-reresolve-reasoned-replace-test-model";
+        const DIMS: usize = 8;
+        let rt = test_runtime_with_hash_embedder(MODEL, DIMS);
+        let token = rt.authorize(Namespace::local()).expect("authorize local");
+
+        for i in 0..3u32 {
+            rt.create_note_with_decay_for_embedding_model(
+                &token,
+                "memory",
+                None,
+                &format!("reasoned replace seed note {i}"),
+                Some(0.7),
+                0.01,
+                None,
+                vec![],
+                None,
+            )
+            .await
+            .expect("create seed note");
+        }
+
+        let ann = new_shared();
+        let key = AnnKey::from_token(MODEL);
+        ensure_ann_for_model(&rt, &token, &ann, MODEL)
+            .await
+            .expect("warm");
+        let s1 = bridge_applied_seq(&ann, &key)
+            .await
+            .expect("bridge watermark after initial warm");
+
+        // A new note lands after the checkpoint; the peer checkpoint below
+        // persists it, and its presence in the outcome's candidates is the
+        // proof that the REASONED Replace still serves the re-resolved
+        // segment rather than falling back to the stale one.
+        let fresh = rt
+            .create_note_with_decay_for_embedding_model(
+                &token,
+                "memory",
+                None,
+                "reasoned replace distinctive fresh note",
+                Some(0.7),
+                0.01,
+                None,
+                vec![],
+                None,
+            )
+            .await
+            .expect("create fresh note");
+
+        let (_live, tail_before) = scope_counts(&rt, MODEL, s1)
+            .await
+            .expect("scope counts before peer checkpoint");
+        assert!(tail_before > 0, "sanity: a tail must exist above s1");
+        let s2 = s1 + tail_before;
+
+        // Peer checkpoint: persist a segment at s2, raise+compact through it
+        // — the mismatch the leg re-resolves from, exactly as in
+        // fresh_tail_leg_reresolves_to_a_newer_persisted_segment_on_mismatch.
+        let dir = ann_segment_dir(&rt, MODEL).expect("segment dir (file-backed test runtime)");
+        let mut peer_bridge = AnnBridge::load(&dir).expect("load persisted segment");
+        let (ops, new_s) = fetch_final_tail(&rt, MODEL, s1, None)
+            .await
+            .expect("fetch tail for peer replay");
+        peer_bridge
+            .apply_final_ops(ops, new_s)
+            .expect("apply peer replay");
+        peer_bridge
+            .save_atomic(&dir)
+            .expect("persist peer checkpoint");
+        raise_watermark(&rt, MODEL, s2)
+            .await
+            .expect("raise registry watermark");
+        compact_log(&rt, MODEL).await.expect("compact log");
+
+        // Pause the leg after its segment load+search, before the SQL phase
+        // whose failure this test injects.
+        ann.reresolve_race_barrier
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let paused = ann.reresolve_race_notify.notified();
+
+        let query = fnv_to_vec("reasoned replace distinctive fresh note", DIMS);
+        let handle = tokio::spawn({
+            let rt = rt.clone();
+            let ann = ann.clone();
+            let key = key.clone();
+            async move { fresh_tail_leg(&rt, &ann, &key, MODEL, &query, 10, Some(s1)).await }
+        });
+        paused.await;
+
+        // Fault injection: remove the registry table so the leg's re-read —
+        // its first post-re-resolution SQL statement — fails. (Test-fixture
+        // database, mirroring the DROP TABLE fault pattern in
+        // handlers/recall.rs's event-store acquisition test.)
+        {
+            let sql = rt.sql();
+            let mut w = sql.writer().await.expect("fault injection writer");
+            w.execute(SqlStatement {
+                sql: "DROP TABLE ann_consumer_watermark".into(),
+                params: vec![],
+                label: Some("test_drop_registry_for_reasoned_replace".into()),
+            })
+            .await
+            .expect("drop registry table");
+        }
+
+        ann.reresolve_race_barrier
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        ann.reresolve_race_release.notify_one();
+
+        let outcome = handle.await.expect("fresh_tail_leg task");
+        match outcome {
+            FreshTailOutcome::Replace(candidates, reason) => {
+                let reason = reason.expect(
+                    "a post-re-resolution SQL failure must be DISCLOSED: \
+                     Replace(_, None) reports read-your-writes visibility \
+                     the leg no longer proved",
+                );
+                assert!(
+                    reason.starts_with("fresh-tail:"),
+                    "the disclosure must name its failure site, got: {reason:?}"
+                );
+                assert!(
+                    candidates.iter().any(|(id, _)| *id == fresh.id),
+                    "a reasoned Replace must still serve the re-resolved \
+                     segment's candidates (which alone reflect the peer's \
+                     checkpoint), got: {candidates:?}"
+                );
+            }
+            FreshTailOutcome::Ops(_) => panic!(
+                "expected re-resolution to replace candidates outright, not \
+                 return ops against the stale bridge"
+            ),
+            FreshTailOutcome::Skipped(_) => panic!(
+                "a failure AFTER successful re-resolution must not discard \
+                 the coherent re-resolved candidates by skipping"
+            ),
+        }
     }
 
     /// ADR-118 §1 "Compaction linearization" applied to re-resolution itself:
@@ -4223,12 +5444,12 @@ mod tests {
 
         let outcome = handle.await.expect("fresh_tail_leg task");
         let candidates = match outcome {
-            FreshTailOutcome::Replace(candidates) => candidates,
+            FreshTailOutcome::Replace(candidates, _) => candidates,
             FreshTailOutcome::Ops(_) => panic!(
                 "expected re-resolution to replace candidates outright, not \
                  just return ops to merge into the stale bridge's candidates"
             ),
-            FreshTailOutcome::Skipped => {
+            FreshTailOutcome::Skipped(_) => {
                 panic!("expected the interleaved-compaction re-resolution to converge, not a skip")
             }
         };
@@ -4471,12 +5692,12 @@ mod tests {
 
         let outcome = handle.await.expect("fresh_tail_leg task");
         let candidates = match outcome {
-            FreshTailOutcome::Replace(candidates) => candidates,
+            FreshTailOutcome::Replace(candidates, _) => candidates,
             FreshTailOutcome::Ops(_) => panic!(
                 "expected the terminal round to replace candidates outright, \
                  not just return ops to merge into the stale bridge's candidates"
             ),
-            FreshTailOutcome::Skipped => {
+            FreshTailOutcome::Skipped(_) => {
                 panic!("expected the bound-exhaustion floored fallback, not a skip")
             }
         };
@@ -4514,10 +5735,10 @@ mod tests {
     /// Registration precondition: absent a durable registry row for this
     /// consumer, the leg must not trust `S = 0` as an entire-scope tail (a
     /// registered peer consumer may have already compacted rows this one
-    /// never saw) — it registers at 0 and sits out the query.
+    /// never saw) — it registers pending and drops the stale candidates.
     #[tokio::test]
     #[serial(adr118_fresh_tail)]
-    async fn fresh_tail_leg_skips_and_reregisters_when_consumer_row_absent() {
+    async fn fresh_tail_leg_drops_candidates_and_reregisters_when_consumer_row_absent() {
         const MODEL: &str = "adr118-registration-precondition-test-model";
         const DIMS: usize = 8;
         let rt = test_runtime_with_hash_embedder(MODEL, DIMS);
@@ -4575,18 +5796,36 @@ mod tests {
 
         let query = fnv_to_vec("registration precondition seed note", DIMS);
         let outcome = fresh_tail_leg(&rt, &ann, &key, MODEL, &query, 10, Some(s)).await;
+        match outcome {
+            FreshTailOutcome::Replace(hits, reason) => {
+                assert!(
+                    hits.is_empty(),
+                    "the exact leg must discard candidates captured before registry loss"
+                );
+                assert!(
+                    reason.is_some_and(|r| !r.is_empty()),
+                    "dropping candidates is a degraded serve and must carry a \
+                     failure-site reason for disclosure"
+                );
+            }
+            _ => panic!(
+                "the exact leg must drop candidates when this consumer's durable \
+                 registration row is absent"
+            ),
+        }
         assert!(
-            matches!(outcome, FreshTailOutcome::Skipped),
-            "the exact leg must sit out a query when this consumer's durable \
-             registration row is absent"
+            search_loaded_with_seq(&ann, &key, &query, 10)
+                .await
+                .expect("search after registry loss")
+                .is_none(),
+            "registry loss must evict the unprotected in-process bridge"
         );
         assert_eq!(
             read_own_watermark(&rt, MODEL)
                 .await
                 .expect("read watermark"),
-            Some(0),
-            "the leg must re-register this consumer at watermark 0 before \
-             sitting out the query"
+            Some(PENDING_WATERMARK),
+            "the leg must re-register this consumer in the closed pending state"
         );
     }
 }

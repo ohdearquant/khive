@@ -4993,11 +4993,57 @@ impl PackRuntime for FakeSubhandlerPack {
     }
 }
 
+struct FakeZeroVerbPack;
+
+impl Pack for FakeZeroVerbPack {
+    const NAME: &'static str = "empty";
+    const NOTE_KINDS: &'static [&'static str] = &[];
+    const ENTITY_KINDS: &'static [&'static str] = &[];
+    const HANDLERS: &'static [HandlerDef] = &[];
+    const REQUIRES: &'static [&'static str] = &["kg"];
+}
+
+#[async_trait]
+impl PackRuntime for FakeZeroVerbPack {
+    fn name(&self) -> &str {
+        FakeZeroVerbPack::NAME
+    }
+
+    fn note_kinds(&self) -> &'static [&'static str] {
+        FakeZeroVerbPack::NOTE_KINDS
+    }
+
+    fn entity_kinds(&self) -> &'static [&'static str] {
+        FakeZeroVerbPack::ENTITY_KINDS
+    }
+
+    fn handlers(&self) -> &'static [HandlerDef] {
+        FakeZeroVerbPack::HANDLERS
+    }
+
+    fn requires(&self) -> &'static [&'static str] {
+        FakeZeroVerbPack::REQUIRES
+    }
+
+    async fn dispatch(
+        &self,
+        verb: &str,
+        _params: Value,
+        _registry: &VerbRegistry,
+        _token: &NamespaceToken,
+    ) -> Result<Value, RuntimeError> {
+        Err(RuntimeError::InvalidInput(format!(
+            "FakeZeroVerbPack does not handle verb {verb:?}"
+        )))
+    }
+}
+
 fn pack_with_subhandler_pack() -> Fixture {
     let rt = KhiveRuntime::memory().expect("in-memory runtime must succeed");
     let mut builder = VerbRegistryBuilder::new();
     builder.register(KgPack::new(rt));
     builder.register(FakeSubhandlerPack);
+    builder.register(FakeZeroVerbPack);
     Fixture {
         registry: builder.build().expect("registry builds"),
     }
@@ -5038,6 +5084,7 @@ async fn verbs_dispatch_unfiltered_returns_public_verbs() {
         verbs_arr.len(),
         "verbs.total must match verbs array length"
     );
+    assert_eq!(result["pack_counts"], json!({"kg": verbs_arr.len()}));
 }
 
 /// `verbs(category="Assertive")` returns only Assertive verbs and no others.
@@ -5104,6 +5151,13 @@ async fn verbs_dispatch_pack_filter_kg() {
         !names.contains(&"fake.pub"),
         "verbs(pack=kg) must not include fake.pub; got: {names:?}"
     );
+    // `pack_counts` is unfiltered by contract: the kg entry equals the number
+    // of public kg verbs, which is exactly what the pack=kg filter returned.
+    assert_eq!(
+        result["pack_counts"],
+        json!({"kg": verbs_arr.len(), "fake": 1, "empty": 0}),
+        "pack_counts must be the full unfiltered map even under a pack filter"
+    );
 }
 
 /// `verbs()` must exclude subhandlers even when a second pack has them.
@@ -5130,6 +5184,51 @@ async fn verbs_dispatch_excludes_subhandlers_across_packs() {
     assert!(
         !names.contains(&"fake.internal"),
         "verbs() must NOT include subhandler fake.internal; got: {names:?}"
+    );
+    // Full-map assertion for the unfiltered multi-pack case: kg's count is the
+    // number of returned entries owned by "kg" (the array is unfiltered, so
+    // per-pack membership in it IS the per-pack public count).
+    let kg_count = verbs_arr
+        .iter()
+        .filter(|v| v["pack"].as_str() == Some("kg"))
+        .count();
+    assert_eq!(
+        result["pack_counts"],
+        json!({"kg": kg_count, "fake": 1, "empty": 0}),
+        "unfiltered pack_counts must name every registered pack exactly once"
+    );
+}
+
+/// A `category` filter narrows `verbs` but must leave `pack_counts` untouched.
+#[tokio::test]
+async fn verbs_dispatch_category_filter_keeps_pack_counts_unfiltered() {
+    let pack = pack_with_subhandler_pack();
+    let unfiltered = pack
+        .dispatch("verbs", json!({}))
+        .await
+        .expect("verbs() must succeed");
+    let filtered = pack
+        .dispatch("verbs", json!({"category": "assertive"}))
+        .await
+        .expect("verbs(category=assertive) must succeed");
+
+    let all = unfiltered["verbs"].as_array().expect("verbs array");
+    let narrowed = filtered["verbs"].as_array().expect("verbs array");
+    // The filter must actually narrow (the fixture has non-assertive verbs),
+    // otherwise this test would pass vacuously.
+    assert!(
+        narrowed.len() < all.len(),
+        "category=assertive must narrow the verb list ({} vs {})",
+        narrowed.len(),
+        all.len()
+    );
+    assert!(
+        !narrowed.is_empty(),
+        "category=assertive must match at least one verb"
+    );
+    assert_eq!(
+        filtered["pack_counts"], unfiltered["pack_counts"],
+        "pack_counts must be invariant under category filtering"
     );
 }
 
@@ -6783,6 +6882,60 @@ async fn propose_with_nonexistent_parent_id_returns_error() {
     assert!(
         msg.contains(fake_parent),
         "BUG-6: error must quote the offending parent_id; got: {msg}"
+    );
+}
+
+/// Changeset error-shape split, identifier arm: a malformed identifier inside
+/// the changeset keeps the full-UUID resolution hint.
+#[tokio::test]
+async fn propose_changeset_bad_identifier_keeps_full_uuid_hint() {
+    let f = pack_with_events();
+    let err = f
+        .dispatch(
+            "propose",
+            json!({
+                "title": "identifier hint arm",
+                "description": "short-prefix identifier must carry the hint",
+                "changeset": {
+                    "kind": "update_entity",
+                    "id": "not-a-uuid",
+                    "patch": {"description": "x"}
+                },
+            }),
+        )
+        .await
+        .expect_err("a non-UUID changeset identifier must be rejected");
+    let msg = invalid_input_message(&err);
+    assert!(
+        msg.contains("every changeset identifier must be a full UUID"),
+        "identifier failures keep the full-UUID hint; got: {msg}"
+    );
+}
+
+/// Changeset error-shape split, generic arm: a wrong-typed field surfaces
+/// serde's own message WITHOUT the misleading identifier hint.
+#[tokio::test]
+async fn propose_changeset_wrong_type_omits_identifier_hint() {
+    let f = pack_with_events();
+    let err = f
+        .dispatch(
+            "propose",
+            json!({
+                "title": "generic parse arm",
+                "description": "wrong-typed field must not carry the identifier hint",
+                "changeset": {"kind": "add_entity", "entity": "nope"},
+            }),
+        )
+        .await
+        .expect_err("a wrong-typed changeset field must be rejected");
+    let msg = invalid_input_message(&err);
+    assert!(
+        msg.contains("invalid changeset"),
+        "generic failures still name the changeset; got: {msg}"
+    );
+    assert!(
+        !msg.contains("every changeset identifier must be a full UUID"),
+        "generic parse failures must not carry the identifier hint; got: {msg}"
     );
 }
 
