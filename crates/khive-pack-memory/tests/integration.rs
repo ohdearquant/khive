@@ -3443,6 +3443,197 @@ async fn test_recall_budget_truncation_preserves_rank_order() {
     );
 }
 
+// ── Regression tests for issue #1749: recall budget and supersession bounds ──
+
+/// Degenerate or overflowing effective character budgets are caller errors,
+/// not empty recall results. Validation must happen before candidate retrieval
+/// so the behavior does not depend on whether the namespace contains a match.
+#[tokio::test]
+async fn test_recall_rejects_degenerate_and_overflowing_token_budgets() {
+    let rt = make_runtime();
+    let registry = make_registry(rt);
+    let cases = [
+        (json!({ "default_token_budget": 0 }), "default_token_budget"),
+        (json!({ "chars_per_token": 0 }), "chars_per_token"),
+        (
+            json!({
+                "default_token_budget": 16_000,
+                "chars_per_token": usize::MAX
+            }),
+            "overflows",
+        ),
+    ];
+
+    for (scoring, expected_message) in cases {
+        let err = registry
+            .dispatch(
+                "memory.recall",
+                json!({
+                    "query": "issue 1749 checked token budget regression",
+                    "config": { "scoring": scoring }
+                }),
+            )
+            .await
+            .expect_err("degenerate effective token budget must be rejected");
+        assert!(
+            matches!(&err, RuntimeError::InvalidInput(_)),
+            "budget validation must return InvalidInput, got {err:?}"
+        );
+        assert!(
+            err.to_string().contains(expected_message),
+            "budget validation error must identify {expected_message:?}, got {err}"
+        );
+    }
+}
+
+/// More matching supersedes edges than ranked candidates must not truncate the
+/// inbound-edge check. More than one storage page targets A and the following
+/// edge targets B, so both the page loop and the old candidate-count leak are
+/// exercised deterministically.
+#[tokio::test]
+async fn test_recall_supersedes_suppression_exhausts_matching_edges() {
+    let rt = make_runtime();
+    let token = rt
+        .authorize(Namespace::parse("local").expect("local namespace"))
+        .expect("authorize local");
+    let query = "issue seventeen forty nine exhaustive supersedes target";
+
+    let target_a = rt
+        .create_note(
+            &token,
+            "memory",
+            None,
+            &format!("{query} alpha"),
+            Some(0.8),
+            Some(json!({ "memory_type": "semantic" })),
+            vec![],
+        )
+        .await
+        .expect("create target A");
+    let target_b = rt
+        .create_note(
+            &token,
+            "memory",
+            None,
+            &format!("{query} beta"),
+            Some(0.8),
+            Some(json!({ "memory_type": "semantic" })),
+            vec![],
+        )
+        .await
+        .expect("create target B");
+    let target_a_id = target_a.id.to_string();
+    let target_b_id = target_b.id.to_string();
+
+    // Ensure graph DDL (including the immutable insertion-sequence trigger) is
+    // installed, then seed the cardinality fixture directly. The source IDs do
+    // not participate in recall suppression; making them unique preserves the
+    // graph edge natural key while avoiding hundreds of unrelated note writes.
+    let _graph = rt.graph(&token).expect("graph store");
+    const TARGET_A_EDGE_COUNT: usize = 300;
+    let mut a_rows = Vec::with_capacity(TARGET_A_EDGE_COUNT);
+    let mut a_params = Vec::with_capacity(TARGET_A_EDGE_COUNT * 3);
+    for _ in 0..TARGET_A_EDGE_COUNT {
+        a_rows.push("('local', ?, ?, ?, 'supersedes', 1.0, 2, 2)".to_string());
+        a_params.extend([
+            SqlValue::Text(Uuid::new_v4().to_string()),
+            SqlValue::Text(Uuid::new_v4().to_string()),
+            SqlValue::Text(target_a_id.clone()),
+        ]);
+    }
+
+    let mut writer = rt.sql().writer().await.expect("sql writer");
+    let inserted_a = writer
+        .execute(SqlStatement {
+            sql: format!(
+                "INSERT INTO graph_edges \
+                 (namespace, id, source_id, target_id, relation, weight, created_at, updated_at) \
+                 VALUES {}",
+                a_rows.join(",")
+            ),
+            params: a_params,
+            label: Some("test-1749-seed-first-supersedes-page".into()),
+        })
+        .await
+        .expect("seed full target-A edge page");
+    assert_eq!(
+        inserted_a,
+        u64::try_from(TARGET_A_EDGE_COUNT).expect("fixture edge count fits u64"),
+        "fixture must exceed one supersedes page"
+    );
+
+    // Insert B after all A edges in sequence order, but give it an older
+    // created_at. The fixed seek walk needs a later page to see B; the reverted
+    // created_at-desc query with limit=candidate_count sees only A.
+    let inserted_b = writer
+        .execute(SqlStatement {
+            sql: "INSERT INTO graph_edges \
+                  (namespace, id, source_id, target_id, relation, weight, created_at, updated_at) \
+                  VALUES ('local', ?1, ?2, ?3, 'supersedes', 1.0, 1, 1)"
+                .into(),
+            params: vec![
+                SqlValue::Text(Uuid::new_v4().to_string()),
+                SqlValue::Text(Uuid::new_v4().to_string()),
+                SqlValue::Text(target_b_id.clone()),
+            ],
+            label: Some("test-1749-seed-second-supersedes-page".into()),
+        })
+        .await
+        .expect("seed target-B edge after first page");
+    assert_eq!(inserted_b, 1, "fixture must add the page-two edge");
+    drop(writer);
+
+    let registry = make_registry(rt);
+    let baseline = registry
+        .dispatch(
+            "memory.recall",
+            json!({
+                "query": query,
+                "limit": 2,
+                "fusion_strategy": "keyword_only",
+                "config": {
+                    "scoring": {
+                        "enable_supersedes_suppression": false,
+                        "mmr_penalty": 0.0
+                    }
+                }
+            }),
+        )
+        .await
+        .expect("baseline recall");
+    let baseline_ids: Vec<&str> = baseline
+        .as_array()
+        .expect("baseline is an array")
+        .iter()
+        .filter_map(|hit| hit["id"].as_str())
+        .collect();
+    assert_eq!(baseline_ids.len(), 2, "both target memories must rank");
+    assert!(baseline_ids.contains(&target_a_id.as_str()));
+    assert!(baseline_ids.contains(&target_b_id.as_str()));
+
+    let suppressed = registry
+        .dispatch(
+            "memory.recall",
+            json!({
+                "query": query,
+                "limit": 2,
+                "fusion_strategy": "keyword_only",
+                "config": {
+                    "scoring": {
+                        "enable_supersedes_suppression": true,
+                        "mmr_penalty": 0.0
+                    }
+                }
+            }),
+        )
+        .await
+        .expect("suppressed recall");
+    assert!(
+        suppressed.as_array().is_some_and(Vec::is_empty),
+        "every targeted candidate must be suppressed after an exhaustive edge walk: {suppressed}"
+    );
+}
+
 // =============================================================================
 // ADR-007 Rev 4 regression tests — additive read visible-set
 // =============================================================================
