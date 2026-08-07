@@ -813,6 +813,97 @@ async fn filtered_default_order_is_stable_across_equal_timestamp_pages() {
     assert_eq!(actual_ids, expected_ids);
 }
 
+/// #1671: `query_notes` (the single-namespace `list` path) had no `id`
+/// tiebreak at all. Rows sharing `created_at` swept via offset pages must come
+/// back exactly once — no duplicates, no misses across page boundaries.
+#[tokio::test]
+async fn query_notes_offset_sweep_covers_equal_created_at_exactly_once() {
+    let store = setup_memory_store();
+    let created_at = 1_750_000_000_000_000_i64;
+    let mut expected_ids = Vec::new();
+
+    for index in 0..211 {
+        let mut note = make_note("ns1", "observation", &format!("note-{index}"));
+        note.created_at = created_at;
+        expected_ids.push(note.id);
+        store.upsert_note(note).await.unwrap();
+    }
+    expected_ids.sort_unstable();
+
+    let mut actual_ids = Vec::new();
+    let page_size = 37_u32;
+    let mut offset = 0_u64;
+    loop {
+        let page = store
+            .query_notes(
+                "ns1",
+                None,
+                PageRequest {
+                    offset,
+                    limit: page_size,
+                },
+            )
+            .await
+            .unwrap();
+        if page.items.is_empty() {
+            break;
+        }
+        offset += page.items.len() as u64;
+        actual_ids.extend(page.items.into_iter().map(|note| note.id));
+    }
+
+    assert_eq!(actual_ids, expected_ids);
+}
+
+/// #1671: a custom JSON `order_by` whose extracted value repeats must also get
+/// an `id` tiebreak in the primary key's direction, or offset pages over equal
+/// values are unsound.
+#[tokio::test]
+async fn query_notes_filtered_custom_order_offset_sweep_is_total() {
+    let store = setup_memory_store();
+    let mut expected_ids = Vec::new();
+
+    for index in 0..113 {
+        let note = make_note_with_props(
+            "ns1",
+            "observation",
+            &format!("note-{index}"),
+            serde_json::json!({"rank": 7}),
+        );
+        expected_ids.push(note.id);
+        store.upsert_note(note).await.unwrap();
+    }
+    expected_ids.sort_unstable_by(|a, b| b.cmp(a));
+
+    let filter = NoteFilter {
+        order_by: Some(("$.rank".to_string(), SortDir::Desc)),
+        ..Default::default()
+    };
+    let mut actual_ids = Vec::new();
+    let page_size = 23_u32;
+    let mut offset = 0_u64;
+    loop {
+        let page = store
+            .query_notes_filtered(
+                "ns1",
+                &filter,
+                PageRequest {
+                    offset,
+                    limit: page_size,
+                },
+            )
+            .await
+            .unwrap();
+        if page.items.is_empty() {
+            break;
+        }
+        offset += page.items.len() as u64;
+        actual_ids.extend(page.items.into_iter().map(|note| note.id));
+    }
+
+    assert_eq!(actual_ids, expected_ids);
+}
+
 #[tokio::test]
 async fn test_filtered_soft_deleted_excluded() {
     let store = setup_memory_store();

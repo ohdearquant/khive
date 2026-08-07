@@ -1098,7 +1098,7 @@ impl NoteStore for SqlNoteStore {
             let data_sql = format!(
                 "SELECT id, namespace, kind, status, name, content, salience, decay_factor, expires_at, \
                  properties, created_at, updated_at, deleted_at \
-                 FROM notes{} ORDER BY created_at DESC LIMIT ?{} OFFSET ?{}",
+                 FROM notes{} ORDER BY created_at DESC, id ASC LIMIT ?{} OFFSET ?{}",
                 where_sql, limit_idx, offset_idx,
             );
 
@@ -1155,8 +1155,23 @@ impl NoteStore for SqlNoteStore {
                         SortDir::Asc => "ASC",
                         SortDir::Desc => "DESC",
                     };
-                    format!(" ORDER BY {} {dir_str}", json_extract_expr(path))
+                    // #1671: append `id` as the final tiebreak in the sort
+                    // field's direction so offset pages form a deterministic
+                    // total order even when the JSON sort value repeats. The
+                    // total order removes tie-order instability only — offset
+                    // paging can still duplicate or skip rows under concurrent
+                    // inserts/deletes or sort-key updates (that would need
+                    // snapshot isolation or keyset pagination).
+                    format!(
+                        " ORDER BY {} {dir_str}, id {dir_str}",
+                        json_extract_expr(path)
+                    )
                 }
+                // #1671: intentionally left unchanged — `id ASC` over the
+                // primary key already makes this clause a deterministic total
+                // order; flipping the direction would change the observable
+                // default order for existing consumers without fixing
+                // anything.
                 None => " ORDER BY created_at DESC, id ASC".to_string(),
             };
 
