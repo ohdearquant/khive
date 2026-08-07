@@ -1582,12 +1582,10 @@ mod windows_impl {
     ) -> io::Result<()> {
         let wide: Vec<u16> = OsStr::new(target_name).encode_wide().collect();
         let name_bytes = wide.len() * 2;
-        // `size_of::<FileRenameInfo>() - 2` over-counts the true header
-        // offset by however much trailing struct padding rounds the whole
-        // type up to its 8-byte alignment — always >= the real `file_name`
-        // field offset, so the buffer this sizes is never too small, only
-        // (harmlessly) a few bytes larger than strictly required.
-        let header_size = std::mem::size_of::<FileRenameInfo>() - 2;
+        // The real field offset, not an approximation — `FileRenameInfoEx`
+        // validates the reported buffer size against this exact offset plus
+        // `file_name_length`.
+        let header_size = std::mem::offset_of!(FileRenameInfo, file_name);
         let total_size = header_size + name_bytes;
         let words = total_size.div_ceil(8).max(1);
         let mut buf: Vec<u64> = vec![0u64; words];
@@ -1596,7 +1594,7 @@ mod windows_impl {
         // pointer arithmetic below stays within that allocation.
         unsafe {
             let header = buf.as_mut_ptr() as *mut FileRenameInfo;
-            (*header).replace_if_exists = 0;
+            (*header).flags = FILE_RENAME_FLAG_REPLACE_IF_EXISTS | FILE_RENAME_FLAG_POSIX_SEMANTICS;
             (*header).root_directory = dir_handle.as_raw_handle() as Handle;
             (*header).file_name_length = name_bytes as u32;
             let name_ptr = (*header).file_name.as_mut_ptr();
@@ -1604,7 +1602,7 @@ mod windows_impl {
         }
         let byte_ptr = buf.as_mut_ptr() as *mut c_void;
         // SAFETY: `file`'s handle is live and was opened with `DELETE`
-        // access (required by the `FileRenameInfo` class); `byte_ptr`
+        // access (required by the `FileRenameInfoEx` class); `byte_ptr`
         // addresses the well-formed buffer built above, sized exactly
         // `total_size`.
         let ok = unsafe {
@@ -1701,16 +1699,20 @@ mod windows_impl {
         dw_high_date_time: u32,
     }
 
-    /// Mirrors Win32's `FILE_RENAME_INFO` (the pre-Windows-10-1607 layout,
-    /// the one `SetFileInformationByHandle`'s `FileRenameInfo` class
-    /// expects): a `BOOLEAN`, then a `HANDLE` (natural alignment inserts
-    /// padding between them, matched here by `repr(C)`), a `DWORD` length,
-    /// and a flexible `WCHAR` array sized by `file_name_length` bytes — the
-    /// trailing `[u16; 1]` is a placeholder; real instances are built in a
-    /// manually sized buffer in [`rename_via_handle`].
+    /// Mirrors Win32's `FILE_RENAME_INFO`: a `DWORD Flags` (the
+    /// `FileRenameInfoEx` interpretation of the leading union member —
+    /// `FileRenameInfoEx` is required, not the classic `FileRenameInfo`
+    /// class, because `SetFileInformationByHandle` rejects a non-null
+    /// `RootDirectory` on the classic class with `ERROR_INVALID_PARAMETER`;
+    /// only the `Ex` class supports a directory-relative by-handle rename),
+    /// then a `HANDLE` (natural alignment inserts padding before it, matched
+    /// here by `repr(C)`), a `DWORD` length, and a flexible `WCHAR` array
+    /// sized by `file_name_length` bytes — the trailing `[u16; 1]` is a
+    /// placeholder; real instances are built in a manually sized buffer in
+    /// [`rename_via_handle`].
     #[repr(C)]
     struct FileRenameInfo {
-        replace_if_exists: u8,
+        flags: u32,
         root_directory: Handle,
         file_name_length: u32,
         file_name: [u16; 1],
@@ -1727,8 +1729,12 @@ mod windows_impl {
     const STILL_ACTIVE: u32 = 259;
     const GENERIC_WRITE: u32 = 0x4000_0000;
     const DELETE: u32 = 0x0001_0000;
-    const FILE_RENAME_INFO_CLASS: i32 = 3;
+    // `FileRenameInfoEx` (22), not the classic `FileRenameInfo` (3) — see
+    // the `FileRenameInfo` struct doc comment above.
+    const FILE_RENAME_INFO_CLASS: i32 = 22;
     const FILE_DISPOSITION_INFO_CLASS: i32 = 4;
+    const FILE_RENAME_FLAG_REPLACE_IF_EXISTS: u32 = 1;
+    const FILE_RENAME_FLAG_POSIX_SEMANTICS: u32 = 2;
 
     fn invalid_handle_value() -> Handle {
         usize::MAX as Handle
