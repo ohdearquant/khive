@@ -2410,11 +2410,17 @@ async fn issue_full_page_never_leaks_raw_updated_at_into_paging_floor() {
 
     // `list` clamps over-cap requests and returns an envelope with
     // `effective_limit` instead of a bare array (#894), so scan every persisted
-    // issue by paging. The envelope carries its rows under a kind-appropriate
-    // key: note-kind listings use `notes`, others use `items`. This assertion is
-    // about credential leakage, not about which key the envelope chose, so it
-    // accepts either rather than coupling the git acceptance suite to the kg
-    // envelope naming.
+    // issue by paging. Which key the envelope uses is a contract, not an
+    // incidental detail: `issue` is a note kind, so a listing of it is routed
+    // through the note branch, which renders its rows under `notes`. Every
+    // other branch renders under `items`. Requiring `notes` and rejecting
+    // `items` is therefore what makes this loop notice the day an issue listing
+    // stops being routed as a note listing. Accepting either key would leave
+    // this loop with nothing of its own to say about the envelope: it would
+    // scan whatever shape it was handed and defer to the row-count assertion
+    // below, which stays satisfied whenever the rows are still served, however
+    // they are keyed. A response carrying both keys would likewise satisfy a
+    // bare `notes` lookup.
     let mut scanned = 0usize;
     let mut offset = 0u64;
     loop {
@@ -2427,12 +2433,20 @@ async fn issue_full_page_never_leaks_raw_updated_at_into_paging_floor() {
             .expect("list issues ok");
         let items = match page.as_array() {
             Some(items) => items.clone(),
-            None => page
-                .get("notes")
-                .or_else(|| page.get("items"))
-                .and_then(Value::as_array)
-                .expect("clamped list response must carry a notes or items array")
-                .clone(),
+            None => {
+                assert!(
+                    page.get("items").is_none(),
+                    "an issue listing is a note listing, so its clamped envelope must \
+                     render rows under `notes`; an `items` key means the kind is no \
+                     longer routed through the note branch: {page}"
+                );
+                page.get("notes")
+                    .and_then(Value::as_array)
+                    .unwrap_or_else(|| {
+                        panic!("clamped issue listing must carry a notes array: {page}")
+                    })
+                    .clone()
+            }
         };
         assert!(
             items.iter().all(|i| !i.to_string().contains(CREDENTIAL)),
