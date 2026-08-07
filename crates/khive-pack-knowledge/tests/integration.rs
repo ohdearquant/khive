@@ -1748,6 +1748,10 @@ async fn search_rejects_invalid_kind_value() {
         .await
         .expect_err("unknown kind must fail closed");
     assert!(
+        matches!(err, RuntimeError::InvalidInput(_)),
+        "must be InvalidInput, got: {err:?}"
+    );
+    assert!(
         err.to_string()
             .contains("kind must be one of: atom, domain"),
         "got: {err}"
@@ -1768,6 +1772,10 @@ async fn search_rejects_invalid_exclude_status_value() {
         )
         .await
         .expect_err("unknown exclusion status must fail closed");
+    assert!(
+        matches!(err, RuntimeError::InvalidInput(_)),
+        "must be InvalidInput, got: {err:?}"
+    );
     assert!(
         err.to_string()
             .contains("exclude_status must be one of: draft, reviewed, deprecated"),
