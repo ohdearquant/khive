@@ -115,7 +115,8 @@ pub enum VerbPresentationPolicy {
     /// Always use `Verbose` output regardless of the caller's mode.
     ///
     /// Declared verbs: `get`, `link`, `query`, `traverse`, `neighbors`,
-    /// `brain.feedback`, `memory.feedback`, `comm.delivered`.
+    /// `brain.feedback`, `brain.auto_feedback`, `memory.feedback`,
+    /// `comm.delivered`.
     ///
     /// `link` is included because the returned edge ID is the only handle for
     /// follow-up `neighbors`/`traverse` calls; short-form IDs risk prefix
@@ -126,6 +127,8 @@ pub enum VerbPresentationPolicy {
     /// prefix is ambiguous and defeats the acknowledged-ID contract (#545).
     /// `memory.feedback` has the same exact-target contract and rejects prefix
     /// resolution, so its acknowledged `target_id` must remain canonical.
+    /// `brain.auto_feedback` acknowledges the same canonical `target_id` and
+    /// feeds those strict paths, so it carries the same guarantee.
     /// `comm.delivered` is included because its `id` is an exact correlation
     /// key and the verb deliberately rejects prefix resolution (#1482).
     AlwaysVerbose,
