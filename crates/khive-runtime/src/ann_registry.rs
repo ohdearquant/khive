@@ -619,6 +619,151 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pending_row_just_inside_grace_survives_and_still_pins_the_log() {
+        let rt = KhiveRuntime::memory().expect("runtime");
+        let sql = rt.sql();
+        let model = "ann-registry-grace-inside";
+        // cutoff = now - PENDING_GRACE_US = 2; registered_at 3 is one
+        // microsecond inside the grace window.
+        register_pending_at(sql.as_ref(), "fresh", "local", model, 3)
+            .await
+            .expect("register");
+        register_pending_at(sql.as_ref(), "peer", "local", model, 3)
+            .await
+            .expect("register peer");
+        assert!(raise_watermark(
+            sql.as_ref(),
+            "peer",
+            "local",
+            model,
+            5,
+            WatermarkAuthority::PendingOrActive,
+        )
+        .await
+        .expect("seed active peer"));
+        execute(
+            sql.as_ref(),
+            "INSERT INTO ann_write_log \
+             (seq, namespace, embedding_model, kind, field, subject_id, op) \
+             VALUES (1, 'local', ?1, 'note', 'note.content', 'subject-1', 'upsert')",
+            vec![SqlValue::Text(model.into())],
+        )
+        .await;
+
+        let outcome = compact_write_log_at(
+            sql.as_ref(),
+            CompactionScope::Namespace("local".into()),
+            model,
+            PENDING_GRACE_US + 2,
+        )
+        .await
+        .expect("compact");
+        assert!(
+            outcome.retired_consumers.is_empty(),
+            "a row inside the grace window must not retire: {:?}",
+            outcome.retired_consumers
+        );
+        // The surviving pending row (-2) keeps the registry minimum below
+        // every log seq, so nothing compacts away underneath the live build.
+        assert_eq!(outcome.deleted_log_rows, 0);
+        assert!(
+            raise_watermark(
+                sql.as_ref(),
+                "fresh",
+                "local",
+                model,
+                1,
+                WatermarkAuthority::PendingOrActive,
+            )
+            .await
+            .expect("in-grace consumer must still be able to publish"),
+            "the surviving registration must accept its checkpoint"
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_row_at_exact_grace_boundary_retires() {
+        let rt = KhiveRuntime::memory().expect("runtime");
+        let sql = rt.sql();
+        let model = "ann-registry-grace-boundary";
+        // cutoff = now - PENDING_GRACE_US = 2; registered_at 2 sits exactly
+        // on the boundary, which the <= comparator retires.
+        register_pending_at(sql.as_ref(), "boundary", "local", model, 2)
+            .await
+            .expect("register");
+        let outcome = compact_write_log_at(
+            sql.as_ref(),
+            CompactionScope::Namespace("local".into()),
+            model,
+            PENDING_GRACE_US + 2,
+        )
+        .await
+        .expect("compact");
+        assert_eq!(outcome.retired_consumers.len(), 1);
+        assert_eq!(outcome.retired_consumers[0].consumer, "boundary");
+        assert_eq!(outcome.retired_consumers[0].registered_at_us, 2);
+        assert!(!raise_watermark(
+            sql.as_ref(),
+            "boundary",
+            "local",
+            model,
+            4,
+            WatermarkAuthority::PendingOrActive,
+        )
+        .await
+        .expect("raise after boundary retirement"));
+    }
+
+    #[tokio::test]
+    async fn checkpoint_publication_before_compaction_defeats_age_retirement() {
+        // Writer serialization makes the retirement/raise decision atomic in
+        // whichever order the two transactions commit. The retire-first
+        // ordering is pinned by `retirement_wins_before_delayed_checkpoint_
+        // publication`; this is the raise-first ordering: an activation that
+        // commits before compaction must protect the row from age
+        // retirement, however far past its grace the registration is.
+        let rt = KhiveRuntime::memory().expect("runtime");
+        let sql = rt.sql();
+        let model = "ann-registry-activate-race";
+        register_pending_at(sql.as_ref(), "late-build", "local", model, 1)
+            .await
+            .expect("register");
+        assert!(raise_watermark(
+            sql.as_ref(),
+            "late-build",
+            "local",
+            model,
+            9,
+            WatermarkAuthority::PendingOrActive,
+        )
+        .await
+        .expect("activation commits first"));
+        let outcome = compact_write_log_at(
+            sql.as_ref(),
+            CompactionScope::Namespace("local".into()),
+            model,
+            10 * PENDING_GRACE_US,
+        )
+        .await
+        .expect("compact");
+        assert!(
+            outcome.retired_consumers.is_empty(),
+            "an activated consumer must never age-retire: {:?}",
+            outcome.retired_consumers
+        );
+        assert_eq!(
+            scalar_i64(
+                sql.as_ref(),
+                "SELECT watermark FROM ann_consumer_watermark \
+                 WHERE consumer = 'late-build' AND embedding_model = ?1",
+                vec![SqlValue::Text(model.into())],
+            )
+            .await,
+            9
+        );
+    }
+
+    #[tokio::test]
     async fn repeated_pending_registration_does_not_refresh_grace() {
         let rt = KhiveRuntime::memory().expect("runtime");
         let sql = rt.sql();
