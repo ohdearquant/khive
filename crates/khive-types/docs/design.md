@@ -168,7 +168,7 @@ types for proposals, events, and namespace isolation.
   agent-mode transforms.
 - `AlwaysVerbose` verbs bypass agent-mode transforms entirely. The current set:
   `get`, `link`, `query`, `traverse`, `neighbors`, `brain.feedback`,
-  `memory.feedback`, `comm.delivered`.
+  `brain.auto_feedback`, `memory.feedback`, `comm.delivered`, `git.digest`.
 - `link` is `AlwaysVerbose` because the returned edge ID is the only handle for
   follow-up graph traversal calls. At scale (~65K edges), two edges can share
   the same 8-character prefix, so shortening the edge ID breaks downstream
@@ -178,8 +178,13 @@ types for proposals, events, and namespace isolation.
   ambiguous.
 - `memory.feedback` is `AlwaysVerbose` because it requires one exact recalled
   record and returns that same strict `target_id` acknowledgement.
+- `brain.auto_feedback` acknowledges the same canonical `target_id` and feeds
+  strict feedback paths, so it carries the same guarantee.
 - `comm.delivered` is `AlwaysVerbose` because its `id` is an exact outbound
   correlation key; prefix resolution cannot prove which write it confirms.
+- `git.digest` is `AlwaysVerbose` because its returned report is also stored
+  verbatim as a durable receipt; the full `receipt_id` and every other field
+  must remain identical across the response and `event.payload.result`.
 
 ### Proposal Lifecycle (ADR-046)
 

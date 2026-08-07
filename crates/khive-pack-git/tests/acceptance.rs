@@ -18,9 +18,14 @@ use khive_pack_git::GitPack;
 use khive_pack_kg::KgPack;
 use khive_runtime::{
     AllowAllGate, BackendId, EmbedderProvider, EntityCreateSpec, KhiveRuntime, Namespace,
-    NamespaceToken, RuntimeConfig, RuntimeError, RuntimeResult, VerbRegistry, VerbRegistryBuilder,
+    NamespaceToken, RequestIdentity, RuntimeConfig, RuntimeError, RuntimeResult, VerbRegistry,
+    VerbRegistryBuilder,
 };
-use khive_storage::types::{SqlStatement, SqlValue};
+use khive_storage::{
+    types::{SqlStatement, SqlValue},
+    Event,
+};
+use khive_types::{EventKind, EventOutcome, SubstrateKind};
 use lattice_embed::{EmbedError, EmbeddingModel, EmbeddingService};
 use serde_json::{json, Value};
 use uuid::Uuid;
@@ -64,9 +69,21 @@ impl Drop for PathGuard {
 
 /// Write a PATH-shadowing fake `gh` executable into `bin_dir` that logs every
 /// invocation's cwd and argv into `log_dir`, and replies to `pr list` /
-/// `issue list` with the given canned JSON bodies (and to `--version` with a
-/// trivial success, matching `gh_available`'s probe).
-fn write_fake_gh(bin_dir: &Path, log_dir: &Path, pr_json: &str, issue_json: &str) {
+/// `issue list` with the given canned JSON bodies. `repo view` returns the
+/// stable repository identity used by the source-bound capability probe.
+fn write_fake_gh(repo: &Path, bin_dir: &Path, log_dir: &Path, pr_json: &str, issue_json: &str) {
+    // The production probe derives its only admissible repository target from
+    // `origin`; test fixtures must therefore carry the same identity returned
+    // by the fake `gh`. A PATH stub alone must never make a remote-less checkout
+    // look GitHub-capable.
+    git(
+        repo,
+        &[
+            "config",
+            "remote.origin.url",
+            "https://github.com/fixture/repository.git",
+        ],
+    );
     std::fs::write(log_dir.join("pr_response.json"), pr_json).expect("write pr fixture");
     std::fs::write(log_dir.join("issue_response.json"), issue_json).expect("write issue fixture");
 
@@ -75,8 +92,12 @@ fn write_fake_gh(bin_dir: &Path, log_dir: &Path, pr_json: &str, issue_json: &str
 printf '%s\n' "$(pwd)" >> '{cwd_log}'
 printf '%s\n' "$*" >> '{args_log}'
 case "$1" in
-  --version)
-    echo "gh version 2.0.0 (fake)"
+  repo)
+    if [ "$2" != "view" ] || [ "$3" != "fixture/repository" ]; then
+      echo "fake gh: repository probe was not explicitly source-bound: $*" 1>&2
+      exit 2
+    fi
+    echo '{{"nameWithOwner":"fixture/repository","url":"https://github.com/fixture/repository"}}'
     ;;
   pr)
     cat '{pr_json_path}'
@@ -110,9 +131,11 @@ esac
 
 async fn fixture() -> (KhiveRuntime, NamespaceToken, VerbRegistry) {
     let rt = rt();
+    let token = rt.authorize(Namespace::local()).expect("authorize local");
     let mut builder = VerbRegistryBuilder::new();
     builder.register(KgPack::new(rt.clone()));
     builder.register(GitPack::new(rt.clone()));
+    builder.with_event_store(rt.events(&token).expect("event store"));
     let registry = builder.build().expect("registry builds");
     rt.install_edge_rules(registry.all_edge_rules());
     // Mirrors the production boot sequence (`serve.rs`): without this call,
@@ -122,7 +145,6 @@ async fn fixture() -> (KhiveRuntime, NamespaceToken, VerbRegistry) {
     // aggregate were absent or builtin-only (PR #925).
     registry.call_register_entity_type_validators(&rt);
     registry.apply_schema_plans(rt.backend());
-    let token = rt.authorize(Namespace::local()).expect("authorize local");
     (rt, token, registry)
 }
 
@@ -1010,6 +1032,7 @@ exec "$REAL_GIT" "$@"
         IngestOptions {
             repo: repo.to_path_buf(),
             project: project_id.to_string(),
+            expected_github_repo: None,
             max_items: None,
             include: IngestInclude {
                 commits: true,
@@ -1129,6 +1152,7 @@ async fn ingest_omits_changed_paths_when_all_paths_filtered() {
         IngestOptions {
             repo: repo.to_path_buf(),
             project: project_id.to_string(),
+            expected_github_repo: None,
             max_items: None,
             include: IngestInclude {
                 commits: true,
@@ -1201,6 +1225,7 @@ async fn ingest_filters_noncanonical_changed_paths_but_keeps_commit() {
         IngestOptions {
             repo: repo.to_path_buf(),
             project: project_id.to_string(),
+            expected_github_repo: None,
             max_items: None,
             include: IngestInclude {
                 commits: true,
@@ -1356,6 +1381,7 @@ async fn ingest_repeat_pass_after_stall_creates_no_duplicates() {
     let opts = || IngestOptions {
         repo: repo.to_path_buf(),
         project: project_id.to_string(),
+        expected_github_repo: None,
         max_items: None,
         include: IngestInclude {
             commits: true,
@@ -1546,7 +1572,7 @@ async fn ingest_masks_pr_body_hash_near_token_without_dropping_note() {
     }])
     .to_string();
 
-    write_fake_gh(&bin_dir, &log_dir, &pr_json, "[]");
+    write_fake_gh(&repo, &bin_dir, &log_dir, &pr_json, "[]");
     let _path_guard = PathGuard::install(&bin_dir);
 
     let report = run_ingest(
@@ -1633,7 +1659,7 @@ async fn ingest_masks_credential_shaped_pr_title_without_dropping_note() {
     }])
     .to_string();
 
-    write_fake_gh(&bin_dir, &log_dir, &pr_json, "[]");
+    write_fake_gh(&repo, &bin_dir, &log_dir, &pr_json, "[]");
     let _path_guard = PathGuard::install(&bin_dir);
 
     let report = run_ingest(
@@ -1723,7 +1749,7 @@ async fn ingest_masks_credential_shaped_issue_title_without_dropping_note() {
     }])
     .to_string();
 
-    write_fake_gh(&bin_dir, &log_dir, "[]", &issue_json);
+    write_fake_gh(&repo, &bin_dir, &log_dir, "[]", &issue_json);
     let _path_guard = PathGuard::install(&bin_dir);
 
     let report = run_ingest(
@@ -1811,7 +1837,7 @@ async fn ingest_does_not_block_issue_with_credential_word_in_title_and_uuid_in_b
     }])
     .to_string();
 
-    write_fake_gh(&bin_dir, &log_dir, "[]", &issue_json);
+    write_fake_gh(&repo, &bin_dir, &log_dir, "[]", &issue_json);
     let _path_guard = PathGuard::install(&bin_dir);
 
     let report = run_ingest(
@@ -1889,7 +1915,7 @@ async fn ingest_masks_credential_word_and_uuid_co_occurring_in_issue_body() {
     }])
     .to_string();
 
-    write_fake_gh(&bin_dir, &log_dir, "[]", &issue_json);
+    write_fake_gh(&repo, &bin_dir, &log_dir, "[]", &issue_json);
     let _path_guard = PathGuard::install(&bin_dir);
 
     let report = run_ingest(
@@ -1967,7 +1993,7 @@ async fn ingest_leaves_clean_issue_title_unmasked() {
     }])
     .to_string();
 
-    write_fake_gh(&bin_dir, &log_dir, "[]", &issue_json);
+    write_fake_gh(&repo, &bin_dir, &log_dir, "[]", &issue_json);
     let _path_guard = PathGuard::install(&bin_dir);
 
     let report = run_ingest(
@@ -2039,7 +2065,7 @@ async fn ingest_masks_credential_shaped_issue_label_without_dropping_note() {
     }])
     .to_string();
 
-    write_fake_gh(&bin_dir, &log_dir, "[]", &issue_json);
+    write_fake_gh(&repo, &bin_dir, &log_dir, "[]", &issue_json);
     let _path_guard = PathGuard::install(&bin_dir);
 
     let report = run_ingest(
@@ -2123,7 +2149,7 @@ async fn ingest_masks_credential_shaped_issue_author_login_without_dropping_note
     }])
     .to_string();
 
-    write_fake_gh(&bin_dir, &log_dir, "[]", &issue_json);
+    write_fake_gh(&repo, &bin_dir, &log_dir, "[]", &issue_json);
     let _path_guard = PathGuard::install(&bin_dir);
 
     let report = run_ingest(
@@ -2211,7 +2237,7 @@ async fn ingest_rejects_credential_shaped_issue_created_at_without_dropping_note
     }])
     .to_string();
 
-    write_fake_gh(&bin_dir, &log_dir, "[]", &issue_json);
+    write_fake_gh(&repo, &bin_dir, &log_dir, "[]", &issue_json);
     let _path_guard = PathGuard::install(&bin_dir);
 
     let report = run_ingest(
@@ -2286,7 +2312,7 @@ async fn ingest_rejects_credential_shaped_issue_closed_at_without_dropping_note(
     }])
     .to_string();
 
-    write_fake_gh(&bin_dir, &log_dir, "[]", &issue_json);
+    write_fake_gh(&repo, &bin_dir, &log_dir, "[]", &issue_json);
     let _path_guard = PathGuard::install(&bin_dir);
 
     let report = run_ingest(
@@ -2378,7 +2404,7 @@ async fn ingest_rejects_credential_shaped_issue_updated_at_and_cursor_never_pers
     ])
     .to_string();
 
-    write_fake_gh(&bin_dir, &log_dir, "[]", &issue_json);
+    write_fake_gh(&repo, &bin_dir, &log_dir, "[]", &issue_json);
     let _path_guard = PathGuard::install(&bin_dir);
 
     let report = run_ingest(
@@ -2405,6 +2431,102 @@ async fn ingest_rejects_credential_shaped_issue_updated_at_and_cursor_never_pers
     assert!(
         cursor.starts_with("2026-01-02"),
         "the cursor must advance to the sibling issue's valid, canonicalized updatedAt: {cursor:?}"
+    );
+}
+
+/// The PR paging boundary has the same trust requirement as issues: a raw
+/// `updatedAt` is remote input, even though it is not persisted on the PR
+/// note. A malformed value is dropped before sorting, while a clean sibling
+/// supplies the only durable/resumable cursor value.
+#[tokio::test]
+async fn ingest_rejects_credential_shaped_pr_updated_at_and_cursor_never_persists_raw_value() {
+    let _guard = ENV_MUTEX.lock().await;
+    let (rt, token, registry) = fixture().await;
+
+    let project_id = create(
+        &registry,
+        json!({"kind": "project", "name": "pr-updated-at-credential-repo"}),
+    )
+    .await;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo: PathBuf = dir.path().join("repo");
+    std::fs::create_dir_all(&repo).expect("mk repo dir");
+    init_repo(&repo);
+    write(&repo, "README.md", "hello\n");
+    commit(&repo, &["README.md"], "Initial commit");
+
+    let bin_dir = dir.path().join("bin");
+    std::fs::create_dir_all(&bin_dir).expect("mk bin dir");
+    let log_dir = dir.path().join("log");
+    std::fs::create_dir_all(&log_dir).expect("mk log dir");
+
+    let fake_token = "ghp_FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF";
+    let pr_json = json!([
+        {
+            "number": 24,
+            "title": "Credential-shaped updatedAt",
+            "author": {"login": "octocat"},
+            "createdAt": "2026-01-01T00:00:00Z",
+            "mergedAt": null,
+            "closedAt": null,
+            "updatedAt": fake_token,
+            "baseRefName": "main",
+            "headRefName": "fix/malformed-updated-at",
+            "mergeCommit": null,
+            "body": ""
+        },
+        {
+            "number": 25,
+            "title": "Clean sibling PR",
+            "author": {"login": "octocat"},
+            "createdAt": "2026-01-02T00:00:00Z",
+            "mergedAt": null,
+            "closedAt": null,
+            "updatedAt": "2026-01-02T00:00:00Z",
+            "baseRefName": "main",
+            "headRefName": "fix/clean-sibling",
+            "mergeCommit": null,
+            "body": ""
+        }
+    ])
+    .to_string();
+
+    write_fake_gh(&repo, &bin_dir, &log_dir, &pr_json, "[]");
+    let _path_guard = PathGuard::install(&bin_dir);
+
+    let mut opts = IngestOptions::unbounded(repo.clone(), project_id.to_string());
+    opts.include.issues = false;
+    opts.include.commits = false;
+    let report = run_ingest(&rt, &token, &registry, opts)
+        .await
+        .expect("ingest ok");
+
+    assert_eq!(
+        report.prs_ingested, 2,
+        "an unparseable updatedAt must not drop the PR: {report:?}"
+    );
+    assert!(
+        !format!("{report:?}").contains(fake_token),
+        "warnings/report must never echo the rejected remote value: {report:?}"
+    );
+
+    let cursor = read_git_cursor(&rt, project_id, "prs")
+        .await
+        .expect("cursor must be written from the sibling PR's valid updatedAt");
+    assert!(
+        !cursor.contains(fake_token),
+        "the paging cursor must never persist a raw credential-shaped updatedAt: {cursor:?}"
+    );
+    assert!(
+        cursor.starts_with("2026-01-02"),
+        "the cursor must advance to the sibling PR's valid, canonicalized updatedAt: {cursor:?}"
+    );
+
+    let args_log = std::fs::read_to_string(log_dir.join("args.log")).expect("read args.log");
+    assert!(
+        !args_log.contains(fake_token),
+        "the rejected updatedAt must never enter a gh invocation's argv: {args_log}"
     );
 }
 
@@ -2450,7 +2572,7 @@ async fn ingest_masks_multiple_credential_spans_in_pr_title_and_body() {
     }])
     .to_string();
 
-    write_fake_gh(&bin_dir, &log_dir, &pr_json, "[]");
+    write_fake_gh(&repo, &bin_dir, &log_dir, &pr_json, "[]");
     let _path_guard = PathGuard::install(&bin_dir);
 
     let report = run_ingest(
@@ -2547,7 +2669,7 @@ async fn ingest_leaves_clean_pr_title_and_null_body_unmasked() {
     }])
     .to_string();
 
-    write_fake_gh(&bin_dir, &log_dir, &pr_json, "[]");
+    write_fake_gh(&repo, &bin_dir, &log_dir, &pr_json, "[]");
     let _path_guard = PathGuard::install(&bin_dir);
 
     let report = run_ingest(
@@ -2675,7 +2797,7 @@ async fn ingest_masks_pr_title_before_truncating_name_to_max_chars() {
     }])
     .to_string();
 
-    write_fake_gh(&bin_dir, &log_dir, &pr_json, "[]");
+    write_fake_gh(&repo, &bin_dir, &log_dir, &pr_json, "[]");
     let _path_guard = PathGuard::install(&bin_dir);
 
     let report = run_ingest(
@@ -2777,7 +2899,7 @@ async fn ingest_masks_pr_body_credential_without_breaking_fixes_reference() {
     }])
     .to_string();
 
-    write_fake_gh(&bin_dir, &log_dir, &pr_json, "[]");
+    write_fake_gh(&repo, &bin_dir, &log_dir, &pr_json, "[]");
     let _path_guard = PathGuard::install(&bin_dir);
 
     let report = run_ingest(
@@ -2995,7 +3117,7 @@ async fn issue_ingest_never_echoes_credential_shaped_state_reason() {
     ])
     .to_string();
 
-    write_fake_gh(&bin_dir, &log_dir, "[]", &issue_json);
+    write_fake_gh(&repo, &bin_dir, &log_dir, "[]", &issue_json);
     let _path_guard = PathGuard::install(&bin_dir);
 
     let mut opts = IngestOptions::unbounded(repo.clone(), project_id.to_string());
@@ -3389,7 +3511,7 @@ async fn gh_boundary_contract_and_partial_ingest_failure() {
     ])
     .to_string();
 
-    write_fake_gh(&bin_dir, &log_dir, &pr_json, &issue_json);
+    write_fake_gh(&repo, &bin_dir, &log_dir, &pr_json, &issue_json);
     let _path_guard = PathGuard::install(&bin_dir);
 
     let report = run_ingest(
@@ -3444,6 +3566,10 @@ async fn gh_boundary_contract_and_partial_ingest_failure() {
         assert!(
             line.contains("--state all"),
             "every gh pr/issue list invocation must request --state all: {line:?}"
+        );
+        assert!(
+            line.contains("--repo fixture/repository"),
+            "every gh pr/issue list invocation must explicitly pin the probed repo: {line:?}"
         );
     }
     let cwd_log = std::fs::read_to_string(log_dir.join("cwd.log")).expect("read cwd.log");
@@ -3630,7 +3756,7 @@ async fn issue_full_page_never_leaks_raw_updated_at_into_paging_floor() {
     );
     let issue_json = Value::Array(issues).to_string();
 
-    write_fake_gh(&bin_dir, &log_dir, "[]", &issue_json);
+    write_fake_gh(&repo, &bin_dir, &log_dir, "[]", &issue_json);
     let _path_guard = PathGuard::install(&bin_dir);
 
     let mut opts = IngestOptions::unbounded(repo.clone(), project_id.to_string());
@@ -3702,6 +3828,147 @@ async fn issue_full_page_never_leaks_raw_updated_at_into_paging_floor() {
     assert!(
         scanned >= PAGE_LIMIT,
         "paging scan must cover every persisted issue: scanned {scanned}"
+    );
+}
+
+/// PR pagination must canonicalize the complete remote page before sorting
+/// it or deriving the next inclusive `updated:>=...` floor. This is the PR
+/// counterpart of `issue_full_page_never_leaks_raw_updated_at_into_paging_floor`.
+#[tokio::test]
+async fn pr_full_page_never_leaks_raw_updated_at_into_paging_floor() {
+    let _guard = ENV_MUTEX.lock().await;
+    let (rt, token, registry) = fixture().await;
+
+    let project_id = create(
+        &registry,
+        json!({"kind": "project", "name": "pr-full-page-repo"}),
+    )
+    .await;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo: PathBuf = dir.path().join("repo");
+    std::fs::create_dir_all(&repo).expect("mk repo dir");
+    init_repo(&repo);
+    write(&repo, "README.md", "hello\n");
+    commit(&repo, &["README.md"], "Initial commit");
+
+    let bin_dir = dir.path().join("bin");
+    std::fs::create_dir_all(&bin_dir).expect("mk bin dir");
+    let log_dir = dir.path().join("log");
+    std::fs::create_dir_all(&log_dir).expect("mk log dir");
+
+    const PAGE_LIMIT: usize = 1000;
+    const CREDENTIAL: &str = "sk-ant-api03-FAKE0987654321FAKE0987654321FAKE0987654321FAKE";
+
+    let mut prs: Vec<Value> = (1..PAGE_LIMIT)
+        .map(|i| {
+            let hour = i / 60;
+            let minute = i % 60;
+            json!({
+                "number": i,
+                "title": format!("pull request {i}"),
+                "author": {"login": "a"},
+                "createdAt": "2026-01-01T00:00:00Z",
+                "mergedAt": null,
+                "closedAt": null,
+                "updatedAt": format!("2026-01-01T{hour:02}:{minute:02}:00Z"),
+                "baseRefName": "main",
+                "headRefName": format!("test/pr-{i}"),
+                "mergeCommit": null,
+                "body": ""
+            })
+        })
+        .collect();
+    prs.push(json!({
+        "number": PAGE_LIMIT,
+        "title": "pull request with malformed updatedAt",
+        "author": {"login": "a"},
+        "createdAt": "2026-01-01T00:00:00Z",
+        "mergedAt": null,
+        "closedAt": null,
+        "updatedAt": CREDENTIAL,
+        "baseRefName": "main",
+        "headRefName": "test/malformed-updated-at",
+        "mergeCommit": null,
+        "body": ""
+    }));
+    assert_eq!(prs.len(), PAGE_LIMIT);
+    let pr_json = Value::Array(prs).to_string();
+
+    write_fake_gh(&repo, &bin_dir, &log_dir, &pr_json, "[]");
+    let _path_guard = PathGuard::install(&bin_dir);
+
+    let mut opts = IngestOptions::unbounded(repo.clone(), project_id.to_string());
+    opts.include.issues = false;
+    opts.include.commits = false;
+    let report = run_ingest(&rt, &token, &registry, opts)
+        .await
+        .expect("ingest ok");
+
+    assert_eq!(
+        report.prs_ingested, PAGE_LIMIT as u64,
+        "every PR lands; only the malformed updatedAt is dropped: {report:?}"
+    );
+    assert!(
+        !format!("{report:?}").contains(CREDENTIAL),
+        "warnings/report must never echo the rejected remote value: {report:?}"
+    );
+
+    let args_log = std::fs::read_to_string(log_dir.join("args.log")).expect("read args.log");
+    assert!(
+        !args_log.contains(CREDENTIAL),
+        "the raw updatedAt must never become a PR paging argv value: {args_log}"
+    );
+    let pr_invocations = args_log
+        .lines()
+        .filter(|line| line.starts_with("pr "))
+        .count();
+    assert!(
+        pr_invocations >= 2,
+        "a full PR page must trigger a continuation fetch: {args_log}"
+    );
+
+    let cursor = read_git_cursor(&rt, project_id, "prs")
+        .await
+        .expect("PR cursor must be written");
+    assert!(
+        !cursor.contains(CREDENTIAL),
+        "the persisted PR cursor must never contain the raw updatedAt: {cursor}"
+    );
+
+    let mut scanned = 0usize;
+    let mut offset = 0u64;
+    loop {
+        let page = registry
+            .dispatch(
+                "list",
+                json!({"kind": "pull_request", "limit": (PAGE_LIMIT + 10) as u64, "offset": offset}),
+            )
+            .await
+            .expect("list PRs ok");
+        let items = match page.as_array() {
+            Some(items) => items.clone(),
+            None => page
+                .get("items")
+                .and_then(Value::as_array)
+                .expect("clamped list response must carry an items array")
+                .clone(),
+        };
+        assert!(
+            items
+                .iter()
+                .all(|item| !item.to_string().contains(CREDENTIAL)),
+            "no persisted PR record may contain the raw updatedAt"
+        );
+        scanned += items.len();
+        if items.is_empty() {
+            break;
+        }
+        offset += items.len() as u64;
+    }
+    assert!(
+        scanned >= PAGE_LIMIT,
+        "paging scan must cover every persisted PR: scanned {scanned}"
     );
 }
 
@@ -3780,7 +4047,7 @@ async fn issue_ingest_sorts_by_updated_at_so_frozen_cursor_survives_out_of_order
         .to_string()
     };
 
-    write_fake_gh(&bin_dir, &log_dir, "[]", &bad_issue_json("WONTFIX"));
+    write_fake_gh(&repo, &bin_dir, &log_dir, "[]", &bad_issue_json("WONTFIX"));
     let _path_guard = PathGuard::install(&bin_dir);
 
     let report = run_ingest(
@@ -3912,7 +4179,7 @@ async fn pr_ingest_sorts_by_updated_at_so_frozen_cursor_survives_out_of_order_li
     ])
     .to_string();
 
-    write_fake_gh(&bin_dir, &log_dir, &bad_pr_json, "[]");
+    write_fake_gh(&repo, &bin_dir, &log_dir, &bad_pr_json, "[]");
     let _path_guard = PathGuard::install(&bin_dir);
 
     let report = run_ingest(
@@ -4058,7 +4325,7 @@ async fn empty_walk_with_non_ancestor_cursor_refuses_completion() {
     std::fs::create_dir_all(&bin_dir).expect("mk bin dir");
     let log_dir = dir.path().join("log");
     std::fs::create_dir_all(&log_dir).expect("mk log dir");
-    write_fake_gh(&bin_dir, &log_dir, "[]", "[]");
+    write_fake_gh(&repo, &bin_dir, &log_dir, "[]", "[]");
     let _path_guard = PathGuard::install(&bin_dir);
 
     let report = run_ingest(
@@ -4164,7 +4431,7 @@ async fn issue_ingest_retries_tie_at_cursor_timestamp() {
         .to_string()
     };
 
-    write_fake_gh(&bin_dir, &log_dir, "[]", &issue_json("WONTFIX"));
+    write_fake_gh(&repo, &bin_dir, &log_dir, "[]", &issue_json("WONTFIX"));
     let _path_guard = PathGuard::install(&bin_dir);
 
     let report = run_ingest(
@@ -4281,7 +4548,7 @@ async fn pr_ingest_retries_tie_at_cursor_timestamp() {
     ])
     .to_string();
 
-    write_fake_gh(&bin_dir, &log_dir, &pr_json, "[]");
+    write_fake_gh(&repo, &bin_dir, &log_dir, &pr_json, "[]");
     let _path_guard = PathGuard::install(&bin_dir);
 
     let report = run_ingest(
@@ -4401,6 +4668,40 @@ async fn digest_verb_auto_creates_project_and_enriches_references() {
         .as_str()
         .expect("project_id present")
         .to_string();
+    let receipt_id = first["receipt_id"]
+        .as_str()
+        .expect("successful digest carries its durable receipt")
+        .to_string();
+
+    // Response-loss recovery uses the existing event query/get surface: no
+    // separate receipt verb or table is required. The persisted result is the
+    // exact complete response, including its own event UUID.
+    let receipts = registry
+        .dispatch(
+            "list",
+            json!({
+                "kind": "event",
+                "event_kind": "audit",
+                "verb": "git.digest",
+                "limit": 10
+            }),
+        )
+        .await
+        .expect("query digest receipts");
+    let listed_receipt = receipts
+        .as_array()
+        .expect("event list")
+        .iter()
+        .find(|event| event["id"].as_str() == Some(receipt_id.as_str()))
+        .expect("receipt is discoverable by the normal audit-event query");
+    assert_eq!(listed_receipt["payload"]["result"], first);
+
+    let recovered = registry
+        .dispatch("get", json!({"id": receipt_id}))
+        .await
+        .expect("get receipt by id");
+    assert_eq!(recovered["kind"], "event");
+    assert_eq!(recovered["payload"]["result"], first);
 
     // Second digest call for the same local path resolves the SAME project
     // (no duplicate anchor entity).
@@ -4519,6 +4820,313 @@ async fn digest_verb_auto_creates_project_and_enriches_references() {
     );
 }
 
+/// An explicit namespace and per-request actor govern the entire digest pass,
+/// including every nested canonical create/link dispatch and the final
+/// receipt. They must never fall back to the warm registry's baked local
+/// token/anonymous actor. The explicit namespace is not a by-ID isolation
+/// boundary: under the fixture's `AllowAllGate`, ADR-007 makes `get(id=...)`
+/// namespace-agnostic.
+#[tokio::test]
+async fn digest_receipt_discovery_uses_explicit_namespace_but_get_is_namespace_agnostic() {
+    let _guard = ENV_MUTEX.lock().await;
+    let (_rt, _token, registry) = fixture().await;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_repo(repo);
+    write(repo, "README.md", "tenant\n");
+    commit(repo, &["README.md"], "Tenant receipt");
+    write(repo, "README.md", "tenant second commit\n");
+    commit(repo, &["README.md"], "Tenant parent edge");
+
+    let response = registry
+        .dispatch_with_identity(
+            "git.digest",
+            json!({
+                "namespace": "receipt-test",
+                "source": repo.to_str().unwrap(),
+                "include": ["commits"],
+                "max_items": 10
+            }),
+            Some(RequestIdentity {
+                namespace: "identity-default-must-not-win".to_string(),
+                actor_id: Some("lambda:tenant-ingester".to_string()),
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect("non-local digest succeeds");
+    let receipt_id = response["receipt_id"]
+        .as_str()
+        .expect("receipt id")
+        .to_string();
+
+    for kind in ["project", "commit", "edge"] {
+        let local_rows = registry
+            .dispatch("list", json!({"kind": kind, "limit": 100}))
+            .await
+            .expect("local list");
+        assert!(
+            local_rows.as_array().expect("local rows array").is_empty(),
+            "nested digest writes must not fall back to local for {kind}: {local_rows}"
+        );
+    }
+
+    let tenant_projects = registry
+        .dispatch(
+            "list",
+            json!({"namespace": "receipt-test", "kind": "project", "limit": 100}),
+        )
+        .await
+        .expect("tenant project list");
+    let projects = tenant_projects.as_array().expect("project array");
+    assert_eq!(
+        projects.len(),
+        1,
+        "exactly one tenant project: {projects:?}"
+    );
+    assert_eq!(projects[0]["id"], response["project_id"]);
+    assert_eq!(projects[0]["namespace"], "receipt-test");
+
+    let tenant_commits = registry
+        .dispatch(
+            "list",
+            json!({"namespace": "receipt-test", "kind": "commit", "limit": 100}),
+        )
+        .await
+        .expect("tenant commit list");
+    let commits = tenant_commits.as_array().expect("commit array");
+    assert_eq!(
+        commits.len(),
+        2,
+        "both commits stay in tenant scope: {commits:?}"
+    );
+    assert!(commits
+        .iter()
+        .all(|commit| commit["namespace"] == "receipt-test"));
+
+    let tenant_edges = registry
+        .dispatch(
+            "list",
+            json!({"namespace": "receipt-test", "kind": "edge", "limit": 100}),
+        )
+        .await
+        .expect("tenant edge list");
+    let edges = tenant_edges.as_array().expect("edge array");
+    assert!(
+        edges.len() >= 3,
+        "two project annotations plus the parent edge must be tenant-scoped: {edges:?}"
+    );
+    assert!(edges.iter().all(|edge| edge["namespace"] == "receipt-test"));
+
+    let local_receipts = registry
+        .dispatch(
+            "list",
+            json!({
+                "kind": "event",
+                "event_kind": "audit",
+                "verb": "git.digest",
+                "limit": 100
+            }),
+        )
+        .await
+        .expect("local event list");
+    assert!(
+        local_receipts
+            .as_array()
+            .expect("event array")
+            .iter()
+            .all(|event| event["id"].as_str() != Some(receipt_id.as_str())),
+        "this fixture's local-only list scope must not discover a tenant-attributed receipt"
+    );
+
+    let tenant_receipts = registry
+        .dispatch(
+            "list",
+            json!({
+                "namespace": "receipt-test",
+                "kind": "event",
+                "event_kind": "audit",
+                "verb": "git.digest",
+                "limit": 100
+            }),
+        )
+        .await
+        .expect("tenant event list");
+    let listed = tenant_receipts
+        .as_array()
+        .expect("event array")
+        .iter()
+        .find(|event| event["id"].as_str() == Some(receipt_id.as_str()))
+        .expect("tenant receipt is discoverable in its original namespace");
+    assert_eq!(listed["payload"]["result"], response);
+    assert_eq!(listed["actor"], "actor:lambda:tenant-ingester");
+
+    let tenant_audits = registry
+        .dispatch(
+            "list",
+            json!({
+                "namespace": "receipt-test",
+                "kind": "event",
+                "event_kind": "audit",
+                "limit": 100
+            }),
+        )
+        .await
+        .expect("tenant audit list");
+    let nested_audits: Vec<&Value> = tenant_audits
+        .as_array()
+        .expect("audit array")
+        .iter()
+        .filter(|event| {
+            matches!(
+                event["verb"].as_str(),
+                Some("git.digest" | "create" | "link" | "update")
+            )
+        })
+        .collect();
+    assert!(
+        nested_audits.iter().any(|event| event["verb"] == "create"),
+        "the fixture must observe nested create audits: {tenant_audits}"
+    );
+    assert!(
+        nested_audits.iter().any(|event| event["verb"] == "link"),
+        "the two-commit fixture must observe a nested link audit: {tenant_audits}"
+    );
+    assert!(
+        nested_audits
+            .iter()
+            .all(|event| event["actor"] == "actor:lambda:tenant-ingester"),
+        "every nested gate/audit must retain the request actor: {nested_audits:?}"
+    );
+
+    let recovered = registry
+        .dispatch("get", json!({"id": receipt_id}))
+        .await
+        .expect("AllowAllGate permits namespace-agnostic by-ID recovery");
+    assert_eq!(recovered["payload"]["result"], response);
+}
+
+/// Recovery freezes one half-open timestamp window and advances `offset`
+/// through every 1000-row event page. A matching receipt older than the first
+/// page remains recoverable even if a newer receipt lands between queries,
+/// because the later row is outside the frozen `until` boundary.
+#[tokio::test]
+async fn digest_receipt_recovery_pages_past_one_thousand_in_a_frozen_window() {
+    let (rt, _token, registry) = fixture().await;
+    let namespace = "receipt-pagination";
+    let tenant_token = rt
+        .authorize(Namespace::parse(namespace).expect("valid namespace"))
+        .expect("authorize receipt namespace");
+    let store = rt.events(&tenant_token).expect("tenant event store");
+    let project_id = Uuid::new_v4();
+
+    const SINCE: i64 = 9_999_999;
+    const UNTIL: i64 = 10_001_001;
+    const PAGE_LIMIT: usize = 1000;
+
+    let receipt = |marker: String, created_at: i64| {
+        let mut event = Event::new(
+            namespace,
+            "git.digest",
+            EventKind::Audit,
+            SubstrateKind::Event,
+            "agent:receipt-recovery-test",
+        )
+        .with_outcome(EventOutcome::Success)
+        .with_target(project_id)
+        .with_payload_schema_version(2);
+        event.created_at = created_at;
+        event.payload = json!({
+            "result": {
+                "receipt_id": event.id,
+                "project_id": project_id,
+                "marker": marker,
+                "done": true
+            }
+        });
+        event
+    };
+
+    // The lost receipt is the oldest in-window row. Exactly 1000 newer
+    // receipts force it onto the second page.
+    let lost = receipt("lost".to_string(), SINCE + 1);
+    let lost_id = lost.id;
+    let lost_id_string = lost_id.to_string();
+    let lost_result = lost.payload["result"].clone();
+    let mut events = vec![lost];
+    events.extend((0..PAGE_LIMIT).map(|index| {
+        receipt(
+            format!("decoy-{index}"),
+            SINCE + 2 + i64::try_from(index).expect("index fits i64"),
+        )
+    }));
+    let summary = store
+        .append_events(events)
+        .await
+        .expect("seed paginated receipt window");
+    assert_eq!(summary.affected, (PAGE_LIMIT + 1) as u64);
+
+    let first_page = registry
+        .dispatch(
+            "list",
+            json!({
+                "namespace": namespace,
+                "kind": "event",
+                "event_kind": "audit",
+                "verb": "git.digest",
+                "since": SINCE,
+                "until": UNTIL,
+                "limit": PAGE_LIMIT,
+                "offset": 0
+            }),
+        )
+        .await
+        .expect("first frozen-window page");
+    let first_items = first_page.as_array().expect("unclamped event page");
+    assert_eq!(first_items.len(), PAGE_LIMIT);
+    assert!(
+        first_items
+            .iter()
+            .all(|event| event["id"].as_str() != Some(lost_id_string.as_str())),
+        "the fixture must place the lost receipt beyond page one"
+    );
+
+    // Simulate a digest completing while recovery is paging. Reusing the
+    // frozen UNTIL excludes it, preventing an offset shift or duplicate.
+    store
+        .append_event(receipt("late".to_string(), UNTIL + 1))
+        .await
+        .expect("append post-snapshot receipt");
+
+    let second_page = registry
+        .dispatch(
+            "list",
+            json!({
+                "namespace": namespace,
+                "kind": "event",
+                "event_kind": "audit",
+                "verb": "git.digest",
+                "since": SINCE,
+                "until": UNTIL,
+                "limit": PAGE_LIMIT,
+                "offset": PAGE_LIMIT
+            }),
+        )
+        .await
+        .expect("second frozen-window page");
+    let second_items = second_page.as_array().expect("unclamped event page");
+    assert_eq!(second_items.len(), 1);
+    assert_eq!(second_items[0]["id"], json!(lost_id));
+    assert_eq!(second_items[0]["payload"]["result"], lost_result);
+
+    let recovered = registry
+        .dispatch("get", json!({"id": lost_id}))
+        .await
+        .expect("by-ID recovery is namespace-agnostic under AllowAllGate");
+    assert_eq!(recovered["payload"]["result"], lost_result);
+}
+
 /// A per-record secret-gate refusal remains non-fatal so the rest of the
 /// digest can land, but the public result must make the partial outcome
 /// mechanically detectable and identify the refused write without echoing
@@ -4574,7 +5182,7 @@ async fn digest_verb_counts_and_describes_partial_secret_gate_refusals() {
         }
     ])
     .to_string();
-    write_fake_gh(&bin_dir, &log_dir, &pr_json, "[]");
+    write_fake_gh(&repo, &bin_dir, &log_dir, &pr_json, "[]");
     let _path_guard = PathGuard::install(&bin_dir);
 
     let result = registry
@@ -4981,7 +5589,7 @@ async fn digest_verb_pr_issue_sources_completed_on_happy_path() {
     ])
     .to_string();
 
-    write_fake_gh(&bin_dir, &log_dir, &pr_json, &issue_json);
+    write_fake_gh(&repo, &bin_dir, &log_dir, &pr_json, &issue_json);
     let _path_guard = PathGuard::install(&bin_dir);
 
     let report = run_ingest(
@@ -5085,7 +5693,7 @@ async fn digest_verb_pr_issue_sources_stopped_early_on_budget_stop() {
     ])
     .to_string();
 
-    write_fake_gh(&bin_dir, &log_dir, &pr_json, &issue_json);
+    write_fake_gh(&repo, &bin_dir, &log_dir, &pr_json, &issue_json);
     let _path_guard = PathGuard::install(&bin_dir);
 
     // max_items = 1: the first PR lands, the PR walk breaks on its second
@@ -5185,7 +5793,13 @@ async fn digest_verb_pr_source_stopped_early_on_full_page_then_refetch_failure_s
     let prs: Vec<Value> = (1..=PAGE_LIMIT as u64)
         .map(|i| pr_fixture(i, &format!("pr {i}"), "2026-01-01T00:16:00Z"))
         .collect();
-    write_fake_gh(&bin_dir, &log_dir, &Value::Array(prs).to_string(), "[]");
+    write_fake_gh(
+        &repo,
+        &bin_dir,
+        &log_dir,
+        &Value::Array(prs).to_string(),
+        "[]",
+    );
     let _path_guard = PathGuard::install(&bin_dir);
 
     let mut opts = IngestOptions::unbounded(repo.clone(), project_id.to_string());
@@ -5215,8 +5829,8 @@ async fn digest_verb_pr_source_stopped_early_on_full_page_then_refetch_failure_s
     // from "failed after it").
     let script = r#"#!/bin/sh
 case "$1" in
-  --version)
-    echo "gh version 2.0.0 (fake)"
+  repo)
+    echo '{"nameWithOwner":"fixture/repository","url":"https://github.com/fixture/repository"}'
     ;;
   *)
     echo "fake gh: simulated listing outage" 1>&2
@@ -5284,7 +5898,7 @@ async fn ingest_walked_then_cursor_write_fails_never_reports_skipped() {
     std::fs::create_dir_all(&log_dir).expect("mk log dir");
 
     let issue_json = json!([issue_fixture(1, "Bug report", "2026-01-01T00:00:01Z")]).to_string();
-    write_fake_gh(&bin_dir, &log_dir, "[]", &issue_json);
+    write_fake_gh(&repo, &bin_dir, &log_dir, "[]", &issue_json);
     let _path_guard = PathGuard::install(&bin_dir);
 
     // Sabotage ONLY the cursor write: read_cursor must keep working (it is
@@ -5413,7 +6027,7 @@ async fn pr_cursor_does_not_advance_past_refused_record_on_later_existing() {
     ])
     .to_string();
 
-    write_fake_gh(&bin_dir, &log_dir, &pr_json, "[]");
+    write_fake_gh(&repo, &bin_dir, &log_dir, &pr_json, "[]");
     let _path_guard = PathGuard::install(&bin_dir);
 
     let mut opts = IngestOptions::unbounded(repo.clone(), project_id.to_string());
@@ -5515,7 +6129,7 @@ async fn issue_cursor_does_not_advance_past_refused_record_on_later_existing() {
     ])
     .to_string();
 
-    write_fake_gh(&bin_dir, &log_dir, "[]", &issue_json);
+    write_fake_gh(&repo, &bin_dir, &log_dir, "[]", &issue_json);
     let _path_guard = PathGuard::install(&bin_dir);
 
     let mut opts = IngestOptions::unbounded(repo.clone(), project_id.to_string());
@@ -5787,7 +6401,7 @@ async fn digest_verb_local_cursor_read_failure_is_not_remote_listing_skip() {
     std::fs::create_dir_all(&bin_dir).expect("mk bin dir");
     let log_dir = dir.path().join("log");
     std::fs::create_dir_all(&log_dir).expect("mk log dir");
-    write_fake_gh(&bin_dir, &log_dir, "[]", "[]");
+    write_fake_gh(&repo, &bin_dir, &log_dir, "[]", "[]");
     let _path_guard = PathGuard::install(&bin_dir);
 
     let mut writer = rt.sql().writer().await.expect("writer");
@@ -5836,8 +6450,205 @@ async fn digest_verb_local_cursor_read_failure_is_not_remote_listing_skip() {
     );
 }
 
+/// Presence on PATH is insufficient: an installed but unauthenticated (or
+/// repo-incompatible) `gh` reports `gh_available:false`, skips requested
+/// remote sources, never starts a walker, and does not echo probe stderr.
+#[tokio::test]
+async fn digest_verb_installed_but_unusable_gh_is_reported_false_without_leaking_stderr() {
+    let _guard = ENV_MUTEX.lock().await;
+    let (_rt, _token, registry) = fixture().await;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path().join("repo");
+    std::fs::create_dir_all(&repo).expect("repo dir");
+    init_repo(&repo);
+    write(&repo, "README.md", "hello\n");
+    commit(&repo, &["README.md"], "Initial commit");
+    git(
+        &repo,
+        &[
+            "config",
+            "remote.origin.url",
+            "https://github.com/fixture/repository.git",
+        ],
+    );
+
+    let bin_dir = dir.path().join("bin");
+    std::fs::create_dir_all(&bin_dir).expect("bin dir");
+    let args_log = dir.path().join("gh-args.log");
+    let script = format!(
+        r#"#!/bin/sh
+printf '%s\n' "$*" >> '{}'
+case "$1" in
+  repo)
+    echo 'authentication failed for token GH_SECRET_DO_NOT_PERSIST' 1>&2
+    exit 1
+    ;;
+  *)
+    echo 'listing must not run after a failed repo probe' 1>&2
+    exit 99
+    ;;
+esac
+"#,
+        args_log.display()
+    );
+    let script_path = bin_dir.join("gh");
+    std::fs::write(&script_path, script).expect("write gh stub");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = std::fs::metadata(&script_path)
+            .expect("stub metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&script_path, permissions).expect("chmod stub");
+    }
+    let _path_guard = PathGuard::install(&bin_dir);
+
+    let response = registry
+        .dispatch(
+            "git.digest",
+            json!({
+                "source": repo.to_str().unwrap(),
+                "include": ["commits", "issues", "pull_requests"]
+            }),
+        )
+        .await
+        .expect("unusable gh degrades in-band");
+
+    assert_eq!(response["gh_available"], false, "{response}");
+    assert_eq!(response["commits_ingested"], 1, "{response}");
+    assert_eq!(response["sources"]["issues"]["state"], "skipped");
+    assert_eq!(response["sources"]["pull_requests"]["state"], "skipped");
+    assert!(
+        response["sources"]["issues"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("could not resolve")),
+        "structured reason describes repository usability: {response}"
+    );
+    assert!(
+        !response.to_string().contains("GH_SECRET_DO_NOT_PERSIST"),
+        "gh stderr must never enter the report or durable receipt: {response}"
+    );
+    let invocations = std::fs::read_to_string(args_log).expect("gh args log");
+    assert_eq!(
+        invocations.lines().collect::<Vec<_>>(),
+        vec!["repo view fixture/repository --json nameWithOwner,url"],
+        "failed capability probe must prevent every listing call"
+    );
+}
+
+/// `gh repo set-default` can select an alternate remote for argument-less
+/// commands. The capability probe must instead derive `origin` and pass that
+/// repository as argv, then pin the same value on every list call.
+#[tokio::test]
+async fn digest_verb_multi_remote_configured_default_cannot_redirect_github_ingest() {
+    let _guard = ENV_MUTEX.lock().await;
+    let (_rt, _token, registry) = fixture().await;
+    let project_id = create(
+        &registry,
+        json!({"kind": "project", "name": "source-bound-gh-probe"}),
+    )
+    .await;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path().join("repo");
+    std::fs::create_dir_all(&repo).expect("repo dir");
+    init_repo(&repo);
+    write(&repo, "README.md", "hello\n");
+    commit(&repo, &["README.md"], "Initial commit");
+    git(
+        &repo,
+        &[
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/fixture/repository.git",
+        ],
+    );
+    git(
+        &repo,
+        &[
+            "remote",
+            "add",
+            "upstream",
+            "https://github.com/alternate/wrong-repository.git",
+        ],
+    );
+    // Mirrors a checkout where gh has marked the alternate remote as its
+    // local default. The fake below deliberately returns that wrong repo if
+    // `repo view` is ever invoked without the explicit source identity.
+    git(&repo, &["config", "remote.upstream.gh-resolved", "base"]);
+
+    let bin_dir = dir.path().join("bin");
+    std::fs::create_dir_all(&bin_dir).expect("bin dir");
+    let args_log = dir.path().join("gh-args.log");
+    let script = format!(
+        r#"#!/bin/sh
+printf '%s\n' "$*" >> '{}'
+case "$1" in
+  repo)
+    if [ "$3" = "fixture/repository" ]; then
+      echo '{{"nameWithOwner":"fixture/repository","url":"https://github.com/fixture/repository"}}'
+    else
+      echo '{{"nameWithOwner":"alternate/wrong-repository","url":"https://github.com/alternate/wrong-repository"}}'
+    fi
+    ;;
+  pr|issue)
+    echo '[]'
+    ;;
+  *)
+    exit 2
+    ;;
+esac
+"#,
+        args_log.display()
+    );
+    let script_path = bin_dir.join("gh");
+    std::fs::write(&script_path, script).expect("write gh stub");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = std::fs::metadata(&script_path)
+            .expect("stub metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&script_path, permissions).expect("chmod stub");
+    }
+    let _path_guard = PathGuard::install(&bin_dir);
+
+    let response = registry
+        .dispatch(
+            "git.digest",
+            json!({
+                "source": repo.to_str().unwrap(),
+                "project": project_id,
+                "include": ["issues", "pull_requests"]
+            }),
+        )
+        .await
+        .expect("source-bound GitHub ingest succeeds");
+    assert_eq!(response["gh_available"], true, "{response}");
+    assert_eq!(response["history_exhausted"], true, "{response}");
+
+    let invocations = std::fs::read_to_string(args_log).expect("gh args log");
+    let lines: Vec<&str> = invocations.lines().collect();
+    assert_eq!(
+        lines.first().copied(),
+        Some("repo view fixture/repository --json nameWithOwner,url"),
+        "the probe must never delegate repository selection to gh: {lines:?}"
+    );
+    for line in lines.iter().skip(1) {
+        assert!(
+            line.contains("--repo fixture/repository"),
+            "every list call must retain the source-bound repo: {line:?}"
+        );
+        assert!(!line.contains("alternate/wrong-repository"), "{line:?}");
+    }
+}
+
 /// A `gh pr list`/`gh issue list` failure on the FIRST fetch — the stub
-/// answers the `--version` probe but exits 1 on listing — leaves both
+/// answers the source-bound probe but exits 1 on listing — leaves both
 /// sources `skipped` with the failure in the reason: the source was never
 /// walked, which is exactly what `skipped` means (issue #1617).
 /// Commits are unaffected (ADR-088 §5 graceful absence).
@@ -5852,15 +6663,23 @@ async fn digest_verb_pr_issue_sources_skipped_on_gh_list_failure() {
     init_repo(&repo);
     write(&repo, "README.md", "hello\n");
     commit(&repo, &["README.md"], "Initial commit");
+    git(
+        &repo,
+        &[
+            "config",
+            "remote.origin.url",
+            "https://github.com/fixture/repository.git",
+        ],
+    );
 
     let bin_dir = dir.path().join("bin");
     std::fs::create_dir_all(&bin_dir).expect("mk bin dir");
 
-    // Present enough to pass the `gh --version` probe; every listing fails.
+    // Resolve a repository successfully, then fail every listing.
     let script = r#"#!/bin/sh
 case "$1" in
-  --version)
-    echo "gh version 2.0.0 (fake)"
+  repo)
+    echo '{"nameWithOwner":"fixture/repository","url":"https://github.com/fixture/repository"}'
     ;;
   *)
     echo "fake gh: simulated listing outage" 1>&2
@@ -5902,10 +6721,14 @@ esac
             .as_str()
             .unwrap_or_else(|| panic!("{source}: skipped carries a reason: {resp:?}"));
         assert!(
-            reason.contains("list failed") && reason.contains("simulated listing outage"),
-            "{source}: the reason names the failing command and gh's stderr: {reason:?}"
+            reason.contains("list failed") && !reason.contains("simulated listing outage"),
+            "{source}: the reason names the failed operation without gh stderr: {reason:?}"
         );
     }
+    assert!(
+        !resp.to_string().contains("simulated listing outage"),
+        "listing stderr must not enter the report or durable receipt: {resp:?}"
+    );
     assert_eq!(
         resp["sources"]["commits"],
         json!({"state": "completed"}),
@@ -6498,14 +7321,14 @@ async fn ingest_over_cap_commit_embedding_is_semantically_retrievable() {
     .expect("runtime with a configured default model");
     rt.register_embedder(FixtureEmbedProvider { dims });
 
+    let token = rt.authorize(Namespace::local()).expect("authorize local");
     let mut builder = VerbRegistryBuilder::new();
     builder.register(KgPack::new(rt.clone()));
     builder.register(GitPack::new(rt.clone()));
+    builder.with_event_store(rt.events(&token).expect("event store"));
     let registry = builder.build().expect("registry builds");
     rt.install_edge_rules(registry.all_edge_rules());
     registry.apply_schema_plans(rt.backend());
-    let token = rt.authorize(Namespace::local()).expect("authorize local");
-
     let project_id = create(
         &registry,
         json!({"kind": "project", "name": "semantic-retrieval-repo"}),
@@ -7253,7 +8076,7 @@ async fn ingest_masks_credential_shaped_pr_author_login_without_dropping_note() 
     }])
     .to_string();
 
-    write_fake_gh(&bin_dir, &log_dir, &pr_json, "[]");
+    write_fake_gh(&repo, &bin_dir, &log_dir, &pr_json, "[]");
     let _path_guard = PathGuard::install(&bin_dir);
 
     let report = run_ingest(
@@ -7335,7 +8158,7 @@ async fn ingest_masks_credential_shaped_pr_base_ref_without_dropping_note() {
     }])
     .to_string();
 
-    write_fake_gh(&bin_dir, &log_dir, &pr_json, "[]");
+    write_fake_gh(&repo, &bin_dir, &log_dir, &pr_json, "[]");
     let _path_guard = PathGuard::install(&bin_dir);
 
     let report = run_ingest(
@@ -7418,7 +8241,7 @@ async fn ingest_masks_credential_shaped_pr_head_ref_without_dropping_note() {
     }])
     .to_string();
 
-    write_fake_gh(&bin_dir, &log_dir, &pr_json, "[]");
+    write_fake_gh(&repo, &bin_dir, &log_dir, &pr_json, "[]");
     let _path_guard = PathGuard::install(&bin_dir);
 
     let report = run_ingest(
@@ -7499,7 +8322,7 @@ async fn ingest_leaves_clean_pr_author_and_refs_unmasked() {
     }])
     .to_string();
 
-    write_fake_gh(&bin_dir, &log_dir, &pr_json, "[]");
+    write_fake_gh(&repo, &bin_dir, &log_dir, &pr_json, "[]");
     let _path_guard = PathGuard::install(&bin_dir);
 
     let report = run_ingest(

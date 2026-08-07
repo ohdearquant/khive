@@ -179,13 +179,14 @@ fn rt() -> KhiveRuntime {
 
 async fn fixture() -> (KhiveRuntime, NamespaceToken, VerbRegistry) {
     let rt = rt();
+    let token = rt.authorize(Namespace::local()).expect("authorize local");
     let mut builder = VerbRegistryBuilder::new();
     builder.register(khive_pack_kg::KgPack::new(rt.clone()));
     builder.register(GitPack::new(rt.clone()));
+    builder.with_event_store(rt.events(&token).expect("event store"));
     let registry = builder.build().expect("registry builds");
     rt.install_edge_rules(registry.all_edge_rules());
     registry.apply_schema_plans(rt.backend());
-    let token = rt.authorize(Namespace::local()).expect("authorize local");
     (rt, token, registry)
 }
 
@@ -201,6 +202,7 @@ fn commits_only_opts(
 ) -> IngestOptions {
     IngestOptions {
         repo,
+        expected_github_repo: None,
         project,
         max_items,
         include: IngestInclude {
@@ -302,16 +304,26 @@ exec "$REAL_GIT" "${{args[@]}}"
 
 /// Minimal fake `gh` (mirrors `tests/acceptance.rs`'s `write_fake_gh`, not
 /// reusable directly since it lives in a separate integration-test binary
-/// target): logs argv, answers `--version`/`pr`/`issue` with canned JSON.
-fn write_fake_gh(bin_dir: &Path, log_dir: &Path, pr_json: &str, issue_json: &str) {
+/// target): logs argv, answers source-bound probe/`pr`/`issue` with canned JSON.
+fn write_fake_gh(
+    bin_dir: &Path,
+    log_dir: &Path,
+    expected_repo: &str,
+    pr_json: &str,
+    issue_json: &str,
+) {
     std::fs::write(log_dir.join("pr_response.json"), pr_json).expect("write pr fixture");
     std::fs::write(log_dir.join("issue_response.json"), issue_json).expect("write issue fixture");
     let script = format!(
         r#"#!/bin/sh
 printf '%s\n' "$*" >> '{args_log}'
 case "$1" in
-  --version)
-    echo "gh version 2.0.0 (fake)"
+  repo)
+    if [ "$2" != "view" ] || [ "$3" != "{expected_repo}" ]; then
+      echo "fake gh: repository probe was not explicitly source-bound: $*" 1>&2
+      exit 2
+    fi
+    echo '{{"nameWithOwner":"{expected_repo}","url":"https://github.com/{expected_repo}"}}'
     ;;
   pr)
     cat '{pr_json_path}'
@@ -328,6 +340,7 @@ esac
         args_log = log_dir.join("gh_args.log").display(),
         pr_json_path = log_dir.join("pr_response.json").display(),
         issue_json_path = log_dir.join("issue_response.json").display(),
+        expected_repo = expected_repo,
     );
     let script_path = bin_dir.join("gh");
     std::fs::write(&script_path, script).expect("write fake gh script");
@@ -698,7 +711,13 @@ async fn public_verb_partial_side_effects_survive_commit_snapshot_recovery() {
         }
     ])
     .to_string();
-    write_fake_gh(bin_dir.path(), log_dir.path(), &pr_json, &issue_json);
+    write_fake_gh(
+        bin_dir.path(),
+        log_dir.path(),
+        "khive-fixture/mandatory-765",
+        &pr_json,
+        &issue_json,
+    );
 
     let _path_guard = PathGuard::install(bin_dir.path());
 
