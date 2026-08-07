@@ -92,6 +92,48 @@ async fn test_upsert_and_get_note() {
 }
 
 #[tokio::test]
+async fn replace_note_cas_requires_new_revision_strictly_greater_than_snapshot() {
+    let store = setup_memory_store();
+    let mut original = make_note("default", "observation", "original");
+    original.created_at = 100;
+    original.updated_at = 100;
+    let id = original.id;
+    store.upsert_note(original.clone()).await.unwrap();
+
+    for refused_revision in [99, 100] {
+        let mut replacement = original.clone();
+        replacement.content = format!("must-not-land-{refused_revision}");
+        replacement.updated_at = refused_revision;
+        assert!(
+            !store
+                .replace_note_if_unchanged(replacement, original.updated_at, original.deleted_at)
+                .await
+                .unwrap(),
+            "CAS must refuse replacement revision {refused_revision} when the snapshot revision is {}",
+            original.updated_at
+        );
+        assert_eq!(
+            store.get_note(id).await.unwrap().unwrap().content,
+            "original"
+        );
+    }
+
+    let mut advanced = original.clone();
+    advanced.content = "advanced".to_string();
+    advanced.updated_at = 101;
+    assert!(
+        store
+            .replace_note_if_unchanged(advanced, original.updated_at, original.deleted_at)
+            .await
+            .unwrap(),
+        "a strictly newer revision must still satisfy the CAS"
+    );
+    let persisted = store.get_note(id).await.unwrap().unwrap();
+    assert_eq!(persisted.content, "advanced");
+    assert_eq!(persisted.updated_at, 101);
+}
+
+#[tokio::test]
 async fn test_kind_roundtrip_all_variants() {
     let store = setup_memory_store();
     for kind in [

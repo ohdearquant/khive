@@ -141,10 +141,10 @@ impl KgPack {
     pub(crate) async fn handle_update(
         &self,
         token: &NamespaceToken,
-        params: Value,
+        mut params: Value,
         registry: &VerbRegistry,
     ) -> Result<Value, RuntimeError> {
-        let p: UpdateParams = deser(params)?;
+        let p: UpdateParams = deser(params.clone())?;
         if p.entity_kind.is_some() {
             return Err(RuntimeError::InvalidInput(
                 "entity_kind is immutable; to change kind, delete then re-create the entity, or use merge() if this is a deduplication correction".into(),
@@ -236,8 +236,9 @@ impl KgPack {
                     ));
                 }
                 registry
-                    .validate_note_update_hook(&self.runtime, token, &note, p.properties.as_ref())
+                    .prepare_note_update_hook(&self.runtime, token, &note, &mut params)
                     .await?;
+                let p: UpdateParams = deser(params)?;
                 let patch = NotePatch::new(
                     optional_string_patch(p.name, "name")?,
                     p.content,
@@ -247,7 +248,7 @@ impl KgPack {
                 );
                 let (note, report) = self
                     .runtime
-                    .update_note_with_embedding_report(token, id, patch)
+                    .update_note_from_snapshot_with_embedding_report(token, note, patch)
                     .await?;
                 let mut response = normalize_entity_timestamps(to_json(&note)?);
                 super::create::add_embedding_truncation_warning(

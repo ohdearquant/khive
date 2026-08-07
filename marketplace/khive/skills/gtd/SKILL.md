@@ -46,9 +46,9 @@ request(ops="[
 ]")
 ```
 
-`gtd.complete` only accepts actionable tasks (`next` / `active`). To cancel or finish an item
-still in `inbox` / `waiting` / `someday`, use `gtd.transition` (`status="cancelled"` or
-`status="done"`) — or move it to `next` / `active` first, then complete.
+`gtd.complete` accepts every non-terminal state because the lifecycle table permits each one
+to move directly to `done` or `cancelled`. Use `gtd.transition` when the lifecycle move itself
+needs a note or when moving among non-terminal states.
 
 ### 3. Surface actionable work
 
@@ -97,7 +97,9 @@ request(ops="gtd.complete(id=\"<id>\", result=\"PR #198 merged, smoke tests gree
 
 `gtd.complete` stamps `completed_at` and validates the terminal transition. Pass a PR number,
 test output, or one concrete sentence as `result`. `done` and `cancelled` are terminal: no
-further transitions. Reopened work means a new `gtd.assign`, not a reopen.
+further transitions. Reopened work means a new `gtd.assign`, not a reopen. Check
+`audit_persisted` on the result: `false` means the task committed but the best-effort lifecycle
+audit append must be reconciled.
 
 ### 6. Weekly planning pass
 

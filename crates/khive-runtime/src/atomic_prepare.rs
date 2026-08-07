@@ -49,7 +49,8 @@ use khive_db::stores::graph::{
     purge_incident_edges_statement,
 };
 use khive_db::stores::note::{
-    note_hard_delete_statement, note_soft_delete_statement, note_upsert_statement,
+    note_hard_delete_statement, note_replace_if_unchanged_statement, note_soft_delete_statement,
+    note_upsert_statement,
 };
 use khive_db::stores::text::insert_document_statement;
 
@@ -187,7 +188,7 @@ fn optional_f64(args: &Value, key: &str) -> RuntimeResult<Option<f64>> {
 /// (`NotePatch::salience` / `NotePatch::decay_factor`): key absent -> `None`
 /// (untouched), key present as JSON `null` -> `Some(None)` (clear), key
 /// present as a number -> `Some(Some(v))` (set). Range validation lives in
-/// curation.rs's `prepare_update_note`, not here.
+/// curation.rs's `prepare_update_note_from_snapshot`, not here.
 fn optional_f64_patch(args: &Value, key: &str) -> RuntimeResult<Option<Option<f64>>> {
     match obj(args)?.get(key) {
         None => Ok(None),
@@ -646,6 +647,109 @@ pub enum AtomicUpdateKind {
     Edge,
 }
 
+/// Enforce a caller's explicit update-kind discriminator against a resolved
+/// note before any pack hook can inspect or normalize the request. Canonical
+/// KG dispatch performs this mismatch check before its hook; the atomic
+/// adapter calls this same helper to preserve that error ordering.
+pub fn validate_note_update_expected_kind(
+    note: &khive_storage::note::Note,
+    expected_kind: &Option<AtomicUpdateKind>,
+) -> RuntimeResult<()> {
+    let id = note.id;
+    match expected_kind {
+        None => Ok(()),
+        Some(AtomicUpdateKind::Note {
+            specific: Some(expected),
+        }) if &note.kind != expected => Err(RuntimeError::NotFound(format!("note {id}"))),
+        Some(AtomicUpdateKind::Note { .. }) => Ok(()),
+        Some(AtomicUpdateKind::Entity { .. }) => {
+            Err(RuntimeError::NotFound(format!("entity {id}")))
+        }
+        Some(AtomicUpdateKind::Edge) => Err(RuntimeError::NotFound(format!("edge {id}"))),
+    }
+}
+
+async fn prepare_note_update_plan_from_snapshot(
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+    args: &Value,
+    expected_kind: &Option<AtomicUpdateKind>,
+    note: khive_storage::note::Note,
+) -> RuntimeResult<AtomicOpPlan> {
+    let id = require_uuid(args, "id")?;
+    if note.id != id {
+        return Err(RuntimeError::NotFound(format!("note {id}")));
+    }
+    validate_note_update_expected_kind(&note, expected_kind)?;
+
+    reject_inapplicable_update_fields(args, "note")?;
+    let name = optional_string_patch(args, "name")?;
+    let content = optional_str(args, "content").map(str::to_string);
+    let properties = optional_properties(args, "properties")?;
+    let salience = optional_f64_patch(args, "salience")?;
+    let decay_factor = optional_f64_patch(args, "decay_factor")?;
+    let expected_updated_at = note.updated_at;
+    let expected_deleted_at = note.deleted_at;
+
+    let (note, text_changed) = runtime
+        .prepare_update_note_from_snapshot(
+            token,
+            note,
+            crate::curation::NotePatch::new(name, content, salience, decay_factor, properties),
+        )
+        .await?;
+
+    let post_commit = if text_changed {
+        PostCommitEffect::ReindexNote { note_id: id }
+    } else {
+        PostCommitEffect::None
+    };
+    Ok(AtomicOpPlan::Update(UpdatePlan {
+        target_id: id,
+        statements: vec![PlanStatement {
+            statement: note_replace_if_unchanged_statement(
+                &note,
+                expected_updated_at,
+                expected_deleted_at,
+            ),
+            guard: Some(AffectedRowGuard::exactly(1)),
+        }],
+        post_commit,
+        edge_natural_key: None,
+    }))
+}
+
+/// Build an atomic update plan from the exact note snapshot already supplied
+/// to a pack update hook. Persistence is guarded by that snapshot's revision
+/// and deletion marker, so hook normalization cannot race a second read.
+pub async fn prepare_update_from_note_snapshot(
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+    args: &Value,
+    expected_kind: Option<AtomicUpdateKind>,
+    note: khive_storage::note::Note,
+) -> RuntimeResult<AtomicOpPlan> {
+    if obj(args)?.get("entity_kind").is_some_and(|v| !v.is_null()) {
+        return Err(RuntimeError::InvalidInput(
+            "entity_kind is immutable; to change kind, delete then re-create the entity, \
+             or use merge() if this is a deduplication correction"
+                .into(),
+        ));
+    }
+    let current = runtime
+        .notes(token)?
+        .get_note(note.id)
+        .await?
+        .ok_or_else(|| RuntimeError::NotFound(format!("note {}", note.id)))?;
+    if current != note {
+        return Err(RuntimeError::InvalidInput(format!(
+            "note {} changed concurrently after it was read; retry with fresh state",
+            note.id
+        )));
+    }
+    prepare_note_update_plan_from_snapshot(runtime, token, args, &expected_kind, note).await
+}
+
 /// `expected_kind`: `None` when the caller omitted `kind` (no check, parity
 /// with canonical's own optional discriminator); `Some(_)` enforces an
 /// exact-parity mismatch check against the resolved record's actual
@@ -712,62 +816,11 @@ pub async fn prepare_update(
             .await
         }
         Some(Resolved::Note(note)) => {
-            match &expected_kind {
-                None => {}
-                Some(AtomicUpdateKind::Note {
-                    specific: Some(expected),
-                }) if &note.kind != expected => {
-                    return Err(RuntimeError::NotFound(format!("note {id}")));
-                }
-                Some(AtomicUpdateKind::Note { .. }) => {}
-                Some(AtomicUpdateKind::Entity { .. }) => {
-                    return Err(RuntimeError::NotFound(format!("entity {id}")));
-                }
-                Some(AtomicUpdateKind::Edge) => {
-                    return Err(RuntimeError::NotFound(format!("edge {id}")));
-                }
-            }
-            // Decide step lives in curation.rs's `prepare_update_note` — the
-            // same function canonical `update_note` calls, including the
-            // salience/decay_factor range validation. `optional_f64_patch`
-            // below preserves tri-state patch semantics (key absent =
-            // untouched, key null = clear, key present = set) when
-            // constructing the `NotePatch`.
-            reject_inapplicable_update_fields(args, "note")?;
-            let name = optional_string_patch(args, "name")?;
-            let content = optional_str(args, "content").map(|s| s.to_string());
-            let properties = optional_properties(args, "properties")?;
-            let salience = optional_f64_patch(args, "salience")?;
-            let decay_factor = optional_f64_patch(args, "decay_factor")?;
-
-            let (note, text_changed) = runtime
-                .prepare_update_note(
-                    token,
-                    id,
-                    crate::curation::NotePatch::new(
-                        name,
-                        content,
-                        salience,
-                        decay_factor,
-                        properties,
-                    ),
-                )
-                .await?;
-
-            let post_commit = if text_changed {
-                PostCommitEffect::ReindexNote { note_id: id }
-            } else {
-                PostCommitEffect::None
-            };
-            Ok(AtomicOpPlan::Update(UpdatePlan {
-                target_id: id,
-                statements: vec![PlanStatement {
-                    statement: note_upsert_statement(&note),
-                    guard: Some(AffectedRowGuard::exactly(1)),
-                }],
-                post_commit,
-                edge_natural_key: None,
-            }))
+            // Patch application lives in curation.rs's
+            // `prepare_update_note_from_snapshot` — the same implementation
+            // canonical guarded update calls, including salience/decay range
+            // validation. The plan retains this exact snapshot's revision.
+            prepare_note_update_plan_from_snapshot(runtime, token, args, &expected_kind, note).await
         }
         Some(_) => Err(RuntimeError::InvalidInput(format!(
             "update target {id} must be an entity, note, or edge"
@@ -1569,7 +1622,8 @@ pub async fn apply_post_commit_effects_with_report(
             PostCommitEffect::GtdAudit { .. } => {
                 // Applied by the `kkernel` caller's own post-commit pass,
                 // not here: `khive-pack-gtd` (owner of
-                // `ensure_audit_schema`/`write_audit_record`) depends on
+                // `ensure_audit_schema`/`write_audit_record_with_status`)
+                // depends on
                 // `khive-runtime`, not the other way around, so this crate
                 // cannot act on the effect itself. See
                 // `PostCommitEffect::GtdAudit`'s doc comment.

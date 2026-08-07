@@ -1229,13 +1229,14 @@ impl KhiveRuntime {
         Ok(report)
     }
 
-    /// Computes the patched `Note` and `text_changed` without writing, mirroring
-    /// `prepare_update_entity` so both the normal write path and the
-    /// atomic-prepare path share one source of truth.
-    pub(crate) async fn prepare_update_note(
+    /// Apply a note patch to exactly the supplied read snapshot without
+    /// fetching the row again. The caller must persist it through
+    /// [`Self::update_note_from_snapshot_with_embedding_report`] or a write
+    /// plan guarded by the snapshot's `updated_at`/`deleted_at` values.
+    pub(crate) async fn prepare_update_note_from_snapshot(
         &self,
-        token: &NamespaceToken,
-        id: Uuid,
+        _token: &NamespaceToken,
+        mut note: khive_storage::note::Note,
         patch: NotePatch,
     ) -> RuntimeResult<(khive_storage::note::Note, bool)> {
         if let Some(ref content) = patch.content {
@@ -1247,11 +1248,6 @@ impl KhiveRuntime {
         if let Some(ref props) = patch.properties {
             crate::secret_gate::check_json(props)?;
         }
-        let store = self.notes(token)?;
-        let mut note = store
-            .get_note(id)
-            .await?
-            .ok_or_else(|| RuntimeError::NotFound(format!("note {id}")))?;
 
         reject_pack_managed_schedule_mutation(&note, "update")?;
 
@@ -1340,7 +1336,20 @@ impl KhiveRuntime {
             note.status = status;
         }
 
-        note.updated_at = chrono::Utc::now().timestamp_micros();
+        // `updated_at` is also the optimistic-concurrency revision for
+        // full-note replacement. Make it strictly advance even when two
+        // operations land inside one clock microsecond. Saturation is not a
+        // valid fallback: reusing i64::MAX would make the CAS accept a write
+        // without advancing its revision.
+        let minimum_updated_at = note.updated_at.checked_add(1).ok_or_else(|| {
+            RuntimeError::Internal(format!(
+                "note {} updated_at is already at i64::MAX and cannot advance",
+                note.id
+            ))
+        })?;
+        note.updated_at = chrono::Utc::now()
+            .timestamp_micros()
+            .max(minimum_updated_at);
         Ok((note, text_changed))
     }
 
@@ -1366,10 +1375,56 @@ impl KhiveRuntime {
         khive_storage::note::Note,
         crate::retrieval::EmbeddingTruncationReport,
     )> {
-        let (note, text_changed) = self.prepare_update_note(token, id, patch).await?;
+        let snapshot = self
+            .notes(token)?
+            .get_note(id)
+            .await?
+            .ok_or_else(|| RuntimeError::NotFound(format!("note {id}")))?;
+        self.update_note_from_snapshot_with_embedding_report(token, snapshot, patch)
+            .await
+    }
 
+    /// Patch and persist one note from a caller-owned read snapshot.
+    ///
+    /// This is the canonical seam for kind hooks that normalize coupled
+    /// fields from the current note. The same snapshot feeds normalization,
+    /// patch application, and the compare-and-swap write; a concurrent note
+    /// change therefore refuses the write instead of persisting derivations
+    /// computed from stale state.
+    pub async fn update_note_from_snapshot_with_embedding_report(
+        &self,
+        token: &NamespaceToken,
+        snapshot: khive_storage::note::Note,
+        patch: NotePatch,
+    ) -> RuntimeResult<(
+        khive_storage::note::Note,
+        crate::retrieval::EmbeddingTruncationReport,
+    )> {
+        let expected_updated_at = snapshot.updated_at;
+        let expected_deleted_at = snapshot.deleted_at;
+        let id = snapshot.id;
         let store = self.notes(token)?;
-        store.upsert_note(note.clone()).await?;
+        let current = store
+            .get_note(id)
+            .await?
+            .ok_or_else(|| RuntimeError::NotFound(format!("note {id}")))?;
+        if current != snapshot {
+            return Err(RuntimeError::InvalidInput(format!(
+                "note {id} changed concurrently after it was read; retry with fresh state"
+            )));
+        }
+        let (note, text_changed) = self
+            .prepare_update_note_from_snapshot(token, snapshot, patch)
+            .await?;
+
+        let persisted = store
+            .replace_note_if_unchanged(note.clone(), expected_updated_at, expected_deleted_at)
+            .await?;
+        if !persisted {
+            return Err(RuntimeError::InvalidInput(format!(
+                "note {id} changed concurrently after it was read; retry with fresh state"
+            )));
+        }
 
         let embedding_report = if text_changed {
             let report = self.reindex_note(token, &note).await?;
@@ -3141,6 +3196,43 @@ mod tests {
         );
         let owned: String = note_embedding_text(&note);
         assert_eq!(owned.as_str(), note.content.as_str());
+    }
+
+    #[tokio::test]
+    async fn generic_note_update_errors_when_revision_is_already_i64_max() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let mut note = Note::new("local", "observation", "saturated revision");
+        note.updated_at = i64::MAX;
+        let note_id = note.id;
+        rt.notes(&tok)
+            .expect("note store")
+            .upsert_note(note.clone())
+            .await
+            .expect("seed saturated note");
+
+        let error = rt
+            .update_note(
+                &tok,
+                note_id,
+                NotePatch::new(None, Some("must not land".to_string()), None, None, None),
+            )
+            .await
+            .expect_err("i64::MAX cannot yield a strictly newer CAS revision");
+        assert!(
+            matches!(&error, RuntimeError::Internal(_)),
+            "revision exhaustion is an internal persisted-state error: {error}"
+        );
+        assert!(error.to_string().contains("i64::MAX"), "error: {error}");
+
+        let persisted = rt
+            .notes(&tok)
+            .expect("note store")
+            .get_note(note_id)
+            .await
+            .expect("read note")
+            .expect("note remains live");
+        assert_eq!(persisted, note, "failed revision advance must not mutate");
     }
 
     async fn restore_edge_preimage(
