@@ -2408,8 +2408,13 @@ async fn issue_full_page_never_leaks_raw_updated_at_into_paging_floor() {
         "the persisted paging cursor must never contain the raw credential value: {cursor}"
     );
 
-    // `list` clamps over-cap requests and returns `{items, effective_limit, ..}`
-    // instead of a bare array (#894), so scan every persisted issue by paging.
+    // `list` clamps over-cap requests and returns an envelope with
+    // `effective_limit` instead of a bare array (#894), so scan every persisted
+    // issue by paging. The envelope carries its rows under a kind-appropriate
+    // key: note-kind listings use `notes`, others use `items`. This assertion is
+    // about credential leakage, not about which key the envelope chose, so it
+    // accepts either rather than coupling the git acceptance suite to the kg
+    // envelope naming.
     let mut scanned = 0usize;
     let mut offset = 0u64;
     loop {
@@ -2423,9 +2428,10 @@ async fn issue_full_page_never_leaks_raw_updated_at_into_paging_floor() {
         let items = match page.as_array() {
             Some(items) => items.clone(),
             None => page
-                .get("items")
+                .get("notes")
+                .or_else(|| page.get("items"))
                 .and_then(Value::as_array)
-                .expect("clamped list response must carry an items array")
+                .expect("clamped list response must carry a notes or items array")
                 .clone(),
         };
         assert!(
