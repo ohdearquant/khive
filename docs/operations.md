@@ -63,7 +63,8 @@ effect of listing backends.
   writes an archive file rather than emitting a JSON summary line; and the pending-events drain
   prints its summary as pretty-printed (multi-line) JSON, not a single line
   (`pending_events.rs:731-745`). Logs (tracing) always go to stderr, so piping stdout never mixes
-  log noise into the JSON (`main.rs:449-461`).
+  log noise into the JSON (`kkernel/src/cli.rs:init_tracing`). Stderr logging is best-effort: a
+  failed or closed stderr consumer does not terminate the stdin/stdout MCP serving loop.
 - **Log level**: `--log <level>` or `KHIVE_LOG` (global arg, default `warn`,
   `main.rs:41-43`). The `lattice_inference` tokenizer-size warning is filtered to `error`
   regardless of the requested level (`main.rs:456`).
