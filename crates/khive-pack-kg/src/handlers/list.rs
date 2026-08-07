@@ -81,12 +81,25 @@ async fn resolve_message_thread_filter(
     }
 
     let normalized_prefix = raw.to_ascii_lowercase();
-    let sql = "SELECT DISTINCT json_extract(properties, '$.thread_id') AS thread_id \
-                   FROM notes WHERE namespace = ?1 AND deleted_at IS NULL \
+    // Resolve over the SAME visibility scope the subsequent note listing
+    // reads (`['local'] ∪ visible_namespaces`): resolving against only the
+    // primary namespace rejects prefixes of threads the list itself would
+    // return, and silently hides a cross-namespace prefix collision.
+    let visible = token.visible_namespace_strs();
+    let placeholders = (1..=visible.len())
+        .map(|index| format!("?{index}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        "SELECT DISTINCT json_extract(properties, '$.thread_id') AS thread_id \
+                   FROM notes WHERE namespace IN ({placeholders}) AND deleted_at IS NULL \
                    AND json_type(properties, '$.thread_id') = 'text' \
                    AND kind = 'message'"
-        .to_string();
-    let params = vec![SqlValue::Text(token.namespace().as_str().to_string())];
+    );
+    let params = visible
+        .into_iter()
+        .map(|namespace| SqlValue::Text(namespace.to_string()))
+        .collect();
     let mut reader = runtime
         .sql()
         .reader()
@@ -142,8 +155,8 @@ async fn resolve_message_thread_filter(
             Some(existing) if existing == candidate => {}
             Some(_) => {
                 return Err(RuntimeError::InvalidInput(format!(
-                    "list: ambiguous thread_id prefix {raw:?} in the caller's primary \
-                     namespace; use a full UUID to identify one exact thread"
+                    "list: ambiguous thread_id prefix {raw:?} across the caller's visible \
+                     namespaces; use a full UUID to identify one exact thread"
                 )))
             }
         }
@@ -158,8 +171,8 @@ async fn resolve_message_thread_filter(
     }
 
     Err(RuntimeError::InvalidInput(format!(
-        "list: no message thread matches prefix {raw:?} in the caller's primary \
-         namespace; a prefix can miss, so use the full thread UUID"
+        "list: no message thread matches prefix {raw:?} in the caller's visible \
+         namespaces; a prefix can miss, so use the full thread UUID"
     )))
 }
 

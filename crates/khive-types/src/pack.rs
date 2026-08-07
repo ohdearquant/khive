@@ -142,8 +142,15 @@ impl HandlerDef {
     /// list means `Standard` applies.
     pub fn presentation_policy(&self) -> VerbPresentationPolicy {
         match self.name {
-            "get" | "link" | "query" | "traverse" | "neighbors" | "brain.feedback"
-            | "memory.feedback" | "comm.delivered" => VerbPresentationPolicy::AlwaysVerbose,
+            "get"
+            | "link"
+            | "query"
+            | "traverse"
+            | "neighbors"
+            | "brain.feedback"
+            | "brain.auto_feedback"
+            | "memory.feedback"
+            | "comm.delivered" => VerbPresentationPolicy::AlwaysVerbose,
             _ => VerbPresentationPolicy::Standard,
         }
     }
@@ -552,6 +559,7 @@ mod tests {
             "traverse",
             "neighbors",
             "brain.feedback",
+            "brain.auto_feedback",
             "memory.feedback",
             "comm.delivered",
         ];

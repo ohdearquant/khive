@@ -605,6 +605,53 @@ async fn memory_feedback_target_id_round_trips_in_agent_mode() -> anyhow::Result
     Ok(())
 }
 
+/// `brain.auto_feedback` acknowledges the canonical target it credited; that
+/// acknowledgement feeds the strict `memory.feedback`/`brain.feedback`
+/// target_id parameter, so the default Agent transform must not shorten it
+/// (the verb is AlwaysVerbose for the same reason `brain.feedback` is).
+#[tokio::test]
+async fn brain_auto_feedback_target_id_round_trips_in_agent_mode() -> anyhow::Result<()> {
+    let client = connect_full().await?;
+    let remembered = ok_one(
+        &client,
+        r#"memory.remember(content="auto feedback strict target", salience=0.7)"#,
+    )
+    .await?;
+    let target_id = remembered["id"]
+        .as_str()
+        .expect("remember must expose a full chaining id");
+
+    let ops = serde_json::to_string(&json!([{
+        "tool": "brain.auto_feedback",
+        "args": {
+            "query": "auto feedback strict target round trip",
+            "results": [{"id": target_id}],
+            "signal": "useful",
+        }
+    }]))?;
+    // No `presentation` key — defaults to Agent; AlwaysVerbose must override.
+    let result = call(&client, "request", json!({ "ops": ops })).await?;
+    let body: Value = serde_json::from_str(&first_text(&result))?;
+    let first = &body["results"][0];
+    assert_eq!(first["ok"], true, "auto_feedback must succeed: {first}");
+    let returned = first["result"]["target_id"]
+        .as_str()
+        .expect("auto_feedback must acknowledge its credited target");
+    assert_eq!(
+        returned.len(),
+        36,
+        "auto_feedback target_id must stay canonical in Agent mode; got {returned:?}"
+    );
+    assert_eq!(returned, target_id);
+
+    agent_one(
+        &client,
+        &format!(r#"memory.feedback(target_id="{returned}", signal="useful")"#),
+    )
+    .await?;
+    Ok(())
+}
+
 #[tokio::test]
 async fn proposal_identifiers_round_trip_in_agent_mode() -> anyhow::Result<()> {
     let client = connect_full().await?;

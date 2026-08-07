@@ -5250,6 +5250,115 @@ async fn list_thread_prefix_resolution_ignores_non_message_notes() {
     assert_eq!(notes[0]["properties"]["thread_id"], message_thread);
 }
 
+/// Regression (PR #1623 round 4): thread-prefix resolution must use the SAME
+/// visibility scope as the list read (`['local'] ∪ visible_namespaces`). A
+/// thread stored only in a configured visible namespace is returned by the
+/// list path, so its prefix must resolve rather than error "no message
+/// thread matches".
+#[tokio::test]
+async fn list_thread_prefix_resolves_across_configured_visible_namespaces() {
+    let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+    let team_ns = khive_runtime::Namespace::parse("thread-team-ns").expect("valid namespace");
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(khive_pack_kg::KgPack::new(runtime.clone()));
+    builder.register(CommPack::new(runtime.clone()));
+    builder.with_default_namespace("local");
+    builder.with_visible_namespaces(vec![team_ns.clone()]);
+    let registry = builder.build().expect("registry builds");
+
+    let team_token = runtime.authorize(team_ns).expect("authorize team ns");
+    let thread = "ccccdddd-1111-4000-8000-000000000001";
+    runtime
+        .create_note(
+            &team_token,
+            "message",
+            None,
+            "visible-namespace threaded message",
+            None,
+            Some(serde_json::json!({"thread_id": thread})),
+            vec![],
+        )
+        .await
+        .expect("create message in visible namespace");
+
+    let result = registry
+        .dispatch(
+            "list",
+            serde_json::json!({"kind": "message", "thread_id": "ccccdddd"}),
+        )
+        .await
+        .expect("a prefix of a thread in a visible namespace must resolve");
+    let messages = result.as_array().expect("list result array");
+    assert_eq!(
+        messages.len(),
+        1,
+        "the visible-namespace thread's message must be returned: {messages:?}"
+    );
+    assert_eq!(messages[0]["properties"]["thread_id"], thread);
+}
+
+/// Regression (PR #1623 round 4): when the same prefix matches two DIFFERENT
+/// thread UUIDs — one in the primary namespace, one in a configured visible
+/// namespace — the resolver must report the ambiguity instead of silently
+/// resolving to the primary row and omitting the visible one.
+#[tokio::test]
+async fn list_thread_prefix_collision_across_visible_namespaces_is_ambiguous() {
+    let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+    let team_ns = khive_runtime::Namespace::parse("thread-collide-ns").expect("valid namespace");
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(khive_pack_kg::KgPack::new(runtime.clone()));
+    builder.register(CommPack::new(runtime.clone()));
+    builder.with_default_namespace("local");
+    builder.with_visible_namespaces(vec![team_ns.clone()]);
+    let registry = builder.build().expect("registry builds");
+
+    let local_token = runtime
+        .authorize(khive_runtime::Namespace::local())
+        .expect("authorize local");
+    runtime
+        .create_note(
+            &local_token,
+            "message",
+            None,
+            "primary-namespace thread",
+            None,
+            Some(serde_json::json!({"thread_id": "eeeeffff-1111-4000-8000-000000000001"})),
+            vec![],
+        )
+        .await
+        .expect("create primary-namespace message");
+    let team_token = runtime.authorize(team_ns).expect("authorize team ns");
+    runtime
+        .create_note(
+            &team_token,
+            "message",
+            None,
+            "visible-namespace thread sharing the prefix",
+            None,
+            Some(serde_json::json!({"thread_id": "eeeeffff-2222-4000-8000-000000000002"})),
+            vec![],
+        )
+        .await
+        .expect("create visible-namespace message");
+
+    let error = registry
+        .dispatch(
+            "list",
+            serde_json::json!({"kind": "message", "thread_id": "eeeeffff"}),
+        )
+        .await
+        .expect_err("a cross-namespace prefix collision must be reported, not silently resolved");
+    let message = error.to_string();
+    assert!(
+        message.contains("ambiguous thread_id prefix"),
+        "unexpected error: {message}"
+    );
+    assert!(
+        message.contains("visible"),
+        "the error must name the visibility scope it searched: {message}"
+    );
+}
+
 /// (a) Reply with correlation matching an outbound note whose from_actor=lambda:khive
 /// → ingested note to_actor=lambda:khive.
 #[tokio::test]
