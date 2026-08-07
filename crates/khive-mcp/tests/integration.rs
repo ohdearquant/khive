@@ -627,6 +627,7 @@ async fn brain_auto_feedback_target_id_round_trips_in_agent_mode() -> anyhow::Re
             "query": "auto feedback strict target round trip",
             "results": [{"id": target_id}],
             "signal": "useful",
+            "target_id": target_id,
         }
     }]))?;
     // No `presentation` key — defaults to Agent; AlwaysVerbose must override.
