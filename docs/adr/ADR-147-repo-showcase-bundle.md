@@ -8,9 +8,16 @@
 
 The git pack ingests repository history (`git.digest`: commits, issues, pull requests as
 note kinds with lifecycle and precedence edges) and the code pack ingests codebase
-structure (`code.ingest`: project, module, function, and datatype entities under a
-22-rule edge vocabulary). Together they place a repository's history and structure in
-one typed graph. Nothing yet consumes that fusion as a product surface.
+structure (`code.ingest`, under a 22-rule edge vocabulary). Together they place a
+repository's history and structure in one typed graph. Nothing yet consumes that fusion
+as a product surface.
+
+The code pack's vocabulary spans two tiers, and only one of them is emitted today.
+`code.ingest` currently produces the **module tier**: projects, packages, and modules
+with their dependency edges. The **symbol tier** (function and datatype entities) is
+declared in the pack vocabulary but not yet produced by the ingest call. This ADR is
+therefore specified at module granularity throughout, and every symbol-tier view is
+marked as such where it appears.
 
 The nearest consumer pattern already shipped: [ADR-145](ADR-145-local-first-kg-workbench.md)
 proved that a versioned, strictly validated JSON bundle with a shared golden vector lets
@@ -46,12 +53,12 @@ not suggestions.
 
 Top-level sections, each independently bounded:
 
-| Section      | Contents                                                                                                                                                                                    |
-| ------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `meta`       | Repository identity (owner, name, default branch), ingest provenance: HEAD commit SHA, ingest timestamp, producing tool versions, and an explicit truncation disclosure per bounded section |
-| `graph`      | The entity/edge slice: project, modules, functions, datatypes; contains and depends_on edges; history notes (commits, issues, pull requests) and their linking edges, bounded and paged     |
-| `aggregates` | Precomputed, chart-ready data (D3); every aggregate names its time window and its truncation rule                                                                                           |
-| `capability` | Static declaration: read-only, no writes, no live queries; renderers drive labeling from these fields, never from hardcoded strings                                                         |
+| Section      | Contents                                                                                                                                                                                                                                                                                                   |
+| ------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `meta`       | Repository identity (owner, name, default branch), ingest provenance: HEAD commit SHA, ingest timestamp, producing tool versions, and an explicit truncation disclosure per bounded section                                                                                                                |
+| `graph`      | The entity/edge slice at module granularity: project, packages, modules; contains and depends_on edges; history notes (commits, issues, pull requests) and their linking edges, bounded and paged. Symbol-tier node types (function, datatype) are typed in the schema and carry an empty collection in v1 |
+| `aggregates` | Precomputed, chart-ready data (D3); every aggregate names its time window and its truncation rule                                                                                                                                                                                                          |
+| `capability` | Static declaration: read-only, no writes, no live queries; renderers drive labeling from these fields, never from hardcoded strings                                                                                                                                                                        |
 
 Absence is encoded, never invented: a repository with no issues carries an empty issue
 series with its own disclosure, not a fabricated zero-filled chart.
@@ -62,37 +69,48 @@ The differentiator is the typed graph, so the showcase leads with graph views an
 them with graph-derived analyses. Generic forge statistics are included only where they
 are cheap and expected.
 
+Every view below is tagged with the ingest tier it consumes. **Module** views are fully
+specified and rendered in v1. **Module (symbol-tier drill-down deferred)** views render
+in v1 at module granularity and gain a deeper level when symbol-tier ingest lands, with
+no schema break, because the graph section already types its nodes.
+
 **Graph views** (rendered from `graph`):
 
-1. **Structure graph** — project → modules → functions/datatypes with typed edges,
-   zoom and filter by subtree, node degree available for sizing.
-2. **History-structure navigation** — selecting an entity surfaces the commits, pull
-   requests, and issues that touched it; selecting a commit highlights the subgraph it
-   touched. Both directions come from the linking edges in the bundle, top-N per
-   entity with full counts disclosed.
-3. **Dependency topology** — module-level depends_on adjacency with cycle detection
-   (cycles precomputed and listed), fan-in and fan-out per module.
+1. **Structure graph** _(module; symbol-tier drill-down deferred)_ — project →
+   packages → modules with typed edges, zoom and filter by subtree, node degree
+   available for sizing. Drill-down below a module activates with the symbol tier.
+2. **History-structure navigation** _(module)_ — selecting a module surfaces the
+   commits, pull requests, and issues that touched it; selecting a commit highlights
+   the subgraph it touched. Both directions come from the linking edges in the bundle,
+   top-N per entity with full counts disclosed.
+3. **Dependency topology** _(module)_ — module-level depends_on adjacency with cycle
+   detection (cycles precomputed and listed), fan-in and fan-out per module.
 
 **Analyses** (rendered from `aggregates`):
 
-4. **Hotspot quadrant** — per module: change frequency (commits touching it, by
-   window) against fan-in. The high-churn, high-fan-in quadrant is the risk surface.
-5. **Hidden coupling** — top-N module pairs that co-change in the same commits but
-   share no structural edge, with co-change count and support window.
-6. **Structure treemap** — module tree sized by contained symbols, colored by recent
-   activity.
-7. **Cadence timeline** — commit counts per week, release tags, pull-request lead-time
-   percentiles, issue open/close series.
-8. **Ownership** — per-module author concentration and a bus-factor indicator derived
-   from commit authorship.
-9. **De-facto API surface** — highest fan-in functions and datatypes with dependent
-   counts.
-10. **Scorecard** — a derived header: repository age, module/symbol counts, activity
-    trend, top hotspots, dependency-cycle count, ownership warnings.
+4. **Hotspot quadrant** _(module)_ — per module: change frequency (commits touching it,
+   by window) against fan-in. The high-churn, high-fan-in quadrant is the risk surface.
+5. **Hidden coupling** _(module)_ — top-N module pairs that co-change in the same
+   commits but share no structural edge, with co-change count and support window.
+6. **Structure treemap** _(module; symbol-tier sizing deferred)_ — module tree sized by
+   contained source-file count from the manifest tier, colored by recent activity.
+   Sizing by contained symbol count activates with the symbol tier.
+7. **Cadence timeline** _(history only)_ — commit counts per week, release tags,
+   pull-request lead-time percentiles, issue open/close series.
+8. **Ownership** _(module)_ — per-module author concentration and a bus-factor
+   indicator derived from commit authorship.
+9. **De-facto API surface** _(module; symbol-tier ranking deferred)_ — modules ranked
+   by dependent count, which is the module-granularity reading of "what the rest of the
+   repository actually relies on." Ranking individual functions and datatypes activates
+   with the symbol tier.
+10. **Scorecard** _(module)_ — a derived header: repository age, package and module
+    counts, activity trend, top hotspots, dependency-cycle count, ownership warnings.
+    A symbol count is reported as unavailable in v1 rather than as zero, per the
+    absence rule in D2.
 
-Each analysis in the schema names its input fields, window, and bound; a renderer must
-be able to draw every chart from the bundle alone, offline. Analyses that would require
-semantic search or live queries are out of contract for v1.
+Each analysis in the schema names its input fields, window, bound, and tier; a renderer
+must be able to draw every chart from the bundle alone, offline. Analyses that would
+require semantic search or live queries are out of contract for v1.
 
 ### D4 — Static-first ladder
 
@@ -160,16 +178,27 @@ state.
 
 ## Implementation Status
 
-`git.digest` and `code.ingest` are live verbs, with two measured granularity facts the
-contract must respect. `code.ingest` today emits the manifest tier and the
-import-scan tier (projects, packages/modules, and their dependency edges); the
-symbol tier (functions, datatypes) is in the pack vocabulary but not yet produced by
-the ingest call. The v1 bundle and every D3 analysis are therefore specified at module
-granularity; the symbol-level views (structure drill-down below modules, symbol-level
-de-facto API) activate when symbol-tier ingest lands, without a schema break, because
-the graph section already types its nodes. Second, `code.ingest` writes to a dedicated
-map database and `git.digest` to a graph store, so the bundle exporter reads two
-stores and merges at export time.
+`git.digest` and `code.ingest` are live verbs. Two measured facts about them shape the
+contract, and both are load-bearing rather than caveats.
+
+The first is the tier fact stated in Context and carried through the normative text:
+`code.ingest` today emits the manifest and import-scan tiers (projects, packages and
+modules with their dependency edges) and not the symbol tier. Every place this ADR
+would otherwise have specified symbols is scoped in situ — the D2 `graph` row types
+symbol node types and gives them an empty collection in v1, and D3 tags each of the ten
+views with the tier it consumes, three of which (#1, #6, #9) name what activates when
+the symbol tier lands. That activation needs no schema break, because the graph section
+already types its nodes.
+
+The second is that `code.ingest` writes to a dedicated map database while `git.digest`
+writes to a graph store, so the bundle exporter reads two stores and merges at export
+time.
+
+A first end-to-end run of the pipeline against this repository has been executed against
+a dedicated store, which fixes two operational properties the exporter has to carry: the
+history digest is cursor-bounded and returns a done flag, so a caller loops it to
+exhaustion rather than issuing one call, and the two verbs land in separate databases as
+described above.
 
 To build: the bundle exporter, the one-shot pipeline entry point, the JSON Schema plus
 golden vector produced from a real repository, and the frontend. The first golden
