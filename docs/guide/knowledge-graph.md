@@ -124,7 +124,12 @@ provide a reviewed change workflow when direct mutation is not appropriate.
 - `list`, `search`, and a singleton `create` need a `kind`. Supply a substrate
   such as `entity` or `note`, or a granular kind such as `concept` or
   `decision`. A bulk `create(items=[...])` carries a `kind` on each item, so it
-  needs no top-level `kind`.
+  needs no top-level `kind`; entities and notes may be mixed. The default is
+  ordered per-item best effort. Pass `atomic=true` for one all-or-nothing
+  mixed row/FTS transaction.
+- Note creates may supply `external_id` (or `properties.external_id`) for
+  idempotent ingestion. A retry in the same namespace and note kind returns
+  the canonical UUID instead of creating another note.
 - `get`, `update`, and `delete` are by-ID operations. Use a UUID rather than a
   natural-language name; use `resolve` when you have a human reference.
 - `neighbors` returns edges in both directions by default. Pass

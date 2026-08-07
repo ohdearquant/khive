@@ -122,15 +122,19 @@ parse error (`DslError::PrevRefInJsonForm`), since JSON form has no chain syntax
 ### Parser constraints (source: `khive-request`, ADR-016)
 
 - **`MAX_OPS` = 100** per request; exceeding it is `DslError::TooManyOps`.
-- **`$prev` is chain-only.** Using it outside a `|` chain, or anywhere in JSON form, is
-  rejected at parse time.
+- **`$prev` is chain-group-only.** A function-call batch may contain groups such as
+  `[a() | b(id=$prev.id), c() | d(id=$prev.id)]`; JSON form still rejects it.
 - **Write-key conflict detection**: a parallel batch where two ops target the same UUID
   via `update`/`delete` (`id`), `merge` (`into_id`/`from_id`), or `link`
-  (`source_id`/`target_id`) is rejected before any op dispatches, rather than racing.
+  (`source_id`/`target_id`) gives those operations per-op conflict errors while
+  non-conflicting operations still run. Across independent chain groups, earlier
+  non-conflicting members run before the actual conflicting member fails; only its
+  remaining group tail is aborted.
 - **`RESERVED_ENVELOPE_ARGS`** (`presentation`, `presentation_per_op`) are envelope-level
   fields on the `request` tool call itself; passing them inside a verb's own argument
   list is rejected (`DslError::ReservedEnvelopeArg`).
-- Mixing `,` and `|` at the top level is rejected (`DslError::MixedSeparators`).
+- Mixing `,` and `|` without enclosing batch brackets is rejected
+  (`DslError::MixedSeparators`).
 - Only single-level `pack.verb` names are supported — `a.b.c` is
   `DslError::UnsupportedVerbNesting`.
 - Argument values are JSON literals. Strings must be double-quoted, including inside
@@ -165,7 +169,7 @@ Declaration = changes institutional status by fiat.
 
 ### `create` — Commissive
 
-Create an entity or note (singleton) or a batch of entities (bulk via `items`).
+Create an entity or note (singleton) or a mixed entity/note batch via `items`.
 
 Singleton writes preserve the complete source in storage and FTS. If a configured embedder
 receives a UTF-8-safe bounded prefix, the successful response includes a `warnings` array; the
@@ -183,13 +187,26 @@ warning is derived from the embedding outcome, not from a separate registry pred
 | `tags`              | array\<string\> | no          | Tag list.                                                                                                                                                                                                                                                                                  |
 | `entity_type`       | string          | no          | First-class type tag, e.g. `"paper"`, `"algorithm"`, `"tool"`.                                                                                                                                                                                                                             |
 | `properties`        | object          | no          | Arbitrary JSON properties.                                                                                                                                                                                                                                                                 |
-| `items`             | array\<object\> | no          | Bulk entity creation, each `{kind, name, entity_kind?, entity_type?, description?, properties?, tags?}`. Capped at 1000/request. Bulk-created entities skip embedding until a later `reindex`.                                                                                             |
-| `atomic`            | bool            | no          | Bulk path. Default true = all-or-nothing; false = per-item errors collected.                                                                                                                                                                                                               |
-| `verbose`           | bool            | no          | Bulk path. When true, response includes full entity objects.                                                                                                                                                                                                                               |
+| `external_id`       | string          | no          | Note-only natural key; retries in the same namespace and note kind return the canonical UUID. May instead be supplied as `properties.external_id`.                                                                                                                                         |
+| `items`             | array\<object\> | no          | Mixed bulk create. Each item requires `kind`; entities require `name`, notes require `content` and may include `note_kind`, `salience`, or `external_id`. Capped at 1000/request.                                                                                                          |
+| `atomic`            | bool            | no          | Bulk path. Default false = ordered per-item best effort; true = one all-or-nothing mixed row/FTS transaction. A present non-boolean value, including null, is rejected before any item write.                                                                                             |
+| `verbose`           | bool            | no          | Bulk path. When true, response includes full `entities` and `notes` arrays. A present non-boolean value, including null, is rejected before any item write.                                                                                                                               |
 
 ```
 request(ops="create(kind=\"concept\", name=\"RoPE\", description=\"Rotary position embedding\")")
 ```
+
+Bulk responses preserve input order in `results` and report `attempted`, `created`,
+`created_notes`, `skipped`, and `failed`. If any note create commits but a best-effort
+index or side effect fails, `post_commit_failures` lists affected UUIDs and
+`post_commit_failure_details` adds repair stages such as `fts`, `embedding`,
+`vector_store`, `vector_insert`, `annotates`, or `after_create` (with the model
+when applicable). Natural-key losers do not rerun winner-only hooks or indexing.
+For `atomic=true`, note FTS rows are part of the atomic commit; only vector
+embedding/store/insert stages can be reported as post-commit index failures.
+Post-commit vector work is skipped when the committed note was concurrently
+updated or deleted, so it cannot overwrite a newer vector or resurrect one for
+a tombstoned row.
 
 ### `get` — Assertive
 

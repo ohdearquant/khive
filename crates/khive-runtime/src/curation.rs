@@ -41,6 +41,24 @@ struct EmbeddingModelPlan {
     model_names: Vec<String>,
 }
 
+/// A vector-side failure observed while rebuilding a committed note's indexes.
+/// FTS failures still return `Err`; these entries describe the best-effort
+/// model stages that historically logged and continued.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct NoteReindexFailure {
+    pub stage: &'static str,
+    pub model: String,
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct NoteReindexOutcome {
+    pub embedding_truncation: crate::retrieval::EmbeddingTruncationReport,
+    /// A substrate-wide FTS repair failure. Model-specific failures remain in
+    /// `failures` so callers can preserve their existing stage/model wire shape.
+    pub fts_failed: bool,
+    pub failures: Vec<NoteReindexFailure>,
+}
+
 impl EmbeddingModelPlan {
     fn capture(runtime: &KhiveRuntime) -> Self {
         Self {
@@ -1167,8 +1185,21 @@ impl KhiveRuntime {
         token: &NamespaceToken,
         note: &khive_storage::note::Note,
     ) -> RuntimeResult<crate::retrieval::EmbeddingTruncationReport> {
+        Ok(self
+            .reindex_note_with_diagnostics(token, note)
+            .await?
+            .embedding_truncation)
+    }
+
+    /// Reindex a committed note while retaining model-specific repair
+    /// diagnostics for callers that cannot compensate the durable row.
+    pub(crate) async fn reindex_note_with_diagnostics(
+        &self,
+        token: &NamespaceToken,
+        note: &khive_storage::note::Note,
+    ) -> RuntimeResult<NoteReindexOutcome> {
         let embedding_plan = EmbeddingModelPlan::capture(self);
-        self.reindex_note_with_plan(token, note, &embedding_plan)
+        self.reindex_note_with_plan_diagnostics(token, note, &embedding_plan)
             .await
     }
 
@@ -1178,12 +1209,24 @@ impl KhiveRuntime {
         note: &khive_storage::note::Note,
         embedding_plan: &EmbeddingModelPlan,
     ) -> RuntimeResult<crate::retrieval::EmbeddingTruncationReport> {
+        Ok(self
+            .reindex_note_with_plan_diagnostics(token, note, embedding_plan)
+            .await?
+            .embedding_truncation)
+    }
+
+    async fn reindex_note_with_plan_diagnostics(
+        &self,
+        token: &NamespaceToken,
+        note: &khive_storage::note::Note,
+        embedding_plan: &EmbeddingModelPlan,
+    ) -> RuntimeResult<NoteReindexOutcome> {
         self.text_for_notes(token)?
             .upsert_document(note_fts_document(note))
             .await?;
 
         let ns = note.namespace.clone();
-        let mut report = crate::retrieval::EmbeddingTruncationReport::default();
+        let mut outcome = NoteReindexOutcome::default();
         for model_name in embedding_plan.model_names() {
             match self
                 .embed_document_with_model_outcome_for_token(
@@ -1193,8 +1236,24 @@ impl KhiveRuntime {
                 )
                 .await
             {
-                Ok(outcome) => {
-                    report.observe(&outcome);
+                Ok(embedding) => {
+                    outcome.embedding_truncation.observe(&embedding);
+                    #[cfg(any(test, feature = "fault-injection"))]
+                    let inject_vector_failure = crate::operations::consume_vector_fail_fault(&ns);
+                    #[cfg(not(any(test, feature = "fault-injection")))]
+                    let inject_vector_failure = false;
+                    if inject_vector_failure {
+                        outcome.failures.push(NoteReindexFailure {
+                            stage: "vector_insert",
+                            model: model_name.clone(),
+                        });
+                        tracing::warn!(
+                            model = model_name,
+                            id = %note.id,
+                            "reindex_note: injected vector insert failure, skipping model"
+                        );
+                        continue;
+                    }
                     match self.vectors_for_model(token, model_name) {
                         Ok(vs) => {
                             if let Err(e) = vs
@@ -1203,10 +1262,14 @@ impl KhiveRuntime {
                                     SubstrateKind::Note,
                                     &ns,
                                     "note.content",
-                                    vec![outcome.vector],
+                                    vec![embedding.vector],
                                 )
                                 .await
                             {
+                                outcome.failures.push(NoteReindexFailure {
+                                    stage: "vector_insert",
+                                    model: model_name.clone(),
+                                });
                                 tracing::warn!(
                                     model = model_name,
                                     id = %note.id,
@@ -1215,6 +1278,10 @@ impl KhiveRuntime {
                             }
                         }
                         Err(e) => {
+                            outcome.failures.push(NoteReindexFailure {
+                                stage: "vector_store",
+                                model: model_name.clone(),
+                            });
                             tracing::warn!(
                                 model = model_name,
                                 id = %note.id,
@@ -1224,6 +1291,10 @@ impl KhiveRuntime {
                     }
                 }
                 Err(e) => {
+                    outcome.failures.push(NoteReindexFailure {
+                        stage: "embedding",
+                        model: model_name.clone(),
+                    });
                     tracing::warn!(
                         model = model_name,
                         id = %note.id,
@@ -1232,7 +1303,7 @@ impl KhiveRuntime {
                 }
             }
         }
-        Ok(report)
+        Ok(outcome)
     }
 
     /// Apply a note patch to exactly the supplied read snapshot without

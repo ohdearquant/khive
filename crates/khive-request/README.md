@@ -17,6 +17,13 @@ assert_eq!(req.mode, ExecutionMode::Single);
 let req = parse_request(r#"[memory.recall(query="x"), memory.remember(content="y")]"#)?;
 assert_eq!(req.mode, ExecutionMode::Parallel);
 
+// Independent chain groups in one parallel batch
+let req = parse_request(
+    r#"[create(kind="concept", name="A") | get(id=$prev.id),
+        create(kind="concept", name="B") | get(id=$prev.id)]"#,
+)?;
+assert_eq!(req.groups.len(), 2);
+
 // Chain — `$prev` resolves against the immediately preceding op's result
 let req = parse_request(r#"create(kind="concept", name="X") | link(source_id=$prev.id, target_id="...", relation="extends")"#)?;
 assert_eq!(req.mode, ExecutionMode::Chain);
@@ -33,7 +40,7 @@ form is a parse error (`DslError::PrevRefInJsonForm`).
 
 ## Result types
 
-- `ParsedRequest { ops: Vec<ParsedOp>, mode: ExecutionMode }`
+- `ParsedRequest { ops: Vec<ParsedOp>, mode: ExecutionMode, groups: Vec<ExecutionGroup> }`
 - `ParsedOp { tool: String, args: BTreeMap<String, ArgValue> }`
 - `ArgValue` — `Value(serde_json::Value)` for concrete JSON, `PrevRef { path }` for a
   `$prev`/`$prev.field.path` back-reference, or `Array`/`Object` containers that hold
@@ -41,22 +48,29 @@ form is a parse error (`DslError::PrevRefInJsonForm`).
   straight to `Value`). `ArgValue::resolve_prev` / `resolve_all` resolve references
   against a preceding op's result.
 - `DslError` — a typed enum (`TooManyOps`, `UnexpectedChar`, `InvalidIdentifier`,
-  `PrevRefOutsideChain`, `WriteKeyConflict`, `ReservedEnvelopeArg`, …), surfaced as
-  `invalid_params` at the MCP boundary.
+  `PrevRefOutsideChain`, `ReservedEnvelopeArg`, …), surfaced as `invalid_params`
+  at the MCP boundary. `WriteKeyConflict` remains available to the test-only
+  batch scanner; production conflict handling uses per-op execution envelopes.
 
 ## Semantics
 
 - **`MAX_OPS`** (100) caps operations per request; exceeding it is `DslError::TooManyOps`.
 - **`$prev` is chain-only.** A `$prev` reference outside `|` chain mode, or anywhere in
   JSON form, is rejected at parse time rather than deferred to a runtime lookup miss.
+- **Parallel batches may contain chain groups.** Commas delimit independently
+  scheduled groups; `|` joins sequential operations within one group. Failure
+  aborts only that group's tail, and the 100-op cap counts flattened operations.
 - **Write-key conflict detection** (`write_keys_for_op_pub`) is a preflight check over a
   parallel batch: two ops that target the same UUID via `update`/`delete` (`id`),
-  `merge` (`into_id`/`from_id`), or `link` (`source_id`/`target_id`) reject the whole
-  batch before any op dispatches, rather than racing.
+  `merge` (`into_id`/`from_id`), or `link` (`source_id`/`target_id`) receive
+  operation-local conflict errors while non-conflicting operations still dispatch.
+  In bracketed chain groups, conflicts are checked across groups: preceding
+  non-conflicting members execute, the actual conflicting member fails, and only
+  that group's tail aborts.
 - **`RESERVED_ENVELOPE_ARGS`** (`presentation`, `presentation_per_op`) are
   envelope-level fields; passing them inside a verb's own argument list is rejected
   (`DslError::ReservedEnvelopeArg`).
-- Mixing `,` and `|` at the top level is rejected (`DslError::MixedSeparators`), as is
+- Mixing `,` and `|` without batch brackets is rejected (`DslError::MixedSeparators`), as is
   a dotted verb name with more than one level, e.g. `a.b.c` (`UnsupportedVerbNesting`) —
   only single-level `pack.verb` names are supported.
 

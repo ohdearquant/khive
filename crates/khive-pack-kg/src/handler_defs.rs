@@ -18,7 +18,7 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 20] = [
     // Commissive: commits an entity or note to the namespace
     HandlerDef {
         name: "create",
-        description: "Create an entity or note (singleton) or a batch of entities (bulk via `items`).",
+        description: "Create an entity or note (singleton) or a mixed batch via `items`.",
         visibility: Visibility::Verb,
         category: VerbCategory::Commissive,
         params: &[
@@ -55,7 +55,13 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 20] = [
                 name: "content",
                 param_type: "string",
                 required: false,
-                description: "Body text (notes, singleton path).",
+                description: "Required body text for singleton and bulk note creates.",
+            },
+            ParamDef {
+                name: "salience",
+                param_type: "number",
+                required: false,
+                description: "Optional note salience in the inclusive range [0.0, 1.0].",
             },
             ParamDef {
                 name: "description",
@@ -92,31 +98,34 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 20] = [
                 description: "Arbitrary JSON properties.",
             },
             ParamDef {
+                name: "external_id",
+                param_type: "string",
+                required: false,
+                description: "Note-only natural key. Normalized to `properties.external_id`; retries in the same namespace and note kind return the canonical existing row.",
+            },
+            ParamDef {
                 name: "items",
                 param_type: "array of object",
                 required: false,
-                description: "Bulk entity creation. Each element is an object with \
-                              `kind` (required), `name` (required), and optional \
-                              `entity_kind`, `entity_type`, `description`, `properties`, \
-                              `tags`. When present, the top-level `kind` is NOT required. \
-                              Capped at 1000 entries per request. Bulk-created entities \
-                              skip vector embedding and are not vector-searchable until \
-                              a subsequent `reindex` call.",
+                description: "Mixed bulk creation. Each item requires `kind`; entities \
+                              require `name`, notes require `content` and may include \
+                              `note_kind`, `salience`, or `external_id`. When present, \
+                              top-level `kind` is not required. Capped at 1000 entries.",
             },
             ParamDef {
                 name: "atomic",
                 param_type: "bool",
                 required: false,
-                description: "Bulk path only. When true (default), all items succeed or \
-                              none are written. When false, items are attempted individually \
-                              and per-item errors are collected in the response.",
+                description: "Bulk path only. False by default: items are attempted \
+                              independently with ordered per-item results. When true, all \
+                              entity/note rows and FTS documents commit together or none do.",
             },
             ParamDef {
                 name: "verbose",
                 param_type: "bool",
                 required: false,
-                description: "Bulk path only. When true, the response includes the full \
-                              entity objects in an `entities` array.",
+                description: "Bulk path only. When true, full records are included in \
+                              `entities` and `notes` arrays.",
             },
         ],
     },

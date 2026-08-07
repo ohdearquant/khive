@@ -27,6 +27,13 @@ pub struct Note {
     pub deleted_at: Option<i64>,
 }
 
+/// Canonical result of inserting a note through an explicit natural key.
+#[derive(Clone, Debug)]
+pub struct NoteInsertOutcome {
+    pub note: Note,
+    pub created: bool,
+}
+
 impl Note {
     /// Create a new note with a generated UUID and current timestamp.
     pub fn new(
@@ -505,6 +512,13 @@ pub trait NoteStore: Send + Sync + 'static {
         }
         Ok(total)
     }
+
+    /// Insert without overwriting and return the canonical live natural-key row.
+    ///
+    /// `created=false` is returned only when a live note with the same
+    /// non-empty `external_id` already exists in the same namespace and kind.
+    /// The insert and canonical lookup must share one writer transaction.
+    async fn insert_note_natural_key(&self, note: Note) -> StorageResult<NoteInsertOutcome>;
 
     /// Attempt to insert a note without overwriting an existing row.
     ///

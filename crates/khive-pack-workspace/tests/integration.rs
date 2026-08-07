@@ -2,13 +2,20 @@
 //! registration, `REQUIRES`, the five `contains` endpoint rules (positive +
 //! negative), and `name`/`schema_version` validation on create.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+
+use async_trait::async_trait;
 use khive_pack_git::GitPack;
 use khive_pack_gtd::GtdPack;
 use khive_pack_kg::KgPack;
 use khive_pack_session::SessionPack;
 use khive_pack_workspace::WorkspacePack;
-use khive_runtime::{KhiveRuntime, VerbRegistry, VerbRegistryBuilder};
-use khive_types::Pack;
+use khive_runtime::pack::PackRuntime;
+use khive_runtime::{
+    KhiveRuntime, KindHook, NamespaceToken, RuntimeError, VerbRegistry, VerbRegistryBuilder,
+};
+use khive_types::{HandlerDef, Pack};
 use serde_json::json;
 use uuid::Uuid;
 
@@ -26,6 +33,114 @@ fn build_registry(rt: KhiveRuntime) -> VerbRegistry {
     let registry = builder.build().expect("registry builds");
     rt.install_edge_rules(registry.all_edge_rules());
     registry
+}
+
+#[derive(Debug)]
+struct CountingEntityHook {
+    prepare_calls: Arc<AtomicUsize>,
+    after_calls: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl KindHook for CountingEntityHook {
+    async fn prepare_create(
+        &self,
+        _runtime: &KhiveRuntime,
+        args: &mut serde_json::Value,
+    ) -> Result<(), RuntimeError> {
+        self.prepare_calls.fetch_add(1, Ordering::SeqCst);
+        let properties = args
+            .as_object_mut()
+            .expect("create args are an object")
+            .entry("properties")
+            .or_insert_with(|| json!({}))
+            .as_object_mut()
+            .ok_or_else(|| RuntimeError::InvalidInput("properties must be an object".into()))?;
+        if properties
+            .get("reject_hook")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+        {
+            return Err(RuntimeError::InvalidInput("hook rejected item".into()));
+        }
+        properties.insert("hook_prepared".to_string(), json!(true));
+        Ok(())
+    }
+
+    async fn after_create(
+        &self,
+        _runtime: &KhiveRuntime,
+        _id: Uuid,
+        args: &serde_json::Value,
+    ) -> Result<(), RuntimeError> {
+        if args["properties"]["hook_prepared"] != json!(true) {
+            return Err(RuntimeError::Internal(
+                "after_create did not receive prepared params".into(),
+            ));
+        }
+        self.after_calls.fetch_add(1, Ordering::SeqCst);
+        if args["properties"]["fail_after"] == json!(true) {
+            return Err(RuntimeError::Internal(
+                "injected after_create failure".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+struct HookProbePack {
+    hook: Arc<CountingEntityHook>,
+}
+
+impl Pack for HookProbePack {
+    const NAME: &'static str = "hook-probe";
+    const NOTE_KINDS: &'static [&'static str] = &["hook_probe_note"];
+    const ENTITY_KINDS: &'static [&'static str] = &["hook_probe"];
+    const HANDLERS: &'static [HandlerDef] = &[];
+    const REQUIRES: &'static [&'static str] = &["kg"];
+}
+
+#[async_trait]
+impl PackRuntime for HookProbePack {
+    fn name(&self) -> &str {
+        <Self as Pack>::NAME
+    }
+
+    fn note_kinds(&self) -> &'static [&'static str] {
+        <Self as Pack>::NOTE_KINDS
+    }
+
+    fn entity_kinds(&self) -> &'static [&'static str] {
+        <Self as Pack>::ENTITY_KINDS
+    }
+
+    fn handlers(&self) -> &'static [HandlerDef] {
+        <Self as Pack>::HANDLERS
+    }
+
+    fn requires(&self) -> &'static [&'static str] {
+        <Self as Pack>::REQUIRES
+    }
+
+    fn kind_hook(&self, kind: &str) -> Option<Arc<dyn KindHook>> {
+        if matches!(kind, "hook_probe" | "hook_probe_note") {
+            Some(self.hook.clone())
+        } else {
+            None
+        }
+    }
+
+    async fn dispatch(
+        &self,
+        verb: &str,
+        _params: serde_json::Value,
+        _registry: &VerbRegistry,
+        _token: &NamespaceToken,
+    ) -> Result<serde_json::Value, RuntimeError> {
+        Err(RuntimeError::InvalidInput(format!(
+            "HookProbePack does not handle verb {verb:?}"
+        )))
+    }
 }
 
 async fn create_workspace(registry: &VerbRegistry, name: &str) -> String {
@@ -79,6 +194,201 @@ async fn create_workspace_rejects_missing_schema_version() {
     assert!(
         err.to_string().contains("schema_version"),
         "error should mention schema_version; got: {err}"
+    );
+}
+
+#[tokio::test]
+async fn bulk_create_workspace_runs_hook_per_item_in_best_effort_mode() {
+    let registry = build_registry(rt());
+    let response = registry
+        .dispatch(
+            "create",
+            json!({
+                "items": [
+                    {
+                        "kind": "workspace",
+                        "name": "bulk-valid",
+                        "properties": {"schema_version": 1}
+                    },
+                    {"kind": "workspace", "name": "bulk-missing-schema"}
+                ]
+            }),
+        )
+        .await
+        .expect("best-effort bulk create returns ordered per-item outcomes");
+
+    assert_eq!(response["attempted"], 2);
+    assert_eq!(response["created"], 1);
+    assert_eq!(response["failed"], 1);
+    assert_eq!(response["results"][0]["ok"], true);
+    assert_eq!(response["results"][1]["ok"], false);
+    assert!(response["results"][1]["error"]
+        .as_str()
+        .is_some_and(|error| error.contains("schema_version")));
+
+    let listed = registry
+        .dispatch("list", json!({"kind": "workspace"}))
+        .await
+        .expect("workspace list succeeds");
+    let names = listed["items"]
+        .as_array()
+        .expect("list returns items")
+        .iter()
+        .filter_map(|item| item["name"].as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(names, vec!["bulk-valid"]);
+}
+
+#[tokio::test]
+async fn atomic_bulk_create_workspace_hook_failure_writes_nothing() {
+    let registry = build_registry(rt());
+    let error = registry
+        .dispatch(
+            "create",
+            json!({
+                "atomic": true,
+                "items": [
+                    {
+                        "kind": "workspace",
+                        "name": "atomic-valid",
+                        "properties": {"schema_version": 1}
+                    },
+                    {"kind": "workspace", "name": "atomic-missing-schema"}
+                ]
+            }),
+        )
+        .await
+        .expect_err("a hook-invalid item rejects the atomic bulk create");
+    assert!(error.to_string().contains("schema_version"));
+
+    let listed = registry
+        .dispatch("list", json!({"kind": "workspace"}))
+        .await
+        .expect("workspace list succeeds");
+    assert_eq!(listed["items"].as_array().map(Vec::len), Some(0));
+}
+
+#[tokio::test]
+async fn bulk_entity_hook_runs_after_create_only_for_persisted_items() {
+    let runtime = rt();
+    let prepare_calls = Arc::new(AtomicUsize::new(0));
+    let after_calls = Arc::new(AtomicUsize::new(0));
+    let hook = Arc::new(CountingEntityHook {
+        prepare_calls: prepare_calls.clone(),
+        after_calls: after_calls.clone(),
+    });
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(KgPack::new(runtime));
+    builder.register(HookProbePack { hook });
+    let registry = builder.build().expect("registry builds");
+
+    let response = registry
+        .dispatch(
+            "create",
+            json!({
+                "items": [
+                    {"kind": "hook_probe", "name": "persisted"},
+                    {
+                        "kind": "hook_probe",
+                        "name": "rejected",
+                        "properties": {"reject_hook": true}
+                    }
+                ]
+            }),
+        )
+        .await
+        .expect("best-effort bulk create returns per-item outcomes");
+
+    assert_eq!(response["created"], 1);
+    assert_eq!(response["failed"], 1);
+    assert_eq!(prepare_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        after_calls.load(Ordering::SeqCst),
+        1,
+        "after_create must run only for the persisted item and receive the prepared params"
+    );
+    let listed = registry
+        .dispatch("list", json!({"kind": "hook_probe"}))
+        .await
+        .expect("probe list succeeds");
+    assert_eq!(listed["items"].as_array().map(Vec::len), Some(1));
+    assert_eq!(listed["items"][0]["properties"]["hook_prepared"], true);
+}
+
+#[tokio::test]
+async fn singleton_note_after_create_failure_is_returned_as_structured_repair_stage() {
+    let runtime = rt();
+    let prepare_calls = Arc::new(AtomicUsize::new(0));
+    let after_calls = Arc::new(AtomicUsize::new(0));
+    let hook = Arc::new(CountingEntityHook {
+        prepare_calls,
+        after_calls: after_calls.clone(),
+    });
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(KgPack::new(runtime));
+    builder.register(HookProbePack { hook });
+    let registry = builder.build().expect("registry builds");
+
+    let response = registry
+        .dispatch(
+            "create",
+            json!({
+                "kind": "hook_probe_note",
+                "content": "singleton hook diagnostic",
+                "properties": {"fail_after": true}
+            }),
+        )
+        .await
+        .expect("after_create failure must not erase the committed note");
+
+    assert_eq!(after_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(response["post_commit_failures"][0], response["id"]);
+    assert_eq!(
+        response["post_commit_failure_details"][0]["stages"][0]["stage"],
+        "after_create"
+    );
+    assert!(response["post_commit_failure_details"][0]["stages"][0]
+        .get("model")
+        .is_none());
+}
+
+#[tokio::test]
+async fn bulk_note_after_create_failure_is_returned_as_structured_repair_stage() {
+    let runtime = rt();
+    let prepare_calls = Arc::new(AtomicUsize::new(0));
+    let after_calls = Arc::new(AtomicUsize::new(0));
+    let hook = Arc::new(CountingEntityHook {
+        prepare_calls,
+        after_calls: after_calls.clone(),
+    });
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(KgPack::new(runtime));
+    builder.register(HookProbePack { hook });
+    let registry = builder.build().expect("registry builds");
+
+    let response = registry
+        .dispatch(
+            "create",
+            json!({
+                "items": [{
+                    "kind": "hook_probe_note",
+                    "content": "bulk hook diagnostic",
+                    "properties": {"fail_after": true}
+                }]
+            }),
+        )
+        .await
+        .expect("after_create failure must not erase the committed bulk note");
+
+    assert_eq!(after_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(response["created"], 1);
+    assert_eq!(
+        response["post_commit_failures"][0],
+        response["results"][0]["id"]
+    );
+    assert_eq!(
+        response["post_commit_failure_details"][0]["stages"][0]["stage"],
+        "after_create"
     );
 }
 

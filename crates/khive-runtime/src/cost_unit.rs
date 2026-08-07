@@ -17,18 +17,24 @@
 use serde_json::Value;
 
 /// True when `verb` is one of ADR-103 Amendment 1's closed
-/// embedding-bearing verb families, given the request's own top-level
-/// params.
+/// embedding-bearing verb families, given the request and successful result.
 ///
-/// `params` is needed only to tell a singleton `create` from a bulk
-/// `create(items=[...])`: the amendment explicitly carves bulk create out as
-/// non-embedding-bearing (`create_many` intentionally skips embedding and
-/// backfills vectors later via a separate `reindex` call,
-/// `crates/khive-runtime/src/operations.rs:4698-4709`), regardless of its
-/// own `created`/`attempted` summary counts.
-fn is_embedding_bearing(verb: &str, params: &Value) -> bool {
+/// A newly persisted singleton create is embedding-bearing. A natural-key
+/// retry is not. Bulk create embeds only newly created notes; the handler
+/// reports that exact count as `created_notes`.
+fn is_embedding_bearing(verb: &str, params: &Value, result: &Value) -> bool {
     match verb {
-        "create" => params.get("items").is_none(),
+        "create" => {
+            if params.get("items").is_some() {
+                result
+                    .get("created_notes")
+                    .and_then(Value::as_i64)
+                    .unwrap_or(0)
+                    > 0
+            } else {
+                result.get("created").and_then(Value::as_bool) != Some(false)
+            }
+        }
         "update" | "memory.remember" | "memory.recall" | "knowledge.search"
         | "knowledge.compose" | "knowledge.index" => true,
         _ => false,
@@ -46,8 +52,8 @@ fn base_weight(_verb: &str) -> i64 {
 /// case is not a default: it is ADR-103 Amendment 1's normative
 /// requirement that a non-embedding-bearing verb's `cost_unit` reduces to
 /// `base_weight(verb)` alone, `item_count`/`model_count` playing no role.
-fn per_item_weight(verb: &str, params: &Value) -> i64 {
-    if is_embedding_bearing(verb, params) {
+fn per_item_weight(verb: &str, params: &Value, result: &Value) -> i64 {
+    if is_embedding_bearing(verb, params, result) {
         1
     } else {
         0
@@ -58,18 +64,23 @@ fn per_item_weight(verb: &str, params: &Value) -> i64 {
 /// table. Only meaningful (and only called by [`cost_unit_for_dispatch`])
 /// when `per_item_weight` is nonzero for this verb.
 ///
-/// - `create` singleton, `memory.remember`, `update`, `memory.recall`,
-///   `knowledge.search`, `knowledge.compose`: always `1`, each is a single
-///   entity/note write or a single query embedding, never a batch.
+/// - `create`: bulk `result["created_notes"]`; singleton is `1` when newly
+///   persisted and `0` for a natural-key retry.
+/// - `memory.remember`, `update`, `memory.recall`, `knowledge.search`,
+///   `knowledge.compose`: always `1`.
 /// - `knowledge.index`: `result["total"]`, the full paged corpus count
 ///   computed across all internally paged reads, never the internal
 ///   `batch_size` chunk ceiling (`clamp(1, 1000)` on the embed-grouping
 ///   page size only, not the dispatch's total work).
 fn item_count(verb: &str, result: &Value) -> i64 {
-    if verb == "knowledge.index" {
-        result.get("total").and_then(Value::as_i64).unwrap_or(0)
-    } else {
-        1
+    match verb {
+        "create" if result.get("created").and_then(Value::as_bool) == Some(false) => 0,
+        "create" => result
+            .get("created_notes")
+            .and_then(Value::as_i64)
+            .unwrap_or(1),
+        "knowledge.index" => result.get("total").and_then(Value::as_i64).unwrap_or(0),
+        _ => 1,
     }
 }
 
@@ -79,9 +90,9 @@ fn item_count(verb: &str, result: &Value) -> i64 {
 ///
 /// `registered_model_count` is evaluated lazily via `FnOnce`, called only
 /// for the two verb families whose `model_count` is not a per-dispatch
-/// constant (`memory.remember`'s implicit-model case, and singleton
-/// `create`), so every other dispatch never touches the runtime's embedder
-/// registry.
+/// constant (`memory.remember`'s implicit-model case, and embedding-bearing
+/// `create`, including bulk notes), so every other dispatch never touches the
+/// runtime's embedder registry.
 ///
 /// `0` is a valid, deliberate result when no embedding model is registered
 /// at all: no embed call is issued, so the whole
@@ -146,7 +157,7 @@ pub fn cost_unit_for_dispatch(
     result: &Value,
     registered_model_count: impl FnOnce() -> i64,
 ) -> i64 {
-    let weight = per_item_weight(verb, params);
+    let weight = per_item_weight(verb, params, result);
     if weight == 0 {
         return compute(base_weight(verb), 0, 0, 0);
     }
@@ -294,7 +305,7 @@ mod tests {
         assert_eq!(cost, 1);
     }
 
-    // ---- Bulk create is base-only ----
+    // ---- Bulk entity create is base-only; bulk notes are attributed ----
 
     #[test]
     fn bulk_create_is_base_weight_only_never_touches_model_count() {
@@ -308,6 +319,34 @@ mod tests {
             cost, 1,
             "bulk create(items=[...]) skips embedding entirely -> base_weight(verb) alone"
         );
+    }
+
+    #[test]
+    fn bulk_note_create_scales_with_newly_indexed_notes() {
+        let cost = cost_unit_for_dispatch(
+            "create",
+            &json!({
+                "items": [
+                    {"kind": "concept", "name": "a"},
+                    {"kind": "observation", "content": "one"},
+                    {"kind": "observation", "content": "dedup"}
+                ]
+            }),
+            &json!({"attempted": 3, "created": 2, "created_notes": 1, "skipped": 1}),
+            || 2,
+        );
+        assert_eq!(cost, 3, "base plus one note across two models");
+    }
+
+    #[test]
+    fn idempotent_singleton_note_retry_is_base_weight_only() {
+        let cost = cost_unit_for_dispatch(
+            "create",
+            &json!({"kind": "observation", "content": "retry", "external_id": "source:1"}),
+            &json!({"id": "canonical", "created": false, "deduplicated": true}),
+            || panic!("deduplicated singleton must not inspect embedding models"),
+        );
+        assert_eq!(cost, 1);
     }
 
     #[test]

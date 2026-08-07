@@ -298,6 +298,24 @@ fn validate_conditional_requirements(
     // early-exit on `items` before the singleton `kind` requirement is even
     // checked.
     if has_items {
+        if args.contains_key("external_id") {
+            return Err(RuntimeError::InvalidInput(
+                "schedule.action: verb \"create\": external_id belongs on each bulk note item, not beside `items`"
+                    .into(),
+            ));
+        }
+        // `handle_create` accepts these options only as JSON booleans. Replay
+        // validation must reject the same malformed actions before persisting a
+        // scheduled event instead of deferring the failure until fire time.
+        for option in ["atomic", "verbose"] {
+            if let Some(value) = args.get(option) {
+                if !matches!(value.as_value(), Some(Value::Bool(_))) {
+                    return Err(RuntimeError::InvalidInput(format!(
+                        "schedule.action: verb \"create\": {option} must be a boolean"
+                    )));
+                }
+            }
+        }
         let items_value = args
             .get("items")
             .and_then(khive_request::ArgValue::as_value)
@@ -323,6 +341,12 @@ fn validate_conditional_requirements(
 
     match classify_create_kind(kind_str, registry)? {
         CreateKindClass::Entity { specific } => {
+            if args.contains_key("external_id") {
+                return Err(RuntimeError::InvalidInput(
+                    "schedule.action: verb \"create\": external_id is only valid for kind=note"
+                        .into(),
+                ));
+            }
             let canonical = reconcile_specific_for_replay(
                 "",
                 specific,
@@ -358,13 +382,20 @@ fn validate_conditional_requirements(
             )?;
         }
         CreateKindClass::Note { specific } => {
-            reconcile_specific_for_replay(
+            let canonical = reconcile_specific_for_replay(
                 "",
                 specific,
                 note_kind_arg,
                 |s| canonical_note_kind_for_replay(s, registry),
                 "note_kind",
-            )?;
+            )?
+            .unwrap_or_else(|| "observation".to_string());
+            if canonical == "scheduled_event" {
+                return Err(RuntimeError::InvalidInput(
+                    "schedule.action: verb \"create\": scheduled_event is not creatable through `create`"
+                        .into(),
+                ));
+            }
             let content = args
                 .get("content")
                 .and_then(khive_request::ArgValue::as_value)
@@ -376,6 +407,13 @@ fn validate_conditional_requirements(
                     "schedule.action: verb \"create\": note creation requires `content`".into(),
                 ));
             }
+            validate_note_external_id_for_replay(
+                args.get("external_id")
+                    .and_then(khive_request::ArgValue::as_value),
+                args.get("properties")
+                    .and_then(khive_request::ArgValue::as_value),
+                "schedule.action: verb \"create\":",
+            )?;
         }
     }
 
@@ -574,18 +612,73 @@ fn reconcile_specific_for_replay(
 #[allow(dead_code)] // fields exist only to mirror BulkCreateEntry's deserialize shape
 struct ScheduleBulkCreateEntryCheck {
     kind: String,
-    name: String,
+    name: Option<String>,
+    content: Option<String>,
     entity_kind: Option<String>,
+    note_kind: Option<String>,
     entity_type: Option<String>,
     description: Option<String>,
     properties: Option<Value>,
     tags: Option<Vec<String>>,
+    salience: Option<f64>,
+    #[serde(default, deserialize_with = "present_bulk_json_value")]
+    external_id: Option<Value>,
+}
+
+fn present_bulk_json_value<'de, D>(deserializer: D) -> Result<Option<Value>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Value::deserialize(deserializer).map(Some)
+}
+
+fn validate_note_external_id_for_replay(
+    external_id: Option<&Value>,
+    properties: Option<&Value>,
+    context: &str,
+) -> Result<(), RuntimeError> {
+    let explicit = match external_id {
+        None => None,
+        Some(Value::String(value)) if !value.trim().is_empty() => Some(value.as_str()),
+        Some(_) => {
+            return Err(RuntimeError::InvalidInput(format!(
+                "{context} external_id must be a non-empty string"
+            )));
+        }
+    };
+    let property = match properties {
+        Some(Value::Object(properties)) => match properties.get("external_id") {
+            None => None,
+            Some(Value::String(value)) if !value.trim().is_empty() => Some(value.as_str()),
+            Some(_) => {
+                return Err(RuntimeError::InvalidInput(format!(
+                    "{context} properties.external_id must be a non-empty string"
+                )));
+            }
+        },
+        Some(Value::Null) | None => None,
+        Some(_) if explicit.is_some() => {
+            return Err(RuntimeError::InvalidInput(format!(
+                "{context} external_id cannot be merged into non-object properties"
+            )));
+        }
+        Some(_) => None,
+    };
+    if explicit
+        .zip(property)
+        .is_some_and(|(left, right)| left != right)
+    {
+        return Err(RuntimeError::InvalidInput(format!(
+            "{context} external_id disagrees with properties.external_id"
+        )));
+    }
+    Ok(())
 }
 
 /// Validate a `create(items=[...])` bulk payload the way `handle_create`'s
 /// bulk path would: `items` must parse into the same shape as
-/// `BulkCreateEntry` (required `kind` + `name`, deny-unknown-fields), and
-/// bulk create only supports entity kinds (never note kinds).
+/// `BulkCreateEntry` (required `kind`, deny-unknown-fields), with the
+/// substrate-specific `name`/`content` requirement checked below.
 fn validate_create_bulk_items(
     items_value: &Value,
     registry: &VerbRegistry,
@@ -606,6 +699,15 @@ fn validate_create_bulk_items(
     for (idx, entry) in entries.iter().enumerate() {
         match classify_create_kind(&entry.kind, registry)? {
             CreateKindClass::Entity { specific } => {
+                if entry.content.is_some()
+                    || entry.note_kind.is_some()
+                    || entry.salience.is_some()
+                    || entry.external_id.is_some()
+                {
+                    return Err(RuntimeError::InvalidInput(format!(
+                        "schedule.action: verb \"create\": items[{idx}] content, note_kind, salience, and external_id are note-only fields"
+                    )));
+                }
                 let canonical = reconcile_specific_for_replay(
                     &format!("items[{idx}] "),
                     specific,
@@ -626,13 +728,60 @@ fn validate_create_bulk_items(
                             "schedule.action: verb \"create\": items[{idx}] {e}"
                         ))
                     })?;
+                if entry
+                    .name
+                    .as_deref()
+                    .map(str::trim)
+                    .unwrap_or("")
+                    .is_empty()
+                {
+                    return Err(RuntimeError::InvalidInput(format!(
+                        "schedule.action: verb \"create\": items[{idx}] entity creation requires `name`"
+                    )));
+                }
             }
-            CreateKindClass::Note { .. } => {
-                return Err(RuntimeError::InvalidInput(format!(
-                    "schedule.action: verb \"create\": items[{idx}] bulk create only supports \
-                     entity kinds; got kind={:?}",
-                    entry.kind
-                )));
+            CreateKindClass::Note { specific } => {
+                if entry.entity_kind.is_some() || entry.entity_type.is_some() {
+                    return Err(RuntimeError::InvalidInput(format!(
+                        "schedule.action: verb \"create\": items[{idx}] entity_kind and entity_type are entity-only fields"
+                    )));
+                }
+                let canonical = reconcile_specific_for_replay(
+                    &format!("items[{idx}] "),
+                    specific,
+                    entry.note_kind.as_deref(),
+                    |s| canonical_note_kind_for_replay(s, registry),
+                    "note_kind",
+                )?
+                .unwrap_or_else(|| "observation".to_string());
+                if canonical == "scheduled_event" {
+                    return Err(RuntimeError::InvalidInput(format!(
+                        "schedule.action: verb \"create\": items[{idx}] scheduled_event is not creatable through `create`"
+                    )));
+                }
+                if entry
+                    .content
+                    .as_deref()
+                    .map(str::trim)
+                    .unwrap_or("")
+                    .is_empty()
+                {
+                    return Err(RuntimeError::InvalidInput(format!(
+                        "schedule.action: verb \"create\": items[{idx}] note creation requires `content`"
+                    )));
+                }
+                if let Some(salience) = entry.salience {
+                    if !salience.is_finite() || !(0.0..=1.0).contains(&salience) {
+                        return Err(RuntimeError::InvalidInput(format!(
+                            "schedule.action: verb \"create\": items[{idx}] salience must be a finite value in [0.0, 1.0]"
+                        )));
+                    }
+                }
+                validate_note_external_id_for_replay(
+                    entry.external_id.as_ref(),
+                    entry.properties.as_ref(),
+                    &format!("schedule.action: verb \"create\": items[{idx}]"),
+                )?;
             }
         }
     }

@@ -157,7 +157,7 @@ shipped semantic allowlist by speech act, which is this section's actual subject
 
 | Verb             | Speech act  | Description                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
 | ---------------- | ----------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `create`         | commissive  | Create an entity or note. Bulk shape: pass `items` (array of entity specs, `kind` + `name` required per item, capped at 1000) instead of a top-level `kind`; `atomic` (default `true`) controls all-or-nothing vs. best-effort per-item semantics, and `verbose` includes the created entity objects in the response. Bulk-created entities skip vector embedding until a subsequent `reindex`.                                                                                                                                                                                                        |
+| `create`         | commissive  | Create an entity or note. Bulk shape: pass mixed entity/note `items` (each has `kind`; entities require `name`, notes require `content`, capped at 1000). Best effort is the default; `atomic=true` selects one all-or-nothing mixed row/FTS transaction. Notes may use `external_id` as an idempotent natural key.                                                                                                                                                                                                                                                                                    |
 | `get`            | assertive   | Fetch any record by UUID                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
 | `list`           | assertive   | Structured browse with pagination                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
 | `update`         | declaration | Patch entity or edge fields                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
@@ -668,6 +668,33 @@ cursor stability does not freeze mutable row membership.
 Message-property filters remain a bounded post-filter scan. In cursor mode, reaching the
 10,000-row safety ceiling returns `scan_incomplete: true` plus the last safe scan boundary,
 so callers can continue instead of mistaking a bounded scan for corpus exhaustion.
+
+## Amendment: mixed, idempotent bulk create (2026-08-06)
+
+The kg `create` verb accepts mixed entity and note entries in `items`. Every
+item carries `kind`; entities require `name`, notes require `content`. The bulk
+default is best effort (`atomic=false`): deserialization, kind-hook preparation,
+validation, and persistence are isolated per item, and `results` contains one
+ordered `{index, ok, ...}` entry per input. `atomic=true` is an explicit
+all-or-nothing mode: every item validates before a single transaction commits
+entity/note rows and both FTS substrates.
+
+Notes may carry a non-empty `external_id`, either at the item/singleton top
+level or as `properties.external_id`; if both are supplied they must match.
+The handler normalizes the value to properties. The storage natural key is
+`(namespace, note kind, external_id)` over live rows. Its atomic insert returns
+either the newly created note or the complete canonical existing row, so races
+and retries receive the same UUID. A duplicate counts as `skipped` and reports
+`created=false`, `deduplicated=true`; ordinary notes without an external ID
+retain create-always semantics. Post-commit hooks and indexing run only for the
+winner, and a natural-key winner is never compensated away after its UUID may
+have become externally visible. Entity and note entries both run their
+pack-owned `prepare_create` hooks before persistence and `after_create` only for
+created rows. A committed note with a failed post-commit stage stays successful
+but reports its UUID in `post_commit_failures` and structured stage/model repair
+data in `post_commit_failure_details`. Stage names preserve the failing boundary:
+`fts`, `embedding`, `vector_store`, `vector_insert`, `annotates`, or
+`after_create`; embedding/vector stages include the affected model when known.
 
 ## Amendment: bounded traversal surface (2026-08-01)
 

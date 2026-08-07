@@ -20,27 +20,31 @@ This public helper checks a runtime `serde_json::Value`, including handler resul
 
 ## `DslError`
 
-| Variant                  | Condition                                                            |
-| ------------------------ | -------------------------------------------------------------------- |
-| `Empty`                  | no input after trimming                                              |
-| `TooManyOps`             | operation count exceeds `MAX_OPS`                                    |
-| `InputTooLarge`          | byte length exceeds `MAX_OPS_INPUT_LEN`                              |
-| `NestingTooDeep`         | array/object depth exceeds `NESTING_DEPTH_LIMIT`                     |
-| `UnexpectedChar`         | wrong delimiter or token at a byte position                          |
-| `UnexpectedEof`          | input ends before a required token                                   |
-| `InvalidIdentifier`      | identifier violates the ASCII identifier grammar                     |
-| `DuplicateArg`           | one operation repeats an argument name                               |
+| Variant                  | Condition                                                                                                                                                                    |
+| ------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `Empty`                  | no input after trimming                                                                                                                                                      |
+| `TooManyOps`             | operation count exceeds `MAX_OPS`                                                                                                                                            |
+| `InputTooLarge`          | byte length exceeds `MAX_OPS_INPUT_LEN`                                                                                                                                      |
+| `NestingTooDeep`         | array/object depth exceeds `NESTING_DEPTH_LIMIT`                                                                                                                             |
+| `UnexpectedChar`         | wrong delimiter or token at a byte position                                                                                                                                  |
+| `UnexpectedEof`          | input ends before a required token                                                                                                                                           |
+| `InvalidIdentifier`      | identifier violates the ASCII identifier grammar                                                                                                                             |
+| `DuplicateArg`           | one operation repeats an argument name                                                                                                                                       |
 | `InvalidValue`           | function-form value cannot be decoded or reference syntax is invalid; an unquoted bareword names the quoting fix (and the corrected call, when the argument or key is known) |
-| `InvalidJson`            | JSON form is malformed or has the wrong shape                        |
-| `UnclosedString`         | quoted string has no terminator                                      |
-| `UnclosedBracket`        | array, object, or parenthesis has no matching close                  |
-| `PrevRefOutsideChain`    | function-form `$prev` appears in single/parallel mode                |
-| `PrevRefInJsonForm`      | JSON string contains a `$prev` reference                             |
-| `MixedSeparators`        | top level mixes parallel comma and chain pipe                        |
-| `EmptyBatch`             | `[]` contains no operations                                          |
-| `UnsupportedVerbNesting` | a tool name has more than one dot                                    |
-| `WriteKeyConflict`       | two parallel operations claim the same derived write key             |
-| `ReservedEnvelopeArg`    | an operation contains an envelope-only field                         |
-| `TrailingComma`          | a batch element list ends `,` immediately before its closing `]`     |
+| `InvalidJson`            | JSON form is malformed or has the wrong shape                                                                                                                                |
+| `UnclosedString`         | quoted string has no terminator                                                                                                                                              |
+| `UnclosedBracket`        | array, object, or parenthesis has no matching close                                                                                                                          |
+| `PrevRefOutsideChain`    | function-form `$prev` appears in single/parallel mode                                                                                                                        |
+| `PrevRefInJsonForm`      | JSON string contains a `$prev` reference                                                                                                                                     |
+| `MixedSeparators`        | unbracketed input mixes parallel comma and chain pipe                                                                                                                        |
+| `EmptyBatch`             | `[]` contains no operations                                                                                                                                                  |
+| `UnsupportedVerbNesting` | a tool name has more than one dot                                                                                                                                            |
+| `WriteKeyConflict`       | test-only batch scanner finds two operations claiming the same derived write key                                                                                             |
+| `ReservedEnvelopeArg`    | an operation contains an envelope-only field                                                                                                                                 |
+| `TrailingComma`          | a batch element list ends `,` immediately before its closing `]`                                                                                                             |
 
-Display messages are actionable and retain values such as byte position, count, duplicated argument, conflicting tools, or reserved field. The enum implements `std::error::Error` and is surfaced as invalid request parameters rather than an operation-level execution failure.
+Display messages are actionable and retain values such as byte position, count,
+duplicated argument, conflicting tools, or reserved field. The enum implements
+`std::error::Error`. Parser errors surface as invalid request parameters;
+production write conflicts instead occupy the affected operations' result
+entries so unrelated work can continue.

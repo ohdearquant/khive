@@ -1,7 +1,7 @@
-"""Contract tests: create(items=[...]) bulk entity creation semantics.
+"""Contract tests: create(items=[...]) mixed entity/note semantics.
 
 ADR: ADR-017 (pack standard)
-section: bulk entity creation; atomic vs non-atomic path; spec-building failure semantics
+section: mixed bulk creation, per-item failures, atomic opt-in, natural keys
 Issue: #260 (formal-pack + create_many coverage), surface: PR #232
 
 Source of truth for all asserted semantics:
@@ -9,35 +9,23 @@ Source of truth for all asserted semantics:
 
 The create verb's bulk path activates when the top-level `items` key is present.
 
---- atomic=true (default, create.rs lines 97-164) ---
+--- default / atomic=false ---
 
-  specs built for all items (one-shot), then self.runtime.create_many(token, specs)
-  called once.  Any runtime failure propagates via `?`, failing the whole batch.
-  Response shape: { attempted, created, skipped: 0, failed: 0 }
-  When verbose=true: adds "entities" array of created entity objects.
-  "entities" key is ABSENT when verbose=false (the default).
+  Every item is deserialized, validated, and written independently. One invalid
+  item does not prevent valid siblings from landing. `results` has one ordered
+  `{index, ok, ...}` entry per input.
 
---- atomic=false (create.rs lines 165-201) ---
+--- atomic=true ---
 
-  Each spec calls self.runtime.create_many(token, vec![spec]) individually.
-  Per-item errors are collected; successful items are counted in "created".
-  Response always includes "errors" key (even if the list is empty).
-  Response shape: { attempted, created, skipped: 0, failed, errors: [...] }
-  When verbose=true: adds "entities" array of the successful entity objects.
+  All items validate before one mixed entity/note transaction. Validation or
+  write failure rejects the whole batch and writes nothing.
 
---- Spec-building errors (create.rs lines 109-148) ---
+--- Note natural keys ---
 
-  The for loop that builds EntityCreateSpec values uses `?` for each item.
-  If any item triggers an error during spec building, the handler returns Err
-  immediately, before reaching the atomic/non-atomic split.
-  Items carrying a note kind (e.g., "observation") hit the `_ =>` branch at
-  create.rs lines 130-136:
-    return Err(RuntimeError::InvalidInput(format!(
-        "items[{idx}]: bulk create only supports entity kinds; got {:?}",
-        entry.kind
-    )))
-  This failure is NOT per-item in the non-atomic sense — it aborts the batch
-  regardless of the atomic flag.
+  Note items accept `content`, optional note fields, and `external_id` (also
+  accepted as `properties.external_id`). Retrying the same
+  `(namespace, note kind, external_id)` returns the canonical row ID and counts
+  as skipped, not created.
 
 --- Limit guard (create.rs lines 92-95) ---
 
@@ -46,10 +34,8 @@ The create verb's bulk path activates when the top-level `items` key is present.
 --- BulkCreateEntry schema (create.rs/params.rs lines 16-26) ---
 
   #[serde(deny_unknown_fields)]
-  Fields: kind (String), name (String), entity_kind?, entity_type?,
-          description?, properties?, tags?
-  Note: "content" is not a field; passing it would fail serde deserialization.
-  Bulk create supports ENTITY kinds only (kind must resolve to KindSpec::Entity).
+  Fields: kind (String), name?, content?, entity_kind?, note_kind?, entity_type?,
+          description?, properties?, tags?, salience?, external_id?
 """
 
 from __future__ import annotations
@@ -73,7 +59,7 @@ def _item(name: str, *, kind: str = "concept", **kwargs: object) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# atomic=true (default) — basic batch
+# default best-effort — basic batch
 # ---------------------------------------------------------------------------
 
 
@@ -85,7 +71,7 @@ def test_create_many_basic(
 ) -> None:
     """create(items=[...]) with 3 valid concepts returns attempted=3 created=3.
 
-    Source: create.rs lines 151-164 (atomic=true default path, verbose=false).
+    Source: create.rs mixed bulk best-effort path (verbose=false).
     Response must have keys attempted/created/skipped/failed.
     "entities" key must be ABSENT when verbose is not passed (default false).
     """
@@ -112,7 +98,7 @@ def test_create_many_basic(
     )
     # verbose=false (default): "entities" key must not be present
     assert "entities" not in result, (
-        "atomic=true + verbose=false must NOT include 'entities' key; "
+        "verbose=false must NOT include 'entities' key; "
         f"got keys: {list(result.keys())}"
     )
 
@@ -125,7 +111,7 @@ def test_create_many_verbose(
 ) -> None:
     """create(items=[...], verbose=true) adds 'entities' array with created objects.
 
-    Source: create.rs lines 160-162 (atomic path, verbose=true branch).
+    Source: create.rs bulk response assembly (verbose=true branch).
     The entities array must have length == created count.
     Each element must carry an "id" field (the new entity's UUID).
     """
@@ -143,7 +129,7 @@ def test_create_many_verbose(
         f"created must be {n}; got {result}"
     )
     assert "entities" in result, (
-        "atomic=true + verbose=true must include 'entities' key; "
+        "verbose=true must include 'entities' key; "
         f"got keys: {list(result.keys())}"
     )
     entities = result["entities"]
@@ -170,13 +156,7 @@ def test_create_many_atomic_false_all_valid(
     khive_session: KhiveMcpSession,
     temp_namespace: str,
 ) -> None:
-    """create(items=[...], atomic=false) with all valid items: errors key always present.
-
-    Source: create.rs lines 165-201 (non-atomic path).
-    Unlike the atomic path, the non-atomic response always carries "errors" even
-    when it is an empty list.  The atomic path does NOT include "errors" at all.
-    This difference in response shape is the canonical distinction.
-    """
+    """create(items=[...], atomic=false) returns an empty errors list when valid."""
     ns = temp_namespace
     n = 3
     items = [_item(f"cm_nonatomic_{i}_{ns[-6:]}") for i in range(n)]
@@ -197,7 +177,7 @@ def test_create_many_atomic_false_all_valid(
     assert result.get("failed") == 0, (
         f"failed must be 0 when all items succeed; got {result}"
     )
-    # Non-atomic path: "errors" key is ALWAYS present (create.rs line 189).
+    # Every bulk response carries the aggregate error list.
     assert "errors" in result, (
         "atomic=false response must always include 'errors' key (even when empty); "
         f"got keys: {list(result.keys())}"
@@ -209,95 +189,101 @@ def test_create_many_atomic_false_all_valid(
 
 @pytest.mark.create_many
 @pytest.mark.slow
-def test_create_many_atomic_true_has_no_errors_key(
+def test_create_many_results_are_ordered_and_complete(
     khive_session: KhiveMcpSession,
     temp_namespace: str,
 ) -> None:
-    """atomic=true (default) response does NOT include 'errors' key.
-
-    Source: create.rs lines 154-163 (atomic response JSON).
-    The serde_json::json! literal for the atomic path does not include 'errors'.
-    This is the shape distinction between atomic and non-atomic responses.
-    """
+    """Every bulk response carries one ordered result per submitted item."""
     ns = temp_namespace
     items = [_item(f"cm_noerr_{i}_{ns[-6:]}") for i in range(2)]
 
     result = khive_session.verb("create", {"items": items, "namespace": ns})
-
-    assert "errors" not in result, (
-        "atomic=true response must NOT include 'errors' key; "
-        f"got keys: {list(result.keys())}"
-    )
+    assert result["errors"] == []
+    assert [entry["index"] for entry in result["results"]] == [0, 1]
+    assert all(entry["ok"] is True for entry in result["results"])
 
 
 # ---------------------------------------------------------------------------
-# Spec-building failures — affect the whole batch before atomic split
+# Note items, natural keys, and per-item failures
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.create_many
 @pytest.mark.slow
-def test_create_many_note_kind_in_items_rejected(
+def test_create_many_note_kind_in_items_supported(
     khive_session: KhiveMcpSession,
     temp_namespace: str,
 ) -> None:
-    """items containing a note kind triggers a whole-batch failure before atomic/non-atomic split.
-
-    Source: create.rs lines 111-136 (spec-building loop, _ => branch):
-      match &item_kind_spec {
-          KindSpec::Entity { .. } => { ... }
-          _ => {
-              return Err(RuntimeError::InvalidInput(format!(
-                  "items[{idx}]: bulk create only supports entity kinds; got {:?}",
-                  entry.kind
-              )));
-          }
-      }
-    This return Err is inside the for loop before the atomic check at line 151.
-    The error propagates immediately regardless of the atomic flag.
-    Note: "content" is not a BulkCreateEntry field (deny_unknown_fields).
-          Use name= to avoid a serde deserialization error.
-    """
+    """Entity and note items coexist; natural-key retries expose one canonical ID."""
     ns = temp_namespace
+    external_id = f"contract:mixed:{ns}"
     items = [
-        _item(f"cm_noterej_concept_{ns[-6:]}"),  # valid entity item
-        {"kind": "observation", "name": f"cm_noterej_note_{ns[-6:]}"},  # note kind
+        _item(f"cm_mixed_concept_{ns[-6:]}"),
+        {
+            "kind": "observation",
+            "content": f"cm mixed note {ns}",
+            "external_id": external_id,
+        },
+        {
+            "kind": "note",
+            "note_kind": "observation",
+            "content": "retry content must not overwrite",
+            "properties": {"external_id": external_id},
+        },
     ]
 
-    with pytest.raises(KhiveOperationError) as exc_info:
-        khive_session.verb("create", {
-            "items": items,
-            "namespace": ns,
-        })
-
-    error_msg = exc_info.value.message.lower()
-    # Error from create.rs line 134: "bulk create only supports entity kinds"
-    assert "entity" in error_msg or "bulk" in error_msg or "kind" in error_msg, (
-        "note-kind rejection must mention entity/bulk/kind in the error; "
-        f"got: {exc_info.value.message!r}"
-    )
+    result = khive_session.verb("create", {
+        "items": items,
+        "verbose": True,
+        "namespace": ns,
+    })
+    assert result["attempted"] == 3
+    assert result["created"] == 2
+    assert result["created_notes"] == 1
+    assert result["skipped"] == 1
+    assert result["results"][1]["id"] == result["results"][2]["id"]
+    assert result["results"][1]["created"] is True
+    assert result["results"][2]["deduplicated"] is True
+    assert len(result["notes"]) == 2  # canonical row returned for both outcomes
 
 
 @pytest.mark.create_many
 @pytest.mark.slow
-def test_create_many_note_kind_rejected_with_atomic_false(
+def test_create_many_invalid_note_isolated_from_valid_siblings(
     khive_session: KhiveMcpSession,
     temp_namespace: str,
 ) -> None:
-    """Note kind in items is rejected even when atomic=false.
-
-    The spec-building loop failure happens before the atomic split
-    (create.rs lines 109-148 vs lines 151/165).  atomic=false does not
-    provide per-item tolerance for spec-building errors — only runtime
-    errors in the non-atomic loop at line 170 are collected per-item.
-    """
+    """Default best effort reports missing note content without aborting siblings."""
     ns = temp_namespace
-    items = [{"kind": "observation", "name": f"cm_noterej2_{ns[-6:]}"}]
+    result = khive_session.verb("create", {
+        "items": [
+            _item(f"cm_valid_{ns[-6:]}"),
+            {"kind": "observation", "name": "missing content"},
+            {"kind": "observation", "content": f"valid note {ns}"},
+        ],
+        "namespace": ns,
+    })
+    assert result["attempted"] == 3
+    assert result["created"] == 2
+    assert result["failed"] == 1
+    assert [entry["ok"] for entry in result["results"]] == [True, False, True]
 
+
+@pytest.mark.create_many
+@pytest.mark.slow
+def test_create_many_atomic_validation_failure_writes_nothing(
+    khive_session: KhiveMcpSession,
+    temp_namespace: str,
+) -> None:
+    """`atomic=true` retains all-or-nothing validation semantics."""
+    ns = temp_namespace
     with pytest.raises(KhiveOperationError):
         khive_session.verb("create", {
-            "items": items,
-            "atomic": False,
+            "atomic": True,
+            "items": [
+                _item(f"cm_atomic_should_not_land_{ns[-6:]}"),
+                {"kind": "observation", "name": "missing content"},
+            ],
             "namespace": ns,
         })
 

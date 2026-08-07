@@ -13,16 +13,44 @@ pub(crate) struct EdgeSpec {
 }
 
 /// A single entry in a bulk `create(items=[...])` request.
-#[derive(Deserialize)]
+#[derive(Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct BulkCreateEntry {
     pub(crate) kind: String,
-    pub(crate) name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) entity_kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) note_kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) entity_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) properties: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) tags: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) salience: Option<f64>,
+    /// Note-only explicit natural key. Preserve explicit JSON null so the
+    /// handler can reject it with the same deliberate error as singleton
+    /// `external_id`, rather than collapsing it into absence.
+    #[serde(
+        default,
+        deserialize_with = "present_json_value",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub(crate) external_id: Option<Value>,
+}
+
+fn present_json_value<'de, D>(deserializer: D) -> Result<Option<Value>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Value::deserialize(deserializer).map(Some)
 }
 
 #[derive(Deserialize)]

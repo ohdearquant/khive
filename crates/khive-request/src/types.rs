@@ -53,7 +53,8 @@ pub fn value_nesting_within_limit(value: &Value, max_depth: usize) -> bool {
 pub enum ExecutionMode {
     /// One operation, no batching or chaining.
     Single,
-    /// `[op1(...), op2(...)]` — parallel, best-effort, independent results.
+    /// `[op1(...), op2(...)]` — parallel, best-effort top-level groups.
+    /// A group may itself be a sequential chain.
     Parallel,
     /// `op1(...) | op2(id=$prev.id)` — sequential, abort-on-failure.
     Chain,
@@ -379,11 +380,35 @@ pub struct ParsedOp {
     pub args: BTreeMap<String, ArgValue>,
 }
 
+/// One independently scheduled top-level request group within [`ParsedRequest::ops`].
+///
+/// A length-one group is a normal single operation. A group with multiple
+/// operations is a sequential chain whose later operations may reference
+/// `$prev`. Parallel requests execute groups concurrently while preserving the
+/// flattened input order in the response.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExecutionGroup {
+    pub start: usize,
+    pub len: usize,
+}
+
+impl ExecutionGroup {
+    pub fn end(self) -> usize {
+        self.start + self.len
+    }
+
+    pub fn is_chain(self) -> bool {
+        self.len > 1
+    }
+}
+
 /// Parsed operations in input order plus their execution mode.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ParsedRequest {
     pub ops: Vec<ParsedOp>,
     pub mode: ExecutionMode,
+    /// Top-level scheduling groups over the flattened [`Self::ops`] vector.
+    pub groups: Vec<ExecutionGroup>,
 }
 
 /// Request syntax or preflight error surfaced as MCP `invalid_params`.
@@ -443,7 +468,7 @@ pub enum DslError {
     PrevRefInJsonForm {
         arg_name: String,
     },
-    /// Mixing `,` and `|` at the top level.
+    /// Mixing `,` and `|` without enclosing batch brackets.
     MixedSeparators,
     /// Empty batch `[]` — no ops provided.
     EmptyBatch,
@@ -532,10 +557,9 @@ impl fmt::Display for DslError {
             DslError::MixedSeparators => {
                 write!(
                     f,
-                    "cannot mix ',' (parallel) and '|' (chain) separators in one request; \
-                     a parallel batch cannot contain a chain. Split the work into two `request` \
-                     calls: put independent ops in one `[...]` batch and dependent ops in a \
-                     separate `a() | b(arg=$prev.id)` chain"
+                    "cannot mix ',' (parallel) and '|' (chain) separators without batch \
+                     brackets; wrap independent chain groups in `[...]`, for example \
+                     `[a() | b(arg=$prev.id), c()]`"
                 )
             }
             DslError::EmptyBatch => {

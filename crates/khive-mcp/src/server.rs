@@ -30,7 +30,10 @@ use sha2::{Digest, Sha256};
 
 use khive_db::ConnectionPool;
 use khive_pack_kg::handlers::{SearchSubstrate, ValidatedSearchRequest};
-use khive_request::{parse_request, ArgValue, DslError, ExecutionMode, ParsedOp, PrevFailure};
+use khive_request::{
+    parse_request, ArgValue, DslError, ExecutionGroup, ExecutionMode, ParsedOp, ParsedRequest,
+    PrevFailure,
+};
 use khive_runtime::{
     present, render_format, InterceptedDispatchResult, KhiveRuntime, OutputFormat, PackLoadError,
     PackRegistry, PresentationMode, RuntimeConfig, RuntimeError, VerbPresentationPolicy,
@@ -168,11 +171,14 @@ pub(crate) enum DispatchOrigin {
     Daemon,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct RunParsedContext<'a> {
     enforce_response_budget: bool,
     from_wire: bool,
     identity: Option<&'a khive_runtime::RequestIdentity>,
+    /// Operation-local write conflicts precomputed by an enclosing parallel
+    /// group. Indices are relative to this nested request.
+    conflict_indices: Option<Arc<std::collections::HashSet<usize>>>,
 }
 
 /// Typed failure crossing the dispatch/envelope seam.
@@ -1031,8 +1037,9 @@ impl KhiveMcpServer {
 
     /// Execute a parsed request, dispatching according to its [`ExecutionMode`].
     ///
-    /// - `Single` / `Parallel`: at most [`MAX_BATCH_CONCURRENCY`] ops run at
-    ///   once; per-op failure does not abort siblings. `aborted` count is 0.
+    /// - `Single` / `Parallel`: at most [`MAX_BATCH_CONCURRENCY`] independent
+    ///   groups run at once. A parallel group may itself be a chain; failure
+    ///   aborts only the remainder of that group, never sibling groups.
     /// - `Chain`: ops run sequentially; `$prev` from each op's result is
     ///   substituted into the next op's args. If any op fails (or a `$prev`
     ///   substitution fails), remaining ops appear as `aborted: true`.
@@ -1068,16 +1075,17 @@ impl KhiveMcpServer {
     /// `"success"` means every op in `results` reports `ok: true`.
     async fn run_parsed(
         &self,
-        ops: Vec<ParsedOp>,
-        mode: ExecutionMode,
+        parsed: ParsedRequest,
         presentation: PresentationMode,
         presentation_per_op: Option<Vec<Option<PresentationMode>>>,
         context: RunParsedContext<'_>,
     ) -> Value {
+        let ParsedRequest { ops, mode, groups } = parsed;
         let RunParsedContext {
             enforce_response_budget,
             from_wire,
             identity,
+            conflict_indices: inherited_conflict_indices,
         } = context;
         let response_budget = if mode == ExecutionMode::Parallel && enforce_response_budget {
             BATCH_RESPONSE_BUDGET_BYTES
@@ -1101,28 +1109,120 @@ impl KhiveMcpServer {
 
         match mode {
             ExecutionMode::Single | ExecutionMode::Parallel => {
-                // Write-key conflict preflight.
-                //
-                // Detect ops that target the same write key in the same parallel/single
-                // batch. Conflicting ops receive per-op error entries; non-conflicting ops
-                // execute normally. `results.length == summary.total` is preserved.
-                let conflict_indices: std::collections::HashSet<usize> = {
-                    let mut seen: std::collections::HashMap<String, usize> =
-                        std::collections::HashMap::new();
-                    let mut bad: std::collections::HashSet<usize> =
-                        std::collections::HashSet::new();
-                    for (i, op) in ops.iter().enumerate() {
-                        for key in khive_request::write_keys_for_op_pub(op) {
-                            if let Some(&prior) = seen.get(&key) {
-                                bad.insert(prior);
-                                bad.insert(i);
-                            } else {
-                                seen.insert(key, i);
+                if mode == ExecutionMode::Parallel
+                    && groups.iter().copied().any(ExecutionGroup::is_chain)
+                {
+                    let total = ops.len();
+                    let conflict_indices = parallel_conflicting_op_indices(&ops, &groups);
+                    let tools_by_group: Vec<Vec<String>> = groups
+                        .iter()
+                        .map(|group| {
+                            ops[group.start..group.end()]
+                                .iter()
+                                .map(|op| op.tool.clone())
+                                .collect()
+                        })
+                        .collect();
+
+                    let futures: Vec<_> = groups
+                        .iter()
+                        .copied()
+                        .enumerate()
+                        .map(|(group_index, group)| {
+                            let group_ops = ops[group.start..group.end()].to_vec();
+                            let group_len = group.len;
+                            let task_tool = group_ops
+                                .first()
+                                .map(|op| op.tool.clone())
+                                .unwrap_or_else(|| "<empty-group>".to_string());
+                            let group_conflict_indices = conflict_indices
+                                .iter()
+                                .copied()
+                                .filter(|index| group.start <= *index && *index < group.end())
+                                .map(|index| index - group.start)
+                                .collect::<std::collections::HashSet<_>>();
+                            let group_presentation = presentation_per_op.as_ref().map(|modes| {
+                                (group.start..group.end())
+                                    .map(|index| modes.get(index).copied().flatten())
+                                    .collect::<Vec<_>>()
+                            });
+                            BatchTask {
+                                index: group_index,
+                                tool: task_tool,
+                                future: async move {
+                                    let group_mode = if group_len > 1 {
+                                        ExecutionMode::Chain
+                                    } else {
+                                        ExecutionMode::Single
+                                    };
+                                    let nested = ParsedRequest {
+                                        ops: group_ops,
+                                        mode: group_mode,
+                                        groups: vec![ExecutionGroup {
+                                            start: 0,
+                                            len: group_len,
+                                        }],
+                                    };
+                                    let response = Box::pin(
+                                        self.run_parsed(
+                                            nested,
+                                            presentation,
+                                            group_presentation,
+                                            RunParsedContext {
+                                                enforce_response_budget: false,
+                                                from_wire,
+                                                identity,
+                                                conflict_indices: (!group_conflict_indices
+                                                    .is_empty())
+                                                .then(|| Arc::new(group_conflict_indices)),
+                                            },
+                                        ),
+                                    )
+                                    .await;
+                                    response
+                                        .get("results")
+                                        .cloned()
+                                        .unwrap_or_else(|| Value::Array(Vec::new()))
+                                },
+                            }
+                        })
+                        .collect();
+
+                    let grouped = execute_bounded_batch(futures, response_budget).await;
+                    let mut results = Vec::with_capacity(total);
+                    for (group_index, value) in grouped.into_iter().enumerate() {
+                        match value {
+                            Value::Array(entries) => results.extend(entries),
+                            budget_error => {
+                                results.push(budget_error);
+                                for tool in tools_by_group[group_index].iter().skip(1) {
+                                    results.push(json!({
+                                        "ok": false,
+                                        "tool": tool,
+                                        "aborted": true,
+                                        "message": "not executed: this chain group was not started because the parallel response budget was exhausted",
+                                    }));
+                                }
                             }
                         }
                     }
-                    bad
-                };
+                    return grouped_parallel_envelope(results, total);
+                }
+
+                // Write-key conflict preflight.
+                //
+                // Detect ops in distinct parallel groups that target the same
+                // write key. Reuse the same group-aware helper as mixed
+                // singleton/chain batches: it deduplicates repeated keys within
+                // one op, so a bulk link can coalesce its own duplicate entries
+                // instead of conflicting with itself.
+                let mut conflict_indices = inherited_conflict_indices
+                    .as_deref()
+                    .cloned()
+                    .unwrap_or_default();
+                if mode == ExecutionMode::Parallel {
+                    conflict_indices.extend(parallel_conflicting_op_indices(&ops, &groups));
+                }
 
                 // Clone coordinator and namespace for use in the per-op closures (ADR-029 D3/D4).
                 let coordinator: Option<Arc<dyn CoordinatorService>> = self.coordinator.clone();
@@ -1136,10 +1236,10 @@ impl KhiveMcpServer {
                 // Independent dispatch — bounded concurrency, results restored to input order.
                 let futures = ops.into_iter().enumerate().map(|(i, op)| {
                     let conflict_with: Option<String> = if conflict_indices.contains(&i) {
-                        Some(format!(
-                            "conflict: writes overlap with another op in this batch (op #{})",
-                            i
-                        ))
+                        Some(
+                            "conflict: writes overlap with another independent group in this batch"
+                                .to_string(),
+                        )
                     } else {
                         None
                     };
@@ -1315,6 +1415,21 @@ impl KhiveMcpServer {
                                  including any $prev reference, were never evaluated."
                             ),
                         }));
+                        continue;
+                    }
+                    if inherited_conflict_indices
+                        .as_deref()
+                        .is_some_and(|indices| indices.contains(&i))
+                    {
+                        let usage_ctx = khive_runtime::usage::UsageContext::new();
+                        let mut entry = json!({
+                            "ok": false,
+                            "tool": op.tool,
+                            "error": "conflict: writes overlap with another independent group in this batch",
+                        });
+                        stamp_usage(&mut entry, &usage_ctx);
+                        results.push(entry);
+                        aborted_from = Some(i + 1);
                         continue;
                     }
                     let op_mode = mode_for_op(i);
@@ -1970,8 +2085,9 @@ Response shape:
     "status": "success" | "partial"
   }
 
-Parallel: a failed op does NOT abort siblings. Chain: failure aborts remaining
-ops (reported as {"ok": false, "aborted": true}). Committed ops are not rolled back.
+Parallel batches may contain chain groups: `[a() | b(id=$prev.id), c()]`.
+Groups run concurrently; failure aborts only the remainder of its own chain
+(reported as {"ok": false, "aborted": true}). Committed ops are not rolled back.
 `status` is "partial" whenever summary.failed or summary.aborted is non-zero — check
 it (or summary) rather than relying on the absence of a top-level error.
 
@@ -1994,9 +2110,9 @@ Verb discovery: install the `kg` / `gtd` plugins for usage skills. The verbs
 currently registered on this server (pack-derived) are listed below. Argument
 schemas live in each pack's docs and SKILL.md files.
 
-Tip: for one-shot calls, the single-op form is the densest. Use batch when
-several independent ops can run together; use chain when each op needs the prior
-result (e.g. create then link with the new entity's id)."#)]
+Tip: for one-shot calls, the single-op form is the densest. Use a batch for
+independent groups and `|` within a group when each step needs the prior result
+(e.g. create then link with the new entity's id)."#)]
     async fn request(&self, Parameters(p): Parameters<RequestParams>) -> Result<String, McpError> {
         // Parse before the daemon decision. The daemon protocol's historical
         // error channel is string-only, so forwarding malformed DSL would turn
@@ -2099,6 +2215,42 @@ fn batch_budget_error(tool: &str, response_budget: usize) -> Value {
     })
 }
 
+fn parallel_conflicting_op_indices(
+    ops: &[ParsedOp],
+    groups: &[ExecutionGroup],
+) -> std::collections::HashSet<usize> {
+    let mut claims: std::collections::HashMap<String, Vec<(usize, usize)>> =
+        std::collections::HashMap::new();
+    for (group_index, group) in groups.iter().copied().enumerate() {
+        for (op_index, op) in ops[group.start..group.end()].iter().enumerate() {
+            let absolute_index = group.start + op_index;
+            let mut within_op = std::collections::HashSet::new();
+            for key in khive_request::write_keys_for_op_pub(op) {
+                if within_op.insert(key.clone()) {
+                    claims
+                        .entry(key)
+                        .or_default()
+                        .push((group_index, absolute_index));
+                }
+            }
+        }
+    }
+
+    let mut conflicts = std::collections::HashSet::new();
+    for key_claims in claims.values() {
+        let Some((first_group, _)) = key_claims.first() else {
+            continue;
+        };
+        if key_claims
+            .iter()
+            .any(|(group_index, _)| group_index != first_group)
+        {
+            conflicts.extend(key_claims.iter().map(|(_, op_index)| *op_index));
+        }
+    }
+    conflicts
+}
+
 async fn execute_bounded_batch<I, F>(tasks: I, response_budget: usize) -> Vec<Value>
 where
     I: IntoIterator<Item = BatchTask<F>>,
@@ -2166,6 +2318,24 @@ fn parallel_batch_envelope(results: Vec<Value>) -> Value {
     })
 }
 
+fn grouped_parallel_envelope(results: Vec<Value>, total: usize) -> Value {
+    debug_assert_eq!(results.len(), total);
+    let succeeded = results
+        .iter()
+        .filter(|result| result.get("ok").and_then(Value::as_bool) == Some(true))
+        .count();
+    let aborted = results
+        .iter()
+        .filter(|result| result.get("aborted").and_then(Value::as_bool) == Some(true))
+        .count();
+    let failed = total - succeeded - aborted;
+    json!({
+        "results": results,
+        "summary": { "total": total, "succeeded": succeeded, "failed": failed, "aborted": aborted },
+        "status": batch_status(failed, aborted),
+    })
+}
+
 /// Extract the fallback-reason string from a strict-mode rejection's
 /// [`McpError`] (#947), or `None` if `e` is not tagged with
 /// [`crate::daemon::STRICT_FALLBACK_MARKER`] — i.e. some other daemon-forward
@@ -2216,6 +2386,19 @@ fn strict_fallback_envelope_response(
                 }
             })
             .collect(),
+        ExecutionMode::Parallel if parsed.groups.iter().copied().any(ExecutionGroup::is_chain) => {
+            let mut results = Vec::with_capacity(total);
+            for group in parsed.groups.iter().copied() {
+                for (index, op) in parsed.ops[group.start..group.end()].iter().enumerate() {
+                    if index == 0 {
+                        results.push(json!({ "ok": false, "tool": op.tool, "error": error_msg }));
+                    } else {
+                        results.push(json!({ "ok": false, "tool": op.tool, "aborted": true }));
+                    }
+                }
+            }
+            results
+        }
         ExecutionMode::Single | ExecutionMode::Parallel => parsed
             .ops
             .iter()
@@ -2223,10 +2406,14 @@ fn strict_fallback_envelope_response(
             .collect(),
     };
 
-    let aborted = if parsed.mode == ExecutionMode::Chain {
-        total.saturating_sub(1)
-    } else {
-        0
+    let aborted = match parsed.mode {
+        ExecutionMode::Chain => total.saturating_sub(1),
+        ExecutionMode::Parallel => parsed
+            .groups
+            .iter()
+            .map(|group| group.len.saturating_sub(1))
+            .sum(),
+        ExecutionMode::Single => 0,
     };
     let failed = total - aborted;
     Ok(serde_json::to_string(&json!({
@@ -2458,14 +2645,14 @@ impl KhiveMcpServer {
 
         let mut result = self
             .run_parsed(
-                parsed.ops,
-                parsed.mode,
+                parsed,
                 presentation,
                 presentation_per_op.clone(),
                 RunParsedContext {
                     enforce_response_budget: save_to.is_none(),
                     from_wire,
                     identity: identity.as_ref(),
+                    conflict_indices: None,
                 },
             )
             .await;
@@ -4160,14 +4347,14 @@ mod tests {
 
         let response = server
             .run_parsed(
-                parsed.ops,
-                parsed.mode,
+                parsed,
                 PresentationMode::Verbose,
                 None,
                 RunParsedContext {
                     enforce_response_budget: true,
                     from_wire: false,
                     identity: None,
+                    conflict_indices: None,
                 },
             )
             .await;
@@ -4197,6 +4384,349 @@ mod tests {
                 "expected abort after the depth guard trips: {r:?}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn parallel_chain_groups_resolve_prev_independently_and_preserve_order() {
+        let config = RuntimeConfig {
+            db_path: None,
+            default_namespace: Namespace::local(),
+            embedding_model: None,
+            additional_embedding_models: vec![],
+            packs: vec!["kg".to_string()],
+            ..RuntimeConfig::default()
+        };
+        let runtime = KhiveRuntime::new(config).expect("in-memory runtime");
+        let server = KhiveMcpServer::new(runtime).expect("server builds with kg");
+        let parsed = parse_request(
+            r#"[create(kind="concept", name="parallel-chain-a") | get(id=$prev.id), create(kind="concept", name="parallel-chain-b") | get(id=$prev.id)]"#,
+        )
+        .expect("parallel chains parse");
+
+        let response = server
+            .run_parsed(
+                parsed,
+                PresentationMode::Verbose,
+                None,
+                RunParsedContext {
+                    enforce_response_budget: true,
+                    from_wire: false,
+                    identity: None,
+                    conflict_indices: None,
+                },
+            )
+            .await;
+
+        assert_eq!(
+            response["summary"],
+            json!({"total": 4, "succeeded": 4, "failed": 0, "aborted": 0})
+        );
+        let results = response["results"].as_array().expect("results array");
+        assert_eq!(results[0]["result"]["id"], results[1]["result"]["id"]);
+        assert_eq!(results[2]["result"]["id"], results[3]["result"]["id"]);
+        assert_ne!(results[0]["result"]["id"], results[2]["result"]["id"]);
+    }
+
+    #[tokio::test]
+    async fn parallel_bulk_link_duplicate_keys_are_within_op_and_coalesce() {
+        let config = RuntimeConfig {
+            db_path: None,
+            default_namespace: Namespace::local(),
+            embedding_model: None,
+            additional_embedding_models: vec![],
+            packs: vec!["kg".to_string()],
+            ..RuntimeConfig::default()
+        };
+        let runtime = KhiveRuntime::new(config).expect("in-memory runtime");
+        let server = KhiveMcpServer::new(runtime).expect("server builds with kg");
+        let source = server
+            .registry
+            .dispatch(
+                "create",
+                json!({"kind": "concept", "name": "parallel-bulk-source"}),
+            )
+            .await
+            .expect("source entity");
+        let target = server
+            .registry
+            .dispatch(
+                "create",
+                json!({"kind": "concept", "name": "parallel-bulk-target"}),
+            )
+            .await
+            .expect("target entity");
+        let source_id = source["id"].as_str().expect("source id");
+        let target_id = target["id"].as_str().expect("target id");
+        let bulk = format!(
+            r#"link(links=[{{"source_id":"{source_id}","target_id":"{target_id}","relation":"extends"}},{{"source_id":"{source_id}","target_id":"{target_id}","relation":"extends"}}])"#,
+        );
+        let pure = parse_request(&format!("[{bulk}, stats()]"))
+            .expect("pure parallel batch with duplicate bulk entries parses");
+        assert!(
+            parallel_conflicting_op_indices(&pure.ops, &pure.groups).is_empty(),
+            "duplicate natural keys inside one bulk op are not inter-group conflicts"
+        );
+        let mixed = parse_request(&format!("[{bulk} | stats(), stats()]"))
+            .expect("mixed parallel batch with duplicate bulk entries parses");
+        assert!(
+            parallel_conflicting_op_indices(&mixed.ops, &mixed.groups).is_empty(),
+            "pure and mixed parallel groups must classify within-op duplicates identically"
+        );
+
+        let response = server
+            .run_parsed(
+                pure,
+                PresentationMode::Verbose,
+                None,
+                RunParsedContext {
+                    enforce_response_budget: true,
+                    from_wire: false,
+                    identity: None,
+                    conflict_indices: None,
+                },
+            )
+            .await;
+
+        assert_eq!(
+            response["summary"],
+            json!({"total": 2, "succeeded": 2, "failed": 0, "aborted": 0})
+        );
+        let bulk_result = &response["results"][0]["result"];
+        assert_eq!(bulk_result["attempted"], json!(2));
+        assert_eq!(bulk_result["created"], json!(1));
+        assert_eq!(bulk_result["skipped"], json!(1));
+        assert_eq!(bulk_result["failed"], json!(0));
+    }
+
+    #[tokio::test]
+    async fn parallel_conflict_diagnostic_matches_pure_and_mixed_groups() {
+        let config = RuntimeConfig {
+            db_path: None,
+            default_namespace: Namespace::local(),
+            embedding_model: None,
+            additional_embedding_models: vec![],
+            packs: vec!["kg".to_string()],
+            ..RuntimeConfig::default()
+        };
+        let runtime = KhiveRuntime::new(config).expect("in-memory runtime");
+        let server = KhiveMcpServer::new(runtime).expect("server builds with kg");
+        let target = uuid::Uuid::new_v4();
+        let diagnostic = "conflict: writes overlap with another independent group in this batch";
+
+        let pure = parse_request(&format!(
+            r#"[update(id="{target}", name="never"), delete(id="{target}")]"#,
+        ))
+        .expect("pure parallel conflicts parse");
+        let pure_response = server
+            .run_parsed(
+                pure,
+                PresentationMode::Verbose,
+                None,
+                RunParsedContext {
+                    enforce_response_budget: true,
+                    from_wire: false,
+                    identity: None,
+                    conflict_indices: None,
+                },
+            )
+            .await;
+
+        let mixed = parse_request(&format!(
+            r#"[update(id="{target}", name="never") | stats(), delete(id="{target}")]"#,
+        ))
+        .expect("mixed parallel conflicts parse");
+        let mixed_response = server
+            .run_parsed(
+                mixed,
+                PresentationMode::Verbose,
+                None,
+                RunParsedContext {
+                    enforce_response_budget: true,
+                    from_wire: false,
+                    identity: None,
+                    conflict_indices: None,
+                },
+            )
+            .await;
+
+        for entry in pure_response["results"]
+            .as_array()
+            .expect("pure results array")
+        {
+            assert_eq!(entry["error"], json!(diagnostic));
+        }
+        assert_eq!(mixed_response["results"][0]["error"], json!(diagnostic));
+        assert_eq!(mixed_response["results"][1]["aborted"], json!(true));
+        assert_eq!(mixed_response["results"][2]["error"], json!(diagnostic));
+    }
+
+    #[tokio::test]
+    async fn parallel_link_alias_conflicts_match_pure_and_mixed_groups() {
+        let config = RuntimeConfig {
+            db_path: None,
+            default_namespace: Namespace::local(),
+            embedding_model: None,
+            additional_embedding_models: vec![],
+            packs: vec!["kg".to_string()],
+            ..RuntimeConfig::default()
+        };
+        let runtime = KhiveRuntime::new(config).expect("in-memory runtime");
+        let server = KhiveMcpServer::new(runtime).expect("server builds with kg");
+        let source = uuid::Uuid::new_v4();
+        let target = uuid::Uuid::new_v4();
+        let canonical =
+            format!(r#"link(source_id="{source}", target_id="{target}", relation="part_of")"#);
+        let alias =
+            format!(r#"link(source_id="{source}", target_id="{target}", relation="partof")"#);
+        let diagnostic = "conflict: writes overlap with another independent group in this batch";
+
+        let pure = parse_request(&format!("[{canonical}, {alias}]")).expect("pure aliases parse");
+        let pure_response = server
+            .run_parsed(
+                pure,
+                PresentationMode::Verbose,
+                None,
+                RunParsedContext {
+                    enforce_response_budget: true,
+                    from_wire: false,
+                    identity: None,
+                    conflict_indices: None,
+                },
+            )
+            .await;
+
+        let mixed = parse_request(&format!("[stats() | {canonical} | stats(), {alias}]"))
+            .expect("mixed aliases parse");
+        let mixed_response = server
+            .run_parsed(
+                mixed,
+                PresentationMode::Verbose,
+                None,
+                RunParsedContext {
+                    enforce_response_budget: true,
+                    from_wire: false,
+                    identity: None,
+                    conflict_indices: None,
+                },
+            )
+            .await;
+
+        assert_eq!(
+            pure_response["summary"],
+            json!({"total": 2, "succeeded": 0, "failed": 2, "aborted": 0})
+        );
+        assert_eq!(pure_response["results"][0]["error"], json!(diagnostic));
+        assert_eq!(pure_response["results"][1]["error"], json!(diagnostic));
+
+        assert_eq!(
+            mixed_response["summary"],
+            json!({"total": 4, "succeeded": 1, "failed": 2, "aborted": 1})
+        );
+        assert_eq!(mixed_response["results"][0]["ok"], json!(true));
+        assert_eq!(mixed_response["results"][1]["error"], json!(diagnostic));
+        assert_eq!(mixed_response["results"][2]["aborted"], json!(true));
+        assert_eq!(mixed_response["results"][3]["error"], json!(diagnostic));
+    }
+
+    #[tokio::test]
+    async fn parallel_chain_failure_aborts_only_its_group() {
+        let config = RuntimeConfig {
+            db_path: None,
+            default_namespace: Namespace::local(),
+            embedding_model: None,
+            additional_embedding_models: vec![],
+            packs: vec!["kg".to_string()],
+            ..RuntimeConfig::default()
+        };
+        let runtime = KhiveRuntime::new(config).expect("in-memory runtime");
+        let server = KhiveMcpServer::new(runtime).expect("server builds with kg");
+        let parsed = parse_request(r#"[create(kind="note") | stats(), stats()]"#)
+            .expect("parallel chain parses");
+
+        let response = server
+            .run_parsed(
+                parsed,
+                PresentationMode::Verbose,
+                None,
+                RunParsedContext {
+                    enforce_response_budget: true,
+                    from_wire: false,
+                    identity: None,
+                    conflict_indices: None,
+                },
+            )
+            .await;
+
+        assert_eq!(
+            response["summary"],
+            json!({"total": 3, "succeeded": 1, "failed": 1, "aborted": 1})
+        );
+        let results = response["results"].as_array().expect("results array");
+        assert_eq!(results[0]["ok"], false);
+        assert_eq!(results[1]["aborted"], true);
+        assert_eq!(results[2]["ok"], true);
+    }
+
+    #[tokio::test]
+    async fn parallel_group_conflict_fails_exact_member_after_preceding_work() {
+        let config = RuntimeConfig {
+            db_path: None,
+            default_namespace: Namespace::local(),
+            embedding_model: None,
+            additional_embedding_models: vec![],
+            packs: vec!["kg".to_string()],
+            ..RuntimeConfig::default()
+        };
+        let runtime = KhiveRuntime::new(config).expect("in-memory runtime");
+        let server = KhiveMcpServer::new(runtime).expect("server builds with kg");
+        let target = uuid::Uuid::new_v4();
+        let parsed = parse_request(&format!(
+            r#"[create(kind="concept", name="before-conflict") | update(id="{target}", name="never") | stats(), delete(id="{target}")]"#,
+        ))
+        .expect("parallel chains parse");
+
+        let response = server
+            .run_parsed(
+                parsed,
+                PresentationMode::Verbose,
+                None,
+                RunParsedContext {
+                    enforce_response_budget: true,
+                    from_wire: false,
+                    identity: None,
+                    conflict_indices: None,
+                },
+            )
+            .await;
+
+        assert_eq!(
+            response["summary"],
+            json!({"total": 4, "succeeded": 1, "failed": 2, "aborted": 1})
+        );
+        let results = response["results"].as_array().expect("results array");
+        assert_eq!(results[0]["ok"], true, "preceding op must execute");
+        assert_eq!(results[0]["tool"], "create");
+        assert_eq!(results[1]["tool"], "update");
+        assert_eq!(
+            results[1]["error"],
+            json!("conflict: writes overlap with another independent group in this batch")
+        );
+        assert_eq!(results[2]["tool"], "stats");
+        assert_eq!(results[2]["aborted"], true);
+        assert_eq!(results[3]["tool"], "delete");
+        assert_eq!(
+            results[3]["error"],
+            json!("conflict: writes overlap with another independent group in this batch")
+        );
+
+        let created_id = results[0]["result"]["id"]
+            .as_str()
+            .expect("successful create returns id");
+        server
+            .registry
+            .dispatch("get", json!({"id": created_id}))
+            .await
+            .expect("the preceding non-conflicting create was persisted");
     }
 
     // ── request-boundary regression: raw controls survive wire decoding ─────
@@ -4232,14 +4762,14 @@ mod tests {
         let parsed = parse_request(&params.ops).expect("literal newline inside quotes must parse");
         let response = server
             .run_parsed(
-                parsed.ops,
-                parsed.mode,
+                parsed,
                 PresentationMode::Verbose,
                 None,
                 RunParsedContext {
                     enforce_response_budget: true,
                     from_wire: false,
                     identity: None,
+                    conflict_indices: None,
                 },
             )
             .await;

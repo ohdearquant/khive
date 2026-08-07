@@ -964,6 +964,79 @@ async fn schedule_schedule_rejects_create_bulk_item_with_contradicting_kind_and_
     );
 }
 
+#[tokio::test]
+async fn schedule_schedule_rejects_non_boolean_bulk_options_with_live_parity_and_no_persist() {
+    let (registry, runtime) = build_registry();
+    let token = runtime
+        .authorize(khive_runtime::Namespace::local())
+        .expect("authorize local namespace");
+    let cases = [
+        (
+            "atomic",
+            "\"not-a-boolean\"",
+            serde_json::json!("not-a-boolean"),
+        ),
+        ("verbose", "1", serde_json::json!(1)),
+    ];
+
+    for (option, action_value, live_value) in cases {
+        let name = format!("invalid-{option}-must-not-persist");
+        let action = format!(
+            "create(items=[{{\"kind\":\"concept\",\"name\":\"{name}\"}}], \
+             {option}={action_value})"
+        );
+        let schedule_error = registry
+            .dispatch(
+                "schedule.schedule",
+                serde_json::json!({
+                    "action": action,
+                    "at": "2099-06-01T10:00:00Z"
+                }),
+            )
+            .await
+            .expect_err("malformed bulk option must be rejected before persistence");
+        assert!(
+            schedule_error.to_string().contains(option)
+                && schedule_error.to_string().contains("boolean"),
+            "schedule-time error must identify the malformed {option} boolean; \
+             got: {schedule_error}"
+        );
+
+        let mut live_args = serde_json::json!({
+            "items": [{"kind": "concept", "name": name}]
+        });
+        live_args
+            .as_object_mut()
+            .expect("live args object")
+            .insert(option.to_string(), live_value);
+        let live_error = registry
+            .dispatch("create", live_args)
+            .await
+            .expect_err("live bulk create must reject the same malformed option");
+        assert!(
+            live_error.to_string().contains(option) && live_error.to_string().contains("boolean"),
+            "live error must identify the malformed {option} boolean; got: {live_error}"
+        );
+
+        assert!(
+            runtime
+                .list_notes(&token, Some("scheduled_event"), 100, 0)
+                .await
+                .expect("list scheduled events")
+                .is_empty(),
+            "invalid scheduled action must not persist a scheduled_event"
+        );
+        assert!(
+            runtime
+                .list_entities(&token, Some("concept"), None, 100, 0)
+                .await
+                .expect("list concepts")
+                .is_empty(),
+            "invalid live create must not persist any bulk item"
+        );
+    }
+}
+
 /// An invalid legacy `entity_kind` value (unknown to both the base
 /// `khive_types::EntityKind` parser and the registry's merged vocabulary)
 /// must be rejected at schedule time, not merely accepted because
@@ -1589,6 +1662,131 @@ async fn schedule_schedule_accepts_every_kg_entity_kind_alias_bulk() {
                 )
             });
     }
+}
+
+#[tokio::test]
+async fn schedule_schedule_accepts_mixed_entity_note_bulk_create() {
+    let (registry, _rt) = build_registry();
+    let action = r#"create(items=[{"kind":"concept","name":"scheduled-entity"},{"kind":"observation","content":"scheduled note","external_id":"schedule:mixed-note"}])"#;
+
+    registry
+        .dispatch(
+            "schedule.schedule",
+            serde_json::json!({ "action": action, "at": "2099-06-01T10:00:00Z" }),
+        )
+        .await
+        .expect("schedule replay validation must accept valid bulk notes");
+
+    let live = registry
+        .dispatch(
+            "create",
+            serde_json::json!({
+                "items": [
+                    {"kind": "concept", "name": "live-mixed-entity"},
+                    {"kind": "observation", "content": "live mixed note", "external_id": "live:mixed-note"}
+                ]
+            }),
+        )
+        .await
+        .expect("live KG handler must accept the same mixed shape");
+    assert_eq!(live["created"], 2);
+    assert_eq!(live["created_notes"], 1);
+}
+
+#[tokio::test]
+async fn schedule_schedule_rejects_invalid_singleton_note_natural_keys_before_replay() {
+    let (registry, _rt) = build_registry();
+    for action in [
+        r#"create(kind="concept", name="x", external_id="entity-key")"#,
+        r#"create(kind="observation", content="x", external_id=null)"#,
+        r#"create(kind="observation", content="x", external_id=17)"#,
+        r#"create(kind="observation", content="x", external_id="")"#,
+        r#"create(kind="observation", content="x", external_id="   ")"#,
+        r#"create(kind="observation", content="x", properties={"external_id":17})"#,
+        r#"create(kind="observation", content="x", external_id="a", properties={"external_id":"b"})"#,
+        r#"create(kind="observation", content="x", external_id="a", properties=[])"#,
+    ] {
+        let error = registry
+            .dispatch(
+                "schedule.schedule",
+                serde_json::json!({ "action": action, "at": "2099-06-01T10:00:00Z" }),
+            )
+            .await
+            .expect_err("a guaranteed-invalid singleton natural key must fail at write time");
+        assert!(
+            error.to_string().contains("external_id"),
+            "schedule rejection should identify external_id for {action:?}: {error}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn schedule_schedule_accepts_valid_singleton_note_natural_key_forms() {
+    let (registry, _rt) = build_registry();
+    for action in [
+        r#"create(kind="observation", content="x", external_id="schedule:top-level")"#,
+        r#"create(kind="observation", content="x", properties={"external_id":"schedule:property"})"#,
+        r#"create(kind="observation", content="x", external_id="schedule:matching", properties={"external_id":"schedule:matching"})"#,
+    ] {
+        registry
+            .dispatch(
+                "schedule.schedule",
+                serde_json::json!({ "action": action, "at": "2099-06-01T10:00:00Z" }),
+            )
+            .await
+            .unwrap_or_else(|error| {
+                panic!("valid singleton natural-key form must be schedulable: {action:?}: {error}")
+            });
+    }
+}
+
+#[tokio::test]
+async fn schedule_schedule_rejects_invalid_bulk_note_natural_keys_before_replay() {
+    let (registry, _rt) = build_registry();
+    for action in [
+        r#"create(items=[{"kind":"observation","content":"x","external_id":null}])"#,
+        r#"create(items=[{"kind":"observation","content":"x","external_id":"a","properties":{"external_id":"b"}}])"#,
+        r#"create(items=[{"kind":"observation","content":"x","salience":2.0}])"#,
+    ] {
+        let error = registry
+            .dispatch(
+                "schedule.schedule",
+                serde_json::json!({ "action": action, "at": "2099-06-01T10:00:00Z" }),
+            )
+            .await
+            .expect_err("guaranteed-invalid bulk note must be rejected when scheduled");
+        assert!(
+            error.to_string().contains("items[0]"),
+            "schedule rejection should locate the invalid item: {error}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn schedule_schedule_rejects_top_level_external_id_on_bulk_create() {
+    let (registry, _rt) = build_registry();
+    let action = r#"create(items=[], external_id="schedule:misplaced")"#;
+
+    let error = registry
+        .dispatch(
+            "schedule.schedule",
+            serde_json::json!({ "action": action, "at": "2099-06-01T10:00:00Z" }),
+        )
+        .await
+        .expect_err("top-level external_id must not survive the bulk early return");
+    assert!(
+        error.to_string().contains("external_id") && error.to_string().contains("beside `items`"),
+        "schedule rejection must explain where the natural key belongs: {error}"
+    );
+
+    let live_error = registry
+        .dispatch(
+            "create",
+            serde_json::json!({ "items": [], "external_id": "live:misplaced" }),
+        )
+        .await
+        .expect_err("the live KG handler must reject the same misplaced field");
+    assert!(live_error.to_string().contains("external_id"));
 }
 
 #[tokio::test]

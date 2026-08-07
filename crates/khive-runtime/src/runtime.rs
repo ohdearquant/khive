@@ -827,8 +827,9 @@ impl KhiveRuntime {
     /// before the write: `create_note_inner` (`operations.rs`, the generic
     /// `create` verb funnel and every other public `create_note*` variant),
     /// `atomic_prepare::prepare_add_note` (the proposal-apply add-note path),
-    /// and `atomic_message::create_notes_atomic_with_report` (the atomic
-    /// multi-note writer).
+    /// `atomic_message::create_notes_atomic_with_report` (the atomic
+    /// multi-note writer), and `atomic_create::create_records_atomic` (the
+    /// generic mixed entity/note bulk writer).
     ///
     /// NOT covered: `try_create_note` (`operations.rs`), and the raw
     /// `try_insert_note` / `upsert_note` methods on the [`NoteStore`] returned

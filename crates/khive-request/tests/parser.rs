@@ -5,7 +5,7 @@
 //! `src/conflict.rs` under `#[cfg(test)] mod tests`.
 
 use khive_request::{
-    parse_request, ArgValue, DslError, ExecutionMode, MAX_OPS, MAX_OPS_INPUT_LEN,
+    parse_request, ArgValue, DslError, ExecutionGroup, ExecutionMode, MAX_OPS, MAX_OPS_INPUT_LEN,
     NESTING_DEPTH_LIMIT,
 };
 use serde_json::json;
@@ -75,6 +75,40 @@ fn batch_three_ops() {
     assert_eq!(r.ops[0].tool, "create");
     assert_eq!(r.ops[2].tool, "link");
     assert_eq!(val(&r.ops[2].args["relation"]), &json!("extends"));
+}
+
+#[test]
+fn batch_accepts_independent_chain_groups() {
+    let r = req(
+        r#"[stats(), create(kind="concept", name="A") | get(id=$prev.id), create(kind="concept", name="B") | get(id=$prev.id)]"#,
+    );
+    assert_eq!(r.mode, ExecutionMode::Parallel);
+    assert_eq!(r.ops.len(), 5);
+    assert_eq!(
+        r.groups,
+        vec![
+            ExecutionGroup { start: 0, len: 1 },
+            ExecutionGroup { start: 1, len: 2 },
+            ExecutionGroup { start: 3, len: 2 },
+        ]
+    );
+    assert_eq!(r.ops[2].args["id"], ArgValue::PrevRef { path: "id".into() });
+    assert_eq!(r.ops[4].args["id"], ArgValue::PrevRef { path: "id".into() });
+}
+
+#[test]
+fn batch_rejects_prev_in_non_chain_group() {
+    let err = parse_request(r#"[get(id=$prev.id), stats()]"#).unwrap_err();
+    assert!(matches!(err, DslError::PrevRefOutsideChain { .. }));
+}
+
+#[test]
+fn batch_chain_total_respects_max_ops() {
+    let chain = std::iter::repeat_n("stats()", MAX_OPS + 1)
+        .collect::<Vec<_>>()
+        .join(" | ");
+    let err = parse_request(&format!("[{chain}]")).unwrap_err();
+    assert!(matches!(err, DslError::TooManyOps { .. }));
 }
 
 #[test]
@@ -1126,16 +1160,6 @@ fn prev_ref_in_fn_batch_is_rejected() {
 // ── MixedSeparators emitted at parse time ─────────────────────────────────────
 
 #[test]
-fn mixed_separators_in_fn_batch_rejected() {
-    // `[a() | b(), c()]` mixes `|` and `,` at top level.
-    let err = parse_request("[a() | b(), c()]").unwrap_err();
-    assert!(
-        matches!(err, DslError::MixedSeparators),
-        "expected MixedSeparators, got {err:?}"
-    );
-}
-
-#[test]
 fn mixed_separator_after_chain_rejected() {
     // `a() | b(), c()` mixes `|` chain with trailing `,`.
     let err = parse_request("a() | b(), c()").unwrap_err();
@@ -1156,9 +1180,8 @@ fn comma_only_parallel_accepted() {
 #[test]
 fn mixed_separator_before_any_chain_pipe_reaches_the_same_message() {
     // `a(), b() | c()` hits the mixed-separator mistake on the very first
-    // op, before a chain `|` has ever been seen — a third code path from
-    // the other two `MixedSeparators` tests above (`[a() | b(), c()]` and
-    // `a() | b(), c()`). All three must reach the same actionable message,
+    // op, before a chain `|` has ever been seen — a different code path from
+    // `a() | b(), c()`. Both must reach the same actionable message,
     // not fall through to a generic "expected '|' or end of input" report.
     let err = parse_request("a(), b() | c()").unwrap_err();
     assert!(
@@ -1171,10 +1194,9 @@ fn mixed_separator_before_any_chain_pipe_reaches_the_same_message() {
         "message must name the mix mistake, got: {msg}"
     );
     assert!(
-        msg.contains("two `request` calls")
-            && msg.contains("one `[...]` batch")
-            && msg.contains("a() | b(arg=$prev.id)"),
-        "message must prescribe the documented two-call split, got: {msg}"
+        msg.contains("wrap independent chain groups in `[...]`")
+            && msg.contains("[a() | b(arg=$prev.id), c()]"),
+        "message must prescribe the documented bracketed form, got: {msg}"
     );
 }
 

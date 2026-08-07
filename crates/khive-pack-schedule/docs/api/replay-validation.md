@@ -167,7 +167,16 @@ not only discovered at trigger-time replay. `context` prefixes error messages (e
 `#[serde(deny_unknown_fields)]`) so schedule-time validation rejects the same
 malformed entries the real bulk handler would. `validate_create_bulk_items`
 validates a `create(items=[...])` bulk payload the way `handle_create`'s bulk path
-would: `items` must parse into that shape (required `kind` + `name`,
-deny-unknown-fields), and bulk create only supports entity kinds (never note kinds).
+would: `items` must parse into that shape (required `kind`,
+deny-unknown-fields), entities require `name`, and notes require `content`.
+Entity and note entries may be mixed; note-only/entity-only fields and kind
+reconciliation are checked before the action is scheduled. Note salience and
+the two accepted `external_id` representations are validated with the same
+range, type, and agreement rules as live replay. Singleton note creates use the
+same natural-key validation: null, empty, non-string, conflicting, or
+non-object-merge forms are rejected when the schedule is written, and entity
+creates reject the note-only top-level field. A bulk action also rejects a
+top-level `external_id` before its `items` early return; natural keys belong on
+the individual note entries, matching live KG dispatch even for an empty batch.
 
 Source: `crates/khive-pack-schedule/src/handlers.rs`.

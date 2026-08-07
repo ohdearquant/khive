@@ -30,16 +30,20 @@ Pure JSON arrays/objects become one `ArgValue::Value`; a container with any `$pr
 
 ## Function-call batches and chains
 
-`[op(...), op(...)]` is parallel and rejects `$prev`. `op(...) | op(...)` is a sequential chain and may contain `$prev` anywhere in an argument value. Empty batches, mixed `,` and `|` separators in one request, trailing input, and more than `MAX_OPS` operations are errors. A chain is not a valid element of a parallel batch.
+`[op(...), op(...)]` is parallel. A comma separates independently scheduled
+groups, and each group may be a sequential chain: `[a() | b(id=$prev.id),
+c() | d(id=$prev.id)]`. `$prev` is scoped to its group. Empty batches,
+unbracketed mixed separators, trailing input, and more than `MAX_OPS` flattened
+operations are errors.
 
-Split independent operations and a dependent chain into two `request` calls:
+Combine independent operations and a dependent chain in one request:
 
 ```text
-request(ops='[create(kind="concept", name="Independent A"), create(kind="concept", name="Independent B")]')
-request(ops='create(kind="concept", name="Dependent") | link(source_id=$prev.id, target_id="<existing-uuid>", relation="extends")')
+request(ops='[create(kind="concept", name="Independent A"), create(kind="concept", name="Independent B"), create(kind="concept", name="Dependent") | link(source_id=$prev.id, target_id="<existing-uuid>", relation="extends")]')
 ```
 
-The calls are independent and may run in either order. `$prev` is scoped to the second call and never crosses a request boundary.
+The three groups run concurrently. Failure in the chain aborts only its own
+tail; the singleton groups continue.
 
 Chain parsing does not resolve references; it only represents them. The dispatcher resolves each operation against the immediately preceding result and aborts after a failed step.
 

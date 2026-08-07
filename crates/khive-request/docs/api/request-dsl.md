@@ -13,11 +13,12 @@ verb(arg=value, arg=value)
 ### Function-call batch (parallel)
 
 ```
-[verb1(arg=value), verb2(arg=value), ...]
+[verb1(arg=value) | verb2(id=$prev.id), verb3(arg=value), ...]
 ```
 
-Ops run concurrently. Results are collected in input order.
-Maximum 100 ops per request (`MAX_OPS`).
+Comma-delimited groups run concurrently; pipe-delimited ops within a group run
+sequentially. A group failure aborts only that group's tail. Results are
+flattened in input order. Maximum 100 total ops per request (`MAX_OPS`).
 
 ### Chain form (sequential)
 
@@ -92,7 +93,8 @@ Write ops and their conflict keys:
 `link(source_id="X", ...)` in the same batch do **not** conflict — they target
 different substrates.
 
-Chain mode skips write-key preflight because sequential ordering is explicit.
+Sequential operations within one chain group skip write-key conflicts because
+their ordering is explicit; conflicts are checked across independent groups.
 See [`write-conflicts.md`](write-conflicts.md) for bulk links, symmetric edges,
 and the production integration boundary.
 
@@ -112,10 +114,10 @@ and the production integration boundary.
 | `UnclosedBracket`        | `[`, `{`, or `(` has no matching close     |
 | `PrevRefOutsideChain`    | `$prev` in a non-chain context             |
 | `PrevRefInJsonForm`      | `$prev` string found in JSON-form input    |
-| `MixedSeparators`        | `,` and `\|` mixed at the top level        |
+| `MixedSeparators`        | `,` and `\|` mixed without batch brackets  |
 | `EmptyBatch`             | `[]` with no ops                           |
 | `UnsupportedVerbNesting` | More than one dot in a verb name (`a.b.c`) |
-| `WriteKeyConflict`       | Two parallel ops target the same record    |
+| `WriteKeyConflict`       | Test-only batch scanner finds an overlap   |
 
 The full taxonomy, including input-size, nesting, and reserved-envelope errors,
 is in [`limits-and-errors.md`](limits-and-errors.md).

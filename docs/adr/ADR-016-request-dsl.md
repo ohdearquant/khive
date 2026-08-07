@@ -57,10 +57,17 @@ intermediate representation:
 verb(arg=value, arg=value)
 ```
 
-**Parallel batch** (operations run independently, results in input order):
+**Parallel batch** (top-level groups run independently, flattened results stay
+in input order):
 
 ```text
 [verb1(...), verb2(...), verb3(...)]
+```
+
+A top-level group may be a sequential chain:
+
+```text
+[verb1(...) | verb2(arg=$prev.id), verb3(...) | verb4(arg=$prev.id)]
 ```
 
 **Sequential chain** (operations run in order, with `$prev` substitution):
@@ -69,9 +76,8 @@ verb(arg=value, arg=value)
 verb1(...) | verb2(arg=$prev.id) | verb3(arg=$prev.field)
 ```
 
-Mixing `,` and `|` in one request is rejected as a parse error. A parallel
-batch cannot contain a chain; sub-chain bracketing is not part of this DSL.
-For example, this combined shape is invalid:
+Inside `[...]`, commas separate independently scheduled groups and `|` joins
+operations within one group. For example:
 
 ```text
 [create(kind="concept", name="Independent A"),
@@ -80,16 +86,14 @@ For example, this combined shape is invalid:
    link(source_id=$prev.id, target_id="<existing-uuid>", relation="extends")]
 ```
 
-Split it into exactly two `request` calls: one parallel call for the
-independent operations, and one sequential call for the dependency:
+The two singleton creates and the dependent create/link chain are scheduled as
+three parallel groups. `$prev` is scoped to its group and resolves only the
+immediately preceding operation in that group. A failed operation aborts the
+remainder of its own chain; sibling groups continue. The request-wide
+`MAX_OPS=100` limit counts every flattened operation, not groups.
 
-```text
-request(ops='[create(kind="concept", name="Independent A"), create(kind="concept", name="Independent B")]')
-request(ops='create(kind="concept", name="Dependent") | link(source_id=$prev.id, target_id="<existing-uuid>", relation="extends")')
-```
-
-The two calls above are independent and may be issued in either order. `$prev`
-is scoped to the second call's chain; it never carries across request calls.
+At the unbracketed top level, `a() | b(), c()` remains a mixed-separator parse
+error. JSON form remains a flat parallel batch and has no chain representation.
 
 **JSON form** is canonical for programmatic input that produces structured objects
 more easily than string templating:
@@ -619,3 +623,15 @@ registry resolves them.
 - ADR-014: Curation Operations — verbs that the DSL invokes (update, merge,
   delete).
 - ADR-017: Pack Standard — how packs register verbs with the `VerbRegistry`.
+
+## Amendment: independently scheduled chain groups (2026-08-06)
+
+Function-call batches may contain sequential groups: `[a() | b($prev.id),
+c() | d($prev.id)]`. The parser flattens operations for the stable response
+shape and records contiguous scheduling groups in `ParsedRequest::groups`.
+Groups execute concurrently under the existing batch concurrency and response
+budgets; operations inside a group execute sequentially. A group failure aborts
+only that group's remaining operations. Write-key conflicts are checked across
+independent groups, while repeated access inside one sequential group is valid.
+The 100-operation limit applies to the flattened total. JSON batches remain
+flat and cannot express `$prev`.

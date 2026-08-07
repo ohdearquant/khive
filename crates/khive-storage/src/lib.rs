@@ -27,7 +27,7 @@ pub use event::{
     Event, EventFilter, EventObservation, EventStore, EventView, ObservationRole, ReferentKind,
 };
 pub use graph::GraphStore;
-pub use note::{FilterOp, Note, NoteFilter, NoteStore, SortDir};
+pub use note::{FilterOp, Note, NoteFilter, NoteInsertOutcome, NoteStore, SortDir};
 pub use sparse::SparseStore;
 pub use sql::{AtomicUnitOp, BoxFuture, SqlAccess, SqlReader, SqlWriter};
 pub use telemetry::{

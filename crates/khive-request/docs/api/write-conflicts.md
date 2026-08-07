@@ -30,6 +30,6 @@ The local symmetric set is deliberately conservative: only `competes_with` and `
 
 ## Batch preflight boundary
 
-Sequential chains may repeat a key because execution order is defined. Parallel conflict detection records the first tool claiming each key and reports the second as `DslError::WriteKeyConflict`.
+Sequential chains may repeat a key because execution order is defined. Parallel conflict detection compares independent operations or chain groups and marks every statically identifiable operation that claims a key also claimed by another group. The MCP dispatcher emits one conflict result for each marked operation; other operations continue.
 
-The batch-scanning helper is currently test-only; the production integration surface is the public per-op extractor. This distinction keeps parser output transport-agnostic while allowing an execution layer to choose envelope or whole-batch conflict policy.
+For a conflict later in a chain group, earlier non-conflicting members execute first. The exact conflicting member then fails preflight and normal chain semantics mark only the remaining group members aborted. Other groups remain independent. The parser's batch-scanning helper is test-only and still uses `DslError::WriteKeyConflict`; the production integration surface is the public per-op extractor plus the MCP operation-level envelope policy.

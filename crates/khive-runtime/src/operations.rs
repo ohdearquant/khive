@@ -24,7 +24,7 @@ use serde::Serialize;
 use uuid::Uuid;
 
 use khive_score::DeterministicScore;
-use khive_storage::note::Note;
+use khive_storage::note::{Note, NoteInsertOutcome};
 use khive_storage::types::{
     DeleteMode, DirectedNeighborHit, Direction, EdgeSortField, GraphPath, LinkId, NeighborHit,
     NeighborQuery, Page, PageRequest, SeekCursor, SortOrder, SqlRow, SqlStatement, SqlValue,
@@ -54,9 +54,18 @@ use crate::runtime::{KhiveRuntime, NamespaceToken};
 // Gated behind `cfg(any(test, feature = "fault-injection"))` so no lock acquisitions
 // or injection surface exist in production/published binaries. External integration
 // test crates enable it via a dev-dependency: khive-runtime = { ..., features = ["fault-injection"] }
-#[cfg(test)]
+#[cfg(any(test, feature = "fault-injection"))]
 std::thread_local! {
     static LINK_FAIL_AFTER: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Arm the annotation-edge failure injection: let `n - 1` annotation links
+/// succeed, then fail the `n`th link. Thread-local and intended for integration
+/// tests that exercise the committed-note repair response end to end.
+/// Available when compiled with `cfg(test)` or `feature = "fault-injection"`.
+#[cfg(any(test, feature = "fault-injection"))]
+pub fn arm_link_fail_after(n: usize) {
+    LINK_FAIL_AFTER.with(|cell| cell.set(n));
 }
 
 // Count-targetable vector-INSERT fault injection: when set to N (N > 0), the next N
@@ -298,6 +307,46 @@ pub(crate) fn consume_fts_fail_fault(ns: &str) -> bool {
 #[cfg(any(test, feature = "fault-injection"))]
 pub(crate) fn consume_vector_fail_fault(ns: &str) -> bool {
     consume_fault(&VECTOR_FAIL_NS, ns)
+}
+
+/// Consume either vector-insert failure seam at the actual insert boundary.
+/// Shared committed-note indexing uses this so natural-key and ordinary create
+/// paths retain identical deterministic fault semantics.
+#[cfg(any(test, feature = "fault-injection"))]
+pub(crate) fn consume_vector_insert_fail_fault(ns: &str) -> bool {
+    let namespace_inject = consume_fault(&VECTOR_FAIL_NS, ns);
+    let count_inject = VECTOR_FAIL_AFTER.with(|cell| match cell.get() {
+        Some(0) => {
+            cell.set(None);
+            true
+        }
+        Some(n) => {
+            cell.set(Some(n - 1));
+            false
+        }
+        None => false,
+    });
+    namespace_inject || count_inject
+}
+
+/// One failed stage in the repair plan for a note whose durable row committed.
+///
+/// `model` is populated for model-specific embedding/vector stages and omitted
+/// for substrate-wide stages such as FTS or annotation-edge creation.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct NotePostCommitFailureStage {
+    pub stage: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+}
+
+impl NotePostCommitFailureStage {
+    fn new(stage: &str, model: Option<&str>) -> Self {
+        Self {
+            stage: stage.to_string(),
+            model: model.map(str::to_string),
+        }
+    }
 }
 
 /// A note search result with UUID, salience-weighted RRF score, and display text.
@@ -1151,24 +1200,33 @@ fn recompute_total_weight(path: &mut GraphPath) {
 /// await, so detached completion cannot change the operation's usage count.
 /// Each task owns cloned runtime/provider state and only computes an embedding;
 /// storage writes remain in the parent after this drain succeeds.
-async fn drain_embed_join_set<T: Send + 'static>(
+struct EmbedJoinFailure {
+    model_index: Option<usize>,
+    error: RuntimeError,
+}
+
+async fn drain_embed_join_set_indexed<T: Send + 'static>(
     mut join_set: tokio::task::JoinSet<(usize, RuntimeResult<T>)>,
     model_count: usize,
-) -> RuntimeResult<Vec<T>> {
+) -> Result<Vec<T>, EmbedJoinFailure> {
     let mut vectors: Vec<Option<T>> = (0..model_count).map(|_| None).collect();
 
     while let Some(joined) = join_set.join_next().await {
         match joined {
             Ok((idx, Ok(vector))) => vectors[idx] = Some(vector),
-            Ok((_idx, Err(e))) => {
+            Ok((idx, Err(error))) => {
                 join_set.abort_all();
-                return Err(e);
+                return Err(EmbedJoinFailure {
+                    model_index: Some(idx),
+                    error,
+                });
             }
             Err(join_err) => {
                 join_set.abort_all();
-                return Err(RuntimeError::Internal(format!(
-                    "embed task panicked: {join_err}"
-                )));
+                return Err(EmbedJoinFailure {
+                    model_index: None,
+                    error: RuntimeError::Internal(format!("embed task panicked: {join_err}")),
+                });
             }
         }
     }
@@ -1177,6 +1235,15 @@ async fn drain_embed_join_set<T: Send + 'static>(
         .into_iter()
         .map(|v| v.expect("every model index observed exactly once by join_set drain"))
         .collect())
+}
+
+async fn drain_embed_join_set<T: Send + 'static>(
+    join_set: tokio::task::JoinSet<(usize, RuntimeResult<T>)>,
+    model_count: usize,
+) -> RuntimeResult<Vec<T>> {
+    drain_embed_join_set_indexed(join_set, model_count)
+        .await
+        .map_err(|failure| failure.error)
 }
 
 impl KhiveRuntime {
@@ -3063,6 +3130,50 @@ impl KhiveRuntime {
         properties: Option<serde_json::Value>,
         annotates: Vec<Uuid>,
     ) -> RuntimeResult<(Note, crate::retrieval::EmbeddingTruncationReport)> {
+        let (note, report, _, _) = self
+            .create_note_inner(
+                token,
+                kind,
+                name,
+                content,
+                embedding_content,
+                salience,
+                None,
+                properties,
+                annotates,
+                None,
+            )
+            .await?;
+        Ok((note, report))
+    }
+
+    /// Natural-key-aware form of
+    /// [`Self::create_note_with_embedding_content_and_report`].
+    ///
+    /// Ordinary notes preserve create-always semantics and return
+    /// `created=true`. A non-empty string `properties.external_id` makes the
+    /// write idempotent: the store atomically inserts or returns the live
+    /// canonical `(namespace, kind, external_id)` row. The final vector reports
+    /// exact post-commit repair stages (and a model where applicable). A
+    /// natural-key winner is never deleted after commit because another
+    /// contender may already have received its canonical id.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_note_with_embedding_content_and_outcome(
+        &self,
+        token: &NamespaceToken,
+        kind: &str,
+        name: Option<&str>,
+        content: &str,
+        embedding_content: Option<&str>,
+        salience: Option<f64>,
+        properties: Option<serde_json::Value>,
+        annotates: Vec<Uuid>,
+    ) -> RuntimeResult<(
+        Note,
+        crate::retrieval::EmbeddingTruncationReport,
+        bool,
+        Vec<NotePostCommitFailureStage>,
+    )> {
         self.create_note_inner(
             token,
             kind,
@@ -3266,7 +3377,12 @@ impl KhiveRuntime {
         properties: Option<serde_json::Value>,
         annotates: Vec<Uuid>,
         embedding_model: Option<&str>,
-    ) -> RuntimeResult<(Note, crate::retrieval::EmbeddingTruncationReport)> {
+    ) -> RuntimeResult<(
+        Note,
+        crate::retrieval::EmbeddingTruncationReport,
+        bool,
+        Vec<NotePostCommitFailureStage>,
+    )> {
         self.validate_note_kind(kind)?;
         // Owned identity properties are derived from the authorization token
         // before anything else touches them, so every caller of this function —
@@ -3274,6 +3390,20 @@ impl KhiveRuntime {
         // same derived values. Runs before the secret gate so the gate scans
         // exactly what will be written.
         let properties = self.derive_note_write_properties(kind, token, properties)?;
+        let external_id = match properties
+            .as_ref()
+            .and_then(|value| value.get("external_id"))
+        {
+            None => None,
+            Some(serde_json::Value::String(value)) if !value.trim().is_empty() => {
+                Some(value.clone())
+            }
+            Some(_) => {
+                return Err(RuntimeError::InvalidInput(
+                    "external_id must be a non-empty string".into(),
+                ));
+            }
+        };
         // Secret gate: scan content, optional name, and structured properties.
         crate::secret_gate::check(content)?;
         if let Some(n) = name {
@@ -3349,11 +3479,32 @@ impl KhiveRuntime {
         if let Some(p) = properties {
             note = note.with_properties(p);
         }
-        self.notes(token)?.upsert_note(note.clone()).await?;
+        let natural_key_create = external_id.is_some();
+        let insert_outcome = if natural_key_create {
+            self.notes(token)?
+                .insert_note_natural_key(note.clone())
+                .await?
+        } else {
+            self.notes(token)?.upsert_note(note.clone()).await?;
+            NoteInsertOutcome {
+                note: note.clone(),
+                created: true,
+            }
+        };
+        let note = insert_outcome.note;
+        if !insert_outcome.created {
+            return Ok((
+                note,
+                crate::retrieval::EmbeddingTruncationReport::default(),
+                false,
+                Vec::new(),
+            ));
+        }
+        let mut post_commit_failures = Vec::new();
 
-        // From here on, any error must compensate by removing the note row, its
-        // FTS document, and any vector entries already inserted — the same
-        // cleanup used by the annotates-edge block below.
+        // Ordinary creates retain the historical compensate-on-side-effect-
+        // failure contract. Natural-key rows are externally observable after
+        // their insert commits and must remain canonical for concurrent losers.
 
         // Decide which embedding models to use (before touching FTS/vectors).
         let embed_model_names: Vec<String> = if let Some(m) = embedding_model {
@@ -3373,7 +3524,83 @@ impl KhiveRuntime {
             }
         };
 
-        // FTS step — compensate note row on failure.
+        let canonical_embed_text = note_embedding_text_ref(&note);
+        let embed_text = embedding_content.unwrap_or(canonical_embed_text);
+        let mut embedding_report = crate::retrieval::EmbeddingTruncationReport::default();
+
+        if natural_key_create {
+            let indexed = crate::atomic_create::index_committed_note_if_current(
+                self,
+                token,
+                &note,
+                embed_text,
+                &embed_model_names,
+                true,
+            )
+            .await;
+            embedding_report.merge(indexed.embedding_truncation);
+            if indexed.fts_failed {
+                post_commit_failures.push(NotePostCommitFailureStage::new("fts", None));
+            }
+            post_commit_failures.extend(indexed.failures.into_iter().map(|failure| {
+                NotePostCommitFailureStage::new(failure.stage, Some(&failure.model))
+            }));
+
+            // A natural-key winner cannot enter the compensating ordinary path
+            // below. Finish its annotation side effects here, retaining the
+            // durable canonical row and reporting any repair stage.
+            let mut created_edges = Vec::with_capacity(annotates.len());
+            for (call_index, target_id) in annotates.iter().copied().enumerate() {
+                #[cfg(any(test, feature = "fault-injection"))]
+                let injected_error = LINK_FAIL_AFTER.with(|cell| {
+                    let fail_at = cell.get();
+                    if fail_at > 0 && call_index + 1 == fail_at {
+                        cell.set(0);
+                        Some(RuntimeError::Internal("injected link failure".to_string()))
+                    } else {
+                        None
+                    }
+                });
+                #[cfg(not(any(test, feature = "fault-injection")))]
+                let injected_error: Option<RuntimeError> = {
+                    let _ = call_index;
+                    None
+                };
+
+                let link_result = if let Some(error) = injected_error {
+                    Err(error)
+                } else {
+                    self.link(
+                        token,
+                        note.id,
+                        target_id,
+                        EdgeRelation::Annotates,
+                        1.0,
+                        None,
+                    )
+                    .await
+                };
+                match link_result {
+                    Ok(edge) => created_edges.push(Uuid::from(edge.id)),
+                    Err(error) => {
+                        for edge_id in created_edges {
+                            let _ = self.delete_edge(token, edge_id, true).await;
+                        }
+                        post_commit_failures
+                            .push(NotePostCommitFailureStage::new("annotates", None));
+                        tracing::warn!(
+                            note_id = %note.id,
+                            error = %error,
+                            "idempotent note committed but annotates side effects failed"
+                        );
+                        break;
+                    }
+                }
+            }
+            return Ok((note, embedding_report, true, post_commit_failures));
+        }
+
+        // FTS step — ordinary notes preserve compensate-on-failure semantics.
         {
             // Injection: check FTS_FAIL_NS (armed by `arm_fts_fail_scoped(ns)`).
             // Fires only when `ns` is in the armed set, removing it on the way
@@ -3414,73 +3641,65 @@ impl KhiveRuntime {
         // capped override when present, otherwise the full stored content.
         // FTS indexing above always used the full `note.content` — this cap
         // affects only the vector-embedding input.
-        let canonical_embed_text = note_embedding_text_ref(&note);
-        let embed_text = embedding_content.unwrap_or(canonical_embed_text);
-
-        let mut embedding_report = crate::retrieval::EmbeddingTruncationReport::default();
         if embed_model_names.len() == 1 {
             // Single-model path: preserves original sequential behaviour.
             let model_name = &embed_model_names[0];
-            let vec_result = self
+            let embed_result = self
                 .embed_document_with_model_outcome_for_token(token, model_name, embed_text)
                 .await;
 
-            // Injection: check VECTOR_FAIL_NS (armed by `arm_vector_fail_scoped(ns)`) or
-            // VECTOR_FAIL_AFTER (armed by `arm_vector_fail_after(n)`). The former
-            // fires only when the armed namespace matches this note's namespace;
-            // callers that cannot guarantee no concurrently-running test also
-            // writes a note into that same namespace (e.g. a test suite whose
-            // fixtures share one default namespace) should prefer the latter,
-            // thread-local count instead — see its doc comment. Either clears
-            // (one-shot) once it fires. No lock/cell access in release builds —
-            // the cfg(not) branch is a const false eliminating the if-branch.
-            #[cfg(any(test, feature = "fault-injection"))]
-            let vec_inject = {
-                let ns_inject = consume_fault(&VECTOR_FAIL_NS, ns);
-                let count_inject = VECTOR_FAIL_AFTER.with(|cell| match cell.get() {
-                    Some(0) => {
-                        cell.set(None);
-                        true
-                    }
-                    Some(n) => {
-                        cell.set(Some(n - 1));
-                        false
-                    }
-                    None => false,
-                });
-                ns_inject || count_inject
-            };
-            #[cfg(not(any(test, feature = "fault-injection")))]
-            let vec_inject = false;
-            let vec_result: RuntimeResult<crate::retrieval::DocumentEmbeddingOutcome> =
-                if vec_inject {
-                    Err(RuntimeError::Internal(
-                        "injected vector failure".to_string(),
-                    ))
-                } else {
-                    vec_result
-                };
-
-            let single_model_result: RuntimeResult<()> = match vec_result {
+            let single_model_failure: Option<(&'static str, RuntimeError)> = match embed_result {
+                Err(error) => Some(("embedding", error)),
                 Ok(outcome) => {
                     embedding_report.observe(&outcome);
                     match self.vectors_for_model(token, model_name) {
-                        Ok(vs) => vs
-                            .insert(
-                                note.id,
-                                SubstrateKind::Note,
-                                ns,
-                                "note.content",
-                                vec![outcome.vector],
-                            )
-                            .await
-                            .map_err(RuntimeError::from),
-                        Err(e) => Err(e),
+                        Err(error) => Some(("vector_store", error)),
+                        Ok(vs) => {
+                            // Injection: check VECTOR_FAIL_NS (armed by
+                            // `arm_vector_fail_scoped(ns)`) or VECTOR_FAIL_AFTER
+                            // (armed by `arm_vector_fail_after(n)`) at the vector
+                            // INSERT boundary so the returned stage stays truthful.
+                            #[cfg(any(test, feature = "fault-injection"))]
+                            let vector_insert_inject = {
+                                let ns_inject = consume_fault(&VECTOR_FAIL_NS, ns);
+                                let count_inject =
+                                    VECTOR_FAIL_AFTER.with(|cell| match cell.get() {
+                                        Some(0) => {
+                                            cell.set(None);
+                                            true
+                                        }
+                                        Some(n) => {
+                                            cell.set(Some(n - 1));
+                                            false
+                                        }
+                                        None => false,
+                                    });
+                                ns_inject || count_inject
+                            };
+                            #[cfg(not(any(test, feature = "fault-injection")))]
+                            let vector_insert_inject = false;
+
+                            let insert_result = if vector_insert_inject {
+                                Err(RuntimeError::Internal(
+                                    "injected vector insert failure".to_string(),
+                                ))
+                            } else {
+                                vs.insert(
+                                    note.id,
+                                    SubstrateKind::Note,
+                                    ns,
+                                    "note.content",
+                                    vec![outcome.vector],
+                                )
+                                .await
+                                .map_err(RuntimeError::from)
+                            };
+                            insert_result.err().map(|error| ("vector_insert", error))
+                        }
                     }
                 }
-                Err(e) => Err(e),
             };
-            if let Err(e) = single_model_result {
+            if let Some((_stage, e)) = single_model_failure {
                 // Compensate note row + FTS.
                 if let Ok(store) = self.notes(token) {
                     let _ = store.delete_note(note.id, DeleteMode::Hard).await;
@@ -3521,37 +3740,67 @@ impl KhiveRuntime {
             // The first failed or panicked handle aborts and detaches its
             // siblings. Embed usage is counted at dispatch, so a synchronous
             // provider winding down in the background cannot change it.
-            let outcomes = match drain_embed_join_set(join_set, embed_model_names.len()).await {
-                Ok(outcomes) => outcomes,
-                Err(e) => {
-                    // Compensate note row + FTS (no vectors inserted yet).
-                    if let Ok(store) = self.notes(token) {
-                        let _ = store.delete_note(note.id, DeleteMode::Hard).await;
+            let outcomes =
+                match drain_embed_join_set_indexed(join_set, embed_model_names.len()).await {
+                    Ok(outcomes) => outcomes,
+                    Err(failure) => {
+                        // Compensate note row + FTS (no vectors inserted yet).
+                        if let Ok(store) = self.notes(token) {
+                            let _ = store.delete_note(note.id, DeleteMode::Hard).await;
+                        }
+                        if let Ok(fts) = self.text_for_notes(token) {
+                            let _ = fts.delete_document(ns, note.id).await;
+                        }
+                        return Err(failure.error);
                     }
-                    if let Ok(fts) = self.text_for_notes(token) {
-                        let _ = fts.delete_document(ns, note.id).await;
-                    }
-                    return Err(e);
-                }
-            };
+                };
             // TODO(P2): parallelize vector inserts
             let mut inserted_models: Vec<String> = Vec::with_capacity(embed_model_names.len());
             for (model_name, outcome) in embed_model_names.iter().zip(outcomes) {
                 embedding_report.observe(&outcome);
-                let insert_result = match self.vectors_for_model(token, model_name) {
-                    Ok(vs) => vs
-                        .insert(
-                            note.id,
-                            SubstrateKind::Note,
-                            ns,
-                            "note.content",
-                            vec![outcome.vector],
-                        )
-                        .await
-                        .map_err(RuntimeError::from),
-                    Err(e) => Err(e),
+                let insert_failure: Option<(&'static str, RuntimeError)> = match self
+                    .vectors_for_model(token, model_name)
+                {
+                    Err(error) => Some(("vector_store", error)),
+                    Ok(vs) => {
+                        #[cfg(any(test, feature = "fault-injection"))]
+                        let vector_insert_inject = {
+                            let ns_inject = consume_fault(&VECTOR_FAIL_NS, ns);
+                            let count_inject = VECTOR_FAIL_AFTER.with(|cell| match cell.get() {
+                                Some(0) => {
+                                    cell.set(None);
+                                    true
+                                }
+                                Some(n) => {
+                                    cell.set(Some(n - 1));
+                                    false
+                                }
+                                None => false,
+                            });
+                            ns_inject || count_inject
+                        };
+                        #[cfg(not(any(test, feature = "fault-injection")))]
+                        let vector_insert_inject = false;
+
+                        let insert_result = if vector_insert_inject {
+                            Err(RuntimeError::Internal(
+                                "injected vector insert failure".to_string(),
+                            ))
+                        } else {
+                            vs.insert(
+                                note.id,
+                                SubstrateKind::Note,
+                                ns,
+                                "note.content",
+                                vec![outcome.vector],
+                            )
+                            .await
+                            .map_err(RuntimeError::from)
+                        };
+                        insert_result.err().map(|error| ("vector_insert", error))
+                    }
                 };
-                if let Err(e) = insert_result {
+                if let Some((_stage, e)) = insert_failure {
                     // Compensate note row + FTS + already-inserted vectors.
                     if let Ok(store) = self.notes(token) {
                         let _ = store.delete_note(note.id, DeleteMode::Hard).await;
@@ -3570,7 +3819,8 @@ impl KhiveRuntime {
             }
         }
 
-        // Create annotates edges, compensating on failure to preserve atomicity.
+        // Create annotates edges. Ordinary notes compensate on failure;
+        // natural-key winners retain the durable canonical row.
         //
         // Pre-validation (above) ensures all targets exist, so link failures are
         // unexpected. If one occurs: delete any edges already created, then remove
@@ -3579,21 +3829,21 @@ impl KhiveRuntime {
 
         // In test builds, iterate with an index so the failure-injection hook can
         // target a specific call.  In release builds, skip the enumerate overhead.
-        #[cfg(test)]
+        #[cfg(any(test, feature = "fault-injection"))]
         let annotates_iter: Vec<(usize, Uuid)> = annotates
             .iter()
             .enumerate()
             .map(|(i, &id)| (i, id))
             .collect();
-        #[cfg(test)]
+        #[cfg(any(test, feature = "fault-injection"))]
         macro_rules! next_target {
             ($pair:expr) => {
                 $pair.1
             };
         }
-        #[cfg(not(test))]
+        #[cfg(not(any(test, feature = "fault-injection")))]
         let annotates_iter: Vec<Uuid> = annotates.to_vec();
-        #[cfg(not(test))]
+        #[cfg(not(any(test, feature = "fault-injection")))]
         macro_rules! next_target {
             ($pair:expr) => {
                 $pair
@@ -3604,7 +3854,7 @@ impl KhiveRuntime {
             let target_id = next_target!(pair);
 
             // Test-only: inject a failure on the configured call index (1-based).
-            #[cfg(test)]
+            #[cfg(any(test, feature = "fault-injection"))]
             let injected_err: Option<RuntimeError> = {
                 let call_idx = pair.0;
                 LINK_FAIL_AFTER.with(|cell| {
@@ -3617,7 +3867,7 @@ impl KhiveRuntime {
                     }
                 })
             };
-            #[cfg(not(test))]
+            #[cfg(not(any(test, feature = "fault-injection")))]
             let injected_err: Option<RuntimeError> = None;
 
             let link_result = if let Some(e) = injected_err {
@@ -3641,6 +3891,16 @@ impl KhiveRuntime {
                     for edge_id in created_edges {
                         let _ = self.delete_edge(token, edge_id, true).await;
                     }
+                    if natural_key_create {
+                        post_commit_failures
+                            .push(NotePostCommitFailureStage::new("annotates", None));
+                        tracing::warn!(
+                            note_id = %note.id,
+                            error = %e,
+                            "idempotent note committed but annotates side effects failed"
+                        );
+                        break;
+                    }
                     if let Ok(store) = self.notes(token) {
                         let _ = store.delete_note(note.id, DeleteMode::Hard).await;
                     }
@@ -3657,7 +3917,7 @@ impl KhiveRuntime {
             }
         }
 
-        Ok((note, embedding_report))
+        Ok((note, embedding_report, true, post_commit_failures))
     }
 
     /// List notes visible to the token, optionally filtered by kind.
@@ -5917,7 +6177,7 @@ pub struct EntityCreateSpec {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::curation::EdgeListFilter;
+    use crate::curation::{EdgeListFilter, NotePatch};
     use crate::embedder_registry::{BlockingEmbeddingService, EmbedderProvider};
     use crate::error::RuntimeError;
     use crate::runtime::{KhiveRuntime, NamespaceToken};
@@ -11055,6 +11315,825 @@ mod tests {
         assert!(
             notes.is_empty(),
             "compensation must remove the note row after FTS failure; got {notes:?}"
+        );
+    }
+
+    // A natural-key winner cannot use the ordinary compensation policy: a
+    // concurrent loser may already have observed its canonical id. Index
+    // failure is therefore a committed outcome with an explicit repair signal.
+    #[tokio::test]
+    async fn idempotent_note_fts_failure_keeps_canonical_winner() {
+        let rt = rt();
+        let ns = Namespace::parse("fault-fts-idempotent-winner").unwrap();
+        let tok = NamespaceToken::for_namespace(ns.clone());
+        let external_id = format!("fault:{}", Uuid::new_v4());
+
+        let _arm = arm_fts_fail_scoped(ns.as_str());
+        let (winner, _report, created, repair_stages) = rt
+            .create_note_with_embedding_content_and_outcome(
+                &tok,
+                "observation",
+                None,
+                "durable natural-key winner",
+                None,
+                None,
+                Some(serde_json::json!({"external_id": external_id})),
+                vec![],
+            )
+            .await
+            .expect("index failure must not erase a committed natural-key winner");
+        assert!(created);
+        assert_eq!(
+            repair_stages,
+            vec![NotePostCommitFailureStage::new("fts", None)]
+        );
+
+        let (retry, _report, retry_created, retry_repair_stages) = rt
+            .create_note_with_embedding_content_and_outcome(
+                &tok,
+                "observation",
+                None,
+                "retry content must not overwrite",
+                None,
+                None,
+                Some(serde_json::json!({"external_id": external_id})),
+                vec![],
+            )
+            .await
+            .expect("retry returns the durable canonical row");
+        assert_eq!(retry.id, winner.id);
+        assert_eq!(retry.content, "durable natural-key winner");
+        assert!(!retry_created);
+        assert!(retry_repair_stages.is_empty());
+
+        let notes = rt.list_notes(&tok, None, 1000, 0).await.unwrap();
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].id, winner.id);
+    }
+
+    #[tokio::test]
+    async fn idempotent_note_vector_failure_reports_exact_stage_and_model() {
+        const MODEL: &str = "idempotent-note-vector-repair";
+
+        let rt = rt();
+        let (provider, _build_count) = ConstVecProvider::new(MODEL, 4);
+        rt.register_embedder(provider);
+        let ns = Namespace::parse("fault-vector-idempotent-winner").unwrap();
+        let tok = NamespaceToken::for_namespace(ns.clone());
+        let external_id = format!("fault:{}", Uuid::new_v4());
+
+        let _arm = arm_vector_fail_scoped(ns.as_str());
+        let (winner, _report, created, repair_stages) = rt
+            .create_note_with_embedding_content_and_outcome(
+                &tok,
+                "observation",
+                None,
+                "durable natural-key vector winner",
+                None,
+                None,
+                Some(serde_json::json!({"external_id": external_id})),
+                vec![],
+            )
+            .await
+            .expect("vector failure must not erase a committed natural-key winner");
+
+        assert!(created);
+        assert_eq!(
+            repair_stages,
+            vec![NotePostCommitFailureStage::new(
+                "vector_insert",
+                Some(MODEL)
+            )]
+        );
+        assert!(rt
+            .notes(&tok)
+            .unwrap()
+            .get_note(winner.id)
+            .await
+            .unwrap()
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn idempotent_note_model_failures_keep_healthy_sibling_and_report_every_model() {
+        const FAILED_MODEL_A: &str = "idempotent-note-a-failed-model";
+        const HEALTHY_MODEL: &str = "idempotent-note-b-healthy-model";
+        const FAILED_MODEL_C: &str = "idempotent-note-c-failed-model";
+
+        let rt = rt();
+        rt.register_embedder(FailFastProvider::new(FAILED_MODEL_A));
+        let (healthy, _build_count) = ConstVecProvider::new(HEALTHY_MODEL, 4);
+        rt.register_embedder(healthy);
+        rt.register_embedder(FailFastProvider::new(FAILED_MODEL_C));
+        let ns = Namespace::parse("idempotent-note-multi-model-repair").unwrap();
+        let tok = NamespaceToken::for_namespace(ns);
+
+        let (winner, _report, created, repair_stages) = rt
+            .create_note_with_embedding_content_and_outcome(
+                &tok,
+                "observation",
+                None,
+                "one model fails while its healthy sibling must still finish",
+                None,
+                None,
+                Some(serde_json::json!({
+                    "external_id": format!("multi-model:{}", Uuid::new_v4())
+                })),
+                vec![],
+            )
+            .await
+            .expect("a model failure cannot compensate a natural-key winner");
+
+        assert!(created);
+        assert_eq!(
+            repair_stages,
+            vec![
+                NotePostCommitFailureStage::new("embedding", Some(FAILED_MODEL_A)),
+                NotePostCommitFailureStage::new("embedding", Some(FAILED_MODEL_C)),
+            ]
+        );
+        assert_eq!(
+            rt.vectors_for_model(&tok, HEALTHY_MODEL)
+                .unwrap()
+                .count()
+                .await
+                .unwrap(),
+            1,
+            "the healthy model must be inserted even when a sibling fails"
+        );
+        assert_eq!(
+            rt.vectors_for_model(&tok, FAILED_MODEL_A)
+                .unwrap()
+                .count()
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            rt.vectors_for_model(&tok, FAILED_MODEL_C)
+                .unwrap()
+                .count()
+                .await
+                .unwrap(),
+            0
+        );
+        assert!(rt
+            .notes(&tok)
+            .unwrap()
+            .get_note(winner.id)
+            .await
+            .unwrap()
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn idempotent_note_post_commit_update_preserves_current_fts_and_vector() {
+        const MODEL: &str = "idempotent-note-post-commit-update-model";
+
+        let rt = rt();
+        let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+        rt.register_embedder(CapturingVecProvider {
+            provider_name: MODEL.to_string(),
+            dims: 4,
+            captured: Arc::clone(&captured),
+        });
+        let namespace = Namespace::parse("idempotent-note-post-commit-update").unwrap();
+        let token = NamespaceToken::for_namespace(namespace.clone());
+        let external_id = format!("post-commit-update:{}", Uuid::new_v4());
+        let (committed, resume) = crate::atomic_create::arm_post_commit_pause(namespace.as_str());
+        let create_runtime = rt.clone();
+        let create_token = token.clone();
+        let create_external_id = external_id.clone();
+
+        let create = tokio::spawn(async move {
+            create_runtime
+                .create_note_with_embedding_content_and_outcome(
+                    &create_token,
+                    "observation",
+                    None,
+                    "stale natural-key content",
+                    None,
+                    None,
+                    Some(serde_json::json!({"external_id": create_external_id})),
+                    vec![],
+                )
+                .await
+        });
+        let note_id = tokio::time::timeout(std::time::Duration::from_secs(10), committed)
+            .await
+            .expect("natural-key insert reaches the pause before timeout")
+            .expect("post-commit pause sender stays live");
+
+        let (retry, _, retry_created, retry_failures) = rt
+            .create_note_with_embedding_content_and_outcome(
+                &token,
+                "observation",
+                None,
+                "losing retry must not overwrite",
+                None,
+                None,
+                Some(serde_json::json!({"external_id": external_id})),
+                vec![],
+            )
+            .await
+            .expect("loser observes the durable canonical row");
+        assert_eq!(retry.id, note_id);
+        assert!(!retry_created);
+        assert!(retry_failures.is_empty());
+
+        let updated = rt
+            .update_note(
+                &token,
+                note_id,
+                NotePatch::new(
+                    None,
+                    Some("current natural-key content".to_string()),
+                    None,
+                    None,
+                    None,
+                ),
+            )
+            .await
+            .expect("concurrent update commits while winner indexing is paused");
+        resume.send(()).expect("resume natural-key winner");
+        let (_, _, created, failures) = create
+            .await
+            .expect("winner task joins")
+            .expect("winner returns its durable outcome");
+        assert!(created);
+        assert!(failures.is_empty());
+
+        let fts = rt
+            .text_for_notes(&token)
+            .unwrap()
+            .get_document(namespace.as_str(), note_id)
+            .await
+            .unwrap()
+            .expect("updated note remains indexed");
+        assert_eq!(fts.body, "current natural-key content");
+        assert_eq!(fts.updated_at.timestamp_micros(), updated.updated_at);
+        let captured = captured.lock().unwrap();
+        assert!(!captured.is_empty());
+        assert!(
+            captured
+                .iter()
+                .all(|text| text == "current natural-key content"),
+            "the stale committed revision must not reach the embedder: {captured:?}"
+        );
+        drop(captured);
+        assert_eq!(
+            rt.vectors_for_model(&token, MODEL)
+                .unwrap()
+                .count()
+                .await
+                .unwrap(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn idempotent_note_name_update_discards_stale_custom_embedding_prefix() {
+        const MODEL: &str = "idempotent-note-post-commit-name-update-model";
+        const CONTENT: &str = "canonical content must replace the stale custom prefix";
+        const PREFIX: &str = "canonical content";
+
+        let rt = rt();
+        let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+        rt.register_embedder(CapturingVecProvider {
+            provider_name: MODEL.to_string(),
+            dims: 4,
+            captured: Arc::clone(&captured),
+        });
+        let namespace = Namespace::parse("idempotent-note-post-commit-name-update").unwrap();
+        let token = NamespaceToken::for_namespace(namespace.clone());
+        let external_id = format!("post-commit-name-update:{}", Uuid::new_v4());
+        let (committed, resume) = crate::atomic_create::arm_post_commit_pause(namespace.as_str());
+        let create_runtime = rt.clone();
+        let create_token = token.clone();
+
+        let create = tokio::spawn(async move {
+            create_runtime
+                .create_note_with_embedding_content_and_outcome(
+                    &create_token,
+                    "observation",
+                    Some("stale name"),
+                    CONTENT,
+                    Some(PREFIX),
+                    None,
+                    Some(serde_json::json!({"external_id": external_id})),
+                    vec![],
+                )
+                .await
+        });
+        let note_id = tokio::time::timeout(std::time::Duration::from_secs(10), committed)
+            .await
+            .expect("natural-key insert reaches the pause before timeout")
+            .expect("post-commit pause sender stays live");
+
+        let updated = rt
+            .update_note(
+                &token,
+                note_id,
+                NotePatch::new(
+                    Some(Some("current name".to_string())),
+                    None,
+                    None,
+                    None,
+                    None,
+                ),
+            )
+            .await
+            .expect("name update commits while winner indexing is paused");
+        resume.send(()).expect("resume natural-key winner");
+        let (_, _, created, failures) = create
+            .await
+            .expect("winner task joins")
+            .expect("winner returns its durable outcome");
+        assert!(created);
+        assert!(failures.is_empty());
+
+        let fts = rt
+            .text_for_notes(&token)
+            .unwrap()
+            .get_document(namespace.as_str(), note_id)
+            .await
+            .unwrap()
+            .expect("name-updated note remains indexed");
+        assert_eq!(fts.title.as_deref(), Some("current name"));
+        assert_eq!(fts.body, format!("current name {CONTENT}"));
+        assert_eq!(fts.updated_at.timestamp_micros(), updated.updated_at);
+        let captured = captured.lock().unwrap();
+        assert!(!captured.is_empty());
+        assert!(
+            captured.iter().all(|text| text == CONTENT),
+            "the old custom prefix must not overwrite a newer name revision: {captured:?}"
+        );
+        assert!(!captured.iter().any(|text| text == PREFIX));
+        drop(captured);
+        assert_eq!(
+            rt.vectors_for_model(&token, MODEL)
+                .unwrap()
+                .count()
+                .await
+                .unwrap(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn idempotent_note_post_commit_non_text_update_repairs_latest_revision_indexes() {
+        const MODEL: &str = "idempotent-note-post-commit-metadata-update-model";
+        const CONTENT: &str = "natural-key content survives a metadata-only update";
+
+        let rt = rt();
+        let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+        rt.register_embedder(CapturingVecProvider {
+            provider_name: MODEL.to_string(),
+            dims: 4,
+            captured: Arc::clone(&captured),
+        });
+        let namespace = Namespace::parse("idempotent-note-post-commit-metadata-update").unwrap();
+        let token = NamespaceToken::for_namespace(namespace.clone());
+        let external_id = format!("post-commit-metadata-update:{}", Uuid::new_v4());
+        let (committed, resume) = crate::atomic_create::arm_post_commit_pause(namespace.as_str());
+        let create_runtime = rt.clone();
+        let create_token = token.clone();
+        let create_external_id = external_id.clone();
+
+        let create = tokio::spawn(async move {
+            create_runtime
+                .create_note_with_embedding_content_and_outcome(
+                    &create_token,
+                    "observation",
+                    None,
+                    CONTENT,
+                    None,
+                    None,
+                    Some(serde_json::json!({"external_id": create_external_id})),
+                    vec![],
+                )
+                .await
+        });
+        let note_id = tokio::time::timeout(std::time::Duration::from_secs(10), committed)
+            .await
+            .expect("natural-key insert reaches the pause before timeout")
+            .expect("post-commit pause sender stays live");
+
+        let (retry, _, retry_created, _) = rt
+            .create_note_with_embedding_content_and_outcome(
+                &token,
+                "observation",
+                None,
+                "loser observes the winner before its metadata update",
+                None,
+                None,
+                Some(serde_json::json!({"external_id": external_id.clone()})),
+                vec![],
+            )
+            .await
+            .expect("loser observes the durable canonical row");
+        assert_eq!(retry.id, note_id);
+        assert!(!retry_created);
+
+        let updated = rt
+            .update_note(
+                &token,
+                note_id,
+                NotePatch::new(
+                    None,
+                    None,
+                    Some(Some(0.9)),
+                    None,
+                    Some(serde_json::json!({
+                        "external_id": external_id,
+                        "marker": "current"
+                    })),
+                ),
+            )
+            .await
+            .expect("metadata-only update commits without reindexing itself");
+        resume.send(()).expect("resume natural-key winner");
+        let (_, _, created, failures) = create
+            .await
+            .expect("winner task joins")
+            .expect("winner returns its durable outcome");
+        assert!(created);
+        assert!(failures.is_empty());
+
+        let fts = rt
+            .text_for_notes(&token)
+            .unwrap()
+            .get_document(namespace.as_str(), note_id)
+            .await
+            .unwrap()
+            .expect("latest metadata-only revision is indexed");
+        assert_eq!(fts.body, CONTENT);
+        assert_eq!(fts.updated_at.timestamp_micros(), updated.updated_at);
+        assert_eq!(
+            fts.metadata
+                .as_ref()
+                .and_then(|value| value["marker"].as_str()),
+            Some("current")
+        );
+        assert_eq!(captured.lock().unwrap().as_slice(), &[CONTENT.to_string()]);
+        assert_eq!(
+            rt.vectors_for_model(&token, MODEL)
+                .unwrap()
+                .count()
+                .await
+                .unwrap(),
+            1,
+            "the latest live revision must own a vector after metadata-only update"
+        );
+    }
+
+    #[tokio::test]
+    async fn idempotent_note_all_failed_first_fanout_retries_latest_revision() {
+        const MODEL: &str = "idempotent-note-all-failed-first-fanout-model";
+        const CONTENT: &str = "natural-key content survives an all-failed first fanout";
+
+        let rt = rt();
+        let (provider, release, entered) = ParkedVecProvider::new(MODEL, 4);
+        rt.register_embedder(provider);
+        let namespace = Namespace::parse("idempotent-note-all-failed-first-fanout").unwrap();
+        let token = NamespaceToken::for_namespace(namespace.clone());
+        let external_id = format!("all-failed-first-fanout:{}", Uuid::new_v4());
+        let _arm = arm_vector_fail_scoped(namespace.as_str());
+        let create_runtime = rt.clone();
+        let create_token = token.clone();
+        let create_external_id = external_id.clone();
+
+        let create = tokio::spawn(async move {
+            create_runtime
+                .create_note_with_embedding_content_and_outcome(
+                    &create_token,
+                    "observation",
+                    None,
+                    CONTENT,
+                    None,
+                    None,
+                    Some(serde_json::json!({"external_id": create_external_id})),
+                    vec![],
+                )
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(10), entered.notified())
+            .await
+            .expect("first indexing attempt reaches the embedder");
+
+        let note = rt
+            .list_notes(&token, None, 10, 0)
+            .await
+            .expect("committed winner is visible")
+            .into_iter()
+            .next()
+            .expect("winner row committed before embedding");
+        let updated = rt
+            .update_note(
+                &token,
+                note.id,
+                NotePatch::new(
+                    None,
+                    None,
+                    Some(Some(0.8)),
+                    None,
+                    Some(serde_json::json!({
+                        "external_id": external_id,
+                        "marker": "latest"
+                    })),
+                ),
+            )
+            .await
+            .expect("metadata update commits during the first fanout");
+
+        release.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(10), entered.notified())
+            .await
+            .expect("stale all-failed attempt is detected and retried");
+        release.notify_one();
+        let (_, _, created, failures) = create
+            .await
+            .expect("winner task joins")
+            .expect("latest-revision retry succeeds");
+        assert!(created);
+        assert!(failures.is_empty());
+
+        let fts = rt
+            .text_for_notes(&token)
+            .unwrap()
+            .get_document(namespace.as_str(), note.id)
+            .await
+            .unwrap()
+            .expect("latest revision owns the FTS row");
+        assert_eq!(fts.updated_at.timestamp_micros(), updated.updated_at);
+        assert_eq!(
+            fts.metadata
+                .as_ref()
+                .and_then(|value| value["marker"].as_str()),
+            Some("latest")
+        );
+        assert_eq!(
+            rt.vectors_for_model(&token, MODEL)
+                .unwrap()
+                .count()
+                .await
+                .unwrap(),
+            1,
+            "the retry must insert the latest live revision's vector"
+        );
+    }
+
+    async fn assert_idempotent_note_post_commit_delete(hard: bool) {
+        let model = if hard {
+            "idempotent-note-post-commit-hard-delete-model"
+        } else {
+            "idempotent-note-post-commit-soft-delete-model"
+        };
+        let rt = rt();
+        let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+        rt.register_embedder(CapturingVecProvider {
+            provider_name: model.to_string(),
+            dims: 4,
+            captured: Arc::clone(&captured),
+        });
+        let namespace = Namespace::parse(if hard {
+            "idempotent-note-post-commit-hard-delete"
+        } else {
+            "idempotent-note-post-commit-soft-delete"
+        })
+        .unwrap();
+        let token = NamespaceToken::for_namespace(namespace.clone());
+        let external_id = format!("post-commit-delete:{}", Uuid::new_v4());
+        let (committed, resume) = crate::atomic_create::arm_post_commit_pause(namespace.as_str());
+        let create_runtime = rt.clone();
+        let create_token = token.clone();
+        let create_external_id = external_id.clone();
+
+        let create = tokio::spawn(async move {
+            create_runtime
+                .create_note_with_embedding_content_and_outcome(
+                    &create_token,
+                    "observation",
+                    None,
+                    "natural-key content deleted before indexing",
+                    None,
+                    None,
+                    Some(serde_json::json!({"external_id": create_external_id})),
+                    vec![],
+                )
+                .await
+        });
+        let note_id = tokio::time::timeout(std::time::Duration::from_secs(10), committed)
+            .await
+            .expect("natural-key insert reaches the pause before timeout")
+            .expect("post-commit pause sender stays live");
+
+        let (retry, _, retry_created, _) = rt
+            .create_note_with_embedding_content_and_outcome(
+                &token,
+                "observation",
+                None,
+                "losing retry observes the winner before deletion",
+                None,
+                None,
+                Some(serde_json::json!({"external_id": external_id})),
+                vec![],
+            )
+            .await
+            .expect("loser observes the durable canonical row");
+        assert_eq!(retry.id, note_id);
+        assert!(!retry_created);
+        assert!(rt.delete_note(&token, note_id, hard).await.unwrap());
+
+        resume.send(()).expect("resume natural-key winner");
+        let (_, _, created, failures) = create
+            .await
+            .expect("winner task joins")
+            .expect("winner returns its durable outcome");
+        assert!(created);
+        assert!(failures.is_empty());
+
+        let stored = rt
+            .notes(&token)
+            .unwrap()
+            .get_note_including_deleted(note_id)
+            .await
+            .unwrap();
+        if hard {
+            assert!(stored.is_none(), "hard-deleted row must stay absent");
+        } else {
+            assert!(stored.is_some_and(|note| note.deleted_at.is_some()));
+        }
+        assert!(rt
+            .text_for_notes(&token)
+            .unwrap()
+            .get_document(namespace.as_str(), note_id)
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            rt.vectors_for_model(&token, model)
+                .unwrap()
+                .count()
+                .await
+                .unwrap(),
+            0
+        );
+        assert!(
+            captured.lock().unwrap().is_empty(),
+            "deleted committed content must not reach the embedder"
+        );
+    }
+
+    #[tokio::test]
+    async fn idempotent_note_post_commit_soft_delete_does_not_resurrect_indexes() {
+        assert_idempotent_note_post_commit_delete(false).await;
+    }
+
+    #[tokio::test]
+    async fn idempotent_note_post_commit_hard_delete_does_not_resurrect_indexes() {
+        assert_idempotent_note_post_commit_delete(true).await;
+    }
+
+    #[tokio::test]
+    async fn idempotent_note_delete_during_embedding_skips_stale_vector_insert() {
+        const MODEL: &str = "idempotent-note-delete-during-embedding";
+
+        let rt = rt();
+        let (provider, release, entered) = ParkedVecProvider::new(MODEL, 4);
+        rt.register_embedder(provider);
+        let namespace = Namespace::parse("idempotent-note-delete-during-embedding").unwrap();
+        let token = NamespaceToken::for_namespace(namespace.clone());
+        let external_id = format!("delete-during-embedding:{}", Uuid::new_v4());
+        let create_runtime = rt.clone();
+        let create_token = token.clone();
+        let create_external_id = external_id.clone();
+
+        let create = tokio::spawn(async move {
+            create_runtime
+                .create_note_with_embedding_content_and_outcome(
+                    &create_token,
+                    "observation",
+                    None,
+                    "this committed revision is deleted while embedding",
+                    None,
+                    None,
+                    Some(serde_json::json!({"external_id": create_external_id})),
+                    vec![],
+                )
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(10), entered.notified())
+            .await
+            .expect("winner reaches the embedder before timeout");
+
+        let (retry, _, retry_created, retry_failures) = rt
+            .create_note_with_embedding_content_and_outcome(
+                &token,
+                "observation",
+                None,
+                "loser observes the canonical row during winner embedding",
+                None,
+                None,
+                Some(serde_json::json!({"external_id": external_id})),
+                vec![],
+            )
+            .await
+            .expect("loser observes the committed natural-key winner");
+        assert!(!retry_created);
+        assert!(retry_failures.is_empty());
+        assert!(rt.delete_note(&token, retry.id, true).await.unwrap());
+
+        release.notify_one();
+        let (_, _, created, failures) = create
+            .await
+            .expect("winner task joins")
+            .expect("winner returns its durable outcome");
+        assert!(created);
+        assert!(failures.is_empty());
+        assert!(rt
+            .notes(&token)
+            .unwrap()
+            .get_note_including_deleted(retry.id)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(rt
+            .text_for_notes(&token)
+            .unwrap()
+            .get_document(namespace.as_str(), retry.id)
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            rt.vectors_for_model(&token, MODEL)
+                .unwrap()
+                .count()
+                .await
+                .unwrap(),
+            0,
+            "the completed stale embedding must fail its transactional witness"
+        );
+    }
+
+    #[tokio::test]
+    async fn idempotent_note_annotates_failure_reports_exact_stage_and_keeps_row() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let target = rt
+            .create_entity(
+                &tok,
+                "concept",
+                None,
+                "annotation target",
+                None,
+                None,
+                vec![],
+            )
+            .await
+            .unwrap();
+        let external_id = format!("fault:{}", Uuid::new_v4());
+
+        LINK_FAIL_AFTER.with(|cell| cell.set(1));
+        let (winner, _report, created, repair_stages) = rt
+            .create_note_with_embedding_content_and_outcome(
+                &tok,
+                "observation",
+                None,
+                "durable natural-key annotation winner",
+                None,
+                None,
+                Some(serde_json::json!({"external_id": external_id})),
+                vec![target.id],
+            )
+            .await
+            .expect("annotation failure must not erase a committed natural-key winner");
+
+        assert!(created);
+        assert_eq!(
+            repair_stages,
+            vec![NotePostCommitFailureStage::new("annotates", None)]
+        );
+        assert!(rt
+            .notes(&tok)
+            .unwrap()
+            .get_note(winner.id)
+            .await
+            .unwrap()
+            .is_some());
+        let edges = rt
+            .neighbors(
+                &tok,
+                winner.id,
+                Direction::Out,
+                None,
+                Some(vec![EdgeRelation::Annotates]),
+            )
+            .await
+            .unwrap();
+        assert!(
+            edges.is_empty(),
+            "failed annotation side effect must not leave an edge"
         );
     }
 

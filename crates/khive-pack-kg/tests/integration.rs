@@ -6,13 +6,16 @@
 
 use async_trait::async_trait;
 use khive_pack_kg::KgPack;
+use khive_runtime::embedder_registry::EmbedderProvider;
 use khive_runtime::pack::{HandlerDef, PackRuntime};
 use khive_runtime::{
-    EntityCreateSpec, KhiveRuntime, Namespace, NamespaceToken, ParamDef, RuntimeError,
-    VerbCategory, VerbRegistry, VerbRegistryBuilder, VerifiedActor, Visibility,
+    arm_link_fail_after, arm_vector_fail_after, EntityCreateSpec, KhiveRuntime, Namespace,
+    NamespaceToken, ParamDef, RuntimeError, RuntimeResult, VerbCategory, VerbRegistry,
+    VerbRegistryBuilder, VerifiedActor, Visibility,
 };
 use khive_storage::{Edge, EdgeRelation, Note, SqlStatement, SqlValue};
 use khive_types::Pack;
+use lattice_embed::{EmbedError, EmbeddingModel, EmbeddingService};
 use serde_json::{json, Value};
 
 // ---- Helpers ----
@@ -38,6 +41,56 @@ impl Fixture {
 
 fn pack() -> Fixture {
     let rt = KhiveRuntime::memory().expect("in-memory runtime must succeed");
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(KgPack::new(rt));
+    Fixture {
+        registry: builder.build().expect("registry builds"),
+    }
+}
+
+const REPAIR_MODEL: &str = "kg-post-commit-repair-model";
+
+struct RepairEmbeddingService;
+
+#[async_trait]
+impl EmbeddingService for RepairEmbeddingService {
+    async fn embed(
+        &self,
+        texts: &[String],
+        _model: EmbeddingModel,
+    ) -> Result<Vec<Vec<f32>>, EmbedError> {
+        Ok(texts.iter().map(|_| vec![0.5; 4]).collect())
+    }
+
+    fn supports_model(&self, _model: EmbeddingModel) -> bool {
+        true
+    }
+
+    fn name(&self) -> &'static str {
+        REPAIR_MODEL
+    }
+}
+
+struct RepairEmbedderProvider;
+
+#[async_trait]
+impl EmbedderProvider for RepairEmbedderProvider {
+    fn name(&self) -> &str {
+        REPAIR_MODEL
+    }
+
+    fn dimensions(&self) -> usize {
+        4
+    }
+
+    async fn build(&self) -> RuntimeResult<std::sync::Arc<dyn EmbeddingService>> {
+        Ok(std::sync::Arc::new(RepairEmbeddingService))
+    }
+}
+
+fn pack_with_repair_embedder() -> Fixture {
+    let rt = KhiveRuntime::memory().expect("in-memory runtime must succeed");
+    rt.register_embedder(RepairEmbedderProvider);
     let mut builder = VerbRegistryBuilder::new();
     builder.register(KgPack::new(rt));
     Fixture {
@@ -168,6 +221,7 @@ async fn create_bulk_items_without_top_level_kind_succeeds() {
         .dispatch(
             "create",
             json!({
+                "atomic": true,
                 "items": [
                     {"kind": "concept", "name": "BulkOne", "entity_type": "theorem"},
                     {"kind": "concept", "name": "BulkTwo"}
@@ -190,6 +244,7 @@ async fn create_bulk_items_atomic_rejects_on_invalid_item() {
         .dispatch(
             "create",
             json!({
+                "atomic": true,
                 "items": [
                     {"kind": "concept", "name": "ShouldNotLand"},
                     {"kind": "concept", "name": ""}
@@ -213,6 +268,374 @@ async fn create_bulk_items_atomic_rejects_on_invalid_item() {
         count, 0,
         "atomic rejection must leave storage empty; got {listed}"
     );
+}
+
+#[tokio::test]
+async fn create_bulk_rejects_non_boolean_atomic_and_verbose_before_writing() {
+    let pack = pack();
+
+    for (field, value) in [
+        ("atomic", json!("true")),
+        ("atomic", json!(1)),
+        ("atomic", Value::Null),
+        ("verbose", json!("true")),
+        ("verbose", json!(1)),
+        ("verbose", Value::Null),
+    ] {
+        let mut payload = json!({
+            "items": [{"kind": "concept", "name": format!("must-not-land-{field}")}]
+        });
+        payload[field] = value;
+        let error = pack
+            .dispatch("create", payload)
+            .await
+            .expect_err("a present non-boolean bulk option must be rejected");
+        assert!(is_invalid_input(&error), "expected InvalidInput: {error:?}");
+        assert!(
+            error.to_string().contains(field) && error.to_string().contains("boolean"),
+            "the rejection must identify the malformed option: {error}"
+        );
+    }
+
+    let listed = pack
+        .dispatch("list", json!({"kind": "concept"}))
+        .await
+        .expect("list after rejected bulk requests succeeds");
+    assert_eq!(
+        listed["items"].as_array().map(Vec::len),
+        Some(0),
+        "malformed bulk options must be rejected before any sibling is durable"
+    );
+}
+
+#[tokio::test]
+async fn create_bulk_mixed_best_effort_isolates_invalid_note_and_deduplicates_retry() {
+    let pack = pack();
+    let external_id = format!("bulk:{}", uuid::Uuid::new_v4());
+    let first = pack
+        .dispatch(
+            "create",
+            json!({
+                "items": [
+                    {"kind": "concept", "name": "MixedBulkEntity"},
+                    {
+                        "kind": "observation",
+                        "content": "canonical bulk note",
+                        "external_id": external_id
+                    },
+                    {"kind": "observation", "name": "missing content"}
+                ]
+            }),
+        )
+        .await
+        .expect("best-effort mixed create succeeds overall");
+    assert_eq!(first["attempted"], 3);
+    assert_eq!(first["created"], 2);
+    assert_eq!(first["created_notes"], 1);
+    assert_eq!(first["failed"], 1);
+    assert_eq!(first["results"][0]["ok"], true);
+    assert_eq!(first["results"][1]["ok"], true);
+    assert_eq!(first["results"][2]["ok"], false);
+    let canonical_id = first["results"][1]["id"]
+        .as_str()
+        .expect("note result has id")
+        .to_string();
+
+    let retry = pack
+        .dispatch(
+            "create",
+            json!({
+                "items": [{
+                    "kind": "observation",
+                    "content": "must not overwrite canonical content",
+                    "external_id": external_id
+                }]
+            }),
+        )
+        .await
+        .expect("natural-key retry succeeds");
+    assert_eq!(retry["created"], 0);
+    assert_eq!(retry["skipped"], 1);
+    assert_eq!(retry["results"][0]["id"], canonical_id);
+    assert_eq!(retry["results"][0]["deduplicated"], true);
+
+    let fetched = pack
+        .dispatch("get", json!({"id": canonical_id}))
+        .await
+        .expect("canonical note remains retrievable");
+    assert_eq!(fetched["content"], "canonical bulk note");
+}
+
+#[tokio::test]
+async fn create_bulk_best_effort_reports_exact_vector_repair_stage_and_model() {
+    let pack = pack_with_repair_embedder();
+    arm_vector_fail_after(0);
+
+    let result = pack
+        .dispatch(
+            "create",
+            json!({
+                "items": [{
+                    "kind": "observation",
+                    "content": "durable best-effort vector failure",
+                    "external_id": format!("bulk-vector:{}", uuid::Uuid::new_v4())
+                }]
+            }),
+        )
+        .await
+        .expect("a committed idempotent note remains a successful bulk outcome");
+
+    assert_eq!(result["created"], 1);
+    assert_eq!(result["failed"], 0);
+    assert_eq!(
+        result["post_commit_failures"][0],
+        result["results"][0]["id"]
+    );
+    assert_eq!(
+        result["post_commit_failure_details"][0]["stages"][0]["stage"],
+        "vector_insert"
+    );
+    assert_eq!(
+        result["post_commit_failure_details"][0]["stages"][0]["model"],
+        REPAIR_MODEL
+    );
+}
+
+#[tokio::test]
+async fn create_bulk_mixed_atomic_persists_entity_and_note_together() {
+    let pack = pack();
+    let result = pack
+        .dispatch(
+            "create",
+            json!({
+                "atomic": true,
+                "items": [
+                    {"kind": "concept", "name": "AtomicMixedEntity"},
+                    {"kind": "observation", "content": "atomic mixed note"}
+                ]
+            }),
+        )
+        .await
+        .expect("atomic mixed create succeeds");
+    assert_eq!(result["created"], 2);
+    assert_eq!(result["created_notes"], 1);
+    assert_eq!(result["failed"], 0);
+    assert_eq!(result["results"][0]["substrate"], "entity");
+    assert_eq!(result["results"][1]["substrate"], "note");
+}
+
+#[tokio::test]
+async fn create_singleton_external_id_race_returns_one_canonical_note() {
+    let pack = pack();
+    let external_id = format!("singleton-race:{}", uuid::Uuid::new_v4());
+    let first_pack = pack.clone();
+    let second_pack = pack.clone();
+    let first_id = external_id.clone();
+    let second_id = external_id.clone();
+    let (first, second) = tokio::join!(
+        first_pack.dispatch(
+            "create",
+            json!({
+                "kind": "observation",
+                "content": "racing contender one",
+                "external_id": first_id
+            }),
+        ),
+        second_pack.dispatch(
+            "create",
+            json!({
+                "kind": "observation",
+                "content": "racing contender two",
+                "external_id": second_id
+            }),
+        )
+    );
+    let first = first.expect("first contender returns canonical result");
+    let second = second.expect("second contender returns canonical result");
+    assert_eq!(first["id"], second["id"]);
+    assert_ne!(first["created"], second["created"]);
+
+    let listed = pack
+        .dispatch("list", json!({"kind": "observation"}))
+        .await
+        .expect("list notes succeeds");
+    assert_eq!(listed["items"].as_array().map(Vec::len), Some(1));
+}
+
+#[tokio::test]
+async fn create_singleton_external_id_retry_returns_canonical_without_changing_ordinary_create() {
+    let pack = pack();
+    let external_id = format!("singleton:{}", uuid::Uuid::new_v4());
+    let first = pack
+        .dispatch(
+            "create",
+            json!({
+                "kind": "observation",
+                "content": "first writer wins",
+                "external_id": external_id,
+                "properties": {"external_id": external_id}
+            }),
+        )
+        .await
+        .expect("first natural-key create succeeds");
+    let retry = pack
+        .dispatch(
+            "create",
+            json!({
+                "kind": "observation",
+                "content": "retry content must not overwrite",
+                "external_id": external_id
+            }),
+        )
+        .await
+        .expect("natural-key retry returns the canonical row");
+
+    assert_eq!(first["id"], retry["id"]);
+    assert_eq!(first["created"], true);
+    assert_eq!(first["deduplicated"], false);
+    assert_eq!(retry["created"], false);
+    assert_eq!(retry["deduplicated"], true);
+    assert_eq!(retry["content"], "first writer wins");
+
+    let ordinary_a = pack
+        .dispatch(
+            "create",
+            json!({"kind": "observation", "content": "ordinary note"}),
+        )
+        .await
+        .expect("first ordinary create succeeds");
+    let ordinary_b = pack
+        .dispatch(
+            "create",
+            json!({"kind": "observation", "content": "ordinary note"}),
+        )
+        .await
+        .expect("second ordinary create succeeds");
+    assert_ne!(ordinary_a["id"], ordinary_b["id"]);
+    assert!(ordinary_a.get("created").is_none());
+    assert!(ordinary_b.get("deduplicated").is_none());
+}
+
+#[tokio::test]
+async fn create_singleton_reports_exact_vector_repair_stage_and_model() {
+    let pack = pack_with_repair_embedder();
+    arm_vector_fail_after(0);
+
+    let result = pack
+        .dispatch(
+            "create",
+            json!({
+                "kind": "observation",
+                "content": "durable singleton vector failure",
+                "external_id": format!("singleton-vector:{}", uuid::Uuid::new_v4())
+            }),
+        )
+        .await
+        .expect("a committed idempotent note remains a successful singleton outcome");
+
+    assert_eq!(result["created"], true);
+    assert_eq!(result["post_commit_failures"][0], result["id"]);
+    assert_eq!(
+        result["post_commit_failure_details"][0]["stages"][0]["stage"],
+        "vector_insert"
+    );
+    assert_eq!(
+        result["post_commit_failure_details"][0]["stages"][0]["model"],
+        REPAIR_MODEL
+    );
+}
+
+#[tokio::test]
+async fn create_singleton_reports_exact_annotates_repair_stage() {
+    let pack = pack();
+    let target = pack
+        .dispatch(
+            "create",
+            json!({"kind": "concept", "name": "annotation repair target"}),
+        )
+        .await
+        .expect("annotation target");
+    let target_id = target["id"].as_str().expect("target id");
+    arm_link_fail_after(1);
+
+    let result = pack
+        .dispatch(
+            "create",
+            json!({
+                "kind": "observation",
+                "content": "durable singleton annotation failure",
+                "external_id": format!("singleton-annotates:{}", uuid::Uuid::new_v4()),
+                "annotates": [target_id]
+            }),
+        )
+        .await
+        .expect("a committed idempotent note survives an annotation failure");
+
+    assert_eq!(result["created"], true);
+    assert_eq!(result["post_commit_failures"][0], result["id"]);
+    assert_eq!(
+        result["post_commit_failure_details"][0]["stages"][0]["stage"],
+        "annotates"
+    );
+    assert!(result["post_commit_failure_details"][0]["stages"][0]
+        .get("model")
+        .is_none());
+    let fetched = pack
+        .dispatch("get", json!({"id": result["id"]}))
+        .await
+        .expect("committed note remains readable for repair");
+    assert_eq!(fetched["content"], "durable singleton annotation failure");
+}
+
+#[tokio::test]
+async fn create_external_id_rejects_conflicts_invalid_types_and_explicit_null() {
+    let pack = pack();
+    for payload in [
+        json!({
+            "kind": "observation",
+            "content": "mismatched forms",
+            "external_id": "wire:a",
+            "properties": {"external_id": "wire:b"}
+        }),
+        json!({"kind": "observation", "content": "non-string", "external_id": 17}),
+        json!({
+            "kind": "observation",
+            "content": "non-string property",
+            "properties": {"external_id": 17}
+        }),
+        json!({"kind": "observation", "content": "null", "external_id": null}),
+        json!({"kind": "observation", "content": "empty", "external_id": ""}),
+        json!({"kind": "observation", "content": "whitespace", "external_id": "   "}),
+    ] {
+        let error = pack
+            .dispatch("create", payload)
+            .await
+            .expect_err("invalid external_id must fail before a write");
+        assert!(
+            is_invalid_input(&error),
+            "expected InvalidInput, got {error:?}"
+        );
+    }
+
+    let bulk_error = pack
+        .dispatch(
+            "create",
+            json!({
+                "atomic": true,
+                "items": [
+                    {"kind": "observation", "content": "bulk null", "external_id": null}
+                ]
+            }),
+        )
+        .await
+        .expect_err("atomic bulk null external_id must fail validation");
+    assert!(is_invalid_input(&bulk_error));
+
+    let listed = pack
+        .dispatch("list", json!({"kind": "observation"}))
+        .await
+        .expect("list after rejected creates succeeds");
+    assert_eq!(listed["items"].as_array().map(Vec::len), Some(0));
 }
 
 #[tokio::test]
@@ -9863,31 +10286,35 @@ async fn formal_depends_on_accepted_with_formal_pack() {
 
 // ── Med-1 regression: malformed `items` must not fall through to singleton ──────
 
-/// A malformed bulk payload (unknown field in an item) must return an error and
-/// must NOT create the top-level entity that was named in the enclosing params.
+/// A malformed bulk item is reported in place while valid siblings still land.
+/// The enclosing singleton-looking fields must never be used as a fallback.
 ///
 /// Pre-fix: `serde_json::from_value(...).ok()` swallowed the parse error, the
 /// bulk path was skipped, and the singleton path ran — creating "TopLevelCreated"
 /// silently even though the caller intended a bulk create.
 #[tokio::test]
-async fn create_bulk_items_malformed_unknown_field_returns_error_creates_nothing() {
+async fn create_bulk_items_malformed_unknown_field_isolated_from_valid_sibling() {
     let pack = pack();
-    let err = pack
+    let result = pack
         .dispatch(
             "create",
             json!({
                 "kind": "concept",
                 "name": "TopLevelCreated",
-                "items": [{"kind": "concept", "name": "ShouldBeBulk", "extra_unknown": 1}]
+                "items": [
+                    {"kind": "concept", "name": "ShouldBeBulk", "extra_unknown": 1},
+                    {"kind": "concept", "name": "ValidBulkSibling"}
+                ]
             }),
         )
         .await
-        .expect_err("malformed items must produce an error");
-    assert!(
-        is_invalid_input(&err),
-        "malformed items must return InvalidInput, got: {err:?}"
-    );
-    // Neither the bulk item nor the top-level entity must have been written.
+        .expect("best-effort bulk reports malformed items in its response");
+    assert_eq!(result["attempted"], 2);
+    assert_eq!(result["created"], 1);
+    assert_eq!(result["failed"], 1);
+    assert_eq!(result["results"][0]["ok"], false);
+    assert_eq!(result["results"][1]["ok"], true);
+
     let listed = pack
         .dispatch("list", json!({"kind": "concept"}))
         .await
@@ -9898,9 +10325,10 @@ async fn create_bulk_items_malformed_unknown_field_returns_error_creates_nothing
         .map(|a| a.len())
         .unwrap_or(0);
     assert_eq!(
-        count, 0,
-        "malformed items rejection must create nothing; got {listed}"
+        count, 1,
+        "only the valid bulk sibling may be written; got {listed}"
     );
+    assert_eq!(listed["items"][0]["name"], "ValidBulkSibling");
 }
 
 // ── entity-type validator is installed by normal pack registration ─────────
@@ -10043,6 +10471,7 @@ async fn create_bulk_items_invalid_entity_type_rejects_batch() {
         .dispatch(
             "create",
             json!({
+                "atomic": true,
                 "items": [
                     {"kind": "concept", "name": "ValidConcept", "entity_type": "not_a_registered_type"}
                 ]

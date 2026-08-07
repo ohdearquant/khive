@@ -1238,6 +1238,43 @@ async fn test_try_insert_note_pk_collision_returns_error_not_dedup() {
     );
 }
 
+/// Natural-key retries return the complete canonical row, not merely a
+/// boolean or the losing contender's UUID. This is the storage guarantee the
+/// generic create surface relies on when concurrent callers race.
+#[tokio::test]
+async fn test_insert_note_natural_key_returns_canonical_existing_row() {
+    let store = setup_memory_store();
+    let external_id = format!("store:{}", uuid::Uuid::new_v4());
+    let canonical = make_note_with_props(
+        "ns1",
+        "observation",
+        "canonical content",
+        serde_json::json!({"external_id": external_id}),
+    );
+    let canonical_id = canonical.id;
+    let inserted = store
+        .insert_note_natural_key(canonical)
+        .await
+        .expect("first natural-key insert succeeds");
+    assert!(inserted.created);
+    assert_eq!(inserted.note.id, canonical_id);
+
+    let contender = make_note_with_props(
+        "ns1",
+        "observation",
+        "losing contender content",
+        serde_json::json!({"external_id": external_id}),
+    );
+    assert_ne!(contender.id, canonical_id);
+    let deduplicated = store
+        .insert_note_natural_key(contender)
+        .await
+        .expect("natural-key collision returns canonical row");
+    assert!(!deduplicated.created);
+    assert_eq!(deduplicated.note.id, canonical_id);
+    assert_eq!(deduplicated.note.content, "canonical content");
+}
+
 // ── #827: single-note insert + notes_seq assignment atomicity ────────────
 
 /// Regression for #827: on the default flag-off (pool-mutex) path,

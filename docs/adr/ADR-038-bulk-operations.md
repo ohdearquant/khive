@@ -163,40 +163,32 @@ entity:<uuid>
 edge-natural:<source_uuid>:<target_uuid>:<relation>
 ```
 
-Known implementation gap: the intended stable error shape includes `conflict_ops`, and bulk
-`link(links=[...])` should contribute every contained natural edge key. The current shipped
-implementation omits `conflict_ops` and only extracts singleton `link(source_id, target_id,
-relation)` keys. Keep those as code-side follow-ups; do not change this ADR to claim bulk
-array conflict protection is complete.
+Bulk `link(links=[...])` contributes every complete natural edge key. The shipped
+wire envelope deliberately keeps conflict diagnostics operation-local and does
+not expose the internal key or a `conflict_ops` array.
 
 #### Preflight algorithm
 
 ```rust
 // crates/khive-mcp/src/server.rs (pseudocode)
-fn preflight_conflict_check(
+fn conflicting_op_indices(
     ops: &[ParsedOp],
-    registry: &VerbRegistry,
-    default_ns: &str,
-) -> Result<(), BatchConflictError> {
-    let mut seen: HashMap<String, usize> = HashMap::new();
-    let mut conflicts: Vec<(usize, usize, String)> = Vec::new();
+    groups: &[ExecutionGroup],
+) -> HashSet<usize> {
+    let mut claims: HashMap<String, Vec<(usize, usize)>> = HashMap::new();
 
-    for (i, op) in ops.iter().enumerate() {
-        let keys = registry.write_keys_for(
-            &op.tool,
-            &Value::Object(op.args.clone()),
-            default_ns,
-        );
-        for key in keys.iter().flatten() {
-            if let Some(&prior) = seen.get(key) {
-                conflicts.push((prior, i, key.clone()));
-            } else {
-                seen.insert(key.clone(), i);
+    for (group_index, group) in groups.iter().enumerate() {
+        for op_index in group.range() {
+            for key in write_keys_for_op_pub(&ops[op_index]) {
+                claims.entry(key).or_default().push((group_index, op_index));
             }
         }
     }
 
-    if conflicts.is_empty() { Ok(()) } else { Err(BatchConflictError { conflicts }) }
+    claims.values()
+        .filter(|claimants| claimants span more than one group)
+        .flat_map(|claimants| claimant operation indices)
+        .collect()
 }
 ```
 
@@ -210,22 +202,26 @@ When the pre-dispatch conflict detector identifies overlapping write-sets in a
 bulk operation:
 
 - The request envelope still succeeds (`request.ok == true`).
-- Each conflicting op returns `{ok: false, error: "conflict: writes overlap with
-  op #<idx>", conflict_ops: [<idx1>, <idx2>, ...]}`.
+- Each conflicting op returns `{ok: false, tool: <verb>, error: "conflict:
+  writes overlap with another ... group in this batch"}`.
 - Non-conflicting ops execute normally.
 - `results.length == summary.total == input.ops.length` (ADR-016 contract preserved).
 
-If ordered dependency semantics are required, the caller uses top-level pipe-chain syntax
-(ADR-016 `op1(...) | op2(...)`) which aborts the chain on first failure. Do not wrap pipe
-chains in `[...]`; bracketed form is the parallel batch syntax.
+If ordered dependency semantics are required, the caller uses pipe-chain syntax
+(ADR-016 `op1(...) | op2(...)`) which aborts that chain on first failure. A
+bracketed parallel request may contain multiple independent chain groups; write
+conflicts are checked between groups, not between sequential operations within
+one group. If a group conflict belongs to a later member, preceding
+non-conflicting members execute, that exact member receives the conflict error,
+and only the remaining group tail is marked aborted.
 
 #### Error shape (per conflicting op)
 
 ```json
 {
   "ok": false,
-  "error": "conflict: writes overlap with op #2",
-  "conflict_ops": [2]
+  "tool": "update",
+  "error": "conflict: writes overlap with another independent group in this batch"
 }
 ```
 
@@ -301,9 +297,10 @@ write-write conflict silently resolves via lock ordering (last-writer-wins). The
 two `ok: true` results but only one value persisted — the result depends on scheduling,
 not intent.
 
-Preflight makes the conflict explicit before any mutation. The error identifies which ops
-conflict and on which key. The caller can restructure the batch (use a chain for dependent
-writes) before retrying.
+Preflight makes each conflicting mutation explicit before that operation
+dispatches. Independent operations may still mutate successfully. The result
+position identifies the conflicting operation; callers can restructure the
+batch (use a chain for dependent writes) before retrying.
 
 ### Why return per-op conflict errors rather than a single batch-level rejection?
 
@@ -341,8 +338,10 @@ tracked per-verb.
 - Bulk edge insertion in a single round trip for import-scale workloads, without adding a new MCP tool.
 - Reuses `GraphStore::upsert_edges` which is already transactional and tested.
 - Singleton `link` callers are unaffected; the new path activates only when `links` is present.
-- Write-write conflicts in parallel batches are surfaced before any mutation — no partial state.
-- Error message identifies conflicting op indexes and the specific key — actionable diagnostic.
+- Write-write conflicts in parallel batches are surfaced before each conflicting
+  operation mutates state; unrelated work can still complete.
+- Stable result positions identify the conflicting operations without exposing
+  internal write-key material.
 - Existing packs compile unchanged; conflict protection is opt-in at the pack level.
 
 ### Negative
@@ -377,8 +376,10 @@ Batch conflict detection:
 - Independent parallel writes (different entity IDs) pass through.
 - Read + write on the same entity is allowed.
 - Unknown verb (no `write_keys` implementation) does not block the batch.
-- Structured error includes op indexes and the conflicting key.
+- Per-op errors occupy the conflicting operations' stable result positions.
 - Bulk `link` write keys include all natural edge keys; conflict with a sibling op is detected.
+- A later conflict in one chain group preserves preceding work and aborts only
+  that group's remaining tail.
 
 ## Open Questions
 

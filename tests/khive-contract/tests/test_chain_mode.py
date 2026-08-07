@@ -4,10 +4,10 @@
 Issue: #389 — unit tests cover chain parsing + $prev substitution only; this
 file adds end-to-end coverage that drives the real MCP server via stdio and
 asserts the full chain semantics: happy-path execution, $prev resolution,
-abort propagation, and mixed-separator rejection.
+abort propagation, and independently scheduled chain groups.
 
 ADR: ADR-016
-section: Chain semantics; $prev substitution; Abort-on-failure; Mixed separators
+section: Chain semantics; $prev substitution; Abort-on-failure; Parallel chain groups
 """
 
 from __future__ import annotations
@@ -16,7 +16,7 @@ import uuid
 
 import pytest
 
-from khive_contract.client import KhiveMcpSession, KhiveRpcError
+from khive_contract.client import KhiveMcpSession
 from khive_contract.schema import assert_envelope
 
 VERBS_UNDER_TEST = {"create", "get", "link", "update", "gtd.assign", "gtd.complete"}
@@ -240,35 +240,45 @@ def test_chain_abort_on_prev_resolution_failure(
 
 
 # ---------------------------------------------------------------------------
-# Case 4: Mixed separators rejected at parse time.
+# Case 4: A bracketed batch can contain an independent chain group.
 #
-# `[create(...), create(...) | get(id=$prev.id)]` — mixing `,` and `|` at
-# the top level must be rejected as an invalid_params RPC error, not as a
-# per-op error inside a successful envelope.
+# `[create(...), create(...) | get(id=$prev.id)]` schedules two groups in
+# parallel. The second group resolves its own `$prev`, and flattened results
+# remain in source order.
 # ---------------------------------------------------------------------------
 
 
-def test_mixed_separators_rejected_as_rpc_error(
+def test_parallel_batch_accepts_independent_chain_group(
     khive_session: KhiveMcpSession,
     temp_namespace: str,
 ) -> None:
-    """Mixing ',' (parallel) and '|' (chain) at the top level raises KhiveRpcError.
+    """A bracketed parallel batch may contain a sequential chain group.
 
     ADR: ADR-016
-    section: Mixed separators
+    section: Independently scheduled chain groups
 
-    The DSL parser must reject this input before dispatch. The error surfaces
-    as a JSON-RPC invalid_params error (isError or top-level error), not as a
-    per-op result with ok=False.
+    Both groups succeed independently, `$prev` in the second group resolves to
+    its own create result, and the response preserves flattened input order.
     """
     ns = temp_namespace
-    bad_ops = (
+    ops = (
         f'[create(kind="entity", entity_kind="concept", name="MixedA", namespace="{ns}")'
         f', create(kind="entity", entity_kind="concept", name="MixedB", namespace="{ns}")'
         f' | get(id=$prev.id, namespace="{ns}")]'
     )
-    with pytest.raises(KhiveRpcError):
-        khive_session.request(bad_ops)
+    envelope = khive_session.request(ops)
+
+    assert_envelope(envelope)
+    results = envelope["results"]
+    assert [entry.get("ok") for entry in results] == [True, True, True]
+    assert results[1]["result"]["id"] == results[2]["result"]["id"]
+    assert results[0]["result"]["id"] != results[1]["result"]["id"]
+    assert envelope["summary"] == {
+        "total": 3,
+        "succeeded": 3,
+        "failed": 0,
+        "aborted": 0,
+    }
 
 
 # ---------------------------------------------------------------------------

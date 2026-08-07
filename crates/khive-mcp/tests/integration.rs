@@ -209,9 +209,8 @@ async fn create_entity_via_dsl() -> anyhow::Result<()> {
 #[tokio::test]
 async fn parallel_batch_of_independent_creates_all_succeed() -> anyhow::Result<()> {
     // Ops inside `[...]` are dispatched in parallel (ADR-016 §dispatch).
-    // This test exercises that contract with independent ops only —
-    // dependent ops (e.g. create-then-list) must split across two `request`
-    // calls because the list won't see the creates inside the same batch.
+    // This test exercises flat independent groups. Dependent work may instead
+    // use a `create(...) | get(id=$prev.id)` group inside the same brackets.
     let client = connect().await?;
     let result = call(
         &client,

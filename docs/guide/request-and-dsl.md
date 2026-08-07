@@ -80,9 +80,17 @@ request(ops="create(kind=\"entity\", entity_kind=\"concept\", name=\"LoRA\") | l
 `a`'s. If a later operation needs a non-adjacent result, split the work into
 separate `request` calls or make that result the immediate predecessor.
 
-`$prev` is available only in function-call chains. JSON form and parallel
-batches reject it. A failed chain operation prevents subsequent operations
-from running; completed operations are not rolled back.
+`$prev` is available only in function-call chains. A parallel function-call
+batch may contain independent chain groups:
+
+```text
+request(ops="[create(kind=\"concept\", name=\"A\") | get(id=$prev.id), create(kind=\"concept\", name=\"B\") | get(id=$prev.id)]")
+```
+
+The groups run concurrently and `$prev` is scoped to each group. A failed
+chain operation prevents only later operations in that group from running;
+sibling groups continue and completed operations are not rolled back. JSON
+form remains flat and rejects `$prev`.
 
 ## Read the result envelope
 
@@ -109,7 +117,7 @@ For example, a parallel batch can return:
 }
 ```
 
-A failure in a parallel batch does not stop its siblings. In a chain, entries
+A failure in a parallel batch does not stop sibling groups. In a chain, entries
 after the failure are returned as `{ "ok": false, "tool": "...", "aborted": true }`;
 the summary records their count in `aborted`.
 

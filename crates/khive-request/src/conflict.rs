@@ -89,6 +89,12 @@ fn canonical_relation_key(relation: &str) -> String {
         .filter(|c| c.is_ascii_alphanumeric() || *c == '_')
         .collect();
     match normalized.as_str() {
+        "partof" => "part_of".to_string(),
+        "instanceof" => "instance_of".to_string(),
+        "variantof" => "variant_of".to_string(),
+        "introducedby" => "introduced_by".to_string(),
+        "derivedfrom" => "derived_from".to_string(),
+        "dependson" => "depends_on".to_string(),
         "competeswith" => "competes_with".to_string(),
         "composedwith" => "composed_with".to_string(),
         _ => normalized,
@@ -106,18 +112,27 @@ pub(crate) fn check_write_key_conflicts(req: &ParsedRequest) -> Result<(), DslEr
     if req.mode == ExecutionMode::Chain {
         return Ok(());
     }
-    let mut seen: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-    for op in &req.ops {
-        let keys = write_keys_for_op_pub(op);
-        for key in keys {
-            if let Some(first) = seen.get(&key) {
-                return Err(DslError::WriteKeyConflict {
-                    id: key,
-                    first_op: first.clone(),
-                    second_op: op.tool.clone(),
-                });
+    let mut seen: std::collections::HashMap<String, (usize, String)> =
+        std::collections::HashMap::new();
+    for (group_index, group) in req.groups.iter().copied().enumerate() {
+        let mut within_group = std::collections::HashSet::new();
+        for op in &req.ops[group.start..group.end()] {
+            for key in write_keys_for_op_pub(op) {
+                if !within_group.insert(key.clone()) {
+                    continue;
+                }
+                if let Some((first_group, first_op)) = seen.get(&key) {
+                    if *first_group != group_index {
+                        return Err(DslError::WriteKeyConflict {
+                            id: key,
+                            first_op: first_op.clone(),
+                            second_op: op.tool.clone(),
+                        });
+                    }
+                } else {
+                    seen.insert(key, (group_index, op.tool.clone()));
+                }
             }
-            seen.insert(key, op.tool.clone());
         }
     }
     Ok(())
@@ -189,6 +204,24 @@ mod tests {
     }
 
     #[test]
+    fn repeated_write_key_inside_parallel_chain_group_is_allowed() {
+        let r =
+            parse_request(r#"[update(id="same-id", name="a") | delete(id="same-id"), stats()]"#)
+                .unwrap();
+        check_write_key_conflicts(&r).unwrap();
+    }
+
+    #[test]
+    fn write_key_collision_across_parallel_chain_groups_conflicts() {
+        let r = parse_request(
+            r#"[update(id="same-id", name="a") | get(id="same-id"), delete(id="same-id") | stats()]"#,
+        )
+        .unwrap();
+        let err = check_write_key_conflicts(&r).unwrap_err();
+        assert!(matches!(err, DslError::WriteKeyConflict { .. }));
+    }
+
+    #[test]
     fn link_source_id_does_not_conflict_with_entity_update() {
         let r = parse_request(
             r#"[update(id="node-1", name="x"), link(source_id="node-1", target_id="node-2", relation="extends")]"#,
@@ -253,6 +286,25 @@ mod tests {
         )
         .unwrap();
         check_write_key_conflicts(&r).unwrap();
+    }
+
+    #[test]
+    fn every_squashed_edge_relation_alias_has_the_canonical_write_key() {
+        let cases = [
+            ("partof", "part_of"),
+            ("instanceof", "instance_of"),
+            ("variantof", "variant_of"),
+            ("introducedby", "introduced_by"),
+            ("derivedfrom", "derived_from"),
+            ("dependson", "depends_on"),
+            ("competeswith", "competes_with"),
+            ("composedwith", "composed_with"),
+        ];
+
+        for (alias, canonical) in cases {
+            assert_eq!(canonical_relation_key(alias), canonical);
+            assert_eq!(canonical_relation_key(canonical), canonical);
+        }
     }
 
     #[test]

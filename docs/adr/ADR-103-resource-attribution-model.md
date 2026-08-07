@@ -880,3 +880,15 @@ accepted placement for future implementation, not a shipped operator knob.
 - Neutral: `work_class`, quota mechanism, phase-span events, and the staged landing
   plan are all unchanged; the response-envelope addition is additive for tolerant
   JSON consumers (Part 3's scoped compatibility statement).
+
+## Amendment: bulk note create attribution (2026-08-06)
+
+This supersedes Amendment 1's blanket base-weight-only rule for bulk `create`.
+Bulk entity-only creation remains base-weight-only because that path does not embed.
+Mixed/note bulk create reports `created_notes`, counting only newly committed
+notes whose indexing work belongs to this dispatch. Its deterministic cost term
+uses `item_count = created_notes` and the registered embedding-model count.
+Natural-key duplicates and failed items contribute zero note items: they neither
+embed nor replay post-create work. A deduplicated singleton note likewise reduces
+to base weight only. These result-derived counts avoid charging request inputs
+when retries collapse to canonical rows.

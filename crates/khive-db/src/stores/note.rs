@@ -8,7 +8,7 @@ use rusqlite::OptionalExtension;
 use uuid::Uuid;
 
 use khive_storage::error::{StorageError, WriterTaskRequestState};
-use khive_storage::note::{FilterOp, Note, NoteFilter, SortDir};
+use khive_storage::note::{FilterOp, Note, NoteFilter, NoteInsertOutcome, SortDir};
 use khive_storage::types::{
     BatchWriteSummary, DeleteMode, Page, PageRequest, SeekCursor, SeekPage, SqlStatement, SqlValue,
 };
@@ -170,6 +170,46 @@ pub fn note_replace_if_unchanged_statement(
             },
         ],
         label: Some("note-replace-if-unchanged".to_string()),
+    }
+}
+
+/// Insert one note without overwriting its UUID or explicit natural key.
+pub fn note_insert_or_ignore_statement(note: &Note) -> SqlStatement {
+    let properties_str = note
+        .properties
+        .as_ref()
+        .map(|v| serde_json::to_string(v).unwrap_or_default());
+    SqlStatement {
+        sql: "INSERT OR IGNORE INTO notes \
+              (id, namespace, kind, status, name, content, salience, decay_factor, expires_at, \
+               properties, created_at, updated_at, deleted_at) \
+              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)"
+            .to_string(),
+        params: vec![
+            SqlValue::Text(note.id.to_string()),
+            SqlValue::Text(note.namespace.clone()),
+            SqlValue::Text(note.kind.clone()),
+            SqlValue::Text(note.status.clone()),
+            note.name.clone().map_or(SqlValue::Null, SqlValue::Text),
+            SqlValue::Text(note.content.clone()),
+            note.salience.map_or(SqlValue::Null, SqlValue::Float),
+            note.decay_factor.map_or(SqlValue::Null, SqlValue::Float),
+            note.expires_at.map_or(SqlValue::Null, SqlValue::Integer),
+            properties_str.map_or(SqlValue::Null, SqlValue::Text),
+            SqlValue::Integer(note.created_at),
+            SqlValue::Integer(note.updated_at),
+            note.deleted_at.map_or(SqlValue::Null, SqlValue::Integer),
+        ],
+        label: Some("note-insert-natural-key".to_string()),
+    }
+}
+
+/// Assign a newly inserted note its immutable seek-pagination sequence.
+pub fn note_assign_seq_statement(note_id: Uuid) -> SqlStatement {
+    SqlStatement {
+        sql: "INSERT OR IGNORE INTO notes_seq (note_id) VALUES (?1)".to_string(),
+        params: vec![SqlValue::Text(note_id.to_string())],
+        label: Some("note-assign-seq".to_string()),
     }
 }
 
@@ -1014,15 +1054,11 @@ impl NoteStore for SqlNoteStore {
         .await
     }
 
-    async fn try_insert_note(&self, note: Note) -> Result<bool, StorageError> {
+    async fn insert_note_natural_key(&self, note: Note) -> Result<NoteInsertOutcome, StorageError> {
         let namespace = note.namespace.clone();
         let id_str = note.id.to_string();
         let kind_str = note.kind.to_string();
-        let status_str = note.status.clone();
-        let properties_str = note
-            .properties
-            .as_ref()
-            .map(|v| serde_json::to_string(v).unwrap_or_default());
+        let statement = note_insert_or_ignore_statement(&note);
 
         // Extract external_id (if any) for dedup verification after a zero-row insert.
         let ext_id_opt: Option<String> = note
@@ -1033,32 +1069,17 @@ impl NoteStore for SqlNoteStore {
             .filter(|s| !s.is_empty())
             .map(|s| s.to_string());
 
-        self.with_writer_tx("try_insert_note", move |conn| {
-            let rows = conn.execute(
-                "INSERT OR IGNORE INTO notes \
-                 (id, namespace, kind, status, name, content, salience, decay_factor, expires_at, \
-                  properties, created_at, updated_at, deleted_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
-                rusqlite::params![
-                    id_str,
-                    namespace,
-                    kind_str,
-                    status_str,
-                    note.name,
-                    note.content,
-                    note.salience,
-                    note.decay_factor,
-                    note.expires_at,
-                    properties_str,
-                    note.created_at,
-                    note.updated_at,
-                    note.deleted_at,
-                ],
-            )?;
+        self.with_writer_tx("insert_note_natural_key", move |conn| {
+            let mut insert = conn.prepare_cached(&statement.sql)?;
+            bind_params(&mut insert, &statement.params)?;
+            let rows = insert.raw_execute()?;
 
             if rows > 0 {
                 assign_note_seq(conn, &id_str)?;
-                return Ok(true);
+                return Ok(NoteInsertOutcome {
+                    note,
+                    created: true,
+                });
             }
 
             // Zero rows: the INSERT was silently skipped by OR IGNORE.
@@ -1067,17 +1088,25 @@ impl NoteStore for SqlNoteStore {
             // Any other ignored constraint (e.g. a PRIMARY KEY collision) must
             // surface as an error rather than being misreported as a duplicate.
             if let Some(ref ext_id) = ext_id_opt {
-                let is_dedup: bool = conn.query_row(
-                    "SELECT COUNT(*) > 0 FROM notes \
-                     WHERE namespace = ?1 \
-                       AND kind = ?2 \
-                       AND json_extract(properties, '$.external_id') = ?3 \
-                       AND deleted_at IS NULL",
-                    rusqlite::params![namespace, kind_str, ext_id],
-                    |row| row.get(0),
-                )?;
-                if is_dedup {
-                    return Ok(false);
+                let canonical = conn
+                    .query_row(
+                        "SELECT id, namespace, kind, status, name, content, salience, decay_factor, \
+                                expires_at, properties, created_at, updated_at, deleted_at \
+                           FROM notes \
+                         WHERE namespace = ?1 \
+                           AND kind = ?2 \
+                           AND json_extract(properties, '$.external_id') = ?3 \
+                           AND deleted_at IS NULL \
+                         ORDER BY rowid ASC LIMIT 1",
+                        rusqlite::params![namespace, kind_str, ext_id],
+                        read_note,
+                    )
+                    .optional()?;
+                if let Some(canonical) = canonical {
+                    return Ok(NoteInsertOutcome {
+                        note: canonical,
+                        created: false,
+                    });
                 }
             }
 
@@ -1086,13 +1115,19 @@ impl NoteStore for SqlNoteStore {
             Err(rusqlite::Error::SqliteFailure(
                 rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CONSTRAINT),
                 Some(
-                    "try_insert_note: INSERT ignored for a constraint other than \
+                    "insert_note_natural_key: INSERT ignored for a constraint other than \
                      external_id dedup; not masking as deduplication"
                         .to_string(),
                 ),
             ))
         })
         .await
+    }
+
+    async fn try_insert_note(&self, note: Note) -> Result<bool, StorageError> {
+        self.insert_note_natural_key(note)
+            .await
+            .map(|outcome| outcome.created)
     }
 
     async fn upsert_notes(&self, notes: Vec<Note>) -> Result<BatchWriteSummary, StorageError> {

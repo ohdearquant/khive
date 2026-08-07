@@ -108,7 +108,7 @@ not shipped.
 | `crates/khive-vamana`           | Vamana ANN index used by knowledge search                                                                                                                                                                                                                         |
 | `crates/khive-query`            | GQL + SPARQL parsers, AST validation, SQL compiler                                                                                                                                                                                                                |
 | `crates/khive-runtime`          | Service API + VerbRegistry + PackRuntime trait                                                                                                                                                                                                                    |
-| `crates/khive-request`          | Request DSL parser (function-call + JSON; pipe/LNDL planned)                                                                                                                                                                                                      |
+| `crates/khive-request`          | Request DSL parser (function-call + JSON, including sequential chains and parallel chain groups)                                                                                                                                                                  |
 | `crates/khive-pack-kg`          | KG pack: vocabulary, 20 verb handlers, kind validation                                                                                                                                                                                                            |
 | `crates/khive-pack-gtd`         | GTD pack: 5 verbs over notes (assign / next / complete / tasks / transition)                                                                                                                                                                                      |
 | `crates/khive-pack-memory`      | Memory pack: `remember`/`recall`/`feedback` verbs, decay-weighted recall ([ADR-021](docs/adr/ADR-021-memory-pack.md))                                                                                                                                             |
@@ -195,6 +195,9 @@ request(ops="verb(arg=value, arg=value)")
 # Parallel batch (max 100, no inter-op ordering)
 request(ops="[v1(...), v2(...), v3(...)]")
 
+# Independent chain groups (groups parallel; each group sequential)
+request(ops="[v1(...) | v2(id=$prev.id), v3(...) | v4(id=$prev.id)]")
+
 # JSON form (equivalent)
 request(ops="[{\"tool\":\"v1\",\"args\":{...}}, ...]")
 ```
@@ -227,7 +230,7 @@ Mixing a granular `kind` with a contradicting `entity_kind`/`note_kind` sub-filt
 
 | Verb             | Args                                                                                                                | What it does                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
 | ---------------- | ------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `create`         | `kind=<substrate\|granular>` + fields                                                                               | Create an entity or note                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| `create`         | `kind=<substrate\|granular>` + fields, or mixed `items`                                                             | Create an entity or note; bulk `items` defaults to ordered per-item best effort and accepts both substrates                                                                                                                                                                                                                                                                                                                                                                |
 | `get`            | `id` (UUID)                                                                                                         | Fetch any record — auto-detects entity/note/edge                                                                                                                                                                                                                                                                                                                                                                                                                           |
 | `list`           | `kind=<substrate\|granular>\|edge` + filters                                                                        | Structured browse with pagination                                                                                                                                                                                                                                                                                                                                                                                                                                          |
 | `stats`          | —                                                                                                                   | Return aggregate KG substrate counts (entities, edges, notes)                                                                                                                                                                                                                                                                                                                                                                                                              |
@@ -275,9 +278,9 @@ Load with `KHIVE_PACKS=kg,memory` or `--pack memory`. Adds the `memory` note kin
 `get`/`update`/`delete`/`merge` are UUID-only — no `kind` needed, the handler resolves
 the substrate from the UUID. `create`/`list`/`search` require `kind`.
 
-Each op returns `{ok: true, tool, result}` or `{ok: false, tool, error}`. A failed op does
-NOT abort the batch — each entry has its own ok/error. The aggregate response also carries
-`summary: {total, succeeded, failed}`.
+Each op returns `{ok: true, tool, result}` or `{ok: false, tool, error}`. A failed independent
+group does not abort siblings. Within a `|` chain it aborts only the remaining operations in that
+group. The aggregate response carries `summary: {total, succeeded, failed, aborted}`.
 
 ---
 

@@ -5,6 +5,7 @@
 pub mod actor_identity;
 pub mod agent_lifecycle;
 pub mod ann_registry;
+pub mod atomic_create;
 pub mod atomic_message;
 pub mod atomic_plan;
 pub mod atomic_prepare;
@@ -41,6 +42,11 @@ pub use actor_identity::{actor_is_unattributed, resolve_actor, should_warn_unatt
 pub use agent_lifecycle::{
     apply_transition, spawn_fingerprint, AgentRecord, AgentState, IllegalTransition,
     TerminalReason, Transition, Trigger,
+};
+pub use atomic_create::{
+    create_records_atomic, BulkCreatedRecord, BulkNoteCreateSpec, BulkPostCommitFailure,
+    BulkPostCommitFailureStage, BulkRecordCreateOutcome, BulkRecordCreateResult,
+    BulkRecordCreateSpec,
 };
 pub use atomic_message::{create_notes_atomic, create_notes_atomic_with_report, AtomicNoteSpec};
 pub use atomic_plan::{
@@ -99,7 +105,7 @@ pub use objectives::{
 #[cfg(any(test, feature = "fault-injection"))]
 pub use operations::{
     arm_entity_compensation_fail_scoped, arm_fts_fail_many_partial_scoped,
-    arm_fts_fail_many_scoped, arm_fts_fail_scoped, arm_rollback_cleanup_fail,
+    arm_fts_fail_many_scoped, arm_fts_fail_scoped, arm_link_fail_after, arm_rollback_cleanup_fail,
     arm_vector_fail_after, arm_vector_fail_scoped, FaultInjectionArm,
 };
 pub use operations::{

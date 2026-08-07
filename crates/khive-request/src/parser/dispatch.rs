@@ -5,8 +5,8 @@ use std::collections::BTreeMap;
 use serde_json::{Map, Value};
 
 use crate::types::{
-    ArgValue, DslError, ExecutionMode, ParsedOp, ParsedRequest, MAX_OPS, MAX_OPS_INPUT_LEN,
-    RESERVED_ENVELOPE_ARGS,
+    ArgValue, DslError, ExecutionGroup, ExecutionMode, ParsedOp, ParsedRequest, MAX_OPS,
+    MAX_OPS_INPUT_LEN, RESERVED_ENVELOPE_ARGS,
 };
 
 use super::parser_impl::Parser;
@@ -63,6 +63,7 @@ pub fn parse_request(input: &str) -> Result<ParsedRequest, DslError> {
         return Ok(ParsedRequest {
             ops: vec![first_op],
             mode: ExecutionMode::Single,
+            groups: vec![ExecutionGroup { start: 0, len: 1 }],
         });
     }
 
@@ -113,9 +114,11 @@ fn parse_chain_tail(mut p: Parser<'_>, first_op: ParsedOp) -> Result<ParsedReque
             expected: "'|' or end of input",
         });
     }
+    let len = ops.len();
     Ok(ParsedRequest {
         ops,
         mode: ExecutionMode::Chain,
+        groups: vec![ExecutionGroup { start: 0, len }],
     })
 }
 
@@ -183,7 +186,10 @@ fn parse_json_form(input: &str) -> Result<ParsedRequest, DslError> {
     } else {
         ExecutionMode::Parallel
     };
-    Ok(ParsedRequest { ops, mode })
+    let groups = (0..ops.len())
+        .map(|start| ExecutionGroup { start, len: 1 })
+        .collect();
+    Ok(ParsedRequest { ops, mode, groups })
 }
 
 fn parse_fn_batch(input: &str) -> Result<ParsedRequest, DslError> {
@@ -191,11 +197,13 @@ fn parse_fn_batch(input: &str) -> Result<ParsedRequest, DslError> {
     p.expect_char('[')?;
     p.skip_ws();
     let mut ops = Vec::new();
+    let mut groups = Vec::new();
     if p.peek() == Some(']') {
         p.advance(1);
         return Err(DslError::EmptyBatch);
     }
     loop {
+        let group_start = ops.len();
         if ops.len() >= MAX_OPS {
             return Err(DslError::TooManyOps {
                 count: ops.len() + 1,
@@ -203,8 +211,36 @@ fn parse_fn_batch(input: &str) -> Result<ParsedRequest, DslError> {
             });
         }
         let op = p.parse_op()?;
+        reject_reserved_args(&op)?;
         ops.push(op);
         p.skip_ws();
+
+        while p.peek() == Some('|') {
+            if ops.len() >= MAX_OPS {
+                return Err(DslError::TooManyOps {
+                    count: ops.len() + 1,
+                    max: MAX_OPS,
+                });
+            }
+            p.advance(1);
+            p.skip_ws();
+            let op = p.parse_op()?;
+            reject_reserved_args(&op)?;
+            ops.push(op);
+            p.skip_ws();
+        }
+
+        let group = ExecutionGroup {
+            start: group_start,
+            len: ops.len() - group_start,
+        };
+        if !group.is_chain() {
+            if let Some(pos) = find_prev_ref_pos(&ops[group.start]) {
+                return Err(DslError::PrevRefOutsideChain { pos });
+            }
+        }
+        groups.push(group);
+
         match p.peek() {
             Some(',') => {
                 let comma_pos = p.pos;
@@ -218,7 +254,6 @@ fn parse_fn_batch(input: &str) -> Result<ParsedRequest, DslError> {
                 p.advance(1);
                 break;
             }
-            Some('|') => return Err(DslError::MixedSeparators),
             Some(c) => {
                 return Err(DslError::UnexpectedChar {
                     pos: p.pos,
@@ -237,15 +272,10 @@ fn parse_fn_batch(input: &str) -> Result<ParsedRequest, DslError> {
             expected: "end of input",
         });
     }
-    for op in &ops {
-        if let Some(pos) = find_prev_ref_pos(op) {
-            return Err(DslError::PrevRefOutsideChain { pos });
-        }
-        reject_reserved_args(op)?;
-    }
     Ok(ParsedRequest {
         ops,
         mode: ExecutionMode::Parallel,
+        groups,
     })
 }
 
