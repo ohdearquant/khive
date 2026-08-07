@@ -1570,16 +1570,18 @@ mod windows_impl {
         Ok(())
     }
 
-    /// Handle-bound rename: `RootDirectory` is the validated directory's
-    /// own handle, so the new name resolves relative to the directory the
-    /// caller already proved is real and non-reparse — the closest Win32
-    /// equivalent to Unix `renameat`, since `CreateFileW` itself has no
-    /// directory-relative open primitive.
-    fn rename_via_handle(
-        file: &fs::File,
-        dir_handle: &fs::File,
-        target_name: &str,
-    ) -> io::Result<()> {
+    /// Handle-bound rename within the file's own parent directory: with a
+    /// null `RootDirectory` and a bare (single-component) new name, the
+    /// rename resolves against the directory the open handle already lives
+    /// in — the same directory `open_relative` proved real and non-reparse
+    /// when it created the file, so the `renameat`-like anchoring holds by
+    /// construction. An explicit directory handle is NOT an option here:
+    /// `SetFileInformationByHandle` rejects a non-null `RootDirectory` with
+    /// `ERROR_INVALID_PARAMETER` (87) for the classic `FileRenameInfo`
+    /// class AND for `FileRenameInfoEx` (both measured on Windows Server
+    /// 2022 CI); directory-relative `RootDirectory` renames exist only at
+    /// the `NtSetInformationFile` layer.
+    fn rename_via_handle(file: &fs::File, target_name: &str) -> io::Result<()> {
         let wide: Vec<u16> = OsStr::new(target_name).encode_wide().collect();
         let name_bytes = wide.len() * 2;
         // The real field offset, not an approximation — `FileRenameInfoEx`
@@ -1595,7 +1597,7 @@ mod windows_impl {
         unsafe {
             let header = buf.as_mut_ptr() as *mut FileRenameInfo;
             (*header).flags = FILE_RENAME_FLAG_REPLACE_IF_EXISTS | FILE_RENAME_FLAG_POSIX_SEMANTICS;
-            (*header).root_directory = dir_handle.as_raw_handle() as Handle;
+            (*header).root_directory = std::ptr::null_mut();
             (*header).file_name_length = name_bytes as u32;
             let name_ptr = (*header).file_name.as_mut_ptr();
             std::ptr::copy_nonoverlapping(wide.as_ptr(), name_ptr, wide.len());
@@ -1637,7 +1639,7 @@ mod windows_impl {
         tmp_file.write_all(body)?;
         tmp_file.sync_all()?;
         remove_relative_if_exists(&dir_handle, target_name)?;
-        rename_via_handle(&tmp_file, &dir_handle, target_name)
+        rename_via_handle(&tmp_file, target_name)
     }
 
     pub(super) fn remove_checked(dir: &Path, name: &str) -> io::Result<()> {
@@ -1701,10 +1703,10 @@ mod windows_impl {
 
     /// Mirrors Win32's `FILE_RENAME_INFO`: a `DWORD Flags` (the
     /// `FileRenameInfoEx` interpretation of the leading union member —
-    /// `FileRenameInfoEx` is required, not the classic `FileRenameInfo`
-    /// class, because `SetFileInformationByHandle` rejects a non-null
-    /// `RootDirectory` on the classic class with `ERROR_INVALID_PARAMETER`;
-    /// only the `Ex` class supports a directory-relative by-handle rename),
+    /// the `Ex` class is used for `FILE_RENAME_FLAG_REPLACE_IF_EXISTS` and
+    /// `FILE_RENAME_FLAG_POSIX_SEMANTICS`; `RootDirectory` stays null on
+    /// BOTH classes because `SetFileInformationByHandle` rejects a non-null
+    /// value with `ERROR_INVALID_PARAMETER` — see [`rename_via_handle`]),
     /// then a `HANDLE` (natural alignment inserts padding before it, matched
     /// here by `repr(C)`), a `DWORD` length, and a flexible `WCHAR` array
     /// sized by `file_name_length` bytes — the trailing `[u16; 1]` is a
