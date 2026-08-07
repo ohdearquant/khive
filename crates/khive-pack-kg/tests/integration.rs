@@ -12403,62 +12403,6 @@ async fn list_tags_filter_rejects_substrates_without_tags() {
     }
 }
 
-#[tokio::test]
-async fn list_note_offset_filter_discloses_scan_ceiling_exhaustion() {
-    let (pack, rt, tok) = pack_and_runtime();
-    let notes = (0..10_001)
-        .map(|index| {
-            Note::new("local", "observation", format!("scan decoy {index}"))
-                .with_properties(json!({"direction": "outbound"}))
-        })
-        .collect();
-    let summary = rt.notes(&tok).unwrap().upsert_notes(notes).await.unwrap();
-    assert_eq!(summary.failed, 0);
-
-    let response = pack
-        .dispatch(
-            "list",
-            json!({"kind": "note", "direction": "inbound", "limit": 1}),
-        )
-        .await
-        .expect("bounded filtered note list must succeed");
-    assert!(list_items(&response).is_empty());
-    assert_eq!(response["scan_incomplete"], true);
-}
-
-#[tokio::test]
-async fn list_event_outcome_filter_discloses_scan_ceiling_exhaustion() {
-    let (pack, rt, tok) = pack_and_runtime();
-    let events = (0..21)
-        .map(|_| {
-            Event::new(
-                "local",
-                "scan_test",
-                EventKind::Audit,
-                SubstrateKind::Entity,
-                "test",
-            )
-        })
-        .collect();
-    let summary = rt
-        .events(&tok)
-        .unwrap()
-        .append_events(events)
-        .await
-        .unwrap();
-    assert_eq!(summary.failed, 0);
-
-    let response = pack
-        .dispatch(
-            "list",
-            json!({"kind": "event", "outcome": "denied", "limit": 1}),
-        )
-        .await
-        .expect("bounded filtered event list must succeed");
-    assert!(list_items(&response).is_empty());
-    assert_eq!(response["scan_incomplete"], true);
-}
-
 /// `list(kind="entity")`: a `limit` at or under the cap (500) uses the same
 /// stable envelope as an over-cap request.
 #[tokio::test]

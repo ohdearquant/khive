@@ -672,9 +672,7 @@ so callers can continue instead of mistaking a bounded scan for corpus exhaustio
 Offset-mode `list` responses use one stable envelope on both sides of every row cap:
 `items`, `requested_limit`, `effective_limit`, and `limit_clamped`. Cursor-mode responses keep
 their substrate-specific item key and `next_after`, with the same three limit fields always
-present. Any bounded note or event post-filter scan that reaches its safety ceiling before it can
-prove exhaustion sets `scan_incomplete: true`; a short page without that field is terminal for the
-requested filter and offset.
+present.
 
 ## Amendment: bounded traversal surface (2026-08-01)
 

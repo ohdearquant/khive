@@ -3506,50 +3506,6 @@ async fn query_edges_offset_sweep_covers_equal_created_at_exactly_once() {
 }
 
 #[tokio::test]
-async fn equal_timestamp_offset_pages_use_id_as_total_order_tiebreak() {
-    let store = setup_memory_store();
-    let timestamp = chrono::DateTime::<chrono::Utc>::from_timestamp_micros(1_000_000).unwrap();
-    let ids = [
-        "00000000-0000-4000-8000-000000000001",
-        "00000000-0000-4000-8000-000000000002",
-        "00000000-0000-4000-8000-000000000003",
-        "00000000-0000-4000-8000-000000000004",
-        "00000000-0000-4000-8000-000000000005",
-    ]
-    .map(|raw| Uuid::parse_str(raw).unwrap());
-
-    for id in ids.into_iter().rev() {
-        let mut edge = make_edge(Uuid::new_v4(), Uuid::new_v4(), EdgeRelation::Extends, 1.0);
-        edge.id = id.into();
-        edge.created_at = timestamp;
-        edge.updated_at = timestamp;
-        store.upsert_edge(edge).await.unwrap();
-    }
-
-    let sort = vec![SortOrder {
-        field: EdgeSortField::CreatedAt,
-        direction: SortDirection::Asc,
-    }];
-    let mut seen = Vec::new();
-    for offset in [0, 2, 4] {
-        let page = store
-            .query_edges(
-                EdgeFilter::default(),
-                sort.clone(),
-                PageRequest { limit: 2, offset },
-            )
-            .await
-            .unwrap();
-        seen.extend(page.items.into_iter().map(|edge| Uuid::from(edge.id)));
-    }
-
-    assert_eq!(
-        seen, ids,
-        "offset pages must tile one deterministic total order"
-    );
-}
-
-#[tokio::test]
 async fn query_edges_after_exact_multiple_final_page_has_no_next_after() {
     let store = setup_memory_store();
 

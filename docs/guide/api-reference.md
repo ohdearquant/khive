@@ -260,10 +260,9 @@ extend the walk. After a substrate/namespace query returns `next_after: null`, r
 that terminal query require a new walk from `after=""`. Updates and deletes can change whether an
 unvisited row matches the filters. A cursor that was hard-deleted, is outside the caller's visible
 namespaces, or otherwise cannot be resolved returns an error instead of silently restarting. Cursor
-mode and `offset` are mutually exclusive. Filtered note and event lists additionally return
-`scan_incomplete: true` when their bounded post-filter scan reaches its safety ceiling before
-exhaustion can be proven. Cursor-mode note responses also provide the last safe continuation
-cursor.
+mode and `offset` are mutually exclusive. Filtered note cursor walks may additionally return
+`scan_incomplete: true` with the last safe continuation cursor when their 10,000-row safety
+ceiling is reached before another matching note is proven.
 
 Row shape (each item in the offset or cursor envelope) depends on `kind`.
 For `kind="entity"`, `"note"`, `"edge"`, and `"event"`, the row is the **full stored record**

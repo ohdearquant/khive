@@ -590,11 +590,10 @@ impl KgPack {
                 }
 
                 let offset = p.offset.unwrap_or(0);
-                let (notes, scan_incomplete): (Vec<_>, bool) = if has_note_filter {
+                let notes: Vec<_> = if has_note_filter {
                     let mut collected: Vec<_> = Vec::new();
                     let mut db_offset: u32 = 0;
                     let target_after_skip = offset as usize + limit as usize;
-                    let mut reached_end = false;
                     loop {
                         let remaining_scan =
                             MAX_SCAN_TOTAL.saturating_sub(db_offset).min(PAGE_SIZE);
@@ -619,22 +618,15 @@ impl KgPack {
                             }
                         }
                         if collected.len() >= target_after_skip || fetched < PAGE_SIZE {
-                            reached_end = fetched < PAGE_SIZE;
                             break;
                         }
                         db_offset += fetched;
                     }
-                    let scan_incomplete = !reached_end
-                        && collected.len() < target_after_skip
-                        && db_offset >= MAX_SCAN_TOTAL;
-                    (collected, scan_incomplete)
+                    collected
                 } else {
-                    (
-                        self.runtime
-                            .list_notes(token, kind_filter.as_deref(), limit, offset)
-                            .await?,
-                        false,
-                    )
+                    self.runtime
+                        .list_notes(token, kind_filter.as_deref(), limit, offset)
+                        .await?
                 };
 
                 let remapped: Vec<Value> = if has_note_filter {
@@ -661,11 +653,7 @@ impl KgPack {
                         })
                         .collect()
                 };
-                let mut response = render_list_response(to_json(&remapped)?, requested, limit);
-                if scan_incomplete {
-                    response["scan_incomplete"] = Value::Bool(true);
-                }
-                Ok(response)
+                Ok(render_list_response(to_json(&remapped)?, requested, limit))
             }
             KindSpec::Proposal => unreachable!("kind=proposal fast-pathed before deser"),
             KindSpec::Event => {
@@ -685,12 +673,11 @@ impl KgPack {
                 let offset = p.offset.unwrap_or(0);
                 let (filter, outcome) = event_filter_from_params(&p)?;
 
-                let (items, scan_incomplete) = if let Some(wanted_outcome) = outcome {
+                let items = if let Some(wanted_outcome) = outcome {
                     let mut items = Vec::new();
                     let mut skipped = 0u32;
                     let mut raw_offset = 0u32;
                     let scan_ceiling = offset.saturating_add(limit).saturating_mul(20);
-                    let mut reached_end = false;
 
                     while (items.len() as u32) < limit {
                         let remaining = scan_ceiling.saturating_sub(raw_offset);
@@ -712,14 +699,10 @@ impl KgPack {
                             .await?;
                         let batch_len = page.items.len() as u32;
                         if batch_len == 0 {
-                            reached_end = true;
                             break;
                         }
                         raw_offset = raw_offset.saturating_add(batch_len);
-                        let eof = batch_len < batch_size
-                            || page
-                                .total
-                                .is_some_and(|total| u64::from(raw_offset) >= total);
+                        let eof = batch_len < batch_size;
 
                         for event in page.items {
                             if event.outcome != wanted_outcome {
@@ -736,13 +719,10 @@ impl KgPack {
                         }
 
                         if eof {
-                            reached_end = true;
                             break;
                         }
                     }
-                    let scan_incomplete =
-                        !reached_end && (items.len() as u32) < limit && raw_offset >= scan_ceiling;
-                    (items, scan_incomplete)
+                    items
                 } else {
                     let page = self
                         .runtime
@@ -755,17 +735,13 @@ impl KgPack {
                             },
                         )
                         .await?;
-                    (page.items, false)
+                    page.items
                 };
-                let mut response = render_list_response(
+                Ok(render_list_response(
                     normalize_event_timestamps_array(to_json(&items)?),
                     requested,
                     limit,
-                );
-                if scan_incomplete {
-                    response["scan_incomplete"] = Value::Bool(true);
-                }
-                Ok(response)
+                ))
             }
         }
     }

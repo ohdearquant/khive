@@ -155,9 +155,8 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 20] = [
                       \"limit_clamped\": bool}; the stable shape lets clients advance by M. \
                       Entity, note, and edge cursor modes return \
                       {\"entities|notes|edges\": [...], \"next_after\": ...} with the same \
-                      limit metadata. Bounded post-filter scans additionally set \
-                      scan_incomplete=true when their safety ceiling prevents proving exhaustion. \
-                      Caps are entity 500, note 200, edge 1000, event 1000, and proposal 500.",
+                      limit metadata. Caps are entity 500, note 200, edge 1000, event 1000, \
+                      and proposal 500.",
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,
         params: &[
