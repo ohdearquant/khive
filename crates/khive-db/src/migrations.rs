@@ -133,7 +133,9 @@ const V15_UP: &str = include_str!("../sql/015-serve-ledger-attribution.sql");
 
 const V16_UP: &str = include_str!("../sql/016-gtd-dependency-cycle-guards.sql");
 
-const V17_UP: &str = include_str!("../sql/017-ann-consumer-pending.sql");
+const V17_UP: &str = include_str!("../sql/017-agents-ddl.sql");
+
+const V18_UP: &str = include_str!("../sql/018-ann-consumer-pending.sql");
 
 /// DDL for the `ann_write_log` delta table.
 ///
@@ -249,8 +251,13 @@ pub const MIGRATIONS: &[VersionedMigration] = &[
     },
     VersionedMigration {
         version: 17,
-        name: "ann_consumer_pending",
+        name: "agents_ddl",
         up: V17_UP,
+    },
+    VersionedMigration {
+        version: 18,
+        name: "ann_consumer_pending",
+        up: V18_UP,
     },
 ];
 

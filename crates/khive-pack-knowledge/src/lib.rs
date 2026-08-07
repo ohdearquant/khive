@@ -30,10 +30,9 @@ pub struct KnowledgeReindexOptions {
 /// ANN snapshot.
 ///
 /// Library entry for `kkernel reindex` — callable without an MCP server.
-/// Knowledge is single-model (search retrieves via the default embedder's ANN),
-/// The atom pass also fans out to secondary registered engines on a best-effort
-/// basis. Returns `{atoms_indexed, sections_indexed, failed, ann_failed,
-/// sections_failed, truncation_by_model}`.
+/// Knowledge is single-model: atom indexing, section indexing, and search all
+/// use the default embedder. Returns `{atoms_indexed, sections_indexed, failed,
+/// ann_failed, sections_failed, truncation_by_model}`.
 ///
 /// Optional progress callbacks receive `(processed, total)` after each batch.
 pub async fn reindex_knowledge(

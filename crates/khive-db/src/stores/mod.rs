@@ -3,6 +3,7 @@
 //! Each module provides a concrete store struct implementing one or more
 //! `khive-storage` capability traits against the shared connection pool.
 
+pub mod agents;
 pub mod blob;
 pub mod blob_s3;
 pub mod entity;

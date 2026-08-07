@@ -45,7 +45,7 @@ use crate::atomic_plan::{
     AddEntityPlan, AffectedRowGuard, DeletePlan, PlanStatement, PostCommitEffect,
 };
 use crate::atomic_runner::{run_atomic_unit, AtomicOpFailure, AtomicOpPlan, AtomicRunOutcome};
-use crate::curation::{entity_fts_document, note_embedding_text, note_fts_document};
+use crate::curation::{entity_fts_document, note_embedding_text_ref, note_fts_document};
 use crate::error::{GuardedWriteFailure, RuntimeError, RuntimeResult};
 use crate::runtime::{KhiveRuntime, NamespaceToken};
 
@@ -806,6 +806,9 @@ pub const BASE_ENTITY_ENDPOINT_RULES: &[(&str, EdgeRelation, &str)] = &[
     ("artifact", EdgeRelation::DerivedFrom, "document"),
     ("artifact", EdgeRelation::DerivedFrom, "project"),
     ("artifact", EdgeRelation::DerivedFrom, "artifact"),
+    // ADR-002 amendment 2026-07-27: publication provenance — a curated or
+    // filtered publication copy points at the canonical source document.
+    ("document", EdgeRelation::DerivedFrom, "document"),
     // Temporal
     ("document", EdgeRelation::Precedes, "document"),
     ("dataset", EdgeRelation::Precedes, "dataset"),
@@ -3199,7 +3202,7 @@ impl KhiveRuntime {
                 .embed_document_with_model_outcome_for_token(
                     token,
                     model_name,
-                    &note_embedding_text(&note),
+                    note_embedding_text_ref(&note),
                 )
                 .await
             {
@@ -3265,6 +3268,12 @@ impl KhiveRuntime {
         embedding_model: Option<&str>,
     ) -> RuntimeResult<(Note, crate::retrieval::EmbeddingTruncationReport)> {
         self.validate_note_kind(kind)?;
+        // Owned identity properties are derived from the authorization token
+        // before anything else touches them, so every caller of this function —
+        // the generic `create` verb and direct Rust callers alike — stores the
+        // same derived values. Runs before the secret gate so the gate scans
+        // exactly what will be written.
+        let properties = self.derive_note_write_properties(kind, token, properties)?;
         // Secret gate: scan content, optional name, and structured properties.
         crate::secret_gate::check(content)?;
         if let Some(n) = name {
@@ -3405,8 +3414,8 @@ impl KhiveRuntime {
         // capped override when present, otherwise the full stored content.
         // FTS indexing above always used the full `note.content` — this cap
         // affects only the vector-embedding input.
-        let canonical_embed_text = note_embedding_text(&note);
-        let embed_text: &str = embedding_content.unwrap_or(&canonical_embed_text);
+        let canonical_embed_text = note_embedding_text_ref(&note);
+        let embed_text = embedding_content.unwrap_or(canonical_embed_text);
 
         let mut embedding_report = crate::retrieval::EmbeddingTruncationReport::default();
         if embed_model_names.len() == 1 {
@@ -3485,17 +3494,23 @@ impl KhiveRuntime {
             // Multi-model path: embed with each model in parallel via spawned tasks,
             // then insert one VectorRecord per model.
             let rt_clone = self.clone();
-            let content_owned = embed_text.to_string();
+            // JoinSet tasks require owned text; an Arc keeps this to one
+            // content-sized allocation rather than one clone per model.
+            let content_owned: std::sync::Arc<str> = std::sync::Arc::from(embed_text);
             let usage_ctx = crate::usage::current();
             let mut join_set = tokio::task::JoinSet::new();
             for (idx, model_name) in embed_model_names.iter().enumerate() {
                 let rt = rt_clone.clone();
-                let text = content_owned.clone();
+                let text = std::sync::Arc::clone(&content_owned);
                 let name = model_name.clone();
                 let ctx = usage_ctx.clone();
                 let token = (*token).clone();
                 join_set.spawn(async move {
-                    let fut = rt.embed_document_with_model_outcome_for_token(&token, &name, &text);
+                    let fut = rt.embed_document_with_model_outcome_for_token(
+                        &token,
+                        &name,
+                        text.as_ref(),
+                    );
                     let result = match ctx {
                         Some(ctx) => crate::usage::scope(ctx, fut).await,
                         None => fut.await,
@@ -5862,7 +5877,7 @@ mod tests {
     use crate::{ActorRef, Namespace};
     use async_trait::async_trait;
     use khive_storage::types::PathNode;
-    use lattice_embed::{EmbedError, EmbeddingModel, EmbeddingService, MAX_TEXT_CHARS};
+    use lattice_embed::{EmbedError, EmbeddingModel, EmbeddingService, MAX_TEXT_BYTES};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
 
@@ -9118,7 +9133,7 @@ mod tests {
     // delete against the guarded write via `tokio::join!` with no explicit
     // ordering control, so the scheduler could run them fully sequentially
     // on one thread without ever exercising real interleaving, and neither
-    // the file-backed storage path nor `write_queue_enabled: true`
+    // the file-backed storage path nor `write_queue_enabled: Some(true)`
     // (`KHIVE_WRITE_QUEUE=1`, the `WriterTask`-routed write path in
     // `SqlGraphStore`) is covered at all. The four tests below close both
     // gaps: file-backed databases, one run with the writer queue off
@@ -15644,10 +15659,10 @@ mod tests {
             _model: EmbeddingModel,
         ) -> std::result::Result<Vec<Vec<f32>>, EmbedError> {
             for text in texts {
-                if text.len() > MAX_TEXT_CHARS {
+                if text.len() > MAX_TEXT_BYTES {
                     return Err(EmbedError::TextTooLong {
                         length: text.len(),
-                        max: MAX_TEXT_CHARS,
+                        max: MAX_TEXT_BYTES,
                     });
                 }
             }
@@ -15699,7 +15714,7 @@ mod tests {
             captured: Arc::clone(&captured),
         });
 
-        let content = format!("{}\u{1f980}tail", "a".repeat(MAX_TEXT_CHARS - 1));
+        let content = format!("{}\u{1f980}tail", "a".repeat(MAX_TEXT_BYTES - 1));
         let note = rt
             .create_note(&tok, "observation", None, &content, None, None, vec![])
             .await
@@ -15715,7 +15730,7 @@ mod tests {
 
         let embedded = captured.lock().unwrap().clone();
         assert_eq!(embedded.len(), 1);
-        assert_eq!(embedded[0].len(), MAX_TEXT_CHARS - 1);
+        assert_eq!(embedded[0].len(), MAX_TEXT_BYTES - 1);
         assert!(embedded[0].is_char_boundary(embedded[0].len()));
         assert!(!embedded[0].contains('\u{1f980}'));
 
@@ -15732,13 +15747,13 @@ mod tests {
         rt.reindex_note(&tok, &fetched)
             .await
             .expect("reindex must bound the same stored content");
-        assert_eq!(captured.lock().unwrap()[0].len(), MAX_TEXT_CHARS - 1);
+        assert_eq!(captured.lock().unwrap()[0].len(), MAX_TEXT_BYTES - 1);
 
         captured.lock().unwrap().clear();
         rt.embed_document_batch_with_model("strict-length-test", std::slice::from_ref(&content))
             .await
             .expect("batch reindex seam must bound stored content");
-        assert_eq!(captured.lock().unwrap()[0].len(), MAX_TEXT_CHARS - 1);
+        assert_eq!(captured.lock().unwrap()[0].len(), MAX_TEXT_BYTES - 1);
 
         let normal = "normal byte-identical embedding input";
         rt.create_note(&tok, "observation", None, normal, None, None, vec![])
@@ -15746,7 +15761,7 @@ mod tests {
             .expect("normal note create must succeed");
         assert_eq!(captured.lock().unwrap().last().unwrap(), normal);
 
-        let long_description = format!("{}\u{1f980}tail", "b".repeat(MAX_TEXT_CHARS));
+        let long_description = format!("{}\u{1f980}tail", "b".repeat(MAX_TEXT_BYTES));
         rt.create_entity(
             &tok,
             "concept",
@@ -15993,5 +16008,136 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(count, 0, "a rejected create must leave no note behind");
+    }
+
+    // ── ADR-002 base endpoint contract conformance (issue #1715) ────────────
+    // Parses the "### Base endpoint contract" tables straight out of
+    // docs/adr/ADR-002-edge-ontology.md and asserts set-equality against
+    // `BASE_ENTITY_ENDPOINT_RULES`. The ADR and the runtime allowlist are
+    // maintained by hand in two places with nothing else comparing them; this
+    // is the comparator, so a future amendment landing in only one of the two
+    // fails CI instead of shipping a silent false refusal (or a silent
+    // over-grant).
+
+    /// Subsections of the "Base endpoint contract" that are intentionally
+    /// excluded from `BASE_ENTITY_ENDPOINT_RULES`:
+    /// - "Annotation relation": `Note -> any substrate UUID` is a substrate-level
+    ///   rule (source is always a note), not an entity-kind pair.
+    /// - "KG pack extensions": additive rows declared via the KG pack's
+    ///   `EDGE_RULES`, not part of the runtime's base allowlist.
+    const ADR002_EXCLUDED_SUBSECTIONS: &[&str] = &["Annotation relation", "KG pack extensions"];
+
+    /// Parse the ADR-002 "Base endpoint contract" markdown tables into the same
+    /// `(source_kind, relation, target_kind)` shape as `BASE_ENTITY_ENDPOINT_RULES`.
+    fn parse_adr002_base_entity_endpoint_matrix(
+    ) -> std::collections::HashSet<(String, EdgeRelation, String)> {
+        let adr_path = format!(
+            "{}/../../docs/adr/ADR-002-edge-ontology.md",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let text = std::fs::read_to_string(&adr_path)
+            .unwrap_or_else(|e| panic!("failed to read {adr_path}: {e}"));
+        let lines: Vec<&str> = text.lines().collect();
+
+        let start = lines
+            .iter()
+            .position(|l| l.trim() == "### Base endpoint contract")
+            .expect("ADR-002 must contain a '### Base endpoint contract' heading");
+        let end = lines[start + 1..]
+            .iter()
+            .position(|l| l.starts_with("## "))
+            .map(|i| start + 1 + i)
+            .unwrap_or(lines.len());
+        let section = &lines[start..end];
+
+        let mut triples = std::collections::HashSet::new();
+        let mut excluded = false;
+
+        for line in section {
+            let trimmed = line.trim();
+            if let Some(title) = trimmed.strip_prefix("#### ") {
+                excluded = ADR002_EXCLUDED_SUBSECTIONS
+                    .iter()
+                    .any(|ex| title.starts_with(ex));
+                continue;
+            }
+            if excluded || !trimmed.starts_with('|') {
+                continue;
+            }
+
+            let cells: Vec<&str> = trimmed
+                .trim_matches('|')
+                .split('|')
+                .map(|c| c.trim())
+                .collect();
+            if cells.len() != 3 {
+                continue;
+            }
+            let is_header = cells[0].eq_ignore_ascii_case("Source");
+            let is_separator = cells
+                .iter()
+                .all(|c| !c.is_empty() && c.chars().all(|ch| ch == '-'));
+            if is_header || is_separator {
+                continue;
+            }
+
+            let src_raw = cells[0].trim_matches('`');
+            let rel_raw = cells[1].trim_matches('`');
+            let tgt_raw = cells[2].trim_matches('`');
+
+            let relation: EdgeRelation = rel_raw.parse().unwrap_or_else(|_| {
+                panic!("ADR-002 base endpoint contract row has unparseable relation: {trimmed:?}")
+            });
+
+            let src = if src_raw.eq_ignore_ascii_case("any entity") {
+                "*".to_string()
+            } else {
+                src_raw.to_ascii_lowercase()
+            };
+            let tgt = tgt_raw.to_ascii_lowercase();
+
+            triples.insert((src, relation, tgt));
+        }
+
+        triples
+    }
+
+    #[test]
+    fn base_entity_endpoint_rules_match_adr002_base_endpoint_contract() {
+        // ADR-002 lives at the repository root, outside this crate's package.
+        // In the repository the workspace manifest sits two levels up and the
+        // ADR must be readable — a missing file there is a hard failure so a
+        // rename cannot silently disarm this gate. From a published package
+        // tarball neither exists; skip with disclosure instead of failing an
+        // environment that cannot carry the canonical document.
+        let workspace_manifest = format!("{}/../Cargo.toml", env!("CARGO_MANIFEST_DIR"));
+        if !std::path::Path::new(&workspace_manifest).exists() {
+            eprintln!(
+                "skipping ADR-002 conformance: workspace manifest not present \
+                 (published-package context); the check runs in the repository"
+            );
+            return;
+        }
+        let adr_matrix = parse_adr002_base_entity_endpoint_matrix();
+        assert!(
+            !adr_matrix.is_empty(),
+            "parsed zero rows from ADR-002's base endpoint contract — parser or heading drift"
+        );
+
+        let runtime_rules: std::collections::HashSet<(String, EdgeRelation, String)> =
+            base_entity_endpoint_rules()
+                .iter()
+                .map(|(src, rel, tgt)| (src.to_string(), *rel, tgt.to_string()))
+                .collect();
+
+        let missing_from_runtime: Vec<_> = adr_matrix.difference(&runtime_rules).collect();
+        let extra_in_runtime: Vec<_> = runtime_rules.difference(&adr_matrix).collect();
+
+        assert!(
+            missing_from_runtime.is_empty() && extra_in_runtime.is_empty(),
+            "BASE_ENTITY_ENDPOINT_RULES has drifted from ADR-002's base endpoint contract.\n\
+             In the ADR but not enforced by the runtime: {missing_from_runtime:#?}\n\
+             Enforced by the runtime but not in the ADR: {extra_in_runtime:#?}"
+        );
     }
 }

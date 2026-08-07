@@ -23,6 +23,14 @@ use khive_pack_code::{ingest_findings_json, CodeIngestBatch, CodeIngestOptions};
 use khive_runtime::{entity_fts_document, note_fts_document, secret_gate, KhiveRuntime, Namespace};
 use khive_storage::{SqlStatement, SqlValue, SubstrateKind};
 
+/// Upper bound on how long the real ingest path waits for the pool's writer
+/// task to exit after the last write returned. Generous relative to any
+/// realistic queue depth for a findings batch; hitting it means something is
+/// holding a `WriterTaskHandle` clone alive (the queue never closed) or the
+/// writer is wedged, and the caller is told loudly rather than returning
+/// with the database file still in motion.
+const WRITER_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Arguments for `kkernel code-ingest`.
 #[derive(Parser, Debug)]
 pub struct CodeIngestArgs {
@@ -185,182 +193,275 @@ where
     }
 
     let runtime = KhiveRuntime::new(cfg).map_err(|e| anyhow::anyhow!("{e}"))?;
-    runtime_setup(&runtime)?;
-    let resolved_ns = runtime.config().default_namespace.clone();
-    let token = runtime
-        .authorize(resolved_ns)
-        .map_err(|e| anyhow::anyhow!("{e}"))
-        .context("failed to authorize namespace")?;
+    // Every path out of the write section below — success or error — must
+    // still drain the pool's writer task before this function returns, so
+    // the section runs as an inner block and the drain happens once, after
+    // it, on the captured result.
+    let ingest_result: Result<CodeIngestReport> = async {
+        runtime_setup(&runtime)?;
+        let resolved_ns = runtime.config().default_namespace.clone();
+        let token = runtime
+            .authorize(resolved_ns)
+            .map_err(|e| anyhow::anyhow!("{e}"))
+            .context("failed to authorize namespace")?;
 
-    // One immutable model-name snapshot governs this ingest pass. Each report
-    // below is still derived from the corresponding completed embed call, so a
-    // provider cannot appear in execution without also appearing in reporting.
-    let embedding_model_names = runtime.registered_embedding_model_names();
+        // One immutable model-name snapshot governs this ingest pass. Each report
+        // below is still derived from the corresponding completed embed call, so a
+        // provider cannot appear in execution without also appearing in reporting.
+        let embedding_model_names = runtime.registered_embedding_model_names();
 
-    let mut report = CodeIngestReport {
-        dry_run: false,
-        ..CodeIngestReport::default()
-    };
+        let mut report = CodeIngestReport {
+            dry_run: false,
+            ..CodeIngestReport::default()
+        };
 
-    let entities = runtime
-        .entities(&token)
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
-    for entity in &batch.entities {
-        let existing = entities
-            .get_entity(entity.id)
-            .await
+        let entities = runtime
+            .entities(&token)
             .map_err(|e| anyhow::anyhow!("{e}"))?;
-        if existing.is_some() {
-            report.entities_skipped_existing += 1;
-            continue;
-        }
-        report.entities_created += 1;
-        entities
-            .upsert_entity(entity.clone())
-            .await
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-
-        let doc = entity_fts_document(entity);
-        let embed_body = doc.body.clone();
-        if let Ok(fts) = runtime.text(&token) {
-            if let Err(e) = fts.upsert_document(doc).await {
-                tracing::warn!(
-                    entity_id = %entity.id,
-                    error = %e,
-                    "code-ingest: entity FTS indexing failed (non-fatal)"
-                );
-            }
-        }
-        for model_name in &embedding_model_names {
-            match runtime
-                .embed_document_with_model_outcome(model_name, &embed_body)
+        for entity in &batch.entities {
+            let existing = entities
+                .get_entity(entity.id)
                 .await
-            {
-                Ok(outcome) => {
-                    report
-                        .truncation_by_model
-                        .entry(model_name.clone())
-                        .or_default()
-                        .observe(&outcome);
-                    if let Ok(vs) = runtime.vectors_for_model(&token, model_name) {
-                        if let Err(e) = vs
-                            .insert(
-                                entity.id,
-                                SubstrateKind::Entity,
-                                token.namespace().as_str(),
-                                // Canonical field label for the entity body
-                                // vector (khive-runtime/src/operations.rs,
-                                // curation.rs) — must match so vector
-                                // provenance metadata agrees with every
-                                // other write path.
-                                "entity.body",
-                                vec![outcome.vector],
-                            )
-                            .await
-                        {
-                            tracing::warn!(
-                                entity_id = %entity.id,
-                                model = %model_name,
-                                error = %e,
-                                "code-ingest: entity vector insert failed (non-fatal)"
-                            );
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            if existing.is_some() {
+                report.entities_skipped_existing += 1;
+                continue;
+            }
+            report.entities_created += 1;
+            entities
+                .upsert_entity(entity.clone())
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+            let doc = entity_fts_document(entity);
+            let embed_body = doc.body.clone();
+            if let Ok(fts) = runtime.text(&token) {
+                if let Err(e) = fts.upsert_document(doc).await {
+                    tracing::warn!(
+                        entity_id = %entity.id,
+                        error = %e,
+                        "code-ingest: entity FTS indexing failed (non-fatal)"
+                    );
+                }
+            }
+            for model_name in &embedding_model_names {
+                match runtime
+                    .embed_document_with_model_outcome(model_name, &embed_body)
+                    .await
+                {
+                    Ok(outcome) => {
+                        report
+                            .truncation_by_model
+                            .entry(model_name.clone())
+                            .or_default()
+                            .observe(&outcome);
+                        if let Ok(vs) = runtime.vectors_for_model(&token, model_name) {
+                            if let Err(e) = vs
+                                .insert(
+                                    entity.id,
+                                    SubstrateKind::Entity,
+                                    token.namespace().as_str(),
+                                    // Canonical field label for the entity body
+                                    // vector (khive-runtime/src/operations.rs,
+                                    // curation.rs) — must match so vector
+                                    // provenance metadata agrees with every
+                                    // other write path.
+                                    "entity.body",
+                                    vec![outcome.vector],
+                                )
+                                .await
+                            {
+                                tracing::warn!(
+                                    entity_id = %entity.id,
+                                    model = %model_name,
+                                    error = %e,
+                                    "code-ingest: entity vector insert failed (non-fatal)"
+                                );
+                            }
                         }
                     }
+                    Err(e) => tracing::warn!(
+                        entity_id = %entity.id,
+                        model = %model_name,
+                        error = %e,
+                        "code-ingest: entity embedding failed (non-fatal)"
+                    ),
                 }
-                Err(e) => tracing::warn!(
-                    entity_id = %entity.id,
-                    model = %model_name,
-                    error = %e,
-                    "code-ingest: entity embedding failed (non-fatal)"
-                ),
             }
         }
-    }
 
-    let notes = runtime.notes(&token).map_err(|e| anyhow::anyhow!("{e}"))?;
-    for note in &batch.notes {
-        let existing = notes
-            .get_note(note.id)
-            .await
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-        if existing.is_some() {
-            report.notes_skipped_existing += 1;
-            continue;
-        }
-        report.notes_created += 1;
-        notes
-            .upsert_note(note.clone())
-            .await
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-
-        if let Ok(fts) = runtime.text_for_notes(&token) {
-            if let Err(e) = fts.upsert_document(note_fts_document(note)).await {
-                tracing::warn!(
-                    note_id = %note.id,
-                    error = %e,
-                    "code-ingest: note FTS indexing failed (non-fatal)"
-                );
-            }
-        }
-        for model_name in &embedding_model_names {
-            match runtime
-                .embed_document_with_model_outcome(model_name, &note.content)
+        let notes = runtime.notes(&token).map_err(|e| anyhow::anyhow!("{e}"))?;
+        for note in &batch.notes {
+            let existing = notes
+                .get_note(note.id)
                 .await
-            {
-                Ok(outcome) => {
-                    report
-                        .truncation_by_model
-                        .entry(model_name.clone())
-                        .or_default()
-                        .observe(&outcome);
-                    if let Ok(vs) = runtime.vectors_for_model(&token, model_name) {
-                        if let Err(e) = vs
-                            .insert(
-                                note.id,
-                                SubstrateKind::Note,
-                                token.namespace().as_str(),
-                                "note.content",
-                                vec![outcome.vector],
-                            )
-                            .await
-                        {
-                            tracing::warn!(
-                                note_id = %note.id,
-                                model = %model_name,
-                                error = %e,
-                                "code-ingest: note vector insert failed (non-fatal)"
-                            );
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            if existing.is_some() {
+                report.notes_skipped_existing += 1;
+                continue;
+            }
+            report.notes_created += 1;
+            notes
+                .upsert_note(note.clone())
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+            if let Ok(fts) = runtime.text_for_notes(&token) {
+                if let Err(e) = fts.upsert_document(note_fts_document(note)).await {
+                    tracing::warn!(
+                        note_id = %note.id,
+                        error = %e,
+                        "code-ingest: note FTS indexing failed (non-fatal)"
+                    );
+                }
+            }
+            for model_name in &embedding_model_names {
+                match runtime
+                    .embed_document_with_model_outcome(model_name, &note.content)
+                    .await
+                {
+                    Ok(outcome) => {
+                        report
+                            .truncation_by_model
+                            .entry(model_name.clone())
+                            .or_default()
+                            .observe(&outcome);
+                        if let Ok(vs) = runtime.vectors_for_model(&token, model_name) {
+                            if let Err(e) = vs
+                                .insert(
+                                    note.id,
+                                    SubstrateKind::Note,
+                                    token.namespace().as_str(),
+                                    "note.content",
+                                    vec![outcome.vector],
+                                )
+                                .await
+                            {
+                                tracing::warn!(
+                                    note_id = %note.id,
+                                    model = %model_name,
+                                    error = %e,
+                                    "code-ingest: note vector insert failed (non-fatal)"
+                                );
+                            }
                         }
                     }
+                    Err(e) => tracing::warn!(
+                        note_id = %note.id,
+                        model = %model_name,
+                        error = %e,
+                        "code-ingest: note embedding failed (non-fatal)"
+                    ),
                 }
-                Err(e) => tracing::warn!(
-                    note_id = %note.id,
-                    model = %model_name,
-                    error = %e,
-                    "code-ingest: note embedding failed (non-fatal)"
-                ),
             }
         }
-    }
 
-    let graph = runtime.graph(&token).map_err(|e| anyhow::anyhow!("{e}"))?;
-    for edge in &batch.edges {
-        let existing = graph
-            .get_edge(edge.id)
-            .await
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-        if existing.is_some() {
-            report.edges_skipped_existing += 1;
-            continue;
+        let graph = runtime.graph(&token).map_err(|e| anyhow::anyhow!("{e}"))?;
+        for edge in &batch.edges {
+            let existing = graph
+                .get_edge(edge.id)
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            if existing.is_some() {
+                report.edges_skipped_existing += 1;
+                continue;
+            }
+            report.edges_created += 1;
+            graph
+                .upsert_edge(edge.clone())
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
         }
-        report.edges_created += 1;
-        graph
-            .upsert_edge(edge.clone())
-            .await
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-    }
 
-    Ok(report)
+        Ok(report)
+    }
+    .await;
+
+    // The migrated stores above route writes through the pool's shared
+    // writer task (ADR-067 Component A), which owns its own SQLite
+    // connection and exits only after every WriterTaskHandle clone has
+    // dropped and the queue has drained. That connection's close fires
+    // SQLite's close-time WAL checkpoint, so until the task exits the
+    // database file bytes can still move after this function returns. The
+    // inner block above dropped every store handle and the token on its way
+    // out (success or error); dropping the runtime here closes the queue.
+    // Then await the task's exit with a bounded, loud timeout — on BOTH
+    // paths, so an early error return cannot leave the file still moving.
+    let writer_join = take_writer_task_join_or_warn(runtime.backend().pool());
+    drop(runtime);
+
+    settle_writer_drain(ingest_result, writer_join, WRITER_DRAIN_TIMEOUT).await
+}
+
+/// Take the pool's writer-task JoinHandle for the drain, warning loudly when
+/// a previously stored handle is unavailable at take time.
+///
+/// A missing handle is benign when no writer-task handle was ever stored: no
+/// queue-routed write occurred, or writer-task setup degraded before a handle
+/// could be stored. It is a drain-ownership problem only when a handle was
+/// stored and another caller already consumed the one-shot slot.
+fn take_writer_task_join_or_warn(
+    pool: &khive_db::ConnectionPool,
+) -> Option<tokio::task::JoinHandle<()>> {
+    let writer_join = pool.take_writer_task_join();
+    if writer_join.is_none() && pool.write_queue_active() && pool.writer_task_join_was_stored() {
+        tracing::warn!(
+            "writer-task JoinHandle was stored but is absent at drain time; \
+             another caller may have taken the one-shot drain handle, so \
+             'return implies settled' is not enforced by this call"
+        );
+    }
+    writer_join
+}
+
+/// Await the taken writer-task JoinHandle and reconcile the drain outcome
+/// with the ingest outcome — the "return implies settled" contract's
+/// enforcement point (extracted from `code_ingest_batch_with_runtime_setup`
+/// so each outcome arm is unit-testable with a synthetic handle).
+///
+/// `timeout` bounds the drain wait (production passes [`WRITER_DRAIN_TIMEOUT`]).
+/// Returns the ingest result unchanged on a clean drain, and — when the
+/// ingest itself failed — also unchanged on a drain problem (the ingest error
+/// is primary; a drain problem is logged, never masks it). Bails when the
+/// ingest succeeded but the drain did not settle.
+async fn settle_writer_drain(
+    ingest_result: Result<CodeIngestReport>,
+    writer_join: Option<tokio::task::JoinHandle<()>>,
+    timeout: std::time::Duration,
+) -> Result<CodeIngestReport> {
+    if let Some(join) = writer_join {
+        let drained = tokio::time::timeout(timeout, join).await;
+        match (&ingest_result, drained) {
+            (_, Ok(Ok(()))) => {}
+            // The ingest itself failed: that error is the primary one. A
+            // drain problem on this path is logged, not returned, so it
+            // cannot mask the actual failure.
+            (Err(_), Ok(Err(join_err))) => {
+                tracing::warn!(error = %join_err, "writer task terminated abnormally after failed ingest");
+            }
+            (Err(_), Err(_elapsed)) => {
+                tracing::warn!(
+                    timeout = ?timeout,
+                    "writer task did not drain after failed ingest; database file state may still be unsettled"
+                );
+            }
+            (Ok(_), Ok(Err(join_err))) => anyhow::bail!(
+                "writer task terminated abnormally after ingest completed: {join_err}"
+            ),
+            // Pinned behavior (fail-loud is the deliberate choice): the ingest
+            // reported success, so some or all of its writes may already be in
+            // the file; we bail anyway because "return implies settled" cannot
+            // be proven until the writer task has exited. The JoinHandle is
+            // consumed by `timeout()` above, so the task DETACHES and keeps
+            // running after this bail — its close-time WAL checkpoint may
+            // still move the database bytes after this function returns.
+            (Ok(_), Err(_elapsed)) => anyhow::bail!(
+                "writer task did not drain within {timeout:?} after ingest; \
+                 database file state may still be unsettled"
+            ),
+        }
+    }
+    ingest_result
 }
 
 /// Scan every entity/note content field and nested property value in `batch`
@@ -523,10 +624,55 @@ mod tests {
 
     use async_trait::async_trait;
     use khive_runtime::{EmbedderProvider, RuntimeError};
-    use lattice_embed::{EmbedError, EmbeddingModel, EmbeddingService, MAX_TEXT_CHARS};
+    use lattice_embed::{EmbedError, EmbeddingModel, EmbeddingService, MAX_TEXT_BYTES};
     use serial_test::serial;
 
     use super::*;
+
+    struct WriteQueueEnvGuard {
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl WriteQueueEnvGuard {
+        fn unset() -> Self {
+            let previous = std::env::var_os("KHIVE_WRITE_QUEUE");
+            std::env::remove_var("KHIVE_WRITE_QUEUE");
+            Self { previous }
+        }
+    }
+
+    impl Drop for WriteQueueEnvGuard {
+        fn drop(&mut self) {
+            match &self.previous {
+                Some(value) => std::env::set_var("KHIVE_WRITE_QUEUE", value),
+                None => std::env::remove_var("KHIVE_WRITE_QUEUE"),
+            }
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct Capture(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Capture {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct MakeCapture(Capture);
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for MakeCapture {
+        type Writer = Capture;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.0.clone()
+        }
+    }
 
     struct FixedEmbeddingService {
         dimensions: usize,
@@ -648,6 +794,39 @@ mod tests {
 
     #[serial]
     #[tokio::test]
+    async fn code_ingest_with_no_queue_writes_does_not_warn_on_drain() {
+        let _write_queue_env = WriteQueueEnvGuard::unset();
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let findings = write_valid_findings(tmp.path());
+        let db = tmp.path().join("no_queue_writes.db");
+
+        code_ingest_batch(base_args(findings.clone(), db.clone()))
+            .await
+            .expect("initial ingest must succeed");
+
+        let capture = Capture::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(MakeCapture(capture.clone()))
+            .with_ansi(false)
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+        let report = code_ingest_batch(base_args(findings, db))
+            .await
+            .expect("all-skipped ingest must succeed");
+        drop(guard);
+
+        assert_eq!(report.entities_created, 0);
+        assert_eq!(report.notes_created, 0);
+        assert_eq!(report.edges_created, 0);
+        let log = String::from_utf8_lossy(&capture.0.lock().unwrap()).to_string();
+        assert!(
+            !log.contains("writer-task JoinHandle"),
+            "an ingest with no queue-routed writes must not warn at drain time: {log}"
+        );
+    }
+
+    #[serial]
+    #[tokio::test]
     async fn code_ingest_dry_run_writes_nothing() {
         let tmp = tempfile::TempDir::new().expect("temp dir");
         let findings = write_valid_findings(tmp.path());
@@ -760,6 +939,60 @@ mod tests {
         assert_eq!(
             bytes_before, bytes_after,
             "a dry run against an existing db must not change a single byte of it"
+        );
+    }
+
+    /// The contract the writer-task drain in `code_ingest_batch` exists to
+    /// provide, pinned as its own test: a real ingest's RETURN implies the
+    /// database file state is settled. Without the drain, the pool's writer
+    /// task exits asynchronously after the last `WriterTaskHandle` clone
+    /// drops, and its connection's close-time WAL checkpoint moves the file
+    /// bytes after `code_ingest_batch` has already returned — which is the
+    /// race the sibling dry-run byte test used to lose. That test passing
+    /// is a consequence of this contract, not a substitute for it.
+    #[serial]
+    #[tokio::test]
+    async fn code_ingest_return_implies_settled_file_state() {
+        // Pin the queue default: with the variable unset, a file-backed pool
+        // resolves the write queue ON, so this test exercises the writer-task
+        // drain rather than silently passing through the queue-off path an
+        // ambient KHIVE_WRITE_QUEUE=0 would select. (#[serial] guards the
+        // env mutation.)
+        let _write_queue_env = WriteQueueEnvGuard::unset();
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let findings = write_valid_findings(tmp.path());
+        let db = tmp.path().join("settled.db");
+
+        code_ingest_batch(base_args(findings, db.clone()))
+            .await
+            .expect("real ingest must succeed");
+
+        // Every connection — the pool's synchronous ones and the writer
+        // task's own — must be closed by the time the call returns, so
+        // SQLite's last-close checkpoint has already run and removed the
+        // WAL sidecars.
+        let wal_path = wal_sidecar_path(&db);
+        let shm_path = shm_sidecar_path(&db);
+        assert!(
+            !wal_path.exists(),
+            "ingest return must imply the -wal sidecar was checkpointed and removed"
+        );
+        assert!(
+            !shm_path.exists(),
+            "ingest return must imply the -shm sidecar was removed"
+        );
+
+        let bytes_at_return = std::fs::read(&db).expect("read db at the return boundary");
+
+        // Give any (incorrectly) still-pending async writer a generous
+        // window: if the writer task were still alive past the return
+        // boundary, its close-time checkpoint would move these bytes.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        let bytes_later = std::fs::read(&db).expect("re-read db after the settle window");
+        assert_eq!(
+            bytes_at_return, bytes_later,
+            "no byte of the database may move after code_ingest_batch has returned"
         );
     }
 
@@ -1030,7 +1263,7 @@ mod tests {
         // Finding-note embeddings use the canonical `title: impact` content,
         // while evidence remains structured properties only.
         document["findings"][0]["impact"] =
-            serde_json::Value::String("x".repeat(MAX_TEXT_CHARS + 1));
+            serde_json::Value::String("x".repeat(MAX_TEXT_BYTES + 1));
         std::fs::write(
             &findings,
             serde_json::to_vec(&document).expect("serialize long findings fixture"),
@@ -1060,6 +1293,226 @@ mod tests {
              {:?}",
             report.truncation_by_model
         );
+    }
+
+    /// The drain-finalization matrix, tested through the extracted
+    /// `settle_writer_drain` with synthetic JoinHandles: the real writer
+    /// task never produces a join ERROR (every documented failure mode —
+    /// op panic, commit failure, poisoned connection — is caught inside the
+    /// request wrapper or exits the task normally; see writer_task.rs's
+    /// `run_writer_task`), and a real drain TIMEOUT would need to exceed the
+    /// 30s production bound, so those two success-path arms are not
+    /// constructible end-to-end with standing infra. The arms below pin the
+    /// contract the production drain relies on.
+    fn ok_report() -> CodeIngestReport {
+        CodeIngestReport {
+            dry_run: false,
+            ..CodeIngestReport::default()
+        }
+    }
+
+    /// 3(b): a join ERROR after a successful ingest surfaces as a bail whose
+    /// message names the writer task.
+    #[tokio::test]
+    async fn settle_writer_drain_join_error_after_success_bails_naming_writer_task() {
+        let join = tokio::spawn(async {
+            panic!("synthetic writer task explosion");
+        });
+        let err = settle_writer_drain(
+            Ok(ok_report()),
+            Some(join),
+            std::time::Duration::from_secs(5),
+        )
+        .await
+        .expect_err("a panicked writer task must fail the settled-file contract");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("writer task terminated abnormally after ingest completed"),
+            "the error must name the writer task: {msg}"
+        );
+    }
+
+    /// 3(c): a drain TIMEOUT after a successful ingest bails — pinning the
+    /// current fail-loud behavior (report discarded, JoinHandle consumed by
+    /// `timeout()` so the task detaches; see the bail-site doc comment).
+    #[tokio::test]
+    async fn settle_writer_drain_timeout_after_success_bails() {
+        let join = tokio::spawn(std::future::pending::<()>());
+        let err = settle_writer_drain(
+            Ok(ok_report()),
+            Some(join),
+            std::time::Duration::from_millis(50),
+        )
+        .await
+        .expect_err("an undrained writer task must fail the settled-file contract");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("did not drain within"),
+            "the error must name the drain timeout: {msg}"
+        );
+    }
+
+    /// 3(a) unit half: when the ingest itself failed, the PRIMARY ingest
+    /// error is what surfaces — a join error on the drain is logged, not
+    /// substituted.
+    #[tokio::test]
+    async fn settle_writer_drain_failed_ingest_error_survives_join_error() {
+        let join = tokio::spawn(async {
+            panic!("synthetic writer task explosion");
+        });
+        let primary: Result<CodeIngestReport> = Err(anyhow::anyhow!("primary ingest failure"));
+        let err = settle_writer_drain(primary, Some(join), std::time::Duration::from_secs(5))
+            .await
+            .expect_err("the primary ingest error must surface");
+        assert_eq!(err.to_string(), "primary ingest failure");
+    }
+
+    /// 3(a) unit half: same for a drain timeout on the failure path — the
+    /// ingest error is primary, the timeout is logged only.
+    #[tokio::test]
+    async fn settle_writer_drain_failed_ingest_error_survives_timeout() {
+        let join = tokio::spawn(std::future::pending::<()>());
+        let primary: Result<CodeIngestReport> = Err(anyhow::anyhow!("primary ingest failure"));
+        let err = settle_writer_drain(primary, Some(join), std::time::Duration::from_millis(50))
+            .await
+            .expect_err("the primary ingest error must surface");
+        assert_eq!(err.to_string(), "primary ingest failure");
+    }
+
+    /// Clean-drain passthrough: a settled task returns the report unchanged,
+    /// and a missing handle (queue off / never spawned) is a no-op.
+    #[tokio::test]
+    async fn settle_writer_drain_clean_passes_report_through() {
+        let join = tokio::spawn(async {});
+        let out = settle_writer_drain(
+            Ok(ok_report()),
+            Some(join),
+            std::time::Duration::from_secs(5),
+        )
+        .await
+        .expect("clean drain must pass the report through");
+        assert!(!out.dry_run);
+        let out = settle_writer_drain(Ok(ok_report()), None, std::time::Duration::from_secs(5))
+            .await
+            .expect("no handle means nothing to await");
+        assert!(!out.dry_run);
+    }
+
+    /// 2: the already-taken arm of `take_writer_task_join_or_warn` — a
+    /// file-backed, queue-enabled pool whose JoinHandle was already taken
+    /// must get `None` back AND a loud warning naming the contract gap.
+    #[serial]
+    #[tokio::test]
+    async fn take_writer_task_join_or_warn_already_taken_warns_loudly() {
+        // The helper reads the resolved config only, but the pool's
+        // `PoolConfig::default()` reads KHIVE_WRITE_QUEUE at construction, so
+        // pin the variable unset to get the file-backed queue-ON default.
+        let _write_queue_env = WriteQueueEnvGuard::unset();
+
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let pool = khive_db::ConnectionPool::new(khive_db::PoolConfig {
+            path: Some(dir.path().join("already_taken.db")),
+            ..khive_db::PoolConfig::default()
+        })
+        .expect("file-backed pool should open");
+        assert!(
+            pool.write_queue_active(),
+            "unset preference on a file-backed pool must resolve the queue ON"
+        );
+        pool.writer_task_handle()
+            .expect("runtime is present")
+            .expect("queue-ON file-backed pool must spawn");
+        let taken = pool
+            .take_writer_task_join()
+            .expect("the first take must return the handle");
+
+        // Capture the tracing output of the second (already-taken) attempt.
+        let capture = Capture::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(MakeCapture(capture.clone()))
+            .with_ansi(false)
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+        let second = take_writer_task_join_or_warn(&pool);
+        drop(guard);
+
+        assert!(
+            second.is_none(),
+            "the one-shot take must yield None once the handle is gone"
+        );
+        let log = String::from_utf8_lossy(&capture.0.lock().unwrap()).to_string();
+        assert!(
+            log.contains("JoinHandle was stored but is absent"),
+            "the already-taken arm must warn loudly about the drain contract gap: {log}"
+        );
+
+        // Clean exit: await the taken handle (drop the pool first so the
+        // writer task's last handle clone goes and the task can exit).
+        drop(pool);
+        tokio::time::timeout(std::time::Duration::from_secs(5), taken)
+            .await
+            .expect("writer task must exit once every handle clone is dropped")
+            .expect("writer task must not panic");
+    }
+
+    /// 3(a) end-to-end half: a real ingest that fails mid-write still drains
+    /// the writer task before returning, and the PRIMARY ingest error — not
+    /// any drain outcome — is what surfaces. A `BEFORE INSERT` trigger on
+    /// `notes` is installed in `runtime_setup` so the entity writes land
+    /// (spawning the writer task) and the finding-note upsert then fails.
+    /// (A trigger, not `DROP TABLE`: `notes_for_namespace` re-runs
+    /// `ensure_notes_schema` on every store acquisition, which would silently
+    /// heal a dropped table — see crates/khive-db/src/backend.rs:229-230.)
+    #[serial]
+    #[tokio::test]
+    async fn code_ingest_failed_ingest_still_drains_and_surfaces_primary_error() {
+        let _write_queue_env = WriteQueueEnvGuard::unset();
+
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let findings = write_valid_findings(tmp.path());
+        let db = tmp.path().join("failed_ingest_drain.db");
+
+        let err =
+            code_ingest_batch_with_runtime_setup(base_args(findings, db.clone()), |runtime| {
+                // Sabotage AFTER migrations but BEFORE any store is acquired:
+                // entity writes succeed through the writer task, then the
+                // finding-note INSERT trips the trigger and fails the ingest.
+                let writer = runtime
+                    .backend()
+                    .pool()
+                    .try_writer()
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                writer
+                    .execute_batch(
+                        "CREATE TRIGGER code_ingest_test_block_notes \
+                     BEFORE INSERT ON notes \
+                     BEGIN SELECT RAISE(ABORT, 'synthetic notes insert failure'); END",
+                    )
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                Ok(())
+            })
+            .await
+            .expect_err("ingest into a trigger-blocked notes table must fail");
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains("synthetic notes insert failure"),
+            "the PRIMARY ingest error (the notes write) must surface, got: {msg}"
+        );
+        assert!(
+            !msg.contains("writer task did not drain")
+                && !msg.contains("writer task terminated abnormally"),
+            "a drain problem must not mask the primary ingest error: {msg}"
+        );
+
+        // Drain proof: every connection — the pool's and the writer task's —
+        // is closed by return time, so SQLite's last-close checkpoint has
+        // removed the WAL sidecar even though the ingest failed mid-batch.
+        assert!(
+            !wal_sidecar_path(&db).exists(),
+            "a failed ingest must still drain the writer task and settle the file"
+        );
+        assert!(!shm_sidecar_path(&db).exists());
     }
 
     /// Query the persisted `finding` note count for a scratch db, independent

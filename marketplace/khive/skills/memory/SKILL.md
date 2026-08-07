@@ -4,8 +4,8 @@ description: Store and retrieve durable agent memory — remember decisions, pre
 
 # Store and recall memory
 
-khive memory is how context survives across sessions. The surface is three verbs —
-`memory.remember`, `memory.recall`, and `memory.feedback` — but the thing worth
+khive memory is how context survives across sessions. The surface is five verbs —
+`memory.remember`, `memory.recall`, `memory.feedback`, `memory.prune`, and `memory.vacuum` — but the thing worth
 learning is the _salience discipline and store-before-recall cycle_, not the verbs.
 Per-verb param detail is one call away: `request(ops="memory.remember(help=true)")`.
 
@@ -92,8 +92,10 @@ request(ops="search(kind=\"note\", query=\"<topic>\", limit=10)")
 After using recall results, emit feedback so the brain pack can tune future ranking:
 
 ```
-request(ops="brain.auto_feedback(query=\"<the recall query that produced these>\", results=[{\"id\":\"<uuid>\",\"score\":0.42}], signal=\"useful\")")
+request(ops="brain.auto_feedback(query=\"<the recall query that produced these>\", results=[{\"id\":\"<uuid>\",\"score\":0.42}], target_id=\"<uuid>\", signal=\"useful\")")
 ```
+
+Name the exact result being judged. Omitting `signal` means abstain and writes no feedback event.
 
 ## Anti-patterns
 

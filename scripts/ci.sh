@@ -100,12 +100,12 @@ phase_docs() {
 
 # #1204 tripwire (shared by phase_tests and phase_tests_doc):
 # RuntimeConfig::default() resolves db_path to $HOME/.khive/khive.db, and
-# migrations apply on open (forward-only, ADR-015). A test that boots a
-# runtime through a config path inheriting that default reaches the
-# operator's/runner's real store instead of an isolated one. Fingerprint the
-# sentinel file set before the suite and compare after; any change fails the
-# gate loudly instead of leaving the drift for a later direct-open to
-# discover. Covered paths are khive.db, khive.db-wal, khive.db-shm,
+# migrations apply on open (forward-only, ADR-015). Run each guarded phase in
+# an ephemeral HOME, while preserving the operator's Cargo and rustup homes,
+# then fingerprint that isolated store before and after. A test that inherits
+# the default path still fails loudly, but an unrelated live daemon can mutate
+# the operator's real store without creating a false attribution (#1627).
+# Covered paths are khive.db, khive.db-wal, khive.db-shm,
 # khive.db.walpin/**, and khive.db.ann/**.
 # A WAL-mode open can leave the main file unchanged until checkpoint, while
 # WAL-pin attribution and ANN persistence write the adjacent directories.
@@ -144,21 +144,46 @@ sentinel_fingerprint() {
 # executes workspace tests of any kind (unit/integration or doctests) must go
 # through this wrapper so no test-execution path escapes the default-store
 # isolation invariant.
-run_with_store_sentinel() {
+run_with_store_sentinel() (
+    operator_home=${HOME:-}
+    isolated_home=$(mktemp -d "${TMPDIR:-/tmp}/khive-ci-home.XXXXXX")
+    trap 'rm -rf -- "$isolated_home"' 0
+    trap 'exit 130' HUP INT TERM
+
+    # `cargo` and `rustup` normally keep their toolchains below HOME. Preserve
+    # those locations before swapping HOME so isolation does not trigger a
+    # toolchain download or make `cargo` disappear on developer machines.
+    if [ -z "${CARGO_HOME+x}" ] && [ -n "$operator_home" ]; then
+        CARGO_HOME="$operator_home/.cargo"
+        export CARGO_HOME
+    fi
+    if [ -z "${RUSTUP_HOME+x}" ] && [ -n "$operator_home" ]; then
+        RUSTUP_HOME="$operator_home/.rustup"
+        export RUSTUP_HOME
+    fi
+    HOME=$isolated_home
+    export HOME
+
     sentinel_before=$(sentinel_fingerprint)
 
-    "$@"
+    if "$@"; then
+        command_status=0
+    else
+        command_status=$?
+    fi
 
     sentinel_after=$(sentinel_fingerprint)
     if [ "$sentinel_after" != "$sentinel_before" ]; then
-        echo "FAIL: test suite touched the real default store under \$HOME/.khive — a test opened/migrated it instead of an isolated db_path/HOME (#1204)" >&2
+        echo "FAIL: test suite touched the default store in its isolated sentinel HOME — a test opened/migrated it instead of using an explicit temporary db_path (#1204)" >&2
         echo "before:" >&2
         printf '%s\n' "$sentinel_before" >&2
         echo "after:" >&2
         printf '%s\n' "$sentinel_after" >&2
         exit 1
     fi
-}
+
+    exit "$command_status"
+)
 
 phase_tests() {
     echo "=== Tests ==="
@@ -198,6 +223,59 @@ phase_channel_email() {
     cargo test -p khive-mcp --features channel-email
 }
 
+run_daemon_recovery_repeats() {
+    # #539/#544: both tests mutate the process-global daemon rendezvous and
+    # intentionally create maximal recovery contention. Run them serially
+    # inside each process, but repeat the paired scenario enough times on every
+    # supported CI OS to expose scheduler-sensitive ownership leaks.
+    #
+    # Fail-closed count gate: a libtest name filter that matches zero tests
+    # still exits 0, so renaming or moving either test would silently turn
+    # this gate into a no-op. Enumerate the exact expected test names, pass
+    # --exact because libtest filters are substring matches by default, capture
+    # the harness summary on every iteration, and require exactly that many
+    # passes; any mismatch (including zero) exits 1 naming the filter.
+    expected_test_names="\
+        daemon::tests::parallel_no_socket_recovery_converges_to_one_usable_daemon \
+        daemon::tests::parallel_parse_failure_is_terminal_and_never_recovers"
+    expected_tests=0
+    for name in $expected_test_names; do
+        expected_tests=$((expected_tests + 1))
+    done
+    repeat=1
+    while [ "$repeat" -le 25 ]; do
+        echo "daemon recovery repeat ${repeat}/25"
+        output_file=$(mktemp)
+        # --test-threads=1: the pair mutates process-global rendezvous state.
+        # The explicit failure branch keeps this gate fail-fast regardless of
+        # the caller's shell mode (the script runs `set -e`, but a pipeline or
+        # a future context change must not be able to disarm it).
+        # shellcheck disable=SC2086
+        cargo test -p khive-mcp --lib -- --test-threads=1 --exact $expected_test_names \
+            > "$output_file" 2>&1 || {
+                cat "$output_file" >&2
+                rm -f "$output_file"
+                echo "FAIL: daemon recovery repeat ${repeat}/25: cargo test exited non-zero (filter: ${expected_test_names})" >&2
+                exit 1
+            }
+        cat "$output_file"
+        ran_count=$(sed -n 's/^test result: ok\. \{0,\}\([0-9][0-9]*\) passed;.*/\1/p' "$output_file" | head -n 1)
+        rm -f "$output_file"
+        if [ -z "$ran_count" ] || [ "$ran_count" -ne "$expected_tests" ]; then
+            echo "FAIL: daemon recovery repeat ${repeat}/25 ran ${ran_count:-0} tests, expected ${expected_tests} (filter: ${expected_test_names}) — the gate must run exactly the enumerated tests" >&2
+            exit 1
+        fi
+        repeat=$((repeat + 1))
+    done
+}
+
+phase_daemon_recovery_flake() {
+    echo "=== Daemon Recovery Flake Gate (25 repeats) ==="
+    # One guard around the complete repeat batch detects any default-store
+    # mutation without re-hashing a potentially large operator store 50 times.
+    run_with_store_sentinel run_daemon_recovery_repeats
+}
+
 phase_no_default_features() {
     echo "=== No-Default-Features Check ==="
     cargo check --workspace --no-default-features
@@ -220,6 +298,7 @@ phase_deno_tests() {
 
 phase_smoke_tests() {
     echo "=== Smoke Test ==="
+    python3 "$SCRIPT_DIR/../tests/test_documented_verb_counts.py"
     python3 "$SCRIPT_DIR/../tests/smoke_test.py"
     python3 "$SCRIPT_DIR/../tests/smoke_brain.py"
     python3 "$SCRIPT_DIR/../tests/smoke_comm.py"
@@ -269,6 +348,7 @@ run_phase() {
         tests) phase_tests ;;
         tests-doc) phase_tests_doc ;;
         channel-email) phase_channel_email ;;
+        daemon-recovery-flake) phase_daemon_recovery_flake ;;
         no-default-features) phase_no_default_features ;;
         release) phase_release ;;
         contract-tests) phase_contract_tests ;;
@@ -280,7 +360,7 @@ run_phase() {
         macos-pr-tests) phase_macos_pr_tests ;;
         *)
             echo "Unknown CI phase: $1" >&2
-            echo "Valid phases: no-stubs-scan lockfile forward-deployed lint no-stubs clippy docs tests tests-doc channel-email no-default-features release contract-tests deno-tests smoke-tests vector-smoke contract-suite macos-pr-check macos-pr-tests" >&2
+            echo "Valid phases: no-stubs-scan lockfile forward-deployed lint no-stubs clippy docs tests tests-doc channel-email daemon-recovery-flake no-default-features release contract-tests deno-tests smoke-tests vector-smoke contract-suite macos-pr-check macos-pr-tests" >&2
             exit 2
             ;;
     esac
@@ -297,6 +377,7 @@ run_all() {
         docs \
         tests \
         channel-email \
+        daemon-recovery-flake \
         no-default-features \
         release \
         contract-tests \

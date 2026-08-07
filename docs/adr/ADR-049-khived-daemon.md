@@ -222,6 +222,10 @@ codes: `config_mismatch`, `namespace_mismatch`, `no_socket`, `parse_failure`,
   deployment never produces these. Fallback is logged at ERROR and counted in a dedicated
   strict-violations metric alongside the per-reason fallback counters.
 
+Amendment 3 supersedes the rollout behavior in the second bullet: the two codes remain in the
+metrics vocabulary, but a post-write `protocol_mismatch` or `parse_failure` is now terminal and
+never falls back or enters daemon recovery.
+
 Under `KHIVE_DAEMON_STRICT=1`, a request that would fall back for **any** reason is instead
 rejected with a structured error carrying the reason code and a stable machine-checkable
 marker, so "strict mode active and fallback count zero" is a sound proof that every served
@@ -247,3 +251,29 @@ The daemon remains an optimization for warm-state reuse; the thin-client archite
 socket protocol, and background warm behavior of this ADR are unaffected. Quiet local
 dispatch remains the contract for genuinely daemonless environments (`no_socket` without a
 confirmed failed recovery attempt, and the `KHIVE_NO_DAEMON=1` opt-out).
+
+## Amendment 3 (2026-08-01): exactly-once recovery boundary and parallel convergence
+
+This amendment corrects Amendment 2's rollout-transient description after the exactly-once
+boundary introduced by #644. `NoSocket` is the only forward outcome eligible to enter daemon
+recovery: connection establishment or the frame write failed, so the request is proven not to
+have reached dispatch. A `ParseFailure` or `ProtocolMismatch` observed after the real frame was
+fully written is terminal. The client returns a hard error and performs no retry, local dispatch,
+kill, or respawn, because the mutation may already have committed before its response was lost.
+The two reason codes remain reserved in the closed fallback-metrics vocabulary for compatibility;
+they are not production local-fallback events.
+
+Parallel `NoSocket` recovery is required to converge after quiescence to exactly one live,
+identity-matching daemon owning the socket/PID rendezvous. The client-side recoverer lock
+serializes confirmation and launch decisions, while the daemon-side boot fence chooses the sole
+owner. The contract does **not** require exactly one launch attempt: the recovery lock can be
+released before a launched child binds, so another caller may legitimately attempt a launch that
+later loses the daemon-side fence.
+
+The executable gate uses eight synchronized clients. One scenario begins from `NoSocket`, runs the
+real daemon server through the test launcher seam on a multi-thread runtime, and requires one live
+owner plus a successful `stats()` exchange and complete teardown. The other makes all eight clients
+lose their response only after the real frame is read and requires eight terminal ambiguity errors,
+zero lifecycle actions, and no follow-up connections. Both scenarios repeat 25 times on every CI
+operating system. Shared recovery counters, framing fixtures, environment cleanup, and the
+in-process launcher live in `crates/khive-mcp/src/daemon/test_harness.rs`.

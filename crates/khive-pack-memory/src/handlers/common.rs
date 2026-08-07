@@ -444,6 +444,12 @@ pub(super) fn make_pipeline(cfg: &RecallConfig) -> MemoryRecallPipeline {
     )
 }
 
+/// #1657: machine-readable degradation label. `collect_model_ann_hits_inner`'s
+/// bounded-wait arm and the `collect_model_ann_hits` wrapper's error arm are
+/// the only producers of a degraded outcome; an empty degraded response cites
+/// that failure-site reason and falls back to this label only if it is absent.
+pub(super) const ANN_DEGRADED_REASON: &str = "ann_unavailable";
+
 pub(super) struct RecallCandidateSet {
     pub(super) namespace: String,
     pub(super) text_hits: Vec<TextSearchHit>,
@@ -455,6 +461,10 @@ pub(super) struct RecallCandidateSet {
     /// #836: true when at least one model's vector leg degraded to FTS-only
     /// after hitting the bounded ANN readiness wait.
     pub(super) ann_degraded: bool,
+    /// #1657: the first degraded model's failure-site reason; `None` when no
+    /// model degraded. Surfaced on empty degraded responses so they are
+    /// distinguishable from a genuine no-match.
+    pub(super) ann_degraded_reason: Option<String>,
 }
 
 impl RecallCandidateSet {
@@ -535,6 +545,9 @@ pub(super) struct RecallVectorCandidateResult {
     pub(super) vector_hits_per_model: Vec<(String, Vec<VectorSearchHit>)>,
     /// Whether any model timed out to FTS-only while its tracked build continued.
     pub(super) ann_degraded: bool,
+    /// #1657: the first degraded model's failure-site reason; `None` when no
+    /// model degraded.
+    pub(super) ann_degraded_reason: Option<String>,
 }
 
 pub(super) fn retrieval_hybrid_config(strategy: &FusionStrategy, limit: usize) -> HybridConfig {
@@ -850,6 +863,7 @@ impl MemoryPack {
             vector_hits_per_model: vector_result.vector_hits_per_model,
             visible_namespaces: visible,
             ann_degraded: vector_result.ann_degraded,
+            ann_degraded_reason: vector_result.ann_degraded_reason,
         })
     }
 
@@ -883,6 +897,9 @@ impl MemoryPack {
         let call_id = PROF_CID.with(|c| c.get());
 
         let mut ann_degraded = false;
+        // #1657: first degraded model's failure-site reason, propagated so an
+        // empty degraded response can cite it verbatim.
+        let mut ann_degraded_reason: Option<String> = None;
         let model_names: Vec<String> = if let Some(m) = embedding_model {
             vec![m.to_string()]
         } else {
@@ -1064,6 +1081,9 @@ impl MemoryPack {
             for r in &per_model_results {
                 if r.degraded {
                     ann_degraded = true;
+                    if ann_degraded_reason.is_none() {
+                        ann_degraded_reason = r.degraded_reason.clone();
+                    }
                 }
                 if r.used_sqlite_vec_fallback {
                     ann_route = "sqlite_vec";
@@ -1092,6 +1112,7 @@ impl MemoryPack {
         Ok(RecallVectorCandidateResult {
             vector_hits_per_model,
             ann_degraded,
+            ann_degraded_reason,
         })
     }
 
@@ -1151,7 +1172,10 @@ pub(super) struct PerModelAnnHits {
     model_name: String,
     hits: Vec<VectorSearchHit>,
     /// This model's warm ANN wait was bounded out (#836); recall degraded to FTS-only for it.
-    degraded: bool,
+    pub(super) degraded: bool,
+    /// The degradation reason captured at the failure site with `{:?}` formatting;
+    /// `Some` iff `degraded`.
+    pub(super) degraded_reason: Option<String>,
     /// This model fell through to the exact sqlite-vec scan instead of warm ANN.
     used_sqlite_vec_fallback: bool,
 }
@@ -1203,6 +1227,13 @@ pub(super) async fn collect_model_ann_hits(
                 model_name: degrade_name,
                 hits: Vec::new(),
                 degraded: true,
+                degraded_reason: Some(format!(
+                    "{}{e:?}",
+                    concat!(
+                        "per-model recall retrieval failed; degrading this engine ",
+                        "to FTS-only: "
+                    )
+                )),
                 used_sqlite_vec_fallback: false,
             })
         }
@@ -1246,7 +1277,9 @@ async fn collect_model_ann_hits_inner(
     // Bound genuine-miss readiness, but never drop the build itself: a tracked task
     // owns ensure and its phase span while this request races only the result channel.
     // Per-model single flight prevents duplicate detached builds.
-    let mut model_ann_timed_out = false;
+    // Degradation reason, captured at the failure site when this model's
+    // bounded readiness wait gives up; `None` while the ANN leg is healthy.
+    let mut model_ann_degrade_reason: Option<String> = None;
     let initial_raw_hits: Option<(Vec<(Uuid, f32)>, u64)> = match search_result {
         Ok(Some(hits_and_seq)) => Some(hits_and_seq),
         Ok(None) => {
@@ -1290,7 +1323,13 @@ async fn collect_model_ann_hits_inner(
                          without a result; degrading recall to \
                          FTS-only for this model (#836)"
                     );
-                    model_ann_timed_out = true;
+                    model_ann_degrade_reason = Some(
+                        concat!(
+                            "memory ANN detached build task ended without a result; ",
+                            "degrading recall to FTS-only for this model"
+                        )
+                        .to_string(),
+                    );
                     None
                 }
                 Err(_elapsed) => {
@@ -1303,7 +1342,12 @@ async fn collect_model_ann_hits_inner(
                          model and detaching the build to finish \
                          in the background (#836)"
                     );
-                    model_ann_timed_out = true;
+                    model_ann_degrade_reason = Some(format!(
+                        "{}{}{}",
+                        "memory ANN not ready within bounded wait of ",
+                        ann_ready_timeout_ms,
+                        "ms; degrading recall to FTS-only for this model"
+                    ));
                     None
                 }
             }
@@ -1320,7 +1364,7 @@ async fn collect_model_ann_hits_inner(
         }
     };
 
-    if model_ann_timed_out {
+    if let Some(mut degrade_reason) = model_ann_degrade_reason {
         // No serving index is available for this model within the bounded
         // wait. Rather than replace it with an O(corpus) exact scan, ADR-118
         // §3's second tier guarantees visibility of the newest
@@ -1330,7 +1374,27 @@ async fn collect_model_ann_hits_inner(
                 .await
             {
                 ann::FreshTailOutcome::Ops(ops) => ops,
-                ann::FreshTailOutcome::Replace(_) | ann::FreshTailOutcome::Skipped => Vec::new(),
+                // A `Replace` cannot arise on this tier (no serving bridge,
+                // so no watermark mismatch to re-resolve), but if one ever
+                // does, its degradation disclosure must not be dropped.
+                ann::FreshTailOutcome::Replace(_, reason) => {
+                    if let Some(reason) = reason {
+                        degrade_reason = format!(
+                            "{degrade_reason}; fresh-tail re-resolution degraded: {reason}"
+                        );
+                    }
+                    Vec::new()
+                }
+                // #1477: the capped exact leg sat out too — this is a second,
+                // exceptional degradation on top of the already-degraded
+                // ANN-not-ready path. Fold its failure-site reason into the
+                // one already surfaced rather than silently discarding it,
+                // so a caller sees why fresh-tail visibility was also lost.
+                ann::FreshTailOutcome::Skipped(reason) => {
+                    degrade_reason =
+                        format!("{degrade_reason}; fresh-tail leg also skipped: {reason}");
+                    Vec::new()
+                }
             };
         let merged = ann::merge_fresh_tail(Vec::new(), &vec, tail_ops);
         let hits: Vec<VectorSearchHit> = merged
@@ -1346,6 +1410,7 @@ async fn collect_model_ann_hits_inner(
             model_name,
             hits,
             degraded: true,
+            degraded_reason: Some(degrade_reason),
             used_sqlite_vec_fallback: false,
         });
     }
@@ -1443,11 +1508,13 @@ async fn collect_model_ann_hits_inner(
             Some(best_seq),
         )
         .await;
-        let best_raw = match outcome {
-            ann::FreshTailOutcome::Ops(ops) => ann::merge_fresh_tail(best_raw, &vec, ops),
-            ann::FreshTailOutcome::Replace(candidates) => candidates,
-            ann::FreshTailOutcome::Skipped => best_raw,
-        };
+        // #1477: an exceptional fresh-tail skip (disabled, registration/registry
+        // failure, reader/snapshot failure, or tail-fetch failure — never an
+        // ordinary "no tail rows" outcome, which comes back as `Ops(vec![])`)
+        // still serves the warm-ANN candidates, but read-your-writes visibility
+        // was lost for this query; the caller must be able to see that.
+        let (best_raw, fresh_tail_skip_reason) =
+            ann::outcome_into_candidates(outcome, best_raw, &vec);
 
         tracing::debug!(
             model = %model_name,
@@ -1467,7 +1534,8 @@ async fn collect_model_ann_hits_inner(
         return Ok(PerModelAnnHits {
             model_name,
             hits,
-            degraded: false,
+            degraded: fresh_tail_skip_reason.is_some(),
+            degraded_reason: fresh_tail_skip_reason,
             used_sqlite_vec_fallback: false,
         });
     }
@@ -1512,6 +1580,7 @@ async fn collect_model_ann_hits_inner(
         model_name,
         hits: all_hits,
         degraded: false,
+        degraded_reason: None,
         used_sqlite_vec_fallback: true,
     })
 }

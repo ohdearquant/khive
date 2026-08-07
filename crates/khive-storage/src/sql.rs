@@ -6,7 +6,7 @@ use std::pin::Pin;
 
 use async_trait::async_trait;
 
-use crate::types::{SqlRow, SqlStatement, SqlValue, StorageResult};
+use crate::types::{PageRequest, SqlRow, SqlStatement, SqlValue, StorageResult};
 
 /// A boxed future, borrowing from the `&mut dyn SqlWriter` an
 /// [`AtomicUnitOp`] is called with (see [`SqlAccess::atomic_unit`]).
@@ -32,9 +32,44 @@ pub type AtomicUnitOp = Box<
 #[async_trait]
 pub trait SqlReader: Send + 'static {
     /// Execute `statement` and return the first row, or `None` if the result set is empty.
+    /// Implementations must not convert later matching rows into owned values.
+    /// Implementations may stop stepping the statement early, so statements with
+    /// side effects (e.g. DML with `RETURNING`) must not be issued through this
+    /// method; use [`SqlWriter::execute`] or [`SqlWriter::execute_batch`] for writes.
     async fn query_row(&mut self, statement: SqlStatement) -> StorageResult<Option<SqlRow>>;
     /// Execute `statement` and return all rows.
+    ///
+    /// This compatibility primitive has no result-size bound. Callers that do
+    /// not already constrain their SQL should use [`Self::query_page`].
     async fn query_all(&mut self, statement: SqlStatement) -> StorageResult<Vec<SqlRow>>;
+    /// Execute `statement` and return only the requested offset page.
+    ///
+    /// The default preserves source compatibility for alternate backends by
+    /// slicing [`Self::query_all`]. Backends should override this method when
+    /// they can stop row conversion at `page.limit`; khive-db's SQLite bridge
+    /// does so. On that path, materialization is bounded by the caller-supplied
+    /// `page.limit`, and callers own choosing a sane limit; the database engine
+    /// may still do work for the query plan and offset.
+    ///
+    /// Like [`Self::query_all`], the default has no result-size bound: it
+    /// materializes every matching row before slicing. Callers issuing
+    /// unconstrained SQL must not rely on the default to keep memory
+    /// proportional to `page.limit` — that bound holds only on backends that
+    /// override this method.
+    ///
+    /// Implementations may stop stepping the statement early, so statements with
+    /// side effects (e.g. DML with `RETURNING`) must not be issued through this
+    /// method; use [`SqlWriter::execute`] or [`SqlWriter::execute_batch`] for writes.
+    async fn query_page(
+        &mut self,
+        statement: SqlStatement,
+        page: PageRequest,
+    ) -> StorageResult<Vec<SqlRow>> {
+        let rows = self.query_all(statement).await?;
+        let offset = usize::try_from(page.offset).unwrap_or(usize::MAX);
+        let limit = usize::try_from(page.limit).unwrap_or(usize::MAX);
+        Ok(rows.into_iter().skip(offset).take(limit).collect())
+    }
     /// Execute `statement` and return the first column of the first row as a scalar.
     async fn query_scalar(&mut self, statement: SqlStatement) -> StorageResult<Option<SqlValue>>;
     /// Run `EXPLAIN QUERY PLAN` for `statement` and return the plan rows.
@@ -45,10 +80,17 @@ pub trait SqlReader: Send + 'static {
 #[async_trait]
 pub trait SqlWriter: SqlReader + Send + 'static {
     /// Execute a single DML statement and return the number of rows affected.
+    ///
+    /// Transaction-control rejection is an `execute_batch` contract; this
+    /// primitive remains available to internal transaction owners such as
+    /// `atomic_unit` for their `BEGIN`/`COMMIT`/`ROLLBACK` calls.
     async fn execute(&mut self, statement: SqlStatement) -> StorageResult<u64>;
     /// Execute multiple DML statements and return the total rows affected.
     async fn execute_batch(&mut self, statements: Vec<SqlStatement>) -> StorageResult<u64>;
     /// Execute a raw SQL script (no parameters; used for migrations).
+    ///
+    /// This script boundary is internal/migration-only and deliberately does
+    /// not inherit `execute_batch`'s transaction-control rejection.
     async fn execute_script(&mut self, script: String) -> StorageResult<()>;
 
     /// Execute a raw SQL script that MUST run outside any open transaction
@@ -64,6 +106,9 @@ pub trait SqlWriter: SqlReader + Send + 'static {
     /// overrides this to route around its writer task's per-request `BEGIN
     /// IMMEDIATE` specifically for this call, while still serializing
     /// through the single writer owner.
+    ///
+    /// This is an internal maintenance boundary (for example `VACUUM` or a
+    /// checkpoint script), not an `execute_batch` transaction-control guard.
     async fn execute_script_top_level(&mut self, script: String) -> StorageResult<()> {
         self.execute_script(script).await
     }

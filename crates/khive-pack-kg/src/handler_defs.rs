@@ -572,7 +572,7 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 20] = [
                     instance_of: *->concept (any source kind), service->project. \
                     extends: concept->concept. variant_of: concept->concept, artifact->artifact. \
                     introduced_by: concept->document, concept->person, concept->org, artifact->document, document->person, document->org. \
-                    derived_from: artifact->dataset, artifact->document, artifact->project, artifact->artifact. \
+                    derived_from: artifact->dataset, artifact->document, artifact->project, artifact->artifact, document->document. \
                     precedes: document->document, dataset->dataset, artifact->artifact, service->service, project->project. \
                     depends_on: project->project, service->project, service->service, service->artifact, service->dataset, artifact->project, artifact->service, document->document. \
                     enables: concept->concept, service->concept, dataset->concept. \
@@ -954,12 +954,15 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 20] = [
         category: VerbCategory::Assertive,
         params: &[],
     },
-    // Assertive: read-only-by-intent WAL/checkpoint operator diagnostics (ADR-091)
+    // Assertive: writer-contention and WAL/checkpoint diagnostics (ADR-091/ADR-135)
     HandlerDef {
         name: "db_diagnostics",
-        description: "Report WAL/checkpoint diagnostics for the main database: build \
-                      identity, ADR-091 checkpoint counters, a PASSIVE checkpoint probe, \
-                      the -wal sidecar file size, and a WAL-pin holder census. The \
+        description: "Report writer-contention and WAL/checkpoint diagnostics for the main \
+                      database: aggregate and class-specific pooled/standalone/writer-task \
+                      acquisitions, finite-wait pool timeouts, swallowed best-effort audit \
+                      append failures, build identity, ADR-091 checkpoint counters, a PASSIVE \
+                      checkpoint probe, the -wal sidecar file size, and an explicitly qualified \
+                      WAL-pin holder census. The \
                       checkpoint probe issues a real PRAGMA wal_checkpoint(PASSIVE), which \
                       backfills WAL frames into the main database on the happy path — that \
                       is ordinary checkpoint I/O, never a TRUNCATE escalation, and it never \
@@ -1028,8 +1031,19 @@ pub(crate) fn handle_verbs(params: Value, registry: &VerbRegistry) -> Result<Val
     let p: VerbsParams =
         serde_json::from_value(params).map_err(|e| RuntimeError::InvalidInput(e.to_string()))?;
 
-    let verbs: Vec<Value> = registry
-        .all_verbs_with_names()
+    let all_verbs = registry.all_verbs_with_names();
+    let pack_counts: serde_json::Map<String, Value> = registry
+        .pack_names()
+        .into_iter()
+        .map(|pack_name| {
+            let count = all_verbs
+                .iter()
+                .filter(|(owner, _)| *owner == pack_name)
+                .count();
+            (pack_name.to_string(), serde_json::json!(count))
+        })
+        .collect();
+    let verbs: Vec<Value> = all_verbs
         .into_iter()
         .filter(|(pack_name, handler)| {
             let cat_ok = p
@@ -1057,6 +1071,7 @@ pub(crate) fn handle_verbs(params: Value, registry: &VerbRegistry) -> Result<Val
     Ok(serde_json::json!({
         "verbs": verbs,
         "total": total,
+        "pack_counts": pack_counts,
     }))
 }
 

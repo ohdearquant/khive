@@ -520,7 +520,10 @@ pub fn assert_captured_db_anchor_consistent(
 ///
 /// Returns `Ok(None)` when no project-anchored config exists, or it exists
 /// but carries no non-empty `[actor].id`: callers fall through to their own
-/// env/anonymous tiers in that case.
+/// env/anonymous tiers in that case. A `config_path` naming a file that does
+/// not exist is a loud error (`ExplicitConfigMissing`), matching the
+/// database-anchored load's explicit-tier contract (ADR-035) — in production
+/// that load errors first, so this lookup only ever sees an existing file.
 pub fn resolve_project_actor_id(
     config_path: Option<&std::path::Path>,
 ) -> Result<Option<String>, crate::engine_config::ConfigError> {
@@ -872,12 +875,20 @@ mod resolve_project_actor_id_tests {
     }
 
     #[test]
-    fn returns_none_for_missing_explicit_path() {
+    fn missing_explicit_path_fails_loud() {
+        // The explicit tier is enforced inside the loader
+        // (`KhiveConfig::load_with_home_fallback_and_source` returns
+        // `ExplicitConfigMissing`): a nonexistent explicit path is an error,
+        // never a silent `None` (ADR-035).
         let missing = std::path::PathBuf::from("/nonexistent/khive-project-actor-test/config.toml");
-        assert_eq!(
-            resolve_project_actor_id(Some(&missing)).expect("no error"),
-            None,
-            "a nonexistent explicit path must resolve to None, not an error"
+        let err = resolve_project_actor_id(Some(&missing))
+            .expect_err("a missing explicit path must fail loud");
+        assert!(
+            matches!(
+                err,
+                crate::engine_config::ConfigError::ExplicitConfigMissing { .. }
+            ),
+            "expected ExplicitConfigMissing, got {err:?}"
         );
     }
 

@@ -1715,7 +1715,7 @@ async fn create_dispatch_emits_embedding_truncation_advisory() {
             json!({
                 "kind": "concept",
                 "name": "warning target",
-                "description": "x".repeat(lattice_embed::MAX_TEXT_CHARS),
+                "description": "x".repeat(lattice_embed::MAX_TEXT_BYTES),
                 "skip_dedup_check": true,
             }),
         )
@@ -1731,14 +1731,14 @@ async fn create_dispatch_emits_embedding_truncation_advisory() {
             json!({
                 "kind": "entity",
                 "id": truncated["id"],
-                "description": "y".repeat(lattice_embed::MAX_TEXT_CHARS + 1),
+                "description": "y".repeat(lattice_embed::MAX_TEXT_BYTES + 1),
             }),
         )
         .await
         .expect("over-limit update");
     assert_eq!(
         updated["description"].as_str().map(str::len),
-        Some(lattice_embed::MAX_TEXT_CHARS + 1),
+        Some(lattice_embed::MAX_TEXT_BYTES + 1),
         "the stored and FTS-indexed source remains complete"
     );
     assert!(
@@ -1785,7 +1785,7 @@ async fn create_dispatch_uses_registry_snapshot_taken_before_embedding() {
         "create",
         json!({
             "kind": "concept",
-            "name": "x".repeat(lattice_embed::MAX_TEXT_CHARS),
+            "name": "x".repeat(lattice_embed::MAX_TEXT_BYTES),
             "skip_dedup_check": true,
         }),
     );

@@ -249,6 +249,19 @@ fn apply_status_multipliers(hits: &mut Vec<ScoredHit>, include_deprecated: bool)
     });
 }
 
+/// Re-applies `min_score` after [`apply_status_multipliers`] so it is a genuine
+/// floor on the scores returned to the caller.
+///
+/// The fusion-stage application in `fuse_ann_hits` stays as an early admission
+/// filter, but the multiplier step rewrites every surviving score via
+/// `s / (s + 1)` (mapping 1.0 to 0.5), so a hit that cleared fusion can land
+/// below the caller's floor. Filtering again here — after the rewrite, before
+/// the `limit` truncation — guarantees every returned score is >= `min_score`;
+/// returning fewer than `limit` hits when the floor removes some is correct.
+fn enforce_min_score_floor(hits: &mut Vec<ScoredHit>, min_score: f32) {
+    hits.retain(|hit| hit.score >= min_score);
+}
+
 // ─── FTS5 phrase quoting ─────────────────────────────────────────────────────
 
 fn quote_fts5_phrase(raw_query: &str) -> String {
@@ -1383,6 +1396,7 @@ impl KnowledgeHandlers {
         }
 
         apply_status_multipliers(&mut hits, include_deprecated);
+        enforce_min_score_floor(&mut hits, min_score);
         hits.truncate(limit);
 
         let results: Vec<Value> = hits
@@ -2192,5 +2206,72 @@ mod tests {
     #[test]
     fn normalize_rrf_score_zero_source_count_returns_zero() {
         assert_eq!(normalize_rrf_score(0.5, 0, RRF_K), 0.0);
+    }
+
+    /// Fusion-admitted hit whose score the status multiplier squashes below
+    /// `min_score` must not survive the late floor. Reproduction arithmetic:
+    /// a single-source RRF top hit normalizes to 1.0, then `s/(s+1)` with
+    /// multiplier 1.0 squashes it to 0.5 — below a 0.7 floor.
+    #[test]
+    fn min_score_floor_drops_hit_squashed_below_threshold_by_status_multiplier() {
+        let mut hits = vec![make_hit("atom-1", Some("reviewed"), 0.0)];
+        fuse_ann_hits(&mut hits, &[], 0.7);
+        assert_eq!(hits.len(), 1, "fusion stage must admit the 1.0 RRF hit");
+        assert_eq!(hits[0].score, 1.0);
+
+        apply_status_multipliers(&mut hits, false);
+        assert!((hits[0].score - 0.5).abs() < 1e-6, "1.0 squashes to 0.5");
+
+        enforce_min_score_floor(&mut hits, 0.7);
+        assert!(
+            hits.is_empty(),
+            "0.5 post-multiplier score must not clear a 0.7 floor"
+        );
+    }
+
+    #[test]
+    fn min_score_floor_keeps_hit_at_or_above_threshold_after_multiplier() {
+        let mut hits = vec![make_hit("atom-1", Some("reviewed"), 0.0)];
+        fuse_ann_hits(&mut hits, &[], 0.4);
+        assert_eq!(hits.len(), 1, "fusion stage must admit the 1.0 RRF hit");
+
+        apply_status_multipliers(&mut hits, false);
+        let squashed = hits[0].score;
+
+        enforce_min_score_floor(&mut hits, 0.4);
+        assert_eq!(
+            hits.len(),
+            1,
+            "0.5 post-multiplier score clears a 0.4 floor"
+        );
+        assert_eq!(hits[0].id, "atom-1");
+        assert!(hits[0].score >= 0.4);
+        assert_eq!(hits[0].score, squashed, "floor must not rewrite scores");
+    }
+
+    /// `min_score = 0.0` (the absent default) must return the identical set —
+    /// the floor cannot alter the no-threshold path.
+    #[test]
+    fn min_score_floor_zero_is_noop_on_multiplier_survivors() {
+        let build = || {
+            let mut hits = vec![
+                make_hit("atom-1", Some("reviewed"), 0.9),
+                make_hit("atom-2", Some("draft"), 0.6),
+                make_hit("atom-3", Some("deprecated"), 0.8),
+            ];
+            apply_status_multipliers(&mut hits, false);
+            hits
+        };
+
+        let before = build();
+        let mut after = build();
+        enforce_min_score_floor(&mut after, 0.0);
+
+        let ids_before: Vec<&str> = before.iter().map(|h| h.id.as_str()).collect();
+        let ids_after: Vec<&str> = after.iter().map(|h| h.id.as_str()).collect();
+        assert_eq!(ids_after, ids_before);
+        for (a, b) in after.iter().zip(before.iter()) {
+            assert_eq!(a.score, b.score);
+        }
     }
 }

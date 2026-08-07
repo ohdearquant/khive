@@ -3,7 +3,7 @@ use async_trait::async_trait;
 use khive_runtime::{EmbedderProvider, KhiveRuntime, Namespace, VerbRegistryBuilder};
 use khive_storage::types::{PageRequest, SqlStatement, SqlValue};
 use khive_types::{Id128, NoteDraft, ProposalChangeset, ProposalCreatedPayload};
-use lattice_embed::{EmbedError, EmbeddingModel, EmbeddingService, MAX_TEXT_CHARS};
+use lattice_embed::{EmbedError, EmbeddingModel, EmbeddingService, MAX_TEXT_BYTES};
 use uuid::Uuid;
 
 struct TruncationService;
@@ -300,7 +300,7 @@ async fn apply_worker_returns_atomic_update_truncation_report() {
         id: Id128::from_u128(entity.id.as_u128()),
         patch: khive_types::ProposalEntityPatch {
             name: None,
-            description: Some(Some("x".repeat(MAX_TEXT_CHARS + 1))),
+            description: Some(Some("x".repeat(MAX_TEXT_BYTES + 1))),
             properties: None,
             tags: None,
         },

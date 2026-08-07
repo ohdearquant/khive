@@ -321,6 +321,11 @@ impl MemoryPack {
         // #836: at least one embedding model's vector leg hit the bounded
         // ANN readiness wait and was served FTS-only for this recall.
         let ann_degraded = candidates.ann_degraded;
+        // #1657: the third state needs a machine-readable marker even when the
+        // degraded result set is empty; keep the failure-site reason so an
+        // empty degraded response can cite it verbatim (a genuine no-match
+        // carries neither).
+        let ann_degraded_reason: Option<String> = candidates.ann_degraded_reason.clone();
 
         if prof {
             if let Some(ref t) = t_stage {
@@ -374,6 +379,20 @@ impl MemoryPack {
             );
             if let Ok(mut state) = self.recall_state.lock() {
                 on_recall_miss(&mut state);
+            }
+            // #1657: an empty degraded response is a third state — surface the
+            // marker here too, otherwise a bare [] is indistinguishable from a
+            // genuine no-match.
+            if ann_degraded {
+                let reason = ann_degraded_reason
+                    .unwrap_or_else(|| super::common::ANN_DEGRADED_REASON.to_string());
+                return to_json(&json!({
+                    "results": Vec::<Value>::new(),
+                    "degraded": true,
+                    // Captured at the failure site (see
+                    // collect_model_ann_hits_inner / collect_model_ann_hits).
+                    "degraded_reason": reason,
+                }));
             }
             return to_json(&Vec::<Value>::new());
         }
@@ -732,6 +751,13 @@ impl MemoryPack {
                 if ann_degraded {
                     // Per-result stamp keeps degradation visible without verbose output.
                     result["degraded"] = json!("ann_unavailable");
+                    // #1477: additive, non-empty failure-site reason so a
+                    // caller can distinguish why serving degraded (e.g. an
+                    // exceptional fresh-tail skip) without breaking the
+                    // load-bearing bare-array shape non-empty callers rely on.
+                    if let Some(ref reason) = ann_degraded_reason {
+                        result["degraded_reason"] = json!(reason);
+                    }
                 }
                 if budget_capped {
                     // Surviving partial results retain the per-item signal so callers
@@ -868,9 +894,42 @@ impl MemoryPack {
             // bare [] would be indistinguishable from a genuine no-match. Non-empty
             // capped responses keep the bare-array shape (load-bearing for callers
             // that index the top-level array) with per-item truncated stamps.
-            return to_json(&json!({
+            let mut envelope = json!({
                 "results": results,
                 "truncated": true,
+            });
+            // A budget cutoff must not silence a concurrent ANN degradation:
+            // this branch returns before the degradation envelope below, and
+            // without these fields a capped-empty degraded response would
+            // read as clean-empty-but-truncated.
+            if ann_degraded {
+                let reason = ann_degraded_reason
+                    .clone()
+                    .unwrap_or_else(|| super::common::ANN_DEGRADED_REASON.to_string());
+                envelope["degraded"] = json!(true);
+                // Captured at the failure site (see
+                // collect_model_ann_hits_inner / collect_model_ann_hits).
+                envelope["degraded_reason"] = json!(reason);
+            }
+            return to_json(&envelope);
+        }
+
+        if results.is_empty() && ann_degraded {
+            // #1657: mirror the budget-cap precedent — an empty degraded
+            // response changes shape to {results: [], degraded: true,
+            // degraded_reason} because a bare [] would be indistinguishable
+            // from a genuine no-match. Non-empty degraded responses keep the
+            // bare-array shape with per-item "degraded": "ann_unavailable"
+            // stamps (load-bearing for callers that index the top-level
+            // array).
+            let reason = ann_degraded_reason
+                .unwrap_or_else(|| super::common::ANN_DEGRADED_REASON.to_string());
+            return to_json(&json!({
+                "results": results,
+                "degraded": true,
+                // Captured at the failure site (see
+                // collect_model_ann_hits_inner / collect_model_ann_hits).
+                "degraded_reason": reason,
             }));
         }
 
@@ -1330,10 +1389,211 @@ mod tests {
         }
     }
 
-    /// ANN timeout plus no FTS match returns an empty result, never an error.
+    /// Guards a mutated `KHIVE_ANN_FRESH_TAIL` value, restoring whatever value
+    /// (present or absent) it held before the guard was created, even if the
+    /// test panics.
+    struct FreshTailEnvGuard {
+        prior: Option<String>,
+    }
+
+    impl FreshTailEnvGuard {
+        fn disable() -> Self {
+            let prior = std::env::var("KHIVE_ANN_FRESH_TAIL").ok();
+            std::env::set_var("KHIVE_ANN_FRESH_TAIL", "0");
+            Self { prior }
+        }
+    }
+
+    impl Drop for FreshTailEnvGuard {
+        fn drop(&mut self) {
+            match self.prior.take() {
+                Some(v) => std::env::set_var("KHIVE_ANN_FRESH_TAIL", v),
+                None => std::env::remove_var("KHIVE_ANN_FRESH_TAIL"),
+            }
+        }
+    }
+
+    /// #1477: an exceptional fresh-tail skip (here, the exact leg disabled via
+    /// `KHIVE_ANN_FRESH_TAIL=0`) forfeits read-your-writes visibility on the
+    /// warm-index path — that is degraded serving, not an ordinary healthy
+    /// response, and must be disclosed on a non-empty response the same way
+    /// #836's bounded-wait degradation already is. Fails on `f74c5461f`, where
+    /// a skipped fresh-tail leg on the warm-index path left `degraded: false`
+    /// and no per-item marker at all.
     #[tokio::test]
-    async fn recall_836_degraded_with_zero_fts_hits_returns_empty_not_error() {
-        const MODEL: &str = "recall-836-ann-timeout-empty-model";
+    #[serial(adr118_fresh_tail)]
+    async fn recall_1477_skipped_fresh_tail_stamps_degraded() {
+        const MODEL: &str = "recall-1477-fresh-tail-disabled-model";
+        const DIMS: usize = 16;
+        const NOTE_TEXT: &str = "issue 1477 fresh tail disabled recall degradation note";
+
+        let _env_guard = FreshTailEnvGuard::disable();
+
+        let rt = KhiveRuntime::memory().expect("in-memory runtime");
+        rt.register_embedder(HashVecProvider {
+            model_name: MODEL.to_owned(),
+            dims: DIMS,
+        });
+
+        let ns = Namespace::parse("local").expect("local namespace");
+        let token = rt.authorize(ns).expect("authorize local");
+
+        rt.create_note(&token, "memory", None, NOTE_TEXT, Some(0.7), None, vec![])
+            .await
+            .expect("create note");
+
+        let pack = MemoryPack::new(rt.clone());
+        let ann_handle = pack.ann.clone();
+
+        // Warm the ANN bridge synchronously so the fresh-tail leg is
+        // exercised via the warm-index branch (initial_raw_hits present),
+        // not the ANN-not-ready branch.
+        crate::ann::ensure_ann_for_model(&rt, &token, &ann_handle, MODEL)
+            .await
+            .expect("warm ann build");
+
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(KgPack::new(rt.clone()));
+        builder.register(pack);
+        let registry = builder.build().expect("registry");
+
+        let result = registry
+            .dispatch(
+                "memory.recall",
+                serde_json::json!({
+                    "query": "1477 fresh tail disabled recall",
+                    "limit": 10
+                }),
+            )
+            .await
+            .expect("recall must not error when the fresh-tail leg is disabled");
+
+        let results = result.as_array().expect("recall result must be an array");
+        assert!(
+            !results.is_empty(),
+            "the seeded note must still surface via the warm-index candidates"
+        );
+        for r in results {
+            assert_eq!(
+                r.get("degraded").and_then(Value::as_str),
+                Some("ann_unavailable"),
+                "#1477 a disabled fresh-tail leg must stamp the existing \
+                 degradation marker on a non-empty response, got: {r:?}"
+            );
+            let reason = r
+                .get("degraded_reason")
+                .and_then(Value::as_str)
+                .expect("#1477 a disabled fresh-tail leg must carry a degraded_reason string");
+            assert!(
+                !reason.is_empty(),
+                "#1477 degraded_reason must be non-empty (captured at the \
+                 failure site), got: {r:?}"
+            );
+        }
+    }
+
+    /// A budget cutoff at the first ranked candidate and an ANN degradation
+    /// can hold at once, and the budget-cap envelope returns before the
+    /// degradation envelope: without the degraded fields on that early
+    /// return, a capped-empty degraded response reads as
+    /// clean-empty-but-truncated and the caller loses the signal that
+    /// distinguishes degraded-empty from a genuine no-match.
+    #[tokio::test]
+    #[serial(adr118_fresh_tail)]
+    async fn recall_budget_capped_empty_response_still_discloses_ann_degradation() {
+        const MODEL: &str = "recall-budget-capped-degraded-model";
+        const DIMS: usize = 16;
+        const NOTE_TEXT: &str = "budget capped degraded disclosure note body";
+
+        let _env_guard = FreshTailEnvGuard::disable();
+
+        let rt = KhiveRuntime::memory().expect("in-memory runtime");
+        rt.register_embedder(HashVecProvider {
+            model_name: MODEL.to_owned(),
+            dims: DIMS,
+        });
+
+        let ns = Namespace::parse("local").expect("local namespace");
+        let token = rt.authorize(ns).expect("authorize local");
+
+        rt.create_note(&token, "memory", None, NOTE_TEXT, Some(0.7), None, vec![])
+            .await
+            .expect("create note");
+
+        let pack = MemoryPack::new(rt.clone());
+        let ann_handle = pack.ann.clone();
+
+        // A one-character budget guarantees the first ranked candidate
+        // exceeds it, so ranking survives but serving empties: budget_capped
+        // with zero results.
+        {
+            let mut cfg = pack.config.lock().unwrap();
+            cfg.scoring = Some(crate::scoring::ScoringConfig {
+                default_token_budget: 1,
+                chars_per_token: 1,
+                ..Default::default()
+            });
+        }
+
+        // Warm the ANN bridge so the disabled fresh-tail leg is what makes
+        // the response degraded (as in the #1477 test above), not ANN
+        // unavailability.
+        crate::ann::ensure_ann_for_model(&rt, &token, &ann_handle, MODEL)
+            .await
+            .expect("warm ann build");
+
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(KgPack::new(rt.clone()));
+        builder.register(pack);
+        let registry = builder.build().expect("registry");
+
+        let result = registry
+            .dispatch(
+                "memory.recall",
+                serde_json::json!({
+                    "query": "budget capped degraded disclosure",
+                    "limit": 10
+                }),
+            )
+            .await
+            .expect("capped degraded recall must not error");
+
+        let obj = result
+            .as_object()
+            .expect("capped-empty response must be the envelope shape, not a bare array");
+        assert_eq!(
+            obj.get("truncated").and_then(Value::as_bool),
+            Some(true),
+            "budget cutoff at the first candidate must disclose truncation: {result:?}"
+        );
+        assert!(
+            obj.get("results")
+                .and_then(Value::as_array)
+                .is_some_and(Vec::is_empty),
+            "this scenario is specifically the capped-EMPTY shape: {result:?}"
+        );
+        assert_eq!(
+            obj.get("degraded").and_then(Value::as_bool),
+            Some(true),
+            "a budget cutoff must not silence the concurrent ANN degradation: {result:?}"
+        );
+        let reason = obj
+            .get("degraded_reason")
+            .and_then(Value::as_str)
+            .expect("capped-empty degraded response must carry degraded_reason");
+        assert!(
+            !reason.is_empty(),
+            "degraded_reason must be non-empty (captured at the failure site): {result:?}"
+        );
+    }
+
+    /// #1657: ANN timeout plus no FTS match is a third state — the response
+    /// must carry the machine-readable degraded marker and a non-empty reason
+    /// captured at the failure site, never a bare [] (indistinguishable from a
+    /// genuine no-match) and never an error.
+    #[tokio::test]
+    async fn recall_1657_degraded_with_zero_fts_hits_carries_marker_and_reason() {
+        const MODEL: &str = "recall-1657-ann-timeout-empty-model";
         const DIMS: usize = 16;
 
         let rt = KhiveRuntime::memory().expect("in-memory runtime");
@@ -1343,8 +1603,8 @@ mod tests {
         });
 
         // Deliberately no notes seeded: the FTS leg has nothing to match, so
-        // an ANN-degraded recall must still resolve to an empty array rather
-        // than propagating an error.
+        // an ANN-degraded recall resolves to an empty result set that must
+        // still carry the degradation evidence.
         let pack = MemoryPack::new(rt.clone());
         let ann_handle = pack.ann.clone();
 
@@ -1368,10 +1628,175 @@ mod tests {
             .await
             .expect("recall must not error when both legs come up empty under ANN degradation");
 
+        let obj = result.as_object().expect(
+            "#1657 degraded-empty recall must return an object carrying the degraded marker, not a bare array",
+        );
+        assert_eq!(
+            obj.get("results"),
+            Some(&serde_json::json!([])),
+            "#1657 degraded-empty recall must carry an empty results array, got: {result:?}"
+        );
+        assert_eq!(
+            obj.get("degraded").and_then(Value::as_bool),
+            Some(true),
+            "#1657 degraded-empty recall must set degraded: true, got: {result:?}"
+        );
+        let reason = obj
+            .get("degraded_reason")
+            .and_then(Value::as_str)
+            .expect("#1657 degraded-empty recall must carry a degraded_reason string");
+        assert!(
+            !reason.trim().is_empty(),
+            "#1657 degraded_reason must be non-empty (captured at the failure site), got: {result:?}"
+        );
+    }
+
+    /// #1657 companion arm: a genuine no-match (no degradation) keeps the
+    /// marker absent — the two empty outcomes must stay distinguishable.
+    #[tokio::test]
+    async fn recall_1657_genuine_empty_match_has_no_degraded_marker() {
+        const MODEL: &str = "recall-1657-genuine-empty-model";
+        const DIMS: usize = 16;
+
+        let rt = KhiveRuntime::memory().expect("in-memory runtime");
+        rt.register_embedder(HashVecProvider {
+            model_name: MODEL.to_owned(),
+            dims: DIMS,
+        });
+
+        // No notes seeded and no lock held: the store genuinely has nothing
+        // and every engine serves normally, so the response must be a bare
+        // empty array with no degraded marker.
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(KgPack::new(rt.clone()));
+        builder.register(MemoryPack::new(rt.clone()));
+        let registry = builder.build().expect("registry");
+
+        let result = registry
+            .dispatch(
+                "memory.recall",
+                serde_json::json!({
+                    "query": "no such content exists anywhere",
+                    "limit": 10
+                }),
+            )
+            .await
+            .expect("recall must succeed on a genuinely empty store");
+
         assert_eq!(
             result,
             serde_json::json!([]),
-            "#836 degraded recall with no FTS hits must return an empty array, not an error"
+            "#1657 a genuine no-match must stay a bare empty array with no degraded marker, got: {result:?}"
+        );
+    }
+
+    /// #1657 failure-site arms: `collect_model_ann_hits` converts a per-model
+    /// retrieval failure into a degraded outcome (ADR-031 engine isolation)
+    /// and must capture the reason at the failure site with {:?} formatting —
+    /// never assemble it later from memory of the failure. The bounded-wait
+    /// timeout arm likewise records why this model served FTS-only.
+    #[tokio::test]
+    #[serial(background_tasks)]
+    async fn recall_1657_degraded_outcome_captures_reason_at_failure_site() {
+        const MODEL: &str = "recall-1657-failure-site-model";
+        const COLD_MODEL: &str = "recall-1657-failure-site-cold-model";
+        const DIMS: usize = 16;
+        const NOTE_TEXT: &str = "issue 1657 failure site reason capture note";
+
+        let rt = KhiveRuntime::memory().expect("in-memory runtime");
+        rt.register_embedder(HashVecProvider {
+            model_name: MODEL.to_owned(),
+            dims: DIMS,
+        });
+        rt.register_embedder(HashVecProvider {
+            model_name: COLD_MODEL.to_owned(),
+            dims: DIMS,
+        });
+
+        let ns = Namespace::parse("local").expect("local namespace");
+        let token = rt.authorize(ns).expect("authorize local");
+
+        rt.create_note(&token, "memory", None, NOTE_TEXT, Some(0.7), None, vec![])
+            .await
+            .expect("create note");
+
+        let ann = crate::ann::new_shared();
+        let key = crate::ann::AnnKey::new(MODEL);
+
+        // Build a real warm index so the failpoint fails the warm-ANN leg
+        // itself (not an empty/never-built index).
+        crate::ann::ensure_ann_for_model(&rt, &token, &ann, MODEL)
+            .await
+            .expect("ensure ANN for the seeded note");
+        assert!(
+            crate::ann::is_current(&ann, &key).await,
+            "the ensured ANN must be current before the failure is injected"
+        );
+
+        // Arm 1 — retrieval failure: the failpoint makes the inner warm-ANN
+        // search return an error; the wrapper must degrade (not propagate) and
+        // capture the actual error with {:?} at the failure site.
+        super::super::common::retrieval_failpoints::fail_ann(MODEL);
+        let outcome = super::super::common::collect_model_ann_hits(
+            &rt,
+            &ann,
+            &token,
+            "local",
+            &["local".to_string()],
+            MODEL.to_string(),
+            vec![0.0_f32; DIMS],
+            10,
+            40,
+            2,
+            1_000,
+        )
+        .await
+        .expect("the wrapper must degrade to FTS-only, never propagate a retrieval failure");
+        super::super::common::retrieval_failpoints::clear_ann(MODEL);
+
+        assert!(
+            outcome.degraded,
+            "#1657 a failed warm-ANN leg must mark the per-model outcome degraded"
+        );
+        let reason = outcome
+            .degraded_reason
+            .expect("#1657 a degraded per-model outcome must carry a failure-site reason");
+        assert!(
+            reason.contains("test-injected ANN retrieval failure"),
+            "#1657 the reason must be captured at the failure site from the actual \
+             error with {{:?}} formatting, got: {reason:?}"
+        );
+
+        // Arm 2 — bounded-wait timeout: a cold model (no index ever ensured)
+        // with a near-zero readiness wait expires the bounded wait and
+        // degrades to FTS-only with the timeout recorded as the reason.
+        let outcome2 = super::super::common::collect_model_ann_hits(
+            &rt,
+            &ann,
+            &token,
+            "local",
+            &["local".to_string()],
+            COLD_MODEL.to_string(),
+            vec![0.0_f32; DIMS],
+            10,
+            40,
+            2,
+            0,
+        )
+        .await
+        .expect("the wrapper must degrade to FTS-only, never propagate a retrieval failure");
+
+        assert!(
+            outcome2.degraded,
+            "#1657 a bounded-out readiness wait must mark the per-model outcome degraded"
+        );
+        let reason2 = outcome2
+            .degraded_reason
+            .expect("#1657 a timed-out per-model outcome must carry a failure-site reason");
+        assert!(
+            reason2.contains("bounded wait"),
+            "#1657 the timeout arm must record the bounded wait as the reason, \
+             got: {reason2:?}"
         );
     }
 

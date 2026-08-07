@@ -140,6 +140,11 @@ anchored beside that resolved database so a thin client and its daemon select
 the same file. With no explicit database path, it is anchored to the current
 project directory. This is the ADR-096 `config_id` coherence rule.
 
+`kkernel mcp`, `kkernel exec` (including `--pending-events`), and `kkernel
+reindex` all expose the explicit `--config` / `KHIVE_CONFIG` tier and thread it
+through every post-resolution config reload. An entry point must not document
+this tier while silently falling back to automatic discovery.
+
 There is no per-key merge between project and global files. A machine-local
 setting that must coexist with committed project settings uses the applicable
 CLI or environment override.
@@ -295,7 +300,7 @@ The shipped behavior has two parts:
 Examples using only shipped flags:
 
 ```bash
-# Re-embed entities, notes, and knowledge with every configured engine.
+# Re-embed entities and notes with every configured engine; knowledge uses the default.
 kkernel reindex --db ~/.khive/khive.db --namespace local
 
 # Repair only the graph substrate and keep vectors that already exist.

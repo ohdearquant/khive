@@ -569,10 +569,10 @@ pub struct MetricsSnapshot {
     /// bring the WAL back below `warn_pages`; resets to 0 the next time an
     /// attempt clears it.
     pub wal_truncate_consecutive_failures: u64,
-    /// Total checkpoint ticks skipped because the writer mutex was busy
-    /// (ADR-091 checkpoint-pressure telemetry), across this process's
-    /// lifetime. `#[serde(default)]` so an older client decoding a newer
-    /// daemon's snapshot (or vice versa) does not fail.
+    /// Total checkpoint ticks skipped because the dedicated checkpoint
+    /// connection was unavailable (ADR-091 checkpoint-pressure telemetry),
+    /// across this process's lifetime. `#[serde(default)]` so an older client
+    /// decoding a newer daemon's snapshot (or vice versa) does not fail.
     #[serde(default)]
     pub wal_checkpoint_skipped_ticks: u64,
     /// Current consecutive-skip run length; 0 once the next tick is observed.
@@ -1202,7 +1202,28 @@ where
 #[cfg(unix)]
 pub async fn run_daemon<D: DaemonDispatch>(dispatcher: D) -> anyhow::Result<()> {
     let boot_guard = Some(acquire_daemon_boot_guard()?);
-    run_daemon_with_boot_guard(dispatcher, boot_guard).await
+    run_daemon_with_boot_guard_inner(dispatcher, boot_guard, false).await
+}
+
+/// Run a real daemon server for an in-process multi-launch test.
+///
+/// Separate production daemon candidates have distinct PIDs, so the boot fence
+/// recognizes a responsive incumbent and makes later candidates exit. Parallel
+/// test launchers share one OS process and therefore one PID; this explicit
+/// fault-injection entry point preserves the production fence semantics by
+/// allowing a responsive same-PID incumbent to win. Ordinary daemon startup
+/// continues to treat a same-PID rendezvous as stale, protecting PID-reuse
+/// cleanup behavior.
+///
+/// A losing candidate still follows the ordinary daemon-exit path and cancels
+/// the process-wide component shutdown token. Callers must therefore use a
+/// component-free dispatcher; this seam validates socket/PID ownership, not
+/// multi-candidate component lifecycle.
+#[cfg(all(unix, any(test, feature = "fault-injection")))]
+#[doc(hidden)]
+pub async fn run_daemon_in_process_test<D: DaemonDispatch>(dispatcher: D) -> anyhow::Result<()> {
+    let boot_guard = Some(acquire_daemon_boot_guard()?);
+    run_daemon_with_boot_guard_inner(dispatcher, boot_guard, true).await
 }
 
 /// Vet the socket's parent directory, re-permissioning it only when it is the
@@ -1444,6 +1465,15 @@ pub async fn run_daemon_with_boot_guard<D: DaemonDispatch>(
     dispatcher: D,
     boot_guard: Option<std::fs::File>,
 ) -> anyhow::Result<()> {
+    run_daemon_with_boot_guard_inner(dispatcher, boot_guard, false).await
+}
+
+#[cfg(unix)]
+async fn run_daemon_with_boot_guard_inner<D: DaemonDispatch>(
+    dispatcher: D,
+    boot_guard: Option<std::fs::File>,
+    allow_same_process_incumbent: bool,
+) -> anyhow::Result<()> {
     // ADR-119: components may have been started by the serve path before this
     // function established (or failed to establish) daemon ownership. Cancel
     // the process-wide shutdown token on EVERY exit — setup failures below,
@@ -1484,7 +1514,7 @@ pub async fn run_daemon_with_boot_guard<D: DaemonDispatch>(
     // same process, which would self-deadlock on `flock`.
     let _startup_lock = boot_guard;
 
-    if !cleanup_stale_daemon(&sock, &pid_file).await {
+    if !cleanup_stale_daemon(&sock, &pid_file, allow_same_process_incumbent).await {
         tracing::info!("a responsive khived is already running; exiting");
         return Ok(());
     }
@@ -1520,7 +1550,9 @@ pub async fn run_daemon_with_boot_guard<D: DaemonDispatch>(
                 drop(listener);
                 let _ = std::fs::remove_file(&sock);
             }
-            if pid_file_names_a_reachable_daemon(&pid_file, &sock).await {
+            if pid_file_names_a_reachable_daemon(&pid_file, &sock, allow_same_process_incumbent)
+                .await
+            {
                 tracing::info!(
                     "a replacement khived already claimed the pid/socket rendezvous; exiting"
                 );
@@ -1779,11 +1811,26 @@ fn is_process_running(pid: u32) -> bool {
     classify_kill_result(rc, errno).is_running()
 }
 
+/// Whether a PID may identify an incumbent from this candidate's point of view.
+///
+/// Production rejects the current PID so a stale rendezvous left by a prior
+/// process whose PID was reused cannot protect an unrelated socket. The
+/// in-process daemon harness opts in to the same-PID case because all of its
+/// otherwise independent boot candidates necessarily share one OS process.
 #[cfg(unix)]
-async fn cleanup_stale_daemon(sock: &std::path::Path, pid_file: &std::path::Path) -> bool {
+fn pid_can_name_incumbent(pid: u32, current_pid: u32, allow_same_process_incumbent: bool) -> bool {
+    allow_same_process_incumbent || pid != current_pid
+}
+
+#[cfg(unix)]
+async fn cleanup_stale_daemon(
+    sock: &std::path::Path,
+    pid_file: &std::path::Path,
+    allow_same_process_incumbent: bool,
+) -> bool {
     if let Ok(pid_str) = std::fs::read_to_string(pid_file) {
         if let Ok(pid) = pid_str.trim().parse::<u32>() {
-            if pid != std::process::id()
+            if pid_can_name_incumbent(pid, std::process::id(), allow_same_process_incumbent)
                 && is_process_running(pid)
                 && sock.exists()
                 && UnixStream::connect(sock).await.is_ok()
@@ -1826,14 +1873,16 @@ fn write_pid_file_exclusive(pid_file: &std::path::Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Return `true` if `pid_file` currently names a different, live process that
+/// Return `true` if `pid_file` currently names an eligible live process that
 /// still answers on `sock` — i.e. a daemon already owns this rendezvous and it
 /// is safe to defer to it rather than treat the `AlreadyExists` PID-file
-/// collision as a boot failure.
+/// collision as a boot failure. Eligibility requires a different PID in
+/// production; the explicit in-process harness may allow the current PID.
 #[cfg(unix)]
 async fn pid_file_names_a_reachable_daemon(
     pid_file: &std::path::Path,
     sock: &std::path::Path,
+    allow_same_process_incumbent: bool,
 ) -> bool {
     let Ok(pid_str) = std::fs::read_to_string(pid_file) else {
         return false;
@@ -1841,7 +1890,7 @@ async fn pid_file_names_a_reachable_daemon(
     let Ok(pid) = pid_str.trim().parse::<u32>() else {
         return false;
     };
-    pid != std::process::id()
+    pid_can_name_incumbent(pid, std::process::id(), allow_same_process_incumbent)
         && is_process_running(pid)
         && sock.exists()
         && UnixStream::connect(sock).await.is_ok()
@@ -2079,6 +2128,31 @@ mod tests {
             classify_kill_result(-1, libc::EPERM).is_running(),
             "EPERM must be unknown-safe: treated as running, never as a basis \
              for stale cleanup to unlink a live daemon's rendezvous files"
+        );
+    }
+
+    #[test]
+    fn same_process_pid_requires_explicit_in_process_harness_opt_in() {
+        let current = std::process::id();
+        assert!(
+            !pid_can_name_incumbent(current, current, false),
+            "production startup must not trust a same-PID stale rendezvous"
+        );
+        assert!(
+            pid_can_name_incumbent(current, current, true),
+            "the in-process harness must let a responsive same-PID owner win"
+        );
+        // Keep the probe two away from `current` so the fixture preserves the
+        // off-by-one regression check for adjacent PIDs; wrapping_add avoids
+        // making the test overflow-sensitive at the u32 boundary.
+        let distinct_probe_pid = current.wrapping_add(2);
+        assert_ne!(
+            distinct_probe_pid, current,
+            "probe PID must differ from this process's PID"
+        );
+        assert!(
+            pid_can_name_incumbent(distinct_probe_pid, current, false),
+            "a distinct PID remains eligible under ordinary production rules"
         );
     }
 
@@ -2728,15 +2802,16 @@ mod tests {
                 .expect("seed writes");
         }
 
-        let tick = khive_db::checkpoint_once(
+        let dedicated_conn = pool
+            .open_standalone_writer()
+            .expect("open dedicated checkpoint connection");
+        khive_db::checkpoint_once(
             &pool,
+            &dedicated_conn,
             &CheckpointConfig::default(),
             &mut khive_db::checkpoint::TruncateState::default(),
-        );
-        assert!(
-            matches!(tick, khive_db::CheckpointTick::Observed(_)),
-            "checkpoint_once on a freshly-writer-held pool must observe, not skip: {tick:?}"
-        );
+        )
+        .expect("checkpoint_once must observe on a healthy dedicated connection");
 
         let dispatcher = MockDispatch {
             namespace: "local".to_string(),
@@ -2818,7 +2893,7 @@ mod tests {
         let enabled_pool = Arc::new(
             ConnectionPool::new(khive_db::PoolConfig {
                 path: Some(dir.path().join("wq_enabled.db")),
-                write_queue_enabled: true,
+                write_queue_enabled: Some(true),
                 ..khive_db::PoolConfig::default()
             })
             .expect("pool open"),
@@ -2840,7 +2915,7 @@ mod tests {
         let disabled_pool = Arc::new(
             ConnectionPool::new(khive_db::PoolConfig {
                 path: Some(dir.path().join("wq_disabled.db")),
-                write_queue_enabled: false,
+                write_queue_enabled: Some(false),
                 ..khive_db::PoolConfig::default()
             })
             .expect("pool open"),

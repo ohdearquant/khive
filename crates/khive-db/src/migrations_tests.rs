@@ -1684,10 +1684,10 @@ fn v14_index_rejects_new_cross_namespace_duplicate_edge_id() {
     );
 }
 
-// ── V17: distinguish never-activated ANN consumers from active S=0 ──────────
+// ── V18: distinguish never-activated ANN consumers from active S=0 ──────────
 
 #[test]
-fn v17_moves_legacy_zero_watermark_into_timestamped_pending_state() {
+fn v18_moves_legacy_zero_watermark_into_timestamped_pending_state() {
     let mut conn = open_memory();
     conn.execute_batch(MIGRATION_TRACKING_TABLE).unwrap();
     for migration in MIGRATIONS
@@ -1713,7 +1713,7 @@ fn v17_moves_legacy_zero_watermark_into_timestamped_pending_state() {
     )
     .unwrap();
 
-    assert_eq!(run_migrations(&mut conn).unwrap(), 17);
+    assert_eq!(run_migrations(&mut conn).unwrap(), 18);
     assert!(table_exists(&conn, "ann_consumer_pending"));
     let legacy: (i64, i64) = conn
         .query_row(

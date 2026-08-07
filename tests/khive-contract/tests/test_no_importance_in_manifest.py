@@ -116,6 +116,11 @@ def test_no_importance_identifiers_in_repo() -> None:
     """
     rg = _find_rg()
     if rg is None:
+        if os.environ.get("CI", "").lower() in {"1", "true", "yes"}:
+            pytest.fail(
+                "ripgrep (rg) is required for the repository identifier-ban "
+                "contract in CI; the check must not silently skip"
+            )
         pytest.skip("ripgrep (rg) not found on PATH — install ripgrep to run this test")
 
     cmd = [rg, "--no-heading", "-n", "importance"] + EXCLUDED_GLOBS
