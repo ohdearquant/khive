@@ -70,8 +70,9 @@ impl KgPack {
         }
         // #1670: the SQL neighbor query aliases one edge endpoint to `node_id`
         // and discards the other, so the stored source/target must be
-        // recovered with a per-hit edge read (N+1, bounded by the existing
-        // neighbor limit). An edge deleted between the two reads reports
+        // recovered with a per-hit edge read. This is one read per hit (N+1);
+        // `limit` is optional, so the read count is capped only when the
+        // caller supplies one. An edge deleted between the two reads reports
         // `null` endpoints rather than failing the whole response; it must not
         // report nil UUIDs, which would be indistinguishable from a real
         // direction and would defeat the purpose of the fields.
@@ -309,6 +310,37 @@ mod tests {
             Some(tgt_id.as_str()),
             "origin_id must echo the queried node, not the stored source"
         );
+
+        // Omitted direction defaults to `both`, which the storage layer serves
+        // through separate UNION ALL SQL rather than the single-direction
+        // query, so it needs its own coverage: the stored endpoints must be
+        // identical whichever side of the edge the query originates from.
+        for (queried, expected_neighbor) in [(&src_id, &tgt_id), (&tgt_id, &src_id)] {
+            let both = pack
+                .dispatch("neighbors", json!({"id": queried}), &registry, &token)
+                .await
+                .expect("neighbors with omitted direction must succeed");
+            let both_arr = both.as_array().expect("neighbors both returns array");
+            let hit = both_arr
+                .iter()
+                .find(|h| h.get("id").and_then(Value::as_str) == Some(expected_neighbor.as_str()))
+                .expect("must find the opposite endpoint under default direction");
+            assert_eq!(
+                hit.get("source_id").and_then(Value::as_str),
+                Some(src_id.as_str()),
+                "default-direction hit must carry the stored source; queried={queried} hit={hit}"
+            );
+            assert_eq!(
+                hit.get("target_id").and_then(Value::as_str),
+                Some(tgt_id.as_str()),
+                "default-direction hit must carry the stored target; queried={queried} hit={hit}"
+            );
+            assert_eq!(
+                hit.get("origin_id").and_then(Value::as_str),
+                Some(queried.as_str()),
+                "origin_id must echo the queried node under default direction"
+            );
+        }
     }
 
     /// Pins the encoding for an edge that could not be read back.
