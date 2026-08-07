@@ -1340,6 +1340,7 @@ fn extended_where_operators_compile_with_bound_parameters() {
             QueryValue::Text(starts),
             QueryValue::Text(first),
             QueryValue::Text(second),
+            QueryValue::Integer(0),
             QueryValue::Integer(_),
         ] if contains == r#"%\%\_\\' OR 1=1 --%"#
             && starts == r#"pre\%\_\\%"#
@@ -1402,6 +1403,7 @@ fn mixed_type_in_with_string_compiles_case_insensitive() {
         [
             QueryValue::Text(kind),
             QueryValue::Integer(1),
+            QueryValue::Integer(0),
             QueryValue::Integer(_),
         ] if kind == "CONCEPT"
     ));
@@ -1411,11 +1413,11 @@ fn mixed_type_in_with_string_compiles_case_insensitive() {
 fn empty_in_list_compiles_to_false_without_value_parameters() {
     let q = parse(QueryLanguage::Gql, "MATCH (n) WHERE n.name IN [] RETURN n").unwrap();
     let compiled = compile(&q, &opts()).unwrap();
-    assert!(compiled.sql.contains("WHERE") && compiled.sql.contains(" AND 0 LIMIT"));
+    assert!(compiled.sql.contains("WHERE") && compiled.sql.contains(" AND 0 ORDER BY"));
     assert_eq!(
         compiled.params.len(),
-        1,
-        "only the LIMIT parameter is expected"
+        2,
+        "only the OFFSET and LIMIT parameters are expected"
     );
 }
 

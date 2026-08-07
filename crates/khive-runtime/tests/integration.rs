@@ -605,6 +605,24 @@ async fn seed_concepts(rt: &KhiveRuntime, ns: &str, n: usize) -> khive_runtime::
     tok
 }
 
+async fn gql_page(
+    rt: &KhiveRuntime,
+    token: &khive_runtime::NamespaceToken,
+    query: &str,
+    page_size: usize,
+) -> khive_runtime::QueryResult {
+    rt.query_with_metadata(
+        token,
+        query,
+        khive_query::CompileOptions {
+            max_limit: page_size,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap()
+}
+
 #[tokio::test]
 async fn no_explicit_limit_under_and_at_cap_emits_no_warning() {
     let rt = rt();
@@ -677,10 +695,12 @@ async fn no_explicit_limit_over_cap_warns_and_strips_sentinel() {
     assert_eq!(result.warnings.len(), 1, "warnings: {:?}", result.warnings);
     assert!(result.warnings[0].contains("500"), "{}", result.warnings[0]);
     assert!(
-        !result.warnings[0].contains("LIMIT/OFFSET"),
-        "#1168: the warning must not recommend an unimplemented OFFSET path: {}",
+        result.warnings[0].contains("SKIP 500") && result.warnings[0].contains("next_offset"),
+        "#1601: the warning must agree with the machine-readable GQL continuation: {}",
         result.warnings[0]
     );
+    assert!(result.has_more);
+    assert_eq!(result.next_offset, Some(500));
     assert!(
         result.truncated,
         "#1247: truncated must be the structural signal, independent of warnings text"
@@ -697,6 +717,24 @@ async fn no_explicit_limit_over_cap_warns_and_strips_sentinel() {
         })
         .collect();
     assert_eq!(names.len(), 500, "sentinel row must not leak into results");
+
+    let final_page = gql_page(&rt, &tok, "MATCH (a:concept) RETURN a SKIP 500", 500).await;
+    assert_eq!((final_page.offset, final_page.page_size), (500, 500));
+    assert_eq!(
+        final_page.rows.len(),
+        1,
+        "SKIP 500 must retrieve the 501st match"
+    );
+    assert!(!final_page.has_more && !final_page.truncated);
+    assert_eq!(final_page.next_offset, None);
+    let final_name = match final_page.rows[0].get("a_name") {
+        Some(khive_storage::types::SqlValue::Text(name)) => name,
+        other => panic!("final page must project the remaining entity name, got {other:?}"),
+    };
+    assert!(
+        !names.contains(final_name),
+        "the final page must not overlap the first 500 rows"
+    );
 }
 
 #[tokio::test]
@@ -803,6 +841,103 @@ async fn explicit_limit_over_cap_with_few_real_matches_emits_no_warning() {
         !result.truncated,
         "#1247: fewer real matches than the cap is not truncation"
     );
+}
+
+#[tokio::test]
+async fn gql_skip_pages_are_deterministic_complete_and_machine_continuable() {
+    let rt = rt();
+    let tok = seed_concepts(&rt, "gql-pages-12", 12).await;
+
+    let names = |result: &khive_runtime::QueryResult| {
+        result
+            .rows
+            .iter()
+            .filter_map(|row| match row.get("a_name") {
+                Some(khive_storage::types::SqlValue::Text(name)) => Some(name.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+
+    let first = gql_page(&rt, &tok, "MATCH (a:concept) RETURN a", 5).await;
+    let first_repeat = gql_page(&rt, &tok, "MATCH (a:concept) RETURN a", 5).await;
+    let second = gql_page(&rt, &tok, "MATCH (a:concept) RETURN a SKIP 5", 5).await;
+    let third = gql_page(&rt, &tok, "MATCH (a:concept) RETURN a SKIP 10", 5).await;
+
+    assert_eq!(
+        names(&first),
+        names(&first_repeat),
+        "page order must be stable"
+    );
+    assert_eq!((first.offset, first.page_size), (0, 5));
+    assert!(first.has_more && first.truncated);
+    assert_eq!(first.next_offset, Some(5));
+    assert!(
+        first
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("SKIP 5")),
+        "human guidance must agree with next_offset: {:?}",
+        first.warnings
+    );
+
+    assert_eq!((second.offset, second.page_size), (5, 5));
+    assert!(second.has_more && second.truncated);
+    assert_eq!(second.next_offset, Some(10));
+
+    assert_eq!((third.offset, third.page_size), (10, 5));
+    assert!(!third.has_more && !third.truncated);
+    assert_eq!(third.next_offset, None);
+    assert_eq!(third.rows.len(), 2);
+
+    let all_names = names(&first)
+        .into_iter()
+        .chain(names(&second))
+        .chain(names(&third))
+        .collect::<std::collections::HashSet<_>>();
+    assert_eq!(
+        all_names.len(),
+        12,
+        "paging must retrieve the full match set"
+    );
+}
+
+#[tokio::test]
+async fn gql_query_limit_composes_with_page_size() {
+    let rt = rt();
+    let tok = seed_concepts(&rt, "gql-page-limit-composition", 8).await;
+
+    let caller_bounded = rt
+        .query_with_metadata(
+            &tok,
+            "MATCH (a:concept) RETURN a LIMIT 3",
+            khive_query::CompileOptions {
+                max_limit: 5,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(caller_bounded.rows.len(), 3);
+    assert_eq!(caller_bounded.page_size, 3);
+    assert!(!caller_bounded.has_more);
+    assert_eq!(caller_bounded.next_offset, None);
+
+    let server_bounded = rt
+        .query_with_metadata(
+            &tok,
+            "MATCH (a:concept) RETURN a LIMIT 8",
+            khive_query::CompileOptions {
+                max_limit: 5,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(server_bounded.rows.len(), 5);
+    assert_eq!(server_bounded.page_size, 5);
+    assert!(server_bounded.has_more);
+    assert_eq!(server_bounded.next_offset, Some(5));
 }
 
 // =============================================================================

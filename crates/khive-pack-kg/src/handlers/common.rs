@@ -880,6 +880,12 @@ pub(crate) fn render_query_result(result: QueryResult) -> Value {
     if !result.warnings.is_empty() {
         out.insert("warnings".to_string(), json!(result.warnings));
     }
+    out.insert("offset".to_string(), json!(result.offset));
+    out.insert("page_size".to_string(), json!(result.page_size));
+    out.insert("has_more".to_string(), json!(result.has_more));
+    if let (true, Some(next_offset)) = (result.has_more, result.next_offset) {
+        out.insert("next_offset".to_string(), json!(next_offset));
+    }
     // Always present (not gated on the cap having fired) so a caller can
     // check it unconditionally rather than inferring "not truncated" from
     // the field's absence (#1168, #1247).

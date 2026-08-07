@@ -12991,13 +12991,10 @@ async fn whoami_appears_in_verbs_introspection() {
     );
 }
 
-/// Regression for #1168/#1247: the `query()` wire response always carries a
-/// structural `truncated` boolean, present whether or not the cap fired, so
-/// a caller can check it directly instead of inferring "not truncated" from
-/// the absence of a `warnings` entry (whose text also used to recommend an
-/// unimplemented OFFSET/SKIP paging path).
+/// Regression for #1168/#1247/#1601: the `query()` wire response always carries
+/// structural page metadata, present whether or not the page bound fired.
 #[tokio::test]
-async fn query_response_always_carries_truncated_field() {
+async fn query_response_always_carries_page_metadata() {
     let pack = pack();
     pack.dispatch(
         "create",
@@ -13017,13 +13014,180 @@ async fn query_response_always_carries_truncated_field() {
         "#1247: an under-the-cap query result must still carry truncated:false, not omit the \
          field; got {result}"
     );
-    if let Some(warnings) = result.get("warnings").and_then(Value::as_array) {
-        for w in warnings {
-            let text = w.as_str().unwrap_or_default();
-            assert!(
-                !text.contains("LIMIT/OFFSET"),
-                "#1168: no warning may recommend the unimplemented OFFSET/SKIP path: {text}"
+    assert_eq!(result.get("has_more").and_then(Value::as_bool), Some(false));
+    assert_eq!(result.get("offset").and_then(Value::as_u64), Some(0));
+    assert_eq!(result.get("page_size").and_then(Value::as_u64), Some(500));
+    assert!(
+        result.get("next_offset").is_none(),
+        "terminal pages must omit next_offset; got {result}"
+    );
+    assert!(
+        result.get("warnings").is_none(),
+        "an under-cap page needs no human warning; got {result}"
+    );
+}
+
+#[tokio::test]
+async fn query_gql_skip_retrieves_every_page_without_overlap() {
+    let pack = pack();
+    let source = pack
+        .dispatch(
+            "create",
+            json!({"kind": "project", "name": "QueryPageSource"}),
+        )
+        .await
+        .expect("source project must be created")["id"]
+        .as_str()
+        .expect("create response must contain an id")
+        .to_string();
+    for i in 0..7 {
+        let target = pack
+            .dispatch(
+                "create",
+                json!({"kind": "project", "name": format!("QueryPageTarget{i}")}),
+            )
+            .await
+            .expect("target project must be created")["id"]
+            .as_str()
+            .expect("create response must contain an id")
+            .to_string();
+        pack.dispatch(
+            "link",
+            json!({
+                "source_id": source,
+                "target_id": target,
+                "relation": "depends_on"
+            }),
+        )
+        .await
+        .expect("depends_on edge must be created");
+    }
+
+    let first = pack
+        .dispatch(
+            "query",
+            json!({
+                "query": "MATCH (a:project)-[r:depends_on]->(b:project) WHERE a.name = 'QueryPageSource' RETURN a.id, r.id, b.id",
+                "page_size": 3
+            }),
+        )
+        .await
+        .expect("first query page must succeed");
+    let first_repeat = pack
+        .dispatch(
+            "query",
+            json!({
+                "query": "MATCH (a:project)-[r:depends_on]->(b:project) WHERE a.name = 'QueryPageSource' RETURN a.id, r.id, b.id",
+                "page_size": 3
+            }),
+        )
+        .await
+        .expect("repeated first page must succeed");
+    let second = pack
+        .dispatch(
+            "query",
+            json!({
+                "query": "MATCH (a:project)-[r:depends_on]->(b:project) WHERE a.name = 'QueryPageSource' RETURN a.id, r.id, b.id SKIP 3",
+                "page_size": 3
+            }),
+        )
+        .await
+        .expect("second query page must succeed");
+    let third = pack
+        .dispatch(
+            "query",
+            json!({
+                "query": "MATCH (a:project)-[r:depends_on]->(b:project) WHERE a.name = 'QueryPageSource' RETURN a.id, r.id, b.id SKIP 6",
+                "page_size": 3
+            }),
+        )
+        .await
+        .expect("terminal query page must succeed");
+
+    assert_eq!(first.get("next_offset").and_then(Value::as_u64), Some(3));
+    assert_eq!(
+        first["rows"], first_repeat["rows"],
+        "an unchanged match set must produce a stable first page"
+    );
+    assert_eq!(second.get("next_offset").and_then(Value::as_u64), Some(6));
+    assert_eq!(first.get("truncated").and_then(Value::as_bool), Some(true));
+    assert_eq!(second.get("truncated").and_then(Value::as_bool), Some(true));
+    assert_eq!(third.get("has_more").and_then(Value::as_bool), Some(false));
+    assert_eq!(third.get("truncated").and_then(Value::as_bool), Some(false));
+    assert!(third.get("next_offset").is_none());
+    assert_eq!(first["rows"].as_array().map(Vec::len), Some(3));
+    assert_eq!(second["rows"].as_array().map(Vec::len), Some(3));
+    assert_eq!(third["rows"].as_array().map(Vec::len), Some(1));
+
+    let mut edge_ids = std::collections::HashSet::new();
+    for page in [&first, &second, &third] {
+        for row in page["rows"].as_array().expect("rows must be an array") {
+            edge_ids.insert(
+                row["r_id"]
+                    .as_str()
+                    .expect("edge id projection must be present")
+                    .to_string(),
             );
         }
     }
+    assert_eq!(
+        edge_ids.len(),
+        7,
+        "all seven depends_on matches must be retrievable"
+    );
+}
+
+#[tokio::test]
+async fn query_page_size_validation_alias_and_hard_cap_are_explicit() {
+    let pack = pack();
+
+    let both = pack
+        .dispatch(
+            "query",
+            json!({
+                "query": "MATCH (a:concept) RETURN a",
+                "page_size": 5,
+                "limit": 5
+            }),
+        )
+        .await
+        .expect_err("page_size and its legacy alias must be mutually exclusive");
+    assert!(
+        is_invalid_input(&both),
+        "mutually exclusive page bounds must be InvalidInput: {both:?}"
+    );
+
+    let zero = pack
+        .dispatch(
+            "query",
+            json!({"query": "MATCH (a:concept) RETURN a", "page_size": 0}),
+        )
+        .await
+        .expect_err("zero-sized pages cannot produce an advancing continuation");
+    assert!(
+        is_invalid_input(&zero),
+        "zero page_size must be InvalidInput"
+    );
+
+    let clamped = pack
+        .dispatch(
+            "query",
+            json!({"query": "MATCH (a:concept) RETURN a", "page_size": 20_000}),
+        )
+        .await
+        .expect("oversized page_size is clamped to the hard cap");
+    assert_eq!(
+        clamped.get("page_size").and_then(Value::as_u64),
+        Some(10_000),
+        "wire metadata must expose the effective hard-capped page size"
+    );
+
+    let legacy = pack
+        .dispatch(
+            "query",
+            json!({"query": "MATCH (a:concept) RETURN a", "limit": 7}),
+        )
+        .await
+        .expect("legacy limit alias remains accepted");
+    assert_eq!(legacy.get("page_size").and_then(Value::as_u64), Some(7));
 }
