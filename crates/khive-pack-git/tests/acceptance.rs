@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 
 use async_trait::async_trait;
-use khive_pack_git::ingest::{run_ingest, IngestOptions};
+use khive_pack_git::ingest::{run_ingest, IngestInclude, IngestOptions};
 use khive_pack_git::GitPack;
 use khive_pack_kg::KgPack;
 use khive_runtime::{
@@ -131,6 +131,31 @@ async fn create(registry: &VerbRegistry, body: Value) -> Uuid {
     Uuid::parse_str(resp["id"].as_str().expect("id present")).expect("id is uuid")
 }
 
+async fn incoming_annotating_ids(
+    registry: &VerbRegistry,
+    target_id: Uuid,
+) -> std::collections::BTreeSet<String> {
+    registry
+        .dispatch(
+            "neighbors",
+            json!({
+                "id": target_id.to_string(),
+                "direction": "incoming",
+                "relations": ["annotates"]
+            }),
+        )
+        .await
+        .expect("target neighbors")
+        .as_array()
+        .expect("neighbor array")
+        .iter()
+        .map(|neighbor| {
+            assert_eq!(neighbor["kind"], "commit");
+            neighbor["id"].as_str().expect("commit id").to_string()
+        })
+        .collect()
+}
+
 fn git(repo: &Path, args: &[&str]) {
     let out = Command::new("git")
         .arg("-C")
@@ -171,6 +196,19 @@ fn head_sha(repo: &Path) -> String {
         .args(["rev-parse", "HEAD"])
         .output()
         .expect("rev-parse");
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+/// Absolute path of the real `git` binary, resolved BEFORE any test shadows
+/// `PATH` — shims delegate every invocation they do not script to it (same
+/// technique as `src/recovery_tests.rs`).
+fn resolve_real_git() -> String {
+    let out = Command::new("sh")
+        .arg("-c")
+        .arg("command -v git")
+        .output()
+        .expect("resolve real git");
+    assert!(out.status.success(), "could not resolve real git on PATH");
     String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
@@ -381,6 +419,1000 @@ async fn ingest_links_commits_to_document_and_pr_by_provenance_query() {
     );
 }
 
+/// Issue #1604: changed-path properties and exact ADR-085 `source_path`
+/// annotations make module churn and repeated cross-project co-change
+/// computable from graph reads without reopening git history.
+#[tokio::test]
+async fn ingest_records_changed_paths_and_links_code_modules() {
+    let _guard = ENV_MUTEX.lock().await;
+    let (rt, token, registry) = fixture().await;
+
+    let project_id = create(
+        &registry,
+        json!({"kind": "project", "name": "path-provenance-repo"}),
+    )
+    .await;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_repo(repo);
+
+    write(repo, "crates/crate-a/src/lib.rs", "pub fn a() {}\n");
+    write(repo, "crates/crate-b/src/lib.rs", "pub fn b() {}\n");
+    commit(
+        repo,
+        &["crates/crate-a/src/lib.rs", "crates/crate-b/src/lib.rs"],
+        "Add both crates",
+    );
+    let both_1 = head_sha(repo);
+
+    write(
+        repo,
+        "crates/crate-a/src/lib.rs",
+        "pub fn a() {}\npub fn a2() {}\n",
+    );
+    commit(repo, &["crates/crate-a/src/lib.rs"], "Change crate A");
+    let only_a = head_sha(repo);
+
+    write(
+        repo,
+        "crates/crate-a/src/lib.rs",
+        "pub fn a() {}\npub fn a2() {}\npub fn a3() {}\n",
+    );
+    write(
+        repo,
+        "crates/crate-b/src/lib.rs",
+        "pub fn b() {}\npub fn b2() {}\n",
+    );
+    commit(
+        repo,
+        &["crates/crate-a/src/lib.rs", "crates/crate-b/src/lib.rs"],
+        "Change both crates again",
+    );
+    let both_2 = head_sha(repo);
+
+    // ADR-085 scopes physical paths to a repository snapshot. A second map
+    // can legitimately carry the same relative path, so the revision must
+    // participate in the binding or digesting this repository would
+    // fabricate an annotation to the other repository's module.
+    let other_dir = tempfile::tempdir().expect("other tempdir");
+    let other_repo = other_dir.path();
+    init_repo(other_repo);
+    write(
+        other_repo,
+        "crates/crate-a/src/lib.rs",
+        "pub fn from_other_repo() {}\n",
+    );
+    commit(
+        other_repo,
+        &["crates/crate-a/src/lib.rs"],
+        "Other repository",
+    );
+    let other_revision = head_sha(other_repo);
+    assert_ne!(both_2, other_revision);
+
+    let module_a = create(
+        &registry,
+        json!({
+            "kind": "concept",
+            "entity_type": "module",
+            "name": "crate_a",
+            "properties": {
+                "source_project": "crate-a",
+                "source_path": "crates/crate-a/src/lib.rs",
+                "source_revision": both_2.clone()
+            }
+        }),
+    )
+    .await;
+    let module_b = create(
+        &registry,
+        json!({
+            "kind": "concept",
+            "entity_type": "module",
+            "name": "crate_b",
+            "properties": {
+                "source_project": "crate-b",
+                "source_path": "crates/crate-b/src/lib.rs",
+                "source_revision": both_2.clone()
+            }
+        }),
+    )
+    .await;
+    let other_repo_module = create(
+        &registry,
+        json!({
+            "kind": "concept",
+            "entity_type": "module",
+            "name": "other_crate_a",
+            "properties": {
+                "source_project": "other-crate-a",
+                "source_path": "crates/crate-a/src/lib.rs",
+                "source_revision": other_revision
+            }
+        }),
+    )
+    .await;
+
+    let report = run_ingest(
+        &rt,
+        &token,
+        &registry,
+        IngestOptions::unbounded(repo.to_path_buf(), project_id.to_string()),
+    )
+    .await
+    .expect("ingest ok");
+    assert_eq!(report.commits_ingested, 3, "{report:?}");
+
+    let commits = registry
+        .dispatch("list", json!({"kind": "commit", "limit": 10}))
+        .await
+        .expect("list commits");
+    let paths_by_sha: std::collections::HashMap<String, Vec<String>> = commits
+        .as_array()
+        .expect("commit array")
+        .iter()
+        .map(|note| {
+            let sha = note["properties"]["sha"].as_str().expect("sha").to_string();
+            let paths = note["properties"]["changed_paths"]
+                .as_array()
+                .expect("changed_paths array")
+                .iter()
+                .map(|path| path.as_str().expect("path string").to_string())
+                .collect();
+            (sha, paths)
+        })
+        .collect();
+    let both_paths = vec![
+        "crates/crate-a/src/lib.rs".to_string(),
+        "crates/crate-b/src/lib.rs".to_string(),
+    ];
+    assert_eq!(paths_by_sha[&both_1], both_paths);
+    assert_eq!(
+        paths_by_sha[&only_a],
+        vec!["crates/crate-a/src/lib.rs".to_string()]
+    );
+    assert_eq!(paths_by_sha[&both_2], both_paths);
+
+    let module_a_commits = incoming_annotating_ids(&registry, module_a).await;
+    let module_b_commits = incoming_annotating_ids(&registry, module_b).await;
+    assert_eq!(module_a_commits.len(), 3, "crate-a churn");
+    assert_eq!(module_b_commits.len(), 2, "crate-b churn");
+    assert!(
+        incoming_annotating_ids(&registry, other_repo_module)
+            .await
+            .is_empty(),
+        "same relative path from another repository must not cross-annotate"
+    );
+    assert_eq!(
+        module_a_commits.intersection(&module_b_commits).count(),
+        2,
+        "the cross-crate pair co-changed in two commits"
+    );
+}
+
+/// A shared revision can occur in two forks. Revision-plus-path narrows the
+/// repository snapshot, but it must not become an arbitrary tie-breaker when
+/// two live module rows still claim that identity.
+#[tokio::test]
+async fn ingest_skips_ambiguous_snapshot_path_bindings() {
+    let _guard = ENV_MUTEX.lock().await;
+    let (rt, token, registry) = fixture().await;
+    let project_id = create(
+        &registry,
+        json!({"kind": "project", "name": "ambiguous-path-repo"}),
+    )
+    .await;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_repo(repo);
+    write(repo, "src/lib.rs", "pub fn shared() {}\n");
+    commit(repo, &["src/lib.rs"], "Shared snapshot");
+    let revision = head_sha(repo);
+
+    // An ambiguous key (two live rows, one `source_path`) NO ingested
+    // commit touches must not inflate the skip count: only a commit path
+    // that actually hits the ambiguous key counts.
+    for name in [
+        "untouched_ambiguous_module_a",
+        "untouched_ambiguous_module_b",
+    ] {
+        create(
+            &registry,
+            json!({
+                "kind": "concept",
+                "entity_type": "module",
+                "name": name,
+                "properties": {
+                    "source_project": "untouched-project",
+                    "source_path": "src/untouched.rs",
+                    "source_revision": revision.clone()
+                }
+            }),
+        )
+        .await;
+    }
+
+    let first = create(
+        &registry,
+        json!({
+            "kind": "concept",
+            "entity_type": "module",
+            "name": "first_shared_module",
+            "properties": {
+                "source_project": "first-project",
+                "source_path": "src/lib.rs",
+                "source_revision": revision.clone()
+            }
+        }),
+    )
+    .await;
+    let second = create(
+        &registry,
+        json!({
+            "kind": "concept",
+            "entity_type": "module",
+            "name": "second_shared_module",
+            "properties": {
+                "source_project": "second-project",
+                "source_path": "src/lib.rs",
+                "source_revision": revision
+            }
+        }),
+    )
+    .await;
+
+    let report = run_ingest(
+        &rt,
+        &token,
+        &registry,
+        IngestOptions::unbounded(repo.to_path_buf(), project_id.to_string()),
+    )
+    .await
+    .expect("ingest ok");
+    assert_eq!(report.commits_ingested, 1, "{report:?}");
+    assert_eq!(
+        report.code_module_ambiguous_path_skips, 1,
+        "only the commit-touched ambiguous key counts; the untouched one does not: {report:?}"
+    );
+    let skip_warnings: Vec<&str> = report
+        .warnings
+        .iter()
+        .map(String::as_str)
+        .filter(|w| w.contains("skipped code-module annotation"))
+        .collect();
+    assert_eq!(
+        skip_warnings.len(),
+        1,
+        "one bounded skip warning per run: {:?}",
+        report.warnings
+    );
+    assert!(
+        skip_warnings[0].contains("src/lib.rs"),
+        "the bounded warning names the first skipped path so the count is \
+         actionable: {}",
+        skip_warnings[0]
+    );
+    assert!(incoming_annotating_ids(&registry, first).await.is_empty());
+    assert!(incoming_annotating_ids(&registry, second).await.is_empty());
+}
+
+/// Issue #1604: `git log -z` is required for an exact path identity. Git's
+/// display form quotes non-ASCII and delimiter-bearing names, which would not
+/// equal ADR-085's filesystem-derived `source_path`.
+#[cfg(unix)]
+#[tokio::test]
+async fn ingest_preserves_unicode_and_delimiter_bearing_changed_paths() {
+    let _guard = ENV_MUTEX.lock().await;
+    let (rt, token, registry) = fixture().await;
+    let project_id = create(
+        &registry,
+        json!({"kind": "project", "name": "raw-path-repo"}),
+    )
+    .await;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_repo(repo);
+    // Backslash is deliberately absent: the hook's canonical shape is
+    // `/`-separated repo-relative and rejects `\` anywhere, so a
+    // backslash-bearing filesystem name can never round-trip through
+    // `changed_paths`. Tab, quote, newline, and non-ASCII coverage remain —
+    // all of them still trigger git's quoted display form without `-z`.
+    let unusual_path = "src/café\t\"quoted\"leaf\nline.rs";
+    write(repo, unusual_path, "pub fn unusual() {}\n");
+    commit(repo, &[unusual_path], "Add unusual path");
+    let revision = head_sha(repo);
+
+    let module_id = create(
+        &registry,
+        json!({
+            "kind": "concept",
+            "entity_type": "module",
+            "name": "unusual_module",
+            "properties": {
+                "source_project": "raw-path-repo",
+                "source_path": unusual_path,
+                "source_revision": revision
+            }
+        }),
+    )
+    .await;
+
+    let report = run_ingest(
+        &rt,
+        &token,
+        &registry,
+        IngestOptions::unbounded(repo.to_path_buf(), project_id.to_string()),
+    )
+    .await
+    .expect("ingest ok");
+    assert_eq!(report.commits_ingested, 1, "{report:?}");
+
+    let commits = registry
+        .dispatch("list", json!({"kind": "commit", "limit": 10}))
+        .await
+        .expect("list commits");
+    assert_eq!(
+        commits.as_array().expect("commit array")[0]["properties"]["changed_paths"],
+        json!([unusual_path])
+    );
+    assert_eq!(
+        incoming_annotating_ids(&registry, module_id).await.len(),
+        1,
+        "raw path must retain its exact module binding"
+    );
+}
+
+/// Issue #1604: merge commits use their first-parent diff as their one
+/// canonical changed-path set. This records the change introduced to the
+/// destination branch without producing one path set per parent.
+#[tokio::test]
+async fn ingest_records_first_parent_paths_for_merge_commits() {
+    let _guard = ENV_MUTEX.lock().await;
+    let (rt, token, registry) = fixture().await;
+    let project_id = create(
+        &registry,
+        json!({"kind": "project", "name": "merge-path-repo"}),
+    )
+    .await;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_repo(repo);
+    write(repo, "base.rs", "pub fn base() {}\n");
+    commit(repo, &["base.rs"], "Base");
+
+    git(repo, &["checkout", "-q", "-b", "feature"]);
+    write(repo, "feature.rs", "pub fn feature() {}\n");
+    commit(repo, &["feature.rs"], "Feature");
+
+    git(repo, &["checkout", "-q", "main"]);
+    write(repo, "main.rs", "pub fn main_change() {}\n");
+    commit(repo, &["main.rs"], "Main change");
+    git(
+        repo,
+        &["merge", "-q", "--no-ff", "feature", "-m", "Merge feature"],
+    );
+    let merge_sha = head_sha(repo);
+
+    let report = run_ingest(
+        &rt,
+        &token,
+        &registry,
+        IngestOptions::unbounded(repo.to_path_buf(), project_id.to_string()),
+    )
+    .await
+    .expect("ingest ok");
+    assert_eq!(report.commits_ingested, 4, "{report:?}");
+
+    let commits = registry
+        .dispatch("list", json!({"kind": "commit", "limit": 10}))
+        .await
+        .expect("list commits");
+    let merge = commits
+        .as_array()
+        .expect("commit array")
+        .iter()
+        .find(|note| note["properties"]["sha"] == merge_sha)
+        .expect("merge commit");
+    assert_eq!(
+        merge["properties"]["changed_paths"],
+        json!(["feature.rs"]),
+        "merge path set is the diff against its first parent"
+    );
+}
+
+/// Issue #1604: `[]` is the canonical shape for a genuinely empty commit
+/// (ADR-088: "the git ingester always supplies it, including an empty array
+/// for an empty commit"). Exercise the `--allow-empty` path end to end so
+/// the contract cannot silently rot.
+#[tokio::test]
+async fn ingest_records_empty_changed_paths_for_empty_commits() {
+    let _guard = ENV_MUTEX.lock().await;
+    let (rt, token, registry) = fixture().await;
+    let project_id = create(
+        &registry,
+        json!({"kind": "project", "name": "empty-commit-repo"}),
+    )
+    .await;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_repo(repo);
+    write(repo, "base.rs", "pub fn base() {}\n");
+    commit(repo, &["base.rs"], "Base");
+    git(
+        repo,
+        &["commit", "-q", "--allow-empty", "-m", "Empty marker"],
+    );
+    let empty_sha = head_sha(repo);
+
+    let report = run_ingest(
+        &rt,
+        &token,
+        &registry,
+        IngestOptions::unbounded(repo.to_path_buf(), project_id.to_string()),
+    )
+    .await
+    .expect("ingest ok");
+    assert_eq!(report.commits_ingested, 2, "{report:?}");
+
+    let commits = registry
+        .dispatch("list", json!({"kind": "commit", "limit": 10}))
+        .await
+        .expect("list commits");
+    let empty = commits
+        .as_array()
+        .expect("commit array")
+        .iter()
+        .find(|note| note["properties"]["sha"] == empty_sha)
+        .expect("empty commit");
+    assert_eq!(
+        empty["properties"]["changed_paths"],
+        json!([]),
+        "an empty commit carries an empty changed-path array"
+    );
+}
+
+/// Issue #1604: rename detection is pinned off, so a rename surfaces as the
+/// delete + add path pair that keeps `changed_paths` an exact join key for
+/// ADR-085's filesystem-derived `source_path`. Without the pin, whether the
+/// old path appears in `--name-only` output would depend on the rename
+/// detection settings of whatever git build runs the ingest.
+#[tokio::test]
+async fn ingest_records_both_sides_of_a_rename() {
+    let _guard = ENV_MUTEX.lock().await;
+    let (rt, token, registry) = fixture().await;
+    let project_id = create(&registry, json!({"kind": "project", "name": "rename-repo"})).await;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_repo(repo);
+    write(repo, "old.rs", "pub fn renamed() {}\n");
+    commit(repo, &["old.rs"], "Add old.rs");
+    git(repo, &["mv", "old.rs", "new.rs"]);
+    git(repo, &["commit", "-q", "-m", "Rename old.rs to new.rs"]);
+    let rename_sha = head_sha(repo);
+
+    let report = run_ingest(
+        &rt,
+        &token,
+        &registry,
+        IngestOptions::unbounded(repo.to_path_buf(), project_id.to_string()),
+    )
+    .await
+    .expect("ingest ok");
+    assert_eq!(report.commits_ingested, 2, "{report:?}");
+
+    let commits = registry
+        .dispatch("list", json!({"kind": "commit", "limit": 10}))
+        .await
+        .expect("list commits");
+    let rename = commits
+        .as_array()
+        .expect("commit array")
+        .iter()
+        .find(|note| note["properties"]["sha"] == rename_sha)
+        .expect("rename commit");
+    assert_eq!(
+        rename["properties"]["changed_paths"],
+        json!(["new.rs", "old.rs"]),
+        "a rename records both the deleted and the added path"
+    );
+}
+
+/// A walked commit with no touched-path entry must never be stored with a
+/// fabricated `[]`: the run warns naming the commit, stalls the cursor at
+/// the last contiguous successful commit, and still completes (see
+/// docs/api/ingest.md#changed-paths-and-code-module-annotations).
+///
+/// The shim below builds the REAL orphan-token shape, not a whole-record
+/// deletion: its `tr '\0' '\n'` round-trip splits git's combined
+/// `<header>\n<first-path>` token into two lines, so `grep -av` removes
+/// only the middle commit's header LINE while its path token survives in
+/// the stream. Because the `--name-only` walk is newest-first, the parser
+/// attaches that orphan token to the most recent header — the NEWER (third)
+/// commit — and the walk-commits pass (unshimmed) still walks all three
+/// shas. Containment is therefore per-record, not per-stream: the middle
+/// commit never lands (no path-set entry), the cursor stalls, but the
+/// orphaned token pollutes the stored newer commit's immutable
+/// `changed_paths` — asserted explicitly below, because commit notes are
+/// immutable and the pollution persists until re-ingest.
+#[tokio::test]
+async fn ingest_stalls_cursor_for_commit_missing_touched_paths() {
+    let _guard = ENV_MUTEX.lock().await;
+    let (rt, token, registry) = fixture().await;
+    let project_id = create(
+        &registry,
+        json!({"kind": "project", "name": "touched-gap-repo"}),
+    )
+    .await;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_repo(repo);
+    write(repo, "first.rs", "pub fn first() {}\n");
+    commit(repo, &["first.rs"], "First");
+    let first_sha = head_sha(repo);
+    write(repo, "second.rs", "pub fn second() {}\n");
+    commit(repo, &["second.rs"], "Second");
+    let second_sha = head_sha(repo);
+    write(repo, "third.rs", "pub fn third() {}\n");
+    commit(repo, &["third.rs"], "Third");
+    let third_sha = head_sha(repo);
+
+    // The `--name-only` pass is the sole authority for touched paths. This
+    // PATH-shadowing shim deletes ONLY the middle commit's header line from
+    // that one stream — the `tr` round-trip puts the header and its first
+    // path on separate lines, so `grep -av` strips just the header and the
+    // middle commit's path token stays in the stream as an orphan — making
+    // the two snapshot passes disagree exactly the way the degradation
+    // branch handles; every other invocation delegates to the real git
+    // binary (same technique as `src/recovery_tests.rs`).
+    let real_git = resolve_real_git();
+    let bin_dir = dir.path().join("bin");
+    std::fs::create_dir_all(&bin_dir).expect("create bin dir");
+    std::fs::write(
+        bin_dir.join("git"),
+        format!(
+            r#"#!/bin/sh
+REAL_GIT="{real_git}"
+case " $* " in
+  *" --name-only "*)
+    "$REAL_GIT" "$@" | tr '\0' '\n' | grep -av '{second_sha}' | tr '\n' '\0'
+    exit 0
+    ;;
+esac
+exec "$REAL_GIT" "$@"
+"#,
+            real_git = real_git,
+            second_sha = second_sha,
+        ),
+    )
+    .expect("write git shim");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(bin_dir.join("git"))
+            .expect("shim metadata")
+            .permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(bin_dir.join("git"), perms).expect("chmod shim");
+    }
+    let _path_guard = PathGuard::install(&bin_dir);
+
+    let report = run_ingest(
+        &rt,
+        &token,
+        &registry,
+        IngestOptions {
+            repo: repo.to_path_buf(),
+            project: project_id.to_string(),
+            max_items: None,
+            include: IngestInclude {
+                commits: true,
+                issues: false,
+                pull_requests: false,
+            },
+        },
+    )
+    .await
+    .expect("the run completes despite the touched-path gap");
+    assert!(
+        !report.done,
+        "a touched-path gap stalls the cursor, so the pass must not report done: {report:?}"
+    );
+    assert!(
+        report.cursor_stalled,
+        "the touched-path gap must surface as a cursor stall: {report:?}"
+    );
+    assert!(
+        report.warnings.iter().any(|w| {
+            w.contains("no touched-path set recorded")
+                && w.contains(&second_sha)
+                && w.contains(&third_sha)
+        }),
+        "the gap warning must name both the stalled commit and the newer polluted recipient: {:?}",
+        report.warnings
+    );
+    assert_eq!(
+        report.commits_ingested, 2,
+        "the two commits with recorded path sets still land: {report:?}"
+    );
+
+    let cursor = read_git_cursor(&rt, project_id, "commits")
+        .await
+        .expect("cursor must be written");
+    assert_eq!(
+        cursor, first_sha,
+        "the cursor must stall at the last contiguous successful commit, \
+         never advance past the gap"
+    );
+
+    let commits = registry
+        .dispatch("list", json!({"kind": "commit", "limit": 10}))
+        .await
+        .expect("list commits");
+    let commit_notes = commits.as_array().expect("commit array");
+    let stored_shas: Vec<&str> = commit_notes
+        .iter()
+        .map(|note| note["properties"]["sha"].as_str().expect("sha"))
+        .collect();
+    assert!(
+        !stored_shas.contains(&second_sha.as_str()),
+        "the gap commit must never be stored with a fabricated []: {stored_shas:?}"
+    );
+    assert!(
+        stored_shas.contains(&third_sha.as_str()),
+        "a commit after the gap is still attempted and lands: {stored_shas:?}"
+    );
+    let first_note = commit_notes
+        .iter()
+        .find(|note| note["properties"]["sha"].as_str() == Some(first_sha.as_str()))
+        .expect("the first commit is stored");
+    assert_eq!(
+        first_note["properties"]["changed_paths"],
+        json!(["first.rs"]),
+        "the newest-first walk attaches the orphan token to the most \
+         recent header (the NEWER commit), so the older commit keeps \
+         exactly its own paths"
+    );
+    let third_note = commit_notes
+        .iter()
+        .find(|note| note["properties"]["sha"].as_str() == Some(third_sha.as_str()))
+        .expect("the newer commit is stored");
+    assert_eq!(
+        third_note["properties"]["changed_paths"],
+        json!(["second.rs", "third.rs"]),
+        "the orphaned path token of the deleted header rides into the \
+         stored NEWER commit's changed_paths: containment is per-record \
+         (the missing sha never lands, the cursor stalls), never \
+         per-stream — commit notes are immutable, so the pollution \
+         persists (a re-ingest skips the stored sha)"
+    );
+}
+
+/// A commit whose raw touched paths are ALL noncanonical is the third
+/// stored state: not a genuinely empty commit (`[]`), so `changed_paths`
+/// is omitted entirely and the run's
+/// `changed_paths_filtered_noncanonical` count carries the evidence.
+#[cfg(unix)]
+#[tokio::test]
+async fn ingest_omits_changed_paths_when_all_paths_filtered() {
+    let _guard = ENV_MUTEX.lock().await;
+    let (rt, token, registry) = fixture().await;
+    let project_id = create(
+        &registry,
+        json!({"kind": "project", "name": "all-filtered-path-repo"}),
+    )
+    .await;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_repo(repo);
+    // Both shapes the canonical contract can never carry: a `\\` byte and
+    // an `X:` drive prefix.
+    write(repo, "src/back\\slash.rs", "pub fn backslash() {}\n");
+    write(repo, "X:drive.rs", "pub fn drive() {}\n");
+    commit(
+        repo,
+        &["src/back\\slash.rs", "X:drive.rs"],
+        "Only non-canonical paths",
+    );
+
+    let report = run_ingest(
+        &rt,
+        &token,
+        &registry,
+        IngestOptions {
+            repo: repo.to_path_buf(),
+            project: project_id.to_string(),
+            max_items: None,
+            include: IngestInclude {
+                commits: true,
+                issues: false,
+                pull_requests: false,
+            },
+        },
+    )
+    .await
+    .expect("an all-filtered commit must not fail the pass");
+    assert_eq!(report.commits_ingested, 1, "{report:?}");
+    assert_eq!(
+        report.changed_paths_filtered_noncanonical, 2,
+        "both noncanonical paths are counted as drops: {report:?}"
+    );
+
+    let commits = registry
+        .dispatch("list", json!({"kind": "commit", "limit": 10}))
+        .await
+        .expect("list commits");
+    let stored = &commits.as_array().expect("commit array")[0];
+    assert!(
+        stored["properties"].get("changed_paths").is_none(),
+        "an all-filtered commit omits changed_paths rather than storing the \
+         [] reserved for a genuinely empty commit: {stored:?}"
+    );
+
+    let cursor = read_git_cursor(&rt, project_id, "commits")
+        .await
+        .expect("cursor must be written");
+    assert_eq!(
+        cursor,
+        head_sha(repo),
+        "the cursor advances: an all-filtered commit is still ingested"
+    );
+}
+
+/// Unix filenames may legitimately contain `\` or start `X:` — shapes the
+/// hook's canonical `changed_paths` contract can never carry. The ingester
+/// must drop exactly those elements, still store the commit with the
+/// canonical remainder (never fail the create and stall the cursor), count
+/// the dropped paths, and warn once per run.
+#[cfg(unix)]
+#[tokio::test]
+async fn ingest_filters_noncanonical_changed_paths_but_keeps_commit() {
+    let _guard = ENV_MUTEX.lock().await;
+    let (rt, token, registry) = fixture().await;
+    let project_id = create(
+        &registry,
+        json!({"kind": "project", "name": "noncanonical-path-repo"}),
+    )
+    .await;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_repo(repo);
+    write(repo, "good.rs", "pub fn good() {}\n");
+    write(repo, "src/back\\slash.rs", "pub fn backslash() {}\n");
+    write(repo, "X:drive.rs", "pub fn drive() {}\n");
+    commit(
+        repo,
+        &["good.rs", "src/back\\slash.rs", "X:drive.rs"],
+        "Add canonical and non-canonical paths",
+    );
+
+    let report = run_ingest(
+        &rt,
+        &token,
+        &registry,
+        IngestOptions {
+            repo: repo.to_path_buf(),
+            project: project_id.to_string(),
+            max_items: None,
+            include: IngestInclude {
+                commits: true,
+                issues: false,
+                pull_requests: false,
+            },
+        },
+    )
+    .await
+    .expect("a non-canonical path must not fail the pass");
+    assert_eq!(report.commits_ingested, 1, "{report:?}");
+    assert_eq!(
+        report.changed_paths_filtered_noncanonical, 2,
+        "exactly the backslash and drive-prefixed paths are dropped: {report:?}"
+    );
+    let filter_warnings: Vec<&str> = report
+        .warnings
+        .iter()
+        .map(String::as_str)
+        .filter(|w| w.contains("dropped from changed_paths"))
+        .collect();
+    assert_eq!(
+        filter_warnings.len(),
+        1,
+        "one bounded warning per run, never one per path: {:?}",
+        report.warnings
+    );
+    assert!(
+        filter_warnings[0].contains('2'),
+        "the warning carries the dropped count: {}",
+        filter_warnings[0]
+    );
+    assert!(
+        filter_warnings[0].contains("NUL"),
+        "the warning names every rejected shape the predicate enforces, \
+         including the NUL byte: {}",
+        filter_warnings[0]
+    );
+
+    let commits = registry
+        .dispatch("list", json!({"kind": "commit", "limit": 10}))
+        .await
+        .expect("list commits");
+    let stored = &commits.as_array().expect("commit array")[0];
+    assert_eq!(
+        stored["properties"]["changed_paths"],
+        json!(["good.rs"]),
+        "the commit lands with exactly the canonical remainder"
+    );
+
+    let cursor = read_git_cursor(&rt, project_id, "commits")
+        .await
+        .expect("cursor must be written");
+    assert_eq!(
+        cursor,
+        head_sha(repo),
+        "the cursor advances past the commit: filtered paths never stall a run"
+    );
+}
+
+/// The canonical filter runs on the RAW path, never the masked one: a
+/// secret-shaped token can itself contain a rejected byte (the masker's
+/// tokens are whitespace-delimited, so a backslash inside the token is
+/// redacted along with it), and filtering after masking would flip the
+/// verdict from reject to accept — storing `src/***MASKED***` for a file
+/// whose real name is non-canonical. The defect must be dropped and
+/// counted, not laundered into a canonical-looking masked path.
+#[cfg(unix)]
+#[tokio::test]
+async fn ingest_filters_noncanonical_path_even_when_masking_hides_the_defect() {
+    let _guard = ENV_MUTEX.lock().await;
+    let (rt, token, registry) = fixture().await;
+    let project_id = create(
+        &registry,
+        json!({"kind": "project", "name": "masked-defect-path-repo"}),
+    )
+    .await;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_repo(repo);
+    write(repo, "good.rs", "pub fn good() {}\n");
+    // Secret-shaped (github-token: `ghp_` + 36 base62 chars) AND
+    // non-canonical (a `\` byte inside the token).
+    let fake_token = "ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+    let rel = format!("src/{fake_token}\\back.rs");
+    write(repo, &rel, "pub fn secret_defect() {}\n");
+    commit(repo, &["good.rs", rel.as_str()], "Mixed paths");
+
+    let report = run_ingest(
+        &rt,
+        &token,
+        &registry,
+        IngestOptions::unbounded(repo.to_path_buf(), project_id.to_string()),
+    )
+    .await
+    .expect("ingest ok");
+    assert_eq!(report.commits_ingested, 1, "{report:?}");
+    assert_eq!(
+        report.changed_paths_filtered_noncanonical, 1,
+        "the raw path's backslash rejects it even though masking would \
+         redact that byte away: {report:?}"
+    );
+
+    let commits = registry
+        .dispatch("list", json!({"kind": "commit", "limit": 10}))
+        .await
+        .expect("list commits");
+    let stored = &commits.as_array().expect("commit array")[0];
+    assert_eq!(
+        stored["properties"]["changed_paths"],
+        json!(["good.rs"]),
+        "the non-canonical path must be dropped, not stored as a \
+         canonical-looking masked residue: {stored:?}"
+    );
+    assert!(
+        !format!("{stored}").contains(fake_token),
+        "the raw token must not survive anywhere in the stored record"
+    );
+}
+
+/// The stalled-cursor contract relies on sha-keyed dedup: a record that
+/// lands AFTER a stall is re-walked by the next pass (the cursor froze
+/// before it) and must come out as `skipped_existing`, never a duplicate
+/// row. Pass 1 stalls on commit B (injected embedder failure) while later
+/// commit C still lands; pass 2 re-walks `first..HEAD`, retries B
+/// successfully, and re-encounters C — total stored rows must stay exactly
+/// one per sha.
+#[tokio::test]
+async fn ingest_repeat_pass_after_stall_creates_no_duplicates() {
+    let _guard = ENV_MUTEX.lock().await;
+    let (rt, token, registry) = fixture().await;
+    rt.register_embedder(FailOnceEmbedderProvider);
+    let project_id = create(
+        &registry,
+        json!({"kind": "project", "name": "stall-redo-repo"}),
+    )
+    .await;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_repo(repo);
+    write(repo, "a.rs", "pub fn a() {}\n");
+    commit(repo, &["a.rs"], "Add a");
+    let sha_a = head_sha(repo);
+    write(repo, "b.rs", "pub fn b() {}\n");
+    commit(repo, &["b.rs"], &format!("Add b {CURSOR_FAIL_SENTINEL}"));
+    let sha_b = head_sha(repo);
+    write(repo, "c.rs", "pub fn c() {}\n");
+    commit(repo, &["c.rs"], "Add c");
+    let sha_c = head_sha(repo);
+
+    let opts = || IngestOptions {
+        repo: repo.to_path_buf(),
+        project: project_id.to_string(),
+        max_items: None,
+        include: IngestInclude {
+            commits: true,
+            issues: false,
+            pull_requests: false,
+        },
+    };
+
+    let report1 = run_ingest(&rt, &token, &registry, opts())
+        .await
+        .expect("pass 1 completes despite the injected failure");
+    assert_eq!(
+        report1.commits_ingested, 2,
+        "A and C land; B fails once on the injected embedder error: {report1:?}"
+    );
+    assert_eq!(
+        read_git_cursor(&rt, project_id, "commits").await.as_deref(),
+        Some(sha_a.as_str()),
+        "pass 1 cursor stalls at A, before failed B"
+    );
+
+    let report2 = run_ingest(&rt, &token, &registry, opts())
+        .await
+        .expect("pass 2 completes");
+    assert_eq!(
+        report2.commits_ingested, 1,
+        "only B is newly created on the retry: {report2:?}"
+    );
+    assert_eq!(
+        report2.commits_skipped_existing, 1,
+        "C is re-walked from the stalled cursor and deduplicated by sha: {report2:?}"
+    );
+    assert_eq!(
+        read_git_cursor(&rt, project_id, "commits").await.as_deref(),
+        Some(sha_c.as_str()),
+        "pass 2 cursor advances to HEAD"
+    );
+
+    let commits = registry
+        .dispatch("list", json!({"kind": "commit", "limit": 10}))
+        .await
+        .expect("list commits");
+    let mut shas: Vec<&str> = commits
+        .as_array()
+        .expect("commit array")
+        .iter()
+        .map(|note| note["properties"]["sha"].as_str().expect("sha"))
+        .collect();
+    shas.sort_unstable();
+    let mut expected = [sha_a.as_str(), sha_b.as_str(), sha_c.as_str()];
+    expected.sort_unstable();
+    assert_eq!(
+        shas, expected,
+        "exactly one stored row per sha after the repeat pass"
+    );
+}
+
 /// Coordinator addendum requirement: a commit message containing a
 /// credential-shaped token must be masked before it is stored.
 #[tokio::test]
@@ -427,6 +1459,47 @@ async fn ingest_masks_secrets_in_commit_message() {
         stored_content.contains("***MASKED***") || stored_content.contains("MASKED"),
         "masked marker must be present: {stored_content:?}"
     );
+}
+
+#[tokio::test]
+async fn ingest_masks_secret_shaped_changed_paths() {
+    let _guard = ENV_MUTEX.lock().await;
+    let (rt, token, registry) = fixture().await;
+    let project_id = create(
+        &registry,
+        json!({"kind": "project", "name": "secret-path-repo"}),
+    )
+    .await;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_repo(repo);
+    let fake_token = "ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+    let rel = format!("src/{fake_token}.rs");
+    write(repo, &rel, "pub fn safe() {}\n");
+    commit(repo, &[rel.as_str()], "Add source file");
+
+    let report = run_ingest(
+        &rt,
+        &token,
+        &registry,
+        IngestOptions::unbounded(repo.to_path_buf(), project_id.to_string()),
+    )
+    .await
+    .expect("ingest ok");
+    assert_eq!(report.commits_ingested, 1, "{report:?}");
+    assert_eq!(report.writes_refused, 0, "{report:?}");
+
+    let commits = registry
+        .dispatch("list", json!({"kind": "commit", "limit": 10}))
+        .await
+        .expect("list commits");
+    let commit = &commits.as_array().expect("commit array")[0];
+    let stored_path = commit["properties"]["changed_paths"][0]
+        .as_str()
+        .expect("changed path");
+    assert!(!stored_path.contains(fake_token), "{stored_path:?}");
+    assert!(stored_path.contains("MASKED"), "{stored_path:?}");
 }
 
 /// Issue #763 exact acceptance repro: a PR body containing a bare 64-char hex
@@ -1996,6 +3069,128 @@ async fn commit_hook_requires_properties_sha() {
         .await
         .expect_err("missing sha must be rejected");
     assert!(format!("{err}").contains("sha"));
+}
+
+#[tokio::test]
+async fn commit_hook_rejects_invalid_changed_path_shapes() {
+    let (_rt, _token, registry) = fixture().await;
+    for changed_paths in [
+        json!("src/lib.rs"),
+        json!(["/absolute.rs"]),
+        json!(["C:/absolute.rs"]),
+        json!(["C:\\absolute.rs"]),
+        json!(["C:drive-relative.rs"]),
+        json!(["src\\file.rs"]),
+        json!(["\\\\server\\share\\file.rs"]),
+        json!(["src/../secret.rs"]),
+        json!([""]),
+        json!(["src//file.rs"]),
+        json!(["./src/file.rs"]),
+        json!(["src/./file.rs"]),
+        json!(["src/file.rs\0trailing"]),
+        json!([7]),
+        json!(["z.rs", "a.rs"]),
+        json!(["same.rs", "same.rs"]),
+    ] {
+        let err = registry
+            .dispatch(
+                "create",
+                json!({
+                    "kind": "commit",
+                    "content": "invalid changed path fixture",
+                    "properties": {
+                        "sha": "0000000000000000000000000000000000000000",
+                        "changed_paths": changed_paths
+                    }
+                }),
+            )
+            .await
+            .expect_err("invalid changed_paths must be rejected");
+        assert!(format!("{err}").contains("changed_paths"), "{err}");
+    }
+}
+
+/// The contract's canonical shape for a genuinely empty commit is `[]`;
+/// the hook must accept it (a missing or null `changed_paths` is likewise
+/// optional for manually created commit notes).
+#[tokio::test]
+async fn commit_hook_accepts_empty_changed_paths() {
+    let (_rt, _token, registry) = fixture().await;
+    registry
+        .dispatch(
+            "create",
+            json!({
+                "kind": "commit",
+                "content": "empty commit fixture",
+                "properties": {
+                    "sha": "0000000000000000000000000000000000000000",
+                    "changed_paths": []
+                }
+            }),
+        )
+        .await
+        .expect("an empty changed_paths array is the canonical empty-commit shape");
+
+    // An explicit JSON `null` carries no path facts and is treated the same
+    // as an absent property.
+    registry
+        .dispatch(
+            "create",
+            json!({
+                "kind": "commit",
+                "content": "null changed_paths fixture",
+                "properties": {
+                    "sha": "1111111111111111111111111111111111111111",
+                    "changed_paths": null
+                }
+            }),
+        )
+        .await
+        .expect("null changed_paths is optional, same as absent");
+}
+
+/// The must-keep control for the canonical shape: a sorted, deduplicated
+/// array of `/`-separated repo-relative paths is accepted (e.g. `src/lib.rs`
+/// survives the tightened path-shape validation unchanged).
+#[tokio::test]
+async fn commit_hook_accepts_canonical_changed_paths() {
+    let (_rt, _token, registry) = fixture().await;
+    registry
+        .dispatch(
+            "create",
+            json!({
+                "kind": "commit",
+                "content": "canonical changed_paths fixture",
+                "properties": {
+                    "sha": "2222222222222222222222222222222222222222",
+                    "changed_paths": ["src/lib.rs"]
+                }
+            }),
+        )
+        .await
+        .expect("a sorted, deduplicated repo-relative path array is accepted");
+
+    // The multi-element canonical shape the ingester emits: every element
+    // repo-relative, the whole array sorted and deduplicated.
+    registry
+        .dispatch(
+            "create",
+            json!({
+                "kind": "commit",
+                "content": "canonical multi-path fixture",
+                "properties": {
+                    "sha": "3333333333333333333333333333333333333333",
+                    "changed_paths": [
+                        "crates/a/src/lib.rs",
+                        "crates/b/src/lib.rs",
+                        "docs/api/ingest.md",
+                        "src/main.rs"
+                    ]
+                }
+            }),
+        )
+        .await
+        .expect("a sorted multi-element repo-relative path array is accepted");
 }
 
 // ── project-scoped idempotency ──────────────────────────────────────────

@@ -15,6 +15,28 @@ fn is_40_hex(s: &str) -> bool {
     s.len() == 40 && s.chars().all(|c| c.is_ascii_hexdigit())
 }
 
+/// The canonical `changed_paths` element shape. `pub(crate)` so the ingester
+/// filters the raw `git log -z --name-only` stream against exactly the rule
+/// this hook enforces, instead of handing the hook paths it must reject
+/// (a Unix filename may legitimately contain `\` or start `X:`; those can
+/// never round-trip through `changed_paths`).
+pub(crate) fn is_repo_relative_path(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    // Any `X:` prefix is a Windows drive reference — absolute (`C:/...`) or
+    // drive-relative (`C:foo`). The canonical shape is `/`-separated
+    // repo-relative, so reject the prefix regardless of what follows it.
+    let windows_drive_prefix =
+        bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':';
+    !path.is_empty()
+        && !path.starts_with('/')
+        && !path.contains('\\')
+        && !windows_drive_prefix
+        && !path.contains('\0')
+        && path
+            .split('/')
+            .all(|component| !component.is_empty() && component != "." && component != "..")
+}
+
 fn properties_obj(args: &Value) -> Result<&serde_json::Map<String, Value>, RuntimeError> {
     args.get("properties")
         .and_then(Value::as_object)
@@ -40,8 +62,10 @@ fn properties_obj_mut(
 /// `KindHook` for the immutable `commit` note kind.
 ///
 /// Validates `properties.sha` (required, 40-hex) and, when present,
-/// `properties.parents` (array of 40-hex strings). Commits have no lifecycle
-/// and no `after_create` edge work.
+/// `properties.parents` (array of 40-hex strings) and `properties.changed_paths`
+/// (array of repository-relative path strings; an explicit JSON `null` is
+/// treated the same as an absent property). Commits have no lifecycle and no
+/// `after_create` edge work.
 #[derive(Debug, Default)]
 pub struct CommitHook;
 
@@ -87,6 +111,38 @@ impl KindHook for CommitHook {
                 return Err(RuntimeError::InvalidInput(format!(
                     "commit properties.short_sha {short:?} must be a non-empty prefix of sha {sha:?}"
                 )));
+            }
+        }
+
+        // An explicit JSON `null` carries no path facts and is treated the
+        // same as an absent property; anything else must be the canonical
+        // sorted, deduplicated array.
+        if let Some(paths) = props.get("changed_paths").filter(|value| !value.is_null()) {
+            let arr = paths.as_array().ok_or_else(|| {
+                RuntimeError::InvalidInput(
+                    "commit properties.changed_paths must be an array".into(),
+                )
+            })?;
+            let mut previous: Option<&str> = None;
+            for (idx, path) in arr.iter().enumerate() {
+                let Some(path) = path.as_str() else {
+                    return Err(RuntimeError::InvalidInput(format!(
+                        "commit properties.changed_paths[{idx}] must be a string"
+                    )));
+                };
+                if !is_repo_relative_path(path) {
+                    return Err(RuntimeError::InvalidInput(format!(
+                        "commit properties.changed_paths[{idx}] must be a non-empty \
+                         repository-relative path using '/' separators, with no empty, '.' or \
+                         '..' components, leading '/', drive prefix, backslash, or NUL byte"
+                    )));
+                }
+                if previous.is_some_and(|prior| path <= prior) {
+                    return Err(RuntimeError::InvalidInput(
+                        "commit properties.changed_paths must be sorted and deduplicated".into(),
+                    ));
+                }
+                previous = Some(path);
             }
         }
 

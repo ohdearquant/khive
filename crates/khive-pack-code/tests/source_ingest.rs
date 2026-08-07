@@ -1,4 +1,4 @@
-//! `code.ingest` L1 + L1.5 pipeline tests (ADR-085 Amendment 2 B3-B8).
+//! `code.ingest` L1 + L1.5 pipeline tests (ADR-085 Amendments 2 and 5).
 //!
 //! Exercises `khive_pack_code::source_ingest::run_code_ingest` directly
 //! against on-disk fixtures — no MCP/VerbRegistry wiring needed since the
@@ -54,16 +54,17 @@ fn write_two_package_fixture(root: &Path) {
     std::fs::write(pkg_b.join("src/lib.rs"), "pub fn helper() {}\n").unwrap();
 }
 
-/// Normalized `(source project/module name, relation, dependency_kinds)`
+/// Normalized `(relation, source name, target name, dependency kinds,
+/// dependency scopes)`
 /// triples for every non-deleted edge in the target db — comparable across
 /// two independently-ingested databases regardless of internal UUID values
 /// (which differ only if content differs, but we compare by name to make the
-/// assertion legible independent of that). `dependency_kinds` is the sorted,
-/// comma-joined `metadata.dependency_kinds` array — `graph_edges`'s
+/// assertion legible independent of that). The final two fields are sorted,
+/// comma-joined metadata arrays — `graph_edges`'s
 /// `(namespace, source_id, target_id, relation)` natural key means only one
 /// `depends_on` edge can exist per pair, so multiple provenances (manifest +
 /// import scan) fold onto one row's kind list rather than separate rows.
-async fn edge_fingerprints(rt: &KhiveRuntime) -> Vec<(String, String, String, String)> {
+async fn edge_fingerprints(rt: &KhiveRuntime) -> Vec<(String, String, String, String, String)> {
     let sql = rt.sql();
     let mut reader = sql.reader().await.expect("reader");
     let rows = reader
@@ -110,7 +111,18 @@ async fn edge_fingerprints(rt: &KhiveRuntime) -> Vec<(String, String, String, St
                 })
                 .unwrap_or_default();
             kinds.sort();
-            (relation, src, tgt, kinds.join(","))
+            let mut scopes: Vec<String> = serde_json::from_str::<serde_json::Value>(&metadata)
+                .ok()
+                .and_then(|v| v.get("dependency_scopes").cloned())
+                .and_then(|v| v.as_array().cloned())
+                .map(|arr| {
+                    arr.into_iter()
+                        .filter_map(|v| v.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default();
+            scopes.sort();
+            (relation, src, tgt, kinds.join(","), scopes.join(","))
         })
         .collect()
 }
@@ -150,6 +162,61 @@ async fn entity_count(rt: &KhiveRuntime) -> i64 {
         Some(SqlValue::Integer(n)) => *n,
         _ => -1,
     }
+}
+
+async fn module_properties_for_path(
+    rt: &KhiveRuntime,
+    source_project: &str,
+    source_path: &str,
+) -> Vec<serde_json::Value> {
+    let sql = rt.sql();
+    let mut reader = sql.reader().await.expect("reader");
+    let rows = reader
+        .query_all(SqlStatement {
+            sql: "SELECT properties FROM entities \
+                  WHERE deleted_at IS NULL AND entity_type='module' \
+                  AND json_extract(properties,'$.source_project')=?1 \
+                  AND json_extract(properties,'$.source_path')=?2"
+                .into(),
+            params: vec![
+                SqlValue::Text(source_project.to_string()),
+                SqlValue::Text(source_path.to_string()),
+            ],
+            label: Some("test_module_properties_for_path".into()),
+        })
+        .await
+        .expect("query modules by source path");
+    rows.into_iter()
+        .filter_map(|row| match row.get("properties") {
+            Some(SqlValue::Text(properties)) => serde_json::from_str(properties).ok(),
+            _ => None,
+        })
+        .collect()
+}
+
+fn git(root: &Path, args: &[&str]) -> String {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        // Keep the fixture independent of machine-wide hooks (for example,
+        // a global leak guard) when it creates its two local commits.
+        .args(["-c", "core.hooksPath=/dev/null"])
+        .args(args)
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_COMMON_DIR")
+        .env_remove("GIT_INDEX_FILE")
+        .output()
+        .expect("git must be available for source-revision test");
+    assert!(
+        output.status.success(),
+        "git {args:?} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout)
+        .expect("git output is utf-8")
+        .trim()
+        .to_string()
 }
 
 #[tokio::test]
@@ -204,18 +271,21 @@ async fn two_package_fixture_converges_regardless_of_ingest_order() {
 
     // Sanity: the manifest depends_on and the import depends_on fold onto
     // ONE edge (graph_edges' natural key allows only one `depends_on` row
-    // per ordered pair) whose `dependency_kinds` records both provenances,
-    // plus both contains edges.
-    assert!(fp1.iter().any(|(rel, src, tgt, kinds)| rel == "depends_on"
-        && src == "pkg_a"
-        && tgt == "pkg_b"
-        && kinds == "dependencies,import"));
+    // per ordered pair) whose evidence and scope arrays record both
+    // provenances, plus both contains edges.
     assert!(fp1
         .iter()
-        .any(|(rel, src, _tgt, _kind)| rel == "contains" && src == "pkg_a"));
+        .any(|(rel, src, tgt, kinds, scopes)| rel == "depends_on"
+            && src == "pkg_a"
+            && tgt == "pkg_b"
+            && kinds == "dependencies,import"
+            && scopes == "normal"));
     assert!(fp1
         .iter()
-        .any(|(rel, src, _tgt, _kind)| rel == "contains" && src == "pkg_b"));
+        .any(|(rel, src, _tgt, _kinds, _scopes)| rel == "contains" && src == "pkg_a"));
+    assert!(fp1
+        .iter()
+        .any(|(rel, src, _tgt, _kinds, _scopes)| rel == "contains" && src == "pkg_b"));
 }
 
 #[tokio::test]
@@ -267,6 +337,288 @@ async fn reingesting_same_fixture_is_idempotent() {
     );
 }
 
+#[tokio::test]
+async fn manifest_scopes_keep_dev_back_edges_out_of_the_production_graph() {
+    let root = TempDir::new().expect("tempdir");
+    for package in ["pkg_a", "pkg_b"] {
+        std::fs::create_dir_all(root.path().join(package).join("src")).unwrap();
+        std::fs::write(
+            root.path().join(package).join("src/lib.rs"),
+            format!("pub fn {package}() {{}}\n"),
+        )
+        .unwrap();
+    }
+    std::fs::write(
+        root.path().join("pkg_a/Cargo.toml"),
+        "[package]\nname = \"pkg-a\"\n\n[dependencies]\npkg-b = \"0.1\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.path().join("pkg_b/Cargo.toml"),
+        "[package]\nname = \"pkg-b\"\n\n[dev-dependencies]\npkg-a = \"0.1\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.path().join("pkg_b/src/lib.rs"),
+        "use pkg_a::test_helper;\n\npub fn pkg_b() { test_helper(); }\n",
+    )
+    .unwrap();
+
+    let rt = rt_at(&root.path().join("scopes.db"));
+    let token = rt.authorize(Namespace::local()).expect("token");
+    run_code_ingest(
+        &rt,
+        &token,
+        CodeSourceIngestOptions {
+            path: root.path(),
+            languages: all_languages(),
+            sweep_time: Utc::now(),
+        },
+    )
+    .await
+    .expect("scope fixture ingests");
+
+    let edges = edge_fingerprints(&rt).await;
+    assert!(edges
+        .iter()
+        .any(|(relation, source, target, kinds, scopes)| {
+            relation == "depends_on"
+                && source == "pkg-a"
+                && target == "pkg-b"
+                && kinds == "dependencies"
+                && scopes == "normal"
+        }));
+    assert!(edges
+        .iter()
+        .any(|(relation, source, target, kinds, scopes)| {
+            relation == "depends_on"
+                && source == "pkg-b"
+                && target == "pkg-a"
+                && kinds == "dev-dependencies,import"
+                && scopes == "dev"
+        }));
+
+    let production_edges: BTreeSet<(&str, &str)> = edges
+        .iter()
+        .filter(|(relation, _, _, _, scopes)| relation == "depends_on" && scopes != "dev")
+        .map(|(_, source, target, _, _)| (source.as_str(), target.as_str()))
+        .collect();
+    assert!(production_edges.contains(&("pkg-a", "pkg-b")));
+    assert!(
+        !production_edges.contains(&("pkg-b", "pkg-a")),
+        "the reciprocal manifest entry is dev-only and must not create a production cycle"
+    );
+    let pkg_b_module = module_properties_for_path(&rt, "pkg-b", "pkg_b/src/lib.rs").await;
+    assert_eq!(pkg_b_module.len(), 1);
+    assert_eq!(pkg_b_module[0]["import_scan_status"], "scanned");
+    assert_eq!(pkg_b_module[0]["unresolved_import_count"], 0);
+}
+
+#[tokio::test]
+async fn renamed_dev_dependency_keeps_its_declared_scope_for_import_edges() {
+    let root = TempDir::new().expect("tempdir");
+    for package in ["pkg_a", "mock_dep"] {
+        std::fs::create_dir_all(root.path().join(package).join("src")).unwrap();
+    }
+    std::fs::write(
+        root.path().join("pkg_a/src/lib.rs"),
+        "use mock_dep::stub;\n\npub fn pkg_a() { stub(); }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.path().join("mock_dep/src/lib.rs"),
+        "pub fn stub() {}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.path().join("pkg_a/Cargo.toml"),
+        "[package]\nname = \"pkg-a\"\n\n[dev-dependencies]\nmock = { package = \"mock-dep\", path = \"../mock_dep\" }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.path().join("mock_dep/Cargo.toml"),
+        "[package]\nname = \"mock-dep\"\n",
+    )
+    .unwrap();
+
+    let rt = rt_at(&root.path().join("renamed.db"));
+    let token = rt.authorize(Namespace::local()).expect("token");
+    run_code_ingest(
+        &rt,
+        &token,
+        CodeSourceIngestOptions {
+            path: root.path(),
+            languages: all_languages(),
+            sweep_time: Utc::now(),
+        },
+    )
+    .await
+    .expect("renamed-dependency fixture ingests");
+
+    // `use mock_dep::…` names the real crate, not the `mock` alias: the
+    // declared `dev` scope must survive that lookup rather than fall back
+    // to the import default `build`.
+    let edges = edge_fingerprints(&rt).await;
+    assert!(
+        edges
+            .iter()
+            .any(|(relation, source, target, kinds, scopes)| {
+                relation == "depends_on"
+                    && source == "pkg-a"
+                    && target == "mock-dep"
+                    && kinds.contains("import")
+                    && scopes == "dev"
+            }),
+        "renamed dev-dependency import edge must keep the declared dev scope: {edges:?}"
+    );
+}
+
+#[tokio::test]
+async fn module_paths_revisions_coverage_and_contains_ownership_are_queryable() {
+    let root = TempDir::new().expect("tempdir");
+    std::fs::create_dir_all(root.path().join("src")).unwrap();
+    std::fs::write(
+        root.path().join("Cargo.toml"),
+        "[package]\nname = \"coverage_fixture\"\n",
+    )
+    .unwrap();
+    std::fs::write(root.path().join("src/lib.rs"), "pub fn independent() {}\n").unwrap();
+    std::fs::write(root.path().join("src/main.rs"), "fn main() {}\n").unwrap();
+    std::fs::write(
+        root.path().join("src/partial.rs"),
+        "use crate::missing::Thing;\n\npub fn needs_missing(_: Thing) {}\n",
+    )
+    .unwrap();
+
+    git(root.path(), &["init", "-q"]);
+    git(root.path(), &["add", "Cargo.toml", "src"]);
+    git(
+        root.path(),
+        &[
+            "-c",
+            "user.name=khive-test",
+            "-c",
+            "user.email=khive-test@example.invalid",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-qm",
+            "initial",
+        ],
+    );
+    let first_revision = git(root.path(), &["rev-parse", "HEAD"]);
+
+    let rt = rt_at(&root.path().join("coverage.db"));
+    let token = rt.authorize(Namespace::local()).expect("token");
+    let first = run_code_ingest(
+        &rt,
+        &token,
+        CodeSourceIngestOptions {
+            path: root.path(),
+            languages: all_languages(),
+            sweep_time: Utc::now(),
+        },
+    )
+    .await
+    .expect("coverage fixture ingests");
+    assert_eq!(first.source_revision, first_revision);
+
+    let lib = module_properties_for_path(&rt, "coverage_fixture", "src/lib.rs").await;
+    assert_eq!(lib.len(), 1, "path lookup must resolve to one module");
+    assert_eq!(
+        lib[0]["source_revision"].as_str(),
+        Some(first_revision.as_str())
+    );
+    assert_eq!(lib[0]["import_scan_status"], "scanned");
+    assert_eq!(lib[0]["import_specifier_count"], 0);
+    assert_eq!(lib[0]["unresolved_import_count"], 0);
+
+    let main = module_properties_for_path(&rt, "coverage_fixture", "src/main.rs").await;
+    assert_eq!(main.len(), 1, "binary-root path must resolve independently");
+    assert_eq!(main[0]["module_path"], "crate::main");
+    assert_eq!(main[0]["import_scan_status"], "scanned");
+
+    let partial = module_properties_for_path(&rt, "coverage_fixture", "src/partial.rs").await;
+    assert_eq!(partial.len(), 1, "path lookup must resolve to one module");
+    assert_eq!(
+        partial[0]["source_revision"].as_str(),
+        Some(first_revision.as_str())
+    );
+    assert_eq!(partial[0]["import_scan_status"], "partially_resolved");
+    assert_eq!(partial[0]["import_specifier_count"], 1);
+    assert_eq!(partial[0]["unresolved_import_count"], 1);
+
+    let sql = rt.sql();
+    let mut reader = sql.reader().await.expect("reader");
+    let ownership_rows = reader
+        .query_all(SqlStatement {
+            sql: "SELECT json_extract(parent.properties,'$.source_project') AS parent_project, \
+                         json_extract(child.properties,'$.source_project') AS child_project \
+                  FROM graph_edges edge \
+                  JOIN entities parent ON parent.id=edge.source_id \
+                  JOIN entities child ON child.id=edge.target_id \
+                  WHERE edge.relation='contains' AND edge.deleted_at IS NULL"
+                .into(),
+            params: vec![],
+            label: Some("test_contains_ownership".into()),
+        })
+        .await
+        .expect("query contains ownership");
+    assert!(!ownership_rows.is_empty());
+    for row in ownership_rows {
+        let parent_project = match row.get("parent_project") {
+            Some(SqlValue::Text(project)) => project,
+            value => panic!("expected text parent source_project, got {value:?}"),
+        };
+        let child_project = match row.get("child_project") {
+            Some(SqlValue::Text(project)) => project,
+            value => panic!("expected text child source_project, got {value:?}"),
+        };
+        assert_eq!(parent_project, "coverage_fixture");
+        assert_eq!(child_project, "coverage_fixture");
+    }
+    drop(reader);
+
+    std::fs::write(root.path().join("src/missing.rs"), "pub struct Thing;\n").unwrap();
+    git(root.path(), &["add", "src/missing.rs"]);
+    git(
+        root.path(),
+        &[
+            "-c",
+            "user.name=khive-test",
+            "-c",
+            "user.email=khive-test@example.invalid",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-qm",
+            "add missing module",
+        ],
+    );
+    let second_revision = git(root.path(), &["rev-parse", "HEAD"]);
+    assert_ne!(first_revision, second_revision);
+
+    run_code_ingest(
+        &rt,
+        &token,
+        CodeSourceIngestOptions {
+            path: root.path(),
+            languages: all_languages(),
+            sweep_time: Utc::now(),
+        },
+    )
+    .await
+    .expect("coverage fixture re-ingests");
+    let resolved = module_properties_for_path(&rt, "coverage_fixture", "src/partial.rs").await;
+    assert_eq!(resolved.len(), 1);
+    assert_eq!(
+        resolved[0]["source_revision"].as_str(),
+        Some(second_revision.as_str())
+    );
+    assert_eq!(resolved[0]["import_scan_status"], "scanned");
+    assert_eq!(resolved[0]["unresolved_import_count"], 0);
+}
+
 /// Issue #1590: `code.ingest` writes an ordinary khive map database, so a
 /// successful ingest must populate the FTS documents that the generic KG
 /// `search` verb reads. Entity rows without these documents made exact-name
@@ -311,7 +663,7 @@ async fn ingested_map_entities_are_visible_to_generic_search() {
 
 /// `src/lib.rs` importing `crate::foo::Thing`, an item declared in
 /// `src/foo.rs`, must resolve to a `crate -> foo` `depends_on` edge with
-/// `dependency_kinds=["import"]` — not stay unresolved because the raw
+/// build-scope `dependency_kinds=["import"]` — not stay unresolved because the raw
 /// import target (`foo::Thing`) names an item inside `foo`, not a nested
 /// module `foo::Thing` (see #1039).
 fn write_item_import_fixture(root: &Path) {
@@ -361,11 +713,14 @@ async fn rust_item_import_resolves_to_containing_module_after_reingest() {
 
     let edges = edge_fingerprints(&rt).await;
     assert!(
-        edges.iter().any(|(rel, src, tgt, kinds)| rel == "depends_on"
-            && src == "crate"
-            && tgt == "foo"
-            && kinds == "import"),
-        "expected one crate -> foo depends_on edge with dependency_kinds=[\"import\"], got: {edges:?}"
+        edges
+            .iter()
+            .any(|(rel, src, tgt, kinds, scopes)| rel == "depends_on"
+                && src == "crate"
+                && tgt == "foo"
+                && kinds == "import"
+                && scopes == "build"),
+        "expected one crate -> foo build-scope import edge, got: {edges:?}"
     );
 }
 
@@ -421,14 +776,14 @@ async fn python_init_reexport_resolves_in_package_without_self_loop() {
         ("pkg.x.z", "pkg.x.y"),
     ] {
         assert!(
-            edges.iter().any(|(rel, s, t, kinds)| rel == "depends_on"
+            edges.iter().any(|(rel, s, t, kinds, _)| rel == "depends_on"
                 && s == src
                 && t == tgt
                 && kinds == "import"),
             "expected {src} -> {tgt} depends_on import edge, got: {edges:?}"
         );
     }
-    let self_loops: Vec<_> = edges.iter().filter(|(_, s, t, _)| s == t).collect();
+    let self_loops: Vec<_> = edges.iter().filter(|(_, s, t, _, _)| s == t).collect();
     assert!(
         self_loops.is_empty(),
         "same-name submodule re-export must not produce self-loop edges, got: {self_loops:?}"
@@ -478,14 +833,14 @@ async fn python_dotless_from_import_emits_submodule_edges() {
     let edges = edge_fingerprints(&rt).await;
     for (src, tgt) in [("pkg.x", "pkg.x.z"), ("pkg.x.w", "pkg.x.z")] {
         assert!(
-            edges.iter().any(|(rel, s, t, kinds)| rel == "depends_on"
+            edges.iter().any(|(rel, s, t, kinds, _)| rel == "depends_on"
                 && s == src
                 && t == tgt
                 && kinds == "import"),
             "expected {src} -> {tgt} depends_on import edge, got: {edges:?}"
         );
     }
-    let self_loops: Vec<_> = edges.iter().filter(|(_, s, t, _)| s == t).collect();
+    let self_loops: Vec<_> = edges.iter().filter(|(_, s, t, _, _)| s == t).collect();
     assert!(
         self_loops.is_empty(),
         "dotless relative import must not produce self-loop edges, got: {self_loops:?}"
@@ -547,15 +902,18 @@ async fn manifestless_rust_folder_uses_basename_fallback() {
     assert!(
         edges
             .iter()
-            .any(|(rel, src, _tgt, _kinds)| rel == "contains" && src == "bare_rust_project"),
+            .any(|(rel, src, _tgt, _kinds, _scopes)| rel == "contains" && src == "bare_rust_project"),
         "expected the basename-fallback project 'bare_rust_project' to contain its module, got: {edges:?}"
     );
     assert!(
-        edges.iter().any(|(rel, src, tgt, kinds)| rel == "depends_on"
-            && src == "crate"
-            && tgt == "util"
-            && kinds == "import"),
-        "expected one crate -> util depends_on edge with dependency_kinds=[\"import\"], got: {edges:?}"
+        edges
+            .iter()
+            .any(|(rel, src, tgt, kinds, scopes)| rel == "depends_on"
+                && src == "crate"
+                && tgt == "util"
+                && kinds == "import"
+                && scopes == "build"),
+        "expected one crate -> util build-scope import edge, got: {edges:?}"
     );
 }
 
@@ -787,4 +1145,426 @@ async fn rejects_nonexistent_path() {
         err,
         khive_pack_code::CodeSourceIngestError::InvalidPath(_)
     ));
+}
+
+#[tokio::test]
+async fn gitless_fixture_reports_unversioned_source_revision() {
+    let root = TempDir::new().expect("tempdir");
+    std::fs::create_dir_all(root.path().join("src")).unwrap();
+    std::fs::write(
+        root.path().join("Cargo.toml"),
+        "[package]\nname = \"unversioned_fixture\"\n",
+    )
+    .unwrap();
+    std::fs::write(root.path().join("src/lib.rs"), "pub fn f() {}\n").unwrap();
+
+    // `git rev-parse` climbs parent directories, so the tempdir could sit
+    // inside an enclosing checkout: mask it and refuse to leak a parent
+    // repo into the fixture (a parent `GIT_*` env would defeat the mask,
+    // so assert those out too).
+    let elsewhere = TempDir::new().expect("gitdir tempdir");
+    let mask = elsewhere.path().join("mask.git");
+    git(
+        root.path(),
+        &[
+            "init",
+            "-q",
+            "--separate-git-dir",
+            mask.to_str().expect("utf-8 gitdir"),
+        ],
+    );
+    std::fs::remove_dir_all(&mask).expect("remove mask gitdir");
+    for var in ["GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR"] {
+        assert!(std::env::var_os(var).is_none(), "{var} must not be set");
+    }
+
+    let rt = rt_at(&root.path().join("unversioned.db"));
+    let token = rt.authorize(Namespace::local()).expect("token");
+    let report = run_code_ingest(
+        &rt,
+        &token,
+        CodeSourceIngestOptions {
+            path: root.path(),
+            languages: all_languages(),
+            sweep_time: Utc::now(),
+        },
+    )
+    .await
+    .expect("gitless fixture ingests");
+
+    assert_eq!(report.source_revision, "unversioned");
+    assert!(report
+        .warnings
+        .iter()
+        .any(|warning| warning.contains("git metadata unavailable")));
+    let module = module_properties_for_path(&rt, "unversioned_fixture", "src/lib.rs").await;
+    assert_eq!(module.len(), 1);
+    assert_eq!(module[0]["source_revision"].as_str(), Some("unversioned"));
+}
+
+fn write_normalization_collision_fixture(root: &Path) {
+    let pkg_a = root.join("pkg_a");
+    let z_dash = root.join("z_dash");
+    let z_underscore = root.join("z_underscore");
+    for package in [&pkg_a, &z_dash, &z_underscore] {
+        std::fs::create_dir_all(package.join("src")).unwrap();
+    }
+    std::fs::write(
+        pkg_a.join("Cargo.toml"),
+        "[package]\nname = \"pkg-a\"\n\n[dependencies]\nz-dep = { path = \"../z_dash\" }\nz_alias = { package = \"z_dep\", path = \"../z_underscore\" }\n",
+    )
+    .unwrap();
+    std::fs::write(pkg_a.join("src/lib.rs"), "use z_dep::helper;\n").unwrap();
+    std::fs::write(z_dash.join("Cargo.toml"), "[package]\nname = \"z-dep\"\n").unwrap();
+    std::fs::write(z_dash.join("src/lib.rs"), "pub fn helper() {}\n").unwrap();
+    std::fs::write(
+        z_underscore.join("Cargo.toml"),
+        "[package]\nname = \"z_dep\"\n",
+    )
+    .unwrap();
+    std::fs::write(z_underscore.join("src/lib.rs"), "pub fn helper() {}\n").unwrap();
+}
+
+#[tokio::test]
+async fn rust_normalization_collision_warns_and_picks_lexicographically_first() {
+    let root = TempDir::new().expect("tempdir");
+    write_normalization_collision_fixture(root.path());
+    let rt = rt_at(&root.path().join("normalization_collision.db"));
+    let token = rt.authorize(Namespace::local()).expect("token");
+
+    let report = run_code_ingest(
+        &rt,
+        &token,
+        CodeSourceIngestOptions {
+            path: root.path(),
+            languages: all_languages(),
+            sweep_time: Utc::now(),
+        },
+    )
+    .await
+    .expect("normalization-collision fixture ingests");
+
+    assert!(report.warnings.iter().any(|warning| {
+        warning.contains("normalization collision")
+            && warning.contains("z-dep")
+            && warning.contains("z_dep")
+            && warning.contains("lexicographically first declared target \"z-dep\" wins")
+    }));
+    let edges = edge_fingerprints(&rt).await;
+    assert!(
+        edges.iter().any(|(relation, source, target, kinds, _)| {
+            relation == "depends_on"
+                && source == "pkg-a"
+                && target == "z-dep"
+                && kinds == "dependencies,import"
+        }),
+        "the deterministic collision pick must put the import evidence on z-dep: {edges:?}"
+    );
+    assert!(
+        edges.iter().any(|(relation, source, target, kinds, _)| {
+            relation == "depends_on"
+                && source == "pkg-a"
+                && target == "z_dep"
+                && kinds == "dependencies"
+        }),
+        "the renamed package declaration must remain distinct from the collision pick: {edges:?}"
+    );
+}
+
+#[tokio::test]
+async fn root_python_init_is_counted_as_skipped_without_module_path() {
+    let root = TempDir::new().expect("tempdir");
+    std::fs::write(
+        root.path().join("pyproject.toml"),
+        "[project]\nname = \"pyproj\"\n",
+    )
+    .unwrap();
+    std::fs::write(root.path().join("__init__.py"), "").unwrap();
+    let rt = rt_at(&root.path().join("module_path_skip.db"));
+    let token = rt.authorize(Namespace::local()).expect("token");
+
+    let report = run_code_ingest(
+        &rt,
+        &token,
+        CodeSourceIngestOptions {
+            path: root.path(),
+            languages: all_languages(),
+            sweep_time: Utc::now(),
+        },
+    )
+    .await
+    .expect("root __init__ fixture ingests");
+
+    assert_eq!(report.files_skipped_without_module_path, 1);
+}
+
+#[tokio::test]
+async fn alias_form_import_resolves_to_package_project_entity() {
+    // `mock = { package = "mock-dep" }` — Rust imports the renamed
+    // dependency under the ALIAS (`use mock::…`); the real crate name never
+    // appears in source. The import edge must target the `mock-dep` project
+    // entity (the identity the dependency's own manifest ingest creates),
+    // never a phantom `mock` project.
+    let root = TempDir::new().expect("tempdir");
+    for package in ["pkg_a", "mock_dep"] {
+        std::fs::create_dir_all(root.path().join(package).join("src")).unwrap();
+    }
+    std::fs::write(
+        root.path().join("pkg_a/src/lib.rs"),
+        "use mock::stub;\n\npub fn pkg_a() { stub(); }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.path().join("mock_dep/src/lib.rs"),
+        "pub fn stub() {}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.path().join("pkg_a/Cargo.toml"),
+        "[package]\nname = \"pkg-a\"\n\n[dev-dependencies]\nmock = { package = \"mock-dep\", path = \"../mock_dep\" }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.path().join("mock_dep/Cargo.toml"),
+        "[package]\nname = \"mock-dep\"\n",
+    )
+    .unwrap();
+
+    let rt = rt_at(&root.path().join("alias.db"));
+    let token = rt.authorize(Namespace::local()).expect("token");
+    let report = run_code_ingest(
+        &rt,
+        &token,
+        CodeSourceIngestOptions {
+            path: root.path(),
+            languages: all_languages(),
+            sweep_time: Utc::now(),
+        },
+    )
+    .await
+    .expect("alias fixture ingests");
+
+    // Alias-targeted edges must not exist: no `mock` project entity.
+    let names = entity_names(&rt).await;
+    assert!(
+        !names.contains(&"mock".to_string()),
+        "the alias must never become a project entity: {names:?}"
+    );
+
+    // The import edge lands on the package identity with the declared scope.
+    let edges = edge_fingerprints(&rt).await;
+    assert!(
+        edges
+            .iter()
+            .any(|(relation, source, target, kinds, scopes)| {
+                relation == "depends_on"
+                    && source == "pkg-a"
+                    && target == "mock-dep"
+                    && kinds.contains("import")
+                    && kinds.contains("dev-dependencies")
+                    && scopes == "dev"
+            }),
+        "alias-form import must fold onto the pkg-a -> mock-dep edge with the declared dev scope: {edges:?}"
+    );
+
+    // The import resolved (module fully scanned) and no unresolved spec
+    // survived on the project entity.
+    let pkg_a_module = module_properties_for_path(&rt, "pkg-a", "pkg_a/src/lib.rs").await;
+    assert_eq!(pkg_a_module.len(), 1);
+    assert_eq!(pkg_a_module[0]["import_scan_status"], "scanned");
+    assert_eq!(pkg_a_module[0]["unresolved_import_count"], 0);
+    let sql = rt.sql();
+    let mut reader = sql.reader().await.expect("reader");
+    let row = reader
+        .query_row(SqlStatement {
+            sql: "SELECT json_extract(properties,'$.unresolved_specifiers') AS u FROM entities \
+                  WHERE deleted_at IS NULL AND kind='project' AND name='pkg-a'"
+                .into(),
+            params: vec![],
+            label: Some("test_alias_unresolved".into()),
+        })
+        .await
+        .expect("query");
+    let leftover = match row.and_then(|r| r.get("u").cloned()) {
+        None | Some(SqlValue::Null) => None,
+        Some(SqlValue::Text(s)) => Some(s),
+        other => panic!("unexpected unresolved column value: {other:?}"),
+    };
+    assert!(
+        leftover.is_none(),
+        "every alias/package spec must resolve this pass, none may linger: {leftover:?}"
+    );
+    assert_eq!(report.coverage_stamps_missed, 0);
+}
+
+#[tokio::test]
+async fn binary_root_crate_import_lands_on_sibling_module() {
+    // `use crate::helper::run` FROM `src/main.rs` must resolve to the
+    // sibling `helper` module — not a phantom `crate::main::helper` and not
+    // the lib root (`crate`).
+    let root = TempDir::new().expect("tempdir");
+    std::fs::create_dir_all(root.path().join("src")).unwrap();
+    std::fs::write(
+        root.path().join("Cargo.toml"),
+        "[package]\nname = \"bin_fixture\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.path().join("src/main.rs"),
+        "mod helper;\n\nuse crate::helper::run;\n\nfn main() {\n    run();\n}\n",
+    )
+    .unwrap();
+    std::fs::write(root.path().join("src/helper.rs"), "pub fn run() {}\n").unwrap();
+
+    let rt = rt_at(&root.path().join("binroot.db"));
+    let token = rt.authorize(Namespace::local()).expect("token");
+    run_code_ingest(
+        &rt,
+        &token,
+        CodeSourceIngestOptions {
+            path: root.path(),
+            languages: all_languages(),
+            sweep_time: Utc::now(),
+        },
+    )
+    .await
+    .expect("binary-root fixture ingests");
+
+    // No phantom module identities.
+    let names = entity_names(&rt).await;
+    for phantom in ["crate::main::helper", "crate::helper"] {
+        assert!(
+            !names.contains(&phantom.to_string()),
+            "phantom module identity {phantom} must not exist: {names:?}"
+        );
+    }
+
+    // The import edge is module crate::main -> module helper, import-scoped.
+    let edges = edge_fingerprints(&rt).await;
+    assert!(
+        edges
+            .iter()
+            .any(|(relation, source, target, kinds, scopes)| {
+                relation == "depends_on"
+                    && source == "crate::main"
+                    && target == "helper"
+                    && kinds == "import"
+                    && scopes == "build"
+            }),
+        "crate:: import from the binary root must land on the helper module: {edges:?}"
+    );
+    assert!(
+        !edges
+            .iter()
+            .any(|(relation, _source, target, _kinds, _scopes)| {
+                relation == "depends_on" && target == "crate"
+            }),
+        "the binary-root import must not land on the lib root: {edges:?}"
+    );
+
+    let main = module_properties_for_path(&rt, "bin_fixture", "src/main.rs").await;
+    assert_eq!(main.len(), 1);
+    assert_eq!(main[0]["module_path"], "crate::main");
+    assert_eq!(main[0]["import_scan_status"], "scanned");
+    assert_eq!(main[0]["unresolved_import_count"], 0);
+}
+
+#[tokio::test]
+async fn import_only_scope_is_order_independent() {
+    // Two modules importing the same UNDECLARED project fold two identical
+    // import specs onto ONE edge. With no manifest-declared kinds, the
+    // edge's scope derives solely from the import scope — which is a
+    // deterministic function of the (source, target) pair against the
+    // sweep's fixed manifest index (here the constant `build` fallback),
+    // never of spec arrival order (see `scopes_for_dependency_kinds`'s
+    // invariant comment). Re-ingesting must leave the metadata unchanged.
+    let root = TempDir::new().expect("tempdir");
+    for package in ["two_importers", "external_dep"] {
+        std::fs::create_dir_all(root.path().join(package).join("src")).unwrap();
+    }
+    std::fs::write(
+        root.path().join("two_importers/Cargo.toml"),
+        "[package]\nname = \"two-importers\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.path().join("two_importers/src/lib.rs"),
+        "pub mod alpha;\npub mod beta;\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.path().join("two_importers/src/alpha.rs"),
+        "use external_dep::thing_a;\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.path().join("two_importers/src/beta.rs"),
+        "use external_dep::thing_b;\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.path().join("external_dep/Cargo.toml"),
+        "[package]\nname = \"external_dep\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.path().join("external_dep/src/lib.rs"),
+        "pub fn thing_a() {}\npub fn thing_b() {}\n",
+    )
+    .unwrap();
+
+    let rt = rt_at(&root.path().join("scope_order.db"));
+    let token = rt.authorize(Namespace::local()).expect("token");
+    run_code_ingest(
+        &rt,
+        &token,
+        CodeSourceIngestOptions {
+            path: root.path(),
+            languages: all_languages(),
+            sweep_time: Utc::now(),
+        },
+    )
+    .await
+    .expect("first pass ingests");
+
+    let edges = edge_fingerprints(&rt).await;
+    let matching: Vec<_> = edges
+        .iter()
+        .filter(|(relation, source, target, _, _)| {
+            relation == "depends_on" && source == "two-importers" && target == "external_dep"
+        })
+        .collect();
+    assert_eq!(
+        matching.len(),
+        1,
+        "both import specs must fold onto one edge: {edges:?}"
+    );
+    let (_, _, _, kinds, scopes) = matching[0];
+    assert_eq!(
+        kinds, "import",
+        "undeclared import carries only import evidence"
+    );
+    assert_eq!(
+        scopes, "build",
+        "import-only scope must be the build default"
+    );
+
+    // Second pass over the same tree: metadata must be unchanged — no
+    // last-writer-wins drift.
+    run_code_ingest(
+        &rt,
+        &token,
+        CodeSourceIngestOptions {
+            path: root.path(),
+            languages: all_languages(),
+            sweep_time: Utc::now(),
+        },
+    )
+    .await
+    .expect("second pass ingests");
+    assert_eq!(
+        edge_fingerprints(&rt).await,
+        edges,
+        "re-ingest must not change the import-only scope"
+    );
 }

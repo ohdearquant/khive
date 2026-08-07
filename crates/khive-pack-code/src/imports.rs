@@ -362,10 +362,13 @@ pub(crate) fn module_path_for_file(
     match language {
         "rust" => {
             let stem = components.last()?.strip_suffix(".rs")?.to_string();
-            let is_root = components.len() == 1 && (stem == "lib" || stem == "main");
+            let is_root = components.len() == 1;
             *components.last_mut()? = stem.clone();
-            if is_root {
+            if is_root && stem == "lib" {
                 return Some("crate".to_string());
+            }
+            if is_root && stem == "main" {
+                return Some("crate::main".to_string());
             }
             if stem == "mod" {
                 components.pop();
@@ -565,6 +568,16 @@ mod tests {
         assert_eq!(
             module_path_for_file(file, root, "rust"),
             Some("foo::bar".to_string())
+        );
+    }
+
+    #[test]
+    fn module_path_for_rust_main_root_does_not_alias_lib_root() {
+        let root = Path::new("/proj");
+        let file = Path::new("/proj/src/main.rs");
+        assert_eq!(
+            module_path_for_file(file, root, "rust"),
+            Some("crate::main".to_string())
         );
     }
 

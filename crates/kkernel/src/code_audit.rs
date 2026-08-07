@@ -2,8 +2,9 @@
 //! dedicated code-map database (docs/adr/ADR-114-code-audit-derived-report.md).
 //!
 //! Phase 1 scope: structural signals computed with deterministic SQL over the
-//! `code.ingest` L1/L1.5 facts already present in the map (no file/history
-//! facts exist yet). This command opens the map database read-only, never
+//! `code.ingest` L1/L1.5 facts already present in the map (modules now carry
+//! path/current-revision provenance, but no per-file history timeline). This
+//! command opens the map database read-only, never
 //! writes to any graph, never creates `finding` notes, and never calls
 //! `memory.remember`. Interpreting a signal as a defect is a separate,
 //! human-approved step outside this pipeline.
@@ -46,8 +47,8 @@ pub struct CodeAuditArgs {
     #[arg(long = "history-window-days", default_value_t = 180)]
     pub history_window_days: u32,
 
-    /// Also evaluate `dev-dependencies`-only project edges in the layering
-    /// signal (production edges are always evaluated). Dependency-cycle
+    /// Also evaluate dev-scope-only project edges in the layering signal
+    /// (normal/build edges are always evaluated). Dependency-cycle
     /// detection always reports production, dev, and module-import graphs
     /// separately regardless of this flag. Policy completeness reporting
     /// (POLICY_INCOMPLETE) is unaffected by this flag — it evaluates the
@@ -242,6 +243,11 @@ WHERE e.relation = 'depends_on' AND e.deleted_at IS NULL
 ORDER BY e.source_id, e.target_id, e.id;
 ";
 
+// `import` is the only evidence kind the import scanner emits; every other
+// `dependency_kinds` value is a manifest declaration section name (Cargo
+// sections, npm `devDependencies`/`peerDependencies`/`optionalDependencies`,
+// Python `optional-dependencies:<group>` — the group suffix is open-ended,
+// so declarations cannot be enumerated in a fixed allowlist).
 const SQL_MANIFEST_IMPORT_MISMATCH: &str = "
 SELECT e.id AS id, s.name AS source_name, t.name AS target_name
 FROM graph_edges e
@@ -252,8 +258,7 @@ WHERE e.relation = 'depends_on' AND e.deleted_at IS NULL
     SELECT 1 FROM json_each(e.metadata, '$.dependency_kinds') WHERE value = 'import'
   )
   AND NOT EXISTS (
-    SELECT 1 FROM json_each(e.metadata, '$.dependency_kinds')
-    WHERE value IN ('dependencies', 'build-dependencies', 'dev-dependencies')
+    SELECT 1 FROM json_each(e.metadata, '$.dependency_kinds') WHERE value <> 'import'
   )
 ORDER BY e.source_id, e.target_id, e.id;
 ";
@@ -761,10 +766,10 @@ async fn ingest_coverage_signals(
             }),
             evidence_ids,
             limitations: vec![
-                "total observed import count is not reconstructable in the phase-1 map \
-                 schema: resolved specifiers are folded into depends_on edge metadata rather \
-                 than counted individually, so only unresolved-specifier and module counts \
-                 are available"
+                "this schema_version=1 coverage ratio remains the legacy module-count / \
+                 unresolved-reference proxy; ADR-085 Amendment 5's per-module \
+                 import_specifier_count and unresolved_import_count remain available on the \
+                 source module entities for consumers that need exact scan coverage"
                     .to_string(),
             ],
         });
@@ -849,18 +854,8 @@ async fn layering_signals(
         let source_name = text_col(row, "source_name").unwrap_or_default();
         let target_name = text_col(row, "target_name").unwrap_or_default();
         let metadata = json_col(row, "metadata").unwrap_or(Value::Null);
-        let kinds: BTreeSet<String> = metadata
-            .get("dependency_kinds")
-            .and_then(|v| v.as_array())
-            .map(|a| {
-                a.iter()
-                    .filter_map(|v| v.as_str().map(str::to_string))
-                    .collect()
-            })
-            .unwrap_or_default();
-        let is_dev_only = kinds.contains("dev-dependencies")
-            && !kinds.contains("dependencies")
-            && !kinds.contains("build-dependencies");
+        let scopes = dependency_scopes(&metadata);
+        let is_dev_only = scopes.len() == 1 && scopes.contains("dev");
         // include_dev_dependencies gates VIOLATION EVALUATION only; policy
         // completeness (above) is independent of it.
         if is_dev_only && !include_dev {
@@ -958,6 +953,47 @@ struct DepEdge {
     id: String,
 }
 
+fn dependency_scopes(metadata: &Value) -> BTreeSet<String> {
+    let scopes: BTreeSet<String> = metadata
+        .get("dependency_scopes")
+        .and_then(Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(Value::as_str)
+                .filter(|scope| matches!(*scope, "normal" | "dev" | "build"))
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    if !scopes.is_empty() {
+        return scopes;
+    }
+
+    let kinds: Vec<&str> = metadata
+        .get("dependency_kinds")
+        .and_then(Value::as_array)
+        .map(|values| values.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    let declared: BTreeSet<String> = kinds
+        .iter()
+        .filter(|kind| **kind != "import")
+        .map(|kind| match *kind {
+            "dev-dependencies" | "devDependencies" => "dev",
+            "build-dependencies" => "build",
+            _ => "normal",
+        })
+        .map(str::to_string)
+        .collect();
+    if !declared.is_empty() {
+        declared
+    } else if kinds.contains(&"import") {
+        ["build".to_string()].into_iter().collect()
+    } else {
+        BTreeSet::new()
+    }
+}
+
 async fn dependency_cycle_signals(
     reader: &mut dyn SqlReader,
     signals: &mut Vec<Signal>,
@@ -983,23 +1019,13 @@ async fn dependency_cycle_signals(
         node_names.insert(source_id.clone(), source_name);
         node_names.insert(target_id.clone(), target_name);
         let metadata = json_col(row, "metadata").unwrap_or(Value::Null);
-        let kinds: BTreeSet<String> = metadata
-            .get("dependency_kinds")
-            .and_then(|v| v.as_array())
-            .map(|a| {
-                a.iter()
-                    .filter_map(|v| v.as_str().map(str::to_string))
-                    .collect()
-            })
-            .unwrap_or_default();
+        let scopes = dependency_scopes(&metadata);
         let edge = DepEdge {
             id: edge_id,
             source_id,
             target_id,
         };
-        let is_dev_only = kinds.contains("dev-dependencies")
-            && !kinds.contains("dependencies")
-            && !kinds.contains("build-dependencies");
+        let is_dev_only = scopes.len() == 1 && scopes.contains("dev");
         if is_dev_only {
             dev_edges.push(edge);
         } else {
@@ -1290,9 +1316,9 @@ fn unavailable_history_signals(signals: &mut Vec<Signal>) {
         ),
         (
             "dead_file",
-            "requires durable file identity (FileIdentity/PathBinding) to distinguish a \
-             file from a module-path projection; not available until an ADR-085/088 \
-             history-join amendment lands",
+            "requires durable file identity and path bindings across revisions; the current \
+             module source_path/source_revision observation does not encode file lifecycle \
+             history",
         ),
         (
             "orphan_test_file",
@@ -1358,6 +1384,31 @@ mod tests {
     use std::path::Path;
 
     use khive_storage::{SqlWriter, StorageResult};
+
+    #[test]
+    fn normalized_dependency_scopes_are_canonical_with_legacy_fallback() {
+        assert_eq!(
+            dependency_scopes(&json!({
+                "dependency_kinds": ["dependencies"],
+                "dependency_scopes": ["dev"]
+            })),
+            ["dev".to_string()].into_iter().collect()
+        );
+        assert_eq!(
+            dependency_scopes(&json!({
+                "dependency_kinds": ["dependencies", "build-dependencies"]
+            })),
+            ["build".to_string(), "normal".to_string()]
+                .into_iter()
+                .collect()
+        );
+        assert_eq!(
+            dependency_scopes(&json!({
+                "dependency_kinds": ["dev-dependencies", "import"]
+            })),
+            ["dev".to_string()].into_iter().collect()
+        );
+    }
 
     async fn seed(
         writer: &mut dyn SqlWriter,
@@ -1479,7 +1530,10 @@ mod tests {
             "44444444-4444-4444-4444-444444444444",
             "11111111-1111-1111-1111-111111111111",
             "22222222-2222-2222-2222-222222222222",
-            json!({"dependency_kinds": ["dependencies"]}),
+            json!({
+                "dependency_kinds": ["dependencies"],
+                "dependency_scopes": ["normal"]
+            }),
         )
         .await
         .unwrap();
@@ -1489,7 +1543,10 @@ mod tests {
             "55555555-5555-5555-5555-555555555555",
             "22222222-2222-2222-2222-222222222222",
             "33333333-3333-3333-3333-333333333333",
-            json!({"dependency_kinds": ["dev-dependencies"]}),
+            json!({
+                "dependency_kinds": ["dev-dependencies"],
+                "dependency_scopes": ["dev"]
+            }),
         )
         .await
         .unwrap();
@@ -1502,7 +1559,10 @@ mod tests {
             "66666666-6666-6666-6666-666666666666",
             "22222222-2222-2222-2222-222222222222",
             "11111111-1111-1111-1111-111111111111",
-            json!({"dependency_kinds": ["dependencies"]}),
+            json!({
+                "dependency_kinds": ["dependencies"],
+                "dependency_scopes": ["normal"]
+            }),
         )
         .await
         .unwrap();
@@ -1591,7 +1651,10 @@ mod tests {
                 id,
                 source,
                 target,
-                json!({"dependency_kinds": ["import"]}),
+                json!({
+                    "dependency_kinds": ["import"],
+                    "dependency_scopes": ["build"]
+                }),
             )
             .await
             .unwrap();
@@ -1892,6 +1955,119 @@ crate-b = 1
             json_a, json_c,
             "two runs over the same fixture must produce byte-identical JSON"
         );
+    }
+
+    #[tokio::test]
+    async fn manifest_import_mismatch_treats_every_declaration_kind_as_declared() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db = tmp.path().join("map.db");
+        let backend = StorageBackend::sqlite(&db).expect("open fixture backend");
+        {
+            let mut writer = backend.pool().writer().expect("writer guard");
+            khive_db::run_migrations(writer.conn_mut()).expect("run core migrations");
+        }
+        let sql = backend.sql();
+        let mut writer = sql.writer().await.expect("sql writer");
+
+        let projects = [
+            ("11111111-1111-1111-1111-11111111aaaa", "app"),
+            ("22222222-2222-2222-2222-22222222aaaa", "npm-dev-dep"),
+            ("33333333-3333-3333-3333-33333333aaaa", "npm-optional-dep"),
+            ("44444444-4444-4444-4444-44444444aaaa", "py-extra-dep"),
+            ("55555555-5555-5555-5555-55555555aaaa", "cargo-dev-dep"),
+            ("66666666-6666-6666-6666-66666666aaaa", "undeclared-dep"),
+        ];
+        for (id, name) in projects {
+            seed(
+                writer.as_mut(),
+                id,
+                "project",
+                None,
+                name,
+                json!({"source_project": name, "last_seen_at": "2026-07-16T00:00:00Z"}),
+            )
+            .await
+            .unwrap();
+        }
+
+        // Each ecosystem's declaration vocabulary alongside import evidence:
+        // none of these may be flagged. The last edge is the must-match
+        // control — import evidence with no declaration at all.
+        let edges = [
+            (
+                "aaaaaaaa-1111-1111-1111-aaaaaaaaaaaa",
+                "22222222-2222-2222-2222-22222222aaaa",
+                json!({"dependency_kinds": ["devDependencies", "import"]}),
+            ),
+            (
+                "aaaaaaaa-2222-2222-2222-aaaaaaaaaaaa",
+                "33333333-3333-3333-3333-33333333aaaa",
+                json!({"dependency_kinds": ["optionalDependencies", "import"]}),
+            ),
+            (
+                "aaaaaaaa-3333-3333-3333-aaaaaaaaaaaa",
+                "44444444-4444-4444-4444-44444444aaaa",
+                json!({"dependency_kinds": ["optional-dependencies:test", "import"]}),
+            ),
+            (
+                "aaaaaaaa-4444-4444-4444-aaaaaaaaaaaa",
+                "55555555-5555-5555-5555-55555555aaaa",
+                json!({"dependency_kinds": ["dev-dependencies", "import"]}),
+            ),
+            (
+                "aaaaaaaa-5555-5555-5555-aaaaaaaaaaaa",
+                "66666666-6666-6666-6666-66666666aaaa",
+                json!({"dependency_kinds": ["import"]}),
+            ),
+        ];
+        for (id, target, metadata) in edges {
+            seed_edge(
+                writer.as_mut(),
+                id,
+                "11111111-1111-1111-1111-11111111aaaa",
+                target,
+                metadata,
+            )
+            .await
+            .unwrap();
+        }
+        drop(writer);
+
+        let policy = write_policy(
+            tmp.path(),
+            "policy.toml",
+            r#"
+policy_version = 1
+coverage_floor = 0.0
+denied_pairs = []
+
+[crate_ranks]
+app = 0
+npm-dev-dep = 1
+npm-optional-dep = 1
+py-extra-dep = 1
+cargo-dev-dep = 1
+undeclared-dep = 1
+"#,
+        );
+        let report = generate_report(&base_request(db, policy)).await.unwrap();
+
+        let flagged: Vec<&Signal> = report
+            .signals
+            .iter()
+            .filter(|s| s.id == "manifest_import_mismatch")
+            .collect();
+        assert_eq!(
+            flagged.len(),
+            1,
+            "only the declaration-free edge may be flagged: {flagged:?}"
+        );
+        assert_eq!(
+            flagged[0].evidence_ids,
+            vec!["aaaaaaaa-5555-5555-5555-aaaaaaaaaaaa".to_string()],
+            "the flagged evidence must be the import-only edge"
+        );
+        assert_eq!(flagged[0].subject_id, "app->undeclared-dep");
     }
 
     #[tokio::test]
