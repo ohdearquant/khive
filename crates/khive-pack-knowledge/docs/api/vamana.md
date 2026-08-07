@@ -64,7 +64,7 @@ full scan may transition it to a normal watermark. Failed or Empty scans keep th
 re-created row cannot be mistaken for uninterrupted registry history.
 `KHIVE_ANN_FRESH_TAIL=0` disables the exact leg but does not bypass this registry guard.
 
-Migration V17 also distinguishes a never-activated registration (`-2` plus a timestamp) from a
+Migration V18 also distinguishes a never-activated registration (`-2` plus a timestamp) from a
 real active checkpoint at `S = 0`. Knowledge treats `-2` exactly like registry loss and promotes it
 to the non-expiring `-1` recovery fence before its authoritative scan. Compaction may retire only
 `-2` after a 24-hour grace, warns with the exact consumer scope, and performs retirement plus log

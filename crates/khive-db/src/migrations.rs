@@ -154,7 +154,7 @@ pub const ANN_WRITE_LOG_MODEL_SEQ_INDEX_DDL: &str = V12_UP;
 
 /// Idempotent DDL for pending ANN-consumer lifecycle metadata (#1479).
 ///
-/// The V17 migration additionally translates legacy zero-watermark rows once.
+/// The V18 migration additionally translates legacy zero-watermark rows once.
 /// This constant deliberately contains only idempotent DDL: vector-store open
 /// paths may execute it repeatedly and must never demote a valid active
 /// checkpoint at sequence zero back to pending.

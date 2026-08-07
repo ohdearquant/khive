@@ -20,7 +20,7 @@ CREATE INDEX IF NOT EXISTS idx_ann_write_log_ns_model_seq
 -- Durable per-consumer watermark registry gating log compaction. A consumer
 -- registers its row at the closed pending watermark -2 before its first scan,
 -- persist, or serve, then raises it to an active S >= 0 after the first segment
--- commit. Migration V17 adds the pending timestamp/lifecycle metadata. The
+-- commit. Migration V18 adds the pending timestamp/lifecycle metadata. The
 -- knowledge consumer additionally uses -1 as a closed force-rebuild sentinel:
 -- every absent row writes -1 before an authoritative scan (local first-use
 -- evidence cannot rule out a stale peer), and only that consumer's fenced full
