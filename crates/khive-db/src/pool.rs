@@ -1,6 +1,7 @@
 //! Connection pool for SQLite: one exclusive writer, N concurrent readers.
 use crossbeam_queue::ArrayQueue;
 use parking_lot::Mutex;
+use rusqlite::hooks::{AuthContext, Authorization};
 use rusqlite::{Connection, OpenFlags};
 use std::fs;
 use std::ops::{Deref, DerefMut};
@@ -23,6 +24,10 @@ const DEFAULT_READER_CAP: usize = 8;
 const DEFAULT_WAL_AUTOCHECKPOINT_PAGES: u32 = 4000;
 const DEFAULT_JOURNAL_SIZE_LIMIT_BYTES: i64 = 67_108_864; // 64 MiB
 const DEFAULT_WRITE_QUEUE_CAPACITY: usize = 256;
+
+fn deny_retired_writer(_context: AuthContext<'_>) -> Authorization {
+    Authorization::Deny
+}
 
 pub(crate) const TEST_HARNESS_ENV: &str = "KHIVE_TEST_HARNESS";
 
@@ -257,6 +262,11 @@ fn canonicalize_deepest_existing(path: &Path) -> Result<PathBuf, SqliteError> {
 /// writer connection.
 pub struct ConnectionPool {
     writer: Arc<Mutex<Connection>>,
+    /// Fail-closed guard for the legacy pool-mutex writer. A transaction
+    /// owner retires this connection after a body panic or when it cannot
+    /// prove that finalization restored autocommit mode; subsequent checkouts
+    /// must never reuse it.
+    pooled_writer_retired: AtomicBool,
     /// Process-local writer acquisition counters shared with the pool's
     /// lifetime-owned writer task. Keeping the counters at the actual
     /// acquisition boundaries means new verbs inherit instrumentation without
@@ -515,6 +525,7 @@ impl ConnectionPool {
 
         let pool = Self {
             writer: Arc::new(Mutex::new(writer)),
+            pooled_writer_retired: AtomicBool::new(false),
             writer_acquisition_counters: Arc::new(WriterAcquisitionCounters::default()),
             readers,
             max_readers,
@@ -562,8 +573,11 @@ impl ConnectionPool {
     /// `reader()` while holding a `WriterGuard` on the same pool.
     pub fn reader(&self) -> Result<ReaderGuard<'_>, SqliteError> {
         if self.max_readers == 0 {
+            self.ensure_pooled_writer_active()?;
+            let guard = self.writer.lock();
+            self.ensure_pooled_writer_active()?;
             return Ok(ReaderGuard {
-                lease: Some(ReaderLease::Shared(self.writer.lock())),
+                lease: Some(ReaderLease::Shared(guard)),
                 pool: self,
             });
         }
@@ -614,6 +628,7 @@ impl ConnectionPool {
     /// `Err(SqliteError::WriterPoolCheckoutTimeout)` if the timeout is
     /// exceeded.
     pub fn writer(&self) -> Result<WriterGuard<'_>, SqliteError> {
+        self.ensure_pooled_writer_active()?;
         let Some(guard) = self.writer.try_lock_for(self.config.checkout_timeout) else {
             self.writer_acquisition_counters
                 .pooled_timeouts
@@ -637,6 +652,7 @@ impl ConnectionPool {
                 timeout: self.config.checkout_timeout,
             });
         };
+        self.ensure_pooled_writer_active()?;
         self.writer_acquisition_counters
             .pooled_acquisitions
             .fetch_add(1, Ordering::Relaxed);
@@ -663,15 +679,36 @@ impl ConnectionPool {
     /// stalling for up to `checkout_timeout` (default 5s) while write traffic
     /// is in progress.
     pub fn try_writer_nowait(&self) -> Result<WriterGuard<'_>, SqliteError> {
+        self.ensure_pooled_writer_active()?;
         let guard = self.writer.try_lock().ok_or_else(|| {
             SqliteError::InvalidData(
                 "writer connection busy (checkpoint skipped this tick)".to_string(),
             )
         })?;
+        self.ensure_pooled_writer_active()?;
         Ok(WriterGuard {
             guard,
             origin: self.origin(),
         })
+    }
+
+    pub(crate) fn retire_pooled_writer(&self, conn: &Connection) {
+        self.pooled_writer_retired.store(true, Ordering::Release);
+        if let Err(error) = conn.authorizer(Some(deny_retired_writer)) {
+            tracing::error!(
+                %error,
+                "failed to install the retired pooled-writer quarantine authorizer"
+            );
+        }
+    }
+
+    fn ensure_pooled_writer_active(&self) -> Result<(), SqliteError> {
+        if self.pooled_writer_retired.load(Ordering::Acquire) {
+            return Err(SqliteError::InvalidData(
+                "pooled writer connection retired after a terminal transaction fault".to_string(),
+            ));
+        }
+        Ok(())
     }
 
     /// Snapshot all instrumented writer acquisition outcomes since this pool

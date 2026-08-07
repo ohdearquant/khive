@@ -11,7 +11,7 @@ use crate::handlers;
 use crate::inbox_signal::InboxSignal;
 use crate::vocab::{COMM_HANDLERS, COMM_SCHEMA_PLAN_STMTS};
 
-/// Communication pack providing nine public `comm.*` verbs.
+/// Communication pack providing ten public `comm.*` verbs.
 ///
 /// Stores and queries `message` notes in the standard notes table; message
 /// metadata lives in the `properties` JSON column.
@@ -145,6 +145,7 @@ impl PackRuntime for CommPack {
                 handlers::handle_inbox(self.runtime(), &self.inbox_signal, token, params).await
             }
             "comm.read" => handlers::handle_read(self.runtime(), token, params).await,
+            "comm.mark_read" => handlers::handle_mark_read(self.runtime(), token, params).await,
             "comm.unread" => handlers::handle_unread(self.runtime(), token, params).await,
             "comm.reply" => {
                 handlers::handle_reply(self.runtime(), &self.inbox_signal, token, params).await
@@ -309,6 +310,31 @@ mod help_tests {
     }
 
     #[test]
+    fn mark_read_declares_required_ids_and_optional_atomic_mode() {
+        let h = find_handler("comm.mark_read");
+        assert_eq!(h.category, VerbCategory::Declaration);
+        assert!(h.description.contains("comm.inbox"));
+        assert!(h.description.contains("comm.thread"));
+
+        let ids = h
+            .params
+            .iter()
+            .find(|param| param.name == "ids")
+            .expect("mark_read must have ids");
+        assert!(ids.required);
+        assert_eq!(ids.param_type, "array of string");
+
+        let atomic = h
+            .params
+            .iter()
+            .find(|param| param.name == "atomic")
+            .expect("mark_read must have atomic");
+        assert!(!atomic.required);
+        assert_eq!(atomic.param_type, "boolean");
+        assert!(atomic.description.contains("Defaults to false"));
+    }
+
+    #[test]
     fn delivered_has_full_uuid_contract() {
         let h = find_handler("comm.delivered");
         assert_eq!(h.visibility, Visibility::Verb);
@@ -414,6 +440,11 @@ mod help_tests {
             h("comm.read").category,
             VerbCategory::Declaration,
             "comm.read must be Declaration"
+        );
+        assert_eq!(
+            h("comm.mark_read").category,
+            VerbCategory::Declaration,
+            "comm.mark_read must be Declaration"
         );
         assert_eq!(
             h("comm.reply").category,

@@ -4,8 +4,8 @@ description: Coordinate with other agents and lambdas over khive comm — be att
 
 # Coordinate over comm
 
-khive comm is how agents and lambdas message each other. The surface is nine verbs —
-`comm.send`, `comm.delivered`, `comm.inbox`, `comm.unread`, `comm.read`, `comm.reply`,
+khive comm is how agents and lambdas message each other. The surface is ten verbs —
+`comm.send`, `comm.delivered`, `comm.inbox`, `comm.unread`, `comm.read`, `comm.mark_read`, `comm.reply`,
 `comm.thread`, `comm.health`, and `comm.probe` —
 but the thing worth learning is the _coordination pattern_, not the verbs. Per-verb param
 detail is one call away: `request(ops="comm.send(help=true)")`.
@@ -74,8 +74,10 @@ The fields you triage on are surfaced at the **top level** — no digging into `
 ```
 
 Scan `from` + `subject` + `preview`, open `content` for the ones that matter, then
-`comm.read(id="<full_id>")` to clear one or `comm.read(ids=[...])` to clear up to 500 in one
-operation. Always pass a `limit` — active inboxes are large. If `next_offset` is non-null, repeat
+`comm.read(id="<full_id>")` to clear one or `comm.mark_read(ids=[...])` to clear up to 500 in one
+operation. `comm.read` is a compatibility mark-read name and does not retrieve content. Pass
+`atomic=true` to `comm.mark_read` when the entire supplied set must change or none may change;
+otherwise inspect each best-effort result's `read`/`mark_error`. Always pass a `limit` — active inboxes are large. If `next_offset` is non-null, repeat
 the same inbox filters with `offset=<next_offset>` until it is null; pagination itself never marks
 messages read. Use `content_contains` when automated notifications omit `subject`; sender
 exact/prefix/exclusion, RFC3339 `since`/`before`, and subject/content substring filters can be
@@ -83,8 +85,7 @@ combined. Use `box="sent"` with optional `to_actor` and `since` to inspect your 
 history; omitting `box` remains inbound-only. For cheap list reads, pass the same strict
 `fields=[...]` projection to `comm.inbox` or `comm.thread` (for example
 `fields=["id","subject","from_actor","sent_at"]`); unknown fields fail rather than being
-ignored. Mark writes are best-effort and cross-message updates are not atomic: inspect every
-result's `read`/`mark_error`, and re-issue failures later.
+ignored. Default mark writes are best-effort; re-issue failed results later.
 
 Use `wait_ms` (maximum 30,000) when you need the next message promptly without
 repeated polling. It waits only if the fully filtered page is initially empty

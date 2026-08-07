@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use rusqlite::OptionalExtension;
 use uuid::Uuid;
 
-use khive_storage::error::StorageError;
+use khive_storage::error::{StorageError, WriterTaskRequestState};
 use khive_storage::note::{FilterOp, Note, NoteFilter, SortDir};
 use khive_storage::types::{
     BatchWriteSummary, DeleteMode, Page, PageRequest, SeekCursor, SeekPage, SqlStatement, SqlValue,
@@ -18,7 +18,7 @@ use khive_storage::StorageCapability;
 use crate::error::SqliteError;
 use crate::pool::ConnectionPool;
 use crate::sql_bridge::bind_params;
-use crate::writer_task::WriterTaskHandle;
+use crate::writer_task::{execute_wrapped_transaction, WriterTaskHandle};
 
 fn map_err(e: rusqlite::Error, op: &'static str) -> StorageError {
     StorageError::driver(StorageCapability::Notes, op, e)
@@ -271,8 +271,9 @@ impl SqlNoteStore {
     /// (`self.writer_task` is `None` by construction whenever that call is
     /// reached) — no double-routing. Callers whose `f` issues more than one
     /// DML statement that must land atomically together (`upsert_note`,
-    /// `try_insert_note`) use [`Self::with_writer_tx`] instead — see its doc
-    /// comment (khive #827).
+    /// `try_insert_note`, `patch_note_property_atomic`) use
+    /// [`Self::with_writer_tx`] instead — see its doc comment (khive #827,
+    /// #1387).
     async fn with_writer<F, R>(&self, op: &'static str, f: F) -> Result<R, StorageError>
     where
         F: FnOnce(&rusqlite::Connection) -> Result<R, rusqlite::Error> + Send + 'static,
@@ -295,16 +296,15 @@ impl SqlNoteStore {
 
     /// Like [`Self::with_writer`], but for callers whose closure issues more
     /// than one DML statement that must land atomically together (khive
-    /// #827): a single-note insert immediately followed by
-    /// `assign_note_seq`. On the flag-on path the WriterTask already wraps
-    /// every request in its own `BEGIN IMMEDIATE`/`COMMIT`/`ROLLBACK`, so `f`
-    /// is sent unwrapped, same as `with_writer`. On the flag-off (pool-mutex)
-    /// path, `with_writer` runs `f` in SQLite's default autocommit mode --
-    /// each statement inside `f` is its own implicit transaction -- so a
-    /// crash or interleaving between the insert and the sequence assignment
-    /// can strand a note that `comm.probe`'s `INNER JOIN notes_seq` will
-    /// never see again. This wraps that path in one explicit transaction,
-    /// matching `upsert_notes`' own flag-off branch.
+    /// #827, #1387), such as a note insert plus `assign_note_seq` or a guarded
+    /// property patch across several notes. On the flag-on path the
+    /// WriterTask already wraps every request in its own `BEGIN
+    /// IMMEDIATE`/`COMMIT`/`ROLLBACK`, so `f` is sent unwrapped, same as
+    /// `with_writer`. On the flag-off (pool-mutex) path, `with_writer` runs
+    /// `f` in SQLite's default autocommit mode -- each statement inside `f`
+    /// is its own implicit transaction -- so a later failure could leave an
+    /// earlier statement committed. This wraps that path in one explicit
+    /// transaction, matching `upsert_notes`' own flag-off branch.
     async fn with_writer_tx<F, R>(&self, op: &'static str, f: F) -> Result<R, StorageError>
     where
         F: FnOnce(&rusqlite::Connection) -> Result<R, rusqlite::Error> + Send + 'static,
@@ -320,22 +320,29 @@ impl SqlNoteStore {
         tokio::task::spawn_blocking(move || {
             let guard = pool.try_writer().map_err(|e| map_sqlite_err(e, op))?;
             let conn = guard.conn();
-            conn.execute_batch("BEGIN IMMEDIATE")
-                .map_err(|e| map_err(e, op))?;
-
-            match f(conn) {
-                Ok(value) => match conn.execute_batch("COMMIT") {
-                    Ok(()) => Ok(value),
-                    Err(e) => {
-                        let _ = conn.execute_batch("ROLLBACK");
-                        Err(map_err(e, op))
-                    }
-                },
-                Err(e) => {
-                    let _ = conn.execute_batch("ROLLBACK");
-                    Err(map_err(e, op))
-                }
+            if !conn.is_autocommit() {
+                pool.retire_pooled_writer(conn);
+                return Err(StorageError::WriterTaskTerminated {
+                    request_state: WriterTaskRequestState::SideEffectsUnknown,
+                });
             }
+            if let Err(begin_error) = conn.execute_batch("BEGIN IMMEDIATE") {
+                if !conn.is_autocommit() {
+                    pool.retire_pooled_writer(conn);
+                    return Err(StorageError::WriterTaskTerminated {
+                        request_state: WriterTaskRequestState::SideEffectsUnknown,
+                    });
+                }
+                return Err(map_err(begin_error, op));
+            }
+
+            let (result, terminal_state) = execute_wrapped_transaction(conn, op, move |conn| {
+                f(conn).map_err(|error| map_err(error, op))
+            });
+            if terminal_state.is_some() {
+                pool.retire_pooled_writer(conn);
+            }
+            result
         })
         .await
         .map_err(|e| StorageError::driver(StorageCapability::Notes, op, e))?
@@ -744,6 +751,38 @@ fn build_note_filter_where(
     Ok((format!(" WHERE {}", conditions.join(" AND ")), params))
 }
 
+fn execute_filtered_note_property_patch(
+    conn: &rusqlite::Connection,
+    id: Uuid,
+    namespace: &str,
+    filter: &NoteFilter,
+    json_path: &str,
+    value_json: &str,
+    updated_at: i64,
+) -> Result<usize, rusqlite::Error> {
+    let (where_clause, mut params) = build_note_filter_where(namespace, filter)?;
+
+    let base = params.len();
+    let sql = format!(
+        "UPDATE notes SET properties = json_set(COALESCE(properties, '{{}}'), ?{p1}, json(?{p2})), \
+         updated_at = ?{p3} {where_clause} \
+         AND (properties IS NULL OR json_type(properties) = 'object') AND id = ?{p4}",
+        p1 = base + 1,
+        p2 = base + 2,
+        p3 = base + 3,
+        p4 = base + 4,
+    );
+    params.push(Box::new(json_path.to_string()));
+    params.push(Box::new(value_json.to_string()));
+    params.push(Box::new(updated_at));
+    params.push(Box::new(id.to_string()));
+
+    let mut stmt = conn.prepare_cached(&sql)?;
+    let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+        params.iter().map(|param| param.as_ref()).collect();
+    stmt.execute(param_refs.as_slice())
+}
+
 // =============================================================================
 // NoteStore implementation
 // =============================================================================
@@ -809,40 +848,64 @@ impl NoteStore for SqlNoteStore {
             StorageError::driver(StorageCapability::Notes, "try_patch_note_property", e)
         })?;
         let json_path = json_path.to_string();
-        let id_str = id.to_string();
 
-        // `build_note_filter_where`'s params are `Box<dyn ToSql>` (not
-        // `Send`), so — matching every other caller in this file — it is
-        // built inside the writer closure rather than moved across the
-        // `with_writer` boundary.
         self.with_writer("try_patch_note_property", move |conn| {
-            let (where_clause, mut params) = build_note_filter_where(&namespace, &filter)?;
+            execute_filtered_note_property_patch(
+                conn,
+                id,
+                &namespace,
+                &filter,
+                &json_path,
+                &value_json,
+                updated_at,
+            )
+            .map(|rows| rows > 0)
+        })
+        .await
+    }
 
-            // Explicit `?N` indices (SQLite numbered params bind by index,
-            // not by text position) so this SET clause's params can be
-            // appended after `where_clause`'s already-self-consistent
-            // `?1..?k` numbering instead of renumbering every filter
-            // placeholder.
-            let base = params.len();
-            let sql = format!(
-                "UPDATE notes SET properties = json_set(COALESCE(properties, '{{}}'), ?{p1}, json(?{p2})), \
-                 updated_at = ?{p3} {where_clause} \
-                 AND (properties IS NULL OR json_type(properties) = 'object') AND id = ?{p4}",
-                p1 = base + 1,
-                p2 = base + 2,
-                p3 = base + 3,
-                p4 = base + 4,
-            );
-            params.push(Box::new(json_path));
-            params.push(Box::new(value_json));
-            params.push(Box::new(updated_at));
-            params.push(Box::new(id_str));
+    async fn patch_note_property_atomic(
+        &self,
+        mut ids: Vec<Uuid>,
+        namespace: &str,
+        filter: &NoteFilter,
+        json_path: &str,
+        value: serde_json::Value,
+        updated_at: i64,
+    ) -> Result<(), StorageError> {
+        let mut seen = HashSet::with_capacity(ids.len());
+        ids.retain(|id| seen.insert(*id));
+        if ids.is_empty() {
+            return Err(StorageError::InvalidInput {
+                capability: StorageCapability::Notes,
+                operation: "patch_note_property_atomic".into(),
+                message: "at least one note id is required".to_string(),
+            });
+        }
 
-            let mut stmt = conn.prepare(&sql)?;
-            let param_refs: Vec<&dyn rusqlite::types::ToSql> =
-                params.iter().map(|p| p.as_ref()).collect();
-            let rows = stmt.execute(param_refs.as_slice())?;
-            Ok(rows > 0)
+        let namespace = namespace.to_string();
+        let filter = filter.clone();
+        let value_json = serde_json::to_string(&value).map_err(|e| {
+            StorageError::driver(StorageCapability::Notes, "patch_note_property_atomic", e)
+        })?;
+        let json_path = json_path.to_string();
+
+        self.with_writer_tx("patch_note_property_atomic", move |conn| {
+            for id in ids {
+                let rows = execute_filtered_note_property_patch(
+                    conn,
+                    id,
+                    &namespace,
+                    &filter,
+                    &json_path,
+                    &value_json,
+                    updated_at,
+                )?;
+                if rows != 1 {
+                    return Err(rusqlite::Error::StatementChangedRows(rows));
+                }
+            }
+            Ok(())
         })
         .await
     }
