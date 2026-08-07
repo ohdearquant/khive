@@ -251,7 +251,10 @@ fn check_no_duplicate_stage_ids(duplicate_ids: &[String]) -> RuleResult {
 /// the configurable rule classes. See `crates/kkernel/docs/kg-commit.md` for
 /// which classes run and why the exclusion must be structural, not a post-hoc
 /// filter over the returned `RuleResult`s.
-fn run_commit_time_rules(changeset: &ChangeSet, rules_path: &Path) -> Result<Vec<RuleResult>> {
+pub(super) fn run_commit_time_rules(
+    changeset: &ChangeSet,
+    rules_path: &Path,
+) -> Result<Vec<RuleResult>> {
     let projected = project_changeset(changeset);
 
     let tmp = tempfile::TempDir::new().context("creating projection temp dir")?;
