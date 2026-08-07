@@ -52,7 +52,9 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 #[cfg(unix)]
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
+#[cfg(any(unix, test))]
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
@@ -3182,6 +3184,7 @@ mod tests {
         ));
     }
 
+    #[cfg(unix)]
     #[test]
     fn ensure_sidecar_dir_creates_0700_owned_dir() {
         let root = tempfile::tempdir().unwrap();
@@ -3193,6 +3196,7 @@ mod tests {
         assert_eq!(meta.uid(), current_uid());
     }
 
+    #[cfg(unix)]
     #[test]
     fn ensure_sidecar_dir_refuses_wrong_mode() {
         let root = tempfile::tempdir().unwrap();
@@ -3203,6 +3207,7 @@ mod tests {
         assert!(err.to_string().contains("expected 0700"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn ensure_sidecar_dir_refuses_symlink() {
         let root = tempfile::tempdir().unwrap();
@@ -3236,6 +3241,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn write_then_read_heartbeat_roundtrips() {
         let root = tempfile::tempdir().unwrap();
@@ -3279,6 +3285,7 @@ mod tests {
         assert_eq!(b.sweep_interval_ms, 60_000);
     }
 
+    #[cfg(unix)]
     #[test]
     fn write_heartbeat_refuses_symlinked_target() {
         let root = tempfile::tempdir().unwrap();
@@ -3388,6 +3395,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn enumerate_live_reports_and_retains_a_genuinely_live_entry() {
         let root = tempfile::tempdir().unwrap();
@@ -3404,6 +3412,7 @@ mod tests {
         assert!(dir.join(format!("{}.json", hb.pid)).exists());
     }
 
+    #[cfg(unix)]
     #[test]
     fn epoch_abs_diff_saturates_instead_of_wrapping() {
         assert_eq!(epoch_abs_diff(5, 3), 2);
@@ -3416,6 +3425,7 @@ mod tests {
         assert_eq!(epoch_abs_diff(-1, i64::MAX), 1u64 << 63);
     }
 
+    #[cfg(unix)]
     #[test]
     fn enumerate_live_extreme_timestamp_classifies_unknown_not_fresh() {
         let root = tempfile::tempdir().unwrap();
@@ -3441,6 +3451,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn enumerate_live_bounded_caps_listing_with_sentinel_marker() {
         let root = tempfile::tempdir().unwrap();
@@ -3478,6 +3489,7 @@ mod tests {
         assert!(report.entries.len() <= 2, "got {:?}", report.entries);
     }
 
+    #[cfg(unix)]
     #[test]
     fn enumerate_live_bounded_caps_hidden_entry_scan_with_sentinel_marker() {
         let root = tempfile::tempdir().unwrap();
@@ -3514,6 +3526,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn enumerate_live_uncapped_population_has_no_sentinel() {
         let root = tempfile::tempdir().unwrap();
@@ -3531,6 +3544,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn enumerate_live_deletes_dead_pid_entry() {
         let root = tempfile::tempdir().unwrap();
@@ -3546,6 +3560,7 @@ mod tests {
         assert!(!dir.join(format!("{}.json", hb.pid)).exists());
     }
 
+    #[cfg(unix)]
     #[test]
     fn enumerate_live_deletes_mismatched_start_time_entry() {
         let root = tempfile::tempdir().unwrap();
@@ -3564,6 +3579,7 @@ mod tests {
         assert!(!dir.join(format!("{}.json", hb.pid)).exists());
     }
 
+    #[cfg(unix)]
     #[test]
     fn enumerate_live_deletes_stale_updated_at_entry() {
         let root = tempfile::tempdir().unwrap();
@@ -3584,6 +3600,7 @@ mod tests {
         assert!(!dir.join(format!("{}.json", hb.pid)).exists());
     }
 
+    #[cfg(unix)]
     #[test]
     fn enumerate_live_subsecond_sweep_interval_does_not_collapse_freshness_window() {
         // Minor (ADR-091 Amendment 2): a sub-second
@@ -3602,6 +3619,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn enumerate_live_refuses_symlinked_entry_as_unknown_without_touching_target() {
         let root = tempfile::tempdir().unwrap();
@@ -3623,6 +3641,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn enumerate_live_refuses_non_owned_entry_before_reading_contents() {
         // We cannot fabricate a genuinely non-owned file without root, so this
@@ -3647,6 +3666,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn enumerate_live_refuses_non_compliant_directory_wholesale() {
         // Item 3 (ADR-091 Amendment 2): a directory that fails the
@@ -3663,6 +3683,7 @@ mod tests {
         assert!(err.to_string().contains("expected 0700"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn enumerate_live_missing_directory_is_ok_empty_not_a_failure() {
         // A sidecar that has simply never been used yet is a distinct case
@@ -3673,6 +3694,7 @@ mod tests {
         assert!(report.entries.is_empty());
     }
 
+    #[cfg(unix)]
     #[test]
     fn enumerate_live_classifies_registered_silent_beacon_with_no_heartbeat() {
         // ADR-091 Amendment 2 spec delta: a live process that has registered
@@ -3692,6 +3714,7 @@ mod tests {
         assert!(report.fully_attributed());
     }
 
+    #[cfg(unix)]
     #[test]
     fn enumerate_live_reporting_wins_over_registered_silent_for_same_pid() {
         let root = tempfile::tempdir().unwrap();
@@ -3705,6 +3728,7 @@ mod tests {
         assert_eq!(report.registered_silent_pids().count(), 0);
     }
 
+    #[cfg(unix)]
     #[test]
     fn enumerate_live_deletes_dead_beacon() {
         let root = tempfile::tempdir().unwrap();
@@ -3719,6 +3743,7 @@ mod tests {
         assert!(!beacon_path(&dir, b.pid).exists());
     }
 
+    #[cfg(unix)]
     #[test]
     fn write_beacon_refuses_symlinked_target() {
         let root = tempfile::tempdir().unwrap();
@@ -3734,6 +3759,7 @@ mod tests {
         assert_eq!(fs::read_to_string(&real).unwrap(), "nope");
     }
 
+    #[cfg(unix)]
     #[test]
     fn enumerate_live_classifies_stale_beacon_as_unknown() {
         // ADR-091 Amendment 2: a beacon that is identity-valid
@@ -3762,6 +3788,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn enumerate_live_stale_heartbeat_with_fresh_beacon_stays_unknown_not_registered_silent() {
         // ADR-091 Amendment 2: a PID whose heartbeat was
