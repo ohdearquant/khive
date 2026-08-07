@@ -71,10 +71,10 @@ refer to their Git or GitHub objects unless explicitly qualified as a khive live
 
 The two repository classes are separate trust domains:
 
-| Class | Normative content | Remote policy | Consumer |
-| --- | --- | --- | --- |
-| Operational history | ADR-101 change-sets and snapshots of live substrates, potentially including notes and memories | No remote, unchanged from ADR-102 D6 | local replay, audit, recovery |
-| Project KG | `.khive/kg/entities.ndjson`, `.khive/kg/edges.ndjson`, `schema.yaml`, and `rules.toml` | Git remote permitted by ADR-010/020; public publication requires the gate below | GitHub collaboration and distribution |
+| Class               | Normative content                                                                              | Remote policy                                                                   | Consumer                              |
+| ------------------- | ---------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------- | ------------------------------------- |
+| Operational history | ADR-101 change-sets and snapshots of live substrates, potentially including notes and memories | No remote, unchanged from ADR-102 D6                                            | local replay, audit, recovery         |
+| Project KG          | `.khive/kg/entities.ndjson`, `.khive/kg/edges.ndjson`, `schema.yaml`, and `rules.toml`         | Git remote permitted by ADR-010/020; public publication requires the gate below | GitHub collaboration and distribution |
 
 No command may convert an operational-history repository into a project KG repository in place.
 Publication is an explicit export into a distinct repository with its own object database, config,
@@ -85,7 +85,7 @@ and operational change-sets are not committed to the project KG path set in v1.
 The v1 publishable coverage is exactly:
 
 ```json
-{"entities":true,"edges":true,"notes":false}
+{ "entities": true, "edges": true, "notes": false }
 ```
 
 Tasks, memories, sessions, events, knowledge-atom bodies, and proposal records are not publishable
@@ -108,13 +108,13 @@ This ADR does not ratify ADR-112 and therefore does not by itself authorize GitH
 
 Every review surface and machine-readable artifact MUST keep these identities separate:
 
-| Identity | Purpose |
-| --- | --- |
-| Git commit SHA | immutable repository history and parentage |
-| canonical KG content hash | semantic identity of the declared snapshot coverage |
-| GitHub pull-request number and head SHA | collaboration and stale-review detection |
-| ADR-101 `batch_id` | producer-attributed staged curation batch |
-| ADR-046 proposal UUID | live event-sourced proposal and apply lifecycle |
+| Identity                                | Purpose                                             |
+| --------------------------------------- | --------------------------------------------------- |
+| Git commit SHA                          | immutable repository history and parentage          |
+| canonical KG content hash               | semantic identity of the declared snapshot coverage |
+| GitHub pull-request number and head SHA | collaboration and stale-review detection            |
+| ADR-101 `batch_id`                      | producer-attributed staged curation batch           |
+| ADR-046 proposal UUID                   | live event-sourced proposal and apply lifecycle     |
 
 No one identifier is an alias for another. UI truncation is presentation only; machine artifacts
 carry full identifiers. A review becomes stale when its GitHub head SHA changes, even if the
@@ -125,10 +125,10 @@ change-set batch ID remains the same.
 CLI, CI, server adapters, and the browser consume one versioned semantic review bundle. Every
 `khive.review.v1` value has a required `review_kind` discriminator:
 
-| `review_kind` | Required core | Allowed enrichment |
-| --- | --- | --- |
-| `changeset` | capability declaration, ADR-101 envelope and ordered operations, tier summary, validation scope/findings, review gate | none invented; repository and PR identities are absent unless independently supplied by a later adapter contract |
-| `pull_request` | the complete `changeset` core plus full Git base/head identities | GitHub PR metadata, structured semantic changes, evidence, affected subgraph, captured retrieval, and conversation |
+| `review_kind`  | Required core                                                                                                         | Allowed enrichment                                                                                                 |
+| -------------- | --------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------ |
+| `changeset`    | capability declaration, ADR-101 envelope and ordered operations, tier summary, validation scope/findings, review gate | none invented; repository and PR identities are absent unless independently supplied by a later adapter contract   |
+| `pull_request` | the complete `changeset` core plus full Git base/head identities                                                      | GitHub PR metadata, structured semantic changes, evidence, affected subgraph, captured retrieval, and conversation |
 
 A later `live_proposal` variant may carry an ADR-046 proposal UUID, but is not defined by this first
 slice. A `pull_request` bundle may carry an optional, explicitly typed live-proposal link; absence is
@@ -141,7 +141,12 @@ The shared core contains:
   canonicalization algorithm; until that prerequisite exists the capability is `unavailable`, and
   fixture hashes are explicitly marked `fixture` and have no correctness authority. The first-slice
   schema rejects `verified`; that state is reserved for a later schema amendment naming the
-  ratified algorithm and verifier trust path;
+  ratified algorithm and verifier trust path. Hashes computed by the current, unratified
+  canonicalization code map to `hash_status: "unavailable"` with `algorithm`, `base_hash`, and
+  `head_hash` all null: a producer running today's algorithm MUST NOT emit its output under
+  `fixture` (reserved for synthetic demo vectors) or any other status, and import validation
+  rejects an `unavailable` identity that carries any hash or algorithm value, so unratified
+  hashes cannot enter a bundle under any label;
 - the ADR-101 producer envelope and ordered operation summaries when a change-set is present;
 - deterministic entity, edge, and eventually note changes, each expressed as semantic subject plus
   ordered `{path, before, after}` fields;
@@ -178,7 +183,7 @@ a ratified algorithm and verifier trust path are named.
 Adapter-backed collections use the same page envelope independently:
 
 ```json
-{"items":[],"next_cursor":null,"truncated":false}
+{ "items": [], "next_cursor": null, "truncated": false }
 ```
 
 `next_cursor` is an opaque string or `null`; `truncated` is true whenever any configured work,

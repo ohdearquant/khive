@@ -72,7 +72,7 @@ transport, or canonical hash algorithm in detail. Those are owned by implementat
 | Custom `khive-vcs` commands         | Superseded                | [ADR-020](ADR-020-git-native-kg-implementation.md)                              |
 | Custom `khive-sync` HTTP server     | Superseded for v1         | [ADR-020](ADR-020-git-native-kg-implementation.md)                              |
 | Custom merge engine                 | Superseded for v1         | [ADR-020](ADR-020-git-native-kg-implementation.md); conflict taxonomy retained  |
-| Conflict resolution UX              | Future                    | New conflict classification and resolution ADR                                 |
+| Conflict resolution UX              | Future                    | New conflict classification and resolution ADR                                  |
 | Federated snapshots                 | Future                    | New federation ADR                                                              |
 | Notes versioning                    | Future (v2)               | New note export/versioning ADR                                                  |
 | Semantic review / PR enrichment     | Proposed                  | [ADR-145](ADR-145-local-first-kg-workbench.md)                                  |
