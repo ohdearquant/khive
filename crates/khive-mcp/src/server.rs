@@ -2415,8 +2415,9 @@ fn parse_output_format(s: Option<&str>) -> Result<Option<OutputFormat>, String> 
 ///   verb's AlwaysVerbose policy forces Verbose), apply `render_format` to the
 ///   `result` payload with the effective presentation so that both
 ///   `presentation_per_op=["verbose"]` and AlwaysVerbose verbs (including
-///   strict feedback and delivery-correlation acknowledgements) correctly skip
-///   the redundancy-drop pre-pass (ADR-078 §7 + §8.4; mirrors `run_parsed`).
+///   strict feedback, delivery-correlation acknowledgements, and durable receipt
+///   responses) correctly skip the redundancy-drop
+///   pre-pass (ADR-078 §7 + §8.4; mirrors `run_parsed`).
 ///
 /// The outer envelope (`{results:[...], summary:{...}}`) is always compact JSON (§8.4).
 /// Daemon-served responses are rendered before fitting. If the rendered envelope
@@ -2841,6 +2842,172 @@ mod tests {
                 .expect("test supplies a valid byte count");
             Ok(json!("x".repeat(bytes)))
         }
+    }
+
+    /// Receipt-only stand-in for the Git pack. Two operations can return
+    /// distinguishable reports for the same project without touching a git
+    /// repository, which lets the request-layer test prove that `request_id`
+    /// groups receipts but does not uniquely identify one operation.
+    struct RequestGroupDigestPack {
+        project_id: uuid::Uuid,
+    }
+
+    impl khive_types::Pack for RequestGroupDigestPack {
+        const NAME: &'static str = "request-group-digest-test";
+        const NOTE_KINDS: &'static [&'static str] = &[];
+        const ENTITY_KINDS: &'static [&'static str] = &[];
+        const HANDLERS: &'static [khive_runtime::HandlerDef] = &[khive_runtime::HandlerDef {
+            name: "git.digest",
+            description: "return a request-group receipt fixture",
+            visibility: khive_runtime::Visibility::Verb,
+            category: khive_runtime::VerbCategory::Commissive,
+            params: &[khive_runtime::ParamDef {
+                name: "marker",
+                param_type: "string",
+                required: true,
+                description: "distinguishes reports in one request group",
+            }],
+        }];
+    }
+
+    #[async_trait::async_trait]
+    impl khive_runtime::PackRuntime for RequestGroupDigestPack {
+        fn name(&self) -> &str {
+            <Self as khive_types::Pack>::NAME
+        }
+
+        fn note_kinds(&self) -> &'static [&'static str] {
+            <Self as khive_types::Pack>::NOTE_KINDS
+        }
+
+        fn entity_kinds(&self) -> &'static [&'static str] {
+            <Self as khive_types::Pack>::ENTITY_KINDS
+        }
+
+        fn handlers(&self) -> &'static [khive_runtime::HandlerDef] {
+            <Self as khive_types::Pack>::HANDLERS
+        }
+
+        async fn dispatch(
+            &self,
+            _verb: &str,
+            params: Value,
+            _registry: &VerbRegistry,
+            _token: &khive_runtime::NamespaceToken,
+        ) -> Result<Value, RuntimeError> {
+            Ok(json!({
+                "project_id": self.project_id,
+                "marker": params.get("marker").cloned().unwrap_or(Value::Null),
+                "done": true,
+            }))
+        }
+    }
+
+    fn request_group_digest_test_server() -> (
+        KhiveMcpServer,
+        Arc<dyn khive_storage::EventStore>,
+        uuid::Uuid,
+    ) {
+        let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+        let token = runtime
+            .authorize(Namespace::local())
+            .expect("authorize local");
+        let store = runtime.events(&token).expect("event store");
+        let project_id = uuid::Uuid::new_v4();
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(RequestGroupDigestPack { project_id });
+        builder.with_event_store(store.clone());
+        let registry = builder.build().expect("request-group registry");
+        (KhiveMcpServer::from_registry(registry), store, project_id)
+    }
+
+    async fn assert_request_group_receipts(ops: &str) {
+        let (server, store, project_id) = request_group_digest_test_server();
+        let response = server
+            .dispatch_request_local(RequestParams {
+                ops: ops.to_string(),
+                request_id: Some(16_470),
+                ..Default::default()
+            })
+            .await
+            .expect("grouped digest request succeeds");
+        let envelope: Value = serde_json::from_str(&response).expect("JSON response");
+        assert_eq!(envelope["summary"]["succeeded"], 2, "{envelope}");
+        let mut returned_by_marker = std::collections::HashMap::new();
+        for entry in envelope["results"]
+            .as_array()
+            .expect("batch/chain response results")
+        {
+            let result = entry.get("result").expect("successful result");
+            let marker = result["marker"].as_str().expect("returned marker");
+            let receipt_id = result["receipt_id"]
+                .as_str()
+                .expect("returned receipt_id remains a string");
+            uuid::Uuid::parse_str(receipt_id)
+                .expect("default MCP presentation must retain the full receipt UUID");
+            assert!(
+                returned_by_marker
+                    .insert(marker.to_string(), result.clone())
+                    .is_none(),
+                "markers are unique"
+            );
+        }
+
+        let page = store
+            .query_events(
+                EventFilter {
+                    verbs: vec!["git.digest".to_string()],
+                    ..EventFilter::default()
+                },
+                PageRequest {
+                    limit: 50,
+                    offset: 0,
+                },
+            )
+            .await
+            .expect("query grouped receipts");
+        assert_eq!(page.items.len(), 2, "one receipt per successful operation");
+        assert!(page.items.iter().all(|event| {
+            event.target_id == Some(project_id)
+                && event.payload["resource"]["request_id"] == json!(16_470)
+        }));
+
+        let mut markers: Vec<&str> = page
+            .items
+            .iter()
+            .map(|event| {
+                assert_eq!(
+                    event.payload["result"]["receipt_id"],
+                    json!(event.id),
+                    "receipt_id is the operation-unique selector"
+                );
+                let marker = event.payload["result"]["marker"].as_str().expect("marker");
+                let returned = returned_by_marker
+                    .remove(marker)
+                    .expect("every stored marker was returned");
+                assert_eq!(
+                    returned, event.payload["result"],
+                    "default MCP output must exactly equal the durable receipt result"
+                );
+                marker
+            })
+            .collect();
+        markers.sort_unstable();
+        assert_eq!(markers, vec!["first", "second"]);
+        assert!(returned_by_marker.is_empty());
+        assert_ne!(page.items[0].id, page.items[1].id);
+    }
+
+    #[tokio::test]
+    async fn duplicate_digest_batch_and_chain_share_request_group_but_keep_distinct_receipts() {
+        assert_request_group_receipts(
+            r#"[git.digest(marker="first"), git.digest(marker="second")]"#,
+        )
+        .await;
+        assert_request_group_receipts(
+            r#"git.digest(marker="first") | git.digest(marker="second")"#,
+        )
+        .await;
     }
 
     async fn dispatch_large_result_through_daemon(

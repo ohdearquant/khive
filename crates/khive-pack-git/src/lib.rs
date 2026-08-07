@@ -40,3 +40,37 @@ mod write_handlers_tests;
 pub mod write_policy;
 
 pub use pack::GitPack;
+
+use khive_runtime::{NamespaceToken, RequestIdentity, RuntimeError, VerbRegistry};
+use serde_json::Value;
+
+/// Re-enter the registry for one Git-pack child operation without replacing
+/// the caller's authority or storage namespace with the warm registry's baked
+/// defaults.
+///
+/// `git.digest` performs its writes through the canonical KG verbs so their
+/// validation, gate, audit, and indexing contracts remain authoritative. A
+/// bare `VerbRegistry::dispatch`, however, would mint a fresh default token:
+/// explicit non-local requests would read through `token` but write and audit
+/// through `local`, and a warm daemon could substitute its own actor. Carry
+/// both the explicit transport namespace and the token-derived identity. The
+/// registry consumes/removes `namespace` before forwarding these KG params.
+pub(crate) async fn dispatch_from_token(
+    registry: &VerbRegistry,
+    token: &NamespaceToken,
+    verb: &str,
+    mut params: Value,
+) -> Result<Value, RuntimeError> {
+    let object = params.as_object_mut().ok_or_else(|| {
+        RuntimeError::InvalidInput(format!(
+            "nested {verb} dispatch requires an object argument"
+        ))
+    })?;
+    object.insert(
+        "namespace".to_string(),
+        Value::String(token.namespace().as_str().to_string()),
+    );
+    registry
+        .dispatch_with_identity(verb, params, Some(RequestIdentity::from_token(token)))
+        .await
+}

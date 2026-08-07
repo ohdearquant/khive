@@ -1,6 +1,7 @@
 //! `git.digest` source resolution (ADR-088 Amendment 1): local paths vs.
 //! `https://` remote URLs, canonicalization, and `github.com` owner/repo
-//! slug derivation for `gh`-based issue/PR ingestion.
+//! slug derivation for repo identity and parse-time GitHub hints. Runtime
+//! `gh` capability is established separately by a source-bound probe.
 //!
 //! Also owns repo-anchor identity derivation (issue #1173): a canonical
 //! `host/owner/repo` slug (or a path-derived fallback for a remote-less
@@ -22,9 +23,10 @@ pub enum DigestSource {
         /// Canonical form used as the cache key (trailing `/` and `.git`
         /// suffix stripped) — same URL always maps to the same cache slot.
         canonical: String,
-        /// `Some((owner, repo))` when the host is `github.com` — the only
-        /// host `gh` can serve issues/PRs for. `None` for any other https
-        /// host: the amendment's commits-only degradation applies.
+        /// Parse-time hint for a syntactic `github.com/<owner>/<repo>` URL.
+        /// This is not a capability decision: after cloning, the ingest core
+        /// uses source-bound `gh repo view <owner/repo>` and trusts only its successful
+        /// `nameWithOwner` result before issue/PR ingestion (#1617).
         gh_slug: Option<(String, String)>,
     },
 }
@@ -166,20 +168,20 @@ fn canonicalize_https_url(url: &str) -> String {
     s
 }
 
-/// Derive `(owner, repo)` from a canonicalized `https://github.com/...` URL.
-/// Returns `None` for any other host, or a github.com URL with fewer than
-/// two path segments.
+/// Derive a credential-free `(owner, repo)` from a canonicalized
+/// `https://github.com/...` URL. Query/fragment material is stripped by the
+/// shared remote normalizer before either component can become a `gh` argv
+/// value. Returns `None` for any other host or anything other than the exact
+/// `github.com/<owner>/<repo>` shape.
 fn github_slug(canonical: &str) -> Option<(String, String)> {
-    let rest = canonical.strip_prefix("https://")?;
-    let mut parts = rest.splitn(2, '/');
-    let host = parts.next()?;
-    if !matches!(host, "github.com" | "www.github.com") {
+    canonical.strip_prefix("https://")?;
+    let normalized = remote_url_to_slug(canonical)?;
+    let mut segs = normalized.split('/');
+    let (Some("github.com"), Some(owner), Some(repo), None) =
+        (segs.next(), segs.next(), segs.next(), segs.next())
+    else {
         return None;
-    }
-    let path = parts.next()?;
-    let mut segs = path.split('/').filter(|s| !s.is_empty());
-    let owner = segs.next()?;
-    let repo = segs.next()?;
+    };
     Some((owner.to_string(), repo.to_string()))
 }
 
@@ -443,6 +445,23 @@ mod tests {
         let a = parse_source("https://github.com/org/repo/").unwrap();
         let b = parse_source("https://github.com/org/repo").unwrap();
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn https_github_slug_never_carries_query_or_fragment_credentials() {
+        let src =
+            parse_source("https://github.com/org/repo.git?token=SECRETTOKEN#fragment").unwrap();
+        match src {
+            DigestSource::Remote { canonical, gh_slug } => {
+                assert!(canonical.contains("SECRETTOKEN"));
+                assert_eq!(gh_slug, Some(("org".to_string(), "repo".to_string())));
+                assert!(
+                    !format!("{gh_slug:?}").contains("SECRETTOKEN"),
+                    "the source-bound gh target must be safe to place in argv"
+                );
+            }
+            other => panic!("expected Remote, got {other:?}"),
+        }
     }
 
     #[test]
