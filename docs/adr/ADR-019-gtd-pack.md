@@ -146,13 +146,13 @@ task-specific knowledge in retrieval.
 
 ### Five disjoint verbs
 
-| Verb             | Purpose                                                                                                                                       |
-| ---------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
-| `gtd.assign`     | Create a task. Args: `title`, `priority?`, `status?`, `assignee?`, `due?`, `depends_on?`, `tags?`, `description?`. Returns the task envelope. |
-| `gtd.next`       | List actionable tasks (`status ∈ {next, active}`), priority-sorted. Args: `limit?`, `assignee?`, `include_blocked?`.                          |
+| Verb             | Purpose                                                                                                                                                         |
+| ---------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `gtd.assign`     | Create a task. Args: `title`, `priority?`, `status?`, `assignee?`, `due?`, `depends_on?`, `tags?`, `description?`. Returns the task envelope.                   |
+| `gtd.next`       | List actionable tasks (`status ∈ {next, active}`), priority-sorted. Args: `limit?`, `assignee?`, `include_blocked?`.                                            |
 | `gtd.complete`   | Validate transition to a terminal state, record `completed_at` and optional `result`. Args: `id`, `status?` (`done` or `cancelled`; default `done`), `result?`. |
-| `gtd.tasks`      | Filtered list. Args: `status?`, `assignee?`, `priority?`, `limit?`, `offset?`.                                                                |
-| `gtd.transition` | Explicit lifecycle change with full transition validation. Args: `id`, `status`, `note?`.                                                     |
+| `gtd.tasks`      | Filtered list. Args: `status?`, `assignee?`, `priority?`, `limit?`, `offset?`.                                                                                  |
+| `gtd.transition` | Explicit lifecycle change with full transition validation. Args: `id`, `status`, `note?`.                                                                       |
 
 No collision with kg pack's shared CRUD. ADR-017's `VerbRegistry` registers all five
 verbs as `gtd`-owned. The kg pack's `create(kind="note", note_kind="task", ...)`
