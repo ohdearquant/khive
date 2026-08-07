@@ -938,6 +938,95 @@ async fn gql_query_limit_composes_with_page_size() {
     assert_eq!(server_bounded.page_size, 5);
     assert!(server_bounded.has_more);
     assert_eq!(server_bounded.next_offset, Some(5));
+
+    // Continue to the terminal page: only 8 real matches exist and LIMIT is 8,
+    // so SKIP 5 must return the remaining 3 rows and terminate.
+    let terminal = rt
+        .query_with_metadata(
+            &tok,
+            "MATCH (a:concept) RETURN a SKIP 5 LIMIT 8",
+            khive_query::CompileOptions {
+                max_limit: 5,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(terminal.rows.len(), 3);
+    assert!(!terminal.has_more);
+    assert_eq!(terminal.next_offset, None);
+}
+
+/// Regression test for the round-1 review defect: an explicit query-text LIMIT
+/// must compose with page_size as a TOTAL bound across every SKIP page, not a
+/// page-local one (ADR-008 §"query LIMIT and page_size composition"). Seeds
+/// more real matches than LIMIT so a page-local limit would leak rows past
+/// LIMIT and keep reporting has_more=true, which is exactly the bug this test
+/// pins down.
+#[tokio::test]
+async fn gql_query_limit_is_a_total_bound_across_skip_pages() {
+    let rt = rt();
+    let tok = seed_concepts(&rt, "gql-page-limit-total-bound", 20).await;
+
+    let mut collected_ids = std::collections::HashSet::new();
+    let mut page_counts = Vec::new();
+    let mut offset = 0usize;
+    loop {
+        let page = gql_page(
+            &rt,
+            &tok,
+            &format!("MATCH (a:concept) RETURN a SKIP {offset} LIMIT 8"),
+            5,
+        )
+        .await;
+        page_counts.push(page.rows.len());
+        for row in &page.rows {
+            if let Some(khive_storage::types::SqlValue::Text(id)) = row.get("a_id") {
+                assert!(
+                    collected_ids.insert(id.clone()),
+                    "row {id} returned on more than one page"
+                );
+            }
+        }
+        match page.next_offset {
+            Some(next) => {
+                assert!(page.has_more);
+                offset = next;
+            }
+            None => {
+                assert!(!page.has_more, "terminal page must not claim has_more");
+                break;
+            }
+        }
+        assert!(
+            page_counts.len() <= 10,
+            "paging did not terminate: {page_counts:?}"
+        );
+    }
+
+    assert_eq!(
+        collected_ids.len(),
+        8,
+        "exactly LIMIT rows must be returned across all pages, not the 20 real matches"
+    );
+    assert_eq!(
+        page_counts,
+        vec![5, 3],
+        "page sizes must respect the remaining LIMIT allowance, not a flat page_size"
+    );
+
+    // An offset at or beyond the query's own LIMIT is a terminal empty page,
+    // never an error and never has_more.
+    let past_limit = gql_page(&rt, &tok, "MATCH (a:concept) RETURN a SKIP 8 LIMIT 8", 5).await;
+    assert_eq!(past_limit.rows.len(), 0);
+    assert!(!past_limit.has_more);
+    assert_eq!(past_limit.next_offset, None);
+
+    let well_past_limit =
+        gql_page(&rt, &tok, "MATCH (a:concept) RETURN a SKIP 20 LIMIT 8", 5).await;
+    assert_eq!(well_past_limit.rows.len(), 0);
+    assert!(!well_past_limit.has_more);
+    assert_eq!(well_past_limit.next_offset, None);
 }
 
 // =============================================================================

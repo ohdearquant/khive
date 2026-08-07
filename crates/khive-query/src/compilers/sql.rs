@@ -119,18 +119,39 @@ impl Default for CompileOptions {
 }
 
 /// Chooses the SQL limit and optional cap-sentinel check (issue #777).
+///
+/// An explicit query-text `LIMIT` is a TOTAL bound across every `SKIP` page, not a
+/// page-local one (ADR-008 §"query LIMIT and page_size composition", docs/guide/api-reference.md).
+/// `offset` is the page's `SKIP` value; the SQL bound is `min(limit - offset, max_limit)`,
+/// and the cap sentinel (`max_limit + 1`) is requested only when another page could still
+/// exist within the query's own limit. An offset at or beyond the limit yields SQL `LIMIT 0`
+/// — a terminal empty page, never an error.
 /// See `crates/khive-query/docs/api/sql-compilation.md` for lifecycle details.
 fn effective_limit(
     requested_limit: Option<usize>,
+    offset: usize,
     max_limit: usize,
 ) -> (usize, Option<TruncationCheck>) {
     match requested_limit {
-        Some(limit) if limit <= max_limit => (limit, None),
-        requested => (
+        Some(limit) => {
+            let remaining = limit.saturating_sub(offset);
+            if remaining <= max_limit {
+                (remaining, None)
+            } else {
+                (
+                    max_limit.saturating_add(1),
+                    Some(TruncationCheck {
+                        max_limit,
+                        requested_limit: Some(limit),
+                    }),
+                )
+            }
+        }
+        None => (
             max_limit.saturating_add(1),
             Some(TruncationCheck {
                 max_limit,
-                requested_limit: requested,
+                requested_limit: None,
             }),
         ),
     }
@@ -660,7 +681,7 @@ fn compile_fixed_length(
     params.push(QueryValue::Integer(offset_i64));
     let offset_param = params.len();
 
-    let (limit, truncation_check) = effective_limit(query.limit, opts.max_limit);
+    let (limit, truncation_check) = effective_limit(query.limit, query.offset, opts.max_limit);
     let limit_i64 = i64::try_from(limit)
         .map_err(|_| QueryError::InvalidInput("limit exceeds i64::MAX".into()))?;
     params.push(QueryValue::Integer(limit_i64));
@@ -1208,7 +1229,7 @@ fn compile_variable_length(
     params.push(QueryValue::Integer(offset_i64));
     let offset_param = params.len();
 
-    let (limit, truncation_check) = effective_limit(query.limit, opts.max_limit);
+    let (limit, truncation_check) = effective_limit(query.limit, query.offset, opts.max_limit);
     let limit_i64 = i64::try_from(limit)
         .map_err(|_| QueryError::InvalidInput("limit exceeds i64::MAX".into()))?;
     params.push(QueryValue::Integer(limit_i64));
