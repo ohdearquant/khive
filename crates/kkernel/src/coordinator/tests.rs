@@ -7,7 +7,8 @@ use uuid::Uuid;
 use khive_pack_kg::handlers::ValidatedSearchRequest;
 use khive_runtime::Namespace as RuntimeNamespace;
 use khive_runtime::{
-    BackendId, KhiveRuntime, PackRegistry, SearchHit, SearchSource, VerbRegistryBuilder,
+    BackendId, KhiveRuntime, NoteSearchHit, PackRegistry, SearchHit, SearchSource,
+    VerbRegistryBuilder,
 };
 use khive_score::DeterministicScore;
 use khive_storage::types::Direction;
@@ -23,6 +24,16 @@ fn memory_runtime() -> Arc<KhiveRuntime> {
 fn search_hit(entity_id: Uuid, source: SearchSource) -> SearchHit {
     SearchHit {
         entity_id,
+        score: DeterministicScore::from_f64(1.0),
+        source,
+        title: None,
+        snippet: None,
+    }
+}
+
+fn note_search_hit(note_id: Uuid, source: SearchSource) -> NoteSearchHit {
+    NoteSearchHit {
+        note_id,
         score: DeterministicScore::from_f64(1.0),
         source,
         title: None,
@@ -528,6 +539,97 @@ async fn fan_out_search_hung_backend_times_out_sibling_still_returns() {
     );
 }
 
+/// Same guarantee as the spawned multi-backend hung-backend test above, but
+/// for the single-backend early-return path (`entries.len() == 1`), which
+/// has no spawned task for the fan-out timeout loop above to bound — the
+/// `hybrid_search` await there is now wrapped in its own
+/// `tokio::time::timeout` directly (r2 follow-up to MAJ-2).
+///
+/// RED before the fix: the single-entry branch awaited `hybrid_search`
+/// directly with no timeout at all, so a hung single backend blocked
+/// `fan_out_search` forever — this test would never resolve rather than
+/// merely asserting the wrong thing (see the mutation-control note in the
+/// implementation report for how this was verified as load-bearing).
+#[tokio::test(start_paused = true)]
+async fn fan_out_search_single_backend_hung_backend_times_out_entity_substrate() {
+    let mut registry = BackendRegistry::new();
+    let rt_hung = memory_runtime();
+    registry.register(BackendId::new("hung"), Arc::clone(&rt_hung));
+    let coord = SubstrateCoordinator::new(registry).with_hanging_backend("hung");
+    assert!(
+        coord.is_single_backend(),
+        "precondition: registry must hold exactly one backend so the \
+         single-entry early-return path (not the spawned fan-out) is taken"
+    );
+    let ns = Namespace::local();
+
+    let request = validated_kg_search(serde_json::json!({
+        "kind": "entity",
+        "query": "SingleBackendTimeoutProbeEntity",
+        "limit": 10,
+    }));
+
+    let (hits, note_hits, per_backend) = coord.fan_out_search(&request, &ns).await;
+
+    assert!(hits.is_empty(), "no hits: the only backend timed out");
+    assert!(
+        note_hits.is_empty(),
+        "no note hits: the only backend timed out"
+    );
+    assert_eq!(per_backend.len(), 1, "the single backend must report");
+    let report = &per_backend[0];
+    assert_eq!(report.backend_id.as_str(), "hung");
+    let err = report
+        .error
+        .as_deref()
+        .expect("hung single backend must carry an error");
+    assert!(
+        err.contains("timed out"),
+        "single-backend timeout error must be timeout-specific, got: {err:?}"
+    );
+}
+
+/// Same as the entity-substrate test above, for the `search_notes` await at
+/// the other single-backend early-return call site.
+#[tokio::test(start_paused = true)]
+async fn fan_out_search_single_backend_hung_backend_times_out_note_substrate() {
+    let mut registry = BackendRegistry::new();
+    let rt_hung = memory_runtime();
+    registry.register(BackendId::new("hung"), Arc::clone(&rt_hung));
+    let coord = SubstrateCoordinator::new(registry).with_hanging_backend("hung");
+    assert!(
+        coord.is_single_backend(),
+        "precondition: registry must hold exactly one backend so the \
+         single-entry early-return path (not the spawned fan-out) is taken"
+    );
+    let ns = Namespace::local();
+
+    let request = validated_kg_search(serde_json::json!({
+        "kind": "observation",
+        "query": "SingleBackendTimeoutProbeNote",
+        "limit": 10,
+    }));
+
+    let (hits, note_hits, per_backend) = coord.fan_out_search(&request, &ns).await;
+
+    assert!(
+        hits.is_empty(),
+        "no entity hits: the only backend timed out"
+    );
+    assert!(note_hits.is_empty(), "no hits: the only backend timed out");
+    assert_eq!(per_backend.len(), 1, "the single backend must report");
+    let report = &per_backend[0];
+    assert_eq!(report.backend_id.as_str(), "hung");
+    let err = report
+        .error
+        .as_deref()
+        .expect("hung single backend must carry an error");
+    assert!(
+        err.contains("timed out"),
+        "single-backend timeout error must be timeout-specific, got: {err:?}"
+    );
+}
+
 // ---- MAJ-3: caller visibility scope must reach the fan-out authorization ----
 
 /// Single-backend coordinator path: a row stored under a namespace visible
@@ -729,6 +831,91 @@ async fn fan_out_search_rrf_merge_uses_full_candidate_window_not_per_backend_lim
         2,
     );
     let old_ids: Vec<Uuid> = old_buggy_result.iter().map(|h| h.entity_id).collect();
+    assert_eq!(
+        old_ids,
+        vec![x, z],
+        "sanity: the pre-fix per-backend-truncated merge should have produced \
+         [X, Z] (Y dropped before ever reaching RRF), got {old_ids:?}"
+    );
+    assert_ne!(
+        ids, old_ids,
+        "the fixed full-candidate-window result must differ from the pre-fix \
+         per-backend-truncated result — otherwise this test cannot distinguish them"
+    );
+}
+
+/// Note-substrate analog of the entity RRF full-window test above, using
+/// `note_hits_override` instead of `entity_hits_override`. Same arithmetic:
+/// `alpha` ranks `[X, W, Y]`, `beta` ranks `[Z, V, Y]`, `Y` at #3 on both
+/// fuses to 2/63 and must outrank the rank-1 singletons X/Z (1/61 each).
+///
+/// RED before the fix: a per-backend `.take(limit)` (limit=2) applied before
+/// the merge would keep only `alpha`'s top 2 (`[X, W]`) and `beta`'s top 2
+/// (`[Z, V]`) — `Y` never reaches the merge, and the old result is `[X, Z]`
+/// instead of `[Y, X]`.
+#[tokio::test]
+async fn fan_out_search_rrf_merge_uses_full_candidate_window_not_per_backend_limit_notes() {
+    let mut registry = BackendRegistry::new();
+    let rt_a = memory_runtime();
+    let rt_b = memory_runtime();
+    registry.register(BackendId::new("alpha"), Arc::clone(&rt_a));
+    registry.register(BackendId::new("beta"), Arc::clone(&rt_b));
+
+    let y = Uuid::from_u128(1);
+    let x = Uuid::from_u128(2);
+    let w = Uuid::from_u128(3);
+    let z = Uuid::from_u128(4);
+    let v = Uuid::from_u128(5);
+
+    let alpha_list = vec![
+        note_search_hit(x, SearchSource::Text),
+        note_search_hit(w, SearchSource::Text),
+        note_search_hit(y, SearchSource::Text),
+    ];
+    let beta_list = vec![
+        note_search_hit(z, SearchSource::Text),
+        note_search_hit(v, SearchSource::Text),
+        note_search_hit(y, SearchSource::Text),
+    ];
+
+    let mut overrides = std::collections::HashMap::new();
+    overrides.insert("alpha".to_string(), alpha_list.clone());
+    overrides.insert("beta".to_string(), beta_list.clone());
+
+    let coord = SubstrateCoordinator::new(registry).with_note_hits_override(overrides);
+    let ns = Namespace::local();
+    let request = validated_kg_search(serde_json::json!({
+        "kind": "observation",
+        "query": "irrelevant, hits are overridden",
+        "limit": 2,
+    }));
+
+    let (_entity_hits, note_hits, per_backend) = coord.fan_out_search(&request, &ns).await;
+    assert!(
+        per_backend.iter().all(|r| r.error.is_none()),
+        "no backend errors: {per_backend:?}"
+    );
+
+    let ids: Vec<Uuid> = note_hits.iter().map(|h| h.note_id).collect();
+    assert_eq!(
+        ids,
+        vec![y, x],
+        "Y (rank-3 on both backends, fused score 2/63) must outrank the rank-1 \
+         singletons X and Z (score 1/61 each); tie between X and Z is broken by \
+         ascending note_id, got {ids:?}"
+    );
+
+    // Mutation control: re-derive what the pre-fix per-backend `.take(limit)`
+    // truncation would have produced from these same override lists, and
+    // assert it disagrees with the fixed result above.
+    let old_buggy_result = super::dispatch::rrf_merge_note_hits(
+        vec![
+            alpha_list.into_iter().take(2).collect(),
+            beta_list.into_iter().take(2).collect(),
+        ],
+        2,
+    );
+    let old_ids: Vec<Uuid> = old_buggy_result.iter().map(|h| h.note_id).collect();
     assert_eq!(
         old_ids,
         vec![x, z],
@@ -2202,4 +2389,128 @@ async fn t7d_multi_backend_search_session_kind_routes_to_note_substrate() {
             "T7d: note-substrate hit must not carry an entity_kind, got: {hit}"
         );
     }
+}
+
+// ---- MIN-1: SubstrateCoordinatorService hydration seam ----
+
+/// The `khive-mcp` row-shape parity test drives `MockCoordinator` with
+/// pre-populated `entity_kinds`/`note_kinds`/etc. maps, so it never runs
+/// `SubstrateCoordinatorService`'s own hydration — the per-hit
+/// `get_entity`/`get_note` batch-fetch in `service.rs` (`fan_out_search`)
+/// that fills `entity_created_at` and `note_kinds`/`note_created_at`/
+/// `note_names` after the RRF merge. This test calls
+/// `SubstrateCoordinatorService::fan_out_search` directly against a real
+/// backend row for both substrates and asserts every hydrated map is
+/// populated from the actual stored record.
+#[tokio::test]
+async fn substrate_coordinator_service_hydrates_entity_and_note_metadata() {
+    use khive_mcp::coordinator::CoordinatorService;
+
+    let mut backend_reg = BackendRegistry::new();
+    let rt = memory_runtime();
+    backend_reg.register(BackendId::new("main"), Arc::clone(&rt));
+    let service = SubstrateCoordinatorService::new(SubstrateCoordinator::new(backend_reg));
+    let ns = Namespace::local();
+
+    let token = rt.authorize(ns.clone()).unwrap();
+    let entity = rt
+        .create_entity(
+            &token,
+            "concept",
+            None,
+            "Min1HydrationEntityProbe",
+            Some("entity for MIN-1 hydration coverage"),
+            None,
+            vec![],
+        )
+        .await
+        .expect("create entity");
+    let note = rt
+        .create_note(
+            &token,
+            "observation",
+            Some("Min1HydrationNoteProbe"),
+            "note content for min1hydrationnoteprobe coverage",
+            None,
+            None,
+            vec![],
+        )
+        .await
+        .expect("create note");
+
+    let entity_request = validated_kg_search(serde_json::json!({
+        "kind": "entity",
+        "query": "Min1HydrationEntityProbe",
+        "limit": 10,
+    }));
+    let entity_result = service.fan_out_search(&entity_request, &ns, &[]).await;
+    let entity_errors: Vec<&str> = entity_result
+        .per_backend
+        .iter()
+        .filter_map(|r| r.error.as_deref())
+        .collect();
+    assert!(
+        entity_errors.is_empty(),
+        "no backend errors: entity search: {entity_errors:?}"
+    );
+    assert!(
+        entity_result
+            .entity_hits
+            .iter()
+            .any(|h| h.entity_id == entity.id),
+        "the seeded entity must be found"
+    );
+    assert_eq!(
+        entity_result
+            .entity_kinds
+            .get(&entity.id)
+            .map(String::as_str),
+        Some("concept"),
+        "entity_kinds must be hydrated from the real stored entity, got: {:?}",
+        entity_result.entity_kinds
+    );
+    assert_eq!(
+        entity_result.entity_created_at.get(&entity.id),
+        Some(&entity.created_at),
+        "entity_created_at must be hydrated from the real stored entity, got: {:?}",
+        entity_result.entity_created_at
+    );
+
+    let note_request = validated_kg_search(serde_json::json!({
+        "kind": "observation",
+        "query": "min1hydrationnoteprobe",
+        "limit": 10,
+    }));
+    let note_result = service.fan_out_search(&note_request, &ns, &[]).await;
+    let note_errors: Vec<&str> = note_result
+        .per_backend
+        .iter()
+        .filter_map(|r| r.error.as_deref())
+        .collect();
+    assert!(
+        note_errors.is_empty(),
+        "no backend errors: note search: {note_errors:?}"
+    );
+    assert!(
+        note_result.note_hits.iter().any(|h| h.note_id == note.id),
+        "the seeded note must be found"
+    );
+    assert_eq!(
+        note_result.note_kinds.get(&note.id).map(String::as_str),
+        Some("observation"),
+        "note_kinds must be hydrated from the real stored note, got: {:?}",
+        note_result.note_kinds
+    );
+    assert_eq!(
+        note_result.note_created_at.get(&note.id),
+        Some(&note.created_at),
+        "note_created_at must be hydrated from the real stored note, got: {:?}",
+        note_result.note_created_at
+    );
+    assert_eq!(
+        note_result.note_names.get(&note.id),
+        Some(&note.name),
+        "note_names must be hydrated from the real stored note, got: {:?}",
+        note_result.note_names
+    );
 }

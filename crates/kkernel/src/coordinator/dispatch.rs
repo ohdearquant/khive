@@ -520,21 +520,44 @@ impl SubstrateCoordinator {
                     return (vec![], vec![], vec![backend_result]);
                 }
             };
+            // MAJ-2 (r2 follow-up): the single-backend early return has no
+            // spawned task to bound with the fan-out timeout loop below, so
+            // both awaits are wrapped directly in the same
+            // `backend_search_timeout_ms()` budget — an unbounded await here
+            // would leave a hung single-backend deployment's search
+            // unbounded even though the multi-backend path is bounded.
+            #[cfg(test)]
+            let should_hang = self
+                .hang_backend_id
+                .as_deref()
+                .map(|id| id == backend_id.as_str())
+                .unwrap_or(false);
+            #[cfg(not(test))]
+            let should_hang = false;
+            let timeout_ms = backend_search_timeout_ms();
+            let timeout_dur = Duration::from_millis(timeout_ms);
+
             if search_notes {
-                match runtime
-                    .search_notes(
-                        &token,
-                        request.query(),
-                        None,
-                        search_limit,
-                        request.kind_filter(),
-                        include_superseded,
-                        &tags_owned,
-                        props_filter_owned.as_ref(),
-                    )
-                    .await
-                {
-                    Ok(note_hits) => {
+                let search_fut = async {
+                    if should_hang {
+                        std::future::pending::<()>().await;
+                        unreachable!("a pending future never resolves");
+                    }
+                    runtime
+                        .search_notes(
+                            &token,
+                            request.query(),
+                            None,
+                            search_limit,
+                            request.kind_filter(),
+                            include_superseded,
+                            &tags_owned,
+                            props_filter_owned.as_ref(),
+                        )
+                        .await
+                };
+                match tokio::time::timeout(timeout_dur, search_fut).await {
+                    Ok(Ok(note_hits)) => {
                         let note_hits: Vec<NoteSearchHit> =
                             note_hits.into_iter().take(limit as usize).collect();
                         let backend_result = BackendSearchResult {
@@ -545,7 +568,7 @@ impl SubstrateCoordinator {
                         };
                         return (vec![], note_hits, vec![backend_result]);
                     }
-                    Err(e) => {
+                    Ok(Err(e)) => {
                         let backend_result = BackendSearchResult {
                             backend_id: backend_id.clone(),
                             hits: vec![],
@@ -554,22 +577,42 @@ impl SubstrateCoordinator {
                         };
                         return (vec![], vec![], vec![backend_result]);
                     }
+                    Err(_elapsed) => {
+                        tracing::warn!(
+                            backend = %backend_id,
+                            timeout_ms,
+                            "backend search task timed out"
+                        );
+                        let backend_result = BackendSearchResult {
+                            backend_id: backend_id.clone(),
+                            hits: vec![],
+                            note_hits: vec![],
+                            error: Some(format!("backend search timed out after {timeout_ms}ms")),
+                        };
+                        return (vec![], vec![], vec![backend_result]);
+                    }
                 }
             } else {
-                match runtime
-                    .hybrid_search(
-                        &token,
-                        request.query(),
-                        None,
-                        search_limit,
-                        request.kind_filter(),
-                        request.entity_type(),
-                        &tags_owned,
-                        props_filter_owned.as_ref(),
-                    )
-                    .await
-                {
-                    Ok(hits) => {
+                let search_fut = async {
+                    if should_hang {
+                        std::future::pending::<()>().await;
+                        unreachable!("a pending future never resolves");
+                    }
+                    runtime
+                        .hybrid_search(
+                            &token,
+                            request.query(),
+                            None,
+                            search_limit,
+                            request.kind_filter(),
+                            request.entity_type(),
+                            &tags_owned,
+                            props_filter_owned.as_ref(),
+                        )
+                        .await
+                };
+                match tokio::time::timeout(timeout_dur, search_fut).await {
+                    Ok(Ok(hits)) => {
                         let hits: Vec<SearchHit> = hits.into_iter().take(limit as usize).collect();
                         let backend_result = BackendSearchResult {
                             backend_id: backend_id.clone(),
@@ -579,12 +622,26 @@ impl SubstrateCoordinator {
                         };
                         return (hits, vec![], vec![backend_result]);
                     }
-                    Err(e) => {
+                    Ok(Err(e)) => {
                         let backend_result = BackendSearchResult {
                             backend_id: backend_id.clone(),
                             hits: vec![],
                             note_hits: vec![],
                             error: Some(e.to_string()),
+                        };
+                        return (vec![], vec![], vec![backend_result]);
+                    }
+                    Err(_elapsed) => {
+                        tracing::warn!(
+                            backend = %backend_id,
+                            timeout_ms,
+                            "backend search task timed out"
+                        );
+                        let backend_result = BackendSearchResult {
+                            backend_id: backend_id.clone(),
+                            hits: vec![],
+                            note_hits: vec![],
+                            error: Some(format!("backend search timed out after {timeout_ms}ms")),
                         };
                         return (vec![], vec![], vec![backend_result]);
                     }
@@ -898,7 +955,10 @@ pub(super) fn rrf_merge_entity_hits(lists: Vec<Vec<SearchHit>>, limit: usize) ->
 }
 
 /// Merge multiple ranked note hit lists via Reciprocal Rank Fusion (k=60).
-fn rrf_merge_note_hits(lists: Vec<Vec<NoteSearchHit>>, limit: usize) -> Vec<NoteSearchHit> {
+pub(super) fn rrf_merge_note_hits(
+    lists: Vec<Vec<NoteSearchHit>>,
+    limit: usize,
+) -> Vec<NoteSearchHit> {
     const K: f64 = 60.0;
 
     let mut scores: HashMap<Uuid, RrfMergeBucket> = HashMap::new();
