@@ -55,19 +55,73 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 20] = [
                 name: "content",
                 param_type: "string",
                 required: false,
-                description: "Required body text for singleton and bulk note creates.",
+                description: "Required body text for ordinary notes; loaded task/finding hooks may derive it from their title/description fields.",
             },
             ParamDef {
                 name: "salience",
                 param_type: "number",
                 required: false,
-                description: "Optional note salience in the inclusive range [0.0, 1.0].",
+                description: "Optional ordinary-note salience in the inclusive range [0.0, 1.0]. Task salience is derived from priority, so task creates reject this field.",
             },
             ParamDef {
                 name: "description",
                 param_type: "string",
                 required: false,
-                description: "Free-text description (entities).",
+                description: "Free-text description for entities, or task body text when the GTD task hook is loaded.",
+            },
+            ParamDef {
+                name: "title",
+                param_type: "string",
+                required: false,
+                description: "Task/finding hook title; may be used instead of `name` for those note kinds.",
+            },
+            ParamDef {
+                name: "priority",
+                param_type: "string",
+                required: false,
+                description: "Task-hook priority (p0 | p1 | p2 | p3).",
+            },
+            ParamDef {
+                name: "status",
+                param_type: "string",
+                required: false,
+                description: "Task-hook initial lifecycle status.",
+            },
+            ParamDef {
+                name: "assignee",
+                param_type: "string",
+                required: false,
+                description: "Task-hook assignee.",
+            },
+            ParamDef {
+                name: "due",
+                param_type: "string",
+                required: false,
+                description: "Task-hook due timestamp.",
+            },
+            ParamDef {
+                name: "start",
+                param_type: "string",
+                required: false,
+                description: "Task-hook start value.",
+            },
+            ParamDef {
+                name: "end",
+                param_type: "string",
+                required: false,
+                description: "Task-hook end value.",
+            },
+            ParamDef {
+                name: "depends_on",
+                param_type: "array of string",
+                required: false,
+                description: "Task-hook dependency references, validated before create.",
+            },
+            ParamDef {
+                name: "context_entity_id",
+                param_type: "string",
+                required: false,
+                description: "Task-hook context entity reference; creates an annotates edge after the note commits.",
             },
             ParamDef {
                 name: "embedding_content",
@@ -98,6 +152,24 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 20] = [
                 description: "Arbitrary JSON properties.",
             },
             ParamDef {
+                name: "annotates",
+                param_type: "array of string",
+                required: false,
+                description: "Singleton note-only annotation target references.",
+            },
+            ParamDef {
+                name: "skip_dedup_check",
+                param_type: "bool",
+                required: false,
+                description: "Singleton create-only retrieval hint; does not change write semantics.",
+            },
+            ParamDef {
+                name: "edges",
+                param_type: "array of object",
+                required: false,
+                description: "Singleton created-record outgoing edge specifications applied after the record write.",
+            },
+            ParamDef {
                 name: "external_id",
                 param_type: "string",
                 required: false,
@@ -108,8 +180,10 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 20] = [
                 param_type: "array of object",
                 required: false,
                 description: "Mixed bulk creation. Each item requires `kind`; entities \
-                              require `name`, notes require `content` and may include \
-                              `note_kind`, `salience`, or `external_id`. When present, \
+                              require `name`, ordinary notes require `content` and may include \
+                              `note_kind`, `salience`, or `external_id`. Loaded task hooks \
+                              accept task fields; finding accepts `title` (other finding metadata \
+                              remains in `properties`); task salience is derived from priority. When present, \
                               top-level `kind` is not required. Capped at 1000 entries.",
             },
             ParamDef {

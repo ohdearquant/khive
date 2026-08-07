@@ -80,9 +80,13 @@ it does not guarantee every handler-internal semantic precondition is caught.
 
 For `tool == "create"`, this mirrors the singleton branches of the KG pack's own
 `handle_create` (`khive-pack-kg/src/handlers/create.rs`): entity/granular-entity
-creates require `name`, note/granular-note creates require `content`, and a bare
+creates require `name`, ordinary note/granular-note creates require `content`, and a bare
 `kind="entity"` requires an `entity_kind` (or a granular entity kind) to resolve a
-concrete kind. It also validates `entity_type` against the KG entity-type/subtype
+concrete kind. Loaded task/finding hooks may derive content from `title`/`name`;
+task-only lifecycle fields are accepted only for a loaded task hook, while
+`description` on an unhooked note is rejected instead of silently dropped. Bulk-only
+`atomic`/`verbose` options are rejected when `items` is absent. It also validates
+`entity_type` against the KG entity-type/subtype
 registry when present — see `validate_entity_type_for_replay` below.
 `khive-pack-schedule` does not depend on `khive-pack-kg` in production (only as a
 dev-dependency for tests), so this reimplements the classification using
@@ -168,7 +172,14 @@ not only discovered at trigger-time replay. `context` prefixes error messages (e
 malformed entries the real bulk handler would. `validate_create_bulk_items`
 validates a `create(items=[...])` bulk payload the way `handle_create`'s bulk path
 would: `items` must parse into that shape (required `kind`,
-deny-unknown-fields), entities require `name`, and notes require `content`.
+deny-unknown-fields), entities require `name`, and ordinary notes require `content`.
+Loaded task-hook fields and finding `title` are preserved per item and checked with
+the same kind and string-type rules as live dispatch; other finding metadata remains
+inside `properties`. Task salience is derived from priority, so an explicit task
+`salience` is rejected instead of being silently overwritten. Explicit null is preserved and rejected
+where a hook field requires a string. Singleton payload fields beside `items`
+(`annotates`, `edges`, `skip_dedup_check`, and the other record fields) are rejected
+rather than ignored; only the compatibility top-level `kind` plus bulk controls remain.
 Entity and note entries may be mixed; note-only/entity-only fields and kind
 reconciliation are checked before the action is scheduled. Note salience and
 the two accepted `external_id` representations are validated with the same

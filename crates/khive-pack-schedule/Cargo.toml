@@ -33,6 +33,7 @@ khive-pack-kg = { version = "0.7.0", path = "../khive-pack-kg" }
 khive-pack-comm = { version = "0.7.0", path = "../khive-pack-comm" }
 khive-pack-brain = { version = "0.7.0", path = "../khive-pack-brain" }
 khive-pack-git = { version = "0.7.0", path = "../khive-pack-git" }
+khive-pack-gtd = { version = "0.7.0", path = "../khive-pack-gtd" }
 criterion = { workspace = true }
 
 [[bench]]

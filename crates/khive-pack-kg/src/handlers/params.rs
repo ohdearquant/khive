@@ -27,8 +27,12 @@ pub(crate) struct BulkCreateEntry {
     pub(crate) note_kind: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) entity_type: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) description: Option<String>,
+    #[serde(
+        default,
+        deserialize_with = "present_json_value",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub(crate) description: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) properties: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -44,6 +48,60 @@ pub(crate) struct BulkCreateEntry {
         skip_serializing_if = "Option::is_none"
     )]
     pub(crate) external_id: Option<Value>,
+    #[serde(
+        default,
+        deserialize_with = "present_json_value",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub(crate) title: Option<Value>,
+    #[serde(
+        default,
+        deserialize_with = "present_json_value",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub(crate) priority: Option<Value>,
+    #[serde(
+        default,
+        deserialize_with = "present_json_value",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub(crate) status: Option<Value>,
+    #[serde(
+        default,
+        deserialize_with = "present_json_value",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub(crate) assignee: Option<Value>,
+    #[serde(
+        default,
+        deserialize_with = "present_json_value",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub(crate) due: Option<Value>,
+    #[serde(
+        default,
+        deserialize_with = "present_json_value",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub(crate) start: Option<Value>,
+    #[serde(
+        default,
+        deserialize_with = "present_json_value",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub(crate) end: Option<Value>,
+    #[serde(
+        default,
+        deserialize_with = "present_json_value",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub(crate) depends_on: Option<Value>,
+    #[serde(
+        default,
+        deserialize_with = "present_json_value",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub(crate) context_entity_id: Option<Value>,
 }
 
 fn present_json_value<'de, D>(deserializer: D) -> Result<Option<Value>, D::Error>

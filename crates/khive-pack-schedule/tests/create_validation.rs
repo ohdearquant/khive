@@ -26,6 +26,16 @@ fn build_registry_with_brain() -> (VerbRegistry, KhiveRuntime) {
     (registry, runtime)
 }
 
+fn build_registry_with_gtd() -> (VerbRegistry, KhiveRuntime) {
+    let runtime = support::memory_runtime();
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(khive_pack_kg::KgPack::new(runtime.clone()));
+    builder.register(khive_pack_gtd::GtdPack::new(runtime.clone()));
+    builder.register(SchedulePack::new(runtime.clone()));
+    let registry = builder.build().expect("registry builds");
+    (registry, runtime)
+}
+
 /// A registry with a real type-declaring pack (git, which declares `adr` as
 /// a `Document` subtype via its `ENTITY_TYPES`) loaded alongside schedule —
 /// used to pin that `schedule.schedule` resolves `entity_type` against the
@@ -1691,6 +1701,169 @@ async fn schedule_schedule_accepts_mixed_entity_note_bulk_create() {
         .expect("live KG handler must accept the same mixed shape");
     assert_eq!(live["created"], 2);
     assert_eq!(live["created_notes"], 1);
+}
+
+#[tokio::test]
+async fn schedule_and_live_bulk_accept_loaded_task_hook_fields() {
+    let (registry, _rt) = build_registry_with_gtd();
+    let action = r#"create(items=[{"kind":"task","title":"scheduled task","description":"scheduled task body","content":"","priority":"p1","status":"next","assignee":"lambda:test","due":"2099-06-01T10:00:00Z","start":"2099-05-01","end":"2099-06-01","depends_on":[]}], atomic=true)"#;
+    registry
+        .dispatch(
+            "schedule.schedule",
+            serde_json::json!({ "action": action, "at": "2099-06-01T09:00:00Z" }),
+        )
+        .await
+        .expect("schedule-time replay validation accepts loaded task hook fields");
+
+    for atomic in [false, true] {
+        let result = registry
+            .dispatch(
+                "create",
+                serde_json::json!({
+                    "atomic": atomic,
+                    "verbose": true,
+                    "items": [{
+                        "kind": "task",
+                        "title": format!("live task {atomic}"),
+                        "description": "live task body",
+                        "content": "",
+                        "priority": "p1",
+                        "status": "next",
+                        "assignee": "lambda:test",
+                        "due": "2099-06-01T10:00:00Z",
+                        "start": "2099-05-01",
+                        "end": "2099-06-01",
+                        "depends_on": []
+                    }]
+                }),
+            )
+            .await
+            .expect("live best-effort and atomic bulk paths accept task hook fields");
+        assert_eq!(result["created"], 1);
+        assert_eq!(result["notes"][0]["content"], "live task body");
+        assert_eq!(result["notes"][0]["properties"]["priority"], "p1");
+    }
+
+    let error = registry
+        .dispatch(
+            "schedule.schedule",
+            serde_json::json!({
+                "action": r#"create(items=[{"kind":"task","title":"bad priority","priority":42}])"#,
+                "at": "2099-06-01T10:00:00Z"
+            }),
+        )
+        .await
+        .expect_err("wrong-type task hook fields fail before replay is stored");
+    assert!(error.to_string().contains("priority must be a string"));
+
+    for action in [
+        r#"create(kind="task", title="derived salience", salience=0.9)"#,
+        r#"create(items=[{"kind":"task","title":"derived salience","salience":0.9}])"#,
+    ] {
+        let error = registry
+            .dispatch(
+                "schedule.schedule",
+                serde_json::json!({"action": action, "at": "2099-06-01T10:00:00Z"}),
+            )
+            .await
+            .expect_err("task salience conflicts fail before replay is stored");
+        assert!(error
+            .to_string()
+            .contains("salience is derived from priority"));
+    }
+
+    for action in [
+        r#"create(kind="task", title="bad dependencies", depends_on=42)"#,
+        r#"create(items=[{"kind":"task","title":"bad dependencies","depends_on":[42]}])"#,
+    ] {
+        let error = registry
+            .dispatch(
+                "schedule.schedule",
+                serde_json::json!({"action": action, "at": "2099-06-01T10:00:00Z"}),
+            )
+            .await
+            .expect_err("malformed task dependencies fail before replay is stored");
+        assert!(error.to_string().contains("depends_on"));
+    }
+}
+
+#[tokio::test]
+async fn schedule_rejects_description_on_unhooked_note() {
+    let (registry, _rt) = build_registry();
+    for action in [
+        r#"create(items=[{"kind":"observation","content":"x","description":"must not disappear"}])"#,
+        r#"create(items=[{"kind":"observation","content":"x","description":null}])"#,
+    ] {
+        let error = registry
+            .dispatch(
+                "schedule.schedule",
+                serde_json::json!({
+                    "action": action,
+                    "at": "2099-06-01T10:00:00Z"
+                }),
+            )
+            .await
+            .expect_err("unsupported note description must fail before replay is stored");
+        assert!(
+            error.to_string().contains("items[0]") && error.to_string().contains("description"),
+            "unexpected replay-validation error: {error}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn schedule_rejects_singleton_payload_fields_beside_bulk_items() {
+    let (registry, _rt) = build_registry();
+    for (field, action) in [
+        (
+            "annotates",
+            r#"create(items=[{"kind":"concept","name":"x"}], annotates=[])"#,
+        ),
+        (
+            "edges",
+            r#"create(items=[{"kind":"concept","name":"x"}], edges=[])"#,
+        ),
+        (
+            "skip_dedup_check",
+            r#"create(items=[{"kind":"concept","name":"x"}], skip_dedup_check=true)"#,
+        ),
+    ] {
+        let error = registry
+            .dispatch(
+                "schedule.schedule",
+                serde_json::json!({"action": action, "at": "2099-06-01T10:00:00Z"}),
+            )
+            .await
+            .expect_err("misplaced singleton payload cannot be scheduled");
+        assert!(
+            error.to_string().contains(field),
+            "unexpected replay-validation error: {error}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn schedule_and_live_reject_bulk_only_options_on_singleton_create() {
+    let (registry, _rt) = build_registry();
+    for option in ["atomic", "verbose"] {
+        let action = format!("create(kind=\"observation\", content=\"x\", {option}=true)");
+        let scheduled_error = registry
+            .dispatch(
+                "schedule.schedule",
+                serde_json::json!({ "action": action, "at": "2099-06-01T10:00:00Z" }),
+            )
+            .await
+            .expect_err("bulk-only option cannot be persisted on singleton replay");
+        assert!(scheduled_error.to_string().contains(option));
+
+        let mut live = serde_json::json!({"kind": "observation", "content": "x"});
+        live[option] = serde_json::json!(true);
+        let live_error = registry
+            .dispatch("create", live)
+            .await
+            .expect_err("live singleton rejects the same option");
+        assert!(live_error.to_string().contains(option));
+    }
 }
 
 #[tokio::test]

@@ -23,6 +23,7 @@ struct PreparedBulkEntry {
     hook: Option<Arc<dyn KindHook>>,
     hook_params: Value,
     idempotent_note: bool,
+    annotates: Vec<uuid::Uuid>,
 }
 
 /// Normalize the optional note natural key into `properties.external_id`.
@@ -95,6 +96,27 @@ fn normalize_note_external_id(
     Ok(canonical)
 }
 
+fn validate_present_string_fields(params: &Value, context: &str) -> Result<(), RuntimeError> {
+    for field in [
+        "description",
+        "title",
+        "priority",
+        "status",
+        "assignee",
+        "due",
+        "start",
+        "end",
+        "context_entity_id",
+    ] {
+        if params.get(field).is_some_and(|value| !value.is_string()) {
+            return Err(RuntimeError::InvalidInput(format!(
+                "{context}: {field} must be a string"
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn append_post_commit_stage(
     failures: &mut Vec<BulkPostCommitFailure>,
     note_id: uuid::Uuid,
@@ -159,6 +181,9 @@ impl KgPack {
         entry: super::params::BulkCreateEntry,
         registry: &VerbRegistry,
     ) -> Result<PreparedBulkEntry, RuntimeError> {
+        let entry_params = serde_json::to_value(&entry)
+            .map_err(|error| RuntimeError::InvalidInput(error.to_string()))?;
+        validate_present_string_fields(&entry_params, &format!("items[{idx}]"))?;
         let item_kind_spec = resolve_kind_spec(&entry.kind, registry)
             .map_err(|error| RuntimeError::InvalidInput(format!("items[{idx}].kind: {error}")))?;
 
@@ -168,9 +193,18 @@ impl KgPack {
                     || entry.note_kind.is_some()
                     || entry.salience.is_some()
                     || entry.external_id.is_some()
+                    || entry.title.is_some()
+                    || entry.priority.is_some()
+                    || entry.status.is_some()
+                    || entry.assignee.is_some()
+                    || entry.due.is_some()
+                    || entry.start.is_some()
+                    || entry.end.is_some()
+                    || entry.depends_on.is_some()
+                    || entry.context_entity_id.is_some()
                 {
                     return Err(RuntimeError::InvalidInput(format!(
-                        "items[{idx}]: content, note_kind, salience, and external_id are note-only fields"
+                        "items[{idx}]: content, note_kind, salience, external_id, title, and task lifecycle fields are note-only fields"
                     )));
                 }
                 let canonical = reconcile_specific(
@@ -191,8 +225,7 @@ impl KgPack {
                 // workspace's hook validates properties.schema_version before
                 // persistence. Keep the hook-mutated params for winner-only
                 // after_create below.
-                let mut hook_params = serde_json::to_value(&entry)
-                    .map_err(|error| RuntimeError::InvalidInput(error.to_string()))?;
+                let mut hook_params = entry_params.clone();
                 let root = hook_params
                     .as_object_mut()
                     .expect("bulk entry serializes as object");
@@ -236,6 +269,7 @@ impl KgPack {
                     hook,
                     hook_params,
                     idempotent_note: false,
+                    annotates: Vec::new(),
                 })
             }
             KindSpec::Note { specific } => {
@@ -258,8 +292,7 @@ impl KgPack {
                     )));
                 }
 
-                let mut hook_params = serde_json::to_value(&entry)
-                    .map_err(|error| RuntimeError::InvalidInput(error.to_string()))?;
+                let mut hook_params = entry_params;
                 let root = hook_params
                     .as_object_mut()
                     .expect("bulk entry serializes as object");
@@ -268,6 +301,37 @@ impl KgPack {
                 root.insert("namespace".into(), json!(token.namespace().as_str()));
 
                 let hook = registry.find_kind_hook(&canonical);
+                let task_hook = canonical == "task" && hook.is_some();
+                let title_hook = task_hook || (canonical == "finding" && hook.is_some());
+                if task_hook && entry.salience.is_some() {
+                    return Err(RuntimeError::InvalidInput(format!(
+                        "items[{idx}]: task salience is derived from priority; use priority instead"
+                    )));
+                }
+                if entry.description.is_some() && !task_hook {
+                    return Err(RuntimeError::InvalidInput(format!(
+                        "items[{idx}]: description is only supported for entities or task notes"
+                    )));
+                }
+                if entry.title.is_some() && !title_hook {
+                    return Err(RuntimeError::InvalidInput(format!(
+                        "items[{idx}]: title is only supported by task or finding note hooks"
+                    )));
+                }
+                if (entry.priority.is_some()
+                    || entry.status.is_some()
+                    || entry.assignee.is_some()
+                    || entry.due.is_some()
+                    || entry.start.is_some()
+                    || entry.end.is_some()
+                    || entry.depends_on.is_some()
+                    || entry.context_entity_id.is_some())
+                    && !task_hook
+                {
+                    return Err(RuntimeError::InvalidInput(format!(
+                        "items[{idx}]: priority, status, assignee, due, start, end, depends_on, and context_entity_id are task-note-only fields"
+                    )));
+                }
                 if let Some(ref kind_hook) = hook {
                     kind_hook
                         .prepare_create(&self.runtime, &mut hook_params)
@@ -281,14 +345,20 @@ impl KgPack {
                 let p: CreateParams = deser(hook_params.clone()).map_err(|error| {
                     RuntimeError::InvalidInput(format!("items[{idx}]: {error}"))
                 })?;
-                if p.embedding_content.is_some()
-                    || p.annotates
-                        .as_ref()
-                        .is_some_and(|values| !values.is_empty())
-                {
+                if p.embedding_content.is_some() {
                     return Err(RuntimeError::InvalidInput(format!(
-                        "items[{idx}]: embedding_content and annotates are singleton-note-only fields"
+                        "items[{idx}]: embedding_content is a singleton-note-only field"
                     )));
+                }
+                let mut annotates = Vec::new();
+                for target in p.annotates.unwrap_or_default() {
+                    annotates.push(
+                        resolve_uuid_unfiltered(&target, &self.runtime, token)
+                            .await
+                            .map_err(|error| {
+                                RuntimeError::InvalidInput(format!("items[{idx}]: {error}"))
+                            })?,
+                    );
                 }
                 let content = p.content.ok_or_else(|| {
                     RuntimeError::InvalidInput(format!(
@@ -316,6 +386,7 @@ impl KgPack {
                     hook,
                     hook_params,
                     idempotent_note: external_id.is_some(),
+                    annotates,
                 })
             }
             KindSpec::Event => Err(immutable_event_error()),
@@ -345,6 +416,35 @@ impl KgPack {
             return Err(RuntimeError::InvalidInput(
                 "external_id belongs on each bulk note item, not beside `items`".into(),
             ));
+        }
+        for field in [
+            "name",
+            "entity_kind",
+            "note_kind",
+            "entity_type",
+            "content",
+            "description",
+            "tags",
+            "properties",
+            "salience",
+            "annotates",
+            "skip_dedup_check",
+            "edges",
+            "title",
+            "priority",
+            "status",
+            "assignee",
+            "due",
+            "start",
+            "end",
+            "depends_on",
+            "context_entity_id",
+        ] {
+            if enclosing_params.get(field).is_some() {
+                return Err(RuntimeError::InvalidInput(format!(
+                    "{field} belongs on each applicable bulk item, not beside `items`"
+                )));
+            }
         }
 
         let attempted = raw_entries.len();
@@ -494,6 +594,45 @@ impl KgPack {
         for (position, idx, outcome) in &successes {
             let entry = &prepared[*position].1;
             if outcome.created {
+                if let BulkCreatedRecord::Note(note) = &outcome.record {
+                    let mut created_edges = Vec::with_capacity(entry.annotates.len());
+                    for target_id in &entry.annotates {
+                        match self
+                            .runtime
+                            .link(
+                                token,
+                                note.id,
+                                *target_id,
+                                khive_storage::EdgeRelation::Annotates,
+                                1.0,
+                                None,
+                            )
+                            .await
+                        {
+                            Ok(edge) => created_edges.push(uuid::Uuid::from(edge.id)),
+                            Err(error) => {
+                                for edge_id in created_edges {
+                                    let _ = self.runtime.delete_edge(token, edge_id, true).await;
+                                }
+                                tracing::warn!(
+                                    index = *idx,
+                                    id = %note.id,
+                                    error = %error,
+                                    "bulk hook-produced annotates side effects failed"
+                                );
+                                append_post_commit_stage(
+                                    &mut post_commit_failures,
+                                    note.id,
+                                    BulkPostCommitFailureStage {
+                                        stage: "annotates".to_string(),
+                                        model: None,
+                                    },
+                                );
+                                break;
+                            }
+                        }
+                    }
+                }
                 if let Some(ref hook) = entry.hook {
                     if let Err(error) = hook
                         .after_create(&self.runtime, outcome.record.id(), &entry.hook_params)
@@ -689,6 +828,15 @@ impl KgPack {
         }
         // ── End bulk path ──────────────────────────────────────────────────────
 
+        for option in ["atomic", "verbose"] {
+            if params.get(option).is_some() {
+                return Err(RuntimeError::InvalidInput(format!(
+                    "create: `{option}` is only valid when `items` is present"
+                )));
+            }
+        }
+        validate_present_string_fields(&params, "create")?;
+
         // Validate the raw singleton discriminants before resolving a hook or
         // replacing them with canonical values. `Value::as_str` would turn a
         // malformed present value into `None`, allowing (for example) an
@@ -751,6 +899,51 @@ impl KgPack {
                 ));
             }
         };
+
+        let task_hook = matches!(&spec, KindSpec::Note { .. })
+            && sub_kind.as_deref() == Some("task")
+            && hook.is_some();
+        let title_hook = task_hook
+            || (matches!(&spec, KindSpec::Note { .. })
+                && sub_kind.as_deref() == Some("finding")
+                && hook.is_some());
+        if task_hook && params.get("salience").is_some() {
+            return Err(RuntimeError::InvalidInput(
+                "task salience is derived from priority; use priority instead".into(),
+            ));
+        }
+        if params.get("description").is_some()
+            && matches!(&spec, KindSpec::Note { .. })
+            && !task_hook
+        {
+            return Err(RuntimeError::InvalidInput(
+                "description is only supported for entities or task notes".into(),
+            ));
+        }
+        if params.get("title").is_some() && !title_hook {
+            return Err(RuntimeError::InvalidInput(
+                "title is only supported by task or finding note hooks".into(),
+            ));
+        }
+        if [
+            "priority",
+            "status",
+            "assignee",
+            "due",
+            "start",
+            "end",
+            "depends_on",
+            "context_entity_id",
+        ]
+        .iter()
+        .any(|field| params.get(*field).is_some())
+            && !task_hook
+        {
+            return Err(RuntimeError::InvalidInput(
+                "priority, status, assignee, due, start, end, depends_on, and context_entity_id are task-note-only fields"
+                    .into(),
+            ));
+        }
 
         if let Some(obj) = params.as_object_mut() {
             obj.insert("kind".into(), json!(spec.substrate_label()));

@@ -304,6 +304,36 @@ fn validate_conditional_requirements(
                     .into(),
             ));
         }
+        for field in [
+            "name",
+            "entity_kind",
+            "note_kind",
+            "entity_type",
+            "content",
+            "description",
+            "tags",
+            "properties",
+            "salience",
+            "annotates",
+            "embedding_content",
+            "skip_dedup_check",
+            "edges",
+            "title",
+            "priority",
+            "status",
+            "assignee",
+            "due",
+            "start",
+            "end",
+            "depends_on",
+            "context_entity_id",
+        ] {
+            if args.contains_key(field) {
+                return Err(RuntimeError::InvalidInput(format!(
+                    "schedule.action: verb \"create\": {field} belongs on each applicable bulk item, not beside `items`"
+                )));
+            }
+        }
         // `handle_create` accepts these options only as JSON booleans. Replay
         // validation must reject the same malformed actions before persisting a
         // scheduled event instead of deferring the failure until fire time.
@@ -323,6 +353,36 @@ fn validate_conditional_requirements(
             .unwrap_or(Value::Null);
         return validate_create_bulk_items(&items_value, registry);
     }
+
+    for option in ["atomic", "verbose"] {
+        if args.contains_key(option) {
+            return Err(RuntimeError::InvalidInput(format!(
+                "schedule.action: verb \"create\": `{option}` is only valid when `items` is present"
+            )));
+        }
+    }
+    for field in [
+        "description",
+        "title",
+        "priority",
+        "status",
+        "assignee",
+        "due",
+        "start",
+        "end",
+        "context_entity_id",
+    ] {
+        validate_present_bulk_string(
+            args.get(field).and_then(khive_request::ArgValue::as_value),
+            field,
+            "singleton",
+        )?;
+    }
+    validate_task_depends_on_for_replay(
+        args.get("depends_on")
+            .and_then(khive_request::ArgValue::as_value),
+        "singleton",
+    )?;
 
     let kind_str = args
         .get("kind")
@@ -344,6 +404,25 @@ fn validate_conditional_requirements(
             if args.contains_key("external_id") {
                 return Err(RuntimeError::InvalidInput(
                     "schedule.action: verb \"create\": external_id is only valid for kind=note"
+                        .into(),
+                ));
+            }
+            if [
+                "title",
+                "priority",
+                "status",
+                "assignee",
+                "due",
+                "start",
+                "end",
+                "depends_on",
+                "context_entity_id",
+            ]
+            .iter()
+            .any(|field| args.contains_key(*field))
+            {
+                return Err(RuntimeError::InvalidInput(
+                    "schedule.action: verb \"create\": title and task lifecycle fields are note-only"
                         .into(),
                 ));
             }
@@ -393,6 +472,46 @@ fn validate_conditional_requirements(
             if canonical == "scheduled_event" {
                 return Err(RuntimeError::InvalidInput(
                     "schedule.action: verb \"create\": scheduled_event is not creatable through `create`"
+                    .into(),
+                ));
+            }
+            let hook = registry.find_kind_hook(&canonical);
+            let task_hook = canonical == "task" && hook.is_some();
+            let finding_hook = canonical == "finding" && hook.is_some();
+            if task_hook && args.contains_key("salience") {
+                return Err(RuntimeError::InvalidInput(
+                    "schedule.action: verb \"create\": task salience is derived from priority; use priority instead"
+                        .into(),
+                ));
+            }
+            if args.contains_key("description") && !task_hook {
+                return Err(RuntimeError::InvalidInput(
+                    "schedule.action: verb \"create\": description is only supported for entities or task notes"
+                        .into(),
+                ));
+            }
+            if args.contains_key("title") && !(task_hook || finding_hook) {
+                return Err(RuntimeError::InvalidInput(
+                    "schedule.action: verb \"create\": title is only supported by task or finding note hooks"
+                        .into(),
+                ));
+            }
+            if [
+                "priority",
+                "status",
+                "assignee",
+                "due",
+                "start",
+                "end",
+                "depends_on",
+                "context_entity_id",
+            ]
+            .iter()
+            .any(|field| args.contains_key(*field))
+                && !task_hook
+            {
+                return Err(RuntimeError::InvalidInput(
+                    "schedule.action: verb \"create\": priority, status, assignee, due, start, end, depends_on, and context_entity_id are task-note-only fields"
                         .into(),
                 ));
             }
@@ -402,7 +521,30 @@ fn validate_conditional_requirements(
                 .and_then(Value::as_str)
                 .map(str::trim)
                 .unwrap_or("");
-            if content.is_empty() {
+            let title = args
+                .get("title")
+                .and_then(khive_request::ArgValue::as_value)
+                .and_then(Value::as_str)
+                .or_else(|| {
+                    args.get("name")
+                        .and_then(khive_request::ArgValue::as_value)
+                        .and_then(Value::as_str)
+                })
+                .map(str::trim)
+                .unwrap_or("");
+            let description = args
+                .get("description")
+                .and_then(khive_request::ArgValue::as_value)
+                .and_then(Value::as_str);
+            if (task_hook || finding_hook) && title.is_empty() {
+                return Err(RuntimeError::InvalidInput(format!(
+                    "schedule.action: verb \"create\": {canonical} creation requires `title` or `name`"
+                )));
+            }
+            if ((!task_hook && !finding_hook) && content.is_empty())
+                || (!task_hook && args.contains_key("content") && content.is_empty())
+                || (task_hook && description.is_some_and(|value| value.trim().is_empty()))
+            {
                 return Err(RuntimeError::InvalidInput(
                     "schedule.action: verb \"create\": note creation requires `content`".into(),
                 ));
@@ -617,12 +759,31 @@ struct ScheduleBulkCreateEntryCheck {
     entity_kind: Option<String>,
     note_kind: Option<String>,
     entity_type: Option<String>,
-    description: Option<String>,
+    #[serde(default, deserialize_with = "present_bulk_json_value")]
+    description: Option<Value>,
     properties: Option<Value>,
     tags: Option<Vec<String>>,
     salience: Option<f64>,
     #[serde(default, deserialize_with = "present_bulk_json_value")]
     external_id: Option<Value>,
+    #[serde(default, deserialize_with = "present_bulk_json_value")]
+    title: Option<Value>,
+    #[serde(default, deserialize_with = "present_bulk_json_value")]
+    priority: Option<Value>,
+    #[serde(default, deserialize_with = "present_bulk_json_value")]
+    status: Option<Value>,
+    #[serde(default, deserialize_with = "present_bulk_json_value")]
+    assignee: Option<Value>,
+    #[serde(default, deserialize_with = "present_bulk_json_value")]
+    due: Option<Value>,
+    #[serde(default, deserialize_with = "present_bulk_json_value")]
+    start: Option<Value>,
+    #[serde(default, deserialize_with = "present_bulk_json_value")]
+    end: Option<Value>,
+    #[serde(default, deserialize_with = "present_bulk_json_value")]
+    depends_on: Option<Value>,
+    #[serde(default, deserialize_with = "present_bulk_json_value")]
+    context_entity_id: Option<Value>,
 }
 
 fn present_bulk_json_value<'de, D>(deserializer: D) -> Result<Option<Value>, D::Error>
@@ -630,6 +791,39 @@ where
     D: serde::Deserializer<'de>,
 {
     Value::deserialize(deserializer).map(Some)
+}
+
+fn validate_present_bulk_string(
+    value: Option<&Value>,
+    field: &str,
+    context: &str,
+) -> Result<(), RuntimeError> {
+    if value.is_some_and(|value| !value.is_string()) {
+        return Err(RuntimeError::InvalidInput(format!(
+            "schedule.action: verb \"create\": {context} {field} must be a string"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_task_depends_on_for_replay(
+    value: Option<&Value>,
+    context: &str,
+) -> Result<(), RuntimeError> {
+    let Some(value) = value else {
+        return Ok(());
+    };
+    let entries = value.as_array().ok_or_else(|| {
+        RuntimeError::InvalidInput(format!(
+            "schedule.action: verb \"create\": {context} depends_on must be an array of strings"
+        ))
+    })?;
+    if entries.iter().any(|entry| !entry.is_string()) {
+        return Err(RuntimeError::InvalidInput(format!(
+            "schedule.action: verb \"create\": {context} depends_on entries must be strings"
+        )));
+    }
+    Ok(())
 }
 
 fn validate_note_external_id_for_replay(
@@ -697,15 +891,38 @@ fn validate_create_bulk_items(
         ));
     }
     for (idx, entry) in entries.iter().enumerate() {
+        for (field, value) in [
+            ("description", entry.description.as_ref()),
+            ("title", entry.title.as_ref()),
+            ("priority", entry.priority.as_ref()),
+            ("status", entry.status.as_ref()),
+            ("assignee", entry.assignee.as_ref()),
+            ("due", entry.due.as_ref()),
+            ("start", entry.start.as_ref()),
+            ("end", entry.end.as_ref()),
+            ("context_entity_id", entry.context_entity_id.as_ref()),
+        ] {
+            validate_present_bulk_string(value, field, &format!("items[{idx}]"))?;
+        }
+        validate_task_depends_on_for_replay(entry.depends_on.as_ref(), &format!("items[{idx}]"))?;
         match classify_create_kind(&entry.kind, registry)? {
             CreateKindClass::Entity { specific } => {
                 if entry.content.is_some()
                     || entry.note_kind.is_some()
                     || entry.salience.is_some()
                     || entry.external_id.is_some()
+                    || entry.title.is_some()
+                    || entry.priority.is_some()
+                    || entry.status.is_some()
+                    || entry.assignee.is_some()
+                    || entry.due.is_some()
+                    || entry.start.is_some()
+                    || entry.end.is_some()
+                    || entry.depends_on.is_some()
+                    || entry.context_entity_id.is_some()
                 {
                     return Err(RuntimeError::InvalidInput(format!(
-                        "schedule.action: verb \"create\": items[{idx}] content, note_kind, salience, and external_id are note-only fields"
+                        "schedule.action: verb \"create\": items[{idx}] content, note_kind, salience, external_id, title, and task lifecycle fields are note-only fields"
                     )));
                 }
                 let canonical = reconcile_specific_for_replay(
@@ -759,12 +976,59 @@ fn validate_create_bulk_items(
                         "schedule.action: verb \"create\": items[{idx}] scheduled_event is not creatable through `create`"
                     )));
                 }
-                if entry
-                    .content
-                    .as_deref()
+                let hook = registry.find_kind_hook(&canonical);
+                let task_hook = canonical == "task" && hook.is_some();
+                let finding_hook = canonical == "finding" && hook.is_some();
+                if task_hook && entry.salience.is_some() {
+                    return Err(RuntimeError::InvalidInput(format!(
+                        "schedule.action: verb \"create\": items[{idx}] task salience is derived from priority; use priority instead"
+                    )));
+                }
+                if entry.description.is_some() && !task_hook {
+                    return Err(RuntimeError::InvalidInput(format!(
+                        "schedule.action: verb \"create\": items[{idx}] description is only supported for entities or task notes"
+                    )));
+                }
+                if entry.title.is_some() && !(task_hook || finding_hook) {
+                    return Err(RuntimeError::InvalidInput(format!(
+                        "schedule.action: verb \"create\": items[{idx}] title is only supported by task or finding note hooks"
+                    )));
+                }
+                if (entry.priority.is_some()
+                    || entry.status.is_some()
+                    || entry.assignee.is_some()
+                    || entry.due.is_some()
+                    || entry.start.is_some()
+                    || entry.end.is_some()
+                    || entry.depends_on.is_some()
+                    || entry.context_entity_id.is_some())
+                    && !task_hook
+                {
+                    return Err(RuntimeError::InvalidInput(format!(
+                        "schedule.action: verb \"create\": items[{idx}] priority, status, assignee, due, start, end, depends_on, and context_entity_id are task-note-only fields"
+                    )));
+                }
+                let title = entry
+                    .title
+                    .as_ref()
+                    .and_then(Value::as_str)
+                    .or(entry.name.as_deref())
                     .map(str::trim)
-                    .unwrap_or("")
-                    .is_empty()
+                    .unwrap_or("");
+                let content = entry.content.as_deref().map(str::trim).unwrap_or("");
+                if (task_hook || finding_hook) && title.is_empty() {
+                    return Err(RuntimeError::InvalidInput(format!(
+                        "schedule.action: verb \"create\": items[{idx}] {canonical} creation requires `title` or `name`"
+                    )));
+                }
+                if ((!task_hook && !finding_hook) && content.is_empty())
+                    || (!task_hook && entry.content.is_some() && content.is_empty())
+                    || (task_hook
+                        && entry
+                            .description
+                            .as_ref()
+                            .and_then(Value::as_str)
+                            .is_some_and(|description| description.trim().is_empty()))
                 {
                     return Err(RuntimeError::InvalidInput(format!(
                         "schedule.action: verb \"create\": items[{idx}] note creation requires `content`"

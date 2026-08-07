@@ -3057,6 +3057,11 @@ impl KhiveRuntime {
     ///   `SubstrateKind::Note`.
     /// - For each UUID in `annotates`, creates an `EdgeRelation::Annotates` edge from
     ///   the note to that target.
+    ///
+    /// This legacy record-only API always performs a create and rejects an
+    /// `external_id` inside `properties` before writing. Call
+    /// [`Self::create_note_with_embedding_content_and_outcome`] when the caller
+    /// can consume idempotent winner/loser and repair-stage outcomes.
     // REASON: note creation requires kind, name, content, salience, properties, annotates,
     // and namespace token — mirrors the MCP verb surface; a builder would not reduce
     // caller complexity for pack handler callers.
@@ -3074,6 +3079,7 @@ impl KhiveRuntime {
         Ok(self
             .create_note_inner(
                 token, kind, name, content, None, salience, None, properties, annotates, None,
+                false,
             )
             .await?
             .0)
@@ -3089,6 +3095,8 @@ impl KhiveRuntime {
     /// Use this when `content` may exceed an embedder's input cap (e.g. a
     /// very long commit message) and only a capped head prefix should be
     /// embedded, while the full text is still stored and searchable via FTS.
+    /// Its create/error and compensation contract is the same as
+    /// [`Self::create_note`].
     #[allow(clippy::too_many_arguments)]
     pub async fn create_note_with_embedding_content(
         &self,
@@ -3113,6 +3121,7 @@ impl KhiveRuntime {
                 properties,
                 annotates,
                 None,
+                false,
             )
             .await?
             .0)
@@ -3142,6 +3151,7 @@ impl KhiveRuntime {
                 properties,
                 annotates,
                 None,
+                false,
             )
             .await?;
         Ok((note, report))
@@ -3185,6 +3195,7 @@ impl KhiveRuntime {
             properties,
             annotates,
             None,
+            true,
         )
         .await
     }
@@ -3247,6 +3258,7 @@ impl KhiveRuntime {
                 properties,
                 annotates,
                 embedding_model,
+                false,
             )
             .await?
             .0)
@@ -3377,6 +3389,7 @@ impl KhiveRuntime {
         properties: Option<serde_json::Value>,
         annotates: Vec<Uuid>,
         embedding_model: Option<&str>,
+        natural_key_outcome: bool,
     ) -> RuntimeResult<(
         Note,
         crate::retrieval::EmbeddingTruncationReport,
@@ -3404,6 +3417,12 @@ impl KhiveRuntime {
                 ));
             }
         };
+        if !natural_key_outcome && external_id.is_some() {
+            return Err(RuntimeError::InvalidInput(
+                "properties.external_id requires create_note_with_embedding_content_and_outcome so the caller can observe idempotent and repair-stage outcomes"
+                    .into(),
+            ));
+        }
         // Secret gate: scan content, optional name, and structured properties.
         crate::secret_gate::check(content)?;
         if let Some(n) = name {
@@ -3479,7 +3498,7 @@ impl KhiveRuntime {
         if let Some(p) = properties {
             note = note.with_properties(p);
         }
-        let natural_key_create = external_id.is_some();
+        let natural_key_create = natural_key_outcome && external_id.is_some();
         let insert_outcome = if natural_key_create {
             self.notes(token)?
                 .insert_note_natural_key(note.clone())
@@ -11316,6 +11335,112 @@ mod tests {
             notes.is_empty(),
             "compensation must remove the note row after FTS failure; got {notes:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn legacy_wrappers_reject_natural_keys_across_mixed_api_race() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let properties = serde_json::json!({
+            "external_id": format!("legacy-wrapper:{}", Uuid::new_v4())
+        });
+        let barrier = Arc::new(tokio::sync::Barrier::new(3));
+        let legacy_runtime = rt.clone();
+        let legacy_token = tok.clone();
+        let legacy_properties = properties.clone();
+        let legacy_barrier = Arc::clone(&barrier);
+        let legacy = tokio::spawn(async move {
+            legacy_barrier.wait().await;
+            legacy_runtime
+                .create_note(
+                    &legacy_token,
+                    "observation",
+                    None,
+                    "legacy contender must never become canonical",
+                    None,
+                    Some(legacy_properties),
+                    vec![],
+                )
+                .await
+        });
+        let outcome_runtime = rt.clone();
+        let outcome_token = tok.clone();
+        let outcome_properties = properties.clone();
+        let outcome_barrier = Arc::clone(&barrier);
+        let outcome = tokio::spawn(async move {
+            outcome_barrier.wait().await;
+            outcome_runtime
+                .create_note_with_embedding_content_and_outcome(
+                    &outcome_token,
+                    "observation",
+                    None,
+                    "durable outcome winner",
+                    None,
+                    None,
+                    Some(outcome_properties),
+                    vec![],
+                )
+                .await
+        });
+        barrier.wait().await;
+
+        let legacy_error = legacy
+            .await
+            .expect("legacy task joins")
+            .expect_err("record-only API rejects natural keys before writing");
+        assert!(legacy_error.to_string().contains("requires"));
+        let (canonical, _, created, failures) = outcome
+            .await
+            .expect("outcome task joins")
+            .expect("outcome API creates the canonical row");
+        assert!(created);
+        assert!(failures.is_empty());
+
+        let full = "legacy create with embedding override";
+        assert!(rt
+            .create_note_with_embedding_content(
+                &tok,
+                "observation",
+                None,
+                full,
+                Some("legacy create"),
+                None,
+                Some(properties.clone()),
+                vec![],
+            )
+            .await
+            .is_err());
+        assert!(rt
+            .create_note_with_embedding_content_and_report(
+                &tok,
+                "observation",
+                None,
+                full,
+                Some("legacy create"),
+                None,
+                Some(properties.clone()),
+                vec![],
+            )
+            .await
+            .is_err());
+        assert!(rt
+            .create_note_with_decay(
+                &tok,
+                "observation",
+                None,
+                "legacy decay create",
+                None,
+                0.2,
+                Some(properties),
+                vec![],
+            )
+            .await
+            .is_err());
+
+        let notes = rt.list_notes(&tok, None, 1000, 0).await.unwrap();
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].id, canonical.id);
+        assert_eq!(notes[0].content, "durable outcome winner");
     }
 
     // A natural-key winner cannot use the ordinary compensation policy: a

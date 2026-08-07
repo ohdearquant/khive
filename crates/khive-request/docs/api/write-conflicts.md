@@ -24,7 +24,7 @@ Bulk and singleton links use the same key builder so equivalent entries collide.
 
 ## Relation and endpoint canonicalization
 
-Relation keys are lowercased, hyphens become underscores, and other non-ASCII-alphanumeric/non-underscore characters are removed. The aliases `competeswith` and `composedwith` normalize to their underscored forms.
+Relation keys are lowercased, hyphens become underscores, and other non-ASCII-alphanumeric/non-underscore characters are removed. The eight squashed aliases normalize to their underscored forms: `partof` → `part_of`, `instanceof` → `instance_of`, `variantof` → `variant_of`, `introducedby` → `introduced_by`, `derivedfrom` → `derived_from`, `dependson` → `depends_on`, `competeswith` → `competes_with`, and `composedwith` → `composed_with`.
 
 The local symmetric set is deliberately conservative: only `competes_with` and `composed_with`. For those relations, endpoints are lexicographically ordered so `A→B` and `B→A` yield one key. Directional relations retain endpoint order. Keeping this small table local avoids making `khive-request` depend on the full domain-type registry.
 

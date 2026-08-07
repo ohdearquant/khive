@@ -5,6 +5,7 @@
 //! runtime so there is no I/O dependency.
 
 use async_trait::async_trait;
+use khive_pack_gtd::GtdPack;
 use khive_pack_kg::KgPack;
 use khive_runtime::embedder_registry::EmbedderProvider;
 use khive_runtime::pack::{HandlerDef, PackRuntime};
@@ -13,7 +14,7 @@ use khive_runtime::{
     NamespaceToken, ParamDef, RuntimeError, RuntimeResult, VerbCategory, VerbRegistry,
     VerbRegistryBuilder, VerifiedActor, Visibility,
 };
-use khive_storage::{Edge, EdgeRelation, Note, SqlStatement, SqlValue};
+use khive_storage::{Direction, Edge, EdgeRelation, Note, SqlStatement, SqlValue};
 use khive_types::Pack;
 use lattice_embed::{EmbedError, EmbeddingModel, EmbeddingService};
 use serde_json::{json, Value};
@@ -116,6 +117,19 @@ fn pack_with_events() -> Fixture {
     Fixture {
         registry: builder.build().expect("registry build must succeed"),
     }
+}
+
+fn pack_with_gtd() -> (Fixture, KhiveRuntime) {
+    let rt = KhiveRuntime::memory().expect("in-memory runtime must succeed");
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(KgPack::new(rt.clone()));
+    builder.register(GtdPack::new(rt.clone()));
+    (
+        Fixture {
+            registry: builder.build().expect("registry builds"),
+        },
+        rt,
+    )
 }
 
 fn is_invalid_input(err: &RuntimeError) -> bool {
@@ -306,6 +320,251 @@ async fn create_bulk_rejects_non_boolean_atomic_and_verbose_before_writing() {
         Some(0),
         "malformed bulk options must be rejected before any sibling is durable"
     );
+}
+
+#[tokio::test]
+async fn create_rejects_bulk_only_options_without_items() {
+    let pack = pack();
+    for option in ["atomic", "verbose"] {
+        for value in [json!(true), json!(false)] {
+            let mut payload = json!({
+                "kind": "observation",
+                "content": "must never be written"
+            });
+            payload[option] = value;
+            let error = pack
+                .dispatch("create", payload)
+                .await
+                .expect_err("bulk-only option on singleton must fail");
+            assert!(
+                error.to_string().contains(option)
+                    && error
+                        .to_string()
+                        .contains("only valid when `items` is present"),
+                "unexpected error: {error}"
+            );
+        }
+    }
+    let listed = pack
+        .dispatch("list", json!({"kind": "observation"}))
+        .await
+        .expect("list succeeds");
+    assert_eq!(listed["items"].as_array().map(Vec::len), Some(0));
+}
+
+#[tokio::test]
+async fn create_bulk_rejects_misplaced_singleton_payload_fields() {
+    let pack = pack();
+    for (field, value) in [
+        ("annotates", json!([])),
+        ("edges", json!([])),
+        ("skip_dedup_check", json!(true)),
+        ("name", json!("misplaced singleton name")),
+    ] {
+        let mut payload = json!({
+            "items": [{"kind": "concept", "name": format!("must-not-land-{field}")}]
+        });
+        payload[field] = value;
+        let error = pack
+            .dispatch("create", payload)
+            .await
+            .expect_err("singleton payload fields beside items must fail closed");
+        assert!(
+            error.to_string().contains(field) && error.to_string().contains("beside `items`"),
+            "unexpected misplaced-field error: {error}"
+        );
+    }
+    let listed = pack
+        .dispatch("list", json!({"kind": "concept"}))
+        .await
+        .expect("list succeeds");
+    assert_eq!(listed["items"].as_array().map(Vec::len), Some(0));
+}
+
+#[tokio::test]
+async fn bulk_observation_description_rejects_without_silent_loss() {
+    let pack = pack();
+    let best_effort = pack
+        .dispatch(
+            "create",
+            json!({
+                "items": [
+                    {
+                        "kind": "observation",
+                        "content": "description would previously disappear",
+                        "description": "must be rejected"
+                    },
+                    {
+                        "kind": "observation",
+                        "content": "null description would previously disappear",
+                        "description": null
+                    },
+                    {"kind": "observation", "content": "valid sibling"}
+                ]
+            }),
+        )
+        .await
+        .expect("best-effort bulk returns per-item validation results");
+    assert_eq!(best_effort["created"], 1);
+    assert_eq!(best_effort["failed"], 2);
+    assert!(best_effort["results"][0]["error"]
+        .as_str()
+        .is_some_and(|message| message.contains("description")));
+    assert!(best_effort["results"][1]["error"]
+        .as_str()
+        .is_some_and(|message| message.contains("description")));
+
+    let atomic_error = pack
+        .dispatch(
+            "create",
+            json!({
+                "atomic": true,
+                "items": [
+                    {"kind": "observation", "content": "atomic sibling"},
+                    {
+                        "kind": "observation",
+                        "content": "invalid atomic note",
+                        "description": null
+                    }
+                ]
+            }),
+        )
+        .await
+        .expect_err("atomic bulk rejects every write when description is unsupported");
+    assert!(atomic_error.to_string().contains("description"));
+    let listed = pack
+        .dispatch("list", json!({"kind": "observation"}))
+        .await
+        .expect("list succeeds");
+    let contents = listed["items"]
+        .as_array()
+        .expect("items")
+        .iter()
+        .filter_map(|note| note["content"].as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(contents, vec!["valid sibling"]);
+}
+
+#[tokio::test]
+async fn task_singleton_and_bulk_share_hook_fields_and_context_edges() {
+    let (pack, runtime) = pack_with_gtd();
+    let context = pack
+        .dispatch("create", json!({"kind": "concept", "name": "task context"}))
+        .await
+        .expect("context entity");
+    let context_id = context["id"].as_str().expect("context id");
+    let task_fields = json!({
+        "kind": "task",
+        "title": "singleton task",
+        "description": "shared task body",
+        "priority": "p1",
+        "status": "next",
+        "assignee": "lambda:test",
+        "due": "2099-06-01T10:00:00Z",
+        "start": "2099-05-01",
+        "end": "2099-06-01",
+        "depends_on": [],
+        "context_entity_id": context_id
+    });
+    let singleton = pack
+        .dispatch("create", task_fields.clone())
+        .await
+        .expect("singleton task hook accepts its public fields");
+
+    let mut bulk_fields = task_fields;
+    bulk_fields["title"] = json!("bulk task");
+    let bulk = pack
+        .dispatch(
+            "create",
+            json!({"atomic": true, "verbose": true, "items": [bulk_fields]}),
+        )
+        .await
+        .expect("atomic bulk task hook accepts the same public fields");
+    assert_eq!(bulk["created"], 1);
+    assert_eq!(bulk["notes"][0]["content"], "shared task body");
+    assert_eq!(bulk["notes"][0]["properties"]["priority"], "p1");
+    assert_eq!(bulk["notes"][0]["properties"]["status"], "next");
+    assert_eq!(
+        bulk["notes"][0]["properties"]["assignee"],
+        singleton["properties"]["assignee"]
+    );
+    assert_eq!(
+        bulk["notes"][0]["properties"]["due"],
+        singleton["properties"]["due"]
+    );
+    assert_eq!(
+        bulk["notes"][0]["properties"]["start"],
+        singleton["properties"]["start"]
+    );
+    assert_eq!(
+        bulk["notes"][0]["properties"]["end"],
+        singleton["properties"]["end"]
+    );
+
+    let bulk_id = bulk["results"][0]["id"]
+        .as_str()
+        .expect("bulk task id")
+        .parse()
+        .expect("UUID");
+    let token = runtime
+        .authorize(Namespace::local())
+        .expect("authorize local namespace");
+    let edges = runtime
+        .neighbors(
+            &token,
+            bulk_id,
+            Direction::Out,
+            None,
+            Some(vec![EdgeRelation::Annotates]),
+        )
+        .await
+        .expect("read task context edge");
+    assert_eq!(edges.len(), 1);
+    assert_eq!(edges[0].node_id.to_string(), context_id);
+
+    let invalid_bulk = pack
+        .dispatch(
+            "create",
+            json!({"items": [{"kind": "task", "title": "bad priority", "priority": 42}]}),
+        )
+        .await
+        .expect("best-effort bulk reports invalid hook-field types in-band");
+    assert_eq!(invalid_bulk["failed"], 1);
+    assert!(invalid_bulk["results"][0]["error"]
+        .as_str()
+        .is_some_and(|message| message.contains("priority must be a string")));
+    let singleton_error = pack
+        .dispatch(
+            "create",
+            json!({"kind": "task", "title": "bad priority", "priority": 42}),
+        )
+        .await
+        .expect_err("singleton rejects the same hook-field type");
+    assert!(singleton_error
+        .to_string()
+        .contains("priority must be a string"));
+
+    let invalid_salience = pack
+        .dispatch(
+            "create",
+            json!({"items": [{"kind": "task", "title": "derived salience", "salience": 0.9}]}),
+        )
+        .await
+        .expect("best-effort bulk reports task salience conflicts in-band");
+    assert_eq!(invalid_salience["failed"], 1);
+    assert!(invalid_salience["results"][0]["error"]
+        .as_str()
+        .is_some_and(|message| message.contains("salience is derived from priority")));
+    let singleton_salience_error = pack
+        .dispatch(
+            "create",
+            json!({"kind": "task", "title": "derived salience", "salience": 0.9}),
+        )
+        .await
+        .expect_err("singleton rejects task salience that its hook would overwrite");
+    assert!(singleton_salience_error
+        .to_string()
+        .contains("salience is derived from priority"));
 }
 
 #[tokio::test]
@@ -10300,7 +10559,6 @@ async fn create_bulk_items_malformed_unknown_field_isolated_from_valid_sibling()
             "create",
             json!({
                 "kind": "concept",
-                "name": "TopLevelCreated",
                 "items": [
                     {"kind": "concept", "name": "ShouldBeBulk", "extra_unknown": 1},
                     {"kind": "concept", "name": "ValidBulkSibling"}

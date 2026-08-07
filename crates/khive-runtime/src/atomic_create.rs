@@ -116,6 +116,11 @@ struct PostCommitPause {
 static POST_COMMIT_PAUSES: std::sync::LazyLock<std::sync::Mutex<HashMap<String, PostCommitPause>>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
 
+#[cfg(test)]
+static VECTOR_INSERT_PAUSES: std::sync::LazyLock<
+    std::sync::Mutex<HashMap<String, PostCommitPause>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
 fn properties_external_id(properties: Option<&Value>) -> RuntimeResult<Option<String>> {
     match properties.and_then(|value| value.get("external_id")) {
         None => Ok(None),
@@ -313,6 +318,32 @@ pub(crate) fn arm_post_commit_pause(
 }
 
 #[cfg(test)]
+fn arm_vector_insert_pause(
+    namespace: &str,
+) -> (
+    tokio::sync::oneshot::Receiver<Uuid>,
+    tokio::sync::oneshot::Sender<()>,
+) {
+    let (committed_tx, committed_rx) = tokio::sync::oneshot::channel();
+    let (resume_tx, resume_rx) = tokio::sync::oneshot::channel();
+    let previous = VECTOR_INSERT_PAUSES
+        .lock()
+        .expect("atomic-create vector pause mutex poisoned")
+        .insert(
+            namespace.to_string(),
+            PostCommitPause {
+                committed: committed_tx,
+                resume: resume_rx,
+            },
+        );
+    assert!(
+        previous.is_none(),
+        "atomic-create vector pause already armed"
+    );
+    (committed_rx, resume_tx)
+}
+
+#[cfg(test)]
 async fn pause_before_note_post_commit_index(committed: &Note) {
     let pause = POST_COMMIT_PAUSES
         .lock()
@@ -329,6 +360,25 @@ async fn pause_before_note_post_commit_index(committed: &Note) {
         .resume
         .await
         .expect("atomic-create pause controller dropped");
+}
+
+#[cfg(test)]
+async fn pause_before_guarded_vector_insert(committed: &Note) {
+    let pause = VECTOR_INSERT_PAUSES
+        .lock()
+        .expect("atomic-create vector pause mutex poisoned")
+        .remove(&committed.namespace);
+    let Some(pause) = pause else {
+        return;
+    };
+    pause
+        .committed
+        .send(committed.id)
+        .expect("atomic-create vector pause observer dropped");
+    pause
+        .resume
+        .await
+        .expect("atomic-create vector pause controller dropped");
 }
 
 async fn guarded_upsert_note_fts(runtime: &KhiveRuntime, committed: &Note) -> RuntimeResult<bool> {
@@ -421,6 +471,9 @@ async fn guarded_insert_note_vectors(
     committed: &Note,
     embeddings: Vec<(String, Vec<f32>)>,
 ) -> RuntimeResult<bool> {
+    #[cfg(test)]
+    pause_before_guarded_vector_insert(committed).await;
+
     let writes: Vec<_> = embeddings
         .into_iter()
         .map(|(model, embedding)| {
@@ -696,7 +749,7 @@ async fn index_note_revision_once(
                         error = %error,
                         "could not verify note revision after failed embedding fan-out"
                     );
-                    outcome.fts_failed = true;
+                    outcome.fts_failed |= include_fts;
                 }
             }
         }
@@ -735,10 +788,11 @@ async fn index_note_revision_once(
 }
 
 /// Rebuild post-commit indexes while following a bounded number of concurrent
-/// live revisions. Natural-key singleton/best-effort creates include FTS;
-/// atomic creates already committed FTS with the row and skip vector work when
-/// a newer revision owns index maintenance. All embedding tasks are awaited so
-/// one failed model never cancels or hides a healthy sibling.
+/// live revisions. Natural-key singleton/best-effort creates include FTS.
+/// Atomic creates already committed FTS with the row: metadata-only revisions
+/// are followed for vector insertion, while a text/name revision owns its own
+/// index maintenance. All embedding tasks are awaited so one failed model never
+/// cancels or hides a healthy sibling.
 pub(crate) async fn index_committed_note_if_current(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
@@ -817,26 +871,28 @@ pub(crate) async fn index_committed_note_if_current(
 
         if !note_matches_committed_witness(&current, &target) {
             if !include_fts {
-                // Atomic create committed its FTS row with the note. A newer
-                // revision owns its own text/vector maintenance, so preserve
-                // the historical coordinator contract and skip stale work
-                // instead of duplicating that revision's embedding.
-                tracing::debug!(
-                    note_id = %committed.id,
-                    "atomic note changed after commit; skipping stale post-commit vector work"
-                );
-                return outcome;
+                if current.name != target.name || current.content != target.content {
+                    tracing::debug!(
+                        note_id = %committed.id,
+                        "atomic note text changed after commit; updater owns replacement indexes"
+                    );
+                    return outcome;
+                }
+                // Metadata-only updates do not reindex themselves. Advance the
+                // full witness while preserving the caller's embedding override.
+                target = current;
+            } else {
+                target_embedding_text =
+                    if current.content == committed.content && current.name == committed.name {
+                        embedding_text.to_string()
+                    } else {
+                        note_embedding_text_ref(&current).to_string()
+                    };
+                target = current;
+                // A non-text update does not reindex itself. Once the original
+                // revision changes, this recovery path must own both substrates.
+                require_fts = true;
             }
-            target_embedding_text =
-                if current.content == committed.content && current.name == committed.name {
-                    embedding_text.to_string()
-                } else {
-                    note_embedding_text_ref(&current).to_string()
-                };
-            target = current;
-            // A non-text update does not reindex itself. Once the original
-            // revision changes, this recovery path must own both substrates.
-            require_fts = true;
         }
 
         #[cfg(test)]
@@ -870,14 +926,7 @@ pub(crate) async fn index_committed_note_if_current(
                 outcome
                     .embedding_truncation
                     .merge(indexed.embedding_truncation);
-                if !include_fts {
-                    // The guarded vector transaction observed a concurrent
-                    // mutation after embedding began. Atomic callers retain
-                    // their vector-only skip semantics; the mutating path owns
-                    // any replacement index work.
-                    return outcome;
-                }
-                require_fts = true;
+                require_fts |= include_fts;
                 tracing::debug!(
                     note_id = %committed.id,
                     attempt = attempt_index + 1,
@@ -888,9 +937,9 @@ pub(crate) async fn index_committed_note_if_current(
     }
 
     // Sustained mutation exhausted the bounded repair loop. The row remains
-    // durable, and the existing closed repair stages communicate that both
+    // durable, and the existing closed repair stages communicate which
     // substrates need a later rebuild without inventing a new wire value.
-    outcome.fts_failed = true;
+    outcome.fts_failed |= require_fts;
     for model in model_names {
         outcome.failures.push(NoteReindexFailure {
             stage: "vector_insert",
@@ -1124,17 +1173,23 @@ pub async fn create_records_atomic(
                     result
                         .embedding_truncation
                         .merge(indexed.embedding_truncation);
-                    if !indexed.failures.is_empty() {
+                    let mut stages = Vec::new();
+                    if indexed.fts_failed {
+                        stages.push(BulkPostCommitFailureStage {
+                            stage: "fts".to_string(),
+                            model: None,
+                        });
+                    }
+                    stages.extend(indexed.failures.into_iter().map(|failure| {
+                        BulkPostCommitFailureStage {
+                            stage: failure.stage.to_string(),
+                            model: Some(failure.model),
+                        }
+                    }));
+                    if !stages.is_empty() {
                         result.post_commit_failures.push(BulkPostCommitFailure {
                             note_id: note.id,
-                            stages: indexed
-                                .failures
-                                .into_iter()
-                                .map(|failure| BulkPostCommitFailureStage {
-                                    stage: failure.stage.to_string(),
-                                    model: Some(failure.model),
-                                })
-                                .collect(),
+                            stages,
                         });
                     }
                     runtime.fire_note_mutation_hook(&note.kind, note.id).await;
@@ -1443,6 +1498,273 @@ mod tests {
             1,
             "the update's current vector must remain present"
         );
+    }
+
+    #[tokio::test]
+    async fn atomic_create_follows_metadata_revision_before_first_index_read() {
+        let runtime = KhiveRuntime::new(RuntimeConfig {
+            db_path: None,
+            packs: vec!["kg".to_string()],
+            ..RuntimeConfig::no_embeddings()
+        })
+        .expect("runtime");
+        let inputs = register_stub(&runtime);
+        let namespace = Namespace::parse("atomic-create-metadata-before-read").expect("namespace");
+        let token = NamespaceToken::for_namespace(namespace.clone());
+        let (committed, resume) = arm_post_commit_pause(namespace.as_str());
+        let create_runtime = runtime.clone();
+        let create_token = token.clone();
+
+        let create = tokio::spawn(async move {
+            create_records_atomic(
+                &create_runtime,
+                &create_token,
+                vec![BulkRecordCreateSpec::Note(BulkNoteCreateSpec {
+                    kind: "observation".to_string(),
+                    name: Some("stable name".to_string()),
+                    content: "stable content".to_string(),
+                    salience: None,
+                    properties: None,
+                    external_id: None,
+                })],
+            )
+            .await
+        });
+        let note_id = tokio::time::timeout(std::time::Duration::from_secs(10), committed)
+            .await
+            .expect("atomic commit reaches the pause before timeout")
+            .expect("atomic commit pause sender stays live");
+        let latest = runtime
+            .update_note(
+                &token,
+                note_id,
+                NotePatch::new(
+                    None,
+                    None,
+                    Some(Some(0.8)),
+                    None,
+                    Some(serde_json::json!({"revision": "latest"})),
+                ),
+            )
+            .await
+            .expect("metadata-only update commits");
+        resume.send(()).expect("resume atomic create");
+
+        let result = create
+            .await
+            .expect("create task joins")
+            .expect("create returns its committed outcome");
+        assert!(result.post_commit_failures.is_empty());
+        let current = runtime
+            .notes(&token)
+            .expect("note store")
+            .get_note(note_id)
+            .await
+            .expect("read note")
+            .expect("note remains live");
+        assert_eq!(current.updated_at, latest.updated_at);
+        assert_eq!(current.salience, Some(0.8));
+        assert_eq!(current.properties, latest.properties);
+        assert!(runtime
+            .text_for_notes(&token)
+            .expect("note FTS")
+            .get_document(namespace.as_str(), note_id)
+            .await
+            .expect("read FTS")
+            .is_some());
+        assert_eq!(
+            inputs.lock().expect("embedding inputs").as_slice(),
+            &["stable content".to_string()]
+        );
+        assert_eq!(
+            runtime
+                .vectors_for_model(&token, MODEL)
+                .expect("vector store")
+                .count()
+                .await
+                .expect("vector count"),
+            1,
+            "one vector must be inserted under the latest full revision witness"
+        );
+    }
+
+    #[tokio::test]
+    async fn atomic_create_retries_metadata_revision_during_guarded_vector_insert() {
+        let runtime = KhiveRuntime::new(RuntimeConfig {
+            db_path: None,
+            packs: vec!["kg".to_string()],
+            ..RuntimeConfig::no_embeddings()
+        })
+        .expect("runtime");
+        let inputs = register_stub(&runtime);
+        let namespace =
+            Namespace::parse("atomic-create-metadata-during-vector").expect("namespace");
+        let token = NamespaceToken::for_namespace(namespace.clone());
+        let (embedding_finished, resume) = arm_vector_insert_pause(namespace.as_str());
+        let create_runtime = runtime.clone();
+        let create_token = token.clone();
+
+        let create = tokio::spawn(async move {
+            create_records_atomic(
+                &create_runtime,
+                &create_token,
+                vec![BulkRecordCreateSpec::Note(BulkNoteCreateSpec {
+                    kind: "observation".to_string(),
+                    name: None,
+                    content: "stable guarded content".to_string(),
+                    salience: None,
+                    properties: None,
+                    external_id: None,
+                })],
+            )
+            .await
+        });
+        let note_id = tokio::time::timeout(std::time::Duration::from_secs(10), embedding_finished)
+            .await
+            .expect("embedding reaches guarded insert before timeout")
+            .expect("vector pause sender stays live");
+        let latest = runtime
+            .update_note(
+                &token,
+                note_id,
+                NotePatch::new(
+                    None,
+                    None,
+                    Some(Some(0.7)),
+                    None,
+                    Some(serde_json::json!({"revision": "during-vector"})),
+                ),
+            )
+            .await
+            .expect("metadata-only update commits");
+        resume.send(()).expect("resume guarded vector insert");
+
+        let result = create
+            .await
+            .expect("create task joins")
+            .expect("create returns its committed outcome");
+        assert!(result.post_commit_failures.is_empty());
+        let current = runtime
+            .notes(&token)
+            .expect("note store")
+            .get_note(note_id)
+            .await
+            .expect("read note")
+            .expect("note remains live");
+        assert_eq!(current.updated_at, latest.updated_at);
+        assert_eq!(current.properties, latest.properties);
+        assert_eq!(
+            inputs.lock().expect("embedding inputs").as_slice(),
+            &[
+                "stable guarded content".to_string(),
+                "stable guarded content".to_string(),
+            ],
+            "the stale embedding is awaited and the latest witness is retried"
+        );
+        assert_eq!(
+            runtime
+                .vectors_for_model(&token, MODEL)
+                .expect("vector store")
+                .count()
+                .await
+                .expect("vector count"),
+            1,
+            "the retry must leave exactly one current vector"
+        );
+    }
+
+    #[tokio::test]
+    async fn atomic_create_metadata_churn_exhaustion_reports_vector_only() {
+        let runtime = KhiveRuntime::new(RuntimeConfig {
+            db_path: None,
+            packs: vec!["kg".to_string()],
+            ..RuntimeConfig::no_embeddings()
+        })
+        .expect("runtime");
+        register_stub(&runtime);
+        let namespace = Namespace::parse("atomic-create-metadata-exhaustion").expect("namespace");
+        let token = NamespaceToken::for_namespace(namespace.clone());
+        let mut pause = Some(arm_vector_insert_pause(namespace.as_str()));
+        let create_runtime = runtime.clone();
+        let create_token = token.clone();
+
+        let create = tokio::spawn(async move {
+            create_records_atomic(
+                &create_runtime,
+                &create_token,
+                vec![BulkRecordCreateSpec::Note(BulkNoteCreateSpec {
+                    kind: "observation".to_string(),
+                    name: None,
+                    content: "stable content under sustained metadata churn".to_string(),
+                    salience: None,
+                    properties: None,
+                    external_id: None,
+                })],
+            )
+            .await
+        });
+
+        let mut note_id = None;
+        for revision in 1..=4 {
+            let (mut embedding_finished, resume) = pause
+                .take()
+                .expect("the next bounded guarded attempt was armed");
+            let paused_id =
+                tokio::time::timeout(std::time::Duration::from_secs(10), &mut embedding_finished)
+                    .await
+                    .expect("embedding reaches every bounded guarded insert")
+                    .expect("vector pause sender stays live");
+            note_id = Some(paused_id);
+            runtime
+                .update_note(
+                    &token,
+                    paused_id,
+                    NotePatch::new(
+                        None,
+                        None,
+                        Some(Some(revision as f64 / 10.0)),
+                        None,
+                        Some(serde_json::json!({"revision": revision})),
+                    ),
+                )
+                .await
+                .expect("metadata-only update commits");
+            pause = (revision < 4).then(|| arm_vector_insert_pause(namespace.as_str()));
+            resume.send(()).expect("resume guarded vector insert");
+        }
+
+        let result = create
+            .await
+            .expect("create task joins")
+            .expect("create returns its committed outcome");
+        let note_id = note_id.expect("at least one guarded attempt");
+        assert_eq!(
+            result.post_commit_failures,
+            vec![BulkPostCommitFailure {
+                note_id,
+                stages: vec![BulkPostCommitFailureStage {
+                    stage: "vector_insert".to_string(),
+                    model: Some(MODEL.to_string()),
+                }],
+            }],
+            "atomic FTS is transaction-owned and must not be reported for vector-only exhaustion"
+        );
+        assert_eq!(
+            runtime
+                .vectors_for_model(&token, MODEL)
+                .expect("vector store")
+                .count()
+                .await
+                .expect("vector count"),
+            0
+        );
+        assert!(runtime
+            .text_for_notes(&token)
+            .expect("note FTS")
+            .get_document(namespace.as_str(), note_id)
+            .await
+            .expect("read FTS")
+            .is_some());
     }
 
     #[tokio::test]
