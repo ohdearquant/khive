@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 import tempfile
@@ -807,10 +808,198 @@ class BuildLocalArtifactTests(unittest.TestCase):
         self.assertFalse(self.receipt.exists())
 
 
+class RecipeRun:
+    """Outcome of executing the real `local:` recipe in a sandbox."""
+
+    def __init__(
+        self,
+        *,
+        rc: int,
+        output: str,
+        installed: bool,
+        installed_bytes: bytes | None,
+        signed_bytes: bytes | None,
+        staging_file_left_behind: bool,
+    ) -> None:
+        self.rc = rc
+        self.output = output
+        self.installed = installed
+        self.installed_bytes = installed_bytes
+        self.signed_bytes = signed_bytes
+        self.staging_file_left_behind = staging_file_left_behind
+
+
+PRE_EXISTING_INSTALL = b"#!/bin/sh\necho PRE-EXISTING\n"
+
+
 class MakefileGateContractTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls.makefile = MAKEFILE.read_text(encoding="utf-8")
+
+    # -- behavioural harness -------------------------------------------------
+    #
+    # Runs the ACTUAL `local:` recipe text extracted from the Makefile, with
+    # every irreversible edge redirected into a temp tree: HOME (and therefore
+    # DEST) points at the sandbox, and the verifier is a stub whose exit code
+    # the test controls. Nothing here touches the real installed daemon.
+
+    @staticmethod
+    def _extract_local_recipe(makefile_text: str) -> list[str]:
+        """Return the shell commands make would run for `local:`, expanded."""
+        variables = dict(
+            re.findall(r"^([A-Z_][A-Z0-9_]*)\s*:=\s*(.*)$", makefile_text, re.M)
+        )
+        body = makefile_text[makefile_text.index("local: verify-local-artifact") :]
+        body = body[body.index("\n") + 1 :]
+
+        lines: list[str] = []
+        for raw in body.split("\n"):
+            if not raw.startswith("\t"):
+                if raw.strip() == "":
+                    continue
+                break
+            lines.append(raw[1:])
+
+        # Re-join make lines: a trailing backslash continues the SAME shell.
+        commands: list[str] = []
+        current: list[str] = []
+        for line in lines:
+            current.append(line)
+            if not line.rstrip().endswith("\\"):
+                commands.append("\n".join(current))
+                current = []
+        if current:
+            commands.append("\n".join(current))
+
+        expanded: list[str] = []
+        for cmd in commands:
+            cmd = cmd.lstrip("@")
+            # Variable values may themselves reference variables
+            # (LOCAL_VERIFY_STAMP is built from LOCAL_BUILD_RECEIPT), so expand
+            # to a fixpoint. A single pass leaves a stray `$(NAME)` that the
+            # shell then reads as command substitution.
+            for _ in range(10):
+                before = cmd
+                for name, value in variables.items():
+                    cmd = cmd.replace(f"$({name})", value.strip())
+                if cmd == before:
+                    break
+            else:  # pragma: no cover - only on a cyclic definition
+                raise AssertionError(f"variable expansion did not converge: {cmd!r}")
+            leftover = re.search(r"\$\([A-Z_][A-Z0-9_]*\)", cmd)
+            self_check = leftover.group(0) if leftover else None
+            assert self_check is None, f"unexpanded make variable {self_check} in recipe"
+            # make collapses `$$` to a single `$` before handing to the shell.
+            cmd = cmd.replace("$$", "$")
+            expanded.append(cmd)
+        return expanded
+
+    def _run_local_recipe(
+        self,
+        *,
+        signed_probe_exit: int = 0,
+        codesign_exit: int = 0,
+        makefile_text: str | None = None,
+    ) -> RecipeRun:
+        commands = self._extract_local_recipe(makefile_text or self.makefile)
+        self.assertTrue(commands, "no recipe extracted from the Makefile")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            home = root / "home"
+            dest_dir = home / ".cargo" / "bin"
+            dest_dir.mkdir(parents=True)
+            dest = dest_dir / "kkernel"
+            dest.write_bytes(PRE_EXISTING_INSTALL)
+            dest.chmod(0o755)
+
+            src = root / "build" / "kkernel"
+            src.parent.mkdir(parents=True)
+            src.write_bytes(b"#!/bin/sh\necho FRESH-BUILD 0.0.0-test\n")
+            src.chmod(0o755)
+            src_sha = hashlib.sha256(src.read_bytes()).hexdigest()
+
+            # Stub verifier: serves the stamp inspection, and its --artifact
+            # (post-signing) probe exits with the code this test chose.
+            (root / "scripts").mkdir()
+            (root / "scripts" / "verify_local_artifact.py").write_text(
+                textwrap.dedent(
+                    f"""\
+                    import sys
+                    argv = sys.argv[1:]
+                    if "--inspect-stamp" in argv:
+                        print('SRC={src}')
+                        print('VERIFIED_SHA256={src_sha}')
+                        print('VERIFIED_VERBS=90')
+                        sys.exit(0)
+                    if "--artifact" in argv:
+                        sys.exit({signed_probe_exit})
+                    sys.exit(0)
+                    """
+                ),
+                encoding="utf-8",
+            )
+
+            # codesign genuinely REWRITES the file, which is the whole reason
+            # the pre-sign verification does not cover the installed bytes.
+            stub_bin = root / "stub-bin"
+            stub_bin.mkdir()
+            (stub_bin / "codesign").write_text(
+                textwrap.dedent(
+                    f"""\
+                    #!/bin/sh
+                    [ {codesign_exit} -ne 0 ] && exit {codesign_exit}
+                    for a in "$@"; do target="$a"; done
+                    printf '\\n# signed\\n' >> "$target"
+                    exit 0
+                    """
+                ),
+                encoding="utf-8",
+            )
+            for noop in ("pkill", "pgrep"):
+                (stub_bin / noop).write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+            for tool in ("codesign", "pkill", "pgrep"):
+                (stub_bin / tool).chmod(0o755)
+
+            env = dict(os.environ)
+            env["HOME"] = str(home)
+            env["PATH"] = f"{stub_bin}:{env.get('PATH', '')}"
+            env["PYTHONDONTWRITEBYTECODE"] = "1"
+
+            rc = 0
+            chunks: list[str] = []
+            signed_bytes: bytes | None = None
+            for cmd in commands:
+                proc = subprocess.run(
+                    ["sh", "-c", cmd],
+                    cwd=root,
+                    env=env,
+                    capture_output=True,
+                    text=True,
+                )
+                chunks.append(
+                    f"$ {cmd[:120]}...\n[rc={proc.returncode}]\n"
+                    f"{proc.stdout}{proc.stderr}"
+                )
+                rc = proc.returncode
+                if rc != 0:
+                    break
+
+            staged = dest_dir / "kkernel.new"
+            installed_bytes = dest.read_bytes() if dest.exists() else None
+            # What SHOULD have landed: the source with the signature appended.
+            if codesign_exit == 0:
+                signed_bytes = src.read_bytes() + b"\n# signed\n"
+
+            return RecipeRun(
+                rc=rc,
+                output="\n".join(chunks),
+                installed=installed_bytes != PRE_EXISTING_INSTALL,
+                installed_bytes=installed_bytes,
+                signed_bytes=signed_bytes,
+                staging_file_left_behind=staged.exists(),
+            )
 
     def test_local_dependency_chain_is_build_then_verify_then_install(self) -> None:
         self.assertIn("verify-local-artifact: build-local\n", self.makefile)
@@ -842,32 +1031,82 @@ class MakefileGateContractTests(unittest.TestCase):
         """`codesign` rewrites the staged file, so every pre-sign check is void
         for the bytes that actually get installed. The gate must therefore fail
         closed on a signing error and re-probe the SIGNED artifact before the
-        move, then bind the installed path to the post-sign digest."""
-        local_recipe = self.makefile[self.makefile.index("local: verify-local-artifact") :]
+        move, then bind the installed path to the post-sign digest.
 
-        # A mutating step inside the install gate may never be ignored.
-        self.assertNotIn('codesign -s - -f "$$DEST.new" 2>/dev/null || true', local_recipe)
-        self.assertNotIn("codesign -s - -f \"$$DEST.new\" || true", local_recipe)
-        self.assertIn('if ! codesign -s - -f "$$DEST.new"; then', local_recipe)
-
-        staged_check = local_recipe.index('if [ "$$VERIFIED_SHA256" != "$$COPIED_SHA256" ]')
-        sign = local_recipe.index('codesign -s - -f "$$DEST.new"')
-        resign_verify = local_recipe.index('--artifact "$$DEST.new"')
-        signed_digest = local_recipe.index("SIGNED_SHA256=")
-        install = local_recipe.index('mv "$$DEST.new" "$$DEST"')
-        installed_check = local_recipe.index(
-            'if [ "$$SIGNED_SHA256" != "$$DEST_SHA256" ]'
+        This is deliberately a BEHAVIOURAL test. An earlier version of this
+        guard asserted only that certain substrings appeared in a certain
+        order, which a recipe that merely echoed those substrings satisfied
+        while probing nothing. Text cannot distinguish a probe from a mention
+        of a probe, so the recipe is executed instead.
+        """
+        control = self._run_local_recipe(signed_probe_exit=0)
+        self.assertTrue(
+            control.installed,
+            "positive control failed: the recipe must install when every probe "
+            f"passes, but the installed binary was unchanged. rc={control.rc}\n"
+            f"{control.output}",
+        )
+        self.assertEqual(control.rc, 0, control.output)
+        self.assertEqual(
+            control.installed_bytes,
+            control.signed_bytes,
+            "control: the installed bytes must be exactly the signed, probed bytes",
         )
 
-        # The signed artifact is re-probed with the full pack set and the same
-        # verb floor, not merely re-hashed: a hash cannot show the binary still
-        # loads every pack.
-        self.assertIn('--packs "$(FULL_PACKS)"', local_recipe)
-        self.assertLess(staged_check, sign)
-        self.assertLess(sign, resign_verify)
-        self.assertLess(resign_verify, signed_digest)
-        self.assertLess(signed_digest, install)
-        self.assertLess(install, installed_check)
+        mutant = self._run_local_recipe(signed_probe_exit=1)
+        self.assertFalse(
+            mutant.installed,
+            "the post-signing probe FAILED and the binary was installed anyway: "
+            "unverified bytes reached the install path\n" + mutant.output,
+        )
+        self.assertNotEqual(
+            mutant.rc, 0, "a failed signed-artifact probe must exit nonzero\n" + mutant.output
+        )
+        self.assertFalse(
+            mutant.staging_file_left_behind,
+            "the failure path must remove the staged file, not leave it for a "
+            "later run to pick up\n" + mutant.output,
+        )
+
+    def test_a_signing_failure_cannot_reach_the_install_path(self) -> None:
+        """`codesign` failure was previously swallowed by `|| true`. Signing is
+        a mutating step inside the install gate, so its failure must abort."""
+        control = self._run_local_recipe(codesign_exit=0)
+        self.assertTrue(control.installed, "positive control failed\n" + control.output)
+
+        mutant = self._run_local_recipe(codesign_exit=1)
+        self.assertFalse(
+            mutant.installed,
+            "codesign failed and the binary was installed anyway\n" + mutant.output,
+        )
+        self.assertNotEqual(mutant.rc, 0, mutant.output)
+
+    def test_the_recipe_harness_can_detect_a_reverted_fix(self) -> None:
+        """Mutation control for the harness itself. A finding-only instrument
+        that never reddens proves nothing, so point it at the pre-fix recipe
+        and require it to catch the defect that motivated this PR."""
+        pre_fix = self.makefile.replace(
+            'if ! codesign -s - -f "$$DEST.new"; then \\\n'
+            '\t  echo "==> ERROR: codesign failed on $$DEST.new — refusing to install"; \\\n'
+            '\t  rm -f "$$DEST.new"; \\\n'
+            "\t  exit 1; \\\n"
+            "\tfi; \\\n",
+            'codesign -s - -f "$$DEST.new" 2>/dev/null || true; \\\n',
+        )
+        self.assertNotEqual(
+            pre_fix, self.makefile, "the fix text was not found; update this control"
+        )
+        # Strip the post-signing re-probe as well, reproducing the old recipe.
+        start = pre_fix.index('echo "==> Re-verifying the SIGNED artifact')
+        end = pre_fix.index("SIGNED_SHA256=")
+        pre_fix = pre_fix[:start] + pre_fix[end:]
+
+        reverted = self._run_local_recipe(signed_probe_exit=1, makefile_text=pre_fix)
+        self.assertTrue(
+            reverted.installed,
+            "the harness did not reproduce the original defect, so a green "
+            "result from it is not evidence\n" + reverted.output,
+        )
 
     def test_cargo_receipt_drives_verifier_and_ci_runs_regression_suite(self) -> None:
         self.assertIn("scripts/build_local_artifact.py", self.makefile)
