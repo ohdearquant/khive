@@ -25,6 +25,12 @@ use crate::error::{RuntimeError, RuntimeResult};
 use crate::operations::{base_entity_rule_allows, canonical_edge_endpoints, endpoint_matches};
 use crate::runtime::{KhiveRuntime, NamespaceToken};
 
+pub(crate) fn stale_note_snapshot_error(id: Uuid) -> RuntimeError {
+    RuntimeError::Khive(KhiveError::conflict(format!(
+        "note {id} changed concurrently after it was read; retry with fresh state"
+    )))
+}
+
 /// Immutable embedding-registry view for one logical write.
 ///
 /// Document byte budgets are derived from the model name at the embedding seam,
@@ -1409,9 +1415,7 @@ impl KhiveRuntime {
             .await?
             .ok_or_else(|| RuntimeError::NotFound(format!("note {id}")))?;
         if current != snapshot {
-            return Err(RuntimeError::InvalidInput(format!(
-                "note {id} changed concurrently after it was read; retry with fresh state"
-            )));
+            return Err(stale_note_snapshot_error(id));
         }
         let (note, text_changed) = self
             .prepare_update_note_from_snapshot(token, snapshot, patch)
@@ -1421,9 +1425,7 @@ impl KhiveRuntime {
             .replace_note_if_unchanged(note.clone(), expected_updated_at, expected_deleted_at)
             .await?;
         if !persisted {
-            return Err(RuntimeError::InvalidInput(format!(
-                "note {id} changed concurrently after it was read; retry with fresh state"
-            )));
+            return Err(stale_note_snapshot_error(id));
         }
 
         let embedding_report = if text_changed {

@@ -1507,6 +1507,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn atomic_task_update_rejects_lifecycle_properties_during_prepare() {
+        let runtime = scratch_runtime();
+        let token = runtime
+            .authorize(Namespace::parse("local").expect("ns"))
+            .expect("authorize");
+        let task_id = seed_task(&runtime, &token, "inbox").await;
+        let registry = full_registry(&runtime);
+        let before = runtime
+            .notes(&token)
+            .expect("note store")
+            .get_note(task_id)
+            .await
+            .expect("read task before rejected update")
+            .expect("task exists");
+
+        let err = prepare_one(
+            &runtime,
+            &token,
+            &registry,
+            "update",
+            &json!({
+                "id": task_id.to_string(),
+                "properties": {"status": "done"},
+            }),
+        )
+        .await
+        .expect_err("atomic prepare must share lifecycle-owned property rejection");
+        assert_eq!(
+            err.to_string(),
+            "invalid input: properties.status is lifecycle-owned and cannot be patched on a task; use gtd.transition for lifecycle changes or gtd.complete for terminal completion"
+        );
+        let after = runtime
+            .notes(&token)
+            .expect("note store")
+            .get_note(task_id)
+            .await
+            .expect("read task after rejected update")
+            .expect("task exists");
+        assert_eq!(after, before, "rejected atomic prepare must not write");
+    }
+
+    #[tokio::test]
     async fn atomic_task_update_checks_explicit_kind_before_running_task_hook() {
         let runtime = scratch_runtime();
         let token = runtime

@@ -742,10 +742,7 @@ pub async fn prepare_update_from_note_snapshot(
         .await?
         .ok_or_else(|| RuntimeError::NotFound(format!("note {}", note.id)))?;
     if current != note {
-        return Err(RuntimeError::InvalidInput(format!(
-            "note {} changed concurrently after it was read; retry with fresh state",
-            note.id
-        )));
+        return Err(crate::curation::stale_note_snapshot_error(note.id));
     }
     prepare_note_update_plan_from_snapshot(runtime, token, args, &expected_kind, note).await
 }

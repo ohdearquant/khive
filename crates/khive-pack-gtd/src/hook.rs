@@ -19,10 +19,26 @@ use crate::task_create::{link_depends_on_edges, prepare_task_create, TaskCreateI
 /// KindHook implementation for the `task` note kind; normalises GTD fields on create.
 pub struct TaskHook;
 
+fn stored_content_is_title_fallback(note: &Note) -> bool {
+    let effective_title = note.name.as_deref().map(str::trim).unwrap_or_default();
+    note.content.trim().is_empty() || note.content.trim() == effective_title
+}
+
 fn synchronize_description(note: &Note, args: &mut Value) -> Result<(), RuntimeError> {
     let root = args
         .as_object_mut()
         .ok_or_else(|| RuntimeError::InvalidInput("update args must be an object".into()))?;
+
+    if let Some(Value::Object(properties)) = root.get("properties") {
+        for field in ["status", "completed_at", "transition_history"] {
+            if properties.contains_key(field) {
+                return Err(RuntimeError::InvalidInput(format!(
+                    "properties.{field} is lifecycle-owned and cannot be patched on a task; use \
+                     gtd.transition for lifecycle changes or gtd.complete for terminal completion"
+                )));
+            }
+        }
+    }
 
     let content_patch = root
         .get("content")
@@ -30,6 +46,11 @@ fn synchronize_description(note: &Note, args: &mut Value) -> Result<(), RuntimeE
         .map(str::to_string);
     let name_patch = match root.get("name") {
         None => None,
+        Some(Value::String(name)) if name.trim().is_empty() => {
+            return Err(RuntimeError::InvalidInput(
+                "task title must not be empty".into(),
+            ));
+        }
         Some(Value::String(name)) => Some(name.clone()),
         Some(Value::Null) => {
             return Err(RuntimeError::InvalidInput(
@@ -61,12 +82,6 @@ fn synchronize_description(note: &Note, args: &mut Value) -> Result<(), RuntimeE
         }
     };
 
-    let effective_title = name_patch
-        .as_deref()
-        .or(note.name.as_deref())
-        .filter(|title| !title.trim().is_empty())
-        .ok_or_else(|| RuntimeError::InvalidInput("task title must not be empty".into()))?;
-
     match (content_patch, description_patch) {
         (Some(content), Some(Some(description))) if content != description => {
             return Err(RuntimeError::InvalidInput(
@@ -94,6 +109,11 @@ fn synchronize_description(note: &Note, args: &mut Value) -> Result<(), RuntimeE
             root.insert("content".into(), json!(description));
         }
         (None, Some(None)) => {
+            let effective_title = name_patch
+                .as_deref()
+                .or(note.name.as_deref())
+                .filter(|title| !title.trim().is_empty())
+                .ok_or_else(|| RuntimeError::InvalidInput("task title must not be empty".into()))?;
             root.insert("content".into(), json!(effective_title));
         }
         (None, None)
@@ -103,9 +123,13 @@ fn synchronize_description(note: &Note, args: &mut Value) -> Result<(), RuntimeE
                     .as_ref()
                     .and_then(|properties| properties.get("description"))
                     .and_then(Value::as_str)
-                    .is_none() =>
+                    .is_none()
+                && stored_content_is_title_fallback(note) =>
         {
-            root.insert("content".into(), json!(effective_title));
+            root.insert(
+                "content".into(),
+                json!(name_patch.as_deref().expect("name patch is present")),
+            );
         }
         (None, None) => {}
     }
@@ -252,10 +276,11 @@ mod tests {
             .update_note_from_snapshot_with_embedding_report(&token, snapshot, patch)
             .await
             .expect_err("stale hook snapshot must not overwrite the concurrent task");
-        assert!(
-            err.to_string().contains("changed concurrently"),
-            "expected explicit stale-snapshot refusal; got: {err}"
-        );
+        let RuntimeError::Khive(conflict) = &err else {
+            panic!("expected structured conflict, got: {err:?}");
+        };
+        assert_eq!(conflict.kind(), khive_types::ErrorKind::Conflict);
+        assert!(conflict.message().contains("retry with fresh state"));
 
         let persisted = runtime
             .notes(&token)

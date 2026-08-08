@@ -1068,6 +1068,130 @@ async fn generic_task_update_keeps_content_and_description_synchronized() {
 }
 
 #[tokio::test]
+async fn renaming_legacy_task_without_description_preserves_body() {
+    let runtime = rt();
+    let pack = pack(runtime.clone());
+    let token = runtime
+        .authorize(khive_runtime::Namespace::local())
+        .expect("authorize local");
+    let body = "acceptance notes:\n- preserve this line\n- and this exact trailing line\n";
+    let mut task = khive_storage::Note::new("local", "task", body);
+    task.name = Some("legacy title".to_string());
+    task.properties = Some(json!({"status": "inbox", "priority": "p2"}));
+    let task_id = task.id;
+    runtime
+        .notes(&token)
+        .expect("note store")
+        .upsert_note(task)
+        .await
+        .expect("seed legacy task");
+
+    let updated = pack
+        .dispatch(
+            "update",
+            json!({"id": task_id.to_string(), "name": "renamed legacy title"}),
+        )
+        .await
+        .expect("rename legacy task");
+
+    assert_eq!(updated["name"], "renamed legacy title");
+    assert_eq!(updated["content"].as_str(), Some(body));
+    assert!(updated["properties"].get("description").is_none());
+    let persisted = runtime
+        .notes(&token)
+        .expect("note store")
+        .get_note(task_id)
+        .await
+        .expect("read renamed task")
+        .expect("task exists");
+    assert_eq!(persisted.content.as_bytes(), body.as_bytes());
+    assert!(persisted
+        .properties
+        .as_ref()
+        .and_then(|properties| properties.get("description"))
+        .is_none());
+}
+
+#[tokio::test]
+async fn generic_task_update_rejects_lifecycle_properties_but_allows_other_properties() {
+    let pack = pack(rt());
+    let created = pack
+        .dispatch(
+            "create",
+            json!({"kind": "note", "note_kind": "task", "title": "owned lifecycle"}),
+        )
+        .await
+        .expect("task create");
+    let id = created["id"].as_str().expect("task id");
+
+    for (field, value) in [
+        ("status", json!("done")),
+        ("completed_at", json!(1234)),
+        ("transition_history", json!([])),
+    ] {
+        let err = pack
+            .dispatch("update", json!({"id": id, "properties": {field: value}}))
+            .await
+            .expect_err("generic update must reject lifecycle-owned properties");
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "invalid input: properties.{field} is lifecycle-owned and cannot be patched on a task; use gtd.transition for lifecycle changes or gtd.complete for terminal completion"
+            )
+        );
+    }
+
+    let updated = pack
+        .dispatch(
+            "update",
+            json!({
+                "id": id,
+                "properties": {
+                    "priority": "p1",
+                    "due": "2026-08-09T12:00:00Z",
+                    "planning_label": "reviewed"
+                }
+            }),
+        )
+        .await
+        .expect("non-lifecycle task properties remain patchable");
+    assert_eq!(updated["properties"]["priority"], "p1");
+    assert_eq!(updated["properties"]["due"], "2026-08-09T12:00:00Z");
+    assert_eq!(updated["properties"]["planning_label"], "reviewed");
+    assert_eq!(updated["properties"]["status"], "inbox");
+}
+
+#[tokio::test]
+async fn salience_only_update_succeeds_for_legacy_nameless_task() {
+    let runtime = rt();
+    let pack = pack(runtime.clone());
+    let token = runtime
+        .authorize(khive_runtime::Namespace::local())
+        .expect("authorize local");
+    let body = "legacy task body without a title";
+    let mut task = khive_storage::Note::new("local", "task", body);
+    task.properties = Some(json!({"status": "inbox", "priority": "p2"}));
+    let task_id = task.id;
+    runtime
+        .notes(&token)
+        .expect("note store")
+        .upsert_note(task)
+        .await
+        .expect("seed nameless task");
+
+    let updated = pack
+        .dispatch(
+            "update",
+            json!({"id": task_id.to_string(), "salience": 0.2}),
+        )
+        .await
+        .expect("salience-only update must not require a title");
+    assert_eq!(updated["salience"], 0.2);
+    assert_eq!(updated["content"], body);
+    assert!(updated["name"].is_null());
+}
+
+#[tokio::test]
 async fn generic_task_update_rejects_title_clear_before_description_clear_can_write() {
     let runtime = rt();
     let pack = pack(runtime.clone());
