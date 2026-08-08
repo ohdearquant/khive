@@ -11,8 +11,8 @@ use khive_runtime::{
     EntityCreateSpec, KhiveRuntime, Namespace, NamespaceToken, ParamDef, RuntimeError,
     VerbCategory, VerbRegistry, VerbRegistryBuilder, VerifiedActor, Visibility,
 };
-use khive_storage::{Edge, EdgeRelation, Event, Note, SqlStatement, SqlValue, SubstrateKind};
-use khive_types::{EventKind, Pack};
+use khive_storage::{Edge, EdgeRelation, Note, SqlStatement, SqlValue};
+use khive_types::Pack;
 use serde_json::{json, Value};
 
 // ---- Helpers ----
@@ -12732,7 +12732,7 @@ async fn list_edge_zero_limit_matches_its_metadata_and_returns_no_rows() {
         .dispatch("list", json!({"kind": "edge", "limit": 0}))
         .await
         .expect("zero-limit offset edge list must succeed");
-    assert_eq!(list_items(&response), &[]);
+    assert!(list_items(&response).is_empty());
     assert_eq!(response["requested_limit"], 0);
     assert_eq!(response["effective_limit"], 0);
     assert_eq!(response["limit_clamped"], false);
@@ -12874,7 +12874,7 @@ async fn list_event_zero_limit_preserves_requested_value_and_returns_no_rows() {
         .dispatch("list", json!({"kind": "event", "limit": 0}))
         .await
         .expect("zero-limit offset event list must succeed like other substrates");
-    assert_eq!(list_items(&response), &[]);
+    assert!(list_items(&response).is_empty());
     assert_eq!(response["requested_limit"], 0);
     assert_eq!(response["effective_limit"], 0);
     assert_eq!(response["limit_clamped"], false);
