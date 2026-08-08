@@ -605,6 +605,77 @@ async fn memory_feedback_target_id_round_trips_in_agent_mode() -> anyhow::Result
     Ok(())
 }
 
+/// #1762: a recalled memory must expose a canonical handle in the default
+/// Agent presentation so the next request can feed it directly to the strict
+/// `memory.feedback(target_id=...)` contract without an intervening `get`.
+#[tokio::test]
+async fn memory_recall_full_id_chains_to_feedback_in_agent_mode() -> anyhow::Result<()> {
+    let client = connect_full().await?;
+    let remembered = ok_one(
+        &client,
+        r#"memory.remember(content="identifier continuity recall sentinel", salience=0.9)"#,
+    )
+    .await?;
+    let expected_id = remembered["id"]
+        .as_str()
+        .expect("remember must return a canonical id");
+
+    let recalled = agent_one(
+        &client,
+        r#"memory.recall(query="identifier continuity recall sentinel", limit=10, fusion_strategy="keyword_only", min_score=0.0)"#,
+    )
+    .await?;
+    let hit = recalled
+        .as_array()
+        .expect("recall result must be an array")
+        .iter()
+        .find(|row| row["full_id"] == expected_id)
+        .expect("recall must expose the remembered row by canonical full_id");
+    let full_id = hit["full_id"]
+        .as_str()
+        .expect("recall hit must expose full_id");
+    assert_eq!(full_id.len(), 36, "full_id must remain canonical");
+
+    let feedback = agent_one(
+        &client,
+        &format!(r#"memory.feedback(target_id="{full_id}", signal="useful")"#),
+    )
+    .await?;
+    assert_eq!(feedback["target_id"], full_id);
+    Ok(())
+}
+
+/// #1762: session summaries keep a canonical cross-request handle even though
+/// Agent presentation may compact their display-oriented `id` field.
+#[tokio::test]
+async fn session_list_full_id_chains_to_resume_in_agent_mode() -> anyhow::Result<()> {
+    let client = connect_full().await?;
+    let stored = ok_one(
+        &client,
+        r#"session.store(content="identifier continuity session sentinel", title="continuity sentinel")"#,
+    )
+    .await?;
+    let expected_id = stored["session"]["id"]
+        .as_str()
+        .expect("session.store must return a canonical session id");
+
+    let listed = agent_one(&client, r#"session.list(limit=20)"#).await?;
+    let summary = listed["sessions"]
+        .as_array()
+        .expect("session.list must return summaries")
+        .iter()
+        .find(|row| row["full_id"] == expected_id)
+        .expect("session.list must expose the stored session by canonical full_id");
+    let full_id = summary["full_id"]
+        .as_str()
+        .expect("session summary must expose full_id");
+    assert_eq!(full_id.len(), 36, "full_id must remain canonical");
+
+    let resumed = agent_one(&client, &format!(r#"session.resume(id="{full_id}")"#)).await?;
+    assert_eq!(resumed["session"]["id"], full_id);
+    Ok(())
+}
+
 /// `brain.auto_feedback` acknowledges the canonical target it credited; that
 /// acknowledgement feeds the strict `memory.feedback`/`brain.feedback`
 /// target_id parameter, so the default Agent transform must not shorten it
@@ -2581,11 +2652,12 @@ fn make_full_server() -> KhiveMcpServer {
             "gtd".to_string(),
             "memory".to_string(),
             "brain".to_string(),
+            "session".to_string(),
         ],
         ..RuntimeConfig::default()
     };
     let runtime = KhiveRuntime::new(config).expect("in-memory runtime with all packs");
-    KhiveMcpServer::new(runtime).expect("server builds with kg+gtd+memory+brain")
+    KhiveMcpServer::new(runtime).expect("server builds with kg+gtd+memory+brain+session")
 }
 
 async fn connect_full(

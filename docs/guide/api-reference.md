@@ -950,6 +950,8 @@ Each result carries `serve_attribution` (`profile`, `unattributed`, or
 `unspecified`). `profile` also carries `served_by_profile_id`; `unattributed`
 means a selected profile record was unreadable and downstream feedback must not
 fall back to a current binding/default.
+Each result also carries canonical `full_id`; pass it directly to
+`memory.feedback(target_id=...)` in a later request without an extra `get`.
 
 ```
 request(ops="memory.recall(query=\"ADR-016 DSL grammar\", limit=5, min_score=0.3)")
@@ -1840,6 +1842,8 @@ request(ops="session.store(content=\"...\", provider=\"claude_code\", title=\"pa
 ### `session.list` — Assertive
 
 List stored sessions newest first.
+Every summary includes canonical `full_id` for direct reuse with
+`session.resume` or `session.export` across requests.
 
 | Param      | Type    | Required | Notes                                               |
 | ---------- | ------- | -------- | --------------------------------------------------- |

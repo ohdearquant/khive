@@ -138,6 +138,8 @@ false, id, full_id, from, to, note: "already in target status"}` — the task fi
 `memory.recall` supports `tags` and `tag_mode` ("any"|"all") for tag-based post-filtering.
 Its optional `namespace` is an exact-match read override; absent means the caller's normal
 visible namespace set.
+Every hit carries `full_id`, a canonical dashed UUID that can be passed directly to
+the strict `memory.feedback(target_id=...)` contract across requests.
 The returned relevance score is normalized to [0,1]. The ranking `rank_score` is nominally
 [0,1] but can exceed 1.0 by up to 15% when a brain profile applies posterior terms. Typical
 production floor: 0.3-0.7.
@@ -278,6 +280,9 @@ unrecognized `section_type` returns a validation error listing the valid values.
 | `session.list`   | List stored sessions, newest first                | "What sessions have I run?"              |
 | `session.resume` | Fetch one session's full content by UUID/prefix   | Continue or reference a specific session |
 | `session.export` | Serialize one session as JSON or markdown         | Share or archive a session outside khive |
+
+Each `session.list` summary carries `full_id`, the canonical UUID to reuse with
+`session.resume` or `session.export` even under Agent presentation.
 
 ### How to call a verb
 
