@@ -443,9 +443,16 @@ producer cadence use the session-sweep fallback captured once at task startup
 interval or the enumerator's current environment override.
 
 The TRUNCATE-no-progress path instead runs the destructive attribution
-enumerator and marks the tick so ordinary housekeeping is skipped afterward.
-There is therefore at most one sidecar-directory pass per tick, processing at
-most `MAX_SIDECAR_ENTRIES`, including on a no-progress tick. Collection does
-not depend on WAL pressure or checkpoint availability; explicitly disabling
-the sidecar disables it. Filesystem work is offloaded with `spawn_blocking`,
-and failure warns without stopping the task.
+enumerator. The synchronous checkpoint core only records a request containing
+the pre-TRUNCATE holder census and stable sidecar inputs. The async task then
+executes the directory walk in an awaited `spawn_blocking` before it considers
+ordinary housekeeping or emits the tick's lifecycle outcome; report logging
+cannot consume a partial result. It marks the tick attempted before spawning,
+so a successful pass, a trust-boundary enumeration error, or a blocking-worker
+join failure all suppress same-tick housekeeping. This is fail-safe for the
+one-pass bound because a failed worker may already have completed part of the
+walk. Enumeration and worker failures retain distinct classifications and
+warn without stopping the task. There is therefore at most one
+sidecar-directory pass per tick, processing at most `MAX_SIDECAR_ENTRIES`,
+including on a no-progress tick. Collection does not depend on WAL pressure or
+checkpoint availability; explicitly disabling the sidecar disables it.

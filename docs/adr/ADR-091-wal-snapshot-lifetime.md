@@ -1187,15 +1187,20 @@ uninspectable, or stale heartbeat/beacon remains on disk and classifies `unknown
 must not consume the evidence that a later no-progress report needs.
 
 When a TRUNCATE attempt makes no progress, the existing `walpin::enumerate_live` attribution pass
-runs instead. It consumes the fresh classifications for the operator report and may then remove
-trusted malformed/stale residue under Amendment 2's original cleanup rule. The checkpoint state
-records that this pass was attempted and suppresses ordinary housekeeping later in the same tick,
-so the 512-entry cap applies to one sidecar-directory pass per tick rather than silently allowing a
-second 512-entry scan. Collection remains independent of WAL size, threshold crossings, and
+runs instead. The synchronous PASSIVE/TRUNCATE core records an immutable attribution request; it
+never enumerates the directory itself. Before the async checkpoint task may consider ordinary
+housekeeping or emit that tick's lifecycle outcome, it consumes the request in an awaited
+`tokio::task::spawn_blocking` and only then uses the classifications for the operator report. The
+pass may remove trusted malformed/stale residue under Amendment 2's original cleanup rule. The
+checkpoint state is marked attempted before the blocking worker starts, so both success and an
+indeterminate worker failure suppress ordinary housekeeping later in the same tick: a panicked
+worker may already have performed part of the walk, and a second scan would violate the bound.
+Thus the 512-entry cap applies to one sidecar-directory pass per tick rather than silently allowing
+a second 512-entry scan. Collection remains independent of WAL size, threshold crossings, and
 checkpoint availability on every tick that did not already run attribution. An operator who
-explicitly disables the sidecar also disables collection. Blocking filesystem work runs in
-`spawn_blocking`; a trust-boundary error or worker panic is warned and never terminates the
-checkpoint loop.
+explicitly disables the sidecar also disables collection. A trust-boundary enumeration error or
+blocking-worker join failure is surfaced distinctly, warned, and never flattened into successful
+attribution or allowed to terminate the checkpoint loop.
 
 `db_diagnostics` remains non-destructive with respect to sidecar evidence: the request does not
 invoke `enumerate_live`. Its cleanup-derived `sidecar_listing_truncated` and

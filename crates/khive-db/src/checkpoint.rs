@@ -1662,13 +1662,24 @@ pub async fn run_checkpoint_task(
         #[cfg(unix)]
         truncate_state.begin_tick();
 
+        #[cfg(unix)]
+        let mut pending_sidecar_attribution = None;
+
         let tick = match checkpoint_conn.ensure_open(&pool) {
             None => {
                 note_checkpoint_skipped();
                 CheckpointTick::Skipped
             }
-            Some(conn) => match checkpoint_once(&pool, conn, &config, &mut truncate_state) {
-                Ok(wal_pages) => CheckpointTick::Observed(wal_pages),
+            Some(conn) => match checkpoint_once_core(&pool, conn, &config, &mut truncate_state) {
+                Ok(outcome) => {
+                    #[cfg(unix)]
+                    {
+                        pending_sidecar_attribution = outcome.sidecar_attribution;
+                    }
+                    #[cfg(not(unix))]
+                    let _ = outcome.sidecar_attribution;
+                    CheckpointTick::Observed(outcome.wal_pages)
+                }
                 Err(e) => {
                     tracing::warn!(
                         error = %e,
@@ -1681,6 +1692,25 @@ pub async fn run_checkpoint_task(
                 }
             },
         };
+
+        // A successful no-progress TRUNCATE returns a bounded attribution
+        // request alongside the core outcome. Consume it before any
+        // report-derived decision or ordinary housekeeping for this tick.
+        // The await is intentional: enumeration may perform up to 512
+        // filesystem reads/classifications, so none of that work is allowed
+        // to run on this Tokio worker, while one-pass-per-tick ordering still
+        // requires the result (or an honest worker/enumeration failure) before
+        // the fallback housekeeping arm is considered.
+        #[cfg(unix)]
+        if let Err(error) =
+            complete_walpin_attribution(pending_sidecar_attribution, &mut truncate_state).await
+        {
+            tracing::warn!(
+                error = %error,
+                failure_kind = error.kind(),
+                "ADR-091 Amendment 2 Plank B: no-progress sidecar attribution failed"
+            );
+        }
 
         // ADR-091 Plank 1: age-based sweep over the registry's oldest entry
         // MUST run on every tick, including a Skipped one — deliberately
@@ -1869,6 +1899,17 @@ fn log_tx_registry_snapshot_warn(wal_pages: u64) {
     }
 }
 
+/// Internal result of the synchronous SQLite checkpoint core. Keeping the
+/// no-progress attribution request next to (but distinct from) `wal_pages`
+/// makes the async handoff explicit and gives deferred work one caller-owned
+/// lifetime instead of leaving it in mutable cross-tick state.
+#[derive(Debug)]
+#[must_use]
+struct CheckpointCoreOutcome {
+    wal_pages: u64,
+    sidecar_attribution: Option<WalpinAttributionRequest>,
+}
+
 /// Issue one checkpoint cycle against the task's dedicated checkpoint
 /// connection (`conn` — see `CheckpointConnection`; NEVER the pool's writer
 /// mutex).
@@ -1885,13 +1926,31 @@ fn log_tx_registry_snapshot_warn(wal_pages: u64) {
 ///
 /// ADR-091 Plank 2: after the PASSIVE pass, this is also the single point
 /// that may escalate to TRUNCATE (`maybe_truncate`) — on the SAME dedicated
-/// connection, never a second connection or a pool checkout.
+/// connection, never a second connection or a pool checkout. A no-progress
+/// result produces a separate cross-process attribution request; the
+/// synchronous core never walks the sidecar directory. Production's
+/// [`run_checkpoint_task`] consumes that request through an awaited
+/// `spawn_blocking` before continuing the tick. This compatibility wrapper
+/// intentionally returns only the historical page-count surface; the daemon
+/// calls `checkpoint_once_core` so it cannot discard the request.
 pub fn checkpoint_once(
     pool: &ConnectionPool,
     conn: &rusqlite::Connection,
     config: &CheckpointConfig,
     truncate_state: &mut TruncateState,
 ) -> Result<u64, rusqlite::Error> {
+    checkpoint_once_core(pool, conn, config, truncate_state).map(|outcome| outcome.wal_pages)
+}
+
+/// Synchronous PASSIVE/TRUNCATE core used by the async task. Unlike the
+/// compatibility wrapper [`checkpoint_once`], this preserves the explicit
+/// no-progress attribution request for the caller to complete off-runtime.
+fn checkpoint_once_core(
+    pool: &ConnectionPool,
+    conn: &rusqlite::Connection,
+    config: &CheckpointConfig,
+    truncate_state: &mut TruncateState,
+) -> Result<CheckpointCoreOutcome, rusqlite::Error> {
     #[cfg(unix)]
     truncate_state.begin_tick();
     let wal_pages = query_wal_pages(conn);
@@ -1902,9 +1961,12 @@ pub fn checkpoint_once(
     }
     tracing::debug!(wal_pages, "WAL checkpoint issued");
 
-    maybe_truncate(pool, conn, config, wal_pages, truncate_state);
+    let sidecar_attribution = maybe_truncate(pool, conn, config, wal_pages, truncate_state);
 
-    Ok(wal_pages)
+    Ok(CheckpointCoreOutcome {
+        wal_pages,
+        sidecar_attribution,
+    })
 }
 
 /// Evaluate and, if due, attempt a TRUNCATE escalation on the same dedicated
@@ -1918,14 +1980,14 @@ fn maybe_truncate(
     config: &CheckpointConfig,
     wal_pages_before: u64,
     truncate_state: &mut TruncateState,
-) {
+) -> Option<WalpinAttributionRequest> {
     if wal_pages_before < config.truncate_high_water_pages {
-        return;
+        return None;
     }
 
     if let Some(last) = truncate_state.last_attempt {
         if last.elapsed() < config.truncate_min_interval {
-            return;
+            return None;
         }
     }
 
@@ -1942,11 +2004,16 @@ fn maybe_truncate(
         // for the full `truncate_min_interval` on a path that never touched
         // the WAL at all.
         tracing::warn!(error = %e, "failed to lower busy_timeout for TRUNCATE attempt; skipping");
-        return;
+        return None;
     }
 
     #[cfg(unix)]
-    let holder_census = capture_wal_holder_census(pool);
+    let holder_attribution =
+        capture_walpin_attribution_request(pool, truncate_state.legacy_walpin_fallback_interval);
+    #[cfg(unix)]
+    let mut sidecar_attribution = None;
+    #[cfg(not(unix))]
+    let sidecar_attribution = None;
 
     // Only now is this a genuine attempt: the writer is held, the threshold
     // and interval gates passed, and the busy_timeout override is in effect
@@ -1988,12 +2055,13 @@ fn maybe_truncate(
                 }
                 #[cfg(unix)]
                 {
-                    truncate_state.sidecar_attribution_attempted_this_tick =
-                        log_walpin_sidecar_report(
-                            pool,
-                            holder_census,
-                            truncate_state.legacy_walpin_fallback_interval,
-                        );
+                    // The census above had to be captured before TRUNCATE so
+                    // a transient holder remains attributable. The bounded
+                    // sidecar walk itself must not run here: this synchronous
+                    // core is called directly from `run_checkpoint_task` on a
+                    // Tokio worker. Hand the immutable request back to that
+                    // async owner for an awaited `spawn_blocking` pass.
+                    sidecar_attribution = holder_attribution;
                 }
                 log_wal_pin_depth(conn);
             }
@@ -2006,6 +2074,7 @@ fn maybe_truncate(
             note_truncate_outcome(config, wal_pages_before, truncate_state);
         }
     }
+    sidecar_attribution
 }
 
 #[cfg(test)]
@@ -2057,6 +2126,119 @@ mod truncate_report_test_sync {
     }
 }
 
+/// Deterministic seam for the async-attribution regressions below. The hook
+/// executes inside the actual `spawn_blocking` closure, so a current-thread
+/// Tokio test can prove both thread displacement and awaited ordering without
+/// relying on sleeps or scheduler timing.
+#[cfg(all(test, unix))]
+mod walpin_attribution_test_sync {
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
+    use std::sync::{Arc, Mutex};
+
+    enum Behavior {
+        Pause {
+            reached_tx: tokio::sync::oneshot::Sender<std::thread::ThreadId>,
+            proceed_rx: Receiver<()>,
+        },
+        Panic,
+    }
+
+    struct Hook {
+        dir: PathBuf,
+        behavior: Behavior,
+    }
+
+    static HOOK: Mutex<Option<Hook>> = Mutex::new(None);
+    static REPORT_COUNTER: Mutex<Option<Arc<AtomicUsize>>> = Mutex::new(None);
+
+    pub(crate) fn install_pause(
+        dir: PathBuf,
+    ) -> (
+        tokio::sync::oneshot::Receiver<std::thread::ThreadId>,
+        SyncSender<()>,
+        Arc<AtomicUsize>,
+    ) {
+        let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
+        let (proceed_tx, proceed_rx) = sync_channel(0);
+        let report_counter = Arc::new(AtomicUsize::new(0));
+        let replaced = HOOK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .replace(Hook {
+                dir,
+                behavior: Behavior::Pause {
+                    reached_tx,
+                    proceed_rx,
+                },
+            });
+        assert!(
+            replaced.is_none(),
+            "walpin attribution hook already installed"
+        );
+        *REPORT_COUNTER
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Arc::clone(&report_counter));
+        (reached_rx, proceed_tx, report_counter)
+    }
+
+    pub(crate) fn install_panic(dir: PathBuf) {
+        let replaced = HOOK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .replace(Hook {
+                dir,
+                behavior: Behavior::Panic,
+            });
+        assert!(
+            replaced.is_none(),
+            "walpin attribution hook already installed"
+        );
+    }
+
+    pub(crate) fn uninstall() {
+        *HOOK.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        *REPORT_COUNTER
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+    }
+
+    pub(crate) fn before_enumeration(dir: &Path) {
+        let hook = {
+            let mut guard = HOOK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            match guard.as_ref() {
+                Some(hook) if hook.dir == dir => guard.take(),
+                _ => None,
+            }
+        };
+        let Some(hook) = hook else {
+            return;
+        };
+        match hook.behavior {
+            Behavior::Pause {
+                reached_tx,
+                proceed_rx,
+            } => {
+                if reached_tx.send(std::thread::current().id()).is_ok() {
+                    let _ = proceed_rx.recv();
+                }
+            }
+            Behavior::Panic => panic!("injected walpin attribution worker panic"),
+        }
+    }
+
+    pub(crate) fn report_used() {
+        if let Some(counter) = REPORT_COUNTER
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+        {
+            counter.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+}
+
 /// ADR-091 Plank 2: track consecutive TRUNCATE attempts that fail to bring
 /// `wal_pages` back below `warn_pages`, firing a one-shot escalated WARN at
 /// exactly the third consecutive failure (does not repeat every attempt
@@ -2089,19 +2271,114 @@ fn note_truncate_outcome(
     TRUNCATE_CONSECUTIVE_FAILURES.store(state.consecutive_failures as u64, Ordering::Relaxed);
 }
 
-/// ADR-091 Amendment 2 Plank B: capture the OS holder census immediately
-/// before a TRUNCATE attempt so a holder that releases during the bounded wait
-/// remains attributable if the attempt reports no progress. A no-op if the
-/// sidecar is disabled or this backend has no on-disk path.
+/// Immutable work captured around an armed TRUNCATE and consumed by the
+/// async checkpoint owner only when that attempt makes no progress.
+///
+/// The holder census belongs here because it must precede the bounded
+/// TRUNCATE wait. The sidecar directory walk does not: it remains deferred
+/// until after the outcome is known and is executed through an awaited
+/// `spawn_blocking` by [`complete_walpin_attribution`].
 #[cfg(unix)]
-fn capture_wal_holder_census(
+#[derive(Debug)]
+struct WalpinAttributionRequest {
+    dir: PathBuf,
+    census: Result<crate::walpin::CensusResult, String>,
+    legacy_fallback_interval: Duration,
+}
+
+/// Non-Unix placeholder keeps the synchronous core's outcome shape stable;
+/// daemon sidecar attribution itself is Unix-only.
+#[cfg(not(unix))]
+type WalpinAttributionRequest = ();
+
+/// Honest failure surface for an attempted no-progress attribution pass.
+/// Both variants suppress same-tick housekeeping because a panicked blocking
+/// worker may already have partially enumerated the directory; retrying a
+/// second pass would violate the one-pass-per-tick bound.
+#[cfg(unix)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum WalpinAttributionFailure {
+    Enumeration(String),
+    Worker(String),
+}
+
+#[cfg(unix)]
+impl WalpinAttributionFailure {
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::Enumeration(_) => "enumeration",
+            Self::Worker(_) => "blocking_worker",
+        }
+    }
+}
+
+#[cfg(unix)]
+impl std::fmt::Display for WalpinAttributionFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Enumeration(error) => write!(
+                formatter,
+                "sidecar directory failed the trust-boundary enumeration; cross-process \
+                 WAL-pin attribution is unestablished for this tick: {error}"
+            ),
+            Self::Worker(error) => write!(
+                formatter,
+                "sidecar attribution blocking worker failed; cross-process WAL-pin \
+                 attribution is unestablished for this tick: {error}"
+            ),
+        }
+    }
+}
+
+/// Capture the pre-TRUNCATE OS holder census and stable sidecar inputs. A
+/// no-op if the sidecar is disabled or this backend has no on-disk path.
+#[cfg(unix)]
+fn capture_walpin_attribution_request(
     pool: &ConnectionPool,
-) -> Option<Result<crate::walpin::CensusResult, String>> {
+    legacy_fallback_interval: Duration,
+) -> Option<WalpinAttributionRequest> {
     let path = pool.canonical_path()?;
     if !crate::walpin::sidecar_enabled(true) {
         return None;
     }
-    Some(crate::walpin::census_holders(path).map_err(|e| e.to_string()))
+    Some(WalpinAttributionRequest {
+        dir: crate::walpin::sidecar_dir_for(path),
+        census: crate::walpin::census_holders(path).map_err(|error| error.to_string()),
+        legacy_fallback_interval,
+    })
+}
+
+/// Consume this tick's no-progress attribution request off the async runtime
+/// worker and await it before any report or fallback housekeeping is used.
+/// Returns `Ok(false)` when no pass was requested. Once a request exists the
+/// state is marked attempted before spawning, so worker panic/cancellation
+/// cannot accidentally authorize a second directory scan in the same tick.
+#[cfg(unix)]
+async fn complete_walpin_attribution(
+    request: Option<WalpinAttributionRequest>,
+    state: &mut TruncateState,
+) -> Result<bool, WalpinAttributionFailure> {
+    let Some(request) = request else {
+        return Ok(false);
+    };
+    state.sidecar_attribution_attempted_this_tick = true;
+
+    let WalpinAttributionRequest {
+        dir,
+        census,
+        legacy_fallback_interval,
+    } = request;
+    let report = tokio::task::spawn_blocking(move || {
+        #[cfg(test)]
+        walpin_attribution_test_sync::before_enumeration(&dir);
+        crate::walpin::enumerate_live(&dir, legacy_fallback_interval)
+    })
+    .await
+    .map_err(|error| WalpinAttributionFailure::Worker(error.to_string()))?
+    .map_err(|error| WalpinAttributionFailure::Enumeration(error.to_string()))?;
+
+    log_walpin_sidecar_report(&report, census);
+    Ok(true)
 }
 
 /// When a TRUNCATE attempt makes no progress, enumerate the walpin sidecar and
@@ -2120,32 +2397,11 @@ fn capture_wal_holder_census(
 /// instead of silently exonerating them.
 #[cfg(unix)]
 fn log_walpin_sidecar_report(
-    pool: &ConnectionPool,
-    census: Option<Result<crate::walpin::CensusResult, String>>,
-    legacy_fallback_interval: Duration,
-) -> bool {
-    let Some(census) = census else {
-        return false;
-    };
-    let Some(path) = pool.canonical_path() else {
-        return false;
-    };
-    let dir = crate::walpin::sidecar_dir_for(path);
-    // Each record carries its producer's own sweep cadence
-    // (`sweep_interval_ms`), which is what freshness is judged against; the
-    // interval passed here is only the fallback for records written before
-    // that field existed.
-    let report = match crate::walpin::enumerate_live(&dir, legacy_fallback_interval) {
-        Ok(report) => report,
-        Err(e) => {
-            tracing::warn!(
-                error = %e,
-                "ADR-091 Amendment 2 Plank B: sidecar directory failed the trust-boundary \
-                 check; cross-process WAL-pin attribution is unestablished for this tick"
-            );
-            return true;
-        }
-    };
+    report: &crate::walpin::WalpinReport,
+    census: Result<crate::walpin::CensusResult, String>,
+) {
+    #[cfg(test)]
+    walpin_attribution_test_sync::report_used();
     let now = now_epoch_secs();
     for hb in report.reporting() {
         // ADR-091 Amendment 3 Plank F2 fail-closed reading rule: the
@@ -2251,7 +2507,6 @@ fn log_walpin_sidecar_report(
              span this sidecar covers"
         );
     }
-    true
 }
 
 /// ADR-091 Amendment 2 Plank C: on a TRUNCATE no-progress event, run a fresh
@@ -2590,6 +2845,16 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    struct WalpinAttributionHookGuard;
+
+    #[cfg(unix)]
+    impl Drop for WalpinAttributionHookGuard {
+        fn drop(&mut self) {
+            walpin_attribution_test_sync::uninstall();
+        }
+    }
+
     struct ReaderProcess {
         child: std::process::Child,
         _stdout: std::io::BufReader<std::process::ChildStdout>,
@@ -2679,10 +2944,15 @@ mod tests {
             .expect("helper releases read snapshot");
     }
 
-    #[test]
+    #[tokio::test(flavor = "current_thread")]
     #[cfg(unix)]
-    #[serial(checkpoint_skip_metrics, khive_walpin_sidecar_env, walpin_report_seam)]
-    fn no_progress_report_keeps_holder_released_after_truncate_timeout() {
+    #[serial(
+        checkpoint_skip_metrics,
+        khive_walpin_sidecar_env,
+        walpin_attribution_async,
+        walpin_report_seam
+    )]
+    async fn no_progress_report_keeps_holder_released_after_truncate_timeout() {
         let _env_guard = crate::walpin::EnvVarGuard::capture("KHIVE_WALPIN_SIDECAR");
         std::env::set_var("KHIVE_WALPIN_SIDECAR", "1");
         let dir = tempfile::tempdir().expect("tempdir");
@@ -2713,28 +2983,22 @@ mod tests {
         let (reached_rx, proceed_tx) = truncate_report_test_sync::install(canonical_path.clone());
         let _hook_guard = TruncateReportHookGuard;
         let buffer = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let thread_buffer = std::sync::Arc::clone(&buffer);
         let checkpoint_pool = Arc::clone(&pool);
         let dedicated_conn = checkpoint_conn(&checkpoint_pool);
         let checkpoint = std::thread::spawn(move || {
-            let subscriber = CaptureSubscriber {
-                events: thread_buffer,
-            };
-            tracing::subscriber::with_default(subscriber, || {
-                let mut state = TruncateState::default();
-                let result = checkpoint_once(
-                    &checkpoint_pool,
-                    &dedicated_conn,
-                    &CheckpointConfig {
-                        truncate_high_water_pages: 0,
-                        truncate_min_interval: Duration::ZERO,
-                        truncate_busy_timeout: Duration::from_millis(50),
-                        ..CheckpointConfig::default()
-                    },
-                    &mut state,
-                );
-                (result, state.sidecar_attribution_attempted_this_tick)
-            })
+            let mut state = TruncateState::default();
+            let result = checkpoint_once_core(
+                &checkpoint_pool,
+                &dedicated_conn,
+                &CheckpointConfig {
+                    truncate_high_water_pages: 0,
+                    truncate_min_interval: Duration::ZERO,
+                    truncate_busy_timeout: Duration::from_millis(50),
+                    ..CheckpointConfig::default()
+                },
+                &mut state,
+            );
+            (result, state)
         });
 
         reached_rx
@@ -2750,9 +3014,25 @@ mod tests {
         proceed_tx
             .send(())
             .expect("allow no-progress reporting to continue");
-        let (checkpoint_result, attribution_attempted) =
-            checkpoint.join().expect("checkpoint thread");
-        checkpoint_result.expect("checkpoint succeeds");
+        let (checkpoint_result, mut state) = checkpoint.join().expect("checkpoint thread");
+        let outcome = checkpoint_result.expect("checkpoint succeeds");
+        assert!(
+            outcome.sidecar_attribution.is_some(),
+            "the synchronous checkpoint result must carry a separate attribution request"
+        );
+        assert!(
+            !state.sidecar_attribution_attempted_this_tick,
+            "capturing a request is not the same as attempting its directory enumeration"
+        );
+
+        let subscriber = CaptureSubscriber {
+            events: std::sync::Arc::clone(&buffer),
+        };
+        let _subscriber_guard = tracing::subscriber::set_default(subscriber);
+        let attribution_attempted =
+            complete_walpin_attribution(outcome.sidecar_attribution, &mut state)
+                .await
+                .expect("deferred attribution succeeds");
         assert!(
             attribution_attempted,
             "a no-progress attribution pass must suppress the redundant healthy-housekeeping \
@@ -2768,6 +3048,188 @@ mod tests {
                     .is_some_and(|pids| pids.contains(&reader_pid.to_string()))
             }),
             "the no-progress report must retain PID {reader_pid} from the pre-attempt census: {events:?}"
+        );
+    }
+
+    /// The 512-entry attribution walk must run on Tokio's blocking pool and
+    /// the async owner must await it before the report is consumed. A paused
+    /// real enumeration proves all three facts without a timing sleep: its
+    /// thread differs from the current-thread runtime, the completion future
+    /// remains pending, and the report-use counter stays zero until release.
+    #[tokio::test(flavor = "current_thread")]
+    #[cfg(unix)]
+    #[serial(walpin_attribution_async)]
+    async fn no_progress_attribution_is_off_runtime_and_awaited_before_report_use() {
+        use std::sync::atomic::Ordering;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sidecar_dir = dir.path().join("checkpoint.db.walpin");
+        let (reached_rx, proceed_tx, report_counter) =
+            walpin_attribution_test_sync::install_pause(sidecar_dir.clone());
+        let _hook_guard = WalpinAttributionHookGuard;
+
+        let runtime_thread = std::thread::current().id();
+        let mut state = TruncateState::default();
+        let request = Some(WalpinAttributionRequest {
+            dir: sidecar_dir,
+            census: Ok(crate::walpin::CensusResult::default()),
+            legacy_fallback_interval: DEFAULT_SESSION_SWEEP_INTERVAL,
+        });
+        let completion = tokio::spawn(async move {
+            let result = complete_walpin_attribution(request, &mut state).await;
+            (result, state)
+        });
+
+        let blocking_thread = reached_rx
+            .await
+            .expect("spawn_blocking attribution reached test seam");
+        assert_ne!(
+            blocking_thread, runtime_thread,
+            "sidecar enumeration must not execute on the current-thread Tokio runtime worker"
+        );
+        assert!(
+            !completion.is_finished(),
+            "the async attribution owner must await the still-paused blocking enumeration"
+        );
+        assert_eq!(
+            report_counter.load(Ordering::SeqCst),
+            0,
+            "the attribution report must not be consumed before enumeration completes"
+        );
+
+        proceed_tx
+            .send(())
+            .expect("release blocking attribution enumeration");
+        let (result, state) = completion.await.expect("attribution task joins");
+        assert_eq!(result, Ok(true));
+        assert_eq!(
+            report_counter.load(Ordering::SeqCst),
+            1,
+            "the completed enumeration must feed exactly one report use"
+        );
+        assert!(state.sidecar_attribution_attempted_this_tick);
+        assert!(
+            !state.housekeeping_due(),
+            "completed attribution must suppress same-tick housekeeping"
+        );
+    }
+
+    /// A panicked blocking worker is not flattened into success. The tick is
+    /// still marked attempted because the worker may have partially walked
+    /// the directory before failing, so starting housekeeping afterward
+    /// would violate the one-pass bound.
+    #[tokio::test(flavor = "current_thread")]
+    #[cfg(unix)]
+    #[serial(walpin_attribution_async)]
+    async fn no_progress_attribution_join_failure_is_honest_and_suppresses_retry() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sidecar_dir = dir.path().join("checkpoint.db.walpin");
+        walpin_attribution_test_sync::install_panic(sidecar_dir.clone());
+        let _hook_guard = WalpinAttributionHookGuard;
+
+        let mut state = TruncateState::default();
+        let request = Some(WalpinAttributionRequest {
+            dir: sidecar_dir,
+            census: Ok(crate::walpin::CensusResult::default()),
+            legacy_fallback_interval: DEFAULT_SESSION_SWEEP_INTERVAL,
+        });
+
+        let error = complete_walpin_attribution(request, &mut state)
+            .await
+            .expect_err("injected worker panic must surface as failure");
+        assert!(
+            matches!(error, WalpinAttributionFailure::Worker(_)),
+            "join failure must retain its worker classification: {error:?}"
+        );
+        assert!(state.sidecar_attribution_attempted_this_tick);
+        assert!(
+            !state.housekeeping_due(),
+            "an indeterminate partial pass must not authorize a second scan"
+        );
+    }
+
+    /// Structural guard for the accepted ADR split: the synchronous SQLite
+    /// checkpoint core only schedules attribution, the sole direct
+    /// `enumerate_live` call is nested in an awaited `spawn_blocking`, and the
+    /// task completes it before either housekeeping or lifecycle outcome use.
+    #[test]
+    #[cfg(unix)]
+    #[serial(checkpoint_skip_metrics)]
+    fn async_checkpoint_source_keeps_enumeration_behind_awaited_spawn_blocking() {
+        fn section<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
+            source
+                .split_once(start)
+                .unwrap_or_else(|| panic!("missing source marker {start:?}"))
+                .1
+                .split_once(end)
+                .unwrap_or_else(|| panic!("missing source marker {end:?}"))
+                .0
+        }
+
+        let source = include_str!("checkpoint.rs");
+        let checkpoint_core = section(
+            source,
+            "fn checkpoint_once_core(",
+            "/// Evaluate and, if due, attempt a TRUNCATE escalation",
+        );
+        let truncate_core = section(
+            source,
+            "fn maybe_truncate(",
+            "#[cfg(test)]\nmod truncate_report_test_sync",
+        );
+        let report_logger = section(
+            source,
+            "fn log_walpin_sidecar_report(",
+            "/// ADR-091 Amendment 2 Plank C",
+        );
+        for (name, body) in [
+            ("checkpoint_once_core", checkpoint_core),
+            ("maybe_truncate", truncate_core),
+            ("log_walpin_sidecar_report", report_logger),
+        ] {
+            assert!(
+                !body.contains("enumerate_live("),
+                "{name} must not perform direct sidecar enumeration"
+            );
+        }
+
+        let async_completion = section(
+            source,
+            "async fn complete_walpin_attribution(",
+            "/// When a TRUNCATE attempt makes no progress",
+        );
+        let spawn = async_completion
+            .find("tokio::task::spawn_blocking")
+            .expect("completion must spawn blocking work");
+        let enumerate = async_completion
+            .find("crate::walpin::enumerate_live")
+            .expect("blocking closure must perform the attribution enumeration");
+        let awaited = async_completion[enumerate..]
+            .find(".await")
+            .map(|offset| enumerate + offset)
+            .expect("blocking worker must be awaited");
+        assert!(spawn < enumerate && enumerate < awaited);
+
+        let task = section(
+            source,
+            "pub async fn run_checkpoint_task(",
+            "/// Whether a `CheckpointOutcomeRecorded` event should be emitted",
+        );
+        let checkpoint = task
+            .find("checkpoint_once_core(")
+            .expect("checkpoint core call");
+        let completion = task
+            .find("complete_walpin_attribution(")
+            .expect("awaited attribution completion");
+        let housekeeping = task
+            .find("reap_dead_entries_bounded(legacy_walpin_fallback_interval)")
+            .expect("fallback housekeeping");
+        let outcome = task
+            .find("checkpoint_outcome_should_emit")
+            .expect("lifecycle outcome use");
+        assert!(
+            checkpoint < completion && completion < housekeeping && housekeeping < outcome,
+            "tick ordering must be checkpoint -> awaited attribution -> housekeeping decision -> outcome"
         );
     }
 
@@ -3512,8 +3974,9 @@ mod tests {
     }
 
     /// Regression guard for #845 (a recurrence of the #828 shared-statics
-    /// race): every test in this module that calls `checkpoint_once` or
-    /// `run_checkpoint_task` — both funnel through `query_wal_pages`, which
+    /// race): every test in this module that calls `checkpoint_once`,
+    /// `checkpoint_once_core`, or `run_checkpoint_task` — all funnel through
+    /// `query_wal_pages`, which
     /// writes the process-wide `LAST_WAL_PAGES` / `CHECKPOINT_*` atomics —
     /// must be tagged with a `#[serial(...)]` group that includes
     /// `checkpoint_skip_metrics`. Before #828, six such call sites carried no
@@ -3546,9 +4009,11 @@ mod tests {
             let end = attr_starts.get(idx + 1).copied().unwrap_or(lines.len());
             let span = &lines[start..end];
 
-            let touches_shared_metrics = span
-                .iter()
-                .any(|l| l.contains("checkpoint_once(") || l.contains("run_checkpoint_task("));
+            let touches_shared_metrics = span.iter().any(|l| {
+                l.contains("checkpoint_once(")
+                    || l.contains("checkpoint_once_core(")
+                    || l.contains("run_checkpoint_task(")
+            });
             if !touches_shared_metrics {
                 continue;
             }
@@ -3575,7 +4040,7 @@ mod tests {
 
         assert!(
             offenders.is_empty(),
-            "these tests call checkpoint_once/run_checkpoint_task (which write the \
+            "these tests call checkpoint_once/checkpoint_once_core/run_checkpoint_task (which write the \
              process-wide LAST_WAL_PAGES/CHECKPOINT_* atomics via query_wal_pages) but \
              are not tagged #[serial(checkpoint_skip_metrics)] (or a group including it); \
              an untagged caller running concurrently on cargo's default test thread pool \
