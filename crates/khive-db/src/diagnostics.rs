@@ -34,13 +34,13 @@
 //!    `ConnectionPool::open_standalone_writer_untracked`, opened without
 //!    `SQLITE_OPEN_CREATE`. A missing database yields `checkpoint_probe:
 //!    null` plus a `checkpoint_probe_error`, never a freshly created file.
-//! 3. The WAL-pin sidecar directory in this crate is enumerated only through
-//!    the read-only OS holder census (`walpin::census_holders`). This
-//!    tree's `khive-db` exposes sidecar directory enumeration only via
-//!    `walpin::enumerate_live`, which unlinks malformed, dead,
-//!    identity-mismatched, and stale entries as part of its cleanup pass —
-//!    a diagnostic request must not be what destroys that forensic
-//!    evidence, so `wal_pin_attribution` deliberately does not call it.
+//! 3. WAL-pin attribution performs only the read-only OS holder census
+//!    (`walpin::census_holders`) and does not inspect the sidecar directory.
+//!    This tree's `khive-db` has no non-destructive reconciliation primitive:
+//!    `walpin::enumerate_live` and `walpin::housekeep_live` both unlink
+//!    entries under their respective cleanup policies. A diagnostic request
+//!    must not be what destroys that forensic evidence, so
+//!    `wal_pin_attribution` deliberately calls neither mutating path.
 //!    Sidecar-to-holder reconciliation (`reporting`/`registered_silent_pids`/
 //!    `sidecar_entries`/`fully_attributed`) is therefore reported empty with
 //!    an explicit `unavailable_reason` rather than fabricated from a
@@ -333,9 +333,9 @@ impl WalPinAttribution {
 #[cfg(unix)]
 fn wal_pin_attribution_from_census(census: crate::walpin::CensusResult) -> WalPinAttribution {
     const SIDECAR_REASON: &str = "sidecar-to-holder reconciliation not available: this tree's \
-        khive-db exposes sidecar enumeration only via walpin::enumerate_live, which deletes \
-        stale/malformed entries as part of its cleanup pass; a diagnostics probe must not \
-        delete forensic sidecar evidence, so only the OS holder census below was collected";
+        khive-db has no non-destructive sidecar reconciliation primitive; walpin::enumerate_live \
+        and walpin::housekeep_live both perform mutating cleanup, so diagnostics called neither \
+        and collected only the read-only OS holder census below";
 
     let census_is_complete = census.is_complete();
     let mut census_holder_pids: Vec<u32> = census.holders.iter().copied().collect();

@@ -2835,13 +2835,14 @@ pub(crate) fn housekeep_live(
     )
 }
 
-/// Ceiling on sidecar entries listed and read per enumeration. Both the
-/// `readdir` loop and the per-entry open/fstat/read/parse run while the
-/// checkpoint writer guard is held, so enumeration work is bounded by
-/// policy, not by directory content — the entry-count sibling of the
-/// per-entry `MAX_SIDECAR_ENTRY_BYTES` bound. A real population is one
-/// heartbeat/beacon pair per live process; a directory holding more than
-/// this contributes one `CAP_SENTINEL_PID` `Unknown` marker (fail-closed:
+/// Ceiling on sidecar entries listed and read per enumeration. After ADR-091
+/// Amendment 5 there is no checkpoint writer guard on this path. For daemon
+/// checkpoint callers, the cap instead bounds the per-tick filesystem work
+/// admitted to the awaited blocking worker, the latency attributable to that
+/// work, and memory retained by the returned report — the entry-count sibling
+/// of the per-entry `MAX_SIDECAR_ENTRY_BYTES` bound. A real population is one
+/// heartbeat/beacon pair per live process; a directory holding more than this
+/// contributes one `CAP_SENTINEL_PID` `Unknown` marker (fail-closed:
 /// unenumerated entries make the census inconclusive, never exonerated).
 #[cfg(unix)]
 const MAX_SIDECAR_ENTRIES: usize = 512;
