@@ -24,6 +24,8 @@ set -uo pipefail
 MAX_JSON_KB="${KHIVE_MAX_JSON_KB:-256}"
 LOCKFILES='package-lock.json|deno.lock|flake.lock|composer.lock|bun.lock|.package.resolved'
 BENCH_RE='(^|/)(bench|benches|benchmark|benchmarks|criterion)(/|$)|bench.*result|result.*bench'
+SHOWCASE_GOLDEN_RE='^(docs/schemas/examples/khive-repo-v1-khive\.json|apps/kg-editor/public/showcase/khive-repo-v1-khive\.json)$'
+SHOWCASE_MAX_JSON_KB=8192
 
 fail=0
 
@@ -45,6 +47,16 @@ check_file() {
       printf '%s' "$base" | grep -qE "^(${LOCKFILES})$" && return 0
       printf '%s' "$lower" | grep -qE "$BENCH_RE" && return 0
       size_kb=$(( ($(wc -c < "$f") + 1023) / 1024 ))
+      # ADR-147 requires one canonical public golden and its byte-identical browser
+      # asset. Keep this exception exact and below the renderer's closed 8 MiB cap;
+      # the KG Studio contract job validates both JSON shape and byte parity.
+      if printf '%s' "$lower" | grep -qE "$SHOWCASE_GOLDEN_RE"; then
+        if [ "$size_kb" -gt "$SHOWCASE_MAX_JSON_KB" ]; then
+          echo "BLOCKED: $f — ${size_kb}KB showcase golden exceeds ${SHOWCASE_MAX_JSON_KB}KB ceiling." >&2
+          fail=1
+        fi
+        return 0
+      fi
       if [ "$size_kb" -gt "$MAX_JSON_KB" ]; then
         echo "BLOCKED: $f — ${size_kb}KB JSON exceeds ${MAX_JSON_KB}KB config-file ceiling." >&2
         fail=1

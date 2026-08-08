@@ -392,10 +392,10 @@ Hybrid FTS + vector search with RRF fusion.
 | `kind`               | string  | yes      | Substrate or granular kind to search.                                                                                                  |
 | `query`              | string  | yes      | Free-text query.                                                                                                                       |
 | `limit`              | integer | no       | Default 10.                                                                                                                            |
-| `entity_kind`        | string  | no       | `kind="entity"` only.                                                                                                                  |
-| `entity_type`        | string  | no       | `kind="entity"` only.                                                                                                                  |
-| `note_kind`          | string  | no       | `kind="note"` only.                                                                                                                    |
-| `include_superseded` | bool    | no       | `kind="note"` only; default false excludes notes targeted by a `supersedes` edge.                                                      |
+| `entity_kind`        | string  | no       | Entity-substrate searches only.                                                                                                        |
+| `entity_type`        | string  | no       | Entity-substrate searches only.                                                                                                        |
+| `note_kind`          | string  | no       | Note-substrate searches only.                                                                                                          |
+| `include_superseded` | bool    | no       | Note-substrate searches only; default false excludes notes targeted by a `supersedes` edge.                                            |
 | `properties`         | object  | no       | Match records whose properties contain all listed key=value pairs, applied before result truncation inside a bounded candidate window. |
 | `tags`               | array   | no       | OR-match against tags; entity tags matched at the SQL level, note tags read from `properties.tags`.                                    |
 | `min_score`          | number  | no       | Score floor 0.0–1.0. No server default; RRF rank-1 scores on small corpora are typically 0.013–0.033.                                  |
@@ -403,6 +403,20 @@ Hybrid FTS + vector search with RRF fusion.
 ```
 request(ops="search(kind=\"entity\", query=\"knowledge graph runtime\", limit=10)")
 ```
+
+`entity_kind` and `note_kind` are compatibility filters for the corresponding
+substrate-level `kind`. A granular discriminator such as `kind="concept"` or
+`kind="observation"` may be paired with the same compatibility value, but a
+contradiction is rejected. Entity-only fields on a note search and note-only
+fields on an entity search are also rejected explicitly; they are never
+ignored. `properties` must be an object and `tags` must be an array of strings.
+The same validated request is used for single- and multi-backend execution.
+
+In multi-backend mode a backend failure yields the successful hits from the
+remaining backends and adds `partial: true` plus `missing_backends` to that
+operation's request envelope. These fields sit beside `result` rather than
+inside the search result array, and remain present through presentation and
+response-frame compaction.
 
 Response shape (`kind="entity"` rows, `presentation="verbose"`):
 
@@ -612,15 +626,34 @@ rejected — use `create`/`update`/`link`/`merge`/`delete` to mutate the graph. 
 that mix fixed-length and variable-length chains are not compiled in one call; split
 them into separate `query()` calls. GQL string equality uses SQLite `COLLATE NOCASE`,
 so `WHERE e.name = "LoRA"` matches both `LoRA` and ASCII case variants such as `lora`.
+GQL results have a deterministic identity order. When a response has `has_more: true`,
+repeat the same query with `SKIP` set to its `next_offset`; keep `page_size` unchanged.
+SPARQL `OFFSET` is not part of the supported dialect.
 
-| Param   | Type    | Required | Notes                                    |
-| ------- | ------- | -------- | ---------------------------------------- |
-| `query` | string  | yes      | GQL or SPARQL pattern string, read-only. |
-| `limit` | integer | no       | Default 500, hard cap 10,000.            |
+| Param       | Type    | Required | Notes                                                                     |
+| ----------- | ------- | -------- | ------------------------------------------------------------------------- |
+| `query`     | string  | yes      | GQL or SPARQL pattern string, read-only. GQL supports `SKIP n [LIMIT m]`. |
+| `page_size` | integer | no       | Rows per call; minimum 1, default 500, clamped to hard cap 10,000.        |
+| `limit`     | integer | no       | Deprecated alias for `page_size`; supplying both is an error.             |
 
 ```
 request(ops="query(query=\"MATCH (c:concept)-[:extends]->(d:concept) RETURN c, d LIMIT 20\")")
 ```
+
+For an exhaustive audit, omit query-text `LIMIT` so the server can report whether another
+page exists. An explicit `LIMIT` at or below `page_size` is a terminal caller-chosen bound.
+
+```text
+request(ops="query(query=\"MATCH (a)-[r:depends_on]->(b) RETURN a, r, b\", page_size=500)")
+# {"rows":[...],"offset":0,"page_size":500,"has_more":true,
+#  "next_offset":500,"truncated":true,...}
+
+request(ops="query(query=\"MATCH (a)-[r:depends_on]->(b) RETURN a, r, b SKIP 500\", page_size=500)")
+```
+
+`next_offset` is `offset + rows.length` and appears only on GQL pages with `has_more: true`.
+`truncated` remains as a compatibility alias for `has_more`. Offset paging is stable while
+the matched graph is unchanged; concurrent inserts or deletes can shift later pages.
 
 ### `propose` — Commissive
 
@@ -1857,17 +1890,18 @@ applies identically either way).
 ### `git.digest` — Commissive
 
 Walk a local repository path or clone/fetch a remote `https://` URL, then ingest commits
-and (when the source is a github.com repo and the `gh` CLI is available) issues and pull
-requests as provenance notes, resolving or auto-creating the repo-anchor `project` entity.
-Bounded and cursor-resumable: call again with the same `source`/`project` while the
-response's `done` field is `false`.
+and (when source-bound `gh repo view <owner/repo>` resolves the GitHub repository derived
+from the canonical source or local `origin`) issues and pull requests as provenance notes,
+resolving or auto-creating the repo-anchor
+`project` entity. Bounded and cursor-resumable: call again with the same
+`source`/`project` while the response's `done` field is `false`.
 
-| Param       | Type            | Required | Notes                                                                                                                                                                                                                                     |
-| ----------- | --------------- | -------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `source`    | string          | yes      | A local filesystem path (must contain `.git`) or an `https://` URL. Any `https` host is accepted; non-github.com hosts degrade to commits-only. `ssh://`, `git://`, `http://`, and scp-shorthand (`user@host:path`) sources are rejected. |
-| `project`   | string          | no       | UUID or 8+ hex prefix of the repo-anchor `project` entity. When absent, resolved by matching `properties.repo_url` or `name`, or created if none is found (see the response's `project_id` and `project_created`).                        |
-| `max_items` | integer         | no       | Bounded work for this call, counted across commits + issues + PRs (default 500, clamped to 1..=2000). Cursor-resumable: call again while the response's `done` field is `false`.                                                          |
-| `include`   | array\<string\> | no       | Which record kinds to ingest this call: any of `commits` \| `issues` \| `pull_requests` (default: all three).                                                                                                                             |
+| Param       | Type            | Required | Notes                                                                                                                                                                                                                                                                                                                         |
+| ----------- | --------------- | -------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `source`    | string          | yes      | A local filesystem path (must contain `.git`) or an `https://` URL. Any `https` host is accepted; issue/PR work requires a successful source-bound GitHub probe, otherwise the pass degrades to commits-only with structured skips. `ssh://`, `git://`, `http://`, and scp-shorthand (`user@host:path`) sources are rejected. |
+| `project`   | string          | no       | UUID or 8+ hex prefix of the repo-anchor `project` entity. When absent, resolved by matching `properties.repo_url` or `name`, or created if none is found (see the response's `project_id` and `project_created`).                                                                                                            |
+| `max_items` | integer         | no       | Bounded work for this call, counted across commits + issues + PRs (default 500, clamped to 1..=2000). Cursor-resumable: call again while the response's `done` field is `false`.                                                                                                                                              |
+| `include`   | array\<string\> | no       | Which record kinds to ingest this call: any of `commits` \| `issues` \| `pull_requests` (default: all three).                                                                                                                                                                                                                 |
 
 ```
 request(ops="git.digest(source=\"https://github.com/org/repo\", max_items=500)")
@@ -1889,6 +1923,62 @@ absent, or a `gh` failure) — so "this repo has no issues/PRs" is distinguishab
 `true` only when every requested source completed: it separates "the walk visited
 everything" from "the walk stopped before the end", a distinction `done`'s
 budget-cursor semantics do not carry.
+
+`gh_available` is `true` only after the probe explicitly targets and returns the
+`owner/repo` derived from the canonical source or configured `origin`; every list call
+pins that value with `--repo`. Argument-less repository selection is never used, so an
+alternate remote selected by `gh repo set-default` cannot redirect ingestion. It is `false`
+for an absent, unauthenticated, or repository-incompatible `gh`, and `null`
+when neither issues nor pull requests were requested. A failed probe marks
+each requested remote source `skipped` and does not expose `gh` stderr.
+
+Every successful response also carries `receipt_id`, the UUID of a durable
+schema-v2 audit event whose `payload.result` is the exact complete response
+and whose target is `project_id`. The runtime appends this receipt before
+returning. `git.digest` is `AlwaysVerbose`, so omitted/default MCP presentation
+still returns the full UUID and exact stored result. If persistence cannot be
+confirmed, the call returns `git_digest_receipt_persist_failed` and warns that
+writes may already have committed instead of returning an unqualified success. If malformed handler
+output prevents receipt construction, the runtime still appends one generic
+Error audit when the gate audit and event store are available.
+
+For response-loss recovery, record `request_started_at_us` before dispatch. One recovery
+attempt freezes `since=request_started_at_us.saturating_sub(1)` and
+`until=recovery_query_time_us + 1`; event-list bounds are strict
+`created_at > since AND created_at < until`. Query with top-level
+`presentation="verbose"` and otherwise-identical filters at offsets 0, 1000, 2000, …:
+
+```text
+request(
+  presentation="verbose",
+  ops="list(namespace=\"<original namespace>\", kind=\"event\", event_kind=\"audit\", verb=\"git.digest\", since=<since>, until=<frozen until>, limit=1000, offset=<offset>)"
+)
+```
+
+Advance by the returned row count and stop only on a page shorter than 1000. The frozen
+upper bound prevents newly completed receipts from shifting newest-first offsets. Match
+`payload.result.project_id` and, when available, `payload.resource.request_id`; the exact
+report is `payload.result`. Explicit namespace constrains this multi-record discovery to
+the digest's attribution namespace. Under `AllowAllGate`, `get(id=<event id>)` remains
+namespace-agnostic per ADR-007; repeating namespace can provide Gate/routing context but
+does not make the by-ID storage lookup namespace-filtered. A namespace-less `list` uses
+the caller's configured visible-namespace scope, not an isolation guarantee.
+
+`request_id` groups an entire request, not an individual operation. Batch and chain
+members therefore share it. Enumerate all matching receipt rows and treat each event's
+`receipt_id` plus `payload.result` as the operation-unique recovery record. If one request
+contains multiple digests for the same project, event order does not identify their input
+positions; inspect every result, or issue one digest per request when one-to-one mapping is
+required. If the client timed out before the daemon finished,
+the receipt appears only when that pass completes; restart at offset zero with a newly
+frozen `until` on a later attempt rather than
+treating temporary absence as proof that nothing committed.
+
+There is no 300-second `git.digest` or daemon-side dispatch deadline. The
+observed 300,000 ms bound is the MCP client's request default, so large
+`max_items` values can outlive a particular caller's wait while the daemon
+continues the pass. The durable receipt is the recovery contract; the item
+bound is not silently clamped to a transport-specific duration.
 
 ### `git.commit` / `git.branch` / `git.push` — Commissive (ADR-108)
 

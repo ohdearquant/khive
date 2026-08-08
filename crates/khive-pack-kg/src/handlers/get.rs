@@ -117,6 +117,13 @@ impl KgPack {
             let remapped = remap_note_status(note_val);
             return flatten_get_result("note", remapped);
         }
+        if include_deleted {
+            if let Some(deleted) = self.runtime.get_note_including_deleted(token, id).await? {
+                let note_val = normalize_entity_timestamps(to_json(&deleted)?);
+                let remapped = remap_note_status(note_val);
+                return flatten_get_result("note", remapped);
+            }
+        }
 
         // PR-A1: by-ID edge get returns the edge regardless of namespace.
         if let Some(edge) = self.runtime.get_edge(token, id).await? {
@@ -126,6 +133,16 @@ impl KgPack {
                 obj.insert("annotations".to_string(), Value::Array(annotations));
             }
             return flatten_get_result("edge", edge_val);
+        }
+        if include_deleted {
+            if let Some(deleted) = self.runtime.get_edge_including_deleted(token, id).await? {
+                let mut edge_val = to_json(&deleted)?;
+                let annotations = self.fetch_edge_annotations(token, id).await?;
+                if let Some(obj) = edge_val.as_object_mut() {
+                    obj.insert("annotations".to_string(), Value::Array(annotations));
+                }
+                return flatten_get_result("edge", edge_val);
+            }
         }
 
         if let Some(event) = self.get_event_unfiltered_by_id(id).await? {

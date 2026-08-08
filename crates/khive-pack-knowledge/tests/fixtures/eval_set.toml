@@ -1,0 +1,39 @@
+[[queries]]
+query = "retrieval augmented generation retrieves passages before generation"
+expected_slugs = ["rag"]
+
+[[queries]]
+query = "low rank adapters for parameter efficient fine tuning"
+expected_slugs = ["lora"]
+
+[[queries]]
+query = "memory efficient exact attention with tiled kernels"
+expected_slugs = ["flash-attention"]
+
+[[queries]]
+query = "grouped query attention reduces key value cache size"
+expected_slugs = ["gqa"]
+
+[[queries]]
+query = "rotary positional embeddings encode relative token positions"
+expected_slugs = ["rope"]
+
+[[queries]]
+query = "language model agent plans and invokes tools"
+expected_slugs = ["agent"]
+
+[[queries]]
+query = "chain of thought exposes intermediate reasoning steps"
+expected_slugs = ["chain-of-thought"]
+
+[[queries]]
+query = "speculative decoding verifies draft model tokens in parallel"
+expected_slugs = ["speculative"]
+
+[[queries]]
+query = "weight quantization reduces model memory and compute"
+expected_slugs = ["quantization"]
+
+[[queries]]
+query = "direct preference optimization trains from preference pairs"
+expected_slugs = ["dpo"]

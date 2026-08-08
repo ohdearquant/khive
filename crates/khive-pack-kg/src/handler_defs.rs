@@ -816,7 +816,7 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 20] = [
     // Assertive: retrieves pattern-matched results
     HandlerDef {
         name: "query",
-        description: "GQL or SPARQL pattern matching (read-only). Write-shaped input (SPARQL INSERT/DELETE/LOAD/WITH…DELETE, GQL/Cypher CREATE/DELETE/DETACH DELETE/SET/MERGE) is rejected; use create, update, link, merge, delete to mutate the graph. When a traversal mixes fixed-length and variable-length chains, split it into separate query() calls.",
+        description: "GQL or SPARQL pattern matching (read-only). GQL pages are deterministically ordered; when `has_more` is true, repeat the query with SKIP set to `next_offset`. Write-shaped input (SPARQL INSERT/DELETE/LOAD/WITH…DELETE, GQL/Cypher CREATE/DELETE/DETACH DELETE/SET/MERGE) is rejected; use create, update, link, merge, delete to mutate the graph. When a traversal mixes fixed-length and variable-length chains, split it into separate query() calls.",
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,
         params: &[
@@ -824,13 +824,22 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 20] = [
                 name: "query",
                 param_type: "string",
                 required: true,
-                description: "GQL or SPARQL pattern query string (read-only). Write-shaped forms are rejected with an actionable error naming the mutation verbs to use instead. Mixed fixed-length plus variable-length traversals are not compiled in one call; split them into separate query() calls.",
+                description: "GQL or SPARQL pattern query string (read-only). GQL supports terminal `SKIP n [LIMIT m]` paging; use the returned `next_offset` as the next SKIP while `has_more` is true. SPARQL OFFSET is not supported. Write-shaped forms are rejected with an actionable error naming the mutation verbs to use instead. Mixed fixed-length plus variable-length traversals are not compiled in one call; split them into separate query() calls.",
+            },
+            ParamDef {
+                name: "page_size",
+                param_type: "integer",
+                required: false,
+                description: "Maximum rows in this result page (minimum 1, default 500, \
+                              clamped to the hard cap 10 000). Mutually exclusive with \
+                              deprecated `limit`. Query-text LIMIT composes as the smaller bound.",
             },
             ParamDef {
                 name: "limit",
                 param_type: "integer",
                 required: false,
-                description: "Maximum rows returned (default 500, hard cap 10 000).",
+                description: "Deprecated alias for `page_size`; mutually exclusive with \
+                              `page_size`.",
             },
         ],
     },
@@ -1473,12 +1482,27 @@ mod tests {
                 .contains("split them into separate query() calls"),
             "query param help must document split-query workaround"
         );
+        let page_size_param = h
+            .params
+            .iter()
+            .find(|p| p.name == "page_size")
+            .expect("page_size param must be documented in query handler metadata");
+        assert!(!page_size_param.required, "page_size must be optional");
+        assert!(
+            page_size_param.description.contains("hard cap 10 000")
+                && page_size_param.description.contains("Query-text LIMIT"),
+            "page_size help must document hard-cap and query-LIMIT composition"
+        );
         let limit_param = h
             .params
             .iter()
             .find(|p| p.name == "limit")
             .expect("limit param must be documented in query handler metadata");
         assert!(!limit_param.required, "limit must be optional");
+        assert!(
+            limit_param.description.contains("Deprecated alias"),
+            "legacy limit must be explicitly documented as an alias"
+        );
     }
 
     // ── issue #160 return-shape regressions ──────────────────────────────────

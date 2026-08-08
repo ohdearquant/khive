@@ -1,0 +1,3595 @@
+{
+  "$defs": {
+    "Analysis": {
+      "additionalProperties": false,
+      "properties": {
+        "data": {
+          "$ref": "#/$defs/Page14"
+        },
+        "meta": {
+          "$ref": "#/$defs/AnalysisMeta"
+        }
+      },
+      "required": [
+        "meta",
+        "data"
+      ],
+      "type": "object"
+    },
+    "Analysis2": {
+      "additionalProperties": false,
+      "properties": {
+        "data": {
+          "$ref": "#/$defs/Page15"
+        },
+        "meta": {
+          "$ref": "#/$defs/AnalysisMeta"
+        }
+      },
+      "required": [
+        "meta",
+        "data"
+      ],
+      "type": "object"
+    },
+    "Analysis3": {
+      "additionalProperties": false,
+      "properties": {
+        "data": {
+          "$ref": "#/$defs/Page16"
+        },
+        "meta": {
+          "$ref": "#/$defs/AnalysisMeta"
+        }
+      },
+      "required": [
+        "meta",
+        "data"
+      ],
+      "type": "object"
+    },
+    "Analysis4": {
+      "additionalProperties": false,
+      "properties": {
+        "data": {
+          "$ref": "#/$defs/Page21"
+        },
+        "meta": {
+          "$ref": "#/$defs/AnalysisMeta"
+        }
+      },
+      "required": [
+        "meta",
+        "data"
+      ],
+      "type": "object"
+    },
+    "AnalysisMeta": {
+      "additionalProperties": false,
+      "properties": {
+        "bound": {
+          "$ref": "#/$defs/PageBound"
+        },
+        "granularity": {
+          "$ref": "#/$defs/Granularity"
+        },
+        "inputs": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "join": {
+          "$ref": "#/$defs/JoinTag"
+        },
+        "label_key": {
+          "type": "string"
+        },
+        "status": {
+          "$ref": "#/$defs/ViewStatus"
+        },
+        "unavailable_reason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "window": {
+          "$ref": "#/$defs/AnalysisWindow"
+        }
+      },
+      "required": [
+        "label_key",
+        "granularity",
+        "join",
+        "status",
+        "inputs",
+        "window",
+        "bound"
+      ],
+      "type": "object"
+    },
+    "AnalysisWindow": {
+      "additionalProperties": false,
+      "properties": {
+        "days": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "end": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Timestamp"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "kind": {
+          "$ref": "#/$defs/WindowKind"
+        },
+        "start": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Timestamp"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "kind"
+      ],
+      "type": "object"
+    },
+    "ApiSurfaceRow": {
+      "additionalProperties": false,
+      "properties": {
+        "dependent_count": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "module_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "module_id",
+        "dependent_count"
+      ],
+      "type": "object"
+    },
+    "AuthorShare": {
+      "additionalProperties": false,
+      "properties": {
+        "author": {
+          "type": "string"
+        },
+        "commits": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "share": {
+          "$ref": "#/$defs/Ratio"
+        }
+      },
+      "required": [
+        "author",
+        "commits",
+        "share"
+      ],
+      "type": "object"
+    },
+    "Availability": {
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "status": {
+              "const": "available",
+              "type": "string"
+            },
+            "value": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "status",
+            "value"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "reason": {
+              "type": "string"
+            },
+            "status": {
+              "const": "unavailable",
+              "type": "string"
+            }
+          },
+          "required": [
+            "status",
+            "reason"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "Availability10": {
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "status": {
+              "const": "available",
+              "type": "string"
+            },
+            "value": {
+              "items": {
+                "$ref": "#/$defs/HistoricalJoinCoverage"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "status",
+            "value"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "reason": {
+              "type": "string"
+            },
+            "status": {
+              "const": "unavailable",
+              "type": "string"
+            }
+          },
+          "required": [
+            "status",
+            "reason"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "Availability11": {
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "status": {
+              "const": "available",
+              "type": "string"
+            },
+            "value": {
+              "$ref": "#/$defs/Percentiles"
+            }
+          },
+          "required": [
+            "status",
+            "value"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "reason": {
+              "type": "string"
+            },
+            "status": {
+              "const": "unavailable",
+              "type": "string"
+            }
+          },
+          "required": [
+            "status",
+            "reason"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "Availability12": {
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "status": {
+              "const": "available",
+              "type": "string"
+            },
+            "value": {
+              "$ref": "#/$defs/ScorecardValue"
+            }
+          },
+          "required": [
+            "status",
+            "value"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "reason": {
+              "type": "string"
+            },
+            "status": {
+              "const": "unavailable",
+              "type": "string"
+            }
+          },
+          "required": [
+            "status",
+            "reason"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "Availability2": {
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "status": {
+              "const": "available",
+              "type": "string"
+            },
+            "value": {
+              "$ref": "#/$defs/GitDigestProvenance"
+            }
+          },
+          "required": [
+            "status",
+            "value"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "reason": {
+              "type": "string"
+            },
+            "status": {
+              "const": "unavailable",
+              "type": "string"
+            }
+          },
+          "required": [
+            "status",
+            "reason"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "Availability3": {
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "status": {
+              "const": "available",
+              "type": "string"
+            },
+            "value": {
+              "$ref": "#/$defs/CodeIngestProvenance"
+            }
+          },
+          "required": [
+            "status",
+            "value"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "reason": {
+              "type": "string"
+            },
+            "status": {
+              "const": "unavailable",
+              "type": "string"
+            }
+          },
+          "required": [
+            "status",
+            "reason"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "Availability4": {
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "status": {
+              "const": "available",
+              "type": "string"
+            },
+            "value": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "status",
+            "value"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "reason": {
+              "type": "string"
+            },
+            "status": {
+              "const": "unavailable",
+              "type": "string"
+            }
+          },
+          "required": [
+            "status",
+            "reason"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "Availability5": {
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "status": {
+              "const": "available",
+              "type": "string"
+            },
+            "value": {
+              "$ref": "#/$defs/Timestamp"
+            }
+          },
+          "required": [
+            "status",
+            "value"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "reason": {
+              "type": "string"
+            },
+            "status": {
+              "const": "unavailable",
+              "type": "string"
+            }
+          },
+          "required": [
+            "status",
+            "reason"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "Availability6": {
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "status": {
+              "const": "available",
+              "type": "string"
+            },
+            "value": {
+              "$ref": "#/$defs/Page8"
+            }
+          },
+          "required": [
+            "status",
+            "value"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "reason": {
+              "type": "string"
+            },
+            "status": {
+              "const": "unavailable",
+              "type": "string"
+            }
+          },
+          "required": [
+            "status",
+            "reason"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "Availability7": {
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "status": {
+              "const": "available",
+              "type": "string"
+            },
+            "value": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "status",
+            "value"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "reason": {
+              "type": "string"
+            },
+            "status": {
+              "const": "unavailable",
+              "type": "string"
+            }
+          },
+          "required": [
+            "status",
+            "reason"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "Availability8": {
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "status": {
+              "const": "available",
+              "type": "string"
+            },
+            "value": {
+              "items": {
+                "$ref": "#/$defs/RepositoryResolution"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "status",
+            "value"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "reason": {
+              "type": "string"
+            },
+            "status": {
+              "const": "unavailable",
+              "type": "string"
+            }
+          },
+          "required": [
+            "status",
+            "reason"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "Availability9": {
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "status": {
+              "const": "available",
+              "type": "string"
+            },
+            "value": {
+              "$ref": "#/$defs/Ratio"
+            }
+          },
+          "required": [
+            "status",
+            "value"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "reason": {
+              "type": "string"
+            },
+            "status": {
+              "const": "unavailable",
+              "type": "string"
+            }
+          },
+          "required": [
+            "status",
+            "reason"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "BoundKind": {
+      "enum": [
+        "all",
+        "top_n"
+      ],
+      "type": "string"
+    },
+    "BundleMeta": {
+      "additionalProperties": false,
+      "properties": {
+        "ingest": {
+          "$ref": "#/$defs/PipelineProvenance"
+        },
+        "producer": {
+          "$ref": "#/$defs/ProducerIdentity"
+        },
+        "repository": {
+          "$ref": "#/$defs/RepositoryIdentity"
+        },
+        "snapshot": {
+          "$ref": "#/$defs/SnapshotIdentity"
+        }
+      },
+      "required": [
+        "repository",
+        "snapshot",
+        "producer",
+        "ingest"
+      ],
+      "type": "object"
+    },
+    "CadenceAnalysis": {
+      "additionalProperties": false,
+      "properties": {
+        "commits": {
+          "$ref": "#/$defs/Page17"
+        },
+        "issues_closed": {
+          "$ref": "#/$defs/Page17"
+        },
+        "issues_opened": {
+          "$ref": "#/$defs/Page17"
+        },
+        "meta": {
+          "$ref": "#/$defs/AnalysisMeta"
+        },
+        "pull_request_lead_time_hours": {
+          "$ref": "#/$defs/Availability11"
+        },
+        "pull_requests_merged": {
+          "$ref": "#/$defs/Page17"
+        },
+        "pull_requests_opened": {
+          "$ref": "#/$defs/Page17"
+        },
+        "release_tags": {
+          "$ref": "#/$defs/Page18"
+        }
+      },
+      "required": [
+        "meta",
+        "commits",
+        "issues_opened",
+        "issues_closed",
+        "pull_requests_opened",
+        "pull_requests_merged",
+        "release_tags",
+        "pull_request_lead_time_hours"
+      ],
+      "type": "object"
+    },
+    "CadencePoint": {
+      "additionalProperties": false,
+      "properties": {
+        "count": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "week_start": {
+          "pattern": "^\\d{4}-\\d{2}-\\d{2}$",
+          "type": "string"
+        }
+      },
+      "required": [
+        "week_start",
+        "count"
+      ],
+      "type": "object"
+    },
+    "Capability": {
+      "additionalProperties": false,
+      "properties": {
+        "labels": {
+          "$ref": "#/$defs/CapabilityLabels"
+        },
+        "languages": {
+          "$ref": "#/$defs/LanguageCapabilities"
+        },
+        "live_queries": {
+          "type": "boolean"
+        },
+        "mode": {
+          "$ref": "#/$defs/CapabilityMode"
+        },
+        "on_demand_ingest": {
+          "type": "boolean"
+        },
+        "read_only": {
+          "type": "boolean"
+        },
+        "views": {
+          "$ref": "#/$defs/ViewCatalog"
+        },
+        "writes": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "mode",
+        "read_only",
+        "writes",
+        "live_queries",
+        "on_demand_ingest",
+        "languages",
+        "labels",
+        "views"
+      ],
+      "type": "object"
+    },
+    "CapabilityLabels": {
+      "additionalProperties": false,
+      "properties": {
+        "derived": {
+          "type": "string"
+        },
+        "hotspot_quadrants": {
+          "$ref": "#/$defs/HotspotQuadrantLabels"
+        },
+        "ingested": {
+          "type": "string"
+        },
+        "input_placeholder": {
+          "type": "string"
+        },
+        "lookup_action": {
+          "type": "string"
+        },
+        "metrics": {
+          "$ref": "#/$defs/MetricLabels"
+        },
+        "miss_body": {
+          "type": "string"
+        },
+        "miss_title": {
+          "type": "string"
+        },
+        "node_types": {
+          "$ref": "#/$defs/NodeTypeLabels"
+        },
+        "product": {
+          "type": "string"
+        },
+        "truncated": {
+          "type": "string"
+        },
+        "unavailable": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "product",
+        "input_placeholder",
+        "lookup_action",
+        "miss_title",
+        "miss_body",
+        "unavailable",
+        "truncated",
+        "derived",
+        "ingested",
+        "node_types",
+        "metrics",
+        "hotspot_quadrants"
+      ],
+      "type": "object"
+    },
+    "CapabilityMode": {
+      "enum": [
+        "static_showcase"
+      ],
+      "type": "string"
+    },
+    "CodeIngestProvenance": {
+      "additionalProperties": false,
+      "properties": {
+        "blocked_count": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "coverage_stamps_missed": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "files_dropped_without_source_path": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "files_skipped_without_module_path": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "languages": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "source_revision": {
+          "pattern": "^[0-9a-f]{40}$",
+          "type": "string"
+        },
+        "warnings_count": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "source_revision",
+        "languages",
+        "blocked_count",
+        "files_dropped_without_source_path",
+        "files_skipped_without_module_path",
+        "coverage_stamps_missed",
+        "warnings_count"
+      ],
+      "type": "object"
+    },
+    "CommitHistoryNavigation": {
+      "additionalProperties": false,
+      "properties": {
+        "commit_id": {
+          "type": "string"
+        },
+        "modules": {
+          "$ref": "#/$defs/Page8"
+        }
+      },
+      "required": [
+        "commit_id",
+        "modules"
+      ],
+      "type": "object"
+    },
+    "CommitNode": {
+      "additionalProperties": false,
+      "properties": {
+        "author": {
+          "type": "string"
+        },
+        "committed_at": {
+          "$ref": "#/$defs/Timestamp"
+        },
+        "id": {
+          "type": "string"
+        },
+        "parents": {
+          "items": {
+            "pattern": "^[0-9a-f]{40}$",
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "sha": {
+          "pattern": "^[0-9a-f]{40}$",
+          "type": "string"
+        },
+        "short_sha": {
+          "pattern": "^[0-9a-f]{7,40}$",
+          "type": "string"
+        },
+        "subject": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "sha",
+        "short_sha",
+        "author",
+        "committed_at",
+        "parents",
+        "subject"
+      ],
+      "type": "object"
+    },
+    "DependencyCycle": {
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "module_ids": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "id",
+        "module_ids"
+      ],
+      "type": "object"
+    },
+    "DependencyModuleRow": {
+      "additionalProperties": false,
+      "properties": {
+        "cycle_ids": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "fan_in": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "fan_out": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "module_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "module_id",
+        "fan_in",
+        "fan_out",
+        "cycle_ids"
+      ],
+      "type": "object"
+    },
+    "DependencyTopologyAnalysis": {
+      "additionalProperties": false,
+      "properties": {
+        "cycles": {
+          "$ref": "#/$defs/Page13"
+        },
+        "meta": {
+          "$ref": "#/$defs/AnalysisMeta"
+        },
+        "modules": {
+          "$ref": "#/$defs/Page12"
+        }
+      },
+      "required": [
+        "meta",
+        "modules",
+        "cycles"
+      ],
+      "type": "object"
+    },
+    "Disclosure": {
+      "additionalProperties": false,
+      "properties": {
+        "reason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "status": {
+          "$ref": "#/$defs/DisclosureStatus"
+        }
+      },
+      "required": [
+        "status"
+      ],
+      "type": "object"
+    },
+    "DisclosureStatus": {
+      "enum": [
+        "complete",
+        "truncated",
+        "unavailable"
+      ],
+      "type": "string"
+    },
+    "EdgeDerivation": {
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "method": {
+              "const": "changed_path_source_path_exact",
+              "type": "string"
+            },
+            "source_path": {
+              "type": "string"
+            },
+            "source_revision": {
+              "pattern": "^[0-9a-f]{40}$",
+              "type": "string"
+            }
+          },
+          "required": [
+            "method",
+            "source_revision",
+            "source_path"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "method": {
+              "const": "clone_path_fallback",
+              "type": "string"
+            },
+            "source_path": {
+              "type": "string"
+            },
+            "source_revision": {
+              "pattern": "^[0-9a-f]{40}$",
+              "type": "string"
+            }
+          },
+          "required": [
+            "method",
+            "source_revision",
+            "source_path"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "method": {
+              "const": "repository_package_normalization",
+              "type": "string"
+            },
+            "source_project": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "method",
+            "source_project"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "EdgeOrigin": {
+      "enum": [
+        "ingested",
+        "derived"
+      ],
+      "type": "string"
+    },
+    "GitDigestProvenance": {
+      "additionalProperties": false,
+      "properties": {
+        "calls": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "changed_paths_filtered_noncanonical": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "cursor_stalled": {
+          "type": "boolean"
+        },
+        "history_exhausted": {
+          "type": "boolean"
+        },
+        "sources": {
+          "$ref": "#/$defs/HistorySourceCoverage"
+        },
+        "writes_refused": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "calls",
+        "history_exhausted",
+        "cursor_stalled",
+        "writes_refused",
+        "changed_paths_filtered_noncanonical",
+        "sources"
+      ],
+      "type": "object"
+    },
+    "Granularity": {
+      "enum": [
+        "repository",
+        "module",
+        "module_symbol_deferred"
+      ],
+      "type": "string"
+    },
+    "GraphEdge": {
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "origin": {
+                "const": "derived"
+              }
+            },
+            "required": [
+              "origin"
+            ]
+          },
+          "then": {
+            "properties": {
+              "derivation": {
+                "not": {
+                  "type": "null"
+                }
+              }
+            },
+            "required": [
+              "derivation"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "origin": {
+                "const": "ingested"
+              }
+            },
+            "required": [
+              "origin"
+            ]
+          },
+          "then": {
+            "properties": {
+              "derivation": {
+                "type": "null"
+              }
+            },
+            "required": [
+              "derivation"
+            ]
+          }
+        }
+      ],
+      "properties": {
+        "derivation": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/EdgeDerivation"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "id": {
+          "type": "string"
+        },
+        "origin": {
+          "$ref": "#/$defs/EdgeOrigin"
+        },
+        "relation": {
+          "type": "string"
+        },
+        "source": {
+          "type": "string"
+        },
+        "target": {
+          "type": "string"
+        },
+        "weight": {
+          "format": "double",
+          "maximum": 1.0,
+          "minimum": 0.0,
+          "type": "number"
+        }
+      },
+      "required": [
+        "id",
+        "source",
+        "target",
+        "relation",
+        "weight",
+        "origin",
+        "derivation"
+      ],
+      "type": "object"
+    },
+    "HiddenCouplingRow": {
+      "additionalProperties": false,
+      "properties": {
+        "cochange_count": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "left_module_id": {
+          "type": "string"
+        },
+        "right_module_id": {
+          "type": "string"
+        },
+        "support": {
+          "$ref": "#/$defs/Ratio"
+        }
+      },
+      "required": [
+        "left_module_id",
+        "right_module_id",
+        "cochange_count",
+        "support"
+      ],
+      "type": "object"
+    },
+    "HistoricalJoinCoverage": {
+      "additionalProperties": false,
+      "properties": {
+        "language": {
+          "type": "string"
+        },
+        "matched_rust_paths": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "out_of_scope_paths": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "repository": {
+          "format": "uri",
+          "type": "string"
+        },
+        "rust_in_scope_paths": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "total_changed_paths": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "unresolved_rust_paths": {
+          "$ref": "#/$defs/Page11"
+        }
+      },
+      "required": [
+        "repository",
+        "language",
+        "total_changed_paths",
+        "rust_in_scope_paths",
+        "matched_rust_paths",
+        "out_of_scope_paths",
+        "unresolved_rust_paths"
+      ],
+      "type": "object"
+    },
+    "HistoricalPathResidual": {
+      "additionalProperties": false,
+      "properties": {
+        "commit_sha": {
+          "pattern": "^[0-9a-f]{40}$",
+          "type": "string"
+        },
+        "reason": {
+          "type": "string"
+        },
+        "source_path": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "commit_sha",
+        "source_path",
+        "reason"
+      ],
+      "type": "object"
+    },
+    "HistoryNavigation": {
+      "additionalProperties": false,
+      "properties": {
+        "by_commit": {
+          "$ref": "#/$defs/Page9"
+        },
+        "by_module": {
+          "$ref": "#/$defs/Page7"
+        }
+      },
+      "required": [
+        "by_module",
+        "by_commit"
+      ],
+      "type": "object"
+    },
+    "HistorySourceCoverage": {
+      "additionalProperties": false,
+      "properties": {
+        "commits": {
+          "$ref": "#/$defs/SourceCoverage"
+        },
+        "issues": {
+          "$ref": "#/$defs/SourceCoverage"
+        },
+        "pull_requests": {
+          "$ref": "#/$defs/SourceCoverage"
+        }
+      },
+      "required": [
+        "commits",
+        "issues",
+        "pull_requests"
+      ],
+      "type": "object"
+    },
+    "HistoryStructureViewCapability": {
+      "additionalProperties": false,
+      "properties": {
+        "commit_module_facet": {
+          "$ref": "#/$defs/Availability7"
+        },
+        "granularity": {
+          "$ref": "#/$defs/Granularity"
+        },
+        "issue_module_facet": {
+          "$ref": "#/$defs/Availability7"
+        },
+        "join": {
+          "$ref": "#/$defs/JoinTag"
+        },
+        "label": {
+          "type": "string"
+        },
+        "pull_request_module_facet": {
+          "$ref": "#/$defs/Availability7"
+        },
+        "status": {
+          "$ref": "#/$defs/ViewStatus"
+        },
+        "unavailable_reason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "label",
+        "granularity",
+        "join",
+        "status",
+        "commit_module_facet",
+        "pull_request_module_facet",
+        "issue_module_facet"
+      ],
+      "type": "object"
+    },
+    "HotspotQuadrant": {
+      "enum": [
+        "high_churn_high_fan_in",
+        "high_churn_low_fan_in",
+        "low_churn_high_fan_in",
+        "low_churn_low_fan_in"
+      ],
+      "type": "string"
+    },
+    "HotspotQuadrantLabels": {
+      "additionalProperties": false,
+      "properties": {
+        "high_churn_high_fan_in": {
+          "type": "string"
+        },
+        "high_churn_low_fan_in": {
+          "type": "string"
+        },
+        "low_churn_high_fan_in": {
+          "type": "string"
+        },
+        "low_churn_low_fan_in": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "high_churn_high_fan_in",
+        "high_churn_low_fan_in",
+        "low_churn_high_fan_in",
+        "low_churn_low_fan_in"
+      ],
+      "type": "object"
+    },
+    "HotspotRow": {
+      "additionalProperties": false,
+      "properties": {
+        "commit_count": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "fan_in": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "module_id": {
+          "type": "string"
+        },
+        "quadrant": {
+          "$ref": "#/$defs/HotspotQuadrant"
+        }
+      },
+      "required": [
+        "module_id",
+        "commit_count",
+        "fan_in",
+        "quadrant"
+      ],
+      "type": "object"
+    },
+    "IssueNode": {
+      "additionalProperties": false,
+      "properties": {
+        "author": {
+          "$ref": "#/$defs/Availability"
+        },
+        "closed_at": {
+          "$ref": "#/$defs/Availability5"
+        },
+        "created_at": {
+          "$ref": "#/$defs/Availability5"
+        },
+        "id": {
+          "type": "string"
+        },
+        "labels": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "number": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "title": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "number",
+        "title",
+        "author",
+        "created_at",
+        "closed_at",
+        "labels"
+      ],
+      "type": "object"
+    },
+    "JoinResidual": {
+      "additionalProperties": false,
+      "properties": {
+        "module_path": {
+          "type": "string"
+        },
+        "reason": {
+          "type": "string"
+        },
+        "side": {
+          "$ref": "#/$defs/ResidualSide"
+        },
+        "source_path": {
+          "type": "string"
+        },
+        "source_project": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "side",
+        "source_project",
+        "module_path",
+        "source_path",
+        "reason"
+      ],
+      "type": "object"
+    },
+    "JoinResolution": {
+      "additionalProperties": false,
+      "properties": {
+        "historical": {
+          "$ref": "#/$defs/Availability10"
+        },
+        "repositories": {
+          "$ref": "#/$defs/Availability8"
+        },
+        "scope": {
+          "$ref": "#/$defs/JoinScope"
+        }
+      },
+      "required": [
+        "scope",
+        "repositories",
+        "historical"
+      ],
+      "type": "object"
+    },
+    "JoinScope": {
+      "additionalProperties": false,
+      "properties": {
+        "languages": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "python": {
+          "$ref": "#/$defs/Availability7"
+        },
+        "typescript": {
+          "$ref": "#/$defs/Availability7"
+        }
+      },
+      "required": [
+        "languages",
+        "python",
+        "typescript"
+      ],
+      "type": "object"
+    },
+    "JoinTag": {
+      "enum": [
+        "history_only",
+        "structure_only",
+        "join",
+        "field_tagged"
+      ],
+      "type": "string"
+    },
+    "LanguageCapabilities": {
+      "additionalProperties": false,
+      "properties": {
+        "python": {
+          "$ref": "#/$defs/LanguageCapability"
+        },
+        "rust": {
+          "$ref": "#/$defs/LanguageCapability"
+        },
+        "typescript": {
+          "$ref": "#/$defs/LanguageCapability"
+        }
+      },
+      "required": [
+        "rust",
+        "python",
+        "typescript"
+      ],
+      "type": "object"
+    },
+    "LanguageCapability": {
+      "additionalProperties": false,
+      "properties": {
+        "label": {
+          "type": "string"
+        },
+        "measured": {
+          "type": "boolean"
+        },
+        "module_join": {
+          "type": "boolean"
+        },
+        "reason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "label",
+        "module_join",
+        "measured"
+      ],
+      "type": "object"
+    },
+    "MetricLabels": {
+      "additionalProperties": false,
+      "properties": {
+        "activity_trend": {
+          "type": "string"
+        },
+        "author_concentration": {
+          "type": "string"
+        },
+        "bus_factor": {
+          "type": "string"
+        },
+        "change_frequency": {
+          "type": "string"
+        },
+        "cochange_count": {
+          "type": "string"
+        },
+        "commits": {
+          "type": "string"
+        },
+        "cycle_count": {
+          "type": "string"
+        },
+        "dependent_count": {
+          "type": "string"
+        },
+        "fan_in": {
+          "type": "string"
+        },
+        "fan_out": {
+          "type": "string"
+        },
+        "issues_closed": {
+          "type": "string"
+        },
+        "issues_opened": {
+          "type": "string"
+        },
+        "lead_time": {
+          "type": "string"
+        },
+        "module_count": {
+          "type": "string"
+        },
+        "ownership_warnings": {
+          "type": "string"
+        },
+        "p50": {
+          "type": "string"
+        },
+        "p90": {
+          "type": "string"
+        },
+        "p95": {
+          "type": "string"
+        },
+        "package_count": {
+          "type": "string"
+        },
+        "pull_requests_merged": {
+          "type": "string"
+        },
+        "pull_requests_opened": {
+          "type": "string"
+        },
+        "recent_activity": {
+          "type": "string"
+        },
+        "repository_age": {
+          "type": "string"
+        },
+        "resolution": {
+          "type": "string"
+        },
+        "source_files": {
+          "type": "string"
+        },
+        "support": {
+          "type": "string"
+        },
+        "symbol_count": {
+          "type": "string"
+        },
+        "top_hotspots": {
+          "type": "string"
+        },
+        "week": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "change_frequency",
+        "fan_in",
+        "fan_out",
+        "cochange_count",
+        "support",
+        "source_files",
+        "recent_activity",
+        "week",
+        "commits",
+        "issues_opened",
+        "issues_closed",
+        "pull_requests_opened",
+        "pull_requests_merged",
+        "lead_time",
+        "p50",
+        "p90",
+        "p95",
+        "author_concentration",
+        "bus_factor",
+        "dependent_count",
+        "cycle_count",
+        "resolution",
+        "repository_age",
+        "package_count",
+        "module_count",
+        "symbol_count",
+        "activity_trend",
+        "top_hotspots",
+        "ownership_warnings"
+      ],
+      "type": "object"
+    },
+    "ModuleHistoryNavigation": {
+      "additionalProperties": false,
+      "properties": {
+        "commits": {
+          "$ref": "#/$defs/Page8"
+        },
+        "issues": {
+          "$ref": "#/$defs/Availability6"
+        },
+        "module_id": {
+          "type": "string"
+        },
+        "pull_requests": {
+          "$ref": "#/$defs/Availability6"
+        }
+      },
+      "required": [
+        "module_id",
+        "commits",
+        "pull_requests",
+        "issues"
+      ],
+      "type": "object"
+    },
+    "ModuleNode": {
+      "additionalProperties": false,
+      "properties": {
+        "content_hash": {
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        },
+        "import_scan_status": {
+          "type": "string"
+        },
+        "language": {
+          "type": "string"
+        },
+        "module_path": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "package_id": {
+          "type": "string"
+        },
+        "source_path": {
+          "type": "string"
+        },
+        "source_revision": {
+          "pattern": "^[0-9a-f]{40}$",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "package_id",
+        "name",
+        "language",
+        "module_path",
+        "source_path",
+        "source_revision",
+        "content_hash",
+        "import_scan_status"
+      ],
+      "type": "object"
+    },
+    "NodeTypeLabels": {
+      "additionalProperties": false,
+      "properties": {
+        "commit": {
+          "type": "string"
+        },
+        "datatype": {
+          "type": "string"
+        },
+        "function": {
+          "type": "string"
+        },
+        "interface": {
+          "type": "string"
+        },
+        "issue": {
+          "type": "string"
+        },
+        "module": {
+          "type": "string"
+        },
+        "package": {
+          "type": "string"
+        },
+        "pull_request": {
+          "type": "string"
+        },
+        "repository": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "repository",
+        "package",
+        "module",
+        "function",
+        "datatype",
+        "interface",
+        "commit",
+        "issue",
+        "pull_request"
+      ],
+      "type": "object"
+    },
+    "OwnershipAnalysis": {
+      "additionalProperties": false,
+      "properties": {
+        "meta": {
+          "$ref": "#/$defs/AnalysisMeta"
+        },
+        "modules": {
+          "$ref": "#/$defs/Page19"
+        },
+        "repository_author_concentration": {
+          "$ref": "#/$defs/Availability9"
+        },
+        "repository_authors": {
+          "$ref": "#/$defs/Page20"
+        },
+        "repository_bus_factor": {
+          "$ref": "#/$defs/Availability4"
+        }
+      },
+      "required": [
+        "meta",
+        "modules",
+        "repository_author_concentration",
+        "repository_bus_factor",
+        "repository_authors"
+      ],
+      "type": "object"
+    },
+    "OwnershipRow": {
+      "additionalProperties": false,
+      "properties": {
+        "author_concentration": {
+          "$ref": "#/$defs/Availability9"
+        },
+        "authors": {
+          "$ref": "#/$defs/Page20"
+        },
+        "bus_factor": {
+          "$ref": "#/$defs/Availability4"
+        },
+        "commit_count": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "module_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "module_id",
+        "commit_count",
+        "author_concentration",
+        "bus_factor",
+        "authors"
+      ],
+      "type": "object"
+    },
+    "PackageNode": {
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "languages": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "name": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "name",
+        "languages"
+      ],
+      "type": "object"
+    },
+    "Page": {
+      "additionalProperties": false,
+      "properties": {
+        "bound": {
+          "$ref": "#/$defs/PageBound"
+        },
+        "disclosure": {
+          "$ref": "#/$defs/Disclosure"
+        },
+        "items": {
+          "items": {
+            "$ref": "#/$defs/PackageNode"
+          },
+          "maxItems": 50000,
+          "type": "array"
+        },
+        "next_cursor": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "total_count": {
+          "$ref": "#/$defs/Availability4"
+        },
+        "truncated": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "items",
+        "total_count",
+        "bound",
+        "truncated",
+        "disclosure"
+      ],
+      "type": "object"
+    },
+    "Page10": {
+      "additionalProperties": false,
+      "properties": {
+        "bound": {
+          "$ref": "#/$defs/PageBound"
+        },
+        "disclosure": {
+          "$ref": "#/$defs/Disclosure"
+        },
+        "items": {
+          "items": {
+            "$ref": "#/$defs/JoinResidual"
+          },
+          "maxItems": 50000,
+          "type": "array"
+        },
+        "next_cursor": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "total_count": {
+          "$ref": "#/$defs/Availability4"
+        },
+        "truncated": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "items",
+        "total_count",
+        "bound",
+        "truncated",
+        "disclosure"
+      ],
+      "type": "object"
+    },
+    "Page11": {
+      "additionalProperties": false,
+      "properties": {
+        "bound": {
+          "$ref": "#/$defs/PageBound"
+        },
+        "disclosure": {
+          "$ref": "#/$defs/Disclosure"
+        },
+        "items": {
+          "items": {
+            "$ref": "#/$defs/HistoricalPathResidual"
+          },
+          "maxItems": 50000,
+          "type": "array"
+        },
+        "next_cursor": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "total_count": {
+          "$ref": "#/$defs/Availability4"
+        },
+        "truncated": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "items",
+        "total_count",
+        "bound",
+        "truncated",
+        "disclosure"
+      ],
+      "type": "object"
+    },
+    "Page12": {
+      "additionalProperties": false,
+      "properties": {
+        "bound": {
+          "$ref": "#/$defs/PageBound"
+        },
+        "disclosure": {
+          "$ref": "#/$defs/Disclosure"
+        },
+        "items": {
+          "items": {
+            "$ref": "#/$defs/DependencyModuleRow"
+          },
+          "maxItems": 50000,
+          "type": "array"
+        },
+        "next_cursor": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "total_count": {
+          "$ref": "#/$defs/Availability4"
+        },
+        "truncated": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "items",
+        "total_count",
+        "bound",
+        "truncated",
+        "disclosure"
+      ],
+      "type": "object"
+    },
+    "Page13": {
+      "additionalProperties": false,
+      "properties": {
+        "bound": {
+          "$ref": "#/$defs/PageBound"
+        },
+        "disclosure": {
+          "$ref": "#/$defs/Disclosure"
+        },
+        "items": {
+          "items": {
+            "$ref": "#/$defs/DependencyCycle"
+          },
+          "maxItems": 50000,
+          "type": "array"
+        },
+        "next_cursor": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "total_count": {
+          "$ref": "#/$defs/Availability4"
+        },
+        "truncated": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "items",
+        "total_count",
+        "bound",
+        "truncated",
+        "disclosure"
+      ],
+      "type": "object"
+    },
+    "Page14": {
+      "additionalProperties": false,
+      "properties": {
+        "bound": {
+          "$ref": "#/$defs/PageBound"
+        },
+        "disclosure": {
+          "$ref": "#/$defs/Disclosure"
+        },
+        "items": {
+          "items": {
+            "$ref": "#/$defs/HotspotRow"
+          },
+          "maxItems": 50000,
+          "type": "array"
+        },
+        "next_cursor": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "total_count": {
+          "$ref": "#/$defs/Availability4"
+        },
+        "truncated": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "items",
+        "total_count",
+        "bound",
+        "truncated",
+        "disclosure"
+      ],
+      "type": "object"
+    },
+    "Page15": {
+      "additionalProperties": false,
+      "properties": {
+        "bound": {
+          "$ref": "#/$defs/PageBound"
+        },
+        "disclosure": {
+          "$ref": "#/$defs/Disclosure"
+        },
+        "items": {
+          "items": {
+            "$ref": "#/$defs/HiddenCouplingRow"
+          },
+          "maxItems": 50000,
+          "type": "array"
+        },
+        "next_cursor": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "total_count": {
+          "$ref": "#/$defs/Availability4"
+        },
+        "truncated": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "items",
+        "total_count",
+        "bound",
+        "truncated",
+        "disclosure"
+      ],
+      "type": "object"
+    },
+    "Page16": {
+      "additionalProperties": false,
+      "properties": {
+        "bound": {
+          "$ref": "#/$defs/PageBound"
+        },
+        "disclosure": {
+          "$ref": "#/$defs/Disclosure"
+        },
+        "items": {
+          "items": {
+            "$ref": "#/$defs/TreemapRow"
+          },
+          "maxItems": 50000,
+          "type": "array"
+        },
+        "next_cursor": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "total_count": {
+          "$ref": "#/$defs/Availability4"
+        },
+        "truncated": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "items",
+        "total_count",
+        "bound",
+        "truncated",
+        "disclosure"
+      ],
+      "type": "object"
+    },
+    "Page17": {
+      "additionalProperties": false,
+      "properties": {
+        "bound": {
+          "$ref": "#/$defs/PageBound"
+        },
+        "disclosure": {
+          "$ref": "#/$defs/Disclosure"
+        },
+        "items": {
+          "items": {
+            "$ref": "#/$defs/CadencePoint"
+          },
+          "maxItems": 50000,
+          "type": "array"
+        },
+        "next_cursor": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "total_count": {
+          "$ref": "#/$defs/Availability4"
+        },
+        "truncated": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "items",
+        "total_count",
+        "bound",
+        "truncated",
+        "disclosure"
+      ],
+      "type": "object"
+    },
+    "Page18": {
+      "additionalProperties": false,
+      "properties": {
+        "bound": {
+          "$ref": "#/$defs/PageBound"
+        },
+        "disclosure": {
+          "$ref": "#/$defs/Disclosure"
+        },
+        "items": {
+          "items": {
+            "$ref": "#/$defs/ReleaseTag"
+          },
+          "maxItems": 50000,
+          "type": "array"
+        },
+        "next_cursor": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "total_count": {
+          "$ref": "#/$defs/Availability4"
+        },
+        "truncated": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "items",
+        "total_count",
+        "bound",
+        "truncated",
+        "disclosure"
+      ],
+      "type": "object"
+    },
+    "Page19": {
+      "additionalProperties": false,
+      "properties": {
+        "bound": {
+          "$ref": "#/$defs/PageBound"
+        },
+        "disclosure": {
+          "$ref": "#/$defs/Disclosure"
+        },
+        "items": {
+          "items": {
+            "$ref": "#/$defs/OwnershipRow"
+          },
+          "maxItems": 50000,
+          "type": "array"
+        },
+        "next_cursor": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "total_count": {
+          "$ref": "#/$defs/Availability4"
+        },
+        "truncated": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "items",
+        "total_count",
+        "bound",
+        "truncated",
+        "disclosure"
+      ],
+      "type": "object"
+    },
+    "Page2": {
+      "additionalProperties": false,
+      "properties": {
+        "bound": {
+          "$ref": "#/$defs/PageBound"
+        },
+        "disclosure": {
+          "$ref": "#/$defs/Disclosure"
+        },
+        "items": {
+          "items": {
+            "$ref": "#/$defs/ModuleNode"
+          },
+          "maxItems": 50000,
+          "type": "array"
+        },
+        "next_cursor": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "total_count": {
+          "$ref": "#/$defs/Availability4"
+        },
+        "truncated": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "items",
+        "total_count",
+        "bound",
+        "truncated",
+        "disclosure"
+      ],
+      "type": "object"
+    },
+    "Page20": {
+      "additionalProperties": false,
+      "properties": {
+        "bound": {
+          "$ref": "#/$defs/PageBound"
+        },
+        "disclosure": {
+          "$ref": "#/$defs/Disclosure"
+        },
+        "items": {
+          "items": {
+            "$ref": "#/$defs/AuthorShare"
+          },
+          "maxItems": 50000,
+          "type": "array"
+        },
+        "next_cursor": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "total_count": {
+          "$ref": "#/$defs/Availability4"
+        },
+        "truncated": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "items",
+        "total_count",
+        "bound",
+        "truncated",
+        "disclosure"
+      ],
+      "type": "object"
+    },
+    "Page21": {
+      "additionalProperties": false,
+      "properties": {
+        "bound": {
+          "$ref": "#/$defs/PageBound"
+        },
+        "disclosure": {
+          "$ref": "#/$defs/Disclosure"
+        },
+        "items": {
+          "items": {
+            "$ref": "#/$defs/ApiSurfaceRow"
+          },
+          "maxItems": 50000,
+          "type": "array"
+        },
+        "next_cursor": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "total_count": {
+          "$ref": "#/$defs/Availability4"
+        },
+        "truncated": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "items",
+        "total_count",
+        "bound",
+        "truncated",
+        "disclosure"
+      ],
+      "type": "object"
+    },
+    "Page3": {
+      "additionalProperties": false,
+      "properties": {
+        "bound": {
+          "$ref": "#/$defs/PageBound"
+        },
+        "disclosure": {
+          "$ref": "#/$defs/Disclosure"
+        },
+        "items": {
+          "items": {
+            "$ref": "#/$defs/CommitNode"
+          },
+          "maxItems": 50000,
+          "type": "array"
+        },
+        "next_cursor": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "total_count": {
+          "$ref": "#/$defs/Availability4"
+        },
+        "truncated": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "items",
+        "total_count",
+        "bound",
+        "truncated",
+        "disclosure"
+      ],
+      "type": "object"
+    },
+    "Page4": {
+      "additionalProperties": false,
+      "properties": {
+        "bound": {
+          "$ref": "#/$defs/PageBound"
+        },
+        "disclosure": {
+          "$ref": "#/$defs/Disclosure"
+        },
+        "items": {
+          "items": {
+            "$ref": "#/$defs/IssueNode"
+          },
+          "maxItems": 50000,
+          "type": "array"
+        },
+        "next_cursor": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "total_count": {
+          "$ref": "#/$defs/Availability4"
+        },
+        "truncated": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "items",
+        "total_count",
+        "bound",
+        "truncated",
+        "disclosure"
+      ],
+      "type": "object"
+    },
+    "Page5": {
+      "additionalProperties": false,
+      "properties": {
+        "bound": {
+          "$ref": "#/$defs/PageBound"
+        },
+        "disclosure": {
+          "$ref": "#/$defs/Disclosure"
+        },
+        "items": {
+          "items": {
+            "$ref": "#/$defs/PullRequestNode"
+          },
+          "maxItems": 50000,
+          "type": "array"
+        },
+        "next_cursor": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "total_count": {
+          "$ref": "#/$defs/Availability4"
+        },
+        "truncated": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "items",
+        "total_count",
+        "bound",
+        "truncated",
+        "disclosure"
+      ],
+      "type": "object"
+    },
+    "Page6": {
+      "additionalProperties": false,
+      "properties": {
+        "bound": {
+          "$ref": "#/$defs/PageBound"
+        },
+        "disclosure": {
+          "$ref": "#/$defs/Disclosure"
+        },
+        "items": {
+          "items": {
+            "$ref": "#/$defs/GraphEdge"
+          },
+          "maxItems": 50000,
+          "type": "array"
+        },
+        "next_cursor": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "total_count": {
+          "$ref": "#/$defs/Availability4"
+        },
+        "truncated": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "items",
+        "total_count",
+        "bound",
+        "truncated",
+        "disclosure"
+      ],
+      "type": "object"
+    },
+    "Page7": {
+      "additionalProperties": false,
+      "properties": {
+        "bound": {
+          "$ref": "#/$defs/PageBound"
+        },
+        "disclosure": {
+          "$ref": "#/$defs/Disclosure"
+        },
+        "items": {
+          "items": {
+            "$ref": "#/$defs/ModuleHistoryNavigation"
+          },
+          "maxItems": 50000,
+          "type": "array"
+        },
+        "next_cursor": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "total_count": {
+          "$ref": "#/$defs/Availability4"
+        },
+        "truncated": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "items",
+        "total_count",
+        "bound",
+        "truncated",
+        "disclosure"
+      ],
+      "type": "object"
+    },
+    "Page8": {
+      "additionalProperties": false,
+      "properties": {
+        "bound": {
+          "$ref": "#/$defs/PageBound"
+        },
+        "disclosure": {
+          "$ref": "#/$defs/Disclosure"
+        },
+        "items": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 50000,
+          "type": "array"
+        },
+        "next_cursor": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "total_count": {
+          "$ref": "#/$defs/Availability4"
+        },
+        "truncated": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "items",
+        "total_count",
+        "bound",
+        "truncated",
+        "disclosure"
+      ],
+      "type": "object"
+    },
+    "Page9": {
+      "additionalProperties": false,
+      "properties": {
+        "bound": {
+          "$ref": "#/$defs/PageBound"
+        },
+        "disclosure": {
+          "$ref": "#/$defs/Disclosure"
+        },
+        "items": {
+          "items": {
+            "$ref": "#/$defs/CommitHistoryNavigation"
+          },
+          "maxItems": 50000,
+          "type": "array"
+        },
+        "next_cursor": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "total_count": {
+          "$ref": "#/$defs/Availability4"
+        },
+        "truncated": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "items",
+        "total_count",
+        "bound",
+        "truncated",
+        "disclosure"
+      ],
+      "type": "object"
+    },
+    "PageBound": {
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "$ref": "#/$defs/BoundKind"
+        },
+        "max_items": {
+          "format": "uint32",
+          "maximum": 50000,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "order": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "max_items",
+        "order"
+      ],
+      "type": "object"
+    },
+    "Percentiles": {
+      "additionalProperties": false,
+      "properties": {
+        "p50": {
+          "format": "double",
+          "minimum": 0.0,
+          "type": "number"
+        },
+        "p90": {
+          "format": "double",
+          "minimum": 0.0,
+          "type": "number"
+        },
+        "p95": {
+          "format": "double",
+          "minimum": 0.0,
+          "type": "number"
+        }
+      },
+      "required": [
+        "p50",
+        "p90",
+        "p95"
+      ],
+      "type": "object"
+    },
+    "PipelineProvenance": {
+      "additionalProperties": false,
+      "properties": {
+        "clone_tags": {
+          "$ref": "#/$defs/SourceCoverage"
+        },
+        "code_ingest": {
+          "$ref": "#/$defs/Availability3"
+        },
+        "git_digest": {
+          "$ref": "#/$defs/Availability2"
+        }
+      },
+      "required": [
+        "git_digest",
+        "code_ingest",
+        "clone_tags"
+      ],
+      "type": "object"
+    },
+    "ProducerIdentity": {
+      "additionalProperties": false,
+      "properties": {
+        "exporter": {
+          "type": "string"
+        },
+        "khive_pack_code_version": {
+          "type": "string"
+        },
+        "khive_pack_git_version": {
+          "type": "string"
+        },
+        "kkernel_version": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "exporter",
+        "kkernel_version",
+        "khive_pack_git_version",
+        "khive_pack_code_version"
+      ],
+      "type": "object"
+    },
+    "PullRequestNode": {
+      "additionalProperties": false,
+      "properties": {
+        "author": {
+          "$ref": "#/$defs/Availability"
+        },
+        "base_ref": {
+          "$ref": "#/$defs/Availability"
+        },
+        "closed_at": {
+          "$ref": "#/$defs/Availability5"
+        },
+        "created_at": {
+          "$ref": "#/$defs/Availability5"
+        },
+        "head_ref": {
+          "$ref": "#/$defs/Availability"
+        },
+        "id": {
+          "type": "string"
+        },
+        "merged_at": {
+          "$ref": "#/$defs/Availability5"
+        },
+        "number": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "title": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "number",
+        "title",
+        "author",
+        "created_at",
+        "merged_at",
+        "closed_at",
+        "base_ref",
+        "head_ref"
+      ],
+      "type": "object"
+    },
+    "Ratio": {
+      "maximum": 1.0,
+      "minimum": 0.0,
+      "type": "number"
+    },
+    "ReleaseTag": {
+      "additionalProperties": false,
+      "properties": {
+        "committed_at": {
+          "$ref": "#/$defs/Availability5"
+        },
+        "name": {
+          "type": "string"
+        },
+        "target_sha": {
+          "pattern": "^[0-9a-f]{40}$",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "target_sha",
+        "committed_at"
+      ],
+      "type": "object"
+    },
+    "RepoAggregates": {
+      "additionalProperties": false,
+      "properties": {
+        "api_surface": {
+          "$ref": "#/$defs/Analysis4"
+        },
+        "cadence_timeline": {
+          "$ref": "#/$defs/CadenceAnalysis"
+        },
+        "dependency_topology": {
+          "$ref": "#/$defs/DependencyTopologyAnalysis"
+        },
+        "hidden_coupling": {
+          "$ref": "#/$defs/Analysis2"
+        },
+        "hotspot_quadrant": {
+          "$ref": "#/$defs/Analysis"
+        },
+        "ownership": {
+          "$ref": "#/$defs/OwnershipAnalysis"
+        },
+        "scorecard": {
+          "$ref": "#/$defs/ScorecardAnalysis"
+        },
+        "structure_treemap": {
+          "$ref": "#/$defs/Analysis3"
+        }
+      },
+      "required": [
+        "dependency_topology",
+        "hotspot_quadrant",
+        "hidden_coupling",
+        "structure_treemap",
+        "cadence_timeline",
+        "ownership",
+        "api_surface",
+        "scorecard"
+      ],
+      "type": "object"
+    },
+    "RepoGraph": {
+      "additionalProperties": false,
+      "properties": {
+        "commit_module_edges": {
+          "$ref": "#/$defs/Page6"
+        },
+        "commits": {
+          "$ref": "#/$defs/Page3"
+        },
+        "datatypes": {
+          "$ref": "#/$defs/SymbolPage"
+        },
+        "functions": {
+          "$ref": "#/$defs/SymbolPage"
+        },
+        "history_edges": {
+          "$ref": "#/$defs/Page6"
+        },
+        "history_navigation": {
+          "$ref": "#/$defs/HistoryNavigation"
+        },
+        "interfaces": {
+          "$ref": "#/$defs/SymbolPage"
+        },
+        "issues": {
+          "$ref": "#/$defs/Page4"
+        },
+        "join_resolution": {
+          "$ref": "#/$defs/JoinResolution"
+        },
+        "modules": {
+          "$ref": "#/$defs/Page2"
+        },
+        "packages": {
+          "$ref": "#/$defs/Page"
+        },
+        "pull_requests": {
+          "$ref": "#/$defs/Page5"
+        },
+        "repository": {
+          "$ref": "#/$defs/RepositoryNode"
+        },
+        "structure_edges": {
+          "$ref": "#/$defs/Page6"
+        }
+      },
+      "required": [
+        "repository",
+        "packages",
+        "modules",
+        "functions",
+        "datatypes",
+        "interfaces",
+        "commits",
+        "issues",
+        "pull_requests",
+        "structure_edges",
+        "history_edges",
+        "commit_module_edges",
+        "history_navigation",
+        "join_resolution"
+      ],
+      "type": "object"
+    },
+    "RepositoryIdentity": {
+      "additionalProperties": false,
+      "properties": {
+        "canonical_url": {
+          "format": "uri",
+          "type": "string"
+        },
+        "default_branch": {
+          "$ref": "#/$defs/Availability"
+        },
+        "host": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "owner": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "host",
+        "owner",
+        "name",
+        "canonical_url",
+        "default_branch"
+      ],
+      "type": "object"
+    },
+    "RepositoryNode": {
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "label": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "label"
+      ],
+      "type": "object"
+    },
+    "RepositoryResolution": {
+      "additionalProperties": false,
+      "properties": {
+        "derived_keys": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "entity_keys": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "files": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "language": {
+          "type": "string"
+        },
+        "matched": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "repository": {
+          "format": "uri",
+          "type": "string"
+        },
+        "residuals": {
+          "$ref": "#/$defs/Page10"
+        },
+        "resolution_rate": {
+          "$ref": "#/$defs/Availability9"
+        }
+      },
+      "required": [
+        "repository",
+        "language",
+        "files",
+        "derived_keys",
+        "entity_keys",
+        "matched",
+        "resolution_rate",
+        "residuals"
+      ],
+      "type": "object"
+    },
+    "ResidualSide": {
+      "enum": [
+        "path",
+        "entity"
+      ],
+      "type": "string"
+    },
+    "SchemaVersion": {
+      "const": "khive.repo.v1",
+      "type": "string"
+    },
+    "ScorecardAnalysis": {
+      "additionalProperties": false,
+      "properties": {
+        "fields": {
+          "items": {
+            "$ref": "#/$defs/ScorecardField"
+          },
+          "type": "array"
+        },
+        "meta": {
+          "$ref": "#/$defs/AnalysisMeta"
+        }
+      },
+      "required": [
+        "meta",
+        "fields"
+      ],
+      "type": "object"
+    },
+    "ScorecardField": {
+      "additionalProperties": false,
+      "properties": {
+        "granularity": {
+          "$ref": "#/$defs/Granularity"
+        },
+        "join": {
+          "$ref": "#/$defs/JoinTag"
+        },
+        "key": {
+          "$ref": "#/$defs/ScorecardKey"
+        },
+        "label_key": {
+          "type": "string"
+        },
+        "value": {
+          "$ref": "#/$defs/Availability12"
+        }
+      },
+      "required": [
+        "key",
+        "label_key",
+        "granularity",
+        "join",
+        "value"
+      ],
+      "type": "object"
+    },
+    "ScorecardKey": {
+      "enum": [
+        "repository_age_days",
+        "package_count",
+        "module_count",
+        "symbol_count",
+        "activity_trend",
+        "top_hotspots",
+        "dependency_cycle_count",
+        "ownership_warnings"
+      ],
+      "type": "string"
+    },
+    "ScorecardValue": {
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "value": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "value_kind": {
+              "const": "count",
+              "type": "string"
+            }
+          },
+          "required": [
+            "value_kind",
+            "value"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "value": {
+              "format": "double",
+              "type": "number"
+            },
+            "value_kind": {
+              "const": "ratio",
+              "type": "string"
+            }
+          },
+          "required": [
+            "value_kind",
+            "value"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "value": {
+              "type": "string"
+            },
+            "value_kind": {
+              "const": "text",
+              "type": "string"
+            }
+          },
+          "required": [
+            "value_kind",
+            "value"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "value": {
+              "$ref": "#/$defs/Page8"
+            },
+            "value_kind": {
+              "const": "module_ids",
+              "type": "string"
+            }
+          },
+          "required": [
+            "value_kind",
+            "value"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "SnapshotIdentity": {
+      "additionalProperties": false,
+      "properties": {
+        "head_sha": {
+          "pattern": "^[0-9a-f]{40}$",
+          "type": "string"
+        },
+        "ingested_at": {
+          "$ref": "#/$defs/Timestamp"
+        }
+      },
+      "required": [
+        "head_sha",
+        "ingested_at"
+      ],
+      "type": "object"
+    },
+    "SourceCoverage": {
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "state": {
+              "const": "completed",
+              "type": "string"
+            }
+          },
+          "required": [
+            "state"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "reason": {
+              "type": "string"
+            },
+            "state": {
+              "const": "stopped_early",
+              "type": "string"
+            }
+          },
+          "required": [
+            "state",
+            "reason"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "reason": {
+              "type": "string"
+            },
+            "state": {
+              "const": "skipped",
+              "type": "string"
+            }
+          },
+          "required": [
+            "state",
+            "reason"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "state": {
+              "const": "unrequested",
+              "type": "string"
+            }
+          },
+          "required": [
+            "state"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "reason": {
+              "type": "string"
+            },
+            "state": {
+              "const": "unknown",
+              "type": "string"
+            }
+          },
+          "required": [
+            "state",
+            "reason"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "SymbolNode": {
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "module_id": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "module_id",
+        "name"
+      ],
+      "type": "object"
+    },
+    "SymbolPage": {
+      "additionalProperties": false,
+      "properties": {
+        "bound": {
+          "$ref": "#/$defs/PageBound"
+        },
+        "disclosure": {
+          "$ref": "#/$defs/Disclosure"
+        },
+        "items": {
+          "items": {
+            "$ref": "#/$defs/SymbolNode"
+          },
+          "maxItems": 0,
+          "type": "array"
+        },
+        "next_cursor": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "total_count": {
+          "$ref": "#/$defs/Availability4"
+        },
+        "truncated": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "items",
+        "total_count",
+        "bound",
+        "truncated",
+        "disclosure"
+      ],
+      "type": "object"
+    },
+    "Timestamp": {
+      "format": "date-time",
+      "type": "string"
+    },
+    "TreemapRow": {
+      "additionalProperties": false,
+      "properties": {
+        "module_id": {
+          "type": "string"
+        },
+        "package_id": {
+          "type": "string"
+        },
+        "recent_commit_count": {
+          "$ref": "#/$defs/Availability4"
+        },
+        "source_file_count": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "package_id",
+        "module_id",
+        "source_file_count",
+        "recent_commit_count"
+      ],
+      "type": "object"
+    },
+    "ViewCapability": {
+      "additionalProperties": false,
+      "properties": {
+        "granularity": {
+          "$ref": "#/$defs/Granularity"
+        },
+        "join": {
+          "$ref": "#/$defs/JoinTag"
+        },
+        "label": {
+          "type": "string"
+        },
+        "status": {
+          "$ref": "#/$defs/ViewStatus"
+        },
+        "unavailable_reason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "label",
+        "granularity",
+        "join",
+        "status"
+      ],
+      "type": "object"
+    },
+    "ViewCatalog": {
+      "additionalProperties": false,
+      "properties": {
+        "api_surface": {
+          "$ref": "#/$defs/ViewCapability"
+        },
+        "cadence_timeline": {
+          "$ref": "#/$defs/ViewCapability"
+        },
+        "dependency_topology": {
+          "$ref": "#/$defs/ViewCapability"
+        },
+        "hidden_coupling": {
+          "$ref": "#/$defs/ViewCapability"
+        },
+        "history_structure_navigation": {
+          "$ref": "#/$defs/HistoryStructureViewCapability"
+        },
+        "hotspot_quadrant": {
+          "$ref": "#/$defs/ViewCapability"
+        },
+        "ownership": {
+          "$ref": "#/$defs/ViewCapability"
+        },
+        "scorecard": {
+          "$ref": "#/$defs/ViewCapability"
+        },
+        "structure_graph": {
+          "$ref": "#/$defs/ViewCapability"
+        },
+        "structure_treemap": {
+          "$ref": "#/$defs/ViewCapability"
+        }
+      },
+      "required": [
+        "structure_graph",
+        "history_structure_navigation",
+        "dependency_topology",
+        "hotspot_quadrant",
+        "hidden_coupling",
+        "structure_treemap",
+        "cadence_timeline",
+        "ownership",
+        "api_surface",
+        "scorecard"
+      ],
+      "type": "object"
+    },
+    "ViewStatus": {
+      "enum": [
+        "available",
+        "unavailable"
+      ],
+      "type": "string"
+    },
+    "WindowKind": {
+      "enum": [
+        "all_history",
+        "rolling_days",
+        "range"
+      ],
+      "type": "string"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "aggregates": {
+      "$ref": "#/$defs/RepoAggregates"
+    },
+    "capability": {
+      "$ref": "#/$defs/Capability"
+    },
+    "graph": {
+      "$ref": "#/$defs/RepoGraph"
+    },
+    "meta": {
+      "$ref": "#/$defs/BundleMeta"
+    },
+    "schema_version": {
+      "$ref": "#/$defs/SchemaVersion"
+    }
+  },
+  "required": [
+    "schema_version",
+    "meta",
+    "graph",
+    "aggregates",
+    "capability"
+  ],
+  "title": "RepoBundle",
+  "type": "object"
+}

@@ -22,6 +22,212 @@ use super::common::{
 };
 use crate::KgPack;
 
+/// Search substrate after the public `kind` discriminator and compatibility
+/// filters have been reconciled against the loaded pack registry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SearchSubstrate {
+    /// Entity storage and retrieval path.
+    Entity,
+    /// Note storage and retrieval path.
+    Note,
+}
+
+/// Strict, canonical search request shared by the KG handler and the
+/// multi-backend coordinator boundary.
+///
+/// Construction performs the same deny-unknown-fields deserialization,
+/// granular-kind reconciliation, entity-type validation, and substrate-field
+/// validation for every dispatch path. Downstream coordinator code receives
+/// this type rather than rebuilding a narrower payload from raw JSON.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ValidatedSearchRequest {
+    query: String,
+    limit: u32,
+    substrate: SearchSubstrate,
+    kind_filter: Option<String>,
+    entity_type: Option<String>,
+    include_superseded: bool,
+    properties: Option<Value>,
+    tags: Vec<String>,
+    min_score: f64,
+}
+
+impl ValidatedSearchRequest {
+    /// Parse and validate the canonical KG search wire contract.
+    pub fn from_value(params: Value, registry: &VerbRegistry) -> Result<Self, RuntimeError> {
+        let p: SearchParams = deser(params)?;
+        let kind_raw = p
+            .kind
+            .as_deref()
+            .ok_or_else(|| missing_kind_error("kind", registry))?;
+        let properties = match p.properties {
+            Some(Value::Object(map)) if !map.is_empty() => Some(Value::Object(map)),
+            Some(Value::Object(_)) | None => None,
+            Some(_) => {
+                return Err(RuntimeError::InvalidInput(
+                    "properties must be an object when provided".to_string(),
+                ));
+            }
+        };
+        let tags = p.tags.unwrap_or_default();
+        let limit = p.limit.unwrap_or(10).min(100);
+        let min_score = p.min_score.unwrap_or(0.0).max(0.0);
+
+        match resolve_kind_spec(kind_raw, registry)? {
+            KindSpec::Entity { specific } => {
+                reject_search_field_for_substrate(
+                    p.note_kind.as_ref(),
+                    "note_kind",
+                    SearchSubstrate::Entity,
+                )?;
+                reject_search_field_for_substrate(
+                    p.include_superseded.as_ref(),
+                    "include_superseded",
+                    SearchSubstrate::Entity,
+                )?;
+                let kind_filter = reconcile_specific(
+                    specific,
+                    p.entity_kind.as_deref(),
+                    |s| canonical_entity_kind(s, registry),
+                    "entity_kind",
+                )?;
+                let entity_type = if let Some(ref raw_entity_type) = p.entity_type {
+                    if let Some(ref kind) = kind_filter {
+                        validate_entity_type(kind, Some(raw_entity_type), registry)?
+                    } else {
+                        Some(raw_entity_type.trim().to_ascii_lowercase())
+                    }
+                } else {
+                    None
+                };
+                Ok(Self {
+                    query: p.query,
+                    limit,
+                    substrate: SearchSubstrate::Entity,
+                    kind_filter,
+                    entity_type,
+                    include_superseded: false,
+                    properties,
+                    tags,
+                    min_score,
+                })
+            }
+            KindSpec::Note { specific } => {
+                reject_search_field_for_substrate(
+                    p.entity_kind.as_ref(),
+                    "entity_kind",
+                    SearchSubstrate::Note,
+                )?;
+                reject_search_field_for_substrate(
+                    p.entity_type.as_ref(),
+                    "entity_type",
+                    SearchSubstrate::Note,
+                )?;
+                let kind_filter = reconcile_specific(
+                    specific,
+                    p.note_kind.as_deref().filter(|kind| !kind.is_empty()),
+                    |s| canonical_note_kind(s, registry),
+                    "note_kind",
+                )?;
+                Ok(Self {
+                    query: p.query,
+                    limit,
+                    substrate: SearchSubstrate::Note,
+                    kind_filter,
+                    entity_type: None,
+                    include_superseded: p.include_superseded.unwrap_or(false),
+                    properties,
+                    tags,
+                    min_score,
+                })
+            }
+            KindSpec::Edge => Err(RuntimeError::InvalidInput(
+                "search does not support kind=edge — use `list(kind=\"edge\", ...)` for edge browsing"
+                    .into(),
+            )),
+            KindSpec::Event => Err(RuntimeError::InvalidInput(
+                "search does not support kind=event — use `list(kind=\"event\", ...)` for event browsing"
+                    .into(),
+            )),
+            KindSpec::Proposal => Err(RuntimeError::InvalidInput(
+                "search does not support kind=proposal — use `list(kind=\"proposal\", ...)` for proposal browsing"
+                    .into(),
+            )),
+        }
+    }
+
+    /// Free-text query supplied by the caller.
+    pub fn query(&self) -> &str {
+        &self.query
+    }
+
+    /// Caller limit after applying the public cap of 100.
+    pub fn limit(&self) -> u32 {
+        self.limit
+    }
+
+    /// Resolved entity or note substrate.
+    pub fn substrate(&self) -> SearchSubstrate {
+        self.substrate
+    }
+
+    /// Canonical granular entity/note kind, or `None` for a substrate-wide search.
+    pub fn kind_filter(&self) -> Option<&str> {
+        self.kind_filter.as_deref()
+    }
+
+    /// Canonical entity subtype filter; always `None` for note searches.
+    pub fn entity_type(&self) -> Option<&str> {
+        self.entity_type.as_deref()
+    }
+
+    /// Whether notes targeted by a `supersedes` edge remain eligible.
+    pub fn include_superseded(&self) -> bool {
+        self.include_superseded
+    }
+
+    /// Non-empty property-superset filter.
+    pub fn properties(&self) -> Option<&Value> {
+        self.properties.as_ref()
+    }
+
+    /// OR-matched tag filter; empty means unrestricted.
+    pub fn tags(&self) -> &[String] {
+        &self.tags
+    }
+
+    /// Non-negative result-score floor.
+    pub fn min_score(&self) -> f64 {
+        self.min_score
+    }
+
+    /// Bounded backend candidate window used to preserve filtered-result recall.
+    pub fn candidate_limit(&self) -> u32 {
+        if self.properties.is_some() || !self.tags.is_empty() {
+            self.limit.saturating_mul(50).min(FILTERED_SCAN_CAP)
+        } else {
+            self.limit
+        }
+    }
+}
+
+fn reject_search_field_for_substrate<T>(
+    value: Option<&T>,
+    field: &str,
+    substrate: SearchSubstrate,
+) -> Result<(), RuntimeError> {
+    if value.is_some() {
+        let required = match substrate {
+            SearchSubstrate::Entity => "note",
+            SearchSubstrate::Note => "entity",
+        };
+        return Err(RuntimeError::InvalidInput(format!(
+            "{field} is only valid when kind resolves to {required}"
+        )));
+    }
+    Ok(())
+}
+
 impl KgPack {
     pub(crate) async fn handle_search(
         &self,
@@ -30,55 +236,21 @@ impl KgPack {
         registry: &VerbRegistry,
     ) -> Result<Value, RuntimeError> {
         let search_start = Instant::now();
-        let p: SearchParams = deser(params)?;
-        let limit = p.limit.unwrap_or(10).min(100);
-        let kind_raw = p
-            .kind
-            .as_deref()
-            .ok_or_else(|| missing_kind_error("kind", registry))?;
-        let spec = resolve_kind_spec(kind_raw, registry)?;
-        match spec {
-            KindSpec::Entity { specific } => {
-                let kind_filter = reconcile_specific(
-                    specific,
-                    p.entity_kind.as_deref(),
-                    |s| canonical_entity_kind(s, registry),
-                    "entity_kind",
-                )?;
-                let validated_et: Option<String> = if let Some(ref raw_et) = p.entity_type {
-                    if let Some(ref kf) = kind_filter {
-                        validate_entity_type(kf, Some(raw_et), registry)?
-                    } else {
-                        let norm = raw_et.trim().to_ascii_lowercase();
-                        Some(norm)
-                    }
-                } else {
-                    None
-                };
-                let props_filter = p.properties.as_ref().and_then(|v| {
-                    if v.as_object().is_some_and(|m| !m.is_empty()) {
-                        Some(v)
-                    } else {
-                        None
-                    }
-                });
-                let tag_filter = p.tags.as_ref().filter(|tags| !tags.is_empty());
-                let search_limit = if props_filter.is_some() || tag_filter.is_some() {
-                    // See docs/api/scan-cliff.md.
-                    (limit * 50).min(FILTERED_SCAN_CAP)
-                } else {
-                    limit
-                };
+        let request = ValidatedSearchRequest::from_value(params, registry)?;
+        match request.substrate() {
+            SearchSubstrate::Entity => {
+                let props_filter = request.properties();
+                let tag_filter = (!request.tags().is_empty()).then_some(request.tags());
                 let hits = self
                     .runtime
                     .hybrid_search(
                         token,
-                        &p.query,
+                        request.query(),
                         None,
-                        search_limit,
-                        kind_filter.as_deref(),
-                        validated_et.as_deref(),
-                        tag_filter.map(|t| t.as_slice()).unwrap_or(&[]),
+                        request.candidate_limit(),
+                        request.kind_filter(),
+                        request.entity_type(),
+                        tag_filter.unwrap_or(&[]),
                         props_filter,
                     )
                     .await?;
@@ -122,21 +294,18 @@ impl KgPack {
                             let Some((_, props, tags, _)) = entity_meta.get(&h.entity_id) else {
                                 return false;
                             };
-                            props_filter
-                                .is_none_or(|pf| props_match(props.as_ref(), pf))
-                                && tag_filter
-                                    .is_none_or(|wanted| tags_match_any(tags, wanted))
+                            props_filter.is_none_or(|pf| props_match(props.as_ref(), pf))
+                                && tag_filter.is_none_or(|wanted| tags_match_any(tags, wanted))
                         })
-                        .take(limit as usize)
+                        .take(request.limit() as usize)
                         .collect::<Vec<_>>()
                 } else {
                     hits
                 };
 
-                let score_floor = p.min_score.unwrap_or(0.0).max(0.0);
                 let result: Vec<Value> = filtered_hits
                     .iter()
-                    .filter(|h| h.score.to_f64() >= score_floor)
+                    .filter(|h| h.score.to_f64() >= request.min_score())
                     .map(|h| {
                         let entity_kind =
                             entity_meta.get(&h.entity_id).map(|(k, _, _, _)| k.as_str());
@@ -160,44 +329,26 @@ impl KgPack {
                     .collect();
                 self.track_search_serve(
                     token,
-                    &p.query,
+                    request.query(),
                     "entity",
                     &result,
                     search_start.elapsed().as_micros() as i64,
                 );
                 to_json(&result)
             }
-            KindSpec::Note { specific } => {
-                let kind_filter = reconcile_specific(
-                    specific,
-                    p.note_kind.as_deref().filter(|s| !s.is_empty()),
-                    |s| canonical_note_kind(s, registry),
-                    "note_kind",
-                )?;
-                let props_filter = p.properties.as_ref().and_then(|v| {
-                    if v.as_object().is_some_and(|m| !m.is_empty()) {
-                        Some(v)
-                    } else {
-                        None
-                    }
-                });
-                let tag_filter = p.tags.as_ref().filter(|tags| !tags.is_empty());
-                let search_limit = if props_filter.is_some() || tag_filter.is_some() {
-                    // See docs/api/scan-cliff.md.
-                    (limit * 50).min(FILTERED_SCAN_CAP)
-                } else {
-                    limit
-                };
+            SearchSubstrate::Note => {
+                let props_filter = request.properties();
+                let tag_filter = (!request.tags().is_empty()).then_some(request.tags());
                 let hits = self
                     .runtime
                     .search_notes(
                         token,
-                        &p.query,
+                        request.query(),
                         None,
-                        search_limit,
-                        kind_filter.as_deref(),
-                        p.include_superseded.unwrap_or(false),
-                        tag_filter.map(|t| t.as_slice()).unwrap_or(&[]),
+                        request.candidate_limit(),
+                        request.kind_filter(),
+                        request.include_superseded(),
+                        tag_filter.unwrap_or(&[]),
                         props_filter,
                     )
                     .await?;
@@ -227,8 +378,8 @@ impl KgPack {
                             let Some((_, props, _, _)) = note_meta.get(&h.note_id) else {
                                 return false;
                             };
-                            let props_ok = props_filter
-                                .is_none_or(|pf| props_match(props.as_ref(), pf));
+                            let props_ok =
+                                props_filter.is_none_or(|pf| props_match(props.as_ref(), pf));
                             let tags_ok = tag_filter.is_none_or(|wanted| {
                                 let note_tags: Vec<String> = props
                                     .as_ref()
@@ -245,16 +396,15 @@ impl KgPack {
                             });
                             props_ok && tags_ok
                         })
-                        .take(limit as usize)
+                        .take(request.limit() as usize)
                         .collect()
                 } else {
                     hits
                 };
 
-                let score_floor = p.min_score.unwrap_or(0.0).max(0.0);
                 let result: Vec<Value> = filtered_hits
                     .iter()
-                    .filter(|h| h.score.to_f64() >= score_floor)
+                    .filter(|h| h.score.to_f64() >= request.min_score())
                     .map(|h| {
                         let meta = note_meta.get(&h.note_id);
                         let note_kind = meta.map(|(k, _, _, _)| k.as_str());
@@ -277,22 +427,13 @@ impl KgPack {
                     .collect();
                 self.track_search_serve(
                     token,
-                    &p.query,
+                    request.query(),
                     "note",
                     &result,
                     search_start.elapsed().as_micros() as i64,
                 );
                 to_json(&result)
             }
-            KindSpec::Edge => Err(RuntimeError::InvalidInput(
-                "search does not support kind=edge — use `list(kind=\"edge\", ...)` for edge browsing".into(),
-            )),
-            KindSpec::Event => Err(RuntimeError::InvalidInput(
-                "search does not support kind=event — use `list(kind=\"event\", ...)` for event browsing".into(),
-            )),
-            KindSpec::Proposal => Err(RuntimeError::InvalidInput(
-                "search does not support kind=proposal — use `list(kind=\"proposal\", ...)` for proposal browsing".into(),
-            )),
         }
     }
 

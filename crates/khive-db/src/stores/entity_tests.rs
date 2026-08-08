@@ -943,6 +943,113 @@ async fn page_offset_over_i64max_rejected() {
     );
 }
 
+/// #1671: offset pages over entities whose primary sort key (`created_at`)
+/// repeats must form a deterministic total order — a full paged sweep returns
+/// every entity exactly once (no duplicates, no misses across page boundaries).
+#[tokio::test]
+async fn query_entities_offset_sweep_covers_equal_created_at_exactly_once() {
+    let store = setup_memory_store_ns("ns1");
+    let created_at = 1_750_000_000_000_000_i64;
+    let mut expected_ids = Vec::new();
+    for index in 0..211 {
+        let mut entity = make_entity("ns1", "concept", &format!("sweep-{index:03}"));
+        entity.created_at = created_at;
+        expected_ids.push(entity.id);
+        store.upsert_entity(entity).await.unwrap();
+    }
+    expected_ids.sort_unstable_by(|a, b| b.cmp(a));
+
+    let mut actual_ids = Vec::new();
+    let page_size = 37_u32;
+    let mut offset = 0_u64;
+    loop {
+        let page = store
+            .query_entities(
+                "ns1",
+                EntityFilter::default(),
+                PageRequest {
+                    offset,
+                    limit: page_size,
+                },
+            )
+            .await
+            .unwrap();
+        if page.items.is_empty() {
+            break;
+        }
+        offset += page.items.len() as u64;
+        actual_ids.extend(page.items.into_iter().map(|entity| entity.id));
+    }
+
+    assert_eq!(
+        actual_ids, expected_ids,
+        "sweep must cover every entity exactly once"
+    );
+}
+
+/// #1671: the name-prefix branch ranks exact matches first, then orders by
+/// `created_at DESC` — that branch needs the same `id` tiebreak so offset
+/// pages over equal `created_at` rows are a deterministic total order.
+///
+/// One row is named exactly `Alpha` (the prefix) so the sweep also exercises
+/// the exact-match `CASE WHEN LOWER(name) = ?` branch under ties: it must
+/// sort ahead of every prefix match.
+#[tokio::test]
+async fn query_entities_name_prefix_offset_sweep_covers_equal_created_at_exactly_once() {
+    let store = setup_memory_store_ns("ns1");
+    let created_at = 1_750_000_000_000_000_i64;
+    let mut expected_ids = Vec::new();
+    for index in 0..113 {
+        let mut entity = make_entity("ns1", "concept", &format!("Alpha-{index:03}"));
+        entity.created_at = created_at;
+        expected_ids.push(entity.id);
+        store.upsert_entity(entity).await.unwrap();
+    }
+    // An exact match for the prefix must rank first despite sharing the same
+    // `created_at` as every prefix-matching row.
+    let mut exact_entity = make_entity("ns1", "concept", "Alpha");
+    exact_entity.created_at = created_at;
+    let exact_id = exact_entity.id;
+    store.upsert_entity(exact_entity).await.unwrap();
+    expected_ids.sort_unstable_by(|a, b| b.cmp(a));
+    expected_ids.insert(0, exact_id);
+
+    let mut actual_ids = Vec::new();
+    let page_size = 23_u32;
+    let mut offset = 0_u64;
+    loop {
+        let page = store
+            .query_entities(
+                "ns1",
+                EntityFilter {
+                    name_prefix: Some("Alpha".to_string()),
+                    ..Default::default()
+                },
+                PageRequest {
+                    offset,
+                    limit: page_size,
+                },
+            )
+            .await
+            .unwrap();
+        if page.items.is_empty() {
+            break;
+        }
+        offset += page.items.len() as u64;
+        actual_ids.extend(page.items.into_iter().map(|entity| entity.id));
+    }
+
+    assert_eq!(
+        actual_ids.first(),
+        Some(&exact_id),
+        "the exact-match row must sort into the exact-match-first group, ahead of prefix matches"
+    );
+    assert_eq!(
+        actual_ids, expected_ids,
+        "name-prefix sweep must cover every entity exactly once"
+    );
+}
+
 // =============================================================================
 // ADR-067 slice 1: WriterTask-routed `upsert_entities` (KHIVE_WRITE_QUEUE=1)
 // =============================================================================
@@ -1395,4 +1502,70 @@ async fn test_content_ref_survives_batch_upsert() {
     assert_eq!(with_ref.content_ref, Some(digest));
     let without_ref = store.get_entity(ids[1]).await.unwrap().unwrap();
     assert_eq!(without_ref.content_ref, None);
+}
+
+/// #1656: a seek-cursor walk with an active `kind` filter must return every
+/// matching row, matching the count an offset-based query would return for
+/// the same filter, even when matching rows are sparse relative to the
+/// sequence range being walked.
+#[tokio::test]
+async fn cursor_kind_filter_returns_records() {
+    let store = setup_memory_store_ns("ns1");
+
+    // Insert a large run of "document" entities first, then a sparse run of
+    // "concept" entities, so a naive seq-first probe window can land
+    // entirely on non-matching rows.
+    for i in 0..40 {
+        store
+            .upsert_entity(make_entity("ns1", "document", &format!("Doc{i}")))
+            .await
+            .unwrap();
+    }
+    let mut concept_ids = Vec::new();
+    for i in 0..5 {
+        let entity = make_entity("ns1", "concept", &format!("Concept{i}"));
+        concept_ids.push(entity.id);
+        store.upsert_entity(entity).await.unwrap();
+    }
+
+    let filter = EntityFilter {
+        kinds: vec!["concept".to_string()],
+        ..Default::default()
+    };
+
+    let mut walked_ids: Vec<Uuid> = Vec::new();
+    let mut after = None;
+    loop {
+        let page = store
+            .query_entities_after("ns1", filter.clone(), after, 2)
+            .await
+            .unwrap();
+        for entity in &page.items {
+            walked_ids.push(entity.id);
+        }
+        after = page.next_after;
+        if after.is_none() {
+            break;
+        }
+    }
+
+    assert_eq!(
+        walked_ids.len(),
+        concept_ids.len(),
+        "cursor walk with kind filter must return every matching row"
+    );
+    let walked_set: std::collections::HashSet<Uuid> = walked_ids.into_iter().collect();
+    for id in &concept_ids {
+        assert!(
+            walked_set.contains(id),
+            "cursor walk missing expected concept entity {id}"
+        );
+    }
+
+    // Control: offset-based query for the same filter must return the same set.
+    let offset_page = store
+        .query_entities("ns1", filter, PageRequest::default())
+        .await
+        .unwrap();
+    assert_eq!(offset_page.items.len(), concept_ids.len());
 }

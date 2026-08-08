@@ -25,12 +25,12 @@ fn effective_list_limit(requested: u32, cap: u32) -> u32 {
     requested.min(cap)
 }
 
-fn render_list_response(items: Value, requested: u32, effective: u32) -> Value {
+fn render_list_response(items: Value, items_key: &str, requested: u32, effective: u32) -> Value {
     if requested <= effective {
         return items;
     }
     serde_json::json!({
-        "items": items,
+        items_key: items,
         "requested_limit": requested,
         "effective_limit": effective,
         "limit_clamped": true,
@@ -44,6 +44,30 @@ fn add_list_limit_metadata(response: &mut Value, requested: u32, effective: u32)
     response["requested_limit"] = serde_json::json!(requested);
     response["effective_limit"] = serde_json::json!(effective);
     response["limit_clamped"] = serde_json::json!(true);
+}
+
+/// Wraps a bounded-scan list response with `scan_incomplete: true` when the
+/// scan hit its ceiling before exhausting all matching rows. `render_list_response`
+/// returns a bare array when the requested limit was not clamped, so this
+/// object-ifies the response (under `items_key`) whenever disclosure is needed.
+fn apply_scan_incomplete(
+    response: Value,
+    scan_incomplete: bool,
+    items_key: &str,
+    requested: u32,
+    effective: u32,
+) -> Value {
+    if !scan_incomplete {
+        return response;
+    }
+    let mut response = if response.is_object() {
+        response
+    } else {
+        serde_json::json!({ items_key: response })
+    };
+    response["scan_incomplete"] = Value::Bool(true);
+    add_list_limit_metadata(&mut response, requested, effective);
+    response
 }
 
 fn parse_after_cursor(raw: &str) -> Result<Option<uuid::Uuid>, RuntimeError> {
@@ -376,6 +400,7 @@ impl KgPack {
                 };
                 Ok(render_list_response(
                     normalize_entity_timestamps_array(to_json(&entities)?),
+                    "items",
                     requested,
                     limit,
                 ))
@@ -425,7 +450,12 @@ impl KgPack {
                         .runtime
                         .list_edges(token, filter, limit, offset)
                         .await?;
-                    Ok(render_list_response(to_json(&edges)?, requested, limit))
+                    Ok(render_list_response(
+                        to_json(&edges)?,
+                        "items",
+                        requested,
+                        limit,
+                    ))
                 }
             }
             KindSpec::Note { specific } => {
@@ -544,6 +574,7 @@ impl KgPack {
                 }
 
                 let offset = p.offset.unwrap_or(0);
+                let mut scan_incomplete = false;
                 let notes: Vec<_> = if has_msg_filter {
                     let mut collected: Vec<_> = Vec::new();
                     let mut db_offset: u32 = 0;
@@ -552,6 +583,7 @@ impl KgPack {
                         let remaining_scan =
                             MAX_SCAN_TOTAL.saturating_sub(db_offset).min(PAGE_SIZE);
                         if remaining_scan == 0 {
+                            scan_incomplete = true;
                             break;
                         }
                         let page = self
@@ -606,7 +638,14 @@ impl KgPack {
                         })
                         .collect()
                 };
-                Ok(render_list_response(to_json(&remapped)?, requested, limit))
+                let response = render_list_response(to_json(&remapped)?, "notes", requested, limit);
+                Ok(apply_scan_incomplete(
+                    response,
+                    scan_incomplete,
+                    "notes",
+                    requested,
+                    limit,
+                ))
             }
             KindSpec::Proposal => unreachable!("kind=proposal fast-pathed before deser"),
             KindSpec::Event => {
@@ -621,6 +660,7 @@ impl KgPack {
                 let offset = p.offset.unwrap_or(0);
                 let (filter, outcome) = event_filter_from_params(&p)?;
 
+                let mut scan_incomplete = false;
                 let items = if let Some(wanted_outcome) = outcome {
                     let mut items = Vec::new();
                     let mut skipped = 0u32;
@@ -630,6 +670,7 @@ impl KgPack {
                     while (items.len() as u32) < limit {
                         let remaining = scan_ceiling.saturating_sub(raw_offset);
                         if remaining == 0 {
+                            scan_incomplete = true;
                             break;
                         }
                         let batch_size = 100u32.min(remaining);
@@ -684,8 +725,16 @@ impl KgPack {
                         .await?;
                     page.items
                 };
-                Ok(render_list_response(
+                let response = render_list_response(
                     normalize_event_timestamps_array(to_json(&items)?),
+                    "items",
+                    requested,
+                    limit,
+                );
+                Ok(apply_scan_incomplete(
+                    response,
+                    scan_incomplete,
+                    "items",
                     requested,
                     limit,
                 ))

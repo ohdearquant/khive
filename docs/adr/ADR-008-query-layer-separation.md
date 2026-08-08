@@ -152,6 +152,26 @@ pub const MAX_TRAVERSAL_DEPTH: usize = 10;
 
 The compiler rejects queries exceeding this depth at AST validation time.
 
+### Bounded GQL result pages
+
+GQL accepts `SKIP <offset>` before an optional `LIMIT <rows>`. The shared AST stores the
+offset, and the SQL compiler applies it only after a deterministic total order over bound match
+identities. Fixed canonical patterns order by substrate discriminators and UUIDs for every node
+and edge; synthetic observation edges use their `(event_id, role, position)` primary key.
+Recursive patterns use `DISTINCT`, so they order by depth, weight, and every projected output
+alias—a total tuple over the rows that survive projection. This makes pages repeatable while the
+matched graph is unchanged without exposing caller-defined ordering in the query dialect.
+
+The query verb supplies a bounded `page_size` (minimum 1, default 500, hard cap 10,000). Query-text
+`LIMIT` and `page_size` compose as the smaller payload bound. When the server page size binds,
+compilation fetches one sentinel row; runtime removes it and returns `has_more`, compatibility
+`truncated`, and a GQL `next_offset` equal to the requested offset plus emitted rows. An explicit
+query `LIMIT` at or below the page size remains a terminal caller-selected bound.
+
+SPARQL `OFFSET` is intentionally not added by this decision. Its parser continues to populate a
+zero AST offset; adding SPARQL paging requires its own frontend contract rather than inheriting GQL
+syntax through the shared AST.
+
 ### GQL WHERE expression
 
 GQL `WHERE` clauses support `AND` and `OR` expression nodes plus `=`, `!=`, `>`, `<`,
@@ -238,16 +258,29 @@ namespace enforcement) that lives in the runtime (ADR-003). If the query compile
 generate writes, it would need access to the EntityTypeRegistry and endpoint validator —
 violating the separation between syntax compilation and semantic validation.
 
+### Why bounded `SKIP` instead of an opaque cursor or aggregates?
+
+`SKIP` extends the existing GQL window syntax and composes directly with the compiler's
+sentinel-based page bound. It works for every currently supported projection without server-side
+cursor state or a public cursor encoding tied to multi-substrate identities. Server-side
+aggregates answer count questions but cannot retrieve the omitted rows, while `COUNT`/`GROUP BY`
+would require a separate expression and grouping model. The compiler-owned identity order is
+deliberately not caller-configurable: it supplies the stable continuation contract without adding
+the much larger `ORDER BY` surface.
+
 ## Alternatives Considered
 
-| Alternative                          | Why rejected                                                                                            |
-| ------------------------------------ | ------------------------------------------------------------------------------------------------------- |
-| Cypher frontend                      | No implementation exists. No concrete use case. GQL covers graph patterns.                              |
-| Cypher output dialect                | No Neo4j backend exists. SQL is the only compilation target.                                            |
-| ATTACH-aware compiler                | Topology is a coordinator concern. Query compiler stays backend-blind.                                  |
-| entity_type via JSON extraction      | Bypasses the dedicated indexed column (ADR-001). Wrong query plan.                                      |
-| Endpoint validation in query layer   | Semantic validation belongs in runtime (ADR-003). Query compiles patterns; runtime validates semantics. |
-| Merge khive-query into khive-request | Different grammars, ASTs, and concerns. Coupling creates unnecessary churn.                             |
+| Alternative                          | Why rejected                                                                                                          |
+| ------------------------------------ | --------------------------------------------------------------------------------------------------------------------- |
+| Cypher frontend                      | No implementation exists. No concrete use case. GQL covers graph patterns.                                            |
+| Cypher output dialect                | No Neo4j backend exists. SQL is the only compilation target.                                                          |
+| ATTACH-aware compiler                | Topology is a coordinator concern. Query compiler stays backend-blind.                                                |
+| entity_type via JSON extraction      | Bypasses the dedicated indexed column (ADR-001). Wrong query plan.                                                    |
+| Endpoint validation in query layer   | Semantic validation belongs in runtime (ADR-003). Query compiles patterns; runtime validates semantics.               |
+| Merge khive-query into khive-request | Different grammars, ASTs, and concerns. Coupling creates unnecessary churn.                                           |
+| Opaque result cursor                 | Requires a versioned encoding across fixed and recursive result identities; defer until deep-offset cost is measured. |
+| Aggregation-only completion          | `COUNT` can audit cardinality but cannot retrieve the missing rows and requires a new expression/grouping model.      |
+| Caller-defined `ORDER BY`            | Expands validation and projection semantics; compiler-owned identity order is sufficient for continuation.            |
 
 ## Consequences
 
@@ -258,6 +291,7 @@ violating the separation between syntax compilation and semantic validation.
 - Relation validation is automatic via `EdgeRelation::from_str`.
 - Adding a new relation to `khive-types` requires zero query-crate changes.
 - Read-only constraint prevents query-path bypass of runtime validation.
+- Broad GQL results can be enumerated through the query surface without falling back to `list`.
 
 ### Negative
 
@@ -266,6 +300,11 @@ violating the separation between syntax compilation and semantic validation.
 - Single-database compilation means cross-backend queries require coordinator fan-out
   above the query layer.
   Mitigated: this is the correct architectural boundary per ADR-003.
+- Deterministic ordering can require a SQLite sort, and deep `SKIP` pages retain offset-scan cost.
+  Mitigated: page payloads remain hard-capped, and a cursor design is deferred until measurements
+  show offset cost warrants its additional public contract.
+- Offset pages are repeatable only while matching data is unchanged; they are not a cross-call
+  database snapshot. Callers requiring a point-in-time audit must prevent concurrent mutation.
 
 ### Neutral
 
@@ -276,8 +315,13 @@ violating the separation between syntax compilation and semantic validation.
 
 - `crates/khive-query/src/parsers/gql.rs`: GQL parser.
 - `crates/khive-query/src/parsers/sparql.rs`: SPARQL parser.
-- `crates/khive-query/src/ast.rs`: shared AST with `NodePattern.entity_type` field.
+- `crates/khive-query/src/ast.rs`: shared AST with `NodePattern.entity_type` and
+  `GqlQuery.offset` fields.
 - `crates/khive-query/src/validate.rs`: AST validation (relation via `EdgeRelation::from_str`,
   depth limits).
 - `crates/khive-query/src/compilers/sql.rs`: AST → SQL compilation. `entity_type` maps to
-  column predicate.
+  a column predicate; deterministic identity ordering precedes bound `LIMIT`/`OFFSET`.
+- `crates/khive-runtime/src/operations.rs`: sentinel removal and structured continuation
+  metadata.
+- `crates/khive-pack-kg/src/handlers/graph.rs`: public page-size validation and hard-cap
+  enforcement.

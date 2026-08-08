@@ -9,6 +9,7 @@ use std::fmt;
 use async_trait::async_trait;
 use uuid::Uuid;
 
+use khive_pack_kg::handlers::ValidatedSearchRequest;
 use khive_runtime::Namespace;
 use khive_runtime::{BackendId, NoteSearchHit, SearchHit};
 use khive_storage::{Edge, EdgeRelation};
@@ -87,6 +88,18 @@ pub struct CoordSearchResult {
     /// Kind string for each note hit, keyed by note UUID.
     /// Populated by the coordinator after the RRF merge.
     pub note_kinds: std::collections::HashMap<uuid::Uuid, String>,
+    /// `created_at` (micros) for each entity hit, keyed by entity UUID —
+    /// row-shape parity with the KG pack's single-backend search serializer
+    /// (`crates/khive-pack-kg/src/handlers/search.rs`). Populated alongside
+    /// `entity_kinds`; missing entries follow the same resolution rule.
+    pub entity_created_at: std::collections::HashMap<uuid::Uuid, i64>,
+    /// `created_at` (micros) for each note hit, keyed by note UUID. Same
+    /// parity purpose and resolution rule as `entity_created_at`.
+    pub note_created_at: std::collections::HashMap<uuid::Uuid, i64>,
+    /// Stored `name` for each note hit, keyed by note UUID — distinct from
+    /// `title` (the search-hit display title). Same parity purpose and
+    /// resolution rule as `entity_created_at`.
+    pub note_names: std::collections::HashMap<uuid::Uuid, Option<String>>,
 }
 
 /// Cross-backend coordinator seam visible to `khive-mcp`.
@@ -125,32 +138,23 @@ pub trait CoordinatorService: Send + Sync {
 
     /// Fan-out search across all registered backends (D4).
     ///
-    /// `kind` controls which substrate to search:
-    /// - `"entity"` or any granular entity kind → entity fan-out via `hybrid_search`
-    /// - `"note"` or any granular note kind → note fan-out via `search_notes`
+    /// `request` is the KG handler's canonical validated search contract. It
+    /// carries the resolved substrate plus every supported filter, so this
+    /// boundary cannot silently narrow the public wire shape.
     ///
-    /// `kind_filter` is the granular kind to pass as a storage-level filter
-    /// (`entity_kind` for entity substrate, `note_kind` for note substrate).
-    /// Pass `None` for substrate-level (`kind="entity"` or `kind="note"`) searches.
-    ///
-    /// `props_filter` and `tags` are entity-substrate filters forwarded to each
-    /// backend's `hybrid_search`. When either is active the per-backend candidate
-    /// window is widened so that sparse matches ranked below the bare `limit` are
-    /// not cut off before filtering (mirrors the single-backend handler).
-    /// Both are ignored for note-substrate searches.
-    ///
-    /// Granular kinds that cannot be resolved to a substrate fall through to the
-    /// registry (single-backend path); the coordinator does not silently drop results.
-    #[allow(clippy::too_many_arguments)]
+    /// `extra_visible` is the caller's resolved extra read-visibility
+    /// namespaces beyond `namespace` itself (MAJ-3 fix) — the same
+    /// `['local'] ∪ visible_namespaces` set the normal registry dispatch path
+    /// authorizes with, or empty when the caller named an explicit
+    /// `namespace=` (which intentionally narrows visibility). Implementations
+    /// must authorize each backend's search token with this widened set
+    /// rather than `namespace` alone, or a namespace visible only through
+    /// `visible_namespaces` silently drops out of coordinator search results.
     async fn fan_out_search(
         &self,
-        kind: &str,
-        query: &str,
+        request: &ValidatedSearchRequest,
         namespace: &Namespace,
-        limit: u32,
-        kind_filter: Option<&str>,
-        props_filter: Option<&serde_json::Value>,
-        tags: &[String],
+        extra_visible: &[Namespace],
     ) -> CoordSearchResult;
 
     /// True when only one backend is registered (zero-change invariant check).
@@ -160,7 +164,9 @@ pub trait CoordinatorService: Send + Sync {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use khive_pack_kg::handlers::SearchSubstrate;
     use khive_runtime::{NoteSearchHit, SearchHit, SearchSource};
+    use serde_json::{json, Value};
     use std::sync::Arc;
 
     /// Minimal mock for server-routing tests (T6 in the test plan).
@@ -168,8 +174,18 @@ pub(crate) mod tests {
         pub link_called: std::sync::atomic::AtomicBool,
         pub search_called: std::sync::atomic::AtomicBool,
         pub single_backend: bool,
+        pub failed_backend: Option<BackendId>,
+        /// When `true`, `fan_out_search` returns zero hits regardless of
+        /// substrate — used to construct the "complete-empty" (healthy, no
+        /// match) and "degraded-empty" (backend failed, no survivor)
+        /// envelope fixtures (ADR-130 §1 regression coverage).
+        pub empty_hits: bool,
+        pub last_search_request: std::sync::Mutex<Option<ValidatedSearchRequest>>,
         /// The `limit` value `fan_out_search` was last called with (MCP-AUD-003).
         pub last_limit: std::sync::atomic::AtomicU32,
+        /// The `extra_visible` slice `fan_out_search` was last called with
+        /// (MAJ-3 visibility-scope regression coverage).
+        pub last_extra_visible: std::sync::Mutex<Vec<Namespace>>,
     }
 
     impl MockCoordinator {
@@ -178,7 +194,55 @@ pub(crate) mod tests {
                 link_called: std::sync::atomic::AtomicBool::new(false),
                 search_called: std::sync::atomic::AtomicBool::new(false),
                 single_backend: false,
+                failed_backend: None,
+                empty_hits: false,
+                last_search_request: std::sync::Mutex::new(None),
                 last_limit: std::sync::atomic::AtomicU32::new(0),
+                last_extra_visible: std::sync::Mutex::new(Vec::new()),
+            })
+        }
+
+        /// Healthy (no backend failure), but the merged result set is empty —
+        /// a genuine no-match. Pairs with `degraded_empty_multi_backend` to
+        /// distinguish "complete-empty" from "degraded-empty" (ADR-130 §1).
+        pub fn empty_multi_backend() -> Arc<Self> {
+            Arc::new(Self {
+                link_called: std::sync::atomic::AtomicBool::new(false),
+                search_called: std::sync::atomic::AtomicBool::new(false),
+                single_backend: false,
+                failed_backend: None,
+                empty_hits: true,
+                last_search_request: std::sync::Mutex::new(None),
+                last_limit: std::sync::atomic::AtomicU32::new(0),
+                last_extra_visible: std::sync::Mutex::new(Vec::new()),
+            })
+        }
+
+        pub fn degraded_multi_backend(failed_backend: &str) -> Arc<Self> {
+            Arc::new(Self {
+                link_called: std::sync::atomic::AtomicBool::new(false),
+                search_called: std::sync::atomic::AtomicBool::new(false),
+                single_backend: false,
+                failed_backend: Some(BackendId::new(failed_backend)),
+                empty_hits: false,
+                last_search_request: std::sync::Mutex::new(None),
+                last_limit: std::sync::atomic::AtomicU32::new(0),
+                last_extra_visible: std::sync::Mutex::new(Vec::new()),
+            })
+        }
+
+        /// A backend failed AND no hit survives — the `search_incomplete`
+        /// fixture (ADR-130 §1).
+        pub fn degraded_empty_multi_backend(failed_backend: &str) -> Arc<Self> {
+            Arc::new(Self {
+                link_called: std::sync::atomic::AtomicBool::new(false),
+                search_called: std::sync::atomic::AtomicBool::new(false),
+                single_backend: false,
+                failed_backend: Some(BackendId::new(failed_backend)),
+                empty_hits: true,
+                last_search_request: std::sync::Mutex::new(None),
+                last_limit: std::sync::atomic::AtomicU32::new(0),
+                last_extra_visible: std::sync::Mutex::new(Vec::new()),
             })
         }
 
@@ -187,7 +251,11 @@ pub(crate) mod tests {
                 link_called: std::sync::atomic::AtomicBool::new(false),
                 search_called: std::sync::atomic::AtomicBool::new(false),
                 single_backend: true,
+                failed_backend: None,
+                empty_hits: false,
+                last_search_request: std::sync::Mutex::new(None),
                 last_limit: std::sync::atomic::AtomicU32::new(0),
+                last_extra_visible: std::sync::Mutex::new(Vec::new()),
             })
         }
     }
@@ -220,22 +288,20 @@ pub(crate) mod tests {
 
         async fn fan_out_search(
             &self,
-            kind: &str,
-            _query: &str,
+            request: &ValidatedSearchRequest,
             _namespace: &Namespace,
-            limit: u32,
-            _kind_filter: Option<&str>,
-            _props_filter: Option<&serde_json::Value>,
-            _tags: &[String],
+            extra_visible: &[Namespace],
         ) -> CoordSearchResult {
             self.search_called
                 .store(true, std::sync::atomic::Ordering::SeqCst);
             self.last_limit
-                .store(limit, std::sync::atomic::Ordering::SeqCst);
+                .store(request.limit(), std::sync::atomic::Ordering::SeqCst);
+            *self.last_search_request.lock().unwrap() = Some(request.clone());
+            *self.last_extra_visible.lock().unwrap() = extra_visible.to_vec();
             let id = Uuid::from_u128(1);
-            let is_note = kind == "note";
+            let is_note = request.substrate() == SearchSubstrate::Note;
             CoordSearchResult {
-                entity_hits: if is_note {
+                entity_hits: if is_note || self.empty_hits {
                     vec![]
                 } else {
                     vec![SearchHit {
@@ -246,7 +312,7 @@ pub(crate) mod tests {
                         snippet: None,
                     }]
                 },
-                note_hits: if is_note {
+                note_hits: if is_note && !self.empty_hits {
                     vec![NoteSearchHit {
                         note_id: id,
                         score: Default::default(),
@@ -257,10 +323,26 @@ pub(crate) mod tests {
                 } else {
                     vec![]
                 },
-                per_backend: vec![],
-                partial: false,
+                per_backend: self
+                    .failed_backend
+                    .iter()
+                    .cloned()
+                    .map(|backend_id| BackendSearchResult {
+                        backend_id,
+                        entity_hits: vec![],
+                        note_hits: vec![],
+                        error: Some("injected search failure".to_string()),
+                    })
+                    .collect(),
+                partial: self.failed_backend.is_some(),
                 entity_kinds: std::collections::HashMap::from([(id, "concept".to_string())]),
                 note_kinds: std::collections::HashMap::from([(id, "observation".to_string())]),
+                entity_created_at: std::collections::HashMap::from([(id, 1_700_000_000_000_000)]),
+                note_created_at: std::collections::HashMap::from([(id, 1_700_000_000_000_000)]),
+                note_names: std::collections::HashMap::from([(
+                    id,
+                    Some("note result".to_string()),
+                )]),
             }
         }
 
@@ -430,6 +512,289 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn multi_backend_search_forwards_the_complete_validated_filter_contract() {
+        let (registry, _runtime) = make_registry();
+        let coord = MockCoordinator::multi_backend();
+        let server = KhiveMcpServer::from_registry_with_meta(registry, "local", "test-cfg")
+            .with_coordinator(Arc::clone(&coord) as Arc<dyn CoordinatorService>);
+
+        for (ops, expected_substrate) in [
+            (
+                r#"search(kind="concept", query="typed entity", limit=4, entity_kind="concept", entity_type="theorem", properties={"tier":"hot"}, tags=["reviewed"], min_score=0.25)"#,
+                SearchSubstrate::Entity,
+            ),
+            (
+                r#"search(kind="observation", query="typed note", limit=5, note_kind="observation", include_superseded=true, properties={"status":"open"}, tags=["urgent"], min_score=0.5)"#,
+                SearchSubstrate::Note,
+            ),
+        ] {
+            server
+                .dispatch_request_local(RequestParams {
+                    ops: ops.to_string(),
+                    presentation: None,
+                    presentation_per_op: None,
+                    save_to: None,
+                    format: None,
+                    format_per_op: None,
+                    request_id: None,
+                })
+                .await
+                .expect("validated search must dispatch");
+
+            let captured = coord
+                .last_search_request
+                .lock()
+                .unwrap()
+                .clone()
+                .expect("coordinator must receive a validated request");
+            assert_eq!(captured.substrate(), expected_substrate);
+            match expected_substrate {
+                SearchSubstrate::Entity => {
+                    assert_eq!(captured.query(), "typed entity");
+                    assert_eq!(captured.limit(), 4);
+                    assert_eq!(captured.kind_filter(), Some("concept"));
+                    assert_eq!(captured.entity_type(), Some("theorem"));
+                    assert!(!captured.include_superseded());
+                    assert_eq!(captured.properties(), Some(&json!({"tier": "hot"})));
+                    assert_eq!(captured.tags(), &["reviewed".to_string()]);
+                    assert_eq!(captured.min_score(), 0.25);
+                }
+                SearchSubstrate::Note => {
+                    assert_eq!(captured.query(), "typed note");
+                    assert_eq!(captured.limit(), 5);
+                    assert_eq!(captured.kind_filter(), Some("observation"));
+                    assert_eq!(captured.entity_type(), None);
+                    assert!(captured.include_superseded());
+                    assert_eq!(captured.properties(), Some(&json!({"status": "open"})));
+                    assert_eq!(captured.tags(), &["urgent".to_string()]);
+                    assert_eq!(captured.min_score(), 0.5);
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn multi_backend_search_rejects_filters_for_the_wrong_substrate() {
+        for ops in [
+            r#"search(kind="entity", query="x", note_kind="observation")"#,
+            r#"search(kind="entity", query="x", include_superseded=true)"#,
+            r#"search(kind="note", query="x", entity_kind="concept")"#,
+            r#"search(kind="note", query="x", entity_type="theorem")"#,
+        ] {
+            let (registry, _runtime) = make_registry();
+            let coord = MockCoordinator::multi_backend();
+            let server = KhiveMcpServer::from_registry_with_meta(registry, "local", "test-cfg")
+                .with_coordinator(Arc::clone(&coord) as Arc<dyn CoordinatorService>);
+            let raw = server
+                .dispatch_request_local(RequestParams {
+                    ops: ops.to_string(),
+                    presentation: None,
+                    presentation_per_op: None,
+                    save_to: None,
+                    format: None,
+                    format_per_op: None,
+                    request_id: None,
+                })
+                .await
+                .expect("validation failures are per-op errors");
+            let response: Value = serde_json::from_str(&raw).expect("JSON response");
+            let entry = &response["results"][0];
+            assert_eq!(entry["ok"], json!(false), "unexpected response: {entry}");
+            assert!(
+                entry["error"]
+                    .to_string()
+                    .contains("only valid when kind resolves"),
+                "error must explain the substrate mismatch: {entry}"
+            );
+            assert!(!coord
+                .search_called
+                .load(std::sync::atomic::Ordering::SeqCst));
+        }
+    }
+
+    #[tokio::test]
+    async fn degraded_search_advisory_survives_single_batch_chain_and_presentation() {
+        let cases = [
+            (r#"search(kind="note", query="x")"#, None),
+            (r#"[search(kind="entity", query="x"), stats()]"#, None),
+            (r#"search(kind="entity", query="x") | stats()"#, None),
+            (r#"search(kind="entity", query="x")"#, Some("human")),
+        ];
+
+        for (ops, presentation) in cases {
+            let (registry, _runtime) = make_registry();
+            let coord = MockCoordinator::degraded_multi_backend("archive");
+            let server = KhiveMcpServer::from_registry_with_meta(registry, "local", "test-cfg")
+                .with_coordinator(Arc::clone(&coord) as Arc<dyn CoordinatorService>);
+            let raw = server
+                .dispatch_request_local(RequestParams {
+                    ops: ops.to_string(),
+                    presentation: presentation.map(str::to_string),
+                    presentation_per_op: None,
+                    save_to: None,
+                    format: None,
+                    format_per_op: None,
+                    request_id: None,
+                })
+                .await
+                .expect("degraded search still returns successful partial data");
+            let response: Value = serde_json::from_str(&raw).expect("JSON response");
+            let search = &response["results"][0];
+            assert_eq!(search["ok"], json!(true), "unexpected response: {search}");
+            assert!(search["result"].is_array());
+            assert_eq!(
+                search["status"],
+                json!("partial"),
+                "unexpected response: {search}"
+            );
+            assert_eq!(search["partial"], json!(true));
+            assert_eq!(search["missing_backends"], json!(["archive"]));
+            assert_eq!(response["status"], json!("success"));
+        }
+    }
+
+    /// ADR-130 §1 completeness contract, complete-empty case: a healthy
+    /// (no backend failure) search with zero merged hits is a genuine
+    /// no-match — `ok: true`, `status: "complete"`, empty `result`.
+    #[tokio::test]
+    async fn search_complete_empty_reports_status_complete_and_stays_ok() {
+        let (registry, _runtime) = make_registry();
+        let coord = MockCoordinator::empty_multi_backend();
+        let server = KhiveMcpServer::from_registry_with_meta(registry, "local", "test-cfg")
+            .with_coordinator(Arc::clone(&coord) as Arc<dyn CoordinatorService>);
+
+        let raw = server
+            .dispatch_request_local(RequestParams {
+                ops: r#"search(kind="entity", query="nothing matches")"#.to_string(),
+                presentation: None,
+                presentation_per_op: None,
+                save_to: None,
+                format: None,
+                format_per_op: None,
+                request_id: None,
+            })
+            .await
+            .expect("a clean no-match is still a successful dispatch");
+        let response: Value = serde_json::from_str(&raw).expect("JSON response");
+        let search = &response["results"][0];
+        assert_eq!(search["ok"], json!(true), "unexpected response: {search}");
+        assert_eq!(search["status"], json!("complete"));
+        assert_eq!(search["result"], json!([]));
+        assert!(search.get("partial").is_none());
+        assert!(search.get("missing_backends").is_none());
+    }
+
+    /// ADR-130 §1 completeness contract, degraded-empty case: a backend
+    /// failed and nothing survived — the operation must fail outright with
+    /// `error.kind: "search_incomplete"`, never a successful empty result.
+    #[tokio::test]
+    async fn search_degraded_empty_returns_search_incomplete_error() {
+        let (registry, _runtime) = make_registry();
+        let coord = MockCoordinator::degraded_empty_multi_backend("archive");
+        let server = KhiveMcpServer::from_registry_with_meta(registry, "local", "test-cfg")
+            .with_coordinator(Arc::clone(&coord) as Arc<dyn CoordinatorService>);
+
+        let raw = server
+            .dispatch_request_local(RequestParams {
+                ops: r#"search(kind="entity", query="degraded")"#.to_string(),
+                presentation: None,
+                presentation_per_op: None,
+                save_to: None,
+                format: None,
+                format_per_op: None,
+                request_id: None,
+            })
+            .await
+            .expect("dispatch itself succeeds; the per-op entry carries ok:false");
+        let response: Value = serde_json::from_str(&raw).expect("JSON response");
+        let search = &response["results"][0];
+        assert_eq!(search["ok"], json!(false), "unexpected response: {search}");
+        assert!(
+            search.get("result").is_none(),
+            "unexpected response: {search}"
+        );
+        assert_eq!(search["error"]["kind"], json!("search_incomplete"));
+        assert_eq!(search["error"]["retryable"], json!(false));
+        assert_eq!(search["error"]["missing_backends"], json!(["archive"]));
+        assert!(search["error"]["message"].as_str().is_some());
+    }
+
+    /// ADR-130 §1, post-filter-empty case: pre-filter fusion found a hit, but
+    /// `min_score` removed it — completeness is judged AFTER filtering, so
+    /// this is also `search_incomplete`, not a successful empty result.
+    #[tokio::test]
+    async fn search_degraded_hit_removed_by_min_score_returns_search_incomplete() {
+        let (registry, _runtime) = make_registry();
+        // `degraded_multi_backend` returns one hit with score 0.0 (Default).
+        let coord = MockCoordinator::degraded_multi_backend("archive");
+        let server = KhiveMcpServer::from_registry_with_meta(registry, "local", "test-cfg")
+            .with_coordinator(Arc::clone(&coord) as Arc<dyn CoordinatorService>);
+
+        let raw = server
+            .dispatch_request_local(RequestParams {
+                ops: r#"search(kind="entity", query="degraded", min_score=0.5)"#.to_string(),
+                presentation: None,
+                presentation_per_op: None,
+                save_to: None,
+                format: None,
+                format_per_op: None,
+                request_id: None,
+            })
+            .await
+            .expect("dispatch itself succeeds; the per-op entry carries ok:false");
+        let response: Value = serde_json::from_str(&raw).expect("JSON response");
+        let search = &response["results"][0];
+        assert_eq!(search["ok"], json!(false), "unexpected response: {search}");
+        assert_eq!(search["error"]["kind"], json!("search_incomplete"));
+        assert_eq!(search["error"]["missing_backends"], json!(["archive"]));
+    }
+
+    /// MIN-1: the coordinator's serialized entity/note rows must carry the
+    /// same canonical fields as the KG pack's single-backend search handler
+    /// (`crates/khive-pack-kg/src/handlers/search.rs`) — `kind` (duplicating
+    /// entity_kind/note_kind), `name`, and `created_at` — not just the
+    /// compatibility subset.
+    #[tokio::test]
+    async fn multi_backend_search_rows_carry_kg_handler_row_shape_parity() {
+        for (kind, kind_field) in [("entity", "entity_kind"), ("note", "note_kind")] {
+            let (registry, _runtime) = make_registry();
+            let coord = MockCoordinator::multi_backend();
+            let server = KhiveMcpServer::from_registry_with_meta(registry, "local", "test-cfg")
+                .with_coordinator(Arc::clone(&coord) as Arc<dyn CoordinatorService>);
+
+            let raw = server
+                .dispatch_request_local(RequestParams {
+                    ops: format!(r#"search(kind="{kind}", query="anything")"#),
+                    presentation: None,
+                    presentation_per_op: None,
+                    save_to: None,
+                    format: None,
+                    format_per_op: None,
+                    request_id: None,
+                })
+                .await
+                .expect("search dispatch must succeed");
+            let response: Value = serde_json::from_str(&raw).expect("response must be valid JSON");
+            let hit = &response["results"][0]["result"][0];
+
+            assert!(
+                hit.get("id").and_then(Value::as_str).is_some(),
+                "{kind}: {hit}"
+            );
+            assert!(
+                hit.get("kind").and_then(Value::as_str).is_some(),
+                "{kind}: {hit}"
+            );
+            assert_eq!(hit["kind"], hit[kind_field], "{kind}: {hit}");
+            assert!(hit.get("name").is_some(), "{kind}: missing name: {hit}");
+            assert!(
+                hit.get("created_at").and_then(Value::as_str).is_some(),
+                "{kind}: missing created_at: {hit}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn coordinator_and_registry_routes_submit_equivalent_link_and_search_gate_requests() {
         let direct_gate = Arc::new(CapturingGate::default());
         let coordinator_gate = Arc::new(CapturingGate::default());
@@ -510,17 +875,18 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn coordinator_route_persists_denied_gate_audit() {
+    async fn coordinator_route_gates_and_audits_before_search_filter_validation() {
         let gate = Arc::new(CapturingGate::denying());
         let (registry, runtime) = make_registry_with_gate(Arc::clone(&gate) as GateRef);
         let coord = MockCoordinator::multi_backend();
         let server = KhiveMcpServer::from_registry_with_meta(registry, "local", "test-cfg")
             .with_coordinator(Arc::clone(&coord) as Arc<dyn CoordinatorService>);
 
-        server
+        let raw = server
             .dispatch_request_local(RequestParams {
-                ops: r#"search(kind="entity", query="gate parity", namespace="tenant-a")"#
-                    .to_string(),
+                // `note_kind` is invalid for an entity search. Denial must win
+                // before the intercepted handler validates that filter.
+                ops: r#"search(kind="entity", query="gate parity", note_kind="observation", namespace="tenant-a")"#.to_string(),
                 presentation: None,
                 presentation_per_op: None,
                 save_to: None,
@@ -530,6 +896,13 @@ pub(crate) mod tests {
             })
             .await
             .expect("dispatch returns a denied per-operation result");
+        let response: Value = serde_json::from_str(&raw).expect("JSON response");
+        let error = response["results"][0]["error"].to_string();
+        assert!(
+            error.contains("denied by coordinator parity test"),
+            "gate denial must precede handler validation: {response}"
+        );
+        assert!(!error.contains("note_kind"));
 
         assert_eq!(
             gate.requests
@@ -572,13 +945,16 @@ pub(crate) mod tests {
                 .expect("search dispatch must succeed");
             let response: serde_json::Value =
                 serde_json::from_str(&raw).expect("response must be valid JSON");
-            let hit = &response["results"][0]["result"][0];
+            let entry = &response["results"][0];
+            let hit = &entry["result"][0];
 
             assert_eq!(
                 hit.get("source").and_then(serde_json::Value::as_str),
                 Some(expected_source),
                 "{kind} hit must expose its retrieval source; got: {hit}"
             );
+            assert!(entry.get("partial").is_none());
+            assert!(entry.get("missing_backends").is_none());
         }
     }
 

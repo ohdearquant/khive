@@ -1392,11 +1392,19 @@ async fn graph_traverse_read_span_scoped_to_secondary_backend_visible_only_in_it
         khive_storage::tx_registry::TxOriginFilter::Secondary(secondary_identity.clone());
     let main_view = khive_storage::tx_registry::TxOriginFilter::Main(other_identity);
 
-    let span = khive_storage::tx_registry::oldest_for(&secondary_view)
-        .expect("statement-scoped traversal span must be visible while its seam is held");
-    assert_eq!(span.label.as_deref(), Some("graph_traverse_read"));
+    // Ask about the traversal span by label rather than through `oldest_for`.
+    // Writes on this same pool open their own `writer_task_tx` spans, and the
+    // writer task replies to its caller *before* dropping that handle, so an
+    // acknowledged write can still hold an open span on this backend. Such a
+    // span is unrelated to what this test asserts, but it is older than the
+    // traversal's, so `oldest_for` returns it and the assertion reads a
+    // different span's lifetime as the traversal's.
     assert!(
-        khive_storage::tx_registry::oldest_for(&main_view).is_none(),
+        khive_storage::tx_registry::any_open_labeled(&secondary_view, "graph_traverse_read"),
+        "statement-scoped traversal span must be visible while its seam is held"
+    );
+    assert!(
+        !khive_storage::tx_registry::any_open_labeled(&main_view, "graph_traverse_read"),
         "a secondary-origin graph_traverse_read span must never be visible through a different backend's Main view"
     );
 
@@ -1414,7 +1422,7 @@ async fn graph_traverse_read_span_scoped_to_secondary_backend_visible_only_in_it
         .expect("the next frontier statement must see the concurrent commit");
     assert_eq!(grandchild_node.depth, 2);
     assert!(
-        khive_storage::tx_registry::oldest_for(&secondary_view).is_none(),
+        !khive_storage::tx_registry::any_open_labeled(&secondary_view, "graph_traverse_read"),
         "the statement-scoped traversal span must be gone when its bounded query returns"
     );
 }
@@ -2719,7 +2727,7 @@ async fn traverse_work_budget_boundary_and_error_are_deterministic() {
     }
     assert_eq!(ctx.snapshot()["graph_hops"], 4);
     assert!(
-        khive_storage::tx_registry::oldest_for(&origin_view).is_none(),
+        !khive_storage::tx_registry::any_open_labeled(&origin_view, "graph_traverse_read"),
         "an over-budget return must drop its statement-scoped registry span"
     );
 }
@@ -2785,7 +2793,7 @@ async fn traverse_progress_handler_interrupts_statement_and_is_cleared() {
         "the test must enter SQLite's VM progress callback"
     );
     assert!(
-        khive_storage::tx_registry::oldest_for(&origin_view).is_none(),
+        !khive_storage::tx_registry::any_open_labeled(&origin_view, "graph_traverse_read"),
         "the interrupted statement must drop its graph_traverse_read span"
     );
 
@@ -3366,6 +3374,135 @@ async fn page_offset_over_i64max_rejected() {
         matches!(result, Err(StorageError::InvalidInput { .. })),
         "expected InvalidInput, got {result:?}"
     );
+}
+
+/// #1671: offset pages over edges whose primary sort key (`created_at`)
+/// repeats must form a deterministic total order — a full paged sweep returns
+/// every edge exactly once (no duplicates, no misses across page boundaries).
+#[tokio::test]
+async fn query_edges_offset_sweep_covers_equal_created_at_exactly_once() {
+    let store = setup_memory_store();
+    let created_at = DateTime::from_timestamp_micros(1_750_000_000_000_000).unwrap();
+    let mut expected_ids = Vec::new();
+    let mut edges = Vec::new();
+    for _ in 0..211 {
+        let mut edge = make_edge(Uuid::new_v4(), Uuid::new_v4(), EdgeRelation::Extends, 1.0);
+        edge.created_at = created_at;
+        expected_ids.push(edge.id);
+        edges.push(edge);
+    }
+    expected_ids.sort_unstable_by(|a, b| Uuid::from(*b).cmp(&Uuid::from(*a)));
+    store.upsert_edges(edges).await.unwrap();
+
+    // Default order (created_at DESC) — the empty-sort path.
+    let mut actual_ids = Vec::new();
+    let page_size = 37_u32;
+    let mut offset = 0_u64;
+    loop {
+        let page = store
+            .query_edges(
+                EdgeFilter::default(),
+                vec![],
+                PageRequest {
+                    offset,
+                    limit: page_size,
+                },
+            )
+            .await
+            .unwrap();
+        if page.items.is_empty() {
+            break;
+        }
+        offset += page.items.len() as u64;
+        actual_ids.extend(page.items.into_iter().map(|edge| edge.id));
+    }
+    assert_eq!(
+        actual_ids, expected_ids,
+        "default-order sweep must cover every edge exactly once"
+    );
+
+    // Explicit ASC primary sort — tiebreak direction follows the primary key.
+    let mut asc_ids = Vec::new();
+    let mut offset = 0_u64;
+    loop {
+        let page = store
+            .query_edges(
+                EdgeFilter::default(),
+                vec![SortOrder {
+                    field: EdgeSortField::CreatedAt,
+                    direction: SortDirection::Asc,
+                }],
+                PageRequest {
+                    offset,
+                    limit: page_size,
+                },
+            )
+            .await
+            .unwrap();
+        if page.items.is_empty() {
+            break;
+        }
+        offset += page.items.len() as u64;
+        asc_ids.extend(page.items.into_iter().map(|edge| edge.id));
+    }
+    let mut expected_asc = expected_ids.clone();
+    expected_asc.reverse();
+    assert_eq!(
+        asc_ids, expected_asc,
+        "ASC sweep must cover every edge exactly once in id ASC order"
+    );
+
+    // Multi-field custom sort: every edge has the same created_at and weight
+    // (1.0), so only the appended `id` tiebreak — following the last sort key's
+    // direction — makes these pages a deterministic total order.
+    for (directions, expected) in [
+        (vec![SortDirection::Desc, SortDirection::Asc], {
+            // expected_ids is id DESC; the appended tiebreak follows the last
+            // sort key's direction, so [Desc, Asc] pages in id ASC order.
+            let mut reversed = expected_ids.clone();
+            reversed.reverse();
+            reversed
+        }),
+        (
+            vec![SortDirection::Asc, SortDirection::Desc],
+            expected_ids.clone(),
+        ),
+    ] {
+        let sort = vec![
+            SortOrder {
+                field: EdgeSortField::CreatedAt,
+                direction: directions[0].clone(),
+            },
+            SortOrder {
+                field: EdgeSortField::Weight,
+                direction: directions[1].clone(),
+            },
+        ];
+        let mut actual = Vec::new();
+        let mut offset = 0_u64;
+        loop {
+            let page = store
+                .query_edges(
+                    EdgeFilter::default(),
+                    sort.clone(),
+                    PageRequest {
+                        offset,
+                        limit: page_size,
+                    },
+                )
+                .await
+                .unwrap();
+            if page.items.is_empty() {
+                break;
+            }
+            offset += page.items.len() as u64;
+            actual.extend(page.items.into_iter().map(|edge| edge.id));
+        }
+        assert_eq!(
+            actual, expected,
+            "multi-field sweep with directions {directions:?} must cover every edge exactly once"
+        );
+    }
 }
 
 #[tokio::test]

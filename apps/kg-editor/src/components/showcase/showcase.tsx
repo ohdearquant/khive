@@ -1,0 +1,172 @@
+"use client";
+
+import { ArrowRight, GitBranch, LoaderCircle, Search, ShieldCheck } from "lucide-react";
+import Link from "next/link";
+import { useEffect, useRef, useState, type FormEvent } from "react";
+
+import { RepoShowcase } from "@/components/showcase/repo-showcase";
+import { loadStaticShowcaseBundle } from "@/lib/adapters/static-showcase-source";
+import type { RepoBundle } from "@/lib/repo-bundle";
+import {
+  resolveShowcaseRepository,
+  SHOWCASE_REGISTRY,
+  type ShowcaseRegistryEntry,
+} from "@/lib/showcase-registry";
+
+type LoadState =
+  | Readonly<{ status: "loading"; entry: ShowcaseRegistryEntry }>
+  | Readonly<{ status: "ready"; entry: ShowcaseRegistryEntry; bundle: RepoBundle }>
+  | Readonly<{ status: "miss"; normalizedUrl: string }>
+  | Readonly<{ status: "invalid"; reason: string }>
+  | Readonly<{ status: "error"; reason: string }>;
+
+const bundleCache = new Map<string, Promise<RepoBundle>>();
+
+function loadEntry(entry: ShowcaseRegistryEntry): Promise<RepoBundle> {
+  const existing = bundleCache.get(entry.assetPath);
+  if (existing) return existing;
+  const pending = loadStaticShowcaseBundle(entry).catch((error: unknown) => {
+    bundleCache.delete(entry.assetPath);
+    throw error;
+  });
+  bundleCache.set(entry.assetPath, pending);
+  return pending;
+}
+
+function replaceRepositoryQuery(repository?: string) {
+  const query = new URL(window.location.href);
+  if (repository) query.searchParams.set("repo", repository);
+  else query.searchParams.delete("repo");
+  const search = query.searchParams.size ? `?${query.searchParams.toString()}` : "";
+  window.history.replaceState(null, "", `${query.pathname}${search}${query.hash}`);
+}
+
+export function Showcase() {
+  const defaultEntry = SHOWCASE_REGISTRY[0];
+  const [input, setInput] = useState(defaultEntry.canonicalUrl);
+  const [state, setState] = useState<LoadState>({ status: "loading", entry: defaultEntry });
+  const [labels, setLabels] = useState<RepoBundle["capability"]["labels"] | null>(null);
+  const loadSequence = useRef(0);
+
+  useEffect(() => {
+    const sequence = ++loadSequence.current;
+    void loadEntry(defaultEntry)
+      .then((bundle) => {
+        setLabels(bundle.capability.labels);
+        if (loadSequence.current === sequence) {
+          setState({ status: "ready", entry: defaultEntry, bundle });
+        }
+      })
+      .catch((error: unknown) => {
+        if (loadSequence.current === sequence) {
+          setState({
+            status: "error",
+            reason: error instanceof Error ? error.message : "The showcase bundle could not be loaded.",
+          });
+        }
+      });
+  }, [defaultEntry]);
+
+  function submit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const lookup = resolveShowcaseRepository(input);
+    const sequence = ++loadSequence.current;
+
+    if (lookup.status === "invalid") {
+      replaceRepositoryQuery();
+      setState(lookup);
+      return;
+    }
+    if (lookup.status === "miss") {
+      replaceRepositoryQuery();
+      setState(lookup);
+      return;
+    }
+
+    setState({ status: "loading", entry: lookup.entry });
+    replaceRepositoryQuery(lookup.normalizedUrl);
+    void loadEntry(lookup.entry)
+      .then((bundle) => {
+        if (loadSequence.current === sequence) {
+          setLabels(bundle.capability.labels);
+          setState({ status: "ready", entry: lookup.entry, bundle });
+        }
+      })
+      .catch((error: unknown) => {
+        if (loadSequence.current === sequence) {
+          setState({
+            status: "error",
+            reason: error instanceof Error ? error.message : "The showcase bundle could not be loaded.",
+          });
+        }
+      });
+  }
+
+  return (
+    <div className="repo-shell">
+      <header className="repo-topbar">
+        <Link className="repo-brand" href="/" aria-label="khive repository showcase home">
+          <span className="repo-brand-mark" aria-hidden="true"><i /><i /><i /></span>
+          <strong>khive</strong>
+          <span>{labels?.product}</span>
+        </Link>
+        <nav className="repo-product-nav" aria-label="Product navigation">
+          <Link className="active" href="/"><Search aria-hidden="true" /> {labels?.product ?? "Showcase"}</Link>
+          <Link href="/review"><ShieldCheck aria-hidden="true" /> KG review</Link>
+        </nav>
+        <span className="repo-readonly"><GitBranch aria-hidden="true" /> {state.status === "ready" ? state.bundle.capability.mode : "…"}</span>
+      </header>
+
+      <main>
+        <section className="repo-hero" aria-labelledby="repo-hero-title">
+          <div className="repo-hero-copy">
+            <span className="repo-eyebrow">History meets structure</span>
+            <h1 id="repo-hero-title">See how a repository <em>really</em> moves.</h1>
+            <p>
+              Explore modules, dependencies, change hotspots, hidden coupling, and ownership from
+              one precomputed, reproducible graph bundle.
+            </p>
+          </div>
+          <form className="repo-url-form" onSubmit={submit} noValidate>
+            <label htmlFor="repository-url">Public repository URL</label>
+            <div>
+              <Search aria-hidden="true" />
+              <input
+                id="repository-url"
+                inputMode="url"
+                spellCheck={false}
+                value={input}
+                onChange={(event) => setInput(event.target.value)}
+                placeholder={labels?.input_placeholder ?? "https://github.com/owner/repository"}
+              />
+              <button type="submit">{labels?.lookup_action ?? "…"} <ArrowRight aria-hidden="true" /></button>
+            </div>
+            <small>Slice 1 looks up curated static bundles only. It never clones or queries the URL you enter.</small>
+          </form>
+        </section>
+
+        <div className="repo-result" aria-busy={state.status === "loading"}>
+          {state.status === "loading" && (
+            <div className="repo-state-card loading" role="status">
+              <LoaderCircle aria-hidden="true" />
+              <div><strong>Opening the static showcase bundle</strong><span>No repository process is running.</span></div>
+            </div>
+          )}
+          {state.status === "invalid" && (
+            <div className="repo-state-card warning" role="alert"><Search aria-hidden="true" /><div><strong>{labels?.unavailable ?? "Unavailable"}</strong><span>{state.reason}</span></div></div>
+          )}
+          {state.status === "miss" && (
+            <div className="repo-state-card miss" role="status">
+              <Search aria-hidden="true" />
+              <div><strong>{labels?.miss_title}</strong><span>{labels?.miss_body} · {state.normalizedUrl}</span></div>
+            </div>
+          )}
+          {state.status === "error" && (
+            <div className="repo-state-card warning" role="alert"><ShieldCheck aria-hidden="true" /><div><strong>{labels?.unavailable ?? "Unavailable"}</strong><span>{state.reason}</span></div></div>
+          )}
+          {state.status === "ready" && <RepoShowcase bundle={state.bundle} />}
+        </div>
+      </main>
+    </div>
+  );
+}

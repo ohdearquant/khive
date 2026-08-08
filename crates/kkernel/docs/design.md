@@ -69,8 +69,10 @@
 
 ### KG validation and init (ADR-034, ADR-035)
 
-- `kkernel kg validate` runs three built-in structural checks (duplicate UUIDs, sort
-  order, referential integrity) plus configurable rules from `rules.toml`.
+- `kkernel kg validate` runs seven unconditional structural checks: six error-severity
+  input/schema/identity/reference/taxonomy checks plus warning-severity sort order. A conditional
+  error-severity note-kind check also runs when `notes.ndjson` is present. Configurable rules from
+  `rules.toml` run afterward.
 - `kkernel kg init` creates `.khive/kg/` and writes `khive.toml` with defaults.
 - See `docs/kg-rules.md` for the rule TOML format.
 

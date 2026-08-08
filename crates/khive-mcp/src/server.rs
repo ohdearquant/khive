@@ -29,18 +29,126 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 use khive_db::ConnectionPool;
+use khive_pack_kg::handlers::{SearchSubstrate, ValidatedSearchRequest};
 use khive_request::{parse_request, ArgValue, DslError, ExecutionMode, ParsedOp, PrevFailure};
 use khive_runtime::{
-    present, render_format, KhiveRuntime, OutputFormat, PackLoadError, PackRegistry,
-    PresentationMode, RuntimeConfig, RuntimeError, VerbPresentationPolicy, VerbRegistry,
-    VerbRegistryBuilder, WRITER_POOL_CHECKOUT_TIMEOUT_STAGE,
+    present, render_format, InterceptedDispatchResult, KhiveRuntime, OutputFormat, PackLoadError,
+    PackRegistry, PresentationMode, RuntimeConfig, RuntimeError, VerbPresentationPolicy,
+    VerbRegistry, VerbRegistryBuilder,
 };
 use khive_types::RefusalReason;
 
 use khive_storage::{EdgeRelation, StorageCapability};
 
-use crate::coordinator::CoordinatorService;
+use crate::coordinator::{CoordSearchResult, CoordinatorService};
 use crate::tools::request::RequestParams;
+
+/// Per-operation completeness discriminator for the `search` verb (ADR-130
+/// §1). `SearchDegradation::status == None` means "not a search op" — no
+/// `status` field is emitted on that operation's envelope.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SearchStatus {
+    Complete,
+    Partial,
+}
+
+impl SearchStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Complete => "complete",
+            Self::Partial => "partial",
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct SearchDegradation {
+    status: Option<SearchStatus>,
+    missing_backends: Vec<String>,
+}
+
+impl SearchDegradation {
+    /// A search op that ran to completion: single-backend/no-coordinator
+    /// registry dispatch, or (in principle) a coordinator fan-out where
+    /// every selected backend succeeded — `from_result` is used for the
+    /// latter instead, since it also has to compute `missing_backends`.
+    fn complete() -> Self {
+        Self {
+            status: Some(SearchStatus::Complete),
+            missing_backends: Vec::new(),
+        }
+    }
+
+    fn from_result(result: &CoordSearchResult) -> Self {
+        let mut missing_backends: Vec<String> = result
+            .per_backend
+            .iter()
+            .filter(|backend| backend.error.is_some())
+            .map(|backend| backend.backend_id.as_str().to_string())
+            .collect();
+        missing_backends.sort();
+        missing_backends.dedup();
+        let status = if result.partial || !missing_backends.is_empty() {
+            SearchStatus::Partial
+        } else {
+            SearchStatus::Complete
+        };
+        Self {
+            status: Some(status),
+            missing_backends,
+        }
+    }
+
+    fn is_partial(&self) -> bool {
+        self.status == Some(SearchStatus::Partial)
+    }
+}
+
+struct OpSuccess {
+    result: Value,
+    degradation: SearchDegradation,
+}
+
+impl OpSuccess {
+    fn complete(result: Value) -> Self {
+        Self {
+            result,
+            degradation: SearchDegradation::default(),
+        }
+    }
+}
+
+/// `OpSuccess` for an op dispatched through the plain registry path
+/// (single-backend deployment, or no coordinator attached). A `search` op
+/// (excluding `help=true`, which returns a schema rather than a result
+/// array) carries `status="complete"` (ADR-130 §1); every other verb keeps
+/// the untagged `OpSuccess::complete` — no `status` field on its envelope.
+fn op_success_from_registry_result(tool: &str, is_help: bool, result: Value) -> OpSuccess {
+    if tool == "search" && !is_help {
+        OpSuccess {
+            result,
+            degradation: SearchDegradation::complete(),
+        }
+    } else {
+        OpSuccess::complete(result)
+    }
+}
+
+/// Structured error for a search whose selected backends failed such that no
+/// hit survived server-side filtering (ADR-130 §1 `search_incomplete`).
+///
+/// Distinguishes a degraded read from a genuine no-match: a genuine no-match
+/// keeps `ok=true` with an empty `result`; this is `ok=false` — a caller
+/// doing `if response.ok && response.result.is_empty()` sees the two cases
+/// differently, instead of concluding "no match" in both.
+fn search_incomplete_error(missing_backends: Vec<String>) -> Value {
+    json!({
+        "kind": "search_incomplete",
+        "message": "no-match was not established because selected backends failed",
+        "retryable": false,
+        "missing_backends": missing_backends,
+    })
+}
 
 /// Per-request parallelism stays bounded even when the parser accepts 100 ops; must be nonzero.
 const MAX_BATCH_CONCURRENCY: usize = 8;
@@ -614,7 +722,8 @@ impl KhiveMcpServer {
     /// - args cannot be extracted for coordinator dispatch (e.g. non-UUID source/target)
     ///
     /// Result semantics mirror the per-op envelope from the registry:
-    /// `Ok(Value)` → success payload (caller wraps in `{ok:true, tool, result}`).
+    /// `Ok(OpSuccess)` → success payload plus any coordinator degradation
+    /// metadata (caller wraps it in the per-op envelope).
     /// `Err(DispatchFailure)` → error payload plus any stable refusal reason.
     ///
     /// `identity` mirrors the override [`Self::dispatch_op`] applies to the
@@ -627,7 +736,7 @@ impl KhiveMcpServer {
         tool: &str,
         args_value: &Value,
         identity: Option<&khive_runtime::RequestIdentity>,
-    ) -> Option<Result<Value, DispatchFailure>> {
+    ) -> Option<Result<OpSuccess, DispatchFailure>> {
         let coord = self.coordinator.as_ref()?;
         if coord.is_single_backend() {
             return None;
@@ -913,7 +1022,8 @@ impl KhiveMcpServer {
                     result,
                     self.schedule_ticker_last_tick_micros.as_ref(),
                 );
-                chain_ok_envelope_or_depth_error(tool, result)
+                let success = op_success_from_registry_result(&tool, is_help, result);
+                chain_ok_envelope_or_depth_error(tool, success)
             }
             Err(error) => Err(DispatchFailure::from_runtime(&tool, error)),
         }
@@ -931,6 +1041,15 @@ impl KhiveMcpServer {
     /// using `mode_for_op` to determine the mode per position. Chain `$prev`
     /// substitution uses canonical (verbose) handler output; the transform runs
     /// only at the final response-envelope boundary.
+    ///
+    /// Aggregate `status` describes failed or aborted operations — distinct
+    /// from a `search` op's own per-operation `status` field ("complete" /
+    /// "partial", ADR-130 §1), which lives inside that op's `results` entry,
+    /// never at this top level. A successful but incomplete coordinator
+    /// search remains a success (`status="partial"` on that entry) and
+    /// carries a typed `missing_backends` advisory plus the deprecated
+    /// `partial` alias; a search where no hit survives a backend failure is
+    /// instead a failed op (`ok: false`, `error.kind: "search_incomplete"`).
     ///
     /// Response envelope:
     /// ```json
@@ -1140,9 +1259,11 @@ impl KhiveMcpServer {
                                     result,
                                     schedule_ticker_last_tick_micros.as_ref(),
                                 );
+                                let success =
+                                    op_success_from_registry_result(&tool, is_help, result);
                                 present_ok_envelope_or_depth_error(
                                     tool,
-                                    result,
+                                    success,
                                     effective_mode,
                                     now_unix,
                                 )
@@ -1272,7 +1393,7 @@ impl KhiveMcpServer {
 
 /// Route a `link` or `search` verb through `coord` when in multi-backend mode.
 /// Shared logic behind both dispatch sites (`dispatch_op` chain mode and the
-/// parallel/single closure in `run_parsed`). Returns `Some(Ok(Value))` when
+/// parallel/single closure in `run_parsed`). Returns `Some(Ok(OpSuccess))` when
 /// the coordinator handled the op, `Some(Err(DispatchFailure))` on a
 /// coordinator error (including fail-closed namespace rejection), `None` to
 /// fall through to the registry. Must apply the exact same fail-closed
@@ -1284,7 +1405,7 @@ async fn dispatch_via_coordinator_inner(
     tool: &str,
     args_value: &Value,
     identity: Option<&khive_runtime::RequestIdentity>,
-) -> Option<Result<Value, DispatchFailure>> {
+) -> Option<Result<OpSuccess, DispatchFailure>> {
     // Only link/search are ever intercepted here.
     if !matches!(tool, "link" | "search") {
         return None;
@@ -1334,172 +1455,206 @@ async fn dispatch_via_coordinator_inner(
                     },
                 )
                 .await;
-            Some(result.map_err(|error| DispatchFailure::from_runtime(tool, error)))
+            Some(
+                result
+                    .map(OpSuccess::complete)
+                    .map_err(|error| DispatchFailure::from_runtime(tool, error)),
+            )
         }
         "search" => {
-            let kind = args_value.get("kind")?.as_str()?;
-            let query = args_value.get("query")?.as_str()?;
+            if args_value.get("help").and_then(Value::as_bool) == Some(true) {
+                return None;
+            }
+            let mut handler_args = args_value.clone();
+            if let Some(fields) = handler_args.as_object_mut() {
+                fields.remove("namespace");
+            }
+            // MAJ-3: widen the fan-out's read-visibility scope to match the
+            // normal registry dispatch path — see `coordinator_search_visibility`.
+            let extra_visible = coordinator_search_visibility(registry, args_value, identity);
             let result = registry
-                .dispatch_intercepted_with_identity(
+                .dispatch_intercepted_with_metadata_with_identity(
                     tool,
                     args_value,
                     identity,
                     |namespace| async move {
-                        // Parse strictly as u32 (matching the single-backend `SearchParams { limit:
-                        // Option<u32> }` contract) instead of parsing as u64 and casting — `as u32`
-                        // wraps values above `u32::MAX` (e.g. 4294967297 as u32 == 1) before the
-                        // `.min(100)` cap ever runs, silently truncating a huge limit to a near-empty
-                        // result set rather than rejecting it (MCP-AUD-003).
-                        let limit = match args_value.get("limit") {
-                            None | Some(Value::Null) => 10,
-                            Some(v) => match serde_json::from_value::<u32>(v.clone()) {
-                                Ok(limit) => limit.min(100),
-                                Err(_) => {
-                                    return Err(RuntimeError::InvalidInput(
-                                        "limit must be an unsigned 32-bit integer".to_string(),
-                                    ));
-                                }
-                            },
-                        };
-                        let score_floor = args_value
-                            .get("min_score")
-                            .and_then(Value::as_f64)
-                            .unwrap_or(0.0)
-                            .max(0.0);
-
-                        // For substrate-level kinds ("entity" / "note"), pass None so the search
-                        // is unrestricted. For granular kinds ("concept", "observation", etc.) pass
-                        // the kind string so each backend filters at the storage layer — matching
-                        // the behaviour of the single-backend handler (search.rs).
-                        let kind_filter: Option<&str> = match kind {
-                            "entity" | "note" => None,
-                            other => Some(other),
-                        };
-
-                        // Extract entity-substrate filters and forward them to each backend.
-                        // When either is active the coordinator widens the per-backend candidate
-                        // window so that sparse matches ranked below the bare limit are not cut
-                        // off before filtering (before-truncation parity with the single-backend
-                        // handler in search.rs).
-                        let props_filter: Option<&serde_json::Value> =
-                            args_value.get("properties").and_then(|v| {
-                                if v.as_object().is_some_and(|m| !m.is_empty()) {
-                                    Some(v)
-                                } else {
-                                    None
-                                }
-                            });
-                        // Parse tags strictly: absent/null → no filter (empty Vec); present and
-                        // valid Vec<String> → use as-is (including empty array → no filter);
-                        // present but not a Vec<String> → reject with a per-op error so the
-                        // multi-backend path matches single-backend behaviour, which rejects
-                        // malformed tags via SearchParams deserialisation (RuntimeError::InvalidInput).
-                        // filter_map(as_str) would silently drop non-string entries and produce
-                        // an empty Vec, bypassing the filter and returning unfiltered results.
-                        let tags_owned: Vec<String> = match args_value.get("tags") {
-                            None | Some(Value::Null) => vec![],
-                            Some(v) => match serde_json::from_value::<Vec<String>>(v.clone()) {
-                                Ok(t) => t,
-                                Err(_) => {
-                                    return Err(RuntimeError::InvalidInput(
-                                        "tags must be an array of strings".to_string(),
-                                    ));
-                                }
-                            },
-                        };
-
+                        // Match normal registry dispatch ordering: the gate has
+                        // already authorized this namespace before handler-level
+                        // search validation runs inside the intercepted closure.
+                        let request = ValidatedSearchRequest::from_value(handler_args, registry)?;
                         let coord_result = coord
-                            .fan_out_search(
-                                kind,
-                                query,
-                                &namespace,
-                                limit,
-                                kind_filter,
-                                props_filter,
-                                &tags_owned,
-                            )
+                            .fan_out_search(&request, &namespace, &extra_visible)
                             .await;
+                        let degradation = SearchDegradation::from_result(&coord_result);
 
-                        // Shape result to match the kg search handler's output fields exactly.
-                        // Entity hits: [{id, entity_kind, score, title, snippet}]
-                        //   - entity_kind: real kind string fetched from the owning backend
-                        //   - score: RRF-merged, subject to min_score floor
-                        // Note hits:   [{id, note_kind, score, title, snippet}]
-                        //   - note_kind: real kind string fetched from the owning backend
-                        let result_val = if !coord_result.note_hits.is_empty()
-                            || (coord_result.entity_hits.is_empty()
-                                && coord_result.note_hits.is_empty())
-                        {
-                            // Note substrate or empty — return note-shaped result.
+                        // Preserve the coordinator search response's compatibility
+                        // fields, and add the KG single-backend handler's canonical
+                        // row fields for shape parity (MIN-1): `kind` (duplicates
+                        // entity_kind/note_kind), `name`, and `created_at`.
+                        // Entity hits: [{id, kind, entity_kind, name, score, source, title, snippet, created_at}]
+                        // Note hits:   [{id, kind, note_kind, name, score, source, title, snippet, created_at}]
+                        let result_val = if request.substrate() == SearchSubstrate::Note {
                             let items: Vec<Value> = coord_result
                                 .note_hits
                                 .iter()
-                                .filter(|h| h.score.to_f64() >= score_floor)
+                                .filter(|h| h.score.to_f64() >= request.min_score())
                                 .map(|h| {
                                     let note_kind = coord_result.note_kinds.get(&h.note_id);
+                                    let name =
+                                        coord_result.note_names.get(&h.note_id).cloned().flatten();
+                                    let created_at = coord_result
+                                        .note_created_at
+                                        .get(&h.note_id)
+                                        .map(|micros| khive_runtime::micros_to_iso(*micros));
                                     json!({
                                         "id": h.note_id.to_string(),
+                                        "kind": note_kind,
                                         "note_kind": note_kind,
+                                        "name": name,
                                         "score": h.score.to_f64(),
                                         "source": h.source.as_str(),
                                         "title": h.title,
                                         "snippet": h.snippet,
+                                        "created_at": created_at,
                                     })
                                 })
                                 .collect();
                             serde_json::to_value(items).unwrap_or_else(|_| json!([]))
                         } else {
-                            // Entity substrate — return entity-shaped result.
                             let items: Vec<Value> = coord_result
                                 .entity_hits
                                 .iter()
-                                .filter(|h| h.score.to_f64() >= score_floor)
+                                .filter(|h| h.score.to_f64() >= request.min_score())
                                 .map(|h| {
                                     let entity_kind = coord_result.entity_kinds.get(&h.entity_id);
+                                    let created_at = coord_result
+                                        .entity_created_at
+                                        .get(&h.entity_id)
+                                        .map(|micros| khive_runtime::micros_to_iso(*micros));
                                     json!({
                                         "id": h.entity_id.to_string(),
+                                        "kind": entity_kind,
                                         "entity_kind": entity_kind,
+                                        "name": h.title,
                                         "score": h.score.to_f64(),
                                         "source": h.source.as_str(),
                                         "title": h.title,
                                         "snippet": h.snippet,
+                                        "created_at": created_at,
                                     })
                                 })
                                 .collect();
                             serde_json::to_value(items).unwrap_or_else(|_| json!([]))
                         };
 
-                        Ok(result_val)
+                        Ok(InterceptedDispatchResult::new(result_val, degradation))
                     },
                 )
                 .await;
-            Some(result.map_err(|error| DispatchFailure::from_runtime(tool, error)))
+            Some(match result {
+                Ok(outcome) => {
+                    let is_empty = outcome
+                        .result
+                        .as_array()
+                        .map(|items| items.is_empty())
+                        .unwrap_or(true);
+                    // ADR-130 §1: a backend failure with zero surviving hits
+                    // (post server-side filtering, min_score included) is a
+                    // failed operation, not a successful empty result — the
+                    // "no match" reading is not established when the answer
+                    // may be sitting on the backend that never responded.
+                    if outcome.metadata.is_partial() && is_empty {
+                        Err(DispatchFailure::unclassified(
+                            tool,
+                            search_incomplete_error(outcome.metadata.missing_backends),
+                        ))
+                    } else {
+                        Ok(OpSuccess {
+                            result: outcome.result,
+                            degradation: outcome.metadata,
+                        })
+                    }
+                }
+                Err(error) => Err(DispatchFailure::from_runtime(tool, error)),
+            })
         }
         _ => None,
     }
 }
 
+/// Resolve the coordinator search boundary's extra read-visibility set
+/// (MAJ-3 fix), mirroring the normal registry dispatch path's default-case
+/// widening to `['local'] ∪ visible_namespaces`
+/// (`khive_runtime::pack::VerbRegistry::dispatch_with_identity`,
+/// `crates/khive-runtime/src/pack.rs`). Without this, `fan_out_search`
+/// authorizes each backend token against the resolved primary namespace
+/// alone, so a namespace visible only through `visible_namespaces` silently
+/// drops out of coordinator search results even though the same caller's
+/// non-coordinator (single-backend) search would see it.
+///
+/// An explicit `namespace=` request parameter intentionally narrows
+/// visibility to that one namespace — this returns an empty set in that
+/// case, unwidened, exactly like the registry path's `explicit_namespace`
+/// branch.
+fn coordinator_search_visibility(
+    registry: &VerbRegistry,
+    args_value: &Value,
+    identity: Option<&khive_runtime::RequestIdentity>,
+) -> Vec<khive_runtime::Namespace> {
+    let explicit_namespace = args_value.get("namespace").is_some();
+    if explicit_namespace {
+        return Vec::new();
+    }
+    let mut extra_visible: Vec<khive_runtime::Namespace> = match identity {
+        Some(id) => id
+            .visible_namespaces
+            .iter()
+            .filter_map(|s| match khive_runtime::Namespace::parse(s) {
+                Ok(parsed) => Some(parsed),
+                Err(e) => {
+                    tracing::warn!(
+                        namespace = %s,
+                        error = %e,
+                        "coordinator_search_visibility: skipping invalid visible_namespace \
+                         entry from per-request identity"
+                    );
+                    None
+                }
+            })
+            .collect(),
+        None => registry.visible_namespaces().to_vec(),
+    };
+    extra_visible.push(khive_runtime::Namespace::local());
+    extra_visible
+}
+
 /// Preserve the established flat-string payload for ordinary runtime errors,
-/// while carrying the ADR-135 F6 writer-pool stage structurally through every
-/// MCP execution mode.
+/// while carrying pre-execution write-admission failures (ADR-135 F6 writer-
+/// pool checkout timeout; #1382/#1643 write-queue saturation) structurally,
+/// and marked retryable, through every MCP execution mode. Both admission
+/// failures happen before SQLite executes the request, so retrying is safe:
+/// there is no partial side effect to roll back.
 fn runtime_error_value(error: RuntimeError) -> Value {
     match error {
         RuntimeError::Khive(k) => serde_json::to_value(&k)
             .unwrap_or_else(|_| json!({"kind": "internal", "message": k.to_string()})),
         other => {
-            let Some(context) = other.writer_pool_checkout_timeout_context() else {
+            let Some(context) = other.admission_failure_context() else {
                 return json!(other.to_string());
             };
             let timeout_ms = u64::try_from(context.timeout.as_millis()).unwrap_or(u64::MAX);
             let capability = context.capability.map(storage_capability_wire_name);
             json!({
                 "kind": "unavailable",
-                "code": WRITER_POOL_CHECKOUT_TIMEOUT_STAGE,
-                "stage": WRITER_POOL_CHECKOUT_TIMEOUT_STAGE,
+                "code": context.stage,
+                "stage": context.stage,
                 "message": other.to_string(),
+                "retryable": true,
                 "timeout_ms": timeout_ms,
                 "capability": capability,
                 "operation": context.operation,
+                "scope": context.scope,
+                "retry_after_ms": context.retry_after_ms,
             })
         }
     }
@@ -1545,11 +1700,40 @@ fn depth_error_payload(context: &str) -> Value {
 /// without re-serializing an already-owned `Value` through `json!` (which
 /// would call `serde_json::to_value` and recurse over the whole tree
 /// again). The depth check must already have passed before this is called.
-fn ok_envelope(tool: String, result: Value) -> Value {
-    let mut map = serde_json::Map::with_capacity(3);
+fn ok_envelope(tool: String, success: OpSuccess) -> Value {
+    let OpSuccess {
+        result,
+        degradation,
+    } = success;
+    let is_partial = degradation.is_partial();
+    let extra_fields = usize::from(degradation.status.is_some()) + if is_partial { 2 } else { 0 };
+    let mut map = serde_json::Map::with_capacity(3 + extra_fields);
     map.insert("ok".to_string(), Value::Bool(true));
     map.insert("tool".to_string(), Value::String(tool));
     map.insert("result".to_string(), result);
+    // ADR-130 §1: `status` is present on every successful search envelope
+    // (complete or partial); absent for every other verb.
+    if let Some(status) = degradation.status {
+        map.insert(
+            "status".to_string(),
+            Value::String(status.as_str().to_string()),
+        );
+    }
+    // Legacy `partial`/`missing_backends` alias, compatibility-release only
+    // (ADR-130 §Compatibility) — omitted for `status="complete"`.
+    if is_partial {
+        map.insert("partial".to_string(), Value::Bool(true));
+        map.insert(
+            "missing_backends".to_string(),
+            Value::Array(
+                degradation
+                    .missing_backends
+                    .into_iter()
+                    .map(Value::String)
+                    .collect(),
+            ),
+        );
+    }
     Value::Object(map)
 }
 
@@ -1652,15 +1836,18 @@ fn decorate_schedule_agenda_with_ticker_health(
 /// wrapped in the response envelope. On violation returns a `result_too_deep`
 /// error that does not embed the oversized value, and discards the rejected
 /// value iteratively so its own drop can't overflow the stack either.
-fn chain_ok_envelope_or_depth_error(tool: String, result: Value) -> Result<Value, DispatchFailure> {
-    if !result_within_depth_limit(&result) {
-        drop_value_iteratively(result);
+fn chain_ok_envelope_or_depth_error(
+    tool: String,
+    success: OpSuccess,
+) -> Result<Value, DispatchFailure> {
+    if !result_within_depth_limit(&success.result) {
+        drop_value_iteratively(success.result);
         return Err(DispatchFailure::unclassified(
             tool,
             depth_error_payload("; cannot be used as $prev chain context"),
         ));
     }
-    Ok(ok_envelope(tool, result))
+    Ok(ok_envelope(tool, success))
 }
 
 /// Parallel/single-mode success path: check the raw handler `result` against
@@ -1671,16 +1858,16 @@ fn chain_ok_envelope_or_depth_error(tool: String, result: Value) -> Result<Value
 /// (see [`drop_value_iteratively`]).
 fn present_ok_envelope_or_depth_error(
     tool: String,
-    result: Value,
+    mut success: OpSuccess,
     mode: PresentationMode,
     now_unix: i64,
 ) -> Value {
-    if !result_within_depth_limit(&result) {
-        drop_value_iteratively(result);
+    if !result_within_depth_limit(&success.result) {
+        drop_value_iteratively(success.result);
         return json!({ "ok": false, "tool": tool, "error": depth_error_payload("") });
     }
-    let presented = present(result, mode, now_unix);
-    ok_envelope(tool, presented)
+    success.result = present(success.result, mode, now_unix);
+    ok_envelope(tool, success)
 }
 
 /// Returns `true` if a dispatched op's canonical `result` field nests
@@ -1787,6 +1974,21 @@ Parallel: a failed op does NOT abort siblings. Chain: failure aborts remaining
 ops (reported as {"ok": false, "aborted": true}). Committed ops are not rolled back.
 `status` is "partial" whenever summary.failed or summary.aborted is non-zero — check
 it (or summary) rather than relying on the absence of a top-level error.
+
+A parallel write-heavy batch is best-effort, not atomic: `results` ordering is
+not a commit prefix (an earlier entry succeeding implies nothing about a later
+one, or vice versa), and one entry's admission failure (e.g. `retryable:
+true`, `code: "writer_pool_checkout_timeout"` or `"writer_queue_saturated"`)
+never rolls back a sibling that already committed. Inspect each result
+entry's own `ok` field rather than assuming batch-level atomicity.
+
+`search` carries its own per-op `status` ("complete" | "partial") inside that
+op's `result` entry, separate from the top-level batch `status` above. A
+degraded-but-answered search stays ok:true with status="partial" plus a
+missing_backends list (and the deprecated partial:true alias). When a backend
+failure leaves no hit standing after filtering, the op instead fails outright
+with ok:false and error.kind="search_incomplete" — that case must not be read
+as "no results found."
 
 Verb discovery: install the `kg` / `gtd` plugins for usage skills. The verbs
 currently registered on this server (pack-derived) are listed below. Argument
@@ -2344,8 +2546,9 @@ fn parse_output_format(s: Option<&str>) -> Result<Option<OutputFormat>, String> 
 ///   verb's AlwaysVerbose policy forces Verbose), apply `render_format` to the
 ///   `result` payload with the effective presentation so that both
 ///   `presentation_per_op=["verbose"]` and AlwaysVerbose verbs (including
-///   strict feedback and delivery-correlation acknowledgements) correctly skip
-///   the redundancy-drop pre-pass (ADR-078 §7 + §8.4; mirrors `run_parsed`).
+///   strict feedback, delivery-correlation acknowledgements, and durable receipt
+///   responses) correctly skip the redundancy-drop
+///   pre-pass (ADR-078 §7 + §8.4; mirrors `run_parsed`).
 ///
 /// The outer envelope (`{results:[...], summary:{...}}`) is always compact JSON (§8.4).
 /// Daemon-served responses are rendered before fitting. If the rendered envelope
@@ -2538,7 +2741,16 @@ fn frame_budget_omission(entry: &Value) -> Value {
     // `reason` is stable machine metadata, not payload detail. It is tiny and
     // must survive even when a large result/error body is omitted to fit the
     // daemon frame.
-    for key in ["ok", "tool", "usage", "aborted", "reason"] {
+    for key in [
+        "ok",
+        "tool",
+        "usage",
+        "aborted",
+        "reason",
+        "status",
+        "partial",
+        "missing_backends",
+    ] {
         if let Some(value) = entry.get(key) {
             omitted.insert(key.to_string(), value.clone());
         }
@@ -2549,10 +2761,25 @@ fn frame_budget_omission(entry: &Value) -> Value {
             json!("operation succeeded; result omitted because the response frame budget was exceeded"),
         );
     } else {
-        omitted.insert(
-            "error".to_string(),
-            json!("operation failed; error details omitted because the response frame budget was exceeded"),
-        );
+        // ADR-130 §Compatibility (MCP envelope builder): `search_incomplete`
+        // is small and typed — it must survive omission untransformed rather
+        // than collapse to the generic omitted-error string every other
+        // (potentially large) error payload gets.
+        let is_search_incomplete = entry
+            .get("error")
+            .and_then(|error| error.get("kind"))
+            .and_then(Value::as_str)
+            == Some("search_incomplete");
+        if is_search_incomplete {
+            if let Some(error) = entry.get("error") {
+                omitted.insert("error".to_string(), error.clone());
+            }
+        } else {
+            omitted.insert(
+                "error".to_string(),
+                json!("operation failed; error details omitted because the response frame budget was exceeded"),
+            );
+        }
     }
     Value::Object(omitted)
 }
@@ -2761,6 +2988,172 @@ mod tests {
                 .expect("test supplies a valid byte count");
             Ok(json!("x".repeat(bytes)))
         }
+    }
+
+    /// Receipt-only stand-in for the Git pack. Two operations can return
+    /// distinguishable reports for the same project without touching a git
+    /// repository, which lets the request-layer test prove that `request_id`
+    /// groups receipts but does not uniquely identify one operation.
+    struct RequestGroupDigestPack {
+        project_id: uuid::Uuid,
+    }
+
+    impl khive_types::Pack for RequestGroupDigestPack {
+        const NAME: &'static str = "request-group-digest-test";
+        const NOTE_KINDS: &'static [&'static str] = &[];
+        const ENTITY_KINDS: &'static [&'static str] = &[];
+        const HANDLERS: &'static [khive_runtime::HandlerDef] = &[khive_runtime::HandlerDef {
+            name: "git.digest",
+            description: "return a request-group receipt fixture",
+            visibility: khive_runtime::Visibility::Verb,
+            category: khive_runtime::VerbCategory::Commissive,
+            params: &[khive_runtime::ParamDef {
+                name: "marker",
+                param_type: "string",
+                required: true,
+                description: "distinguishes reports in one request group",
+            }],
+        }];
+    }
+
+    #[async_trait::async_trait]
+    impl khive_runtime::PackRuntime for RequestGroupDigestPack {
+        fn name(&self) -> &str {
+            <Self as khive_types::Pack>::NAME
+        }
+
+        fn note_kinds(&self) -> &'static [&'static str] {
+            <Self as khive_types::Pack>::NOTE_KINDS
+        }
+
+        fn entity_kinds(&self) -> &'static [&'static str] {
+            <Self as khive_types::Pack>::ENTITY_KINDS
+        }
+
+        fn handlers(&self) -> &'static [khive_runtime::HandlerDef] {
+            <Self as khive_types::Pack>::HANDLERS
+        }
+
+        async fn dispatch(
+            &self,
+            _verb: &str,
+            params: Value,
+            _registry: &VerbRegistry,
+            _token: &khive_runtime::NamespaceToken,
+        ) -> Result<Value, RuntimeError> {
+            Ok(json!({
+                "project_id": self.project_id,
+                "marker": params.get("marker").cloned().unwrap_or(Value::Null),
+                "done": true,
+            }))
+        }
+    }
+
+    fn request_group_digest_test_server() -> (
+        KhiveMcpServer,
+        Arc<dyn khive_storage::EventStore>,
+        uuid::Uuid,
+    ) {
+        let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+        let token = runtime
+            .authorize(Namespace::local())
+            .expect("authorize local");
+        let store = runtime.events(&token).expect("event store");
+        let project_id = uuid::Uuid::new_v4();
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(RequestGroupDigestPack { project_id });
+        builder.with_event_store(store.clone());
+        let registry = builder.build().expect("request-group registry");
+        (KhiveMcpServer::from_registry(registry), store, project_id)
+    }
+
+    async fn assert_request_group_receipts(ops: &str) {
+        let (server, store, project_id) = request_group_digest_test_server();
+        let response = server
+            .dispatch_request_local(RequestParams {
+                ops: ops.to_string(),
+                request_id: Some(16_470),
+                ..Default::default()
+            })
+            .await
+            .expect("grouped digest request succeeds");
+        let envelope: Value = serde_json::from_str(&response).expect("JSON response");
+        assert_eq!(envelope["summary"]["succeeded"], 2, "{envelope}");
+        let mut returned_by_marker = std::collections::HashMap::new();
+        for entry in envelope["results"]
+            .as_array()
+            .expect("batch/chain response results")
+        {
+            let result = entry.get("result").expect("successful result");
+            let marker = result["marker"].as_str().expect("returned marker");
+            let receipt_id = result["receipt_id"]
+                .as_str()
+                .expect("returned receipt_id remains a string");
+            uuid::Uuid::parse_str(receipt_id)
+                .expect("default MCP presentation must retain the full receipt UUID");
+            assert!(
+                returned_by_marker
+                    .insert(marker.to_string(), result.clone())
+                    .is_none(),
+                "markers are unique"
+            );
+        }
+
+        let page = store
+            .query_events(
+                EventFilter {
+                    verbs: vec!["git.digest".to_string()],
+                    ..EventFilter::default()
+                },
+                PageRequest {
+                    limit: 50,
+                    offset: 0,
+                },
+            )
+            .await
+            .expect("query grouped receipts");
+        assert_eq!(page.items.len(), 2, "one receipt per successful operation");
+        assert!(page.items.iter().all(|event| {
+            event.target_id == Some(project_id)
+                && event.payload["resource"]["request_id"] == json!(16_470)
+        }));
+
+        let mut markers: Vec<&str> = page
+            .items
+            .iter()
+            .map(|event| {
+                assert_eq!(
+                    event.payload["result"]["receipt_id"],
+                    json!(event.id),
+                    "receipt_id is the operation-unique selector"
+                );
+                let marker = event.payload["result"]["marker"].as_str().expect("marker");
+                let returned = returned_by_marker
+                    .remove(marker)
+                    .expect("every stored marker was returned");
+                assert_eq!(
+                    returned, event.payload["result"],
+                    "default MCP output must exactly equal the durable receipt result"
+                );
+                marker
+            })
+            .collect();
+        markers.sort_unstable();
+        assert_eq!(markers, vec!["first", "second"]);
+        assert!(returned_by_marker.is_empty());
+        assert_ne!(page.items[0].id, page.items[1].id);
+    }
+
+    #[tokio::test]
+    async fn duplicate_digest_batch_and_chain_share_request_group_but_keep_distinct_receipts() {
+        assert_request_group_receipts(
+            r#"[git.digest(marker="first"), git.digest(marker="second")]"#,
+        )
+        .await;
+        assert_request_group_receipts(
+            r#"git.digest(marker="first") | git.digest(marker="second")"#,
+        )
+        .await;
     }
 
     async fn dispatch_large_result_through_daemon(
@@ -2981,6 +3374,78 @@ mod tests {
             &response,
             &server.config_id
         ));
+    }
+
+    #[test]
+    fn frame_budget_omission_preserves_search_degradation_advisory() {
+        let omitted = frame_budget_omission(&json!({
+            "ok": true,
+            "tool": "search",
+            "result": "oversized",
+            "status": "partial",
+            "partial": true,
+            "missing_backends": ["archive"],
+        }));
+
+        assert_eq!(omitted["ok"], json!(true));
+        assert_eq!(omitted["status"], json!("partial"));
+        assert_eq!(omitted["partial"], json!(true));
+        assert_eq!(omitted["missing_backends"], json!(["archive"]));
+        assert!(omitted.get("result").is_none());
+        assert!(omitted.get("result_omitted").is_some());
+    }
+
+    #[test]
+    fn frame_budget_omission_preserves_complete_search_status() {
+        let omitted = frame_budget_omission(&json!({
+            "ok": true,
+            "tool": "search",
+            "result": "oversized",
+            "status": "complete",
+        }));
+
+        assert_eq!(omitted["ok"], json!(true));
+        assert_eq!(omitted["status"], json!("complete"));
+        assert!(omitted.get("partial").is_none());
+        assert!(omitted.get("result").is_none());
+    }
+
+    /// ADR-130 §Compatibility: the `search_incomplete` error is small and
+    /// typed — it must survive frame-budget omission untransformed, not
+    /// collapse to the generic omitted-error string.
+    #[test]
+    fn frame_budget_omission_preserves_search_incomplete_error_untransformed() {
+        let error = json!({
+            "kind": "search_incomplete",
+            "message": "no-match was not established because selected backends failed",
+            "retryable": false,
+            "missing_backends": ["archive"],
+        });
+        let omitted = frame_budget_omission(&json!({
+            "ok": false,
+            "tool": "search",
+            "error": error,
+        }));
+
+        assert_eq!(omitted["ok"], json!(false));
+        assert_eq!(omitted["error"], error);
+    }
+
+    #[test]
+    fn frame_budget_omission_still_collapses_other_large_errors() {
+        let omitted = frame_budget_omission(&json!({
+            "ok": false,
+            "tool": "create",
+            "error": { "kind": "invalid_input", "message": "x".repeat(10_000) },
+        }));
+
+        assert_eq!(omitted["ok"], json!(false));
+        assert_eq!(
+            omitted["error"],
+            json!(
+                "operation failed; error details omitted because the response frame budget was exceeded"
+            )
+        );
     }
 
     #[tokio::test]
@@ -3580,8 +4045,11 @@ mod tests {
         // this value would be a real stack risk; the guard must reject it
         // via the iterative checker without ever attempting that recursion.
         let pathological = nest_object(khive_request::NESTING_DEPTH_LIMIT + 50_000, json!(true));
-        let err = chain_ok_envelope_or_depth_error("traverse".to_string(), pathological)
-            .expect_err("over-limit result must be rejected, not enveloped");
+        let err = chain_ok_envelope_or_depth_error(
+            "traverse".to_string(),
+            OpSuccess::complete(pathological),
+        )
+        .expect_err("over-limit result must be rejected, not enveloped");
         assert_eq!(err.tool, "traverse");
         assert_eq!(err.error["kind"], json!("result_too_deep"));
         // The error payload must never embed the oversized value itself.
@@ -3592,8 +4060,11 @@ mod tests {
     #[test]
     fn chain_seam_accepts_at_limit_result_and_moves_value_without_reserializing() {
         let at_limit = nest_object(khive_request::NESTING_DEPTH_LIMIT, json!("leaf"));
-        let envelope = chain_ok_envelope_or_depth_error("get".to_string(), at_limit.clone())
-            .expect("result at exactly the limit must be accepted");
+        let envelope = chain_ok_envelope_or_depth_error(
+            "get".to_string(),
+            OpSuccess::complete(at_limit.clone()),
+        )
+        .expect("result at exactly the limit must be accepted");
         assert_eq!(envelope["ok"], json!(true));
         assert_eq!(envelope["tool"], json!("get"));
         assert_eq!(envelope["result"], at_limit);
@@ -3604,7 +4075,7 @@ mod tests {
         let pathological = nest_object(khive_request::NESTING_DEPTH_LIMIT + 50_000, json!(true));
         let envelope = present_ok_envelope_or_depth_error(
             "context".to_string(),
-            pathological,
+            OpSuccess::complete(pathological),
             PresentationMode::Agent,
             0,
         );
@@ -3619,7 +4090,7 @@ mod tests {
         let shallow = json!({"id": "11111111-1111-1111-1111-111111111111"});
         let envelope = present_ok_envelope_or_depth_error(
             "get".to_string(),
-            shallow,
+            OpSuccess::complete(shallow),
             PresentationMode::Verbose,
             0,
         );
@@ -3628,6 +4099,29 @@ mod tests {
             envelope["result"]["id"],
             json!("11111111-1111-1111-1111-111111111111")
         );
+    }
+
+    #[test]
+    fn success_envelope_requires_typed_degradation_and_preserves_it_through_presentation() {
+        let success = OpSuccess {
+            result: json!([{"id": "11111111-1111-1111-1111-111111111111"}]),
+            degradation: SearchDegradation {
+                status: Some(SearchStatus::Partial),
+                missing_backends: vec!["archive".to_string()],
+            },
+        };
+        let envelope = present_ok_envelope_or_depth_error(
+            "search".to_string(),
+            success,
+            PresentationMode::Agent,
+            0,
+        );
+
+        assert_eq!(envelope["ok"], json!(true));
+        assert_eq!(envelope["status"], json!("partial"));
+        assert_eq!(envelope["partial"], json!(true));
+        assert_eq!(envelope["missing_backends"], json!(["archive"]));
+        assert!(envelope.get("result").is_some());
     }
 
     #[tokio::test]
@@ -4337,6 +4831,159 @@ mod tests {
         };
         let runtime = KhiveRuntime::new(config).expect("in-memory runtime");
         KhiveMcpServer::new(runtime).expect("server builds with kg")
+    }
+
+    /// ADR-130 §1: the KG single-backend (no coordinator) envelope must also
+    /// carry `status="complete"` on every successful `search` — both for a
+    /// genuine no-match and a populated result — with no possible "partial"
+    /// state for a lone backend. Other verbs must not gain a `status` field.
+    #[tokio::test]
+    async fn single_backend_search_reports_status_complete() {
+        let server = in_memory_kg_server();
+
+        let resp = server
+            .dispatch_request_local(RequestParams {
+                ops: r#"search(kind="entity", query="nothing here")"#.to_string(),
+                presentation: None,
+                presentation_per_op: None,
+                save_to: None,
+                format: None,
+                format_per_op: None,
+                request_id: None,
+            })
+            .await
+            .expect("search dispatch must succeed");
+        let parsed: Value = serde_json::from_str(&resp).expect("envelope must be JSON");
+        let search = &parsed["results"][0];
+        assert_eq!(search["ok"], json!(true), "unexpected response: {search}");
+        assert_eq!(search["status"], json!("complete"));
+        assert_eq!(search["result"], json!([]));
+        assert!(search.get("partial").is_none());
+
+        // Chain (`|`), not a parallel batch: `search` must observe the
+        // preceding `create`, which an independent-ops batch does not
+        // guarantee (bounded-concurrency ops have no relative ordering).
+        let resp = server
+            .dispatch_request_local(RequestParams {
+                ops: "create(kind=\"entity\", entity_kind=\"concept\", name=\"kg-search-status\") \
+                       | search(kind=\"entity\", query=\"kg-search-status\")"
+                    .to_string(),
+                presentation: None,
+                presentation_per_op: None,
+                save_to: None,
+                format: None,
+                format_per_op: None,
+                request_id: None,
+            })
+            .await
+            .expect("chain dispatch must succeed");
+        let parsed: Value = serde_json::from_str(&resp).expect("envelope must be JSON");
+        let create = &parsed["results"][0];
+        let search = &parsed["results"][1];
+        assert!(
+            create.get("status").is_none(),
+            "non-search verbs must not gain a status field: {create}"
+        );
+        assert_eq!(search["ok"], json!(true), "unexpected response: {search}");
+        assert_eq!(search["status"], json!("complete"));
+        assert!(
+            search["result"]
+                .as_array()
+                .map(|items| !items.is_empty())
+                .unwrap_or(false),
+            "unexpected response: {search}"
+        );
+    }
+
+    // ── MAJ-3: explicit-namespace narrowing arm of `coordinator_search_visibility` ──
+
+    fn registry_with_visible_namespaces(ns: Vec<khive_runtime::Namespace>) -> VerbRegistry {
+        let mut builder = VerbRegistryBuilder::new();
+        builder.with_visible_namespaces(ns);
+        builder.build().expect("build registry with no packs")
+    }
+
+    fn request_identity_with_visible_namespaces(ns: Vec<&str>) -> khive_runtime::RequestIdentity {
+        khive_runtime::RequestIdentity {
+            namespace: "local".to_string(),
+            actor_id: None,
+            visible_namespaces: ns.into_iter().map(str::to_string).collect(),
+            process_ref: None,
+            request_id: None,
+        }
+    }
+
+    /// No per-request identity: falls back to the registry's operator-baked
+    /// `visible_namespaces`, widened with `local` — mirrors the normal
+    /// registry dispatch path's default-case widening.
+    #[test]
+    fn coordinator_search_visibility_widens_to_registry_defaults_when_no_identity() {
+        let registry =
+            registry_with_visible_namespaces(vec![
+                khive_runtime::Namespace::parse("tenant-a").unwrap()
+            ]);
+        let extra = coordinator_search_visibility(&registry, &json!({}), None);
+        assert!(
+            extra.contains(&khive_runtime::Namespace::parse("tenant-a").unwrap()),
+            "must widen to the registry's baked visible_namespaces: {extra:?}"
+        );
+        assert!(
+            extra.contains(&khive_runtime::Namespace::local()),
+            "must always include local: {extra:?}"
+        );
+    }
+
+    /// A per-request identity's `visible_namespaces` overrides the registry's
+    /// baked defaults entirely (ADR-096 Fork 1) — the registry's "tenant-a"
+    /// must NOT leak into a request identity scoped to "tenant-b" only.
+    #[test]
+    fn coordinator_search_visibility_widens_to_identity_visible_namespaces() {
+        let registry =
+            registry_with_visible_namespaces(vec![
+                khive_runtime::Namespace::parse("tenant-a").unwrap()
+            ]);
+        let identity = request_identity_with_visible_namespaces(vec!["tenant-b"]);
+        let extra = coordinator_search_visibility(&registry, &json!({}), Some(&identity));
+        assert!(
+            extra.contains(&khive_runtime::Namespace::parse("tenant-b").unwrap()),
+            "must widen to the per-request identity's visible_namespaces: {extra:?}"
+        );
+        assert!(
+            !extra.contains(&khive_runtime::Namespace::parse("tenant-a").unwrap()),
+            "must NOT fall back to the registry's baked defaults when an identity is \
+             present: {extra:?}"
+        );
+        assert!(
+            extra.contains(&khive_runtime::Namespace::local()),
+            "must always include local: {extra:?}"
+        );
+    }
+
+    /// An explicit `namespace=` request argument intentionally narrows
+    /// visibility to that one namespace — the coordinator boundary must
+    /// return an unwidened empty extra-visibility set in that case, exactly
+    /// like the normal registry dispatch path's `explicit_namespace` branch.
+    ///
+    /// RED before the fix: an explicit namespace still widened visibility to
+    /// the caller's full `visible_namespaces` set, silently overriding the
+    /// caller's intended narrowing.
+    #[test]
+    fn coordinator_search_visibility_narrows_to_empty_when_namespace_explicit() {
+        let registry =
+            registry_with_visible_namespaces(vec![
+                khive_runtime::Namespace::parse("tenant-a").unwrap()
+            ]);
+        let identity = request_identity_with_visible_namespaces(vec!["tenant-b"]);
+        let extra = coordinator_search_visibility(
+            &registry,
+            &json!({"namespace": "tenant-c"}),
+            Some(&identity),
+        );
+        assert!(
+            extra.is_empty(),
+            "an explicit namespace= argument must narrow to an empty extra-visible \
+             set, not widen: {extra:?}"
+        );
     }
 
     #[tokio::test]

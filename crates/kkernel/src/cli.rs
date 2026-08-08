@@ -17,7 +17,7 @@ use clap::{Parser, Subcommand};
 use crate::{
     code_audit, code_ingest,
     coordinator::{BackendRegistry, SubstrateCoordinator, SubstrateCoordinatorService},
-    engine, exec, git_ingest, kg, pack_introspect, reindex, sync, vector,
+    engine, exec, git_ingest, kg, pack_introspect, reindex, repo, sync, vector,
 };
 use khive_runtime::{BackendId, KhiveConfig, KhiveRuntime, RuntimeConfig};
 
@@ -62,6 +62,10 @@ enum Command {
     /// KG validation, init, and hook management.
     #[command(subcommand)]
     Kg(kg::KgCommand),
+
+    /// Build and export offline repository showcase bundles (ADR-147).
+    #[command(subcommand)]
+    Repo(repo::RepoCommand),
 
     /// Schema migration lifecycle: migrate and check.
     #[command(subcommand)]
@@ -252,6 +256,7 @@ pub async fn cli_main() -> Result<()> {
         Command::Sync(s) => cmd_sync(s).await,
         Command::Pack(p) => cmd_pack(p),
         Command::Kg(k) => kg::run_kg(k).await,
+        Command::Repo(r) => repo::run_repo(r).await,
         Command::Db(d) => cmd_db(d).await,
         Command::Engine(e) => engine::run_engine(e).await,
         Command::Vector(v) => vector::run_vector(v),
@@ -331,8 +336,7 @@ pub async fn cli_main() -> Result<()> {
                 // and finish server assembly through the shared #603 constructor
                 // (`build_multi_backend_server_with_coordinator`) — this branch
                 // contains no server-assembly logic of its own beyond building
-                // the coordinator inputs (BackendRegistry + note_kinds) and
-                // attaching it.
+                // the coordinator's BackendRegistry and attaching it.
                 let (cli_ns_explicit, cli_ns) = khive_mcp::args::resolve_cli_namespace(&a)
                     .map_err(|e| anyhow::anyhow!("{e}"))?;
 
@@ -505,14 +509,7 @@ fn build_multi_backend_server_with_coordinator_and_db_anchor(
         backend_reg.register(backend_id, Arc::clone(rt));
     }
 
-    let note_kinds: std::collections::HashSet<String> = multi
-        .registry
-        .all_note_kinds()
-        .into_iter()
-        .map(str::to_string)
-        .collect();
-    let coord =
-        SubstrateCoordinatorService::new(SubstrateCoordinator::new(backend_reg), note_kinds);
+    let coord = SubstrateCoordinatorService::new(SubstrateCoordinator::new(backend_reg));
 
     let server = khive_mcp::serve::build_server_from_multi_backend_registry(
         multi,
@@ -650,6 +647,29 @@ async fn cmd_db_check(args: DbCheckArgs) -> Result<()> {
     Ok(())
 }
 
+/// Writer adapter for process-lifetime diagnostics.
+///
+/// `tracing-subscriber` reports a failed event write with `eprintln!`. If the
+/// subscriber itself writes to a closed stderr pipe, that fallback panics and
+/// takes the stdio MCP transport down with it. Logging is auxiliary to the
+/// stdin/stdout protocol, so make every stderr write best-effort before it
+/// reaches the subscriber's error-reporting path.
+struct BestEffortWriter<W>(W);
+
+impl<W: std::io::Write> std::io::Write for BestEffortWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self.0.write(buf) {
+            Ok(written) => Ok(written),
+            Err(_) => Ok(buf.len()),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        let _ = self.0.flush();
+        Ok(())
+    }
+}
+
 fn init_tracing(level: &str) {
     // Tracing goes to stderr — stdout is reserved for JSON / MCP results.
     //
@@ -664,7 +684,7 @@ fn init_tracing(level: &str) {
     // silently filtered for every operator who never sets KHIVE_LOG.
     let filter = format!("{level},khive.boot=info,lattice_inference=error");
     tracing_subscriber::fmt()
-        .with_writer(std::io::stderr)
+        .with_writer(|| BestEffortWriter(std::io::stderr()))
         .with_env_filter(filter)
         .with_ansi(false)
         .init();
@@ -1092,6 +1112,9 @@ mod tests {
 
     fn base_multi_backend_runtime_config() -> RuntimeConfig {
         use khive_runtime::Namespace;
+        // Callers that construct a server with no explicit DB override must be
+        // `#[serial]`: both this resolver and the construction guard read the
+        // process-wide HOME, which another CLI test deliberately mutates.
         RuntimeConfig {
             // Matches what `resolve_runtime_config` would set for a `--db`-unset
             // invocation (the `cli_db_override: None` every call site below
@@ -1128,6 +1151,7 @@ mod tests {
     /// File-backed main: both boot paths must agree on every `WiringSurface`
     /// field — in particular, both must wire a checkpoint pool (#601/#604).
     #[test]
+    #[serial]
     fn multi_backend_boot_paths_share_identical_wiring_surface_file_backed() {
         let dir = TempDir::new().expect("temp dir");
         let main_path = dir.path().join("main.db");
@@ -1165,6 +1189,7 @@ mod tests {
     /// In-memory main: both paths must agree that no checkpoint pool is wired
     /// (checkpoint_once must never run on a non-WAL connection).
     #[test]
+    #[serial]
     fn multi_backend_boot_paths_share_identical_wiring_surface_in_memory() {
         let khive_cfg = single_main_backend_config(khive_runtime::BackendKind::Memory, None);
 
@@ -1376,6 +1401,7 @@ mod tests {
     /// Regression for #674 — see
     /// `crates/kkernel/docs/coordinator.md#kkernel-mainrs--coordinator-attached-boot-path`.
     #[tokio::test]
+    #[serial]
     async fn coordinator_link_annotates_resolves_edge_target_like_get() {
         use khive_mcp::tools::request::RequestParams;
         use khive_runtime::PackConfig;

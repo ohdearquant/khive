@@ -1770,6 +1770,8 @@ dependencies = [
  "percent-encoding",
  "referencing",
  "regex",
+ "reqwest 0.13.4",
+ "rustls",
  "serde",
  "serde_json",
  "unicode-general-category",
@@ -2095,9 +2097,11 @@ dependencies = [
  "khive-runtime",
  "khive-storage",
  "khive-types",
+ "quote",
  "regex",
  "serde",
  "serde_json",
+ "syn",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
@@ -2229,6 +2233,7 @@ dependencies = [
  "sha2",
  "tempfile",
  "tokio",
+ "toml",
  "tracing",
  "uuid",
 ]
@@ -2355,6 +2360,23 @@ dependencies = [
  "khive-types",
  "rusqlite",
  "thiserror 2.0.18",
+]
+
+[[package]]
+name = "khive-repo-showcase"
+version = "0.7.0"
+dependencies = [
+ "chrono",
+ "hex",
+ "jsonschema",
+ "rusqlite",
+ "schemars",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror 2.0.18",
+ "toml",
 ]
 
 [[package]]
@@ -2561,6 +2583,7 @@ dependencies = [
  "khive-pack-schedule",
  "khive-pack-session",
  "khive-pack-workspace",
+ "khive-repo-showcase",
  "khive-request",
  "khive-runtime",
  "khive-score",
@@ -3692,6 +3715,7 @@ checksum = "219c5811de6525e5416c7d5d53bb656d3afdbc6c5af816e0802bcfa42dbdc1c3"
 dependencies = [
  "base64 0.22.1",
  "bytes",
+ "futures-channel",
  "futures-core",
  "futures-util",
  "h2",
@@ -3709,6 +3733,8 @@ dependencies = [
  "rustls",
  "rustls-pki-types",
  "rustls-platform-verifier",
+ "serde",
+ "serde_json",
  "sync_wrapper",
  "tokio",
  "tokio-rustls",

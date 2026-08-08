@@ -7,7 +7,8 @@ library crate consumed by `kkernel`.
 
 All subcommands emit JSON on stdout by default; pass `--human` where supported for a
 readable table. `--log <level>` (env `KHIVE_LOG`, default `warn`) is global and goes
-to stderr — stdout stays clean for JSON / MCP traffic.
+to stderr — stdout stays clean for JSON / MCP traffic. Stderr is diagnostic-only and
+best-effort; disconnecting its consumer does not terminate the stdin/stdout MCP transport.
 
 `kkernel -V` reports the package version; `kkernel --version` also reports the full source
 revision (including `-dirty` when applicable) and UTC build time.

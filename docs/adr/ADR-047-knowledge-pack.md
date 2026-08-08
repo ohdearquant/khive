@@ -1,8 +1,16 @@
 # ADR-047: Knowledge Pack
 
-**Status**: accepted (amended 2026-06-07, 2026-06-10, 2026-06-10b, 2026-08-01)
+**Status**: accepted (amended 2026-06-07, 2026-06-10, 2026-06-10b, 2026-08-01, 2026-08-06)
 **Date**: 2026-05-25
 **Authors**: khive maintainers
+
+## Amendment (2026-08-06): fail-closed search filter values
+
+`knowledge.search` accepts only `atom` or `domain` for `kind`/`type`. Its atom-status
+vocabulary is closed to `draft`, `reviewed`, and `deprecated`, so a non-blank
+`exclude_status` outside that set is invalid. Both cases return `InvalidInput`; an unknown
+kind never falls through to atom search, and a misspelled exclusion never replaces the safe
+default status filter.
 
 ## Amendment (2026-08-01): exact namespace support for `knowledge.compose`
 

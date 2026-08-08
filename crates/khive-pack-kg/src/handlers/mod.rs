@@ -32,6 +32,7 @@ pub use common::{
     normalize_entity_timestamps, resolve_kind_spec, resolve_uuid_unfiltered,
     resolve_uuid_unfiltered_including_deleted, KindSpec,
 };
+pub use search::{SearchSubstrate, ValidatedSearchRequest};
 
 #[cfg(test)]
 pub(crate) use common::{

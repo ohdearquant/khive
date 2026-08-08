@@ -692,6 +692,79 @@ async fn list_notes_offset_returns_disjoint_pages() {
     }
 }
 
+// ---- #1658: offset-mode message-filter scan must disclose scan_incomplete ----
+//
+// Loop 2 in list.rs (offset + message filter) shares MAX_SCAN_TOTAL=10_000 with
+// loop 1 (cursor + message filter) but, before this fix, never reported
+// scan_incomplete when the scan hit that ceiling before exhausting matches.
+
+#[tokio::test]
+async fn list_notes_offset_message_filter_scan_incomplete_true() {
+    let rt = KhiveRuntime::memory().expect("in-memory runtime");
+    let token = rt.authorize(Namespace::local()).expect("authorize local");
+    let store = rt.notes(&token).expect("note store");
+
+    // 10,050 plain "message" notes with no outbound direction — the message
+    // filter (direction=outbound) never matches, so the scan must run to the
+    // full 10,000-row ceiling before giving up.
+    for i in 0..10_050u32 {
+        let note = Note::new("local", "message", format!("filler {i}"))
+            .with_properties(serde_json::json!({ "direction": "inbound" }));
+        store.upsert_note(note).await.expect("upsert filler note");
+    }
+
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(KgPack::new(rt.clone()));
+    let registry = builder.build().expect("registry builds");
+
+    let result = registry
+        .dispatch(
+            "list",
+            json!({"kind": "note", "direction": "outbound", "offset": 0, "limit": 5}),
+        )
+        .await
+        .expect("list must succeed even when scan is truncated");
+
+    assert_eq!(
+        result.get("scan_incomplete").and_then(Value::as_bool),
+        Some(true),
+        "offset-mode message-filter scan must disclose truncation at the 10,000-row \
+         ceiling; got {result}"
+    );
+}
+
+#[tokio::test]
+async fn list_notes_offset_message_filter_scan_incomplete_absent_when_not_truncated() {
+    let rt = KhiveRuntime::memory().expect("in-memory runtime");
+    let token = rt.authorize(Namespace::local()).expect("authorize local");
+    let store = rt.notes(&token).expect("note store");
+
+    for i in 0..5u32 {
+        let note = Note::new("local", "message", format!("small {i}"))
+            .with_properties(serde_json::json!({ "direction": "outbound" }));
+        store.upsert_note(note).await.expect("upsert note");
+    }
+
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(KgPack::new(rt.clone()));
+    let registry = builder.build().expect("registry builds");
+
+    let result = registry
+        .dispatch(
+            "list",
+            json!({"kind": "note", "direction": "outbound", "offset": 0, "limit": 5}),
+        )
+        .await
+        .expect("list must succeed");
+
+    assert!(
+        result.get("scan_incomplete").is_none()
+            || result.get("scan_incomplete") == Some(&Value::Bool(false)),
+        "scan_incomplete must be absent/false when the scan completes before the \
+         ceiling; got {result}"
+    );
+}
+
 #[tokio::test]
 async fn list_unknown_kind_returns_invalid_input() {
     let pack = pack();
@@ -1024,6 +1097,27 @@ async fn search_nameless_note_name_is_null() {
         hit.get("title").and_then(Value::as_str).is_some(),
         "title must remain populated as the display value; got hit {hit}"
     );
+}
+
+#[tokio::test]
+async fn search_rejects_filters_that_do_not_apply_to_the_resolved_substrate() {
+    let pack = pack();
+    for params in [
+        json!({"kind": "entity", "query": "x", "note_kind": "observation"}),
+        json!({"kind": "entity", "query": "x", "include_superseded": true}),
+        json!({"kind": "note", "query": "x", "entity_kind": "concept"}),
+        json!({"kind": "note", "query": "x", "entity_type": "theorem"}),
+        json!({"kind": "entity", "query": "x", "properties": ["not", "an", "object"]}),
+    ] {
+        let error = pack
+            .dispatch("search", params)
+            .await
+            .expect_err("an inapplicable or malformed filter must not be ignored");
+        assert!(
+            is_invalid_input(&error),
+            "search validation must return InvalidInput, got {error:?}"
+        );
+    }
 }
 
 /// Regression for #163: `search` accepts a `properties` filter that restricts
@@ -2906,6 +3000,67 @@ async fn list_events_pagination_offset_beyond_end_returns_empty() {
     );
 }
 
+// ---- #1658: event outcome-filter scan must disclose scan_incomplete ----
+//
+// Loop 3 in list.rs (event + outcome filter) computes a per-call scan ceiling
+// of (offset + limit) * 20 but, before this fix, never reported
+// scan_incomplete when that ceiling was reached before exhausting matches.
+
+#[tokio::test]
+async fn list_events_outcome_filter_scan_incomplete_true() {
+    let pack = pack_with_events();
+    // 25 create events, all outcome=success — with limit=1 the scan ceiling
+    // is (0 + 1) * 20 = 20, so a filter for an outcome that never occurs
+    // ("denied") must exhaust the ceiling before finding any match.
+    for i in 0..25u32 {
+        pack.dispatch(
+            "create",
+            json!({"kind": "concept", "name": format!("ScanFill-{i}")}),
+        )
+        .await
+        .expect("create must succeed");
+    }
+
+    let result = pack
+        .dispatch(
+            "list",
+            json!({"kind": "event", "outcome": "denied", "limit": 1}),
+        )
+        .await
+        .expect("list must succeed even when scan is truncated");
+
+    assert_eq!(
+        result.get("scan_incomplete").and_then(Value::as_bool),
+        Some(true),
+        "event outcome-filter scan must disclose truncation at its ceiling; got {result}"
+    );
+}
+
+#[tokio::test]
+async fn list_events_outcome_filter_scan_incomplete_absent_when_not_truncated() {
+    let pack = pack_with_events();
+    for name in ["SmallA", "SmallB", "SmallC"] {
+        pack.dispatch("create", json!({"kind": "concept", "name": name}))
+            .await
+            .expect("create must succeed");
+    }
+
+    let result = pack
+        .dispatch(
+            "list",
+            json!({"kind": "event", "outcome": "denied", "limit": 1}),
+        )
+        .await
+        .expect("list must succeed");
+
+    assert!(
+        result.get("scan_incomplete").is_none()
+            || result.get("scan_incomplete") == Some(&Value::Bool(false)),
+        "scan_incomplete must be absent/false when the scan completes before the \
+         ceiling; got {result}"
+    );
+}
+
 #[tokio::test]
 async fn list_unknown_kind_includes_event_in_valid_list() {
     let pack = pack();
@@ -3832,6 +3987,167 @@ async fn update_nonexistent_uuid_without_kind_returns_not_found() {
     assert!(
         matches!(err, RuntimeError::NotFound(_)),
         "update on nonexistent UUID without kind must be NotFound, got: {err:?}"
+    );
+}
+
+// ---- #1660: kind-discriminant mismatch returns InvalidInput, not NotFound ----
+
+#[tokio::test]
+async fn update_entity_kind_mismatch_returns_invalid_input() {
+    let pack = pack();
+    let created = pack
+        .dispatch(
+            "create",
+            json!({"kind": "entity", "name": "MismatchTarget", "entity_kind": "service"}),
+        )
+        .await
+        .expect("create must succeed");
+    let id = created
+        .get("id")
+        .and_then(Value::as_str)
+        .unwrap()
+        .to_string();
+
+    let err = pack
+        .dispatch(
+            "update",
+            json!({"id": id, "kind": "concept", "description": "x"}),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        is_invalid_input(&err),
+        "kind mismatch on update must be InvalidInput, got: {err:?}"
+    );
+    let msg = invalid_input_message(&err);
+    assert!(
+        msg.contains("service") && msg.contains("concept"),
+        "message must name both stored and expected kind, got: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn update_entity_correct_kind_succeeds() {
+    let pack = pack();
+    let created = pack
+        .dispatch(
+            "create",
+            json!({"kind": "entity", "name": "MatchTarget", "entity_kind": "service"}),
+        )
+        .await
+        .expect("create must succeed");
+    let id = created
+        .get("id")
+        .and_then(Value::as_str)
+        .unwrap()
+        .to_string();
+
+    let result = pack
+        .dispatch(
+            "update",
+            json!({"id": id, "kind": "service", "description": "updated"}),
+        )
+        .await;
+    assert!(
+        result.is_ok(),
+        "update with matching kind discriminant must succeed: {:?}",
+        result
+    );
+}
+
+#[tokio::test]
+async fn delete_entity_kind_mismatch_returns_invalid_input() {
+    let pack = pack();
+    let created = pack
+        .dispatch(
+            "create",
+            json!({"kind": "entity", "name": "DeleteMismatch", "entity_kind": "service"}),
+        )
+        .await
+        .expect("create must succeed");
+    let id = created
+        .get("id")
+        .and_then(Value::as_str)
+        .unwrap()
+        .to_string();
+
+    let err = pack
+        .dispatch("delete", json!({"id": id, "kind": "concept"}))
+        .await
+        .unwrap_err();
+    assert!(
+        is_invalid_input(&err),
+        "kind mismatch on delete must be InvalidInput, got: {err:?}"
+    );
+    let msg = invalid_input_message(&err);
+    assert!(
+        msg.contains("service") && msg.contains("concept"),
+        "message must name both stored and expected kind, got: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn update_note_kind_mismatch_returns_invalid_input() {
+    let pack = pack();
+    let created = pack
+        .dispatch(
+            "create",
+            json!({"kind": "note", "content": "note body", "note_kind": "observation"}),
+        )
+        .await
+        .expect("create must succeed");
+    let id = created
+        .get("id")
+        .and_then(Value::as_str)
+        .unwrap()
+        .to_string();
+
+    let err = pack
+        .dispatch(
+            "update",
+            json!({"id": id, "kind": "insight", "content": "updated body"}),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        is_invalid_input(&err),
+        "kind mismatch on note update must be InvalidInput, got: {err:?}"
+    );
+    let msg = invalid_input_message(&err);
+    assert!(
+        msg.contains("observation") && msg.contains("insight"),
+        "message must name both stored and expected kind, got: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn delete_note_kind_mismatch_returns_invalid_input() {
+    let pack = pack();
+    let created = pack
+        .dispatch(
+            "create",
+            json!({"kind": "note", "content": "note body", "note_kind": "observation"}),
+        )
+        .await
+        .expect("create must succeed");
+    let id = created
+        .get("id")
+        .and_then(Value::as_str)
+        .unwrap()
+        .to_string();
+
+    let err = pack
+        .dispatch("delete", json!({"id": id, "kind": "insight"}))
+        .await
+        .unwrap_err();
+    assert!(
+        is_invalid_input(&err),
+        "kind mismatch on note delete must be InvalidInput, got: {err:?}"
+    );
+    let msg = invalid_input_message(&err);
+    assert!(
+        msg.contains("observation") && msg.contains("insight"),
+        "message must name both stored and expected kind, got: {msg}"
     );
 }
 
@@ -12231,7 +12547,9 @@ async fn list_note_limit_over_cap_truncates_with_metadata() {
         .dispatch("list", json!({"kind": "note", "limit": 300}))
         .await
         .expect("#894: list notes must succeed even when the cap binds");
-    let items = resp["items"].as_array().expect("items must be an array");
+    let items = resp["notes"]
+        .as_array()
+        .expect("clamped note envelope must contain notes");
     assert_eq!(
         items.len(),
         200,
@@ -12484,6 +12802,105 @@ async fn list_proposal_limit_over_cap_reports_effective_limit() {
     assert_eq!(response["requested_limit"], 600);
     assert_eq!(response["effective_limit"], 500);
     assert_eq!(response["limit_clamped"], true);
+}
+
+/// #1671: a full offset sweep over `list(kind="proposal")` must enumerate
+/// every proposal exactly once — no duplicates, no misses across page
+/// boundaries — even when proposals share `updated_at` timestamps — and the
+/// concatenated pages must follow the documented `updated_at DESC,
+/// proposal_id DESC` order (with one shared `updated_at`, that is `proposal_id
+/// DESC`). Uniqueness alone would still pass with a wrong tiebreak direction.
+#[tokio::test]
+async fn list_proposals_offset_sweep_covers_all_exactly_once() {
+    let rt = KhiveRuntime::memory().expect("in-memory runtime must succeed");
+    let tok = rt.authorize(Namespace::local()).unwrap();
+    let event_store = rt.events(&tok).expect("event store must be available");
+    let mut builder = VerbRegistryBuilder::new();
+    builder.with_event_store(event_store);
+    builder.register(KgPack::new(rt.clone()));
+    let f = Fixture {
+        registry: builder.build().expect("registry build must succeed"),
+    };
+    let mut created_ids = Vec::new();
+    for i in 0..61 {
+        let response = f
+            .dispatch(
+                "propose",
+                json!({
+                    "title": format!("sweep-{i:03}"),
+                    "description": "offset sweep coverage",
+                    "changeset": changeset_add_entity(),
+                }),
+            )
+            .await
+            .expect("propose must succeed");
+        created_ids.push(response["id"].as_str().expect("proposal id").to_string());
+    }
+
+    // Force every proposal onto one shared `updated_at` so the sweep exercises
+    // the tiebreak path; otherwise unique microsecond timestamps would let the
+    // test pass even without the `proposal_id` tiebreak.
+    let shared_updated_at = 1_750_000_000_000_000_i64;
+    {
+        let sql = rt.sql();
+        let mut writer = sql.writer().await.expect("sql writer must open");
+        for id in &created_ids {
+            writer
+                .execute(SqlStatement {
+                    sql: "UPDATE proposals_open SET updated_at = ?1 WHERE proposal_id = ?2".into(),
+                    params: vec![
+                        SqlValue::Integer(shared_updated_at),
+                        SqlValue::Text(id.clone()),
+                    ],
+                    label: None,
+                })
+                .await
+                .expect("force shared updated_at");
+        }
+    }
+    created_ids.sort_unstable_by(|a, b| b.cmp(a));
+
+    let mut seen = std::collections::HashSet::new();
+    let mut ordered_ids: Vec<String> = Vec::new();
+    let mut offset = 0_u64;
+    let page_size = 7_u64;
+    loop {
+        let page = f
+            .dispatch(
+                "list",
+                json!({"kind": "proposal", "limit": page_size, "offset": offset}),
+            )
+            .await
+            .expect("list proposals page");
+        let items = page.as_array().expect("proposal list is a JSON array");
+        if items.is_empty() {
+            break;
+        }
+        for row in items {
+            let id = row["id"].as_str().expect("proposal id").to_string();
+            assert!(seen.insert(id.clone()), "duplicate id across pages: {id}");
+            ordered_ids.push(id);
+        }
+        offset += items.len() as u64;
+    }
+    assert_eq!(
+        seen.len(),
+        61,
+        "sweep must cover every proposal exactly once"
+    );
+    let mut seen_sorted: Vec<String> = seen.into_iter().collect();
+    seen_sorted.sort_unstable_by(|a, b| b.cmp(a));
+    assert_eq!(
+        seen_sorted, created_ids,
+        "sweep must return exactly the proposals that were created"
+    );
+    // `created_ids` is sorted `proposal_id DESC`; with one shared `updated_at`
+    // that is exactly the documented `updated_at DESC, proposal_id DESC` order,
+    // so the pages concatenated must reproduce it.
+    assert_eq!(
+        ordered_ids, created_ids,
+        "sweep pages must appear in updated_at DESC, proposal_id DESC order"
+    );
 }
 
 // ── #806: `search_executed` event-plane emission ────────────────────────────
@@ -13045,13 +13462,10 @@ async fn whoami_appears_in_verbs_introspection() {
     );
 }
 
-/// Regression for #1168/#1247: the `query()` wire response always carries a
-/// structural `truncated` boolean, present whether or not the cap fired, so
-/// a caller can check it directly instead of inferring "not truncated" from
-/// the absence of a `warnings` entry (whose text also used to recommend an
-/// unimplemented OFFSET/SKIP paging path).
+/// Regression for #1168/#1247/#1601: the `query()` wire response always carries
+/// structural page metadata, present whether or not the page bound fired.
 #[tokio::test]
-async fn query_response_always_carries_truncated_field() {
+async fn query_response_always_carries_page_metadata() {
     let pack = pack();
     pack.dispatch(
         "create",
@@ -13071,13 +13485,180 @@ async fn query_response_always_carries_truncated_field() {
         "#1247: an under-the-cap query result must still carry truncated:false, not omit the \
          field; got {result}"
     );
-    if let Some(warnings) = result.get("warnings").and_then(Value::as_array) {
-        for w in warnings {
-            let text = w.as_str().unwrap_or_default();
-            assert!(
-                !text.contains("LIMIT/OFFSET"),
-                "#1168: no warning may recommend the unimplemented OFFSET/SKIP path: {text}"
+    assert_eq!(result.get("has_more").and_then(Value::as_bool), Some(false));
+    assert_eq!(result.get("offset").and_then(Value::as_u64), Some(0));
+    assert_eq!(result.get("page_size").and_then(Value::as_u64), Some(500));
+    assert!(
+        result.get("next_offset").is_none(),
+        "terminal pages must omit next_offset; got {result}"
+    );
+    assert!(
+        result.get("warnings").is_none(),
+        "an under-cap page needs no human warning; got {result}"
+    );
+}
+
+#[tokio::test]
+async fn query_gql_skip_retrieves_every_page_without_overlap() {
+    let pack = pack();
+    let source = pack
+        .dispatch(
+            "create",
+            json!({"kind": "project", "name": "QueryPageSource"}),
+        )
+        .await
+        .expect("source project must be created")["id"]
+        .as_str()
+        .expect("create response must contain an id")
+        .to_string();
+    for i in 0..7 {
+        let target = pack
+            .dispatch(
+                "create",
+                json!({"kind": "project", "name": format!("QueryPageTarget{i}")}),
+            )
+            .await
+            .expect("target project must be created")["id"]
+            .as_str()
+            .expect("create response must contain an id")
+            .to_string();
+        pack.dispatch(
+            "link",
+            json!({
+                "source_id": source,
+                "target_id": target,
+                "relation": "depends_on"
+            }),
+        )
+        .await
+        .expect("depends_on edge must be created");
+    }
+
+    let first = pack
+        .dispatch(
+            "query",
+            json!({
+                "query": "MATCH (a:project)-[r:depends_on]->(b:project) WHERE a.name = 'QueryPageSource' RETURN a.id, r.id, b.id",
+                "page_size": 3
+            }),
+        )
+        .await
+        .expect("first query page must succeed");
+    let first_repeat = pack
+        .dispatch(
+            "query",
+            json!({
+                "query": "MATCH (a:project)-[r:depends_on]->(b:project) WHERE a.name = 'QueryPageSource' RETURN a.id, r.id, b.id",
+                "page_size": 3
+            }),
+        )
+        .await
+        .expect("repeated first page must succeed");
+    let second = pack
+        .dispatch(
+            "query",
+            json!({
+                "query": "MATCH (a:project)-[r:depends_on]->(b:project) WHERE a.name = 'QueryPageSource' RETURN a.id, r.id, b.id SKIP 3",
+                "page_size": 3
+            }),
+        )
+        .await
+        .expect("second query page must succeed");
+    let third = pack
+        .dispatch(
+            "query",
+            json!({
+                "query": "MATCH (a:project)-[r:depends_on]->(b:project) WHERE a.name = 'QueryPageSource' RETURN a.id, r.id, b.id SKIP 6",
+                "page_size": 3
+            }),
+        )
+        .await
+        .expect("terminal query page must succeed");
+
+    assert_eq!(first.get("next_offset").and_then(Value::as_u64), Some(3));
+    assert_eq!(
+        first["rows"], first_repeat["rows"],
+        "an unchanged match set must produce a stable first page"
+    );
+    assert_eq!(second.get("next_offset").and_then(Value::as_u64), Some(6));
+    assert_eq!(first.get("truncated").and_then(Value::as_bool), Some(true));
+    assert_eq!(second.get("truncated").and_then(Value::as_bool), Some(true));
+    assert_eq!(third.get("has_more").and_then(Value::as_bool), Some(false));
+    assert_eq!(third.get("truncated").and_then(Value::as_bool), Some(false));
+    assert!(third.get("next_offset").is_none());
+    assert_eq!(first["rows"].as_array().map(Vec::len), Some(3));
+    assert_eq!(second["rows"].as_array().map(Vec::len), Some(3));
+    assert_eq!(third["rows"].as_array().map(Vec::len), Some(1));
+
+    let mut edge_ids = std::collections::HashSet::new();
+    for page in [&first, &second, &third] {
+        for row in page["rows"].as_array().expect("rows must be an array") {
+            edge_ids.insert(
+                row["r_id"]
+                    .as_str()
+                    .expect("edge id projection must be present")
+                    .to_string(),
             );
         }
     }
+    assert_eq!(
+        edge_ids.len(),
+        7,
+        "all seven depends_on matches must be retrievable"
+    );
+}
+
+#[tokio::test]
+async fn query_page_size_validation_alias_and_hard_cap_are_explicit() {
+    let pack = pack();
+
+    let both = pack
+        .dispatch(
+            "query",
+            json!({
+                "query": "MATCH (a:concept) RETURN a",
+                "page_size": 5,
+                "limit": 5
+            }),
+        )
+        .await
+        .expect_err("page_size and its legacy alias must be mutually exclusive");
+    assert!(
+        is_invalid_input(&both),
+        "mutually exclusive page bounds must be InvalidInput: {both:?}"
+    );
+
+    let zero = pack
+        .dispatch(
+            "query",
+            json!({"query": "MATCH (a:concept) RETURN a", "page_size": 0}),
+        )
+        .await
+        .expect_err("zero-sized pages cannot produce an advancing continuation");
+    assert!(
+        is_invalid_input(&zero),
+        "zero page_size must be InvalidInput"
+    );
+
+    let clamped = pack
+        .dispatch(
+            "query",
+            json!({"query": "MATCH (a:concept) RETURN a", "page_size": 20_000}),
+        )
+        .await
+        .expect("oversized page_size is clamped to the hard cap");
+    assert_eq!(
+        clamped.get("page_size").and_then(Value::as_u64),
+        Some(10_000),
+        "wire metadata must expose the effective hard-capped page size"
+    );
+
+    let legacy = pack
+        .dispatch(
+            "query",
+            json!({"query": "MATCH (a:concept) RETURN a", "limit": 7}),
+        )
+        .await
+        .expect("legacy limit alias remains accepted");
+    assert_eq!(legacy.get("page_size").and_then(Value::as_u64), Some(7));
 }

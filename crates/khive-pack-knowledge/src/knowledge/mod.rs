@@ -8,6 +8,7 @@ pub(crate) mod vamana;
 
 mod compose;
 mod crud;
+mod eval;
 mod fold_handler;
 mod index_handler;
 mod search;
