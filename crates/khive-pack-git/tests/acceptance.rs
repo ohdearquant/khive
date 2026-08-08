@@ -7500,7 +7500,9 @@ async fn ingest_reports_truncation_even_with_no_embedder_configured() {
         .dispatch("list", json!({"kind": "commit", "limit": 10}))
         .await
         .expect("list ok");
-    let stored_content = list[0]["content"].as_str().expect("content is string");
+    let stored_content = list_items(&list)[0]["content"]
+        .as_str()
+        .expect("content is string");
     assert!(stored_content.contains(&message));
 }
 

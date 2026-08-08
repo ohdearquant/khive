@@ -39,7 +39,9 @@ from ingest_workspace_artifacts import (  # noqa: E402
     cap_content,
     compute_annotate_targets,
     dsl_escape,
+    fetch_all,
     filter_pr_by_number,
+    load_existing_ws_ingest_notes,
     missing_annotate_targets,
     reconcile_existing_note,
     select_exact_project,
@@ -220,6 +222,87 @@ class ProjectScopingTests(unittest.TestCase):
     def test_filter_pr_by_number_ignores_rows_missing_project_id(self):
         rows = [{"id": "n1", "properties": {"number": 1049}}]
         self.assertEqual(filter_pr_by_number(rows, "khive-oss-id"), {})
+
+
+class ClampedListPaginationTests(unittest.TestCase):
+    class PagingKKernel:
+        def __init__(self, pages: dict[int, list[dict]]):
+            self.pages = pages
+            self.offsets: list[int] = []
+
+        def read(self, ops: str) -> dict:
+            match = re.search(r"offset=(\d+)", ops)
+            assert match, f"missing offset in list ops: {ops}"
+            offset = int(match.group(1))
+            self.offsets.append(offset)
+            return {
+                "results": [
+                    {
+                        "ok": True,
+                        "result": {
+                            "items": self.pages.get(offset, []),
+                            "effective_limit": 2,
+                            "limit_clamped": True,
+                            "requested_limit": 200,
+                        },
+                    }
+                ]
+            }
+
+    def test_fetch_all_advances_by_returned_rows_until_empty_page(self):
+        kk = self.PagingKKernel(
+            {
+                0: [{"id": "p1"}, {"id": "p2"}],
+                2: [{"id": "p3"}],
+            }
+        )
+
+        rows = fetch_all(kk, "project", page_limit=200, max_pages=10)
+
+        self.assertEqual([row["id"] for row in rows], ["p1", "p2", "p3"])
+        self.assertEqual(kk.offsets, [0, 2, 3])
+
+    def test_existing_note_scan_advances_by_returned_rows_until_empty_page(self):
+        def tagged(note_id, source, sha):
+            return {
+                "id": note_id,
+                "properties": {
+                    "tags": ["ws-ingest"],
+                    "source_path": source,
+                    "content_sha256_16": sha,
+                },
+            }
+
+        kk = self.PagingKKernel(
+            {
+                0: [tagged("n1", "one", "sha-1"), tagged("n2", "two", "sha-2")],
+                2: [tagged("n3", "three", "sha-3")],
+            }
+        )
+
+        seen = load_existing_ws_ingest_notes(
+            kk, ["reference"], page_limit=200, max_pages=10
+        )
+
+        self.assertEqual(
+            seen,
+            {("one", "sha-1"): "n1", ("two", "sha-2"): "n2", ("three", "sha-3"): "n3"},
+        )
+        self.assertEqual(kk.offsets, [0, 2, 3])
+
+    def test_fetch_all_still_stops_at_max_pages(self):
+        kk = self.PagingKKernel(
+            {
+                0: [{"id": "p1"}],
+                1: [{"id": "p2"}],
+                2: [{"id": "p3"}],
+            }
+        )
+
+        rows = fetch_all(kk, "project", page_limit=200, max_pages=2)
+
+        self.assertEqual([row["id"] for row in rows], ["p1", "p2"])
+        self.assertEqual(kk.offsets, [0, 1])
 
 
 class ComputeAnnotateTargetsTests(unittest.TestCase):

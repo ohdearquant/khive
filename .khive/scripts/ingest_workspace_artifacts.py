@@ -349,7 +349,7 @@ def list_items(result) -> list:
 
 
 def fetch_all(kk: KKernel, kind: str, page_limit: int = 200, max_pages: int = 50) -> list[dict]:
-    """Fetch every row of `kind` via bounded pagination. Read-only."""
+    """Fetch rows via bounded offset pagination until the server returns an empty page."""
     rows_all: list[dict] = []
     offset = 0
     for _ in range(max_pages):
@@ -358,9 +358,7 @@ def fetch_all(kk: KKernel, kind: str, page_limit: int = 200, max_pages: int = 50
         if not rows:
             break
         rows_all.extend(rows)
-        if len(rows) < page_limit:
-            break
-        offset += page_limit
+        offset += len(rows)
     return rows_all
 
 
@@ -419,7 +417,9 @@ def load_existing_ws_ingest_notes(
     """(source_path, content_sha256_16) -> note id, for notes already ingested
     by this script, across kinds. The note id is retained (not just the key)
     so a match can be reconciled — its `annotates` edges verified/backfilled
-    — rather than accepted as complete on sight; see reconcile_existing_note."""
+    — rather than accepted as complete on sight; see reconcile_existing_note.
+    Pagination advances by rows returned and stops only on an empty page so a
+    server-clamped page cannot skip rows or terminate the scan early."""
     seen: dict[tuple[str, str], str] = {}
     for kind in note_kinds:
         offset = 0
@@ -437,9 +437,7 @@ def load_existing_ws_ingest_notes(
                 sha = props.get("content_sha256_16")
                 if sp and sha:
                     seen[(sp, sha)] = row["id"]
-            if len(rows) < page_limit:
-                break
-            offset += page_limit
+            offset += len(rows)
     return seen
 
 
