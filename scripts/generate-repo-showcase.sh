@@ -23,6 +23,7 @@ cargo run --locked \
   --manifest-path "$repo_root/crates/Cargo.toml" \
   -p kkernel -- \
   repo build \
+  --enable-l2 \
   --source https://github.com/ohdearquant/khive \
   --revision c2979d2443738a075e55a170c772d1dc86cf0f91 \
   --work-dir "$scratch_root/work" \

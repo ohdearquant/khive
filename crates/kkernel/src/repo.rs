@@ -11,12 +11,12 @@ use khive_mcp::server::KhiveMcpServer;
 use khive_mcp::tools::request::RequestParams;
 use khive_pack_git::source::{parse_source, remote_url_to_slug, DigestSource};
 use khive_repo_showcase::{
-    export, write_canonical_atomic, Availability, CodeIngestProvenance, ExportRequest,
-    GitDigestProvenance, HistorySourceCoverage, PipelineProvenance, SourceCoverage,
+    export, write_canonical_atomic, Availability, CodeIngestL2Provenance, CodeIngestProvenance,
+    ExportRequest, GitDigestProvenance, HistorySourceCoverage, PipelineProvenance, SourceCoverage,
 };
 use khive_runtime::{KhiveRuntime, Namespace, RuntimeConfig};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 
 const DIGEST_MAX_ITEMS: u64 = 2_000;
 const DEFAULT_MAX_DIGEST_PASSES: usize = 10_000;
@@ -94,6 +94,10 @@ pub struct RepoBuildArgs {
     /// Override the dedicated code-map database path.
     #[arg(long)]
     pub map_db: Option<PathBuf>,
+
+    /// Include the Rust L2 symbol tier in repository-showcase code ingest.
+    #[arg(long)]
+    pub enable_l2: bool,
 
     /// History sources to ingest. Commits are mandatory in v1.
     #[arg(
@@ -202,6 +206,15 @@ pub struct DigestReport {
     pub warnings: Vec<String>,
 }
 
+#[derive(Debug, Clone, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct CodeIngestL2Report {
+    pub symbols_created: u64,
+    pub symbols_updated: u64,
+    pub symbol_dependencies_unresolved: u64,
+    pub symbol_edges_stamped: u64,
+    pub symbol_parse_failures: u64,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct CodeIngestReport {
     pub source_revision: String,
@@ -222,6 +235,8 @@ pub struct CodeIngestReport {
     pub languages: Vec<String>,
     #[serde(default)]
     pub warnings: Vec<String>,
+    #[serde(flatten, skip_serializing_if = "Option::is_none")]
+    pub l2: Option<CodeIngestL2Report>,
 }
 
 #[derive(Debug, Serialize)]
@@ -303,6 +318,7 @@ async fn run_build(args: RepoBuildArgs) -> Result<()> {
     if args.max_digest_passes == 0 {
         bail!("--max-digest-passes must be greater than zero");
     }
+    let enable_l2 = args.enable_l2;
     let requested: BTreeSet<HistorySource> = args.include.into_iter().collect();
     if !requested.contains(&HistorySource::Commits) {
         bail!("repository showcase v1 requires commits in --include");
@@ -405,19 +421,19 @@ async fn run_build(args: RepoBuildArgs) -> Result<()> {
     }
     require_unchanged_head(&source.repo, &initial_head, "git.digest")?;
 
-    let code_value = dispatch_single(
-        &server,
-        "code.ingest",
-        json!({
-            "path": path_for_request(&source.repo, "repository")?,
-            "db": path_for_request(&map_db, "code-map database")?,
-            "languages": ["rust"],
-        }),
-    )
-    .await?;
+    let code_args = code_ingest_request_args(
+        path_for_request(&source.repo, "repository")?,
+        path_for_request(&map_db, "code-map database")?,
+        enable_l2,
+    );
+    let code_value = dispatch_single(&server, "code.ingest", code_args).await?;
+    let code_raw = code_value
+        .as_object()
+        .context("code.ingest response is not a JSON object")?;
+    let _ = validated_l2(code_raw)?;
     let code: CodeIngestReport = serde_json::from_value(code_value)
         .context("decode code.ingest repository-showcase report")?;
-    verify_code_ingest(&code, &initial_head, &map_db)?;
+    verify_code_ingest(&code, &initial_head, &map_db, enable_l2)?;
     require_unchanged_head(&source.repo, &initial_head, "code.ingest")?;
     let tag_coverage = establish_tag_coverage(&source.repo, args.tags)?;
     require_unchanged_head(&source.repo, &initial_head, "tag observation")?;
@@ -521,6 +537,14 @@ fn pipeline_provenance(
             files_skipped_without_module_path: code.files_skipped_without_module_path,
             coverage_stamps_missed: code.coverage_stamps_missed,
             warnings_count,
+            l2: code.l2.as_ref().map(|l2| CodeIngestL2Provenance {
+                source_revision: code.source_revision.clone(),
+                symbols_created: l2.symbols_created,
+                symbols_updated: l2.symbols_updated,
+                symbol_dependencies_unresolved: l2.symbol_dependencies_unresolved,
+                symbol_edges_stamped: l2.symbol_edges_stamped,
+                symbol_parse_failures: l2.symbol_parse_failures,
+            }),
         }),
         clone_tags,
     })
@@ -662,7 +686,9 @@ fn verify_code_ingest(
     report: &CodeIngestReport,
     expected_head: &str,
     expected_db: &Path,
+    expected_l2: bool,
 ) -> Result<()> {
+    verify_code_ingest_l2(report, expected_l2)?;
     if report.source_revision != expected_head {
         bail!(
             "code.ingest revision mismatch: expected {expected_head}, got {}",
@@ -675,13 +701,7 @@ fn verify_code_ingest(
             report.blocked_count
         );
     }
-    if report.coverage_stamps_missed > 0 || report.files_dropped_without_source_path > 0 {
-        bail!(
-            "code.ingest coverage is incomplete: coverage_stamps_missed={}, files_dropped_without_source_path={}",
-            report.coverage_stamps_missed,
-            report.files_dropped_without_source_path
-        );
-    }
+    verify_code_ingest_coverage(report, expected_l2)?;
     let reported_db = PathBuf::from(&report.db_path);
     let reported_db = reported_db.canonicalize().with_context(|| {
         format!(
@@ -703,6 +723,92 @@ fn verify_code_ingest(
         );
     }
     Ok(())
+}
+
+fn verify_code_ingest_l2(report: &CodeIngestReport, expected_l2: bool) -> Result<()> {
+    match (expected_l2, report.l2.as_ref()) {
+        (true, None) => bail!("code.ingest l2 was requested but the report carries no l2 counters"),
+        (false, Some(_)) => {
+            bail!("code.ingest returned l2 counters when l2 was not requested")
+        }
+        (_, Some(l2)) if l2.symbol_parse_failures > 0 => bail!(
+            "code.ingest l2 coverage is incomplete: symbol_parse_failures={}",
+            l2.symbol_parse_failures
+        ),
+        _ => Ok(()),
+    }
+}
+
+fn verify_code_ingest_coverage(report: &CodeIngestReport, expected_l2: bool) -> Result<()> {
+    if expected_l2 {
+        if report.coverage_stamps_missed > 0
+            || report.files_dropped_without_source_path > 0
+            || report.files_skipped_without_module_path > 0
+        {
+            bail!(
+                "code.ingest coverage is incomplete: coverage_stamps_missed={}, files_dropped_without_source_path={}, files_skipped_without_module_path={}",
+                report.coverage_stamps_missed,
+                report.files_dropped_without_source_path,
+                report.files_skipped_without_module_path
+            );
+        }
+    } else if report.coverage_stamps_missed > 0 || report.files_dropped_without_source_path > 0 {
+        bail!(
+            "code.ingest coverage is incomplete: coverage_stamps_missed={}, files_dropped_without_source_path={}",
+            report.coverage_stamps_missed,
+            report.files_dropped_without_source_path
+        );
+    }
+    Ok(())
+}
+
+fn code_ingest_request_args(path: &str, db: &str, enable_l2: bool) -> Value {
+    let mut args = json!({
+        "path": path,
+        "db": db,
+        "languages": ["rust"],
+    });
+    if enable_l2 {
+        args["tiers"] = json!(["l1", "l1.5", "l2"]);
+    }
+    args
+}
+
+fn validated_l2(raw: &Map<String, Value>) -> Result<Option<CodeIngestL2Report>> {
+    const L2_KEYS: [&str; 5] = [
+        "symbols_created",
+        "symbols_updated",
+        "symbol_dependencies_unresolved",
+        "symbol_edges_stamped",
+        "symbol_parse_failures",
+    ];
+
+    let present = L2_KEYS
+        .iter()
+        .copied()
+        .filter(|key| raw.contains_key(*key))
+        .collect::<Vec<_>>();
+    match present.len() {
+        0 => Ok(None),
+        5 => {
+            let counters = L2_KEYS
+                .iter()
+                .map(|key| {
+                    (
+                        (*key).to_string(),
+                        raw.get(*key).expect("all L2 keys were counted").clone(),
+                    )
+                })
+                .collect::<Map<_, _>>();
+            serde_json::from_value(Value::Object(counters))
+                .context("decode validated L2 report")
+                .map(Some)
+        }
+        count => bail!(
+            "code.ingest l2 report is partial: expected all 5 counters or none, found {count} ({})",
+            present.join(", ")
+        ),
+    }
 }
 
 async fn dispatch_single(server: &KhiveMcpServer, tool: &str, args: Value) -> Result<Value> {
@@ -1192,4 +1298,180 @@ fn sqlite_sidecars(path: &Path) -> [PathBuf; 3] {
 fn print_json(value: &impl Serialize) -> Result<()> {
     println!("{}", serde_json::to_string_pretty(value)?);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn code_ingest_report_value() -> Value {
+        json!({
+            "source_revision": "revision",
+            "db_path": "map.db",
+            "projects_created": 0,
+            "projects_updated": 0,
+            "modules_created": 0,
+            "modules_updated": 0,
+            "edges_created": 0,
+            "edges_updated": 0,
+            "blocked_count": 0,
+            "blocked": [],
+            "coverage_stamps_missed": 0,
+            "files_dropped_without_source_path": 0,
+            "files_skipped_without_module_path": 0,
+            "languages": ["rust"],
+            "warnings": [],
+        })
+    }
+
+    #[test]
+    fn partial_l2_group_reports_named_error() {
+        let raw = json!({
+            "symbols_created": 1,
+            "symbols_updated": 2,
+            "symbol_edges_stamped": 3,
+        });
+
+        let error = validated_l2(raw.as_object().expect("object fixture"))
+            .expect_err("a partial L2 counter group must be rejected");
+
+        assert_eq!(
+            error.to_string(),
+            "code.ingest l2 report is partial: expected all 5 counters or none, found 3 (symbols_created, symbols_updated, symbol_edges_stamped)"
+        );
+    }
+
+    #[test]
+    fn absent_l2_group_is_none() {
+        let raw = json!({});
+
+        assert_eq!(
+            validated_l2(raw.as_object().expect("object fixture"))
+                .expect("an absent L2 counter group is valid"),
+            None
+        );
+    }
+
+    #[test]
+    fn complete_l2_group_decodes_all_counters() {
+        let raw = json!({
+            "symbols_created": 1,
+            "symbols_updated": 2,
+            "symbol_dependencies_unresolved": 3,
+            "symbol_edges_stamped": 4,
+            "symbol_parse_failures": 5,
+        });
+
+        assert_eq!(
+            validated_l2(raw.as_object().expect("object fixture"))
+                .expect("a complete L2 counter group is valid"),
+            Some(CodeIngestL2Report {
+                symbols_created: 1,
+                symbols_updated: 2,
+                symbol_dependencies_unresolved: 3,
+                symbol_edges_stamped: 4,
+                symbol_parse_failures: 5,
+            })
+        );
+    }
+
+    #[test]
+    fn flattened_l2_group_decodes_as_part_of_the_ingest_report() {
+        let mut raw = code_ingest_report_value();
+        raw.as_object_mut().expect("object fixture").extend(
+            json!({
+                "symbols_created": 1,
+                "symbols_updated": 2,
+                "symbol_dependencies_unresolved": 3,
+                "symbol_edges_stamped": 4,
+                "symbol_parse_failures": 5,
+            })
+            .as_object()
+            .expect("object fixture")
+            .clone(),
+        );
+
+        let report: CodeIngestReport =
+            serde_json::from_value(raw).expect("complete flattened report decodes");
+
+        assert_eq!(
+            report.l2,
+            Some(CodeIngestL2Report {
+                symbols_created: 1,
+                symbols_updated: 2,
+                symbol_dependencies_unresolved: 3,
+                symbol_edges_stamped: 4,
+                symbol_parse_failures: 5,
+            })
+        );
+    }
+
+    #[test]
+    fn omitted_l2_group_decodes_as_none() {
+        let report: CodeIngestReport = serde_json::from_value(code_ingest_report_value())
+            .expect("report without L2 counters decodes");
+
+        assert_eq!(report.l2, None);
+    }
+
+    #[test]
+    fn l2_request_uses_all_three_tiers_without_changing_the_default_request() {
+        let default = code_ingest_request_args("/source", "/map.db", false);
+        let enabled = code_ingest_request_args("/source", "/map.db", true);
+
+        assert!(default.get("tiers").is_none());
+        assert_eq!(enabled["tiers"], json!(["l1", "l1.5", "l2"]));
+    }
+
+    #[test]
+    fn requested_l2_requires_the_report_group_with_exact_error() {
+        let report: CodeIngestReport = serde_json::from_value(code_ingest_report_value())
+            .expect("report without L2 counters decodes");
+
+        let error = verify_code_ingest_l2(&report, true)
+            .expect_err("requested L2 without its report must fail");
+
+        assert_eq!(
+            error.to_string(),
+            "code.ingest l2 was requested but the report carries no l2 counters"
+        );
+    }
+
+    #[test]
+    fn requested_all_zero_l2_is_present_not_absent() {
+        let mut raw = code_ingest_report_value();
+        raw.as_object_mut().expect("object fixture").extend(
+            json!({
+                "symbols_created": 0,
+                "symbols_updated": 0,
+                "symbol_dependencies_unresolved": 0,
+                "symbol_edges_stamped": 0,
+                "symbol_parse_failures": 0,
+            })
+            .as_object()
+            .expect("object fixture")
+            .clone(),
+        );
+        let report: CodeIngestReport =
+            serde_json::from_value(raw).expect("all-zero L2 report decodes");
+
+        verify_code_ingest_l2(&report, true).expect("all-zero L2 is a complete report");
+    }
+
+    #[test]
+    fn skipped_module_paths_only_block_an_l2_request() {
+        let mut report: CodeIngestReport =
+            serde_json::from_value(code_ingest_report_value()).expect("base report decodes");
+        report.files_skipped_without_module_path = 1;
+
+        verify_code_ingest_coverage(&report, false)
+            .expect("the established default coverage check remains unchanged");
+        let error = verify_code_ingest_coverage(&report, true)
+            .expect_err("L2 requires every source file to have a module path");
+
+        assert_eq!(
+            error.to_string(),
+            "code.ingest coverage is incomplete: coverage_stamps_missed=0, files_dropped_without_source_path=0, files_skipped_without_module_path=1"
+        );
+    }
 }

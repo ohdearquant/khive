@@ -7,6 +7,9 @@ const sha = z.string().regex(/^[0-9a-f]{40}$/);
 const shortShaSchema = z.string().regex(/^[0-9a-f]{7,40}$/);
 const timestamp = z.iso.datetime({ offset: true });
 const boundedItems = 50_000;
+const symbolPageLimit = 10_000;
+const unavailableSymbolReason = "symbol-tier ingest is deferred in khive.repo.v1";
+const populatedSymbolOrder = "module_path,name,symbol_id";
 
 const granularitySchema = z.enum(["repository", "module", "module_symbol_deferred"]);
 const joinTagSchema = z.enum(["history_only", "structure_only", "join", "field_tagged"]);
@@ -71,6 +74,15 @@ const repositoryIdentitySchema = z.strictObject({
   default_branch: availabilitySchema(wireString),
 });
 
+const codeIngestL2ProvenanceSchema = z.strictObject({
+  source_revision: sha,
+  symbols_created: z.number().int().nonnegative(),
+  symbols_updated: z.number().int().nonnegative(),
+  symbol_dependencies_unresolved: z.number().int().nonnegative(),
+  symbol_edges_stamped: z.number().int().nonnegative(),
+  symbol_parse_failures: z.number().int().nonnegative(),
+});
+
 const bundleMetaSchema = z.strictObject({
   repository: repositoryIdentitySchema,
   snapshot: z.strictObject({ head_sha: sha, ingested_at: timestamp }),
@@ -101,6 +113,7 @@ const bundleMetaSchema = z.strictObject({
       files_skipped_without_module_path: z.number().int().nonnegative(),
       coverage_stamps_missed: z.number().int().nonnegative(),
       warnings_count: z.number().int().nonnegative(),
+      l2: codeIngestL2ProvenanceSchema.optional(),
     })),
     clone_tags: sourceCoverageSchema,
   }),
@@ -123,7 +136,16 @@ const moduleNodeSchema = z.strictObject({
   content_hash: wireString,
   import_scan_status: wireString,
 });
-const symbolNodeSchema = z.strictObject({ id: wireString, module_id: wireString, name: wireString });
+const symbolNodeSchema = z.strictObject({
+  id: wireString,
+  module_id: wireString,
+  module_path: wireString,
+  name: wireString,
+  kind: wireString,
+  outgoing_call_edge_count: z.number().int().nonnegative(),
+  outgoing_type_reference_edge_count: z.number().int().nonnegative(),
+  incoming_implements_edge_count: z.number().int().nonnegative(),
+});
 const commitNodeSchema = z.strictObject({
   id: wireString,
   sha,
@@ -484,13 +506,116 @@ export const repoBundleSchema = z.strictObject({
   }),
   capability: capabilitySchema,
 }).superRefine((bundle, context) => {
-  if (bundle.meta.ingest.code_ingest.status === "available" &&
-      bundle.meta.snapshot.head_sha !== bundle.meta.ingest.code_ingest.value.source_revision) {
+  const codeIngest = bundle.meta.ingest.code_ingest;
+  if (codeIngest.status === "available" &&
+      bundle.meta.snapshot.head_sha !== codeIngest.value.source_revision) {
     context.addIssue({ code: "custom", path: ["meta", "ingest", "code_ingest", "source_revision"], message: "code map revision must equal the bundle HEAD" });
   }
-  for (const key of ["functions", "datatypes", "interfaces"] as const) {
-    if (bundle.graph[key].items.length !== 0) {
-      context.addIssue({ code: "custom", path: ["graph", key, "items"], message: "symbol-tier collections are typed but empty in khive.repo.v1" });
+
+  const l2 = codeIngest.status === "available" ? codeIngest.value.l2 : undefined;
+  if (l2 && l2.source_revision !== bundle.meta.snapshot.head_sha) {
+    context.addIssue({
+      code: "custom",
+      path: ["meta", "ingest", "code_ingest", "value", "l2", "source_revision"],
+      message: "code.ingest L2 revision must equal the bundle HEAD",
+    });
+  }
+
+  for (const [key, kind] of [
+    ["functions", "function"],
+    ["datatypes", "datatype"],
+    ["interfaces", "interface"],
+  ] as const) {
+    const page = bundle.graph[key];
+    if (!l2) {
+      const retainsUnavailableShape =
+        page.items.length === 0 &&
+        page.total_count.status === "unavailable" &&
+        page.total_count.reason === unavailableSymbolReason &&
+        page.bound.kind === "all" &&
+        page.bound.max_items === 0 &&
+        page.bound.order === "symbol_id" &&
+        page.next_cursor === null &&
+        page.truncated === false &&
+        page.disclosure.status === "unavailable" &&
+        page.disclosure.reason === unavailableSymbolReason;
+      if (!retainsUnavailableShape) {
+        context.addIssue({
+          code: "custom",
+          path: ["graph", key],
+          message: "symbol page must retain the legacy unavailable shape when L2 provenance is absent",
+        });
+      }
+      continue;
+    }
+
+    page.items.forEach((item, index) => {
+      if (item.kind !== kind) {
+        context.addIssue({
+          code: "custom",
+          path: ["graph", key, "items", index, "kind"],
+          message: "symbol kind must agree with its page",
+        });
+      }
+      if (index > 0) {
+        const prior = page.items[index - 1];
+        const outOfOrder =
+          prior.module_path > item.module_path ||
+          (prior.module_path === item.module_path && prior.name > item.name) ||
+          (prior.module_path === item.module_path && prior.name === item.name && prior.id > item.id);
+        if (outOfOrder) {
+          context.addIssue({
+            code: "custom",
+            path: ["graph", key, "items", index],
+            message: "symbol page items must follow the declared order",
+          });
+        }
+      }
+    });
+
+    const hasPopulatedEnvelope =
+      page.total_count.status === "available" &&
+      page.bound.order === populatedSymbolOrder &&
+      page.bound.max_items <= symbolPageLimit;
+    if (!hasPopulatedEnvelope || page.total_count.status !== "available") {
+      context.addIssue({
+        code: "custom",
+        path: ["graph", key],
+        message: "attested symbol page must expose an available total and the declared symbol bound",
+      });
+      continue;
+    }
+
+    if (!page.truncated) {
+      const isComplete =
+        page.bound.kind === "all" &&
+        page.items.length === page.total_count.value &&
+        page.next_cursor === null &&
+        page.disclosure.status === "complete" &&
+        page.disclosure.reason === null;
+      if (!isComplete) {
+        context.addIssue({
+          code: "custom",
+          path: ["graph", key],
+          message: "complete symbol page must use the declared bound, total, and disclosure",
+        });
+      }
+      continue;
+    }
+
+    const isTruncated =
+      page.bound.kind === "top_n" &&
+      page.items.length === page.bound.max_items &&
+      page.total_count.value > page.items.length &&
+      page.next_cursor === `offset:${page.bound.max_items}` &&
+      page.disclosure.status === "truncated" &&
+      page.disclosure.reason === `section limited to ${page.bound.max_items} items`;
+    if (!isTruncated) {
+      context.addIssue({
+        code: "custom",
+        path: ["graph", key],
+        message: "truncated symbol page must use the declared bound, cursor, total, and disclosure",
+      });
     }
   }
 });

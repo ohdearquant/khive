@@ -58,6 +58,14 @@ test("dogfoods every repository analysis from the curated static bundle", async 
     await expect(page.locator(`[data-cadence-series="${series}"]`)).toHaveAttribute("data-series-status", "unavailable");
   }
 
+  await page.locator('[data-view-id="api_surface"]').click();
+  for (const section of ["Functions", "Datatypes", "Interfaces"]) {
+    await expect(page.getByRole("heading", { name: section })).toBeVisible();
+  }
+  await expect(page.locator('[data-symbol-page="functions"]')).toContainText(
+    "symbol-tier ingest is deferred in khive.repo.v1",
+  );
+
   for (const viewId of viewIds) {
     const trigger = page.locator(`[data-view-id="${viewId}"]`);
     await expect(trigger).toBeVisible();

@@ -87,12 +87,22 @@ fn isolated_command(home: &Path) -> Command {
     command
 }
 
-fn build(home: &Path, repo: &Path, work: &Path, output: &Path, include: &str) -> Output {
+fn build_with_symbol_tier(
+    home: &Path,
+    repo: &Path,
+    work: &Path,
+    output: &Path,
+    include: &str,
+    enable_l2: bool,
+) -> Output {
     let revision = git(repo, &["rev-parse", "HEAD"]);
-    isolated_command(home)
+    let mut command = isolated_command(home);
+    command.args(["repo", "build"]);
+    if enable_l2 {
+        command.arg("--enable-l2");
+    }
+    command
         .args([
-            "repo",
-            "build",
             "--source",
             repo.to_str().expect("utf-8 repo path"),
             "--revision",
@@ -112,6 +122,75 @@ fn build(home: &Path, repo: &Path, work: &Path, output: &Path, include: &str) ->
         ])
         .output()
         .expect("run repo build")
+}
+
+fn build(home: &Path, repo: &Path, work: &Path, output: &Path, include: &str) -> Output {
+    build_with_symbol_tier(home, repo, work, output, include, false)
+}
+
+#[test]
+fn l2_enabled_build_reports_and_exports_symbol_provenance() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let home = tmp.path().join("home");
+    std::fs::create_dir_all(&home).expect("create home");
+    let repo = fixture_repo(tmp.path());
+    let output_path = tmp.path().join("bundle.json");
+
+    let output = build_with_symbol_tier(
+        &home,
+        &repo,
+        &tmp.path().join("work"),
+        &output_path,
+        "commits",
+        true,
+    );
+    assert!(
+        output.status.success(),
+        "L2 build failed:\nstdout={}\nstderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let head = git(&repo, &["rev-parse", "HEAD"]);
+    let report: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("build report JSON");
+    assert_eq!(report["code"]["source_revision"], head);
+    for counter in [
+        "symbols_created",
+        "symbols_updated",
+        "symbol_dependencies_unresolved",
+        "symbol_edges_stamped",
+        "symbol_parse_failures",
+    ] {
+        assert!(
+            report["code"][counter].is_u64(),
+            "L2 report omitted {counter}"
+        );
+    }
+    assert!(report["code"]["symbols_created"].as_u64().unwrap() > 0);
+
+    let bundle: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(output_path).expect("L2 bundle bytes"))
+            .expect("L2 bundle JSON");
+    let provenance = &bundle["meta"]["ingest"]["code_ingest"]["value"]["l2"];
+    assert_eq!(provenance["source_revision"], head);
+    for counter in [
+        "symbols_created",
+        "symbols_updated",
+        "symbol_dependencies_unresolved",
+        "symbol_edges_stamped",
+        "symbol_parse_failures",
+    ] {
+        assert_eq!(provenance[counter], report["code"][counter]);
+    }
+    for page in ["functions", "datatypes", "interfaces"] {
+        assert_eq!(bundle["graph"][page]["total_count"]["status"], "available");
+        assert_eq!(bundle["graph"][page]["disclosure"]["status"], "complete");
+        assert_eq!(
+            bundle["graph"][page]["bound"]["order"],
+            "module_path,name,symbol_id"
+        );
+    }
 }
 
 #[test]

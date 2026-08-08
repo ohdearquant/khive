@@ -47,6 +47,36 @@ pub(crate) struct MapData {
     pub(crate) edges: Vec<RawEdge>,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct RawOwnedDeclaration {
+    pub(crate) owner_module_id: String,
+    pub(crate) declaration_index: i64,
+    pub(crate) declaration_id_type: String,
+    pub(crate) declaration_id: String,
+    pub(crate) entity: Option<RawEntity>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct RawSymbolEdge {
+    pub(crate) id: String,
+    pub(crate) source_id: String,
+    pub(crate) target_id: String,
+    pub(crate) relation: String,
+    pub(crate) weight: f64,
+    pub(crate) last_seen_at: Option<String>,
+    pub(crate) language: Option<String>,
+    pub(crate) evidence_type: Option<String>,
+    pub(crate) has_call: bool,
+    pub(crate) has_type_reference: bool,
+    pub(crate) has_unknown_evidence: bool,
+}
+
+#[derive(Debug)]
+pub(crate) struct SymbolSnapshot {
+    pub(crate) declarations: Vec<RawOwnedDeclaration>,
+    pub(crate) edges: Vec<RawSymbolEdge>,
+}
+
 fn open_read_only(path: &Path) -> Result<Connection, ExportError> {
     if !path.is_file() {
         return Err(ExportError::MissingDatabase(path.to_path_buf()));
@@ -252,12 +282,18 @@ fn history_project_ids(
 
 pub(crate) fn read_map(path: &Path, revision: &str) -> Result<MapData, ExportError> {
     let conn = open_read_only(path)?;
-    let mut projects = read_entities(&conn, path, "kind='project' AND deleted_at IS NULL", &[])?;
+    let mut projects = read_entities(
+        &conn,
+        path,
+        "namespace='local' AND kind='project' AND deleted_at IS NULL",
+        &[],
+    )?;
     let modules = read_entities(
         &conn,
         path,
-        "kind='concept' AND entity_type='module' AND deleted_at IS NULL
-         AND json_extract(properties,'$.source_revision')=?1",
+        "namespace='local' AND kind='concept' AND entity_type='module' AND deleted_at IS NULL
+         AND json_extract(properties,'$.source_revision')=?1
+         AND json_type(properties,'$.import_scan_status')='text'",
         &[revision],
     )?;
     let source_projects = modules
@@ -285,7 +321,8 @@ pub(crate) fn read_map(path: &Path, revision: &str) -> Result<MapData, ExportErr
     let mut stmt = conn
         .prepare(
             "SELECT id,source_id,target_id,relation,weight FROM graph_edges
-             WHERE deleted_at IS NULL AND relation IN ('contains','depends_on')
+             WHERE namespace='local' AND deleted_at IS NULL
+               AND relation IN ('contains','depends_on')
              ORDER BY relation,source_id,target_id,id",
         )
         .map_err(|source| ExportError::Sqlite {
@@ -321,6 +358,167 @@ pub(crate) fn read_map(path: &Path, revision: &str) -> Result<MapData, ExportErr
         modules,
         edges,
     })
+}
+
+pub(crate) fn read_l2_snapshot(path: &Path, revision: &str) -> Result<SymbolSnapshot, ExportError> {
+    let conn = open_read_only(path)?;
+    let declarations = read_owned_declarations(&conn, path, revision)?;
+    let edges = read_symbol_edges(&conn, path)?;
+    Ok(SymbolSnapshot {
+        declarations,
+        edges,
+    })
+}
+
+fn read_owned_declarations(
+    conn: &Connection,
+    path: &Path,
+    revision: &str,
+) -> Result<Vec<RawOwnedDeclaration>, ExportError> {
+    let mut stmt = conn
+        .prepare(
+            "WITH current_rust_file_modules AS (
+                 SELECT id,properties
+                 FROM entities
+                 WHERE namespace='local'
+                   AND kind='concept'
+                   AND entity_type='module'
+                   AND deleted_at IS NULL
+                   AND json_extract(properties,'$.source_revision')=?1
+                   AND json_extract(properties,'$.language')='rust'
+                   AND json_type(properties,'$.import_scan_status')='text'
+                   AND json_type(properties,'$.declaration_ids')='array'
+             )
+             SELECT m.id,d.key,d.type,COALESCE(CAST(d.value AS TEXT),''),
+                    s.id,s.kind,s.entity_type,s.name,s.properties
+             FROM current_rust_file_modules m
+             JOIN json_each(m.properties,'$.declaration_ids') d ON TRUE
+             LEFT JOIN entities s
+               ON s.namespace='local'
+              AND s.id=CAST(d.value AS TEXT)
+              AND s.deleted_at IS NULL
+             ORDER BY m.id,d.key,CAST(d.value AS TEXT)",
+        )
+        .map_err(|source| ExportError::Sqlite {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    let rows = stmt
+        .query_map([revision], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, Option<String>>(5)?,
+                row.get::<_, Option<String>>(6)?,
+                row.get::<_, Option<String>>(7)?,
+                row.get::<_, Option<String>>(8)?,
+            ))
+        })
+        .map_err(|source| ExportError::Sqlite {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    let mut declarations = Vec::new();
+    for row in rows {
+        let (
+            owner_module_id,
+            declaration_index,
+            declaration_id_type,
+            declaration_id,
+            entity_id,
+            kind,
+            entity_type,
+            name,
+            properties,
+        ) = row.map_err(|source| ExportError::Sqlite {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        let entity = match entity_id {
+            Some(id) => Some(RawEntity {
+                kind: kind.unwrap_or_default(),
+                entity_type,
+                name: name.unwrap_or_default(),
+                properties: parse_properties(path, properties, &id)?,
+                id,
+            }),
+            None => None,
+        };
+        declarations.push(RawOwnedDeclaration {
+            owner_module_id,
+            declaration_index,
+            declaration_id_type,
+            declaration_id,
+            entity,
+        });
+    }
+    Ok(declarations)
+}
+
+fn read_symbol_edges(conn: &Connection, path: &Path) -> Result<Vec<RawSymbolEdge>, ExportError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT e.id,e.source_id,e.target_id,e.relation,e.weight,
+                    json_extract(e.metadata,'$.last_seen_at'),
+                    json_extract(e.metadata,'$.language'),
+                    json_type(e.metadata,'$.l2_evidence'),
+                    EXISTS (
+                        SELECT 1
+                        FROM json_each(COALESCE(e.metadata,'{}'),'$.l2_evidence')
+                        WHERE value='call'
+                    ),
+                    EXISTS (
+                        SELECT 1
+                        FROM json_each(COALESCE(e.metadata,'{}'),'$.l2_evidence')
+                        WHERE value='type_reference'
+                    ),
+                    EXISTS (
+                        SELECT 1
+                        FROM json_each(COALESCE(e.metadata,'{}'),'$.l2_evidence')
+                        WHERE type<>'text' OR value NOT IN ('call','type_reference')
+                    )
+             FROM graph_edges e
+             WHERE e.namespace='local'
+               AND e.deleted_at IS NULL
+               AND e.relation IN ('depends_on','implements')
+               AND json_extract(e.metadata,'$.l2_derived')=1
+             ORDER BY e.relation,e.source_id,e.target_id,e.id",
+        )
+        .map_err(|source| ExportError::Sqlite {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok(RawSymbolEdge {
+                id: row.get(0)?,
+                source_id: row.get(1)?,
+                target_id: row.get(2)?,
+                relation: row.get(3)?,
+                weight: row.get(4)?,
+                last_seen_at: row.get(5)?,
+                language: row.get(6)?,
+                evidence_type: row.get(7)?,
+                has_call: row.get::<_, i64>(8)? != 0,
+                has_type_reference: row.get::<_, i64>(9)? != 0,
+                has_unknown_evidence: row.get::<_, i64>(10)? != 0,
+            })
+        })
+        .map_err(|source| ExportError::Sqlite {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    let mut edges = Vec::new();
+    for row in rows {
+        edges.push(row.map_err(|source| ExportError::Sqlite {
+            path: path.to_path_buf(),
+            source,
+        })?);
+    }
+    Ok(edges)
 }
 
 fn read_entities(

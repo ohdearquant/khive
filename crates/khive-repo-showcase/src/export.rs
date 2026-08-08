@@ -4,7 +4,7 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use chrono::{DateTime, SecondsFormat, Utc};
+use chrono::{DateTime, FixedOffset, SecondsFormat, Utc};
 use schemars::schema_for;
 use serde_json::Value;
 use tempfile::NamedTempFile;
@@ -15,7 +15,9 @@ use crate::join::{
     changed_paths_fallback, derive_rust_module_keys, head_committed_at, head_sha, natural_id,
     release_tags, tracked_paths,
 };
-use crate::read::{read_history, read_map, HistoryData, MapData};
+use crate::read::{
+    read_history, read_l2_snapshot, read_map, HistoryData, MapData, RawEntity, SymbolSnapshot,
+};
 use crate::*;
 
 #[derive(Debug, Error)]
@@ -134,6 +136,24 @@ struct PreparedGraph {
     tags: Page<ReleaseTag>,
 }
 
+#[derive(Debug, Clone)]
+struct PreparedModuleIdentity {
+    wire_id: String,
+    source_project: String,
+    language: String,
+    module_path: String,
+    source_path: String,
+}
+
+#[derive(Debug, Clone)]
+struct PreparedSymbol {
+    node: SymbolNode,
+    source_project: String,
+    language: String,
+    entity_type: String,
+    last_seen_at: DateTime<FixedOffset>,
+}
+
 pub fn export(request: &ExportRequest) -> Result<RepoBundle, ExportError> {
     validate_bounds(&request.bounds)?;
     let repository =
@@ -147,7 +167,13 @@ pub fn export(request: &ExportRequest) -> Result<RepoBundle, ExportError> {
     );
     let history = read_history(&request.history_db, &repo_slug, &repository.canonical_url)?;
     let map = read_map(&request.map_db, &head)?;
-    let prepared = prepare_graph(request, &repository, &head, history, map)?;
+    let symbols = match &request.provenance.code_ingest {
+        Availability::Available { value } if value.l2.is_some() => {
+            Some(read_l2_snapshot(&request.map_db, &head)?)
+        }
+        Availability::Available { .. } | Availability::Unavailable { .. } => None,
+    };
+    let prepared = prepare_graph(request, &repository, &head, history, map, symbols)?;
     let aggregates = build_aggregates(AggregateInput {
         generated_at: &generated_at,
         graph: &prepared.graph,
@@ -189,6 +215,7 @@ fn validate_bounds(bounds: &ExportBounds) -> Result<(), ExportError> {
     let limits = [
         ("packages", bounds.packages, 2_048),
         ("modules", bounds.modules, 10_000),
+        ("symbols_per_kind", bounds.symbols_per_kind, 10_000),
         ("commits", bounds.commits, 5_000),
         ("issues", bounds.issues, 2_000),
         ("pull_requests", bounds.pull_requests, 2_000),
@@ -314,6 +341,29 @@ fn validate_provenance(request: &ExportRequest, head: &str) -> Result<(), Export
                 "code.ingest source_revision {} does not equal HEAD {head}",
                 value.source_revision
             )));
+        }
+        if let Some(l2) = &value.l2 {
+            if l2.source_revision != head {
+                return Err(ExportError::InvalidData(format!(
+                    "code.ingest l2 source_revision {} does not equal HEAD {head}",
+                    l2.source_revision
+                )));
+            }
+            if value.blocked_count > 0
+                || value.files_dropped_without_source_path > 0
+                || value.files_skipped_without_module_path > 0
+                || value.coverage_stamps_missed > 0
+                || l2.symbol_parse_failures > 0
+            {
+                return Err(ExportError::InvalidData(format!(
+                    "code.ingest l2 coverage is incomplete: blocked={}, dropped_without_source_path={}, skipped_without_module_path={}, coverage_stamps_missed={}, symbol_parse_failures={}",
+                    value.blocked_count,
+                    value.files_dropped_without_source_path,
+                    value.files_skipped_without_module_path,
+                    value.coverage_stamps_missed,
+                    l2.symbol_parse_failures
+                )));
+            }
         }
     }
     if let Availability::Available { value } = &request.provenance.git_digest {
@@ -506,6 +556,41 @@ pub(crate) fn bounded_page<T>(mut items: Vec<T>, limit: u32, order: impl Into<St
     }
 }
 
+fn bounded_symbol_page(mut items: Vec<SymbolNode>, limit: u32) -> SymbolPage {
+    items.sort_by(|left, right| {
+        left.module_path
+            .cmp(&right.module_path)
+            .then_with(|| left.name.cmp(&right.name))
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    let total = items.len() as u64;
+    let truncated = total > u64::from(limit);
+    items.truncate(limit as usize);
+    SymbolPage {
+        items,
+        total_count: Availability::available(total),
+        bound: PageBound {
+            kind: if truncated {
+                BoundKind::TopN
+            } else {
+                BoundKind::All
+            },
+            max_items: limit,
+            order: "module_path,name,symbol_id".into(),
+        },
+        next_cursor: truncated.then(|| format!("offset:{limit}")),
+        truncated,
+        disclosure: Disclosure {
+            status: if truncated {
+                DisclosureStatus::Truncated
+            } else {
+                DisclosureStatus::Complete
+            },
+            reason: truncated.then(|| format!("section limited to {limit} items")),
+        },
+    }
+}
+
 fn covered_page<T>(
     items: Vec<T>,
     limit: u32,
@@ -552,12 +637,407 @@ fn source_coverage(
     }
 }
 
+fn prepared_module_identities(
+    module_rows: &[(String, String, ModuleNode)],
+) -> BTreeMap<String, PreparedModuleIdentity> {
+    module_rows
+        .iter()
+        .map(|(raw_id, source_project, module)| {
+            (
+                raw_id.clone(),
+                PreparedModuleIdentity {
+                    wire_id: module.id.clone(),
+                    source_project: source_project.clone(),
+                    language: module.language.clone(),
+                    module_path: module.module_path.clone(),
+                    source_path: module.source_path.clone(),
+                },
+            )
+        })
+        .collect()
+}
+
+fn required_declaration_ids(
+    raw_modules: &[RawEntity],
+    owners: &BTreeMap<String, PreparedModuleIdentity>,
+) -> Result<BTreeMap<String, String>, ExportError> {
+    let mut declarations = BTreeMap::new();
+    for raw in raw_modules {
+        let owner = owners.get(&raw.id).ok_or_else(|| {
+            ExportError::InvalidData(format!("module {} has no prepared identity", raw.id))
+        })?;
+        if owner.language != "rust" {
+            continue;
+        }
+        let values = raw
+            .properties
+            .get("declaration_ids")
+            .ok_or_else(|| {
+                ExportError::InvalidData(format!(
+                    "module {} has no declaration_ids array for attested l2",
+                    raw.id
+                ))
+            })?
+            .as_array()
+            .ok_or_else(|| {
+                ExportError::InvalidData(format!(
+                    "module {} declaration_ids must be an array",
+                    raw.id
+                ))
+            })?;
+        let mut local = BTreeSet::new();
+        for (index, value) in values.iter().enumerate() {
+            let declaration_id = value
+                .as_str()
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    ExportError::InvalidData(format!(
+                        "module {} declaration_ids[{index}] must be a non-empty string",
+                        raw.id
+                    ))
+                })?;
+            if !local.insert(declaration_id) {
+                return Err(ExportError::InvalidData(format!(
+                    "module {} declaration_ids contains duplicate symbol {declaration_id}",
+                    raw.id
+                )));
+            }
+            if let Some(existing) = declarations.insert(declaration_id.to_string(), raw.id.clone())
+            {
+                return Err(ExportError::InvalidData(format!(
+                    "symbol {declaration_id} is owned by modules {existing} and {}",
+                    raw.id
+                )));
+            }
+        }
+    }
+    Ok(declarations)
+}
+
+fn validate_symbol_owner_property(
+    symbol: &RawEntity,
+    owner_module_id: &str,
+    field: &str,
+    expected: &str,
+) -> Result<String, ExportError> {
+    let actual = prop_str(&symbol.properties, field, &symbol.id)?;
+    if actual != expected {
+        return Err(ExportError::InvalidData(format!(
+            "module {owner_module_id} symbol {} has {field} {actual:?}, expected {expected:?}",
+            symbol.id
+        )));
+    }
+    Ok(actual)
+}
+
+fn increment_symbol_fact(value: &mut u64, edge_id: &str) -> Result<(), ExportError> {
+    *value = value.checked_add(1).ok_or_else(|| {
+        ExportError::InvalidData(format!("symbol fact count overflow at edge {edge_id}"))
+    })?;
+    Ok(())
+}
+
+fn prepare_symbols(
+    repository: &RepositoryIdentity,
+    head: &str,
+    raw_modules: &[RawEntity],
+    module_rows: &[(String, String, ModuleNode)],
+    snapshot: SymbolSnapshot,
+    limit: u32,
+) -> Result<(SymbolPage, SymbolPage, SymbolPage), ExportError> {
+    let owners = prepared_module_identities(module_rows);
+    let required = required_declaration_ids(raw_modules, &owners)?;
+    let mut rows = BTreeMap::new();
+    for declaration in snapshot.declarations {
+        if declaration.declaration_index < 0 {
+            return Err(ExportError::InvalidData(format!(
+                "module {} has a negative declaration_ids index",
+                declaration.owner_module_id
+            )));
+        }
+        if declaration.declaration_id_type != "text" {
+            return Err(ExportError::InvalidData(format!(
+                "module {} declaration_ids[{}] must be a string",
+                declaration.owner_module_id, declaration.declaration_index
+            )));
+        }
+        match required.get(&declaration.declaration_id) {
+            Some(owner) if owner == &declaration.owner_module_id => {}
+            Some(owner) => {
+                return Err(ExportError::InvalidData(format!(
+                    "symbol {} is owned by modules {owner} and {}",
+                    declaration.declaration_id, declaration.owner_module_id
+                )))
+            }
+            None => {
+                return Err(ExportError::InvalidData(format!(
+                    "module {} yielded undeclared symbol {}",
+                    declaration.owner_module_id, declaration.declaration_id
+                )))
+            }
+        }
+        if rows
+            .insert(declaration.declaration_id.clone(), declaration)
+            .is_some()
+        {
+            return Err(ExportError::InvalidData(
+                "declaration ownership query returned a duplicate symbol row".into(),
+            ));
+        }
+    }
+
+    let mut missing_by_module = BTreeMap::<String, usize>::new();
+    for (declaration_id, owner_module_id) in &required {
+        if rows
+            .get(declaration_id)
+            .and_then(|row| row.entity.as_ref())
+            .is_none()
+        {
+            *missing_by_module
+                .entry(owner_module_id.clone())
+                .or_default() += 1;
+        }
+    }
+    if let Some((module_id, count)) = missing_by_module.into_iter().next() {
+        return Err(ExportError::InvalidData(format!(
+            "module {module_id} declaration_ids reference {count} missing symbol row(s)"
+        )));
+    }
+
+    let mut symbols = BTreeMap::<String, PreparedSymbol>::new();
+    for (declaration_id, owner_module_id) in &required {
+        let row = rows
+            .get(declaration_id)
+            .expect("every required declaration was returned by the ownership query");
+        let symbol = row
+            .entity
+            .as_ref()
+            .expect("missing declarations were rejected above");
+        let owner = owners
+            .get(owner_module_id)
+            .expect("required declarations name prepared modules");
+        if symbol.kind != "concept" {
+            return Err(ExportError::InvalidData(format!(
+                "module {owner_module_id} symbol {} has kind {:?}, expected concept",
+                symbol.id, symbol.kind
+            )));
+        }
+        let entity_type = symbol.entity_type.as_deref().ok_or_else(|| {
+            ExportError::InvalidData(format!(
+                "module {owner_module_id} symbol {} has no entity_type",
+                symbol.id
+            ))
+        })?;
+        if !matches!(
+            entity_type,
+            "function" | "datatype" | "interface" | "module"
+        ) {
+            return Err(ExportError::InvalidData(format!(
+                "module {owner_module_id} symbol {} has unsupported entity_type {entity_type:?}",
+                symbol.id
+            )));
+        }
+        let actual_revision = prop_str(&symbol.properties, "source_revision", &symbol.id)?;
+        if actual_revision != head {
+            return Err(ExportError::InvalidData(format!(
+                "module {owner_module_id} symbol {} has source_revision {actual_revision}, expected {head}",
+                symbol.id
+            )));
+        }
+        let source_project = validate_symbol_owner_property(
+            symbol,
+            owner_module_id,
+            "source_project",
+            &owner.source_project,
+        )?;
+        let language =
+            validate_symbol_owner_property(symbol, owner_module_id, "language", &owner.language)?;
+        let _source_path = validate_symbol_owner_property(
+            symbol,
+            owner_module_id,
+            "source_path",
+            &owner.source_path,
+        )?;
+        let module_path = prop_str(&symbol.properties, "module_path", &symbol.id)?;
+        let nested_prefix = format!("{}::", owner.module_path);
+        if module_path != owner.module_path && !module_path.starts_with(&nested_prefix) {
+            return Err(ExportError::InvalidData(format!(
+                "module {owner_module_id} symbol {} has module_path {module_path:?} outside {:?}",
+                symbol.id, owner.module_path
+            )));
+        }
+        let last_seen_raw = prop_str(&symbol.properties, "last_seen_at", &symbol.id)?;
+        let last_seen_at = DateTime::parse_from_rfc3339(&last_seen_raw).map_err(|error| {
+            ExportError::InvalidData(format!(
+                "module {owner_module_id} symbol {} has invalid RFC3339 last_seen_at: {error}",
+                symbol.id
+            ))
+        })?;
+        if entity_type == "module" {
+            continue;
+        }
+        let wire_id = natural_id(
+            "symbol",
+            &[
+                &repository.canonical_url,
+                &source_project,
+                &language,
+                &module_path,
+                entity_type,
+                &symbol.name,
+            ],
+        );
+        symbols.insert(
+            symbol.id.clone(),
+            PreparedSymbol {
+                node: SymbolNode {
+                    id: wire_id,
+                    module_id: owner.wire_id.clone(),
+                    module_path,
+                    name: symbol.name.clone(),
+                    kind: entity_type.to_string(),
+                    outgoing_call_edge_count: 0,
+                    outgoing_type_reference_edge_count: 0,
+                    incoming_implements_edge_count: 0,
+                },
+                source_project,
+                language,
+                entity_type: entity_type.to_string(),
+                last_seen_at,
+            },
+        );
+    }
+
+    let mut counts = symbols
+        .keys()
+        .map(|id| (id.clone(), (0_u64, 0_u64, 0_u64)))
+        .collect::<BTreeMap<_, _>>();
+    for edge in snapshot.edges {
+        let (Some(source), Some(target)) =
+            (symbols.get(&edge.source_id), symbols.get(&edge.target_id))
+        else {
+            continue;
+        };
+        let last_seen_raw = edge.last_seen_at.as_deref().ok_or_else(|| {
+            ExportError::InvalidData(format!(
+                "current symbol edge {} has no last_seen_at",
+                edge.id
+            ))
+        })?;
+        let last_seen_at = DateTime::parse_from_rfc3339(last_seen_raw).map_err(|error| {
+            ExportError::InvalidData(format!(
+                "symbol edge {} has invalid RFC3339 last_seen_at: {error}",
+                edge.id
+            ))
+        })?;
+        if last_seen_at < source.last_seen_at {
+            continue;
+        }
+        if last_seen_at > source.last_seen_at {
+            return Err(ExportError::InvalidData(format!(
+                "symbol edge {} has future last_seen_at {last_seen_raw}",
+                edge.id
+            )));
+        }
+        if edge.weight != 1.0 {
+            return Err(ExportError::InvalidData(format!(
+                "current symbol edge {} has weight {}; expected 1",
+                edge.id, edge.weight
+            )));
+        }
+        let edge_language = edge
+            .language
+            .as_deref()
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                ExportError::InvalidData(format!("current symbol edge {} has no language", edge.id))
+            })?;
+        if edge_language != source.language || edge_language != target.language {
+            return Err(ExportError::InvalidData(format!(
+                "current symbol edge {} language {edge_language:?} does not match its endpoints",
+                edge.id
+            )));
+        }
+        if source.source_project != target.source_project {
+            return Err(ExportError::InvalidData(format!(
+                "current symbol edge {} crosses source projects {:?} and {:?}",
+                edge.id, source.source_project, target.source_project
+            )));
+        }
+        match edge.relation.as_str() {
+            "depends_on" => {
+                if edge.evidence_type.as_deref() != Some("array")
+                    || edge.has_unknown_evidence
+                    || (!edge.has_call && !edge.has_type_reference)
+                {
+                    return Err(ExportError::InvalidData(format!(
+                        "current depends_on edge {} requires a nonempty recognized l2_evidence array",
+                        edge.id
+                    )));
+                }
+                let source_counts = counts
+                    .get_mut(&edge.source_id)
+                    .expect("visible source has a fact counter");
+                if edge.has_call {
+                    increment_symbol_fact(&mut source_counts.0, &edge.id)?;
+                }
+                if edge.has_type_reference {
+                    increment_symbol_fact(&mut source_counts.1, &edge.id)?;
+                }
+            }
+            "implements" => {
+                if source.entity_type != "datatype" || target.entity_type != "interface" {
+                    return Err(ExportError::InvalidData(format!(
+                        "current implements edge {} requires datatype-to-interface endpoints",
+                        edge.id
+                    )));
+                }
+                let target_counts = counts
+                    .get_mut(&edge.target_id)
+                    .expect("visible target has a fact counter");
+                increment_symbol_fact(&mut target_counts.2, &edge.id)?;
+            }
+            relation => {
+                return Err(ExportError::InvalidData(format!(
+                    "symbol edge {} has unsupported relation {relation:?}",
+                    edge.id
+                )))
+            }
+        }
+    }
+
+    let mut functions = Vec::new();
+    let mut datatypes = Vec::new();
+    let mut interfaces = Vec::new();
+    for (raw_id, mut symbol) in symbols {
+        let (calls, type_references, implementations) = counts
+            .remove(&raw_id)
+            .expect("every prepared symbol has fact counters");
+        symbol.node.outgoing_call_edge_count = calls;
+        symbol.node.outgoing_type_reference_edge_count = type_references;
+        symbol.node.incoming_implements_edge_count = implementations;
+        match symbol.entity_type.as_str() {
+            "function" => functions.push(symbol.node),
+            "datatype" => datatypes.push(symbol.node),
+            "interface" => interfaces.push(symbol.node),
+            _ => unreachable!("only visible symbol kinds are prepared"),
+        }
+    }
+
+    Ok((
+        bounded_symbol_page(functions, limit),
+        bounded_symbol_page(datatypes, limit),
+        bounded_symbol_page(interfaces, limit),
+    ))
+}
+
 fn prepare_graph(
     request: &ExportRequest,
     repository: &RepositoryIdentity,
     head: &str,
     history: HistoryData,
     map: MapData,
+    symbol_snapshot: Option<SymbolSnapshot>,
 ) -> Result<PreparedGraph, ExportError> {
     let repository_id = natural_id("repository", &[&repository.canonical_url]);
 
@@ -620,6 +1100,22 @@ fn prepare_graph(
             )));
         }
     }
+
+    let (functions, datatypes, interfaces) = match symbol_snapshot {
+        Some(snapshot) => prepare_symbols(
+            repository,
+            head,
+            &map.modules,
+            &module_rows,
+            snapshot,
+            request.bounds.symbols_per_kind,
+        )?,
+        None => (
+            SymbolPage::empty(),
+            SymbolPage::empty(),
+            SymbolPage::empty(),
+        ),
+    };
 
     let mut package_languages: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     for (_, source_project, module) in &module_rows {
@@ -1163,9 +1659,9 @@ fn prepare_graph(
             "module_id",
             code_ingest_reason.as_deref(),
         ),
-        functions: SymbolPage::empty(),
-        datatypes: SymbolPage::empty(),
-        interfaces: SymbolPage::empty(),
+        functions,
+        datatypes,
+        interfaces,
         commits: covered_page(
             public_commits,
             request.bounds.commits,

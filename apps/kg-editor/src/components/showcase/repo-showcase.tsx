@@ -35,6 +35,8 @@ type Labels = RepoBundle["capability"]["labels"];
 type ViewCapability = RepoBundle["capability"]["views"][ViewId];
 type Icon = typeof Network;
 type ModuleMap = Map<string, RepoModule>;
+type SymbolPageKey = "functions" | "datatypes" | "interfaces";
+type SymbolRow = RepoBundle["graph"]["functions"]["items"][number];
 
 const viewOrder: readonly ViewId[] = [
   "structure_graph",
@@ -717,13 +719,108 @@ function OwnershipView({ bundle, moduleById }: { bundle: RepoBundle; moduleById:
   );
 }
 
+const symbolTableConfig = {
+  functions: {
+    title: "Functions",
+    kind: "function",
+    factLabel: "Resolved direct-call edges",
+    fact: (row: SymbolRow) => row.outgoing_call_edge_count,
+  },
+  datatypes: {
+    title: "Datatypes",
+    kind: "datatype",
+    factLabel: "Outgoing type-reference edges",
+    fact: (row: SymbolRow) => row.outgoing_type_reference_edge_count,
+  },
+  interfaces: {
+    title: "Interfaces",
+    kind: "interface",
+    factLabel: "Implementers",
+    fact: (row: SymbolRow) => row.incoming_implements_edge_count,
+  },
+} satisfies Record<SymbolPageKey, {
+  title: string;
+  kind: "function" | "datatype" | "interface";
+  factLabel: string;
+  fact: (row: SymbolRow) => number;
+}>;
+
+function SymbolTable({
+  pageKey,
+  page,
+  labels,
+}: {
+  pageKey: SymbolPageKey;
+  page: RepoBundle["graph"][SymbolPageKey];
+  labels: Labels;
+}) {
+  const config = symbolTableConfig[pageKey];
+  const kindLabel = labels.node_types[config.kind];
+  const rows = page.items.slice(0, UI_ROW_LIMIT);
+  const unavailableReason = page.total_count.status === "unavailable"
+    ? page.total_count.reason
+    : page.disclosure.reason;
+  const isKnownEmpty = page.total_count.status === "available" && page.total_count.value === 0;
+
+  return (
+    <section className="repo-card repo-table-wrap" data-symbol-page={pageKey}>
+      <div className="repo-card-heading"><h3>{config.title}</h3></div>
+      {page.disclosure.status === "unavailable" ? (
+        <div className="repo-empty compact" role="status">
+          <Info aria-hidden="true" />
+          <strong>{labels.unavailable}</strong>
+          <span>{unavailableReason}</span>
+        </div>
+      ) : isKnownEmpty ? (
+        <div className="repo-empty compact" role="status">
+          <Code2 aria-hidden="true" />
+          <strong>0</strong>
+          <span>{kindLabel}</span>
+        </div>
+      ) : (
+        <table className="repo-table">
+          <thead><tr><th>Symbol</th><th>Kind</th><th>Owning module</th><th>{config.factLabel}</th></tr></thead>
+          <tbody>{rows.map((row) => (
+            <tr key={row.id}>
+              <td><strong>{row.name}</strong></td>
+              <td>{kindLabel}</td>
+              <td><code>{row.module_path || row.module_id}</code></td>
+              <td>{formatNumber(config.fact(row))}</td>
+            </tr>
+          ))}</tbody>
+        </table>
+      )}
+      <LocalSliceDisclosure shown={rows.length} total={page.items.length} label={kindLabel} labels={labels} />
+      <BoundDisclosure page={page} labels={labels} />
+    </section>
+  );
+}
+
+function SymbolTierTables({ bundle }: { bundle: RepoBundle }) {
+  return (
+    <div className="repo-grid three">
+      {(["functions", "datatypes", "interfaces"] as const).map((pageKey) => (
+        <SymbolTable
+          key={pageKey}
+          pageKey={pageKey}
+          page={bundle.graph[pageKey]}
+          labels={bundle.capability.labels}
+        />
+      ))}
+    </div>
+  );
+}
+
 function ApiSurfaceView({ bundle, moduleById }: { bundle: RepoBundle; moduleById: ModuleMap }) {
   const analysis = bundle.aggregates.api_surface;
   const labels = bundle.capability.labels;
   const rows = analysis.data.items.slice(0, UI_ROW_LIMIT);
   const max = Math.max(1, ...rows.map((row) => row.dependent_count));
   return (
-    <div className="repo-view-body"><section className="repo-card repo-table-wrap"><table className="repo-table"><thead><tr><th>{labels.node_types.module}</th><th>{labels.metrics.dependent_count}</th><th>{labels.metrics.dependent_count}</th></tr></thead><tbody>{rows.map((row) => <tr key={row.module_id}><td><strong>{moduleName(moduleById, row.module_id)}</strong></td><td>{formatNumber(row.dependent_count)}</td><td><div className="repo-bar"><span style={{ width: `${(row.dependent_count / max) * 100}%` }} /></div></td></tr>)}</tbody></table><LocalSliceDisclosure shown={rows.length} total={analysis.data.items.length} label={bundle.capability.views.api_surface.label} labels={labels} /><BoundDisclosure page={analysis.data} labels={labels} /></section></div>
+    <div className="repo-view-body">
+      <section className="repo-card repo-table-wrap"><table className="repo-table"><thead><tr><th>{labels.node_types.module}</th><th>{labels.metrics.dependent_count}</th><th>{labels.metrics.dependent_count}</th></tr></thead><tbody>{rows.map((row) => <tr key={row.module_id}><td><strong>{moduleName(moduleById, row.module_id)}</strong></td><td>{formatNumber(row.dependent_count)}</td><td><div className="repo-bar"><span style={{ width: `${(row.dependent_count / max) * 100}%` }} /></div></td></tr>)}</tbody></table><LocalSliceDisclosure shown={rows.length} total={analysis.data.items.length} label={bundle.capability.views.api_surface.label} labels={labels} /><BoundDisclosure page={analysis.data} labels={labels} /></section>
+      <SymbolTierTables bundle={bundle} />
+    </div>
   );
 }
 

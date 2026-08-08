@@ -344,6 +344,18 @@ impl SourceCoverage {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+pub struct CodeIngestL2Provenance {
+    #[schemars(regex(pattern = r"^[0-9a-f]{40}$"))]
+    pub source_revision: String,
+    pub symbols_created: u64,
+    pub symbols_updated: u64,
+    pub symbol_dependencies_unresolved: u64,
+    pub symbol_edges_stamped: u64,
+    pub symbol_parse_failures: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct CodeIngestProvenance {
     #[schemars(regex(pattern = r"^[0-9a-f]{40}$"))]
     pub source_revision: String,
@@ -353,6 +365,8 @@ pub struct CodeIngestProvenance {
     pub files_skipped_without_module_path: u64,
     pub coverage_stamps_missed: u64,
     pub warnings_count: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub l2: Option<CodeIngestL2Provenance>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -409,13 +423,18 @@ pub struct ModuleNode {
 pub struct SymbolNode {
     pub id: String,
     pub module_id: String,
+    pub module_path: String,
     pub name: String,
+    pub kind: String,
+    pub outgoing_call_edge_count: u64,
+    pub outgoing_type_reference_edge_count: u64,
+    pub incoming_implements_edge_count: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct SymbolPage {
-    #[schemars(length(max = 0))]
+    #[schemars(length(max = 10_000))]
     pub items: Vec<SymbolNode>,
     pub total_count: Availability<u64>,
     pub bound: PageBound,
@@ -1125,6 +1144,8 @@ pub struct ExportBounds {
     pub packages: u32,
     #[schemars(range(max = 10_000))]
     pub modules: u32,
+    #[schemars(range(max = 10_000))]
+    pub symbols_per_kind: u32,
     #[schemars(range(max = 5_000))]
     pub commits: u32,
     #[schemars(range(max = 2_000))]
@@ -1154,6 +1175,7 @@ impl Default for ExportBounds {
         Self {
             packages: 2_048,
             modules: 10_000,
+            symbols_per_kind: 2_000,
             commits: 5_000,
             issues: 2_000,
             pull_requests: 2_000,
@@ -1180,4 +1202,66 @@ pub struct ExportRequest {
     pub provenance: PipelineProvenance,
     /// Explicit input metadata. The exporter never reads mutable branch refs from the clone.
     pub default_branch: Availability<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use schemars::schema_for;
+    use serde_json::json;
+
+    #[test]
+    fn symbol_node_serializes_the_complete_row_contract() {
+        let node = SymbolNode {
+            id: "symbol-id".into(),
+            module_id: "module-id".into(),
+            module_path: "crate::module".into(),
+            name: "call_target".into(),
+            kind: "function".into(),
+            outgoing_call_edge_count: 1,
+            outgoing_type_reference_edge_count: 2,
+            incoming_implements_edge_count: 3,
+        };
+
+        assert_eq!(
+            serde_json::to_value(node).expect("symbol node serializes"),
+            json!({
+                "id": "symbol-id",
+                "module_id": "module-id",
+                "module_path": "crate::module",
+                "name": "call_target",
+                "kind": "function",
+                "outgoing_call_edge_count": 1,
+                "outgoing_type_reference_edge_count": 2,
+                "incoming_implements_edge_count": 3,
+            })
+        );
+    }
+
+    #[test]
+    fn symbol_export_bound_defaults_to_two_thousand() {
+        assert_eq!(ExportBounds::default().symbols_per_kind, 2_000);
+    }
+
+    #[test]
+    fn symbol_export_bound_schema_caps_at_ten_thousand() {
+        let schema = serde_json::to_value(schema_for!(ExportBounds))
+            .expect("export bounds schema serializes");
+
+        assert_eq!(
+            schema.pointer("/properties/symbols_per_kind/maximum"),
+            Some(&json!(10_000))
+        );
+    }
+
+    #[test]
+    fn symbol_page_schema_caps_items_at_ten_thousand() {
+        let schema =
+            serde_json::to_value(schema_for!(SymbolPage)).expect("symbol page schema serializes");
+
+        assert_eq!(
+            schema.pointer("/properties/items/maxItems"),
+            Some(&json!(10_000))
+        );
+    }
 }

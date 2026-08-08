@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { render, screen, waitFor } from "@testing-library/react";
@@ -14,8 +15,23 @@ vi.mock("@/lib/adapters/static-showcase-source", () => ({
 import { Showcase } from "@/components/showcase/showcase";
 
 const goldenPath = resolve(process.cwd(), "../../docs/schemas/examples/khive-repo-v1-khive.json");
-const bundle = parseRepoBundle(JSON.parse(readFileSync(goldenPath, "utf8")));
+const goldenText = readFileSync(goldenPath, "utf8");
+const bundle = parseRepoBundle(JSON.parse(goldenText));
 const mockedLoad = vi.mocked(loadStaticShowcaseBundle);
+
+function topLevelObjectBytes(key: string, nextKey: string) {
+  const marker = `,"${key}":`;
+  const nextMarker = `,"${nextKey}":`;
+  const start = goldenText.indexOf(marker);
+  const end = goldenText.indexOf(nextMarker, start + marker.length);
+  expect(start).toBeGreaterThanOrEqual(0);
+  expect(end).toBeGreaterThan(start);
+  return goldenText.slice(start + marker.length, end);
+}
+
+function sha256(value: string) {
+  return createHash("sha256").update(value).digest("hex");
+}
 
 describe("static repository lookup", () => {
   beforeEach(() => {
@@ -54,4 +70,58 @@ describe("static repository lookup", () => {
     expect(window.location.search).toBe("");
     expect(mockedLoad).toHaveBeenCalledTimes(1);
   }, 15_000);
+
+  it("loads populated symbol pages from the pinned code snapshot", () => {
+    expect(bundle.meta.snapshot.head_sha).toBe("c2979d2443738a075e55a170c772d1dc86cf0f91");
+    expect(bundle.meta.snapshot.ingested_at).toBe("2026-08-07T18:00:00Z");
+
+    const codeIngest = bundle.meta.ingest.code_ingest;
+    expect(codeIngest.status).toBe("available");
+    if (codeIngest.status !== "available") {
+      throw new Error("the checked-in bundle must carry code-ingest provenance");
+    }
+    expect(codeIngest.value.l2?.source_revision).toBe(bundle.meta.snapshot.head_sha);
+
+    const symbolPages = [
+      bundle.graph.functions,
+      bundle.graph.datatypes,
+      bundle.graph.interfaces,
+    ];
+    for (const page of symbolPages) {
+      expect(page.items.length).toBeGreaterThan(0);
+      expect(page.total_count.status).toBe("available");
+      expect(page.bound.max_items).toBe(2_000);
+      expect(page.bound.order).toBe("module_path,name,symbol_id");
+      expect(["complete", "truncated"]).toContain(page.disclosure.status);
+    }
+
+    const symbolIds = new Set(symbolPages.flatMap((page) => page.items.map((symbol) => symbol.id)));
+    expect(bundle.graph.structure_edges.items.every(
+      (edge) => !symbolIds.has(edge.source) && !symbolIds.has(edge.target),
+    )).toBe(true);
+  });
+
+  it("preserves the aggregate and module-edge golden bytes", () => {
+    const aggregates = topLevelObjectBytes("aggregates", "capability");
+    expect(Buffer.byteLength(aggregates)).toBe(1_123_968);
+    expect(sha256(aggregates)).toBe(
+      "8248048bc08a01d215923a0f944c89c02b016252b73c650776dc969900f58d70",
+    );
+
+    const structureEdges = topLevelObjectBytes("structure_edges", "history_edges");
+    expect(Buffer.byteLength(structureEdges)).toBe(521_608);
+    expect(sha256(structureEdges)).toBe(
+      "89d0b69efae3d9e2301eb9541473e561735413a16e001e6a512ecd0cc65cae92",
+    );
+
+    expect(bundle.capability.views.structure_graph.granularity).toBe("module_symbol_deferred");
+    const symbolCount = bundle.aggregates.scorecard.fields.find(
+      (field) => field.key === "symbol_count",
+    );
+    expect(symbolCount?.granularity).toBe("module_symbol_deferred");
+    expect(symbolCount?.value).toEqual({
+      status: "unavailable",
+      reason: "symbol-tier ingest is deferred",
+    });
+  });
 });

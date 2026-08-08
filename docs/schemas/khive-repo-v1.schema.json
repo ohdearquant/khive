@@ -845,6 +845,49 @@
       ],
       "type": "string"
     },
+    "CodeIngestL2Provenance": {
+      "additionalProperties": false,
+      "properties": {
+        "source_revision": {
+          "pattern": "^[0-9a-f]{40}$",
+          "type": "string"
+        },
+        "symbol_dependencies_unresolved": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "symbol_edges_stamped": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "symbol_parse_failures": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "symbols_created": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "symbols_updated": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "source_revision",
+        "symbols_created",
+        "symbols_updated",
+        "symbol_dependencies_unresolved",
+        "symbol_edges_stamped",
+        "symbol_parse_failures"
+      ],
+      "type": "object"
+    },
     "CodeIngestProvenance": {
       "additionalProperties": false,
       "properties": {
@@ -867,6 +910,16 @@
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
+        },
+        "l2": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CodeIngestL2Provenance"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "languages": {
           "items": {
@@ -3388,17 +3441,43 @@
         "id": {
           "type": "string"
         },
+        "incoming_implements_edge_count": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "kind": {
+          "type": "string"
+        },
         "module_id": {
+          "type": "string"
+        },
+        "module_path": {
           "type": "string"
         },
         "name": {
           "type": "string"
+        },
+        "outgoing_call_edge_count": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "outgoing_type_reference_edge_count": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
         }
       },
       "required": [
         "id",
         "module_id",
-        "name"
+        "module_path",
+        "name",
+        "kind",
+        "outgoing_call_edge_count",
+        "outgoing_type_reference_edge_count",
+        "incoming_implements_edge_count"
       ],
       "type": "object"
     },
@@ -3415,7 +3494,7 @@
           "items": {
             "$ref": "#/$defs/SymbolNode"
           },
-          "maxItems": 0,
+          "maxItems": 10000,
           "type": "array"
         },
         "next_cursor": {
