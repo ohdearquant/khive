@@ -3497,7 +3497,7 @@ id = "lambda:fallback"
                 .await
                 .expect("list must dispatch");
             let resp: serde_json::Value = serde_json::from_str(&raw).expect("valid JSON");
-            resp["results"][0]["result"]
+            resp["results"][0]["result"]["items"]
                 .as_array()
                 .map(|a| a.len())
                 .unwrap_or(0)
@@ -4774,7 +4774,7 @@ id = "lambda:fallback"
         };
         let raw = server.dispatch_request_local(params).await.unwrap();
         let resp: serde_json::Value = serde_json::from_str(&raw).unwrap();
-        let count = resp["results"][0]["result"]
+        let count = resp["results"][0]["result"]["items"]
             .as_array()
             .map(|a| a.len())
             .unwrap_or(0);
@@ -5968,7 +5968,7 @@ backend = "sessions"
         };
         let raw = server.dispatch_request_local(params).await.unwrap();
         let resp: serde_json::Value = serde_json::from_str(&raw).unwrap();
-        let count = resp["results"][0]["result"]
+        let count = resp["results"][0]["result"]["items"]
             .as_array()
             .map(|a| a.len())
             .unwrap_or(0);
