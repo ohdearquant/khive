@@ -236,6 +236,9 @@ async fn two_package_fixture_converges_regardless_of_ingest_order() {
                 path: &root.path().join(pkg),
                 languages: all_languages(),
                 sweep_time: Utc::now(),
+                enable_l1: true,
+                enable_l1_5: true,
+                enable_l2: false,
             },
         )
         .await
@@ -254,6 +257,9 @@ async fn two_package_fixture_converges_regardless_of_ingest_order() {
                 path: &root.path().join(pkg),
                 languages: all_languages(),
                 sweep_time: Utc::now(),
+                enable_l1: true,
+                enable_l1_5: true,
+                enable_l2: false,
             },
         )
         .await
@@ -300,6 +306,9 @@ async fn reingesting_same_fixture_is_idempotent() {
         path: root.path(),
         languages: all_languages(),
         sweep_time: Utc::now(),
+        enable_l1: true,
+        enable_l1_5: true,
+        enable_l2: false,
     };
 
     let first = run_code_ingest(&rt, &token, opts())
@@ -373,6 +382,9 @@ async fn manifest_scopes_keep_dev_back_edges_out_of_the_production_graph() {
             path: root.path(),
             languages: all_languages(),
             sweep_time: Utc::now(),
+            enable_l1: true,
+            enable_l1_5: true,
+            enable_l2: false,
         },
     )
     .await
@@ -422,12 +434,12 @@ async fn renamed_dev_dependency_keeps_its_declared_scope_for_import_edges() {
     }
     std::fs::write(
         root.path().join("pkg_a/src/lib.rs"),
-        "use mock_dep::stub;\n\npub fn pkg_a() { stub(); }\n",
+        "use mock_dep::dependency_entry;\n\npub fn pkg_a() { dependency_entry(); }\n",
     )
     .unwrap();
     std::fs::write(
         root.path().join("mock_dep/src/lib.rs"),
-        "pub fn stub() {}\n",
+        "pub fn dependency_entry() {}\n",
     )
     .unwrap();
     std::fs::write(
@@ -450,6 +462,9 @@ async fn renamed_dev_dependency_keeps_its_declared_scope_for_import_edges() {
             path: root.path(),
             languages: all_languages(),
             sweep_time: Utc::now(),
+            enable_l1: true,
+            enable_l1_5: true,
+            enable_l2: false,
         },
     )
     .await
@@ -470,6 +485,67 @@ async fn renamed_dev_dependency_keeps_its_declared_scope_for_import_edges() {
                     && scopes == "dev"
             }),
         "renamed dev-dependency import edge must keep the declared dev scope: {edges:?}"
+    );
+}
+
+#[tokio::test]
+async fn l1_5_only_uses_manifest_context_without_emitting_manifest_evidence() {
+    let root = TempDir::new().expect("tempdir");
+    for package in ["pkg_a", "mock_dep"] {
+        std::fs::create_dir_all(root.path().join(package).join("src")).unwrap();
+    }
+    std::fs::write(
+        root.path().join("pkg_a/src/lib.rs"),
+        "use mock::dependency_entry;\npub fn pkg_a() { dependency_entry(); }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.path().join("mock_dep/src/lib.rs"),
+        "pub fn dependency_entry() {}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.path().join("pkg_a/Cargo.toml"),
+        "[package]\nname = \"pkg-a\"\n\n[dev-dependencies]\nmock = { package = \"mock-dep\", path = \"../mock_dep\" }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.path().join("mock_dep/Cargo.toml"),
+        "[package]\nname = \"mock-dep\"\n",
+    )
+    .unwrap();
+
+    let rt = rt_at(&root.path().join("l1-5-context.db"));
+    let token = rt.authorize(Namespace::local()).expect("token");
+    run_code_ingest(
+        &rt,
+        &token,
+        CodeSourceIngestOptions {
+            path: root.path(),
+            languages: all_languages(),
+            sweep_time: Utc::now(),
+            enable_l1: false,
+            enable_l1_5: true,
+            enable_l2: false,
+        },
+    )
+    .await
+    .expect("L1.5-only ingest succeeds");
+
+    let edges = edge_fingerprints(&rt).await;
+    let edge = edges
+        .iter()
+        .find(|(relation, source, target, kinds, _)| {
+            relation == "depends_on"
+                && source == "pkg-a"
+                && target == "mock-dep"
+                && kinds.contains("import")
+        })
+        .unwrap_or_else(|| panic!("alias import edge must target package identity: {edges:?}"));
+    assert_eq!(edge.4, "dev");
+    assert_eq!(
+        edge.3, "import",
+        "L1 manifest evidence must remain disabled"
     );
 }
 
@@ -517,6 +593,9 @@ async fn module_paths_revisions_coverage_and_contains_ownership_are_queryable() 
             path: root.path(),
             languages: all_languages(),
             sweep_time: Utc::now(),
+            enable_l1: true,
+            enable_l1_5: true,
+            enable_l2: false,
         },
     )
     .await
@@ -605,6 +684,9 @@ async fn module_paths_revisions_coverage_and_contains_ownership_are_queryable() 
             path: root.path(),
             languages: all_languages(),
             sweep_time: Utc::now(),
+            enable_l1: true,
+            enable_l1_5: true,
+            enable_l2: false,
         },
     )
     .await
@@ -619,10 +701,10 @@ async fn module_paths_revisions_coverage_and_contains_ownership_are_queryable() 
     assert_eq!(resolved[0]["unresolved_import_count"], 0);
 }
 
-/// Issue #1590: `code.ingest` writes an ordinary khive map database, so a
-/// successful ingest must populate the FTS documents that the generic KG
-/// `search` verb reads. Entity rows without these documents made exact-name
-/// searches return an indistinguishable empty result.
+/// `code.ingest` writes an ordinary khive map database, so a successful ingest
+/// must populate the FTS documents that the generic KG `search` verb reads.
+/// Entity rows without these documents make exact-name searches return an
+/// indistinguishable empty result.
 #[tokio::test]
 async fn ingested_map_entities_are_visible_to_generic_search() {
     let root = TempDir::new().expect("tempdir");
@@ -638,6 +720,9 @@ async fn ingested_map_entities_are_visible_to_generic_search() {
             path: root.path(),
             languages: all_languages(),
             sweep_time: Utc::now(),
+            enable_l1: true,
+            enable_l1_5: true,
+            enable_l2: false,
         },
     )
     .await
@@ -697,6 +782,9 @@ async fn rust_item_import_resolves_to_containing_module_after_reingest() {
         path: root.path(),
         languages: all_languages(),
         sweep_time: Utc::now(),
+        enable_l1: true,
+        enable_l1_5: true,
+        enable_l2: false,
     };
 
     // First pass records the item import as unresolved (module `foo` did
@@ -761,6 +849,9 @@ async fn python_init_reexport_resolves_in_package_without_self_loop() {
         path: root.path(),
         languages: all_languages(),
         sweep_time: Utc::now(),
+        enable_l1: true,
+        enable_l1_5: true,
+        enable_l2: false,
     };
     run_code_ingest(&rt, &token, opts())
         .await
@@ -822,6 +913,9 @@ async fn python_dotless_from_import_emits_submodule_edges() {
         path: root.path(),
         languages: all_languages(),
         sweep_time: Utc::now(),
+        enable_l1: true,
+        enable_l1_5: true,
+        enable_l2: false,
     };
     run_code_ingest(&rt, &token, opts())
         .await
@@ -875,6 +969,9 @@ async fn manifestless_rust_folder_uses_basename_fallback() {
             path: &proj,
             languages: all_languages(),
             sweep_time: Utc::now(),
+            enable_l1: true,
+            enable_l1_5: true,
+            enable_l2: false,
         },
     )
     .await
@@ -888,6 +985,9 @@ async fn manifestless_rust_folder_uses_basename_fallback() {
             path: &proj,
             languages: all_languages(),
             sweep_time: Utc::now(),
+            enable_l1: true,
+            enable_l1_5: true,
+            enable_l2: false,
         },
     )
     .await
@@ -938,7 +1038,7 @@ fn write_gate_blocked_dependency_fixture(root: &Path) {
     std::fs::write(pkg_b.join("src/lib.rs"), "pub fn helper() {}\n").unwrap();
 }
 
-/// issue #1594: a single secret-gate refusal during `code.ingest` must
+/// A single secret-gate refusal during `code.ingest` must
 /// quarantine the refused item, not abort the whole pass. `pkg_a`'s
 /// gate-blocked dependency name is recorded in `report.blocked` and skipped;
 /// both `pkg_a`'s own project entity and the unrelated sibling `pkg_b` are
@@ -958,6 +1058,9 @@ async fn gate_blocked_write_is_quarantined_and_siblings_ingest() {
             path: root.path(),
             languages: all_languages(),
             sweep_time: Utc::now(),
+            enable_l1: true,
+            enable_l1_5: true,
+            enable_l2: false,
         },
     )
     .await
@@ -1025,7 +1128,7 @@ fn write_gate_blocked_project_name_fixture(root: &Path) {
     std::fs::write(pkg_ok.join("src/lib.rs"), "pub fn helper() {}\n").unwrap();
 }
 
-/// issue #1594 / gate-report label leak: when the *project name itself* is
+/// Gate-report label safety: when the *project name itself* is
 /// secret-shaped, the quarantine report's `blocked[].file` must carry a
 /// trusted on-disk file location (the governing manifest for the manifest
 /// tier, the triggering source file for the import-scan fallback), never the
@@ -1047,6 +1150,9 @@ async fn gate_blocked_project_name_reports_safe_manifest_path() {
             path: root.path(),
             languages: all_languages(),
             sweep_time: Utc::now(),
+            enable_l1: true,
+            enable_l1_5: true,
+            enable_l2: false,
         },
     )
     .await
@@ -1137,6 +1243,9 @@ async fn rejects_nonexistent_path() {
             path: &root.path().join("does-not-exist"),
             languages: all_languages(),
             sweep_time: Utc::now(),
+            enable_l1: true,
+            enable_l1_5: true,
+            enable_l2: false,
         },
     )
     .await
@@ -1187,6 +1296,9 @@ async fn gitless_fixture_reports_unversioned_source_revision() {
             path: root.path(),
             languages: all_languages(),
             sweep_time: Utc::now(),
+            enable_l1: true,
+            enable_l1_5: true,
+            enable_l2: false,
         },
     )
     .await
@@ -1239,6 +1351,9 @@ async fn rust_normalization_collision_warns_and_picks_lexicographically_first() 
             path: root.path(),
             languages: all_languages(),
             sweep_time: Utc::now(),
+            enable_l1: true,
+            enable_l1_5: true,
+            enable_l2: false,
         },
     )
     .await
@@ -1290,6 +1405,9 @@ async fn root_python_init_is_counted_as_skipped_without_module_path() {
             path: root.path(),
             languages: all_languages(),
             sweep_time: Utc::now(),
+            enable_l1: true,
+            enable_l1_5: true,
+            enable_l2: false,
         },
     )
     .await
@@ -1311,12 +1429,12 @@ async fn alias_form_import_resolves_to_package_project_entity() {
     }
     std::fs::write(
         root.path().join("pkg_a/src/lib.rs"),
-        "use mock::stub;\n\npub fn pkg_a() { stub(); }\n",
+        "use mock::dependency_entry;\n\npub fn pkg_a() { dependency_entry(); }\n",
     )
     .unwrap();
     std::fs::write(
         root.path().join("mock_dep/src/lib.rs"),
-        "pub fn stub() {}\n",
+        "pub fn dependency_entry() {}\n",
     )
     .unwrap();
     std::fs::write(
@@ -1339,6 +1457,9 @@ async fn alias_form_import_resolves_to_package_project_entity() {
             path: root.path(),
             languages: all_languages(),
             sweep_time: Utc::now(),
+            enable_l1: true,
+            enable_l1_5: true,
+            enable_l2: false,
         },
     )
     .await
@@ -1425,6 +1546,9 @@ async fn binary_root_crate_import_lands_on_sibling_module() {
             path: root.path(),
             languages: all_languages(),
             sweep_time: Utc::now(),
+            enable_l1: true,
+            enable_l1_5: true,
+            enable_l2: false,
         },
     )
     .await
@@ -1522,6 +1646,9 @@ async fn import_only_scope_is_order_independent() {
             path: root.path(),
             languages: all_languages(),
             sweep_time: Utc::now(),
+            enable_l1: true,
+            enable_l1_5: true,
+            enable_l2: false,
         },
     )
     .await
@@ -1558,6 +1685,9 @@ async fn import_only_scope_is_order_independent() {
             path: root.path(),
             languages: all_languages(),
             sweep_time: Utc::now(),
+            enable_l1: true,
+            enable_l1_5: true,
+            enable_l2: false,
         },
     )
     .await

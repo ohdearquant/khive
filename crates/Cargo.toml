@@ -124,6 +124,12 @@ base64 = "0.22"
 # S3-compatible BlobStore backend (ADR-111 Amendment 2). aws-only: no fs/azure/gcs
 # backends, no multipart-upload surface we don't use.
 object_store = { version = "=0.14.1", default-features = false, features = ["aws"] }
+# Code pack L2 symbol tier (ADR-085 Amendment 2 B2): syn::parse_file +
+# syn::visit::Visit-based Rust declaration/call-graph scanner. quote is
+# direct (not transitive) — the scanner uses quote::ToTokens for stable
+# change-detection text, not just a syn dependency of some other crate.
+syn = { version = "2", features = ["full", "visit"] }
+quote = "1"
 
 [profile.release]
 opt-level = 3
