@@ -8,14 +8,17 @@ The term was eliminated in favour of 'salience' (consistent with notes.salience
 substrate column) on 2026-05-25. Any future regression that re-adds 'importance'
 as a verb parameter must be caught here.
 
-Two complementary tests:
+Three complementary tests:
 1. Live MCP check: the 'request' tool description must not contain 'importance'.
 2. Static repository sweep: rg over the entire repo with an allowlist confirms
    no non-allowed identifier containing 'importance' was added back.
+3. Parsed showcase-bundle check: captured history values remain verbatim while
+   every JSON object key stays subject to the identifier ban.
 """
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
@@ -44,8 +47,18 @@ SWEEP_ALLOWLIST: list[str] = [
     "importance_weight",       # TODO: should not appear — explicit false-safeguard entry
 ]
 
-# Paths excluded from the sweep (binary artefacts, archive, git internals, build output)
+# Repository showcase bundles contain captured commit subjects, so their values are
+# observations rather than khive identifiers.  Exclude their raw bytes from the text
+# sweep and check every JSON object key separately below.
+SHOWCASE_BUNDLE_GLOBS = (
+    "docs/schemas/examples/khive-repo-v1-*.json",
+    "apps/kg-editor/public/showcase/khive-repo-v1-*.json",
+)
+
+# Paths excluded from the sweep (captured data, binary artefacts, archive, git
+# internals, build output)
 EXCLUDED_GLOBS = [
+    *(f"--glob=!{pattern}" for pattern in SHOWCASE_BUNDLE_GLOBS),
     "--glob=!docs/_archive/**",
     "--glob=!target/**",
     "--glob=!tests/khive-contract/tune/REPORT*.md",
@@ -155,6 +168,39 @@ def test_no_importance_identifiers_in_repo() -> None:
         )
 
 
+@pytest.mark.adr_021
+def test_no_importance_identifiers_in_showcase_bundle_keys() -> None:
+    """Captured history values may use legacy prose, but wire keys may not.
+
+    ADR-147 showcase bundles preserve repository history verbatim.  A historical
+    commit subject can therefore contain a word that is forbidden as a live khive
+    identifier.  Parse the excluded observation bundles and keep the identifier
+    guard on their complete object-key surface without rewriting those facts.
+    """
+    bundle_paths = sorted(
+        {
+            path
+            for pattern in SHOWCASE_BUNDLE_GLOBS
+            for path in REPO_ROOT.glob(pattern)
+        }
+    )
+    assert bundle_paths, "expected at least one khive.repo.v1 showcase bundle"
+
+    violations: list[str] = []
+    for path in bundle_paths:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        relative = path.relative_to(REPO_ROOT)
+        violations.extend(
+            f"{relative}:{key_path}"
+            for key_path in _json_key_paths_containing(payload, "importance")
+        )
+
+    assert not violations, (
+        "Found forbidden 'importance' identifier(s) in khive.repo.v1 wire keys:\n"
+        + "\n".join(violations[:50])
+    )
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -186,3 +232,24 @@ def _is_allowed(line: str) -> bool:
         if allowed in line:
             return True
     return False
+
+
+def _json_key_paths_containing(
+    value: object,
+    needle: str,
+    path: str = "$",
+) -> list[str]:
+    """Return compact JSON paths whose object key contains ``needle``."""
+    matches: list[str] = []
+    if isinstance(value, dict):
+        for key, child in value.items():
+            child_path = f"{path}.{key}"
+            if needle.casefold() in key.casefold():
+                matches.append(child_path)
+            matches.extend(_json_key_paths_containing(child, needle, child_path))
+    elif isinstance(value, list):
+        for index, child in enumerate(value):
+            matches.extend(
+                _json_key_paths_containing(child, needle, f"{path}[{index}]")
+            )
+    return matches

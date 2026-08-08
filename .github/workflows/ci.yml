@@ -287,8 +287,17 @@ jobs:
         run: npm run typecheck
       - name: Unit and interaction tests
         run: npm test
+      # Must run before the build: `prebuild` regenerates the browser asset from
+      # the canonical golden, so a parity check placed after it reads bytes the
+      # build just rewrote and passes unconditionally.
+      - name: Showcase asset parity
+        run: npm run check:showcase
       - name: Production build
         run: npm run build
+      - name: Install browser for repository dogfood
+        run: npx playwright install --with-deps chromium
+      - name: Repository showcase dogfood
+        run: npx playwright test
 
   supply-chain:
     name: Supply-chain (cargo-deny)
