@@ -361,6 +361,24 @@ impl<'ast> Visit<'ast> for TypeRefCollector {
         }
         visit::visit_type_path(self, node);
     }
+
+    // A trait bound's own path (`T: Bound`, `trait Child: Parent`,
+    // `dyn Bound`, `impl Bound`) is a `Path`, not a `TypePath`, and syn's
+    // default `visit_path` never dispatches to `visit_type_path` -- without
+    // this override the outer bound path is silently dropped while its
+    // generic arguments are still collected.
+    fn visit_trait_bound(&mut self, node: &'ast syn::TraitBound) {
+        let segments: Vec<String> = node
+            .path
+            .segments
+            .iter()
+            .map(|s| s.ident.to_string())
+            .collect();
+        if !segments.is_empty() {
+            self.type_refs.push(segments);
+        }
+        visit::visit_trait_bound(self, node);
+    }
 }
 
 /// Type references in a function/method signature: parameter types, the

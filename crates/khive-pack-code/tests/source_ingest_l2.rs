@@ -1911,6 +1911,51 @@ async fn type_reference_floor_resolves_field_types() {
     );
 }
 
+/// Bound and supertrait paths are type references: a supertrait
+/// (`trait Child: Parent`), a generic bound (`fn bounded<T: Parent>`), and a
+/// `dyn` bound in a field type must each resolve to `depends_on` with
+/// `type_reference` evidence (ADR-085 D3 rules 3, 5, and 6).
+#[tokio::test]
+async fn bound_and_supertrait_paths_are_type_references() {
+    let root = TempDir::new().expect("tempdir");
+    let pkg = root.path().join("pkg_bounds");
+    write_manifest(root.path(), "pkg_bounds");
+    std::fs::write(
+        pkg.join("src/lib.rs"),
+        "pub trait Parent {}\n\
+         pub trait Child: Parent {}\n\
+         pub fn bounded<T: Parent>(_x: T) -> i32 { 1 }\n\
+         pub struct Holder {\n\
+             pub h: Box<dyn Parent>,\n\
+         }\n",
+    )
+    .unwrap();
+
+    let db = root.path().join("bounds.db");
+    let rt = rt_at(&db);
+    let token = rt.authorize(Namespace::local()).expect("token");
+    run_code_ingest(&rt, &token, l2_only_opts(&pkg))
+        .await
+        .expect("ingest succeeds");
+
+    let fingerprints = l2_edge_fingerprints(&rt).await;
+    for (src, tgt, site) in [
+        ("Child", "Parent", "supertrait"),
+        ("bounded", "Parent", "generic bound"),
+        ("Holder", "Parent", "dyn field bound"),
+    ] {
+        assert!(
+            fingerprints.iter().any(|(rel, s, t, evidence, _)| {
+                rel == "depends_on"
+                    && s == src
+                    && t == tgt
+                    && evidence.contains(&"type_reference".to_string())
+            }),
+            "{site}: {src} -> {tgt} must resolve with type_reference evidence: {fingerprints:?}"
+        );
+    }
+}
+
 /// Positive `impl Trait for Type` emits a datatype -> interface `implements`
 /// edge; inherent and negative impls emit none.
 #[tokio::test]
