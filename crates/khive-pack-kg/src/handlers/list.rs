@@ -386,7 +386,6 @@ impl KgPack {
                 };
                 Ok(render_list_response(
                     normalize_entity_timestamps_array(to_json(&entities)?),
-                    "items",
                     requested,
                     limit,
                 ))
@@ -441,12 +440,7 @@ impl KgPack {
                         .runtime
                         .list_edges(token, filter, limit, offset)
                         .await?;
-                    Ok(render_list_response(
-                        to_json(&edges)?,
-                        "items",
-                        requested,
-                        limit,
-                    ))
+                    Ok(render_list_response(to_json(&edges)?, requested, limit))
                 }
             }
             KindSpec::Note { specific } => {

@@ -52,11 +52,12 @@ def test_create_list_get_each_base_note_kind(
     )
 
     # list filtered by note_kind must include the new id
-    listed = khive_session.verb("list", {
+    page = khive_session.verb("list", {
         "kind": "note",
         "note_kind": note_kind,
         "namespace": temp_namespace,
     })
+    listed = page["items"]
     assert isinstance(listed, list), f"list returned non-list: {listed!r}"
     ids = [n.get("id") for n in listed]
     assert note_id in ids, (

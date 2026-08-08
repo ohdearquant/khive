@@ -12600,9 +12600,9 @@ async fn list_note_limit_over_cap_truncates_with_metadata() {
         .dispatch("list", json!({"kind": "note", "limit": 300}))
         .await
         .expect("#894: list notes must succeed even when the cap binds");
-    let items = resp["notes"]
+    let items = resp["items"]
         .as_array()
-        .expect("clamped note envelope must contain notes");
+        .expect("clamped note envelope must contain items");
     assert_eq!(
         items.len(),
         200,
@@ -12931,7 +12931,9 @@ async fn list_proposals_offset_sweep_covers_all_exactly_once() {
             )
             .await
             .expect("list proposals page");
-        let items = page.as_array().expect("proposal list is a JSON array");
+        let items = page["items"]
+            .as_array()
+            .expect("proposal offset envelope must contain items");
         if items.is_empty() {
             break;
         }
