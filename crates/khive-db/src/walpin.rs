@@ -1587,18 +1587,19 @@ mod windows_impl {
     /// validated by `write_atomic`. The single-component target name only
     /// constrains the leaf and does not close that window.
     fn rename_via_handle(file: &fs::File, target_path: &Path) -> io::Result<()> {
-        let wide: Vec<u16> = target_path.as_os_str().encode_wide().collect();
-        let name_bytes = wide.len() * 2;
+        let wide = to_wide_nul(target_path)?;
+        let name_bytes = (wide.len() - 1) * 2;
         // The real field offset, not an approximation — `FileRenameInfoEx`
         // validates the reported buffer size against this exact offset plus
-        // `file_name_length`.
+        // `file_name_length`. Keep the trailing NUL in the buffer but out of
+        // that length, matching the Win32 `FILE_RENAME_INFO` contract.
         let header_size = std::mem::offset_of!(FileRenameInfo, file_name);
-        let total_size = header_size + name_bytes;
+        let total_size = header_size + name_bytes + std::mem::size_of::<u16>();
         let words = total_size.div_ceil(8).max(1);
         let mut buf: Vec<u64> = vec![0u64; words];
         // SAFETY: `buf` is 8-byte aligned (backed by `Vec<u64>`) and sized
-        // to hold at least the header plus `name_bytes` of `file_name`; the
-        // pointer arithmetic below stays within that allocation.
+        // to hold the header, `name_bytes` of `file_name`, and its trailing
+        // NUL; the pointer arithmetic below stays within that allocation.
         unsafe {
             let header = buf.as_mut_ptr() as *mut FileRenameInfo;
             (*header).flags = FILE_RENAME_FLAG_REPLACE_IF_EXISTS | FILE_RENAME_FLAG_POSIX_SEMANTICS;
