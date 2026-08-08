@@ -4877,13 +4877,66 @@ mod tests {
             Duration::from_millis(500),
         )
         .expect("sidecar enabled for a file-backed path");
-        state.register_beacon().await;
         let pid = std::process::id();
+        state.register_beacon().await;
         let beacon_path = sidecar_dir.join(format!("{pid}.beacon"));
-        let before = std::fs::metadata(&beacon_path)
-            .expect("beacon registered")
-            .modified()
-            .unwrap();
+        let production_write_landed = beacon_path.exists();
+        if !production_write_landed {
+            // Windows diagnosis aid: `WalpinSidecarState::register_beacon`
+            // swallows a failed `write_beacon` behind a `tracing::warn`
+            // (fail-open logging), so the `metadata()` call below would
+            // otherwise only ever report a generic `NotFound`. Attempt the
+            // identical write synchronously, outside `register_beacon`'s
+            // `spawn_blocking` wrapper, so a real failure panics with the
+            // underlying OS error code instead — and so a difference in
+            // outcome between this direct call and `register_beacon`'s own
+            // (already-failed) call narrows the bug to the `spawn_blocking`
+            // indirection rather than `write_beacon` itself.
+            crate::walpin::write_beacon(
+                &sidecar_dir,
+                &crate::walpin::WalpinBeacon {
+                    pid,
+                    process_role: "session".to_string(),
+                    started_at: crate::walpin::process_start_time_secs(pid).unwrap_or(0),
+                    sweep_interval_ms: 500,
+                },
+            )
+            .expect(
+                "windows diagnosis: direct write_beacon call also failed (see error for OS code)",
+            );
+        }
+        // Windows diagnosis aid, second stage: a prior run showed the write
+        // path REPORT success while the file stayed unobservable at the
+        // expected path. On failure, enumerate what actually exists so the
+        // next log distinguishes wrong-location from never-written from
+        // vanished.
+        let before = match std::fs::metadata(&beacon_path) {
+            Ok(meta) => meta.modified().unwrap(),
+            Err(error) => {
+                let list = |p: &std::path::Path| -> String {
+                    match std::fs::read_dir(p) {
+                        Ok(rd) => rd
+                            .filter_map(|e| {
+                                e.ok().map(|e| e.file_name().to_string_lossy().into_owned())
+                            })
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                        Err(e) => format!("<read_dir failed: {e}>"),
+                    }
+                };
+                panic!(
+                    "beacon not observable at {beacon_path:?}: {error}; \
+                     production_write_landed={production_write_landed}; \
+                     sidecar_dir {sidecar_dir:?} contents: [{}]; \
+                     parent contents: [{}]",
+                    list(&sidecar_dir),
+                    sidecar_dir
+                        .parent()
+                        .map(list)
+                        .unwrap_or_else(|| "<no parent>".to_string()),
+                );
+            }
+        };
 
         // Force the heartbeat write to fail without touching directory
         // permissions (which would confound with the dir-mode validation):
@@ -4966,7 +5019,12 @@ mod tests {
         // the body-byte comparison below is what actually distinguishes
         // touch from rewrite.
         let backdated = std::time::SystemTime::now() - Duration::from_secs(120);
-        std::fs::File::open(&heartbeat_path)
+        // `set_modified` needs write access to the handle on Windows (a
+        // read-only open succeeds but is refused by `set_modified` with
+        // `PermissionDenied`); Unix accepts a read-only handle for this.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&heartbeat_path)
             .unwrap()
             .set_modified(backdated)
             .unwrap();
@@ -5056,6 +5114,7 @@ mod tests {
             tx_warn_secs: Duration::from_millis(20),
             tx_max_age_secs: Duration::from_millis(500),
         };
+        let sweep_interval_ms = cfg.interval.as_millis().min(u64::MAX as u128) as u64;
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
         let handle = tokio::spawn(run_session_sweep_task(
             vec![SweepBackend {
@@ -5074,8 +5133,30 @@ mod tests {
         // that write can take longer than any small fixed window.
         let pid = std::process::id();
         let beacon = crate::walpin::beacon_path(&sidecar_dir, pid);
+        let beacon_registered = wait_for(Duration::from_secs(2), || beacon.exists()).await;
+        if !beacon_registered {
+            // Windows diagnosis aid: the sweep task's own beacon
+            // registration swallows a failed `write_beacon` behind a
+            // `tracing::warn` (fail-open logging), so the poll above only
+            // ever reports "never appeared" with no OS error. Attempt the
+            // identical write synchronously, outside the sweep task's
+            // `spawn_blocking`, so a real failure panics with the
+            // underlying OS error code instead.
+            crate::walpin::write_beacon(
+                &sidecar_dir,
+                &crate::walpin::WalpinBeacon {
+                    pid,
+                    process_role: "session".to_string(),
+                    started_at: crate::walpin::process_start_time_secs(pid).unwrap_or(0),
+                    sweep_interval_ms,
+                },
+            )
+            .expect(
+                "windows diagnosis: direct write_beacon call also failed (see error for OS code)",
+            );
+        }
         assert!(
-            wait_for(Duration::from_secs(2), || beacon.exists()).await,
+            beacon_registered,
             "a quiet process must still register its one-time beacon"
         );
         assert!(

@@ -47,12 +47,14 @@
 //! control ACE for their owner, and existing directories with broader ACLs
 //! are refused rather than repaired.
 
-#[cfg(unix)]
+#[cfg(any(unix, test))]
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 #[cfg(unix)]
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
+#[cfg(any(unix, test))]
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
@@ -1568,24 +1570,27 @@ mod windows_impl {
         Ok(())
     }
 
-    /// Handle-bound rename: `RootDirectory` is the validated directory's
-    /// own handle, so the new name resolves relative to the directory the
-    /// caller already proved is real and non-reparse — the closest Win32
-    /// equivalent to Unix `renameat`, since `CreateFileW` itself has no
-    /// directory-relative open primitive.
-    fn rename_via_handle(
-        file: &fs::File,
-        dir_handle: &fs::File,
-        target_name: &str,
-    ) -> io::Result<()> {
-        let wide: Vec<u16> = OsStr::new(target_name).encode_wide().collect();
+    /// Handle-bound rename to a full destination path with a null
+    /// `RootDirectory`. Both indirect forms are refused on this API
+    /// (measured on Windows Server 2022 CI, one round each): a non-null
+    /// `RootDirectory` fails with `ERROR_INVALID_PARAMETER` (87) on the
+    /// classic `FileRenameInfo` class AND on `FileRenameInfoEx`
+    /// (directory-relative `RootDirectory` renames exist only at the
+    /// `NtSetInformationFile` layer), and a bare relative name with a null
+    /// `RootDirectory` resolves against the process working directory, not
+    /// the file's parent — `ERROR_NOT_SAME_DEVICE` (17) when cwd and temp
+    /// sit on different drives. The caller therefore supplies the fully
+    /// qualified destination; `write_atomic` builds it from the validated
+    /// directory plus the single-component target name, so the rename
+    /// cannot escape the directory the caller already proved real and
+    /// non-reparse.
+    fn rename_via_handle(file: &fs::File, target_path: &Path) -> io::Result<()> {
+        let wide: Vec<u16> = target_path.as_os_str().encode_wide().collect();
         let name_bytes = wide.len() * 2;
-        // `size_of::<FileRenameInfo>() - 2` over-counts the true header
-        // offset by however much trailing struct padding rounds the whole
-        // type up to its 8-byte alignment — always >= the real `file_name`
-        // field offset, so the buffer this sizes is never too small, only
-        // (harmlessly) a few bytes larger than strictly required.
-        let header_size = std::mem::size_of::<FileRenameInfo>() - 2;
+        // The real field offset, not an approximation — `FileRenameInfoEx`
+        // validates the reported buffer size against this exact offset plus
+        // `file_name_length`.
+        let header_size = std::mem::offset_of!(FileRenameInfo, file_name);
         let total_size = header_size + name_bytes;
         let words = total_size.div_ceil(8).max(1);
         let mut buf: Vec<u64> = vec![0u64; words];
@@ -1594,15 +1599,15 @@ mod windows_impl {
         // pointer arithmetic below stays within that allocation.
         unsafe {
             let header = buf.as_mut_ptr() as *mut FileRenameInfo;
-            (*header).replace_if_exists = 0;
-            (*header).root_directory = dir_handle.as_raw_handle() as Handle;
+            (*header).flags = FILE_RENAME_FLAG_REPLACE_IF_EXISTS | FILE_RENAME_FLAG_POSIX_SEMANTICS;
+            (*header).root_directory = std::ptr::null_mut();
             (*header).file_name_length = name_bytes as u32;
             let name_ptr = (*header).file_name.as_mut_ptr();
             std::ptr::copy_nonoverlapping(wide.as_ptr(), name_ptr, wide.len());
         }
         let byte_ptr = buf.as_mut_ptr() as *mut c_void;
         // SAFETY: `file`'s handle is live and was opened with `DELETE`
-        // access (required by the `FileRenameInfo` class); `byte_ptr`
+        // access (required by the `FileRenameInfoEx` class); `byte_ptr`
         // addresses the well-formed buffer built above, sized exactly
         // `total_size`.
         let ok = unsafe {
@@ -1637,7 +1642,7 @@ mod windows_impl {
         tmp_file.write_all(body)?;
         tmp_file.sync_all()?;
         remove_relative_if_exists(&dir_handle, target_name)?;
-        rename_via_handle(&tmp_file, &dir_handle, target_name)
+        rename_via_handle(&tmp_file, &dir.join(target_name))
     }
 
     pub(super) fn remove_checked(dir: &Path, name: &str) -> io::Result<()> {
@@ -1699,16 +1704,20 @@ mod windows_impl {
         dw_high_date_time: u32,
     }
 
-    /// Mirrors Win32's `FILE_RENAME_INFO` (the pre-Windows-10-1607 layout,
-    /// the one `SetFileInformationByHandle`'s `FileRenameInfo` class
-    /// expects): a `BOOLEAN`, then a `HANDLE` (natural alignment inserts
-    /// padding between them, matched here by `repr(C)`), a `DWORD` length,
-    /// and a flexible `WCHAR` array sized by `file_name_length` bytes — the
-    /// trailing `[u16; 1]` is a placeholder; real instances are built in a
-    /// manually sized buffer in [`rename_via_handle`].
+    /// Mirrors Win32's `FILE_RENAME_INFO`: a `DWORD Flags` (the
+    /// `FileRenameInfoEx` interpretation of the leading union member —
+    /// the `Ex` class is used for `FILE_RENAME_FLAG_REPLACE_IF_EXISTS` and
+    /// `FILE_RENAME_FLAG_POSIX_SEMANTICS`; `RootDirectory` stays null on
+    /// BOTH classes because `SetFileInformationByHandle` rejects a non-null
+    /// value with `ERROR_INVALID_PARAMETER` — see [`rename_via_handle`]),
+    /// then a `HANDLE` (natural alignment inserts padding before it, matched
+    /// here by `repr(C)`), a `DWORD` length, and a flexible `WCHAR` array
+    /// sized by `file_name_length` bytes — the trailing `[u16; 1]` is a
+    /// placeholder; real instances are built in a manually sized buffer in
+    /// [`rename_via_handle`].
     #[repr(C)]
     struct FileRenameInfo {
-        replace_if_exists: u8,
+        flags: u32,
         root_directory: Handle,
         file_name_length: u32,
         file_name: [u16; 1],
@@ -1725,8 +1734,12 @@ mod windows_impl {
     const STILL_ACTIVE: u32 = 259;
     const GENERIC_WRITE: u32 = 0x4000_0000;
     const DELETE: u32 = 0x0001_0000;
-    const FILE_RENAME_INFO_CLASS: i32 = 3;
+    // `FileRenameInfoEx` (22), not the classic `FileRenameInfo` (3) — see
+    // the `FileRenameInfo` struct doc comment above.
+    const FILE_RENAME_INFO_CLASS: i32 = 22;
     const FILE_DISPOSITION_INFO_CLASS: i32 = 4;
+    const FILE_RENAME_FLAG_REPLACE_IF_EXISTS: u32 = 1;
+    const FILE_RENAME_FLAG_POSIX_SEMANTICS: u32 = 2;
 
     fn invalid_handle_value() -> Handle {
         usize::MAX as Handle
@@ -3182,6 +3195,7 @@ mod tests {
         ));
     }
 
+    #[cfg(unix)]
     #[test]
     fn ensure_sidecar_dir_creates_0700_owned_dir() {
         let root = tempfile::tempdir().unwrap();
@@ -3193,6 +3207,7 @@ mod tests {
         assert_eq!(meta.uid(), current_uid());
     }
 
+    #[cfg(unix)]
     #[test]
     fn ensure_sidecar_dir_refuses_wrong_mode() {
         let root = tempfile::tempdir().unwrap();
@@ -3203,6 +3218,7 @@ mod tests {
         assert!(err.to_string().contains("expected 0700"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn ensure_sidecar_dir_refuses_symlink() {
         let root = tempfile::tempdir().unwrap();
@@ -3279,6 +3295,7 @@ mod tests {
         assert_eq!(b.sweep_interval_ms, 60_000);
     }
 
+    #[cfg(unix)]
     #[test]
     fn write_heartbeat_refuses_symlinked_target() {
         let root = tempfile::tempdir().unwrap();
@@ -3388,6 +3405,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn enumerate_live_reports_and_retains_a_genuinely_live_entry() {
         let root = tempfile::tempdir().unwrap();
@@ -3404,6 +3422,7 @@ mod tests {
         assert!(dir.join(format!("{}.json", hb.pid)).exists());
     }
 
+    #[cfg(unix)]
     #[test]
     fn epoch_abs_diff_saturates_instead_of_wrapping() {
         assert_eq!(epoch_abs_diff(5, 3), 2);
@@ -3416,6 +3435,7 @@ mod tests {
         assert_eq!(epoch_abs_diff(-1, i64::MAX), 1u64 << 63);
     }
 
+    #[cfg(unix)]
     #[test]
     fn enumerate_live_extreme_timestamp_classifies_unknown_not_fresh() {
         let root = tempfile::tempdir().unwrap();
@@ -3441,6 +3461,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn enumerate_live_bounded_caps_listing_with_sentinel_marker() {
         let root = tempfile::tempdir().unwrap();
@@ -3478,6 +3499,7 @@ mod tests {
         assert!(report.entries.len() <= 2, "got {:?}", report.entries);
     }
 
+    #[cfg(unix)]
     #[test]
     fn enumerate_live_bounded_caps_hidden_entry_scan_with_sentinel_marker() {
         let root = tempfile::tempdir().unwrap();
@@ -3514,6 +3536,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn enumerate_live_uncapped_population_has_no_sentinel() {
         let root = tempfile::tempdir().unwrap();
@@ -3531,6 +3554,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn enumerate_live_deletes_dead_pid_entry() {
         let root = tempfile::tempdir().unwrap();
@@ -3546,6 +3570,7 @@ mod tests {
         assert!(!dir.join(format!("{}.json", hb.pid)).exists());
     }
 
+    #[cfg(unix)]
     #[test]
     fn enumerate_live_deletes_mismatched_start_time_entry() {
         let root = tempfile::tempdir().unwrap();
@@ -3564,6 +3589,7 @@ mod tests {
         assert!(!dir.join(format!("{}.json", hb.pid)).exists());
     }
 
+    #[cfg(unix)]
     #[test]
     fn enumerate_live_deletes_stale_updated_at_entry() {
         let root = tempfile::tempdir().unwrap();
@@ -3584,6 +3610,7 @@ mod tests {
         assert!(!dir.join(format!("{}.json", hb.pid)).exists());
     }
 
+    #[cfg(unix)]
     #[test]
     fn enumerate_live_subsecond_sweep_interval_does_not_collapse_freshness_window() {
         // Minor (ADR-091 Amendment 2): a sub-second
@@ -3602,6 +3629,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn enumerate_live_refuses_symlinked_entry_as_unknown_without_touching_target() {
         let root = tempfile::tempdir().unwrap();
@@ -3623,6 +3651,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn enumerate_live_refuses_non_owned_entry_before_reading_contents() {
         // We cannot fabricate a genuinely non-owned file without root, so this
@@ -3647,6 +3676,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn enumerate_live_refuses_non_compliant_directory_wholesale() {
         // Item 3 (ADR-091 Amendment 2): a directory that fails the
@@ -3663,6 +3693,7 @@ mod tests {
         assert!(err.to_string().contains("expected 0700"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn enumerate_live_missing_directory_is_ok_empty_not_a_failure() {
         // A sidecar that has simply never been used yet is a distinct case
@@ -3673,6 +3704,7 @@ mod tests {
         assert!(report.entries.is_empty());
     }
 
+    #[cfg(unix)]
     #[test]
     fn enumerate_live_classifies_registered_silent_beacon_with_no_heartbeat() {
         // ADR-091 Amendment 2 spec delta: a live process that has registered
@@ -3692,6 +3724,7 @@ mod tests {
         assert!(report.fully_attributed());
     }
 
+    #[cfg(unix)]
     #[test]
     fn enumerate_live_reporting_wins_over_registered_silent_for_same_pid() {
         let root = tempfile::tempdir().unwrap();
@@ -3705,6 +3738,7 @@ mod tests {
         assert_eq!(report.registered_silent_pids().count(), 0);
     }
 
+    #[cfg(unix)]
     #[test]
     fn enumerate_live_deletes_dead_beacon() {
         let root = tempfile::tempdir().unwrap();
@@ -3719,6 +3753,7 @@ mod tests {
         assert!(!beacon_path(&dir, b.pid).exists());
     }
 
+    #[cfg(unix)]
     #[test]
     fn write_beacon_refuses_symlinked_target() {
         let root = tempfile::tempdir().unwrap();
@@ -3734,6 +3769,7 @@ mod tests {
         assert_eq!(fs::read_to_string(&real).unwrap(), "nope");
     }
 
+    #[cfg(unix)]
     #[test]
     fn enumerate_live_classifies_stale_beacon_as_unknown() {
         // ADR-091 Amendment 2: a beacon that is identity-valid
@@ -3762,6 +3798,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn enumerate_live_stale_heartbeat_with_fresh_beacon_stays_unknown_not_registered_silent() {
         // ADR-091 Amendment 2: a PID whose heartbeat was
@@ -4429,5 +4466,170 @@ mod tests {
         census.apply_self_canary_for(None);
 
         assert!(census.truncated);
+    }
+
+    /// #1335: the Windows FFI paths (`open_relative`/`NtCreateFile`,
+    /// `validate_owner_only_dacl`, `rename_via_handle`,
+    /// `remove_relative_if_exists`/`delete_via_handle`, mtime touch) are
+    /// exercised only through `windows_impl`'s public-to-`super` wrappers
+    /// (`ensure_sidecar_dir`/`write_heartbeat`/`touch_heartbeat`/
+    /// `remove_heartbeat`/`write_beacon`/`touch_beacon`/`remove_beacon`),
+    /// driven against a real temp directory. `windows_impl` only exists
+    /// under `cfg(windows)`, so this module compiles and runs on Windows
+    /// only; it has no effect on `cargo check`/`cargo test` for any other
+    /// target.
+    #[cfg(all(test, windows))]
+    mod windows_tests {
+        use super::*;
+        use std::fs;
+
+        #[test]
+        fn ensure_sidecar_dir_creates_directory() {
+            let root = tempfile::tempdir().unwrap();
+            let dir = root.path().join("khive.db.walpin");
+            ensure_sidecar_dir(&dir).expect("should create");
+            let meta = fs::symlink_metadata(&dir).unwrap();
+            assert!(meta.is_dir());
+        }
+
+        #[test]
+        fn ensure_sidecar_dir_is_idempotent_and_revalidates_dacl() {
+            let root = tempfile::tempdir().unwrap();
+            let dir = root.path().join("khive.db.walpin");
+            ensure_sidecar_dir(&dir).expect("first create should succeed");
+            ensure_sidecar_dir(&dir)
+                .expect("second call must re-open and re-validate the existing dir, not fail");
+        }
+
+        #[test]
+        fn ensure_sidecar_dir_refuses_preexisting_dir_with_default_acl() {
+            let root = tempfile::tempdir().unwrap();
+            let dir = root.path().join("khive.db.walpin");
+            // A plain `create_dir` inherits the parent's ACL rather than the
+            // single owner-only ACE this module writes — the DACL round-trip
+            // must refuse it rather than repair it in place.
+            fs::create_dir(&dir).unwrap();
+            let err = ensure_sidecar_dir(&dir)
+                .expect_err("a pre-existing dir without the exact owner-only DACL must be refused");
+            assert!(err.to_string().contains("owner"), "unexpected error: {err}");
+        }
+
+        #[test]
+        fn ensure_sidecar_dir_refuses_symlinked_target() {
+            let root = tempfile::tempdir().unwrap();
+            let real = root.path().join("real_dir");
+            fs::create_dir(&real).unwrap();
+            let link = root.path().join("khive.db.walpin");
+            std::os::windows::fs::symlink_dir(&real, &link).expect(
+                "creating a directory symlink requires Developer Mode or an elevated \
+                 process on the Windows CI runner",
+            );
+            let err = ensure_sidecar_dir(&link)
+                .expect_err("a reparse-point sidecar path must be refused, never followed");
+            assert!(
+                err.to_string().contains("reparse"),
+                "unexpected error: {err}"
+            );
+        }
+
+        #[test]
+        fn write_heartbeat_creates_then_replaces_then_removes() {
+            let root = tempfile::tempdir().unwrap();
+            let dir = root.path().join("khive.db.walpin");
+            let pid = std::process::id();
+            let path = dir.join(format!("{pid}.json"));
+
+            let first = heartbeat(pid);
+            write_heartbeat(&dir, &first).expect("initial create must succeed");
+            let read_back: WalpinHeartbeat =
+                serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+            assert_eq!(read_back, first);
+
+            let mut second = heartbeat(pid);
+            second.oldest_tx_label = Some("replaced".to_string());
+            write_heartbeat(&dir, &second)
+                .expect("replacing an already-existing target must succeed");
+            let read_back: WalpinHeartbeat =
+                serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+            assert_eq!(read_back, second);
+            assert_ne!(read_back, first);
+
+            remove_heartbeat(&dir, pid).expect("remove must succeed");
+            assert!(!path.exists());
+        }
+
+        #[test]
+        fn remove_heartbeat_on_missing_sidecar_dir_is_a_noop() {
+            let root = tempfile::tempdir().unwrap();
+            let dir = root.path().join("khive.db.walpin");
+            remove_heartbeat(&dir, 4242).expect("missing sidecar dir must be a no-op");
+            assert!(
+                !dir.exists(),
+                "removal must never create the sidecar dir as a side effect"
+            );
+        }
+
+        #[test]
+        fn touch_heartbeat_refreshes_mtime_without_changing_content() {
+            let root = tempfile::tempdir().unwrap();
+            let dir = root.path().join("khive.db.walpin");
+            let pid = std::process::id();
+            let hb = heartbeat(pid);
+            write_heartbeat(&dir, &hb).unwrap();
+            let path = dir.join(format!("{pid}.json"));
+            let before = fs::metadata(&path).unwrap().modified().unwrap();
+
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            touch_heartbeat(&dir, pid).expect("touch of an existing heartbeat must succeed");
+
+            let after = fs::metadata(&path).unwrap().modified().unwrap();
+            assert!(
+                after > before,
+                "touch must advance the mtime; an unchanged timestamp means the \
+                 refresh was a no-op (before {before:?}, after {after:?})"
+            );
+            let content_after: WalpinHeartbeat =
+                serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+            assert_eq!(
+                content_after, hb,
+                "touch is metadata-only; the body must be unchanged"
+            );
+        }
+
+        #[test]
+        fn touch_heartbeat_fails_when_entry_is_absent() {
+            let root = tempfile::tempdir().unwrap();
+            let dir = root.path().join("khive.db.walpin");
+            ensure_sidecar_dir(&dir).unwrap();
+            let err = touch_heartbeat(&dir, 99999)
+                .expect_err("touching a nonexistent heartbeat must fail");
+            assert!(
+                err.to_string().contains("does not exist"),
+                "unexpected error: {err}"
+            );
+        }
+
+        #[test]
+        fn beacon_write_touch_remove_cycle() {
+            let root = tempfile::tempdir().unwrap();
+            let dir = root.path().join("khive.db.walpin");
+            let pid = std::process::id();
+            let b = beacon(pid);
+            let path = beacon_path(&dir, pid);
+
+            write_beacon(&dir, &b).expect("beacon create must succeed");
+            assert!(path.exists());
+            let before = fs::metadata(&path).unwrap().modified().unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            touch_beacon(&dir, pid).expect("beacon touch must succeed");
+            let after = fs::metadata(&path).unwrap().modified().unwrap();
+            assert!(
+                after > before,
+                "beacon touch must advance the mtime; an unchanged timestamp means \
+                 the refresh was a no-op (before {before:?}, after {after:?})"
+            );
+            remove_beacon(&dir, pid).expect("beacon remove must succeed");
+            assert!(!path.exists());
+        }
     }
 }
