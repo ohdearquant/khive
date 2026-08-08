@@ -646,11 +646,30 @@ async fn try_patch_note_property_refuses_array_document() {
     assert_eq!(fetched.updated_at, original_updated_at);
 }
 
-#[tokio::test]
-async fn atomic_note_property_patch_rolls_back_when_one_target_is_ineligible() {
+fn atomic_mark_read_filter() -> khive_storage::note::NoteFilter {
     use khive_storage::note::{FilterOp, NoteFilter, PropertyFilter};
     use khive_storage::types::SqlValue;
 
+    NoteFilter {
+        kind: Some("message".to_string()),
+        property_filters: vec![
+            PropertyFilter {
+                json_path: "$.direction".to_string(),
+                op: FilterOp::NotInOrMissing(vec![SqlValue::Text("outbound".to_string())]),
+                value: SqlValue::Null,
+            },
+            PropertyFilter {
+                json_path: "$.to_actor".to_string(),
+                op: FilterOp::EqOrMissing,
+                value: SqlValue::Text("lambda:reader".to_string()),
+            },
+        ],
+        ..Default::default()
+    }
+}
+
+#[tokio::test]
+async fn atomic_note_property_patch_rolls_back_when_one_target_is_ineligible() {
     let store = setup_memory_store();
     let eligible = make_note("local", "message", "eligible").with_properties(serde_json::json!({
         "direction": "inbound",
@@ -671,24 +690,9 @@ async fn atomic_note_property_patch_rolls_back_when_one_target_is_ineligible() {
     store.upsert_note(eligible).await.unwrap();
     store.upsert_note(ineligible).await.unwrap();
 
-    let filter = NoteFilter {
-        kind: Some("message".to_string()),
-        property_filters: vec![
-            PropertyFilter {
-                json_path: "$.direction".to_string(),
-                op: FilterOp::NotInOrMissing(vec![SqlValue::Text("outbound".to_string())]),
-                value: SqlValue::Null,
-            },
-            PropertyFilter {
-                json_path: "$.to_actor".to_string(),
-                op: FilterOp::EqOrMissing,
-                value: SqlValue::Text("lambda:reader".to_string()),
-            },
-        ],
-        ..Default::default()
-    };
+    let filter = atomic_mark_read_filter();
 
-    let result = store
+    let error = store
         .patch_note_property_atomic(
             vec![eligible_id, ineligible_id],
             "local",
@@ -697,11 +701,14 @@ async fn atomic_note_property_patch_rolls_back_when_one_target_is_ineligible() {
             serde_json::json!(true),
             updated_at,
         )
-        .await;
+        .await
+        .expect_err("an ineligible target must abort the atomic patch");
     assert!(
-        result.is_err(),
-        "an ineligible target must abort the atomic patch"
+        matches!(&error, StorageError::Conflict { message, .. }
+            if message.contains(&ineligible_id.to_string())),
+        "the conflict must name the first failing id {ineligible_id}; got {error:?}"
     );
+    assert!(!error.is_retryable(), "a precondition conflict is terminal");
 
     for (id, preserved) in [(eligible_id, "eligible"), (ineligible_id, "ineligible")] {
         let stored = store.get_note(id).await.unwrap().unwrap();
@@ -725,6 +732,100 @@ async fn atomic_note_property_patch_rolls_back_when_one_target_is_ineligible() {
     let properties = stored.properties.unwrap();
     assert_eq!(properties["read"], true);
     assert_eq!(properties["preserve"], "eligible");
+}
+
+#[tokio::test]
+async fn atomic_note_property_patch_writer_task_commits_and_rolls_back() {
+    let dir = tempfile::tempdir().unwrap();
+    let pool = Arc::new(
+        ConnectionPool::new(PoolConfig {
+            path: Some(dir.path().join("atomic-note-property-writer-task.db")),
+            write_queue_enabled: Some(true),
+            ..PoolConfig::default()
+        })
+        .unwrap(),
+    );
+    {
+        let writer = pool.writer().unwrap();
+        writer.conn().execute_batch(NOTES_DDL).unwrap();
+    }
+    let store = SqlNoteStore::new(Arc::clone(&pool), true);
+    let eligible_properties = serde_json::json!({
+        "direction": "inbound",
+        "to_actor": "lambda:reader",
+        "read": false,
+    });
+    let first = make_note("local", "message", "first eligible")
+        .with_properties(eligible_properties.clone());
+    let second = make_note("local", "message", "second eligible")
+        .with_properties(eligible_properties.clone());
+    let ineligible =
+        make_note("local", "message", "ineligible").with_properties(serde_json::json!({
+            "direction": "outbound",
+            "to_actor": "lambda:reader",
+            "read": false,
+        }));
+    let first_id = first.id;
+    let second_id = second.id;
+    let ineligible_id = ineligible.id;
+    let updated_at = first
+        .updated_at
+        .max(second.updated_at)
+        .max(ineligible.updated_at)
+        + 1;
+    for note in [first, second, ineligible] {
+        store.upsert_note(note).await.unwrap();
+    }
+
+    let filter = atomic_mark_read_filter();
+    store
+        .patch_note_property_atomic(
+            vec![first_id, second_id],
+            "local",
+            &filter,
+            "$.read",
+            serde_json::json!(true),
+            updated_at,
+        )
+        .await
+        .expect("all eligible rows commit through the writer task");
+    for id in [first_id, second_id] {
+        let stored = store.get_note(id).await.unwrap().unwrap();
+        assert_eq!(stored.properties.unwrap()["read"], true);
+    }
+
+    store
+        .update_note_properties(first_id, Some(eligible_properties), updated_at + 1)
+        .await
+        .unwrap();
+    let error = store
+        .patch_note_property_atomic(
+            vec![first_id, ineligible_id],
+            "local",
+            &filter,
+            "$.read",
+            serde_json::json!(true),
+            updated_at + 2,
+        )
+        .await
+        .expect_err("a later ineligible row must abort the writer-task transaction");
+    assert!(
+        matches!(&error, StorageError::Conflict { message, .. }
+            if message.contains(&ineligible_id.to_string())),
+        "the conflict must name the first failing id {ineligible_id}; got {error:?}"
+    );
+    assert_eq!(
+        store
+            .get_note(first_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .properties
+            .unwrap()["read"],
+        false,
+        "the earlier eligible update must roll back"
+    );
+    assert_eq!(pool.writer_task_spawn_count(), 1);
 }
 
 #[tokio::test]

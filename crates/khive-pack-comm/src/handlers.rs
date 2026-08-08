@@ -1025,7 +1025,7 @@ async fn mark_read_targets_atomic(
     let mut results = Vec::with_capacity(targets.len());
     for (id, note) in targets {
         let properties = match store.get_note(id).await {
-            Ok(Some(fresh)) => fresh.properties.unwrap_or_else(|| json!({ "read": true })),
+            Ok(Some(fresh)) => fresh.properties.unwrap_or_else(|| json!({})),
             _ => {
                 let mut fallback = note.properties.unwrap_or_else(|| json!({}));
                 fallback["read"] = json!(true);

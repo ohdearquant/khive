@@ -10684,7 +10684,7 @@ async fn i1387_atomic_mark_read_rolls_back_an_earlier_live_patch() {
         .await
         .unwrap();
 
-    registry
+    let error = registry
         .dispatch(
             "comm.mark_read",
             serde_json::json!({
@@ -10694,6 +10694,11 @@ async fn i1387_atomic_mark_read_rolls_back_an_earlier_live_patch() {
         )
         .await
         .expect_err("a non-object target must abort the guarded transaction");
+    let error = error.to_string();
+    assert!(
+        error.contains("conflict") && error.contains(&non_object.to_string()),
+        "the verb error must name the conflict and failing id {non_object}; got {error}"
+    );
 
     let eligible = runtime
         .notes(&token)

@@ -310,10 +310,17 @@ impl SqlNoteStore {
         F: FnOnce(&rusqlite::Connection) -> Result<R, rusqlite::Error> + Send + 'static,
         R: Send + 'static,
     {
+        self.with_writer_tx_storage(op, move |conn| f(conn).map_err(|error| map_err(error, op)))
+            .await
+    }
+
+    async fn with_writer_tx_storage<F, R>(&self, op: &'static str, f: F) -> Result<R, StorageError>
+    where
+        F: FnOnce(&rusqlite::Connection) -> Result<R, StorageError> + Send + 'static,
+        R: Send + 'static,
+    {
         if let Some(writer_task) = &self.writer_task {
-            return writer_task
-                .send(move |conn| f(conn).map_err(|e| map_err(e, op)))
-                .await;
+            return writer_task.send(f).await;
         }
 
         let pool = Arc::clone(&self.pool);
@@ -336,9 +343,7 @@ impl SqlNoteStore {
                 return Err(map_err(begin_error, op));
             }
 
-            let (result, terminal_state) = execute_wrapped_transaction(conn, op, move |conn| {
-                f(conn).map_err(|error| map_err(error, op))
-            });
+            let (result, terminal_state) = execute_wrapped_transaction(conn, op, f);
             if terminal_state.is_some() {
                 pool.retire_pooled_writer(conn);
             }
@@ -890,7 +895,7 @@ impl NoteStore for SqlNoteStore {
         })?;
         let json_path = json_path.to_string();
 
-        self.with_writer_tx("patch_note_property_atomic", move |conn| {
+        self.with_writer_tx_storage("patch_note_property_atomic", move |conn| {
             for id in ids {
                 let rows = execute_filtered_note_property_patch(
                     conn,
@@ -900,9 +905,16 @@ impl NoteStore for SqlNoteStore {
                     &json_path,
                     &value_json,
                     updated_at,
-                )?;
+                )
+                .map_err(|error| map_err(error, "patch_note_property_atomic"))?;
                 if rows != 1 {
-                    return Err(rusqlite::Error::StatementChangedRows(rows));
+                    return Err(StorageError::Conflict {
+                        capability: StorageCapability::Notes,
+                        operation: "patch_note_property_atomic".into(),
+                        message: format!(
+                            "precondition failed for note {id}: guarded update changed {rows} rows; expected 1"
+                        ),
+                    });
                 }
             }
             Ok(())

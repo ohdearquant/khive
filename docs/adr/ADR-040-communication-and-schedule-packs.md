@@ -788,7 +788,8 @@ autocommit mode. A lost writer-task reply or an unverified transaction finalizat
 existing `side_effects_unknown` storage error and permanently retires that writer seam: the unit is
 still indivisible, but the caller cannot infer whether it committed and the poisoned connection is
 never reused. A successful unit returns the existing bulk summary with `read=true` for every unique
-target.
+target. The 500-id cap also bounds contention: one atomic call holds the single writer across at
+most 500 guarded `UPDATE`s, limiting head-of-line latency for concurrent writers.
 
 This amendment does not change ADR-057's actor or legacy-row decisions. In particular,
 `to_actor`-less pre-ADR-057 rows retain the accepted `EqOrMissing` fail-open compatibility rule for
