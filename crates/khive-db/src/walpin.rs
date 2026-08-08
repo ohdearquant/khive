@@ -1580,10 +1580,12 @@ mod windows_impl {
     /// `RootDirectory` resolves against the process working directory, not
     /// the file's parent — `ERROR_NOT_SAME_DEVICE` (17) when cwd and temp
     /// sit on different drives. The caller therefore supplies the fully
-    /// qualified destination; `write_atomic` builds it from the validated
-    /// directory plus the single-component target name, so the rename
-    /// cannot escape the directory the caller already proved real and
-    /// non-reparse.
+    /// qualified destination. With a null `RootDirectory`, Windows resolves
+    /// that destination by name at rename time, leaving a TOCTOU window
+    /// after directory validation: replacing a parent entry with a junction
+    /// or other reparse point can redirect the rename outside the directory
+    /// validated by `write_atomic`. The single-component target name only
+    /// constrains the leaf and does not close that window.
     fn rename_via_handle(file: &fs::File, target_path: &Path) -> io::Result<()> {
         let wide: Vec<u16> = target_path.as_os_str().encode_wide().collect();
         let name_bytes = wide.len() * 2;

@@ -569,7 +569,8 @@ jobs:
       # #1335: the walpin sidecar's real Windows FFI paths (open/ACL/rename/
       # delete/mtime touch) previously had no executable coverage — a
       # refactor could compile and pass this job without ever running them.
-      # Scoped to just that module's tests (not the full suite) to keep this
+      # The substring filter runs the walpin module plus
+      # checkpoint::tests::walpin_* (not the full suite) to keep this
       # still-new lane fast; widen alongside the `cargo check` step above.
       - name: khive-db walpin Windows FFI tests
         run: cargo test -p khive-db --lib walpin
