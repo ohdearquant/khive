@@ -434,11 +434,18 @@ name and escalate THIS entry despite that older decoy.
 ### Healthy-tick WAL-pin sidecar collection
 
 After the task refreshes its own WAL-pin beacon/heartbeat, every
-sidecar-enabled checkpoint tick runs one bounded `walpin::enumerate_live`
-cleanup pass. This occurs before the Skipped early return and does not depend
-on WAL pressure or a TRUNCATE attempt. Explicitly disabling the sidecar also
-disables collection. Each pass processes at most `MAX_SIDECAR_ENTRIES`;
-filesystem work is offloaded with `spawn_blocking`, and failure warns without
-stopping the task. The no-progress path still enumerates separately because it
-consumes the classification report for holder attribution rather than
-housekeeping alone.
+sidecar-enabled checkpoint tick that did not already run no-progress
+attribution runs one bounded `walpin::housekeep_live` pass. It removes only
+positively dead/reused-PID residue and preserves malformed, uninspectable, and
+live-but-stale evidence for attribution. Legacy records with no declared
+producer cadence use the session-sweep fallback captured once at task startup
+(the ADR-defined compiled default, 5000 ms), never the daemon's checkpoint
+interval or the enumerator's current environment override.
+
+The TRUNCATE-no-progress path instead runs the destructive attribution
+enumerator and marks the tick so ordinary housekeeping is skipped afterward.
+There is therefore at most one sidecar-directory pass per tick, processing at
+most `MAX_SIDECAR_ENTRIES`, including on a no-progress tick. Collection does
+not depend on WAL pressure or checkpoint availability; explicitly disabling
+the sidecar disables it. Filesystem work is offloaded with `spawn_blocking`,
+and failure warns without stopping the task.

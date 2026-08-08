@@ -1175,15 +1175,27 @@ enumerator already had a 512-entry work bound. The same coupling also tempted di
 serialize cleanup counters as `0`/`false` when no enumeration occurred, making "not measured"
 look like a measured clean state (#1794, #1795).
 
-**Decision.** After refreshing its own beacon/heartbeat, every sidecar-enabled daemon checkpoint
-tick runs one `walpin::enumerate_live` pass for that task's file-backed backend, before the
-Observed/Skipped branch. The pass therefore runs independently of WAL size, threshold crossings,
-checkpoint availability, and TRUNCATE outcome. An operator who explicitly disables the sidecar
-also disables its collection. `MAX_SIDECAR_ENTRIES` remains the hard bound on directory work and
-report memory for one tick. Blocking filesystem work runs in `spawn_blocking`; a trust-boundary
-error or worker panic is warned and never terminates the checkpoint loop. Existing no-progress
-enumeration remains because that path consumes the live classifications for attribution, while
-ordinary-tick enumeration is housekeeping only.
+**Decision.** Every sidecar-enabled daemon checkpoint tick performs at most one bounded sidecar
+pass for that task's file-backed backend. When the tick does not enter TRUNCATE-no-progress
+attribution, the task refreshes its own beacon/heartbeat and runs the housekeeping-specific
+`walpin::housekeep_live` pass before the Observed/Skipped branch. This pass uses the session-sweep
+legacy-record cadence fallback captured once at daemon-task startup
+(the ADR-defined compiled default, 5000 ms), never either the daemon's 500 ms checkpoint cadence
+or the enumerating process's current environment override. It removes only entries whose producer
+is positively dead or whose PID start identity proves reuse. A live PID's malformed,
+uninspectable, or stale heartbeat/beacon remains on disk and classifies `unknown`; housekeeping
+must not consume the evidence that a later no-progress report needs.
+
+When a TRUNCATE attempt makes no progress, the existing `walpin::enumerate_live` attribution pass
+runs instead. It consumes the fresh classifications for the operator report and may then remove
+trusted malformed/stale residue under Amendment 2's original cleanup rule. The checkpoint state
+records that this pass was attempted and suppresses ordinary housekeeping later in the same tick,
+so the 512-entry cap applies to one sidecar-directory pass per tick rather than silently allowing a
+second 512-entry scan. Collection remains independent of WAL size, threshold crossings, and
+checkpoint availability on every tick that did not already run attribution. An operator who
+explicitly disables the sidecar also disables collection. Blocking filesystem work runs in
+`spawn_blocking`; a trust-boundary error or worker panic is warned and never terminates the
+checkpoint loop.
 
 `db_diagnostics` remains non-destructive with respect to sidecar evidence: the request does not
 invoke `enumerate_live`. Its cleanup-derived `sidecar_listing_truncated` and

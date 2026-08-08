@@ -22,8 +22,8 @@
 //! `touch_beacon`) and the identity primitives (`is_process_alive`/
 //! `process_start_time_secs`) need to run on every platform — a Windows
 //! session still needs to report itself into the sidecar. Directory
-//! enumeration (`enumerate_live`, and the OS-derived holder census it
-//! anchors to) is Unix-only: its sole caller is the daemon's checkpoint task,
+//! enumeration (`enumerate_live`/`housekeep_live`, and the OS-derived holder
+//! census they anchor to) is Unix-only: its sole caller is the daemon's checkpoint task,
 //! and daemon mode itself requires Unix (`khive-mcp/src/serve.rs` refuses
 //! `--daemon` on non-Unix). The Unix write path is additionally
 //! **handle-bound at every path component**: reaching the sidecar directory
@@ -2806,7 +2806,33 @@ fn epoch_abs_diff(a: i64, b: i64) -> u64 {
 /// existing-but-untrustworthy one.
 #[cfg(unix)]
 pub fn enumerate_live(dir: &Path, sweep_interval: Duration) -> io::Result<WalpinReport> {
-    enumerate_live_bounded(dir, sweep_interval, MAX_SIDECAR_ENTRIES)
+    enumerate_live_bounded(
+        dir,
+        sweep_interval,
+        MAX_SIDECAR_ENTRIES,
+        EnumerationPurpose::Attribution,
+    )
+}
+
+/// Run the ordinary-tick, bounded sidecar housekeeping pass.
+///
+/// This uses the same trust checks, liveness classification, and
+/// `MAX_SIDECAR_ENTRIES` work bound as [`enumerate_live`], but removes only
+/// residue whose producer is positively dead or whose PID has been reused.
+/// Malformed, uninspectable, and live-but-stale records remain on disk so a
+/// later TRUNCATE-no-progress attribution pass can consume their `Unknown`
+/// evidence instead of observing a falsely clean directory.
+#[cfg(unix)]
+pub(crate) fn housekeep_live(
+    dir: &Path,
+    legacy_sweep_interval: Duration,
+) -> io::Result<WalpinReport> {
+    enumerate_live_bounded(
+        dir,
+        legacy_sweep_interval,
+        MAX_SIDECAR_ENTRIES,
+        EnumerationPurpose::Housekeeping,
+    )
 }
 
 /// Ceiling on sidecar entries listed and read per enumeration. Both the
@@ -2828,10 +2854,31 @@ const MAX_SIDECAR_ENTRIES: usize = 512;
 const CAP_SENTINEL_PID: u32 = 0;
 
 #[cfg(unix)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EnumerationPurpose {
+    /// Consume a fresh classification for a TRUNCATE-no-progress report.
+    /// Unknown trusted residue is retained in this pass's report and removed
+    /// from disk so it cannot accumulate indefinitely.
+    Attribution,
+    /// Ordinary healthy-tick collection. Only positively dead/reused-PID
+    /// residue may be removed; uncertain evidence stays available for a later
+    /// attribution pass.
+    Housekeeping,
+}
+
+#[cfg(unix)]
+impl EnumerationPurpose {
+    fn removes_uncertain_evidence(self) -> bool {
+        self == Self::Attribution
+    }
+}
+
+#[cfg(unix)]
 fn enumerate_live_bounded(
     dir: &Path,
     sweep_interval: Duration,
     max_entries: usize,
+    purpose: EnumerationPurpose,
 ) -> io::Result<WalpinReport> {
     let handle = match unix_impl::SidecarDirHandle::open_if_exists(dir) {
         Ok(Some(h)) => h,
@@ -2909,24 +2956,44 @@ fn enumerate_live_bounded(
             let heartbeat: WalpinHeartbeat = match serde_json::from_slice(&body) {
                 Ok(hb) => hb,
                 Err(_) => {
-                    // Fail closed: a malformed entry is removed so it cannot
-                    // wedge future ticks, but THIS tick's attribution for
-                    // the PID stays inconclusive — deletion is cleanup,
-                    // never exoneration.
-                    let _ = handle.unlink_tolerant(&name);
+                    if purpose.removes_uncertain_evidence() || !is_process_alive(pid) {
+                        let _ = handle.unlink_tolerant(&name);
+                    }
+                    wedged.insert(pid);
                     unknown.push((pid, "malformed walpin heartbeat entry"));
                     continue;
                 }
             };
+            if heartbeat.pid != pid {
+                if purpose.removes_uncertain_evidence() {
+                    let _ = handle.unlink_tolerant(&name);
+                }
+                wedged.insert(pid);
+                unknown.push((pid, "walpin heartbeat PID does not match its entry name"));
+                continue;
+            }
             let alive = is_process_alive(heartbeat.pid);
-            let identity_ok = alive
-                && process_start_time_secs(heartbeat.pid)
-                    .map(|actual| {
-                        epoch_abs_diff(actual, heartbeat.started_at) <= START_TIME_EPSILON_SECS
-                    })
-                    .unwrap_or(false);
+            let actual_start = if alive {
+                process_start_time_secs(heartbeat.pid)
+            } else {
+                None
+            };
+            let identity_ok = actual_start
+                .map(|actual| {
+                    epoch_abs_diff(actual, heartbeat.started_at) <= START_TIME_EPSILON_SECS
+                })
+                .unwrap_or(false);
             if !identity_ok {
-                let _ = handle.unlink_tolerant(&name);
+                let positively_dead_or_reused = !alive
+                    || actual_start.is_some_and(|actual| {
+                        epoch_abs_diff(actual, heartbeat.started_at) > START_TIME_EPSILON_SECS
+                    });
+                if purpose.removes_uncertain_evidence() || positively_dead_or_reused {
+                    let _ = handle.unlink_tolerant(&name);
+                } else {
+                    wedged.insert(pid);
+                    unknown.push((pid, "walpin heartbeat identity could not be verified"));
+                }
                 continue;
             }
             // ADR-091 Amendment 3 Plank F1: a record carrying
@@ -2946,7 +3013,9 @@ fn enumerate_live_bounded(
                 epoch_abs_diff(now, heartbeat.updated_at) <= window as u64
             };
             if !hb_fresh {
-                let _ = handle.unlink_tolerant(&name);
+                if purpose.removes_uncertain_evidence() {
+                    let _ = handle.unlink_tolerant(&name);
+                }
                 wedged.insert(pid);
                 unknown.push((pid, "stale walpin heartbeat"));
                 continue;
@@ -2956,22 +3025,42 @@ fn enumerate_live_bounded(
             let beacon: WalpinBeacon = match serde_json::from_slice(&body) {
                 Ok(b) => b,
                 Err(_) => {
-                    // Fail closed, as for a malformed heartbeat: cleanup,
-                    // never exoneration.
-                    let _ = handle.unlink_tolerant(&name);
+                    if purpose.removes_uncertain_evidence() || !is_process_alive(pid) {
+                        let _ = handle.unlink_tolerant(&name);
+                    }
+                    wedged.insert(pid);
                     unknown.push((pid, "malformed walpin beacon entry"));
                     continue;
                 }
             };
+            if beacon.pid != pid {
+                if purpose.removes_uncertain_evidence() {
+                    let _ = handle.unlink_tolerant(&name);
+                }
+                wedged.insert(pid);
+                unknown.push((pid, "walpin beacon PID does not match its entry name"));
+                continue;
+            }
             let alive = is_process_alive(beacon.pid);
-            let identity_ok = alive
-                && process_start_time_secs(beacon.pid)
-                    .map(|actual| {
-                        epoch_abs_diff(actual, beacon.started_at) <= START_TIME_EPSILON_SECS
-                    })
-                    .unwrap_or(false);
+            let actual_start = if alive {
+                process_start_time_secs(beacon.pid)
+            } else {
+                None
+            };
+            let identity_ok = actual_start
+                .map(|actual| epoch_abs_diff(actual, beacon.started_at) <= START_TIME_EPSILON_SECS)
+                .unwrap_or(false);
             if !identity_ok {
-                let _ = handle.unlink_tolerant(&name);
+                let positively_dead_or_reused = !alive
+                    || actual_start.is_some_and(|actual| {
+                        epoch_abs_diff(actual, beacon.started_at) > START_TIME_EPSILON_SECS
+                    });
+                if purpose.removes_uncertain_evidence() || positively_dead_or_reused {
+                    let _ = handle.unlink_tolerant(&name);
+                } else {
+                    wedged.insert(pid);
+                    unknown.push((pid, "walpin beacon identity could not be verified"));
+                }
                 continue;
             }
             // Beacon refresh rule: freshness is the entry's mtime (the
@@ -2981,7 +3070,9 @@ fn enumerate_live_bounded(
             let window = stale_window_secs(beacon.sweep_interval_ms, fallback_window_secs);
             let fresh = epoch_abs_diff(now, mtime_secs) <= window as u64;
             if !fresh {
-                let _ = handle.unlink_tolerant(&name);
+                if purpose.removes_uncertain_evidence() {
+                    let _ = handle.unlink_tolerant(&name);
+                }
                 wedged.insert(pid);
                 unknown.push((pid, "stale walpin beacon"));
                 continue;
@@ -2990,9 +3081,15 @@ fn enumerate_live_bounded(
         }
     }
 
+    for (pid, _) in &unknown {
+        wedged.insert(*pid);
+    }
+
     let mut entries: Vec<WalpinPidHealth> = Vec::new();
     for (pid, hb) in heartbeats {
-        entries.push(WalpinPidHealth::Reporting(hb));
+        if !wedged.contains(&pid) {
+            entries.push(WalpinPidHealth::Reporting(hb));
+        }
         beacon_pids.remove(&pid);
     }
     for pid in beacon_pids {
@@ -3477,7 +3574,13 @@ mod tests {
             write_heartbeat(&dir, &hb).unwrap();
         }
 
-        let report = enumerate_live_bounded(&dir, Duration::from_secs(5), 1).unwrap();
+        let report = enumerate_live_bounded(
+            &dir,
+            Duration::from_secs(5),
+            1,
+            EnumerationPurpose::Attribution,
+        )
+        .unwrap();
         let markers = report
             .entries
             .iter()
@@ -3517,7 +3620,13 @@ mod tests {
             std::fs::write(dir.join(format!(".junk{i}")), b"x").unwrap();
         }
 
-        let report = enumerate_live_bounded(&dir, Duration::from_secs(5), 4).unwrap();
+        let report = enumerate_live_bounded(
+            &dir,
+            Duration::from_secs(5),
+            4,
+            EnumerationPurpose::Attribution,
+        )
+        .unwrap();
         let markers = report
             .entries
             .iter()
@@ -3742,6 +3851,89 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[test]
+    fn housekeeping_uses_the_five_second_legacy_cadence_fallback() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("khive.db.walpin");
+        let pid = std::process::id();
+        let mut hb = heartbeat(pid);
+        hb.oldest_tx_started_at = None;
+        hb.sweep_interval_ms = 0;
+        hb.updated_at = now_epoch_secs() - 4;
+        write_heartbeat(&dir, &hb).unwrap();
+
+        let report = housekeep_live(&dir, Duration::from_secs(5)).unwrap();
+
+        assert_eq!(
+            report.reporting().count(),
+            1,
+            "a 4s-old legacy record is inside the ADR-091 15s fallback window; the daemon's \
+             500ms checkpoint cadence would incorrectly narrow that window to 3s: {report:?}"
+        );
+        assert!(
+            dir.join(format!("{pid}.json")).exists(),
+            "healthy housekeeping must retain a live legacy record"
+        );
+    }
+
+    #[test]
+    fn housekeeping_preserves_malformed_unknown_for_no_progress_attribution() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("khive.db.walpin");
+        let pid = std::process::id();
+        write_beacon(&dir, &beacon(pid)).unwrap();
+        let heartbeat_path = dir.join(format!("{pid}.json"));
+        fs::write(&heartbeat_path, b"{not-json").unwrap();
+
+        let housekeeping = housekeep_live(&dir, Duration::from_secs(5)).unwrap();
+        assert_eq!(housekeeping.unknown_pids().collect::<Vec<_>>(), vec![pid]);
+        assert_eq!(housekeeping.registered_silent_pids().count(), 0);
+        assert!(
+            heartbeat_path.exists(),
+            "ordinary housekeeping must preserve malformed live-PID evidence"
+        );
+
+        let attribution = enumerate_live(&dir, Duration::from_secs(5)).unwrap();
+        assert_eq!(attribution.unknown_pids().collect::<Vec<_>>(), vec![pid]);
+        assert_eq!(
+            attribution.registered_silent_pids().count(),
+            0,
+            "a fresh beacon must never exonerate a PID whose heartbeat is malformed"
+        );
+        assert!(!attribution.fully_attributed());
+    }
+
+    #[test]
+    fn housekeeping_preserves_stale_unknown_for_no_progress_attribution() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("khive.db.walpin");
+        let pid = std::process::id();
+        write_beacon(&dir, &beacon(pid)).unwrap();
+        let mut hb = heartbeat(pid);
+        hb.oldest_tx_started_at = None;
+        hb.sweep_interval_ms = 1_000;
+        hb.updated_at = now_epoch_secs() - 30;
+        write_heartbeat(&dir, &hb).unwrap();
+        let heartbeat_path = dir.join(format!("{pid}.json"));
+
+        let housekeeping = housekeep_live(&dir, Duration::from_secs(5)).unwrap();
+        assert_eq!(housekeeping.unknown_pids().collect::<Vec<_>>(), vec![pid]);
+        assert_eq!(housekeeping.registered_silent_pids().count(), 0);
+        assert!(
+            heartbeat_path.exists(),
+            "ordinary housekeeping must preserve a live PID's stale heartbeat evidence"
+        );
+
+        let attribution = enumerate_live(&dir, Duration::from_secs(5)).unwrap();
+        assert_eq!(attribution.unknown_pids().collect::<Vec<_>>(), vec![pid]);
+        assert_eq!(
+            attribution.registered_silent_pids().count(),
+            0,
+            "a fresh beacon must never exonerate a PID whose heartbeat went stale"
+        );
+        assert!(!attribution.fully_attributed());
+    }
+
     #[test]
     fn enumerate_live_deletes_dead_beacon() {
         let root = tempfile::tempdir().unwrap();

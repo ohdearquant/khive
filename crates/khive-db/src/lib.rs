@@ -25,9 +25,9 @@ pub mod stores;
 mod timeout_sink;
 /// Cross-process WAL-pin attribution sidecar (ADR-091 Amendment 2 Plank B).
 /// The sidecar write path (heartbeat/beacon) and identity primitives are
-/// portable; directory enumeration (`enumerate_live`) is Unix-only — its
-/// only caller is the daemon's checkpoint task, and daemon mode itself
-/// requires Unix (see `khive-mcp/src/serve.rs`).
+/// portable; directory collection (`enumerate_live`/`housekeep_live`) is
+/// Unix-only — its only caller is the daemon's checkpoint task, and daemon
+/// mode itself requires Unix (see `khive-mcp/src/serve.rs`).
 pub mod walpin;
 /// Single-writer task and bounded write queue (ADR-067 Component A).
 pub mod writer_task;

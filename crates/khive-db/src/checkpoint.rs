@@ -404,7 +404,7 @@ fn tx_age_thresholds_from_env(
 /// configuration: `last_attempt` and `consecutive_failures` mutate every tick,
 /// while `CheckpointConfig` is parsed once and held immutable for the life of
 /// the task.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct TruncateState {
     /// When the last TRUNCATE *attempt* ran (armed + writer held), regardless
     /// of whether it succeeded in reclaiming pages. `None` means no attempt
@@ -415,6 +415,49 @@ pub struct TruncateState {
     /// `warn_pages`; used to fire a one-shot escalated WARN at exactly 3
     /// consecutive failures (does not repeat every subsequent attempt).
     consecutive_failures: u32,
+    /// Fallback freshness cadence for legacy sidecar records that do not
+    /// declare their producer interval. Captured once when the daemon task
+    /// starts; this is ADR-091's compiled 5000 ms session-sweep default, never
+    /// the daemon's faster checkpoint cadence or a local environment override.
+    #[cfg(unix)]
+    legacy_walpin_fallback_interval: Duration,
+    /// Whether the no-progress attribution arm already attempted the one
+    /// bounded sidecar enumeration allowed for this checkpoint tick.
+    #[cfg(unix)]
+    sidecar_attribution_attempted_this_tick: bool,
+}
+
+impl Default for TruncateState {
+    fn default() -> Self {
+        Self {
+            last_attempt: None,
+            consecutive_failures: 0,
+            #[cfg(unix)]
+            legacy_walpin_fallback_interval: DEFAULT_SESSION_SWEEP_INTERVAL,
+            #[cfg(unix)]
+            sidecar_attribution_attempted_this_tick: false,
+        }
+    }
+}
+
+impl TruncateState {
+    #[cfg(unix)]
+    fn with_legacy_walpin_fallback(interval: Duration) -> Self {
+        Self {
+            legacy_walpin_fallback_interval: interval,
+            ..Self::default()
+        }
+    }
+
+    #[cfg(unix)]
+    fn begin_tick(&mut self) {
+        self.sidecar_attribution_attempted_this_tick = false;
+    }
+
+    #[cfg(unix)]
+    fn housekeeping_due(&self) -> bool {
+        !self.sidecar_attribution_attempted_this_tick
+    }
 }
 
 /// ADR-091 graduated severity rung for sustained WAL pressure.
@@ -781,15 +824,16 @@ impl WalpinSidecarState {
         }
     }
 
-    /// Run one bounded cleanup pass independently of WAL pressure. The
-    /// enumerator caps both directory work and report memory, and all
-    /// blocking filesystem operations stay off the async runtime worker.
+    /// Run one bounded housekeeping pass independently of WAL pressure. The
+    /// collector removes only positively dead/reused-PID residue; uncertain
+    /// evidence remains for a no-progress attribution pass. Directory work
+    /// and report memory are capped, and all blocking filesystem operations
+    /// stay off the async runtime worker.
     #[cfg(unix)]
-    async fn reap_stale_entries_bounded(&self) {
+    async fn reap_dead_entries_bounded(&self, legacy_fallback_interval: Duration) {
         let dir = self.dir.clone();
-        let fallback_interval = Duration::from_millis(self.sweep_interval_ms);
         let result = tokio::task::spawn_blocking(move || {
-            crate::walpin::enumerate_live(&dir, fallback_interval)
+            crate::walpin::housekeep_live(&dir, legacy_fallback_interval)
         })
         .await;
         match result {
@@ -1073,6 +1117,8 @@ fn now_epoch_secs() -> i64 {
 /// sweep. Sessions never checkpoint — that stays daemon-owned so N session
 /// processes never compete for the writer mutex — this only watches
 /// `tx_registry` (and, Plank B, refreshes this process's walpin heartbeat).
+const DEFAULT_SESSION_SWEEP_INTERVAL: Duration = Duration::from_secs(5);
+
 #[derive(Clone, Debug)]
 pub struct SessionSweepConfig {
     /// How often a session polls the registry. Coarser than the daemon's
@@ -1089,7 +1135,7 @@ pub struct SessionSweepConfig {
 impl Default for SessionSweepConfig {
     fn default() -> Self {
         Self {
-            interval: Duration::from_secs(5),
+            interval: DEFAULT_SESSION_SWEEP_INTERVAL,
             tx_warn_secs: Duration::from_secs(30),
             tx_max_age_secs: Duration::from_secs(120),
         }
@@ -1102,14 +1148,7 @@ impl SessionSweepConfig {
     /// reads) so a session and the daemon agree on the same thresholds.
     pub fn from_env() -> Self {
         let mut cfg = Self::default();
-
-        if let Ok(ms) = std::env::var("KHIVE_SESSION_SWEEP_INTERVAL_MS") {
-            if let Ok(v) = ms.parse::<u64>() {
-                if v > 0 {
-                    cfg.interval = Duration::from_millis(v);
-                }
-            }
-        }
+        cfg.interval = session_sweep_interval_from_env();
         // Shares `tx_age_thresholds_from_env` with `CheckpointConfig::from_env`
         // (minor, ADR-091 Amendment 2) so a session and the daemon
         // parse and validate `KHIVE_TX_WARN_SECS`/`KHIVE_TX_MAX_AGE_SECS`
@@ -1119,6 +1158,15 @@ impl SessionSweepConfig {
 
         cfg
     }
+}
+
+fn session_sweep_interval_from_env() -> Duration {
+    std::env::var("KHIVE_SESSION_SWEEP_INTERVAL_MS")
+        .ok()
+        .and_then(|ms| ms.parse::<u64>().ok())
+        .filter(|ms| *ms > 0)
+        .map(Duration::from_millis)
+        .unwrap_or(DEFAULT_SESSION_SWEEP_INTERVAL)
 }
 
 /// One file-backed backend the session sweep observes (ADR-091 Amendment 3
@@ -1547,6 +1595,12 @@ pub async fn run_checkpoint_task(
     let mut severity_state = CheckpointSeverityState::default();
     let mut tx_age_state = TxAgeSweepState::default();
     let mut was_above_high_water = false;
+    #[cfg(unix)]
+    let legacy_walpin_fallback_interval = DEFAULT_SESSION_SWEEP_INTERVAL;
+    #[cfg(unix)]
+    let mut truncate_state =
+        TruncateState::with_legacy_walpin_fallback(legacy_walpin_fallback_interval);
+    #[cfg(not(unix))]
     let mut truncate_state = TruncateState::default();
     let mut lifecycle_emitter = CheckpointLifecycleEmitter::new(lifecycle_owner);
     // Independent of `severity_state` (which owns the WARN-episode ladder
@@ -1605,6 +1659,9 @@ pub async fn run_checkpoint_task(
             _ = shutdown_rx.changed() => break,
         }
 
+        #[cfg(unix)]
+        truncate_state.begin_tick();
+
         let tick = match checkpoint_conn.ensure_open(&pool) {
             None => {
                 note_checkpoint_skipped();
@@ -1657,7 +1714,11 @@ pub async fn run_checkpoint_task(
             sidecar
                 .observe(oldest_tx.clone(), config.tx_warn_secs)
                 .await;
-            sidecar.reap_stale_entries_bounded().await;
+            if truncate_state.housekeeping_due() {
+                sidecar
+                    .reap_dead_entries_bounded(legacy_walpin_fallback_interval)
+                    .await;
+            }
         }
 
         // Skipped ticks leave crossing state unchanged — a busy tick must not
@@ -1831,6 +1892,8 @@ pub fn checkpoint_once(
     config: &CheckpointConfig,
     truncate_state: &mut TruncateState,
 ) -> Result<u64, rusqlite::Error> {
+    #[cfg(unix)]
+    truncate_state.begin_tick();
     let wal_pages = query_wal_pages(conn);
 
     if let Err(e) = conn.execute_batch("PRAGMA wal_checkpoint(PASSIVE)") {
@@ -1924,7 +1987,14 @@ fn maybe_truncate(
                     truncate_report_test_sync::after_no_progress_before_report(path);
                 }
                 #[cfg(unix)]
-                log_walpin_sidecar_report(pool, holder_census);
+                {
+                    truncate_state.sidecar_attribution_attempted_this_tick =
+                        log_walpin_sidecar_report(
+                            pool,
+                            holder_census,
+                            truncate_state.legacy_walpin_fallback_interval,
+                        );
+                }
                 log_wal_pin_depth(conn);
             }
 
@@ -2036,10 +2106,10 @@ fn capture_wal_holder_census(
 
 /// When a TRUNCATE attempt makes no progress, enumerate the walpin sidecar and
 /// combine it with the holder census captured immediately before that attempt.
-/// Ordinary ticks also enumerate for bounded housekeeping, but this path runs
-/// a fresh pass because it consumes the classifications for attribution;
-/// holder identity cannot be deferred because a transient blocker may have
-/// released by then.
+/// This pass consumes the classifications for attribution and returns whether
+/// enumeration was attempted; the caller uses that marker to suppress the
+/// ordinary housekeeping pass later in the same tick. Holder identity cannot
+/// be deferred because a transient blocker may have released by then.
 ///
 /// Sidecar-health attribution (ADR-091 Amendment 2):
 /// the sharper "unregistered/native mechanism" conclusion is licensed only
@@ -2052,20 +2122,20 @@ fn capture_wal_holder_census(
 fn log_walpin_sidecar_report(
     pool: &ConnectionPool,
     census: Option<Result<crate::walpin::CensusResult, String>>,
-) {
+    legacy_fallback_interval: Duration,
+) -> bool {
     let Some(census) = census else {
-        return;
+        return false;
     };
     let Some(path) = pool.canonical_path() else {
-        return;
+        return false;
     };
     let dir = crate::walpin::sidecar_dir_for(path);
     // Each record carries its producer's own sweep cadence
     // (`sweep_interval_ms`), which is what freshness is judged against; the
     // interval passed here is only the fallback for records written before
     // that field existed.
-    let sweep_interval = SessionSweepConfig::from_env().interval;
-    let report = match crate::walpin::enumerate_live(&dir, sweep_interval) {
+    let report = match crate::walpin::enumerate_live(&dir, legacy_fallback_interval) {
         Ok(report) => report,
         Err(e) => {
             tracing::warn!(
@@ -2073,7 +2143,7 @@ fn log_walpin_sidecar_report(
                 "ADR-091 Amendment 2 Plank B: sidecar directory failed the trust-boundary \
                  check; cross-process WAL-pin attribution is unestablished for this tick"
             );
-            return;
+            return true;
         }
     };
     let now = now_epoch_secs();
@@ -2181,6 +2251,7 @@ fn log_walpin_sidecar_report(
              span this sidecar covers"
         );
     }
+    true
 }
 
 /// ADR-091 Amendment 2 Plank C: on a TRUNCATE no-progress event, run a fresh
@@ -2610,8 +2681,10 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
-    #[serial(checkpoint_skip_metrics, walpin_report_seam)]
+    #[serial(checkpoint_skip_metrics, khive_walpin_sidecar_env, walpin_report_seam)]
     fn no_progress_report_keeps_holder_released_after_truncate_timeout() {
+        let _env_guard = crate::walpin::EnvVarGuard::capture("KHIVE_WALPIN_SIDECAR");
+        std::env::set_var("KHIVE_WALPIN_SIDECAR", "1");
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("transient-reader.db");
         let pool = file_pool(&path);
@@ -2648,7 +2721,8 @@ mod tests {
                 events: thread_buffer,
             };
             tracing::subscriber::with_default(subscriber, || {
-                checkpoint_once(
+                let mut state = TruncateState::default();
+                let result = checkpoint_once(
                     &checkpoint_pool,
                     &dedicated_conn,
                     &CheckpointConfig {
@@ -2657,8 +2731,9 @@ mod tests {
                         truncate_busy_timeout: Duration::from_millis(50),
                         ..CheckpointConfig::default()
                     },
-                    &mut TruncateState::default(),
-                )
+                    &mut state,
+                );
+                (result, state.sidecar_attribution_attempted_this_tick)
             })
         });
 
@@ -2675,7 +2750,14 @@ mod tests {
         proceed_tx
             .send(())
             .expect("allow no-progress reporting to continue");
-        let _ = checkpoint.join().expect("checkpoint thread");
+        let (checkpoint_result, attribution_attempted) =
+            checkpoint.join().expect("checkpoint thread");
+        checkpoint_result.expect("checkpoint succeeds");
+        assert!(
+            attribution_attempted,
+            "a no-progress attribution pass must suppress the redundant healthy-housekeeping \
+             pass for the same tick"
+        );
 
         let events = buffer.lock().expect("captured events");
         assert!(
@@ -2843,7 +2925,7 @@ mod tests {
 
         assert!(
             reaped,
-            "the ordinary healthy tick must sweep stale sidecar entries independently of \
+            "the ordinary healthy tick must reap positively dead sidecar residue independently of \
              TRUNCATE diagnostics"
         );
     }
