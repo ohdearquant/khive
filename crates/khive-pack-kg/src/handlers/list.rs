@@ -41,30 +41,6 @@ fn add_list_limit_metadata(response: &mut Value, requested: u32, effective: u32)
     response["limit_clamped"] = serde_json::json!(requested > effective);
 }
 
-/// Wraps a bounded-scan list response with `scan_incomplete: true` when the
-/// scan hit its ceiling before exhausting all matching rows. `render_list_response`
-/// returns a bare array when the requested limit was not clamped, so this
-/// object-ifies the response (under `items_key`) whenever disclosure is needed.
-fn apply_scan_incomplete(
-    response: Value,
-    scan_incomplete: bool,
-    items_key: &str,
-    requested: u32,
-    effective: u32,
-) -> Value {
-    if !scan_incomplete {
-        return response;
-    }
-    let mut response = if response.is_object() {
-        response
-    } else {
-        serde_json::json!({ items_key: response })
-    };
-    response["scan_incomplete"] = Value::Bool(true);
-    add_list_limit_metadata(&mut response, requested, effective);
-    response
-}
-
 fn parse_after_cursor(raw: &str) -> Result<Option<uuid::Uuid>, RuntimeError> {
     if raw.is_empty() {
         return Ok(None);
@@ -590,6 +566,7 @@ impl KgPack {
                 }
 
                 let offset = p.offset.unwrap_or(0);
+                let mut scan_incomplete = false;
                 let notes: Vec<_> = if has_note_filter {
                     let mut collected: Vec<_> = Vec::new();
                     let mut db_offset: u32 = 0;
@@ -653,7 +630,11 @@ impl KgPack {
                         })
                         .collect()
                 };
-                Ok(render_list_response(to_json(&remapped)?, requested, limit))
+                let mut response = render_list_response(to_json(&remapped)?, requested, limit);
+                if scan_incomplete {
+                    response["scan_incomplete"] = Value::Bool(true);
+                }
+                Ok(response)
             }
             KindSpec::Proposal => unreachable!("kind=proposal fast-pathed before deser"),
             KindSpec::Event => {
@@ -673,6 +654,7 @@ impl KgPack {
                 let offset = p.offset.unwrap_or(0);
                 let (filter, outcome) = event_filter_from_params(&p)?;
 
+                let mut scan_incomplete = false;
                 let items = if let Some(wanted_outcome) = outcome {
                     let mut items = Vec::new();
                     let mut skipped = 0u32;
@@ -737,11 +719,15 @@ impl KgPack {
                         .await?;
                     page.items
                 };
-                Ok(render_list_response(
+                let mut response = render_list_response(
                     normalize_event_timestamps_array(to_json(&items)?),
                     requested,
                     limit,
-                ))
+                );
+                if scan_incomplete {
+                    response["scan_incomplete"] = Value::Bool(true);
+                }
+                Ok(response)
             }
         }
     }
