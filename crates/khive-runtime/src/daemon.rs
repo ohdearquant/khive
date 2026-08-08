@@ -1994,11 +1994,70 @@ mod tests {
     use super::*;
     use serial_test::serial;
 
+    struct AppendCompletionEventStore {
+        inner: Arc<dyn khive_storage::EventStore>,
+        first_append: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    }
+
+    #[async_trait]
+    impl khive_storage::EventStore for AppendCompletionEventStore {
+        async fn append_event(
+            &self,
+            event: khive_storage::Event,
+        ) -> khive_storage::StorageResult<()> {
+            self.inner.append_event(event).await?;
+            if let Some(completed) = self
+                .first_append
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take()
+            {
+                let _ = completed.send(());
+            }
+            Ok(())
+        }
+
+        async fn append_events(
+            &self,
+            events: Vec<khive_storage::Event>,
+        ) -> khive_storage::StorageResult<khive_storage::BatchWriteSummary> {
+            self.inner.append_events(events).await
+        }
+
+        async fn get_event(
+            &self,
+            id: uuid::Uuid,
+        ) -> khive_storage::StorageResult<Option<khive_storage::Event>> {
+            self.inner.get_event(id).await
+        }
+
+        async fn query_events(
+            &self,
+            filter: khive_storage::EventFilter,
+            page: khive_storage::PageRequest,
+        ) -> khive_storage::StorageResult<khive_storage::Page<khive_storage::Event>> {
+            self.inner.query_events(filter, page).await
+        }
+
+        async fn count_events(
+            &self,
+            filter: khive_storage::EventFilter,
+        ) -> khive_storage::StorageResult<u64> {
+            self.inner.count_events(filter).await
+        }
+    }
+
     #[tokio::test]
     #[serial(checkpoint_skip_metrics)]
     async fn secondary_only_checkpoint_topology_emits_lifecycle_outcome() {
         let main_backend = khive_db::StorageBackend::memory().expect("in-memory main backend");
-        let event_store = main_backend.events().expect("main event store");
+        let inner_event_store = main_backend.events().expect("main event store");
+        let (first_append_tx, first_append_rx) = tokio::sync::oneshot::channel();
+        let event_store: Arc<dyn khive_storage::EventStore> =
+            Arc::new(AppendCompletionEventStore {
+                inner: inner_event_store,
+                first_append: std::sync::Mutex::new(Some(first_append_tx)),
+            });
         let secondary_dir = tempfile::tempdir().expect("secondary tempdir");
         let secondary_backend =
             khive_db::StorageBackend::sqlite(secondary_dir.path().join("secondary.db"))
@@ -2032,12 +2091,13 @@ mod tests {
             task.is_main,
         ));
 
-        tokio::time::sleep(std::time::Duration::from_millis(60)).await;
-        shutdown_tx.send(()).expect("send checkpoint shutdown");
-        tokio::time::timeout(std::time::Duration::from_secs(1), handle)
+        // The scheduler intentionally aborts its bounded append worker during
+        // shutdown. Wait on the append's completion edge before requesting
+        // shutdown, so the observation cannot race that deliberate abort.
+        tokio::time::timeout(std::time::Duration::from_secs(10), first_append_rx)
             .await
-            .expect("checkpoint task should exit within 1s")
-            .expect("checkpoint task panicked");
+            .expect("secondary checkpoint owner did not complete an append within 10s")
+            .expect("checkpoint lifecycle append completion sender dropped");
 
         let events = event_store
             .query_events(
@@ -2049,6 +2109,12 @@ mod tests {
             )
             .await
             .expect("query lifecycle events");
+
+        shutdown_tx.send(()).expect("send checkpoint shutdown");
+        tokio::time::timeout(std::time::Duration::from_secs(1), handle)
+            .await
+            .expect("checkpoint task should exit within 1s")
+            .expect("checkpoint task panicked");
         assert!(
             !events.items.is_empty()
                 && events

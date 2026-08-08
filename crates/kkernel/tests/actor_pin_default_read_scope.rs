@@ -149,11 +149,14 @@ id = "lambda:fallback"
     // (ADR-007 Rev 4): it targets exactly that namespace regardless of the
     // caller's actor/default namespace, so seeding does not depend on the
     // pin behavior under test.
-    let seed_ops = r#"[
-        create(kind="observation", content="local-record", namespace="local"),
-        create(kind="observation", content="fallback-record", namespace="lambda:fallback"),
+    // These writes only establish fixtures; concurrent-writer behavior is not
+    // under test. Keep them in one sequential chain so a loaded shared runner
+    // cannot turn SQLite writer admission into an unrelated seed failure.
+    let seed_ops = r#"
+        create(kind="observation", content="local-record", namespace="local") |
+        create(kind="observation", content="fallback-record", namespace="lambda:fallback") |
         create(kind="observation", content="pinned-record", namespace="lambda:pinned")
-    ]"#;
+    "#;
     let seed_save = project_dir.path().join("seed-result.jsonl");
     let seed_args = base_args(
         &db_str,
