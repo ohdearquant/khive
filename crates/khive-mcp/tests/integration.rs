@@ -1038,7 +1038,11 @@ async fn pack_schedule_without_comm_rejects_only_remind_before_persisting() -> a
     );
 
     let notes = ok_one(&client, r#"list(kind="note")"#).await?;
-    assert_eq!(notes, json!([]), "failed remind must persist no note");
+    assert_eq!(
+        notes["items"],
+        json!([]),
+        "failed remind must persist no note"
+    );
     let empty_agenda = ok_one(&client, "schedule.agenda()").await?;
     assert_eq!(empty_agenda["count"], json!(0));
 
