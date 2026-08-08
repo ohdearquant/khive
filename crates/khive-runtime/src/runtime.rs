@@ -366,10 +366,11 @@ impl KhiveRuntime {
         self.backend.ann_root()
     }
 
-    /// Writer-contention plus WAL/checkpoint diagnostics (ADR-091/ADR-135
-    /// operator surface): pooled writer and audit-failure counters, build
-    /// identity, checkpoint counters, a PASSIVE checkpoint probe, WAL file
-    /// size, and explicitly qualified WAL-pin census. Not write-free: the
+    /// Writer-contention, graph-edge integrity, and WAL/checkpoint diagnostics
+    /// (ADR-091/ADR-135 operator surface): pooled writer and audit-failure
+    /// counters, build identity, duplicate edge-ID and list-ledger counts,
+    /// checkpoint counters, a PASSIVE checkpoint probe, WAL file size, and
+    /// explicitly qualified WAL-pin census. Not write-free: the
     /// PASSIVE probe may backfill WAL frames into the database (normal
     /// checkpoint I/O). It never changes logical state, escalates to TRUNCATE,
     /// creates a missing database file, or deletes sidecar evidence — see

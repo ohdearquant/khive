@@ -781,6 +781,34 @@ impl WalpinSidecarState {
         }
     }
 
+    /// Run one bounded cleanup pass independently of WAL pressure. The
+    /// enumerator caps both directory work and report memory, and all
+    /// blocking filesystem operations stay off the async runtime worker.
+    #[cfg(unix)]
+    async fn reap_stale_entries_bounded(&self) {
+        let dir = self.dir.clone();
+        let fallback_interval = Duration::from_millis(self.sweep_interval_ms);
+        let result = tokio::task::spawn_blocking(move || {
+            crate::walpin::enumerate_live(&dir, fallback_interval)
+        })
+        .await;
+        match result {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => {
+                tracing::warn!(
+                    error = %e,
+                    "ADR-091 Amendment 6: bounded walpin sidecar cleanup failed"
+                );
+            }
+            Err(join_err) => {
+                tracing::warn!(
+                    error = %join_err,
+                    "ADR-091 Amendment 6: walpin sidecar cleanup task panicked"
+                );
+            }
+        }
+    }
+
     /// ADR-091 Amendment 2 beacon refresh rule: a metadata-only mtime touch
     /// of this process's already-registered beacon, performed on every
     /// sweep tick except one where an over-threshold heartbeat write failed
@@ -1629,6 +1657,7 @@ pub async fn run_checkpoint_task(
             sidecar
                 .observe(oldest_tx.clone(), config.tx_warn_secs)
                 .await;
+            sidecar.reap_stale_entries_bounded().await;
         }
 
         // Skipped ticks leave crossing state unchanged — a busy tick must not
@@ -2007,7 +2036,8 @@ fn capture_wal_holder_census(
 
 /// When a TRUNCATE attempt makes no progress, enumerate the walpin sidecar and
 /// combine it with the holder census captured immediately before that attempt.
-/// Sidecar enumeration remains deferred until this consumed diagnostic path;
+/// Ordinary ticks also enumerate for bounded housekeeping, but this path runs
+/// a fresh pass because it consumes the classifications for attribution;
 /// holder identity cannot be deferred because a transient blocker may have
 /// released by then.
 ///
@@ -2768,6 +2798,54 @@ mod tests {
             .await
             .expect("checkpoint task should exit within 1s")
             .expect("checkpoint task panicked");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial(checkpoint_skip_metrics, khive_walpin_sidecar_env)]
+    async fn healthy_checkpoint_tick_reaps_a_dead_walpin_beacon_without_truncate() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("healthy_sidecar_reap.db");
+        let pool = file_pool(&path);
+        let sidecar_dir =
+            crate::walpin::sidecar_dir_for(pool.canonical_path().expect("file-backed pool"));
+        let _env_guard = crate::walpin::EnvVarGuard::capture("KHIVE_WALPIN_SIDECAR");
+        std::env::set_var("KHIVE_WALPIN_SIDECAR", "1");
+
+        let dead_pid = 2_000_000_000;
+        let dead_beacon = crate::walpin::WalpinBeacon {
+            pid: dead_pid,
+            process_role: "session".to_string(),
+            started_at: 1,
+            sweep_interval_ms: 5_000,
+        };
+        crate::walpin::write_beacon(&sidecar_dir, &dead_beacon)
+            .expect("seed a crashed process's orphan beacon");
+        let dead_beacon_path = crate::walpin::beacon_path(&sidecar_dir, dead_pid);
+        assert!(dead_beacon_path.exists(), "orphan fixture must exist");
+
+        let cfg = CheckpointConfig {
+            interval: Duration::from_millis(10),
+            warn_pages: u64::MAX,
+            high_water_pages: u64::MAX,
+            truncate_high_water_pages: u64::MAX,
+            ..CheckpointConfig::default()
+        };
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
+        let handle = tokio::spawn(run_checkpoint_task(pool, cfg, None, shutdown_rx, true));
+
+        let reaped = wait_for(Duration::from_secs(2), || !dead_beacon_path.exists()).await;
+        shutdown_tx.send(()).expect("send shutdown signal");
+        tokio::time::timeout(Duration::from_secs(1), handle)
+            .await
+            .expect("checkpoint task should exit within 1s")
+            .expect("checkpoint task panicked");
+
+        assert!(
+            reaped,
+            "the ordinary healthy tick must sweep stale sidecar entries independently of \
+             TRUNCATE diagnostics"
+        );
     }
 
     /// Regression #774: exits via watch-signal even with a live event_store

@@ -1,5 +1,5 @@
-//! Non-mutating-by-intent WAL/checkpoint diagnostics (read-only operator
-//! surface).
+//! Non-mutating-by-intent database, WAL, and checkpoint diagnostics (read-only
+//! operator surface).
 //!
 //! Answers "is a reader pinning the checkpoint / why is the WAL at 64MiB"
 //! without raw SQL against a production store.
@@ -44,7 +44,12 @@
 //!    Sidecar-to-holder reconciliation (`reporting`/`registered_silent_pids`/
 //!    `sidecar_entries`/`fully_attributed`) is therefore reported empty with
 //!    an explicit `unavailable_reason` rather than fabricated from a
-//!    mutating enumeration.
+//!    mutating enumeration. Cleanup-derived counters are omitted entirely,
+//!    so a skipped measurement never looks like measured `0`/`false`.
+//! 4. Graph-edge integrity uses three scalar SELECTs on the same guarded
+//!    standalone connection. It exposes the exact pre-V14 duplicate-ID group
+//!    count plus raw live-edge/list-ledger counts and never repairs or deletes
+//!    data.
 //!
 //! The counters are process-global statics inside this crate, so a report is
 //! only meaningful when built inside the process that owns the checkpoint
@@ -229,8 +234,12 @@ pub struct WalPinAttribution {
     pub fully_attributed: bool,
     /// Always empty in this port — see the module docs.
     pub sidecar_entries: Vec<serde_json::Value>,
-    pub sidecar_listing_truncated: bool,
-    pub sidecar_entries_cleanup_would_reap: usize,
+    /// Present only when this request actually enumerated the sidecar.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sidecar_listing_truncated: Option<bool>,
+    /// Present only when this request actually ran the mutating cleanup pass.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sidecar_entries_cleanup_would_reap: Option<usize>,
 }
 
 /// Overall quality of the WAL-pin attribution answer.
@@ -315,8 +324,8 @@ impl WalPinAttribution {
             census_pids_without_attribution: Vec::new(),
             fully_attributed: false,
             sidecar_entries: Vec::new(),
-            sidecar_listing_truncated: false,
-            sidecar_entries_cleanup_would_reap: 0,
+            sidecar_listing_truncated: None,
+            sidecar_entries_cleanup_would_reap: None,
         }
     }
 }
@@ -381,8 +390,8 @@ fn wal_pin_attribution_from_census(census: crate::walpin::CensusResult) -> WalPi
         census_pids_without_attribution: Vec::new(),
         fully_attributed: false,
         sidecar_entries: Vec::new(),
-        sidecar_listing_truncated: false,
-        sidecar_entries_cleanup_would_reap: 0,
+        sidecar_listing_truncated: None,
+        sidecar_entries_cleanup_would_reap: None,
     }
 }
 
@@ -451,7 +460,43 @@ impl WriterContentionDiagnostics {
     }
 }
 
-/// The full diagnostics payload.
+/// Live graph-edge rows compared with the durable list-cursor ledger.
+///
+/// `duplicate_edge_id_groups > 0` is the exact pre-V14 state in which two
+/// namespaces share an edge UUID and a multi-namespace cursor walk can drop
+/// one row during ID-based deduplication. The two raw row counts are reported
+/// separately because sequence rows intentionally survive hard deletion;
+/// count inequality by itself is therefore not proof of corruption.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct GraphEdgeIntegrity {
+    pub duplicate_edge_id_groups: i64,
+    pub graph_edges_rows: i64,
+    pub graph_edges_seq_rows: i64,
+    pub pre_v14_duplicate_edge_state_detected: bool,
+}
+
+fn graph_edge_integrity(conn: &Connection) -> rusqlite::Result<GraphEdgeIntegrity> {
+    conn.query_row(
+        "SELECT
+             (SELECT COUNT(*) FROM (
+                 SELECT id FROM graph_edges GROUP BY id HAVING COUNT(*) > 1
+             )),
+             (SELECT COUNT(*) FROM graph_edges),
+             (SELECT COUNT(*) FROM graph_edges_seq)",
+        [],
+        |row| {
+            let duplicate_edge_id_groups = row.get(0)?;
+            Ok(GraphEdgeIntegrity {
+                duplicate_edge_id_groups,
+                graph_edges_rows: row.get(1)?,
+                graph_edges_seq_rows: row.get(2)?,
+                pre_v14_duplicate_edge_state_detected: duplicate_edge_id_groups > 0,
+            })
+        },
+    )
+}
+
+/// The full database-integrity, writer-contention, and WAL/checkpoint payload.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct DbDiagnostics {
     pub build: BuildIdentity,
@@ -464,6 +509,8 @@ pub struct DbDiagnostics {
     pub checkpoint_probe_error: Option<String>,
     /// Writer-pool and best-effort audit persistence signals.
     pub writer_contention: WriterContentionDiagnostics,
+    pub graph_edge_integrity: Option<GraphEdgeIntegrity>,
+    pub graph_edge_integrity_error: Option<String>,
     pub wal_pin: WalPinAttribution,
 }
 
@@ -520,39 +567,80 @@ fn collect_inner(
                 "in-memory database: no WAL file and no checkpoint to probe".to_string(),
             ),
             writer_contention,
+            graph_edge_integrity: None,
+            graph_edge_integrity_error: Some(
+                "in-memory database: no durable graph-edge ledger to inspect".to_string(),
+            ),
             wal_pin: WalPinAttribution::unavailable(
                 "in-memory database: no file for the OS holder census",
             ),
         };
     };
 
-    let (probe, probe_error) = match probe_pool(pool) {
-        Ok(p) => (Some(p), None),
-        Err(e) => (None, Some(e)),
-    };
+    let inspection = inspect_pool(pool);
 
     DbDiagnostics {
         build,
         db_path: Some(path.display().to_string()),
         wal_file: Some(wal_file_state(&path)),
         checkpoint_counters: counters,
-        checkpoint_probe: probe,
-        checkpoint_probe_error: probe_error,
+        checkpoint_probe: inspection.checkpoint_probe,
+        checkpoint_probe_error: inspection.checkpoint_probe_error,
         writer_contention,
+        graph_edge_integrity: inspection.graph_edge_integrity,
+        graph_edge_integrity_error: inspection.graph_edge_integrity_error,
         wal_pin: wal_pin_attribution(&path, sweep_interval),
     }
 }
 
-/// Run one PASSIVE probe on a guarded standalone connection.
+struct PoolInspection {
+    checkpoint_probe: Option<CheckpointProbe>,
+    checkpoint_probe_error: Option<String>,
+    graph_edge_integrity: Option<GraphEdgeIntegrity>,
+    graph_edge_integrity_error: Option<String>,
+}
+
+/// Run the PASSIVE probe and graph-ledger reads on one guarded standalone
+/// connection.
 ///
 /// Every failure — missing file, read-only pool, in-memory pool, or the
-/// pragma itself — comes back as an error string the caller surfaces as
-/// `checkpoint_probe_error`. Nothing here can create a file.
-fn probe_pool(pool: &ConnectionPool) -> Result<CheckpointProbe, String> {
-    let conn = pool
-        .open_standalone_writer_untracked()
-        .map_err(|e| format!("guarded standalone open refused: {e}"))?;
-    checkpoint_probe(&conn).map_err(|e| format!("PRAGMA wal_checkpoint(PASSIVE) failed: {e}"))
+/// pragma/query itself — comes back in its section's error field. Nothing
+/// here can create a file.
+fn inspect_pool(pool: &ConnectionPool) -> PoolInspection {
+    let conn = match pool.open_standalone_writer_untracked() {
+        Ok(conn) => conn,
+        Err(e) => {
+            let reason = format!("guarded standalone open refused: {e}");
+            return PoolInspection {
+                checkpoint_probe: None,
+                checkpoint_probe_error: Some(reason.clone()),
+                graph_edge_integrity: None,
+                graph_edge_integrity_error: Some(reason),
+            };
+        }
+    };
+
+    let (checkpoint_probe, checkpoint_probe_error) = match checkpoint_probe(&conn) {
+        Ok(probe) => (Some(probe), None),
+        Err(e) => (
+            None,
+            Some(format!("PRAGMA wal_checkpoint(PASSIVE) failed: {e}")),
+        ),
+    };
+    let (graph_edge_integrity, graph_edge_integrity_error) = match graph_edge_integrity(&conn) {
+        Ok(integrity) => (Some(integrity), None),
+        Err(e) => (
+            None,
+            Some(format!("graph-edge integrity query failed: {e}")),
+        ),
+    };
+
+    PoolInspection {
+        checkpoint_probe,
+        checkpoint_probe_error,
+        graph_edge_integrity,
+        graph_edge_integrity_error,
+    }
 }
 
 #[cfg(test)]
@@ -575,6 +663,15 @@ mod tests {
                 .conn()
                 .execute_batch(
                     "CREATE TABLE t (x INTEGER); \
+                     CREATE TABLE graph_edges (
+                         namespace TEXT NOT NULL,
+                         id TEXT NOT NULL,
+                         PRIMARY KEY (namespace, id)
+                     ); \
+                     CREATE TABLE graph_edges_seq (
+                         seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                         edge_id TEXT NOT NULL UNIQUE
+                     ); \
                      INSERT INTO t VALUES (1), (2), (3);",
                 )
                 .expect("seed writes");
@@ -713,6 +810,16 @@ mod tests {
         assert_eq!(report.writer_contention.standalone_writer_acquisitions, 0);
         assert_eq!(report.writer_contention.writer_task_acquisitions, 0);
         assert_eq!(report.writer_contention.writer_acquisition_timeouts, 0);
+        assert_eq!(
+            report.graph_edge_integrity,
+            Some(GraphEdgeIntegrity {
+                duplicate_edge_id_groups: 0,
+                graph_edges_rows: 0,
+                graph_edges_seq_rows: 0,
+                pre_v14_duplicate_edge_state_detected: false,
+            })
+        );
+        assert!(report.graph_edge_integrity_error.is_none());
         assert!(report.writer_contention.audit_append_failures.is_none());
         assert!(
             report
@@ -824,6 +931,86 @@ mod tests {
         let json = serde_json::to_value(counters).expect("serializes");
         assert!(json["last_observed_wal_pages"].is_null());
         assert!(json["checkpoint_last_skip_wal_pages"].is_null());
+    }
+
+    #[test]
+    fn graph_edge_integrity_detects_the_pre_v14_duplicate_state() {
+        let conn = Connection::open_in_memory().expect("in-memory sqlite");
+        conn.execute_batch(
+            "CREATE TABLE graph_edges (
+                 namespace TEXT NOT NULL,
+                 id TEXT NOT NULL,
+                 PRIMARY KEY (namespace, id)
+             );
+             CREATE TABLE graph_edges_seq (
+                 seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                 edge_id TEXT NOT NULL UNIQUE
+             );
+             INSERT INTO graph_edges(namespace, id)
+             VALUES ('alpha', 'shared-edge'), ('beta', 'shared-edge');
+             INSERT INTO graph_edges_seq(edge_id) VALUES ('shared-edge');",
+        )
+        .expect("seed the state possible before the V14 uniqueness guard");
+
+        let integrity = graph_edge_integrity(&conn).expect("integrity query succeeds");
+
+        assert_eq!(integrity.duplicate_edge_id_groups, 1);
+        assert_eq!(integrity.graph_edges_rows, 2);
+        assert_eq!(integrity.graph_edges_seq_rows, 1);
+        assert!(integrity.pre_v14_duplicate_edge_state_detected);
+    }
+
+    #[test]
+    fn graph_edge_integrity_does_not_mislabel_retained_delete_history_as_a_duplicate() {
+        let conn = Connection::open_in_memory().expect("in-memory sqlite");
+        conn.execute_batch(
+            "CREATE TABLE graph_edges (
+                 namespace TEXT NOT NULL,
+                 id TEXT NOT NULL,
+                 PRIMARY KEY (namespace, id)
+             );
+             CREATE TABLE graph_edges_seq (
+                 seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                 edge_id TEXT NOT NULL UNIQUE
+             );
+             INSERT INTO graph_edges(namespace, id) VALUES ('local', 'live-edge');
+             INSERT INTO graph_edges_seq(edge_id)
+             VALUES ('deleted-edge'), ('live-edge');",
+        )
+        .expect("seed a retained sequence row for a hard-deleted edge");
+
+        let integrity = graph_edge_integrity(&conn).expect("integrity query succeeds");
+
+        assert_eq!(integrity.duplicate_edge_id_groups, 0);
+        assert_eq!(integrity.graph_edges_rows, 1);
+        assert_eq!(integrity.graph_edges_seq_rows, 2);
+        assert!(
+            !integrity.pre_v14_duplicate_edge_state_detected,
+            "ledger rows intentionally survive hard deletion; count mismatch alone is not the \
+             pre-V14 duplicate state"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unmeasured_sidecar_cleanup_fields_are_absent_from_the_wire_payload() {
+        let pin = wal_pin_attribution_from_census(crate::walpin::CensusResult {
+            holders: std::collections::HashSet::new(),
+            uninspectable_pids: Vec::new(),
+            truncated: false,
+        });
+
+        assert_eq!(pin.sidecar_listing_truncated, None);
+        assert_eq!(pin.sidecar_entries_cleanup_would_reap, None);
+        let json = serde_json::to_value(pin).expect("attribution serializes");
+        assert!(
+            json.get("sidecar_listing_truncated").is_none(),
+            "a skipped enumeration must omit sidecar_listing_truncated, not fabricate false"
+        );
+        assert!(
+            json.get("sidecar_entries_cleanup_would_reap").is_none(),
+            "a skipped enumeration must omit sidecar_entries_cleanup_would_reap, not fabricate 0"
+        );
     }
 
     /// A missing configured path must never be created by a diagnostic

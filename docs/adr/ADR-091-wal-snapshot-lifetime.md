@@ -1165,3 +1165,28 @@ walpin sidecar heartbeat (Amendment 2 Plank B) are behavior-neutral under
 this amendment — only which connection/lock a checkpoint tick runs on
 changed. `run_checkpoint_task`'s public signature, and every other daemon
 call site, are also unchanged.
+
+### 2026-08-08 amendment (Amendment 6): independent bounded sidecar collection
+
+**Motivation.** Amendment 2 coupled `walpin::enumerate_live` — the operation that removes
+dead, reused-PID, stale, and malformed trusted entries — to the TRUNCATE-no-progress diagnostic
+arm. A healthy database never enters that arm, so crash residue accumulated even though the
+enumerator already had a 512-entry work bound. The same coupling also tempted diagnostics to
+serialize cleanup counters as `0`/`false` when no enumeration occurred, making "not measured"
+look like a measured clean state (#1794, #1795).
+
+**Decision.** After refreshing its own beacon/heartbeat, every sidecar-enabled daemon checkpoint
+tick runs one `walpin::enumerate_live` pass for that task's file-backed backend, before the
+Observed/Skipped branch. The pass therefore runs independently of WAL size, threshold crossings,
+checkpoint availability, and TRUNCATE outcome. An operator who explicitly disables the sidecar
+also disables its collection. `MAX_SIDECAR_ENTRIES` remains the hard bound on directory work and
+report memory for one tick. Blocking filesystem work runs in `spawn_blocking`; a trust-boundary
+error or worker panic is warned and never terminates the checkpoint loop. Existing no-progress
+enumeration remains because that path consumes the live classifications for attribution, while
+ordinary-tick enumeration is housekeeping only.
+
+`db_diagnostics` remains non-destructive with respect to sidecar evidence: the request does not
+invoke `enumerate_live`. Its cleanup-derived `sidecar_listing_truncated` and
+`sidecar_entries_cleanup_would_reap` members are optional and omitted when enumeration did not
+run. A background checkpoint tick may independently perform its normal cleanup, but the
+diagnostic request itself never converts an unmeasured value into a clean-looking zero.

@@ -430,3 +430,15 @@ concurrently-running write path (e.g. `graph_upsert_edges`) could do in the
 real suite. The fix (looking up this test's own entry by label via
 `snapshot()` instead of trusting global `oldest()`) must still correctly
 name and escalate THIS entry despite that older decoy.
+
+### Healthy-tick WAL-pin sidecar collection
+
+After the task refreshes its own WAL-pin beacon/heartbeat, every
+sidecar-enabled checkpoint tick runs one bounded `walpin::enumerate_live`
+cleanup pass. This occurs before the Skipped early return and does not depend
+on WAL pressure or a TRUNCATE attempt. Explicitly disabling the sidecar also
+disables collection. Each pass processes at most `MAX_SIDECAR_ENTRIES`;
+filesystem work is offloaded with `spawn_blocking`, and failure warns without
+stopping the task. The no-progress path still enumerates separately because it
+consumes the classification report for holder attribution rather than
+housekeeping alone.

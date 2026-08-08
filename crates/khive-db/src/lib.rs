@@ -7,7 +7,7 @@
 pub mod backend;
 /// Periodic WAL checkpoint task.
 pub mod checkpoint;
-/// Read-only-by-intent WAL/checkpoint diagnostics operator surface.
+/// Read-only-by-intent database-integrity and WAL/checkpoint diagnostics.
 pub mod diagnostics;
 /// Error types for the SQLite layer.
 pub mod error;

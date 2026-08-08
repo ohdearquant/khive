@@ -7,9 +7,10 @@
 The KG pack provides 20 verb handlers for the knowledge graph substrate: entity
 CRUD, note CRUD, edge creation/traversal, hybrid search, graph queries (GQL),
 entity-anchored graph context (ADR-089), event-sourced proposals (ADR-046),
-caller identity introspection (`whoami`), and writer-contention plus
-WAL/checkpoint operator diagnostics (`db_diagnostics`, ADR-091/ADR-135 — its
-PASSIVE probe may backfill WAL frames but never changes logical state).
+caller identity introspection (`whoami`), and writer-contention, graph-edge
+integrity, plus WAL/checkpoint operator diagnostics (`db_diagnostics`,
+ADR-091/ADR-135 — its PASSIVE probe may backfill WAL frames but never changes
+logical state).
 It is the first-party pack shipped with the khive binary.
 
 ## ADR Compliance
