@@ -96,7 +96,14 @@ GET_RESPONSE_SCHEMA: dict[str, Any] = {
 }
 
 LIST_RESPONSE_SCHEMA: dict[str, Any] = {
-    "type": "array",
+    "type": "object",
+    "required": ["items", "requested_limit", "effective_limit", "limit_clamped"],
+    "properties": {
+        "items": {"type": "array"},
+        "requested_limit": {"type": "integer", "minimum": 0},
+        "effective_limit": {"type": "integer", "minimum": 0},
+        "limit_clamped": {"type": "boolean"},
+    },
 }
 
 SEARCH_RESPONSE_SCHEMA: dict[str, Any] = {

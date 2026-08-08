@@ -846,8 +846,12 @@ async fn public_verb_partial_side_effects_survive_commit_snapshot_recovery() {
         .dispatch("list", json!({"kind": "issue", "limit": 10}))
         .await
         .expect("list issues");
-    assert_eq!(list_items(&issues).len(), 1, "{issues:?}");
-    let issue1_id = issues[0]["id"].as_str().expect("issue1 id").to_string();
+    let issue_items = list_items(&issues);
+    assert_eq!(issue_items.len(), 1, "{issues:?}");
+    let issue1_id = issue_items[0]["id"]
+        .as_str()
+        .expect("issue1 id")
+        .to_string();
 
     let commits = registry
         .dispatch("list", json!({"kind": "commit", "limit": 10}))

@@ -643,7 +643,7 @@ impl KgPack {
                             .into(),
                     ));
                 }
-                let requested = p.limit.unwrap_or(100).max(1);
+                let requested = p.limit.unwrap_or(100);
                 let limit = effective_list_limit(requested, EVENT_LIST_CAP);
                 let offset = p.offset.unwrap_or(0);
                 let (filter, outcome) = event_filter_from_params(&p)?;

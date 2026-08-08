@@ -387,7 +387,7 @@ def test_reply_to_non_message_note(proc):
                 "limit": 10,
             })
             obs_note = next(
-                (n for n in notes_list
+                (n for n in notes_list["items"]
                  if n.get("content") == "this is a KG observation note, not a message"),
                 None,
             )

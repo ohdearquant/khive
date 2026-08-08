@@ -12695,6 +12695,49 @@ async fn list_edge_offset_mode_limit_under_cap_honored_exactly() {
     assert_eq!(resp["limit_clamped"], false);
 }
 
+#[tokio::test]
+async fn list_edge_zero_limit_matches_its_metadata_and_returns_no_rows() {
+    use khive_storage::EdgeRelation;
+
+    let (pack, rt, tok) = pack_and_runtime();
+    let source = rt
+        .create_entity(
+            &tok,
+            "concept",
+            None,
+            "zero-edge-source",
+            None,
+            None,
+            vec![],
+        )
+        .await
+        .expect("create source");
+    let target = rt
+        .create_entity(
+            &tok,
+            "concept",
+            None,
+            "zero-edge-target",
+            None,
+            None,
+            vec![],
+        )
+        .await
+        .expect("create target");
+    rt.link(&tok, source.id, target.id, EdgeRelation::Extends, 1.0, None)
+        .await
+        .expect("create edge");
+
+    let response = pack
+        .dispatch("list", json!({"kind": "edge", "limit": 0}))
+        .await
+        .expect("zero-limit offset edge list must succeed");
+    assert_eq!(list_items(&response), &[]);
+    assert_eq!(response["requested_limit"], 0);
+    assert_eq!(response["effective_limit"], 0);
+    assert_eq!(response["limit_clamped"], false);
+}
+
 /// `list(kind="edge", limit=<over EDGE_LIST_MAX_LIMIT>)`: the cap genuinely
 /// binds and the response truncates with explicit metadata, like the entity/note
 /// cases in both offset mode (`{"items": [...]}`) and cursor mode
@@ -12815,6 +12858,26 @@ async fn list_event_limit_under_cap_honored_exactly() {
     assert_eq!(resp["requested_limit"], 2);
     assert_eq!(resp["effective_limit"], 2);
     assert_eq!(resp["limit_clamped"], false);
+}
+
+#[tokio::test]
+async fn list_event_zero_limit_preserves_requested_value_and_returns_no_rows() {
+    let f = pack_with_events();
+    f.dispatch(
+        "create",
+        json!({"kind": "concept", "name": "zero-limit-event"}),
+    )
+    .await
+    .expect("create must produce at least one event");
+
+    let response = f
+        .dispatch("list", json!({"kind": "event", "limit": 0}))
+        .await
+        .expect("zero-limit offset event list must succeed like other substrates");
+    assert_eq!(list_items(&response), &[]);
+    assert_eq!(response["requested_limit"], 0);
+    assert_eq!(response["effective_limit"], 0);
+    assert_eq!(response["limit_clamped"], false);
 }
 
 #[tokio::test]

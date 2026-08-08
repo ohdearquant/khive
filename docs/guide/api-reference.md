@@ -243,9 +243,9 @@ request(ops="list(kind=\"entity\", entity_kind=\"concept\", limit=20)")
 
 Offset-mode responses always use `{"items": [...], "requested_limit": N,
 "effective_limit": M, "limit_clamped": bool}`. The shape is identical whether or not the
-server-side cap binds, so clients can always advance by `effective_limit` without a production-only
-shape change or skipped rows. The caps are entity 500, note 200, edge 1000, event 1000, and
-proposal 500. Entity, note, and edge cursor modes return
+server-side cap binds. Advance `offset` by `items.length`, not by either limit field;
+`effective_limit` discloses the server cap but is not a guaranteed row count. The caps are entity
+500, note 200, edge 1000, event 1000, and proposal 500. Entity, note, and edge cursor modes return
 `{"entities": [...], "next_after": ...}`, `{"notes": [...], "next_after": ...}`, or
 `{"edges": [...], "next_after": ...}` and always include the same limit metadata.
 
@@ -263,6 +263,11 @@ namespaces, or otherwise cannot be resolved returns an error instead of silently
 mode and `offset` are mutually exclusive. Filtered note cursor walks may additionally return
 `scan_incomplete: true` with the last safe continuation cursor when their 10,000-row safety
 ceiling is reached before another matching note is proven.
+
+Outcome-filtered event offset pages may also set `scan_incomplete: true` when their bounded
+post-filter scan cannot prove exhaustion. Such a short page is not terminal: advance only by the
+rows actually returned, and treat an incomplete empty page as non-resumable without a narrower
+filter or a larger effective limit.
 
 Row shape (each item in the offset or cursor envelope) depends on `kind`.
 For `kind="entity"`, `"note"`, `"edge"`, and `"event"`, the row is the **full stored record**

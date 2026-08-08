@@ -254,7 +254,7 @@ for i in range(5):
     call("create", {"kind":"note","note_kind":"observation","content":f"Seed observation {i}: performance measurement baseline data for khive engine","salience":0.7})
 
 # Seed 3 edges
-entities = call("list", {"kind":"entity","entity_kind":"concept"})
+entities = call("list", {"kind":"entity","entity_kind":"concept"})["items"]
 if len(entities) >= 2:
     for i in range(min(3, len(entities)-1)):
         try:

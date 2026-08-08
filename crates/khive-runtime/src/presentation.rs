@@ -338,7 +338,7 @@ pub enum PresentationMode {
     /// Token-efficient. Default for MCP callers (agents).
     ///
     /// Short UUIDs (8-char), compact timestamps (minute granularity or
-    /// relative), empty fields dropped, lifecycle nulls preserved, score
+    /// relative), empty fields dropped, structural nulls preserved, score
     /// fields truncated to 3 significant figures.
     #[default]
     Agent,
@@ -355,10 +355,11 @@ pub enum PresentationMode {
     Human,
 }
 
-/// Lifecycle `null` fields that are PRESERVED in Agent mode even when null.
+/// Structural `null` fields that are PRESERVED in Agent mode even when null.
 ///
-/// These fields carry lifecycle meaning (absent ≠ null) and must not be dropped.
-const LIFECYCLE_NULL_PRESERVE: &[&str] = &[
+/// These fields carry lifecycle or pagination meaning (absent ≠ null) and
+/// must not be dropped.
+const PRESERVED_NULL_FIELDS: &[&str] = &[
     "completed_at",
     "deleted_at",
     "due_at",
@@ -372,6 +373,21 @@ const LIFECYCLE_NULL_PRESERVE: &[&str] = &[
     "superseded_by",
     "replaced_by",
 ];
+
+/// Empty collection fields that define a stable response envelope and must
+/// survive Agent-mode compaction. Dropping these turns an empty page into a
+/// different response type and leaves callers unable to distinguish an empty
+/// result from a missing/unsupported field.
+const EMPTY_ARRAY_PRESERVE: &[&str] = &["items", "entities", "notes", "edges"];
+
+fn is_stable_list_envelope(map: &Map<String, Value>) -> bool {
+    map.contains_key("requested_limit")
+        && map.contains_key("effective_limit")
+        && map.contains_key("limit_clamped")
+        && EMPTY_ARRAY_PRESERVE
+            .iter()
+            .any(|field| map.contains_key(*field))
+}
 
 /// Field names carrying caller-supplied payload timestamps that must never be
 /// compacted (relative-time or minute-truncated), regardless of nesting.
@@ -442,7 +458,7 @@ fn should_shorten_uuid_field(key: &str) -> bool {
 ///
 /// - `Verbose` / `Human`: returns `value` unchanged.
 /// - `Agent`: applies UUID shortening, timestamp compaction, empty-field
-///   dropping, lifecycle-null preservation, and score truncation.
+///   dropping, structural-null preservation, and score truncation.
 ///
 /// `now_unix_seconds` is sampled once per response and passed through so all
 /// relative datetime renderings within a response use the same instant.
@@ -450,14 +466,13 @@ pub fn present(value: Value, mode: PresentationMode, now_unix_seconds: i64) -> V
     match mode {
         PresentationMode::Verbose | PresentationMode::Human => value,
         PresentationMode::Agent => {
-            let lifecycle_preserve: HashSet<&str> =
-                LIFECYCLE_NULL_PRESERVE.iter().copied().collect();
+            let preserved_nulls: HashSet<&str> = PRESERVED_NULL_FIELDS.iter().copied().collect();
             let score_fields: HashSet<&str> = SCORE_FIELDS.iter().copied().collect();
             let payload_timestamps: HashSet<&str> =
                 PAYLOAD_TIMESTAMP_FIELDS.iter().copied().collect();
             transform_agent(
                 value,
-                &lifecycle_preserve,
+                &preserved_nulls,
                 &score_fields,
                 &payload_timestamps,
                 now_unix_seconds,
@@ -474,7 +489,7 @@ pub fn present(value: Value, mode: PresentationMode, now_unix_seconds: i64) -> V
 /// because they encode domain semantics the agent may need to round-trip.
 fn transform_agent(
     value: Value,
-    lifecycle: &HashSet<&str>,
+    preserved_nulls: &HashSet<&str>,
     scores: &HashSet<&str>,
     payload_timestamps: &HashSet<&str>,
     now: i64,
@@ -482,17 +497,19 @@ fn transform_agent(
 ) -> Value {
     match value {
         Value::Object(map) => {
+            let preserve_list_envelope = is_stable_list_envelope(&map);
             let mut out = Map::new();
             for (k, v) in map {
                 let child_inside_properties = inside_properties || k == "properties";
                 let transformed = transform_field_agent(
                     &k,
                     v,
-                    lifecycle,
+                    preserved_nulls,
                     scores,
                     payload_timestamps,
                     now,
                     child_inside_properties,
+                    preserve_list_envelope,
                 );
                 match transformed {
                     None => {} // drop
@@ -509,7 +526,7 @@ fn transform_agent(
                 .map(|v| {
                     transform_agent(
                         v,
-                        lifecycle,
+                        preserved_nulls,
                         scores,
                         payload_timestamps,
                         now,
@@ -537,22 +554,29 @@ fn transform_agent(
 fn transform_field_agent(
     key: &str,
     value: Value,
-    lifecycle: &HashSet<&str>,
+    preserved_nulls: &HashSet<&str>,
     scores: &HashSet<&str>,
     payload_timestamps: &HashSet<&str>,
     now: i64,
     inside_properties: bool,
+    preserve_list_envelope: bool,
 ) -> Option<Value> {
     match &value {
-        // Preserve lifecycle nulls; drop other nulls.
+        // Preserve lifecycle and stable-envelope nulls; drop other nulls.
         Value::Null => {
-            if lifecycle.contains(key) {
+            if preserved_nulls.contains(key) || (preserve_list_envelope && key == "next_after") {
                 Some(value)
             } else {
                 None
             }
         }
-        // Drop empty strings, arrays, objects.
+        // Stable page-envelope arrays remain present even when empty.
+        Value::Array(a)
+            if preserve_list_envelope && a.is_empty() && EMPTY_ARRAY_PRESERVE.contains(&key) =>
+        {
+            Some(value)
+        }
+        // Drop other empty strings, arrays, objects.
         Value::String(s) if s.is_empty() => None,
         Value::Array(a) if a.is_empty() => None,
         Value::Object(o) if o.is_empty() => None,
@@ -578,7 +602,7 @@ fn transform_field_agent(
         // Recurse into objects and arrays.
         Value::Object(_) | Value::Array(_) => Some(transform_agent(
             value,
-            lifecycle,
+            preserved_nulls,
             scores,
             payload_timestamps,
             now,
@@ -796,6 +820,32 @@ mod tests {
         let v = json!({"tags": [], "title": "ok"});
         let out = agent(v);
         assert!(out.get("tags").is_none());
+    }
+
+    #[test]
+    fn agent_preserves_empty_list_page_arrays() {
+        let v = json!({
+            "items": [],
+            "entities": [],
+            "notes": [],
+            "edges": [],
+            "next_after": null,
+            "requested_limit": 10,
+            "effective_limit": 10,
+            "limit_clamped": false,
+        });
+        let out = agent(v);
+        for key in EMPTY_ARRAY_PRESERVE {
+            assert_eq!(out[*key], json!([]), "missing structural key {key}");
+        }
+        assert_eq!(out["next_after"], json!(null));
+    }
+
+    #[test]
+    fn agent_still_drops_empty_arrays_outside_list_envelopes() {
+        let out = agent(json!({"items": [], "entities": [], "title": "ordinary response"}));
+        assert!(out.get("items").is_none());
+        assert!(out.get("entities").is_none());
     }
 
     #[test]

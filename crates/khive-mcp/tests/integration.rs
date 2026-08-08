@@ -131,6 +131,32 @@ async fn agent_one(
     Ok(first["result"].clone())
 }
 
+/// #1789: Agent presentation must retain the stable offset/cursor page keys
+/// even when the page is empty or terminal.
+#[tokio::test]
+async fn list_empty_pages_keep_structural_keys_in_agent_mode() -> anyhow::Result<()> {
+    let client = connect().await?;
+
+    let offset_page = agent_one(&client, r#"list(kind="entity", limit=10)"#).await?;
+    assert_eq!(offset_page["items"], json!([]));
+    assert!(
+        offset_page.get("items").is_some(),
+        "empty offset page must retain items: {offset_page}"
+    );
+
+    let cursor_page = agent_one(&client, r#"list(kind="entity", limit=10, after="")"#).await?;
+    assert_eq!(cursor_page["entities"], json!([]));
+    assert!(
+        cursor_page.get("entities").is_some(),
+        "empty cursor page must retain entities: {cursor_page}"
+    );
+    assert!(
+        cursor_page.get("next_after").is_some_and(Value::is_null),
+        "terminal cursor page must retain next_after:null: {cursor_page}"
+    );
+    Ok(())
+}
+
 // ── server info / surface shape ──────────────────────────────────────────────
 
 #[tokio::test]

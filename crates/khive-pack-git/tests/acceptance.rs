@@ -3935,27 +3935,7 @@ async fn pr_full_page_never_leaks_raw_updated_at_into_paging_floor() {
             )
             .await
             .expect("list PRs ok");
-        // Same contract as the issue-listing scan above: `pull_request` is a
-        // note kind, so its clamped envelope renders rows under `notes`, and an
-        // `items` key means the kind is no longer routed through the note
-        // branch.
-        let items = match page.as_array() {
-            Some(items) => items.clone(),
-            None => {
-                assert!(
-                    page.get("items").is_none(),
-                    "a pull_request listing is a note listing, so its clamped envelope \
-                     must render rows under `notes`; an `items` key means the kind is \
-                     no longer routed through the note branch: {page}"
-                );
-                page.get("notes")
-                    .and_then(Value::as_array)
-                    .unwrap_or_else(|| {
-                        panic!("clamped pull_request listing must carry a notes array: {page}")
-                    })
-                    .clone()
-            }
-        };
+        let items = list_items(&page);
         assert!(
             items
                 .iter()
@@ -4682,9 +4662,7 @@ async fn digest_verb_auto_creates_project_and_enriches_references() {
         )
         .await
         .expect("query digest receipts");
-    let listed_receipt = receipts
-        .as_array()
-        .expect("event list")
+    let listed_receipt = list_items(&receipts)
         .iter()
         .find(|event| event["id"].as_str() == Some(receipt_id.as_str()))
         .expect("receipt is discoverable by the normal audit-event query");
@@ -4861,7 +4839,7 @@ async fn digest_receipt_discovery_uses_explicit_namespace_but_get_is_namespace_a
             .await
             .expect("local list");
         assert!(
-            local_rows.as_array().expect("local rows array").is_empty(),
+            list_items(&local_rows).is_empty(),
             "nested digest writes must not fall back to local for {kind}: {local_rows}"
         );
     }
@@ -4873,7 +4851,7 @@ async fn digest_receipt_discovery_uses_explicit_namespace_but_get_is_namespace_a
         )
         .await
         .expect("tenant project list");
-    let projects = tenant_projects.as_array().expect("project array");
+    let projects = list_items(&tenant_projects);
     assert_eq!(
         projects.len(),
         1,
@@ -4889,7 +4867,7 @@ async fn digest_receipt_discovery_uses_explicit_namespace_but_get_is_namespace_a
         )
         .await
         .expect("tenant commit list");
-    let commits = tenant_commits.as_array().expect("commit array");
+    let commits = list_items(&tenant_commits);
     assert_eq!(
         commits.len(),
         2,
@@ -4906,7 +4884,7 @@ async fn digest_receipt_discovery_uses_explicit_namespace_but_get_is_namespace_a
         )
         .await
         .expect("tenant edge list");
-    let edges = tenant_edges.as_array().expect("edge array");
+    let edges = list_items(&tenant_edges);
     assert!(
         edges.len() >= 3,
         "two project annotations plus the parent edge must be tenant-scoped: {edges:?}"
@@ -4926,9 +4904,7 @@ async fn digest_receipt_discovery_uses_explicit_namespace_but_get_is_namespace_a
         .await
         .expect("local event list");
     assert!(
-        local_receipts
-            .as_array()
-            .expect("event array")
+        list_items(&local_receipts)
             .iter()
             .all(|event| event["id"].as_str() != Some(receipt_id.as_str())),
         "this fixture's local-only list scope must not discover a tenant-attributed receipt"
@@ -4947,9 +4923,7 @@ async fn digest_receipt_discovery_uses_explicit_namespace_but_get_is_namespace_a
         )
         .await
         .expect("tenant event list");
-    let listed = tenant_receipts
-        .as_array()
-        .expect("event array")
+    let listed = list_items(&tenant_receipts)
         .iter()
         .find(|event| event["id"].as_str() == Some(receipt_id.as_str()))
         .expect("tenant receipt is discoverable in its original namespace");
@@ -4968,9 +4942,7 @@ async fn digest_receipt_discovery_uses_explicit_namespace_but_get_is_namespace_a
         )
         .await
         .expect("tenant audit list");
-    let nested_audits: Vec<&Value> = tenant_audits
-        .as_array()
-        .expect("audit array")
+    let nested_audits: Vec<&Value> = list_items(&tenant_audits)
         .iter()
         .filter(|event| {
             matches!(
@@ -5077,7 +5049,7 @@ async fn digest_receipt_recovery_pages_past_one_thousand_in_a_frozen_window() {
         )
         .await
         .expect("first frozen-window page");
-    let first_items = first_page.as_array().expect("unclamped event page");
+    let first_items = list_items(&first_page);
     assert_eq!(first_items.len(), PAGE_LIMIT);
     assert!(
         first_items
@@ -5109,7 +5081,7 @@ async fn digest_receipt_recovery_pages_past_one_thousand_in_a_frozen_window() {
         )
         .await
         .expect("second frozen-window page");
-    let second_items = second_page.as_array().expect("unclamped event page");
+    let second_items = list_items(&second_page);
     assert_eq!(second_items.len(), 1);
     assert_eq!(second_items[0]["id"], json!(lost_id));
     assert_eq!(second_items[0]["payload"]["result"], lost_result);

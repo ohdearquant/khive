@@ -152,7 +152,8 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 20] = [
         name: "list",
         description: "List records with optional filtering. Offset-mode results always use \
                       {\"items\": [...], \"requested_limit\": N, \"effective_limit\": M, \
-                      \"limit_clamped\": bool}; the stable shape lets clients advance by M. \
+                      \"limit_clamped\": bool}; clients advance offset by items.length, while M \
+                      discloses the server cap and is not a guaranteed row count. \
                       Entity, note, and edge cursor modes return \
                       {\"entities|notes|edges\": [...], \"next_after\": ...} with the same \
                       limit metadata. Caps are entity 500, note 200, edge 1000, event 1000, \

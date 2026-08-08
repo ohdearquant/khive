@@ -338,11 +338,10 @@ def first_op_result(resp: dict) -> dict:
     return op["result"]
 
 
-# The server clamps `list` limit to 200 and, only when the caller's requested
-# limit exceeded that clamp, wraps the array in
-# {items, effective_limit, limit_clamped, requested_limit} instead of
-# returning a bare array. Requesting <=200 always yields a bare array; we
-# still normalize defensively in case that changes.
+# `list` always returns the stable
+# {items, effective_limit, limit_clamped, requested_limit} offset envelope.
+# Keep the bare-array fallback so this workspace helper can still read from an
+# older server during a rolling upgrade.
 def list_items(result) -> list:
     if isinstance(result, dict) and "items" in result:
         return result["items"]
