@@ -272,6 +272,12 @@ struct DispatchActionError {
     outcome_uncertain: bool,
 }
 
+impl std::fmt::Display for DispatchActionError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.failure.fmt(formatter)
+    }
+}
+
 impl DispatchActionError {
     fn known(failure: DispatchFailure) -> Self {
         Self {
