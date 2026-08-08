@@ -11,7 +11,7 @@ pub(crate) static CODE_HANDLERS: [HandlerDef; 1] = [HandlerDef {
     name: "code.ingest",
     description: "Ingest L1 manifest edges and L1.5 regex import-scan edges from a source \
                    folder into a dedicated map database (never the shared production graph). \
-                   L2 Scanner/Extractor symbol-tier ingest is not implemented by this call.",
+                   L2 Rust symbol ingest is available as an opt-in tier.",
     visibility: Visibility::Verb,
     category: VerbCategory::Commissive,
     params: &[
@@ -35,6 +35,13 @@ pub(crate) static CODE_HANDLERS: [HandlerDef; 1] = [HandlerDef {
             required: false,
             description: "Restrict ingest to a subset of rust | python | typescript. Defaults \
                            to all three (auto-detected from manifests found under path).",
+        },
+        ParamDef {
+            name: "tiers",
+            param_type: "array of string",
+            required: false,
+            description: "Select any of l1 | l1.5 | l2. Defaults to l1 and l1.5; l2 is \
+                           opt-in and currently scans Rust sources only.",
         },
     ],
 }];
@@ -203,7 +210,19 @@ pub(crate) static CODE_EDGE_RULES: [EdgeEndpointRule; 22] = [
 mod tests {
     use khive_types::{EdgeRelation, EndpointKind};
 
-    use super::CODE_EDGE_RULES;
+    use super::{CODE_EDGE_RULES, CODE_HANDLERS};
+
+    #[test]
+    fn code_ingest_declares_optional_tiers() {
+        let tiers = CODE_HANDLERS[0]
+            .params
+            .iter()
+            .find(|param| param.name == "tiers")
+            .expect("code.ingest must declare the tiers parameter");
+
+        assert_eq!(tiers.param_type, "array of string");
+        assert!(!tiers.required);
+    }
 
     #[test]
     fn code_edge_rules_has_22_rows() {
