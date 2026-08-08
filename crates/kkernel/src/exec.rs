@@ -4608,13 +4608,84 @@ backend = "sessions"
             embedding_model: None,
             additional_embedding_models: vec![],
             // Pin the pack list explicitly rather than inheriting `KHIVE_PACKS`
-            // from the ambient environment (#1276). This shared helper covers
-            // both base KG operations and GTD-aware atomic updates/lifecycle
-            // verbs, so its registry must install the same GTD hooks those
-            // assertions exercise.
-            packs: vec!["kg".to_string(), "gtd".to_string()],
+            // from the ambient environment (#1276). Atomic execution retains
+            // the complete discovered validation/lifecycle surface even when
+            // the caller configures only the base KG pack.
+            packs: vec!["kg".to_string()],
             ..Default::default()
         }
+    }
+
+    #[tokio::test]
+    async fn atomic_kg_only_config_keeps_gtd_hook_and_lifecycle_execution() {
+        let db_file = NamedTempFile::new().expect("temp db");
+        let db_path = db_file.path().to_str().expect("utf8").to_string();
+        let khive_cfg = KhiveConfig::default();
+
+        let (hook_task_id, transition_task_id, complete_task_id) = {
+            let server = isolated_server(&db_path);
+            let response = dispatch_json(
+                &server,
+                r#"[gtd.assign(title="HookGuard", status="next"), gtd.assign(title="TransitionGuard", status="inbox"), gtd.assign(title="CompleteGuard", status="active")]"#,
+            )
+            .await;
+            let full_id = |index: usize| {
+                response["results"][index]["result"]["full_id"]
+                    .as_str()
+                    .unwrap_or_else(|| panic!("missing task full_id at index {index}: {response}"))
+                    .to_string()
+            };
+            (full_id(0), full_id(1), full_id(2))
+        };
+
+        let hook_error = crate::atomic_apply::execute_atomic_ops_file(
+            vec![atomic_op(
+                "update",
+                serde_json::json!({
+                    "id": hook_task_id.as_str(),
+                    "properties": {"depends_on": [hook_task_id.as_str()]},
+                }),
+            )],
+            atomic_cfg(&db_path),
+            &khive_cfg,
+            khive_types::pack::ATOMIC_MAX_OPS_DEFAULT,
+        )
+        .await
+        .expect_err("the GTD task hook must reject a self-dependency");
+        assert!(
+            format!("{hook_error:#}").contains("cannot depend on itself"),
+            "the kg-only atomic registry must enforce the GTD hook: {hook_error:#}"
+        );
+
+        let server = isolated_server(&db_path);
+        let response = dispatch_json(&server, &format!(r#"get(id="{hook_task_id}")"#)).await;
+        assert!(
+            response["results"][0]["result"]["properties"]
+                .get("depends_on")
+                .is_none(),
+            "the rejected dependency update must not mutate the task: {response}"
+        );
+
+        let envelope = crate::atomic_apply::execute_atomic_ops_file(
+            vec![
+                atomic_op(
+                    "gtd.transition",
+                    serde_json::json!({"id": transition_task_id, "status": "next"}),
+                ),
+                atomic_op(
+                    "gtd.complete",
+                    serde_json::json!({"id": complete_task_id, "result": "verified"}),
+                ),
+            ],
+            atomic_cfg(&db_path),
+            &khive_cfg,
+            khive_types::pack::ATOMIC_MAX_OPS_DEFAULT,
+        )
+        .await
+        .expect("GTD lifecycle adapters must execute with a kg-only config");
+        assert_eq!(envelope["atomic"]["committed"], true, "{envelope}");
+        assert_eq!(envelope["results"][0]["result"]["to"], "next");
+        assert_eq!(envelope["results"][1]["result"]["to"], "done");
     }
 
     /// Acceptance test 1a: an all-success atomic ops-file run commits every

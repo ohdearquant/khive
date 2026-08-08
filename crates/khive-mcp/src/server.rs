@@ -88,18 +88,13 @@ impl DispatchFailure {
         }
     }
 
-    fn from_runtime(registry: &VerbRegistry, tool: &str, error: RuntimeError) -> Self {
+    fn from_runtime(tool: &str, error: RuntimeError) -> Self {
         let reason = match &error {
             // `gate-refusal` is deliberately limited to the write-time secret
             // gate. Authorization denials and gate infrastructure errors keep
             // their established, unclassified shapes.
             RuntimeError::SecretDetected(_) => Some(RefusalReason::GateRefusal),
-            // Unknown and unloaded verbs currently use InvalidInput. Combine
-            // that typed variant with registry membership instead of scraping
-            // the human-readable message.
-            RuntimeError::InvalidInput(_) if !registry.has_verb(tool) => {
-                Some(RefusalReason::VerbRefused)
-            }
+            RuntimeError::UnknownVerb(_) => Some(RefusalReason::VerbRefused),
             _ => None,
         };
         Self {
@@ -920,7 +915,7 @@ impl KhiveMcpServer {
                 );
                 chain_ok_envelope_or_depth_error(tool, result)
             }
-            Err(error) => Err(DispatchFailure::from_runtime(&self.registry, &tool, error)),
+            Err(error) => Err(DispatchFailure::from_runtime(&tool, error)),
         }
     }
 
@@ -1153,7 +1148,7 @@ impl KhiveMcpServer {
                                 )
                             }
                             Err(error) => {
-                                DispatchFailure::from_runtime(&registry, &tool, error).into_entry()
+                                DispatchFailure::from_runtime(&tool, error).into_entry()
                             }
                         }
                         })
@@ -1339,7 +1334,7 @@ async fn dispatch_via_coordinator_inner(
                     },
                 )
                 .await;
-            Some(result.map_err(|error| DispatchFailure::from_runtime(registry, tool, error)))
+            Some(result.map_err(|error| DispatchFailure::from_runtime(tool, error)))
         }
         "search" => {
             let kind = args_value.get("kind")?.as_str()?;
@@ -1478,7 +1473,7 @@ async fn dispatch_via_coordinator_inner(
                     },
                 )
                 .await;
-            Some(result.map_err(|error| DispatchFailure::from_runtime(registry, tool, error)))
+            Some(result.map_err(|error| DispatchFailure::from_runtime(tool, error)))
         }
         _ => None,
     }
@@ -4342,6 +4337,29 @@ mod tests {
         };
         let runtime = KhiveRuntime::new(config).expect("in-memory runtime");
         KhiveMcpServer::new(runtime).expect("server builds with kg")
+    }
+
+    #[tokio::test]
+    async fn unknown_verb_with_invalid_namespace_is_not_classified_as_verb_refused() {
+        let server = in_memory_kg_server();
+        let response = server
+            .dispatch_request_local(RequestParams {
+                ops: "not_loaded(namespace=5)".to_string(),
+                ..Default::default()
+            })
+            .await
+            .expect("dispatch failures remain in the per-operation envelope");
+        let response: Value = serde_json::from_str(&response).expect("response envelope");
+        assert!(
+            response["results"][0]["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("invalid namespace")),
+            "unexpected error: {response}"
+        );
+        assert!(
+            response["results"][0].get("reason").is_none(),
+            "namespace validation is not an unknown-verb refusal: {response}"
+        );
     }
 
     #[tokio::test]

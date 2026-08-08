@@ -393,7 +393,7 @@ fn atomic_scenario_outputs() -> &'static AtomicScenarioOutputs {
         let unknown_and_unloaded = run_ops_file(
             &home,
             "atomic-unknown.jsonl",
-            "{\"tool\":\"not_loaded\",\"args\":{}}\n{\"tool\":\"gtd.transition\",\"args\":{\"id\":\"00000000-0000-0000-0000-000000000000\",\"status\":\"next\"}}\n",
+            "{\"tool\":\"not_loaded\",\"args\":{}}\n{\"tool\":\"comm.send\",\"args\":{\"to\":\"lambda:test\",\"content\":\"not dispatched\"}}\n",
             "kg",
             &db,
             &["--actor", "lambda:test"],
@@ -509,7 +509,7 @@ fn atomic_unknown_and_unloaded_verbs_are_typed_per_operation() {
     let response = stdout_json(output);
     assert_eq!(response["summary"]["total"], 2);
     assert_eq!(response["results"][0]["tool"], "not_loaded");
-    assert_eq!(response["results"][1]["tool"], "gtd.transition");
+    assert_eq!(response["results"][1]["tool"], "comm.send");
     assert!(response["results"]
         .as_array()
         .expect("results array")

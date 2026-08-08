@@ -1225,7 +1225,7 @@ impl VerbRegistry {
         // Verb-visibility handler names, precomputed at build() time (internal
         // subhandlers are excluded so they are not advertised in the
         // unknown-verb error).
-        Err(RuntimeError::InvalidInput(format!(
+        Err(RuntimeError::UnknownVerb(format!(
             "unknown verb {verb:?}; available: {}",
             self.available_verbs.join(", ")
         )))
@@ -1880,7 +1880,7 @@ impl VerbRegistry {
         // trail (matches the "no audit row is ever dropped" contract above).
         if let Some(audit) = deferred_audit.take() {
             if let Some(store) = &self.event_store {
-                // Dispatch is about to return `InvalidInput` below (no pack
+                // Dispatch is about to return `UnknownVerb` below (no pack
                 // owns this verb), so the persisted outcome must be `Error`,
                 // not `Success`. `work_class` is still stamped (ADR-103
                 // Decision (a)); `resource.cost_unit` is omitted, matching
@@ -1898,7 +1898,7 @@ impl VerbRegistry {
         // Verb-visibility handler names, precomputed at build() time (internal
         // subhandlers are excluded so they are not advertised in the
         // unknown-verb error).
-        Err(RuntimeError::InvalidInput(format!(
+        Err(RuntimeError::UnknownVerb(format!(
             "unknown verb {verb:?}; available: {}",
             self.available_verbs.join(", ")
         )))
@@ -4654,7 +4654,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(page.items[0].duration_us, 0);
-        // Dispatch returns InvalidInput for an unknown verb, so the
+        // Dispatch returns UnknownVerb for an unknown verb, so the
         // persisted outcome must be Error, not the previously-hardcoded
         // Success.
         assert_eq!(page.items[0].outcome, EventOutcome::Error);
@@ -7305,8 +7305,8 @@ mod help_tests {
             .unwrap_err();
 
         assert!(
-            matches!(err, RuntimeError::InvalidInput(_)),
-            "help=true on unknown verb must return InvalidInput, got {err:?}"
+            matches!(err, RuntimeError::UnknownVerb(_)),
+            "help=true on unknown verb must return UnknownVerb, got {err:?}"
         );
         let msg = err.to_string();
         assert!(

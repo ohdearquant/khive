@@ -156,6 +156,9 @@ fn classify_atomic_preflight(
 
     let mut failures = Vec::new();
     for (op_index, op) in ops.iter().enumerate() {
+        let Some(rejection) = rejections.get(&op_index) else {
+            continue;
+        };
         if !registry.has_verb(&op.tool) {
             let static_detail = rejections
                 .get(&op_index)
@@ -171,7 +174,7 @@ fn classify_atomic_preflight(
                 error,
                 reason: Some(RefusalReason::VerbRefused),
             });
-        } else if let Some(rejection) = rejections.get(&op_index) {
+        } else {
             failures.push(AtomicFailureDetail {
                 op_index,
                 tool: op.tool.clone(),
@@ -270,7 +273,10 @@ pub(crate) async fn execute_atomic_ops_file(
     // Dropped right after `KhiveRuntime::new` returns rather than held for the
     // whole atomic run: the race this closes is cold-boot schema init, not the
     // prepare/commit passes below.
-    let pack_names = cfg.packs.clone();
+    let pack_names: Vec<String> = PackRegistry::discovered_names()
+        .into_iter()
+        .map(str::to_string)
+        .collect();
     let boot_guard = crate::exec::acquire_local_construction_guard(&cfg)?;
     let namespace = cfg.default_namespace.clone();
     let runtime = KhiveRuntime::new(cfg).context("build in-process runtime for --atomic")?;
@@ -279,8 +285,8 @@ pub(crate) async fn execute_atomic_ops_file(
         .authorize(namespace)
         .context("authorize namespace for --atomic")?;
 
-    // ADR-099 B3: a `VerbRegistry` built from the configured pack set, reusing
-    // the REAL runtime just constructed above (via
+    // ADR-099 B3: a `VerbRegistry` built from the full discovered pack set,
+    // reusing the REAL runtime just constructed above (via
     // `.clone()` — `KhiveRuntime` derives `Clone`) rather than a second
     // throwaway one (the pattern `kkernel::pack_introspect::build_registry`
     // uses for introspection). This is what makes `resolve_kind_spec`

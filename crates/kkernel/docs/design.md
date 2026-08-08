@@ -107,9 +107,11 @@ It runs, in order:
 
 1. Parse-time admissibility (`khive_request::atomic::check_atomic_admissible`, B1), loaded-verb
    resolution against a metadata-only in-memory registry for the configured pack set, and the
-   op-count guard. This may build an ephemeral in-memory runtime for authoritative pack metadata,
-   but runs BEFORE opening or touching the target database. Unknown/unloaded verbs are therefore
-   distinguishable from loaded verbs that are merely atomic-ineligible without scraping prose.
+   op-count guard. Configured-pack membership classifies only statically rejected operations; it
+   does not narrow the full discovered execution registry used by atomic prepare. This may build
+   an ephemeral in-memory runtime for authoritative pack metadata, but runs BEFORE opening or
+   touching the target database. Unknown/unloaded verbs are therefore distinguishable from loaded
+   verbs that are merely atomic-ineligible without scraping prose.
 2. The async prepare pass: KG-substrate verbs via `khive_runtime::atomic_prepare::prepare_op`;
    `gtd.transition`/`gtd.complete` via two `prepare_gtd_*` adapters in this module that wrap
    the SAME decide functions (`khive_pack_gtd::handlers::prepare_transition`/

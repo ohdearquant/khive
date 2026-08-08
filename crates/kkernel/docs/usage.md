@@ -115,7 +115,9 @@ aborted operation. A specific dispatch reason (`gate-refusal` or
 `verb-refused`) takes precedence over the aggregate `strict-op-failure` reason
 for that entry. An invocation-level actor refusal emits one line and returns
 the same normal `results`/`summary` JSON shape over every parsed operation
-without dispatching. A malformed expression or JSONL line has no operation
+without dispatching. Those failed rows and the `summary.failed` count describe
+not-attempted operations, not per-operation execution failures. A malformed
+expression or JSONL line has no operation
 list, so it preserves the parse-before-envelope boundary and prints a dedicated
 invocation error instead of inventing a tool:
 
@@ -130,8 +132,9 @@ invocation error instead of inventing a tool:
 }
 ```
 
-Carrier parsing precedes actor expectation and attributed-actor gates. If an
-invocation is both malformed and would fail an identity guard after parsing,
+Carrier parsing precedes actor expectation, attributed-actor gates, and the
+explicit `--db` versus multi-backend `database_override_conflict` check. If an
+invocation is malformed and would also fail any of those later preflights,
 `parse-error` is therefore the deterministic first classification for inline
 DSL and JSONL alike.
 
