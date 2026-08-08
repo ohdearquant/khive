@@ -820,6 +820,8 @@ class RecipeRun:
         installed_bytes: bytes | None,
         signed_bytes: bytes | None,
         staging_file_left_behind: bool,
+        codesign_invocations: int,
+        signed_probe_invocations: int,
     ) -> None:
         self.rc = rc
         self.output = output
@@ -827,6 +829,8 @@ class RecipeRun:
         self.installed_bytes = installed_bytes
         self.signed_bytes = signed_bytes
         self.staging_file_left_behind = staging_file_left_behind
+        self.codesign_invocations = codesign_invocations
+        self.signed_probe_invocations = signed_probe_invocations
 
 
 PRE_EXISTING_INSTALL = b"#!/bin/sh\necho PRE-EXISTING\n"
@@ -901,12 +905,40 @@ class MakefileGateContractTests(unittest.TestCase):
         signed_probe_exit: int = 0,
         codesign_exit: int = 0,
         makefile_text: str | None = None,
+        fixture_shape: str = "bare",
     ) -> RecipeRun:
-        commands = self._extract_local_recipe(makefile_text or self.makefile)
+        recipe_makefile = makefile_text or self.makefile
+        commands = self._extract_local_recipe(recipe_makefile)
         self.assertTrue(commands, "no recipe extracted from the Makefile")
 
         with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+            fixture = Path(tmp)
+            root = fixture / "workspace"
+            root.mkdir()
+            (root / "Makefile").write_text(recipe_makefile, encoding="utf-8")
+            if fixture_shape == "git-dir":
+                subprocess.run(
+                    ["git", "init", "-q", str(root)],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+            elif fixture_shape == "git-file":
+                subprocess.run(
+                    [
+                        "git",
+                        "init",
+                        "-q",
+                        f"--separate-git-dir={fixture / 'git-dir'}",
+                        str(root),
+                    ],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+            elif fixture_shape != "bare":
+                raise AssertionError(f"unknown recipe fixture shape: {fixture_shape}")
+
             home = root / "home"
             dest_dir = home / ".cargo" / "bin"
             dest_dir.mkdir(parents=True)
@@ -919,6 +951,8 @@ class MakefileGateContractTests(unittest.TestCase):
             src.write_bytes(b"#!/bin/sh\necho FRESH-BUILD 0.0.0-test\n")
             src.chmod(0o755)
             src_sha = hashlib.sha256(src.read_bytes()).hexdigest()
+            signed_probe_record = root / "signed-probe-invocations"
+            codesign_record = root / "codesign-invocations"
 
             # Stub verifier: serves the stamp inspection, and its --artifact
             # (post-signing) probe exits with the code this test chose.
@@ -926,6 +960,7 @@ class MakefileGateContractTests(unittest.TestCase):
             (root / "scripts" / "verify_local_artifact.py").write_text(
                 textwrap.dedent(
                     f"""\
+                    import os
                     import sys
                     argv = sys.argv[1:]
                     if "--inspect-stamp" in argv:
@@ -934,6 +969,10 @@ class MakefileGateContractTests(unittest.TestCase):
                         print('VERIFIED_VERBS=90')
                         sys.exit(0)
                     if "--artifact" in argv:
+                        with open(
+                            os.environ["SIGNED_PROBE_RECORD"], "a", encoding="utf-8"
+                        ) as record:
+                            record.write("called\\n")
                         sys.exit({signed_probe_exit})
                     sys.exit(0)
                     """
@@ -949,6 +988,7 @@ class MakefileGateContractTests(unittest.TestCase):
                 textwrap.dedent(
                     f"""\
                     #!/bin/sh
+                    printf 'called\n' >> "$CODESIGN_RECORD"
                     [ {codesign_exit} -ne 0 ] && exit {codesign_exit}
                     for a in "$@"; do target="$a"; done
                     printf '\\n# signed\\n' >> "$target"
@@ -966,6 +1006,8 @@ class MakefileGateContractTests(unittest.TestCase):
             env["HOME"] = str(home)
             env["PATH"] = f"{stub_bin}:{env.get('PATH', '')}"
             env["PYTHONDONTWRITEBYTECODE"] = "1"
+            env["CODESIGN_RECORD"] = str(codesign_record)
+            env["SIGNED_PROBE_RECORD"] = str(signed_probe_record)
 
             rc = 0
             chunks: list[str] = []
@@ -992,6 +1034,17 @@ class MakefileGateContractTests(unittest.TestCase):
             if codesign_exit == 0:
                 signed_bytes = src.read_bytes() + b"\n# signed\n"
 
+            codesign_invocations = (
+                len(codesign_record.read_text(encoding="utf-8").splitlines())
+                if codesign_record.exists()
+                else 0
+            )
+            signed_probe_invocations = (
+                len(signed_probe_record.read_text(encoding="utf-8").splitlines())
+                if signed_probe_record.exists()
+                else 0
+            )
+
             return RecipeRun(
                 rc=rc,
                 output="\n".join(chunks),
@@ -999,7 +1052,50 @@ class MakefileGateContractTests(unittest.TestCase):
                 installed_bytes=installed_bytes,
                 signed_bytes=signed_bytes,
                 staging_file_left_behind=staged.exists(),
+                codesign_invocations=codesign_invocations,
+                signed_probe_invocations=signed_probe_invocations,
             )
+
+    @staticmethod
+    def _verification_behavior(run: RecipeRun) -> tuple[object, ...]:
+        return (
+            run.rc,
+            run.installed,
+            run.installed_bytes,
+            run.signed_bytes,
+            run.staging_file_left_behind,
+            run.codesign_invocations,
+            run.signed_probe_invocations,
+        )
+
+    def _run_local_recipe_variants(
+        self,
+        *,
+        signed_probe_exit: int = 0,
+        codesign_exit: int = 0,
+        makefile_text: str | None = None,
+    ) -> dict[str, RecipeRun]:
+        runs = {
+            shape: self._run_local_recipe(
+                signed_probe_exit=signed_probe_exit,
+                codesign_exit=codesign_exit,
+                makefile_text=makefile_text,
+                fixture_shape=shape,
+            )
+            for shape in ("bare", "git-dir", "git-file")
+        }
+        bare_behavior = self._verification_behavior(runs["bare"])
+        for shape in ("git-dir", "git-file"):
+            with self.subTest(fixture_shape=shape, check="environment-parity"):
+                self.assertEqual(
+                    self._verification_behavior(runs[shape]),
+                    bare_behavior,
+                    "the local recipe's verification behavior changed with the "
+                    f"checkout environment ({shape})\n"
+                    f"bare run:\n{runs['bare'].output}\n"
+                    f"{shape} run:\n{runs[shape].output}",
+                )
+        return runs
 
     def test_local_dependency_chain_is_build_then_verify_then_install(self) -> None:
         self.assertIn("verify-local-artifact: build-local\n", self.makefile)
@@ -1039,47 +1135,71 @@ class MakefileGateContractTests(unittest.TestCase):
         while probing nothing. Text cannot distinguish a probe from a mention
         of a probe, so the recipe is executed instead.
         """
-        control = self._run_local_recipe(signed_probe_exit=0)
-        self.assertTrue(
-            control.installed,
-            "positive control failed: the recipe must install when every probe "
-            f"passes, but the installed binary was unchanged. rc={control.rc}\n"
-            f"{control.output}",
-        )
-        self.assertEqual(control.rc, 0, control.output)
-        self.assertEqual(
-            control.installed_bytes,
-            control.signed_bytes,
-            "control: the installed bytes must be exactly the signed, probed bytes",
-        )
+        for shape, control in self._run_local_recipe_variants(
+            signed_probe_exit=0
+        ).items():
+            with self.subTest(fixture_shape=shape, probe="passes"):
+                self.assertTrue(
+                    control.installed,
+                    "positive control failed: the recipe must install when every probe "
+                    f"passes, but the installed binary was unchanged. rc={control.rc}\n"
+                    f"{control.output}",
+                )
+                self.assertEqual(control.rc, 0, control.output)
+                self.assertEqual(
+                    control.installed_bytes,
+                    control.signed_bytes,
+                    "control: the installed bytes must be exactly the signed, probed bytes",
+                )
+                self.assertEqual(control.codesign_invocations, 1, control.output)
+                self.assertEqual(control.signed_probe_invocations, 1, control.output)
 
-        mutant = self._run_local_recipe(signed_probe_exit=1)
-        self.assertFalse(
-            mutant.installed,
-            "the post-signing probe FAILED and the binary was installed anyway: "
-            "unverified bytes reached the install path\n" + mutant.output,
-        )
-        self.assertNotEqual(
-            mutant.rc, 0, "a failed signed-artifact probe must exit nonzero\n" + mutant.output
-        )
-        self.assertFalse(
-            mutant.staging_file_left_behind,
-            "the failure path must remove the staged file, not leave it for a "
-            "later run to pick up\n" + mutant.output,
-        )
+        for shape, mutant in self._run_local_recipe_variants(
+            signed_probe_exit=1
+        ).items():
+            with self.subTest(fixture_shape=shape, probe="fails"):
+                self.assertFalse(
+                    mutant.installed,
+                    "the post-signing probe FAILED and the binary was installed anyway: "
+                    "unverified bytes reached the install path\n" + mutant.output,
+                )
+                self.assertNotEqual(
+                    mutant.rc,
+                    0,
+                    "a failed signed-artifact probe must exit nonzero\n" + mutant.output,
+                )
+                self.assertFalse(
+                    mutant.staging_file_left_behind,
+                    "the failure path must remove the staged file, not leave it for a "
+                    "later run to pick up\n" + mutant.output,
+                )
+                self.assertEqual(mutant.codesign_invocations, 1, mutant.output)
+                self.assertEqual(mutant.signed_probe_invocations, 1, mutant.output)
 
     def test_a_signing_failure_cannot_reach_the_install_path(self) -> None:
         """`codesign` failure was previously swallowed by `|| true`. Signing is
         a mutating step inside the install gate, so its failure must abort."""
-        control = self._run_local_recipe(codesign_exit=0)
-        self.assertTrue(control.installed, "positive control failed\n" + control.output)
+        for shape, control in self._run_local_recipe_variants(
+            codesign_exit=0
+        ).items():
+            with self.subTest(fixture_shape=shape, codesign="passes"):
+                self.assertTrue(
+                    control.installed, "positive control failed\n" + control.output
+                )
+                self.assertEqual(control.codesign_invocations, 1, control.output)
+                self.assertEqual(control.signed_probe_invocations, 1, control.output)
 
-        mutant = self._run_local_recipe(codesign_exit=1)
-        self.assertFalse(
-            mutant.installed,
-            "codesign failed and the binary was installed anyway\n" + mutant.output,
-        )
-        self.assertNotEqual(mutant.rc, 0, mutant.output)
+        for shape, mutant in self._run_local_recipe_variants(
+            codesign_exit=1
+        ).items():
+            with self.subTest(fixture_shape=shape, codesign="fails"):
+                self.assertFalse(
+                    mutant.installed,
+                    "codesign failed and the binary was installed anyway\n" + mutant.output,
+                )
+                self.assertNotEqual(mutant.rc, 0, mutant.output)
+                self.assertEqual(mutant.codesign_invocations, 1, mutant.output)
+                self.assertEqual(mutant.signed_probe_invocations, 0, mutant.output)
 
     def test_the_recipe_harness_can_detect_a_reverted_fix(self) -> None:
         """Mutation control for the harness itself. A finding-only instrument
@@ -1101,12 +1221,15 @@ class MakefileGateContractTests(unittest.TestCase):
         end = pre_fix.index("SIGNED_SHA256=")
         pre_fix = pre_fix[:start] + pre_fix[end:]
 
-        reverted = self._run_local_recipe(signed_probe_exit=1, makefile_text=pre_fix)
-        self.assertTrue(
-            reverted.installed,
-            "the harness did not reproduce the original defect, so a green "
-            "result from it is not evidence\n" + reverted.output,
-        )
+        for shape, reverted in self._run_local_recipe_variants(
+            signed_probe_exit=1, makefile_text=pre_fix
+        ).items():
+            with self.subTest(fixture_shape=shape):
+                self.assertTrue(
+                    reverted.installed,
+                    "the harness did not reproduce the original defect, so a green "
+                    "result from it is not evidence\n" + reverted.output,
+                )
 
     def test_cargo_receipt_drives_verifier_and_ci_runs_regression_suite(self) -> None:
         self.assertIn("scripts/build_local_artifact.py", self.makefile)
