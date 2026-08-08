@@ -363,8 +363,11 @@ make fmt-check  # verify without modifying
 # Build release binary
 make build      # cargo build --workspace --release
 
+# Build + verify Cargo's exact reported local artifact without installing or stopping the daemon
+make verify-local-artifact  # receipt-bound daemonless verbs() probe; requires all requested packs and >=90 verbs
+
 # Build + install locally (ALWAYS use this after code changes)
-make local      # build release khive-mcp → kill stale → codesign → install to ~/.cargo/bin/
+make local      # depends on verify-local-artifact, then codesigns + installs kkernel → kills stale daemon
                 # then /mcp in Claude Code to reconnect
 
 # Publish to crates.io
