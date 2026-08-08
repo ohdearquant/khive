@@ -75,6 +75,11 @@ pub enum ConfigError {
 
     #[error("the explicitly selected config file does not exist: {path}")]
     ExplicitConfigMissing { path: PathBuf },
+
+    #[error(
+        "[gate] configuration is not supported by this build; refusing to start because the requested caller-enrollment policy would not be enforced"
+    )]
+    UnsupportedGateSection,
 }
 
 // ---- Config structs ----
@@ -348,7 +353,10 @@ pub struct GitWriteSectionConfig {
 /// - `[[backends]]`: storage backend declarations (ADR-028)
 /// - `[packs.<name>]`: per-pack backend assignments (ADR-028)
 ///
-/// Unknown keys are silently ignored by serde — forward-compatible.
+/// Unknown keys are silently ignored by serde for forward compatibility. The
+/// security-sensitive `[gate]` exception is detected by [`KhiveConfig::load`]
+/// before deserialization so a request for caller enrollment can never be
+/// mistaken for active enforcement.
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct KhiveConfig {
     /// Typed only so a top-level `db` key can be rejected loudly by
@@ -462,7 +470,17 @@ impl KhiveConfig {
         }
 
         let raw = std::fs::read_to_string(&resolved)?;
-        let cfg: KhiveConfig = toml::from_str(&raw).map_err(|source| ConfigError::Parse {
+        let parsed: toml::Value = toml::from_str(&raw).map_err(|source| ConfigError::Parse {
+            path: resolved.clone(),
+            source,
+        })?;
+        if parsed
+            .as_table()
+            .is_some_and(|table| table.contains_key("gate"))
+        {
+            return Err(ConfigError::UnsupportedGateSection);
+        }
+        let cfg: KhiveConfig = parsed.try_into().map_err(|source| ConfigError::Parse {
             path: resolved,
             source,
         })?;
@@ -1890,6 +1908,48 @@ db = "/tmp/scratch/demo.db"
             matches!(err, ConfigError::UnsupportedTopLevelDb { ref value } if value == "/tmp/scratch/demo.db"),
             "expected UnsupportedTopLevelDb {{ value: \"/tmp/scratch/demo.db\" }}, got {err:?}"
         );
+    }
+
+    #[test]
+    fn gate_caller_enrollment_is_rejected_instead_of_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_toml(
+            &dir,
+            r#"
+[gate]
+granted_actors = ["lambda:enrolled"]
+grant_unattributed = false
+"#,
+        );
+
+        let err = KhiveConfig::load(Some(&path))
+            .expect_err("an unenforced caller-enrollment policy must abort startup");
+        assert!(
+            matches!(err, ConfigError::UnsupportedGateSection),
+            "expected UnsupportedGateSection, got {err:?}"
+        );
+        assert!(
+            err.to_string().contains("would not be enforced"),
+            "operator-facing error must explain the fail-loud reason: {err}"
+        );
+    }
+
+    #[test]
+    fn empty_gate_table_is_still_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_toml(&dir, "[gate]\n");
+        let err = KhiveConfig::load(Some(&path))
+            .expect_err("a present gate table must never disappear through serde defaults");
+        assert!(matches!(err, ConfigError::UnsupportedGateSection));
+    }
+
+    #[test]
+    fn unrelated_unknown_top_level_sections_remain_forward_compatible() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_toml(&dir, "[future_feature]\nenabled = true\n");
+        KhiveConfig::load(Some(&path))
+            .expect("unrelated future config stays forward compatible")
+            .expect("config exists");
     }
 
     // ── [git_write] section (ADR-108 Amendment) ─────────────────────────────

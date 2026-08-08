@@ -10,6 +10,14 @@ fail-closed verb class; proposed [ADR-068](ADR-068-process-isolation-topology.md
 would replace the deployment-topology clause.\
 **Authors**: khive maintainers
 
+> **Implementation status (2026-08-08):** The `Gate` trait, hard `Deny`
+> enforcement, and explicit programmatic `AllowAllGate` are implemented. The
+> accepted ADR-129 default flip and ADR-143 store-held caller-grant model are
+> not yet implemented; the current runtime default remains `AllowAllGate`.
+> Operator configuration therefore rejects every `[gate]` table instead of
+> accepting an enrollment policy that this build would not enforce. This note
+> records implementation state only and does not amend the accepted decisions.
+
 ## Context
 
 khive's verb dispatch path is the chokepoint where every operation reaches storage.

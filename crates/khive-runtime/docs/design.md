@@ -126,6 +126,9 @@
 ### Gate Authorization (ADR-029)
 
 - `RuntimeConfig::gate` defaults to `AllowAllGate`; production deployments plug in a policy-backed impl
+- Operator `[gate]` configuration is reserved and rejected until ADR-143's
+  store-held caller grants ship; an unenforced enrollment policy must not be
+  accepted silently
 
 ### Layered Retrieval Architecture (ADR-030)
 

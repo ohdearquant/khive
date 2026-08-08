@@ -5212,6 +5212,129 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn update_denial_precedes_id_existence_resolution() {
+        #[derive(Debug)]
+        struct AlwaysDenyUpdateGate {
+            checked: Arc<AtomicUsize>,
+        }
+        impl Gate for AlwaysDenyUpdateGate {
+            fn check(&self, _req: &GateRequest) -> Result<GateDecision, GateError> {
+                self.checked.fetch_add(1, Ordering::SeqCst);
+                Ok(GateDecision::deny("caller has no update capability"))
+            }
+        }
+
+        #[derive(Debug)]
+        struct ExistenceOracleUpdatePack {
+            existing_id: String,
+            invoked: Arc<AtomicUsize>,
+        }
+
+        impl khive_types::Pack for ExistenceOracleUpdatePack {
+            const NAME: &'static str = "existence_oracle";
+            const NOTE_KINDS: &'static [&'static str] = &[];
+            const ENTITY_KINDS: &'static [&'static str] = &[];
+            const HANDLERS: &'static [HandlerDef] = &[HandlerDef {
+                name: "update",
+                description: "distinguish a present id from an absent id",
+                visibility: Visibility::Verb,
+                category: VerbCategory::Declaration,
+                params: &[],
+            }];
+        }
+
+        #[async_trait]
+        impl PackRuntime for ExistenceOracleUpdatePack {
+            fn name(&self) -> &str {
+                Self::NAME
+            }
+            fn note_kinds(&self) -> &'static [&'static str] {
+                Self::NOTE_KINDS
+            }
+            fn entity_kinds(&self) -> &'static [&'static str] {
+                Self::ENTITY_KINDS
+            }
+            fn handlers(&self) -> &'static [HandlerDef] {
+                Self::HANDLERS
+            }
+            async fn dispatch(
+                &self,
+                _verb: &str,
+                params: Value,
+                _registry: &VerbRegistry,
+                _token: &NamespaceToken,
+            ) -> Result<Value, RuntimeError> {
+                self.invoked.fetch_add(1, Ordering::SeqCst);
+                match params.get("id").and_then(Value::as_str) {
+                    Some(id) if id == self.existing_id => Ok(serde_json::json!({"updated": id})),
+                    _ => Err(RuntimeError::NotFound("record".to_string())),
+                }
+            }
+        }
+
+        let existing_id = uuid::Uuid::new_v4().to_string();
+        let absent_id = uuid::Uuid::new_v4().to_string();
+        let invoked = Arc::new(AtomicUsize::new(0));
+        let checked = Arc::new(AtomicUsize::new(0));
+
+        let pack = || ExistenceOracleUpdatePack {
+            existing_id: existing_id.clone(),
+            invoked: Arc::clone(&invoked),
+        };
+
+        let mut control_builder = VerbRegistryBuilder::new();
+        control_builder.register(pack());
+        let control = control_builder.build().expect("control registry builds");
+        control
+            .dispatch("update", serde_json::json!({"id": existing_id.clone()}))
+            .await
+            .expect("positive control resolves the present id");
+        assert!(matches!(
+            control
+                .dispatch("update", serde_json::json!({"id": absent_id.clone()}))
+                .await,
+            Err(RuntimeError::NotFound(_))
+        ));
+        assert_eq!(invoked.load(Ordering::SeqCst), 2);
+
+        let mut denied_builder = VerbRegistryBuilder::new();
+        denied_builder.register(pack());
+        denied_builder.with_gate(Arc::new(AlwaysDenyUpdateGate {
+            checked: Arc::clone(&checked),
+        }));
+        let denied = denied_builder.build().expect("denied registry builds");
+
+        let present_error = denied
+            .dispatch("update", serde_json::json!({"id": existing_id.clone()}))
+            .await
+            .expect_err("denied present-id update must not resolve the id");
+        let absent_error = denied
+            .dispatch("update", serde_json::json!({"id": absent_id.clone()}))
+            .await
+            .expect_err("denied absent-id update must not resolve the id");
+
+        let denial = |error: RuntimeError| match error {
+            RuntimeError::PermissionDenied { verb, reason } => (verb, reason),
+            other => panic!("expected gate refusal, got {other:?}"),
+        };
+        let present_denial = denial(present_error);
+        let absent_denial = denial(absent_error);
+        assert_eq!(present_denial.0, "update");
+        assert_eq!(present_denial.1, "caller has no update capability");
+        assert_eq!(present_denial, absent_denial);
+        assert_eq!(
+            checked.load(Ordering::SeqCst),
+            2,
+            "both denied requests must consult the configured gate"
+        );
+        assert_eq!(
+            invoked.load(Ordering::SeqCst),
+            2,
+            "neither denied request may reach the existence oracle"
+        );
+    }
+
+    #[tokio::test]
     async fn audit_event_persists_to_event_store_on_allow() {
         let store = Arc::new(MemoryEventStore::default());
         let mut builder = VerbRegistryBuilder::new();
