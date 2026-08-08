@@ -672,7 +672,11 @@ async fn session_list_full_id_chains_to_resume_in_agent_mode() -> anyhow::Result
     assert_eq!(full_id.len(), 36, "full_id must remain canonical");
 
     let resumed = agent_one(&client, &format!(r#"session.resume(id="{full_id}")"#)).await?;
-    assert_eq!(resumed["session"]["id"], full_id);
+    assert_eq!(
+        resumed["session"]["id"].as_str(),
+        Some(&full_id[..8]),
+        "the canonical list handle must be accepted even though the Standard resume response compacts id"
+    );
     Ok(())
 }
 
