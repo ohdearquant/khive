@@ -5,7 +5,7 @@
 **Amends**: [ADR-088 Amendment 1](ADR-088-amendment-1-git-digest.md)
 (anchor-resolution clause of the `project`
 parameter)
-**Tracking**: issue #1173
+**Tracking**: issues #1173, #1708
 
 ## Context
 
@@ -64,19 +64,28 @@ entity properties.
    separate ingests), the handler deterministically selects the oldest by
    `created_at` and surfaces the condition as a report warning naming the
    duplicate anchor ids; it never picks arbitrarily or silently.
-2. Otherwise match on legacy `properties.repo_url` — first by exact string
-   equality, then by normalization: a legacy anchor without `repo_slug`
-   whose stored `repo_url` normalizes to the same slug also matches (this
+2. Otherwise match on stored `properties.repo_url` evidence — first by exact
+   string equality among pre-slug anchors, then by normalization among every
+   live anchor whose `repo_slug` is absent **or differs from the canonical
+   source slug**. A stored URL that normalizes to the canonical slug is
+   authoritative reconciliation evidence even when the row already carries
+   a hand-written, stale, or otherwise non-canonical slug (#1708). This
    reconciles an anchor created from one spelling with a later ingest under
-   another, e.g. a local-path anchor with a subsequent remote-URL digest).
-   Step-2 matches, exact or normalized, resolve multi-candidate cases by
-   the same rule as step 1: oldest `created_at` (id tie-break) selected
-   deterministically, with the remainder surfaced in the same report
-   warning — never an arbitrary or silent pick. On a hit, backfill
-   `properties.repo_slug` onto the matched entity, and redact its stored
-   `properties.repo_url` (userinfo, query, fragment) in the same patch —
-   the lazy-upgrade path also closes out any credential-bearing legacy URL
-   it touches. Existing anchors therefore need no migration.
+   another, including a local-path anchor with a subsequent remote-URL
+   digest. Exact and normalized tiers each select the oldest candidate by
+   `created_at` (id tie-break); exact-string resolution precedes normalized
+   resolution. The selected anchor is backfilled with the canonical
+   `properties.repo_slug`, and its stored `properties.repo_url` is redacted
+   (userinfo, query, fragment) in the same patch. The lazy-upgrade path also
+   closes out any credential-bearing legacy URL it touches.
+
+   A canonical step-1 winner always keeps precedence, even when a normalized
+   URL-equivalent anchor with a conflicting slug is older. Such anchors are
+   not rewritten behind the winner; they are surfaced as duplicate or
+   conflicting anchor ids in the same report warning. The same warning also
+   names unselected candidates from an exact or normalized step-2 match.
+   Candidate enumeration and warning order remain deterministic, and an id
+   is emitted at most once. Existing anchors therefore need no migration.
 3. Otherwise create the anchor with both `repo_slug` and `repo_url` set.
 
 Anchor creation carries no uniqueness constraint, so two concurrent digests
@@ -117,6 +126,8 @@ documented limitation, consistent with hard-delete cascade semantics.
 
 - All spellings of one repository converge on one anchor and one corpus;
   same-basename distinct repositories no longer collapse.
-- Legacy anchors upgrade lazily on first contact, with no migration step.
+- Legacy and present-but-noncanonical anchors upgrade lazily on first contact,
+  with no migration step; conflicts beside an existing canonical winner are
+  visible for deliberate curation.
 - Deleting an anchor while its corpus remains live is surfaced to the caller
   instead of silently duplicated around.

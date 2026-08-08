@@ -37,3 +37,27 @@ or administrative-ingester callers do not fabricate a receipt. Runtime
 presentation classifies `git.digest` as `AlwaysVerbose`, preserving the strict
 identity contract: the default MCP result is exactly the stored
 `payload.result`, including the full `receipt_id` UUID.
+
+### Repo-anchor resolution and conflict warning
+
+When `project` is absent, `git.digest` resolves a canonical `repo_slug` and
+uses the tier order defined by ADR-088 Amendment 2: exact canonical slug,
+exact legacy `repo_url`, normalized `repo_url`, then create. The normalized
+route considers live anchors whose slug is absent or differs from the
+canonical slug. A URL-equivalent anchor with a present non-canonical slug is
+therefore repaired and reused rather than excluded and duplicated (#1708);
+the selected anchor receives the canonical slug and a credential-redacted
+`repo_url` in the same update.
+
+An exact canonical-slug winner retains precedence over an older
+URL-equivalent anchor with a conflicting slug. The conflicting row is left
+unchanged and named in `warnings` for deliberate curation. The public warning
+uses this form:
+
+```text
+multiple live project anchors resolve to the same repo identity; selected <id> by canonical resolution order; duplicate or conflicting anchors: <ids>
+```
+
+Candidate queries use `created_at ASC, id ASC`; tier precedence, selection,
+and warning-id order are deterministic. An anchor id appears at most once in
+the warning.
