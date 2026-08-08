@@ -10,7 +10,7 @@ use crate::types::{
 };
 
 /// A storage-level note record. Flat, SQL-friendly representation.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Note {
     pub id: Uuid,
     pub namespace: String,
@@ -234,6 +234,12 @@ pub enum FilterOp {
     /// Matches rows where the JSON field equals the value OR the field is absent/NULL.
     /// Used for properties that may be missing in legacy rows (e.g. `$.read`).
     EqOrMissing,
+    /// Matches rows where a JSON text field equals the value, while treating
+    /// every missing or non-text value as that same value. The SQL adapter
+    /// emits `CASE WHEN json_type(...) = 'text' THEN json_extract(...) ELSE
+    /// value END = value`, mirroring callers whose read model assigns one
+    /// textual default to absent, JSON-null, and malformed legacy values.
+    TextEqOrNonText,
     Ne,
     Lt,
     Lte,
@@ -300,6 +306,31 @@ pub struct NoteFilter {
 pub trait NoteStore: Send + Sync + 'static {
     /// Insert or update a single note.
     async fn upsert_note(&self, note: Note) -> StorageResult<()>;
+    /// Replace a note only when the persisted row still matches the caller's
+    /// read snapshot.
+    ///
+    /// `expected_updated_at` is the snapshot revision and
+    /// `expected_deleted_at` closes the soft-delete race (legacy soft-delete
+    /// paths may change `deleted_at` without changing `updated_at`). The
+    /// replacement note's `updated_at` must be strictly greater than that
+    /// persisted revision. Returns `false` when the row disappeared, changed,
+    /// or was supplied a non-advancing replacement revision. This is the
+    /// full-note compare-and-swap seam used when a pack hook derives coupled
+    /// fields from that snapshot before persistence. The default returns
+    /// `Unsupported` rather than falling back to an unguarded upsert and
+    /// reintroducing the stale-snapshot race.
+    async fn replace_note_if_unchanged(
+        &self,
+        _note: Note,
+        _expected_updated_at: i64,
+        _expected_deleted_at: Option<i64>,
+    ) -> StorageResult<bool> {
+        Err(crate::StorageError::Unsupported {
+            capability: crate::StorageCapability::Notes,
+            operation: "replace_note_if_unchanged".into(),
+            message: "this backend does not implement guarded note replacement".into(),
+        })
+    }
     /// Insert or update a batch of notes.
     async fn upsert_notes(&self, notes: Vec<Note>) -> StorageResult<BatchWriteSummary>;
     /// Fetch a note by UUID, returning `None` if absent.

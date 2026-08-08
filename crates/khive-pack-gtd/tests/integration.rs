@@ -1587,65 +1587,52 @@ async fn next_excludes_terminal_tasks() {
     let _ = t1["full_id"].as_str();
 }
 
-// ── UE2-H1: complete() state machine enforcement ─────────────────────────────
+// ── complete() state machine enforcement ─────────────────────────────────────
 
-/// complete() from inbox must be rejected — task must be in next or active first.
+/// `complete()` follows the same accepted lifecycle table as `transition`.
 #[tokio::test]
-async fn complete_from_inbox_is_rejected() {
+async fn complete_from_inbox_succeeds_per_lifecycle_table() {
     let pack = pack(rt());
     let resp = assign(&pack, json!({"title": "inbox task"})).await;
     let id = resp["full_id"].as_str().unwrap().to_string();
     assert_eq!(resp["status"], "inbox");
 
-    let err = pack
+    let done = pack
         .dispatch("gtd.complete", json!({"id": id}))
         .await
-        .unwrap_err();
-    let msg = err.to_string();
-    assert!(
-        msg.contains("inbox"),
-        "error must mention current state 'inbox'; got: {msg}"
-    );
-    assert!(
-        msg.contains("transition to 'next' or 'active'"),
-        "error must guide caller to transition first; got: {msg}"
-    );
+        .expect("ADR-019 permits inbox -> done");
+    assert_eq!(done["from"], "inbox");
+    assert_eq!(done["to"], "done");
 }
 
-/// complete() from waiting must be rejected.
+/// `waiting -> done` is a legal terminal transition.
 #[tokio::test]
-async fn complete_from_waiting_is_rejected() {
+async fn complete_from_waiting_succeeds_per_lifecycle_table() {
     let pack = pack(rt());
     let resp = assign(&pack, json!({"title": "waiting task", "status": "waiting"})).await;
     let id = resp["full_id"].as_str().unwrap().to_string();
 
-    let err = pack
+    let done = pack
         .dispatch("gtd.complete", json!({"id": id}))
         .await
-        .unwrap_err();
-    let msg = err.to_string();
-    assert!(
-        msg.contains("waiting"),
-        "error must mention current state 'waiting'; got: {msg}"
-    );
+        .expect("ADR-019 permits waiting -> done");
+    assert_eq!(done["from"], "waiting");
+    assert_eq!(done["to"], "done");
 }
 
-/// complete() from someday must be rejected.
+/// `someday -> done` is a legal terminal transition.
 #[tokio::test]
-async fn complete_from_someday_is_rejected() {
+async fn complete_from_someday_succeeds_per_lifecycle_table() {
     let pack = pack(rt());
     let resp = assign(&pack, json!({"title": "someday task", "status": "someday"})).await;
     let id = resp["full_id"].as_str().unwrap().to_string();
 
-    let err = pack
+    let done = pack
         .dispatch("gtd.complete", json!({"id": id}))
         .await
-        .unwrap_err();
-    let msg = err.to_string();
-    assert!(
-        msg.contains("someday"),
-        "error must mention current state 'someday'; got: {msg}"
-    );
+        .expect("ADR-019 permits someday -> done");
+    assert_eq!(done["from"], "someday");
+    assert_eq!(done["to"], "done");
 }
 
 /// complete() from next must succeed.
@@ -2634,8 +2621,9 @@ async fn next_succeeds_when_matches_exactly_at_scan_bound() {
 /// `json_extract` on a legacy row with no stored `status` key evaluates to
 /// SQL `NULL`, which `Eq` never matches, even though every other code path
 /// (`task_status`, `render_task`) treats a missing `status` as `"inbox"`.
-/// The filter must use `EqOrMissing` so `status="inbox"` also surfaces tasks
-/// that predate the `status` property being written at all.
+/// The filter's default-aware text predicate must therefore make
+/// `status="inbox"` also surface tasks that predate the `status` property
+/// being written at all.
 #[tokio::test]
 async fn tasks_status_inbox_filter_matches_legacy_task_missing_status_property() {
     use khive_storage::note::Note;
@@ -2680,6 +2668,71 @@ async fn tasks_status_inbox_filter_matches_legacy_task_missing_status_property()
          status property, since a missing status defaults to inbox everywhere \
          else; result: {result:?}"
     );
+}
+
+/// `task_status`/`render_task` default every non-string `properties.status`
+/// value to `inbox`, not only an absent key. The pushed-down SQL predicate
+/// must use the same CASE rule for every persisted JSON type; otherwise the
+/// rendered task says `inbox` but `tasks(status="inbox")` cannot find it.
+#[tokio::test]
+async fn tasks_status_inbox_filter_matches_persisted_null_and_all_non_text_status_values() {
+    use khive_storage::note::Note;
+
+    let runtime = rt();
+    let token = runtime
+        .authorize(khive_runtime::Namespace::local())
+        .unwrap();
+    let note_store = runtime.notes(&token).expect("note store");
+    let now = chrono::Utc::now().timestamp_micros();
+    let malformed_statuses = [
+        ("legacy-status-null", Value::Null),
+        ("legacy-status-bool", json!(true)),
+        ("legacy-status-integer", json!(7)),
+        ("legacy-status-real", json!(1.5)),
+        ("legacy-status-array", json!(["next"])),
+        ("legacy-status-object", json!({"value": "next"})),
+    ];
+
+    for (offset, (title, status)) in malformed_statuses.iter().enumerate() {
+        let note = Note {
+            id: uuid::Uuid::new_v4(),
+            namespace: "local".to_string(),
+            kind: "task".to_string(),
+            status: "active".to_string(),
+            name: Some((*title).to_string()),
+            content: format!("legacy task with {title}"),
+            salience: None,
+            decay_factor: None,
+            expires_at: None,
+            properties: Some(json!({"status": status})),
+            created_at: now + i64::try_from(offset).unwrap(),
+            updated_at: now + i64::try_from(offset).unwrap(),
+            deleted_at: None,
+        };
+        note_store
+            .upsert_note(note)
+            .await
+            .expect("persist malformed legacy status");
+    }
+
+    let pack = pack(runtime);
+    let result = pack
+        .dispatch("gtd.tasks", json!({"status": "inbox"}))
+        .await
+        .expect("inbox query");
+    let titles: std::collections::BTreeSet<&str> = result
+        .as_array()
+        .expect("tasks array")
+        .iter()
+        .filter_map(|task| task["title"].as_str())
+        .collect();
+    for (title, _) in &malformed_statuses {
+        assert!(
+            titles.contains(title),
+            "persisted non-text status for {title:?} must default to inbox in both rendering \
+             and SQL filtering; result: {result:?}"
+        );
+    }
 }
 
 /// Same bug as above, for `priority="p2"`: a legacy task with no stored

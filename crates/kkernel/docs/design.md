@@ -124,12 +124,21 @@ It runs, in order:
    the canonical non-atomic handler.
 
 Before prepare, the atomic runtime installs the same aggregate pack edge rules as canonical
-server startup. After each task-note `update` or dependency `link` plan is built, the boundary
-also invokes `VerbRegistry`'s shared `KindHook` validator for typed parity with canonical KG
-dispatch. Since every plan is still prepared before any write, core migration V15 supplies the
+server startup. Before each task-note `update` plan is built, the boundary invokes
+`VerbRegistry`'s shared `KindHook` normalizer/validator; dependency `link` plans run their
+shared validator as well. This preserves typed and content/description-mirror parity with
+canonical KG dispatch. An explicit update-kind mismatch is rejected before the hook runs.
+The hook and plan share one note snapshot, and the plan's update statement rechecks that
+snapshot revision/deletion marker in the transaction. Since every plan is still prepared before any write, core migration V15 supplies the
 transaction-time task dependency cycle triggers: a later statement sees earlier writes in the
 unit, and a trigger error rolls the entire unit back. The same triggers serialize opposite
 concurrent writers, while leaving unrelated notes and edge relations untouched.
+
+Atomic v1 does not maintain a projected note image across two generic updates of the same
+target in one file. Both prepare from the original snapshot; after the first advances its
+revision, the second observes zero affected rows, fails closed, and rolls the entire unit
+back. This is deliberate until projected-state preparation can preserve all ordered patch
+semantics without weakening concurrent-write guards.
 
 **Verbs without a prepare implementation.** `propose`/`review`/`withdraw` are listed in
 `khive_types::pack::ATOMIC_ADMISSIBLE_VERBS` (ADR-099 D3 intends them to eventually gain a
@@ -149,14 +158,23 @@ The returned envelope is additive-only and lives entirely outside `dispatch_requ
 response shape — non-atomic `--ops-file` runs (and every other exec path) are untouched.
 
 **`apply_gtd_audit_post_commit_effects`** applies every `PostCommitEffect::GtdAudit` by
-calling the SAME `ensure_audit_schema`/`write_audit_record` functions the canonical
-`handle_transition`/`handle_complete` handlers call (GAP-5). It lives in `kkernel` rather
+calling the SAME `ensure_audit_schema`/`write_audit_record_with_status` functions the
+canonical `handle_transition`/`handle_complete` handlers call (GAP-5). It lives in `kkernel` rather
 than `khive-runtime::atomic_prepare` because those two functions are owned by
 `khive-pack-gtd`, which depends on `khive-runtime` — not the other way around; `kkernel` is
 the first crate in the dependency graph that can see both. Non-`GtdAudit` effects are
 ignored here (they are `atomic_prepare::apply_post_commit_effects`'s job, called
-separately). Best-effort by construction: both callee functions log-and-swallow their own
-errors, so this function itself cannot fail.
+separately). Best-effort by construction: the callee logs append failures and returns a
+boolean outcome. The atomic result builder exposes that outcome as `audit_persisted`, so the
+already-committed unit cannot be failed while audit degradation remains visible.
+
+An idempotent same-status `gtd.transition` is different: atomic v1 emits a guarded
+no-effect assertion and no post-commit audit effect, even when the caller supplied
+`note`. The assertion revalidates the exact prepare revision/deletion/status snapshot
+inside the commit transaction, so an earlier same-unit transition, update, or delete
+cannot make the no-op stale. It returns the base no-op shape and persists no note event.
+Canonical dispatch owns the guarded note-bearing no-op behavior; callers needing it must
+use that path until atomic projected-state support exists.
 
 **`validate_atomic_args`** closes an ADR-099 B3 parity gap: the canonical (non-atomic)
 handlers deserialize their args through a `#[serde(deny_unknown_fields)]` param struct, so a

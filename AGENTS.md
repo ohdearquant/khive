@@ -120,10 +120,16 @@ Full `gtd.transition` allowed transitions:
 `done` and `cancelled` are terminal.
 
 `gtd.transition` returns one of two shapes. On a real transition: `{transitioned: true, id, full_id,
-from, to, is_terminal, title, priority, assignee, due}` — `is_terminal: true` when the task reaches
-`done` or `cancelled`. On an idempotent no-op (the task is already in the requested status): `{transitioned:
-false, id, full_id, from, to, note: "already in target status"}` — the task fields (`title`, `priority`,
-`assignee`, `due`, `is_terminal`) are omitted. Branch on `transitioned` before reading those fields.
+from, to, is_terminal, title, priority, assignee, due, audit_persisted}` — `is_terminal: true` when
+the task reaches `done` or `cancelled`; `audit_persisted: false` means the state change committed but
+its best-effort lifecycle-audit append failed. On an idempotent no-op (the task is already in the
+requested status): `{transitioned: false, id, full_id, from, to, note: "already in target status"}` —
+the task fields (`title`, `priority`, `assignee`, `due`, `is_terminal`) are omitted. Canonical
+dispatch with a caller-supplied transition note additionally returns `note_recorded` and, when that
+note write wins its guard, `audit_persisted`; atomic v1 treats every same-status transition as a
+mutation-free guarded assertion and does not persist that note. The assertion revalidates the exact
+prepare snapshot so an earlier op in the same atomic unit cannot make the no-op stale. Branch on
+`transitioned` before reading those fields.
 
 ### Memory pack — 5 verbs (`memory.` prefix, [ADR-021](docs/adr/ADR-021-memory-pack.md))
 

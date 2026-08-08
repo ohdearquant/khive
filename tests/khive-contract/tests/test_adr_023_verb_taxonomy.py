@@ -166,7 +166,7 @@ def test_pack_product_verbs_are_reachable_when_loaded(
     assert trans.get("transitioned") is True, f"gtd.transition must return transitioned=True: {trans}"
     assert trans.get("to") == "waiting", f"gtd.transition must report to=waiting: {trans}"
 
-    # gtd.complete (need a task in actionable status, so transition back to next)
+    # gtd.complete (transition back to next to exercise that source state)
     khive_gtd_session.verb("gtd.transition", {"id": task_id, "status": "next", "namespace": ns})
     done = khive_gtd_session.verb("gtd.complete", {"id": task_id, "result": "taxonomy pass",
                                                      "namespace": ns})

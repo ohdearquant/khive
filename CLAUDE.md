@@ -252,13 +252,13 @@ Mixing a granular `kind` with a contradicting `entity_kind`/`note_kind` sub-filt
 
 Load with `KHIVE_PACKS=kg,gtd` or `--pack gtd`. Adds the `task` note kind.
 
-| Verb             | Args                                                                         | What it does                                                |
-| ---------------- | ---------------------------------------------------------------------------- | ----------------------------------------------------------- |
-| `gtd.assign`     | `title`, `priority?`, `status?`, `assignee?`, `due?`, `depends_on?`, `tags?` | Create a task (defaults: status=inbox, priority=p2)         |
-| `gtd.next`       | `limit?`, `assignee?`                                                        | List actionable tasks (status ∈ next/active), priority-sort |
-| `gtd.complete`   | `id`, `result?`                                                              | Validate transition → done, record `completed_at`           |
-| `gtd.tasks`      | `status?`, `assignee?`, `priority?`, `limit?`, `offset?`                     | Filtered task listing                                       |
-| `gtd.transition` | `id`, `status`, `note?`                                                      | Explicit lifecycle change with `can_transition` validation  |
+| Verb             | Args                                                                         | What it does                                                           |
+| ---------------- | ---------------------------------------------------------------------------- | ---------------------------------------------------------------------- |
+| `gtd.assign`     | `title`, `priority?`, `status?`, `assignee?`, `due?`, `depends_on?`, `tags?` | Create a task (defaults: status=inbox, priority=p2)                    |
+| `gtd.next`       | `limit?`, `assignee?`                                                        | List actionable tasks (status ∈ next/active), priority-sort            |
+| `gtd.complete`   | `id`, `status?` (`done` or `cancelled`), `result?`                           | Validate a terminal transition (default `done`), record `completed_at` |
+| `gtd.tasks`      | `status?`, `assignee?`, `priority?`, `limit?`, `offset?`                     | Filtered task listing                                                  |
+| `gtd.transition` | `id`, `status`, `note?`                                                      | Explicit lifecycle change with `can_transition` validation             |
 
 ### Memory pack verbs (5 — ADR-021, optional)
 

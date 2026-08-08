@@ -851,6 +851,9 @@ request(ops="gtd.next(assignee=\"agent:docs\", limit=10)")
 ### `gtd.complete` — Declaration
 
 Mark a task done (or cancelled) with an optional result note.
+Every non-terminal GTD state may move directly to either terminal state. Successful
+state changes include `audit_persisted`; `false` means the task committed but the
+best-effort lifecycle-audit append failed.
 
 | Param    | Type   | Required | Notes                                             |
 | -------- | ------ | -------- | ------------------------------------------------- |

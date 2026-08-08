@@ -24,9 +24,9 @@ use crate::schema::{
 /// params or the generic create path's args. `properties` carries the
 /// generic path's nested-properties object (empty for `gtd.assign`, which has
 /// no nested-properties calling convention) — [`prepare_task_create`] falls
-/// back to it for `priority`/`depends_on`/`context_entity_id` exactly as
-/// `TaskHook::prepare_create` did before unification, so `create(kind="note",
-/// note_kind="task", properties={"priority": "p1"})` keeps working.
+/// back to recognized nested GTD fields when their top-level form is absent,
+/// so `create(kind="note", note_kind="task",
+/// properties={"priority": "p1"})` keeps working without a second type policy.
 #[derive(Debug, Default)]
 pub(crate) struct TaskCreateInput {
     pub(crate) title: String,
@@ -43,74 +43,151 @@ pub(crate) struct TaskCreateInput {
     pub(crate) properties: Value,
 }
 
+fn optional_string_field(
+    container: &Value,
+    key: &str,
+    display_name: &str,
+) -> Result<Option<String>, RuntimeError> {
+    match container.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(value)) => Ok(Some(value.clone())),
+        Some(other) => Err(RuntimeError::InvalidInput(format!(
+            "{display_name} must be a string or null; got {other}"
+        ))),
+    }
+}
+
+fn optional_string_array_field(
+    container: &Value,
+    key: &str,
+    display_name: &str,
+) -> Result<Option<Vec<String>>, RuntimeError> {
+    match container.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Array(values)) => values
+            .iter()
+            .map(|value| {
+                value.as_str().map(str::to_string).ok_or_else(|| {
+                    RuntimeError::InvalidInput(format!(
+                        "{display_name} must be an array of strings"
+                    ))
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map(Some),
+        Some(_) => Err(RuntimeError::InvalidInput(format!(
+            "{display_name} must be an array of strings"
+        ))),
+    }
+}
+
 impl TaskCreateInput {
     /// Build an input from the generic `create` verb's raw args, honoring
     /// the same `title`/`name` fallback `TaskHook::prepare_create` used.
     pub(crate) fn from_create_args(args: &Value) -> Result<Self, RuntimeError> {
-        let title = args
-            .get("title")
-            .or_else(|| args.get("name"))
-            .and_then(Value::as_str)
-            .map(str::to_string)
-            .ok_or_else(|| {
-                RuntimeError::InvalidInput("kind=note + note_kind=task requires 'title'".into())
-            })?;
+        // Parse both spellings even when one wins so a malformed present value
+        // is never hidden by fallback normalization. JSON null means optional
+        // absence, therefore `title=null, name="fallback"` uses `name`.
+        let title = optional_string_field(args, "title", "title")?;
+        let name = optional_string_field(args, "name", "name")?;
+        let title = title.or(name).ok_or_else(|| {
+            RuntimeError::InvalidInput(
+                "kind=note + note_kind=task requires string 'title' or 'name'".into(),
+            )
+        })?;
 
-        let depends_on = match args.get("depends_on") {
-            Some(value) => {
-                let arr = value.as_array().ok_or_else(|| {
-                    RuntimeError::InvalidInput("depends_on must be an array of strings".into())
-                })?;
-                Some(
-                    arr.iter()
-                        .map(|v| {
-                            v.as_str().map(str::to_string).ok_or_else(|| {
-                                RuntimeError::InvalidInput(
-                                    "depends_on entries must be strings".into(),
-                                )
-                            })
-                        })
-                        .collect::<Result<Vec<_>, _>>()?,
-                )
+        let mut properties = match args.get("properties") {
+            None | Some(Value::Null) => json!({}),
+            Some(Value::Object(_)) => args["properties"].clone(),
+            Some(other) => {
+                return Err(RuntimeError::InvalidInput(format!(
+                    "properties must be an object or null; got {other}"
+                )))
             }
-            None => None,
         };
+
+        // Validate both calling conventions even when a top-level value wins.
+        // Otherwise a malformed nested GTD field remains stored and can surface
+        // later after the caller was told the create succeeded.
+        let description = optional_string_field(args, "description", "description")?.or(
+            optional_string_field(&properties, "description", "properties.description")?,
+        );
+        let assignee = optional_string_field(args, "assignee", "assignee")?.or(
+            optional_string_field(&properties, "assignee", "properties.assignee")?,
+        );
+        let priority = optional_string_field(args, "priority", "priority")?.or(
+            optional_string_field(&properties, "priority", "properties.priority")?,
+        );
+        let status = optional_string_field(args, "status", "status")?.or(optional_string_field(
+            &properties,
+            "status",
+            "properties.status",
+        )?);
+        let due = optional_string_field(args, "due", "due")?.or(optional_string_field(
+            &properties,
+            "due",
+            "properties.due",
+        )?);
+        let start = optional_string_field(args, "start", "start")?.or(optional_string_field(
+            &properties,
+            "start",
+            "properties.start",
+        )?);
+        let end = optional_string_field(args, "end", "end")?.or(optional_string_field(
+            &properties,
+            "end",
+            "properties.end",
+        )?);
+        let depends_on = optional_string_array_field(args, "depends_on", "depends_on")?.or(
+            optional_string_array_field(&properties, "depends_on", "properties.depends_on")?,
+        );
+        let context_entity_id =
+            optional_string_field(args, "context_entity_id", "context_entity_id")?.or(
+                optional_string_field(
+                    &properties,
+                    "context_entity_id",
+                    "properties.context_entity_id",
+                )?,
+            );
+        let tags = optional_string_array_field(args, "tags", "tags")?.or(
+            optional_string_array_field(&properties, "tags", "properties.tags")?,
+        );
+
+        // JSON null has the same optional-field meaning as absence at the typed
+        // `gtd.assign` boundary. Do not retain null mirrors in the stored task
+        // property bag when the generic create path uses that spelling.
+        if let Some(object) = properties.as_object_mut() {
+            for key in [
+                "description",
+                "assignee",
+                "priority",
+                "status",
+                "due",
+                "start",
+                "end",
+                "depends_on",
+                "context_entity_id",
+                "tags",
+            ] {
+                if object.get(key).is_some_and(Value::is_null) {
+                    object.remove(key);
+                }
+            }
+        }
 
         Ok(Self {
             title,
-            description: args
-                .get("description")
-                .and_then(Value::as_str)
-                .map(str::to_string),
-            assignee: args
-                .get("assignee")
-                .and_then(Value::as_str)
-                .map(str::to_string),
-            priority: args
-                .get("priority")
-                .and_then(Value::as_str)
-                .map(str::to_string),
-            status: args
-                .get("status")
-                .and_then(Value::as_str)
-                .map(str::to_string),
-            due: args.get("due").and_then(Value::as_str).map(str::to_string),
-            start: args
-                .get("start")
-                .and_then(Value::as_str)
-                .map(str::to_string),
-            end: args.get("end").and_then(Value::as_str).map(str::to_string),
+            description,
+            assignee,
+            priority,
+            status,
+            due,
+            start,
+            end,
             depends_on,
-            context_entity_id: args
-                .get("context_entity_id")
-                .and_then(Value::as_str)
-                .map(str::to_string),
-            tags: args.get("tags").cloned(),
-            properties: args
-                .get("properties")
-                .cloned()
-                .filter(Value::is_object)
-                .unwrap_or_else(|| json!({})),
+            context_entity_id,
+            tags: tags.map(|values| json!(values)),
+            properties,
         })
     }
 }
@@ -147,7 +224,7 @@ impl PreparedTaskCreate {
             // that later resolution.
             let mut seen = std::collections::HashSet::new();
             let mut merged = Vec::new();
-            if let Some(existing) = root.get("annotates") {
+            if let Some(existing) = root.get("annotates").filter(|value| !value.is_null()) {
                 let arr = existing.as_array().ok_or_else(|| {
                     RuntimeError::InvalidInput("annotates must be an array of strings".into())
                 })?;

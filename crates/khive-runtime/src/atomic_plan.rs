@@ -116,15 +116,17 @@ pub enum PostCommitEffect {
     ReindexNote { note_id: Uuid },
     /// Append one `gtd_lifecycle_audit` row for a committed `gtd.transition`
     /// or `gtd.complete` (ADR-099 B3, GAP-5): canonical `handle_transition`/
-    /// `handle_complete` call `ensure_audit_schema` + `write_audit_record`
+    /// `handle_complete` call `ensure_audit_schema` +
+    /// `write_audit_record_with_status`
     /// (`khive-pack-gtd::handlers`) as a best-effort side write — a failed
     /// audit insert must never roll back an already-committed transition.
-    /// Carries exactly the fields `write_audit_record` needs. Applied
+    /// Carries exactly the fields the lifecycle-audit helper needs. Applied
     /// outside `khive-runtime` (crate-direction: `khive-pack-gtd` depends on
     /// `khive-runtime`, not the other way around) — this crate's own
     /// `apply_post_commit_effects` treats this variant as a no-op; the
     /// `kkernel` caller that owns both crates applies it by calling the
-    /// canonical `ensure_audit_schema`/`write_audit_record` functions
+    /// canonical `ensure_audit_schema`/`write_audit_record_with_status`
+    /// functions
     /// directly.
     GtdAudit {
         task_id: Uuid,
@@ -412,34 +414,42 @@ impl MergePlan {
 #[derive(Debug, Clone)]
 pub struct GtdTransitionPlan {
     pub(crate) task_id: Uuid,
-    /// Status-column DML to apply inside the atomic unit. Property-only
-    /// status mutation — triggers no reindex (ADR-099 D3). The transition
-    /// statement carries the guard (prepare validated the current status
-    /// and the requested transition were legal). Empty for an idempotent
-    /// no-op (`current == target` after `normalize_status`, GAP-5/GAP-6 fix
-    /// round) — canonical performs no write in that case either
-    /// (`handlers.rs:995-1005`).
+    /// Task-property DML to apply inside the atomic unit. Property-only status
+    /// mutation triggers no reindex (ADR-099 D3). The transition
+    /// statement carries the guard over the exact decision snapshot's note
+    /// revision, deletion marker, and semantic status (prepare validated the
+    /// current status and requested transition were legal). For an idempotent
+    /// no-op (`current == target` after `normalize_status`) this contains one
+    /// guarded, mutation-free assertion that revalidates the prepare snapshot
+    /// under the commit transaction. Atomic v1 still persists no caller note;
+    /// canonical dispatch has a separately documented note-event path.
     pub(crate) statements: Vec<PlanStatement>,
+    /// Explicit result-shape discriminator. A no-op can no longer be inferred
+    /// from an empty statement list because it carries a guarded assertion.
+    pub(crate) idempotent_noop: bool,
     /// Deferred lifecycle audit row assigned by the prepare pass (GAP-5):
-    /// `PostCommitEffect::None` for the idempotent no-op case, matching
-    /// canonical's early return before its own
-    /// `ensure_audit_schema`/`write_audit_record` call.
+    /// `PostCommitEffect::None` for the idempotent no-op case. This matches a
+    /// canonical no-op without a note; canonical note-bearing no-ops instead
+    /// attempt a same-status audit append outside atomic v1.
     pub(crate) post_commit: PostCommitEffect,
 }
 
 impl GtdTransitionPlan {
-    /// Build a plan from its already-decided statements and audit effect.
+    /// Build a plan from its already-decided statements, no-op classification,
+    /// and audit effect.
     /// Callers outside this crate (e.g. the atomic-apply layer wiring
     /// `gtd.transition` into a multi-op unit) cannot construct the struct
     /// literal directly since its fields are crate-private.
     pub fn new(
         task_id: Uuid,
         statements: Vec<PlanStatement>,
+        idempotent_noop: bool,
         post_commit: PostCommitEffect,
     ) -> Self {
         Self {
             task_id,
             statements,
+            idempotent_noop,
             post_commit,
         }
     }
@@ -449,10 +459,15 @@ impl GtdTransitionPlan {
         self.task_id
     }
 
-    /// Status-column DML for this transition; empty for the idempotent
-    /// no-op case.
+    /// Guarded task-property DML for this transition, or the guarded
+    /// mutation-free snapshot assertion for an idempotent no-op.
     pub fn statements(&self) -> &[PlanStatement] {
         &self.statements
+    }
+
+    /// Whether prepare classified this transition as already at its target.
+    pub fn is_idempotent_noop(&self) -> bool {
+        self.idempotent_noop
     }
 
     /// The deferred lifecycle audit effect assigned by the prepare pass.
@@ -465,13 +480,14 @@ impl GtdTransitionPlan {
 #[derive(Debug, Clone)]
 pub struct GtdCompletePlan {
     pub(crate) task_id: Uuid,
-    /// Status + `completed_at` DML to apply inside the atomic unit, in
-    /// order. The status-update statement carries the guard (prepare
-    /// validated the task was in a completable state); the `completed_at`
-    /// write targets the same already-guarded row and is unguarded.
+    /// Status + `completed_at` property DML to apply inside the atomic unit.
+    /// The statement guards the exact decision snapshot's note revision,
+    /// deletion marker, and semantic status after prepare validated that the
+    /// task was in a completable state.
     pub(crate) statements: Vec<PlanStatement>,
     /// Deferred lifecycle audit row assigned by the prepare pass (GAP-5):
-    /// mirrors `handle_complete`'s best-effort `write_audit_record` call.
+    /// mirrors `handle_complete`'s best-effort
+    /// `write_audit_record_with_status` call.
     pub(crate) post_commit: PostCommitEffect,
 }
 
@@ -497,7 +513,7 @@ impl GtdCompletePlan {
         self.task_id
     }
 
-    /// Status + `completed_at` DML for this completion.
+    /// Guarded status + `completed_at` property DML for this completion.
     pub fn statements(&self) -> &[PlanStatement] {
         &self.statements
     }
@@ -674,6 +690,7 @@ mod tests {
         let plan = GtdTransitionPlan {
             task_id: Uuid::new_v4(),
             statements: vec![guarded("update-status", AffectedRowGuard::exactly(1))],
+            idempotent_noop: false,
             post_commit: PostCommitEffect::None,
         };
         // A status-only transition never triggers a reindex: the type has no
@@ -685,15 +702,22 @@ mod tests {
     }
 
     #[test]
-    fn gtd_transition_plan_idempotent_noop_carries_no_statements_and_no_audit() {
-        // current == target after normalization is an idempotent no-op:
-        // canonical performs no write and never reaches its audit-record call.
+    fn gtd_transition_plan_idempotent_noop_carries_guarded_assertion_and_no_audit() {
+        // Atomic v1 keeps current == target mutation-free and audit-free, but
+        // must revalidate the prepare snapshot in a multi-op unit. A canonical
+        // no-op carrying a note has a separate note-event contract.
         let plan = GtdTransitionPlan {
             task_id: Uuid::new_v4(),
-            statements: vec![],
+            statements: vec![guarded(
+                "assert-noop-snapshot",
+                AffectedRowGuard::exactly(1),
+            )],
+            idempotent_noop: true,
             post_commit: PostCommitEffect::None,
         };
-        assert!(plan.statements.is_empty());
+        assert_eq!(plan.statements.len(), 1);
+        assert!(plan.statements[0].guard.is_some());
+        assert!(plan.is_idempotent_noop());
         assert_eq!(plan.post_commit, PostCommitEffect::None);
     }
 
@@ -703,6 +727,7 @@ mod tests {
         let plan = GtdTransitionPlan {
             task_id,
             statements: vec![guarded("update-status", AffectedRowGuard::exactly(1))],
+            idempotent_noop: false,
             post_commit: PostCommitEffect::GtdAudit {
                 task_id,
                 from_status: "inbox".to_string(),
@@ -724,19 +749,20 @@ mod tests {
     }
 
     #[test]
-    fn gtd_complete_plan_guard_is_anchored_to_the_status_write() {
+    fn gtd_complete_plan_guards_the_single_snapshot_property_write() {
         let plan = GtdCompletePlan {
             task_id: Uuid::new_v4(),
-            statements: vec![
-                guarded("update-status", AffectedRowGuard::exactly(1)),
-                unguarded("update-completed-at"),
-            ],
+            statements: vec![guarded(
+                "update-status-and-completed-at",
+                AffectedRowGuard::exactly(1),
+            )],
             post_commit: PostCommitEffect::None,
         };
-        assert_eq!(plan.statements.len(), 2);
-        let guard = plan.statements[0].guard.expect("status write is guarded");
+        assert_eq!(plan.statements.len(), 1);
+        let guard = plan.statements[0]
+            .guard
+            .expect("snapshot property write is guarded");
         assert!(guard.holds_for(1));
-        assert_eq!(plan.statements[1].guard, None);
     }
 
     #[test]

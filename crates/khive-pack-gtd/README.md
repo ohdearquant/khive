@@ -22,6 +22,11 @@ unique 8+ character hexadecimal prefix resolves without a namespace filter,
 as required by ADR-007. The task keeps its original namespace attribution;
 authorization remains the Gate's responsibility.
 
+`gtd.complete` accepts every non-terminal lifecycle state, matching the same
+transition table as `gtd.transition`. Successful state changes report
+`audit_persisted`; `false` means the task write committed but the best-effort
+lifecycle-audit append failed.
+
 ## Task lifecycle
 
 The `task` note kind's lifecycle field is `kind_status` (not `status` — that
