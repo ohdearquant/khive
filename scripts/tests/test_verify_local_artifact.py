@@ -916,7 +916,7 @@ class MakefileGateContractTests(unittest.TestCase):
             root = fixture / "workspace"
             root.mkdir()
             (root / "Makefile").write_text(recipe_makefile, encoding="utf-8")
-            if fixture_shape == "git-dir":
+            if fixture_shape in ("git-dir", "real-make"):
                 subprocess.run(
                     ["git", "init", "-q", str(root)],
                     check=True,
@@ -988,7 +988,7 @@ class MakefileGateContractTests(unittest.TestCase):
                 textwrap.dedent(
                     f"""\
                     #!/bin/sh
-                    printf 'called\n' >> "$CODESIGN_RECORD"
+                    printf 'called\\n' >> "$CODESIGN_RECORD"
                     [ {codesign_exit} -ne 0 ] && exit {codesign_exit}
                     for a in "$@"; do target="$a"; done
                     printf '\\n# signed\\n' >> "$target"
@@ -996,6 +996,9 @@ class MakefileGateContractTests(unittest.TestCase):
                     """
                 ),
                 encoding="utf-8",
+            )
+            (root / "scripts" / "build_local_artifact.py").write_text(
+                "raise SystemExit(0)\n", encoding="utf-8"
             )
             for noop in ("pkill", "pgrep"):
                 (stub_bin / noop).write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
@@ -1008,25 +1011,41 @@ class MakefileGateContractTests(unittest.TestCase):
             env["PYTHONDONTWRITEBYTECODE"] = "1"
             env["CODESIGN_RECORD"] = str(codesign_record)
             env["SIGNED_PROBE_RECORD"] = str(signed_probe_record)
+            env.pop("MAKEFLAGS", None)
+            env.pop("MAKELEVEL", None)
 
             rc = 0
             chunks: list[str] = []
             signed_bytes: bytes | None = None
-            for cmd in commands:
+            if fixture_shape == "real-make":
                 proc = subprocess.run(
-                    ["sh", "-c", cmd],
+                    ["make", "-f", "Makefile", "local"],
                     cwd=root,
                     env=env,
                     capture_output=True,
                     text=True,
                 )
                 chunks.append(
-                    f"$ {cmd[:120]}...\n[rc={proc.returncode}]\n"
+                    f"$ make -f Makefile local\n[rc={proc.returncode}]\n"
                     f"{proc.stdout}{proc.stderr}"
                 )
-                rc = proc.returncode
-                if rc != 0:
-                    break
+                rc = 0 if proc.returncode == 0 else 1
+            else:
+                for cmd in commands:
+                    proc = subprocess.run(
+                        ["sh", "-c", cmd],
+                        cwd=root,
+                        env=env,
+                        capture_output=True,
+                        text=True,
+                    )
+                    chunks.append(
+                        f"$ {cmd[:120]}...\n[rc={proc.returncode}]\n"
+                        f"{proc.stdout}{proc.stderr}"
+                    )
+                    rc = proc.returncode
+                    if rc != 0:
+                        break
 
             staged = dest_dir / "kkernel.new"
             installed_bytes = dest.read_bytes() if dest.exists() else None
@@ -1068,6 +1087,24 @@ class MakefileGateContractTests(unittest.TestCase):
             run.signed_probe_invocations,
         )
 
+    def _condition_signed_probe(self, condition: str) -> str:
+        start = self.makefile.index(
+            '\techo "==> Re-verifying the SIGNED artifact'
+        )
+        end = self.makefile.index("\tSIGNED_SHA256=", start)
+        probe = self.makefile[start:end]
+        nested_probe = "".join(
+            f"\t  {line[1:]}" if line.startswith("\t") else line
+            for line in probe.splitlines(keepends=True)
+        )
+        return (
+            self.makefile[:start]
+            + f"\tif {condition}; then \\\n"
+            + nested_probe
+            + "\tfi; \\\n"
+            + self.makefile[end:]
+        )
+
     def _run_local_recipe_variants(
         self,
         *,
@@ -1084,18 +1121,51 @@ class MakefileGateContractTests(unittest.TestCase):
             )
             for shape in ("bare", "git-dir", "git-file")
         }
+        runs["real-make"] = self._run_local_recipe(
+            signed_probe_exit=signed_probe_exit,
+            codesign_exit=codesign_exit,
+            makefile_text=makefile_text,
+            fixture_shape="real-make",
+        )
         bare_behavior = self._verification_behavior(runs["bare"])
-        for shape in ("git-dir", "git-file"):
-            with self.subTest(fixture_shape=shape, check="environment-parity"):
-                self.assertEqual(
-                    self._verification_behavior(runs[shape]),
-                    bare_behavior,
-                    "the local recipe's verification behavior changed with the "
-                    f"checkout environment ({shape})\n"
-                    f"bare run:\n{runs['bare'].output}\n"
-                    f"{shape} run:\n{runs[shape].output}",
-                )
+        for shape in ("git-dir", "git-file", "real-make"):
+            self.assertEqual(
+                self._verification_behavior(runs[shape]),
+                bare_behavior,
+                "the local recipe's verification behavior changed with the "
+                f"checkout environment ({shape})\n"
+                f"bare run:\n{runs['bare'].output}\n"
+                f"{shape} run:\n{runs[shape].output}",
+            )
         return runs
+
+    def test_parity_rejects_git_conditioned_signed_probe(self) -> None:
+        forged = self._condition_signed_probe("[ ! -e .git ]")
+
+        with self.assertRaisesRegex(
+            AssertionError,
+            r"verification behavior changed with the checkout environment \(git-dir\)",
+        ):
+            self._run_local_recipe_variants(
+                signed_probe_exit=1, makefile_text=forged
+            )
+
+    def test_parity_rejects_makelevel_conditioned_signed_probe(self) -> None:
+        forged = self._condition_signed_probe('[ -z "$$MAKELEVEL" ]')
+
+        with self.assertRaisesRegex(
+            AssertionError,
+            r"verification behavior changed with the checkout environment \(real-make\)",
+        ):
+            self._run_local_recipe_variants(
+                signed_probe_exit=1, makefile_text=forged
+            )
+
+    def test_extracted_recipe_ignores_harness_fingerprints(self) -> None:
+        recipe = "\n".join(self._extract_local_recipe(self.makefile))
+
+        self.assertNotIn("CODESIGN_RECORD", recipe)
+        self.assertNotIn("SIGNED_PROBE_RECORD", recipe)
 
     def test_local_dependency_chain_is_build_then_verify_then_install(self) -> None:
         self.assertIn("verify-local-artifact: build-local\n", self.makefile)

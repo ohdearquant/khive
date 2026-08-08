@@ -366,6 +366,7 @@ The local install contract is now build, verify, then install:
 The existing install-copy integrity check remains: the MD5 of the codesigned staging file
 must equal the installed destination after the atomic move. This amendment adds a runtime
 provenance gate before that copy check; it does not replace it.
+Post-`mv` hash drift exits nonzero but is not rolled back because the previous binary has already been replaced.
 
 A zero-downtime daemon cut-over remains outside this amendment. `make local` still replaces
 the installed binary and stops the old daemon after verification so bridges can respawn the
