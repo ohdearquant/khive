@@ -1801,7 +1801,12 @@ pub(crate) enum FreshTailOutcome {
     /// A compaction mismatch forced current-query segment re-resolution. These
     /// candidates already come from one coherent replacement segment plus its
     /// own tail and must replace, never merge with, the caller's stale list.
-    Replace(Vec<(Uuid, f32)>),
+    Replace {
+        candidates: Vec<(Uuid, f32)>,
+        /// Whether the replacement ANN source returned fewer than the
+        /// requested `k` candidates before its own fresh tail was merged.
+        source_exhausted: bool,
+    },
     /// The exact leg could not run; retain the caller's existing candidates.
     Skipped,
 }
@@ -1821,7 +1826,10 @@ pub(crate) async fn fresh_tail_leg(
         // its Ready ownership.  Do not invalidate the authoritative warm now
         // in flight on every concurrent query; dropping this query's captured
         // candidates is sufficient until that warm replaces the cache.
-        return FreshTailOutcome::Replace(Vec::new());
+        return FreshTailOutcome::Replace {
+            candidates: Vec::new(),
+            source_exhausted: true,
+        };
     }
     if !fresh_tail_enabled() {
         return match read_own_watermark(rt, ns, model).await {
@@ -1834,7 +1842,10 @@ pub(crate) async fn fresh_tail_leg(
                     model,
                     "knowledge ANN registry read failed while fresh-tail was disabled"
                 );
-                FreshTailOutcome::Replace(Vec::new())
+                FreshTailOutcome::Replace {
+                    candidates: Vec::new(),
+                    source_exhausted: true,
+                }
             }
         };
     }
@@ -1862,7 +1873,10 @@ async fn force_cold_after_registry_loss(
         );
     }
     clear_namespace(ann, &key.namespace).await;
-    FreshTailOutcome::Replace(Vec::new())
+    FreshTailOutcome::Replace {
+        candidates: Vec::new(),
+        source_exhausted: true,
+    }
 }
 
 fn ready_snapshot_watermark(snapshot: &FreshTailSnapshot) -> Option<u64> {
@@ -1899,7 +1913,10 @@ async fn fresh_tail_serving(
                 model,
                 "knowledge fresh-tail snapshot failed; dropping stale vector leg"
             );
-            return FreshTailOutcome::Replace(Vec::new());
+            return FreshTailOutcome::Replace {
+                candidates: Vec::new(),
+                source_exhausted: true,
+            };
         }
     };
     let Some(_own_watermark) = ready_snapshot_watermark(&snapshot) else {
@@ -1931,11 +1948,10 @@ async fn fresh_tail_serving(
                 // do not mix those operations with candidates from the older
                 // bridge: return an exact-only replacement vector source.
                 clear_namespace(ann, ns).await;
-                return FreshTailOutcome::Replace(merge_fresh_tail(
-                    Vec::new(),
-                    query,
-                    snapshot.ops,
-                ));
+                return FreshTailOutcome::Replace {
+                    candidates: merge_fresh_tail(Vec::new(), query, snapshot.ops),
+                    source_exhausted: true,
+                };
             }
         }
     }
@@ -1971,7 +1987,10 @@ async fn fresh_tail_reresolve(
                 model,
                 "knowledge fresh-tail published segment disappeared during re-resolution"
             );
-            return FreshTailOutcome::Replace(Vec::new());
+            return FreshTailOutcome::Replace {
+                candidates: Vec::new(),
+                source_exhausted: true,
+            };
         };
         let bridge = match AnnBridge::load(&dir) {
             Ok(bridge) => bridge,
@@ -1983,7 +2002,10 @@ async fn fresh_tail_reresolve(
                     model,
                     "knowledge fresh-tail published segment load failed"
                 );
-                return FreshTailOutcome::Replace(Vec::new());
+                return FreshTailOutcome::Replace {
+                    candidates: Vec::new(),
+                    source_exhausted: true,
+                };
             }
         };
         let loaded_watermark = bridge
@@ -1991,6 +2013,7 @@ async fn fresh_tail_reresolve(
             .last_applied_seq()
             .unwrap_or(expected_watermark);
         let candidates = bridge.search(query, k);
+        let source_exhausted = candidates.len() < k;
 
         let snapshot = match fetch_fresh_tail_snapshot(rt, ns, model, loaded_watermark, None).await
         {
@@ -2003,7 +2026,10 @@ async fn fresh_tail_reresolve(
                     model,
                     "knowledge fresh-tail re-resolution snapshot failed"
                 );
-                return FreshTailOutcome::Replace(Vec::new());
+                return FreshTailOutcome::Replace {
+                    candidates: Vec::new(),
+                    source_exhausted: true,
+                };
             }
         };
         let Some(_own_watermark) = ready_snapshot_watermark(&snapshot) else {
@@ -2012,7 +2038,10 @@ async fn fresh_tail_reresolve(
         let registry_min = nonnegative_registry_min(&snapshot);
 
         if registry_min <= loaded_watermark {
-            return FreshTailOutcome::Replace(merge_fresh_tail(candidates, query, snapshot.ops));
+            return FreshTailOutcome::Replace {
+                candidates: merge_fresh_tail(candidates, query, snapshot.ops),
+                source_exhausted,
+            };
         }
 
         if round == FRESH_TAIL_RERESOLVE_MAX_ROUNDS {
@@ -2024,7 +2053,10 @@ async fn fresh_tail_reresolve(
                 floor = registry_min,
                 "knowledge fresh-tail re-resolution did not converge; using exact-only floored suffix"
             );
-            return FreshTailOutcome::Replace(merge_fresh_tail(Vec::new(), query, snapshot.ops));
+            return FreshTailOutcome::Replace {
+                candidates: merge_fresh_tail(Vec::new(), query, snapshot.ops),
+                source_exhausted: true,
+            };
         }
 
         expected_watermark = registry_min;
@@ -3083,7 +3115,11 @@ mod tests {
 
         let outcome = force_cold_after_registry_loss(&rt, &ann, &key).await;
 
-        assert!(matches!(outcome, FreshTailOutcome::Replace(ref hits) if hits.is_empty()));
+        assert!(matches!(
+            outcome,
+            FreshTailOutcome::Replace { ref candidates, source_exhausted: true }
+                if candidates.is_empty()
+        ));
         assert_eq!(
             read_own_watermark(&rt, namespace, model)
                 .await
@@ -3104,7 +3140,11 @@ mod tests {
 
         let outcome = fresh_tail_leg(&rt, &ann, &key, &[1.0], 1, None).await;
 
-        assert!(matches!(outcome, FreshTailOutcome::Replace(ref hits) if hits.is_empty()));
+        assert!(matches!(
+            outcome,
+            FreshTailOutcome::Replace { ref candidates, source_exhausted: true }
+                if candidates.is_empty()
+        ));
         assert!(
             is_warming_not_loaded(&ann, &key),
             "a concurrent degraded query must not invalidate the authoritative warm"
@@ -4649,7 +4689,7 @@ mod tests {
         let generation_before = current_generation(&ann, "local");
         let outcome = fresh_tail_leg(&rt, &ann, &key, &query, 20, Some(old_watermark)).await;
         let replacement_candidates = match outcome {
-            FreshTailOutcome::Replace(candidates) => candidates,
+            FreshTailOutcome::Replace { candidates, .. } => candidates,
             FreshTailOutcome::Ops(_) => {
                 panic!("a compaction mismatch must replace, not extend, stale candidates")
             }
@@ -4732,7 +4772,11 @@ mod tests {
 
         let outcome = fresh_tail_leg(&rt, &ann, &key, &query, 20, Some(stale_watermark)).await;
         assert!(
-            matches!(outcome, FreshTailOutcome::Replace(ref hits) if hits.is_empty()),
+            matches!(
+                outcome,
+                FreshTailOutcome::Replace { ref candidates, source_exhausted: true }
+                    if candidates.is_empty()
+            ),
             "the query that detects registry loss must discard stale candidates"
         );
         assert!(search_loaded_with_seq(&ann, &key, &query, 20)

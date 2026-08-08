@@ -17,6 +17,18 @@ operational pattern (cursor table, secret masking on ingest, cursor
 advances only on success) — NOT a daemon loop, NOT a webhook, NOT a poller:
 one pass per invocation.
 
+When issues or pull requests are requested, capability detection is
+source-bound: `probe_gh_repository` derives the expected `owner/repo` from
+the canonical source or configured `origin`, runs `gh repo view
+<owner/repo> --json nameWithOwner,url`, validates that exact returned identity
+and github.com URL, and every walker then passes it explicitly as `--repo`.
+Argument-less repository selection is never used, so `gh repo set-default`
+cannot redirect a digest. A successful
+`gh --version` is not evidence that the checkout is usable. Probe failures
+set `gh_available=false` and mark each requested remote source `skipped`; a
+commits-only pass does not probe and leaves `gh_available` unset. Public
+reasons are stable and omit both origin URLs and `gh` stderr.
+
 ## `Budget`
 
 Bounds the number of new-record creation attempts across a `run_ingest`
@@ -56,9 +68,10 @@ time:
   window, or a per-record write failure that froze the cursor — the same
   events that force `done = false` / `cursor_stalled`).
 - `skipped` — the source was never walked; `reason` names the cause (budget
-  exhausted before an earlier-ordered source finished, `gh` CLI absent, a
-  `gh` listing failure, or a local cursor/database read failure before remote
-  listing). A gate refusal therefore never terminates the walk:
+  exhausted before an earlier-ordered source finished, the source-bound `gh`
+  probe could not resolve an authenticated GitHub repository, a `gh` listing
+  failure, or a local cursor/database read failure before remote listing). A
+  gate refusal therefore never terminates the walk:
   it is recorded on the source and the pass continues to the remaining
   sources.
 
@@ -74,6 +87,19 @@ Budget exhaustion and cursor stalls continue to force `done` to `false`; a
 first-fetch remote failure or a pre-listing local cursor read failure does not,
 because no source walk consumed the budget. Consumers using `done` as a resume
 signal must handle these newly reported false values.
+
+## Durable `git.digest` receipt
+
+`run_ingest` itself returns an `IngestReport` without a receipt because it is
+also used by the administrative CLI. When invoked through `git.digest`, the
+runtime dispatch seam adds `receipt_id` only after the complete serialized
+report has been durably stored in a schema-v2 audit event. The event id and
+`receipt_id` are identical, its target is `project_id`, and its
+`payload.result` is the exact caller-visible report. `git.digest` is
+`AlwaysVerbose`, so default MCP Agent presentation cannot shorten the receipt
+UUID or otherwise make the returned result differ from the stored result. See
+ADR-088 Amendment 1's 2026-08-07 operational rider for bounded,
+namespace-aware query/recovery and failure semantics.
 
 Two edge semantics, stated explicitly:
 
@@ -245,11 +271,13 @@ and go through the same `mask_secrets` gate `content` already used —
 closing the gap where the commit note `name` (built from the raw subject)
 and its `author`/`author_email` properties skipped masking entirely.
 
-For `MaskedPrFields`: `number`, the four timestamp fields, and
+For `MaskedPrFields`: `number`, `created_at`, `merged_at`, `closed_at`, and
 `merge_commit`'s `oid` are GitHub-generated (not attacker-authored free
-text) and pass through unchanged. `title`, `body`, the author login, and
-both ref names are contributor-controlled prose and go through the same
-`mask_secrets` gate.
+text) and pass through unchanged. `updated_at` is special because it crosses
+the paging cursor/argv boundary: it is parsed and canonicalized before page
+sorting, and an invalid value is dropped with a value-free warning. `title`,
+`body`, the author login, and both ref names are contributor-controlled prose
+and go through the same `mask_secrets` gate.
 
 `StateReasonField` is the classified outcome of parsing a raw `stateReason`
 string against the governed enum (`hook::ISSUE_STATE_REASONS`, ADR-088 §3)
@@ -322,16 +350,18 @@ exactly the tie reason: a successful and a failing record sharing one
 `updated_at` must both be re-examined next pass until the cursor moves past
 that tie.
 
-In `ingest_issues`, the entire fetched page is classified (masked strings,
-canonicalized timestamps, governed-enum `state_reason`) before anything
-else — including the sort and the paging cursor derivation — touches it. A
-raw `GhIssue.updated_at` must never reach the sort comparator,
+In both `ingest_issues` and `ingest_prs`, the entire fetched page is
+classified before anything else—including the sort and paging-cursor
+derivation—touches it. A raw `GhIssue.updated_at` or `GhPr.updated_at` must
+never reach the sort comparator,
 `last_updated_at`, or (via `decide_page_outcome`'s `Continue`) a future `gh
 --search updated:>=` argument (a credential-shaped `updatedAt` could
 otherwise sort last and leak into process arguments through the paging
-floor). An ungoverned `stateReason` is rejected before the record is ever
-built or dispatched — the warning names only the field, never the raw
-(possibly credential-shaped) value, matching ADR-088's
+floor). Issues additionally classify masked strings, every timestamp, and
+the governed-enum `state_reason`; PRs canonicalize the cursor-bearing
+`updated_at` and mask their prose fields. An ungoverned `stateReason` is
+rejected before the issue is ever built or dispatched—the warning names only
+the field, never the raw (possibly credential-shaped) value, matching ADR-088's
 fail-closed/no-silent-coercion contract.
 
 Reported `done = false` whenever the remote window is not proven complete

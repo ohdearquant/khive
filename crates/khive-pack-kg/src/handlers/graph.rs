@@ -19,6 +19,13 @@ use crate::KgPack;
 #[derive(Serialize)]
 struct NeighborHitResponse {
     origin_id: Uuid,
+    /// Stored endpoints of the edge behind this hit. `None` (serialized as
+    /// `null`) means the edge could not be read back, not that the edge runs
+    /// between nil nodes: the whole point of these fields is to convey stored
+    /// direction, so an unknown direction must be distinguishable from a
+    /// known one rather than being reported as a pair of nil UUIDs.
+    source_id: Option<Uuid>,
+    target_id: Option<Uuid>,
     #[serde(flatten)]
     hit: NeighborHit,
 }
@@ -61,15 +68,29 @@ impl KgPack {
                 hit.entity_type = None;
             }
         }
-        to_json(
-            &hits
-                .into_iter()
-                .map(|hit| NeighborHitResponse {
-                    origin_id: node_id,
-                    hit,
-                })
-                .collect::<Vec<_>>(),
-        )
+        // #1670: the SQL neighbor query aliases one edge endpoint to `node_id`
+        // and discards the other, so the stored source/target must be
+        // recovered with a per-hit edge read. This is one read per hit (N+1);
+        // `limit` is optional, so the read count is capped only when the
+        // caller supplies one. An edge deleted between the two reads reports
+        // `null` endpoints rather than failing the whole response; it must not
+        // report nil UUIDs, which would be indistinguishable from a real
+        // direction and would defeat the purpose of the fields.
+        let mut responses = Vec::with_capacity(hits.len());
+        for hit in hits {
+            let endpoints = self
+                .runtime
+                .get_edge(token, hit.edge_id)
+                .await?
+                .map(|e| (e.source_id, e.target_id));
+            responses.push(NeighborHitResponse {
+                origin_id: node_id,
+                source_id: endpoints.map(|(source, _)| source),
+                target_id: endpoints.map(|(_, target)| target),
+                hit,
+            });
+        }
+        to_json(&responses)
     }
 
     pub(crate) async fn handle_traverse(
@@ -147,8 +168,22 @@ impl KgPack {
         params: Value,
     ) -> Result<Value, RuntimeError> {
         let p: QueryParams = deser(params)?;
+        let requested_page_size = match (p.page_size, p.limit) {
+            (Some(_), Some(_)) => {
+                return Err(RuntimeError::InvalidInput(
+                    "query accepts either `page_size` or deprecated `limit`, not both".into(),
+                ));
+            }
+            (Some(page_size), None) | (None, Some(page_size)) => page_size,
+            (None, None) => 500,
+        };
+        if requested_page_size == 0 {
+            return Err(RuntimeError::InvalidInput(
+                "query page_size must be at least 1".into(),
+            ));
+        }
         let opts = khive_query::CompileOptions {
-            max_limit: p.limit.unwrap_or(500).min(HARD_CAP),
+            max_limit: requested_page_size.min(HARD_CAP),
             ..Default::default()
         };
         let result = self
@@ -156,5 +191,220 @@ impl KgPack {
             .query_with_metadata(token, &p.query, opts)
             .await?;
         Ok(render_query_result(result))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use khive_runtime::pack::PackRuntime;
+    use khive_runtime::{KhiveRuntime, Namespace, VerbRegistryBuilder};
+    use khive_types::EdgeRelation;
+    use serde_json::json;
+
+    use super::*;
+
+    /// Regression for #1670: `neighbors` response must carry the edge's
+    /// stored `source_id`/`target_id`, independent of `direction` and
+    /// `origin_id` (which always echoes the queried node). Without the
+    /// `graph.rs` fix, `NeighborHitResponse` serializes only `origin_id` +
+    /// the flattened `NeighborHit` — `source_id`/`target_id` are absent.
+    #[tokio::test]
+    async fn neighbors_stored_direction() {
+        let rt = KhiveRuntime::memory().expect("in-memory runtime must succeed");
+        let token = rt.authorize(Namespace::local()).expect("authorize");
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(KgPack::new(rt.clone()));
+        let registry = builder.build().expect("registry build");
+        let pack = KgPack::new(rt);
+
+        let src = pack
+            .dispatch(
+                "create",
+                json!({"kind": "entity", "name": "Src1670", "entity_kind": "concept"}),
+                &registry,
+                &token,
+            )
+            .await
+            .expect("create source must succeed");
+        let tgt = pack
+            .dispatch(
+                "create",
+                json!({"kind": "entity", "name": "Tgt1670", "entity_kind": "concept"}),
+                &registry,
+                &token,
+            )
+            .await
+            .expect("create target must succeed");
+        let src_id = src["id"].as_str().expect("src id").to_string();
+        let tgt_id = tgt["id"].as_str().expect("tgt id").to_string();
+
+        pack.dispatch(
+            "link",
+            json!({"source_id": src_id, "target_id": tgt_id, "relation": "contains", "weight": 1.0}),
+            &registry,
+            &token,
+        )
+        .await
+        .expect("link must succeed");
+
+        // Querying from src with direction=out: origin_id == src. The
+        // stored edge direction is unaffected by the query direction.
+        let out = pack
+            .dispatch(
+                "neighbors",
+                json!({"id": src_id, "direction": "out"}),
+                &registry,
+                &token,
+            )
+            .await
+            .expect("neighbors out must succeed");
+        let out_arr = out.as_array().expect("neighbors out returns array");
+        let out_hit = out_arr
+            .iter()
+            .find(|h| h.get("id").and_then(Value::as_str) == Some(tgt_id.as_str()))
+            .expect("must find tgt in outbound neighbors");
+        assert_eq!(
+            out_hit.get("source_id").and_then(Value::as_str),
+            Some(src_id.as_str()),
+            "source_id must be the edge's stored source; hit={out_hit}"
+        );
+        assert_eq!(
+            out_hit.get("target_id").and_then(Value::as_str),
+            Some(tgt_id.as_str()),
+            "target_id must be the edge's stored target; hit={out_hit}"
+        );
+        assert_eq!(
+            out_hit.get("origin_id").and_then(Value::as_str),
+            Some(src_id.as_str()),
+            "origin_id must echo the queried node"
+        );
+
+        // Querying from tgt with direction=in: origin_id == tgt, but the
+        // stored edge direction (source == src, target == tgt) must not flip.
+        let incoming = pack
+            .dispatch(
+                "neighbors",
+                json!({"id": tgt_id, "direction": "in"}),
+                &registry,
+                &token,
+            )
+            .await
+            .expect("neighbors in must succeed");
+        let in_arr = incoming.as_array().expect("neighbors in returns array");
+        let in_hit = in_arr
+            .iter()
+            .find(|h| h.get("id").and_then(Value::as_str) == Some(src_id.as_str()))
+            .expect("must find src in inbound neighbors");
+        assert_eq!(
+            in_hit.get("source_id").and_then(Value::as_str),
+            Some(src_id.as_str()),
+            "source_id must be the edge's stored source regardless of query direction; hit={in_hit}"
+        );
+        assert_eq!(
+            in_hit.get("target_id").and_then(Value::as_str),
+            Some(tgt_id.as_str()),
+            "target_id must be the edge's stored target regardless of query direction; hit={in_hit}"
+        );
+        assert_eq!(
+            in_hit.get("origin_id").and_then(Value::as_str),
+            Some(tgt_id.as_str()),
+            "origin_id must echo the queried node, not the stored source"
+        );
+
+        // Omitted direction defaults to `both`, which the storage layer serves
+        // through separate UNION ALL SQL rather than the single-direction
+        // query, so it needs its own coverage: the stored endpoints must be
+        // identical whichever side of the edge the query originates from.
+        for (queried, expected_neighbor) in [(&src_id, &tgt_id), (&tgt_id, &src_id)] {
+            let both = pack
+                .dispatch("neighbors", json!({"id": queried}), &registry, &token)
+                .await
+                .expect("neighbors with omitted direction must succeed");
+            let both_arr = both.as_array().expect("neighbors both returns array");
+            let hit = both_arr
+                .iter()
+                .find(|h| h.get("id").and_then(Value::as_str) == Some(expected_neighbor.as_str()))
+                .expect("must find the opposite endpoint under default direction");
+            assert_eq!(
+                hit.get("source_id").and_then(Value::as_str),
+                Some(src_id.as_str()),
+                "default-direction hit must carry the stored source; queried={queried} hit={hit}"
+            );
+            assert_eq!(
+                hit.get("target_id").and_then(Value::as_str),
+                Some(tgt_id.as_str()),
+                "default-direction hit must carry the stored target; queried={queried} hit={hit}"
+            );
+            assert_eq!(
+                hit.get("origin_id").and_then(Value::as_str),
+                Some(queried.as_str()),
+                "origin_id must echo the queried node under default direction"
+            );
+        }
+    }
+
+    /// Pins the encoding for an edge that could not be read back.
+    ///
+    /// The neighbor query and the per-hit edge read are two separate reads, so
+    /// an edge deleted between them leaves the endpoints unknown. Reporting a
+    /// pair of nil UUIDs there would be a value-shaped absence: syntactically a
+    /// direction, semantically false, and indistinguishable from a real edge
+    /// between nil nodes. Since the entire purpose of these fields is to convey
+    /// the STORED direction, an unknown direction has to stay distinguishable
+    /// from a known one.
+    ///
+    /// This asserts the wire format rather than the race: it fails if the
+    /// unknown case is ever encoded as `Uuid::nil()` again.
+    #[test]
+    fn unresolvable_edge_endpoints_serialize_as_null_never_nil_uuids() {
+        let response = NeighborHitResponse {
+            origin_id: Uuid::from_u128(1),
+            source_id: None,
+            target_id: None,
+            hit: NeighborHit {
+                node_id: Uuid::from_u128(2),
+                edge_id: Uuid::from_u128(3),
+                relation: EdgeRelation::Contains,
+                weight: 1.0,
+                name: None,
+                kind: None,
+                entity_type: None,
+            },
+        };
+
+        let encoded = serde_json::to_value(&response).expect("serialize");
+        assert_eq!(
+            encoded.get("source_id"),
+            Some(&Value::Null),
+            "an unreadable edge must report a null source_id; encoded={encoded}"
+        );
+        assert_eq!(
+            encoded.get("target_id"),
+            Some(&Value::Null),
+            "an unreadable edge must report a null target_id; encoded={encoded}"
+        );
+
+        let nil = Uuid::nil().to_string();
+        assert_ne!(
+            encoded.get("source_id").and_then(Value::as_str),
+            Some(nil.as_str()),
+            "the unknown case must not be encoded as the nil UUID: a consumer \
+             cannot tell that apart from a stored direction"
+        );
+
+        // Control: a KNOWN direction still serializes as the plain id, so the
+        // assertions above are about the unknown case and not about the field
+        // disappearing from the response altogether.
+        let known = NeighborHitResponse {
+            source_id: Some(Uuid::from_u128(7)),
+            target_id: Some(Uuid::from_u128(8)),
+            ..response
+        };
+        let encoded = serde_json::to_value(&known).expect("serialize");
+        assert_eq!(
+            encoded.get("source_id").and_then(Value::as_str),
+            Some(Uuid::from_u128(7).to_string().as_str()),
+            "a known source must still serialize as its id; encoded={encoded}"
+        );
     }
 }

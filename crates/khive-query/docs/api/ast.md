@@ -4,7 +4,7 @@ The query AST is the shared contract between the GQL and SPARQL parsers, validat
 
 ## `GqlQuery`
 
-`GqlQuery` contains one alternating `MatchPattern`, a `WhereExpr`, ordered `ReturnItem` projections, and an optional row limit. Parsers produce this form; callers that construct it directly must still pass it through `validate` or `compile`, which repeats the structural validation.
+`GqlQuery` contains one alternating `MatchPattern`, a `WhereExpr`, ordered `ReturnItem` projections, a non-negative row `offset`, and an optional row limit. GQL `SKIP` populates `offset`; the SPARQL parser leaves it at zero because its `OFFSET` form is not supported. Parsers produce this form; callers that construct it directly must still pass it through `validate` or `compile`, which repeats the structural validation.
 
 ## `MatchPattern` and `PatternElement`
 

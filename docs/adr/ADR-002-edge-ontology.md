@@ -321,11 +321,18 @@ reachable when every edge row has two live entity endpoints: `stats()` counts ra
 edge rows, while entity-pattern matching excludes edges with soft-deleted or
 note-substrate endpoints, so a residual short of `stats()` is expected on relations
 carrying such rows and must be diagnosed (fetch the residual edge ids, inspect their
-endpoints) rather than assumed benign. Second, `list`-verb offset pagination is not a
-sound enumeration substitute: page ordering is non-deterministic, so paged sweeps both
-duplicate and miss rows (issue #1671). The edge list surface also carries a keyset
-cursor (`after`/`next_after`) that reads raw edge rows — substrate-blind, so it covers
-the note-endpoint and soft-deleted-endpoint edges the entity pattern misses. Where a
+endpoints) rather than assumed benign. Second, `list`-verb offset pagination
+(2026-08-07 amendment, issue #1671) now gives every store's default list order a
+deterministic `(created_at, id)` total order — equal-`created_at` rows tiebreak on `id`
+in a fixed direction — so a sweep over a table with no concurrent writes returns each
+row exactly once, no duplicates or misses. That total order does not make offset
+pagination a sound enumeration substitute under concurrent change, though: offset counts
+positions in a result set that can shift while the sweep is in flight, so a sweep that
+spans a concurrent insert, delete, or sort-key update to the paged rows can still
+duplicate or skip rows. For a census that must be sound under concurrent writes, use the
+keyset-cursor path below, not offset pagination. The edge list surface also carries a
+keyset cursor (`after`/`next_after`) that reads raw edge rows — substrate-blind, so it
+covers the note-endpoint and soft-deleted-endpoint edges the entity pattern misses. Where a
 deployment supports it end-to-end, per-relation cursor traversal (until the cursor is
 exhausted) followed by client-side pairing is the preferred MCP census path. Measured
 caveats on the reference deployment: traversal fails loudly on edges created before the

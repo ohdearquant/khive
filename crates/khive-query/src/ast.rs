@@ -14,12 +14,16 @@ pub enum QueryValue {
     Blob(Vec<u8>),
 }
 
-/// A parsed query: pattern, predicates, projections, and optional row limit.
+/// A parsed query: pattern, predicates, projections, row offset, and optional row limit.
 #[derive(Debug, Clone)]
 pub struct GqlQuery {
     pub pattern: MatchPattern,
     pub where_clause: WhereExpr,
     pub return_items: Vec<ReturnItem>,
+    /// Number of deterministically ordered matches to skip before returning rows.
+    ///
+    /// GQL supplies this through `SKIP`; SPARQL currently always sets it to zero.
+    pub offset: usize,
     pub limit: Option<usize>,
 }
 
@@ -188,6 +192,7 @@ pub enum CompareOp {
     StartsWith,
     In,
     IsNotNull,
+    IsNull,
 }
 
 /// A typed condition value; integer and decimal forms remain distinct.

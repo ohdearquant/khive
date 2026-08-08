@@ -498,9 +498,11 @@ impl SqlGraphStore {
         is_file_backed: bool,
         namespace: impl Into<String>,
     ) -> Self {
-        // Best-effort opt-in (ADR-067 Component A, mirrors entity.rs slice 1
-        // policy): a missing writer task degrades to the legacy pool-mutex /
-        // standalone-connection path rather than failing construction.
+        // Enabled by default for file-backed pools; explicit off/degraded
+        // fallback remains possible (ADR-067 Component A, mirrors
+        // entity.rs policy): a missing writer task degrades to the legacy
+        // pool-mutex / standalone-connection path rather than failing
+        // construction.
         let writer_task = pool.writer_task_handle().ok().flatten();
 
         Self {
@@ -535,7 +537,7 @@ impl SqlGraphStore {
     {
         if let Some(writer_task) = &self.writer_task {
             return writer_task
-                .send(move |conn| f(conn).map_err(|e| map_err(e, op)))
+                .send_bounded(move |conn| f(conn).map_err(|e| map_err(e, op)))
                 .await;
         }
 
@@ -1292,14 +1294,14 @@ impl GraphStore for SqlGraphStore {
         // SQLite's nested-transaction rule).
         if let Some(writer_task) = &self.writer_task {
             return writer_task
-                .send(move |conn| {
+                .send_bounded(move |conn| {
                     batch_upsert_edges(conn, &edges, attempted)
                         .map_err(|e| map_err(e, "upsert_edges"))
                 })
                 .await;
         }
 
-        // Flag-off (default) path: byte-for-byte unchanged from pre-ADR-067
+        // Explicitly disabled or degraded fallback path: byte-for-byte unchanged from pre-ADR-067
         // behavior — the closure owns its own BEGIN IMMEDIATE/COMMIT/ROLLBACK
         // via the pool-mutex/standalone writer.
         let origin = self.pool.origin();
@@ -1352,7 +1354,7 @@ impl GraphStore for SqlGraphStore {
         // violate SQLite's nested-transaction rule.
         if let Some(writer_task) = &self.writer_task {
             return writer_task
-                .send(move |conn| {
+                .send_bounded(move |conn| {
                     edge_insert_guarded(conn, &statement, source_id, target_id)
                         .map_err(|e| map_err(e, "upsert_edge_guarded"))
                 })
@@ -1400,7 +1402,7 @@ impl GraphStore for SqlGraphStore {
         // endpoint is caught before any `INSERT` in this batch runs at all.
         if let Some(writer_task) = &self.writer_task {
             return writer_task
-                .send(move |conn| {
+                .send_bounded(move |conn| {
                     batch_upsert_edges_guarded(conn, &edges, attempted)
                         .map_err(|e| map_err(e, "upsert_edges_guarded"))
                 })
@@ -1865,9 +1867,16 @@ impl GraphStore for SqlGraphStore {
             };
 
             let order_clause = if sort.is_empty() {
-                " ORDER BY created_at DESC".to_string()
+                // #1671: append `id` as the final tiebreak in the same DESC
+                // direction as the `created_at` primary sort key, giving a
+                // deterministic total order. That removes tie-order
+                // instability only — offset paging can still duplicate or
+                // skip rows under concurrent inserts/deletes or sort-key
+                // updates (that would need snapshot isolation or keyset
+                // pagination).
+                " ORDER BY created_at DESC, id DESC".to_string()
             } else {
-                let parts: Vec<String> = sort
+                let mut parts: Vec<String> = sort
                     .iter()
                     .map(|s| {
                         let dir = match s.direction {
@@ -1877,6 +1886,15 @@ impl GraphStore for SqlGraphStore {
                         format!("{} {}", edge_sort_col(&s.field), dir)
                     })
                     .collect();
+                // #1671: the appended `id` tiebreak follows the LAST sort
+                // field's direction (the behavior the multi-field sweep tests
+                // codify), so pages over equal sort values stay a
+                // deterministic total order.
+                let dir = match sort.last().map(|s| &s.direction) {
+                    Some(SortDirection::Asc) => "ASC",
+                    _ => "DESC",
+                };
+                parts.push(format!("id {dir}"));
                 format!(" ORDER BY {}", parts.join(", "))
             };
 

@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Deterministic GQL `SKIP` paging with structured `has_more`/`next_offset`
+  continuation metadata for result sets beyond the query page bound (#1601).
 - `comm.mark_read(ids=[...], atomic=false)` as the canonical bulk mark-read
   surface, with an opt-in all-or-nothing transaction and the released
   `comm.read(id|ids)` forms retained for compatibility. This closes #1387's

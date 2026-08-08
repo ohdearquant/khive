@@ -58,6 +58,36 @@ $$
 \mathrm{RRF}(d) = \sum_{r \in \text{rankers}} \frac{1}{k + \mathrm{rank}_r(d)}
 $$
 
+### Candidate Admission and Degradation
+
+The FTS leg is a recall stage, not the final ranker. It ORs the de-duplicated non-stop query
+terms, including the scorer's singular/plural expansions, so candidates with matching terms
+separated in their text remain eligible for in-memory TF-IDF scoring. FTS candidates are ordered
+by BM25, with slug as a deterministic tie-break. Deletion, status, and atom/domain kind
+eligibility are applied in SQL before the bounded candidate-window `LIMIT`; ineligible rows
+therefore cannot consume the window and hide eligible rows beyond it. The bounded full-scan
+fallback applies the same pre-limit eligibility rules. Status precedence is resolved once for
+candidate admission and final scoring: an explicit `exclude_status` excludes exactly that status,
+so `deprecated` remains eligible unless the resolved policy excludes it; default and
+`include_drafts=true` searches continue to exclude deprecated rows.
+
+ANN-only candidates are hydrated from the canonical atom/domain tables before eligibility or RRF
+admission. If deletion, status, or kind filtering consumes the initial ANN top-k, retrieval widens
+the deterministic ANN prefix until the eligible target is filled or the vector corpus is
+exhausted. Exhaustion is measured on the ANN prefix before fresh-tail deletes are merged, and a
+live vector-store count is not used as a hard serving-bridge bound, so a newly deleted leading
+candidate cannot make a full prefix look exhausted. Ineligible candidates therefore neither
+consume returned slots nor distort eligible RRF ranks. Hydration queries are chunked below
+SQLite's portable bind-variable ceiling. A stale id
+or storage-read failure degrades the candidate pool but does not discard a valid lexical response.
+Unresolved shells are never returned, and a partial response reports the number under
+`degraded.hydration_failures`. The field is omitted when the count is zero. This diagnostic
+composes with `knowledge.suggest`'s existing ANN-unavailable degradation object and is propagated
+through auto-`knowledge.compose` when its internal suggestion is degraded.
+
+Eligibility refill does not override caller-requested score semantics: `min_score` is reapplied
+after status multipliers, so a genuine score-floor rejection may still return fewer than `limit`.
+
 ## Fold (`knowledge.fold`)
 
 Uses a greedy knapsack selector from `khive-fold`. Candidates are sorted by

@@ -3,11 +3,12 @@
 use std::path::PathBuf;
 
 use clap::Subcommand;
+use khive_changeset::Envelope;
 use serde::Serialize;
 
 // ── Subcommand tree ────────────────────────────────────────────────────────────
 
-/// Subcommands for `kkernel kg` — KG validation, sync, import/export, and hook management.
+/// Subcommands for `kkernel kg` — KG validation/review, sync, import/export, and hooks.
 #[derive(Subcommand, Debug)]
 pub enum KgCommand {
     /// Validate the KG in `.khive/kg/` against structural and rule-pass checks.
@@ -38,6 +39,9 @@ pub enum KgCommand {
 
     /// Validate and commit a staged tier-2 change-set (ADR-102 Amendment to ADR-020).
     Commit(CommitArgs),
+
+    /// Review a staged change-set without applying or committing it (ADR-145).
+    Review(ReviewArgs),
 }
 
 /// CLI arguments for `kkernel kg validate`.
@@ -239,6 +243,30 @@ pub struct CommitArgs {
     pub format: OutputFormat,
 }
 
+/// CLI arguments for `kkernel kg review`.
+///
+/// This is the read-only, npm-routed review slice from ADR-145 D8. It parses
+/// the strict ADR-101 change-set, runs the same partial-view rule pass as
+/// `kg commit`, and evaluates the ADR-102 tier/reviewer floor. It deliberately
+/// accepts no repository, database, apply, commit, or publish arguments.
+#[derive(clap::Parser, Debug)]
+pub struct ReviewArgs {
+    /// Path to the staged ADR-101 NDJSON-delta change-set.
+    pub changeset: PathBuf,
+
+    /// Explicit TOML rules file used by the commit-time partial-view rule pass.
+    #[arg(long)]
+    pub rules: PathBuf,
+
+    /// Opaque reviewer model-family token used by the ADR-102 Tier-2 gate.
+    #[arg(long)]
+    pub reviewer_model_family: Option<String>,
+
+    /// Output format for the versioned review report.
+    #[arg(long, default_value = "text")]
+    pub format: OutputFormat,
+}
+
 /// Result of a successful `kkernel kg commit` run.
 #[derive(Debug, Serialize)]
 pub struct CommitReport {
@@ -253,6 +281,106 @@ pub struct CommitReport {
     /// Value carried as the `Change-Set-Producer-Batch` trailer (see
     /// `kg::commit` module docs for how it is derived from the envelope).
     pub producer_batch: String,
+}
+
+/// Stable read-only report emitted by `kkernel kg review` (ADR-145 D4/D8).
+#[derive(Debug, Serialize)]
+pub struct ReviewReport {
+    pub schema_version: &'static str,
+    pub review_kind: &'static str,
+    pub capability: ReviewCapability,
+    pub change_set: ReviewChangeSet,
+    pub tier_summary: ReviewTierSummary,
+    pub validation: ReviewValidationSummary,
+    pub findings: Vec<ReviewFinding>,
+    pub review_gate: ReviewGate,
+}
+
+/// Provenance envelope and ordered operation summaries for the reviewed batch.
+#[derive(Debug, Serialize)]
+pub struct ReviewChangeSet {
+    pub envelope: Envelope,
+    pub operations: Vec<ReviewOperation>,
+}
+
+/// One ADR-101 operation in source order with its ADR-102 floor classification.
+#[derive(Debug, Serialize)]
+pub struct ReviewOperation {
+    pub index: usize,
+    pub id: String,
+    pub op: String,
+    pub target: String,
+    pub tier: String,
+    pub summary: String,
+    pub reason: String,
+    pub tier_reasons: Vec<String>,
+    pub entity_ids: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub before: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub after: Option<serde_json::Value>,
+}
+
+/// Aggregate tier counts for the ordered operation list.
+#[derive(Debug, Serialize)]
+pub struct ReviewTierSummary {
+    pub operations: usize,
+    pub tier_1: usize,
+    pub tier_2: usize,
+    pub highest_tier: String,
+    pub requires_independent_review: bool,
+    pub policy: &'static str,
+}
+
+/// A deterministic, flattened validation finding.
+#[derive(Debug, Serialize)]
+pub struct ReviewFinding {
+    pub rule_id: String,
+    pub severity: String,
+    pub message: String,
+    pub subject_id: Option<String>,
+    pub subject_name: Option<String>,
+    pub subject_kind: Option<String>,
+    pub fixable: bool,
+}
+
+/// Aggregate state for the reused commit-time partial-view rule pass.
+#[derive(Debug, Serialize)]
+pub struct ReviewValidationSummary {
+    pub scope: &'static str,
+    pub rules_evaluated: usize,
+    pub failed_rules: usize,
+    pub errors: usize,
+    pub warnings: usize,
+    pub info: usize,
+    pub passed: bool,
+}
+
+/// ADR-102 independent-review routing result.
+#[derive(Debug, Serialize)]
+pub struct ReviewGate {
+    pub required: bool,
+    pub producer_model_family: String,
+    pub reviewer_model_family: Option<String>,
+    pub eligible: bool,
+    pub approval_ready: bool,
+    pub status: String,
+    pub reason: String,
+    pub persisted: bool,
+}
+
+/// Explicit capability declaration for the initial local review slice.
+#[derive(Debug, Serialize)]
+pub struct ReviewCapability {
+    pub source: &'static str,
+    pub mutability: &'static str,
+    pub no_writes: bool,
+    pub git_reads: bool,
+    pub khive_reads: bool,
+    pub github_writes: bool,
+    pub wasm: bool,
+    pub persistence: bool,
+    pub unavailable_actions: [&'static str; 5],
 }
 
 /// Subcommands for `kkernel kg hook` — install, remove, and check the pre-commit hook.

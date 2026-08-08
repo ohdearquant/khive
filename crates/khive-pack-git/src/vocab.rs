@@ -80,7 +80,8 @@ pub(crate) static GIT_HANDLERS: [HandlerDef; 4] = [
         description: "Ingest commit/issue/pull_request provenance from a local git repo path or \
                        an https:// URL into the graph. Bounded and cursor-resumable: call \
                        repeatedly until the response's `done` field is true. Check \
-                       `writes_refused` is zero before treating a completed pass as clean.",
+                       `writes_refused` is zero before treating a completed pass as clean. Every \
+                       successful response includes a durable audit-event `receipt_id`.",
         visibility: Visibility::Verb,
         category: VerbCategory::Commissive,
         params: &[

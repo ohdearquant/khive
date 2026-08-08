@@ -19,6 +19,7 @@ use khive_storage::types::{SqlStatement, SqlValue};
 
 use crate::hook;
 use crate::refs;
+use crate::source::remote_url_to_slug;
 
 /// Which record kinds a `run_ingest` pass processes. `Default` selects all
 /// three — the CLI's historical behavior and the `git.digest` verb's default
@@ -45,6 +46,12 @@ impl Default for IngestInclude {
 pub struct IngestOptions {
     /// Local path to the git repository to walk.
     pub repo: PathBuf,
+    /// Expected GitHub `owner/repo` derived from the caller's canonical
+    /// remote source. Local-path and administrative callers leave this
+    /// unset, and the ingest core derives the same identity from the
+    /// checkout's configured `origin`. The value is an identity constraint,
+    /// never a capability hint: `gh` is always invoked with it explicitly.
+    pub expected_github_repo: Option<String>,
     /// The repo-anchor `project` entity — full UUID or an 8+ hex prefix.
     pub project: String,
     /// Bounded work per call, counted across commits + issues + PRs
@@ -61,6 +68,7 @@ impl IngestOptions {
     pub fn unbounded(repo: PathBuf, project: String) -> Self {
         Self {
             repo,
+            expected_github_repo: None,
             project,
             max_items: None,
             include: IngestInclude::default(),
@@ -129,14 +137,11 @@ pub enum IngestSourceState {
     StoppedEarly(String),
     /// The source was never walked this pass. The reason names the cause:
     /// the budget was already exhausted before the source was reached, or
-    /// the `gh` CLI was unusable — absent from PATH (a repo whose remote is
-    /// not github.com takes this same arm: `gh_available` probes only
-    /// `gh --version`, so such a repo skips only when `gh` is absent, and
-    /// when `gh` IS present it takes the walker-failure path, whose reason
-    /// carries `gh`'s own stderr) — or `gh` itself failed before the walk
-    /// began. A local cursor/database read failure before remote listing is
-    /// also `Skipped`, with a distinct local-failure reason. A failure after
-    /// the walk began is `StoppedEarly`, never `Skipped`.
+    /// the source-bound `gh repo view` probe could not resolve an authenticated
+    /// GitHub repository for this checkout, or `gh` itself failed before the
+    /// walk began. A local cursor/database read failure before remote listing
+    /// is also `Skipped`, with a distinct local-failure reason. A failure
+    /// after the walk began is `StoppedEarly`, never `Skipped`.
     Skipped(String),
 }
 
@@ -155,15 +160,23 @@ pub struct IngestSourceStatus {
 /// Outcome of one ingest pass. Serializable so CLI callers can emit it as JSON.
 #[derive(Debug, Default, Serialize)]
 pub struct IngestReport {
+    /// Durable audit-event receipt for this exact successful `git.digest`
+    /// response. The runtime dispatch seam fills this after the ingest report
+    /// has been serialized and before returning it to the caller; direct
+    /// `run_ingest` users do not receive a receipt.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub receipt_id: Option<String>,
     pub commits_ingested: u64,
     pub commits_skipped_existing: u64,
     pub issues_ingested: u64,
     pub issues_skipped_existing: u64,
     pub prs_ingested: u64,
     pub prs_skipped_existing: u64,
-    /// `Some(false)` when the `gh` CLI probe ran and gh was unusable —
-    /// issues/PRs were skipped but commits still ingested (ADR-088 §5
-    /// graceful-absence rule). `Some(true)` when the probe succeeded. `None`
+    /// `Some(false)` when the source-bound `gh repo view` probe ran but could
+    /// not resolve an authenticated GitHub repository — issues/PRs were
+    /// skipped but commits still ingested (ADR-088 §5 graceful-absence rule).
+    /// `Some(true)` only when that probe returned a usable `owner/repo`, which
+    /// is then passed explicitly to every `gh ... list --repo` call. `None`
     /// when this pass never probed: the probe runs only when `include`
     /// requests issues or pull requests, and a commits-only pass says nothing
     /// about `gh` either way (issue #1645).
@@ -377,12 +390,14 @@ pub(crate) async fn run_ingest_with_commit_recovery(
     let mut gh_walk_failed_after_walk = false;
 
     // Graceful degradation covers both "gh is not on PATH" and "gh is present
-    // but this repo has no usable GitHub remote" (e.g. a synthetic/local-only
-    // repo) — either way, issues/PRs are skipped with a warning and commits
-    // still ingest (ADR-088 §5). A hard `gh` failure must never abort the
-    // whole pass.
+    // but cannot resolve an authenticated GitHub repository for this checkout"
+    // (e.g. a non-GitHub or local-only repo). Either way, requested issues/PRs
+    // are skipped with a structured reason and commits still ingest (ADR-088
+    // §5). The successful probe returns the exact owner/repo later passed via
+    // `--repo`, so PATH presence is never mistaken for remote usability.
     if opts.include.issues || opts.include.pull_requests {
-        if gh_available(&opts.repo) {
+        let gh_probe = probe_gh_repository(&opts.repo, opts.expected_github_repo.as_deref());
+        if let Ok(gh_repo) = &gh_probe {
             report.gh_available = Some(true);
             if opts.include.pull_requests && !budget.exhausted() {
                 match ingest_prs(
@@ -390,6 +405,7 @@ pub(crate) async fn run_ingest_with_commit_recovery(
                     token,
                     registry,
                     &opts.repo,
+                    gh_repo,
                     project_id,
                     &mut report,
                     &mut merge_sha_to_pr,
@@ -483,6 +499,7 @@ pub(crate) async fn run_ingest_with_commit_recovery(
                     token,
                     registry,
                     &opts.repo,
+                    gh_repo,
                     project_id,
                     &mut report,
                     &mut budget,
@@ -552,20 +569,18 @@ pub(crate) async fn run_ingest_with_commit_recovery(
                 ));
             }
         } else {
+            let reason = gh_probe
+                .as_ref()
+                .expect_err("successful probe handled in the preceding branch");
             report.gh_available = Some(false);
-            report.warnings.push(
-                "gh CLI not found on PATH; skipped issues and pull requests — commits still ingest"
-                    .to_string(),
-            );
+            report.warnings.push(format!(
+                "{reason}; skipped requested GitHub sources — commits still ingest"
+            ));
             if opts.include.pull_requests {
-                report.sources.pull_requests = Some(IngestSourceState::Skipped(
-                    "gh CLI not found on PATH".to_string(),
-                ));
+                report.sources.pull_requests = Some(IngestSourceState::Skipped(reason.to_string()));
             }
             if opts.include.issues {
-                report.sources.issues = Some(IngestSourceState::Skipped(
-                    "gh CLI not found on PATH".to_string(),
-                ));
+                report.sources.issues = Some(IngestSourceState::Skipped(reason.to_string()));
             }
         }
     }
@@ -807,17 +822,18 @@ async fn link_references(
                 // that quotes its own number) — not a real cross-reference.
                 continue;
             }
-            match registry
-                .dispatch(
-                    "link",
-                    json!({
+            match crate::dispatch_from_token(
+                registry,
+                token,
+                "link",
+                json!({
                         "source_id": record.id.to_string(),
                         "target_id": target.to_string(),
                         "relation": "annotates",
                         "metadata": { "ref_kind": mention.kind.as_str() },
-                    }),
-                )
-                .await
+                }),
+            )
+            .await
             {
                 Ok(_) => report.reference_edges_created += 1,
                 Err(e) => report.warnings.push(format!(
@@ -829,14 +845,190 @@ async fn link_references(
     }
 }
 
-/// `true` when `gh` is on PATH and can run inside `repo`.
-fn gh_available(repo: &Path) -> bool {
-    Command::new("gh")
-        .arg("--version")
+/// Resolve the exact GitHub `owner/repo` that `gh` can access for this
+/// checkout. The target is derived from the canonical remote source when the
+/// verb has one, otherwise from the checkout's configured `origin`. It is
+/// passed to `gh repo view` explicitly: argument-less repository selection is
+/// forbidden because `gh repo set-default` or an alternate remote could
+/// otherwise redirect ingestion into a different repository.
+///
+/// Failure strings are stable and credential-safe. Neither the origin URL nor
+/// `gh` stderr is copied into the public ingest report.
+fn probe_gh_repository(
+    repo: &Path,
+    expected: Option<&str>,
+) -> std::result::Result<String, &'static str> {
+    let expected = match expected {
+        Some(expected) => validate_owner_repo(expected)?,
+        None => github_repository_from_origin(repo)?,
+    };
+    let output = Command::new("gh")
+        .args([
+            "repo",
+            "view",
+            expected.as_str(),
+            "--json",
+            "nameWithOwner,url",
+        ])
         .current_dir(repo)
+        // Process-global GH_REPO/GH_HOST overrides could otherwise make this
+        // checkout appear usable by probing a different repo or host.
+        .env_remove("GH_REPO")
+        .env_remove("GH_HOST")
+        .env("GH_PROMPT_DISABLED", "1")
         .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+        .map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                "gh CLI not found on PATH"
+            } else {
+                "gh CLI could not be started"
+            }
+        })?;
+    if !output.status.success() {
+        return Err(
+            "gh CLI could not resolve an authenticated GitHub repository for this checkout",
+        );
+    }
+    parse_gh_repository_identity(&output.stdout, &expected)
+}
+
+/// Derive a GitHub `owner/repo` from the checkout's fetch identity. Only the
+/// configured `origin` is authoritative: another remote, or `gh`'s own local
+/// default, must never select the issue/PR source for this ingest.
+fn github_repository_from_origin(repo: &Path) -> std::result::Result<String, &'static str> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["remote", "get-url", "origin"])
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .output()
+        .map_err(|_| "git CLI could not resolve this checkout's origin repository")?;
+    if !output.status.success() {
+        return Err("checkout has no usable github.com origin repository");
+    }
+    let origin = std::str::from_utf8(&output.stdout)
+        .map(str::trim)
+        .map_err(|_| "checkout has no usable github.com origin repository")?;
+    let slug =
+        remote_url_to_slug(origin).ok_or("checkout has no usable github.com origin repository")?;
+    let mut segments = slug.split('/');
+    let (Some(host), Some(owner), Some(name), None) = (
+        segments.next(),
+        segments.next(),
+        segments.next(),
+        segments.next(),
+    ) else {
+        return Err("checkout has no usable github.com origin repository");
+    };
+    if !host.eq_ignore_ascii_case("github.com") {
+        return Err("checkout has no usable github.com origin repository");
+    }
+    validate_owner_repo(&format!("{owner}/{name}"))
+}
+
+fn validate_owner_repo(slug: &str) -> std::result::Result<String, &'static str> {
+    let Some((owner, name)) = slug.split_once('/') else {
+        return Err("invalid expected GitHub repository identity");
+    };
+    if owner.is_empty()
+        || name.is_empty()
+        || name.contains('/')
+        || slug.chars().any(|c| c.is_whitespace() || c.is_control())
+    {
+        return Err("invalid expected GitHub repository identity");
+    }
+    Ok(slug.to_string())
+}
+
+/// Validate the repository identity returned by `gh repo view` without
+/// trusting either field in isolation. Keeping this pure makes the
+/// non-GitHub and mismatched-identity boundaries deterministic to test.
+fn parse_gh_repository_identity(
+    stdout: &[u8],
+    expected: &str,
+) -> std::result::Result<String, &'static str> {
+    let payload: serde_json::Value = serde_json::from_slice(stdout)
+        .map_err(|_| "gh CLI returned an invalid repository identity")?;
+    let slug = payload
+        .get("nameWithOwner")
+        .and_then(serde_json::Value::as_str)
+        .ok_or("gh CLI returned an invalid repository identity")?;
+    if validate_owner_repo(slug).is_err() {
+        return Err("gh CLI returned an invalid repository identity");
+    }
+    let url = payload
+        .get("url")
+        .and_then(serde_json::Value::as_str)
+        .ok_or("gh CLI returned an invalid repository identity")?;
+    let url_slug =
+        remote_url_to_slug(url).ok_or("gh CLI returned an invalid repository identity")?;
+    if !url_slug.eq_ignore_ascii_case(&format!("github.com/{slug}")) {
+        return Err("gh CLI did not resolve a github.com repository for this checkout");
+    }
+    if !slug.eq_ignore_ascii_case(expected) {
+        return Err("gh CLI resolved a different repository than the digest source");
+    }
+    Ok(slug.to_string())
+}
+
+#[cfg(test)]
+mod gh_repository_identity_tests {
+    use super::parse_gh_repository_identity;
+
+    #[test]
+    fn accepts_matching_github_identity() {
+        assert_eq!(
+            parse_gh_repository_identity(
+                br#"{"nameWithOwner":"Fixture/Repository","url":"https://github.com/Fixture/Repository"}"#,
+                "fixture/repository",
+            ),
+            Ok("Fixture/Repository".to_string())
+        );
+    }
+
+    #[test]
+    fn rejects_successful_non_github_identity() {
+        assert_eq!(
+            parse_gh_repository_identity(
+                br#"{"nameWithOwner":"fixture/repository","url":"https://gitlab.com/fixture/repository"}"#,
+                "fixture/repository",
+            ),
+            Err("gh CLI did not resolve a github.com repository for this checkout")
+        );
+    }
+
+    #[test]
+    fn rejects_mismatched_slug_and_url() {
+        assert_eq!(
+            parse_gh_repository_identity(
+                br#"{"nameWithOwner":"fixture/repository","url":"https://github.com/other/repository"}"#,
+                "fixture/repository",
+            ),
+            Err("gh CLI did not resolve a github.com repository for this checkout")
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_identity() {
+        assert_eq!(
+            parse_gh_repository_identity(
+                br#"{"nameWithOwner":"fixture/repository"}"#,
+                "fixture/repository",
+            ),
+            Err("gh CLI returned an invalid repository identity")
+        );
+    }
+
+    #[test]
+    fn rejects_self_consistent_but_unexpected_repository() {
+        assert_eq!(
+            parse_gh_repository_identity(
+                br#"{"nameWithOwner":"other/repository","url":"https://github.com/other/repository"}"#,
+                "fixture/repository",
+            ),
+            Err("gh CLI resolved a different repository than the digest source")
+        );
+    }
 }
 
 /// Look up an existing `commit` note by its `properties.sha` (natural-key
@@ -1906,7 +2098,7 @@ async fn ingest_commits(
         }
 
         budget.try_consume();
-        match registry.dispatch("create", create_request).await {
+        match crate::dispatch_from_token(registry, token, "create", create_request).await {
             Ok(v) => {
                 report.commits_ingested += 1;
                 if embedding_head.is_some() {
@@ -1940,16 +2132,17 @@ async fn ingest_commits(
                         if parent_id == id {
                             continue;
                         }
-                        match registry
-                            .dispatch(
-                                "link",
-                                json!({
+                        match crate::dispatch_from_token(
+                            registry,
+                            token,
+                            "link",
+                            json!({
                                     "source_id": parent_id.to_string(),
                                     "target_id": id.to_string(),
                                     "relation": "precedes",
-                                }),
-                            )
-                            .await
+                            }),
+                        )
+                        .await
                         {
                             Ok(_) => report.parent_edges_created += 1,
                             Err(e) => report.warnings.push(format!(
@@ -2251,19 +2444,22 @@ fn canonical_issue_timestamp(
     }
 }
 
-fn gh_json(repo: &Path, args: &[&str]) -> Result<String> {
-    // gh has no `-C` flag (unlike git) — repo targeting is via working directory.
+fn gh_json(repo: &Path, gh_repo: &str, args: &[&str]) -> Result<String> {
+    // gh has no `-C` flag (unlike git). Keep cwd for local git configuration,
+    // but target the repository explicitly so later remote/cwd drift cannot
+    // redirect a resumed digest to a different repository.
     let output = Command::new("gh")
         .current_dir(repo)
         .args(args)
+        .args(["--repo", gh_repo])
+        .env_remove("GH_REPO")
+        .env_remove("GH_HOST")
+        .env("GH_PROMPT_DISABLED", "1")
         .output()
         .context("spawning gh")?;
     if !output.status.success() {
-        return Err(anyhow!(
-            "gh {:?} failed: {}",
-            args,
-            String::from_utf8_lossy(&output.stderr)
-        ));
+        let operation = args.get(0..2).unwrap_or(args).join(" ");
+        return Err(anyhow!("gh {operation} failed"));
     }
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
@@ -2324,10 +2520,11 @@ const PR_FIELDS: &str = "number,title,author,createdAt,mergedAt,closedAt,updated
 const ISSUE_FIELDS: &str =
     "number,title,author,createdAt,closedAt,updatedAt,labels,stateReason,body";
 
-fn fetch_pr_page(repo: &Path, floor: Option<&str>) -> Result<Vec<GhPr>> {
+fn fetch_pr_page(repo: &Path, gh_repo: &str, floor: Option<&str>) -> Result<Vec<GhPr>> {
     let search = search_query(floor);
     let raw = gh_json(
         repo,
+        gh_repo,
         &[
             "pr",
             "list",
@@ -2344,10 +2541,11 @@ fn fetch_pr_page(repo: &Path, floor: Option<&str>) -> Result<Vec<GhPr>> {
     serde_json::from_str(&raw).context("parsing gh pr list --json")
 }
 
-fn fetch_issue_page(repo: &Path, floor: Option<&str>) -> Result<Vec<GhIssue>> {
+fn fetch_issue_page(repo: &Path, gh_repo: &str, floor: Option<&str>) -> Result<Vec<GhIssue>> {
     let search = search_query(floor);
     let raw = gh_json(
         repo,
+        gh_repo,
         &[
             "issue",
             "list",
@@ -2365,8 +2563,10 @@ fn fetch_issue_page(repo: &Path, floor: Option<&str>) -> Result<Vec<GhIssue>> {
 }
 
 /// Every `GhPr` field funnels through this constructor before it can reach
-/// `properties`/`content`/the note `name`/the in-memory PR-linking maps,
-/// masking secrets in contributor-controlled prose fields. See
+/// `properties`/`content`/the note `name`/the in-memory PR-linking maps or
+/// the paging cursor. Contributor-controlled prose fields are masked, and
+/// `updatedAt` is canonicalized before it can affect sorting or a later
+/// `gh --search` argument. See
 /// crates/khive-pack-git/docs/api/ingest.md#masking-boundaries-maskedcommitfields-maskedissuefields-maskedprfields.
 struct MaskedPrFields {
     number: u64,
@@ -2383,7 +2583,7 @@ struct MaskedPrFields {
 }
 
 impl MaskedPrFields {
-    fn new(pr: GhPr) -> Self {
+    fn new(pr: GhPr, warnings: &mut Vec<String>) -> Self {
         let GhPr {
             number,
             title,
@@ -2407,10 +2607,33 @@ impl MaskedPrFields {
             created_at,
             merged_at,
             closed_at,
-            updated_at,
+            updated_at: canonical_pr_updated_at(number, updated_at, warnings),
             base_ref_name: base_ref_name.map(|r| secret_gate::mask_secrets(&r).into_owned()),
             head_ref_name: head_ref_name.map(|r| secret_gate::mask_secrets(&r).into_owned()),
             merge_commit_oid: merge_commit.and_then(|m| m.oid),
+        }
+    }
+}
+
+/// Parses a GitHub pull-request `updatedAt` into canonical RFC3339 form.
+/// Invalid values are dropped before page sorting so raw remote data can
+/// never become a persisted cursor or a later `gh --search` argument.
+fn canonical_pr_updated_at(
+    number: u64,
+    raw: Option<String>,
+    warnings: &mut Vec<String>,
+) -> Option<String> {
+    let raw = raw?;
+    match chrono::DateTime::parse_from_rfc3339(&raw) {
+        Ok(dt) => Some(
+            dt.with_timezone(&Utc)
+                .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        ),
+        Err(_) => {
+            warnings.push(format!(
+                "pull request #{number}: updatedAt is not a valid RFC3339 timestamp, field dropped"
+            ));
+            None
         }
     }
 }
@@ -2421,6 +2644,7 @@ async fn ingest_prs(
     token: &NamespaceToken,
     registry: &VerbRegistry,
     repo: &Path,
+    gh_repo: &str,
     project_id: Uuid,
     report: &mut IngestReport,
     merge_sha_to_pr: &mut HashMap<String, Uuid>,
@@ -2458,7 +2682,7 @@ async fn ingest_prs(
         // leaving the loop before the window completes IS stopping early,
         // and the arms below specialize the reason when they fire.
         let first_page = report.sources.pull_requests.is_none();
-        let mut page = match fetch_pr_page(repo, floor.as_deref()) {
+        let page = match fetch_pr_page(repo, gh_repo, floor.as_deref()) {
             Ok(page) => {
                 if first_page {
                     report.sources.pull_requests = Some(IngestSourceState::StoppedEarly(
@@ -2470,6 +2694,13 @@ async fn ingest_prs(
             Err(e) => return Err(e),
         };
         let page_len = page.len();
+        // Mask/canonicalize the complete remote page before either sorting
+        // or selecting its continuation floor. In particular, raw
+        // `updatedAt` must never enter the cursor/argv boundary.
+        let mut page: Vec<MaskedPrFields> = page
+            .into_iter()
+            .map(|pr| MaskedPrFields::new(pr, &mut report.warnings))
+            .collect();
         // Each page is already `sort:updated-asc` server-side, but `--search`
         // makes no hard ordering guarantee across ties — re-sort defensively
         // so the frozen-cursor invariant (records walked in nondecreasing
@@ -2481,12 +2712,12 @@ async fn ingest_prs(
         page.sort_by(|a, b| a.updated_at.cmp(&b.updated_at));
         let last_updated_at = page.last().and_then(|pr| pr.updated_at.clone());
 
-        for pr in page {
+        for masked in page {
             if let Some(existing) =
-                find_by_number(runtime, token, "pull_request", project_id, pr.number).await?
+                find_by_number(runtime, token, "pull_request", project_id, masked.number).await?
             {
-                number_to_pr.insert(pr.number, existing);
-                if let Some(oid) = pr.merge_commit.as_ref().and_then(|m| m.oid.clone()) {
+                number_to_pr.insert(masked.number, existing);
+                if let Some(oid) = masked.merge_commit_oid.as_ref().cloned() {
                     merge_sha_to_pr.insert(oid, existing);
                 }
                 report.prs_skipped_existing += 1;
@@ -2502,7 +2733,7 @@ async fn ingest_prs(
                 // all-existing pass (the common resumed-pass shape) still
                 // advances normally and never re-fetches its window twice.
                 if !cursor_stalled {
-                    if let Some(u) = &pr.updated_at {
+                    if let Some(u) = &masked.updated_at {
                         if max_updated
                             .as_deref()
                             .map(|m| u.as_str() > m)
@@ -2520,7 +2751,7 @@ async fn ingest_prs(
             // must not freeze the cursor at the pass floor.
             let is_new = since
                 .as_deref()
-                .zip(pr.updated_at.as_deref())
+                .zip(masked.updated_at.as_deref())
                 .map(|(cursor, updated)| updated >= cursor)
                 .unwrap_or(true);
             if !is_new {
@@ -2539,8 +2770,6 @@ async fn ingest_prs(
                 stop_reason = Some("budget exhausted before the pull request window completed");
                 break;
             }
-
-            let masked = MaskedPrFields::new(pr);
             let content = masked.body;
             let properties = json!({
                 "number": masked.number,
@@ -2559,18 +2788,19 @@ async fn ingest_prs(
             );
 
             budget.try_consume();
-            let result = match registry
-                .dispatch(
-                    "create",
-                    json!({
+            let result = match crate::dispatch_from_token(
+                registry,
+                token,
+                "create",
+                json!({
                         "kind": "pull_request",
                         "name": name,
                         "content": content,
                         "properties": properties,
                         "annotates": [project_id.to_string()],
-                    }),
-                )
-                .await
+                }),
+            )
+            .await
             {
                 Ok(v) => v,
                 Err(e) => {
@@ -2686,6 +2916,7 @@ async fn ingest_issues(
     token: &NamespaceToken,
     registry: &VerbRegistry,
     repo: &Path,
+    gh_repo: &str,
     project_id: Uuid,
     report: &mut IngestReport,
     budget: &mut Budget,
@@ -2719,7 +2950,7 @@ async fn ingest_issues(
         // the walk-start marker also pre-seeds the stopped-early state that
         // leaving the loop early implies.
         let first_page = report.sources.issues.is_none();
-        let page = match fetch_issue_page(repo, floor.as_deref()) {
+        let page = match fetch_issue_page(repo, gh_repo, floor.as_deref()) {
             Ok(page) => {
                 if first_page {
                     report.sources.issues = Some(IngestSourceState::StoppedEarly(
@@ -2831,18 +3062,19 @@ async fn ingest_issues(
             let name = refs::truncate_chars(&format!("#{number} {safe_title}"), NAME_MAX_CHARS);
 
             budget.try_consume();
-            let result = match registry
-                .dispatch(
-                    "create",
-                    json!({
+            let result = match crate::dispatch_from_token(
+                registry,
+                token,
+                "create",
+                json!({
                         "kind": "issue",
                         "name": name,
                         "content": content,
                         "properties": properties,
                         "annotates": [project_id.to_string()],
-                    }),
-                )
-                .await
+                }),
+            )
+            .await
             {
                 Ok(v) => v,
                 Err(e) => {

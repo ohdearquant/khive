@@ -2,22 +2,59 @@
 
 `CoordinatorService` (`src/coordinator.rs`) is the cross-backend dispatch seam
 a multi-backend server routes `link`/`search` through instead of the plain
-`VerbRegistry`. This document records three validation regressions the
-`server.rs` intercept (`dispatch_via_coordinator_inner`) must never
-reintroduce — each is pinned by a `coordinator.rs` test named for it.
+`VerbRegistry`. This document records the validation and degradation contracts
+the `server.rs` intercept (`dispatch_via_coordinator_inner`) must never
+reintroduce. The boundary constructs the KG pack's public
+`ValidatedSearchRequest` once, before fan-out, rather than parsing an ad-hoc
+subset of the search JSON.
+
+## Complete search-filter contract (#1377)
+
+The validated request represents `kind`, `query`, `limit`, `entity_kind`,
+`entity_type`, `note_kind`, `include_superseded`, `properties`, `tags`, and
+`min_score`. The coordinator receives that type, forwards every applicable
+storage filter to every backend, and the MCP seam applies `min_score` to the
+merged ranking. `namespace` remains a transport/authentication field: it is
+removed before KG parameter validation and resolved fail-closed by the registry
+gate seam.
+
+`entity_kind` and `note_kind` are compatibility spellings for callers that use
+the substrate-level `kind="entity"` or `kind="note"`. A granular `kind` may be
+combined with its matching compatibility spelling; contradictory values are
+rejected. Entity-only fields (`entity_kind`, `entity_type`) on a note search and
+note-only fields (`note_kind`, `include_superseded`) on an entity search are
+rejected with a substrate-specific validation error. `properties` must be an
+object and `tags` must be an array of strings. No accepted filter is silently
+dropped.
+
+## Partial-result advisory (#1370)
+
+Backend failures do not erase successful sibling results. A degraded search
+operation is successful but its operation envelope also carries:
+
+```json
+{
+  "ok": true,
+  "tool": "search",
+  "result": [],
+  "partial": true,
+  "missing_backends": ["archive"]
+}
+```
+
+The advisory is part of a typed intercepted-dispatch outcome, not an optional
+mutex slot. The same value flows through single, batch, and chain execution;
+presentation transforms only `result`, and daemon frame-budget omission keeps
+`partial` and `missing_backends` even if the result itself must be omitted.
 
 ## `t6d` — malformed `tags` must reject, not silently drop the filter
 
 A multi-backend `search` with a malformed `tags` value must return a per-op
 error (`ok: false`) rather than silently returning unfiltered results.
-Single-backend rejects malformed tags via `SearchParams` deserialization
+Single-backend rejects malformed tags via the shared validated request
 (`RuntimeError::InvalidInput` → `ok: false`); multi-backend must match that
 contract: the server rejects before reaching the coordinator, not by
-collapsing the filter to an empty `Vec` via `filter_map(as_str)`. The
-regression test fails against the old `filter_map` code (which called the
-coordinator with an empty tags `Vec` and returned `ok: true, result: []`) and
-passes once the multi-backend path uses a strict
-`serde_json::from_value::<Vec<String>>`.
+collapsing the filter to an empty `Vec` via `filter_map(as_str)`.
 
 ## `t6e-namespace` — malformed `namespace` must fail closed (RUNTIME-AUD-002 / #433)
 

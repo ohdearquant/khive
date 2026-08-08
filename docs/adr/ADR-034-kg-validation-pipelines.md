@@ -4,12 +4,22 @@
 **Date**: 2026-05-23
 **Authors**: khive maintainers
 
+## Amendment (2026-08-06): validation input readability
+
+`entities.ndjson` and `edges.ndjson` are mandatory validator inputs. The unconditional
+`required-input-files` structural rule fails when either path is absent, unreadable, or not
+valid UTF-8. `notes.ndjson` remains optional when absent, but a present notes path must also be
+readable UTF-8. Even where a downstream rule skips an unreadable file, the unconditional
+structural rule ensures that an input read failure cannot produce a passing aggregate report.
+
 ## Context
 
-[ADR-020](ADR-020-git-native-kg-implementation.md) introduced `kkernel kg validate` with
-six built-in checks that guard the structural invariants git-native versioning depends on:
-schema compliance, referential integrity, no duplicate UUIDs, sort order, remote resolution,
-and cross-repo reference format. These checks are unconditional and apply to every KG.
+[ADR-020](ADR-020-git-native-kg-implementation.md) introduced `kkernel kg validate` to guard the
+structural invariants git-native versioning depends on. The current pass has seven unconditional
+checks: `required-input-files`, `schema-compliance`, `no-duplicate-uuids`,
+`referential-integrity`, `valid-entity-kinds`, and `valid-edge-relations` at error severity, plus
+`sort-order` at warning severity. The error-severity `valid-note-kinds` check is conditional on
+`notes.ndjson` being present.
 
 Projects building domain-specific KGs need validation beyond these structural invariants.
 A biology team requires all concept entities to carry a `taxa_rank` property. A research
@@ -44,9 +54,10 @@ This ADR documents the shipped `kkernel kg validate` validation surface:
 
 ### What changes and what does not
 
-- ADR-020 `khive kg validate` built-in structural checks: **unchanged**. This ADR adds
-  an optional TOML RulePass that runs after the structural pass when
-  `.khive/kg/rules.toml` exists and `--no-rules` is not set.
+- ADR-020 `khive kg validate` built-in structural checks: **amended** by the unconditional
+  `required-input-files` readability rule above. This ADR also adds an optional TOML RulePass
+  that runs after the structural pass when `.khive/kg/rules.toml` exists and `--no-rules` is not
+  set.
 - ADR-023 pack standard: **extended by the shipped Rust validator API** (`PackRuntime::validation_rules`,
   `VerbRegistry::all_validation_rules`). What remains deferred is CLI runner integration —
   `kkernel kg validate` does not yet call these methods against live corpus data.
@@ -310,8 +321,9 @@ The `fix` callback receives the same `ValidationContext` and the violations emit
 
 The validation pipeline runs in a defined sequence:
 
-1. **ADR-020 structural checks** (schema compliance, referential integrity, duplicate
-   UUIDs, sort order, remote resolution). Run first; results always included.
+1. **ADR-020 structural checks**: seven unconditional checks run first, with six at error severity
+   and `sort-order` at warning severity. `valid-note-kinds` additionally runs at error severity
+   when `notes.ndjson` is present. Results for every applicable check are always included.
 2. **Configurable TOML rules** from `.khive/kg/rules.toml`, when the file exists and
    `--no-rules` is not set. Rules run in file order.
 3. **Pack-provided validation rules** (§9): the Rust API is shipped; CLI runner integration
@@ -497,8 +509,9 @@ into a single non-zero exit code obscures which action is needed.
 
 ### Neutral
 
-- The ADR-020 structural pass is unchanged. Existing `kkernel kg validate` invocations
-  continue to work and gain the new rules transparently.
+- The ADR-020 structural pass gains the `required-input-files` rule. Existing clean
+  `kkernel kg validate` invocations remain compatible; inputs that are absent or unreadable now
+  fail closed.
 - The JSON output format (`--format json`) extends the ADR-020 exit-code contract: 0 for
   clean, 1 for violations, 2 for rule-file parse or unsupported-format errors. The text format is a superset
   of the ADR-020 single-line-per-check output.

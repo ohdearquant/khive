@@ -4607,10 +4607,16 @@ pub struct QueryResult {
     pub rows: Vec<SqlRow>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<String>,
-    /// `true` when the server-side row cap bound this result — `rows` is a
-    /// prefix of the true match set, not the whole thing (#1168, #1247). A
-    /// structural flag so a caller can detect an incomplete result without
-    /// parsing the human-oriented `warnings` text.
+    /// Zero-based offset of this deterministic result page.
+    pub offset: usize,
+    /// Effective payload bound after composing query `LIMIT` and server page size.
+    pub page_size: usize,
+    /// `true` when at least one additional match exists after this page.
+    pub has_more: bool,
+    /// GQL continuation offset. Present exactly when GQL has another page.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_offset: Option<usize>,
+    /// Backward-compatible alias for `has_more` (#1168, #1247, #1601).
     pub truncated: bool,
 }
 
@@ -4640,6 +4646,13 @@ impl KhiveRuntime {
         use khive_storage::types::SqlValue;
 
         let (language, ast) = khive_query::language::parse_auto_with_language(query)?;
+        if opts.max_limit == 0 {
+            return Err(RuntimeError::InvalidInput(
+                "query page size must be at least 1".into(),
+            ));
+        }
+        let offset = ast.offset;
+        let page_size = ast.limit.unwrap_or(opts.max_limit).min(opts.max_limit);
         opts.scopes = token
             .visible_namespaces()
             .iter()
@@ -4675,42 +4688,76 @@ impl KhiveRuntime {
         };
         let mut rows = reader.query_all(stmt).await?;
 
-        // When the server-side cap was the binding constraint, the compiled
+        // When the effective page size was the binding constraint, the compiled
         // SQL asked for one extra (sentinel) row. Its presence in the actual
-        // result set — not the requested LIMIT — is the truncation signal
-        // (a `LIMIT 1000` that only matches 20 rows must not warn, and a
-        // query with no `LIMIT` that matches 501+ rows must).
+        // result set — not the requested LIMIT — is the continuation signal.
         let mut truncated = false;
         if let Some(check) = truncation_check {
             if rows.len() > check.max_limit {
                 rows.truncate(check.max_limit);
                 truncated = true;
-                // GQL has no SKIP/OFFSET/ORDER BY today (#1168) — the prior
-                // wording here recommended a paging path that does not exist.
-                // `truncated` is the structural signal (#1247); this message
-                // stays prose-only context for a human reader.
-                warnings.push(match check.requested_limit {
-                    Some(requested) => format!(
-                        "result set capped at {} rows; requested limit {requested} exceeds the \
-                         cap. This query language does not support SKIP/OFFSET paging yet — \
-                         check the `truncated` field, not this message, to detect an incomplete \
-                         result programmatically.",
-                        check.max_limit
-                    ),
-                    None => format!(
-                        "result set capped at {} rows; more than {} rows matched with no LIMIT \
-                         clause. This query language does not support SKIP/OFFSET paging yet — \
-                         check the `truncated` field, not this message, to detect an incomplete \
-                         result programmatically.",
-                        check.max_limit, check.max_limit
-                    ),
-                });
             }
+        }
+
+        let next_offset = if truncated && language == khive_query::QueryLanguage::Gql {
+            let next = offset.checked_add(rows.len()).ok_or_else(|| {
+                RuntimeError::InvalidInput("GQL next_offset exceeds usize::MAX".into())
+            })?;
+            if next == offset {
+                return Err(RuntimeError::InvalidInput(
+                    "query page did not advance; page size must be at least 1".into(),
+                ));
+            }
+            i64::try_from(next).map_err(|_| {
+                RuntimeError::InvalidInput("GQL next_offset exceeds i64::MAX".into())
+            })?;
+            Some(next)
+        } else {
+            None
+        };
+
+        if truncated {
+            let Some(check) = truncation_check else {
+                return Err(RuntimeError::Internal(
+                    "truncated query result is missing sentinel metadata".into(),
+                ));
+            };
+            let bound = match check.requested_limit {
+                Some(requested) => {
+                    format!("requested query LIMIT {requested} exceeds the effective page size")
+                }
+                None => "the query has no explicit LIMIT".to_string(),
+            };
+            let warning = match language {
+                khive_query::QueryLanguage::Gql => {
+                    let Some(next) = next_offset else {
+                        return Err(RuntimeError::Internal(
+                            "truncated GQL result is missing its continuation offset".into(),
+                        ));
+                    };
+                    format!(
+                        "result page capped at {} rows because {bound}; more matches exist. \
+                         Continue the same GQL query with `SKIP {next}` (the machine-readable \
+                         `next_offset`) and keep the same page size.",
+                        check.max_limit
+                    )
+                }
+                khive_query::QueryLanguage::Sparql => format!(
+                    "result page capped at {} rows because {bound}; more matches exist. \
+                     SPARQL OFFSET paging is not part of the supported dialect.",
+                    check.max_limit
+                ),
+            };
+            warnings.push(warning);
         }
 
         Ok(QueryResult {
             rows,
             warnings,
+            offset,
+            page_size,
+            has_more: truncated,
+            next_offset,
             truncated,
         })
     }

@@ -438,9 +438,13 @@ impl Parser {
                 } else if self.try_keyword("IN") {
                     Ok(CompareOp::In)
                 } else if self.try_keyword("IS") {
-                    self.expect_keyword("NOT")?;
-                    self.expect_keyword("NULL")?;
-                    Ok(CompareOp::IsNotNull)
+                    if self.try_keyword("NOT") {
+                        self.expect_keyword("NULL")?;
+                        Ok(CompareOp::IsNotNull)
+                    } else {
+                        self.expect_keyword("NULL")?;
+                        Ok(CompareOp::IsNull)
+                    }
                 } else {
                     Err(self.err("expected comparison operator"))
                 }
@@ -477,7 +481,7 @@ impl Parser {
         let op = self.parse_compare_op()?;
         let value = match op {
             CompareOp::In => ConditionValue::List(self.parse_list_literal()?),
-            CompareOp::IsNotNull => ConditionValue::Null,
+            CompareOp::IsNotNull | CompareOp::IsNull => ConditionValue::Null,
             CompareOp::Contains | CompareOp::StartsWith => {
                 let value = self.parse_value()?;
                 if !matches!(value, ConditionValue::String(_)) {
@@ -580,6 +584,12 @@ impl Parser {
         self.expect_keyword("RETURN")?;
         let return_items = self.parse_return_items()?;
 
+        let offset = if self.try_keyword("SKIP") {
+            self.parse_number()?
+        } else {
+            0
+        };
+
         let limit = if self.try_keyword("LIMIT") {
             Some(self.parse_number()?)
         } else {
@@ -598,6 +608,7 @@ impl Parser {
             pattern,
             where_clause,
             return_items,
+            offset,
             limit,
         })
     }
@@ -670,7 +681,49 @@ mod tests {
         assert_eq!(edges[0].relations, vec!["extends", "variant_of"]);
         assert_eq!(edges[0].min_hops, 1);
         assert_eq!(edges[0].max_hops, 3);
+        assert_eq!(q.offset, 0);
         assert_eq!(q.limit, Some(20));
+    }
+
+    #[test]
+    fn skip_and_limit_parse_as_page_window() {
+        let q = parse("MATCH (a:concept) RETURN a SKIP 500 LIMIT 200").unwrap();
+        assert_eq!(q.offset, 500);
+        assert_eq!(q.limit, Some(200));
+    }
+
+    #[test]
+    fn skip_without_limit_is_supported() {
+        let q = parse("MATCH (a:concept) RETURN a SKIP 500").unwrap();
+        assert_eq!(q.offset, 500);
+        assert_eq!(q.limit, None);
+    }
+
+    #[test]
+    fn negative_skip_is_rejected() {
+        let err = parse("MATCH (a:concept) RETURN a SKIP -1").unwrap_err();
+        assert!(
+            matches!(err, QueryError::Parse { .. }),
+            "negative SKIP must be a parse error, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn skip_after_limit_is_rejected() {
+        let err = parse("MATCH (a:concept) RETURN a LIMIT 20 SKIP 10").unwrap_err();
+        assert!(
+            matches!(err, QueryError::Parse { .. }),
+            "SKIP must precede LIMIT, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn sql_offset_keyword_remains_outside_gql() {
+        let err = parse("MATCH (a:concept) RETURN a OFFSET 10").unwrap_err();
+        assert!(
+            matches!(err, QueryError::Parse { .. }),
+            "GQL paging uses SKIP rather than OFFSET, got {err:?}"
+        );
     }
 
     #[test]
@@ -766,6 +819,27 @@ mod tests {
         );
         assert_eq!(conds[3].op, CompareOp::IsNotNull);
         assert_eq!(conds[3].value, ConditionValue::Null);
+    }
+
+    #[test]
+    fn where_clause_is_null() {
+        let q = parse("MATCH (n:entity) WHERE n.properties.domain IS NULL RETURN n").unwrap();
+        let conds: Vec<_> = q.where_clause.conditions().collect();
+        assert_eq!(conds.len(), 1);
+        assert_eq!(conds[0].op, CompareOp::IsNull);
+        assert_eq!(conds[0].value, ConditionValue::Null);
+    }
+
+    #[test]
+    fn where_clause_is_null_and_is_not_null_together() {
+        let q = parse(
+            "MATCH (n:entity) WHERE n.name IS NOT NULL AND n.properties.domain IS NULL RETURN n",
+        )
+        .unwrap();
+        let conds: Vec<_> = q.where_clause.conditions().collect();
+        assert_eq!(conds.len(), 2);
+        assert_eq!(conds[0].op, CompareOp::IsNotNull);
+        assert_eq!(conds[1].op, CompareOp::IsNull);
     }
 
     #[test]

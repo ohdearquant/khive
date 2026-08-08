@@ -74,8 +74,9 @@ pub use engine_config::{
     GitWriteEntryConfig, GitWriteSectionConfig, KhiveConfig, PackConfig, StorageSectionConfig,
 };
 pub use error::{
-    fts_text_leg_or_err, GuardedWriteFailure, RuntimeError, RuntimeResult,
-    WriterPoolCheckoutTimeoutContext, WRITER_POOL_CHECKOUT_TIMEOUT_STAGE,
+    fts_text_leg_or_err, AdmissionFailureContext, GuardedWriteFailure, RuntimeError, RuntimeResult,
+    WriterPoolCheckoutTimeoutContext, WRITER_ADMISSION_SCOPE, WRITER_POOL_CHECKOUT_TIMEOUT_STAGE,
+    WRITER_QUEUE_SATURATED_STAGE,
 };
 pub use fusion::FusionStrategy;
 pub use graph_traversal::PathNode;
@@ -107,11 +108,11 @@ pub use operations::{
     NoteSearchHit, QueryResult, Resolved,
 };
 pub use pack::{
-    resolve_explicit_namespace, DispatchHook, HandlerDef, KindHook, NoteKindSpec,
-    NoteLifecycleSpec, PackByIdResolver, PackFactory, PackInstall, PackLoadError, PackRegistration,
-    PackRegistry, PackRuntime, PackSchemaCollisionError, PackSchemaPlan, ParamDef, RequestIdentity,
-    SchemaPlan, VerbCategory, VerbPresentationPolicy, VerbRegistry, VerbRegistryBuilder,
-    VerifiedActor, Visibility,
+    resolve_explicit_namespace, DispatchHook, HandlerDef, InterceptedDispatchResult, KindHook,
+    NoteKindSpec, NoteLifecycleSpec, PackByIdResolver, PackFactory, PackInstall, PackLoadError,
+    PackRegistration, PackRegistry, PackRuntime, PackSchemaCollisionError, PackSchemaPlan,
+    ParamDef, RequestIdentity, SchemaPlan, VerbCategory, VerbPresentationPolicy, VerbRegistry,
+    VerbRegistryBuilder, VerifiedActor, Visibility,
 };
 pub use phase_events::{emit_phase_event, is_benign_shutdown_cancellation};
 pub use portability::{ImportSummary, KgArchive};

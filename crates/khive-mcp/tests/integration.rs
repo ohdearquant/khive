@@ -1590,6 +1590,13 @@ impl khive_types::Pack for ErrorInjectPack {
             category: VerbCategory::Assertive,
             params: &[],
         },
+        HandlerDef {
+            name: "write_queue_full",
+            description: "returns a typed write-queue saturation error",
+            visibility: Visibility::Verb,
+            category: VerbCategory::Assertive,
+            params: &[],
+        },
     ];
 }
 
@@ -1627,6 +1634,11 @@ impl PackRuntime for ErrorInjectPack {
                 },
             );
             return Err(RuntimeError::Storage(storage));
+        }
+        if verb == "write_queue_full" {
+            return Err(RuntimeError::Storage(
+                khive_storage::StorageError::WriteQueueFull { timeout_ms: 175 },
+            ));
         }
         let err = KhiveError::unavailable("downstream service offline")
             .with_code(KhiveErrorCode::new(ErrorDomain::Runtime, 10))
@@ -1755,11 +1767,52 @@ async fn writer_pool_timeout_survives_storage_runtime_and_mcp_wire() -> anyhow::
             "code": "writer_pool_checkout_timeout",
             "stage": "writer_pool_checkout_timeout",
             "message": "storage: backend driver error in Notes during append_note: invalid data: timed out after 175ms waiting for sqlite writer connection",
+            "retryable": true,
             "timeout_ms": 175,
             "capability": "notes",
             "operation": "append_note",
+            "scope": serde_json::Value::Null,
+            "retry_after_ms": serde_json::Value::Null,
         }),
-        "the exact wire contract must preserve stage, deadline, and storage context"
+        "the exact wire contract must preserve stage, deadline, retryability, and storage context"
+    );
+
+    Ok(())
+}
+
+/// A bounded write-queue enqueue timeout (#1382's `send_bounded` /
+/// `send_top_level_bounded`) must remain structurally classifiable and marked
+/// retryable after `RuntimeError::Storage` wraps it, then crosses the real
+/// MCP request transport (#1643). The request was never accepted onto the
+/// queue, so retrying is safe.
+#[tokio::test]
+async fn write_queue_full_survives_storage_runtime_and_mcp_wire() -> anyhow::Result<()> {
+    let client = connect_error_inject().await?;
+    let result = call(
+        &client,
+        "request",
+        serde_json::json!({"ops": "write_queue_full()"}),
+    )
+    .await?;
+    let body: serde_json::Value = serde_json::from_str(&first_text(&result))?;
+    let first = &body["results"][0];
+
+    assert_eq!(first["ok"], false, "expected op failure: {first}");
+    assert_eq!(
+        first["error"],
+        serde_json::json!({
+            "kind": "unavailable",
+            "code": "writer_queue_saturated",
+            "stage": "writer_queue_saturated",
+            "message": "storage: write queue full: timed out after 175ms waiting for writer task capacity",
+            "retryable": true,
+            "timeout_ms": 175,
+            "capability": serde_json::Value::Null,
+            "operation": serde_json::Value::Null,
+            "scope": "writer_admission",
+            "retry_after_ms": 175,
+        }),
+        "the exact wire contract must preserve stage, deadline, retryability, and ADR-131:251's scope/retry_after_ms for queue saturation"
     );
 
     Ok(())

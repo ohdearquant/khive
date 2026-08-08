@@ -265,6 +265,40 @@ jobs:
         if: env.CI_SUITE == 'full' && matrix.shard == 1
         run: ../scripts/ci.sh contract-suite
 
+  kg-editor:
+    name: KG Studio (Next.js)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: apps/kg-editor
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: apps/kg-editor/package-lock.json
+      - name: Install locked dependencies
+        run: npm ci --no-audit --no-fund
+      - name: Lint
+        run: npm run lint
+      - name: Typecheck
+        run: npm run typecheck
+      - name: Unit and interaction tests
+        run: npm test
+      # Must run before the build: `prebuild` regenerates the browser asset from
+      # the canonical golden, so a parity check placed after it reads bytes the
+      # build just rewrote and passes unconditionally.
+      - name: Showcase asset parity
+        run: npm run check:showcase
+      - name: Production build
+        run: npm run build
+      - name: Install browser for repository dogfood
+        run: npx playwright install --with-deps chromium
+      - name: Repository showcase dogfood
+        run: npx playwright test
+
   supply-chain:
     name: Supply-chain (cargo-deny)
     runs-on: ubuntu-latest
@@ -671,6 +705,7 @@ jobs:
     needs:
       - automerge-push-guard
       - ci
+      - kg-editor
       - supply-chain
       - data-leak-guard
       - secret-scan

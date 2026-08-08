@@ -29,6 +29,13 @@ pub enum SqliteError {
         timeout: Duration,
     },
 
+    /// A `PoolConfig` value violated a validated invariant at configuration
+    /// load time (e.g. ADR-131 Decision 2's `write_admission_deadline_ms`
+    /// range). Fires before any connection is opened, and is never silently
+    /// clamped into range.
+    #[error("invalid config: {0}")]
+    InvalidConfig(String),
+
     /// Filesystem I/O error.
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),

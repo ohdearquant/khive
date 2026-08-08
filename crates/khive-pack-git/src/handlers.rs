@@ -132,12 +132,10 @@ impl GitPack {
             Some(v) => parse_include(v)?,
         };
 
-        let mut warnings: Vec<String> = Vec::new();
-
         // Resolve a local repo path -- remote sources clone/fetch into the
         // scratch cache first (ADR-088 Amendment 1 §Remote-URL mode).
-        let (repo_path, gh_capable) = match &source {
-            DigestSource::Local(p) => (p.clone(), true),
+        let (repo_path, expected_github_repo) = match &source {
+            DigestSource::Local(p) => (p.clone(), None),
             DigestSource::Remote { canonical, gh_slug } => {
                 let cloned = cache::ensure_clone(canonical).map_err(|e| {
                     RuntimeError::InvalidInput(format!(
@@ -145,14 +143,12 @@ impl GitPack {
                         redact_repo_url(canonical)
                     ))
                 })?;
-                if gh_slug.is_none() {
-                    warnings.push(format!(
-                        "host for {:?} is not github.com; issue/pull_request \
-                         ingestion is skipped (commits-only degradation, ADR-088 Amendment 1)",
-                        redact_repo_url(canonical)
-                    ));
-                }
-                (cloned, gh_slug.is_some())
+                (
+                    cloned,
+                    gh_slug
+                        .as_ref()
+                        .map(|(owner, repo)| format!("{owner}/{repo}")),
+                )
             }
         };
 
@@ -179,17 +175,17 @@ impl GitPack {
         let project_id = resolution.id;
         let project_created = resolution.created;
 
-        let effective_include = IngestInclude {
-            commits: include.commits,
-            issues: include.issues && gh_capable,
-            pull_requests: include.pull_requests && gh_capable,
-        };
-
         let opts = IngestOptions {
             repo: repo_path,
+            expected_github_repo,
             project: project_id.to_string(),
             max_items: Some(max_items),
-            include: effective_include,
+            // Preserve the caller's requested sources all the way into the
+            // ingest core. Its source-bound `gh repo view` probe records an
+            // unusable/non-GitHub source as `Skipped` + `gh_available:false`;
+            // masking these bits here would instead make the source look
+            // unrequested and silently fabricate completeness (#1617).
+            include,
         };
 
         // Only a remote-URL source has a disposable cache to repair (ADR-088
@@ -207,7 +203,6 @@ impl GitPack {
         }
         .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?;
 
-        report.warnings.extend(warnings);
         if !resolution.slug_duplicates.is_empty() {
             report.warnings.push(format!(
                 "multiple live project anchors match the same repo identity; selected oldest {}; duplicates: {}",
@@ -332,10 +327,11 @@ async fn resolve_or_create_project(
         .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?;
     if let Some((id, duplicates)) = exact_matches.split_first() {
         let id = *id;
-        registry
-            .dispatch(
-                "update",
-                json!({
+        crate::dispatch_from_token(
+            registry,
+            token,
+            "update",
+            json!({
                     "id": id.to_string(),
                     // Backfill hits also redact the stored repo_url in the
                     // same patch (ADR-088 Amendment 2 step 2) -- the
@@ -345,9 +341,9 @@ async fn resolve_or_create_project(
                         REPO_SLUG_PROPERTY: identity,
                         "repo_url": redact_repo_url(&repo_url),
                     },
-                }),
-            )
-            .await?;
+            }),
+        )
+        .await?;
         return Ok(ProjectResolution {
             id,
             created: false,
@@ -377,10 +373,11 @@ async fn resolve_or_create_project(
     }
     if let Some(((selected, selected_repo_url), duplicates)) = normalized_matches.split_first() {
         let selected = *selected;
-        registry
-            .dispatch(
-                "update",
-                json!({
+        crate::dispatch_from_token(
+            registry,
+            token,
+            "update",
+            json!({
                     "id": selected.to_string(),
                     // Same-patch redaction of the matched anchor's own stored
                     // repo_url (ADR-088 Amendment 2 step 2).
@@ -388,9 +385,9 @@ async fn resolve_or_create_project(
                         REPO_SLUG_PROPERTY: identity,
                         "repo_url": redact_repo_url(selected_repo_url),
                     },
-                }),
-            )
-            .await?;
+            }),
+        )
+        .await?;
         return Ok(ProjectResolution {
             id: selected,
             created: false,
@@ -403,19 +400,20 @@ async fn resolve_or_create_project(
         .await
         .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?;
 
-    let resp = registry
-        .dispatch(
-            "create",
-            json!({
+    let resp = crate::dispatch_from_token(
+        registry,
+        token,
+        "create",
+        json!({
                 "kind": "project",
                 "name": name,
                 "properties": {
                     "repo_url": redact_repo_url(&repo_url),
                     REPO_SLUG_PROPERTY: identity,
                 },
-            }),
-        )
-        .await?;
+        }),
+    )
+    .await?;
     let id = resp
         .get("id")
         .and_then(Value::as_str)
@@ -769,13 +767,14 @@ mod tests {
 
     async fn fixture() -> (KhiveRuntime, NamespaceToken, VerbRegistry) {
         let rt = KhiveRuntime::memory().expect("memory runtime");
+        let token = rt.authorize(Namespace::local()).expect("authorize local");
         let mut builder = VerbRegistryBuilder::new();
         builder.register(khive_pack_kg::KgPack::new(rt.clone()));
         builder.register(GitPack::new(rt.clone()));
+        builder.with_event_store(rt.events(&token).expect("event store"));
         let registry = builder.build().expect("registry builds");
         rt.install_edge_rules(registry.all_edge_rules());
         registry.apply_schema_plans(rt.backend());
-        let token = rt.authorize(Namespace::local()).expect("authorize local");
         (rt, token, registry)
     }
 

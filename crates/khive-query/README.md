@@ -10,7 +10,9 @@ parameterized SQL.
 use khive_query::{compile, parse_auto, CompileOptions};
 
 // parse_auto detects the dialect: `SELECT` -> SPARQL, `MATCH` -> GQL, else GQL.
-let query = parse_auto("MATCH (a:concept)-[:extends]->(b:concept) RETURN a, b")?;
+let query = parse_auto(
+    "MATCH (a:concept)-[:extends]->(b:concept) RETURN a, b SKIP 500",
+)?;
 
 let opts = CompileOptions {
     scopes: vec!["local".to_string()],
@@ -56,8 +58,11 @@ graph writes go through `create` / `update` / `link` / `merge` / `delete` at the
 runtime layer instead.
 
 `CompileOptions.scopes` restricts the query to specific namespaces (empty means
-cross-namespace); `max_limit` is a server-side cap — the effective `LIMIT` is
-`min(requested, max_limit)`.
+cross-namespace); `max_limit` is the effective server page size. The payload bound
+is `min(query LIMIT, max_limit)`, and GQL `SKIP` compiles to a bound SQL offset after
+a deterministic identity order. When no query `LIMIT` exists (or it exceeds the page
+size), the compiler fetches one sentinel row so the runtime can return `has_more` and
+`next_offset`. SPARQL `OFFSET` is intentionally unsupported.
 
 Errors are typed as `QueryError`: `Parse { position, message }`, `Compile(String)`,
 `Validation(String)`, `Unsupported(String)`, `InvalidInput(String)`.

@@ -722,7 +722,7 @@ impl khive_storage::SqlWriter for SqliteWriter {
         // this same handle still works over the standalone connection.
         if let Some(writer_task) = self.writer_task.clone() {
             return writer_task
-                .send(move |conn| {
+                .send_bounded(move |conn| {
                     let mut stmt = prepare_sql_statement(conn, &statement.sql)
                         .map_err(|e| map_rusqlite_err(e, "execute"))?;
                     bind_params(&mut stmt, &statement.params)
@@ -783,7 +783,7 @@ impl khive_storage::SqlWriter for SqliteWriter {
         reject_transaction_control_statements(&statements, "execute_batch")?;
         if let Some(writer_task) = self.writer_task.clone() {
             return writer_task
-                .send(move |conn| {
+                .send_bounded(move |conn| {
                     for statement in &statements {
                         reject_multiple_statement(conn, &statement.sql)
                             .map_err(|e| map_rusqlite_err(e, "execute_batch"))?;
@@ -951,7 +951,7 @@ impl khive_storage::SqlWriter for SqliteWriter {
         // runs inside the writer task's transaction.
         if let Some(writer_task) = self.writer_task.clone() {
             return writer_task
-                .send(move |conn| {
+                .send_bounded(move |conn| {
                     conn.execute_batch(&script)
                         .map_err(|e| map_rusqlite_err(e, "execute_script"))
                 })
@@ -994,7 +994,7 @@ impl khive_storage::SqlWriter for SqliteWriter {
         // wrap entirely.
         if let Some(writer_task) = self.writer_task.clone() {
             return writer_task
-                .send_top_level(move |conn| {
+                .send_top_level_bounded(move |conn| {
                     conn.execute_batch(&script)
                         .map_err(|e| map_rusqlite_err(e, "execute_script_top_level"))
                 })
@@ -1722,7 +1722,7 @@ impl khive_storage::SqlAccess for SqlBridge {
                 // after it returns — `op` must not (and, via `InlineWriter`,
                 // does not) issue its own transaction control.
                 return writer_task
-                    .send(move |conn| {
+                    .send_bounded(move |conn| {
                         let mut inline = InlineWriter {
                             conn: conn as *const rusqlite::Connection,
                         };

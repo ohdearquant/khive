@@ -126,11 +126,43 @@ successfully-resolved dispatch, or `crate::cost_unit::base_resource_payload` (`{
 case. `None` is reserved for a caller with no `work_class` to stamp at all (none exist today); it
 must never be used to omit `cost_unit` alone.
 
+## persist_git_digest_receipt
+
+Successful `git.digest` is the one strict exception to best-effort audit
+persistence. Both `dispatch_with_identity` and
+`dispatch_intercepted_with_identity` allocate one schema-v2 audit event,
+insert its UUID into the handler result as `receipt_id`, attach the complete
+result at `payload.result`, set `target_id=project_id`, and append before
+returning. The normal flattened `AuditEvent` fields and ADR-103 `resource`
+object remain present, including `resource.request_id` when the transport
+supplied one. That id correlates the containing request as a group: every
+operation in one batch or chain shares it. `receipt_id` remains the unique
+key for one successful digest result. The handler policy is `AlwaysVerbose`,
+so the default MCP presentation returns the exact stored `payload.result`
+without shortening UUIDs or dropping empty fields.
+
+No configured event store, no gate audit decision, malformed `project_id`,
+or append failure replaces the handler success with
+`RuntimeError::Internal("git_digest_receipt_persist_failed: ...")`. The
+message tells the caller that writes may already have committed and reveals
+no storage/source/command detail. When receipt construction rejects malformed
+handler output while a store and gate audit are available, the borrowed audit
+is still appended once through the generic schema-v1 Error path; it is not
+silently consumed. A receipt append failure is not retried as a generic append
+against the same failing store. Handler errors and every other verb retain the
+ordinary best-effort audit path.
+
 ## LinkAuditSuccessV2
 
 Schema v2 audit payload for a successful singleton `link` call. Additive over the v1 `AuditEvent`
 shape: every v1 field is preserved via `#[serde(flatten)]`, and the edge identity/relation/weight
 the caller created or resolved are added at the top level.
+
+Audit schema v2 is a verb-discriminated additive family: the flattened `verb`
+selects its enrichment. Singleton `link` carries the edge fields above;
+successful `git.digest` carries `result` (the complete receipted report) plus
+the ordinary `resource` object. Consumers must retain the common v1 envelope
+and branch on `verb` before interpreting enrichment fields.
 
 ## link_audit_success_from_result
 

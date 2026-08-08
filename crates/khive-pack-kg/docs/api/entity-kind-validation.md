@@ -14,6 +14,13 @@ request resolves kinds, ids, and result payloads through the SAME canonical logi
 handlers use, instead of re-deriving or duplicating that logic. `kkernel` already depends on
 this crate directly, so this is not a crate-graph inversion.
 
+`ValidatedSearchRequest` is public and shared with the MCP/kkernel coordinator
+seam for the same reason: multi-backend dispatch must use the exact deny-unknown-fields,
+kind reconciliation, entity-type validation, and substrate-field rules as the
+KG handler. Its fields remain private and are exposed through read-only
+accessors, preventing downstream code from manufacturing a partially validated
+request or narrowing the public search contract by rebuilding it from raw JSON.
+
 `resolve_uuid_unfiltered` implements the ADR-007 Rev 6 by-ID contract: UUID resolution for
 get/update/delete/merge is namespace-agnostic — the Gate is the authz seam, not storage-layer
 filtering. Full-UUID inputs were already unfiltered (`resolve_by_id`); this function closes

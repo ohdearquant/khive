@@ -67,7 +67,9 @@ impl KnowledgeHandlers {
                     .map_err(|e| sql_err("index page reader", e))?;
                 let rows = reader
                     .query_all(SqlStatement {
-                        sql: "SELECT * FROM knowledge_atoms WHERE namespace = ?1 AND deleted_at IS NULL ORDER BY created_at LIMIT ?2 OFFSET ?3".into(),
+                        // #1671: `id` tiebreak — the batch re-embed sweep pages the
+                        // full atom table; a non-total order would duplicate/skip atoms.
+                        sql: "SELECT * FROM knowledge_atoms WHERE namespace = ?1 AND deleted_at IS NULL ORDER BY created_at ASC, id ASC LIMIT ?2 OFFSET ?3".into(),
                         params: vec![
                             SqlValue::Text(ns.clone()),
                             SqlValue::Integer(batch_size as i64),

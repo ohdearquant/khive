@@ -47,9 +47,11 @@ impl SqlEventStore {
         is_file_backed: bool,
         namespace: impl Into<String>,
     ) -> Self {
-        // Best-effort opt-in (ADR-067 Component A, mirrors entity.rs slice 1
-        // policy): a missing writer task degrades to the legacy pool-mutex /
-        // standalone-connection path rather than failing construction.
+        // Enabled by default for file-backed pools; explicit off/degraded
+        // fallback remains possible (ADR-067 Component A, mirrors
+        // entity.rs policy): a missing writer task degrades to the legacy
+        // pool-mutex / standalone-connection path rather than failing
+        // construction.
         let writer_task = pool.writer_task_handle().ok().flatten();
         Self {
             pool,
@@ -89,7 +91,7 @@ impl SqlEventStore {
     {
         if let Some(writer_task) = &self.writer_task {
             return writer_task
-                .send(move |conn| f(conn).map_err(|e| map_err(e, op)))
+                .send_bounded(move |conn| f(conn).map_err(|e| map_err(e, op)))
                 .await;
         }
 
@@ -1004,7 +1006,7 @@ impl EventStore for SqlEventStore {
         // only after the usage snapshot is frozen, so it never counts itself.
         if let Some(writer_task) = &self.writer_task {
             return writer_task
-                .send(move |conn| {
+                .send_bounded(move |conn| {
                     insert_event_with_observations(conn, &event)
                         .map_err(|e| map_err(e, "append_event"))
                 })
@@ -1014,7 +1016,7 @@ impl EventStore for SqlEventStore {
                 });
         }
 
-        // Flag-off (default) path: byte-for-byte unchanged from pre-ADR-067
+        // Explicitly disabled or degraded fallback path: byte-for-byte unchanged from pre-ADR-067
         // behavior — the closure owns its own BEGIN IMMEDIATE/COMMIT/ROLLBACK.
         let origin = self.pool.origin();
         self.with_writer("append_event", move |conn| {
@@ -1046,7 +1048,7 @@ impl EventStore for SqlEventStore {
         // and issues the ROLLBACK on `Err`.
         if let Some(writer_task) = &self.writer_task {
             return writer_task
-                .send(move |conn| {
+                .send_bounded(move |conn| {
                     batch_append_events_dml(conn, &events, attempted)
                         .map_err(|e| map_err(e, "append_events"))
                 })
@@ -1059,7 +1061,7 @@ impl EventStore for SqlEventStore {
                 });
         }
 
-        // Flag-off (default) path: byte-for-byte unchanged from pre-ADR-067
+        // Explicitly disabled or degraded fallback path: byte-for-byte unchanged from pre-ADR-067
         // behavior — the closure owns its own BEGIN IMMEDIATE/COMMIT/ROLLBACK.
         let origin = self.pool.origin();
         self.with_writer("append_events", move |conn| {

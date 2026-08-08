@@ -211,9 +211,10 @@ impl SqliteSparseStore {
         namespace: String,
     ) -> Result<Self, SqliteError> {
         let table_name = format!("sparse_{}", model_key);
-        // Best-effort opt-in (ADR-067 Component A, mirrors entity.rs slice 1
-        // policy): a missing writer task degrades to the legacy pool-mutex
-        // path rather than failing construction.
+        // Enabled by default for file-backed pools; explicit off/degraded
+        // fallback remains possible (ADR-067 Component A, mirrors
+        // entity.rs policy): a missing writer task degrades to the legacy
+        // pool-mutex path rather than failing construction.
         let writer_task = pool.writer_task_handle().ok().flatten();
         Ok(Self {
             pool,
@@ -244,7 +245,7 @@ impl SqliteSparseStore {
     {
         if let Some(writer_task) = &self.writer_task {
             return writer_task
-                .send(move |conn| f(conn).map_err(|e| map_err(e, op)))
+                .send_bounded(move |conn| f(conn).map_err(|e| map_err(e, op)))
                 .await;
         }
 
@@ -355,14 +356,14 @@ impl SqliteSparseStore {
         if let Some(writer_task) = &self.writer_task {
             let table2 = table.clone();
             return writer_task
-                .send(move |conn| {
+                .send_bounded(move |conn| {
                     batch_insert_sparse_dml(conn, &table2, &records, attempted)
                         .map_err(|e| map_err(e, "sparse_insert_batch"))
                 })
                 .await;
         }
 
-        // Flag-off (default) path: byte-for-byte unchanged from pre-ADR-067
+        // Explicitly disabled or degraded fallback path: byte-for-byte unchanged from pre-ADR-067
         // behavior — the closure owns its own BEGIN IMMEDIATE/COMMIT.
         let origin = self.pool.origin();
         self.with_writer("sparse_insert_batch", move |conn| {

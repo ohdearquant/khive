@@ -212,7 +212,10 @@ fn validate_condition(cond: &mut Condition, is_edge: bool) -> Result<(), QueryEr
             };
             if matches!(
                 cond.op,
-                CompareOp::Contains | CompareOp::StartsWith | CompareOp::IsNotNull
+                CompareOp::Contains
+                    | CompareOp::StartsWith
+                    | CompareOp::IsNotNull
+                    | CompareOp::IsNull
             ) {
                 return Ok(());
             }

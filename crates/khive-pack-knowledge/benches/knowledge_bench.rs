@@ -40,6 +40,7 @@ fn build_registry(rt: KhiveRuntime) -> VerbRegistry {
     builder.register(KgPack::new(rt.clone()));
     builder.register(KnowledgePack::new(rt.clone()));
     let registry = builder.build().expect("registry");
+    registry.apply_schema_plans(rt.backend());
     rt.install_edge_rules(registry.all_edge_rules());
     registry
 }
@@ -202,8 +203,12 @@ fn bench_stats(c: &mut Criterion) {
     seed_atoms(&registry, &rt_tokio, 50);
 
     group.bench_function("stats_query", |b| {
-        b.to_async(&rt_tokio)
-            .iter(|| registry.dispatch("knowledge.stats", black_box(json!({}))));
+        b.to_async(&rt_tokio).iter(|| async {
+            registry
+                .dispatch("knowledge.stats", black_box(json!({})))
+                .await
+                .expect("knowledge.stats benchmark dispatch")
+        });
     });
 
     group.finish();

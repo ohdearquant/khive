@@ -249,6 +249,9 @@ pub(crate) const HARD_CAP: usize = 10_000;
 pub(crate) struct QueryParams {
     pub(crate) query: String,
     #[serde(default)]
+    pub(crate) page_size: Option<usize>,
+    /// Deprecated compatibility alias for `page_size`.
+    #[serde(default)]
     pub(crate) limit: Option<usize>,
 }
 

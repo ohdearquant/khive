@@ -528,7 +528,13 @@ impl KgPack {
         }
 
         sql_str.push_str(&format!(
-            " ORDER BY updated_at DESC LIMIT ?{param_idx} OFFSET ?{}",
+            // #1671: `proposal_id` tiebreak makes the offset page order a
+            // deterministic total order across rows that share an
+            // `updated_at` timestamp. Offset paging can still duplicate or
+            // skip rows under concurrent inserts/deletes/updates — the
+            // tiebreak only removes tie-order instability, same caveat as
+            // the entity/graph/note sweeps.
+            " ORDER BY updated_at DESC, proposal_id DESC LIMIT ?{param_idx} OFFSET ?{}",
             param_idx + 1
         ));
         sql_params.push(SqlValue::Integer(limit));

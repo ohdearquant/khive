@@ -325,9 +325,10 @@ impl SqliteVecStore {
     ) -> Result<Self, SqliteError> {
         validate_model_key(&model_key)?;
         let table_name = format!("vec_{}", model_key);
-        // Best-effort opt-in (ADR-067 Component A, mirrors entity.rs slice 1
-        // policy): a missing writer task degrades to the legacy pool-mutex
-        // path rather than failing construction.
+        // Enabled by default for file-backed pools; explicit off/degraded
+        // fallback remains possible (ADR-067 Component A, mirrors
+        // entity.rs policy): a missing writer task degrades to the legacy
+        // pool-mutex path rather than failing construction.
         let writer_task = pool.writer_task_handle().ok().flatten();
         Ok(Self {
             pool,
@@ -391,7 +392,7 @@ impl SqliteVecStore {
     {
         if let Some(writer_task) = self.current_writer_task() {
             return writer_task
-                .send(move |conn| f(conn).map_err(|e| map_err(e, op)))
+                .send_bounded(move |conn| f(conn).map_err(|e| map_err(e, op)))
                 .await;
         }
 
@@ -946,7 +947,7 @@ impl VectorStore for SqliteVecStore {
             let embedding_model2 = embedding_model.clone();
             let embedding2 = embedding.clone();
             return writer_task
-                .send(move |conn| {
+                .send_bounded(move |conn| {
                     vec_upsert_atomic_dml(
                         conn,
                         &table2,
@@ -965,7 +966,7 @@ impl VectorStore for SqliteVecStore {
                 .await;
         }
 
-        // Flag-off (default) path: the closure owns its own transaction via
+        // Explicitly disabled or degraded fallback path: the closure owns its own transaction via
         // `conn.unchecked_transaction()`; the DELETE+INSERT body is the same
         // shared helper the WriterTask/batch paths use (#546), so this path
         // now also exercises the post-delete failpoint in tests.
@@ -1026,7 +1027,7 @@ impl VectorStore for SqliteVecStore {
             let table2 = table.clone();
             let store_embedding_model2 = store_embedding_model.clone();
             return writer_task
-                .send(move |conn| {
+                .send_bounded(move |conn| {
                     batch_insert_vectors_dml(
                         conn,
                         &table2,
@@ -1041,7 +1042,7 @@ impl VectorStore for SqliteVecStore {
                 .await;
         }
 
-        // Flag-off (default) path: byte-for-byte unchanged from pre-ADR-067
+        // Explicitly disabled or degraded fallback path: byte-for-byte unchanged from pre-ADR-067
         // behavior — the closure owns its own BEGIN IMMEDIATE/COMMIT.
         let origin = self.pool.origin();
         self.with_writer("vec_insert_batch", move |conn| {
@@ -1116,7 +1117,7 @@ impl VectorStore for SqliteVecStore {
             let embedding_model2 = embedding_model.clone();
             let embedding2 = embedding.clone();
             return writer_task
-                .send(move |conn| {
+                .send_bounded(move |conn| {
                     vec_upsert_atomic_dml(
                         conn,
                         &table2,
@@ -1135,7 +1136,7 @@ impl VectorStore for SqliteVecStore {
                 .await;
         }
 
-        // Flag-off (default) path: the closure owns its own transaction via
+        // Explicitly disabled or degraded fallback path: the closure owns its own transaction via
         // `conn.unchecked_transaction()`; the DELETE+INSERT body is the same
         // shared helper the WriterTask/batch paths use (#546).
         let origin = self.pool.origin();
@@ -1375,7 +1376,7 @@ impl VectorStore for SqliteVecStore {
         if let Some(writer_task) = &self.writer_task {
             let table_for_error = table.clone();
             return writer_task
-                .send(move |conn| {
+                .send_bounded(move |conn| {
                     delete_vector_subjects_dml(conn, &table, &id_strings)
                         .map_err(|e| map_err(e, "vec_delete_subjects"))
                 })
@@ -1514,7 +1515,7 @@ impl VectorStore for SqliteVecStore {
             let kind_json2 = kind_json.clone();
             let allow_json2 = allow_json.clone();
             return writer_task
-                .send(move |conn| {
+                .send_bounded(move |conn| {
                     orphan_sweep_dml(
                         conn,
                         &table2,
@@ -1529,7 +1530,7 @@ impl VectorStore for SqliteVecStore {
                 .await;
         }
 
-        // Flag-off (default) path: byte-for-byte unchanged from pre-ADR-067
+        // Explicitly disabled or degraded fallback path: byte-for-byte unchanged from pre-ADR-067
         // behavior — the closure owns its own transaction via
         // `Transaction::new_unchecked`.
         refuse_direct_route_if_strict(

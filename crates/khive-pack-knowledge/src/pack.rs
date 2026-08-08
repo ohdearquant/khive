@@ -10,7 +10,8 @@ use uuid::Uuid;
 use khive_brain_core::SectionPosteriorState;
 use khive_runtime::pack::{PackByIdResolver, PackRuntime};
 use khive_runtime::{
-    KhiveRuntime, Namespace, NamespaceToken, Resolved, RuntimeError, VerbRegistry,
+    KhiveRuntime, Namespace, NamespaceToken, PackSchemaPlan, Resolved, RuntimeError, SchemaPlan,
+    VerbRegistry,
 };
 use khive_storage::types::{SqlStatement, SqlValue};
 use khive_storage::{PhaseCancelledPayload, PhaseCompletedPayload, PhaseStartedPayload};
@@ -19,7 +20,7 @@ use khive_types::{EventKind, HandlerDef, Pack};
 use crate::knowledge::util::{atom_from_row, atom_to_json, domain_from_row, domain_to_json};
 use crate::knowledge::vamana;
 use crate::knowledge::KnowledgeHandlers;
-use crate::vocab::KNOWLEDGE_HANDLERS;
+use crate::vocab::{KNOWLEDGE_HANDLERS, KNOWLEDGE_SCHEMA_PLAN_STMTS};
 
 /// Knowledge corpus pack — atoms, domains, TF-IDF search, fold, import, and KG concept verbs.
 pub struct KnowledgePack {
@@ -47,6 +48,10 @@ impl Pack for KnowledgePack {
         &[khive_brain_core::ConsumerKind::KnowledgeCompose.as_str()];
     const HANDLERS: &'static [HandlerDef] = &KNOWLEDGE_HANDLERS;
     const REQUIRES: &'static [&'static str] = &["kg"];
+    const SCHEMA_PLAN: Option<PackSchemaPlan> = Some(PackSchemaPlan {
+        pack: "knowledge",
+        statements: &KNOWLEDGE_SCHEMA_PLAN_STMTS,
+    });
 }
 
 impl KnowledgePack {
@@ -111,6 +116,13 @@ impl PackRuntime for KnowledgePack {
 
     fn requires(&self) -> &'static [&'static str] {
         <KnowledgePack as Pack>::REQUIRES
+    }
+
+    fn schema_plan(&self) -> SchemaPlan {
+        SchemaPlan {
+            pack: "knowledge",
+            statements: &KNOWLEDGE_SCHEMA_PLAN_STMTS,
+        }
     }
 
     async fn warm(&self) {
@@ -218,6 +230,9 @@ impl PackRuntime for KnowledgePack {
                 KnowledgeHandlers::delete_atoms(&self.runtime, token, params).await
             }
             "knowledge.stats" => KnowledgeHandlers::stats(&self.runtime, token, params).await,
+            "knowledge.eval_retrieval" => {
+                KnowledgeHandlers::eval_retrieval(&self.runtime, token, params, &self.ann).await
+            }
             "knowledge.index" => {
                 KnowledgeHandlers::index(&self.runtime, token, params, &self.ann, None).await
             }

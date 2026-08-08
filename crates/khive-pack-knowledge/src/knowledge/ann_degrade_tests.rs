@@ -400,9 +400,9 @@ async fn suggest_sets_ann_unavailable_when_warming_times_out() {
 /// `compose` in auto-mode delegates to `suggest` and must surface
 /// `data["ann_unavailable"] = true` when the underlying `suggest` sets the flag.
 ///
-/// Auto-mode is triggered when `domain_ids` and `atom_ids` are absent.  Because
-/// `suggest` finds no domain hits, `compose` returns early with the no-domains
-/// response, placing `ann_unavailable` in `result["data"]["ann_unavailable"]`.
+/// Auto-mode is triggered when `domain_ids` and `atom_ids` are absent. A live
+/// lexical domain with no members makes compose reach the separate "No atoms
+/// found" early return after degraded suggest has already selected a domain.
 #[tokio::test]
 async fn compose_propagates_ann_unavailable_in_auto_mode() {
     let _serial = TIMEOUT_OVERRIDE_SERIAL.lock().await;
@@ -414,17 +414,18 @@ async fn compose_propagates_ann_unavailable_in_auto_mode() {
 
     registry
         .dispatch(
-            "knowledge.upsert_atoms",
+            "knowledge.upsert_domains",
             json!({
-                "atoms": [{
-                    "slug": "degrade-compose-atom",
-                    "name": "Degrade Compose Atom",
-                    "content": "attention mechanism self-attention transformer encoder decoder positional embedding layer normalization residual connection feed forward dense sparse retrieval vector nearest neighbor"
+                "domains": [{
+                    "slug": "degrade-empty-compose-domain",
+                    "name": "Degrade Empty Compose Domain",
+                    "description": "machine learning neural network transformer attention architecture multi head self attention retrieval composition domain with intentionally empty membership for reliable production operations",
+                    "members": []
                 }]
             }),
         )
         .await
-        .expect("upsert atom");
+        .expect("upsert empty domain");
 
     registry
         .dispatch("knowledge.index", json!({ "rebuild_ann": false }))
@@ -438,7 +439,7 @@ async fn compose_propagates_ann_unavailable_in_auto_mode() {
 
     let token = rt.authorize(Namespace::local()).expect("authorize");
     // Auto-mode requires ≥10 words; no domain_ids/atom_ids.
-    // type_weights are not reached on the ANN-degrade path (returns before section scoring).
+    // type_weights are not reached because the selected domain has no members.
     let result = KnowledgeHandlers::compose(
         &rt,
         &token,
@@ -459,6 +460,10 @@ async fn compose_propagates_ann_unavailable_in_auto_mode() {
         Some(true),
         "compose must propagate ann_unavailable=true from its internal suggest call; \
          got: {result}"
+    );
+    assert_eq!(
+        result["data"]["markdown"], "# Knowledge Briefing\n\nNo atoms found.",
+        "the regression must exercise the empty-member early return; got: {result}"
     );
 }
 
@@ -572,7 +577,7 @@ async fn suggest_reports_degraded_candidates_or_lexical_only_from_ranking_conseq
                     {
                         "slug": "degrade-semantic-domain",
                         "name": "Opaque Systems Domain",
-                        "description": "SEMANTIC_TARGET serving throughput latency batching cache scheduling gpu utilization request queuing parallelism autoscaling deployment topology load balancing production workloads resource management observability reliability"
+                        "description": "SEMANTIC_TARGET speculative serving throughput decoding latency batching inference cache scheduling acceleration gpu utilization techniques request queuing large scale parallelism language aware autoscaling models deployment topology load balancing production workloads resource management observability reliability"
                     },
                     {
                         "slug": "degrade-lexical-collision",
