@@ -105,3 +105,35 @@ pub struct RequestParams {
     )]
     pub request_id: Option<u64>,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::RequestParams;
+    use serde_json::json;
+
+    #[test]
+    fn request_params_reject_unknown_envelope_fields() {
+        let error = serde_json::from_value::<RequestParams>(json!({
+            "ops": "verbs()",
+            "presentaton": "verbose"
+        }))
+        .expect_err("misspelled request-envelope fields must be rejected");
+
+        assert!(
+            error.to_string().contains("presentaton"),
+            "the validation error must name the rejected field: {error}"
+        );
+    }
+
+    #[test]
+    fn request_tool_schema_is_closed() {
+        let schema = schemars::schema_for!(RequestParams);
+        let value = serde_json::to_value(schema).expect("serialize request schema");
+
+        assert_eq!(
+            value.get("additionalProperties"),
+            Some(&json!(false)),
+            "the MCP request schema must reject fields outside its declared properties"
+        );
+    }
+}
