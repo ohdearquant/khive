@@ -14,10 +14,11 @@ properties, so those compatibility fields never appear twice.
 
 ## `EdgeRecord`
 
-The record carries UUID `edge_id`, source and target IDs, relation, weight, JSON properties, and
-optional timestamps. Weight defaults to `0.7`. Custom deserialization rejects NaN and infinities,
-then rejects finite values outside `[0, 1]`; direct Rust construction remains the caller's
-responsibility.
+The record carries UUID `edge_id`, non-blank source and target IDs, relation, weight, JSON
+properties, and optional timestamps. The JSON adapter validates endpoint strings after trimming
+but preserves their original accepted bytes. Weight defaults to `0.7`. Custom deserialization
+rejects NaN and infinities, then rejects finite values outside `[0, 1]`; direct Rust construction
+remains the caller's responsibility.
 
 ## Error taxonomy
 

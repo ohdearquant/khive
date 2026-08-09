@@ -782,6 +782,58 @@ fn test_json_adapter_canonical_source_target_still_dispatches_edge() {
 }
 
 #[test]
+fn test_json_adapter_rejects_whitespace_only_edge_source() {
+    let mut adapter =
+        JsonFormatAdapter::new(r#"[{"source":" \t\n ","target":"bb","relation":"extends"}]"#)
+            .expect("structurally valid JSON must construct");
+    let error = adapter
+        .edges()
+        .next()
+        .expect("one edge")
+        .expect_err("whitespace-only source must fail closed");
+
+    assert!(matches!(
+        error,
+        AdapterError::InvalidField { field, reason, .. }
+            if field == "source" && reason.contains("non-blank")
+    ));
+}
+
+#[test]
+fn test_json_adapter_rejects_whitespace_only_edge_target() {
+    let mut adapter =
+        JsonFormatAdapter::new(r#"[{"source":"aa","target":" \t\n ","relation":"extends"}]"#)
+            .expect("structurally valid JSON must construct");
+    let error = adapter
+        .edges()
+        .next()
+        .expect("one edge")
+        .expect_err("whitespace-only target must fail closed");
+
+    assert!(matches!(
+        error,
+        AdapterError::InvalidField { field, reason, .. }
+            if field == "target" && reason.contains("non-blank")
+    ));
+}
+
+#[test]
+fn test_json_adapter_preserves_accepted_edge_endpoint_bytes() {
+    let mut adapter = JsonFormatAdapter::new(
+        r#"[{"source":"  source-id\t","target":"\ttarget-id  ","relation":"extends"}]"#,
+    )
+    .expect("structurally valid JSON must construct");
+    let edge = adapter
+        .edges()
+        .next()
+        .expect("one edge")
+        .expect("non-blank endpoints must parse");
+
+    assert_eq!(edge.source, "  source-id\t");
+    assert_eq!(edge.target, "\ttarget-id  ");
+}
+
+#[test]
 fn test_json_adapter_rejects_malformed_or_non_string_timestamps() {
     for (json, expected_field) in [
         (

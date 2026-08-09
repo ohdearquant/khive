@@ -343,19 +343,10 @@ fn parse_edge(
     mut obj: serde_json::Map<String, Value>,
     warnings: &mut Vec<String>,
 ) -> Result<EdgeRecord, AdapterError> {
-    let source = remove_ci(&mut obj, "source")
-        .and_then(|(_, v)| v.as_str().map(|s| s.to_owned()))
-        .ok_or_else(|| AdapterError::MissingField {
-            index,
-            field: "source".into(),
-        })?;
-
-    let target = remove_ci(&mut obj, "target")
-        .and_then(|(_, v)| v.as_str().map(|s| s.to_owned()))
-        .ok_or_else(|| AdapterError::MissingField {
-            index,
-            field: "target".into(),
-        })?;
+    // Validate on a trimmed view but retain the caller's exact nonblank bytes,
+    // matching entity-name behavior and the ADR-036 adapter boundary.
+    let source = extract_required_string(&mut obj, index, "source")?;
+    let target = extract_required_string(&mut obj, index, "target")?;
 
     let relation = {
         let raw = extract_required_string(&mut obj, index, "relation")?;

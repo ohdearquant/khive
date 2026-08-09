@@ -13,6 +13,8 @@
   accumulate in `FormatAdapter::warnings()`.
 - Field lookup is case-insensitive: keys are matched by ASCII-lowercase comparison, allowing
   `"Name"`, `"name"`, and `"NAME"` to all resolve to the `name` field.
+- Required entity labels and edge endpoint strings are non-blank after trimming, while their
+  original accepted bytes are preserved in the adapter record.
 - Unknown entity keys fold into the `properties` map rather than being rejected.
 - Schema mode strictness applies only to entity kinds; edge relations are always validated
   against the closed set regardless of schema mode.

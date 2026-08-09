@@ -71,6 +71,22 @@ pub enum MergeConflict {
         modified_in: BranchSide,
         deleted_in: BranchSide,
     },
+    /// Both branches changed an edge's durable UUID to different values.
+    EdgeIdentityMismatch {
+        source_id: Uuid,
+        target_id: Uuid,
+        relation: String,
+        ours: Uuid,
+        theirs: Uuid,
+    },
+    /// Both branches changed the same edge-property key differently.
+    EdgePropertyMismatch {
+        source_id: Uuid,
+        target_id: Uuid,
+        relation: String,
+        ours: Option<serde_json::Value>,
+        theirs: Option<serde_json::Value>,
+    },
     /// An edge references a missing entity (dangling reference).
     DanglingEdge {
         source_id: Uuid,

@@ -386,12 +386,33 @@ type MergeConflict =
     deletedIn: "ours" | "theirs";
   }
   | {
+    type: "duplicate_addition";
+    entityId: string;
+    differingFields: string[];
+  }
+  | {
     type: "edge_modify_delete";
     sourceId: string;
     targetId: string;
     relation: string;
     modifiedIn: "ours" | "theirs";
     deletedIn: "ours" | "theirs";
+  }
+  | {
+    type: "edge_identity_mismatch";
+    sourceId: string;
+    targetId: string;
+    relation: string;
+    ours: string;
+    theirs: string;
+  }
+  | {
+    type: "edge_property_mismatch";
+    sourceId: string;
+    targetId: string;
+    relation: string;
+    ours: unknown | null;
+    theirs: unknown | null;
   }
   | {
     type: "dangling_edge";

@@ -12,15 +12,17 @@ The merge API separates valid semantic conflicts from invalid inputs and interna
 
 ## `MergeConflict`
 
-| Variant             | Meaning                                                                 |
-| ------------------- | ----------------------------------------------------------------------- |
-| `NameConflict`      | both branches supply different entity names                             |
-| `KindConflict`      | both branches supply different entity kinds                             |
-| `PropertyMismatch`  | both branches supply different values for one property or `entity_type` |
-| `ModifyDelete`      | one branch modifies an entity while the other deletes it                |
-| `DuplicateAddition` | both branches add the same UUID with different content                  |
-| `EdgeModifyDelete`  | one branch changes an edge weight while the other deletes it            |
-| `DanglingEdge`      | a selected edge references an entity absent from the merged entity set  |
+| Variant                 | Meaning                                                                        |
+| ----------------------- | ------------------------------------------------------------------------------ |
+| `NameConflict`          | both branches supply different entity names                                    |
+| `KindConflict`          | both branches supply different entity kinds                                    |
+| `PropertyMismatch`      | both branches supply different values for one entity property or `entity_type` |
+| `ModifyDelete`          | one branch modifies an entity while the other deletes it                       |
+| `DuplicateAddition`     | both branches add the same UUID with different content                         |
+| `EdgeModifyDelete`      | one branch changes edge identity, weight, or properties while the other deletes it |
+| `EdgeIdentityMismatch`  | both branches replace one semantic edge's durable UUID differently             |
+| `EdgePropertyMismatch`  | both branches change the same property key on one semantic edge differently    |
+| `DanglingEdge`          | a selected edge references an entity absent from the merged entity set         |
 
 `BranchSide::Ours` denotes the local branch being merged into the common base; `Theirs` denotes the remote branch being incorporated.
 
@@ -32,7 +34,7 @@ The merge API separates valid semantic conflicts from invalid inputs and interna
 | `InvalidEdgeWeight` | an input edge weight is NaN or infinite                                            |
 | `DuplicateEntityId` | one archive repeats an entity UUID                                                 |
 | `DuplicateEdgeKey`  | one archive repeats a semantic `(source, target, relation)` key                    |
-| `Internal`          | duplicate edge UUID, relation reconstruction failure, or another invariant failure |
+| `Internal`          | duplicate edge UUID or another invariant failure                                   |
 
 A conflict is not an error: it represents well-formed inputs whose changes need a policy or human decision. Invalid archives fail before diff computation.
 

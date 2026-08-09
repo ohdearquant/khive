@@ -790,6 +790,143 @@ fn merge_preserves_weight_modified_edge_id() {
     }
 }
 
+#[test]
+fn auto_preserves_one_sided_property_only_edge_with_provenance() {
+    let a = Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap();
+    let b = Uuid::parse_str("22222222-2222-2222-2222-222222222222").unwrap();
+    let entities = vec![entity(a, "A"), entity(b, "B")];
+    let mut base_edge = edge_weighted(a, b, 0.7);
+    base_edge.created_at = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+        .unwrap()
+        .with_timezone(&Utc);
+    base_edge.updated_at = chrono::DateTime::parse_from_rfc3339("2026-01-02T00:00:00Z")
+        .unwrap()
+        .with_timezone(&Utc);
+    let mut ours_edge = base_edge.clone();
+    ours_edge.properties = Some(serde_json::json!({"confidence": 0.95}));
+    ours_edge.created_at = chrono::DateTime::parse_from_rfc3339("2026-03-03T00:00:00Z")
+        .unwrap()
+        .with_timezone(&Utc);
+    ours_edge.updated_at = chrono::DateTime::parse_from_rfc3339("2026-04-04T00:00:00Z")
+        .unwrap()
+        .with_timezone(&Utc);
+
+    let base = archive_full(entities.clone(), vec![base_edge.clone()]);
+    let ours = archive_full(entities.clone(), vec![ours_edge.clone()]);
+    let theirs = archive_full(entities, vec![base_edge]);
+    let result = three_way_merge(&base, &ours, &theirs, SnapshotMergeStrategy::Auto).unwrap();
+
+    match result {
+        MergeResult::Clean { merged } => {
+            assert_eq!(merged.edges.len(), 1);
+            assert_eq!(merged.edges[0].edge_id, ours_edge.edge_id);
+            assert_eq!(merged.edges[0].properties, ours_edge.properties);
+            assert_eq!(merged.edges[0].created_at, ours_edge.created_at);
+            assert_eq!(merged.edges[0].updated_at, ours_edge.updated_at);
+        }
+        MergeResult::Conflicts { conflicts } => {
+            panic!("one-sided property change must merge cleanly: {conflicts:?}")
+        }
+    }
+}
+
+fn divergent_property_archives() -> (KgArchive, KgArchive, KgArchive) {
+    let a = Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap();
+    let b = Uuid::parse_str("22222222-2222-2222-2222-222222222222").unwrap();
+    let entities = vec![entity(a, "A"), entity(b, "B")];
+    let mut base_edge = edge_weighted(a, b, 0.7);
+    base_edge.properties = Some(serde_json::json!({"confidence": 0.5}));
+    let mut ours_edge = base_edge.clone();
+    ours_edge.properties = Some(serde_json::json!({"confidence": 0.8}));
+    ours_edge.created_at = chrono::DateTime::parse_from_rfc3339("2026-05-05T00:00:00Z")
+        .unwrap()
+        .with_timezone(&Utc);
+    ours_edge.updated_at = chrono::DateTime::parse_from_rfc3339("2026-06-06T00:00:00Z")
+        .unwrap()
+        .with_timezone(&Utc);
+    let mut theirs_edge = base_edge.clone();
+    theirs_edge.properties = Some(serde_json::json!({"confidence": 0.9}));
+    theirs_edge.created_at = chrono::DateTime::parse_from_rfc3339("2026-07-07T00:00:00Z")
+        .unwrap()
+        .with_timezone(&Utc);
+    theirs_edge.updated_at = chrono::DateTime::parse_from_rfc3339("2026-08-08T00:00:00Z")
+        .unwrap()
+        .with_timezone(&Utc);
+
+    (
+        archive_full(entities.clone(), vec![base_edge]),
+        archive_full(entities.clone(), vec![ours_edge]),
+        archive_full(entities, vec![theirs_edge]),
+    )
+}
+
+#[test]
+fn auto_reports_divergent_edge_property_changes() {
+    let (base, ours, theirs) = divergent_property_archives();
+    let result = three_way_merge(&base, &ours, &theirs, SnapshotMergeStrategy::Auto).unwrap();
+
+    assert!(matches!(
+        result,
+        MergeResult::Conflicts { ref conflicts }
+            if conflicts.iter().any(|conflict| matches!(
+                conflict,
+                MergeConflict::EdgePropertyMismatch { .. }
+            ))
+    ));
+}
+
+#[test]
+fn ours_strategy_resolves_divergent_edge_properties_to_ours() {
+    let (base, ours, theirs) = divergent_property_archives();
+    let result = three_way_merge(&base, &ours, &theirs, SnapshotMergeStrategy::Ours).unwrap();
+
+    match result {
+        MergeResult::Clean { merged } => {
+            assert_eq!(
+                merged.edges[0].properties,
+                Some(serde_json::json!({"confidence": 0.8}))
+            );
+            assert_eq!(
+                merged.edges[0].created_at.to_rfc3339(),
+                "2026-05-05T00:00:00+00:00"
+            );
+            assert_eq!(
+                merged.edges[0].updated_at.to_rfc3339(),
+                "2026-06-06T00:00:00+00:00"
+            );
+        }
+        MergeResult::Conflicts { conflicts } => {
+            panic!("ours strategy must resolve the property conflict: {conflicts:?}")
+        }
+    }
+}
+
+#[test]
+fn theirs_strategy_resolves_divergent_edge_properties_to_theirs() {
+    let (base, ours, theirs) = divergent_property_archives();
+    let result = three_way_merge(&base, &ours, &theirs, SnapshotMergeStrategy::Theirs).unwrap();
+
+    match result {
+        MergeResult::Clean { merged } => {
+            assert_eq!(
+                merged.edges[0].properties,
+                Some(serde_json::json!({"confidence": 0.9}))
+            );
+            assert_eq!(
+                merged.edges[0].created_at.to_rfc3339(),
+                "2026-07-07T00:00:00+00:00"
+            );
+            assert_eq!(
+                merged.edges[0].updated_at.to_rfc3339(),
+                "2026-08-08T00:00:00+00:00"
+            );
+        }
+        MergeResult::Conflicts { conflicts } => {
+            panic!("theirs strategy must resolve the property conflict: {conflicts:?}")
+        }
+    }
+}
+
 // ── Strategy tests ──────────────────────────────────────────────────────────
 
 #[test]
@@ -927,7 +1064,7 @@ fn diff_added_edge() {
 }
 
 #[test]
-fn diff_weight_modified_edge() {
+fn diff_weight_change_is_modified_edge() {
     use khive_merge::diff_local::{diff_edges, EdgeChange, EdgeKey};
     let a = Uuid::new_v4();
     let b = Uuid::new_v4();
@@ -939,7 +1076,7 @@ fn diff_weight_modified_edge() {
         target: b,
         relation: "extends".into(),
     };
-    assert!(matches!(diff[&key], EdgeChange::WeightModified { .. }));
+    assert!(matches!(diff[&key], EdgeChange::Modified { .. }));
 }
 
 // ── #454: entity_type must participate in diff and merge ───────────────────

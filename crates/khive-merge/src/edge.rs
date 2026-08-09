@@ -6,23 +6,23 @@
 
 use std::collections::{HashMap, HashSet};
 
-use chrono::Utc;
 use khive_runtime::portability::{ExportedEdge, KgArchive};
 use uuid::Uuid;
 
-use crate::diff_local::{diff_edges, EdgeChange, EdgeKey};
+use crate::diff_local::{diff_edges, properties_equal, EdgeChange, EdgeKey};
 use crate::types::{BranchSide, MergeConflict, MergeError};
 
 /// Merges edges from `base`, `ours`, and `theirs` by semantic edge key.
 ///
-/// Returns the provisional edge set and any modify/delete conflicts. Call
+/// Returns the provisional edge set and any typed edge conflicts. Call
 /// [`validate_dangling_edges`] after entity merge before accepting the set.
 ///
 /// # Errors
 ///
-/// Returns [`MergeError::Internal`] if a relation cannot be reconstructed.
-/// Use the top-level merge to validate namespaces, weights, and duplicates.
-/// See `crates/khive-merge/docs/api/edge-merge.md` for all merge rules.
+/// The current edge pass is infallible after top-level input validation; the
+/// `Result` shape remains part of the merge-layer contract. Use the top-level
+/// merge to validate namespaces, weights, and duplicates. See
+/// `crates/khive-merge/docs/api/edge-merge.md` for all merge rules.
 pub fn merge_edges(
     base: &KgArchive,
     ours: &KgArchive,
@@ -48,18 +48,8 @@ pub fn merge_edges(
     let mut merged: Vec<ExportedEdge> = Vec::new();
     let mut conflicts: Vec<MergeConflict> = Vec::new();
 
-    // Preserve originating edge IDs across merge/diff cycles.
+    // Preserve the common-base record for unchanged output.
     let base_edge_map: HashMap<EdgeKey, &ExportedEdge> = base
-        .edges
-        .iter()
-        .map(|e| (EdgeKey::from_edge(e), e))
-        .collect();
-    let ours_edge_map: HashMap<EdgeKey, &ExportedEdge> = ours
-        .edges
-        .iter()
-        .map(|e| (EdgeKey::from_edge(e), e))
-        .collect();
-    let theirs_edge_map: HashMap<EdgeKey, &ExportedEdge> = theirs
         .edges
         .iter()
         .map(|e| (EdgeKey::from_edge(e), e))
@@ -87,11 +77,9 @@ pub fn merge_edges(
             }
 
             (Some(EdgeChange::Added(e_ours)), Some(EdgeChange::Added(e_theirs))) => {
-                // Simultaneous weight changes auto-resolve to the maximum.
-                let weight = f64::max(e_ours.weight, e_theirs.weight);
-                let mut edge = e_ours.clone();
-                edge.weight = weight;
+                let (edge, edge_conflicts) = merge_added_edges(key, e_ours, e_theirs);
                 merged.push(edge);
+                conflicts.extend(edge_conflicts);
             }
 
             (Some(EdgeChange::Deleted), Some(EdgeChange::Deleted)) => {}
@@ -103,45 +91,54 @@ pub fn merge_edges(
             | (None, Some(EdgeChange::Deleted)) => {}
 
             (
-                Some(EdgeChange::WeightModified { branch_weight, .. }),
+                Some(EdgeChange::Modified {
+                    branch: edge_ours, ..
+                }),
                 Some(EdgeChange::Unchanged),
             )
-            | (Some(EdgeChange::WeightModified { branch_weight, .. }), None) => {
-                let existing = ours_edge_map.get(key).copied();
-                let edge = build_edge(key, *branch_weight, existing)?;
-                merged.push(edge);
+            | (
+                Some(EdgeChange::Modified {
+                    branch: edge_ours, ..
+                }),
+                None,
+            ) => {
+                merged.push(edge_ours.clone());
             }
 
             (
                 Some(EdgeChange::Unchanged),
-                Some(EdgeChange::WeightModified { branch_weight, .. }),
-            )
-            | (None, Some(EdgeChange::WeightModified { branch_weight, .. })) => {
-                let existing = theirs_edge_map.get(key).copied();
-                let edge = build_edge(key, *branch_weight, existing)?;
-                merged.push(edge);
-            }
-
-            // Prefer ours' ID when both weights changed for deterministic identity.
-            (
-                Some(EdgeChange::WeightModified {
-                    branch_weight: ours_w,
+                Some(EdgeChange::Modified {
+                    branch: edge_theirs,
                     ..
                 }),
-                Some(EdgeChange::WeightModified {
-                    branch_weight: theirs_w,
+            )
+            | (
+                None,
+                Some(EdgeChange::Modified {
+                    branch: edge_theirs,
                     ..
                 }),
             ) => {
-                let existing = ours_edge_map
-                    .get(key)
-                    .or_else(|| theirs_edge_map.get(key))
-                    .copied();
-                let edge = build_edge(key, f64::max(*ours_w, *theirs_w), existing)?;
-                merged.push(edge);
+                merged.push(edge_theirs.clone());
             }
 
-            (Some(EdgeChange::Deleted), Some(EdgeChange::WeightModified { .. })) => {
+            (
+                Some(EdgeChange::Modified {
+                    base,
+                    branch: edge_ours,
+                }),
+                Some(EdgeChange::Modified {
+                    branch: edge_theirs,
+                    ..
+                }),
+            ) => {
+                let (edge, edge_conflicts) =
+                    merge_modified_edges(key, base, edge_ours, edge_theirs);
+                merged.push(edge);
+                conflicts.extend(edge_conflicts);
+            }
+
+            (Some(EdgeChange::Deleted), Some(EdgeChange::Modified { .. })) => {
                 conflicts.push(MergeConflict::EdgeModifyDelete {
                     source_id: key.source,
                     target_id: key.target,
@@ -151,7 +148,7 @@ pub fn merge_edges(
                 });
             }
 
-            (Some(EdgeChange::WeightModified { .. }), Some(EdgeChange::Deleted)) => {
+            (Some(EdgeChange::Modified { .. }), Some(EdgeChange::Deleted)) => {
                 conflicts.push(MergeConflict::EdgeModifyDelete {
                     source_id: key.source,
                     target_id: key.target,
@@ -166,6 +163,180 @@ pub fn merge_edges(
     }
 
     Ok((merged, conflicts))
+}
+
+/// Reconciles two independently added records for one semantic edge key.
+///
+/// Independent additions have no common durable UUID, so the established
+/// policy keeps ours' identity and timestamps and takes the maximum weight.
+/// Object properties reconcile per key; same-key divergence remains a typed
+/// conflict rather than being silently discarded.
+fn merge_added_edges(
+    key: &EdgeKey,
+    ours: &ExportedEdge,
+    theirs: &ExportedEdge,
+) -> (ExportedEdge, Vec<MergeConflict>) {
+    let mut result = ours.clone();
+    result.weight = f64::max(ours.weight, theirs.weight);
+    let no_base = None;
+    let (properties, conflicts) =
+        merge_edge_properties(key, &no_base, &ours.properties, &theirs.properties);
+    result.properties = properties;
+
+    (result, conflicts)
+}
+
+/// Three-way reconciliation for two modified records of one semantic edge.
+///
+/// Weight follows the existing maximum policy only when both branches changed
+/// it; a one-sided increase or decrease is retained exactly. Property objects
+/// reconcile per key, while durable UUIDs use ordinary three-way selection;
+/// each reports a typed conflict only when both branches changed the same
+/// governed value differently. Ours' complete timestamp pair is the
+/// deterministic provenance carrier for a double-modified result; timestamps
+/// never create a change or conflict alone.
+fn merge_modified_edges(
+    key: &EdgeKey,
+    base: &ExportedEdge,
+    ours: &ExportedEdge,
+    theirs: &ExportedEdge,
+) -> (ExportedEdge, Vec<MergeConflict>) {
+    let mut result = ours.clone();
+    let mut conflicts = Vec::new();
+
+    let ours_weight_changed = !weights_equal(base.weight, ours.weight);
+    let theirs_weight_changed = !weights_equal(base.weight, theirs.weight);
+    result.weight = match (ours_weight_changed, theirs_weight_changed) {
+        (false, false) => base.weight,
+        (true, false) => ours.weight,
+        (false, true) => theirs.weight,
+        (true, true) => f64::max(ours.weight, theirs.weight),
+    };
+
+    let (properties, property_conflicts) =
+        merge_edge_properties(key, &base.properties, &ours.properties, &theirs.properties);
+    result.properties = properties;
+    conflicts.extend(property_conflicts);
+
+    let ours_identity_changed = base.edge_id != ours.edge_id;
+    let theirs_identity_changed = base.edge_id != theirs.edge_id;
+    result.edge_id = match (ours_identity_changed, theirs_identity_changed) {
+        (false, false) => base.edge_id,
+        (true, false) => ours.edge_id,
+        (false, true) => theirs.edge_id,
+        (true, true) if ours.edge_id == theirs.edge_id => ours.edge_id,
+        (true, true) => {
+            conflicts.push(MergeConflict::EdgeIdentityMismatch {
+                source_id: key.source,
+                target_id: key.target,
+                relation: key.relation.clone(),
+                ours: ours.edge_id,
+                theirs: theirs.edge_id,
+            });
+            ours.edge_id
+        }
+    };
+
+    (result, conflicts)
+}
+
+/// Three-way merges governed edge metadata without discarding independent keys.
+///
+/// The accepted wire/storage contract makes properties an object. `None` is
+/// treated as an empty map for key-level reconciliation; non-object legacy
+/// payloads retain conservative atomic selection. A divergent same-key edit
+/// produces one payload-level conflict and keeps ours for that key in the
+/// provisional record.
+fn merge_edge_properties(
+    key: &EdgeKey,
+    base: &Option<serde_json::Value>,
+    ours: &Option<serde_json::Value>,
+    theirs: &Option<serde_json::Value>,
+) -> (Option<serde_json::Value>, Vec<MergeConflict>) {
+    if properties_equal(ours, theirs) {
+        return (ours.clone(), Vec::new());
+    }
+    if properties_equal(ours, base) {
+        return (theirs.clone(), Vec::new());
+    }
+    if properties_equal(theirs, base) {
+        return (ours.clone(), Vec::new());
+    }
+
+    let all_object_like = [base, ours, theirs]
+        .into_iter()
+        .all(|value| matches!(value, None | Some(serde_json::Value::Object(_))));
+    if !all_object_like {
+        return (
+            ours.clone(),
+            vec![edge_property_conflict(key, ours, theirs)],
+        );
+    }
+
+    let base_object = base.as_ref().and_then(serde_json::Value::as_object);
+    let ours_object = ours.as_ref().and_then(serde_json::Value::as_object);
+    let theirs_object = theirs.as_ref().and_then(serde_json::Value::as_object);
+    let mut property_keys: HashSet<String> = HashSet::new();
+    for object in [base_object, ours_object, theirs_object]
+        .into_iter()
+        .flatten()
+    {
+        property_keys.extend(object.keys().cloned());
+    }
+    let mut property_keys: Vec<String> = property_keys.into_iter().collect();
+    property_keys.sort();
+
+    let mut merged = serde_json::Map::new();
+    let mut has_conflict = false;
+    for property_key in property_keys {
+        let base_value = base_object.and_then(|object| object.get(&property_key));
+        let ours_value = ours_object.and_then(|object| object.get(&property_key));
+        let theirs_value = theirs_object.and_then(|object| object.get(&property_key));
+        let selected = if ours_value == theirs_value {
+            ours_value
+        } else if ours_value == base_value {
+            theirs_value
+        } else if theirs_value == base_value {
+            ours_value
+        } else {
+            has_conflict = true;
+            ours_value
+        };
+
+        if let Some(value) = selected {
+            merged.insert(property_key, value.clone());
+        }
+    }
+
+    let merged = if merged.is_empty() && (ours.is_none() || theirs.is_none()) {
+        None
+    } else {
+        Some(serde_json::Value::Object(merged))
+    };
+    let conflicts = if has_conflict {
+        vec![edge_property_conflict(key, ours, theirs)]
+    } else {
+        Vec::new()
+    };
+    (merged, conflicts)
+}
+
+fn edge_property_conflict(
+    key: &EdgeKey,
+    ours: &Option<serde_json::Value>,
+    theirs: &Option<serde_json::Value>,
+) -> MergeConflict {
+    MergeConflict::EdgePropertyMismatch {
+        source_id: key.source,
+        target_id: key.target,
+        relation: key.relation.clone(),
+        ours: ours.clone(),
+        theirs: theirs.clone(),
+    }
+}
+
+fn weights_equal(a: f64, b: f64) -> bool {
+    (a - b).abs() < f64::EPSILON
 }
 
 /// Reports edges whose source or target is absent from `entity_ids`.
@@ -195,29 +366,6 @@ pub fn validate_dangling_edges(
         }
     }
     conflicts
-}
-
-/// Reconstructs an edge, preserving the selected branch's identity and
-/// timestamps, or minting import-time provenance for a synthetic fallback.
-fn build_edge(
-    key: &EdgeKey,
-    weight: f64,
-    existing: Option<&ExportedEdge>,
-) -> Result<ExportedEdge, MergeError> {
-    let relation = key
-        .relation
-        .parse::<khive_storage::EdgeRelation>()
-        .map_err(|e| MergeError::Internal(e.to_string()))?;
-    Ok(ExportedEdge {
-        edge_id: existing.map_or_else(Uuid::new_v4, |edge| edge.edge_id),
-        source: key.source,
-        target: key.target,
-        relation,
-        weight,
-        properties: existing.and_then(|edge| edge.properties.clone()),
-        created_at: existing.map_or_else(Utc::now, |edge| edge.created_at),
-        updated_at: existing.map_or_else(Utc::now, |edge| edge.updated_at),
-    })
 }
 
 #[cfg(test)]
@@ -377,5 +525,175 @@ mod tests {
             merged[0].edge_id, expected_id,
             "merged edge_id must equal ours' edge_id after weight modification"
         );
+    }
+
+    #[test]
+    fn one_sided_property_change_preserves_complete_branch_edge() {
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        let base_edge = edge(a, b, 0.7);
+        let mut ours_edge = base_edge.clone();
+        ours_edge.properties = Some(serde_json::json!({"confidence": 0.95}));
+        ours_edge.created_at = chrono::DateTime::parse_from_rfc3339("2026-03-03T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        ours_edge.updated_at = chrono::DateTime::parse_from_rfc3339("2026-04-04T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+
+        let base = archive(vec![base_edge.clone()]);
+        let ours = archive(vec![ours_edge.clone()]);
+        let theirs = archive(vec![base_edge]);
+        let (merged, conflicts) = merge_edges(&base, &ours, &theirs).unwrap();
+
+        assert!(conflicts.is_empty(), "unexpected conflicts: {conflicts:?}");
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].edge_id, ours_edge.edge_id);
+        assert_eq!(merged[0].properties, ours_edge.properties);
+        assert_eq!(merged[0].created_at, ours_edge.created_at);
+        assert_eq!(merged[0].updated_at, ours_edge.updated_at);
+    }
+
+    #[test]
+    fn divergent_property_only_changes_report_typed_conflict() {
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        let mut base_edge = edge(a, b, 0.7);
+        base_edge.properties = Some(serde_json::json!({"confidence": 0.5}));
+        let mut ours_edge = base_edge.clone();
+        ours_edge.properties = Some(serde_json::json!({"confidence": 0.8}));
+        let mut theirs_edge = base_edge.clone();
+        theirs_edge.properties = Some(serde_json::json!({"confidence": 0.9}));
+
+        let base = archive(vec![base_edge]);
+        let ours = archive(vec![ours_edge]);
+        let theirs = archive(vec![theirs_edge]);
+        let (_, conflicts) = merge_edges(&base, &ours, &theirs).unwrap();
+
+        assert!(matches!(
+            conflicts.as_slice(),
+            [MergeConflict::EdgePropertyMismatch {
+                source_id,
+                target_id,
+                relation,
+                ours: Some(ours),
+                theirs: Some(theirs),
+            }] if *source_id == a
+                && *target_id == b
+                && relation == "extends"
+                && ours == &serde_json::json!({"confidence": 0.8})
+                && theirs == &serde_json::json!({"confidence": 0.9})
+        ));
+    }
+
+    #[test]
+    fn independent_property_key_changes_merge_without_loss() {
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        let mut base_edge = edge(a, b, 0.7);
+        base_edge.properties = Some(serde_json::json!({"shared": "base"}));
+        let mut ours_edge = base_edge.clone();
+        ours_edge.properties = Some(serde_json::json!({
+            "ours": 1,
+            "shared": "base",
+        }));
+        let mut theirs_edge = base_edge.clone();
+        theirs_edge.properties = Some(serde_json::json!({
+            "shared": "base",
+            "theirs": 2,
+        }));
+
+        let base = archive(vec![base_edge]);
+        let ours = archive(vec![ours_edge]);
+        let theirs = archive(vec![theirs_edge]);
+        let (merged, conflicts) = merge_edges(&base, &ours, &theirs).unwrap();
+
+        assert!(conflicts.is_empty(), "unexpected conflicts: {conflicts:?}");
+        assert_eq!(
+            merged[0].properties,
+            Some(serde_json::json!({
+                "ours": 1,
+                "shared": "base",
+                "theirs": 2,
+            }))
+        );
+    }
+
+    #[test]
+    fn independent_weight_and_property_changes_merge_without_loss() {
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        let mut base_edge = edge(a, b, 0.5);
+        base_edge.properties = Some(serde_json::json!({"origin": "base"}));
+        let mut ours_edge = base_edge.clone();
+        ours_edge.properties = Some(serde_json::json!({"origin": "ours"}));
+        let mut theirs_edge = base_edge.clone();
+        theirs_edge.weight = 0.2;
+
+        let base = archive(vec![base_edge]);
+        let ours = archive(vec![ours_edge.clone()]);
+        let theirs = archive(vec![theirs_edge]);
+        let (merged, conflicts) = merge_edges(&base, &ours, &theirs).unwrap();
+
+        assert!(conflicts.is_empty(), "unexpected conflicts: {conflicts:?}");
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].weight, 0.2);
+        assert_eq!(merged[0].properties, ours_edge.properties);
+        assert_eq!(merged[0].created_at, ours_edge.created_at);
+        assert_eq!(merged[0].updated_at, ours_edge.updated_at);
+    }
+
+    #[test]
+    fn divergent_edge_identity_changes_report_typed_conflict() {
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        let base_edge = edge(a, b, 0.7);
+        let mut ours_edge = base_edge.clone();
+        ours_edge.edge_id = Uuid::new_v4();
+        let mut theirs_edge = base_edge.clone();
+        theirs_edge.edge_id = Uuid::new_v4();
+
+        let base = archive(vec![base_edge]);
+        let ours = archive(vec![ours_edge.clone()]);
+        let theirs = archive(vec![theirs_edge.clone()]);
+        let (_, conflicts) = merge_edges(&base, &ours, &theirs).unwrap();
+
+        assert!(matches!(
+            conflicts.as_slice(),
+            [MergeConflict::EdgeIdentityMismatch {
+                source_id,
+                target_id,
+                relation,
+                ours,
+                theirs,
+            }] if *source_id == a
+                && *target_id == b
+                && relation == "extends"
+                && *ours == ours_edge.edge_id
+                && *theirs == theirs_edge.edge_id
+        ));
+    }
+
+    #[test]
+    fn property_modify_delete_is_an_edge_modify_delete_conflict() {
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        let base_edge = edge(a, b, 0.7);
+        let mut theirs_edge = base_edge.clone();
+        theirs_edge.properties = Some(serde_json::json!({"confidence": 0.95}));
+
+        let base = archive(vec![base_edge]);
+        let ours = archive(vec![]);
+        let theirs = archive(vec![theirs_edge]);
+        let (_, conflicts) = merge_edges(&base, &ours, &theirs).unwrap();
+
+        assert!(matches!(
+            conflicts.as_slice(),
+            [MergeConflict::EdgeModifyDelete {
+                modified_in: BranchSide::Theirs,
+                deleted_in: BranchSide::Ours,
+                ..
+            }]
+        ));
     }
 }
