@@ -71,21 +71,15 @@ const MAX_FATTEN_ROWS: u32 = 200_000;
 
 /// Insert 64 KiB blobs, each its own committed (autocommit) transaction, so
 /// `checkpoint_once` has real, checkpointable frames waiting, until the
-/// `-wal` file reaches `MIN_WAL_BYTES`. Disables `PRAGMA wal_autocheckpoint`
-/// on this connection first — otherwise SQLite's own default auto-checkpoint
-/// threshold (~4000 pages / 16 MiB, well under `MIN_WAL_BYTES`) fires on
-/// every commit past that point, capping the WAL near that default forever
-/// instead of letting it grow, which turns this loop into a runaway
-/// insert-and-immediately-reclaim cycle instead of a bounded fixture.
+/// `-wal` file reaches `MIN_WAL_BYTES`. The production pool configuration
+/// disables connection-local autocheckpoint, so this fixture also fails loud
+/// if that writer invariant regresses.
 fn fatten_wal(pool: &ConnectionPool, db_path: &Path) {
     let writer = pool.writer().expect("acquire writer to seed the WAL");
     writer
         .conn()
-        .execute_batch(
-            "PRAGMA wal_autocheckpoint = 0; \
-             CREATE TABLE blobs (v BLOB NOT NULL);",
-        )
-        .expect("disable auto-checkpoint and create table");
+        .execute_batch("CREATE TABLE blobs (v BLOB NOT NULL)")
+        .expect("create table");
 
     let payload = vec![0xABu8; 64 * 1024];
     let wal = wal_path(db_path);

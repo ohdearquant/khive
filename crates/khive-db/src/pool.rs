@@ -21,7 +21,6 @@ const CACHE_SIZE_KIB: &str = "-65536";
 const MMAP_SIZE_BYTES: &str = "1073741824";
 const DEFAULT_READER_CAP: usize = 8;
 
-const DEFAULT_WAL_AUTOCHECKPOINT_PAGES: u32 = 4000;
 const DEFAULT_JOURNAL_SIZE_LIMIT_BYTES: i64 = 67_108_864; // 64 MiB
 const DEFAULT_WRITE_QUEUE_CAPACITY: usize = 256;
 
@@ -48,13 +47,6 @@ pub struct PoolConfig {
     ///
     /// Overridable via `KHIVE_CHECKOUT_TIMEOUT_SECS`.
     pub checkout_timeout: Duration,
-    /// Number of WAL pages that triggers an automatic checkpoint.
-    ///
-    /// Maps to `PRAGMA wal_autocheckpoint`. The default (4000 pages, ~16 MiB
-    /// at SQLite's default 4 KiB page size) matches the pre-config behaviour.
-    ///
-    /// Overridable via `KHIVE_WAL_AUTOCHECKPOINT_PAGES`.
-    pub wal_autocheckpoint_pages: u32,
     /// Maximum WAL journal size in bytes before SQLite resets the WAL.
     ///
     /// Maps to `PRAGMA journal_size_limit`. Default: 64 MiB.
@@ -153,10 +145,6 @@ impl Default for PoolConfig {
                     .and_then(|v| v.parse::<u64>().ok())
                     .unwrap_or(5),
             ),
-            wal_autocheckpoint_pages: std::env::var("KHIVE_WAL_AUTOCHECKPOINT_PAGES")
-                .ok()
-                .and_then(|v| v.parse::<u32>().ok())
-                .unwrap_or(DEFAULT_WAL_AUTOCHECKPOINT_PAGES),
             journal_size_limit_bytes: std::env::var("KHIVE_JOURNAL_SIZE_LIMIT_BYTES")
                 .ok()
                 .and_then(|v| v.parse::<i64>().ok())
@@ -1031,6 +1019,7 @@ impl ConnectionPool {
                 | OpenFlags::SQLITE_OPEN_URI,
         )?;
         conn.busy_timeout(self.config.busy_timeout)?;
+        conn.pragma_update(None, "wal_autocheckpoint", 0)?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         Ok(conn)
@@ -1282,11 +1271,11 @@ fn configure_writer_connection(
     conn.pragma_update(None, "cache_size", CACHE_SIZE_KIB)?;
     conn.pragma_update(None, "mmap_size", MMAP_SIZE_BYTES)?;
     conn.pragma_update(None, "temp_store", "MEMORY")?;
+    conn.pragma_update(None, "wal_autocheckpoint", 0)?;
 
     let wal_enabled = wants_wal && current_journal_mode(conn)?.eq_ignore_ascii_case("wal");
 
     if wal_enabled {
-        conn.pragma_update(None, "wal_autocheckpoint", config.wal_autocheckpoint_pages)?;
         conn.pragma_update(None, "journal_size_limit", config.journal_size_limit_bytes)?;
     }
 
@@ -1478,6 +1467,11 @@ mod tests {
         guard
     }
 
+    fn wal_autocheckpoint_pages(conn: &Connection) -> u32 {
+        conn.pragma_query_value(None, "wal_autocheckpoint", |row| row.get(0))
+            .expect("read PRAGMA wal_autocheckpoint")
+    }
+
     #[test]
     #[serial]
     fn pool_config_default_values_match_constants() {
@@ -1486,10 +1480,6 @@ mod tests {
         // so clear them first — this test asserts the constants, not the env.
         let _pool_env = clear_pool_env();
         let cfg = PoolConfig::default();
-        assert_eq!(
-            cfg.wal_autocheckpoint_pages,
-            DEFAULT_WAL_AUTOCHECKPOINT_PAGES
-        );
         assert_eq!(
             cfg.journal_size_limit_bytes,
             DEFAULT_JOURNAL_SIZE_LIMIT_BYTES
@@ -1500,11 +1490,18 @@ mod tests {
 
     #[test]
     #[serial]
-    fn pool_config_env_override_wal_autocheckpoint() {
+    fn legacy_env_cannot_reenable_wal_autocheckpoint() {
+        let _pool_env = clear_pool_env();
         std::env::set_var("KHIVE_WAL_AUTOCHECKPOINT_PAGES", "8000");
-        let cfg = PoolConfig::default();
-        std::env::remove_var("KHIVE_WAL_AUTOCHECKPOINT_PAGES");
-        assert_eq!(cfg.wal_autocheckpoint_pages, 8000);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy_autocheckpoint_env.db");
+        let pool = ConnectionPool::new(PoolConfig {
+            path: Some(path),
+            ..PoolConfig::default()
+        })
+        .expect("pool open");
+        let writer = pool.writer().expect("writer");
+        assert_eq!(wal_autocheckpoint_pages(writer.conn()), 0);
     }
 
     #[test]
@@ -1672,16 +1669,10 @@ mod tests {
 
     #[test]
     #[serial]
-    fn pool_config_env_invalid_falls_back_to_default() {
-        std::env::set_var("KHIVE_WAL_AUTOCHECKPOINT_PAGES", "not_a_number");
+    fn pool_config_invalid_journal_size_limit_falls_back_to_default() {
         std::env::set_var("KHIVE_JOURNAL_SIZE_LIMIT_BYTES", "");
         let cfg = PoolConfig::default();
-        std::env::remove_var("KHIVE_WAL_AUTOCHECKPOINT_PAGES");
         std::env::remove_var("KHIVE_JOURNAL_SIZE_LIMIT_BYTES");
-        assert_eq!(
-            cfg.wal_autocheckpoint_pages,
-            DEFAULT_WAL_AUTOCHECKPOINT_PAGES
-        );
         assert_eq!(
             cfg.journal_size_limit_bytes,
             DEFAULT_JOURNAL_SIZE_LIMIT_BYTES
@@ -1699,6 +1690,82 @@ mod tests {
         let pool = ConnectionPool::new(cfg).expect("file-backed pool should open");
         assert!(path.exists());
         assert!(pool.max_readers() > 0);
+    }
+
+    #[test]
+    fn every_writer_connection_disables_wal_autocheckpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("writer_autocheckpoint.db");
+        let pool = ConnectionPool::new(PoolConfig {
+            path: Some(path),
+            write_queue_enabled: Some(false),
+            ..PoolConfig::default()
+        })
+        .expect("pool open");
+
+        {
+            let writer = pool.writer().expect("pooled writer");
+            assert_eq!(wal_autocheckpoint_pages(writer.conn()), 0);
+        }
+
+        let standalone = pool
+            .open_standalone_writer()
+            .expect("standalone writer opened after pool initialization");
+        assert_eq!(wal_autocheckpoint_pages(&standalone), 0);
+        drop(standalone);
+
+        let later_standalone = pool
+            .open_standalone_writer_untracked()
+            .expect("later infrastructure writer");
+        assert_eq!(wal_autocheckpoint_pages(&later_standalone), 0);
+
+        let memory_pool = ConnectionPool::new(PoolConfig {
+            write_queue_enabled: Some(false),
+            ..PoolConfig::default()
+        })
+        .expect("in-memory pool open");
+        let memory_writer = memory_pool.writer().expect("in-memory writer");
+        assert_eq!(wal_autocheckpoint_pages(memory_writer.conn()), 0);
+    }
+
+    #[test]
+    fn threshold_crossing_commits_do_not_run_an_implicit_checkpoint() {
+        const FORMER_AUTOCHECKPOINT_THRESHOLD_PAGES: i64 = 4_000;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("no_implicit_checkpoint.db");
+        let pool = ConnectionPool::new(PoolConfig {
+            path: Some(path),
+            write_queue_enabled: Some(false),
+            ..PoolConfig::default()
+        })
+        .expect("pool open");
+        let writer = pool.writer().expect("pooled writer");
+        writer
+            .execute_batch("CREATE TABLE blobs (value BLOB NOT NULL)")
+            .expect("create fixture table");
+
+        let page_size: i64 = writer
+            .pragma_query_value(None, "page_size", |row| row.get(0))
+            .expect("read page size");
+        let payload_bytes = page_size * 32;
+        for _ in 0..160 {
+            writer
+                .execute(
+                    "INSERT INTO blobs (value) VALUES (zeroblob(?1))",
+                    [payload_bytes],
+                )
+                .expect("autocommit fixture row");
+        }
+
+        let log_frames: i64 = writer
+            .query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |row| row.get(1))
+            .expect("observe WAL frame count");
+        assert!(
+            log_frames > FORMER_AUTOCHECKPOINT_THRESHOLD_PAGES,
+            "the commit sequence must retain more than the former automatic threshold; \
+             observed {log_frames} frames"
+        );
     }
 
     #[tokio::test]

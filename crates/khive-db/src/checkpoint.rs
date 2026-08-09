@@ -3322,6 +3322,29 @@ mod tests {
         );
     }
 
+    #[test]
+    fn checkpoint_connection_disables_wal_autocheckpoint_on_open_and_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("checkpoint_autocheckpoint.db");
+        let pool = file_pool(&path);
+        let mut checkpoint_conn = CheckpointConnection::new();
+
+        let initial: u32 = checkpoint_conn
+            .ensure_open(&pool)
+            .expect("dedicated checkpoint connection must open")
+            .pragma_query_value(None, "wal_autocheckpoint", |row| row.get(0))
+            .expect("read initial autocheckpoint setting");
+        assert_eq!(initial, 0);
+
+        checkpoint_conn.conn = None;
+        let reopened: u32 = checkpoint_conn
+            .ensure_open(&pool)
+            .expect("dedicated checkpoint connection must reopen")
+            .pragma_query_value(None, "wal_autocheckpoint", |row| row.get(0))
+            .expect("read reopened autocheckpoint setting");
+        assert_eq!(reopened, 0);
+    }
+
     #[tokio::test]
     #[serial(checkpoint_skip_metrics)]
     async fn checkpoint_task_exits_on_shutdown_signal() {

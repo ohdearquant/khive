@@ -1207,3 +1207,25 @@ invoke `enumerate_live`. Its cleanup-derived `sidecar_listing_truncated` and
 `sidecar_entries_cleanup_would_reap` members are optional and omitted when enumeration did not
 run. A background checkpoint tick may independently perform its normal cleanup, but the
 diagnostic request itself never converts an unmeasured value into a clean-looking zero.
+
+### 2026-08-09 amendment (Amendment 7): disable per-connection WAL autocheckpoint
+
+**Motivation.** Amendment 5 moved scheduled checkpoint work to one dedicated connection, but
+SQLite's automatic checkpoint threshold is connection-local. A non-zero threshold on any
+ordinary writer still runs an implicit PASSIVE checkpoint synchronously in the commit that
+crosses it. Disabling the threshold only on the dedicated connection therefore cannot keep
+checkpoint I/O off application commit paths.
+
+**Decision.** Every writer-capable connection sets `PRAGMA wal_autocheckpoint = 0` when it is
+opened. The pool's startup writer applies the invariant in `configure_writer_connection`; the
+single standalone-writer constructor applies it to store and SQL-bridge writers as well as the
+writer task, diagnostics connection, and dedicated checkpoint connection, including every later
+open or checkpoint reconnect. The former `PoolConfig::wal_autocheckpoint_pages` field and
+`KHIVE_WAL_AUTOCHECKPOINT_PAGES` override are removed: routine checkpoint ownership is a safety
+invariant, not a tuning parameter.
+
+The scheduled task remains the only in-process source of routine PASSIVE checkpoint I/O.
+Amendment 5's dedicated-connection admission contract, TRUNCATE gates and busy bound, sidecar
+collection, counters, and severity ladder are otherwise unchanged. Regressions read the pragma on
+each connection class and grow a WAL past the former 4,000-page threshold before observing it, so
+configuration-only coverage cannot mask a later-created connection reverting to SQLite's default.

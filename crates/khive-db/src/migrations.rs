@@ -625,7 +625,12 @@ pub fn query_embedding_models(
     if !path.exists() {
         return Ok(Vec::new());
     }
-    let conn = Connection::open(path)?;
+    let conn = Connection::open_with_flags(
+        path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+            | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX
+            | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+    )?;
     query_embedding_models_conn(&conn, engine_filter)
 }
 

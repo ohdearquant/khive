@@ -172,6 +172,10 @@ logically (frames, not file bytes — the file size is retention, not debt);
 RESTART/TRUNCATE reserved for bounded maintenance windows under the admission
 authority's control.
 
+The connection-local disable is a topology-independent prerequisite and is already required on
+every writer-capable connection by ADR-091 Amendment 7. It does not by itself establish the
+single-owner topology this ADR proposes.
+
 ## Consequences
 
 **Gains.** Contention becomes O(1) in process count at the file-lock level; saturation,

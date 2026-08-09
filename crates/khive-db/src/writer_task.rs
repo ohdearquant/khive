@@ -1152,6 +1152,27 @@ mod tests {
         assert_eq!(counters.timeouts, 0);
     }
 
+    #[tokio::test]
+    async fn writer_task_connection_disables_wal_autocheckpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("writer_task_autocheckpoint.db");
+        let pool = file_pool(&path);
+        let handle = spawn(&pool, 8).expect("writer task should spawn");
+
+        let pages = handle
+            .send_top_level(|conn| {
+                conn.pragma_query_value(None, "wal_autocheckpoint", |row| row.get::<_, u32>(0))
+                    .map_err(|e| StorageError::Pool {
+                        operation: "test_wal_autocheckpoint".into(),
+                        message: e.to_string(),
+                    })
+            })
+            .await
+            .expect("query writer-task connection pragma");
+
+        assert_eq!(pages, 0);
+    }
+
     #[test]
     fn spawn_fails_on_in_memory_pool() {
         // In-memory pools have no standalone-connection support

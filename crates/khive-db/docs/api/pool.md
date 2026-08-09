@@ -7,6 +7,18 @@ function-specific technical reference for the pool's private/internal
 mechanics and the tests that pin them down; see `crates/khive-db/docs/design.md`
 ("Single-Writer Write Queue") for the ADR-067 rationale.
 
+## WAL autocheckpoint ownership
+
+Every writer-capable connection is created with `PRAGMA wal_autocheckpoint = 0`.
+This includes the pool's startup writer and every connection opened later through
+the standalone boundary. Store writers, raw SQL bridge writers, the writer task,
+diagnostics, and the dedicated checkpoint task all inherit one of those two open
+paths. There is no environment or `PoolConfig` override that can put routine
+checkpoint I/O back on an application commit path. The dedicated ADR-091 task owns
+routine PASSIVE checkpointing; its separately bounded TRUNCATE policy is unchanged.
+The standalone embedding-model registry query is opened read-only and is not a
+third writer constructor.
+
 ## `ConnectionPool::writer_task_handle` — single-writer-task rationale
 
 See `crates/khive-db/src/pool.rs` — `writer_task_handle`.
