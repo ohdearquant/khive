@@ -92,7 +92,11 @@ written before immutable provenance existed fail closed: the payload is not disp
 row becomes terminal `status="failed"`, and `dispatch_error` plus `dispatch_failed_at`
 explain the migration-policy failure. Legacy reminders ignore any unprovenanced actor claim
 and use the current server actor, then `local`, preserving a safe form of Amendment C's
-fallback without permitting forged delivery identity.
+fallback without permitting forged delivery identity. Refused generic rows retain
+`anonymous:local` in their diagnostic receipt because they have no verified creator; the daemon
+fallback is reminder-only. Legacy batches and chains are also refused before
+`mark_dispatch_invoking`, with terminal `failed`/`not_invoked` state, so best-effort partial
+success can never be retried as a whole and duplicated.
 
 Other generic dispatch failures remain per-event: they are persisted as
 `dispatch_error`/`dispatch_failed_at`. A failed one-shot returns to `pending` for a later
@@ -141,9 +145,10 @@ states prove that no target action future was polled; they are not dispatch outc
 Missed reminders still resolve immutable creator provenance so their retained receipt is
 creator-attributed; only a genuinely legacy reminder without provenance uses the scheduler
 fallback.
-Recovery also re-checks the current deadline in its final CAS, so a live claimant
-that renews after the recovery scan wins ownership instead of being finalized from
-the scan's stale snapshot.
+Recovery re-checks the current deadline and matches the exact serialized properties selected by
+its scan in every requeue, quarantine, and lifecycle-finalization CAS. A renewal, durable outcome,
+or any other intervening properties mutation therefore wins ownership instead of being overwritten
+from the scan's stale snapshot.
 
 `reclaim_stale_firing_events` reconciles expired deadlines by durable state. A
 v1 receipt is fully validated before its state is interpreted: the version,

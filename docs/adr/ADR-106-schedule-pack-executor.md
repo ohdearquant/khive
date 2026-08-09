@@ -893,10 +893,18 @@ dispatched, the claimed row becomes terminal `status="failed"`, and the drain pe
 `dispatch_error` plus `dispatch_failed_at`. This is the migration policy for rows written
 before creator attribution and deliberately differs from Amendment C's reminder-only legacy
 fallback: an unprovenanced reminder ignores its note actor claim and targets only the current
-server actor (then `local`). Other generic dispatch failures remain per-event. Amendment F
+server actor (then `local`). The refusal receipt for an unprovenanced generic action is stamped
+`anonymous:local`, because no actor was verified; the daemon fallback is reserved for genuinely
+legacy reminders. Other generic dispatch failures remain per-event. Amendment F
 supersedes their one-shot lifecycle: a failed one-shot remains `pending` and retryable; a
 named repeat advances normally. Both persist the same error fields, and later success clears
 them.
+
+The drain also revalidates the single-operation boundary before setting a receipt to
+`invoking`. A legacy action stored as a batch or chain becomes terminal `failed` with a
+`not_invoked` receipt. It is never submitted to best-effort batch dispatch: otherwise one
+operation could commit while a sibling returns a known failure, and retrying the occurrence
+would duplicate the successful side effect.
 
 ## Amendment F: Durable dispatch receipts and renewable leases (2026-08-07)
 
@@ -940,7 +948,8 @@ non-empty error; an occurrence skipped by the grace policy uses `state="missed"`
 
 The receipt actor is derived from the same immutable creator provenance as replay, including
 for reminders skipped by the missed-event policy. Only a genuinely legacy reminder with no
-provenance uses the configured scheduler/anonymous-local fallback. The receipt is diagnostic
+provenance uses the configured scheduler/anonymous-local fallback. A refused generic row with
+no verified creator uses `anonymous:local`, never the daemon actor. The receipt is diagnostic
 and never authorizes the dispatch; `VerifiedActor`, namespace injection, public visibility,
 and Gate evaluation remain the authority boundary described by Amendment E.
 
@@ -951,9 +960,12 @@ and Gate evaluation remain the authority boundary described by Amendment E.
 of that duration through action execution and durable outcome persistence. The renewal is
 independent of the action future's polling task, so a synchronously blocked handler cannot
 starve its own heartbeat on a multi-thread runtime, and writer contention after action return
-cannot create an unleased outcome gap. Reclaim compares the durable deadline, not the original start time.
-Its final CAS re-checks the current deadline, so a renewal that lands after recovery's
-SELECT fences that stale recovery snapshot.
+cannot create an unleased outcome gap. Reclaim compares the durable deadline, not the original
+start time. Every recovery requeue, quarantine, or lifecycle finalization matches the exact
+serialized properties snapshot selected by the recovery scan as well as re-checking the current
+deadline and claim identity. Any outcome persistence, renewal, or other properties mutation after
+the SELECT therefore fences the stale recovery write, including the race where an `invoking`
+snapshot is followed by a durable `succeeded` outcome whose completed lease is already expired.
 Rows written by older binaries without `lease_expires_at` retain the historical five-minute
 `firing_at` fallback.
 
@@ -1026,7 +1038,9 @@ second drain runs (one target-verb entry and one visible side effect), a crash a
 success but before finalization (resume without invocation), an expired `invoking` receipt
 (terminal indeterminate with no replay), failed one-shot retry with stable occurrence/distinct
 invocation ids, stale-claim finalization fencing, malformed terminal receipt fields and
-occurrence identity, truthful `claimed -> not_invoked -> pending` recovery, creator-attributed
-missed-reminder receipts, a committed side effect followed by structured `side_effects_unknown`
-across two drains (one invocation/one visible side effect), and an injected expired-row
-finalization failure that does not wedge later due work.
+occurrence identity, truthful `claimed -> not_invoked -> pending` recovery, a stale recovery
+snapshot losing to a newly durable success, creator-attributed missed-reminder receipts,
+anonymous attribution for refused generic rows, terminal pre-invocation refusal of legacy
+multi-op actions across two drains, a committed side effect followed by structured
+`side_effects_unknown` across two drains (one invocation/one visible side effect), and an
+injected expired-row finalization failure that does not wedge later due work.
