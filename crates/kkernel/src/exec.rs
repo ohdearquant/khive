@@ -2057,6 +2057,33 @@ mod tests {
         let _server = isolated_server(&db_path);
     }
 
+    fn rerun_in_command_scoped_empty_home(child_marker: &str, test_name: &str) -> bool {
+        if std::env::var_os(child_marker).is_some() {
+            return false;
+        }
+
+        let calling_process_home = std::env::var_os("HOME");
+        let empty_home = tempfile::tempdir().expect("isolated child HOME");
+        let status =
+            std::process::Command::new(std::env::current_exe().expect("current test executable"))
+                .arg(test_name)
+                .arg("--exact")
+                .env("HOME", empty_home.path())
+                .env_remove("KHIVE_EMBEDDING_MODEL")
+                .env_remove("KHIVE_ADDITIONAL_EMBEDDING_MODELS")
+                .env_remove("KHIVE_ACTOR")
+                .env(child_marker, "1")
+                .status()
+                .expect("spawn isolated config-discovery test process");
+        assert_eq!(
+            std::env::var_os("HOME"),
+            calling_process_home,
+            "command-scoped HOME must not mutate the calling test process"
+        );
+        assert!(status.success(), "isolated child test failed: {status}");
+        true
+    }
+
     // ── exec-path / serve-path config_id parity (#581) ────────────────────────
     //
     // `run_exec`'s cfg construction (above) and `kkernel mcp`'s `build_server`
@@ -2074,10 +2101,12 @@ mod tests {
     #[test]
     #[serial]
     fn exec_config_id_matches_serve_config_id_for_project_toml_actor() {
-        std::env::remove_var("KHIVE_EMBEDDING_MODEL");
-        std::env::remove_var("KHIVE_ADDITIONAL_EMBEDDING_MODELS");
-        std::env::remove_var("KHIVE_ACTOR");
-        let (previous_home, _home_dir) = isolate_home_for_test();
+        const CHILD_MARKER: &str = "KKERNEL_EXEC_PROJECT_CONFIG_TEST_CHILD";
+        const TEST_NAME: &str =
+            "exec::tests::exec_config_id_matches_serve_config_id_for_project_toml_actor";
+        if rerun_in_command_scoped_empty_home(CHILD_MARKER, TEST_NAME) {
+            return;
+        }
 
         let dir = tempfile::tempdir().expect("tempdir");
         let khive_dir = dir.path().join(".khive");
@@ -2169,7 +2198,6 @@ default = true
             compute_config_id(&serve_cfg, None),
             "exec-path config_id must match the serve/daemon-path config_id for the same db"
         );
-        restore_home(previous_home);
     }
 
     /// Regression guard: an explicit `--actor` pin must rebuild the
@@ -2185,10 +2213,12 @@ default = true
     #[test]
     #[serial]
     fn actor_pin_rebuilds_visible_namespaces_dropping_displaced_fallback() {
-        std::env::remove_var("KHIVE_EMBEDDING_MODEL");
-        std::env::remove_var("KHIVE_ADDITIONAL_EMBEDDING_MODELS");
-        std::env::remove_var("KHIVE_ACTOR");
-        let (previous_home, _home_dir) = isolate_home_for_test();
+        const CHILD_MARKER: &str = "KKERNEL_ACTOR_PIN_CONFIG_TEST_CHILD";
+        const TEST_NAME: &str =
+            "exec::tests::actor_pin_rebuilds_visible_namespaces_dropping_displaced_fallback";
+        if rerun_in_command_scoped_empty_home(CHILD_MARKER, TEST_NAME) {
+            return;
+        }
 
         let dir = tempfile::tempdir().expect("tempdir");
         let khive_dir = dir.path().join(".khive");
@@ -2261,7 +2291,6 @@ id = "lambda:fallback"
              fallback actor nor adding a new one: {:?}",
             local_cfg.visible_namespaces
         );
-        restore_home(previous_home);
     }
 
     /// Settles the `namespace_explicit` design question by constructing both
