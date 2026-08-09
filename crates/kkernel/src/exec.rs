@@ -543,9 +543,18 @@ pub(crate) fn parse_ops_file(path: &Path) -> Result<Vec<OpsFileEntry>> {
 /// without the per-op reason strings is unactionable: a gate rejection, a
 /// schema error, and a transient failure all look identical, and pipelines
 /// that trust the counts alone lose records silently.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OpsFileReportMode {
+    /// Preserve the pre-save-file CLI wire exactly for compatibility.
+    LegacyNoSave,
+    /// Bound durable manifest diagnostics independently from saved rows.
+    BoundedSave,
+}
+
 fn collect_op_failures(
     parsed: &serde_json::Value,
     applied_before: usize,
+    mode: OpsFileReportMode,
 ) -> Vec<serde_json::Value> {
     let Some(results) = parsed["results"].as_array() else {
         return Vec::new();
@@ -557,16 +566,86 @@ fn collect_op_failures(
         .map(|(i, entry)| {
             let error = match &entry["error"] {
                 serde_json::Value::Null => serde_json::Value::from("unknown error"),
-                other => bounded_failure_error(other),
+                other if mode == OpsFileReportMode::BoundedSave => bounded_failure_error(other),
+                other => other.clone(),
             };
-            serde_json::json!({
+            let mut failure = serde_json::json!({
                 "op_index": applied_before + i,
                 "tool": entry["tool"].as_str().unwrap_or("?"),
                 "error": error,
-                "aborted": entry["aborted"].as_bool().unwrap_or(false),
-            })
+            });
+            if mode == OpsFileReportMode::BoundedSave {
+                failure["aborted"] =
+                    serde_json::Value::Bool(entry["aborted"].as_bool().unwrap_or(false));
+            }
+            failure
         })
         .collect()
+}
+
+fn retain_failure_detail(
+    mode: OpsFileReportMode,
+    failure: serde_json::Value,
+    failures: &mut Vec<serde_json::Value>,
+    omitted: &mut usize,
+) -> bool {
+    if mode == OpsFileReportMode::BoundedSave && failures.len() >= MAX_OPS_FILE_FAILURE_DETAILS {
+        *omitted += 1;
+        false
+    } else {
+        failures.push(failure);
+        true
+    }
+}
+
+fn ops_file_progress_line(
+    mode: OpsFileReportMode,
+    applied: usize,
+    total: usize,
+    succeeded: usize,
+    failed: usize,
+    aborted: usize,
+) -> String {
+    match mode {
+        OpsFileReportMode::LegacyNoSave => {
+            format!("applied {applied}/{total} (ok={succeeded}, failed={failed})")
+        }
+        OpsFileReportMode::BoundedSave => format!(
+            "applied {applied}/{total} (ok={succeeded}, failed={failed}, aborted={aborted})"
+        ),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn ops_file_summary(
+    mode: OpsFileReportMode,
+    total: usize,
+    succeeded: usize,
+    failed: usize,
+    aborted: usize,
+    failures: Vec<serde_json::Value>,
+    failure_details_omitted: usize,
+) -> serde_json::Value {
+    let mut summary = match mode {
+        OpsFileReportMode::LegacyNoSave => serde_json::json!({
+            "total": total,
+            "succeeded": succeeded,
+            "failed": failed,
+        }),
+        OpsFileReportMode::BoundedSave => serde_json::json!({
+            "total": total,
+            "succeeded": succeeded,
+            "failed": failed,
+            "aborted": aborted,
+        }),
+    };
+    if !failures.is_empty() {
+        summary["failures"] = serde_json::Value::Array(failures);
+    }
+    if mode == OpsFileReportMode::BoundedSave && failure_details_omitted > 0 {
+        summary["failure_details_omitted"] = serde_json::json!(failure_details_omitted);
+    }
+    summary
 }
 
 fn bounded_failure_error(error: &serde_json::Value) -> serde_json::Value {
@@ -734,10 +813,15 @@ async fn apply_ops_file_reader<R: std::io::BufRead>(
     mut reader: R,
     total: usize,
     presentation: Option<String>,
-    output_format: Option<String>,
+    _output_format: Option<String>,
     save_file: Option<String>,
     strict: bool,
 ) -> Result<serde_json::Value> {
+    let report_mode = if save_file.is_some() {
+        OpsFileReportMode::BoundedSave
+    } else {
+        OpsFileReportMode::LegacyNoSave
+    };
     let mut total_succeeded: usize = 0;
     let mut total_failed: usize = 0;
     let mut total_aborted: usize = 0;
@@ -794,12 +878,13 @@ async fn apply_ops_file_reader<R: std::io::BufRead>(
             presentation_per_op: None,
             save_to: None,
             // Inline --save-file writes raw results before format rendering.
-            // Reproduce that lossless shape for the combined bulk save; when
-            // no save is requested, preserve the explicit CLI tier-1 override.
+            // Reproduce that lossless shape for the combined bulk save. The
+            // no-save path deliberately preserves its pre-PR behavior, which
+            // did not forward the CLI output-format override to each chunk.
             format: if save_sink.is_some() {
                 Some("json".to_string())
             } else {
-                output_format.clone()
+                None
             },
             format_per_op: None,
             request_id: None,
@@ -822,20 +907,20 @@ async fn apply_ops_file_reader<R: std::io::BufRead>(
         total_failed += chunk_failed;
         total_aborted += chunk_aborted;
 
-        for failure in collect_op_failures(&parsed, applied_before) {
+        for failure in collect_op_failures(&parsed, applied_before, report_mode) {
             let reason = match &failure["error"] {
                 serde_json::Value::String(s) => s.clone(),
                 other => other.to_string(),
             };
-            if failures.len() < MAX_OPS_FILE_FAILURE_DETAILS {
-                eprintln!(
-                    "op {} ({}) failed: {reason}",
-                    failure["op_index"],
-                    failure["tool"].as_str().unwrap_or("?"),
-                );
-                failures.push(failure);
-            } else {
-                failure_details_omitted += 1;
+            let op_index = failure["op_index"].clone();
+            let tool = failure["tool"].as_str().unwrap_or("?").to_string();
+            if retain_failure_detail(
+                report_mode,
+                failure,
+                &mut failures,
+                &mut failure_details_omitted,
+            ) {
+                eprintln!("op {} ({}) failed: {reason}", op_index, tool,);
             }
         }
 
@@ -848,7 +933,15 @@ async fn apply_ops_file_reader<R: std::io::BufRead>(
         processed += chunk.len();
         let applied_now = processed;
         eprintln!(
-            "applied {applied_now}/{total} (ok={total_succeeded}, failed={total_failed}, aborted={total_aborted})"
+            "{}",
+            ops_file_progress_line(
+                report_mode,
+                applied_now,
+                total,
+                total_succeeded,
+                total_failed,
+                total_aborted,
+            )
         );
         chunk_idx += 1;
     }
@@ -859,18 +952,15 @@ async fn apply_ops_file_reader<R: std::io::BufRead>(
         );
     }
 
-    let mut summary = serde_json::json!({
-        "total": total,
-        "succeeded": total_succeeded,
-        "failed": total_failed,
-        "aborted": total_aborted,
-    });
-    if !failures.is_empty() {
-        summary["failures"] = serde_json::Value::Array(failures);
-    }
-    if failure_details_omitted > 0 {
-        summary["failure_details_omitted"] = serde_json::json!(failure_details_omitted);
-    }
+    let summary = ops_file_summary(
+        report_mode,
+        total,
+        total_succeeded,
+        total_failed,
+        total_aborted,
+        failures,
+        failure_details_omitted,
+    );
     let output = if let Some(save_sink) = save_sink {
         let manifest = save_sink.finish(summary.clone())?;
         println!(
@@ -886,14 +976,27 @@ async fn apply_ops_file_reader<R: std::io::BufRead>(
         summary
     };
     if total > 0 && total_succeeded == 0 {
-        anyhow::bail!(
-            "every op failed: {total_failed} failed, {total_aborted} aborted out of {total}, 0 succeeded (see printed output above)"
-        );
+        match report_mode {
+            OpsFileReportMode::LegacyNoSave => anyhow::bail!(
+                "every op failed: {total_failed} op(s) failed out of {total}, 0 succeeded (see printed summary above)"
+            ),
+            OpsFileReportMode::BoundedSave => anyhow::bail!(
+                "every op failed: {total_failed} failed, {total_aborted} aborted out of {total}, 0 succeeded (see printed output above)"
+            ),
+        }
     }
-    if strict && (total_failed > 0 || total_aborted > 0) {
-        anyhow::bail!(
-            "--strict: {total_failed} op(s) failed, {total_aborted} op(s) aborted out of {total} (see printed output above)"
-        );
+    if strict {
+        match report_mode {
+            OpsFileReportMode::LegacyNoSave if total_failed > 0 => anyhow::bail!(
+                "--strict: {total_failed} op(s) failed out of {total} (see printed summary above)"
+            ),
+            OpsFileReportMode::BoundedSave if total_failed > 0 || total_aborted > 0 => {
+                anyhow::bail!(
+                    "--strict: {total_failed} op(s) failed, {total_aborted} op(s) aborted out of {total} (see printed output above)"
+                )
+            }
+            _ => {}
+        }
     }
     Ok(output)
 }
@@ -1586,7 +1689,7 @@ mod tests {
             ],
             "summary": {"total": 3, "succeeded": 1, "failed": 2}
         });
-        let failures = collect_op_failures(&parsed, 500);
+        let failures = collect_op_failures(&parsed, 500, OpsFileReportMode::LegacyNoSave);
         assert_eq!(failures.len(), 2);
         assert_eq!(failures[0]["op_index"], 501);
         assert_eq!(failures[0]["tool"], "create");
@@ -1610,7 +1713,7 @@ mod tests {
             ],
             "summary": {"total": 1, "succeeded": 0, "failed": 1}
         });
-        let failures = collect_op_failures(&parsed, 0);
+        let failures = collect_op_failures(&parsed, 0, OpsFileReportMode::LegacyNoSave);
         assert_eq!(
             failures[0]["error"],
             serde_json::json!({"kind": "invalid_input", "message": "content rejected"}),
@@ -1624,8 +1727,156 @@ mod tests {
             "results": [{"ok": true, "tool": "stats", "result": {}}],
             "summary": {"total": 1, "succeeded": 1, "failed": 0}
         });
-        assert!(collect_op_failures(&all_ok, 0).is_empty());
-        assert!(collect_op_failures(&serde_json::json!({}), 0).is_empty());
+        assert!(collect_op_failures(&all_ok, 0, OpsFileReportMode::LegacyNoSave).is_empty());
+        assert!(
+            collect_op_failures(&serde_json::json!({}), 0, OpsFileReportMode::LegacyNoSave)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn no_save_reporting_matches_exact_legacy_golden() {
+        let parsed = serde_json::json!({
+            "results": [
+                {"ok": true, "tool": "create", "result": {}},
+                {"ok": false, "tool": "search", "error": "boom"},
+            ],
+        });
+        let failures = collect_op_failures(&parsed, 0, OpsFileReportMode::LegacyNoSave);
+        assert_eq!(failures.len(), 1);
+        assert!(failures[0].get("aborted").is_none());
+        let summary = ops_file_summary(OpsFileReportMode::LegacyNoSave, 2, 1, 1, 0, failures, 0);
+
+        assert_eq!(
+            ops_file_progress_line(OpsFileReportMode::LegacyNoSave, 2, 2, 1, 1, 0),
+            "applied 2/2 (ok=1, failed=1)"
+        );
+        assert_eq!(
+            serde_json::to_string_pretty(&summary).unwrap(),
+            concat!(
+                "{\n",
+                "  \"failed\": 1,\n",
+                "  \"failures\": [\n",
+                "    {\n",
+                "      \"error\": \"boom\",\n",
+                "      \"op_index\": 1,\n",
+                "      \"tool\": \"search\"\n",
+                "    }\n",
+                "  ],\n",
+                "  \"succeeded\": 1,\n",
+                "  \"total\": 2\n",
+                "}"
+            )
+        );
+        assert!(summary.get("aborted").is_none());
+        assert!(summary.get("failure_details_omitted").is_none());
+    }
+
+    #[test]
+    fn no_save_reporting_retains_more_than_one_thousand_failures() {
+        let parsed = serde_json::json!({
+            "results": (0..=MAX_OPS_FILE_FAILURE_DETAILS)
+                .map(|index| serde_json::json!({
+                    "ok": false,
+                    "tool": "create",
+                    "error": format!("failure-{index}"),
+                }))
+                .collect::<Vec<_>>(),
+        });
+        let mut retained = Vec::new();
+        let mut omitted = 0;
+        for failure in collect_op_failures(&parsed, 0, OpsFileReportMode::LegacyNoSave) {
+            assert!(retain_failure_detail(
+                OpsFileReportMode::LegacyNoSave,
+                failure,
+                &mut retained,
+                &mut omitted,
+            ));
+        }
+        assert_eq!(retained.len(), MAX_OPS_FILE_FAILURE_DETAILS + 1);
+        assert_eq!(omitted, 0);
+
+        let summary = ops_file_summary(
+            OpsFileReportMode::LegacyNoSave,
+            retained.len(),
+            0,
+            retained.len(),
+            0,
+            retained,
+            omitted,
+        );
+        assert_eq!(
+            summary["failures"].as_array().unwrap().len(),
+            MAX_OPS_FILE_FAILURE_DETAILS + 1
+        );
+        assert!(summary.get("failure_details_omitted").is_none());
+    }
+
+    #[test]
+    fn no_save_reporting_retains_error_larger_than_four_kib() {
+        let large_error = "x".repeat(MAX_OPS_FILE_FAILURE_ERROR_BYTES + 1);
+        let parsed = serde_json::json!({
+            "results": [{"ok": false, "tool": "create", "error": large_error}],
+        });
+        let failures = collect_op_failures(&parsed, 0, OpsFileReportMode::LegacyNoSave);
+        assert_eq!(
+            failures[0]["error"].as_str().unwrap().len(),
+            MAX_OPS_FILE_FAILURE_ERROR_BYTES + 1
+        );
+        assert_eq!(failures[0]["error"], large_error);
+    }
+
+    #[test]
+    fn save_reporting_bounds_failure_count_and_error_detail() {
+        let large_error = "x".repeat(MAX_OPS_FILE_FAILURE_ERROR_BYTES + 1);
+        let parsed = serde_json::json!({
+            "results": (0..=MAX_OPS_FILE_FAILURE_DETAILS)
+                .map(|index| serde_json::json!({
+                    "ok": false,
+                    "tool": "create",
+                    "aborted": index % 2 == 0,
+                    "error": if index == 0 {
+                        serde_json::Value::String(large_error.clone())
+                    } else {
+                        serde_json::Value::String(format!("failure-{index}"))
+                    },
+                }))
+                .collect::<Vec<_>>(),
+        });
+        let mut retained = Vec::new();
+        let mut omitted = 0;
+        for failure in collect_op_failures(&parsed, 0, OpsFileReportMode::BoundedSave) {
+            retain_failure_detail(
+                OpsFileReportMode::BoundedSave,
+                failure,
+                &mut retained,
+                &mut omitted,
+            );
+        }
+        assert_eq!(retained.len(), MAX_OPS_FILE_FAILURE_DETAILS);
+        assert_eq!(omitted, 1);
+        assert_eq!(retained[0]["aborted"], true);
+        assert_eq!(
+            retained[0]["error"],
+            format!(
+                "error detail omitted: exceeds {MAX_OPS_FILE_FAILURE_ERROR_BYTES}-byte ops-file diagnostic limit"
+            )
+        );
+
+        let summary = ops_file_summary(
+            OpsFileReportMode::BoundedSave,
+            MAX_OPS_FILE_FAILURE_DETAILS + 1,
+            0,
+            MAX_OPS_FILE_FAILURE_DETAILS + 1,
+            0,
+            retained,
+            omitted,
+        );
+        assert_eq!(summary["failure_details_omitted"], 1);
+        assert_eq!(
+            summary["failures"].as_array().unwrap().len(),
+            MAX_OPS_FILE_FAILURE_DETAILS
+        );
     }
 
     // ── HOME isolation for local-fallback tests ───────────────────────────────
@@ -3187,7 +3438,8 @@ id = "lambda:fallback"
         assert_eq!(summary["total"], 3);
         assert_eq!(summary["succeeded"], 3);
         assert_eq!(summary["failed"], 0);
-        assert_eq!(summary["aborted"], 0);
+        assert!(summary.get("aborted").is_none());
+        assert!(summary.get("failure_details_omitted").is_none());
         assert!(summary.get("results").is_none());
 
         // Verify all 3 entities are present.
