@@ -4018,9 +4018,26 @@ mod tests {
                 continue;
             }
 
-            let has_group_tag = span
-                .iter()
-                .any(|l| l.contains("#[serial") && l.contains("checkpoint_skip_metrics"));
+            // Rustfmt splits long multi-key attributes across lines, so scan
+            // the whole attribute instead of requiring the group on `#[serial(`.
+            let mut in_serial_attr = false;
+            let has_group_tag = span.iter().any(|line| {
+                let trimmed = line.trim();
+                if !in_serial_attr {
+                    in_serial_attr = trimmed.starts_with("#[serial(");
+                }
+                if !in_serial_attr {
+                    return false;
+                }
+
+                let has_group = trimmed
+                    .split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_')
+                    .any(|token| token == "checkpoint_skip_metrics");
+                if trimmed.ends_with(")]") {
+                    in_serial_attr = false;
+                }
+                has_group
+            });
 
             if !has_group_tag {
                 let name = span
