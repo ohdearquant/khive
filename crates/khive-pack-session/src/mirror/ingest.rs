@@ -1631,6 +1631,54 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn repeated_public_mirror_file_call_replays_same_length_replacement() {
+        let (rt, dir) = setup().await;
+        let path = dir.path().join("same-length-public.jsonl");
+        let replacement_path = dir.path().join("same-length-public.next.jsonl");
+        let old = format!(
+            "{}\n",
+            user_line("uuid-public-old", "sess-public-replace", "old")
+        );
+        let new = format!(
+            "{}\n",
+            user_line("uuid-public-new", "sess-public-replace", "new")
+        );
+        assert_eq!(old.len(), new.len());
+        std::fs::write(&path, old).expect("original transcript");
+
+        let first = mirror_file(&rt, &path, 0, LineTailSource::ClaudeCode, None)
+            .await
+            .expect("mirror original generation");
+        assert_eq!(first.inserted, 1);
+
+        std::fs::write(&replacement_path, new).expect("replacement transcript");
+        std::fs::rename(&replacement_path, &path).expect("same-path atomic replacement");
+        assert_eq!(
+            std::fs::metadata(&path)
+                .expect("replacement metadata")
+                .len(),
+            first.new_offset
+        );
+
+        let second = mirror_file(
+            &rt,
+            &path,
+            first.new_offset,
+            LineTailSource::ClaudeCode,
+            None,
+        )
+        .await
+        .expect("mirror replacement generation");
+        assert_eq!(
+            second.inserted, 1,
+            "the public API must bind its offset to the persisted generation witness"
+        );
+        assert_eq!(second.new_offset, first.new_offset);
+        assert_eq!(count_rows(&rt, "session_messages").await, 2);
+    }
+
     #[tokio::test]
     async fn mirror_file_respects_low_test_cap_and_advances_over_multiple_passes() {
         // PACKSESSION-AUD-003 regression: multi-pass bounded reads (see docs guide).
@@ -2155,7 +2203,13 @@ mod tests {
         let (rt, dir) = setup().await;
         let path = dir.path().join("witnessed-empty.jsonl");
         let replacement = dir.path().join("witnessed-empty.next.jsonl");
-        std::fs::write(&path, "\n").expect("original blank transcript");
+        let replacement_line = format!(
+            "{}\n",
+            user_line("uuid-deferred-replacement", "sess-deferred", "replacement")
+        );
+        let original_line = format!("{}\n", "x".repeat(replacement_line.len() - 1));
+        assert_eq!(original_line.len(), replacement_line.len());
+        std::fs::write(&path, original_line).expect("original unparseable transcript");
         let original_identity =
             metadata_file_identity(&std::fs::metadata(&path).expect("original metadata"));
 
@@ -2186,9 +2240,9 @@ mod tests {
         .await
         .expect("witnessed deferred read");
         assert_eq!(pass.stats.inserted, 0);
-        assert_eq!(pass.stats.new_offset, 1);
+        assert_eq!(pass.stats.new_offset, replacement_line.len() as u64);
 
-        std::fs::write(&replacement, "\n").expect("replacement blank transcript");
+        std::fs::write(&replacement, replacement_line).expect("replacement transcript");
         std::fs::rename(&replacement, &path).expect("atomic replacement before cursor commit");
         let replacement_identity =
             metadata_file_identity(&std::fs::metadata(&path).expect("replacement metadata"));
@@ -2201,6 +2255,24 @@ mod tests {
             cursor_file_identity(&rt, &path.to_string_lossy()).await,
             original_identity,
             "the cursor must not bless the replacement with its predecessor's offset"
+        );
+
+        let replay = mirror_file(
+            &rt,
+            &path,
+            pass.stats.new_offset,
+            LineTailSource::ClaudeCode,
+            None,
+        )
+        .await
+        .expect("replay replacement after deferred commit");
+        assert_eq!(
+            replay.inserted, 1,
+            "the next public call must detect the old witness and replay the replacement"
+        );
+        assert_eq!(
+            cursor_file_identity(&rt, &path.to_string_lossy()).await,
+            replacement_identity
         );
     }
 

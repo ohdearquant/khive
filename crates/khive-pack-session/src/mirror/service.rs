@@ -2932,9 +2932,10 @@ mod discovery_tests {
 mod cursor_retry_tests {
     use super::{
         adopt_dispatch_cursor, delete_cursors, drain_pending_cursor_deletes,
-        ensure_cursor_identity_schema, finalize_dispatch_stats, queue_cursor_deletes,
-        tally_dispatch_errors, CandidateDispatch, CursorResetReason, DiscoveredKind,
-        DiscoveryIndex, MirrorCursorState, CURSOR_DELETE_RETRY_LIMIT, FILE_ERROR_POLLS_BEFORE_COLD,
+        ensure_cursor_identity_schema, finalize_dispatch_stats, load_cursors, queue_cursor_deletes,
+        reconcile_cursor_durably, tally_dispatch_errors, CandidateDispatch, CursorResetReason,
+        DiscoveredKind, DiscoveryIndex, MirrorCursorState, CURSOR_DELETE_RETRY_LIMIT,
+        FILE_ERROR_POLLS_BEFORE_COLD,
     };
     #[cfg(unix)]
     use crate::mirror::ingest::metadata_file_identity;
@@ -3140,6 +3141,115 @@ mod cursor_retry_tests {
         .expect("mirror replacement transcript");
         assert_eq!(second.inserted, 1, "replacement prefix must be ingested");
         assert_eq!(second.new_offset, first.new_offset);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn zero_truncation_is_persisted_before_eof_and_survives_restart_regrowth() {
+        let (rt, dir) = runtime_without_schema();
+        apply_session_schema(&rt).await;
+        let path = dir.path().join("truncate-zero-restart.jsonl");
+        let old_line = r#"{"uuid":"uuid-zero-old","sessionId":"sess-zero","type":"user","timestamp":"2026-08-09T10:00:00Z","message":{"role":"user","content":"old generation"}}"#;
+        std::fs::write(&path, format!("{old_line}\n")).expect("old generation");
+        let old = mirror_file(&rt, &path, 0, LineTailSource::ClaudeCode, None)
+            .await
+            .expect("mirror old generation");
+        let old_offset = old.new_offset;
+        assert!(old_offset > 0);
+
+        let mut cursors = load_cursors(&rt).await.expect("load old cursor");
+        let cursor = cursors.get_mut(&path).expect("old cursor state");
+        let old_identity = cursor.file_identity.clone();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&path)
+            .expect("truncate to zero");
+        let (empty_metadata, empty_identity) = probe_file(&path).expect("empty generation probe");
+        assert_eq!(empty_metadata.len(), 0);
+        assert_eq!(
+            empty_identity, old_identity,
+            "in-place truncate retains identity"
+        );
+
+        assert_eq!(
+            reconcile_cursor_durably(
+                &rt,
+                &path,
+                cursor,
+                empty_metadata.len(),
+                empty_identity.clone(),
+            )
+            .await
+            .expect("persist reset before EOF"),
+            Some(CursorResetReason::Truncated)
+        );
+        assert_eq!(cursor.byte_offset, 0);
+        drop(cursors);
+
+        let mut restarted = load_cursors(&rt)
+            .await
+            .expect("reload after daemon restart");
+        let cursor = restarted.get_mut(&path).expect("durable reset cursor");
+        assert_eq!(
+            cursor.byte_offset, 0,
+            "restart must not resurrect the stale offset"
+        );
+        assert_eq!(cursor.file_identity, empty_identity);
+
+        let prefix_uuid = "uuid-zero-prefix";
+        let prefix = format!(
+            r#"{{"uuid":"{prefix_uuid}","sessionId":"sess-zero","type":"user","timestamp":"2026-08-09T10:01:00Z","message":{{"role":"user","content":"new prefix"}}}}\n"#
+        );
+        let suffix = format!(
+            r#"{{"uuid":"uuid-zero-suffix","sessionId":"sess-zero","type":"user","timestamp":"2026-08-09T10:02:00Z","message":{{"role":"user","content":"{}"}}}}\n"#,
+            "regrown interval ".repeat(16)
+        );
+        std::fs::write(&path, format!("{prefix}{suffix}")).expect("regrow new generation");
+        assert!(
+            std::fs::metadata(&path).expect("regrown metadata").len() > old_offset,
+            "fixture must cross the stale pre-truncation offset"
+        );
+
+        let replay = mirror_file(
+            &rt,
+            &path,
+            cursor.byte_offset,
+            LineTailSource::ClaudeCode,
+            None,
+        )
+        .await
+        .expect("replay regrown generation");
+        assert_eq!(replay.inserted, 2);
+        assert!(
+            session_message_exists(&rt, prefix_uuid).await,
+            "the interval below the stale offset must survive stop/restart/regrowth"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn failed_pre_read_reset_does_not_mutate_in_memory_cursor() {
+        let (rt, dir) = runtime_without_schema();
+        let path = dir.path().join("failed-reset.jsonl");
+        std::fs::write(&path, "").expect("empty file");
+        let identity = metadata_file_identity(&std::fs::metadata(&path).expect("metadata"));
+        let mut cursor = MirrorCursorState {
+            byte_offset: 64,
+            file_identity: identity.clone(),
+        };
+
+        reconcile_cursor_durably(&rt, &path, &mut cursor, 0, identity.clone())
+            .await
+            .expect_err("missing cursor schema must reject reset commit");
+        assert_eq!(
+            cursor,
+            MirrorCursorState {
+                byte_offset: 64,
+                file_identity: identity,
+            },
+            "RAM may change only after the reset row commits"
+        );
     }
 
     #[cfg(unix)]
