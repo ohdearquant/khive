@@ -12,6 +12,7 @@
 // dispatch and is intentionally co-located.
 
 use std::{
+    collections::BTreeMap,
     future::Future,
     sync::{
         atomic::{AtomicI64, Ordering},
@@ -43,6 +44,9 @@ use khive_storage::{EdgeRelation, StorageCapability};
 use crate::coordinator::{CoordSearchResult, CoordinatorService};
 use crate::tools::request::RequestParams;
 
+const MAX_BACKEND_ERROR_MESSAGE_CHARS: usize = 1_024;
+const MISSING_BACKEND_ERROR_MESSAGE: &str = "backend search failed without diagnostic detail";
+
 /// Per-operation completeness discriminator for the `search` verb (ADR-130
 /// §1). `SearchDegradation::status == None` means "not a search op" — no
 /// `status` field is emitted on that operation's envelope.
@@ -65,6 +69,7 @@ impl SearchStatus {
 struct SearchDegradation {
     status: Option<SearchStatus>,
     missing_backends: Vec<String>,
+    backend_errors: BTreeMap<String, String>,
 }
 
 impl SearchDegradation {
@@ -76,19 +81,27 @@ impl SearchDegradation {
         Self {
             status: Some(SearchStatus::Complete),
             missing_backends: Vec::new(),
+            backend_errors: BTreeMap::new(),
         }
     }
 
     fn from_result(result: &CoordSearchResult) -> Self {
-        let mut missing_backends: Vec<String> = result
+        let backend_errors: BTreeMap<String, String> = result
             .per_backend
             .iter()
-            .filter(|backend| backend.error.is_some())
-            .map(|backend| backend.backend_id.as_str().to_string())
+            .filter_map(|backend| {
+                backend.error.as_ref().map(|error| {
+                    (
+                        backend.backend_id.as_str().to_string(),
+                        bounded_backend_error_message(error),
+                    )
+                })
+            })
             .collect();
-        missing_backends.sort();
-        missing_backends.dedup();
-        let status = if result.partial || !missing_backends.is_empty() {
+        let missing_backends: Vec<String> = backend_errors.keys().cloned().collect();
+        let is_partial = !missing_backends.is_empty();
+        debug_assert_eq!(result.partial, is_partial);
+        let status = if is_partial {
             SearchStatus::Partial
         } else {
             SearchStatus::Complete
@@ -96,6 +109,7 @@ impl SearchDegradation {
         Self {
             status: Some(status),
             missing_backends,
+            backend_errors,
         }
     }
 
@@ -134,6 +148,38 @@ fn op_success_from_registry_result(tool: &str, is_help: bool, result: Value) -> 
     }
 }
 
+fn bounded_backend_error_message(message: &str) -> String {
+    if message.trim().is_empty() {
+        return MISSING_BACKEND_ERROR_MESSAGE.to_string();
+    }
+    let mut chars = message.chars();
+    let mut bounded: String = chars
+        .by_ref()
+        .take(MAX_BACKEND_ERROR_MESSAGE_CHARS)
+        .collect();
+    if chars.next().is_some() {
+        bounded.push('…');
+    }
+    bounded
+}
+
+fn backend_errors_value(errors: BTreeMap<String, String>) -> Value {
+    Value::Object(
+        errors
+            .into_iter()
+            .map(|(backend, message)| {
+                (
+                    backend,
+                    json!({
+                        "kind": "backend_error",
+                        "message": message,
+                    }),
+                )
+            })
+            .collect(),
+    )
+}
+
 /// Structured error for a search whose selected backends failed such that no
 /// hit survived server-side filtering (ADR-130 §1 `search_incomplete`).
 ///
@@ -141,12 +187,13 @@ fn op_success_from_registry_result(tool: &str, is_help: bool, result: Value) -> 
 /// keeps `ok=true` with an empty `result`; this is `ok=false` — a caller
 /// doing `if response.ok && response.result.is_empty()` sees the two cases
 /// differently, instead of concluding "no match" in both.
-fn search_incomplete_error(missing_backends: Vec<String>) -> Value {
+fn search_incomplete_error(degradation: SearchDegradation) -> Value {
     json!({
         "kind": "search_incomplete",
         "message": "no-match was not established because selected backends failed",
         "retryable": false,
-        "missing_backends": missing_backends,
+        "missing_backends": degradation.missing_backends,
+        "backend_errors": backend_errors_value(degradation.backend_errors),
     })
 }
 
@@ -1047,9 +1094,10 @@ impl KhiveMcpServer {
     /// "partial", ADR-130 §1), which lives inside that op's `results` entry,
     /// never at this top level. A successful but incomplete coordinator
     /// search remains a success (`status="partial"` on that entry) and
-    /// carries a typed `missing_backends` advisory plus the deprecated
-    /// `partial` alias; a search where no hit survives a backend failure is
-    /// instead a failed op (`ok: false`, `error.kind: "search_incomplete"`).
+    /// carries typed `missing_backends` and `backend_errors` diagnostics plus
+    /// the deprecated `partial` alias; a search where no hit survives a
+    /// backend failure is instead a failed op (`ok: false`,
+    /// `error.kind: "search_incomplete"`).
     ///
     /// Response envelope:
     /// ```json
@@ -1566,7 +1614,7 @@ async fn dispatch_via_coordinator_inner(
                     if outcome.metadata.is_partial() && is_empty {
                         Err(DispatchFailure::unclassified(
                             tool,
-                            search_incomplete_error(outcome.metadata.missing_backends),
+                            search_incomplete_error(outcome.metadata),
                         ))
                     } else {
                         Ok(OpSuccess {
@@ -1705,15 +1753,20 @@ fn ok_envelope(tool: String, success: OpSuccess) -> Value {
         result,
         degradation,
     } = success;
-    let is_partial = degradation.is_partial();
-    let extra_fields = usize::from(degradation.status.is_some()) + if is_partial { 2 } else { 0 };
+    let SearchDegradation {
+        status,
+        missing_backends,
+        backend_errors,
+    } = degradation;
+    let is_partial = status == Some(SearchStatus::Partial);
+    let extra_fields = usize::from(status.is_some()) + if is_partial { 3 } else { 0 };
     let mut map = serde_json::Map::with_capacity(3 + extra_fields);
     map.insert("ok".to_string(), Value::Bool(true));
     map.insert("tool".to_string(), Value::String(tool));
     map.insert("result".to_string(), result);
     // ADR-130 §1: `status` is present on every successful search envelope
     // (complete or partial); absent for every other verb.
-    if let Some(status) = degradation.status {
+    if let Some(status) = status {
         map.insert(
             "status".to_string(),
             Value::String(status.as_str().to_string()),
@@ -1725,13 +1778,11 @@ fn ok_envelope(tool: String, success: OpSuccess) -> Value {
         map.insert("partial".to_string(), Value::Bool(true));
         map.insert(
             "missing_backends".to_string(),
-            Value::Array(
-                degradation
-                    .missing_backends
-                    .into_iter()
-                    .map(Value::String)
-                    .collect(),
-            ),
+            Value::Array(missing_backends.into_iter().map(Value::String).collect()),
+        );
+        map.insert(
+            "backend_errors".to_string(),
+            backend_errors_value(backend_errors),
         );
     }
     Value::Object(map)
@@ -1985,10 +2036,11 @@ entry's own `ok` field rather than assuming batch-level atomicity.
 `search` carries its own per-op `status` ("complete" | "partial") inside that
 op's `result` entry, separate from the top-level batch `status` above. A
 degraded-but-answered search stays ok:true with status="partial" plus a
-missing_backends list (and the deprecated partial:true alias). When a backend
+missing_backends list, backend_errors causes, and the deprecated partial:true
+alias. When a backend
 failure leaves no hit standing after filtering, the op instead fails outright
-with ok:false and error.kind="search_incomplete" — that case must not be read
-as "no results found."
+with ok:false and error.kind="search_incomplete"; its error retains both the
+failed backend list and causes. That case must not be read as "no results found."
 
 Verb discovery: install the `kg` / `gtd` plugins for usage skills. The verbs
 currently registered on this server (pack-derived) are listed below. Argument
@@ -2750,6 +2802,7 @@ fn frame_budget_omission(entry: &Value) -> Value {
         "status",
         "partial",
         "missing_backends",
+        "backend_errors",
     ] {
         if let Some(value) = entry.get(key) {
             omitted.insert(key.to_string(), value.clone());
@@ -3403,6 +3456,19 @@ mod tests {
         );
         assert!(omitted.get("result").is_none());
         assert!(omitted.get("result_omitted").is_some());
+    }
+
+    #[test]
+    fn backend_error_evidence_is_bounded_before_frame_preservation() {
+        let oversized = "x".repeat(MAX_BACKEND_ERROR_MESSAGE_CHARS + 100);
+        let bounded = bounded_backend_error_message(&oversized);
+
+        assert_eq!(bounded.chars().count(), MAX_BACKEND_ERROR_MESSAGE_CHARS + 1);
+        assert!(bounded.ends_with('…'));
+        assert_eq!(
+            bounded_backend_error_message(" \t\n"),
+            MISSING_BACKEND_ERROR_MESSAGE
+        );
     }
 
     #[test]
@@ -4124,6 +4190,10 @@ mod tests {
             degradation: SearchDegradation {
                 status: Some(SearchStatus::Partial),
                 missing_backends: vec!["archive".to_string()],
+                backend_errors: BTreeMap::from([(
+                    "archive".to_string(),
+                    "storage unavailable".to_string(),
+                )]),
             },
         };
         let envelope = present_ok_envelope_or_depth_error(
@@ -4137,6 +4207,10 @@ mod tests {
         assert_eq!(envelope["status"], json!("partial"));
         assert_eq!(envelope["partial"], json!(true));
         assert_eq!(envelope["missing_backends"], json!(["archive"]));
+        assert_eq!(
+            envelope["backend_errors"]["archive"]["message"],
+            json!("storage unavailable")
+        );
         assert!(envelope.get("result").is_some());
     }
 

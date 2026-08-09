@@ -510,7 +510,7 @@ impl SubstrateCoordinator {
             {
                 Ok(t) => t,
                 Err(e) => {
-                    tracing::warn!(error = %e, "fan_out_search: authorization denied for namespace");
+                    tracing::warn!(backend = %backend_id, error = %e, "fan_out_search: authorization denied for namespace");
                     let backend_result = BackendSearchResult {
                         backend_id: backend_id.clone(),
                         hits: vec![],
@@ -569,6 +569,7 @@ impl SubstrateCoordinator {
                         return (vec![], note_hits, vec![backend_result]);
                     }
                     Ok(Err(e)) => {
+                        tracing::warn!(backend = %backend_id, error = %e, "fan_out_search: backend search failed");
                         let backend_result = BackendSearchResult {
                             backend_id: backend_id.clone(),
                             hits: vec![],
@@ -623,6 +624,7 @@ impl SubstrateCoordinator {
                         return (hits, vec![], vec![backend_result]);
                     }
                     Ok(Err(e)) => {
+                        tracing::warn!(backend = %backend_id, error = %e, "fan_out_search: backend search failed");
                         let backend_result = BackendSearchResult {
                             backend_id: backend_id.clone(),
                             hits: vec![],
@@ -733,7 +735,7 @@ impl SubstrateCoordinator {
                 let token = match runtime.authorize_with_visibility(ns, extra_visible_task) {
                     Ok(t) => t,
                     Err(e) => {
-                        tracing::warn!(error = %e, "fan_out_search: authorization denied for namespace");
+                        tracing::warn!(backend = %backend_id, error = %e, "fan_out_search: authorization denied for namespace");
                         return (backend_id, Err(e), None);
                     }
                 };
@@ -808,6 +810,7 @@ impl SubstrateCoordinator {
                     });
                 }
                 Ok(Ok((backend_id, Err(e), _))) => {
+                    tracing::warn!(backend = %backend_id, error = %e, "fan_out_search: backend search failed");
                     per_backend.push(BackendSearchResult {
                         backend_id,
                         hits: vec![],

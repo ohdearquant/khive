@@ -36,16 +36,27 @@ operation is successful but its operation envelope also carries:
 {
   "ok": true,
   "tool": "search",
-  "result": [],
+  "result": [{ "id": "..." }],
+  "status": "partial",
   "partial": true,
-  "missing_backends": ["archive"]
+  "missing_backends": ["archive"],
+  "backend_errors": {
+    "archive": {
+      "kind": "backend_error",
+      "message": "backend search timed out after 5000ms"
+    }
+  }
 }
 ```
 
 The advisory is part of a typed intercepted-dispatch outcome, not an optional
 mutex slot. The same value flows through single, batch, and chain execution;
 presentation transforms only `result`, and daemon frame-budget omission keeps
-`partial` and `missing_backends` even if the result itself must be omitted.
+`status`, `partial`, `missing_backends`, and `backend_errors` even if the result
+itself must be omitted. If no result survives filtering, the operation instead
+returns `ok: false` with `error.kind="search_incomplete"`; the same
+`missing_backends` and `backend_errors` live inside that error object. Complete
+searches omit both degradation fields.
 
 ## `t6d` — malformed `tags` must reject, not silently drop the filter
 

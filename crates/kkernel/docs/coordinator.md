@@ -47,7 +47,9 @@ the coordinator cannot accidentally accept a public filter that its signature ha
 Results are merged with Reciprocal Rank Fusion (unweighted, k=60). Per-backend errors — including
 spawned-task join failures — are captured in `BackendSearchResult::error`; a single failing backend
 does NOT abort the fan-out or disappear from diagnostics. The MCP service derives the operation's
-`partial`/`missing_backends` advisory from these typed per-backend results.
+`status`/`partial`/`missing_backends` advisory and its backend-keyed `backend_errors` causes from
+these per-backend results. Ordinary backend failures are also logged at warning level with the
+backend id and captured cause.
 
 When `is_single_backend()` is true the fan-out degenerates to a single backend call.
 
@@ -81,7 +83,7 @@ via `khive.toml` (ADR-028).
 - The primary backend is always the first registered.
 - `LocatorCache` entries are immutable once inserted (backend affinity is stable per entity).
 - `fan_out_search` never silently drops a backend error; ordinary errors and task-join failures are
-  captured in the result.
+  captured in the result, exposed as `backend_errors`, and logged with their backend id.
 - Every public search filter is validated once and either forwarded to its substrate runtime or
   rejected before fan-out.
 

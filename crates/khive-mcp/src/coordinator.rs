@@ -978,6 +978,7 @@ pub(crate) mod tests {
             );
             assert!(entry.get("partial").is_none());
             assert!(entry.get("missing_backends").is_none());
+            assert!(entry.get("backend_errors").is_none());
         }
     }
 
