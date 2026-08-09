@@ -1557,7 +1557,7 @@ one identity.
 
 ## Amendment 7 (2026-08-09): explicit map-target admission
 
-Amendment 4 made source ingest's explicit `db` create-capable. That made a
+Amendment 2 made source ingest's explicit `db` create-capable. That made a
 caller typo indistinguishable from authorization to create and migrate a new
 database at the misspelled path. This amendment supersedes only that
 create-capable clause: an explicit target is now a claim that an

@@ -55,8 +55,11 @@ impl StorageBackend {
     ///
     /// Unlike [`Self::sqlite`], this constructor never passes
     /// `SQLITE_OPEN_CREATE`: a missing path is rejected instead of created.
-    /// It does not apply or validate schema migrations; callers that require a
-    /// current schema must inspect it before construction.
+    /// It does not apply or validate schema migrations. Callers that require
+    /// the complete canonical current ledger must use
+    /// [`Self::sqlite_existing_current`]; a separate preinspection followed by
+    /// this constructor is not admission because the path can change before
+    /// this constructor opens its raw read-write connection.
     pub fn sqlite_existing(path: impl AsRef<Path>) -> Result<Self, SqliteError> {
         crate::extension::ensure_extensions_loaded();
         let resolved = path.as_ref().to_path_buf();
