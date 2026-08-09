@@ -7,7 +7,7 @@ use khive_runtime::pack::PackRuntime;
 use khive_runtime::{KhiveRuntime, NamespaceToken, RuntimeError, VerbRegistry};
 use khive_types::{EntityTypeDef, HandlerDef, Pack};
 
-use crate::{handlers, MoodboardPack, PACK_NAME};
+use crate::{handlers, preference_handlers, MoodboardPack, PACK_NAME};
 
 struct MoodboardPackFactory;
 
@@ -64,6 +64,14 @@ impl PackRuntime for MoodboardPack {
             "moodboard.model" => handlers::handle_model(self, params).await,
             "moodboard.ingest" => handlers::handle_ingest(self, token, params).await,
             "moodboard.search" => handlers::handle_search(self, token, params).await,
+            "moodboard.serve" => preference_handlers::handle_serve(self, token, params).await,
+            "moodboard.judge" => preference_handlers::handle_judge(self, token, params).await,
+            "moodboard.train_preference" => {
+                preference_handlers::handle_train_preference(self, token, params).await
+            }
+            "moodboard.preference" => {
+                preference_handlers::handle_preference(self, token, params).await
+            }
             _ => Err(RuntimeError::InvalidInput(format!(
                 "{PACK_NAME} pack does not handle verb {verb:?}"
             ))),

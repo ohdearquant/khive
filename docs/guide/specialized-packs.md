@@ -8,9 +8,9 @@ import-scan source ingestion into a dedicated map database, see
 edge rules; `findings.json` ingestion remains an admin CLI path. `workspace`
 registers the `workspace` entity kind and five `contains` endpoint rules only,
 with no verbs. Beyond the
-default set, khive also ships niche packs that extend the graph for a
-specific domain without adding verbs of their own. This guide covers the
-formal-math pack, the first of these, and how pack loading works in general.
+default set, khive also ships opt-in packs for narrower domains. Some are
+pure ontology extensions; others expose specialized verbs. This guide covers
+the formal-math and Moodboard packs and how pack loading works in general.
 
 ## Pack composition model
 
@@ -94,6 +94,37 @@ With only `kg` loaded (no `formal`), the same `link` call is rejected. The
 base ADR-002 contract does not admit a `concept`-to-`concept` `depends_on`
 edge between two arbitrary subtypes on its own; the `formal` pack's rules
 are what makes this specific `(theorem, depends_on, structure)` triple legal.
+
+## The Moodboard pack
+
+`crates/khive-pack-moodboard/` is an opt-in experimental visual-media pack. Load it with its
+required KG vocabulary:
+
+```bash
+kkernel mcp --pack kg --pack moodboard
+# or
+KHIVE_PACKS="kg,moodboard" kkernel mcp
+```
+
+It contributes the additive `artifact` subtypes `visual_asset`, `moodboard`, and
+`moodboard_model`. Its ADR-148 visual path publishes original raster bytes to BlobStore, derives
+an identity-bound Lattice descriptor, and performs exact descriptor-space retrieval through
+`moodboard.model`, `moodboard.ingest`, and `moodboard.search`.
+
+ADR-149 adds explicit interaction learning through `moodboard.serve`, `moodboard.judge`,
+`moodboard.train_preference`, and `moodboard.preference`. These four verbs require a canonically
+attributed non-`local` actor. Training uses immutable randomized pairwise judgments, deterministic
+unordered-pair train/calibration/test splits, a frozen ten-feature contract, and minimum support
+gates. It fits deterministic logistic binary cross-entropy in the pack, then persists and serves
+the exact zero-intercept `10 -> 1` head through `lattice-fann` 0.7.1. FANN bytes, the calibrated
+model bundle, and their provenance live in BlobStore, an `artifact/moodboard_model`, and immutable
+events.
+
+The learned result is a conditional pairwise-preference probability. It is deliberately returned
+separately from conformal evidence, retrieval similarity, and any later board-level coherence
+measure; wrong identity or insufficient calibration fails closed. See
+[ADR-148](../adr/ADR-148-moodboard-visual-retrieval-pack.md) and
+[ADR-149](../adr/ADR-149-moodboard-preference-learning.md) for the exact contracts.
 
 ## See also
 

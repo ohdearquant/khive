@@ -1,4 +1,5 @@
-//! Experimental raster ingest and exact visual retrieval over Khive substrates.
+//! Experimental raster ingest, exact visual retrieval, and pairwise preference learning over
+//! Khive substrates.
 //!
 //! The pack is intentionally opt-in. Original bytes live in the configured
 //! [`khive_storage::BlobStore`], graph identity lives in `visual_asset`
@@ -10,6 +11,8 @@
 pub mod handlers;
 mod model;
 mod pack;
+mod preference;
+mod preference_handlers;
 mod preprocess;
 pub mod vocab;
 
@@ -20,7 +23,7 @@ use model::VisionModelState;
 
 pub(crate) const PACK_NAME: &str = "moodboard";
 
-/// Opt-in Moodboard visual-retrieval pack.
+/// Opt-in Moodboard visual-retrieval and preference-learning pack.
 pub struct MoodboardPack {
     runtime: KhiveRuntime,
     model: VisionModelState,

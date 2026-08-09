@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- ADR-149 Moodboard pairwise preference learning: actor-attributed randomized
+  serve/judgment events, deterministic grouped logistic BCE training,
+  temperature/tie calibration, and BlobStore-backed `lattice-fann` model
+  serialization/inference through four opt-in `moodboard.*` verbs.
 - Deterministic GQL `SKIP` paging with structured `has_more`/`next_offset`
   continuation metadata for result sets beyond the query page bound (#1601).
 - `comm.mark_read(ids=[...], atomic=false)` as the canonical bulk mark-read
