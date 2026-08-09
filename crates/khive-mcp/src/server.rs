@@ -237,7 +237,9 @@ impl DispatchFailure {
 /// declaration, the backend topology (sorted backend list, explicit read-only
 /// modes, and pack→backend assignments) is folded into the fingerprint so that
 /// two configs differing only in routing or access mode produce different ids
-/// (ADR-049 / B-SHOULD-FIX-4).
+/// (ADR-049 / B-SHOULD-FIX-4). Delimiter-free topologies retain their legacy
+/// spelling; a topology containing reserved delimiter text uses an injective,
+/// escaped v2 encoding so path data can never impersonate access mode.
 ///
 /// When `khive_cfg` is `None` or its `backends` list is empty, a writable
 /// target remains byte-identical to what it would have been before this
@@ -300,16 +302,18 @@ fn configured_storage_read_only(
     })
 }
 
-/// Test-only storage-policy variant of [`compute_config_id`].
+/// Compute the daemon identity with an authoritative effective storage mode.
 ///
 /// A chmod-detected snapshot has the same configured path as its writable
 /// source but cannot safely share a warm daemon with it: the writable daemon
 /// would omit the audit advisory and could retain a write-capable file handle.
 /// Fold the effective main-backend mode into the existing `backend` component
 /// so the mismatch remains parseable as a structured backend mismatch without
-/// changing the legacy fingerprint for writable runtimes.
-#[cfg(test)]
-pub(crate) fn compute_config_id_with_storage_mode(
+/// changing the legacy fingerprint for writable runtimes. Pre-open callers
+/// that have already applied a storage override (for example, multi-backend
+/// `--db :memory:`) must use this form rather than re-reading the superseded
+/// declaration through [`compute_config_id`].
+pub fn compute_config_id_with_storage_mode(
     config: &RuntimeConfig,
     khive_cfg: Option<&khive_runtime::KhiveConfig>,
     storage_read_only: bool,
@@ -395,38 +399,119 @@ pub(crate) fn compute_config_id_with_runtime_policies(
     // with the pre-change fingerprint.
     let topology = khive_cfg
         .filter(|cfg| !cfg.backends.is_empty())
-        .map(|cfg| {
-            let mut backend_entries: Vec<String> = cfg
-                .backends
-                .iter()
-                .map(|b| {
-                    let path = b
-                        .path
-                        .as_deref()
-                        .map(canonical_fingerprint_path)
-                        .unwrap_or_else(|| ":memory:".to_string());
-                    let read_only = if b.read_only { ":read_only" } else { "" };
-                    format!("{}:{:?}:{}{}", b.name, b.kind, path, read_only)
-                })
-                .collect();
-            backend_entries.sort();
-
-            let mut pack_entries: Vec<String> = cfg
-                .packs
-                .iter()
-                .map(|(pack, pc)| format!("{}={}", pack, pc.backend))
-                .collect();
-            pack_entries.sort();
-
-            format!(
-                ";backends=[{}];pack_backends=[{}]",
-                backend_entries.join(","),
-                pack_entries.join(","),
-            )
-        })
+        .map(encode_backend_topology)
         .unwrap_or_default();
 
     format!("{base}{topology}")
+}
+
+/// Reserved syntax in the legacy topology spelling.
+///
+/// Keeping the legacy representation when every caller-controlled component
+/// excludes these bytes preserves existing warm-daemon identities without
+/// retaining its ambiguity. The v2 marker itself contains `|`, so a safe
+/// legacy value can never equal a v2 value.
+fn legacy_topology_component_is_safe(value: &str) -> bool {
+    !value
+        .bytes()
+        .any(|byte| matches!(byte, b':' | b',' | b'[' | b']' | b'=' | b';' | b'|'))
+}
+
+/// Percent-encode a v2 topology field so its payload can contain none of the
+/// structural `:`, `,`, or `=` delimiters. `%` itself is always escaped, making
+/// the mapping injective over the original UTF-8 bytes.
+fn escape_topology_component(value: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut escaped = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'/') {
+            escaped.push(byte as char);
+        } else {
+            escaped.push('%');
+            escaped.push(HEX[(byte >> 4) as usize] as char);
+            escaped.push(HEX[(byte & 0x0f) as usize] as char);
+        }
+    }
+    escaped
+}
+
+fn encode_backend_topology(cfg: &khive_runtime::KhiveConfig) -> String {
+    let mut legacy_safe = true;
+    let mut backend_rows: Vec<(String, String, String, bool)> = cfg
+        .backends
+        .iter()
+        .map(|backend| {
+            let kind = format!("{:?}", backend.kind);
+            let path = backend
+                .path
+                .as_deref()
+                .map(canonical_fingerprint_path)
+                .unwrap_or_else(|| ":memory:".to_string());
+            legacy_safe &= legacy_topology_component_is_safe(&backend.name)
+                && legacy_topology_component_is_safe(&kind)
+                && backend
+                    .path
+                    .is_none_or(|_| legacy_topology_component_is_safe(&path));
+            (backend.name.clone(), kind, path, backend.read_only)
+        })
+        .collect();
+    backend_rows.sort();
+
+    let mut pack_rows: Vec<(String, String)> = cfg
+        .packs
+        .iter()
+        .map(|(pack, pack_config)| {
+            legacy_safe &= legacy_topology_component_is_safe(pack)
+                && legacy_topology_component_is_safe(&pack_config.backend);
+            (pack.clone(), pack_config.backend.clone())
+        })
+        .collect();
+    pack_rows.sort();
+
+    let (backends, pack_backends) = if legacy_safe {
+        let backends = backend_rows
+            .iter()
+            .map(|(name, kind, path, is_read_only)| {
+                let read_only = if *is_read_only { ":read_only" } else { "" };
+                format!("{name}:{kind}:{path}{read_only}")
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        let pack_backends = pack_rows
+            .iter()
+            .map(|(pack, backend)| format!("{pack}={backend}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        (backends, pack_backends)
+    } else {
+        let backends = backend_rows
+            .iter()
+            .map(|(name, kind, path, read_only)| {
+                let mode = if *read_only { "r" } else { "w" };
+                format!(
+                    "{}:{}:{}:{mode}",
+                    escape_topology_component(name),
+                    escape_topology_component(kind),
+                    escape_topology_component(path),
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        let pack_backends = pack_rows
+            .iter()
+            .map(|(pack, backend)| {
+                format!(
+                    "{}={}",
+                    escape_topology_component(pack),
+                    escape_topology_component(backend),
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        (format!("v2|{backends}"), format!("v2|{pack_backends}"))
+    };
+
+    format!(";backends=[{backends}];pack_backends=[{pack_backends}]")
 }
 
 /// Resolve any path headed into `config_id` fingerprinting — a declared
@@ -4177,6 +4262,111 @@ mod tests {
             "two projects declaring the same relative backend path string from \
              different working directories must not share a config_id; both \
              produced: {id_a}"
+        );
+    }
+
+    /// A backend path is caller-controlled data, so the legacy `:read_only`
+    /// suffix must never be confusable with literal path text. Before this
+    /// regression, these two distinct archive backends produced the same
+    /// topology string and could therefore share the wrong warm daemon:
+    ///
+    /// - read-only `/.../archive.db`
+    /// - writable `/.../archive.db:read_only`
+    #[test]
+    fn config_id_does_not_confuse_read_only_mode_with_a_path_suffix() {
+        use khive_runtime::{BackendConfig, BackendId, BackendKind, KhiveConfig, PackConfig};
+
+        let dir = tempfile::tempdir().expect("topology collision tempdir");
+        let main_path = dir.path().join("main.db");
+        let archive_path = dir.path().join("archive.db");
+        let literal_suffix_path = dir.path().join("archive.db:read_only");
+        let runtime = RuntimeConfig {
+            db_path: Some(main_path.clone()),
+            packs: vec!["kg".to_string(), "knowledge".to_string()],
+            backend_id: BackendId::main(),
+            ..RuntimeConfig::no_embeddings()
+        };
+
+        let topology = |path, read_only| KhiveConfig {
+            backends: vec![
+                BackendConfig {
+                    name: "main".to_string(),
+                    kind: BackendKind::Sqlite,
+                    path: Some(main_path.clone()),
+                    cache_mb: None,
+                    journal_mode: None,
+                    read_only: false,
+                },
+                BackendConfig {
+                    name: "archive".to_string(),
+                    kind: BackendKind::Sqlite,
+                    path: Some(path),
+                    cache_mb: None,
+                    journal_mode: None,
+                    read_only,
+                },
+            ],
+            packs: std::collections::HashMap::from([(
+                "knowledge".to_string(),
+                PackConfig {
+                    backend: "archive".to_string(),
+                },
+            )]),
+            ..KhiveConfig::default()
+        };
+
+        let read_only_archive = topology(archive_path, true);
+        let writable_literal_suffix = topology(literal_suffix_path, false);
+
+        assert_ne!(
+            compute_config_id(&runtime, Some(&read_only_archive)),
+            compute_config_id(&runtime, Some(&writable_literal_suffix)),
+            "backend mode must be encoded as a field, not an ambiguous path suffix"
+        );
+    }
+
+    /// The collision fix is deliberately conditional: ordinary topology
+    /// components that contain no reserved syntax keep their existing daemon
+    /// identity, avoiding an unnecessary one-time fallback/restart for the
+    /// overwhelmingly common configuration shape.
+    #[test]
+    fn config_id_preserves_legacy_topology_spelling_when_delimiter_free() {
+        use khive_runtime::{BackendConfig, BackendId, BackendKind, KhiveConfig, PackConfig};
+
+        let dir = tempfile::tempdir().expect("legacy topology tempdir");
+        let main_path = dir.path().join("main.db");
+        let runtime = RuntimeConfig {
+            db_path: Some(main_path.clone()),
+            packs: vec!["kg".to_string()],
+            backend_id: BackendId::main(),
+            ..RuntimeConfig::no_embeddings()
+        };
+        let topology = KhiveConfig {
+            backends: vec![BackendConfig {
+                name: "main".to_string(),
+                kind: BackendKind::Sqlite,
+                path: Some(main_path.clone()),
+                cache_mb: None,
+                journal_mode: None,
+                read_only: false,
+            }],
+            packs: std::collections::HashMap::from([(
+                "kg".to_string(),
+                PackConfig {
+                    backend: "main".to_string(),
+                },
+            )]),
+            ..KhiveConfig::default()
+        };
+
+        let expected_suffix = format!(
+            ";backends=[main:Sqlite:{}];pack_backends=[kg=main]",
+            canonical_fingerprint_path(&main_path)
+        );
+        let config_id = compute_config_id(&runtime, Some(&topology));
+        assert!(
+            config_id.ends_with(&expected_suffix),
+            "delimiter-free topologies must retain their legacy fingerprint spelling; got {config_id}"
         );
     }
 

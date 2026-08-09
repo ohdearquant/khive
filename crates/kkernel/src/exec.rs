@@ -47,9 +47,9 @@ use khive_mcp::serve::{
     normalize_redundant_db_override_with_source, reject_conflicting_db_override_with_source,
     RuntimeConfigInputs,
 };
-#[cfg(unix)]
-use khive_mcp::server::compute_config_id;
 use khive_mcp::server::KhiveMcpServer;
+#[cfg(unix)]
+use khive_mcp::server::{compute_config_id, compute_config_id_with_storage_mode};
 use khive_mcp::tools::request::RequestParams;
 #[cfg(unix)]
 use khive_runtime::{daemon::PROTOCOL_VERSION, DaemonRequestFrame};
@@ -1970,8 +1970,10 @@ async fn run_exec_inline_with_forward(
     // correctly rejects it. A matching concrete override is redundant, so its
     // fingerprint and captured construction anchor are normalized to the same
     // values used when no override is supplied.
-    if !khive_cfg.backends.is_empty() {
-        normalize_redundant_db_override_with_source(
+    let force_memory = if khive_cfg.backends.is_empty() {
+        false
+    } else {
+        let force_memory = normalize_redundant_db_override_with_source(
             &mut cfg,
             db_context.raw.as_deref(),
             &khive_cfg.backends,
@@ -1980,7 +1982,8 @@ async fn run_exec_inline_with_forward(
         if matches!(db_context.raw.as_deref(), Some(path) if path != ":memory:") {
             db_context.anchor = cfg.db_path.clone();
         }
-    }
+        force_memory
+    };
 
     disclose_resolved_database(&cfg, &khive_cfg);
 
@@ -2006,8 +2009,16 @@ async fn run_exec_inline_with_forward(
                 .map(|ns| ns.as_str().to_string())
                 .collect(),
             // Fold the SAME backends topology the daemon folds (`Some(&khive_cfg)`)
-            // instead of `None` — see the `khive_cfg` load above.
-            config_id: compute_config_id(&cfg, Some(&khive_cfg)),
+            // instead of `None` — see the `khive_cfg` load above. A force-memory
+            // override also supplies the effective writable mode explicitly:
+            // the declaration can say `main.read_only = true`, but the runtime
+            // the child opens is writable memory and fingerprints that captured
+            // mode after construction.
+            config_id: if force_memory {
+                compute_config_id_with_storage_mode(&cfg, Some(&khive_cfg), false)
+            } else {
+                compute_config_id(&cfg, Some(&khive_cfg))
+            },
             protocol_version: PROTOCOL_VERSION,
             probe_only: false,
             metrics_only: false,
@@ -5314,6 +5325,106 @@ id = "lambda:fallback"
             Some(":memory:".to_string()),
             "the daemon spawn seam must receive the raw --db override so a spawned daemon \
              can be constructed with the same ephemeral in-memory storage"
+        );
+    }
+
+    /// A declared read-only SQLite `main` backend becomes a writable memory
+    /// backend when `--db :memory:` forces the whole topology ephemeral. The
+    /// pre-open exec frame must fingerprint that effective runtime mode, not
+    /// the superseded declaration, or the freshly spawned daemon rejects its
+    /// very first request as a config mismatch.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial]
+    async fn force_memory_exec_frame_matches_opened_read_only_topology_runtime() {
+        std::env::remove_var("KHIVE_EMBEDDING_MODEL");
+        std::env::remove_var("KHIVE_ADDITIONAL_EMBEDDING_MODELS");
+        std::env::remove_var("KHIVE_ACTOR");
+        std::env::remove_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR");
+        std::env::remove_var("KHIVE_DB");
+        let (prev_home, _home_dir) = isolate_home_for_test();
+        SPY_CAPTURED_CONFIG_ID.with(|captured| *captured.borrow_mut() = None);
+
+        let fixture = tempfile::tempdir().expect("force-memory config tempdir");
+        let config_path = fixture.path().join("read-only-topology.toml");
+        let declared_main = fixture.path().join("declared-main.db");
+        let declared_archive = fixture.path().join("declared-archive.db");
+        std::fs::write(
+            &config_path,
+            format!(
+                r#"
+[[backends]]
+name = "main"
+kind = "sqlite"
+path = "{}"
+read_only = true
+
+[[backends]]
+name = "archive"
+kind = "sqlite"
+path = "{}"
+"#,
+                declared_main.display(),
+                declared_archive.display(),
+            ),
+        )
+        .expect("write read-only topology config");
+
+        let cfg = resolve_runtime_config(RuntimeConfigInputs {
+            db: Some(":memory:"),
+            config: Some(&config_path),
+            namespace: Namespace::local(),
+            namespace_explicit: true,
+            actor_explicit: false,
+            no_embed: true,
+            packs: Some(vec!["kg".to_string()]),
+            brain_profile: None,
+        })
+        .expect("resolve force-memory exec config");
+        assert_eq!(
+            cfg.db_path, None,
+            "the force-memory anchor must be in-memory"
+        );
+
+        let result = run_exec_inline_with_forward(
+            "stats()".to_string(),
+            cfg.clone(),
+            None,
+            None,
+            None,
+            ExecDbContext {
+                raw: Some(":memory:".to_string()),
+                anchor: None,
+                config: Some(config_path.clone()),
+            },
+            false,
+            spy_capture_config_and_succeed,
+        )
+        .await;
+        assert!(result.is_ok(), "force-memory dispatch failed: {result:?}");
+
+        let frame_config_id = SPY_CAPTURED_CONFIG_ID
+            .with(|captured| captured.borrow_mut().take())
+            .expect("spy must capture the forwarded config id");
+        let khive_cfg = KhiveConfig::load_with_home_fallback(Some(&config_path), None)
+            .expect("load force-memory topology")
+            .expect("explicit config must exist");
+        let opened =
+            khive_mcp::serve::build_registry_for_multi_backend(cfg, &khive_cfg, Some(":memory:"))
+                .expect("force-memory runtime must build");
+        restore_home(prev_home);
+
+        assert!(
+            !opened.default_runtime.is_read_only(),
+            "force-memory replaces the declared read-only SQLite main with writable memory"
+        );
+        assert_eq!(
+            frame_config_id, opened.config_id,
+            "the pre-open exec frame and opened force-memory runtime must have identical config ids"
+        );
+        assert!(
+            !declared_main.exists() && !declared_archive.exists(),
+            "force-memory parity setup must not materialize either declared SQLite path"
         );
     }
 
