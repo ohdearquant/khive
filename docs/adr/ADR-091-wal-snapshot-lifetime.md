@@ -1230,6 +1230,15 @@ execution with typed `SqliteError::DiskCapacityFloor`; the writer operation is
 not counted as acquired, and a writer task stays healthy for later work after
 capacity recovers.
 
+The reserve is recovery capacity, not an absolute prohibition on SQLite I/O.
+On a retained standalone writer, an exact transaction-control head of
+`ROLLBACK` bypasses the admission sample so both whole-transaction `ROLLBACK`
+and savepoint `ROLLBACK TO [SAVEPOINT] name` can unwind work that was admitted
+before capacity fell. This is the only raw-SQL exception: `BEGIN`/`START`,
+`COMMIT`/`END`, `SAVEPOINT`, `RELEASE`, and all DML remain guarded. Single-
+statement preparation still rejects an executable tail, so the exception
+cannot carry later DML in the same `SqlStatement`.
+
 The database identity and capacity probe share one canonical path resolver.
 A dangling final-component symlink at first open is resolved to its ultimate
 target before the probe parent is selected, so a link crossing filesystem

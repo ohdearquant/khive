@@ -39,6 +39,14 @@ The MCP wire form is `kind="resource_exhausted"`,
 `code="sqlite_disk_reserve"`, with `available_bytes`, `reserve_bytes`, and no
 fabricated timeout or retry-after value.
 
+One narrow recovery exception applies to a retained standalone raw-SQL
+writer: an exact `ROLLBACK` statement head bypasses the sample. This covers
+both `ROLLBACK` and `ROLLBACK TO [SAVEPOINT] name`, allowing an already-open
+transaction or savepoint to consume the headroom that admission reserved.
+`BEGIN`/`START`, `COMMIT`/`END`, `SAVEPOINT`, `RELEASE`, and DML still fail at
+the floor. The normal single-statement parser remains in force, so a rollback
+cannot smuggle a second statement through the exception.
+
 With a nonzero reserve, the configured database must be a filesystem path.
 `file:` SQLite URIs are rejected rather than probing a guessed/decoded path;
 use the equivalent filesystem path. A URI remains available only when the

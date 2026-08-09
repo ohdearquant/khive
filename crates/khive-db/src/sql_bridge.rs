@@ -236,6 +236,17 @@ fn transaction_control_head(sql: &str) -> Option<&'static str> {
         })
 }
 
+/// Whether `sql` is a transaction-recovery control that must remain usable
+/// after an admitted transaction consumes the remaining disk headroom.
+///
+/// Both whole-transaction `ROLLBACK` and savepoint `ROLLBACK TO` share this
+/// exact statement head. The keyword-boundary classifier deliberately keeps
+/// `ROLLBACKISH` and ordinary DML out; the single-statement prepare below
+/// separately rejects an executable tail.
+fn is_recovery_rollback(sql: &str) -> bool {
+    transaction_control_head(sql) == Some("ROLLBACK")
+}
+
 /// Reject transaction-control statements in `statements` with a typed
 /// [`StorageError::InvalidInput`] BEFORE anything executes, preserving the
 /// batch's all-or-nothing contract (see [`TRANSACTION_CONTROL_KEYWORDS`]).
@@ -888,7 +899,13 @@ impl khive_storage::SqlWriter for SqliteWriter {
         &mut self,
         statement: SqlStatement,
     ) -> khive_storage::types::StorageResult<u64> {
-        self.check_write_capacity("sql_bridge.execute.disk_reserve")?;
+        // Admission preserves recovery headroom for an already-open
+        // transaction. Spending that reserve must remain possible through
+        // exact ROLLBACK / ROLLBACK TO controls; every transaction opener,
+        // closer, savepoint creator/releaser, and DML statement stays guarded.
+        if !is_recovery_rollback(&statement.sql) {
+            self.check_write_capacity("sql_bridge.execute.disk_reserve")?;
+        }
         // ADR-067 Component A (Fork C slice 2): a single statement is
         // self-contained, just like `execute_batch`'s full statement list —
         // transaction-control rejection remains an `execute_batch` contract;
@@ -1848,6 +1865,53 @@ mod tests {
     use khive_storage::types::{SqlStatement, SqlValue};
     use khive_storage::{SqlAccess as _, SqlReader as _};
 
+    fn test_statement(sql: &str) -> SqlStatement {
+        SqlStatement {
+            sql: sql.to_string(),
+            params: vec![],
+            label: Some("disk-reserve-recovery-test".to_string()),
+        }
+    }
+
+    fn assert_disk_capacity_floor(error: &StorageError, reserve_bytes: u64) {
+        assert!(
+            matches!(
+                error,
+                StorageError::Driver { source, .. }
+                    if matches!(
+                        source.downcast_ref::<SqliteError>(),
+                        Some(SqliteError::DiskCapacityFloor {
+                            available_bytes: 0,
+                            reserve_bytes: actual_reserve,
+                            ..
+                        }) if *actual_reserve == reserve_bytes
+                    )
+            ),
+            "expected a typed disk-capacity-floor error; got {error:?}"
+        );
+    }
+
+    async fn direct_sqlite_writer(pool: Arc<ConnectionPool>) -> SqliteWriter {
+        let handle_slot = acquire_handle_slot(
+            pool.sql_bridge_writer_slots(),
+            pool.config().checkout_timeout,
+            "sql_bridge.writer_handle",
+        )
+        .await
+        .unwrap();
+        let conn = open_standalone_writer(&pool).unwrap();
+        SqliteWriter {
+            handle: Some(StandaloneHandle {
+                conn,
+                _slot: handle_slot,
+            }),
+            writer_task: None,
+            origin: pool.origin(),
+            db: crate::timeout_sink::db_label(&pool),
+            pool,
+        }
+    }
+
     struct NotifyOnDrop(Arc<tokio::sync::Notify>);
 
     impl Drop for NotifyOnDrop {
@@ -2133,6 +2197,215 @@ mod tests {
         )
         .await
         .expect("capacity recovery must not poison a retained writer handle");
+    }
+
+    #[tokio::test]
+    async fn direct_writer_can_rollback_an_open_transaction_below_disk_reserve() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = Arc::new(
+            ConnectionPool::new(PoolConfig {
+                path: Some(dir.path().join("rollback-recovery-reserve.db")),
+                write_queue_enabled: Some(false),
+                disk_reserve_bytes: 1,
+                ..PoolConfig::default()
+            })
+            .unwrap(),
+        );
+        let mut writer = direct_sqlite_writer(Arc::clone(&pool)).await;
+        khive_storage::SqlWriter::execute_script(
+            &mut writer,
+            "CREATE TABLE rollback_recovery (id INTEGER PRIMARY KEY)".to_string(),
+        )
+        .await
+        .unwrap();
+
+        pool.force_available_bytes_for_test(2);
+        khive_storage::SqlWriter::execute(&mut writer, test_statement("BEGIN IMMEDIATE"))
+            .await
+            .unwrap();
+        khive_storage::SqlWriter::execute(
+            &mut writer,
+            test_statement("INSERT INTO rollback_recovery (id) VALUES (1)"),
+        )
+        .await
+        .unwrap();
+
+        // The admitted transaction consumed the remaining capacity. Recovery
+        // must still be able to spend the reserve that admission preserved.
+        pool.force_available_bytes_for_test(0);
+        khive_storage::SqlWriter::execute(&mut writer, test_statement("ROLLBACK"))
+            .await
+            .expect("ROLLBACK must remain available below the admission floor");
+
+        let conn = &writer.handle.as_ref().unwrap().conn;
+        assert!(conn.is_autocommit(), "ROLLBACK must close the transaction");
+        let row_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM rollback_recovery", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(row_count, 0, "ROLLBACK must undo the admitted write");
+    }
+
+    #[tokio::test]
+    async fn direct_writer_can_rollback_to_savepoint_below_disk_reserve() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = Arc::new(
+            ConnectionPool::new(PoolConfig {
+                path: Some(dir.path().join("savepoint-recovery-reserve.db")),
+                write_queue_enabled: Some(false),
+                disk_reserve_bytes: 1,
+                ..PoolConfig::default()
+            })
+            .unwrap(),
+        );
+        let mut writer = direct_sqlite_writer(Arc::clone(&pool)).await;
+        khive_storage::SqlWriter::execute_script(
+            &mut writer,
+            "CREATE TABLE savepoint_recovery (id INTEGER PRIMARY KEY)".to_string(),
+        )
+        .await
+        .unwrap();
+
+        pool.force_available_bytes_for_test(2);
+        for sql in [
+            "BEGIN IMMEDIATE",
+            "INSERT INTO savepoint_recovery (id) VALUES (1)",
+            "SAVEPOINT recovery_point",
+            "INSERT INTO savepoint_recovery (id) VALUES (2)",
+        ] {
+            khive_storage::SqlWriter::execute(&mut writer, test_statement(sql))
+                .await
+                .unwrap();
+        }
+
+        pool.force_available_bytes_for_test(0);
+        khive_storage::SqlWriter::execute(
+            &mut writer,
+            test_statement("ROLLBACK TO SAVEPOINT recovery_point"),
+        )
+        .await
+        .expect("ROLLBACK TO must remain available below the admission floor");
+
+        let conn = &writer.handle.as_ref().unwrap().conn;
+        let row_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM savepoint_recovery", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(row_count, 1, "ROLLBACK TO must undo post-savepoint work");
+        assert!(
+            !conn.is_autocommit(),
+            "ROLLBACK TO must leave the owning transaction open"
+        );
+
+        pool.force_available_bytes_for_test(2);
+        for sql in ["RELEASE SAVEPOINT recovery_point", "COMMIT"] {
+            khive_storage::SqlWriter::execute(&mut writer, test_statement(sql))
+                .await
+                .unwrap();
+        }
+        assert!(
+            writer.handle.as_ref().unwrap().conn.is_autocommit(),
+            "the recovered transaction must remain committable after capacity returns"
+        );
+    }
+
+    #[tokio::test]
+    async fn disk_reserve_still_refuses_non_recovery_transaction_controls_and_dml() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = Arc::new(
+            ConnectionPool::new(PoolConfig {
+                path: Some(dir.path().join("non-recovery-reserve.db")),
+                write_queue_enabled: Some(false),
+                disk_reserve_bytes: 1,
+                ..PoolConfig::default()
+            })
+            .unwrap(),
+        );
+        let mut writer = direct_sqlite_writer(Arc::clone(&pool)).await;
+        khive_storage::SqlWriter::execute_script(
+            &mut writer,
+            "CREATE TABLE non_recovery (id INTEGER PRIMARY KEY)".to_string(),
+        )
+        .await
+        .unwrap();
+
+        pool.force_available_bytes_for_test(0);
+        for sql in [
+            "BEGIN IMMEDIATE",
+            "START TRANSACTION",
+            "COMMIT",
+            "END TRANSACTION",
+            "SAVEPOINT recovery_point",
+            "RELEASE SAVEPOINT recovery_point",
+            "INSERT INTO non_recovery (id) VALUES (1)",
+            "ROLLBACKISH",
+        ] {
+            let error = khive_storage::SqlWriter::execute(&mut writer, test_statement(sql))
+                .await
+                .expect_err("only an exact recovery ROLLBACK may bypass admission");
+            assert_disk_capacity_floor(&error, 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn manual_atomic_commit_refusal_can_rollback_below_disk_reserve() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = Arc::new(
+            ConnectionPool::new(PoolConfig {
+                path: Some(dir.path().join("manual-atomic-recovery-reserve.db")),
+                write_queue_enabled: Some(false),
+                disk_reserve_bytes: 1,
+                ..PoolConfig::default()
+            })
+            .unwrap(),
+        );
+        let mut writer = direct_sqlite_writer(Arc::clone(&pool)).await;
+        khive_storage::SqlWriter::execute_script(
+            &mut writer,
+            "CREATE TABLE manual_atomic_recovery (id INTEGER PRIMARY KEY)".to_string(),
+        )
+        .await
+        .unwrap();
+
+        pool.force_available_bytes_for_test(2);
+        let op_pool = Arc::clone(&pool);
+        let op: AtomicUnitOp = Box::new(move |writer| {
+            Box::pin(async move {
+                khive_storage::SqlWriter::execute(
+                    writer,
+                    test_statement("INSERT INTO manual_atomic_recovery (id) VALUES (1)"),
+                )
+                .await?;
+                // Force the capacity change after the body succeeds so
+                // COMMIT is still guarded and the fallback ROLLBACK is the
+                // only path that can restore the connection.
+                op_pool.force_available_bytes_for_test(0);
+                Ok(Box::new(()) as Box<dyn Any + Send>)
+            })
+        });
+
+        let error = match run_manual_atomic_unit(&mut writer, op, pool.origin()).await {
+            Ok(_) => panic!("COMMIT must remain capacity-guarded"),
+            Err(error) => error,
+        };
+        assert_disk_capacity_floor(&error, 1);
+
+        let conn = &writer.handle.as_ref().unwrap().conn;
+        assert!(
+            conn.is_autocommit(),
+            "fallback ROLLBACK must restore autocommit after COMMIT refusal"
+        );
+        let row_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM manual_atomic_recovery", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            row_count, 0,
+            "fallback ROLLBACK must undo a body whose COMMIT was refused"
+        );
     }
 
     #[test]
@@ -3028,6 +3301,39 @@ mod tests {
                 transaction_control_head(sql),
                 expected,
                 "classification mismatch for {sql:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn recovery_rollback_classification_is_exact() {
+        for sql in [
+            "ROLLBACK",
+            "rollback transaction",
+            "ROLLBACK TO recovery_point",
+            "rollback to savepoint recovery_point",
+            "\u{feff} -- recovery\n /* still recovery */ ROLLBACK TO recovery_point",
+        ] {
+            assert!(
+                is_recovery_rollback(sql),
+                "expected recovery rollback classification for {sql:?}"
+            );
+        }
+
+        for sql in [
+            "BEGIN IMMEDIATE",
+            "START TRANSACTION",
+            "COMMIT",
+            "END TRANSACTION",
+            "SAVEPOINT recovery_point",
+            "RELEASE SAVEPOINT recovery_point",
+            "INSERT INTO rollback_log DEFAULT VALUES",
+            "ROLLBACKISH",
+            "SELECT 'ROLLBACK'",
+        ] {
+            assert!(
+                !is_recovery_rollback(sql),
+                "must not classify non-recovery SQL as rollback: {sql:?}"
             );
         }
     }
