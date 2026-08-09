@@ -2077,6 +2077,7 @@ mod tests {
         std::env::remove_var("KHIVE_EMBEDDING_MODEL");
         std::env::remove_var("KHIVE_ADDITIONAL_EMBEDDING_MODELS");
         std::env::remove_var("KHIVE_ACTOR");
+        let (previous_home, _home_dir) = isolate_home_for_test();
 
         let dir = tempfile::tempdir().expect("tempdir");
         let khive_dir = dir.path().join(".khive");
@@ -2168,6 +2169,7 @@ default = true
             compute_config_id(&serve_cfg, None),
             "exec-path config_id must match the serve/daemon-path config_id for the same db"
         );
+        restore_home(previous_home);
     }
 
     /// Regression guard: an explicit `--actor` pin must rebuild the
@@ -2186,6 +2188,7 @@ default = true
         std::env::remove_var("KHIVE_EMBEDDING_MODEL");
         std::env::remove_var("KHIVE_ADDITIONAL_EMBEDDING_MODELS");
         std::env::remove_var("KHIVE_ACTOR");
+        let (previous_home, _home_dir) = isolate_home_for_test();
 
         let dir = tempfile::tempdir().expect("tempdir");
         let khive_dir = dir.path().join(".khive");
@@ -2258,6 +2261,7 @@ id = "lambda:fallback"
              fallback actor nor adding a new one: {:?}",
             local_cfg.visible_namespaces
         );
+        restore_home(previous_home);
     }
 
     /// Settles the `namespace_explicit` design question by constructing both

@@ -1270,6 +1270,30 @@ default = true
     }
 
     #[test]
+    fn home_gate_config_is_rejected_while_explicit_empty_config_is_hermetic() {
+        let project_dir = tempfile::tempdir().unwrap();
+        let home_dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home_dir.path().join(".khive")).unwrap();
+        std::fs::write(
+            home_dir.path().join(".khive/config.toml"),
+            "[gate]\ngranted_actors = [\"lambda:enrolled\"]\n",
+        )
+        .unwrap();
+
+        let err = KhiveConfig::load_with_roots(project_dir.path(), Some(home_dir.path()), None)
+            .expect_err("an unsupported home gate policy must still fail loud");
+        assert!(matches!(err, ConfigError::UnsupportedGateSection));
+
+        let empty = project_dir.path().join("empty-khive-config.toml");
+        std::fs::write(&empty, "").unwrap();
+        let isolated = KhiveConfig::load_with_home_fallback(Some(&empty), None)
+            .expect("an explicit empty fixture must isolate config discovery")
+            .expect("the explicit config exists");
+        assert!(isolated.engines.is_empty());
+        assert!(isolated.actor.id.is_none());
+    }
+
+    #[test]
     fn test_load_with_home_fallback_explicit_path() {
         let dir = tempfile::tempdir().unwrap();
         let path = write_toml(
